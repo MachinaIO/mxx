@@ -1415,6 +1415,10 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        let mut msg_blocks2 = msg_blocks1.clone();
+        let bumped =
+            msg_blocks2[0].entry(0, 0) + <DCRTPolyMatrix as PolyMatrix>::P::const_one(&params);
+        msg_blocks2[0].set_entry(0, 0, bumped);
         let msg_stream1 = MsgMatrixStream::from_blocks(msg_blocks1);
         let start = Instant::now();
         let commitment = wee25_commit.commit(&params, &msg_stream1, &public_params);
@@ -1433,16 +1437,6 @@ mod tests {
         let start = Instant::now();
         let _verifier = wee25_commit.verifier(&params, cols, None, &public_params);
         info!("verifier generated in {:?}", start.elapsed());
-        let msg_blocks2 = (0..cols)
-            .map(|_| {
-                uniform_sampler.sample_uniform(
-                    &params,
-                    secret_size,
-                    wee25_commit.m_b,
-                    DistType::FinRingDist,
-                )
-            })
-            .collect::<Vec<_>>();
         let msg_matrix2 = concat_blocks(&msg_blocks2);
         let msg_stream2 = MsgMatrixStream::from_blocks(msg_blocks2);
         let start = Instant::now();

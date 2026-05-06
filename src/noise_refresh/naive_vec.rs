@@ -1223,6 +1223,216 @@ where
             .collect()
     }
 
+    /// Computes many online refreshes while materializing decoder matrices in
+    /// bounded chunks.
+    ///
+    /// This has the same semantics as `online_eval_many`, but `decoder_factory`
+    /// is called only for the currently processed chunk. It is useful for
+    /// DiamondIO, where decoder matrices are read from disk and multiplied by
+    /// the final Diamond state; building all decoder sets for all refreshed
+    /// wires at once can exhaust GPU memory even though each individual matrix
+    /// is tiny.
+    #[allow(clippy::too_many_arguments)]
+    pub fn online_eval_many_with_decoder_factory<PE, ST, DF>(
+        &self,
+        refresh_ids: &[Vec<u8>],
+        one: &NaiveBGGEncodingVec<M>,
+        refreshed_inputs: &[NaiveBGGEncodingVec<M>],
+        enc_seeds: &[NaiveBGGEncodingVec<M>],
+        decryption_key: &NaiveBGGEncodingVec<M>,
+        decoder_factory: DF,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Vec<NaiveBGGEncodingVec<M>>
+    where
+        PE: PltEvaluator<NaiveBGGEncodingVec<M>>,
+        ST: SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
+        DF: Fn(usize) -> Vec<M> + Sync,
+    {
+        info!(
+            target: "mxx::func_enc::aky24",
+            refresh_id_count = refresh_ids.len(),
+            refreshed_input_count = refreshed_inputs.len(),
+            seed_wire_count = enc_seeds.len(),
+            decoder_chunk_size = crate::env::noise_refresh_decoder_chunk_size(),
+            "naive-vector noise-refresh online_eval_many_with_decoder_factory entered"
+        );
+        assert_eq!(
+            refresh_ids.len(),
+            refreshed_inputs.len(),
+            "refresh id count must match refreshed input count"
+        );
+        let num_slots = refreshed_inputs
+            .first()
+            .expect("online_eval_many_with_decoder_factory requires at least one refreshed input")
+            .num_slots();
+        assert_eq!(
+            num_slots,
+            self.params().ring_dimension() as usize,
+            "Naive noise refresh currently expects one logical slot per ring coefficient"
+        );
+        refreshed_inputs.par_iter().for_each(|input| one.assert_compatible(input));
+        one.assert_compatible(decryption_key);
+        enc_seeds.par_iter().for_each(|seed| one.assert_compatible(seed));
+
+        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
+        let log_base_q = self.params().modulus_digits();
+        let secret_size = one.encoding(0).pubkey.matrix.row_size();
+        let decoded_refresh_terms = if self.debug_reuse_single_material {
+            info!(
+                target: "mxx::func_enc::aky24",
+                num_slots,
+                crt_depth,
+                log_base_q,
+                "naive-vector noise-refresh chunked online eval sampling debug PRG-output material"
+            );
+            let debug_decode_circuit = build_noise_refresh_debug_material_decode_circuit::<
+                M::P,
+                A,
+                M,
+            >(self.ring_gsw.clone(), self.v_bits);
+            let material_input_count = debug_decode_circuit.num_input() - 1;
+            assert_eq!(
+                material_input_count % 2,
+                0,
+                "debug noise-refresh material input count must split into error and mask halves"
+            );
+            let per_material_input_count = material_input_count / 2;
+            let error_wire = debug_sample_prg_output_encoding_wires::<M, HS>(
+                self.params(),
+                self.hash_key,
+                b"noise-refresh-debug-error-material",
+                1,
+                num_slots,
+                one,
+            )
+            .into_iter()
+            .next()
+            .expect("debug noise-refresh must sample one reusable error wire");
+            let mask_wire = debug_sample_prg_output_encoding_wires::<M, HS>(
+                self.params(),
+                self.hash_key,
+                b"noise-refresh-debug-mask-material",
+                1,
+                num_slots,
+                one,
+            )
+            .into_iter()
+            .next()
+            .expect("debug noise-refresh must sample one reusable mask wire");
+            let mut inputs = Vec::with_capacity(material_input_count + 1);
+            inputs.extend(std::iter::repeat_n(error_wire, per_material_input_count));
+            inputs.extend(std::iter::repeat_n(mask_wire, per_material_input_count));
+            inputs.push(decryption_key.clone());
+            let decoded = debug_decode_circuit.eval(
+                self.params(),
+                one.clone(),
+                inputs,
+                Some(plt_evaluator),
+                Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>),
+                None,
+            );
+            let decoded_row_size = decoded
+                .first()
+                .and_then(|value| {
+                    (value.num_slots() > 0).then(|| value.encoding(0).pubkey.matrix.row_size())
+                })
+                .expect("debug noise-refresh decoded encoding material must be nonempty");
+            let unit_column_target =
+                M::unit_column_vector(self.params(), decoded_row_size, decoded_row_size - 1);
+            let decoded = decoded
+                .into_iter()
+                .map(|value| value.matrix_mul(self.params(), &unit_column_target))
+                .collect::<Vec<_>>();
+            decoded_refresh_terms_encoding(
+                self.params(),
+                &decoded,
+                num_slots,
+                crt_depth,
+                log_base_q,
+                secret_size,
+            )
+        } else {
+            let material_seed_bits = self.seed_bits;
+            let seed_wire_count = enc_seeds
+                .len()
+                .checked_div(self.seed_bits)
+                .expect("noise-refresh seed bit count must be positive");
+            assert_eq!(
+                seed_wire_count * self.seed_bits,
+                enc_seeds.len(),
+                "noise-refresh encrypted seed wire count must be divisible by seed_bits"
+            );
+            let material_seed_wire_count = material_seed_bits
+                .checked_mul(seed_wire_count)
+                .expect("noise-refresh material seed wire count overflow");
+            let mut inputs =
+                enc_seeds[..material_seed_wire_count].par_iter().cloned().collect::<Vec<_>>();
+            inputs.push(decryption_key.clone());
+            let decoded = self.material_circuit.eval(
+                self.params(),
+                one.clone(),
+                inputs,
+                Some(plt_evaluator),
+                Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>),
+                None,
+            );
+            let decoded_row_size = decoded
+                .first()
+                .and_then(|value| {
+                    (value.num_slots() > 0).then(|| value.encoding(0).pubkey.matrix.row_size())
+                })
+                .expect("noise-refresh decoded encoding material must be nonempty");
+            let unit_column_target =
+                M::unit_column_vector(self.params(), decoded_row_size, decoded_row_size - 1);
+            let decoded = decoded
+                .into_iter()
+                .map(|value| value.matrix_mul(self.params(), &unit_column_target))
+                .collect::<Vec<_>>();
+            decoded_refresh_terms_encoding(
+                self.params(),
+                &decoded,
+                num_slots,
+                crt_depth,
+                log_base_q,
+                secret_size,
+            )
+        };
+
+        let chunk_size = crate::env::noise_refresh_decoder_chunk_size();
+        let mut outputs = Vec::with_capacity(refresh_ids.len());
+        for chunk_start in (0..refresh_ids.len()).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(refresh_ids.len());
+            let decoder_started = std::time::Instant::now();
+            let decoder_sets = (chunk_start..chunk_end).map(&decoder_factory).collect::<Vec<_>>();
+            debug!(
+                target: "mxx::func_enc::aky24",
+                chunk_start,
+                chunk_end,
+                decoder_set_count = decoder_sets.len(),
+                decoder_count = decoder_sets.iter().map(Vec::len).sum::<usize>(),
+                elapsed_ms = decoder_started.elapsed().as_millis(),
+                "naive-vector noise-refresh chunked online eval materialized decoder chunk"
+            );
+            let mut chunk_outputs = refresh_ids[chunk_start..chunk_end]
+                .par_iter()
+                .zip(refreshed_inputs[chunk_start..chunk_end].par_iter())
+                .zip(decoder_sets.par_iter())
+                .map(|((refresh_id, refreshed_input), decoders)| {
+                    self.online_from_decoded(
+                        refresh_id,
+                        one,
+                        refreshed_input,
+                        &decoded_refresh_terms,
+                        decoders,
+                    )
+                })
+                .collect::<Vec<_>>();
+            outputs.append(&mut chunk_outputs);
+        }
+        outputs
+    }
+
     fn preprocess_from_decoded(
         &self,
         refresh_id: &[u8],

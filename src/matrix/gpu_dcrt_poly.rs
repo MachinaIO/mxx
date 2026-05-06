@@ -239,7 +239,19 @@ impl GpuDCRTPolyMatrix {
                 &mut raw as *mut *mut GpuMatrixOpaque,
             )
         };
-        check_status(status, "gpu_matrix_create");
+        let context = format!(
+            "gpu_matrix_create(nrow={}, ncol={}, level={}, format={}, ring_dim={}, crt_depth={}, crt_bits={}, base_bits={})",
+            nrow,
+            ncol,
+            level,
+            format,
+            params.ring_dimension(),
+            params.crt_depth(),
+            params.crt_bits(),
+            params.base_bits()
+        );
+        debug!("{context}");
+        check_status(status, &context);
         Self { params: params.clone(), nrow, ncol, level, is_ntt, raw }
     }
 
@@ -628,7 +640,20 @@ impl GpuDCRTPolyMatrix {
                 &mut events as *mut *mut GpuEventSetOpaque,
             )
         };
-        check_status(status, "gpu_matrix_load_rns_batch");
+        let context = format!(
+            "gpu_matrix_load_rns_batch(nrow={}, ncol={}, level={}, current_ntt={}, format={}, bytes={}, bytes_per_poly={}, ring_dim={}, crt_depth={})",
+            self.nrow,
+            self.ncol,
+            self.level,
+            self.is_ntt,
+            format,
+            bytes.len(),
+            bytes_per_poly,
+            self.params.ring_dimension(),
+            self.params.crt_depth()
+        );
+        debug!("{context}");
+        check_status(status, &context);
         if !events.is_null() {
             let wait_status = unsafe { gpu_event_set_wait(events) };
             unsafe { gpu_event_set_destroy(events) };
@@ -1405,16 +1430,22 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             return Self::new_empty(&self.params, self.nrow, ncol);
         }
 
-        // Keep peak memory low by processing one decomposed column at a time.
+        // Keep peak memory tunable by processing a bounded number of
+        // decomposed columns at a time. The default chunk width is one column,
+        // which preserves the previous low-VRAM behavior.
+        let column_chunk_width = crate::env::mul_decompose_column_chunk_width().min(ncol).max(1);
         let mut out = Self::new_empty(&self.params, self.nrow, ncol);
         let mut decompose_total = Duration::ZERO;
         let mut mul_total = Duration::ZERO;
         let mut copy_total = Duration::ZERO;
-        for j in 0..ncol {
-            let col_start = Instant::now();
+        for col_start_idx in (0..ncol).step_by(column_chunk_width) {
+            let col_end_idx = (col_start_idx + column_chunk_width).min(ncol);
+            let chunk_ncol = col_end_idx - col_start_idx;
+            let chunk_start = Instant::now();
 
             let decompose_start = Instant::now();
-            let col_decomposed = other.get_column_matrix_decompose(j);
+            let col_decomposed =
+                other.slice(0, other.nrow, col_start_idx, col_end_idx).decompose_owned();
             let decompose_elapsed = decompose_start.elapsed();
 
             let mul_start = Instant::now();
@@ -1422,22 +1453,24 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             let mul_elapsed = mul_start.elapsed();
 
             let copy_start = Instant::now();
-            out.copy_block_from(&product, 0, j, 0, 0, self.nrow, 1);
+            out.copy_block_from(&product, 0, col_start_idx, 0, 0, self.nrow, chunk_ncol);
             let copy_elapsed = copy_start.elapsed();
 
-            let col_elapsed = col_start.elapsed();
+            let chunk_elapsed = chunk_start.elapsed();
             decompose_total += decompose_elapsed;
             mul_total += mul_elapsed;
             copy_total += copy_elapsed;
 
             debug!(
-                "GpuDCRTPolyMatrix::mul_decompose timing: col={}/{}, decompose_ms={:.3}, mul_ms={:.3}, copy_ms={:.3}, col_total_ms={:.3}",
-                j + 1,
+                "GpuDCRTPolyMatrix::mul_decompose timing: cols={}..{}/{}, chunk_width={}, decompose_ms={:.3}, mul_ms={:.3}, copy_ms={:.3}, chunk_total_ms={:.3}",
+                col_start_idx,
+                col_end_idx,
                 ncol,
+                chunk_ncol,
                 to_ms(decompose_elapsed),
                 to_ms(mul_elapsed),
                 to_ms(copy_elapsed),
-                to_ms(col_elapsed)
+                to_ms(chunk_elapsed)
             );
         }
 
@@ -1478,16 +1511,22 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             return Self::new_empty(&self.params, self.nrow, ncol);
         }
 
-        // Keep peak memory low by processing one compact-decomposed column at a time.
+        // Keep peak memory tunable by processing a bounded number of
+        // compact-decomposed columns at a time. The default chunk width is one
+        // column, which preserves the previous low-VRAM behavior.
+        let column_chunk_width = crate::env::mul_decompose_column_chunk_width().min(ncol).max(1);
         let mut out = Self::new_empty(&self.params, self.nrow, ncol);
         let mut decompose_total = Duration::ZERO;
         let mut mul_total = Duration::ZERO;
         let mut copy_total = Duration::ZERO;
-        for j in 0..ncol {
-            let col_start = Instant::now();
+        for col_start_idx in (0..ncol).step_by(column_chunk_width) {
+            let col_end_idx = (col_start_idx + column_chunk_width).min(ncol);
+            let chunk_ncol = col_end_idx - col_start_idx;
+            let chunk_start = Instant::now();
 
             let decompose_start = Instant::now();
-            let col_small_decomposed = other.slice(0, other.nrow, j, j + 1).small_decompose_owned();
+            let col_small_decomposed =
+                other.slice(0, other.nrow, col_start_idx, col_end_idx).small_decompose_owned();
             let decompose_elapsed = decompose_start.elapsed();
 
             let mul_start = Instant::now();
@@ -1495,22 +1534,24 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             let mul_elapsed = mul_start.elapsed();
 
             let copy_start = Instant::now();
-            out.copy_block_from(&product, 0, j, 0, 0, self.nrow, 1);
+            out.copy_block_from(&product, 0, col_start_idx, 0, 0, self.nrow, chunk_ncol);
             let copy_elapsed = copy_start.elapsed();
 
-            let col_elapsed = col_start.elapsed();
+            let chunk_elapsed = chunk_start.elapsed();
             decompose_total += decompose_elapsed;
             mul_total += mul_elapsed;
             copy_total += copy_elapsed;
 
             debug!(
-                "GpuDCRTPolyMatrix::mul_decompose_small timing: col={}/{}, decompose_ms={:.3}, mul_ms={:.3}, copy_ms={:.3}, col_total_ms={:.3}",
-                j + 1,
+                "GpuDCRTPolyMatrix::mul_decompose_small timing: cols={}..{}/{}, chunk_width={}, decompose_ms={:.3}, mul_ms={:.3}, copy_ms={:.3}, chunk_total_ms={:.3}",
+                col_start_idx,
+                col_end_idx,
                 ncol,
+                chunk_ncol,
                 to_ms(decompose_elapsed),
                 to_ms(mul_elapsed),
                 to_ms(copy_elapsed),
-                to_ms(col_elapsed)
+                to_ms(chunk_elapsed)
             );
         }
 

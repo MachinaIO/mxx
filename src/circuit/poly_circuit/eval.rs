@@ -15,7 +15,9 @@ impl<P: Poly> PolyCircuit<P> {
     ) -> Vec<E>
     where
         E: Evaluable<P = P>,
+        E::Compact: Send + Sync,
         PE: PltEvaluator<E>,
+        PE: Sync,
     {
         let (call_id_base, gate_id_base) = self.eval_gate_id_bases();
         let parallel_gates = crate::env::resolve_circuit_parallel_gates(parallel_gates);
@@ -25,20 +27,30 @@ impl<P: Poly> PolyCircuit<P> {
             inputs.into_iter().map(|input| Arc::new(input.to_compact())).collect::<Vec<_>>();
         let scoped_gate_ids = self.build_scoped_gate_id_map(&call_id_base, &gate_id_base);
         let call_prefix = ScopedGateKey::from(0u32);
-        let outputs = self.eval_scoped(
-            params,
-            &one,
-            one_compact,
-            &input_compacts,
-            &[],
-            plt_evaluator,
-            slot_transfer_evaluator,
-            &call_prefix,
-            &call_id_base,
-            &gate_id_base,
-            &scoped_gate_ids,
-            parallel_gates,
-        );
+        let outputs = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("poly-circuit-eval".to_string())
+                .stack_size(64 * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    self.eval_scoped(
+                        params,
+                        &one,
+                        one_compact,
+                        &input_compacts,
+                        &[],
+                        plt_evaluator,
+                        slot_transfer_evaluator,
+                        &call_prefix,
+                        &call_id_base,
+                        &gate_id_base,
+                        &scoped_gate_ids,
+                        parallel_gates,
+                    )
+                })
+                .expect("failed to spawn PolyCircuit eval thread")
+                .join()
+                .expect("PolyCircuit eval thread panicked")
+        });
         outputs.into_iter().map(|value| E::from_compact(params, value.as_ref())).collect()
     }
 
@@ -557,7 +569,20 @@ impl<P: Poly> PolyCircuit<P> {
                     let (eval_params, _) = &shard_params_and_one[shard_idx];
                     let gate_id = *gate_id;
                     let gate = self.gates.get(&gate_id).expect("gate not found").clone();
+                    debug!(
+                        gate_id = gate_id.0,
+                        gate_kind = ?gate.gate_type.kind(),
+                        shard_idx,
+                        input_count = gate.input_gates.len(),
+                        "PolyCircuit GPU load gate inputs started"
+                    );
                     if wires.contains_key(&gate_id) {
+                        debug!(
+                            gate_id = gate_id.0,
+                            gate_kind = ?gate.gate_type.kind(),
+                            shard_idx,
+                            "PolyCircuit GPU load skipped existing gate"
+                        );
                         return LoadedGateCtx {
                             gate_id,
                             gate,
@@ -608,6 +633,12 @@ impl<P: Poly> PolyCircuit<P> {
                             panic!("sub-circuit output gate should not be in regular chunk path");
                         }
                     };
+                    debug!(
+                        gate_id = gate_id.0,
+                        gate_kind = ?gate.gate_type.kind(),
+                        shard_idx,
+                        "PolyCircuit GPU load gate inputs finished"
+                    );
                     LoadedGateCtx { gate_id, gate, shard_idx, inputs }
                 })
                 .collect()
@@ -619,6 +650,12 @@ impl<P: Poly> PolyCircuit<P> {
                 .map(|loaded| {
                     let LoadedGateCtx { gate_id, gate, shard_idx, inputs } = loaded;
                     let (eval_params, eval_one) = &shard_params_and_one[shard_idx];
+                    debug!(
+                        gate_id = gate_id.0,
+                        gate_kind = ?gate.gate_type.kind(),
+                        shard_idx,
+                        "PolyCircuit GPU compute gate started"
+                    );
                     let value = match (inputs, &gate.gate_type) {
                         (LoadedGateInputs::SkipExisting, _) => ComputedGateValue::SkipExisting,
                         (LoadedGateInputs::Binary(left, right), PolyGateType::Add) => {
@@ -713,6 +750,12 @@ impl<P: Poly> PolyCircuit<P> {
                             panic!("loaded gate inputs do not match gate type for gate {}", gate_id)
                         }
                     };
+                    debug!(
+                        gate_id = gate_id.0,
+                        gate_kind = ?gate.gate_type.kind(),
+                        shard_idx,
+                        "PolyCircuit GPU compute gate finished"
+                    );
                     ComputedGateCtx { gate_id, gate, shard_idx, value }
                 })
                 .collect()
@@ -721,6 +764,12 @@ impl<P: Poly> PolyCircuit<P> {
         let store_chunk = |computed_chunk: Vec<ComputedGateCtx<E>>| {
             computed_chunk.into_par_iter().for_each(|computed| {
                 let ComputedGateCtx { gate_id, gate, shard_idx, value } = computed;
+                debug!(
+                    gate_id = gate_id.0,
+                    gate_kind = ?gate.gate_type.kind(),
+                    shard_idx,
+                    "PolyCircuit GPU store gate started"
+                );
                 match value {
                     ComputedGateValue::SkipExisting => {
                         release_consumed_inputs(&gate);
@@ -741,6 +790,12 @@ impl<P: Poly> PolyCircuit<P> {
                         debug!("{}", format!("Gate id {gate_id} finished"));
                     }
                 }
+                debug!(
+                    gate_id = gate_id.0,
+                    gate_kind = ?gate.gate_type.kind(),
+                    shard_idx,
+                    "PolyCircuit GPU store gate finished"
+                );
             });
         };
         for (level_idx, level) in levels.iter().enumerate() {
@@ -790,24 +845,64 @@ impl<P: Poly> PolyCircuit<P> {
                     let (eval_params, eval_one) = shard_params_and_one
                         .first()
                         .expect("at least one eval shard context required");
-                    representative_subcircuit_gates
-                        .par_iter()
-                        .copied()
-                        .for_each(|gate_id| eval_gate(gate_id, eval_params, eval_one));
+                    if let Some(chunk_size) = parallel_gates {
+                        for chunk in representative_subcircuit_gates.chunks(chunk_size) {
+                            if chunk_size == 1 {
+                                chunk
+                                    .iter()
+                                    .copied()
+                                    .for_each(|gate_id| eval_gate(gate_id, eval_params, eval_one));
+                            } else {
+                                chunk
+                                    .par_iter()
+                                    .copied()
+                                    .for_each(|gate_id| eval_gate(gate_id, eval_params, eval_one));
+                            }
+                        }
+                    } else {
+                        representative_subcircuit_gates
+                            .par_iter()
+                            .copied()
+                            .for_each(|gate_id| eval_gate(gate_id, eval_params, eval_one));
+                    }
                 }
                 #[cfg(not(feature = "gpu"))]
                 {
-                    representative_subcircuit_gates
-                        .par_iter()
-                        .copied()
-                        .for_each(|gate_id| eval_gate(gate_id, params, one));
+                    if let Some(chunk_size) = parallel_gates {
+                        for chunk in representative_subcircuit_gates.chunks(chunk_size) {
+                            if chunk_size == 1 {
+                                chunk
+                                    .iter()
+                                    .copied()
+                                    .for_each(|gate_id| eval_gate(gate_id, params, one));
+                            } else {
+                                chunk
+                                    .par_iter()
+                                    .copied()
+                                    .for_each(|gate_id| eval_gate(gate_id, params, one));
+                            }
+                        }
+                    } else {
+                        representative_subcircuit_gates
+                            .par_iter()
+                            .copied()
+                            .for_each(|gate_id| eval_gate(gate_id, params, one));
+                    }
                 }
             }
             if let Some(chunk_size) = parallel_gates {
                 #[cfg(feature = "gpu")]
                 {
                     let regular_chunks: Vec<&[GateId]> = regular_gates.chunks(chunk_size).collect();
-                    if !regular_chunks.is_empty() {
+                    if chunk_size == 1 {
+                        let (eval_params, eval_one) = shard_params_and_one
+                            .first()
+                            .expect("at least one eval shard context required");
+                        regular_gates
+                            .iter()
+                            .copied()
+                            .for_each(|gate_id| eval_gate(gate_id, eval_params, eval_one));
+                    } else if !regular_chunks.is_empty() {
                         let mut loaded_curr = Some(load_chunk(regular_chunks[0]));
                         let mut computed_prev: Option<Vec<ComputedGateCtx<E>>> = None;
                         for chunk_idx in 0..regular_chunks.len() {
@@ -839,10 +934,17 @@ impl<P: Poly> PolyCircuit<P> {
                 #[cfg(not(feature = "gpu"))]
                 {
                     regular_gates.chunks(chunk_size).for_each(|chunk| {
-                        chunk
-                            .par_iter()
-                            .copied()
-                            .for_each(|gate_id| eval_gate(gate_id, params, one));
+                        if chunk_size == 1 {
+                            chunk
+                                .iter()
+                                .copied()
+                                .for_each(|gate_id| eval_gate(gate_id, params, one));
+                        } else {
+                            chunk
+                                .par_iter()
+                                .copied()
+                                .for_each(|gate_id| eval_gate(gate_id, params, one));
+                        }
                     });
                 }
             } else if use_parallel {
@@ -859,10 +961,17 @@ impl<P: Poly> PolyCircuit<P> {
             if let Some(chunk_size) = parallel_gates {
                 let mut out: Vec<Arc<E::Compact>> = Vec::with_capacity(self.output_ids.len());
                 for chunk in self.output_ids.chunks(chunk_size) {
-                    let mut chunk_out: Vec<Arc<E::Compact>> = chunk
-                        .par_iter()
-                        .map(|&id| wires.get(&id).expect("output missing").clone())
-                        .collect();
+                    let mut chunk_out: Vec<Arc<E::Compact>> = if chunk_size == 1 {
+                        chunk
+                            .iter()
+                            .map(|&id| wires.get(&id).expect("output missing").clone())
+                            .collect()
+                    } else {
+                        chunk
+                            .par_iter()
+                            .map(|&id| wires.get(&id).expect("output missing").clone())
+                            .collect()
+                    };
                     out.append(&mut chunk_out);
                 }
                 out

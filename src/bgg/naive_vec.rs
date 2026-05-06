@@ -1,3 +1,5 @@
+#[cfg(feature = "gpu")]
+use crate::poly::PolyParams;
 use crate::{
     bgg::{
         encoding::{BggEncoding, BggEncodingCompact},
@@ -15,6 +17,66 @@ use std::{
     ops::{Add, Mul, Sub},
     sync::Arc,
 };
+
+fn effective_slot_parallelism<M: PolyMatrix>(
+    params: &<M::P as Poly>::Params,
+    num_slots: usize,
+) -> usize {
+    if num_slots == 0 {
+        return 0;
+    }
+
+    let requested = crate::env::bgg_poly_encoding_slot_parallelism().max(1);
+    #[cfg(feature = "gpu")]
+    {
+        let _ = params;
+        requested.min(num_slots).min(crate::poly::dcrt::gpu::detected_gpu_device_count().max(1))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = params;
+        requested.min(num_slots)
+    }
+}
+
+fn map_slots_with_params<M, T, F>(params: &<M::P as Poly>::Params, num_slots: usize, f: F) -> Vec<T>
+where
+    M: PolyMatrix,
+    T: Send,
+    F: Fn(usize, &<M::P as Poly>::Params) -> T + Send + Sync,
+{
+    if num_slots == 0 {
+        return Vec::new();
+    }
+
+    let slot_parallelism = effective_slot_parallelism::<M>(params, num_slots);
+    let mut outputs = Vec::with_capacity(num_slots);
+    for slot_start in (0..num_slots).step_by(slot_parallelism) {
+        let chunk_len = (slot_start + slot_parallelism).min(num_slots) - slot_start;
+        #[cfg(feature = "gpu")]
+        let chunk_outputs = {
+            let device_ids = crate::poly::dcrt::gpu::detected_gpu_device_ids();
+            assert!(
+                !device_ids.is_empty(),
+                "NaiveBGGEncodingVec GPU slot processing requires at least one GPU device"
+            );
+            (0..chunk_len)
+                .into_par_iter()
+                .map(|offset| {
+                    let local_params = params.params_for_device(device_ids[offset]);
+                    f(slot_start + offset, &local_params)
+                })
+                .collect::<Vec<_>>()
+        };
+        #[cfg(not(feature = "gpu"))]
+        let chunk_outputs = (0..chunk_len)
+            .into_par_iter()
+            .map(|offset| f(slot_start + offset, params))
+            .collect::<Vec<_>>();
+        outputs.extend(chunk_outputs);
+    }
+    outputs
+}
 
 /// A deliberately simple slotwise BGG public-key container.
 ///
@@ -277,16 +339,16 @@ impl<M: PolyMatrix> Add<&Self> for NaiveBGGPublicKeyVec<M> {
     fn add(self, other: &Self) -> Self {
         self.assert_compatible(other);
         let params = self.params.clone();
-        let keys = self
-            .keys
-            .into_par_iter()
-            .zip(other.keys.par_iter())
-            .map(|(lhs, rhs)| {
-                let lhs = BggPublicKey::from_compact(params.as_ref(), &lhs);
-                let rhs = BggPublicKey::from_compact(params.as_ref(), rhs);
+        let lhs_keys = self.keys;
+        let keys = map_slots_with_params::<M, _, _>(
+            params.as_ref(),
+            lhs_keys.len(),
+            |slot_idx, local_params| {
+                let lhs = BggPublicKey::from_compact(local_params, &lhs_keys[slot_idx]);
+                let rhs = BggPublicKey::from_compact(local_params, &other.keys[slot_idx]);
                 (lhs + &rhs).to_compact()
-            })
-            .collect::<Vec<_>>();
+            },
+        );
         Self::from_compact_slots(params.as_ref(), keys)
     }
 }
@@ -305,16 +367,16 @@ impl<M: PolyMatrix> Sub<&Self> for NaiveBGGPublicKeyVec<M> {
     fn sub(self, other: &Self) -> Self {
         self.assert_compatible(other);
         let params = self.params.clone();
-        let keys = self
-            .keys
-            .into_par_iter()
-            .zip(other.keys.par_iter())
-            .map(|(lhs, rhs)| {
-                let lhs = BggPublicKey::from_compact(params.as_ref(), &lhs);
-                let rhs = BggPublicKey::from_compact(params.as_ref(), rhs);
+        let lhs_keys = self.keys;
+        let keys = map_slots_with_params::<M, _, _>(
+            params.as_ref(),
+            lhs_keys.len(),
+            |slot_idx, local_params| {
+                let lhs = BggPublicKey::from_compact(local_params, &lhs_keys[slot_idx]);
+                let rhs = BggPublicKey::from_compact(local_params, &other.keys[slot_idx]);
                 (lhs - &rhs).to_compact()
-            })
-            .collect::<Vec<_>>();
+            },
+        );
         Self::from_compact_slots(params.as_ref(), keys)
     }
 }
@@ -333,16 +395,16 @@ impl<M: PolyMatrix> Mul<&Self> for NaiveBGGPublicKeyVec<M> {
     fn mul(self, other: &Self) -> Self {
         self.assert_compatible(other);
         let params = self.params.clone();
-        let keys = self
-            .keys
-            .into_par_iter()
-            .zip(other.keys.par_iter())
-            .map(|(lhs, rhs)| {
-                let lhs = BggPublicKey::from_compact(params.as_ref(), &lhs);
-                let rhs = BggPublicKey::from_compact(params.as_ref(), rhs);
+        let lhs_keys = self.keys;
+        let keys = map_slots_with_params::<M, _, _>(
+            params.as_ref(),
+            lhs_keys.len(),
+            |slot_idx, local_params| {
+                let lhs = BggPublicKey::from_compact(local_params, &lhs_keys[slot_idx]);
+                let rhs = BggPublicKey::from_compact(local_params, &other.keys[slot_idx]);
                 (lhs * &rhs).to_compact()
-            })
-            .collect::<Vec<_>>();
+            },
+        );
         Self::from_compact_slots(params.as_ref(), keys)
     }
 }
@@ -368,28 +430,22 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGPublicKeyVec<M> {
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {
         Self::from_compact_slots(
             params,
-            self.keys
-                .par_iter()
-                .map(|key| {
-                    BggPublicKey::from_compact(params, key)
-                        .small_scalar_mul(params, scalar)
-                        .to_compact()
-                })
-                .collect::<Vec<_>>(),
+            map_slots_with_params::<M, _, _>(params, self.keys.len(), |slot_idx, local_params| {
+                BggPublicKey::from_compact(local_params, &self.keys[slot_idx])
+                    .small_scalar_mul(local_params, scalar)
+                    .to_compact()
+            }),
         )
     }
 
     fn large_scalar_mul(&self, params: &Self::Params, scalar: &[BigUint]) -> Self {
         Self::from_compact_slots(
             params,
-            self.keys
-                .par_iter()
-                .map(|key| {
-                    BggPublicKey::from_compact(params, key)
-                        .large_scalar_mul(params, scalar)
-                        .to_compact()
-                })
-                .collect::<Vec<_>>(),
+            map_slots_with_params::<M, _, _>(params, self.keys.len(), |slot_idx, local_params| {
+                BggPublicKey::from_compact(local_params, &self.keys[slot_idx])
+                    .large_scalar_mul(local_params, scalar)
+                    .to_compact()
+            }),
         )
     }
 
@@ -399,15 +455,20 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGPublicKeyVec<M> {
         }
         Self::from_compact_slots(
             self.params(),
-            (0..self.num_slots())
-                .into_par_iter()
-                .map(|slot_idx| {
-                    let key = self.key(slot_idx);
-                    let other_keys =
-                        others.iter().map(|other| other.key(slot_idx)).collect::<Vec<_>>();
+            map_slots_with_params::<M, _, _>(
+                self.params(),
+                self.num_slots(),
+                |slot_idx, local_params| {
+                    let key = BggPublicKey::from_compact(local_params, &self.keys[slot_idx]);
+                    let other_keys = others
+                        .iter()
+                        .map(|other| {
+                            BggPublicKey::from_compact(local_params, &other.keys[slot_idx])
+                        })
+                        .collect::<Vec<_>>();
                     key.concat_columns(&other_keys).to_compact()
-                })
-                .collect::<Vec<_>>(),
+                },
+            ),
         )
     }
 
@@ -417,14 +478,11 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGPublicKeyVec<M> {
     {
         Self::from_compact_slots(
             params,
-            self.keys
-                .par_iter()
-                .map(|key| {
-                    BggPublicKey::from_compact(params, key)
-                        .matrix_mul(params, rhs_matrix)
-                        .to_compact()
-                })
-                .collect::<Vec<_>>(),
+            map_slots_with_params::<M, _, _>(params, self.keys.len(), |slot_idx, local_params| {
+                BggPublicKey::from_compact(local_params, &self.keys[slot_idx])
+                    .matrix_mul(local_params, rhs_matrix)
+                    .to_compact()
+            }),
         )
     }
 }
@@ -443,16 +501,16 @@ impl<M: PolyMatrix> Add<&Self> for NaiveBGGEncodingVec<M> {
     fn add(self, other: &Self) -> Self {
         self.assert_compatible(other);
         let params = self.params.clone();
-        let encodings = self
-            .encodings
-            .into_par_iter()
-            .zip(other.encodings.par_iter())
-            .map(|(lhs, rhs)| {
-                let lhs = BggEncoding::from_compact(params.as_ref(), &lhs);
-                let rhs = BggEncoding::from_compact(params.as_ref(), rhs);
+        let lhs_encodings = self.encodings;
+        let encodings = map_slots_with_params::<M, _, _>(
+            params.as_ref(),
+            lhs_encodings.len(),
+            |slot_idx, local_params| {
+                let lhs = BggEncoding::from_compact(local_params, &lhs_encodings[slot_idx]);
+                let rhs = BggEncoding::from_compact(local_params, &other.encodings[slot_idx]);
                 (lhs + &rhs).to_compact()
-            })
-            .collect::<Vec<_>>();
+            },
+        );
         Self::from_compact_slots(params.as_ref(), encodings)
     }
 }
@@ -471,16 +529,16 @@ impl<M: PolyMatrix> Sub<&Self> for NaiveBGGEncodingVec<M> {
     fn sub(self, other: &Self) -> Self {
         self.assert_compatible(other);
         let params = self.params.clone();
-        let encodings = self
-            .encodings
-            .into_par_iter()
-            .zip(other.encodings.par_iter())
-            .map(|(lhs, rhs)| {
-                let lhs = BggEncoding::from_compact(params.as_ref(), &lhs);
-                let rhs = BggEncoding::from_compact(params.as_ref(), rhs);
+        let lhs_encodings = self.encodings;
+        let encodings = map_slots_with_params::<M, _, _>(
+            params.as_ref(),
+            lhs_encodings.len(),
+            |slot_idx, local_params| {
+                let lhs = BggEncoding::from_compact(local_params, &lhs_encodings[slot_idx]);
+                let rhs = BggEncoding::from_compact(local_params, &other.encodings[slot_idx]);
                 (lhs - &rhs).to_compact()
-            })
-            .collect::<Vec<_>>();
+            },
+        );
         Self::from_compact_slots(params.as_ref(), encodings)
     }
 }
@@ -499,16 +557,16 @@ impl<M: PolyMatrix> Mul<&Self> for NaiveBGGEncodingVec<M> {
     fn mul(self, other: &Self) -> Self {
         self.assert_compatible(other);
         let params = self.params.clone();
-        let encodings = self
-            .encodings
-            .into_par_iter()
-            .zip(other.encodings.par_iter())
-            .map(|(lhs, rhs)| {
-                let lhs = BggEncoding::from_compact(params.as_ref(), &lhs);
-                let rhs = BggEncoding::from_compact(params.as_ref(), rhs);
+        let lhs_encodings = self.encodings;
+        let encodings = map_slots_with_params::<M, _, _>(
+            params.as_ref(),
+            lhs_encodings.len(),
+            |slot_idx, local_params| {
+                let lhs = BggEncoding::from_compact(local_params, &lhs_encodings[slot_idx]);
+                let rhs = BggEncoding::from_compact(local_params, &other.encodings[slot_idx]);
                 (lhs * &rhs).to_compact()
-            })
-            .collect::<Vec<_>>();
+            },
+        );
         Self::from_compact_slots(params.as_ref(), encodings)
     }
 }
@@ -534,28 +592,30 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGEncodingVec<M> {
     fn small_scalar_mul(&self, params: &Self::Params, scalar: &[u32]) -> Self {
         Self::from_compact_slots(
             params,
-            self.encodings
-                .par_iter()
-                .map(|encoding| {
-                    BggEncoding::from_compact(params, encoding)
-                        .small_scalar_mul(params, scalar)
+            map_slots_with_params::<M, _, _>(
+                params,
+                self.encodings.len(),
+                |slot_idx, local_params| {
+                    BggEncoding::from_compact(local_params, &self.encodings[slot_idx])
+                        .small_scalar_mul(local_params, scalar)
                         .to_compact()
-                })
-                .collect::<Vec<_>>(),
+                },
+            ),
         )
     }
 
     fn large_scalar_mul(&self, params: &Self::Params, scalar: &[BigUint]) -> Self {
         Self::from_compact_slots(
             params,
-            self.encodings
-                .par_iter()
-                .map(|encoding| {
-                    BggEncoding::from_compact(params, encoding)
-                        .large_scalar_mul(params, scalar)
+            map_slots_with_params::<M, _, _>(
+                params,
+                self.encodings.len(),
+                |slot_idx, local_params| {
+                    BggEncoding::from_compact(local_params, &self.encodings[slot_idx])
+                        .large_scalar_mul(local_params, scalar)
                         .to_compact()
-                })
-                .collect::<Vec<_>>(),
+                },
+            ),
         )
     }
 
@@ -565,15 +625,21 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGEncodingVec<M> {
         }
         Self::from_compact_slots(
             self.params(),
-            (0..self.num_slots())
-                .into_par_iter()
-                .map(|slot_idx| {
-                    let encoding = self.encoding(slot_idx);
-                    let other_encodings =
-                        others.iter().map(|other| other.encoding(slot_idx)).collect::<Vec<_>>();
+            map_slots_with_params::<M, _, _>(
+                self.params(),
+                self.num_slots(),
+                |slot_idx, local_params| {
+                    let encoding =
+                        BggEncoding::from_compact(local_params, &self.encodings[slot_idx]);
+                    let other_encodings = others
+                        .iter()
+                        .map(|other| {
+                            BggEncoding::from_compact(local_params, &other.encodings[slot_idx])
+                        })
+                        .collect::<Vec<_>>();
                     encoding.concat_columns(&other_encodings).to_compact()
-                })
-                .collect::<Vec<_>>(),
+                },
+            ),
         )
     }
 
@@ -583,14 +649,15 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGEncodingVec<M> {
     {
         Self::from_compact_slots(
             params,
-            self.encodings
-                .par_iter()
-                .map(|encoding| {
-                    BggEncoding::from_compact(params, encoding)
-                        .matrix_mul(params, rhs_matrix)
+            map_slots_with_params::<M, _, _>(
+                params,
+                self.encodings.len(),
+                |slot_idx, local_params| {
+                    BggEncoding::from_compact(local_params, &self.encodings[slot_idx])
+                        .matrix_mul(local_params, rhs_matrix)
                         .to_compact()
-                })
-                .collect::<Vec<_>>(),
+                },
+            ),
         )
     }
 }

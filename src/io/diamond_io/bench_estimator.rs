@@ -153,12 +153,12 @@ where
             .expect("DiamondIO benchmark gadget column count overflow");
 
         // Mirrors `DiamondInjector::load_or_sample_b_checkpoint`: sample one trapdoor/public
-        // matrix pair for the Diamond state row size. Storage bytes are estimated separately, so
-        // avoid materializing compact CPU bytes here; doing so can exceed the Runpod cgroup memory
-        // limit before the estimator reaches the actual DiamondIO cost composition.
+        // matrix pair for the Diamond state row size, then serialize both artifacts because the
+        // concrete preprocessing path persists them as checkpoint files.
         let trapdoor_checkpoint = bench_estimate_named("trapdoor_checkpoint", iterations, || {
             let trap_sampler = TS::new(params, diamond.injector.trapdoor_sigma);
-            trap_sampler.trapdoor(params, state_row_size)
+            let (trapdoor, matrix) = trap_sampler.trapdoor(params, state_row_size);
+            (TS::trapdoor_to_bytes(&trapdoor), matrix.to_compact_bytes())
         });
 
         let trap_sampler = TS::new(params, diamond.injector.trapdoor_sigma);
@@ -172,61 +172,74 @@ where
             DistType::FinRingDist,
         );
         let transition_chunk_len = column_chunk_bounds(shape.state_col_size, 0).1;
-        let transition_target = M::zero(params, state_row_size, transition_chunk_len);
+        let one_column_target = M::zero(params, state_row_size, 1);
 
-        // Mirrors one chunked `preimage_extend` call in Diamond input injection and final decoder
-        // preprocessing. The target has one maximum-size persisted chunk; narrower tail chunks are
-        // conservatively charged at this same unit cost by the higher-level estimator.
-        let trapdoor_preimage_extend =
-            bench_estimate_named("trapdoor_preimage_extend", iterations, || {
-                trap_sampler.preimage_extend(
+        // Measure `preimage_extend` with one target column and compact serialization, then scale
+        // the parallel work by the real target width while keeping latency at the measured one-
+        // column value. Running the full-width serialized benchmark can exceed the H200 pod's CPU
+        // cgroup memory limit before the estimator reaches the final composed estimate.
+        let trapdoor_preimage_extend_one_col =
+            bench_estimate_named("trapdoor_preimage_extend_one_col", iterations, || {
+                let preimage = trap_sampler.preimage_extend(
                     params,
                     &trapdoor,
                     &public_matrix,
                     &ext_matrix,
-                    &transition_target,
-                )
+                    &one_column_target,
+                );
+                preimage.to_compact_bytes()
             });
+        let trapdoor_preimage_extend = scale_estimate_total_parallelism(
+            trapdoor_preimage_extend_one_col,
+            transition_chunk_len,
+        );
 
-        let final_output_target = M::zero(params, state_row_size, gadget_col_size);
+        let final_output_preimage_extend_one_col =
+            bench_estimate_named("final_output_preimage_extend_one_col", iterations, || {
+                let preimage = trap_sampler.preimage_extend(
+                    params,
+                    &trapdoor,
+                    &public_matrix,
+                    &ext_matrix,
+                    &one_column_target,
+                );
+                preimage.to_compact_bytes()
+            });
         let final_output_preimage_extend =
-            bench_estimate_named("final_output_preimage_extend", iterations, || {
-                trap_sampler.preimage_extend(
-                    params,
-                    &trapdoor,
-                    &public_matrix,
-                    &ext_matrix,
-                    &final_output_target,
-                )
-            });
+            scale_estimate_total_parallelism(final_output_preimage_extend_one_col, gadget_col_size);
 
-        let lookup_bridge_target = M::zero(params, state_row_size, shape.lookup_bridge_cols);
-        let lookup_bridge_preimage_extend =
-            bench_estimate_named("lookup_bridge_preimage_extend", iterations, || {
-                trap_sampler.preimage_extend(
+        let lookup_bridge_preimage_extend_one_col =
+            bench_estimate_named("lookup_bridge_preimage_extend_one_col", iterations, || {
+                let preimage = trap_sampler.preimage_extend(
                     params,
                     &trapdoor,
                     &public_matrix,
                     &ext_matrix,
-                    &lookup_bridge_target,
-                )
+                    &one_column_target,
+                );
+                preimage.to_compact_bytes()
             });
+        let lookup_bridge_preimage_extend = scale_estimate_total_parallelism(
+            lookup_bridge_preimage_extend_one_col,
+            shape.lookup_bridge_cols,
+        );
 
         let full_w_block_hash_sample =
             bench_estimate_named("full_w_block_hash_sample", iterations, || {
-                HS::new().sample_hash(
+                let matrix = HS::new().sample_hash(
                     params,
                     [0x52u8; 32],
                     b"diamond_io_bench_full_w_block_hash",
                     state_row_size,
                     gadget_col_size,
                     DistType::FinRingDist,
-                )
+                );
+                matrix.to_compact_bytes()
             });
 
         let transition_w_chunk_hash_sample =
             bench_estimate_named("transition_w_chunk_hash_sample", iterations, || {
-                HS::new().sample_hash_columns(
+                let matrix = HS::new().sample_hash_columns(
                     params,
                     [0x53u8; 32],
                     b"diamond_io_bench_transition_w_chunk_hash",
@@ -235,7 +248,8 @@ where
                     0,
                     shape.transition_w_hash_max_col_len,
                     DistType::FinRingDist,
-                )
+                );
+                matrix.to_compact_bytes()
             });
 
         let mut bgg_public_key_tag = diamond.bgg_tag.clone();
@@ -955,6 +969,29 @@ where
         "finished DiamondIO benchmark unit cost"
     );
     estimate
+}
+
+fn scale_estimate_total_parallelism(
+    estimate: CircuitBenchEstimate,
+    column_count: usize,
+) -> CircuitBenchEstimate {
+    let column_count_u128 = column_count as u128;
+    let scaled =
+        CircuitBenchEstimate::new(estimate.total_time * column_count as f64, estimate.latency)
+            .with_max_parallelism(
+                estimate
+                    .max_parallelism
+                    .checked_mul(column_count_u128)
+                    .expect("DiamondIO preimage benchmark parallelism overflow"),
+            );
+    #[cfg(feature = "gpu")]
+    {
+        scaled.with_peak_vram(estimate.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        scaled
+    }
 }
 
 fn sample_native_ternary_secret<M, US>(

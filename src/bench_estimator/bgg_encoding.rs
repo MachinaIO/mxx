@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, time::Instant};
 
 use crate::{
     bench_estimator::{
@@ -11,6 +11,7 @@ use crate::{
     poly::Poly,
 };
 use num_bigint::BigUint;
+use tracing::info;
 
 fn per_gate_time_estimate(time: f64, peak_vram: usize) -> CircuitBenchEstimate {
     CircuitBenchEstimate::new(time, time).with_peak_vram(peak_vram)
@@ -58,23 +59,74 @@ where
         let enc_a = BggEncoding::new(matrix.clone(), pubkey.clone(), Some(plaintext_a));
         let enc_b = BggEncoding::new(matrix, pubkey, Some(plaintext_b));
 
+        info!("BggEncodingBenchEstimator::benchmark starting add");
+        let started = Instant::now();
         let add = benchmark_gate_operation(iterations, || enc_a.clone() + &enc_b);
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = add.peak_vram,
+            "BggEncodingBenchEstimator::benchmark finished add"
+        );
+        info!("BggEncodingBenchEstimator::benchmark starting sub");
+        let started = Instant::now();
         let sub = benchmark_gate_operation(iterations, || enc_a.clone() - &enc_b);
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = sub.peak_vram,
+            "BggEncodingBenchEstimator::benchmark finished sub"
+        );
+        info!("BggEncodingBenchEstimator::benchmark starting mul");
+        let started = Instant::now();
         let mul = benchmark_gate_operation(iterations, || enc_a.clone() * &enc_b);
         let mul_rhs_column_count = enc_b.pubkey.matrix.col_size();
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = mul.peak_vram,
+            mul_rhs_column_count,
+            "BggEncodingBenchEstimator::benchmark finished mul"
+        );
+        info!("BggEncodingBenchEstimator::benchmark starting small scalar mul");
+        let started = Instant::now();
         let small_scalar_mul =
             benchmark_gate_operation(iterations, || enc_a.small_scalar_mul(params, &[3u32]));
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = small_scalar_mul.peak_vram,
+            "BggEncodingBenchEstimator::benchmark finished small scalar mul"
+        );
+        info!("BggEncodingBenchEstimator::benchmark starting large scalar mul");
+        let started = Instant::now();
         let large_scalar_mul = benchmark_gate_operation(iterations, || {
             enc_a.large_scalar_mul(params, &[BigUint::from(5u32)])
         });
         let large_scalar_mul_rhs_column_count = enc_a.pubkey.matrix.col_size();
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = large_scalar_mul.peak_vram,
+            large_scalar_mul_rhs_column_count,
+            "BggEncodingBenchEstimator::benchmark finished large scalar mul"
+        );
 
         // Scalar `BggEncoding` does not have its own slot-transfer or public-LUT benchmark
         // evaluator. The naive-vector wrapper supplies the slot structure, so these single-scalar
         // placeholders keep the estimate type complete without introducing packed
         // `BggPolyEncoding` machinery in callers that benchmark naive vectors.
+        info!("BggEncodingBenchEstimator::benchmark starting slot-transfer placeholder");
+        let started = Instant::now();
         let slot_transfer = benchmark_gate_operation(iterations, || enc_a.clone());
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = slot_transfer.peak_vram,
+            "BggEncodingBenchEstimator::benchmark finished slot-transfer placeholder"
+        );
+        info!("BggEncodingBenchEstimator::benchmark starting public-LUT placeholder");
+        let started = Instant::now();
         let public_lut = benchmark_gate_operation(iterations, || enc_b.clone());
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = public_lut.peak_vram,
+            "BggEncodingBenchEstimator::benchmark finished public-LUT placeholder"
+        );
 
         Self {
             input_time: 0.0,

@@ -678,6 +678,7 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
             "mxx::io::diamond_io::bench_estimator_native",
             tracing_subscriber::filter::LevelFilter::INFO,
         )
+        .with_target("mxx::bench_estimator", tracing_subscriber::filter::LevelFilter::INFO)
         .with_target("mxx::noise_refresh", tracing_subscriber::filter::LevelFilter::INFO)
         .with_target("mxx::storage::write", tracing_subscriber::filter::LevelFilter::INFO)
         .with_default(tracing_subscriber::filter::LevelFilter::WARN);

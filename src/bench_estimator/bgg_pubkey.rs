@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, time::Instant};
 
 use crate::{
     bgg::public_key::BggPublicKey,
@@ -10,7 +10,7 @@ use crate::{
 };
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::{
     BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
@@ -213,31 +213,70 @@ where
         PE: PltEvaluator<BggPublicKey<M>>,
         SE: SlotTransferEvaluator<BggPublicKey<M>>,
     {
+        info!("BggPublicKeyBenchEstimator::benchmark starting add");
+        let started = Instant::now();
         let add_bench =
             benchmark_gate_operation(iterations, || samples.add_lhs.clone() + samples.add_rhs);
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = add_bench.peak_vram,
+            "BggPublicKeyBenchEstimator::benchmark finished add"
+        );
         debug!("BggPublicKeyBenchEstimator::benchmark add_bench={:?}", add_bench);
+        info!("BggPublicKeyBenchEstimator::benchmark starting sub");
+        let started = Instant::now();
         let sub_bench =
             benchmark_gate_operation(iterations, || samples.sub_lhs.clone() - samples.sub_rhs);
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = sub_bench.peak_vram,
+            "BggPublicKeyBenchEstimator::benchmark finished sub"
+        );
         debug!("BggPublicKeyBenchEstimator::benchmark sub_bench={:?}", sub_bench);
+        info!("BggPublicKeyBenchEstimator::benchmark starting mul");
+        let started = Instant::now();
         let mul_bench =
             benchmark_gate_operation(iterations, || samples.mul_lhs.clone() * samples.mul_rhs);
         let mul_rhs_column_count = samples.mul_rhs.matrix.col_size();
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = mul_bench.peak_vram,
+            mul_rhs_column_count,
+            "BggPublicKeyBenchEstimator::benchmark finished mul"
+        );
         debug!("BggPublicKeyBenchEstimator::benchmark mul_bench={:?}", mul_bench);
+        info!("BggPublicKeyBenchEstimator::benchmark starting small scalar mul");
+        let started = Instant::now();
         let small_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.small_scalar_input.small_scalar_mul(samples.params, samples.small_scalar)
         });
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = small_scalar_mul_bench.peak_vram,
+            "BggPublicKeyBenchEstimator::benchmark finished small scalar mul"
+        );
         debug!(
             "BggPublicKeyBenchEstimator::benchmark small_scalar_mul_bench={:?}",
             small_scalar_mul_bench
         );
+        info!("BggPublicKeyBenchEstimator::benchmark starting large scalar mul");
+        let started = Instant::now();
         let large_scalar_mul_bench = benchmark_gate_operation(iterations, || {
             samples.large_scalar_input.large_scalar_mul(samples.params, samples.large_scalar)
         });
         let large_scalar_mul_rhs_column_count = samples.large_scalar_input.matrix.col_size();
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = large_scalar_mul_bench.peak_vram,
+            large_scalar_mul_rhs_column_count,
+            "BggPublicKeyBenchEstimator::benchmark finished large scalar mul"
+        );
         debug!(
             "BggPublicKeyBenchEstimator::benchmark large_scalar_mul_bench={:?}",
             large_scalar_mul_bench
         );
+        info!("BggPublicKeyBenchEstimator::benchmark starting public LUT");
+        let started = Instant::now();
         let public_lut_bench = benchmark_gate_operation(iterations, || {
             public_lut_evaluator.public_lookup(
                 samples.params,
@@ -248,7 +287,17 @@ where
                 samples.public_lut_id,
             )
         });
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = public_lut_bench.peak_vram,
+            "BggPublicKeyBenchEstimator::benchmark finished public LUT"
+        );
         debug!("BggPublicKeyBenchEstimator::benchmark public_lut_bench={:?}", public_lut_bench);
+        info!(
+            slot_count = samples.slot_transfer_src_slots.len(),
+            "BggPublicKeyBenchEstimator::benchmark starting slot transfer"
+        );
+        let started = Instant::now();
         let slot_transfer_bench = benchmark_gate_operation(iterations, || {
             slot_transfer_evaluator.slot_transfer(
                 samples.params,
@@ -257,6 +306,12 @@ where
                 samples.slot_transfer_gate_id,
             )
         });
+        info!(
+            elapsed = ?started.elapsed(),
+            peak_vram = slot_transfer_bench.peak_vram,
+            slot_count = samples.slot_transfer_src_slots.len(),
+            "BggPublicKeyBenchEstimator::benchmark finished slot transfer"
+        );
         debug!(
             "BggPublicKeyBenchEstimator::benchmark slot_transfer_bench={:?}",
             slot_transfer_bench

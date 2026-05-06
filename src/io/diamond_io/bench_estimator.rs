@@ -151,6 +151,18 @@ where
         let gadget_col_size = DIAMOND_SECRET_SIZE
             .checked_mul(params.modulus_digits())
             .expect("DiamondIO benchmark gadget column count overflow");
+        info!(
+            iterations,
+            state_row_size,
+            gadget_col_size,
+            state_col_size = shape.state_col_size,
+            transition_chunk_len = column_chunk_bounds(shape.state_col_size, 0).1,
+            transition_w_hash_max_col_len = shape.transition_w_hash_max_col_len,
+            lookup_bridge_cols = shape.lookup_bridge_cols,
+            modulus_digits = params.modulus_digits(),
+            ring_dimension = params.ring_dimension(),
+            "starting DiamondIO benchmark unit-cost measurement"
+        );
 
         // Mirrors `DiamondInjector::load_or_sample_b_checkpoint`: sample one trapdoor/public
         // matrix pair for the Diamond state row size, then serialize both artifacts because the

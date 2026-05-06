@@ -169,8 +169,26 @@ impl DiamondIOBenchShape {
             .unwrap_or(modulus_digits);
         let lookup_bridge_preimage_bytes =
             matrix_compact_bytes::<M>(params, state_col_size, lookup_cols, modulus_bits);
-        let ring_gsw_wire_count =
-            diamond.build_goldreich_prg_range_circuit(0, 1, 0, 1).num_output();
+        let ring_gsw_active_levels = diamond.ring_gsw_enable_levels.unwrap_or_else(|| {
+            diamond
+                .ring_gsw_context
+                .q_moduli_depth
+                .checked_sub(diamond.ring_gsw_level_offset)
+                .expect("DiamondIO Ring-GSW level offset exceeds q-moduli depth")
+        });
+        assert!(
+            diamond.ring_gsw_level_offset + ring_gsw_active_levels <=
+                diamond.ring_gsw_context.q_moduli_depth,
+            "DiamondIO Ring-GSW active-level range exceeds q-moduli depth"
+        );
+        // Shape calculation only needs the flattened wire count of one Ring-GSW ciphertext.
+        // Avoid constructing a representative Goldreich PRG circuit here; the actual PRG circuit
+        // is still built and measured by `estimate_prf_path`.
+        let ring_gsw_wire_count = 2usize
+            .checked_mul(diamond.ring_gsw_width)
+            .and_then(|count| count.checked_mul(ring_gsw_active_levels))
+            .and_then(|count| count.checked_mul(diamond.ring_gsw_context.p_moduli.len()))
+            .expect("DiamondIO Ring-GSW wire count overflow");
 
         Self {
             ring_dim,

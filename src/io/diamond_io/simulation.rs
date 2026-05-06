@@ -214,7 +214,8 @@ where
     ///
     /// The mask-independent prefix and final-mask representative PRG are cached across candidates.
     /// The remaining per-candidate work accounts for that bit width's mask decrypt/recomposition
-    /// error. A candidate is valid exactly when `noisy_plaintext_error + 2^candidate < q / 4`.
+    /// error. The final mask is centered, so a candidate is valid exactly when
+    /// `noisy_plaintext_error + 2^(candidate - 1) < q / 4`.
     pub fn max_safe_prf_mask_output_coeff_bits<PE, ST>(
         &self,
         func_type: DiamondIOFuncType,
@@ -286,7 +287,7 @@ where
             );
             let q: Arc<BigUint> = prefix.cpu_params.modulus().into();
             let quarter_q = biguint_to_decimal(&(q.as_ref() / 4u32));
-            let mask_value = biguint_to_decimal(&(BigUint::from(1u32) << candidate));
+            let mask_value = centered_bit_width_magnitude(candidate);
             let valid = &simulation.noisy_plaintext_error.poly_norm.norm + &mask_value < quarter_q;
             debug!(
                 candidate,
@@ -1033,7 +1034,7 @@ fn diamond_io_final_decode_margin(
 ) -> Option<BigDecimal> {
     let q: Arc<BigUint> = params.modulus().into();
     let threshold = biguint_to_decimal(&(q.as_ref() / 4u32));
-    let mask = biguint_to_decimal(&(BigUint::from(1u32) << prf_mask_output_coeff_bits));
+    let mask = centered_bit_width_magnitude(prf_mask_output_coeff_bits);
     (threshold > mask).then_some(threshold - mask)
 }
 
@@ -1046,8 +1047,13 @@ fn diamond_io_noise_refresh_pre_round_margin(
     let full_q: Arc<BigUint> = params.modulus().into();
     let threshold =
         biguint_to_decimal(full_q.as_ref()) / (BigDecimal::from(2u32) * BigDecimal::from(q_max));
-    let mask = biguint_to_decimal(&(BigUint::from(1u32) << v_bits));
+    let mask = centered_bit_width_magnitude(v_bits);
     (threshold > mask).then_some(threshold - mask)
+}
+
+fn centered_bit_width_magnitude(bits: usize) -> BigDecimal {
+    assert!(bits > 0, "centered bit width must be positive");
+    biguint_to_decimal(&(BigUint::from(1u32) << (bits - 1)))
 }
 
 fn eval_first_error_output<PE>(

@@ -139,6 +139,14 @@ struct DiamondIOGpuBenchConfig {
     d_secret: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DiamondIOGpuBenchSelectedSimulation {
+    crt_depth: usize,
+    prf_mask_output_coeff_bits: usize,
+    noisy_plaintext_error_bits: usize,
+    input_injection_error_bits: usize,
+}
+
 impl DiamondIOGpuBenchConfig {
     fn from_env() -> Self {
         let cfg = Self {
@@ -225,6 +233,30 @@ impl DiamondIOGpuBenchConfig {
             .expect("DiamondIO PRF-mask search bound overflow")
             .max(1)
     }
+
+    fn selected_simulation_from_env() -> Option<DiamondIOGpuBenchSelectedSimulation> {
+        let crt_depth = env_or_parse_optional_usize("DIAMOND_IO_GPU_BENCH_SELECTED_CRT_DEPTH")?;
+        let prf_mask_output_coeff_bits = env_or_parse_optional_usize(
+            "DIAMOND_IO_GPU_BENCH_SELECTED_PRF_MASK_OUTPUT_COEFF_BITS",
+        )?;
+        let noisy_plaintext_error_bits = env_or_parse_optional_usize(
+            "DIAMOND_IO_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS",
+        )?;
+        let input_injection_error_bits = env_or_parse_optional_usize(
+            "DIAMOND_IO_GPU_BENCH_SELECTED_INPUT_INJECTION_ERROR_BITS",
+        )?;
+        assert!(crt_depth > 0, "DIAMOND_IO_GPU_BENCH_SELECTED_CRT_DEPTH must be positive");
+        assert!(
+            prf_mask_output_coeff_bits > 0,
+            "DIAMOND_IO_GPU_BENCH_SELECTED_PRF_MASK_OUTPUT_COEFF_BITS must be positive"
+        );
+        Some(DiamondIOGpuBenchSelectedSimulation {
+            crt_depth,
+            prf_mask_output_coeff_bits,
+            noisy_plaintext_error_bits,
+            input_injection_error_bits,
+        })
+    }
 }
 
 struct DynamicNormPltLWEEvaluator {
@@ -271,6 +303,12 @@ fn env_or_parse_usize(key: &str, default: usize) -> usize {
         .ok()
         .map(|raw| raw.parse::<usize>().unwrap_or_else(|err| panic!("{key} must be usize: {err}")))
         .unwrap_or(default)
+}
+
+fn env_or_parse_optional_usize(key: &str) -> Option<usize> {
+    env::var(key)
+        .ok()
+        .map(|raw| raw.parse::<usize>().unwrap_or_else(|err| panic!("{key} must be usize: {err}")))
 }
 
 fn env_or_parse_f64(key: &str, default: f64) -> f64 {
@@ -652,43 +690,63 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
     let temp_dir = tempdir().expect("DiamondIO GPU bench test must create a tempdir");
     init_storage_system(temp_dir.path().to_path_buf());
 
-    let plt_evaluator = DynamicNormPltLWEEvaluator::new(cfg.error_sigma);
-    let slot_transfer_evaluator = NormNaiveBggEncodingVecSTEvaluator::new();
-    let search = diamond_io_find_crt_depth(
-        cfg.min_crt_depth,
-        cfg.max_crt_depth,
-        cfg.prf_mask_output_coeff_bits_search_bound(),
-        cfg.security_bits,
-        DiamondIOFuncType::DebugDecryption,
-        |crt_depth| {
-            build_cpu_diamond_io_for_search(
-                &cfg,
-                crt_depth,
-                cfg.prf_mask_output_coeff_bits_search_bound(),
-            )
-        },
-        &plt_evaluator,
-        &slot_transfer_evaluator,
-    )
-    .expect("DiamondIO CRT-depth search must find a valid benchmark candidate");
-    info!(
-        crt_depth = search.crt_depth,
-        prf_mask_output_coeff_bits = search.prf_mask_output_coeff_bits,
-        noisy_plaintext_error_bits =
-            bigdecimal_bits_ceil(&search.total_noisy_plaintext_error.poly_norm.norm),
-        input_injection_error_bits =
-            bigdecimal_bits_ceil(&search.input_injection_projection_error.poly_norm.norm),
-        "DiamondIO CRT-depth search selected parameters"
-    );
+    let selected = if let Some(selected) = DiamondIOGpuBenchConfig::selected_simulation_from_env() {
+        info!(
+            crt_depth = selected.crt_depth,
+            prf_mask_output_coeff_bits = selected.prf_mask_output_coeff_bits,
+            noisy_plaintext_error_bits = selected.noisy_plaintext_error_bits,
+            input_injection_error_bits = selected.input_injection_error_bits,
+            "DiamondIO selected simulation parameters provided; skipping error simulation"
+        );
+        selected
+    } else {
+        let plt_evaluator = DynamicNormPltLWEEvaluator::new(cfg.error_sigma);
+        let slot_transfer_evaluator = NormNaiveBggEncodingVecSTEvaluator::new();
+        let search = diamond_io_find_crt_depth(
+            cfg.min_crt_depth,
+            cfg.max_crt_depth,
+            cfg.prf_mask_output_coeff_bits_search_bound(),
+            cfg.security_bits,
+            DiamondIOFuncType::DebugDecryption,
+            |crt_depth| {
+                build_cpu_diamond_io_for_search(
+                    &cfg,
+                    crt_depth,
+                    cfg.prf_mask_output_coeff_bits_search_bound(),
+                )
+            },
+            &plt_evaluator,
+            &slot_transfer_evaluator,
+        )
+        .expect("DiamondIO CRT-depth search must find a valid benchmark candidate");
+        let selected = DiamondIOGpuBenchSelectedSimulation {
+            crt_depth: search.crt_depth,
+            prf_mask_output_coeff_bits: search.prf_mask_output_coeff_bits,
+            noisy_plaintext_error_bits: bigdecimal_bits_ceil(
+                &search.total_noisy_plaintext_error.poly_norm.norm,
+            ) as usize,
+            input_injection_error_bits: bigdecimal_bits_ceil(
+                &search.input_injection_projection_error.poly_norm.norm,
+            ) as usize,
+        };
+        info!(
+            crt_depth = selected.crt_depth,
+            prf_mask_output_coeff_bits = selected.prf_mask_output_coeff_bits,
+            noisy_plaintext_error_bits = selected.noisy_plaintext_error_bits,
+            input_injection_error_bits = selected.input_injection_error_bits,
+            "DiamondIO CRT-depth search selected parameters"
+        );
+        selected
+    };
 
-    let (_, gpu_params) = gpu_params_for_crt_depth(&cfg, search.crt_depth, gpu_id);
+    let (_, gpu_params) = gpu_params_for_crt_depth(&cfg, selected.crt_depth, gpu_id);
     let final_dir = temp_dir.path().join("final_estimate");
     ensure_clean_dir(&final_dir);
     init_storage_system(final_dir.clone());
     let diamond = build_diamond_io(
         &cfg,
-        search.crt_depth,
-        search.prf_mask_output_coeff_bits,
+        selected.crt_depth,
+        selected.prf_mask_output_coeff_bits,
         gpu_id,
         final_dir.clone(),
     );

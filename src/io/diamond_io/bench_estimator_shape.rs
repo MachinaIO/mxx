@@ -495,7 +495,10 @@ fn matrix_compact_bytes<M>(
 where
     M: PolyMatrix,
 {
-    M::zero_compact_bytes(params, nrow, ncol, 0, false, modulus_bits).len()
+    // This is only a shape/size estimate. Calling `M::zero_compact_bytes(...).len()` would
+    // materialize the full compact-byte payload just to ask for its length, which can exceed the
+    // H200 CPU cgroup for large DiamondIO shapes before any benchmark unit is measured.
+    matrix_compact_bytes_for_shape(nrow, ncol, params.ring_dimension() as usize, modulus_bits)
 }
 
 fn matrix_compact_bytes_for_shape(
@@ -507,8 +510,7 @@ fn matrix_compact_bytes_for_shape(
     let coeff_count =
         nrow.checked_mul(ncol).and_then(|count| count.checked_mul(ring_dim)).unwrap_or(usize::MAX);
     let payload = coeff_count.checked_mul(modulus_bits as usize).unwrap_or(usize::MAX).div_ceil(8);
-    // This is a compact upper-ish estimate for places where we cannot call the concrete matrix
-    // type. It is only used for small metadata-side estimates; concrete persisted matrix artifacts
-    // use `M::zero_compact_bytes` above.
+    // This is a compact upper-ish estimate used when benchmark estimation needs byte lengths
+    // without materializing the underlying matrix payload.
     payload + 128
 }

@@ -426,9 +426,14 @@ impl DCRTPolyMatrix {
     pub(crate) fn from_cpp_matrix_ptr(params: &DCRTPolyParams, cpp_matrix: &CppMatrix) -> Self {
         let nrow = cpp_matrix.nrow();
         let ncol = cpp_matrix.ncol();
-        let matrix_inner = parallel_iter!(0..nrow)
-            .map(|i| parallel_iter!(0..ncol).map(|j| cpp_matrix.entry(i, j)).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
+        let mut matrix_inner = Vec::with_capacity(nrow);
+        for i in 0..nrow {
+            let mut row = Vec::with_capacity(ncol);
+            for j in 0..ncol {
+                row.push(cpp_matrix.entry(i, j));
+            }
+            matrix_inner.push(row);
+        }
 
         DCRTPolyMatrix::from_poly_vec(params, matrix_inner)
     }

@@ -156,13 +156,25 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        let decrypted = decrypt_bit_decomposed_polynomial::<M::P, NestedRnsPoly<M::P>, M>(
+        let decrypted = decrypt_bit_decomposed_polynomial_parts::<M::P, NestedRnsPoly<M::P>, M>(
             &mut circuit,
             &encrypted_bits,
             decryption_key,
             &plaintext_moduli,
         );
-        circuit.output(vec![decrypted]);
+        // Interpret the final PRF mask as a centered perturbation. Only the
+        // secret-dependent branch is decoded as a BGG value; the public bottom
+        // branch, including this centering constant, is added as plaintext
+        // after decoder cancellation.
+        let midpoint = BigUint::from(1u64) << (self.prf_mask_output_coeff_bits - 1);
+        let midpoint_poly = M::P::from_biguints(
+            &self.injector.params,
+            &vec![midpoint; self.injector.params.ring_dimension() as usize],
+        );
+        let midpoint_gate = circuit.const_poly(&midpoint_poly);
+        let centered_public_bottom =
+            circuit.sub_gate(decrypted.public_bottom, midpoint_gate).as_single_wire();
+        circuit.output(vec![decrypted.secret_dependent, centered_public_bottom]);
         circuit
     }
 }

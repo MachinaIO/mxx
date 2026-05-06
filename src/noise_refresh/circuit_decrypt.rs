@@ -9,7 +9,7 @@ use crate::{
     circuit::{PolyCircuit, gate::GateId},
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
-        fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
+        fhe::ring_gsw::{RingGswCiphertext, RingGswContext, RingGswDecryptionParts},
         fhe_prg::goldreich::{decrypt_bit_decomposed_scalar_outputs, sum_gate_ids},
     },
     matrix::PolyMatrix,
@@ -69,14 +69,38 @@ where
 ///
 /// Mask bits are decoded against the full coefficient modulus `q`, not against a CRT modulus
 /// `q_i`.  Bit `j` uses plaintext modulus `q / 2^j`, so Ring-GSW decrypt contributes
-/// `2^j * mask_j`.  The merge phase can then add this small unscaled perturbation to a
-/// `q/q_i`-scaled error and rely on rounding to remove the mask.
+/// `2^j * mask_j`.
 pub fn decrypt_bit_decomposed_polynomial<P, A, M>(
     circuit: &mut PolyCircuit<P>,
     encrypted_bits: &[RingGswCiphertext<P, A>],
     decryption_key: GateId,
     plaintext_moduli: &[BigUint],
 ) -> GateId
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+    M: PolyMatrix<P = P>,
+{
+    decrypt_bit_decomposed_polynomial_parts::<P, A, M>(
+        circuit,
+        encrypted_bits,
+        decryption_key,
+        plaintext_moduli,
+    )
+    .add_in_circuit(circuit)
+}
+
+/// Decrypts one bit-decomposed mask polynomial into Ring-GSW split parts.
+///
+/// Encoding consumers can decode only the `secret_dependent` branch as a BGG
+/// value and add the `public_bottom` plaintext after cancellation. This avoids
+/// treating the public Ring-GSW bottom branch as if it carried the BGG secret.
+pub fn decrypt_bit_decomposed_polynomial_parts<P, A, M>(
+    circuit: &mut PolyCircuit<P>,
+    encrypted_bits: &[RingGswCiphertext<P, A>],
+    decryption_key: GateId,
+    plaintext_moduli: &[BigUint],
+) -> RingGswDecryptionParts
 where
     P: Poly + 'static,
     A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
@@ -108,10 +132,51 @@ where
                 plaintext_moduli[bit_idx].clone(),
                 circuit,
             )
-            .add_in_circuit(circuit)
         })
         .collect::<Vec<_>>();
-    sum_gate_ids(circuit, &bit_terms)
+    let secret_dependent_terms =
+        bit_terms.iter().map(|term| term.secret_dependent).collect::<Vec<_>>();
+    let public_bottom_terms = bit_terms.iter().map(|term| term.public_bottom).collect::<Vec<_>>();
+    RingGswDecryptionParts {
+        secret_dependent: sum_gate_ids(circuit, &secret_dependent_terms),
+        public_bottom: sum_gate_ids(circuit, &public_bottom_terms),
+    }
+}
+
+/// Decrypts one centered bit-decomposed mask polynomial.
+///
+/// The raw bit-decomposed value is in `0..2^bit_size`. Noise refresh uses this value as an
+/// unscaled perturbation that should round away after CRT-level reconstruction, so keeping it
+/// nonnegative would introduce a one-sided bias when `v_bits` is large. In the BGG
+/// noise-refresh material path this decrypted mask is represented as the negated raw value modulo
+/// `q`; adding `2^(bit_size - 1)` makes the decoded mask live around zero while preserving the
+/// same number of random PRG bits.
+pub fn decrypt_centered_bit_decomposed_polynomial<P, A, M>(
+    circuit: &mut PolyCircuit<P>,
+    encrypted_bits: &[RingGswCiphertext<P, A>],
+    decryption_key: GateId,
+    plaintext_moduli: &[BigUint],
+) -> GateId
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+    M: PolyMatrix<P = P>,
+{
+    let bit_size = plaintext_moduli.len();
+    assert!(bit_size > 0, "bit_size must be positive");
+    let first_ctx: Arc<RingGswContext<P, A>> =
+        encrypted_bits.first().expect("at least one encrypted bit is required").ctx.clone();
+    let decoded = decrypt_bit_decomposed_polynomial::<P, A, M>(
+        circuit,
+        encrypted_bits,
+        decryption_key,
+        plaintext_moduli,
+    );
+    let ring_dim = first_ctx.params.ring_dimension() as usize;
+    let midpoint = BigUint::from(1u64) << (bit_size - 1);
+    let midpoint_poly = P::from_biguints(&first_ctx.params, &vec![midpoint; ring_dim]);
+    let midpoint_gate = circuit.const_poly(&midpoint_poly);
+    circuit.add_gate(decoded, midpoint_gate).as_single_wire()
 }
 
 /// Decrypts one bit-decomposed scalar mask.
@@ -185,7 +250,7 @@ where
         ));
 
         let mask_start = digit_idx * mask_q_chunk_len;
-        decrypted_masks.push(decrypt_bit_decomposed_polynomial::<P, A, M>(
+        decrypted_masks.push(decrypt_centered_bit_decomposed_polynomial::<P, A, M>(
             &mut circuit,
             &masks[mask_start..mask_start + mask_q_chunk_len],
             decryption_key,
@@ -244,7 +309,7 @@ where
             crt_idx.checked_mul(mask_q_chunk_len).expect("CRT mask slice start overflow");
         let mask_end =
             mask_start.checked_add(mask_q_chunk_len).expect("CRT mask slice end overflow");
-        decrypted_masks.push(decrypt_bit_decomposed_polynomial::<P, A, M>(
+        decrypted_masks.push(decrypt_centered_bit_decomposed_polynomial::<P, A, M>(
             &mut circuit,
             &masks[mask_start..mask_end],
             decryption_key,
@@ -259,8 +324,10 @@ where
 /// Derives mask bit plaintext moduli from the full coefficient modulus.
 ///
 /// Bit indices are zero-based: bit `0` uses plaintext modulus `q`, bit `1` uses `q/2`, and so on.
-/// With Ring-GSW decrypt's `q/plaintext_modulus` scaling, the decoded mask polynomial is therefore
-/// the ordinary binary sum `sum_j 2^j * mask_j`.
+/// With Ring-GSW decrypt's `q/plaintext_modulus` scaling, the intended raw mask magnitude is the
+/// ordinary binary sum `sum_j 2^j * mask_j`. Noise-refresh callers then center the value,
+/// accounting for the sign convention of the circuit path that consumes it, before merging it with
+/// decoded error material.
 pub fn mask_plaintext_moduli_from_full_modulus(
     full_modulus: &BigUint,
     bit_size: usize,

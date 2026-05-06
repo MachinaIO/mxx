@@ -23,12 +23,12 @@ use tracing::{debug, info};
 
 /// Returns the largest mask bit-size that is guaranteed to round away.
 ///
-/// The noise-refresh mask is decoded as a non-scaled binary integer.  To make sure this mask and
-/// the accumulated pre-rounding perturbation disappear when the `q/q_i`-scaled term is rounded back
-/// modulo every CRT factor, the conservative sufficient condition is:
+/// The noise-refresh mask is decoded as a centered non-scaled binary integer.  To make sure this
+/// mask and the accumulated pre-rounding perturbation disappear when the `q/q_i`-scaled term is
+/// rounded back modulo every CRT factor, the conservative sufficient condition is:
 ///
 /// ```text
-/// 2^v_bits + rounding_error + pre_rounding_error < full_q / (2 * q_max)
+/// 2^(v_bits - 1) + rounding_error + pre_rounding_error < full_q / (2 * q_max)
 /// ```
 ///
 /// where `full_q` is the full DCRT modulus and `q_max` is the largest CRT factor.  The
@@ -47,6 +47,7 @@ pub fn max_safe_noise_refresh_v_bits(
         biguint_to_decimal(full_q.as_ref()) / (BigDecimal::from(2u32) * BigDecimal::from(q_max));
     let available = bound - &secret_norm.poly_norm.norm - &pre_rounding_error.poly_norm.norm;
     max_power_of_two_bits_strictly_below(&available, params.modulus_bits())
+        .map(|max_centered_exponent| (max_centered_exponent + 1).min(params.modulus_bits()))
 }
 
 fn max_power_of_two_bits_strictly_below(available: &BigDecimal, max_bits: usize) -> Option<usize> {

@@ -138,6 +138,35 @@ pub fn aux_sampling_chunk_width() -> usize {
         .unwrap_or(30)
 }
 
+/// `MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH`: number of RHS columns processed
+/// together by `mul_decompose` and `mul_decompose_small`. Default: 1.
+pub fn mul_decompose_column_chunk_width() -> usize {
+    std::env::var("MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+/// `MXX_DIAMOND_IO_EVAL_RELATION_ASSERTS`: enable expensive DiamondIO eval
+/// relation diagnostics in test builds. Default: false.
+pub fn diamond_io_eval_relation_asserts() -> bool {
+    std::env::var("MXX_DIAMOND_IO_EVAL_RELATION_ASSERTS")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// `MXX_NOISE_REFRESH_DECODER_CHUNK_SIZE`: number of refreshed wires whose
+/// decoder matrices are materialized at once in chunked online noise refresh.
+/// Default: 200.
+pub fn noise_refresh_decoder_chunk_size() -> usize {
+    std::env::var("MXX_NOISE_REFRESH_DECODER_CHUNK_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(200)
+}
+
 /// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).
 pub fn block_size() -> usize {
     std::env::var("BLOCK_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(100)

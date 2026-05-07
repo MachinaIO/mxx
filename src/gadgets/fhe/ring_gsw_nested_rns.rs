@@ -24,18 +24,22 @@ use rayon::prelude::*;
 pub type NestedRnsRingGswEntry<P> = NestedRnsPoly<P>;
 pub type NestedRnsRingGswContext<P> = RingGswContext<P, NestedRnsRingGswEntry<P>>;
 pub type NestedRnsRingGswCiphertext<P> = RingGswCiphertext<P, NestedRnsRingGswEntry<P>>;
-pub type NativeRingGswCiphertext = [Vec<DCRTPoly>; 2];
+pub type NativeRingGswCiphertext<P = DCRTPoly> = [Vec<P>; 2];
 
 pub fn active_q_modulus(ctx: &NestedRnsPolyContext) -> BigUint {
     BigUint::from(*ctx.q_moduli().first().expect("Ring-GSW helpers require one active q modulus"))
 }
 
-fn native_gadget_row(params: &DCRTPolyParams, ctx: &NestedRnsPolyContext) -> Vec<DCRTPoly> {
-    nested_rns_gadget_vector::<DCRTPoly, DCRTPolyMatrix>(params, ctx, None, None)
+fn native_gadget_row<P, M>(params: &P::Params, ctx: &NestedRnsPolyContext) -> Vec<P>
+where
+    P: Poly,
+    M: PolyMatrix<P = P>,
+{
+    nested_rns_gadget_vector::<P, M>(params, ctx, None, None)
         .get_row(0)
         .into_par_iter()
         .map(|poly| {
-            DCRTPoly::from_biguint_to_constant(
+            P::from_biguint_to_constant(
                 params,
                 poly.coeffs_biguints()
                     .into_iter()
@@ -92,13 +96,85 @@ pub fn sample_public_key<B: AsRef<[u8]>>(
     tag: B,
     error_sigma: Option<f64>,
 ) -> NativeRingGswCiphertext {
+    sample_public_key_with_samplers::<
+        DCRTPoly,
+        DCRTPolyMatrix,
+        DCRTPolyHashSampler<Keccak256>,
+        DCRTPolyUniformSampler,
+        B,
+    >(params, width, secret_key, hash_key, tag, error_sigma)
+}
+
+pub fn sample_public_key_with_samplers<P, M, HS, US, B>(
+    params: &P::Params,
+    width: usize,
+    secret_key: &P,
+    hash_key: [u8; 32],
+    tag: B,
+    error_sigma: Option<f64>,
+) -> NativeRingGswCiphertext<P>
+where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+    US: PolyUniformSampler<M = M>,
+    B: AsRef<[u8]>,
+{
+    sample_public_key_columns_with_samplers::<P, M, HS, US, B>(
+        params,
+        width,
+        secret_key,
+        hash_key,
+        tag,
+        0,
+        width,
+        error_sigma,
+    )
+}
+
+pub fn sample_public_key_columns_with_samplers<P, M, HS, US, B>(
+    params: &P::Params,
+    width: usize,
+    secret_key: &P,
+    hash_key: [u8; 32],
+    tag: B,
+    col_start: usize,
+    col_len: usize,
+    error_sigma: Option<f64>,
+) -> NativeRingGswCiphertext<P>
+where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+    US: PolyUniformSampler<M = M>,
+    B: AsRef<[u8]>,
+{
     assert!(width > 0, "Ring-GSW public-key width must be positive");
-    let hash_sampler = DCRTPolyHashSampler::<Keccak256>::new();
-    let a =
-        hash_sampler.sample_hash(params, hash_key, tag, 1, width, DistType::FinRingDist).get_row(0);
+    let col_end =
+        col_start.checked_add(col_len).expect("Ring-GSW public-key column range overflow");
+    assert!(
+        col_end <= width,
+        "Ring-GSW public-key column range out of bounds: start={}, len={}, width={}",
+        col_start,
+        col_len,
+        width
+    );
+    let hash_sampler = HS::new();
+    let a = hash_sampler
+        .sample_hash_columns(
+            params,
+            hash_key,
+            tag,
+            1,
+            width,
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        )
+        .get_row(0);
     let error = error_sigma.filter(|sigma| *sigma != 0.0).map(|sigma| {
-        let uniform_sampler = DCRTPolyUniformSampler::new();
-        uniform_sampler.sample_uniform(params, 1, width, DistType::GaussDist { sigma }).get_row(0)
+        let uniform_sampler = US::new();
+        uniform_sampler.sample_uniform(params, 1, col_len, DistType::GaussDist { sigma }).get_row(0)
     });
     let b = a
         .par_iter()
@@ -110,7 +186,7 @@ pub fn sample_public_key<B: AsRef<[u8]>>(
                 None => base,
             }
         })
-        .collect::<Vec<DCRTPoly>>();
+        .collect::<Vec<P>>();
     [a, b]
 }
 
@@ -120,12 +196,34 @@ pub fn encrypt_plaintext_bit(
     public_key: &NativeRingGswCiphertext,
     plaintext: bool,
 ) -> NativeRingGswCiphertext {
+    encrypt_plaintext_bit_with_sampler::<DCRTPoly, DCRTPolyMatrix, DCRTPolyUniformSampler>(
+        params, ctx, public_key, plaintext,
+    )
+}
+
+pub fn encrypt_plaintext_bit_with_sampler<P, M, US>(
+    params: &P::Params,
+    ctx: &NestedRnsPolyContext,
+    public_key: &NativeRingGswCiphertext<P>,
+    plaintext: bool,
+) -> NativeRingGswCiphertext<P>
+where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+    US: PolyUniformSampler<M = M>,
+{
     let width = public_key[0].len();
     let mut ciphertext = [Vec::with_capacity(width), Vec::with_capacity(width)];
-    encrypt_plaintext_bit_columns(params, ctx, public_key, plaintext, |_, top, bottom| {
-        ciphertext[0].push(top);
-        ciphertext[1].push(bottom);
-    });
+    encrypt_plaintext_bit_columns_with_sampler::<P, M, US, _>(
+        params,
+        ctx,
+        public_key,
+        plaintext,
+        |_, top, bottom| {
+            ciphertext[0].push(top);
+            ciphertext[1].push(bottom);
+        },
+    );
     ciphertext
 }
 
@@ -134,47 +232,135 @@ pub fn encrypt_plaintext_bit_columns<F>(
     ctx: &NestedRnsPolyContext,
     public_key: &NativeRingGswCiphertext,
     plaintext: bool,
-    mut consume_column: F,
+    consume_column: F,
 ) where
     F: FnMut(usize, DCRTPoly, DCRTPoly),
 {
+    encrypt_plaintext_bit_columns_with_sampler::<DCRTPoly, DCRTPolyMatrix, DCRTPolyUniformSampler, F>(
+        params,
+        ctx,
+        public_key,
+        plaintext,
+        consume_column,
+    );
+}
+
+pub fn encrypt_plaintext_bit_columns_with_sampler<P, M, US, F>(
+    params: &P::Params,
+    ctx: &NestedRnsPolyContext,
+    public_key: &NativeRingGswCiphertext<P>,
+    plaintext: bool,
+    mut consume_column: F,
+) where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+    US: PolyUniformSampler<M = M>,
+    F: FnMut(usize, P, P),
+{
     let width = public_key[0].len();
     assert_eq!(public_key[1].len(), width, "Ring-GSW public key rows must have the same width");
-    let uniform_sampler = DCRTPolyUniformSampler::new();
-    let gadget_row = native_gadget_row(params, ctx);
+    let uniform_sampler = US::new();
+    let gadget_row = native_gadget_row::<P, M>(params, ctx);
     assert_eq!(
         width,
         gadget_row.len() * 2,
         "Ring-GSW public-key width must equal the native gadget matrix width"
     );
-    let zero = DCRTPoly::const_zero(params);
+    let zero = P::const_zero(params);
 
     for col_idx in 0..width {
-        let mut top = zero.clone();
-        let mut bottom = zero.clone();
-        for key_idx in 0..width {
-            let randomizer_entry = uniform_sampler.sample_poly(params, &DistType::BitDist);
-            top += &(public_key[0][key_idx].clone() * &randomizer_entry);
-            bottom += &(public_key[1][key_idx].clone() * &randomizer_entry);
-        }
-
-        if plaintext {
-            let gadget_len = gadget_row.len();
-            if col_idx < gadget_len {
-                top += &gadget_row[col_idx];
-            } else {
-                bottom += &gadget_row[col_idx - gadget_len];
-            }
-        }
+        let (top, bottom) = encrypt_plaintext_bit_column_with_material(
+            params,
+            public_key,
+            plaintext,
+            col_idx,
+            &uniform_sampler,
+            &gadget_row,
+            &zero,
+        );
 
         consume_column(col_idx, top, bottom);
     }
 }
 
+pub fn encrypt_plaintext_bit_column_with_sampler<P, M, US>(
+    params: &P::Params,
+    ctx: &NestedRnsPolyContext,
+    public_key: &NativeRingGswCiphertext<P>,
+    plaintext: bool,
+    col_idx: usize,
+) -> (P, P)
+where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+    US: PolyUniformSampler<M = M>,
+{
+    let width = public_key[0].len();
+    assert_eq!(public_key[1].len(), width, "Ring-GSW public key rows must have the same width");
+    assert!(
+        col_idx < width,
+        "Ring-GSW ciphertext column index out of bounds: col_idx={}, width={}",
+        col_idx,
+        width
+    );
+    let uniform_sampler = US::new();
+    let gadget_row = native_gadget_row::<P, M>(params, ctx);
+    assert_eq!(
+        width,
+        gadget_row.len() * 2,
+        "Ring-GSW public-key width must equal the native gadget matrix width"
+    );
+    let zero = P::const_zero(params);
+    encrypt_plaintext_bit_column_with_material(
+        params,
+        public_key,
+        plaintext,
+        col_idx,
+        &uniform_sampler,
+        &gadget_row,
+        &zero,
+    )
+}
+
+fn encrypt_plaintext_bit_column_with_material<P, M, US>(
+    params: &P::Params,
+    public_key: &NativeRingGswCiphertext<P>,
+    plaintext: bool,
+    col_idx: usize,
+    uniform_sampler: &US,
+    gadget_row: &[P],
+    zero: &P,
+) -> (P, P)
+where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+    US: PolyUniformSampler<M = M>,
+{
+    let width = public_key[0].len();
+    let mut top = zero.clone();
+    let mut bottom = zero.clone();
+    for key_idx in 0..width {
+        let randomizer_entry = uniform_sampler.sample_poly(params, &DistType::BitDist);
+        top += public_key[0][key_idx].clone() * &randomizer_entry;
+        bottom += public_key[1][key_idx].clone() * &randomizer_entry;
+    }
+
+    if plaintext {
+        let gadget_len = gadget_row.len();
+        if col_idx < gadget_len {
+            top += gadget_row[col_idx].clone();
+        } else {
+            bottom += gadget_row[col_idx - gadget_len].clone();
+        }
+    }
+
+    (top, bottom)
+}
+
 pub fn ciphertext_inputs_from_native<P: Poly>(
     params: &P::Params,
     ctx: &NestedRnsPolyContext,
-    ciphertext: &NativeRingGswCiphertext,
+    ciphertext: &NativeRingGswCiphertext<impl Poly>,
     level_offset: usize,
     enable_levels: Option<usize>,
 ) -> Vec<PolyVec<P>> {

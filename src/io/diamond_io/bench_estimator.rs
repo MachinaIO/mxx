@@ -12,11 +12,13 @@ use tracing::{debug, info};
 
 use std::hint::black_box;
 
+#[cfg(feature = "gpu")]
+use keccak_asm::Keccak256;
+
 use crate::{
     bench_estimator::{
         BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
         benchmark_gate_operation, estimate_public_key_circuit_bench_with_aux,
-        measure_bench_operation,
     },
     bgg::{
         naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
@@ -24,13 +26,28 @@ use crate::{
     },
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
-        fhe::ring_gsw_nested_rns::{encrypt_plaintext_bit_columns, sample_public_key},
+        fhe::ring_gsw_nested_rns::{
+            encrypt_plaintext_bit_column_with_sampler, sample_public_key_columns_with_samplers,
+            sample_public_key_with_samplers,
+        },
     },
     matrix::PolyMatrix,
     noise_refresh::NoiseRefresherNaiveVec,
     poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     slot_transfer::bgg_pubkey::column_chunk_bounds,
+};
+
+#[cfg(not(feature = "gpu"))]
+use crate::bench_estimator::measure_bench_operation;
+#[cfg(not(feature = "gpu"))]
+use crate::gadgets::fhe::ring_gsw_nested_rns::{encrypt_plaintext_bit_columns, sample_public_key};
+
+#[cfg(feature = "gpu")]
+use crate::{
+    matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
+    poly::dcrt::gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
+    sampler::gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
 };
 
 pub use bench_estimator_native::DiamondIONativeBenchEstimator;
@@ -281,6 +298,76 @@ where
         let native_secret =
             sample_native_ternary_secret::<M, US>(params, &diamond.native_poly_params);
 
+        #[cfg(feature = "gpu")]
+        let (ring_gsw_public_key_sample, ring_gsw_encrypt_bit) = {
+            let gpu_native_params =
+                gpu_native_params_from_cpu::<M>(&diamond.native_poly_params, params);
+            let gpu_secret =
+                GpuDCRTPoly::from_biguints(&gpu_native_params, &native_secret.coeffs_biguints());
+            let ring_gsw_public_key_sample_one_col =
+                bench_estimate_named("ring_gsw_public_key_sample_one_col", iterations, || {
+                    let public_key_col = sample_public_key_columns_with_samplers::<
+                        GpuDCRTPoly,
+                        GpuDCRTPolyMatrix,
+                        GpuDCRTPolyHashSampler<Keccak256>,
+                        GpuDCRTPolyUniformSampler,
+                        _,
+                    >(
+                        &gpu_native_params,
+                        diamond.ring_gsw_width,
+                        &gpu_secret,
+                        [0x6du8; 32],
+                        b"diamond_io_bench_ring_gsw_public_key",
+                        0,
+                        1,
+                        diamond.ring_gsw_public_key_error_sigma,
+                    );
+                    black_box(public_key_col)
+                });
+            let ring_gsw_public_key_sample = scale_estimate_total_parallelism(
+                ring_gsw_public_key_sample_one_col,
+                diamond.ring_gsw_width,
+            );
+
+            let ring_gsw_public_key = sample_public_key_with_samplers::<
+                GpuDCRTPoly,
+                GpuDCRTPolyMatrix,
+                GpuDCRTPolyHashSampler<Keccak256>,
+                GpuDCRTPolyUniformSampler,
+                _,
+            >(
+                &gpu_native_params,
+                diamond.ring_gsw_width,
+                &gpu_secret,
+                [0x6du8; 32],
+                b"diamond_io_bench_ring_gsw_public_key",
+                diamond.ring_gsw_public_key_error_sigma,
+            );
+
+            let ring_gsw_encrypt_bit_one_col =
+                bench_estimate_named("ring_gsw_encrypt_bit_one_col", iterations, || {
+                    let ciphertext_col = encrypt_plaintext_bit_column_with_sampler::<
+                        GpuDCRTPoly,
+                        GpuDCRTPolyMatrix,
+                        GpuDCRTPolyUniformSampler,
+                    >(
+                        &gpu_native_params,
+                        diamond.ring_gsw_context.as_ref(),
+                        &ring_gsw_public_key,
+                        true,
+                        0,
+                    );
+                    black_box(ciphertext_col)
+                });
+            let ring_gsw_encrypt_bit = scale_estimate_total_parallelism(
+                ring_gsw_encrypt_bit_one_col,
+                diamond.ring_gsw_width,
+            );
+
+            (ring_gsw_public_key_sample, ring_gsw_encrypt_bit)
+        };
+
+        #[cfg(not(feature = "gpu"))]
         let ring_gsw_public_key_sample =
             bench_estimate_cpu_named("ring_gsw_public_key_sample", iterations, || {
                 sample_public_key(
@@ -293,6 +380,7 @@ where
                 )
             });
 
+        #[cfg(not(feature = "gpu"))]
         let ring_gsw_public_key = sample_public_key(
             &diamond.native_poly_params,
             diamond.ring_gsw_width,
@@ -302,6 +390,7 @@ where
             diamond.ring_gsw_public_key_error_sigma,
         );
 
+        #[cfg(not(feature = "gpu"))]
         let ring_gsw_encrypt_bit =
             bench_estimate_cpu_named("ring_gsw_encrypt_bit", iterations, || {
                 let mut consumed_columns = 0usize;
@@ -996,6 +1085,7 @@ where
     estimate
 }
 
+#[cfg(not(feature = "gpu"))]
 fn bench_estimate_cpu_named<R, F>(
     name: &'static str,
     iterations: usize,
@@ -1050,4 +1140,22 @@ where
 {
     let secret = US::new().sample_poly(params, &DistType::TernaryDist);
     DCRTPoly::from_biguints(native_params, &secret.coeffs_biguints())
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_native_params_from_cpu<M>(
+    native_params: &<DCRTPoly as Poly>::Params,
+    params: &<M::P as Poly>::Params,
+) -> GpuDCRTPolyParams
+where
+    M: PolyMatrix,
+{
+    let (moduli, _, _) = native_params.to_crt();
+    GpuDCRTPolyParams::new_with_gpu(
+        native_params.ring_dimension(),
+        moduli,
+        native_params.base_bits(),
+        params.device_ids(),
+        None,
+    )
 }

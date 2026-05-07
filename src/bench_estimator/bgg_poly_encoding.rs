@@ -40,11 +40,9 @@ fn per_slot_column_parallel_gate_estimate(
     rhs_column_count: usize,
 ) -> CircuitBenchEstimate {
     let slot_estimate = column_parallel_gate_estimate(total_time, peak_vram, rhs_column_count);
-    let total_time = slot_estimate.total_time * num_slots as f64;
-    let max_parallelism = slot_estimate.max_parallelism.checked_mul(num_slots as u128).expect(
-        "BGG poly encoding column-parallel gate parallelism overflowed while scaling by slot count",
-    );
-    let estimate = CircuitBenchEstimate::new(total_time, slot_estimate.latency)
+    let total_time = slot_estimate.total_time.clone() * BigUint::from(num_slots);
+    let max_parallelism = slot_estimate.max_parallelism.clone() * BigUint::from(num_slots);
+    let estimate = CircuitBenchEstimate::from_nanos(total_time, slot_estimate.latency)
         .with_max_parallelism(max_parallelism);
     #[cfg(feature = "gpu")]
     {
@@ -591,7 +589,7 @@ mod tests {
             mul,
             CircuitBenchEstimate::new(9.0, 1.0).with_peak_vram(estimator.mul_peak_vram.div_ceil(3))
         );
-        assert_eq!(mul.max_parallelism, 3 * estimator.num_slots as u128);
+        assert_eq!(mul.max_parallelism, BigUint::from(3u32) * BigUint::from(estimator.num_slots));
 
         let small_scalar = estimator.estimate_small_scalar_mul(&[3u32, 5u32]);
         assert_eq!(
@@ -606,7 +604,10 @@ mod tests {
             CircuitBenchEstimate::new(15.0, 1.0)
                 .with_peak_vram(estimator.large_scalar_mul_peak_vram.div_ceil(5))
         );
-        assert_eq!(large_scalar.max_parallelism, 5 * estimator.num_slots as u128);
+        assert_eq!(
+            large_scalar.max_parallelism,
+            BigUint::from(5u32) * BigUint::from(estimator.num_slots)
+        );
 
         let public_lookup = estimator.estimate_public_lookup(7);
         assert_eq!(

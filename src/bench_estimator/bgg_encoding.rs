@@ -193,8 +193,8 @@ where
         assert!(input_count > 0, "slot_reduce input_count must be positive");
         let mut estimate =
             per_gate_time_estimate(self.slot_transfer_time, self.slot_transfer_peak_vram);
-        estimate.total_time *= input_count as f64;
-        estimate.max_parallelism = estimate.max_parallelism.saturating_mul(input_count as u128);
+        estimate.total_time *= BigUint::from(input_count);
+        estimate.max_parallelism *= BigUint::from(input_count);
         estimate
     }
 
@@ -211,6 +211,10 @@ mod tests {
         matrix::dcrt_poly::DCRTPolyMatrix,
     };
     use std::marker::PhantomData;
+
+    fn nanos(value: u64) -> num_bigint::BigUint {
+        num_bigint::BigUint::from(value)
+    }
 
     #[test]
     fn bgg_encoding_bench_estimator_returns_scalar_gate_estimates() {
@@ -251,17 +255,15 @@ mod tests {
             BggEncoding<DCRTPolyMatrix>,
         >>::estimate_public_lookup(&estimator, 0);
 
-        assert!(add.total_time.is_finite());
         assert!(add.latency.is_finite());
-        assert!(public_lookup.total_time.is_finite());
         assert!(public_lookup.latency.is_finite());
-        assert_eq!(add.total_time, 1.0);
-        assert_eq!(mul.total_time, 3.0);
+        assert_eq!(add.total_time, nanos(1_000_000_000));
+        assert_eq!(mul.total_time, nanos(3_000_000_000));
         assert_eq!(mul.latency, 1.0);
-        assert_eq!(mul.max_parallelism, 3);
-        assert_eq!(large_scalar_mul.total_time, 5.0);
+        assert_eq!(mul.max_parallelism, nanos(3));
+        assert_eq!(large_scalar_mul.total_time, nanos(5_000_000_000));
         assert_eq!(large_scalar_mul.latency, 1.0);
-        assert_eq!(large_scalar_mul.max_parallelism, 5);
-        assert_eq!(public_lookup.total_time, 6.0);
+        assert_eq!(large_scalar_mul.max_parallelism, nanos(5));
+        assert_eq!(public_lookup.total_time, nanos(6_000_000_000));
     }
 }

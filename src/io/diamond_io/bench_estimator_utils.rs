@@ -1,8 +1,14 @@
+use num_bigint::BigUint;
+use num_traits::Zero;
+
 use crate::bench_estimator::{CircuitBenchEstimate, CircuitBenchSummary};
 
 pub(super) fn estimate_summary(estimate: CircuitBenchEstimate) -> CircuitBenchSummary {
-    let summary =
-        CircuitBenchSummary::new(estimate.total_time, estimate.latency, estimate.max_parallelism);
+    let summary = CircuitBenchSummary::from_nanos(
+        estimate.total_time,
+        estimate.latency,
+        estimate.max_parallelism,
+    );
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(estimate.peak_vram)
@@ -18,9 +24,9 @@ pub(super) fn scale_estimate(estimate: CircuitBenchEstimate, count: usize) -> Ci
 }
 
 pub(super) fn scale_summary(summary: CircuitBenchSummary, count: usize) -> CircuitBenchSummary {
-    let total_time = summary.total_time * count as f64;
-    let max_parallelism = summary.max_parallelism.saturating_mul(count as u128);
-    let scaled = CircuitBenchSummary::new(total_time, summary.latency, max_parallelism);
+    let total_time = summary.total_time * BigUint::from(count);
+    let max_parallelism = summary.max_parallelism * BigUint::from(count);
+    let scaled = CircuitBenchSummary::from_nanos(total_time, summary.latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         scaled.with_peak_vram(summary.peak_vram)
@@ -35,9 +41,9 @@ pub(super) fn repeat_sequential_summary(
     summary: CircuitBenchSummary,
     count: usize,
 ) -> CircuitBenchSummary {
-    let total_time = summary.total_time * count as f64;
+    let total_time = summary.total_time * BigUint::from(count);
     let latency = summary.latency * count as f64;
-    let repeated = CircuitBenchSummary::new(total_time, latency, summary.max_parallelism);
+    let repeated = CircuitBenchSummary::from_nanos(total_time, latency, summary.max_parallelism);
     #[cfg(feature = "gpu")]
     {
         repeated.with_peak_vram(summary.peak_vram)
@@ -49,10 +55,11 @@ pub(super) fn repeat_sequential_summary(
 }
 
 pub(super) fn sequential_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
-    let total_time = parts.iter().map(|part| part.total_time).sum::<f64>();
+    let total_time = parts.iter().map(|part| part.total_time.clone()).sum::<BigUint>();
     let latency = parts.iter().map(|part| part.latency).sum::<f64>();
-    let max_parallelism = parts.iter().map(|part| part.max_parallelism).max().unwrap_or(0);
-    let summary = CircuitBenchSummary::new(total_time, latency, max_parallelism);
+    let max_parallelism =
+        parts.iter().map(|part| part.max_parallelism.clone()).max().unwrap_or_else(BigUint::zero);
+    let summary = CircuitBenchSummary::from_nanos(total_time, latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(parts.iter().map(|part| part.peak_vram).max().unwrap_or(0))
@@ -64,13 +71,10 @@ pub(super) fn sequential_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenc
 }
 
 pub(super) fn parallel_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
-    let total_time = parts.iter().map(|part| part.total_time).sum::<f64>();
+    let total_time = parts.iter().map(|part| part.total_time.clone()).sum::<BigUint>();
     let latency = parts.iter().map(|part| part.latency).fold(0.0f64, f64::max);
-    let max_parallelism = parts
-        .iter()
-        .map(|part| part.max_parallelism)
-        .fold(0u128, |acc, value| acc.saturating_add(value));
-    let summary = CircuitBenchSummary::new(total_time, latency, max_parallelism);
+    let max_parallelism = parts.iter().map(|part| part.max_parallelism.clone()).sum::<BigUint>();
+    let summary = CircuitBenchSummary::from_nanos(total_time, latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(parts.iter().map(|part| part.peak_vram).sum::<usize>())

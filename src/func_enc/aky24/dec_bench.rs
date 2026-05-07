@@ -108,12 +108,12 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
         let final_mask_decrypt = self.estimate_final_mask_decrypt(params);
         let final_decode = self.estimate_final_decode();
         let total = sequential_summaries(&[
-            function_circuit,
-            selected_half_prg,
-            noise_refresh_online,
-            final_mask_prg,
-            final_mask_decrypt,
-            final_decode,
+            function_circuit.clone(),
+            selected_half_prg.clone(),
+            noise_refresh_online.clone(),
+            final_mask_prg.clone(),
+            final_mask_decrypt.clone(),
+            final_decode.clone(),
         ]);
         Aky24DecBenchEstimate {
             function_circuit,
@@ -231,9 +231,9 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
     /// them, and subtracting the `c_b * output_preimage` term.
     fn estimate_final_decode(&self) -> CircuitBenchSummary {
         let parts = [
-            scale_estimate(self.native_matrix_mul, 2),
-            scale_estimate(self.native_matrix_add, 1),
-            scale_estimate(self.native_matrix_sub, 1),
+            scale_estimate(self.native_matrix_mul.clone(), 2),
+            scale_estimate(self.native_matrix_add.clone(), 1),
+            scale_estimate(self.native_matrix_sub.clone(), 1),
         ];
         sequential_summaries(&parts)
     }

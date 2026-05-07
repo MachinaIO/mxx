@@ -526,16 +526,17 @@ where
         // but the produced columns are independent public matrices, so the GPU estimate scales the
         // supplied one-key unit across all keys.
         let bgg_public_key_sampling =
-            scale_estimate(self.bgg_public_key_sample, diamond.input_size + 2);
+            scale_estimate(self.bgg_public_key_sample.clone(), diamond.input_size + 2);
 
         // Corresponds to `sample_public_key` for the native Ring-GSW key encrypting the private
         // seed bits.
-        let ring_gsw_public_key_sampling = estimate_summary(self.ring_gsw_public_key_sample);
+        let ring_gsw_public_key_sampling =
+            estimate_summary(self.ring_gsw_public_key_sample.clone());
 
         // Corresponds to the seed loop in `obfuscation`: each private seed bit is encrypted
         // natively, then the resulting native Ring-GSW ciphertext is decomposed into nested-RNS
         // input wires and lifted with `one_vec.key(slot_idx).large_scalar_mul(...)`.
-        let seed_encrypt = scale_estimate(self.ring_gsw_encrypt_bit, diamond.seed_bits);
+        let seed_encrypt = scale_estimate(self.ring_gsw_encrypt_bit.clone(), diamond.seed_bits);
         let seed_lift_unit =
             self.public_key_estimator.estimate_large_scalar_mul(scalar_one.as_slice());
         let seed_lift = scale_estimate(
@@ -545,7 +546,8 @@ where
                 .checked_mul(shape.ring_gsw_wire_count)
                 .expect("DiamondIO seed lift count overflow"),
         );
-        let seed_encryption_and_lift = sequential_summaries(&[seed_encrypt, seed_lift]);
+        let seed_encryption_and_lift =
+            sequential_summaries(&[seed_encrypt.clone(), seed_lift.clone()]);
 
         let prf_public_key_path = self
             .estimate_prf_path::<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
@@ -566,20 +568,30 @@ where
         );
 
         let final_projection_standard_preimages = shape.final_projection_standard_preimage_count();
-        let lookup_bridge_hash_sampling = estimate_summary(self.full_w_block_hash_sample);
-        let lookup_bridge_preimage = estimate_summary(self.lookup_bridge_preimage_extend);
-        let lookup_bridge_work =
-            sequential_summaries(&[lookup_bridge_hash_sampling, lookup_bridge_preimage]);
-        let final_projection_hash_sampling =
-            scale_estimate(self.full_w_block_hash_sample, final_projection_standard_preimages);
+        let lookup_bridge_hash_sampling = estimate_summary(self.full_w_block_hash_sample.clone());
+        let lookup_bridge_preimage = estimate_summary(self.lookup_bridge_preimage_extend.clone());
+        let lookup_bridge_work = sequential_summaries(&[
+            lookup_bridge_hash_sampling.clone(),
+            lookup_bridge_preimage.clone(),
+        ]);
+        let final_projection_hash_sampling = scale_estimate(
+            self.full_w_block_hash_sample.clone(),
+            final_projection_standard_preimages,
+        );
         let final_projection_target_building =
             shape.estimate_final_projection_target_building(self.native_estimator);
-        let final_projection_preimages =
-            scale_estimate(self.final_output_preimage_extend, final_projection_standard_preimages);
-        let final_projection_inputs =
-            parallel_summaries(&[final_projection_hash_sampling, final_projection_target_building]);
-        let final_projection_work =
-            sequential_summaries(&[final_projection_inputs, final_projection_preimages]);
+        let final_projection_preimages = scale_estimate(
+            self.final_output_preimage_extend.clone(),
+            final_projection_standard_preimages,
+        );
+        let final_projection_inputs = parallel_summaries(&[
+            final_projection_hash_sampling.clone(),
+            final_projection_target_building.clone(),
+        ]);
+        let final_projection_work = sequential_summaries(&[
+            final_projection_inputs.clone(),
+            final_projection_preimages.clone(),
+        ]);
 
         // After the scalar BGG public keys exist, the input-injection trapdoor chain and the
         // native seed-encryption/lifting branch have no data dependency. The PRF and function
@@ -588,25 +600,29 @@ where
         // lookup bridge can run on the input-injection branch while the PRF/function branch is
         // still producing public keys; only the refresh-decoder and final-output projection
         // preimages require both branches to have finished.
-        let seed_public_side =
-            sequential_summaries(&[ring_gsw_public_key_sampling, seed_encryption_and_lift]);
+        let seed_public_side = sequential_summaries(&[
+            ring_gsw_public_key_sampling.clone(),
+            seed_encryption_and_lift.clone(),
+        ]);
         let public_circuit_work = sequential_summaries(&[
-            seed_public_side,
+            seed_public_side.clone(),
             parallel_summaries(&[
-                prf_public_key_path.compute_without_refresh_decoder,
-                function_public_key_eval,
+                prf_public_key_path.compute_without_refresh_decoder.clone(),
+                function_public_key_eval.clone(),
             ]),
         ]);
         let input_injection_and_lookup =
-            sequential_summaries(&[input_injection.obfuscate, lookup_bridge_work]);
+            sequential_summaries(&[input_injection.obfuscate.clone(), lookup_bridge_work.clone()]);
         let public_and_input_branches =
-            parallel_summaries(&[input_injection_and_lookup, public_circuit_work]);
-        let post_join_projection_work =
-            parallel_summaries(&[prf_public_key_path.refresh_decoder_work, final_projection_work]);
+            parallel_summaries(&[input_injection_and_lookup.clone(), public_circuit_work.clone()]);
+        let post_join_projection_work = parallel_summaries(&[
+            prf_public_key_path.refresh_decoder_work.clone(),
+            final_projection_work.clone(),
+        ]);
         let total = sequential_summaries(&[
-            bgg_public_key_sampling,
-            public_and_input_branches,
-            post_join_projection_work,
+            bgg_public_key_sampling.clone(),
+            public_and_input_branches.clone(),
+            post_join_projection_work.clone(),
         ]);
 
         debug!(
@@ -687,7 +703,7 @@ where
         // all input encodings and lookup evaluators are available. With enough GPUs, these two
         // branches can occupy separate devices; the final decoder waits for both.
         let prf_and_function =
-            parallel_summaries(&[prf_encoding_path.total, function_encoding_eval]);
+            parallel_summaries(&[prf_encoding_path.total.clone(), function_encoding_eval.clone()]);
 
         // Corresponds to `decoder_outputs`: one `states[0] * decoder_preimage` per final
         // secret-dependent output slot.
@@ -708,15 +724,15 @@ where
             estimate_summary(self.native_estimator.estimate_vector_sub(DIAMOND_SECRET_SIZE)),
             estimate_summary(self.native_estimator.estimate_vector_add(DIAMOND_SECRET_SIZE)),
         ]);
-        let final_decode = scale_summary(final_decode_unit, diamond.output_size);
+        let final_decode = scale_summary(final_decode_unit.clone(), diamond.output_size);
 
         let total = sequential_summaries(&[
-            input_injection,
-            input_encoding_projection,
-            seed_ciphertext_lift,
-            prf_and_function,
-            decoder_projection,
-            final_decode,
+            input_injection.clone(),
+            input_encoding_projection.clone(),
+            seed_ciphertext_lift.clone(),
+            prf_and_function.clone(),
+            decoder_projection.clone(),
+            final_decode.clone(),
         ]);
 
         debug!(
@@ -749,13 +765,13 @@ where
         // Corresponds to `load_or_sample_b_checkpoint` for levels `0..=input_count`. Checkpoints
         // do not depend on each other, so enough GPUs can sample them concurrently.
         let checkpoint_sampling =
-            scale_estimate(self.trapdoor_checkpoint, diamond.injector.input_count + 1);
+            scale_estimate(self.trapdoor_checkpoint.clone(), diamond.injector.input_count + 1);
 
         // Corresponds to `build_initial_encoding`: one native product plus an error addition for
         // the empty prefix state. The W block is deterministic hash-derived public data, so it is
         // regenerated rather than stored, but preprocessing still pays the sampling cost.
         let initial_state = sequential_summaries(&[
-            estimate_summary(self.full_w_block_hash_sample),
+            estimate_summary(self.full_w_block_hash_sample.clone()),
             self.native_estimator
                 .estimate_vector_matrix_product(shape.state_row_size, shape.state_col_size),
             estimate_summary(self.native_estimator.estimate_vector_add(shape.state_col_size)),
@@ -764,30 +780,34 @@ where
         // Corresponds to `build_k_target_chunk_with_params` for every level/digit/state/chunk.
         // Target construction precedes the matching preimage sample, but all chunks in a stage are
         // independent.
-        let transition_ext_w_hash_sampling =
-            scale_estimate(self.full_w_block_hash_sample, shape.transition_ext_w_hash_count);
+        let transition_ext_w_hash_sampling = scale_estimate(
+            self.full_w_block_hash_sample.clone(),
+            shape.transition_ext_w_hash_count,
+        );
         let transition_target_w_hash_sampling = scale_estimate(
-            self.transition_w_chunk_hash_sample,
+            self.transition_w_chunk_hash_sample.clone(),
             shape.transition_target_w_hash_chunk_count,
         );
         let transition_target_building =
             shape.estimate_transition_target_building(self.native_estimator);
 
         // Corresponds to the chunked `preimage_extend` calls inside `DiamondInjector::preprocess`.
-        let transition_preimages =
-            scale_estimate(self.trapdoor_preimage_extend, shape.transition_preimage_chunk_count);
+        let transition_preimages = scale_estimate(
+            self.trapdoor_preimage_extend.clone(),
+            shape.transition_preimage_chunk_count,
+        );
 
         let transition_public_hashing = parallel_summaries(&[
-            transition_ext_w_hash_sampling,
-            transition_target_w_hash_sampling,
+            transition_ext_w_hash_sampling.clone(),
+            transition_target_w_hash_sampling.clone(),
         ]);
         let transition_stage = sequential_summaries(&[
-            transition_public_hashing,
-            transition_target_building,
-            transition_preimages,
+            transition_public_hashing.clone(),
+            transition_target_building.clone(),
+            transition_preimages.clone(),
         ]);
-        let body = parallel_summaries(&[initial_state, transition_stage]);
-        let preprocess_total = sequential_summaries(&[checkpoint_sampling, body]);
+        let body = parallel_summaries(&[initial_state.clone(), transition_stage.clone()]);
+        let preprocess_total = sequential_summaries(&[checkpoint_sampling.clone(), body.clone()]);
 
         let online_eval_total = shape.estimate_online_input_injection(self.native_estimator);
 
@@ -855,13 +875,13 @@ where
         };
         info!(?mode, ?prg_unit, "estimated DiamondIO PRF benchmark representative PRG unit");
         let selected_half_prg_per_round = scale_summary(
-            prg_unit,
+            prg_unit.clone(),
             2usize
                 .checked_mul(diamond.seed_bits)
                 .expect("DiamondIO selected-half PRG output count overflow"),
         );
         let selected_half_prg =
-            repeat_sequential_summary(selected_half_prg_per_round, diamond.input_size);
+            repeat_sequential_summary(selected_half_prg_per_round.clone(), diamond.input_size);
 
         let selected_wire_count_per_round = diamond
             .seed_bits
@@ -880,14 +900,14 @@ where
             ),
         };
         let selected_half_mux_unit = sequential_summaries(&[
-            estimate_summary(sub),
-            estimate_summary(mul),
-            estimate_summary(add),
+            estimate_summary(sub.clone()),
+            estimate_summary(mul.clone()),
+            estimate_summary(add.clone()),
         ]);
         let selected_half_mux_per_round =
-            scale_summary(selected_half_mux_unit, selected_wire_count_per_round);
+            scale_summary(selected_half_mux_unit.clone(), selected_wire_count_per_round);
         let selected_half_mux =
-            repeat_sequential_summary(selected_half_mux_per_round, diamond.input_size);
+            repeat_sequential_summary(selected_half_mux_per_round.clone(), diamond.input_size);
         info!(
             ?mode,
             selected_wire_count_per_round,
@@ -901,8 +921,8 @@ where
                 diamond,
                 shape.clone(),
                 mode,
-                prg_unit,
-                final_mask_decrypt_unit,
+                prg_unit.clone(),
+                final_mask_decrypt_unit.clone(),
             );
         info!(?mode, ?refresh_parts, "finished DiamondIO PRF benchmark noise-refresh estimate");
         let refresh_decoder_count_per_round = selected_wire_count_per_round
@@ -911,8 +931,14 @@ where
             .expect("DiamondIO refresh decoder count overflow");
         let refresh_decoder_work_per_round = match mode {
             PrfBenchMode::PublicKeyPreprocess => sequential_summaries(&[
-                scale_estimate(self.full_w_block_hash_sample, refresh_decoder_count_per_round),
-                scale_estimate(self.final_output_preimage_extend, refresh_decoder_count_per_round),
+                scale_estimate(
+                    self.full_w_block_hash_sample.clone(),
+                    refresh_decoder_count_per_round,
+                ),
+                scale_estimate(
+                    self.final_output_preimage_extend.clone(),
+                    refresh_decoder_count_per_round,
+                ),
             ]),
             PrfBenchMode::EncodingOnline => scale_summary(
                 self.native_estimator
@@ -921,16 +947,17 @@ where
             ),
         };
         let noise_refresh_per_round = sequential_summaries(&[
-            refresh_parts.material,
-            scale_summary(refresh_parts.per_refresh, selected_wire_count_per_round),
+            refresh_parts.material.clone(),
+            scale_summary(refresh_parts.per_refresh.clone(), selected_wire_count_per_round),
         ]);
-        let noise_refresh = repeat_sequential_summary(noise_refresh_per_round, diamond.input_size);
+        let noise_refresh =
+            repeat_sequential_summary(noise_refresh_per_round.clone(), diamond.input_size);
 
         // The final PRG output stream contains `output_size * ring_dim *
         // prf_mask_output_coeff_bits` independent Ring-GSW ciphertext bits. A representative
         // one-output Goldreich circuit keeps estimator memory bounded and preserves the
         // enough-GPUs latency rule.
-        let final_mask_prg = scale_summary(prg_unit, shape.final_mask_prg_output_count());
+        let final_mask_prg = scale_summary(prg_unit.clone(), shape.final_mask_prg_output_count());
         info!(?mode, ?final_mask_prg, "estimated DiamondIO PRF benchmark final-mask PRG");
 
         // The concrete final-mask decrypt circuit consumes `ring_dim * coeff_bits` encrypted
@@ -944,7 +971,7 @@ where
             .and_then(|count| count.checked_mul(diamond.output_size))
             .expect("DiamondIO final-mask decrypt contribution count overflow");
         let final_mask_decrypt =
-            scale_summary(final_mask_decrypt_unit, final_mask_decrypt_contribution_count);
+            scale_summary(final_mask_decrypt_unit.clone(), final_mask_decrypt_contribution_count);
         info!(
             ?mode,
             final_mask_decrypt_contribution_count,
@@ -959,40 +986,48 @@ where
         // Ring-GSW wire count.
         let round_compute_per_round = match mode {
             PrfBenchMode::PublicKeyPreprocess => sequential_summaries(&[
-                selected_half_prg_per_round,
-                selected_half_mux_per_round,
-                noise_refresh_per_round,
+                selected_half_prg_per_round.clone(),
+                selected_half_mux_per_round.clone(),
+                noise_refresh_per_round.clone(),
             ]),
             PrfBenchMode::EncodingOnline => sequential_summaries(&[
-                selected_half_prg_per_round,
-                selected_half_mux_per_round,
-                refresh_decoder_work_per_round,
-                noise_refresh_per_round,
+                selected_half_prg_per_round.clone(),
+                selected_half_mux_per_round.clone(),
+                refresh_decoder_work_per_round.clone(),
+                noise_refresh_per_round.clone(),
             ]),
         };
         let round_summary_per_round = sequential_summaries(&[
-            selected_half_prg_per_round,
-            selected_half_mux_per_round,
-            refresh_decoder_work_per_round,
-            noise_refresh_per_round,
+            selected_half_prg_per_round.clone(),
+            selected_half_mux_per_round.clone(),
+            refresh_decoder_work_per_round.clone(),
+            noise_refresh_per_round.clone(),
         ]);
-        let round_compute = repeat_sequential_summary(round_compute_per_round, diamond.input_size);
-        let round_summary = repeat_sequential_summary(round_summary_per_round, diamond.input_size);
+        let round_compute =
+            repeat_sequential_summary(round_compute_per_round.clone(), diamond.input_size);
+        let round_summary =
+            repeat_sequential_summary(round_summary_per_round.clone(), diamond.input_size);
         let refresh_decoder_work = match mode {
             PrfBenchMode::PublicKeyPreprocess => {
-                scale_summary(refresh_decoder_work_per_round, diamond.input_size)
+                scale_summary(refresh_decoder_work_per_round.clone(), diamond.input_size)
             }
-            PrfBenchMode::EncodingOnline => {
-                repeat_sequential_summary(refresh_decoder_work_per_round, diamond.input_size)
-            }
+            PrfBenchMode::EncodingOnline => repeat_sequential_summary(
+                refresh_decoder_work_per_round.clone(),
+                diamond.input_size,
+            ),
         };
-        let final_summary = sequential_summaries(&[final_mask_prg, final_mask_decrypt]);
-        let compute_without_refresh_decoder = sequential_summaries(&[round_compute, final_summary]);
+        let final_summary =
+            sequential_summaries(&[final_mask_prg.clone(), final_mask_decrypt.clone()]);
+        let compute_without_refresh_decoder =
+            sequential_summaries(&[round_compute.clone(), final_summary.clone()]);
         let total = match mode {
-            PrfBenchMode::PublicKeyPreprocess => {
-                parallel_summaries(&[compute_without_refresh_decoder, refresh_decoder_work])
+            PrfBenchMode::PublicKeyPreprocess => parallel_summaries(&[
+                compute_without_refresh_decoder.clone(),
+                refresh_decoder_work.clone(),
+            ]),
+            PrfBenchMode::EncodingOnline => {
+                sequential_summaries(&[round_summary.clone(), final_summary.clone()])
             }
-            PrfBenchMode::EncodingOnline => sequential_summaries(&[round_summary, final_summary]),
         };
 
         let estimate = DiamondIOPrfBenchEstimateParts {
@@ -1003,7 +1038,7 @@ where
             final_mask_prg,
             final_mask_decrypt,
             compute_without_refresh_decoder,
-            total,
+            total: total.clone(),
         };
         debug!(?mode, ?estimate, "estimated DiamondIO PRF benchmark");
         info!(?mode, ?total, "finished DiamondIO PRF benchmark path estimation");
@@ -1113,25 +1148,29 @@ where
                 ),
             };
 
-        let input_stage = scale_estimate(input, input_count);
+        let input_stage = scale_estimate(input.clone(), input_count);
         let linear_rows = sequential_summaries(&[
-            scale_estimate(small_scalar_mul, linear_const_small_scalar_count),
-            scale_estimate(add, linear_reduce_add_count),
+            scale_estimate(small_scalar_mul.clone(), linear_const_small_scalar_count),
+            scale_estimate(add.clone(), linear_reduce_add_count),
         ]);
         let weighted_top = sequential_summaries(&[
-            scale_estimate(slot_reduce_one_input, top_weighted_term_count),
-            scale_estimate(mul, top_weighted_term_count),
-            scale_estimate(large_scalar_mul, top_weighted_term_count + 1),
-            scale_estimate(add, top_weighted_term_count),
+            scale_estimate(slot_reduce_one_input.clone(), top_weighted_term_count),
+            scale_estimate(mul.clone(), top_weighted_term_count),
+            scale_estimate(large_scalar_mul.clone(), top_weighted_term_count + 1),
+            scale_estimate(add.clone(), top_weighted_term_count),
         ]);
         let bottom_reconstruct = sequential_summaries(&[
-            scale_estimate(large_scalar_mul, bottom_reconstruct_large_scalar_count),
-            scale_estimate(add, bottom_reconstruct_add_count),
-            scale_estimate(sub, active_levels),
-            estimate_summary(slot_reduce_one_input),
+            scale_estimate(large_scalar_mul.clone(), bottom_reconstruct_large_scalar_count),
+            scale_estimate(add.clone(), bottom_reconstruct_add_count),
+            scale_estimate(sub.clone(), active_levels),
+            estimate_summary(slot_reduce_one_input.clone()),
         ]);
-        let summary =
-            sequential_summaries(&[input_stage, linear_rows, weighted_top, bottom_reconstruct]);
+        let summary = sequential_summaries(&[
+            input_stage.clone(),
+            linear_rows.clone(),
+            weighted_top.clone(),
+            bottom_reconstruct.clone(),
+        ]);
         info!(
             ?mode,
             ring_gsw_width = diamond.ring_gsw_width,
@@ -1198,9 +1237,9 @@ where
             PrfBenchMode::EncodingOnline => self.encoding_estimator.estimate_add(),
         };
         let material = sequential_summaries(&[
-            scale_summary(prg_unit, material_ciphertext_count),
-            scale_summary(decrypt_contribution_unit, material_ciphertext_count),
-            scale_estimate(add, material_merge_count),
+            scale_summary(prg_unit.clone(), material_ciphertext_count),
+            scale_summary(decrypt_contribution_unit.clone(), material_ciphertext_count),
+            scale_estimate(add.clone(), material_merge_count),
         ]);
 
         let scalar_target = [BigUint::from(1u32)];
@@ -1217,7 +1256,7 @@ where
             diamond.noise_refresh_hash_key,
             1,
         );
-        let a_prime_sampling_stage = scale_summary(a_prime_sampling_unit, shape.ring_dim);
+        let a_prime_sampling_stage = scale_summary(a_prime_sampling_unit.clone(), shape.ring_dim);
 
         let per_refresh = match mode {
             PrfBenchMode::PublicKeyPreprocess => {
@@ -1226,16 +1265,16 @@ where
                 let pk_add = self.public_key_estimator.estimate_add();
                 let pk_sub = self.public_key_estimator.estimate_sub();
                 let combine_unit = sequential_summaries(&[
-                    estimate_summary(pk_matrix_mul),
-                    estimate_summary(pk_matrix_mul),
-                    scale_estimate(pk_matrix_mul, shape.modulus_digits),
-                    scale_estimate(pk_add, collapse_add_count),
-                    estimate_summary(pk_add),
-                    estimate_summary(pk_sub),
+                    estimate_summary(pk_matrix_mul.clone()),
+                    estimate_summary(pk_matrix_mul.clone()),
+                    scale_estimate(pk_matrix_mul.clone(), shape.modulus_digits),
+                    scale_estimate(pk_add.clone(), collapse_add_count),
+                    estimate_summary(pk_add.clone()),
+                    estimate_summary(pk_sub.clone()),
                 ]);
                 sequential_summaries(&[
-                    a_prime_sampling_stage,
-                    scale_summary(combine_unit, combine_task_count),
+                    a_prime_sampling_stage.clone(),
+                    scale_summary(combine_unit.clone(), combine_task_count),
                 ])
             }
             PrfBenchMode::EncodingOnline => {
@@ -1245,22 +1284,22 @@ where
                 let enc_sub = self.encoding_estimator.estimate_sub();
                 let crt_recompose = self.native_estimator.estimate_vector_add(shape.modulus_digits);
                 let combine_unit = sequential_summaries(&[
-                    estimate_summary(enc_matrix_mul),
-                    estimate_summary(enc_matrix_mul),
-                    scale_estimate(enc_matrix_mul, shape.modulus_digits),
-                    scale_estimate(enc_add, collapse_add_count),
-                    estimate_summary(enc_add),
-                    estimate_summary(enc_sub),
-                    estimate_summary(enc_sub),
-                    estimate_summary(crt_recompose),
+                    estimate_summary(enc_matrix_mul.clone()),
+                    estimate_summary(enc_matrix_mul.clone()),
+                    scale_estimate(enc_matrix_mul.clone(), shape.modulus_digits),
+                    scale_estimate(enc_add.clone(), collapse_add_count),
+                    estimate_summary(enc_add.clone()),
+                    estimate_summary(enc_sub.clone()),
+                    estimate_summary(enc_sub.clone()),
+                    estimate_summary(crt_recompose.clone()),
                 ]);
                 sequential_summaries(&[
-                    a_prime_sampling_stage,
-                    scale_summary(combine_unit, combine_task_count),
+                    a_prime_sampling_stage.clone(),
+                    scale_summary(combine_unit.clone(), combine_task_count),
                 ])
             }
         };
-        let total = sequential_summaries(&[material, per_refresh]);
+        let total = sequential_summaries(&[material.clone(), per_refresh.clone()]);
 
         info!(
             ?mode,
@@ -1340,7 +1379,7 @@ struct DiamondIOInputInjectionBenchEstimateParts {
     eval: CircuitBenchSummary,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DiamondIOBenchUnitEstimates {
     trapdoor_checkpoint: CircuitBenchEstimate,
     trapdoor_preimage_extend: CircuitBenchEstimate,
@@ -1413,7 +1452,7 @@ where
         );
         matrix.into_compact_bytes()
     });
-    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1);
+    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1u32);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(bench.peak_vram)
@@ -1450,10 +1489,11 @@ fn scale_estimate_total_parallelism(
     estimate: CircuitBenchEstimate,
     column_count: usize,
 ) -> CircuitBenchEstimate {
-    let column_count_u128 = column_count as u128;
-    let scaled =
-        CircuitBenchEstimate::new(estimate.total_time * column_count as f64, estimate.latency)
-            .with_max_parallelism(estimate.max_parallelism.saturating_mul(column_count_u128));
+    let scaled = CircuitBenchEstimate::from_nanos(
+        estimate.total_time.clone() * BigUint::from(column_count),
+        estimate.latency,
+    )
+    .with_max_parallelism(estimate.max_parallelism.clone() * BigUint::from(column_count));
     #[cfg(feature = "gpu")]
     {
         scaled.with_peak_vram(estimate.peak_vram)

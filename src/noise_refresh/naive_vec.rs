@@ -180,7 +180,7 @@ where
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NoiseRefreshBenchEstimateParts {
     pub(crate) material: CircuitBenchSummary,
     pub(crate) per_refresh: CircuitBenchSummary,
@@ -188,12 +188,9 @@ pub(crate) struct NoiseRefreshBenchEstimateParts {
 }
 
 fn scaled_estimate_summary(unit: CircuitBenchEstimate, task_count: usize) -> CircuitBenchSummary {
-    let total_time = unit.total_time * task_count as f64;
-    let max_parallelism = unit
-        .max_parallelism
-        .checked_mul(task_count as u128)
-        .expect("noise-refresh benchmark parallelism overflowed while scaling a stage");
-    let summary = CircuitBenchSummary::new(total_time, unit.latency, max_parallelism);
+    let total_time = unit.total_time.clone() * BigUint::from(task_count);
+    let max_parallelism = unit.max_parallelism.clone() * BigUint::from(task_count);
+    let summary = CircuitBenchSummary::from_nanos(total_time, unit.latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(unit.peak_vram)
@@ -300,12 +297,9 @@ where
 }
 
 fn scaled_summary(summary: CircuitBenchSummary, task_count: usize) -> CircuitBenchSummary {
-    let total_time = summary.total_time * task_count as f64;
-    let max_parallelism = summary
-        .max_parallelism
-        .checked_mul(task_count as u128)
-        .expect("noise-refresh benchmark parallelism overflowed while scaling a summary");
-    let scaled = CircuitBenchSummary::new(total_time, summary.latency, max_parallelism);
+    let total_time = summary.total_time.clone() * BigUint::from(task_count);
+    let max_parallelism = summary.max_parallelism.clone() * BigUint::from(task_count);
+    let scaled = CircuitBenchSummary::from_nanos(total_time, summary.latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         scaled.with_peak_vram(summary.peak_vram)
@@ -321,10 +315,11 @@ fn expand_batched_wires(wires: &[BatchedWire]) -> Vec<BatchedWire> {
 }
 
 fn sequential_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
-    let total_time = parts.iter().map(|part| part.total_time).sum::<f64>();
+    let total_time = parts.iter().map(|part| part.total_time.clone()).sum::<BigUint>();
     let latency = parts.iter().map(|part| part.latency).sum::<f64>();
-    let max_parallelism = parts.iter().map(|part| part.max_parallelism).max().unwrap_or(0);
-    let summary = CircuitBenchSummary::new(total_time, latency, max_parallelism);
+    let max_parallelism =
+        parts.iter().map(|part| part.max_parallelism.clone()).max().unwrap_or_default();
+    let summary = CircuitBenchSummary::from_nanos(total_time, latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(parts.iter().map(|part| part.peak_vram).max().unwrap_or(0))
@@ -366,7 +361,7 @@ where
     let bench = benchmark_gate_operation(NATIVE_BENCH_ITERATIONS, || {
         crt_recompose_rows::<M>(params, &crt_values, 1)
     });
-    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1);
+    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1u32);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(bench.peak_vram)
@@ -400,7 +395,7 @@ where
         );
         matrix.into_compact_bytes()
     });
-    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1);
+    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1u32);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(bench.peak_vram)
@@ -561,35 +556,37 @@ where
             self.hash_key,
             secret_size,
         );
-        let a_prime_sampling_stage = scaled_summary(a_prime_sampling_unit, num_slots);
+        let a_prime_sampling_stage = scaled_summary(a_prime_sampling_unit.clone(), num_slots);
         let collapse_add_count = log_base_q
             .checked_mul(num_slots.saturating_sub(1))
             .expect("noise-refresh collapse add count overflow");
         let preprocess_combine_unit = sequential_summaries(&[
             // Compute the public-key one-term for the naive slot vector:
             // `one.keys[slot_idx].matrix_mul((q / q_i) * A')`.
-            estimate_summary(pk_matrix_mul),
+            estimate_summary(pk_matrix_mul.clone()),
             // Compute the refreshed-input public-key term for the naive slot vector:
             // `refreshed_input.keys[slot_idx].matrix_mul((q / q_i) * G)`.
-            estimate_summary(pk_matrix_mul),
+            estimate_summary(pk_matrix_mul.clone()),
             // Apply the one-column target to each of the `log_base_q` decoded material columns.
-            scaled_estimate_summary(pk_matrix_mul, log_base_q),
+            scaled_estimate_summary(pk_matrix_mul.clone(), log_base_q),
             // For each decoded material column, `collapse_slot_matrices` sums `num_slots`
             // rotated slot matrices into one polynomial column; `concat_owned_columns` then only
             // lays those columns side by side and is not modeled as arithmetic.
-            scaled_estimate_summary(pk_add, collapse_add_count),
+            scaled_estimate_summary(pk_add.clone(), collapse_add_count),
             // Add the refreshed-input term and the decoded refresh term.
-            estimate_summary(pk_add),
+            estimate_summary(pk_add.clone()),
             // Subtract the one-term so the public refresh matrix has the intended sign.
-            estimate_summary(pk_sub),
+            estimate_summary(pk_sub.clone()),
         ]);
 
         let preprocess_combine_stage = sequential_summaries(&[
-            a_prime_sampling_stage,
-            scaled_summary(preprocess_combine_unit, combine_task_count),
+            a_prime_sampling_stage.clone(),
+            scaled_summary(preprocess_combine_unit.clone(), combine_task_count),
         ]);
-        let preprocess_summary =
-            sequential_summaries(&[public_material_summary, preprocess_combine_stage]);
+        let preprocess_summary = sequential_summaries(&[
+            public_material_summary.clone(),
+            preprocess_combine_stage.clone(),
+        ]);
 
         debug!(
             v_bits = self.v_bits,
@@ -668,30 +665,30 @@ where
             self.hash_key,
             secret_size,
         );
-        let a_prime_sampling_stage = scaled_summary(a_prime_sampling_unit, num_slots);
+        let a_prime_sampling_stage = scaled_summary(a_prime_sampling_unit.clone(), num_slots);
         let collapse_add_count = log_base_q
             .checked_mul(num_slots.saturating_sub(1))
             .expect("noise-refresh collapse add count overflow");
         let online_combine_unit = sequential_summaries(&[
             // Compute the encoding one-term for the naive slot vector:
             // `one.encodings[slot_idx].matrix_mul((q / q_i) * A')`.
-            estimate_summary(enc_matrix_mul),
+            estimate_summary(enc_matrix_mul.clone()),
             // Compute the refreshed-input encoding term for the naive slot vector:
             // `refreshed_input.encodings[slot_idx].matrix_mul((q / q_i) * G)`.
-            estimate_summary(enc_matrix_mul),
+            estimate_summary(enc_matrix_mul.clone()),
             // Apply the one-column target to each of the `log_base_q` decoded material columns.
-            scaled_estimate_summary(enc_matrix_mul, log_base_q),
+            scaled_estimate_summary(enc_matrix_mul.clone(), log_base_q),
             // For each decoded material column, `collapse_slot_matrices` sums `num_slots`
             // rotated slot vectors into one polynomial column; `concat_owned_columns` then only
             // lays those columns side by side and is not modeled as arithmetic.
-            scaled_estimate_summary(enc_add, collapse_add_count),
+            scaled_estimate_summary(enc_add.clone(), collapse_add_count),
             // Add the refreshed-input term and the decoded refresh term.
-            estimate_summary(enc_add),
+            estimate_summary(enc_add.clone()),
             // Subtract the one-term to leave the desired positive `A'` contribution after
             // decoding.
-            estimate_summary(enc_sub),
+            estimate_summary(enc_sub.clone()),
             // Subtract the caller-provided decoder for this `(slot_idx, crt_idx)` level.
-            estimate_summary(enc_sub),
+            estimate_summary(enc_sub.clone()),
         ]);
 
         // Measure the native `crt_recompose_rows` work for one final slot row directly.  This is
@@ -700,12 +697,14 @@ where
         let online_crt_recompose_unit = measured_crt_recompose_unit_summary::<M>(self.params());
 
         let online_combine_stage = sequential_summaries(&[
-            a_prime_sampling_stage,
-            scaled_summary(online_combine_unit, combine_task_count),
+            a_prime_sampling_stage.clone(),
+            scaled_summary(online_combine_unit.clone(), combine_task_count),
         ]);
-        let online_crt_stage = scaled_summary(online_crt_recompose_unit, num_slots);
-        let online_per_refresh = sequential_summaries(&[online_combine_stage, online_crt_stage]);
-        let online_summary = sequential_summaries(&[online_material_summary, online_per_refresh]);
+        let online_crt_stage = scaled_summary(online_crt_recompose_unit.clone(), num_slots);
+        let online_per_refresh =
+            sequential_summaries(&[online_combine_stage.clone(), online_crt_stage.clone()]);
+        let online_summary =
+            sequential_summaries(&[online_material_summary.clone(), online_per_refresh.clone()]);
 
         debug!(
             v_bits = self.v_bits,
@@ -2328,17 +2327,16 @@ mod tests {
             let summary = refresher.estimate_preprocess_bench(&material_estimator);
             tracing::info!(
                 ?summary,
-                total_time = summary.total_time,
+                total_time_nanos = %summary.total_time,
                 latency = summary.latency,
-                max_parallelism = summary.max_parallelism,
+                max_parallelism = %summary.max_parallelism,
                 "naive-vector noise-refresh preprocess benchmark summary"
             );
 
-            assert!(summary.total_time.is_finite());
-            assert!(summary.total_time > 0.0);
+            assert!(summary.total_time > BigUint::from(0u32));
             assert!(summary.latency.is_finite());
             assert!(summary.latency > 0.0);
-            assert!(summary.max_parallelism > 0);
+            assert!(summary.max_parallelism > BigUint::from(0u32));
         }
 
         #[test]
@@ -2351,23 +2349,21 @@ mod tests {
             let summary = refresher.estimate_online_eval_bench(&material_estimator);
             tracing::info!(
                 ?summary,
-                total_time = summary.total_time,
+                total_time_nanos = %summary.total_time,
                 latency = summary.latency,
-                max_parallelism = summary.max_parallelism,
+                max_parallelism = %summary.max_parallelism,
                 "naive-vector noise-refresh online benchmark summary"
             );
 
-            assert!(summary.total_time.is_finite());
-            assert!(summary.total_time > 0.0);
+            assert!(summary.total_time > BigUint::from(0u32));
             assert!(summary.latency.is_finite());
             assert!(summary.latency > 0.0);
-            assert!(summary.max_parallelism > 0);
+            assert!(summary.max_parallelism > BigUint::from(0u32));
 
             let crt_unit =
                 measured_crt_recompose_unit_summary::<GpuDCRTPolyMatrix>(refresher.params());
-            assert!(crt_unit.total_time.is_finite());
             assert!(crt_unit.latency.is_finite());
-            assert!(crt_unit.max_parallelism > 0);
+            assert!(crt_unit.max_parallelism > BigUint::from(0u32));
         }
     }
 }

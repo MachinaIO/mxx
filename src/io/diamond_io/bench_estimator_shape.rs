@@ -318,7 +318,7 @@ impl DiamondIOBenchShape {
         let levels = self
             .online_level_state_counts
             .iter()
-            .map(|&state_count| scale_summary(per_state, state_count))
+            .map(|&state_count| scale_summary(per_state.clone(), state_count))
             .collect::<Vec<_>>();
         sequential_summaries(levels.as_slice())
     }

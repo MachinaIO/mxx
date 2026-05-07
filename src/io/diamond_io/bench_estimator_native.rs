@@ -135,7 +135,7 @@ impl GpuDCRTPolyMatrixNativeBenchEstimator {
             .read()
             .expect("DiamondIO native bench cache read lock poisoned")
             .get(&key)
-            .copied()
+            .cloned()
         {
             info!(?key, ?estimate, "DiamondIO native GPU bench cache hit");
             return estimate;
@@ -146,7 +146,7 @@ impl GpuDCRTPolyMatrixNativeBenchEstimator {
         self.cache
             .write()
             .expect("DiamondIO native bench cache write lock poisoned")
-            .insert(key, estimate);
+            .insert(key, estimate.clone());
         estimate
     }
 

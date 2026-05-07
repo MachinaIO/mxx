@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(
             estimator.estimate_mul(),
             CircuitBenchEstimate::new(estimator.mul_time, estimator.mul_time / 3.0)
-                .with_max_parallelism(3)
+                .with_max_parallelism(3u32)
                 .with_peak_vram(estimator.mul_peak_vram.div_ceil(3))
         );
         assert_eq!(
@@ -702,7 +702,7 @@ mod tests {
                 estimator.large_scalar_mul_time,
                 estimator.large_scalar_mul_time / 4.0
             )
-            .with_max_parallelism(4)
+            .with_max_parallelism(4u32)
             .with_peak_vram(estimator.large_scalar_mul_peak_vram.div_ceil(4))
         );
         assert!(estimator.public_lut_time >= 0.0);

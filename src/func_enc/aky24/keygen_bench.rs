@@ -14,6 +14,7 @@ use crate::{
     poly::PolyParams,
     sampler::PolyHashSampler,
 };
+use num_bigint::BigUint;
 
 /// Shape parameters that are not directly inferable from `Aky24Params` for keygen estimation.
 ///
@@ -109,12 +110,12 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
         let final_mask_decrypt = self.estimate_final_mask_decrypt(params);
         let trapdoor_preimages = self.estimate_trapdoor_preimages(params, shape);
         let total = sequential_summaries(&[
-            function_circuit,
-            selected_half_prg,
-            noise_refresh_preprocess,
-            final_mask_prg,
-            final_mask_decrypt,
-            trapdoor_preimages,
+            function_circuit.clone(),
+            selected_half_prg.clone(),
+            noise_refresh_preprocess.clone(),
+            final_mask_prg.clone(),
+            final_mask_decrypt.clone(),
+            trapdoor_preimages.clone(),
         ]);
         Aky24KeygenBenchEstimate {
             function_circuit,
@@ -263,7 +264,7 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
             .and_then(|count| count.checked_mul(params.n()))
             .and_then(|count| count.checked_mul(crt_depth))
             .expect("AKY24 keygen refresh preimage benchmark count overflow");
-        scale_estimate(self.trapdoor_preimage, refresh_preimages + 1)
+        scale_estimate(self.trapdoor_preimage.clone(), refresh_preimages + 1)
     }
 }
 
@@ -273,8 +274,12 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
 /// the single-operation values, matching the convention used by existing benchmark estimators.
 pub(super) fn scale_estimate(estimate: CircuitBenchEstimate, count: usize) -> CircuitBenchSummary {
     scale_summary(
-        CircuitBenchSummary::new(estimate.total_time, estimate.latency, estimate.max_parallelism)
-            .with_peak_vram_estimate(estimate),
+        CircuitBenchSummary::from_nanos(
+            estimate.total_time.clone(),
+            estimate.latency,
+            estimate.max_parallelism.clone(),
+        )
+        .with_peak_vram_estimate(estimate),
         count,
     )
 }
@@ -284,12 +289,9 @@ pub(super) fn scale_estimate(estimate: CircuitBenchEstimate, count: usize) -> Ci
 /// This helper is used for PRG, refresh, and decrypt stages where a representative circuit or stage
 /// estimate is repeated many times with independent inputs.
 pub(super) fn scale_summary(summary: CircuitBenchSummary, count: usize) -> CircuitBenchSummary {
-    let total_time = summary.total_time * count as f64;
-    let max_parallelism = summary
-        .max_parallelism
-        .checked_mul(count as u128)
-        .expect("AKY24 benchmark parallelism overflow while scaling summary");
-    let scaled = CircuitBenchSummary::new(total_time, summary.latency, max_parallelism);
+    let total_time = summary.total_time.clone() * BigUint::from(count);
+    let max_parallelism = summary.max_parallelism.clone() * BigUint::from(count);
+    let scaled = CircuitBenchSummary::from_nanos(total_time, summary.latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         scaled.with_peak_vram(summary.peak_vram)
@@ -305,10 +307,11 @@ pub(super) fn scale_summary(summary: CircuitBenchSummary, count: usize) -> Circu
 /// Sequential composition adds total time and latency, while maximum parallelism and peak VRAM are
 /// the maxima across stages rather than sums.
 pub(super) fn sequential_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
-    let total_time = parts.iter().map(|part| part.total_time).sum::<f64>();
+    let total_time = parts.iter().map(|part| part.total_time.clone()).sum::<BigUint>();
     let latency = parts.iter().map(|part| part.latency).sum::<f64>();
-    let max_parallelism = parts.iter().map(|part| part.max_parallelism).max().unwrap_or(0);
-    let summary = CircuitBenchSummary::new(total_time, latency, max_parallelism);
+    let max_parallelism =
+        parts.iter().map(|part| part.max_parallelism.clone()).max().unwrap_or_default();
+    let summary = CircuitBenchSummary::from_nanos(total_time, latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(parts.iter().map(|part| part.peak_vram).max().unwrap_or(0))

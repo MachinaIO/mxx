@@ -782,17 +782,17 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
 
     info!(
         obfuscate_latency = estimate.obfuscate.latency,
-        obfuscate_total_time = estimate.obfuscate.total_time,
-        obfuscate_max_parallelism = estimate.obfuscate.max_parallelism,
+        obfuscate_total_time_nanos = %estimate.obfuscate.total_time,
+        obfuscate_max_parallelism = %estimate.obfuscate.max_parallelism,
         eval_latency = estimate.eval.latency,
-        eval_total_time = estimate.eval.total_time,
-        eval_max_parallelism = estimate.eval.max_parallelism,
+        eval_total_time_nanos = %estimate.eval.total_time,
+        eval_max_parallelism = %estimate.eval.max_parallelism,
         obfuscated_circuit_bytes = %estimate.obfuscated_circuit_bytes,
         input_injection_bytes = %estimate.input_injection_bytes,
         "DiamondIO GPU benchmark estimate"
     );
-    assert!(estimate.obfuscate.total_time >= 0.0);
-    assert!(estimate.eval.total_time >= 0.0);
+    assert!(estimate.obfuscate.total_time >= BigUint::from(0u32));
+    assert!(estimate.eval.total_time >= BigUint::from(0u32));
     assert!(estimate.obfuscated_circuit_bytes > BigUint::from(0u32));
     assert!(estimate.input_injection_bytes > BigUint::from(0u32));
 }

@@ -1634,10 +1634,25 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 circuit.large_scalar_mul(w_times_secret, std::slice::from_ref(gadget_scalar)),
             );
         }
-        let mut sum = circuit.large_scalar_mul(batch_secret_key, &[BigUint::ZERO]).as_single_wire();
-        for term in weighted_top_terms {
-            sum = circuit.add_gate(sum, term).as_single_wire();
-        }
+        let sum = if weighted_top_terms.is_empty() {
+            circuit.large_scalar_mul(batch_secret_key, &[BigUint::ZERO]).as_single_wire()
+        } else {
+            let mut current_layer =
+                weighted_top_terms.into_iter().map(BatchedWire::as_single_wire).collect::<Vec<_>>();
+            while current_layer.len() > 1 {
+                let mut next_layer = Vec::with_capacity(current_layer.len().div_ceil(2));
+                let mut iter = current_layer.into_iter();
+                while let Some(left) = iter.next() {
+                    if let Some(right) = iter.next() {
+                        next_layer.push(circuit.add_gate(left, right).as_single_wire());
+                    } else {
+                        next_layer.push(left);
+                    }
+                }
+                current_layer = next_layer;
+            }
+            current_layer.pop().expect("non-empty top-term reduction must leave one term")
+        };
         let bottom_inputs = bottom_entries
             .into_iter()
             .map(|bottom_entry| bottom_entry.reconstruct(circuit))

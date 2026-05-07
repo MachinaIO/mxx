@@ -112,7 +112,7 @@ where
     pub(super) fn native_ciphertexts_to_public_key_wires(
         &self,
         one_vec: &NaiveBGGPublicKeyVec<M>,
-        ciphertexts: &[NativeRingGswCiphertext],
+        ciphertexts: &[NativeRingGswCiphertext<DCRTPoly>],
     ) -> Vec<NaiveBGGPublicKeyVec<M>> {
         let params = &self.injector.params;
         ciphertexts
@@ -152,7 +152,7 @@ where
     pub(super) fn native_ciphertexts_to_encoding_wires(
         &self,
         one_vec: &NaiveBGGEncodingVec<M>,
-        ciphertexts: &[NativeRingGswCiphertext],
+        ciphertexts: &[NativeRingGswCiphertext<DCRTPoly>],
     ) -> Vec<NaiveBGGEncodingVec<M>> {
         let params = &self.injector.params;
         ciphertexts
@@ -195,9 +195,9 @@ where
     pub(super) fn sample_debug_prg_public_key_wires(
         &self,
         one_vec: &NaiveBGGPublicKeyVec<M>,
-        ring_gsw_public_key: &NativeRingGswCiphertext,
+        ring_gsw_public_key: &NativeRingGswCiphertext<DCRTPoly>,
         output_bit_count: usize,
-        debug_prg_ciphertexts: &mut Vec<NativeRingGswCiphertext>,
+        debug_prg_ciphertexts: &mut Vec<NativeRingGswCiphertext<DCRTPoly>>,
     ) -> Vec<NaiveBGGPublicKeyVec<M>> {
         if output_bit_count == 0 {
             return Vec::new();
@@ -222,7 +222,7 @@ where
     pub(super) fn read_debug_prg_encoding_wires(
         &self,
         one_vec: &NaiveBGGEncodingVec<M>,
-        debug_prg_ciphertexts: &[NativeRingGswCiphertext],
+        debug_prg_ciphertexts: &[NativeRingGswCiphertext<DCRTPoly>],
         cursor: &mut usize,
         output_bit_count: usize,
     ) -> Vec<NaiveBGGEncodingVec<M>> {
@@ -400,8 +400,8 @@ where
         k_vec: &NaiveBGGPublicKeyVec<M>,
         input_digit_vecs: &[NaiveBGGPublicKeyVec<M>],
         enc_seed_public_keys: &[NaiveBGGPublicKeyVec<M>],
-        debug_ring_gsw_public_key: Option<&NativeRingGswCiphertext>,
-        mut debug_prg_ciphertexts: Option<&mut Vec<NativeRingGswCiphertext>>,
+        debug_ring_gsw_public_key: Option<&NativeRingGswCiphertext<DCRTPoly>>,
+        mut debug_prg_ciphertexts: Option<&mut Vec<NativeRingGswCiphertext<DCRTPoly>>>,
     ) -> Vec<(NaiveBGGPublicKeyVec<M>, NaiveBGGPublicKeyVec<M>)>
     where
         M: Send + Sync + 'static,
@@ -737,7 +737,7 @@ where
         k_vec: &NaiveBGGEncodingVec<M>,
         input_digit_vecs: &[NaiveBGGEncodingVec<M>],
         enc_seed_wires: Vec<NaiveBGGEncodingVec<M>>,
-        debug_prg_ciphertexts: &[NativeRingGswCiphertext],
+        debug_prg_ciphertexts: &[NativeRingGswCiphertext<DCRTPoly>],
         enc_lookup_evaluator: &ENCPE,
         enc_slot_transfer_evaluator: &ENCST,
     ) -> Vec<(NaiveBGGEncodingVec<M>, NaiveBGGEncodingVec<M>)>

@@ -1220,7 +1220,7 @@ mod tests {
         params: &DCRTPolyParams,
         outputs: &[PolyVec<DCRTPoly>],
         width: usize,
-    ) -> Vec<NativeRingGswCiphertext> {
+    ) -> Vec<NativeRingGswCiphertext<DCRTPoly>> {
         let ciphertext_size = 2 * width;
         assert!(
             outputs.len().is_multiple_of(ciphertext_size),
@@ -1389,7 +1389,7 @@ mod tests {
         );
         reconstructed_ciphertexts.par_iter().zip(expected_bits.par_iter()).enumerate().for_each(
             |(idx, (ciphertext, expected_bit))| {
-                let decrypted = decrypt_ciphertext(
+                let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
                     &params,
                     ring_gsw.nested_rns.as_ref(),
                     ciphertext,
@@ -1488,7 +1488,7 @@ mod tests {
             .zip(expected_bits.par_iter())
             .enumerate()
             .for_each(|(idx, (ciphertext, expected_bit))| {
-                let decrypted = decrypt_ciphertext(
+                let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
                     &params,
                     ring_gsw.nested_rns.as_ref(),
                     ciphertext,
@@ -1665,7 +1665,7 @@ mod tests {
             .zip(expected_coefficients.par_iter())
             .enumerate()
             .for_each(|(idx, (ciphertext, expected))| {
-                let decrypted = decrypt_ciphertext(
+                let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
                     &params,
                     ring_gsw.nested_rns.as_ref(),
                     ciphertext,

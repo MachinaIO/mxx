@@ -2207,8 +2207,13 @@ mod tests {
             let ciphertext =
                 encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, plaintext);
             let expected = expected_coeffs(plaintext as u64);
-            let decrypted =
-                decrypt_ciphertext(&params, ctx.nested_rns.as_ref(), &ciphertext, &secret_key, 2);
+            let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
+                &params,
+                ctx.nested_rns.as_ref(),
+                &ciphertext,
+                &secret_key,
+                2,
+            );
             assert_eq!(
                 rounded_coeffs(&decrypted, 2, &q_modulus),
                 expected,
@@ -2285,7 +2290,7 @@ mod tests {
                     &public_key,
                     plaintext != 0,
                 );
-                let native_decrypted = decrypt_ciphertext(
+                let native_decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
                     &params,
                     ctx.nested_rns.as_ref(),
                     &ciphertext,

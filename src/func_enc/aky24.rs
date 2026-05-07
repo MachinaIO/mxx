@@ -48,6 +48,8 @@ pub mod keygen_bench;
 
 #[cfg(test)]
 use crate::gadgets::fhe::ring_gsw_nested_rns::{active_q_modulus, decrypt_ciphertext};
+#[cfg(test)]
+use crate::matrix::dcrt_poly::DCRTPolyMatrix;
 
 #[derive(Debug, Clone)]
 pub struct Aky24Params<M, TD>
@@ -904,7 +906,7 @@ where
         );
         #[cfg(test)]
         {
-            let native_decrypted = decrypt_ciphertext(
+            let native_decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
                 &params.native_poly_params,
                 params.ring_gsw_context.as_ref(),
                 &native_message_ciphertext,

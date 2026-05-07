@@ -24,7 +24,7 @@ use rayon::prelude::*;
 pub type NestedRnsRingGswEntry<P> = NestedRnsPoly<P>;
 pub type NestedRnsRingGswContext<P> = RingGswContext<P, NestedRnsRingGswEntry<P>>;
 pub type NestedRnsRingGswCiphertext<P> = RingGswCiphertext<P, NestedRnsRingGswEntry<P>>;
-pub type NativeRingGswCiphertext<P = DCRTPoly> = [Vec<P>; 2];
+pub type NativeRingGswCiphertext<P> = [Vec<P>; 2];
 
 pub fn active_q_modulus(ctx: &NestedRnsPolyContext) -> BigUint {
     BigUint::from(*ctx.q_moduli().first().expect("Ring-GSW helpers require one active q modulus"))
@@ -50,17 +50,21 @@ where
         .collect::<Vec<_>>()
 }
 
-fn native_gadget_decompose_window(
-    params: &DCRTPolyParams,
+fn native_gadget_decompose_window<P, M>(
+    params: &P::Params,
     ctx: &NestedRnsPolyContext,
-    input_poly: &DCRTPoly,
+    input_poly: &P,
     enable_levels: Option<usize>,
     level_offset: Option<usize>,
-) -> Vec<DCRTPoly> {
-    let decomposed = nested_rns_gadget_decomposed::<DCRTPoly, DCRTPolyMatrix>(
+) -> Vec<P>
+where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+{
+    let decomposed = nested_rns_gadget_decomposed::<P, M>(
         params,
         ctx,
-        &DCRTPolyMatrix::from_poly_vec(params, vec![vec![input_poly.clone()]]),
+        &M::from_poly_vec(params, vec![vec![input_poly.clone()]]),
         enable_levels,
         level_offset,
     );
@@ -75,12 +79,16 @@ fn native_gadget_decompose_window(
         .collect::<Vec<_>>()
 }
 
-fn native_gadget_decompose(
-    params: &DCRTPolyParams,
+fn native_gadget_decompose<P, M>(
+    params: &P::Params,
     ctx: &NestedRnsPolyContext,
-    input_poly: &DCRTPoly,
-) -> Vec<DCRTPoly> {
-    native_gadget_decompose_window(params, ctx, input_poly, None, None)
+    input_poly: &P,
+) -> Vec<P>
+where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+{
+    native_gadget_decompose_window::<P, M>(params, ctx, input_poly, None, None)
 }
 
 pub fn sample_secret_key(params: &DCRTPolyParams) -> DCRTPoly {
@@ -95,7 +103,7 @@ pub fn sample_public_key<B: AsRef<[u8]>>(
     hash_key: [u8; 32],
     tag: B,
     error_sigma: Option<f64>,
-) -> NativeRingGswCiphertext {
+) -> NativeRingGswCiphertext<DCRTPoly> {
     sample_public_key_with_samplers::<
         DCRTPoly,
         DCRTPolyMatrix,
@@ -193,9 +201,9 @@ where
 pub fn encrypt_plaintext_bit(
     params: &DCRTPolyParams,
     ctx: &NestedRnsPolyContext,
-    public_key: &NativeRingGswCiphertext,
+    public_key: &NativeRingGswCiphertext<DCRTPoly>,
     plaintext: bool,
-) -> NativeRingGswCiphertext {
+) -> NativeRingGswCiphertext<DCRTPoly> {
     encrypt_plaintext_bit_with_sampler::<DCRTPoly, DCRTPolyMatrix, DCRTPolyUniformSampler>(
         params, ctx, public_key, plaintext,
     )
@@ -230,7 +238,7 @@ where
 pub fn encrypt_plaintext_bit_columns<F>(
     params: &DCRTPolyParams,
     ctx: &NestedRnsPolyContext,
-    public_key: &NativeRingGswCiphertext,
+    public_key: &NativeRingGswCiphertext<DCRTPoly>,
     plaintext: bool,
     consume_column: F,
 ) where
@@ -410,8 +418,8 @@ pub fn ciphertext_inputs_from_native<P: Poly>(
         .collect()
 }
 
-fn ciphertext_poly_from_output(params: &DCRTPolyParams, output: &PolyVec<DCRTPoly>) -> DCRTPoly {
-    DCRTPoly::from_biguints(
+fn ciphertext_poly_from_output<P: Poly>(params: &P::Params, output: &PolyVec<P>) -> P {
+    P::from_biguints(
         params,
         &output
             .as_slice()
@@ -427,18 +435,15 @@ fn ciphertext_poly_from_output(params: &DCRTPolyParams, output: &PolyVec<DCRTPol
     )
 }
 
-fn ciphertext_row_from_outputs(
-    params: &DCRTPolyParams,
-    outputs: &[PolyVec<DCRTPoly>],
-) -> Vec<DCRTPoly> {
+fn ciphertext_row_from_outputs<P: Poly>(params: &P::Params, outputs: &[PolyVec<P>]) -> Vec<P> {
     outputs.par_iter().map(|output| ciphertext_poly_from_output(params, output)).collect()
 }
 
-pub fn ciphertext_from_outputs(
-    params: &DCRTPolyParams,
-    outputs: &[PolyVec<DCRTPoly>],
+pub fn ciphertext_from_outputs<P: Poly>(
+    params: &P::Params,
+    outputs: &[PolyVec<P>],
     width: usize,
-) -> NativeRingGswCiphertext {
+) -> NativeRingGswCiphertext<P> {
     assert_eq!(
         outputs.len(),
         2 * width,
@@ -451,19 +456,23 @@ pub fn ciphertext_from_outputs(
     [row0, row1]
 }
 
-pub fn decrypt_ciphertext(
-    params: &DCRTPolyParams,
+pub fn decrypt_ciphertext<P, M>(
+    params: &P::Params,
     ctx: &NestedRnsPolyContext,
-    ciphertext: &NativeRingGswCiphertext,
-    secret_key: &DCRTPoly,
+    ciphertext: &NativeRingGswCiphertext<P>,
+    secret_key: &P,
     plaintext_modulus: u64,
-) -> DCRTPoly {
+) -> P
+where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+{
     let q = ctx.q_moduli().iter().fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i));
     let scaled = &q / BigUint::from(plaintext_modulus);
-    let zero_poly = DCRTPoly::const_zero(params);
-    let scaled_poly = DCRTPoly::from_biguint_to_constant(params, scaled);
-    let mut g_inverse = native_gadget_decompose(params, ctx, &zero_poly);
-    g_inverse.extend(native_gadget_decompose(params, ctx, &scaled_poly));
+    let zero_poly = P::const_zero(params);
+    let scaled_poly = P::from_biguint_to_constant(params, scaled);
+    let mut g_inverse = native_gadget_decompose::<P, M>(params, ctx, &zero_poly);
+    g_inverse.extend(native_gadget_decompose::<P, M>(params, ctx, &scaled_poly));
     let products = ciphertext[0]
         .par_iter()
         .zip(ciphertext[1].par_iter())

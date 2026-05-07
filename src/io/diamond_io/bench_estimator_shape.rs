@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::{
-    DIAMOND_SECRET_SIZE, DiamondIO, DiamondIOFuncType,
+    DIAMOND_SECRET_SIZE, DiamondIO,
     bench_estimator_native::DiamondIONativeBenchEstimator,
     bench_estimator_utils::{
         estimate_summary, parallel_summaries, scale_summary, sequential_summaries,
@@ -447,22 +447,6 @@ impl DiamondIOBenchShape {
     pub(super) fn prf_refresh_preimage_bytes(&self) -> BigUint {
         BigUint::from(self.output_preimage_bytes) *
             BigUint::from(self.prf_refresh_decoder_preimage_count())
-    }
-}
-
-pub(super) fn diamond_function_circuit<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
-    diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
-    func: DiamondIOFuncType,
-) -> crate::circuit::PolyCircuit<M::P>
-where
-    M: PolyMatrix + Send + Sync + 'static,
-    M::P: 'static,
-    US: PolyUniformSampler<M = M> + Send + Sync,
-    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
-    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
-{
-    match func {
-        DiamondIOFuncType::DebugDecryption => diamond.build_debug_decryption_circuit(),
     }
 }
 

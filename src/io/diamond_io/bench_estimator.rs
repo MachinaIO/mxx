@@ -51,9 +51,7 @@ pub use bench_estimator_native::DiamondIONativeBenchEstimator;
 #[cfg(feature = "gpu")]
 pub use bench_estimator_native::GpuDCRTPolyMatrixNativeBenchEstimator;
 
-use bench_estimator_shape::{
-    DiamondIOBenchShape, DiamondIOStorageEstimate, diamond_function_circuit,
-};
+use bench_estimator_shape::{DiamondIOBenchShape, DiamondIOStorageEstimate};
 use bench_estimator_utils::{
     estimate_summary, parallel_summaries, repeat_sequential_summary, scale_estimate, scale_summary,
     sequential_summaries,
@@ -556,16 +554,14 @@ where
                 PrfBenchMode::PublicKeyPreprocess,
             );
 
-        // Corresponds to `circuit.eval(... public keys ...)` for the selected function. For
-        // DebugDecryption this is the Ring-GSW decrypt circuit over `k` and all encrypted seed
-        // wires.
-        let function_circuit = diamond_function_circuit(diamond, func);
-        let function_public_key_eval = estimate_public_key_circuit_bench_with_aux::<
-            NaiveBGGPublicKeyVec<M>,
-            PKBE,
-        >(
-            self.public_key_estimator, params, &function_circuit
-        );
+        // Corresponds to `circuit.eval(... public keys ...)` for the selected function.
+        let function_public_key_eval = self
+            .estimate_function_circuit::<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+                diamond,
+                shape.clone(),
+                func,
+                PrfBenchMode::PublicKeyPreprocess,
+            );
 
         let final_projection_standard_preimages = shape.final_projection_standard_preimage_count();
         let lookup_bridge_hash_sampling = estimate_summary(self.full_w_block_hash_sample.clone());
@@ -696,8 +692,12 @@ where
         );
 
         let function_encoding_eval = self
-            .encoding_estimator
-            .estimate_circuit_bench(&diamond_function_circuit(diamond, func));
+            .estimate_function_circuit::<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+                diamond,
+                shape.clone(),
+                func,
+                PrfBenchMode::EncodingOnline,
+            );
 
         // The concrete eval computes PRF mask encodings and function encodings independently after
         // all input encodings and lookup evaluators are available. With enough GPUs, these two
@@ -748,6 +748,49 @@ where
         );
 
         total
+    }
+
+    fn estimate_function_circuit<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+        &self,
+        diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+        shape: DiamondIOBenchShape,
+        func: DiamondIOFuncType,
+        mode: PrfBenchMode,
+    ) -> CircuitBenchSummary
+    where
+        M: PolyMatrix + Send + Sync + 'static,
+        M::P: 'static,
+        US: PolyUniformSampler<M = M> + Send + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+        TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+        NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
+    {
+        match func {
+            DiamondIOFuncType::DebugDecryption => {
+                // DebugDecryption decrypts one independent Ring-GSW ciphertext per private seed
+                // bit. Measuring the full representative circuit would allocate all seed
+                // ciphertext inputs at once; measuring the one-ciphertext decrypt primitive and
+                // scaling by `seed_bits` preserves the work and enough-GPUs latency model.
+                let unit = self
+                    .estimate_prf_mask_decrypt_one_ciphertext_bit_unit::<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+                        diamond,
+                        &shape,
+                        mode,
+                    );
+                let summary = scale_summary(unit.clone(), diamond.seed_bits);
+                info!(
+                    ?mode,
+                    ?func,
+                    seed_bits = diamond.seed_bits,
+                    ?unit,
+                    ?summary,
+                    "estimated DiamondIO function benchmark from one Ring-GSW decrypt primitive"
+                );
+                summary
+            }
+        }
     }
 
     fn estimate_input_injection<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(

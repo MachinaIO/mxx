@@ -831,6 +831,26 @@ where
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
         info!(?mode, "starting DiamondIO PRF benchmark path estimation");
+        let final_mask_decrypt_unit_circuit = prf_mask_decrypt_one_ciphertext_bit_circuit(diamond);
+        info!(?mode, "built DiamondIO PRF benchmark final-mask decrypt unit circuit");
+        let final_mask_decrypt_unit = match mode {
+            PrfBenchMode::PublicKeyPreprocess => {
+                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+                    self.public_key_estimator,
+                    &diamond.injector.params,
+                    &final_mask_decrypt_unit_circuit,
+                )
+            }
+            PrfBenchMode::EncodingOnline => {
+                self.encoding_estimator.estimate_circuit_bench(&final_mask_decrypt_unit_circuit)
+            }
+        };
+        info!(
+            ?mode,
+            ?final_mask_decrypt_unit,
+            "estimated DiamondIO PRF benchmark final-mask decrypt unit"
+        );
+
         let prg_circuit = diamond.build_goldreich_prg_range_circuit(0, 1, 0, 1);
         info!(?mode, "built DiamondIO PRF benchmark representative PRG circuit");
         let prg_unit = match mode {
@@ -886,20 +906,6 @@ where
             ?selected_half_mux_per_round,
             "estimated DiamondIO PRF benchmark selected-half mux unit"
         );
-
-        let final_mask_decrypt_unit_circuit = prf_mask_decrypt_one_ciphertext_bit_circuit(diamond);
-        let final_mask_decrypt_unit = match mode {
-            PrfBenchMode::PublicKeyPreprocess => {
-                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
-                    self.public_key_estimator,
-                    &diamond.injector.params,
-                    &final_mask_decrypt_unit_circuit,
-                )
-            }
-            PrfBenchMode::EncodingOnline => {
-                self.encoding_estimator.estimate_circuit_bench(&final_mask_decrypt_unit_circuit)
-            }
-        };
 
         info!(?mode, "starting DiamondIO PRF benchmark noise-refresh estimate");
         let refresh_parts = self

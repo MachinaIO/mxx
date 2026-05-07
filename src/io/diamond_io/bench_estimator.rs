@@ -24,9 +24,13 @@ use crate::{
         naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
         sampler::BGGPublicKeySampler,
     },
+    circuit::PolyCircuit,
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
-        fhe::ring_gsw_nested_rns::sample_public_key_columns_with_samplers,
+        fhe::{
+            ring_gsw::RingGswCiphertext,
+            ring_gsw_nested_rns::sample_public_key_columns_with_samplers,
+        },
     },
     matrix::PolyMatrix,
     noise_refresh::naive_vec::NoiseRefreshBenchEstimateParts,
@@ -764,6 +768,7 @@ where
         HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
         TS: PolyTrapdoorSampler<M = M> + Send + Sync,
         PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
@@ -899,7 +904,7 @@ where
         info!(
             ?mode,
             ?final_mask_decrypt_unit,
-            "estimated DiamondIO PRF benchmark final-mask decrypt unit from primitive costs"
+            "estimated DiamondIO PRF benchmark final-mask decrypt unit from one-bit circuit"
         );
 
         let prg_circuit = diamond.build_goldreich_prg_range_circuit(0, 1, 0, 1);
@@ -1091,144 +1096,39 @@ where
     fn estimate_prf_mask_decrypt_one_ciphertext_bit_unit<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
         &self,
         diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
-        shape: &DiamondIOBenchShape,
+        _shape: &DiamondIOBenchShape,
         mode: PrfBenchMode,
     ) -> CircuitBenchSummary
     where
         M: PolyMatrix + Send + Sync + 'static,
+        M::P: 'static,
         US: PolyUniformSampler<M = M> + Send + Sync,
         HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
         TS: PolyTrapdoorSampler<M = M> + Send + Sync,
         PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+        NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
-        let gadget_len =
-            diamond.ring_gsw_width.checked_div(2).expect("DiamondIO Ring-GSW width must be even");
-        assert_eq!(
-            diamond.ring_gsw_width,
-            2 * gadget_len,
-            "DiamondIO Ring-GSW width must equal twice the gadget length"
-        );
-        let nested_entry_wire_count = shape
-            .ring_gsw_wire_count
-            .checked_div(
-                2usize
-                    .checked_mul(diamond.ring_gsw_width)
-                    .expect("DiamondIO Ring-GSW entry divisor overflow"),
-            )
-            .expect("DiamondIO Ring-GSW entry wire divisor must be nonzero");
-        assert_eq!(
-            shape.ring_gsw_wire_count,
-            2 * diamond.ring_gsw_width * nested_entry_wire_count,
-            "DiamondIO Ring-GSW flattened wire count must divide by ciphertext entries"
-        );
-        let p_moduli_len = diamond.ring_gsw_context.p_moduli.len();
-        assert!(p_moduli_len > 0, "DiamondIO Ring-GSW p-moduli list must be nonempty");
-        let decomposition_len =
-            p_moduli_len.checked_add(1).expect("DiamondIO Ring-GSW decomposition length overflow");
-        let active_levels = nested_entry_wire_count
-            .checked_div(p_moduli_len)
-            .expect("DiamondIO Ring-GSW p-moduli length must be nonzero");
-        assert_eq!(
-            nested_entry_wire_count,
-            active_levels * p_moduli_len,
-            "DiamondIO Ring-GSW entry wire count must divide by p-moduli length"
-        );
-        assert_eq!(
-            gadget_len,
-            active_levels * decomposition_len,
-            "DiamondIO Ring-GSW gadget length must equal active levels times decomposition length"
-        );
-        let p_depth = decomposition_len.saturating_sub(1);
-
-        let input_count = shape
-            .ring_gsw_wire_count
-            .checked_add(1)
-            .expect("DiamondIO Ring-GSW decrypt input count overflow");
-        let linear_const_small_scalar_count = 2usize
-            .checked_mul(gadget_len)
-            .and_then(|count| count.checked_mul(nested_entry_wire_count))
-            .expect("DiamondIO Ring-GSW decrypt const-mul gate count overflow");
-        let linear_reduce_add_count = 2usize
-            .checked_mul(gadget_len.saturating_sub(1))
-            .and_then(|count| count.checked_mul(nested_entry_wire_count))
-            .expect("DiamondIO Ring-GSW decrypt row-reduce add count overflow");
-        let top_weighted_term_count = active_levels
-            .checked_mul(p_depth + 1)
-            .expect("DiamondIO Ring-GSW decrypt weighted term count overflow");
-        assert_eq!(
-            top_weighted_term_count, gadget_len,
-            "DiamondIO Ring-GSW weighted top term count must match gadget length"
-        );
-        let bottom_reconstruct_large_scalar_count = active_levels
-            .checked_mul(p_depth + 2)
-            .expect("DiamondIO Ring-GSW bottom reconstruct large-scalar count overflow");
-        let bottom_reconstruct_add_count = active_levels
-            .checked_mul(p_depth + 1)
-            .expect("DiamondIO Ring-GSW bottom reconstruct add count overflow");
-
-        let small_scalar = [1u32];
-        let large_scalar = [BigUint::from(1u32)];
-        let (input, small_scalar_mul, add, sub, mul, large_scalar_mul, slot_reduce_one_input) =
-            match mode {
-                PrfBenchMode::PublicKeyPreprocess => (
-                    self.public_key_estimator.estimate_input(),
-                    self.public_key_estimator.estimate_small_scalar_mul(&small_scalar),
-                    self.public_key_estimator.estimate_add(),
-                    self.public_key_estimator.estimate_sub(),
-                    self.public_key_estimator.estimate_mul(),
-                    self.public_key_estimator.estimate_large_scalar_mul(&large_scalar),
-                    self.public_key_estimator.estimate_slot_reduce(1, shape.ring_dim),
-                ),
-                PrfBenchMode::EncodingOnline => (
-                    self.encoding_estimator.estimate_input(),
-                    self.encoding_estimator.estimate_small_scalar_mul(&small_scalar),
-                    self.encoding_estimator.estimate_add(),
-                    self.encoding_estimator.estimate_sub(),
-                    self.encoding_estimator.estimate_mul(),
-                    self.encoding_estimator.estimate_large_scalar_mul(&large_scalar),
-                    self.encoding_estimator.estimate_slot_reduce(1, shape.ring_dim),
-                ),
-            };
-
-        let input_stage = scale_estimate(input.clone(), input_count);
-        let linear_rows = sequential_summaries(&[
-            scale_estimate(small_scalar_mul.clone(), linear_const_small_scalar_count),
-            scale_estimate(add.clone(), linear_reduce_add_count),
-        ]);
-        let weighted_top = sequential_summaries(&[
-            scale_estimate(slot_reduce_one_input.clone(), top_weighted_term_count),
-            scale_estimate(mul.clone(), top_weighted_term_count),
-            scale_estimate(large_scalar_mul.clone(), top_weighted_term_count + 1),
-            scale_estimate(add.clone(), top_weighted_term_count),
-        ]);
-        let bottom_reconstruct = sequential_summaries(&[
-            scale_estimate(large_scalar_mul.clone(), bottom_reconstruct_large_scalar_count),
-            scale_estimate(add.clone(), bottom_reconstruct_add_count),
-            scale_estimate(sub.clone(), active_levels),
-            estimate_summary(slot_reduce_one_input.clone()),
-        ]);
-        let summary = sequential_summaries(&[
-            input_stage.clone(),
-            linear_rows.clone(),
-            weighted_top.clone(),
-            bottom_reconstruct.clone(),
-        ]);
+        let circuit = prf_mask_decrypt_one_ciphertext_bit_circuit(diamond);
+        let summary = match mode {
+            PrfBenchMode::PublicKeyPreprocess => {
+                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+                    self.public_key_estimator,
+                    &diamond.injector.params,
+                    &circuit,
+                )
+            }
+            PrfBenchMode::EncodingOnline => {
+                self.encoding_estimator.estimate_circuit_bench(&circuit)
+            }
+        };
         info!(
             ?mode,
-            ring_gsw_width = diamond.ring_gsw_width,
-            gadget_len,
-            active_levels,
-            p_moduli_len,
-            decomposition_len,
-            input_count,
-            linear_const_small_scalar_count,
-            linear_reduce_add_count,
-            top_weighted_term_count,
-            bottom_reconstruct_large_scalar_count,
-            bottom_reconstruct_add_count,
+            input_count = circuit.num_input(),
+            output_count = circuit.num_output(),
             ?summary,
-            "estimated DiamondIO PRF mask decrypt primitive composition"
+            "estimated DiamondIO PRF mask decrypt one-bit circuit"
         );
         summary
     }
@@ -1467,6 +1367,32 @@ where
 enum PrfBenchMode {
     PublicKeyPreprocess,
     EncodingOnline,
+}
+
+fn prf_mask_decrypt_one_ciphertext_bit_circuit<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+    diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+) -> PolyCircuit<M::P>
+where
+    M: PolyMatrix + Send + Sync + 'static,
+    M::P: 'static,
+    US: PolyUniformSampler<M = M> + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
+{
+    let mut circuit = PolyCircuit::new();
+    let ring_gsw_context = diamond.build_ring_gsw_circuit_context(&mut circuit);
+    let decryption_key = circuit.input(1).at(0).as_single_wire();
+    let encrypted_bit =
+        RingGswCiphertext::input(ring_gsw_context, Some(BigUint::from(1u64)), &mut circuit);
+    let decrypted = RingGswCiphertext::decrypt_batch::<M>(
+        &[&encrypted_bit],
+        decryption_key,
+        BigUint::from(2u64),
+        &mut circuit,
+    );
+    circuit.output(vec![decrypted.secret_dependent, decrypted.public_bottom]);
+    circuit
 }
 
 #[derive(Debug, Clone, PartialEq)]

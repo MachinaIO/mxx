@@ -1453,12 +1453,7 @@ fn scale_estimate_total_parallelism(
     let column_count_u128 = column_count as u128;
     let scaled =
         CircuitBenchEstimate::new(estimate.total_time * column_count as f64, estimate.latency)
-            .with_max_parallelism(
-                estimate
-                    .max_parallelism
-                    .checked_mul(column_count_u128)
-                    .expect("DiamondIO preimage benchmark parallelism overflow"),
-            );
+            .with_max_parallelism(estimate.max_parallelism.saturating_mul(column_count_u128));
     #[cfg(feature = "gpu")]
     {
         scaled.with_peak_vram(estimate.peak_vram)

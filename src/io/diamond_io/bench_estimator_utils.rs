@@ -19,10 +19,7 @@ pub(super) fn scale_estimate(estimate: CircuitBenchEstimate, count: usize) -> Ci
 
 pub(super) fn scale_summary(summary: CircuitBenchSummary, count: usize) -> CircuitBenchSummary {
     let total_time = summary.total_time * count as f64;
-    let max_parallelism = summary
-        .max_parallelism
-        .checked_mul(count as u128)
-        .expect("DiamondIO benchmark parallelism overflow while scaling summary");
+    let max_parallelism = summary.max_parallelism.saturating_mul(count as u128);
     let scaled = CircuitBenchSummary::new(total_time, summary.latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
@@ -72,8 +69,7 @@ pub(super) fn parallel_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchS
     let max_parallelism = parts
         .iter()
         .map(|part| part.max_parallelism)
-        .try_fold(0u128, |acc, value| acc.checked_add(value))
-        .expect("DiamondIO benchmark parallelism overflow while parallelizing summaries");
+        .fold(0u128, |acc, value| acc.saturating_add(value));
     let summary = CircuitBenchSummary::new(total_time, latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {

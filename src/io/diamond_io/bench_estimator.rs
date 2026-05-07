@@ -1046,6 +1046,8 @@ where
         );
         let p_moduli_len = diamond.ring_gsw_context.p_moduli.len();
         assert!(p_moduli_len > 0, "DiamondIO Ring-GSW p-moduli list must be nonempty");
+        let decomposition_len =
+            p_moduli_len.checked_add(1).expect("DiamondIO Ring-GSW decomposition length overflow");
         let active_levels = nested_entry_wire_count
             .checked_div(p_moduli_len)
             .expect("DiamondIO Ring-GSW p-moduli length must be nonzero");
@@ -1054,7 +1056,12 @@ where
             active_levels * p_moduli_len,
             "DiamondIO Ring-GSW entry wire count must divide by p-moduli length"
         );
-        let p_depth = p_moduli_len.saturating_sub(1);
+        assert_eq!(
+            gadget_len,
+            active_levels * decomposition_len,
+            "DiamondIO Ring-GSW gadget length must equal active levels times decomposition length"
+        );
+        let p_depth = decomposition_len.saturating_sub(1);
 
         let input_count = shape
             .ring_gsw_wire_count
@@ -1131,6 +1138,7 @@ where
             gadget_len,
             active_levels,
             p_moduli_len,
+            decomposition_len,
             input_count,
             linear_const_small_scalar_count,
             linear_reduce_add_count,

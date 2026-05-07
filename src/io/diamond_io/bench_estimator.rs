@@ -24,9 +24,13 @@ use crate::{
         naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
         sampler::BGGPublicKeySampler,
     },
+    circuit::PolyCircuit,
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
-        fhe::ring_gsw_nested_rns::sample_public_key_columns_with_samplers,
+        fhe::{
+            ring_gsw::RingGswCiphertext,
+            ring_gsw_nested_rns::sample_public_key_columns_with_samplers,
+        },
     },
     matrix::PolyMatrix,
     noise_refresh::NoiseRefresherNaiveVec,
@@ -818,7 +822,9 @@ where
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
+        info!(?mode, "starting DiamondIO PRF benchmark path estimation");
         let prg_circuit = diamond.build_goldreich_prg_range_circuit(0, 1, 0, 1);
+        info!(?mode, "built DiamondIO PRF benchmark representative PRG circuit");
         let prg_unit = match mode {
             PrfBenchMode::PublicKeyPreprocess => {
                 estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
@@ -831,6 +837,7 @@ where
                 self.encoding_estimator.estimate_circuit_bench(&prg_circuit)
             }
         };
+        info!(?mode, ?prg_unit, "estimated DiamondIO PRF benchmark representative PRG unit");
         let selected_half_prg_per_round = scale_summary(
             prg_unit,
             2usize
@@ -865,6 +872,12 @@ where
             scale_summary(selected_half_mux_unit, selected_wire_count_per_round);
         let selected_half_mux =
             repeat_sequential_summary(selected_half_mux_per_round, diamond.input_size);
+        info!(
+            ?mode,
+            selected_wire_count_per_round,
+            ?selected_half_mux_per_round,
+            "estimated DiamondIO PRF benchmark selected-half mux unit"
+        );
 
         let mut refresh_context_circuit = crate::circuit::PolyCircuit::new();
         let noise_refresher = NoiseRefresherNaiveVec::<M, NestedRnsPoly<M::P>, HS>::new(
@@ -875,6 +888,7 @@ where
             diamond.noise_refresh_cbd_n,
             diamond.noise_refresh_hash_key,
         );
+        info!(?mode, "starting DiamondIO PRF benchmark noise-refresh estimate");
         let refresh_parts = match mode {
             PrfBenchMode::PublicKeyPreprocess => {
                 noise_refresher.estimate_preprocess_bench_parts(self.public_key_estimator)
@@ -883,6 +897,7 @@ where
                 noise_refresher.estimate_online_eval_bench_parts(self.encoding_estimator)
             }
         };
+        info!(?mode, ?refresh_parts, "finished DiamondIO PRF benchmark noise-refresh estimate");
         let refresh_decoder_count_per_round = selected_wire_count_per_round
             .checked_mul(shape.ring_dim)
             .and_then(|count| count.checked_mul(shape.crt_depth))
@@ -909,21 +924,40 @@ where
         // one-output Goldreich circuit keeps estimator memory bounded and preserves the
         // enough-GPUs latency rule.
         let final_mask_prg = scale_summary(prg_unit, shape.final_mask_prg_output_count());
+        info!(?mode, ?final_mask_prg, "estimated DiamondIO PRF benchmark final-mask PRG");
 
-        let final_mask_circuit = diamond.build_prf_mask_circuit();
+        // The concrete final-mask decrypt circuit consumes `ring_dim * coeff_bits` encrypted
+        // Ring-GSW bit ciphertexts per DiamondIO output. For benchmarking, measure one independent
+        // ciphertext-bit decrypt contribution and scale the total work by the number of
+        // contributions. This keeps the H200 run from materializing a giant representative GPU
+        // public-key matrix while preserving the enough-GPUs latency model.
+        let final_mask_decrypt_unit_circuit = prf_mask_decrypt_one_ciphertext_bit_circuit(diamond);
+        let final_mask_decrypt_contribution_count = shape
+            .ring_dim
+            .checked_mul(diamond.prf_mask_output_coeff_bits)
+            .and_then(|count| count.checked_mul(diamond.output_size))
+            .expect("DiamondIO final-mask decrypt contribution count overflow");
         let final_mask_decrypt_unit = match mode {
             PrfBenchMode::PublicKeyPreprocess => {
                 estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
                     self.public_key_estimator,
                     &diamond.injector.params,
-                    &final_mask_circuit,
+                    &final_mask_decrypt_unit_circuit,
                 )
             }
             PrfBenchMode::EncodingOnline => {
-                self.encoding_estimator.estimate_circuit_bench(&final_mask_circuit)
+                self.encoding_estimator.estimate_circuit_bench(&final_mask_decrypt_unit_circuit)
             }
         };
-        let final_mask_decrypt = scale_summary(final_mask_decrypt_unit, diamond.output_size);
+        let final_mask_decrypt =
+            scale_summary(final_mask_decrypt_unit, final_mask_decrypt_contribution_count);
+        info!(
+            ?mode,
+            final_mask_decrypt_contribution_count,
+            ?final_mask_decrypt_unit,
+            ?final_mask_decrypt,
+            "estimated DiamondIO PRF benchmark final-mask decrypt"
+        );
 
         // The PRF seed rounds are sequential, because each refresh produces the seed consumed by
         // the next round. The noise-refresh material circuit is evaluated once per round; only the
@@ -978,6 +1012,7 @@ where
             total,
         };
         debug!(?mode, ?estimate, "estimated DiamondIO PRF benchmark");
+        info!(?mode, ?total, "finished DiamondIO PRF benchmark path estimation");
         estimate
     }
 
@@ -1036,6 +1071,32 @@ where
 enum PrfBenchMode {
     PublicKeyPreprocess,
     EncodingOnline,
+}
+
+fn prf_mask_decrypt_one_ciphertext_bit_circuit<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+    diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+) -> PolyCircuit<M::P>
+where
+    M: PolyMatrix + Send + Sync + 'static,
+    M::P: 'static,
+    US: PolyUniformSampler<M = M> + Send + Sync,
+    HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+    TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+    NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
+{
+    let mut circuit = PolyCircuit::new();
+    let ring_gsw_context = diamond.build_ring_gsw_circuit_context(&mut circuit);
+    let decryption_key = circuit.input(1).at(0).as_single_wire();
+    let encrypted_bit =
+        RingGswCiphertext::input(ring_gsw_context, Some(BigUint::from(1u64)), &mut circuit);
+    let decrypted = RingGswCiphertext::decrypt_batch::<M>(
+        &[&encrypted_bit],
+        decryption_key,
+        BigUint::from(2u64),
+        &mut circuit,
+    );
+    circuit.output(vec![decrypted.secret_dependent, decrypted.public_bottom]);
+    circuit
 }
 
 #[derive(Debug, Clone, PartialEq)]

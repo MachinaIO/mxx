@@ -1693,6 +1693,85 @@ impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for NestedRnsPoly<P> {
         nested_rns_gadget_decomposed(params, ctx, target, enable_levels, level_offset)
     }
 
+    fn gadget_constant_coeffs<M: PolyMatrix<P = P>>(
+        params: &P::Params,
+        ctx: &Self::Context,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Vec<BigUint> {
+        let (level_offset, active_q_moduli) =
+            encoding::resolve_nested_rns_active_window(ctx, enable_levels, level_offset);
+        let reconst_coeffs = encoding::nested_rns_level_reconstruction_coeffs(&active_q_moduli);
+        let chunk_width =
+            <NestedRnsPolyContext as ModularArithmeticContext<P>>::decomposition_len(ctx);
+        let mut constants = Vec::with_capacity(active_q_moduli.len() * chunk_width);
+        for (q_idx, level_values) in
+            ctx.gadget_values[level_offset..level_offset + active_q_moduli.len()].iter().enumerate()
+        {
+            for residue in level_values {
+                let row = ctx
+                    .p_moduli
+                    .iter()
+                    .map(|&p_i| (residue % BigUint::from(p_i)).to_u64().expect("row residue fits"))
+                    .collect::<Vec<_>>();
+                constants.push(encoding::nested_rns_sparse_level_slot_value::<P>(
+                    params,
+                    ctx,
+                    &reconst_coeffs[q_idx],
+                    &row,
+                ));
+            }
+        }
+        constants
+    }
+
+    fn gadget_decomposed_constant_tower_coeffs<M: PolyMatrix<P = P>>(
+        params: &P::Params,
+        ctx: &Self::Context,
+        constant: BigUint,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Vec<Vec<u64>> {
+        let (_, active_q_moduli) =
+            encoding::resolve_nested_rns_active_window(ctx, enable_levels, level_offset);
+        let chunk_width =
+            <NestedRnsPolyContext as ModularArithmeticContext<P>>::decomposition_len(ctx);
+        let reconst_coeffs = encoding::nested_rns_level_reconstruction_coeffs(&active_q_moduli);
+        let mut output = Vec::with_capacity(active_q_moduli.len() * chunk_width);
+        for (q_idx, &q_i) in active_q_moduli.iter().enumerate() {
+            let q_i_big = BigUint::from(q_i);
+            let input_residue =
+                (&constant % &q_i_big).to_u64().expect("q-level residue must fit in u64");
+            let input_row = ctx.p_moduli.iter().map(|&p_i| input_residue % p_i).collect::<Vec<_>>();
+            let (ys, w) = encoding::nested_rns_decomposition_terms_from_row(ctx, &input_row);
+            for digit_idx in 0..chunk_width {
+                let scalar = if digit_idx < ctx.p_moduli.len() {
+                    ys[digit_idx].to_u64().expect("decomposition digit must fit in u64")
+                } else {
+                    w.to_u64().expect("rounding digit must fit in u64")
+                };
+                let encoded_row = ctx.p_moduli.iter().map(|&p_i| scalar % p_i).collect::<Vec<_>>();
+                let coeff = encoding::nested_rns_sparse_level_slot_value::<P>(
+                    params,
+                    ctx,
+                    &reconst_coeffs[q_idx],
+                    &encoded_row,
+                );
+                output.push(
+                    active_q_moduli
+                        .iter()
+                        .map(|&tower_q| {
+                            (&coeff % BigUint::from(tower_q))
+                                .to_u64()
+                                .expect("decomposition tower residue must fit in u64")
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        output
+    }
+
     fn gadget_decomposition_norm_bound(
         ctx: &Self::Context,
         enable_levels: Option<usize>,

@@ -15,6 +15,8 @@ use std::hint::black_box;
 #[cfg(feature = "gpu")]
 use keccak_asm::Keccak256;
 
+#[cfg(feature = "gpu")]
+use crate::gadgets::fhe::ring_gsw_nested_rns::sample_public_key_columns_with_samplers;
 use crate::{
     bench_estimator::{
         BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
@@ -27,10 +29,7 @@ use crate::{
     circuit::PolyCircuit,
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
-        fhe::{
-            ring_gsw::RingGswCiphertext,
-            ring_gsw_nested_rns::sample_public_key_columns_with_samplers,
-        },
+        fhe::ring_gsw::RingGswCiphertext,
     },
     matrix::PolyMatrix,
     noise_refresh::naive_vec::NoiseRefreshBenchEstimateParts,

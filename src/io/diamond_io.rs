@@ -19,7 +19,7 @@ use crate::{
             ring_gsw::RingGswCiphertext,
             ring_gsw_nested_rns::{
                 NativeRingGswCiphertext, NestedRnsRingGswContext, ciphertext_inputs_from_native,
-                encrypt_plaintext_bit, sample_public_key,
+                encrypt_plaintext_bit_with_sampler, sample_public_key_with_samplers,
             },
         },
         fhe_prg::goldreich::evaluate_goldreich_uniform_range,
@@ -35,10 +35,7 @@ use crate::{
             decrypt_bit_decomposed_polynomial_parts, mask_plaintext_moduli_from_full_modulus,
         },
     },
-    poly::{
-        Poly, PolyParams,
-        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-    },
+    poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     slot_transfer::SlotTransferEvaluator,
 };
@@ -102,11 +99,11 @@ where
     /// Function descriptor that determined the evaluated decoder circuit.
     pub func_type: DiamondIOFuncType,
     /// Native Ring-GSW public key for the sampled ternary decryption key `k`.
-    pub ring_gsw_public_key: NativeRingGswCiphertext<DCRTPoly>,
+    pub ring_gsw_public_key: NativeRingGswCiphertext<M::P>,
     /// Native Ring-GSW encryptions of the private PRF seed bits. Circuit input
     /// encodings can be derived again from these ciphertexts and the public
     /// Ring-GSW parameters, so no derived inputs are stored here.
-    pub seed_ciphertexts: Vec<NativeRingGswCiphertext<DCRTPoly>>,
+    pub seed_ciphertexts: Vec<NativeRingGswCiphertext<M::P>>,
     /// Original private seed bits, kept only in tests so debug circuits can
     /// assert that the obfuscated decryption path returns the sampled bits.
     #[cfg(test)]
@@ -115,7 +112,7 @@ where
     /// Goldreich PRG circuit outputs. They are stored so eval can use the exact
     /// same random PRG-output wires as obfuscation.
     #[cfg(test)]
-    pub debug_prg_ciphertexts: Vec<NativeRingGswCiphertext<DCRTPoly>>,
+    pub debug_prg_ciphertexts: Vec<NativeRingGswCiphertext<M::P>>,
 }
 
 /// Diamond iO frontend that turns a high-level function type into Diamond input
@@ -280,7 +277,7 @@ where
         let key_started = Instant::now();
         let uniform_sampler = US::new();
         let k = uniform_sampler.sample_poly(params, &DistType::TernaryDist);
-        let native_k = DCRTPoly::from_biguints(&self.native_poly_params, &k.coeffs_biguints());
+        let native_k = M::P::from_biguints(params, &k.coeffs_biguints());
         let bgg_hash_key = rand::random::<[u8; 32]>();
 
         // Sample scalar BGG public keys for one, k, and every input bit. The
@@ -310,8 +307,8 @@ where
 
         // Sample the native Ring-GSW public key for `k`.
         let ring_gsw_started = Instant::now();
-        let ring_gsw_public_key = sample_public_key(
-            &self.native_poly_params,
+        let ring_gsw_public_key = sample_public_key_with_samplers::<M::P, M, HS, US, _>(
+            params,
             self.ring_gsw_width,
             &native_k,
             bgg_hash_key,
@@ -337,8 +334,8 @@ where
             let seed_bit = rand::random::<bool>();
             #[cfg(test)]
             original_seed_bits.push(seed_bit);
-            let native_seed_ciphertext = encrypt_plaintext_bit(
-                &self.native_poly_params,
+            let native_seed_ciphertext = encrypt_plaintext_bit_with_sampler::<M::P, M, US>(
+                params,
                 self.ring_gsw_context.as_ref(),
                 &ring_gsw_public_key,
                 seed_bit,
@@ -445,7 +442,7 @@ where
         let debug_prg_ciphertext_sink =
             self.debug_encrypt_random_prg_wires().then_some(&mut debug_prg_ciphertexts);
         #[cfg(not(test))]
-        let debug_prg_ciphertext_sink: Option<&mut Vec<NativeRingGswCiphertext<DCRTPoly>>> = None;
+        let debug_prg_ciphertext_sink: Option<&mut Vec<NativeRingGswCiphertext<M::P>>> = None;
         let final_prf_mask_public_key_vecs = self.compute_prf_mask_public_key(
             Some(dir_path),
             Some(&preprocess_out),
@@ -939,7 +936,7 @@ where
         #[cfg(test)]
         let debug_prg_ciphertexts = obf.debug_prg_ciphertexts.as_slice();
         #[cfg(not(test))]
-        let debug_prg_ciphertexts: &[NativeRingGswCiphertext<DCRTPoly>] = &[];
+        let debug_prg_ciphertexts: &[NativeRingGswCiphertext<M::P>] = &[];
         let prf_eval_started = Instant::now();
         let final_prf_mask_encodings = self.compute_prf_mask_encoding(
             dir_path,
@@ -1233,7 +1230,9 @@ mod tests {
         circuit::evaluable::PolyVec,
         gadgets::{
             arith::{ModularArithmeticContext, NestedRnsPolyContext},
-            fhe::ring_gsw_nested_rns::{decrypt_ciphertext, sample_secret_key},
+            fhe::ring_gsw_nested_rns::{
+                decrypt_ciphertext, encrypt_plaintext_bit, sample_public_key, sample_secret_key,
+            },
         },
         input_injector::DiamondInjector,
         lookup::{
@@ -1247,6 +1246,7 @@ mod tests {
             dcrt::{
                 gpu::{GpuDCRTPoly, GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync},
                 params::DCRTPolyParams,
+                poly::DCRTPoly,
             },
         },
         sampler::{

@@ -22,6 +22,7 @@ pub(super) struct DiamondIOStorageEstimate {
     pub(super) input_injection_bytes: BigUint,
     pub(super) final_projection_preimage_bytes: BigUint,
     pub(super) prf_refresh_preimage_bytes: BigUint,
+    pub(super) public_lut_aux_bytes: BigUint,
     pub(super) total_bytes: BigUint,
 }
 
@@ -433,6 +434,41 @@ impl DiamondIOBenchShape {
         self.final_decoder_count()
             .checked_mul(self.prf_mask_output_coeff_bits)
             .expect("DiamondIO final mask PRG output count overflow")
+    }
+
+    pub(super) fn selected_prg_output_count(&self) -> usize {
+        self.input_size
+            .checked_mul(2)
+            .and_then(|count| count.checked_mul(self.seed_bits))
+            .expect("DiamondIO selected-half PRG output count overflow")
+    }
+
+    pub(super) fn sparse_noise_refresh_material_ciphertext_count(&self, v_bits: usize) -> usize {
+        let per_slot_digit_ciphertexts = self
+            .ring_dim
+            .checked_mul(
+                1usize
+                    .checked_add(
+                        self.crt_depth
+                            .checked_mul(v_bits)
+                            .expect("DiamondIO noise-refresh mask ciphertext count overflow"),
+                    )
+                    .expect("DiamondIO noise-refresh material ciphertext count overflow"),
+            )
+            .expect("DiamondIO noise-refresh per-slot material count overflow");
+        self.ring_dim
+            .checked_mul(self.modulus_digits)
+            .and_then(|count| count.checked_mul(per_slot_digit_ciphertexts))
+            .expect("DiamondIO noise-refresh material ciphertext count overflow")
+    }
+
+    pub(super) fn sparse_noise_refresh_material_prg_output_count(
+        &self,
+        input_size: usize,
+        v_bits: usize,
+    ) -> BigUint {
+        BigUint::from(self.sparse_noise_refresh_material_ciphertext_count(v_bits)) *
+            BigUint::from(input_size)
     }
 
     pub(super) fn prf_refresh_decoder_preimage_count(&self) -> usize {

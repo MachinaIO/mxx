@@ -1370,10 +1370,12 @@ where
         US: PolyUniformSampler<M = M> + Send + Sync,
         HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
         TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
     {
         let final_projection_preimage_bytes =
             BigUint::from(shape.final_projection_preimage_bytes());
         let prf_refresh_preimage_bytes = shape.prf_refresh_preimage_bytes();
+        let public_lut_aux_bytes = self.estimate_public_lut_aux_storage_bytes(diamond, &shape);
         let input_injection_metadata_and_seed_bytes =
             shape.input_injection_metadata_and_seed_bytes();
         let input_injection_public_checkpoint_bytes =
@@ -1383,18 +1385,22 @@ where
         let input_injection_bytes = shape.input_injection_bytes();
         let total_bytes = input_injection_bytes.clone() +
             final_projection_preimage_bytes.clone() +
-            prf_refresh_preimage_bytes.clone();
+            prf_refresh_preimage_bytes.clone() +
+            public_lut_aux_bytes.clone();
 
         debug!(
             input_size = diamond.input_size,
             output_size = diamond.output_size,
             seed_bits = diamond.seed_bits,
             ring_gsw_wire_count = shape.ring_gsw_wire_count,
+            selected_prg_output_count = shape.selected_prg_output_count(),
+            final_mask_prg_output_count = shape.final_mask_prg_output_count(),
             ?input_injection_metadata_and_seed_bytes,
             ?input_injection_public_checkpoint_bytes,
             ?input_injection_transition_preimage_bytes,
             ?final_projection_preimage_bytes,
             ?prf_refresh_preimage_bytes,
+            ?public_lut_aux_bytes,
             ?input_injection_bytes,
             ?total_bytes,
             "estimated DiamondIO obfuscated-circuit storage"
@@ -1405,8 +1411,55 @@ where
             input_injection_bytes,
             final_projection_preimage_bytes,
             prf_refresh_preimage_bytes,
+            public_lut_aux_bytes,
             total_bytes,
         }
+    }
+
+    fn estimate_public_lut_aux_storage_bytes<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+        &self,
+        diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+        shape: &DiamondIOBenchShape,
+    ) -> BigUint
+    where
+        M: PolyMatrix + Send + Sync + 'static,
+        M::P: 'static,
+        US: PolyUniformSampler<M = M> + Send + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+        TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
+    {
+        let prg_circuit = diamond.build_goldreich_prg_range_circuit(0, 1, 0, 1);
+        let prg_aux =
+            self.public_key_estimator.estimate_public_lut_sample_aux_matrices_for_circuit(
+                &diamond.injector.params,
+                &prg_circuit,
+            );
+        if prg_aux.compact_bytes == BigUint::default() {
+            return BigUint::default();
+        }
+
+        // These counts mirror the places where `estimate_prf_path(PublicKeyPreprocess)` scales
+        // the same representative one-output PRG circuit. The measured representative circuit is
+        // intentionally small, but the persisted Public LUT auxiliary matrices must be counted for
+        // every independent PRG output in the real obfuscated circuit.
+        let selected_prg_outputs = BigUint::from(shape.selected_prg_output_count());
+        let noise_refresh_material_prg_outputs = shape
+            .sparse_noise_refresh_material_prg_output_count(
+                diamond.input_size,
+                diamond.noise_refresh_v_bits,
+            );
+        let final_mask_prg_outputs = BigUint::from(shape.final_mask_prg_output_count());
+        let prg_output_count =
+            selected_prg_outputs + noise_refresh_material_prg_outputs + final_mask_prg_outputs;
+        let total = prg_aux.compact_bytes.clone() * prg_output_count.clone();
+        debug!(
+            ?prg_aux,
+            ?prg_output_count,
+            ?total,
+            "estimated DiamondIO public LUT auxiliary compact-byte storage"
+        );
+        total
     }
 }
 

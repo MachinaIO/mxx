@@ -110,13 +110,13 @@ impl GpuDCRTPolyMatrixNativeBenchEstimator {
         )
     }
 
-    fn sample_matrix_bytes(&self, nrow: usize, ncol: usize) -> Vec<u8> {
+    fn sample_matrix_bytes(&self, nrow: usize, ncol: usize, is_ntt: bool) -> Vec<u8> {
         GpuDCRTPolyMatrix::zero_compact_bytes(
             &self.params,
             nrow,
             ncol,
             0,
-            false,
+            is_ntt,
             self.params.modulus_bits().try_into().expect("GPU modulus bits must fit in u16"),
         )
     }
@@ -170,11 +170,12 @@ impl DiamondIONativeBenchEstimator for GpuDCRTPolyMatrixNativeBenchEstimator {
             GpuNativeBenchKey { op: GpuNativeBenchOp::PolyVectorMul, vector_len },
             |estimator| {
                 let scalar_bytes = estimator.sample_poly_bytes();
-                let vector_bytes = estimator.sample_matrix_bytes(1, vector_len);
+                let vector_bytes = estimator.sample_matrix_bytes(1, vector_len, true);
                 info!(
                     vector_len,
                     scalar_bytes = scalar_bytes.len(),
                     vector_bytes = vector_bytes.len(),
+                    vector_format = "eval",
                     "DiamondIO native GPU bench prepared poly-vector mul inputs"
                 );
                 estimator.measured(move || {
@@ -193,12 +194,13 @@ impl DiamondIONativeBenchEstimator for GpuDCRTPolyMatrixNativeBenchEstimator {
         self.cached(
             GpuNativeBenchKey { op: GpuNativeBenchOp::VectorInnerProduct, vector_len },
             |estimator| {
-                let lhs_bytes = estimator.sample_matrix_bytes(1, vector_len);
-                let rhs_bytes = estimator.sample_matrix_bytes(vector_len, 1);
+                let lhs_bytes = estimator.sample_matrix_bytes(1, vector_len, true);
+                let rhs_bytes = estimator.sample_matrix_bytes(vector_len, 1, true);
                 info!(
                     vector_len,
                     lhs_bytes = lhs_bytes.len(),
                     rhs_bytes = rhs_bytes.len(),
+                    input_format = "eval",
                     "DiamondIO native GPU bench prepared vector inner-product inputs"
                 );
                 estimator.measured(move || {
@@ -216,12 +218,13 @@ impl DiamondIONativeBenchEstimator for GpuDCRTPolyMatrixNativeBenchEstimator {
         self.cached(
             GpuNativeBenchKey { op: GpuNativeBenchOp::VectorAdd, vector_len },
             |estimator| {
-                let lhs_bytes = estimator.sample_matrix_bytes(1, vector_len);
-                let rhs_bytes = estimator.sample_matrix_bytes(1, vector_len);
+                let lhs_bytes = estimator.sample_matrix_bytes(1, vector_len, false);
+                let rhs_bytes = estimator.sample_matrix_bytes(1, vector_len, false);
                 info!(
                     vector_len,
                     lhs_bytes = lhs_bytes.len(),
                     rhs_bytes = rhs_bytes.len(),
+                    input_format = "coeff",
                     "DiamondIO native GPU bench prepared vector add inputs"
                 );
                 estimator.measured(move || {
@@ -239,12 +242,13 @@ impl DiamondIONativeBenchEstimator for GpuDCRTPolyMatrixNativeBenchEstimator {
         self.cached(
             GpuNativeBenchKey { op: GpuNativeBenchOp::VectorSub, vector_len },
             |estimator| {
-                let lhs_bytes = estimator.sample_matrix_bytes(1, vector_len);
-                let rhs_bytes = estimator.sample_matrix_bytes(1, vector_len);
+                let lhs_bytes = estimator.sample_matrix_bytes(1, vector_len, false);
+                let rhs_bytes = estimator.sample_matrix_bytes(1, vector_len, false);
                 info!(
                     vector_len,
                     lhs_bytes = lhs_bytes.len(),
                     rhs_bytes = rhs_bytes.len(),
+                    input_format = "coeff",
                     "DiamondIO native GPU bench prepared vector sub inputs"
                 );
                 estimator.measured(move || {

@@ -129,13 +129,18 @@ pub fn slot_transfer_slot_parallelism() -> usize {
 
 /// `AUX_SAMPLING_CHUNK_WIDTH`: column chunk width for chunked auxiliary-sampling decomposition /
 /// hash-window assembly in the public-lookup and slot-transfer paths.
-/// Default: 30.
+/// Default: 1 with the `gpu` feature, 30 otherwise.
 pub fn aux_sampling_chunk_width() -> usize {
+    #[cfg(feature = "gpu")]
+    let default_width = 1;
+    #[cfg(not(feature = "gpu"))]
+    let default_width = 30;
+
     std::env::var("AUX_SAMPLING_CHUNK_WIDTH")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(30)
+        .unwrap_or(default_width)
 }
 
 /// `MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH`: number of RHS columns processed

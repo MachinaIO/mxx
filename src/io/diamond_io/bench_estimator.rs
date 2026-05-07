@@ -989,7 +989,7 @@ where
     {
         let final_projection_preimage_bytes =
             BigUint::from(shape.final_projection_preimage_bytes());
-        let prf_refresh_preimage_bytes = BigUint::from(shape.prf_refresh_preimage_bytes());
+        let prf_refresh_preimage_bytes = shape.prf_refresh_preimage_bytes();
         let input_injection_metadata_and_seed_bytes =
             shape.input_injection_metadata_and_seed_bytes();
         let input_injection_public_checkpoint_bytes =

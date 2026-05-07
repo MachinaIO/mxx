@@ -444,10 +444,9 @@ impl DiamondIOBenchShape {
             .expect("DiamondIO PRF refresh decoder count overflow")
     }
 
-    pub(super) fn prf_refresh_preimage_bytes(&self) -> usize {
-        self.output_preimage_bytes
-            .checked_mul(self.prf_refresh_decoder_preimage_count())
-            .expect("DiamondIO PRF refresh preimage byte count overflow")
+    pub(super) fn prf_refresh_preimage_bytes(&self) -> BigUint {
+        BigUint::from(self.output_preimage_bytes) *
+            BigUint::from(self.prf_refresh_decoder_preimage_count())
     }
 }
 

@@ -347,24 +347,22 @@ where
                 diamond.ring_gsw_public_key_error_sigma,
             );
 
-            let ring_gsw_encrypt_bit_key_col_contribution = bench_estimate_named(
-                "ring_gsw_encrypt_bit_key_col_contribution",
-                iterations,
-                || {
-                    let randomizer = GpuDCRTPolyUniformSampler::new()
-                        .sample_poly(&gpu_native_params, &DistType::BitDist);
-                    let top = ring_gsw_public_key_col[0][0].clone() * &randomizer;
-                    let bottom = ring_gsw_public_key_col[1][0].clone() * &randomizer;
+            let ring_gsw_encrypt_bit_one_ciphertext_col =
+                bench_estimate_named("ring_gsw_encrypt_bit_one_ciphertext_col", iterations, || {
+                    let mut top = GpuDCRTPoly::const_zero(&gpu_native_params);
+                    let mut bottom = GpuDCRTPoly::const_zero(&gpu_native_params);
+                    let sampler = GpuDCRTPolyUniformSampler::new();
+                    for _ in 0..diamond.ring_gsw_width {
+                        let randomizer =
+                            sampler.sample_poly(&gpu_native_params, &DistType::BitDist);
+                        top += ring_gsw_public_key_col[0][0].clone() * &randomizer;
+                        bottom += ring_gsw_public_key_col[1][0].clone() * &randomizer;
+                    }
                     black_box((top, bottom))
-                },
-            );
-            let ring_gsw_encrypt_bit_contribution_count = diamond
-                .ring_gsw_width
-                .checked_mul(diamond.ring_gsw_width)
-                .expect("DiamondIO Ring-GSW encrypt-bit contribution count overflow");
+                });
             let ring_gsw_encrypt_bit = scale_estimate_total_parallelism(
-                ring_gsw_encrypt_bit_key_col_contribution,
-                ring_gsw_encrypt_bit_contribution_count,
+                ring_gsw_encrypt_bit_one_ciphertext_col,
+                diamond.ring_gsw_width,
             );
 
             (ring_gsw_public_key_sample, ring_gsw_encrypt_bit)
@@ -469,11 +467,19 @@ where
         );
 
         let shape = DiamondIOBenchShape::from_diamond(diamond);
+        info!("starting DiamondIO input-injection benchmark estimation");
         let input_injection = self.estimate_input_injection(diamond, shape.clone());
+        info!("completed DiamondIO input-injection benchmark estimation");
+        info!("starting DiamondIO storage benchmark estimation");
         let storage = self.estimate_storage(diamond, shape.clone());
+        info!("completed DiamondIO storage benchmark estimation");
+        info!("starting DiamondIO obfuscation benchmark estimation");
         let obfuscate =
             self.estimate_obfuscate(diamond, func, shape.clone(), &input_injection, &storage);
+        info!("completed DiamondIO obfuscation benchmark estimation");
+        info!("starting DiamondIO eval benchmark estimation");
         let eval = self.estimate_eval(diamond, func, shape, &storage);
+        info!("completed DiamondIO eval benchmark estimation");
         DiamondIOBenchEstimate {
             obfuscate,
             eval,

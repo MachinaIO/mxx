@@ -419,12 +419,13 @@ fn build_lwe_scalar_pubkey_plt_evaluator(
 
 fn build_diamond_io(
     cfg: &DiamondIOGpuBenchConfig,
-    crt_depth: usize,
+    cpu_params: DCRTPolyParams,
+    gpu_params: GpuDCRTPolyParams,
     prf_mask_output_coeff_bits: usize,
     gpu_id: i32,
     dir_path: PathBuf,
 ) -> GpuDiamondIO {
-    let (cpu_params, gpu_params) = gpu_params_for_crt_depth(cfg, crt_depth, gpu_id);
+    let crt_depth = gpu_params.crt_depth();
     let ring_gsw_context = build_ring_gsw_context(&gpu_params, cfg, crt_depth);
     let ring_gsw_level_offset = 0usize;
     let ring_gsw_enable_levels = Some(crt_depth);
@@ -748,13 +749,14 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         selected
     };
 
-    let (_, gpu_params) = gpu_params_for_crt_depth(&cfg, selected.crt_depth, gpu_id);
+    let (cpu_params, gpu_params) = gpu_params_for_crt_depth(&cfg, selected.crt_depth, gpu_id);
     let final_dir = temp_dir.path().join("final_estimate");
     ensure_clean_dir(&final_dir);
     init_storage_system(final_dir.clone());
     let diamond = build_diamond_io(
         &cfg,
-        selected.crt_depth,
+        cpu_params,
+        gpu_params.clone(),
         selected.prf_mask_output_coeff_bits,
         gpu_id,
         final_dir.clone(),

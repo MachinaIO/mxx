@@ -26,10 +26,7 @@ use crate::{
     },
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
-        fhe::ring_gsw_nested_rns::{
-            encrypt_plaintext_bit_column_with_sampler, sample_public_key_columns_with_samplers,
-            sample_public_key_with_samplers,
-        },
+        fhe::ring_gsw_nested_rns::sample_public_key_columns_with_samplers,
     },
     matrix::PolyMatrix,
     noise_refresh::NoiseRefresherNaiveVec,
@@ -329,7 +326,11 @@ where
                 diamond.ring_gsw_width,
             );
 
-            let ring_gsw_public_key = sample_public_key_with_samplers::<
+            // Keep only one representative public-key column resident on the GPU. A full
+            // `NativeRingGswCiphertext<GpuDCRTPoly>` reaches the H200 VRAM limit at the selected
+            // DiamondIO parameters; the benchmark model treats public-key columns as persisted
+            // independently and sent to devices column-by-column.
+            let ring_gsw_public_key_col = sample_public_key_columns_with_samplers::<
                 GpuDCRTPoly,
                 GpuDCRTPolyMatrix,
                 GpuDCRTPolyHashSampler<Keccak256>,
@@ -341,27 +342,29 @@ where
                 &gpu_secret,
                 [0x6du8; 32],
                 b"diamond_io_bench_ring_gsw_public_key",
+                0,
+                1,
                 diamond.ring_gsw_public_key_error_sigma,
             );
 
-            let ring_gsw_encrypt_bit_one_col =
-                bench_estimate_named("ring_gsw_encrypt_bit_one_col", iterations, || {
-                    let ciphertext_col = encrypt_plaintext_bit_column_with_sampler::<
-                        GpuDCRTPoly,
-                        GpuDCRTPolyMatrix,
-                        GpuDCRTPolyUniformSampler,
-                    >(
-                        &gpu_native_params,
-                        diamond.ring_gsw_context.as_ref(),
-                        &ring_gsw_public_key,
-                        true,
-                        0,
-                    );
-                    black_box(ciphertext_col)
-                });
+            let ring_gsw_encrypt_bit_key_col_contribution = bench_estimate_named(
+                "ring_gsw_encrypt_bit_key_col_contribution",
+                iterations,
+                || {
+                    let randomizer = GpuDCRTPolyUniformSampler::new()
+                        .sample_poly(&gpu_native_params, &DistType::BitDist);
+                    let top = ring_gsw_public_key_col[0][0].clone() * &randomizer;
+                    let bottom = ring_gsw_public_key_col[1][0].clone() * &randomizer;
+                    black_box((top, bottom))
+                },
+            );
+            let ring_gsw_encrypt_bit_contribution_count = diamond
+                .ring_gsw_width
+                .checked_mul(diamond.ring_gsw_width)
+                .expect("DiamondIO Ring-GSW encrypt-bit contribution count overflow");
             let ring_gsw_encrypt_bit = scale_estimate_total_parallelism(
-                ring_gsw_encrypt_bit_one_col,
-                diamond.ring_gsw_width,
+                ring_gsw_encrypt_bit_key_col_contribution,
+                ring_gsw_encrypt_bit_contribution_count,
             );
 
             (ring_gsw_public_key_sample, ring_gsw_encrypt_bit)

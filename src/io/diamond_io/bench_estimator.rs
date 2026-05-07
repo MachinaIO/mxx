@@ -14,6 +14,7 @@ use crate::{
     bench_estimator::{
         BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
         benchmark_gate_operation, estimate_public_key_circuit_bench_with_aux,
+        measure_bench_operation,
     },
     bgg::{
         naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
@@ -277,17 +278,9 @@ where
 
         let native_secret =
             sample_native_ternary_secret::<M, US>(params, &diamond.native_poly_params);
-        let ring_gsw_public_key = sample_public_key(
-            &diamond.native_poly_params,
-            diamond.ring_gsw_width,
-            &native_secret,
-            [0x6du8; 32],
-            b"diamond_io_bench_ring_gsw_public_key",
-            diamond.ring_gsw_public_key_error_sigma,
-        );
 
         let ring_gsw_public_key_sample =
-            bench_estimate_named("ring_gsw_public_key_sample", iterations, || {
+            bench_estimate_cpu_named("ring_gsw_public_key_sample", iterations, || {
                 sample_public_key(
                     &diamond.native_poly_params,
                     diamond.ring_gsw_width,
@@ -298,14 +291,24 @@ where
                 )
             });
 
-        let ring_gsw_encrypt_bit = bench_estimate_named("ring_gsw_encrypt_bit", iterations, || {
-            encrypt_plaintext_bit(
-                &diamond.native_poly_params,
-                diamond.ring_gsw_context.as_ref(),
-                &ring_gsw_public_key,
-                true,
-            )
-        });
+        let ring_gsw_public_key = sample_public_key(
+            &diamond.native_poly_params,
+            diamond.ring_gsw_width,
+            &native_secret,
+            [0x6du8; 32],
+            b"diamond_io_bench_ring_gsw_public_key",
+            diamond.ring_gsw_public_key_error_sigma,
+        );
+
+        let ring_gsw_encrypt_bit =
+            bench_estimate_cpu_named("ring_gsw_encrypt_bit", iterations, || {
+                encrypt_plaintext_bit(
+                    &diamond.native_poly_params,
+                    diamond.ring_gsw_context.as_ref(),
+                    &ring_gsw_public_key,
+                    true,
+                )
+            });
 
         debug!(
             ?trapdoor_checkpoint,
@@ -979,6 +982,27 @@ where
         elapsed = ?start.elapsed(),
         ?estimate,
         "finished DiamondIO benchmark unit cost"
+    );
+    estimate
+}
+
+fn bench_estimate_cpu_named<R, F>(
+    name: &'static str,
+    iterations: usize,
+    op: F,
+) -> CircuitBenchEstimate
+where
+    F: FnMut() -> R,
+{
+    info!(unit = name, iterations, "starting DiamondIO CPU-only benchmark unit cost");
+    let start = Instant::now();
+    let time = measure_bench_operation(iterations.max(1), op);
+    let estimate = CircuitBenchEstimate::new(time, time);
+    info!(
+        unit = name,
+        elapsed = ?start.elapsed(),
+        ?estimate,
+        "finished DiamondIO CPU-only benchmark unit cost"
     );
     estimate
 }

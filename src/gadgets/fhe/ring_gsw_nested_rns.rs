@@ -30,8 +30,8 @@ pub fn active_q_modulus(ctx: &NestedRnsPolyContext) -> BigUint {
     BigUint::from(*ctx.q_moduli().first().expect("Ring-GSW helpers require one active q modulus"))
 }
 
-fn native_gadget_matrix(params: &DCRTPolyParams, ctx: &NestedRnsPolyContext) -> DCRTPolyMatrix {
-    let gadget_row = nested_rns_gadget_vector::<DCRTPoly, DCRTPolyMatrix>(params, ctx, None, None)
+fn native_gadget_row(params: &DCRTPolyParams, ctx: &NestedRnsPolyContext) -> Vec<DCRTPoly> {
+    nested_rns_gadget_vector::<DCRTPoly, DCRTPolyMatrix>(params, ctx, None, None)
         .get_row(0)
         .into_par_iter()
         .map(|poly| {
@@ -43,17 +43,7 @@ fn native_gadget_matrix(params: &DCRTPolyParams, ctx: &NestedRnsPolyContext) -> 
                     .expect("nested-RNS gadget row entry must contain a constant coefficient"),
             )
         })
-        .collect::<Vec<_>>();
-    let gadget_len = gadget_row.len();
-    let zero = DCRTPoly::const_zero(params);
-
-    let mut top = gadget_row.clone();
-    top.extend((0..gadget_len).map(|_| zero.clone()));
-
-    let mut bottom = vec![zero.clone(); gadget_len];
-    bottom.extend(gadget_row);
-
-    DCRTPolyMatrix::from_poly_vec(params, vec![top, bottom])
+        .collect::<Vec<_>>()
 }
 
 fn native_gadget_decompose_window(
@@ -133,14 +123,38 @@ pub fn encrypt_plaintext_bit(
     let width = public_key[0].len();
     assert_eq!(public_key[1].len(), width, "Ring-GSW public key rows must have the same width");
     let uniform_sampler = DCRTPolyUniformSampler::new();
-    let randomizer = uniform_sampler.sample_uniform(params, width, width, DistType::BitDist);
-    let public_matrix =
-        DCRTPolyMatrix::from_poly_vec(params, vec![public_key[0].clone(), public_key[1].clone()]);
-    let gadget_matrix = native_gadget_matrix(params, ctx);
-    let plaintext_poly =
-        DCRTPoly::from_biguint_to_constant(params, BigUint::from(plaintext as u64));
-    let ciphertext = (public_matrix * randomizer) + (gadget_matrix * plaintext_poly);
-    [ciphertext.get_row(0), ciphertext.get_row(1)]
+    let gadget_row = native_gadget_row(params, ctx);
+    assert_eq!(
+        width,
+        gadget_row.len() * 2,
+        "Ring-GSW public-key width must equal the native gadget matrix width"
+    );
+    let zero = DCRTPoly::const_zero(params);
+    let mut ciphertext = [Vec::with_capacity(width), Vec::with_capacity(width)];
+
+    for col_idx in 0..width {
+        let mut top = zero.clone();
+        let mut bottom = zero.clone();
+        for key_idx in 0..width {
+            let randomizer_entry = uniform_sampler.sample_poly(params, &DistType::BitDist);
+            top += &(public_key[0][key_idx].clone() * &randomizer_entry);
+            bottom += &(public_key[1][key_idx].clone() * &randomizer_entry);
+        }
+
+        if plaintext {
+            let gadget_len = gadget_row.len();
+            if col_idx < gadget_len {
+                top += &gadget_row[col_idx];
+            } else {
+                bottom += &gadget_row[col_idx - gadget_len];
+            }
+        }
+
+        ciphertext[0].push(top);
+        ciphertext[1].push(bottom);
+    }
+
+    ciphertext
 }
 
 pub fn ciphertext_inputs_from_native<P: Poly>(

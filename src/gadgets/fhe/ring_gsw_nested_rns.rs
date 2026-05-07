@@ -121,6 +121,24 @@ pub fn encrypt_plaintext_bit(
     plaintext: bool,
 ) -> NativeRingGswCiphertext {
     let width = public_key[0].len();
+    let mut ciphertext = [Vec::with_capacity(width), Vec::with_capacity(width)];
+    encrypt_plaintext_bit_columns(params, ctx, public_key, plaintext, |_, top, bottom| {
+        ciphertext[0].push(top);
+        ciphertext[1].push(bottom);
+    });
+    ciphertext
+}
+
+pub fn encrypt_plaintext_bit_columns<F>(
+    params: &DCRTPolyParams,
+    ctx: &NestedRnsPolyContext,
+    public_key: &NativeRingGswCiphertext,
+    plaintext: bool,
+    mut consume_column: F,
+) where
+    F: FnMut(usize, DCRTPoly, DCRTPoly),
+{
+    let width = public_key[0].len();
     assert_eq!(public_key[1].len(), width, "Ring-GSW public key rows must have the same width");
     let uniform_sampler = DCRTPolyUniformSampler::new();
     let gadget_row = native_gadget_row(params, ctx);
@@ -130,7 +148,6 @@ pub fn encrypt_plaintext_bit(
         "Ring-GSW public-key width must equal the native gadget matrix width"
     );
     let zero = DCRTPoly::const_zero(params);
-    let mut ciphertext = [Vec::with_capacity(width), Vec::with_capacity(width)];
 
     for col_idx in 0..width {
         let mut top = zero.clone();
@@ -150,11 +167,8 @@ pub fn encrypt_plaintext_bit(
             }
         }
 
-        ciphertext[0].push(top);
-        ciphertext[1].push(bottom);
+        consume_column(col_idx, top, bottom);
     }
-
-    ciphertext
 }
 
 pub fn ciphertext_inputs_from_native<P: Poly>(

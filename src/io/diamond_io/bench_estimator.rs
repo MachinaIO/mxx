@@ -10,6 +10,8 @@ use std::time::Instant;
 
 use tracing::{debug, info};
 
+use std::hint::black_box;
+
 use crate::{
     bench_estimator::{
         BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
@@ -22,7 +24,7 @@ use crate::{
     },
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
-        fhe::ring_gsw_nested_rns::{encrypt_plaintext_bit, sample_public_key},
+        fhe::ring_gsw_nested_rns::{encrypt_plaintext_bit_columns, sample_public_key},
     },
     matrix::PolyMatrix,
     noise_refresh::NoiseRefresherNaiveVec,
@@ -302,12 +304,20 @@ where
 
         let ring_gsw_encrypt_bit =
             bench_estimate_cpu_named("ring_gsw_encrypt_bit", iterations, || {
-                encrypt_plaintext_bit(
+                let mut consumed_columns = 0usize;
+                encrypt_plaintext_bit_columns(
                     &diamond.native_poly_params,
                     diamond.ring_gsw_context.as_ref(),
                     &ring_gsw_public_key,
                     true,
-                )
+                    |col_idx, top, bottom| {
+                        consumed_columns = consumed_columns
+                            .checked_add(1)
+                            .expect("Ring-GSW encrypt-bit consumed column count overflow");
+                        black_box((col_idx, top, bottom));
+                    },
+                );
+                consumed_columns
             });
 
         debug!(

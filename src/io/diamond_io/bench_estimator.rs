@@ -33,7 +33,7 @@ use crate::{
         },
     },
     matrix::PolyMatrix,
-    noise_refresh::NoiseRefresherNaiveVec,
+    noise_refresh::naive_vec::NoiseRefreshBenchEstimateParts,
     poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     slot_transfer::bgg_pubkey::column_chunk_bounds,
@@ -64,6 +64,8 @@ use bench_estimator_utils::{
 };
 
 use super::{DIAMOND_SECRET_SIZE, DiamondIO, DiamondIOFuncType};
+
+const NATIVE_BENCH_ITERATIONS: usize = 1;
 
 /// Combined DiamondIO benchmark estimate for `obfuscation` and `eval`.
 #[derive(Debug, Clone, PartialEq)]
@@ -885,24 +887,29 @@ where
             "estimated DiamondIO PRF benchmark selected-half mux unit"
         );
 
-        let mut refresh_context_circuit = crate::circuit::PolyCircuit::new();
-        let noise_refresher = NoiseRefresherNaiveVec::<M, NestedRnsPoly<M::P>, HS>::new(
-            diamond.build_ring_gsw_circuit_context(&mut refresh_context_circuit),
-            diamond.seed_bits,
-            diamond.noise_refresh_v_bits,
-            diamond.goldreich_graph_seed,
-            diamond.noise_refresh_cbd_n,
-            diamond.noise_refresh_hash_key,
-        );
-        info!(?mode, "starting DiamondIO PRF benchmark noise-refresh estimate");
-        let refresh_parts = match mode {
+        let final_mask_decrypt_unit_circuit = prf_mask_decrypt_one_ciphertext_bit_circuit(diamond);
+        let final_mask_decrypt_unit = match mode {
             PrfBenchMode::PublicKeyPreprocess => {
-                noise_refresher.estimate_preprocess_bench_parts(self.public_key_estimator)
+                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+                    self.public_key_estimator,
+                    &diamond.injector.params,
+                    &final_mask_decrypt_unit_circuit,
+                )
             }
             PrfBenchMode::EncodingOnline => {
-                noise_refresher.estimate_online_eval_bench_parts(self.encoding_estimator)
+                self.encoding_estimator.estimate_circuit_bench(&final_mask_decrypt_unit_circuit)
             }
         };
+
+        info!(?mode, "starting DiamondIO PRF benchmark noise-refresh estimate");
+        let refresh_parts = self
+            .estimate_noise_refresh_sparse::<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+                diamond,
+                shape.clone(),
+                mode,
+                prg_unit,
+                final_mask_decrypt_unit,
+            );
         info!(?mode, ?refresh_parts, "finished DiamondIO PRF benchmark noise-refresh estimate");
         let refresh_decoder_count_per_round = selected_wire_count_per_round
             .checked_mul(shape.ring_dim)
@@ -937,24 +944,11 @@ where
         // ciphertext-bit decrypt contribution and scale the total work by the number of
         // contributions. This keeps the H200 run from materializing a giant representative GPU
         // public-key matrix while preserving the enough-GPUs latency model.
-        let final_mask_decrypt_unit_circuit = prf_mask_decrypt_one_ciphertext_bit_circuit(diamond);
         let final_mask_decrypt_contribution_count = shape
             .ring_dim
             .checked_mul(diamond.prf_mask_output_coeff_bits)
             .and_then(|count| count.checked_mul(diamond.output_size))
             .expect("DiamondIO final-mask decrypt contribution count overflow");
-        let final_mask_decrypt_unit = match mode {
-            PrfBenchMode::PublicKeyPreprocess => {
-                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
-                    self.public_key_estimator,
-                    &diamond.injector.params,
-                    &final_mask_decrypt_unit_circuit,
-                )
-            }
-            PrfBenchMode::EncodingOnline => {
-                self.encoding_estimator.estimate_circuit_bench(&final_mask_decrypt_unit_circuit)
-            }
-        };
         let final_mask_decrypt =
             scale_summary(final_mask_decrypt_unit, final_mask_decrypt_contribution_count);
         info!(
@@ -1020,6 +1014,132 @@ where
         debug!(?mode, ?estimate, "estimated DiamondIO PRF benchmark");
         info!(?mode, ?total, "finished DiamondIO PRF benchmark path estimation");
         estimate
+    }
+
+    fn estimate_noise_refresh_sparse<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+        &self,
+        diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+        shape: DiamondIOBenchShape,
+        mode: PrfBenchMode,
+        prg_unit: CircuitBenchSummary,
+        decrypt_contribution_unit: CircuitBenchSummary,
+    ) -> NoiseRefreshBenchEstimateParts
+    where
+        M: PolyMatrix + Send + Sync + 'static,
+        M::P: 'static,
+        US: PolyUniformSampler<M = M> + Send + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
+        TS: PolyTrapdoorSampler<M = M> + Send + Sync,
+        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
+        EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+    {
+        let per_slot_digit_ciphertexts = shape
+            .ring_dim
+            .checked_mul(
+                1usize
+                    .checked_add(
+                        shape
+                            .crt_depth
+                            .checked_mul(diamond.noise_refresh_v_bits)
+                            .expect("DiamondIO noise-refresh mask ciphertext count overflow"),
+                    )
+                    .expect("DiamondIO noise-refresh material ciphertext count overflow"),
+            )
+            .expect("DiamondIO noise-refresh per-slot material count overflow");
+        let material_ciphertext_count = shape
+            .ring_dim
+            .checked_mul(shape.modulus_digits)
+            .and_then(|count| count.checked_mul(per_slot_digit_ciphertexts))
+            .expect("DiamondIO noise-refresh material ciphertext count overflow");
+        let material_merge_count = shape
+            .ring_dim
+            .checked_mul(shape.crt_depth)
+            .and_then(|count| count.checked_mul(shape.modulus_digits))
+            .expect("DiamondIO noise-refresh material merge count overflow");
+
+        let add = match mode {
+            PrfBenchMode::PublicKeyPreprocess => self.public_key_estimator.estimate_add(),
+            PrfBenchMode::EncodingOnline => self.encoding_estimator.estimate_add(),
+        };
+        let material = sequential_summaries(&[
+            scale_summary(prg_unit, material_ciphertext_count),
+            scale_summary(decrypt_contribution_unit, material_ciphertext_count),
+            scale_estimate(add, material_merge_count),
+        ]);
+
+        let scalar_target = [BigUint::from(1u32)];
+        let combine_task_count = shape
+            .ring_dim
+            .checked_mul(shape.crt_depth)
+            .expect("DiamondIO noise-refresh combine task count overflow");
+        let collapse_add_count = shape
+            .modulus_digits
+            .checked_mul(shape.ring_dim.saturating_sub(1))
+            .expect("DiamondIO noise-refresh collapse add count overflow");
+        let a_prime_sampling_unit = measured_a_prime_hash_sampling_unit_summary::<M, HS>(
+            &diamond.injector.params,
+            diamond.noise_refresh_hash_key,
+            1,
+        );
+        let a_prime_sampling_stage = scale_summary(a_prime_sampling_unit, shape.ring_dim);
+
+        let per_refresh = match mode {
+            PrfBenchMode::PublicKeyPreprocess => {
+                let pk_matrix_mul =
+                    self.public_key_estimator.estimate_large_scalar_mul(&scalar_target);
+                let pk_add = self.public_key_estimator.estimate_add();
+                let pk_sub = self.public_key_estimator.estimate_sub();
+                let combine_unit = sequential_summaries(&[
+                    estimate_summary(pk_matrix_mul),
+                    estimate_summary(pk_matrix_mul),
+                    scale_estimate(pk_matrix_mul, shape.modulus_digits),
+                    scale_estimate(pk_add, collapse_add_count),
+                    estimate_summary(pk_add),
+                    estimate_summary(pk_sub),
+                ]);
+                sequential_summaries(&[
+                    a_prime_sampling_stage,
+                    scale_summary(combine_unit, combine_task_count),
+                ])
+            }
+            PrfBenchMode::EncodingOnline => {
+                let enc_matrix_mul =
+                    self.encoding_estimator.estimate_large_scalar_mul(&scalar_target);
+                let enc_add = self.encoding_estimator.estimate_add();
+                let enc_sub = self.encoding_estimator.estimate_sub();
+                let crt_recompose = self.native_estimator.estimate_vector_add(shape.modulus_digits);
+                let combine_unit = sequential_summaries(&[
+                    estimate_summary(enc_matrix_mul),
+                    estimate_summary(enc_matrix_mul),
+                    scale_estimate(enc_matrix_mul, shape.modulus_digits),
+                    scale_estimate(enc_add, collapse_add_count),
+                    estimate_summary(enc_add),
+                    estimate_summary(enc_sub),
+                    estimate_summary(enc_sub),
+                    estimate_summary(crt_recompose),
+                ]);
+                sequential_summaries(&[
+                    a_prime_sampling_stage,
+                    scale_summary(combine_unit, combine_task_count),
+                ])
+            }
+        };
+        let total = sequential_summaries(&[material, per_refresh]);
+
+        info!(
+            ?mode,
+            material_ciphertext_count,
+            material_merge_count,
+            combine_task_count,
+            collapse_add_count,
+            ?material,
+            ?per_refresh,
+            ?total,
+            "estimated DiamondIO sparse noise-refresh benchmark"
+        );
+
+        NoiseRefreshBenchEstimateParts { material, per_refresh, total }
     }
 
     fn estimate_storage<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
@@ -1159,6 +1279,40 @@ where
         "finished DiamondIO benchmark unit cost"
     );
     estimate
+}
+
+fn measured_a_prime_hash_sampling_unit_summary<M, HS>(
+    params: &<M::P as Poly>::Params,
+    hash_key: [u8; 32],
+    secret_size: usize,
+) -> CircuitBenchSummary
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+{
+    let log_base_q = params.modulus_digits();
+    let bench = benchmark_gate_operation(NATIVE_BENCH_ITERATIONS, || {
+        let matrix = HS::new().sample_hash(
+            params,
+            hash_key,
+            b"diamond-io-noise-refresh-bench-a-prime",
+            secret_size,
+            secret_size
+                .checked_mul(log_base_q)
+                .expect("DiamondIO noise-refresh a_prime benchmark column count overflow"),
+            DistType::FinRingDist,
+        );
+        matrix.into_compact_bytes()
+    });
+    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1);
+    #[cfg(feature = "gpu")]
+    {
+        summary.with_peak_vram(bench.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        summary
+    }
 }
 
 #[cfg(not(feature = "gpu"))]

@@ -8,6 +8,10 @@ use tracing::{debug, info};
 
 use crate::{
     circuit::{Evaluable, PolyCircuit},
+    decoder::simulation::{
+        DecodeThreshold, centered_mask_magnitude, decode_margin, search_mask_bits_with_simulation,
+        validate_error_bound_security_margin,
+    },
     gadgets::{
         arith::NestedRnsPolyContext,
         fhe::{ring_gsw::RingGswCiphertext, ring_gsw_nested_rns::NestedRnsRingGswContext},
@@ -16,10 +20,7 @@ use crate::{
     input_injector::DiamondInputErrorSimulation,
     lookup::PltEvaluator,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-    noise_refresh::{
-        NoiseRefreshErrorSimulation, simulate_symmetric_noise_refresh_error_growth,
-        simulation::validate_error_bound_security_margin,
-    },
+    noise_refresh::{NoiseRefreshErrorSimulation, simulate_symmetric_noise_refresh_error_growth},
     poly::{
         PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -229,9 +230,6 @@ where
     {
         let cpu_params = cpu_params_from_poly_params(&self.injector.params);
         let max_candidate = max_bits.min(cpu_params.modulus_bits());
-        let mut low = 1usize;
-        let mut high = max_candidate;
-        let mut best = None;
         info!(max_bits, max_candidate, "starting DiamondIO PRF mask bit search");
         let prefix = self.simulate_mask_independent_error_prefix(
             func_type,
@@ -274,41 +272,37 @@ where
                 bigdecimal_bits_ceil(&cached_final_mask_base_error.matrix_norm.poly_norm.norm),
             "DiamondIO PRF mask bit search cached final-mask representative decrypt"
         );
-        while low <= high {
-            let candidate = low + (high - low) / 2;
-            info!(candidate, low, high, "evaluating DiamondIO PRF mask bit candidate");
-            let simulation = self.finish_error_growth_from_mask_independent_prefix(
-                &prefix,
-                candidate,
-                Some(cached_final_mask_prg_output.clone()),
-                Some(cached_final_mask_base_error.clone()),
-                plt_evaluator,
-                slot_transfer_evaluator,
-            );
-            let q: Arc<BigUint> = prefix.cpu_params.modulus().into();
-            let quarter_q = biguint_to_decimal(&(q.as_ref() / 4u32));
-            let mask_value = centered_bit_width_magnitude(candidate);
-            let valid = &simulation.noisy_plaintext_error.poly_norm.norm + &mask_value < quarter_q;
+        let q: Arc<BigUint> = prefix.cpu_params.modulus().into();
+        let best = search_mask_bits_with_simulation(
+            q.as_ref(),
+            max_candidate,
+            &DecodeThreshold::boolean(),
+            |candidate| {
+                info!(candidate, "evaluating DiamondIO PRF mask bit candidate");
+                self.finish_error_growth_from_mask_independent_prefix(
+                    &prefix,
+                    candidate,
+                    Some(cached_final_mask_prg_output.clone()),
+                    Some(cached_final_mask_base_error.clone()),
+                    plt_evaluator,
+                    slot_transfer_evaluator,
+                )
+            },
+            |simulation| simulation.noisy_plaintext_error.poly_norm.norm.clone(),
+        )
+        .map(|result| {
+            let mask_value = centered_mask_magnitude(result.mask_bits);
             debug!(
-                candidate,
-                valid,
-                noisy_plaintext_error = %simulation.noisy_plaintext_error.poly_norm.norm,
+                candidate = result.mask_bits,
+                noisy_plaintext_error = %result.simulation.noisy_plaintext_error.poly_norm.norm,
                 mask_value = %mask_value,
-                quarter_q = %quarter_q,
-                "DiamondIO PRF mask bit candidate evaluated"
+                "DiamondIO PRF mask bit candidate selected"
             );
-            if valid {
-                best = Some(DiamondIOPrfMaskOutputCoeffBitsSearchResult {
-                    prf_mask_output_coeff_bits: candidate,
-                    simulation,
-                });
-                low = candidate + 1;
-            } else if candidate == 1 {
-                break;
-            } else {
-                high = candidate - 1;
+            DiamondIOPrfMaskOutputCoeffBitsSearchResult {
+                prf_mask_output_coeff_bits: result.mask_bits,
+                simulation: result.simulation,
             }
-        }
+        });
         info!(found = best.is_some(), "finished DiamondIO PRF mask bit search");
         best
     }
@@ -960,10 +954,6 @@ fn simulator_context(params: &DCRTPolyParams) -> Arc<SimulatorContext> {
     ))
 }
 
-fn biguint_to_decimal(value: &BigUint) -> BigDecimal {
-    BigDecimal::from(BigInt::from(value.clone()))
-}
-
 fn diamond_io_input_injection_projection_error(
     input_injection: &DiamondInputErrorSimulation,
 ) -> PolyMatrixNorm {
@@ -1033,9 +1023,7 @@ fn diamond_io_final_decode_margin(
     prf_mask_output_coeff_bits: usize,
 ) -> Option<BigDecimal> {
     let q: Arc<BigUint> = params.modulus().into();
-    let threshold = biguint_to_decimal(&(q.as_ref() / 4u32));
-    let mask = centered_bit_width_magnitude(prf_mask_output_coeff_bits);
-    (threshold > mask).then_some(threshold - mask)
+    decode_margin(q.as_ref(), prf_mask_output_coeff_bits, &DecodeThreshold::boolean())
 }
 
 fn diamond_io_noise_refresh_pre_round_margin(
@@ -1045,15 +1033,7 @@ fn diamond_io_noise_refresh_pre_round_margin(
     let (q_moduli, _crt_bits, _crt_depth) = params.to_crt();
     let q_max = q_moduli.iter().copied().max().expect("CRT modulus list must be nonempty");
     let full_q: Arc<BigUint> = params.modulus().into();
-    let threshold =
-        biguint_to_decimal(full_q.as_ref()) / (BigDecimal::from(2u32) * BigDecimal::from(q_max));
-    let mask = centered_bit_width_magnitude(v_bits);
-    (threshold > mask).then_some(threshold - mask)
-}
-
-fn centered_bit_width_magnitude(bits: usize) -> BigDecimal {
-    assert!(bits > 0, "centered bit width must be positive");
-    biguint_to_decimal(&(BigUint::from(1u32) << (bits - 1)))
+    decode_margin(full_q.as_ref(), v_bits, &DecodeThreshold::new(q_max))
 }
 
 fn eval_first_error_output<PE>(
@@ -1155,7 +1135,7 @@ fn ring_gsw_wire_count(flat_input_count: usize, logical_bit_count: usize) -> usi
 mod tests {
     use super::*;
     use crate::{
-        func_enc::aky24::NoCircuitEvaluator,
+        func_enc::NoCircuitEvaluator,
         gadgets::arith::ModularArithmeticContext,
         input_injector::DiamondInjector,
         matrix::dcrt_poly::DCRTPolyMatrix,

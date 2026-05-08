@@ -10,7 +10,7 @@ use mxx::{
     bgg::{public_key::BggPublicKey, sampler::BGGPublicKeySampler},
     circuit::{PolyCircuit, gate::GateId},
     element::PolyElem,
-    func_enc::aky24::NoCircuitEvaluator,
+    func_enc::NoCircuitEvaluator,
     gadgets::arith::{ModularArithmeticContext, NestedRnsPolyContext},
     input_injector::DiamondInjector,
     io::diamond_io::{

@@ -198,6 +198,98 @@ pub struct GoldreichGraph {
     pub generation: GoldreichGraphGeneration,
 }
 
+/// Stateful generator for contiguous chunks of one full-domain Goldreich graph.
+///
+/// It preserves the exact duplicate-rejection state of full graph generation while allowing callers
+/// to stream chunks without holding every edge or replaying earlier prefixes for each chunk.
+pub struct GoldreichFullDomainRangeGenerator {
+    input_size: usize,
+    conceptual_output_size: usize,
+    full_range_seed: [u8; 32],
+    generation: GoldreichGraphGeneration,
+    stream: GraphSeedStream,
+    accepted_count: usize,
+    seen_role_keys: HashSet<GoldreichEdgeKey>,
+    seen_vertex_sets: Option<HashSet<[usize; 5]>>,
+}
+
+impl GoldreichFullDomainRangeGenerator {
+    pub fn new(
+        input_size: usize,
+        conceptual_output_size: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
+        validate_graph_dimensions(input_size, conceptual_output_size);
+        let capacity = generation.max_unique_edges(input_size);
+        assert!(
+            (conceptual_output_size as u128) <= capacity,
+            "requested conceptual Goldreich graph output size {} exceeds unique-edge capacity {} for input_size={input_size}",
+            conceptual_output_size,
+            capacity
+        );
+        let full_range_seed =
+            derive_range_graph_seed(graph_seed, conceptual_output_size, 0, conceptual_output_size);
+        Self {
+            input_size,
+            conceptual_output_size,
+            full_range_seed,
+            generation,
+            stream: GraphSeedStream::new(full_range_seed),
+            accepted_count: 0,
+            seen_role_keys: HashSet::new(),
+            seen_vertex_sets: if generation.reject_same_vertex_set {
+                Some(HashSet::new())
+            } else {
+                None
+            },
+        }
+    }
+
+    pub fn next_range(&mut self, range_start: usize, range_len: usize) -> GoldreichGraph {
+        assert!(range_len > 0, "Goldreich graph output range length must be positive");
+        assert!(
+            range_start >= self.accepted_count,
+            "Goldreich full-domain range generator only supports forward ranges"
+        );
+        let range_end =
+            range_start.checked_add(range_len).expect("Goldreich graph output range end overflow");
+        assert!(
+            range_end <= self.conceptual_output_size,
+            "Goldreich graph output range [{range_start}, {range_end}) exceeds conceptual output size {}",
+            self.conceptual_output_size
+        );
+
+        while self.accepted_count < range_start {
+            sample_next_unique_edge(
+                self.input_size,
+                &mut self.stream,
+                &mut self.seen_role_keys,
+                &mut self.seen_vertex_sets,
+            );
+            self.accepted_count += 1;
+        }
+
+        let mut edges = Vec::with_capacity(range_len);
+        while self.accepted_count < range_end {
+            edges.push(sample_next_unique_edge(
+                self.input_size,
+                &mut self.stream,
+                &mut self.seen_role_keys,
+                &mut self.seen_vertex_sets,
+            ));
+            self.accepted_count += 1;
+        }
+
+        GoldreichGraph {
+            input_size: self.input_size,
+            edges,
+            graph_seed: Some(self.full_range_seed),
+            generation: self.generation,
+        }
+    }
+}
+
 impl GoldreichGraph {
     /// Deterministically generates a public Goldreich graph from `graph_seed`.
     ///
@@ -231,30 +323,12 @@ impl GoldreichGraph {
         };
 
         while edges.len() < output_size {
-            let mut sampled = Vec::with_capacity(5);
-            while sampled.len() < 5 {
-                let candidate = stream.sample_below(input_size);
-                if sampled.contains(&candidate) {
-                    continue;
-                }
-                sampled.push(candidate);
-            }
-
-            let edge =
-                GoldreichEdge::new([sampled[0], sampled[1], sampled[2]], [sampled[3], sampled[4]]);
-            let role_aware_key = edge.role_aware_key();
-            if seen_role_keys.contains(&role_aware_key) {
-                continue;
-            }
-            if let Some(seen_vertex_sets) = seen_vertex_sets.as_mut() {
-                let same_vertex_set_key = edge.same_vertex_set_key();
-                if seen_vertex_sets.contains(&same_vertex_set_key) {
-                    continue;
-                }
-                seen_vertex_sets.insert(same_vertex_set_key);
-            }
-            seen_role_keys.insert(role_aware_key);
-            edges.push(edge);
+            edges.push(sample_next_unique_edge(
+                input_size,
+                &mut stream,
+                &mut seen_role_keys,
+                &mut seen_vertex_sets,
+            ));
         }
 
         Self { input_size, edges, graph_seed: Some(graph_seed), generation }
@@ -293,6 +367,45 @@ impl GoldreichGraph {
         let range_seed =
             derive_range_graph_seed(graph_seed, conceptual_output_size, range_start, range_len);
         Self::generate(input_size, range_len, range_seed, generation)
+    }
+
+    /// Generates one interval using the same public graph domain as the full conceptual range.
+    ///
+    /// This is more expensive than [`generate_range`] because it replays full-range generation up
+    /// to `range_start + range_len`, including duplicate-rejection state. It is needed when a
+    /// caller persists artifacts against the full-range graph and later wants to evaluate only one
+    /// contiguous output chunk without changing the graph semantics.
+    pub fn generate_full_domain_range(
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
+        validate_graph_dimensions(input_size, conceptual_output_size);
+        assert!(range_len > 0, "Goldreich graph output range length must be positive");
+        let range_end =
+            range_start.checked_add(range_len).expect("Goldreich graph output range end overflow");
+        assert!(
+            range_end <= conceptual_output_size,
+            "Goldreich graph output range [{range_start}, {range_end}) exceeds conceptual output size {conceptual_output_size}"
+        );
+        let capacity = generation.max_unique_edges(input_size);
+        assert!(
+            (conceptual_output_size as u128) <= capacity,
+            "requested conceptual Goldreich graph output size {} exceeds unique-edge capacity {} for input_size={input_size}",
+            conceptual_output_size,
+            capacity
+        );
+
+        GoldreichFullDomainRangeGenerator::new(
+            input_size,
+            conceptual_output_size,
+            graph_seed,
+            generation,
+        )
+        .next_range(range_start, range_len)
     }
 
     /// Validates an explicit public Goldreich graph against the same invariants as [`generate`].
@@ -460,6 +573,51 @@ where
         )
     }
 
+    pub fn setup_full_domain_range(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+    ) -> Self {
+        Self::setup_full_domain_range_with_options(
+            circuit,
+            ring_gsw,
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            GoldreichGraphGeneration::default(),
+        )
+    }
+
+    pub fn setup_full_domain_range_with_options(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
+        Self::from_public_graph(
+            circuit,
+            ring_gsw,
+            GoldreichGraph::generate_full_domain_range(
+                input_size,
+                conceptual_output_size,
+                range_start,
+                range_len,
+                graph_seed,
+                generation,
+            ),
+        )
+    }
+
     /// Builds the PRG from an already validated public graph instead of generating one from a
     /// `graph_seed`.
     pub fn from_public_graph(
@@ -542,10 +700,22 @@ where
     }
 }
 
-/// Adds a nonempty list of scalar wires with the circuit's ordinary addition gate.
+/// Adds a nonempty list of scalar wires with a balanced ordinary-addition tree.
 pub(crate) fn sum_gate_ids<P: Poly>(circuit: &mut PolyCircuit<P>, values: &[GateId]) -> GateId {
-    let (first, rest) = values.split_first().expect("at least one gate is required");
-    rest.iter().fold(*first, |acc, value| circuit.add_gate(acc, *value).as_single_wire())
+    assert!(!values.is_empty(), "at least one gate is required");
+    let mut layer = values.to_vec();
+    while layer.len() > 1 {
+        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
+        let mut chunks = layer.chunks_exact(2);
+        for pair in &mut chunks {
+            next.push(circuit.add_gate(pair[0], pair[1]).as_single_wire());
+        }
+        if let Some(&carry) = chunks.remainder().first() {
+            next.push(carry);
+        }
+        layer = next;
+    }
+    layer[0]
 }
 
 /// Homomorphically evaluates a selected interval of a conceptual Goldreich PRG output.
@@ -569,6 +739,37 @@ where
     A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
 {
     let goldreich = GoldreichFhePrg::setup_range(
+        circuit,
+        ring_gsw,
+        encrypted_seeds.len(),
+        conceptual_output_bits,
+        range_start,
+        range_len,
+        graph_seed,
+    );
+    goldreich.evaluate_uniform(encrypted_seeds, circuit)
+}
+
+/// Homomorphically evaluates a selected interval using the full-range graph domain.
+///
+/// Unlike [`evaluate_goldreich_uniform_range`], this helper produces the same public edges as
+/// evaluating the full conceptual range and slicing `[range_start, range_start + range_len)`. It
+/// avoids retaining the full output vector, but it still replays graph generation up to the end of
+/// the requested range so persisted public-key artifacts and online encodings stay aligned.
+pub fn evaluate_goldreich_uniform_full_domain_range<P, A>(
+    circuit: &mut PolyCircuit<P>,
+    ring_gsw: Arc<RingGswContext<P, A>>,
+    encrypted_seeds: &[RingGswCiphertext<P, A>],
+    conceptual_output_bits: usize,
+    range_start: usize,
+    range_len: usize,
+    graph_seed: [u8; 32],
+) -> Vec<RingGswCiphertext<P, A>>
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+{
+    let goldreich = GoldreichFhePrg::setup_full_domain_range(
         circuit,
         ring_gsw,
         encrypted_seeds.len(),
@@ -782,6 +983,40 @@ where
 fn validate_graph_dimensions(input_size: usize, output_size: usize) {
     assert!(input_size >= 5, "Goldreich graph input_size must be at least 5");
     assert!(output_size > 0, "Goldreich graph output_size must be positive");
+}
+
+fn sample_next_unique_edge(
+    input_size: usize,
+    stream: &mut GraphSeedStream,
+    seen_role_keys: &mut HashSet<GoldreichEdgeKey>,
+    seen_vertex_sets: &mut Option<HashSet<[usize; 5]>>,
+) -> GoldreichEdge {
+    loop {
+        let mut sampled = Vec::with_capacity(5);
+        while sampled.len() < 5 {
+            let candidate = stream.sample_below(input_size);
+            if sampled.contains(&candidate) {
+                continue;
+            }
+            sampled.push(candidate);
+        }
+
+        let edge =
+            GoldreichEdge::new([sampled[0], sampled[1], sampled[2]], [sampled[3], sampled[4]]);
+        let role_aware_key = edge.role_aware_key();
+        if seen_role_keys.contains(&role_aware_key) {
+            continue;
+        }
+        if let Some(seen_vertex_sets) = seen_vertex_sets.as_mut() {
+            let same_vertex_set_key = edge.same_vertex_set_key();
+            if seen_vertex_sets.contains(&same_vertex_set_key) {
+                continue;
+            }
+            seen_vertex_sets.insert(same_vertex_set_key);
+        }
+        seen_role_keys.insert(role_aware_key);
+        return edge;
+    }
 }
 
 fn derive_range_graph_seed(
@@ -1258,6 +1493,53 @@ mod tests {
         assert_ne!(
             first_range.edges, second_range.edges,
             "same-width ranges at different starts must use different Goldreich edges"
+        );
+    }
+
+    #[test]
+    fn test_goldreich_graph_full_domain_range_matches_full_range_slice() {
+        let graph_seed = sample_graph_seed();
+        let options = GoldreichGraphGeneration::default();
+        let conceptual_output_size = 32usize;
+        let full_range_seed =
+            derive_range_graph_seed(graph_seed, conceptual_output_size, 0, conceptual_output_size);
+        let full = GoldreichGraph::generate(10, conceptual_output_size, full_range_seed, options);
+        let range_start = 11usize;
+        let range_len = 7usize;
+        let chunk = GoldreichGraph::generate_full_domain_range(
+            10,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            options,
+        );
+
+        assert_eq!(
+            chunk.edges,
+            full.edges[range_start..range_start + range_len],
+            "full-domain range generation must match the corresponding full-range graph slice"
+        );
+
+        let mut generator =
+            GoldreichFullDomainRangeGenerator::new(10, conceptual_output_size, graph_seed, options);
+        let first_chunk = generator.next_range(0, 5);
+        let second_chunk = generator.next_range(5, 9);
+        let later_chunk = generator.next_range(20, 4);
+        assert_eq!(
+            first_chunk.edges,
+            full.edges[0..5],
+            "stateful full-domain streaming must start from the full graph prefix"
+        );
+        assert_eq!(
+            second_chunk.edges,
+            full.edges[5..14],
+            "stateful full-domain streaming must preserve duplicate-rejection state across adjacent chunks"
+        );
+        assert_eq!(
+            later_chunk.edges,
+            full.edges[20..24],
+            "stateful full-domain streaming must preserve duplicate-rejection state while skipping forward"
         );
     }
 

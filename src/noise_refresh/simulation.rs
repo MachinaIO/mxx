@@ -1,4 +1,8 @@
 use crate::{
+    decoder::simulation::{
+        DecodeThreshold, max_safe_mask_bits as max_safe_decoder_mask_bits,
+        validate_error_bound_security_margin as validate_decoder_error_bound_security_margin,
+    },
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
         fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
@@ -18,7 +22,7 @@ use crate::{
     slot_transfer::SlotTransferEvaluator,
 };
 use bigdecimal::BigDecimal;
-use num_bigint::{BigInt, BigUint, Sign};
+use num_bigint::BigUint;
 use rayon::prelude::*;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -42,45 +46,12 @@ pub fn max_safe_noise_refresh_v_bits(
     let (q_moduli, _crt_bits, _crt_depth) = params.to_crt();
     let q_max = q_moduli.iter().copied().max().expect("CRT modulus list must be nonempty");
     let full_q: Arc<BigUint> = params.modulus().into();
-    let bound =
-        biguint_to_decimal(full_q.as_ref()) / (BigDecimal::from(2u32) * BigDecimal::from(q_max));
-    let available = bound - &pre_rounding_error.poly_norm.norm;
-    max_power_of_two_bits_strictly_below(&available, params.modulus_bits())
-        .map(|max_centered_exponent| (max_centered_exponent + 1).min(params.modulus_bits()))
-}
-
-fn max_power_of_two_bits_strictly_below(available: &BigDecimal, max_bits: usize) -> Option<usize> {
-    if available <= &BigDecimal::from(1u32) {
-        return None;
-    }
-    let mut bound = floor_positive_decimal(available).to_biguint()?;
-    if is_integer_decimal(available) {
-        bound -= 1u32;
-    }
-    if bound < BigUint::from(2u32) {
-        return None;
-    }
-    Some(((bound.bits() as usize) - 1).min(max_bits))
-}
-
-fn floor_positive_decimal(value: &BigDecimal) -> BigInt {
-    let (digits, scale) = value.as_bigint_and_exponent();
-    if scale <= 0 {
-        return digits * BigInt::from(10u32).pow((-scale) as u32);
-    }
-    let divisor = BigInt::from(10u32).pow(scale as u32);
-    let quotient = &digits / &divisor;
-    let remainder = &digits % &divisor;
-    if digits.sign() == Sign::Minus && remainder != BigInt::from(0u32) {
-        quotient - 1u32
-    } else {
-        quotient
-    }
-}
-
-fn is_integer_decimal(value: &BigDecimal) -> bool {
-    let (digits, scale) = value.as_bigint_and_exponent();
-    scale <= 0 || digits % BigInt::from(10u32).pow(scale as u32) == BigInt::from(0u32)
+    max_safe_decoder_mask_bits(
+        full_q.as_ref(),
+        &pre_rounding_error.poly_norm.norm,
+        params.modulus_bits(),
+        &DecodeThreshold::new(q_max),
+    )
 }
 
 /// Checks whether a proposed mask bit-size satisfies the conservative rounding-away bound.
@@ -101,8 +72,7 @@ pub fn validate_error_bound_security_margin(
     error_bound: &BigDecimal,
     security_bit: usize,
 ) -> bool {
-    let security_factor = BigDecimal::from(BigInt::from(BigUint::from(1u32) << security_bit));
-    threshold >= &(error_bound * security_factor)
+    validate_decoder_error_bound_security_margin(threshold, error_bound, security_bit)
 }
 
 /// Error-growth summary for one noise-refresh material evaluation.
@@ -159,21 +129,8 @@ where
     ST: SlotTransferEvaluator<ErrorNorm>,
 {
     info!(seed_bits, cbd_n, num_slots, "starting noise-refresh error simulation mask-bit search");
-    let zero_pre_rounding =
-        PolyMatrixNorm::new(one.clone_ctx(), 1, 1, BigDecimal::from(0u32), None);
-    let Some(max_candidate) = max_safe_noise_refresh_v_bits(&ring_gsw.params, &zero_pre_rounding)
-    else {
-        info!("noise-refresh error simulation found no candidate before circuit error");
-        return None;
-    };
-    debug!(max_candidate, "noise-refresh initial max v_bits candidate");
-    let mut low = 1usize;
-    let mut high = max_candidate;
-    let mut best = None;
-    while low <= high {
-        let candidate = low + (high - low) / 2;
-        info!(candidate, low, high, "evaluating noise-refresh v_bits candidate");
-        let simulation = simulate_noise_refresh_error_growth_for_v_bits(
+    search_noise_refresh_v_bits(&ring_gsw.params, one.clone_ctx(), "noise-refresh", |candidate| {
+        simulate_noise_refresh_error_growth_for_v_bits(
             ring_gsw.clone(),
             seed_bits,
             candidate,
@@ -188,26 +145,8 @@ where
             decoders,
             plt_evaluator,
             slot_transfer_evaluator,
-        );
-        let worst_pre_rounding = worst_pre_rounding_error(&simulation);
-        let valid = validate_noise_refresh_v_bits(&ring_gsw.params, candidate, worst_pre_rounding);
-        debug!(
-            candidate,
-            valid,
-            worst_pre_rounding_norm = %worst_pre_rounding.poly_norm.norm,
-            "noise-refresh candidate evaluated"
-        );
-        if valid {
-            best = Some(simulation);
-            low = candidate + 1;
-        } else if candidate == 1 {
-            break;
-        } else {
-            high = candidate - 1;
-        }
-    }
-    info!(found = best.is_some(), "finished noise-refresh error simulation mask-bit search");
-    best
+        )
+    })
 }
 
 /// Simulates noise-refresh error growth using the protocol's slot symmetry.
@@ -244,16 +183,6 @@ where
         seed_bits,
         cbd_n, num_slots, "starting symmetric noise-refresh error simulation mask-bit search"
     );
-    let zero_pre_rounding =
-        PolyMatrixNorm::new(one.clone_ctx(), 1, 1, BigDecimal::from(0u32), None);
-    let Some(max_candidate) = max_safe_noise_refresh_v_bits(&ring_gsw.params, &zero_pre_rounding)
-    else {
-        info!("symmetric noise-refresh error simulation found no candidate before circuit error");
-        return None;
-    };
-    let mut low = 1usize;
-    let mut high = max_candidate;
-    let mut best = None;
     info!("building symmetric noise-refresh representative material prefix");
     let prg_prefix = build_symmetric_noise_refresh_prg_error_prefix(
         &ring_gsw,
@@ -278,34 +207,66 @@ where
         slot_transfer_evaluator,
     );
     info!("finished symmetric noise-refresh representative decrypt prefix");
+    search_noise_refresh_v_bits(
+        &ring_gsw.params,
+        one.clone_ctx(),
+        "symmetric noise-refresh",
+        |candidate| {
+            simulate_symmetric_noise_refresh_error_growth_for_v_bits_with_prefix(
+                ring_gsw.clone(),
+                &prg_prefix,
+                &decrypt_prefix,
+                seed_bits,
+                candidate,
+                graph_seed,
+                cbd_n,
+                ring_gsw_error_sigma,
+                num_slots,
+                one.clone(),
+                refreshed_input.clone(),
+                enc_seeds,
+                decryption_key.clone(),
+                decoder.clone(),
+                plt_evaluator,
+                slot_transfer_evaluator,
+            )
+        },
+    )
+}
+
+fn search_noise_refresh_v_bits<F>(
+    params: &<DCRTPoly as crate::poly::Poly>::Params,
+    ctx: Arc<SimulatorContext>,
+    simulation_name: &'static str,
+    mut simulate_candidate: F,
+) -> Option<NoiseRefreshErrorSimulation>
+where
+    F: FnMut(usize) -> NoiseRefreshErrorSimulation,
+{
+    let zero_pre_rounding = PolyMatrixNorm::new(ctx, 1, 1, BigDecimal::from(0u32), None);
+    let Some(max_candidate) = max_safe_noise_refresh_v_bits(params, &zero_pre_rounding) else {
+        info!(
+            simulation = simulation_name,
+            "noise-refresh error simulation found no candidate before circuit error"
+        );
+        return None;
+    };
+    debug!(simulation = simulation_name, max_candidate, "noise-refresh initial v_bits candidate");
+    let mut low = 1usize;
+    let mut high = max_candidate;
+    let mut best = None;
     while low <= high {
         let candidate = low + (high - low) / 2;
-        info!(candidate, low, high, "evaluating symmetric noise-refresh v_bits candidate");
-        let simulation = simulate_symmetric_noise_refresh_error_growth_for_v_bits_with_prefix(
-            ring_gsw.clone(),
-            &prg_prefix,
-            &decrypt_prefix,
-            seed_bits,
-            candidate,
-            graph_seed,
-            cbd_n,
-            ring_gsw_error_sigma,
-            num_slots,
-            one.clone(),
-            refreshed_input.clone(),
-            enc_seeds,
-            decryption_key.clone(),
-            decoder.clone(),
-            plt_evaluator,
-            slot_transfer_evaluator,
-        );
+        info!(simulation = simulation_name, candidate, low, high, "evaluating v_bits candidate");
+        let simulation = simulate_candidate(candidate);
         let worst_pre_rounding = worst_pre_rounding_error(&simulation);
-        let valid = validate_noise_refresh_v_bits(&ring_gsw.params, candidate, worst_pre_rounding);
+        let valid = validate_noise_refresh_v_bits(params, candidate, worst_pre_rounding);
         debug!(
+            simulation = simulation_name,
             candidate,
             valid,
             worst_pre_rounding_norm = %worst_pre_rounding.poly_norm.norm,
-            "symmetric noise-refresh candidate evaluated"
+            "noise-refresh candidate evaluated"
         );
         if valid {
             best = Some(simulation);
@@ -317,8 +278,9 @@ where
         }
     }
     info!(
+        simulation = simulation_name,
         found = best.is_some(),
-        "finished symmetric noise-refresh error simulation mask-bit search"
+        "finished noise-refresh error simulation mask-bit search"
     );
     best
 }
@@ -1091,8 +1053,4 @@ where
         collapsed_norm += coeff_norm;
     }
     collapsed_norm
-}
-
-fn biguint_to_decimal(value: &BigUint) -> BigDecimal {
-    BigDecimal::from(BigInt::from(value.clone()))
 }

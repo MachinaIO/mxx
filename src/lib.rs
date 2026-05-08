@@ -13,6 +13,7 @@ pub mod bench_estimator;
 pub mod bgg;
 pub mod circuit;
 pub mod commit;
+pub mod decoder;
 pub mod element;
 pub mod env;
 pub mod func_enc;

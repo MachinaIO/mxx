@@ -6,16 +6,17 @@ use num_traits::FromPrimitive;
 
 use crate::{
     circuit::PolyCircuit,
+    decoder::simulation::{
+        DecodeThreshold, biguint_to_decimal, decode_margin, search_mask_bits_with_simulation,
+        validate_error_bound_security_margin,
+    },
     func_enc::aky24::{
         Aky24Func, Aky24Params, build_func_circuit, build_goldreich_prg_range_circuit,
         build_prf_mask_circuit, build_ring_gsw_context,
     },
     lookup::PltEvaluator,
     matrix::dcrt_poly::DCRTPolyMatrix,
-    noise_refresh::simulation::{
-        NoiseRefreshErrorSimulation, simulate_noise_refresh_error_growth,
-        validate_error_bound_security_margin,
-    },
+    noise_refresh::simulation::{NoiseRefreshErrorSimulation, simulate_noise_refresh_error_growth},
     poly::{PolyParams, dcrt::poly::DCRTPoly},
     simulator::{
         SimulatorContext,
@@ -403,47 +404,57 @@ where
 {
     info!(max_bits, "starting AKY24 PRF mask output coefficient bit search");
     let max_candidate = max_bits.min(params.poly_params.modulus_bits());
-    let mut low = 1usize;
-    let mut high = max_candidate;
-    let mut best = None;
-    while low <= high {
-        let candidate = low + (high - low) / 2;
-        info!(candidate, low, high, "evaluating AKY24 PRF mask bit candidate");
-        let mut candidate_params = params.clone();
-        candidate_params.prf_mask_output_coeff_bits = candidate;
-        let simulation = simulate_aky24_dec_error(
-            &candidate_params,
-            inputs.clone(),
-            ring_gsw_error_sigma,
-            num_slots,
-            one.clone(),
-            decryption_key.clone(),
-            decoders,
-            plt_evaluator,
-            slot_transfer_evaluator,
-        )?;
-        let q: Arc<BigUint> = candidate_params.poly_params.modulus().into();
-        let quarter_q = biguint_to_decimal(&(q.as_ref() / 4u32));
-        let mask_value = biguint_to_decimal(&(BigUint::from(1u32) << candidate));
-        let valid = &simulation.error_bound.poly_norm.norm + &mask_value < quarter_q;
-        debug!(
-            candidate,
-            valid,
-            error_bound = %simulation.error_bound.poly_norm.norm,
-            "AKY24 PRF mask bit candidate evaluated"
-        );
-        if valid {
-            best = Some(Aky24PrfMaskOutputCoeffBitsSearchResult {
-                prf_mask_output_coeff_bits: candidate,
-                simulation,
-            });
-            low = candidate + 1;
-        } else if candidate == 1 {
-            break;
-        } else {
-            high = candidate - 1;
+    let q: Arc<BigUint> = params.poly_params.modulus().into();
+    let mut aborted = false;
+    let best = search_mask_bits_with_simulation(
+        q.as_ref(),
+        max_candidate,
+        &DecodeThreshold::boolean(),
+        |candidate| {
+            if aborted {
+                return None;
+            }
+            info!(candidate, "evaluating AKY24 PRF mask bit candidate");
+            let mut candidate_params = params.clone();
+            candidate_params.prf_mask_output_coeff_bits = candidate;
+            let simulation = simulate_aky24_dec_error(
+                &candidate_params,
+                inputs.clone(),
+                ring_gsw_error_sigma,
+                num_slots,
+                one.clone(),
+                decryption_key.clone(),
+                decoders,
+                plt_evaluator,
+                slot_transfer_evaluator,
+            );
+            if simulation.is_none() {
+                aborted = true;
+            }
+            simulation
+        },
+        |simulation| {
+            simulation
+                .as_ref()
+                .map(|simulation| simulation.error_bound.poly_norm.norm.clone())
+                .unwrap_or_else(|| biguint_to_decimal(q.as_ref()))
+        },
+    )
+    .and_then(|result| {
+        if aborted {
+            return None;
         }
-    }
+        let simulation = result.simulation?;
+        debug!(
+            candidate = result.mask_bits,
+            error_bound = %simulation.error_bound.poly_norm.norm,
+            "AKY24 PRF mask bit candidate selected"
+        );
+        Some(Aky24PrfMaskOutputCoeffBitsSearchResult {
+            prf_mask_output_coeff_bits: result.mask_bits,
+            simulation,
+        })
+    });
     info!(found = best.is_some(), "finished AKY24 PRF mask output coefficient bit search");
     best
 }
@@ -576,9 +587,7 @@ fn aky24_final_decode_margin(
     prf_mask_output_coeff_bits: usize,
 ) -> Option<BigDecimal> {
     let q: Arc<BigUint> = params.modulus().into();
-    let threshold = biguint_to_decimal(&(q.as_ref() / 4u32));
-    let mask = biguint_to_decimal(&(BigUint::from(1u32) << prf_mask_output_coeff_bits));
-    (threshold > mask).then_some(threshold - mask)
+    decode_margin(q.as_ref(), prf_mask_output_coeff_bits, &DecodeThreshold::boolean())
 }
 
 fn noise_refresh_pre_round_margin(
@@ -588,10 +597,7 @@ fn noise_refresh_pre_round_margin(
     let (q_moduli, _crt_bits, _crt_depth) = params.to_crt();
     let q_max = q_moduli.iter().copied().max().expect("CRT modulus list must be nonempty");
     let full_q: Arc<BigUint> = params.modulus().into();
-    let threshold =
-        biguint_to_decimal(full_q.as_ref()) / (BigDecimal::from(2u32) * BigDecimal::from(q_max));
-    let mask = biguint_to_decimal(&(BigUint::from(1u32) << v_bits));
-    (threshold > mask).then_some(threshold - mask)
+    decode_margin(full_q.as_ref(), v_bits, &DecodeThreshold::new(q_max))
 }
 
 /// Evaluates the AKY24 function circuit and returns the first decoded output's matrix error.
@@ -684,11 +690,6 @@ fn ring_gsw_wire_count(flat_input_count: usize, logical_bit_count: usize) -> usi
         "flattened Ring-GSW input count must be divisible by logical bit count"
     );
     flat_input_count / logical_bit_count
-}
-
-/// Converts an unsigned integer modulus quantity into `BigDecimal` for margin arithmetic.
-fn biguint_to_decimal(value: &BigUint) -> BigDecimal {
-    BigDecimal::from(BigInt::from(value.clone()))
 }
 
 #[cfg(test)]

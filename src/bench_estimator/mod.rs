@@ -174,6 +174,51 @@ impl CircuitBenchSummary {
     }
 }
 
+/// Scale independent representative work while preserving representative latency.
+///
+/// This models work that can be split across enough independent devices or
+/// workers: total work and available parallelism grow with `count`, while the
+/// critical-path latency and peak per-device resource usage stay equal to the
+/// representative unit.
+pub(crate) fn scale_independent_estimate(
+    estimate: CircuitBenchEstimate,
+    count: usize,
+) -> CircuitBenchEstimate {
+    let count = BigUint::from(count);
+    let scaled =
+        CircuitBenchEstimate::from_nanos(estimate.total_time.clone() * &count, estimate.latency)
+            .with_max_parallelism(estimate.max_parallelism.clone() * count);
+    #[cfg(feature = "gpu")]
+    {
+        scaled.with_peak_vram(estimate.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        scaled
+    }
+}
+
+/// Scale an already-composed independent summary while preserving latency.
+pub(crate) fn scale_independent_summary(
+    summary: CircuitBenchSummary,
+    count: usize,
+) -> CircuitBenchSummary {
+    let count = BigUint::from(count);
+    let scaled = CircuitBenchSummary::from_nanos(
+        summary.total_time.clone() * &count,
+        summary.latency,
+        summary.max_parallelism.clone() * count,
+    );
+    #[cfg(feature = "gpu")]
+    {
+        scaled.with_peak_vram(summary.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        scaled
+    }
+}
+
 pub(crate) fn seconds_to_nanos(seconds: f64) -> BigUint {
     assert!(seconds.is_finite(), "benchmark time must be finite");
     assert!(seconds >= 0.0, "benchmark time must be non-negative");

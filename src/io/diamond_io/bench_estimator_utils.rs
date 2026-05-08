@@ -1,7 +1,9 @@
 use num_bigint::BigUint;
 use num_traits::Zero;
 
-use crate::bench_estimator::{CircuitBenchEstimate, CircuitBenchSummary};
+use crate::bench_estimator::{
+    CircuitBenchEstimate, CircuitBenchSummary, scale_independent_summary,
+};
 
 pub(super) fn estimate_summary(estimate: CircuitBenchEstimate) -> CircuitBenchSummary {
     let summary = CircuitBenchSummary::from_nanos(
@@ -24,17 +26,7 @@ pub(super) fn scale_estimate(estimate: CircuitBenchEstimate, count: usize) -> Ci
 }
 
 pub(super) fn scale_summary(summary: CircuitBenchSummary, count: usize) -> CircuitBenchSummary {
-    let total_time = summary.total_time * BigUint::from(count);
-    let max_parallelism = summary.max_parallelism * BigUint::from(count);
-    let scaled = CircuitBenchSummary::from_nanos(total_time, summary.latency, max_parallelism);
-    #[cfg(feature = "gpu")]
-    {
-        scaled.with_peak_vram(summary.peak_vram)
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        scaled
-    }
+    scale_independent_summary(summary, count)
 }
 
 pub(super) fn repeat_sequential_summary(

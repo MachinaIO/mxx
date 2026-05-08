@@ -11,6 +11,10 @@ use crate::{
         NaiveBGGPublicKeyVecSampler,
     },
     circuit::{Evaluable, PolyCircuit, evaluable::PolyVec, gate::GateId},
+    decoder::{
+        mask_circuit::mask_plaintext_moduli_from_full_modulus,
+        prg::{expand_debug_reused_mask_wires, generated_mask_output_bits},
+    },
     func_enc::FuncEnc,
     gadgets::{
         arith::{
@@ -24,14 +28,12 @@ use crate::{
                 sample_public_key,
             },
         },
-        fhe_prg::goldreich::GoldreichFhePrg,
+        fhe_prg::goldreich::{GoldreichFhePrg, decrypt_bit_decomposed_scalar_outputs},
     },
     lookup::{PltEvaluator, PublicLut},
     matrix::PolyMatrix,
     noise_refresh::{
-        NoiseRefresherNaiveVec,
-        circuit_decrypt::{decrypt_bit_decomposed_scalar, mask_plaintext_moduli_from_full_modulus},
-        debug_sample_prg_encoding_wires, debug_sample_prg_plaintext_wires,
+        NoiseRefresherNaiveVec, debug_sample_prg_encoding_wires, debug_sample_prg_plaintext_wires,
         debug_sample_prg_public_key_wires,
     },
     poly::{
@@ -483,7 +485,7 @@ where
 
         let mask_output_bits = params.prf_mask_output_coeff_bits();
         let generated_mask_output_bits =
-            if params.debug_reuse_single_prg_sample() { 1 } else { mask_output_bits };
+            generated_mask_output_bits(mask_output_bits, params.debug_reuse_single_prg_sample());
         debug!(
             mask_output_bits,
             generated_mask_output_bits,
@@ -533,18 +535,12 @@ where
         let mut mask_inputs = Vec::with_capacity(1 + mask_output_wires.len());
         mask_inputs
             .push(NaiveBGGPublicKeyVec::new(&params.poly_params, vec![decryption_key.key(0)]));
-        if params.debug_reuse_single_prg_sample() {
-            assert_eq!(
-                mask_output_wires.len(),
-                wire_count,
-                "debug PRF mask reuse expects one generated Ring-GSW ciphertext"
-            );
-            for _ in 0..mask_output_bits {
-                mask_inputs.extend(mask_output_wires.iter().cloned());
-            }
-        } else {
-            mask_inputs.extend(mask_output_wires);
-        };
+        mask_inputs.extend(expand_debug_reused_mask_wires(
+            mask_output_wires,
+            mask_output_bits,
+            wire_count,
+            params.debug_reuse_single_prg_sample(),
+        ));
         let mask_circuit = build_prf_mask_circuit(params);
         debug!(
             input_count = mask_inputs.len(),
@@ -722,7 +718,7 @@ where
 
         let mask_output_bits = params.prf_mask_output_coeff_bits();
         let generated_mask_output_bits =
-            if params.debug_reuse_single_prg_sample() { 1 } else { mask_output_bits };
+            generated_mask_output_bits(mask_output_bits, params.debug_reuse_single_prg_sample());
         let mask_output_wires = if params.debug_reuse_single_prg_sample() {
             let plaintext_wires = debug_sample_prg_plaintext_wires::<M::P>(
                 &params.poly_params,
@@ -773,18 +769,12 @@ where
         let mut mask_inputs = Vec::with_capacity(1 + mask_output_wires.len());
         mask_inputs
             .push(NaiveBGGEncodingVec::new(&params.poly_params, vec![decryption_key.encoding(0)]));
-        if params.debug_reuse_single_prg_sample() {
-            assert_eq!(
-                mask_output_wires.len(),
-                wire_count,
-                "debug PRF mask reuse expects one generated Ring-GSW ciphertext"
-            );
-            for _ in 0..mask_output_bits {
-                mask_inputs.extend(mask_output_wires.iter().cloned());
-            }
-        } else {
-            mask_inputs.extend(mask_output_wires);
-        }
+        mask_inputs.extend(expand_debug_reused_mask_wires(
+            mask_output_wires,
+            mask_output_bits,
+            wire_count,
+            params.debug_reuse_single_prg_sample(),
+        ));
         let mask_circuit = build_prf_mask_circuit(params);
         let evaluated = mask_circuit.eval(
             &params.poly_params,
@@ -1369,7 +1359,7 @@ where
             )
         })
         .collect::<Vec<_>>();
-    let decrypted = decrypt_bit_decomposed_scalar::<M::P, NestedRnsPoly<M::P>, M>(
+    let decrypted = decrypt_bit_decomposed_scalar_outputs::<M::P, NestedRnsPoly<M::P>, M>(
         &mut circuit,
         &encrypted_bits,
         fhe_decryption_key,

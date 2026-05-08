@@ -49,6 +49,7 @@ pub(super) struct DiamondIOBenchShape {
     pub(super) online_level_state_counts: Vec<usize>,
     pub(super) transition_chunk_col_lens: Vec<usize>,
     pub(super) output_preimage_bytes: usize,
+    pub(super) final_decoder_preimage_bytes: usize,
     pub(super) lookup_bridge_cols: usize,
     pub(super) lookup_bridge_preimage_bytes: usize,
     pub(super) ring_gsw_wire_count: usize,
@@ -163,6 +164,8 @@ impl DiamondIOBenchShape {
             .expect("DiamondIO transition preimage byte count overflow");
         let output_preimage_bytes =
             matrix_compact_bytes::<M>(params, state_col_size, modulus_digits, modulus_bits);
+        let final_decoder_preimage_bytes =
+            matrix_compact_bytes::<M>(params, state_col_size, 1, modulus_bits);
         let lookup_cols = diamond
             .enc_lookup_base_matrix
             .as_ref()
@@ -213,6 +216,7 @@ impl DiamondIOBenchShape {
             online_level_state_counts,
             transition_chunk_col_lens,
             output_preimage_bytes,
+            final_decoder_preimage_bytes,
             lookup_bridge_cols: lookup_cols,
             lookup_bridge_preimage_bytes,
             ring_gsw_wire_count,
@@ -407,22 +411,30 @@ impl DiamondIOBenchShape {
     }
 
     pub(super) fn final_projection_standard_preimage_count(&self) -> usize {
-        // All final projection preimages except the lookup bridge have the ordinary
-        // `modulus_digits` column count: one, k, each explicit input bit, and the final decoder
-        // preimages. The lookup bridge is excluded because its column count is determined by the
-        // lookup evaluator matrix and may be wider.
+        // Ordinary final projection preimages have `modulus_digits` columns: one, k, and each
+        // explicit input bit. The lookup bridge has lookup-specific width, and final decoder
+        // preimages have a one-column target induced by the identity selector.
         self.final_projection_preimage_count()
             .checked_sub(1)
             .expect("DiamondIO final projection count must include the lookup bridge")
+            .checked_sub(self.final_decoder_count())
+            .expect("DiamondIO final projection count must include final decoder preimages")
     }
 
     pub(super) fn final_projection_preimage_bytes(&self) -> usize {
         self.lookup_bridge_preimage_bytes
             .checked_add(
                 self.output_preimage_bytes
-                    .checked_mul(self.final_projection_preimage_count() - 1)
+                    .checked_mul(self.final_projection_standard_preimage_count())
                     .expect("DiamondIO output preimage byte count overflow"),
             )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.final_decoder_preimage_bytes
+                        .checked_mul(self.final_decoder_count())
+                        .expect("DiamondIO final decoder preimage byte count overflow"),
+                )
+            })
             .expect("DiamondIO final projection byte count overflow")
     }
 

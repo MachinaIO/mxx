@@ -21,16 +21,22 @@ use crate::{
     bench_estimator::{
         BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
         benchmark_gate_operation, estimate_public_key_circuit_bench_with_aux,
+        scale_independent_estimate,
     },
     bgg::{
         naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
         sampler::BGGPublicKeySampler,
     },
     circuit::PolyCircuit,
-    gadgets::{
-        arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
-        fhe::ring_gsw::RingGswCiphertext,
+    decoder::{
+        bench::{
+            bit_decomposed_mask_reduce_add_count, bit_decomposed_polynomial_mask_reduction_summary,
+            bit_decomposed_refresh_material_counts, bit_decomposed_refresh_material_summary,
+            scale_bit_decomposed_polynomial_mask_decrypt_contributions,
+        },
+        mask_circuit::append_one_ciphertext_bit_decrypt,
     },
+    gadgets::arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
     matrix::PolyMatrix,
     noise_refresh::naive_vec::NoiseRefreshBenchEstimateParts,
     poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
@@ -99,6 +105,8 @@ pub struct DiamondIOBenchEstimator<'a, PKBE, EncBE, NBE> {
     pub trapdoor_preimage_extend: CircuitBenchEstimate,
     /// Cost model for one ordinary final-output `preimage_extend` call.
     pub final_output_preimage_extend: CircuitBenchEstimate,
+    /// Cost model for one final decoder `preimage_extend` call with a one-column target.
+    pub final_decoder_preimage_extend: CircuitBenchEstimate,
     /// Cost model for the lookup-table bridge `preimage_extend` call.
     pub lookup_bridge_preimage_extend: CircuitBenchEstimate,
     /// Cost model for hashing one full Diamond W block.
@@ -142,6 +150,7 @@ where
             trapdoor_checkpoint: units.trapdoor_checkpoint,
             trapdoor_preimage_extend: units.trapdoor_preimage_extend,
             final_output_preimage_extend: units.final_output_preimage_extend,
+            final_decoder_preimage_extend: units.final_decoder_preimage_extend,
             lookup_bridge_preimage_extend: units.lookup_bridge_preimage_extend,
             full_w_block_hash_sample: units.full_w_block_hash_sample,
             transition_w_chunk_hash_sample: units.transition_w_chunk_hash_sample,
@@ -221,10 +230,8 @@ where
                 );
                 preimage.to_compact_bytes()
             });
-        let trapdoor_preimage_extend = scale_estimate_total_parallelism(
-            trapdoor_preimage_extend_one_col,
-            transition_chunk_len,
-        );
+        let trapdoor_preimage_extend =
+            scale_independent_estimate(trapdoor_preimage_extend_one_col, transition_chunk_len);
 
         let final_output_preimage_extend_one_col =
             bench_estimate_named("final_output_preimage_extend_one_col", iterations, || {
@@ -237,8 +244,11 @@ where
                 );
                 preimage.to_compact_bytes()
             });
-        let final_output_preimage_extend =
-            scale_estimate_total_parallelism(final_output_preimage_extend_one_col, gadget_col_size);
+        let final_output_preimage_extend = scale_independent_estimate(
+            final_output_preimage_extend_one_col.clone(),
+            gadget_col_size,
+        );
+        let final_decoder_preimage_extend = final_output_preimage_extend_one_col;
 
         let lookup_bridge_preimage_extend_one_col =
             bench_estimate_named("lookup_bridge_preimage_extend_one_col", iterations, || {
@@ -251,7 +261,7 @@ where
                 );
                 preimage.to_compact_bytes()
             });
-        let lookup_bridge_preimage_extend = scale_estimate_total_parallelism(
+        let lookup_bridge_preimage_extend = scale_independent_estimate(
             lookup_bridge_preimage_extend_one_col,
             shape.lookup_bridge_cols,
         );
@@ -324,7 +334,7 @@ where
                     );
                     black_box(public_key_col)
                 });
-            let ring_gsw_public_key_sample = scale_estimate_total_parallelism(
+            let ring_gsw_public_key_sample = scale_independent_estimate(
                 ring_gsw_public_key_sample_one_col,
                 diamond.ring_gsw_width,
             );
@@ -365,11 +375,11 @@ where
                     black_box((top, bottom))
                 },
             );
-            let ring_gsw_encrypt_bit_one_ciphertext_col = scale_estimate_total_parallelism(
+            let ring_gsw_encrypt_bit_one_ciphertext_col = scale_independent_estimate(
                 ring_gsw_encrypt_bit_key_col_contribution,
                 diamond.ring_gsw_width,
             );
-            let ring_gsw_encrypt_bit = scale_estimate_total_parallelism(
+            let ring_gsw_encrypt_bit = scale_independent_estimate(
                 ring_gsw_encrypt_bit_one_ciphertext_col,
                 diamond.ring_gsw_width,
             );
@@ -423,6 +433,7 @@ where
             ?trapdoor_checkpoint,
             ?trapdoor_preimage_extend,
             ?final_output_preimage_extend,
+            ?final_decoder_preimage_extend,
             ?lookup_bridge_preimage_extend,
             ?full_w_block_hash_sample,
             ?transition_w_chunk_hash_sample,
@@ -436,6 +447,7 @@ where
             trapdoor_checkpoint,
             trapdoor_preimage_extend,
             final_output_preimage_extend,
+            final_decoder_preimage_extend,
             lookup_bridge_preimage_extend,
             full_w_block_hash_sample,
             transition_w_chunk_hash_sample,
@@ -567,6 +579,7 @@ where
             );
 
         let final_projection_standard_preimages = shape.final_projection_standard_preimage_count();
+        let final_projection_decoder_preimages = shape.final_decoder_count();
         let lookup_bridge_hash_sampling = estimate_summary(self.full_w_block_hash_sample.clone());
         let lookup_bridge_preimage = estimate_summary(self.lookup_bridge_preimage_extend.clone());
         let lookup_bridge_work = sequential_summaries(&[
@@ -575,14 +588,22 @@ where
         ]);
         let final_projection_hash_sampling = scale_estimate(
             self.full_w_block_hash_sample.clone(),
-            final_projection_standard_preimages,
+            final_projection_standard_preimages
+                .checked_add(final_projection_decoder_preimages)
+                .expect("DiamondIO final projection hash count overflow"),
         );
         let final_projection_target_building =
             shape.estimate_final_projection_target_building(self.native_estimator);
-        let final_projection_preimages = scale_estimate(
-            self.final_output_preimage_extend.clone(),
-            final_projection_standard_preimages,
-        );
+        let final_projection_preimages = parallel_summaries(&[
+            scale_estimate(
+                self.final_output_preimage_extend.clone(),
+                final_projection_standard_preimages,
+            ),
+            scale_estimate(
+                self.final_decoder_preimage_extend.clone(),
+                final_projection_decoder_preimages,
+            ),
+        ]);
         let final_projection_inputs = parallel_summaries(&[
             final_projection_hash_sampling.clone(),
             final_projection_target_building.clone(),
@@ -632,6 +653,7 @@ where
             ?prf_public_key_path,
             ?function_public_key_eval,
             final_projection_standard_preimages,
+            final_projection_decoder_preimages,
             ?lookup_bridge_hash_sampling,
             ?lookup_bridge_preimage,
             ?lookup_bridge_work,
@@ -711,8 +733,7 @@ where
         // Corresponds to `decoder_outputs`: one `states[0] * decoder_preimage` per final
         // secret-dependent output slot.
         let decoder_projection = scale_summary(
-            self.native_estimator
-                .estimate_vector_matrix_product(shape.state_col_size, shape.modulus_digits),
+            self.native_estimator.estimate_vector_matrix_product(shape.state_col_size, 1),
             shape.final_decoder_count(),
         );
 
@@ -727,7 +748,7 @@ where
             estimate_summary(self.native_estimator.estimate_vector_sub(DIAMOND_SECRET_SIZE)),
             estimate_summary(self.native_estimator.estimate_vector_add(DIAMOND_SECRET_SIZE)),
         ]);
-        let final_decode = scale_summary(final_decode_unit.clone(), diamond.output_size);
+        let final_decode = scale_summary(final_decode_unit.clone(), shape.final_decoder_count());
 
         let total = sequential_summaries(&[
             input_injection.clone(),
@@ -1012,17 +1033,45 @@ where
         // ciphertext-bit decrypt contribution and scale the total work by the number of
         // contributions. This keeps the H200 run from materializing a giant representative GPU
         // public-key matrix while preserving the enough-GPUs latency model.
-        let final_mask_decrypt_contribution_count = shape
-            .ring_dim
-            .checked_mul(diamond.prf_mask_output_coeff_bits)
-            .and_then(|count| count.checked_mul(diamond.output_size))
-            .expect("DiamondIO final-mask decrypt contribution count overflow");
-        let final_mask_decrypt =
-            scale_summary(final_mask_decrypt_unit.clone(), final_mask_decrypt_contribution_count);
+        let (final_mask_decrypt_contributions, final_mask_decrypt_contribution_count) =
+            scale_bit_decomposed_polynomial_mask_decrypt_contributions(
+                final_mask_decrypt_unit.clone(),
+                shape.ring_dim,
+                diamond.prf_mask_output_coeff_bits,
+                diamond.output_size,
+            );
+        let final_mask_reduce_add_count =
+            bit_decomposed_mask_reduce_add_count(diamond.prf_mask_output_coeff_bits);
+        let (add, sub) = match mode {
+            PrfBenchMode::PublicKeyPreprocess => {
+                (self.public_key_estimator.estimate_add(), self.public_key_estimator.estimate_sub())
+            }
+            PrfBenchMode::EncodingOnline => {
+                (self.encoding_estimator.estimate_add(), self.encoding_estimator.estimate_sub())
+            }
+        };
+        let final_mask_reduction = bit_decomposed_polynomial_mask_reduction_summary(
+            add,
+            None,
+            Some(sub),
+            diamond.prf_mask_output_coeff_bits,
+            // `build_prf_mask_circuit` consumes `ring_dim * coeff_bits` encrypted bits and reduces
+            // them into one polynomial mask. `output_size` is therefore the number of independent
+            // polynomial masks; multiplying by `ring_dim` here would double-count coefficient
+            // work.
+            diamond.output_size,
+        );
+        let final_mask_decrypt = sequential_summaries(&[
+            final_mask_decrypt_contributions.clone(),
+            final_mask_reduction.clone(),
+        ]);
         info!(
             ?mode,
             final_mask_decrypt_contribution_count,
+            final_mask_reduce_add_count,
             ?final_mask_decrypt_unit,
+            ?final_mask_decrypt_contributions,
+            ?final_mask_reduction,
             ?final_mask_decrypt,
             "estimated DiamondIO PRF benchmark final-mask decrypt"
         );
@@ -1150,39 +1199,25 @@ where
         PKBE: PublicKeyAuxBenchEstimator<M::P>,
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
     {
-        let per_slot_digit_ciphertexts = shape
-            .ring_dim
-            .checked_mul(
-                1usize
-                    .checked_add(
-                        shape
-                            .crt_depth
-                            .checked_mul(diamond.noise_refresh_v_bits)
-                            .expect("DiamondIO noise-refresh mask ciphertext count overflow"),
-                    )
-                    .expect("DiamondIO noise-refresh material ciphertext count overflow"),
-            )
-            .expect("DiamondIO noise-refresh per-slot material count overflow");
-        let material_ciphertext_count = shape
-            .ring_dim
-            .checked_mul(shape.modulus_digits)
-            .and_then(|count| count.checked_mul(per_slot_digit_ciphertexts))
-            .expect("DiamondIO noise-refresh material ciphertext count overflow");
-        let material_merge_count = shape
-            .ring_dim
-            .checked_mul(shape.crt_depth)
-            .and_then(|count| count.checked_mul(shape.modulus_digits))
-            .expect("DiamondIO noise-refresh material merge count overflow");
-
+        let material_counts = bit_decomposed_refresh_material_counts(
+            shape.ring_dim,
+            shape.modulus_digits,
+            shape.crt_depth,
+            diamond.noise_refresh_v_bits,
+            false,
+        );
         let add = match mode {
             PrfBenchMode::PublicKeyPreprocess => self.public_key_estimator.estimate_add(),
             PrfBenchMode::EncodingOnline => self.encoding_estimator.estimate_add(),
         };
-        let material = sequential_summaries(&[
-            scale_summary(prg_unit.clone(), material_ciphertext_count),
-            scale_summary(decrypt_contribution_unit.clone(), material_ciphertext_count),
-            scale_estimate(add.clone(), material_merge_count),
-        ]);
+        let material = bit_decomposed_refresh_material_summary(
+            prg_unit.clone(),
+            prg_unit.clone(),
+            decrypt_contribution_unit.clone(),
+            add.clone(),
+            material_counts,
+            diamond.noise_refresh_v_bits,
+        );
 
         let scalar_target = [BigUint::from(1u32)];
         let combine_task_count = shape
@@ -1245,8 +1280,10 @@ where
 
         info!(
             ?mode,
-            material_ciphertext_count,
-            material_merge_count,
+            ?material_counts,
+            material_prg_output_count = material_counts.total_prg_output_count(),
+            material_decrypt_contribution_count =
+                material_counts.total_decrypt_contribution_count(),
             combine_task_count,
             collapse_add_count,
             ?material,
@@ -1381,14 +1418,10 @@ where
 {
     let mut circuit = PolyCircuit::new();
     let ring_gsw_context = diamond.build_ring_gsw_circuit_context(&mut circuit);
-    let decryption_key = circuit.input(1).at(0).as_single_wire();
-    let encrypted_bit =
-        RingGswCiphertext::input(ring_gsw_context, Some(BigUint::from(1u64)), &mut circuit);
-    let decrypted = RingGswCiphertext::decrypt_batch::<M>(
-        &[&encrypted_bit],
-        decryption_key,
-        BigUint::from(2u64),
+    let decrypted = append_one_ciphertext_bit_decrypt::<M::P, NestedRnsPoly<M::P>, M>(
         &mut circuit,
+        ring_gsw_context,
+        BigUint::from(2u64),
     );
     circuit.output(vec![decrypted.secret_dependent, decrypted.public_bottom]);
     circuit
@@ -1405,6 +1438,7 @@ struct DiamondIOBenchUnitEstimates {
     trapdoor_checkpoint: CircuitBenchEstimate,
     trapdoor_preimage_extend: CircuitBenchEstimate,
     final_output_preimage_extend: CircuitBenchEstimate,
+    final_decoder_preimage_extend: CircuitBenchEstimate,
     lookup_bridge_preimage_extend: CircuitBenchEstimate,
     full_w_block_hash_sample: CircuitBenchEstimate,
     transition_w_chunk_hash_sample: CircuitBenchEstimate,
@@ -1504,25 +1538,6 @@ where
         "finished DiamondIO CPU-only benchmark unit cost"
     );
     estimate
-}
-
-fn scale_estimate_total_parallelism(
-    estimate: CircuitBenchEstimate,
-    column_count: usize,
-) -> CircuitBenchEstimate {
-    let scaled = CircuitBenchEstimate::from_nanos(
-        estimate.total_time.clone() * BigUint::from(column_count),
-        estimate.latency,
-    )
-    .with_max_parallelism(estimate.max_parallelism.clone() * BigUint::from(column_count));
-    #[cfg(feature = "gpu")]
-    {
-        scaled.with_peak_vram(estimate.peak_vram)
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        scaled
-    }
 }
 
 fn sample_native_ternary_secret<M, US>(

@@ -7,6 +7,14 @@ where
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
 {
+    pub(super) fn goldreich_prg_graph_seed(&self, round_idx: usize) -> [u8; 32] {
+        let mut hasher = Keccak256::new();
+        hasher.update(b"DiamondIOGoldreichPrfGraph/v1");
+        hasher.update(self.goldreich_graph_seed);
+        hasher.update(round_idx.to_le_bytes());
+        hasher.finalize().into()
+    }
+
     /// Build the debug circuit that decrypts private seed ciphertext inputs.
     ///
     /// The explicit iO input bits are PRF/selector inputs for the surrounding
@@ -48,6 +56,44 @@ where
             outputs.push(decrypted.public_bottom);
         }
         circuit.output(outputs);
+        circuit
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(super) fn build_debug_decryption_output_circuit(
+        &self,
+        output_idx: usize,
+    ) -> PolyCircuit<M::P>
+    where
+        M::P: 'static,
+    {
+        assert!(
+            output_idx < self.seed_bits,
+            "DiamondIO DebugDecryption output index must fit in the seed"
+        );
+        let mut circuit = PolyCircuit::new();
+        let nested_rns_context = Arc::new(NestedRnsPolyContext::setup(
+            &mut circuit,
+            &self.injector.params,
+            self.ring_gsw_context.p_moduli_bits,
+            self.ring_gsw_context.max_unreduced_muls,
+            self.ring_gsw_context.scale,
+            false,
+            self.ring_gsw_enable_levels,
+        ));
+        let ring_gsw_context = Arc::new(NestedRnsRingGswContext::<M::P>::from_arith_context(
+            &mut circuit,
+            &self.injector.params,
+            self.injector.params.ring_dimension() as usize,
+            nested_rns_context,
+            self.ring_gsw_enable_levels,
+            Some(self.ring_gsw_level_offset),
+        ));
+        let decryption_key = circuit.input(1).at(0).as_single_wire();
+        let ciphertext =
+            RingGswCiphertext::input(ring_gsw_context, Some(BigUint::from(1u64)), &mut circuit);
+        let decrypted = ciphertext.decrypt::<M>(decryption_key, BigUint::from(2u64), &mut circuit);
+        circuit.output(vec![decrypted.secret_dependent, decrypted.public_bottom]);
         circuit
     }
 
@@ -115,14 +161,38 @@ where
             conceptual_output_bits,
             range_start,
             range_len,
-            {
-                let mut hasher = Keccak256::new();
-                hasher.update(b"DiamondIOGoldreichPrfGraph/v1");
-                hasher.update(self.goldreich_graph_seed);
-                hasher.update(round_idx.to_le_bytes());
-                hasher.finalize().into()
-            },
+            self.goldreich_prg_graph_seed(round_idx),
         );
+        circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
+        circuit
+    }
+
+    pub(super) fn build_goldreich_prg_public_graph_circuit(
+        &self,
+        public_graph: GoldreichGraph,
+    ) -> PolyCircuit<M::P>
+    where
+        M::P: 'static,
+    {
+        assert!(self.seed_bits >= 5, "DiamondIO Goldreich PRF seed bit length must be at least 5");
+        assert_eq!(
+            public_graph.input_size, self.seed_bits,
+            "DiamondIO Goldreich public graph input size must match seed_bits"
+        );
+        let mut circuit = PolyCircuit::new();
+        let ring_gsw_context = self.build_ring_gsw_circuit_context(&mut circuit);
+        let seed_ciphertexts = (0..self.seed_bits)
+            .map(|_| {
+                RingGswCiphertext::input(
+                    ring_gsw_context.clone(),
+                    Some(BigUint::from(1u64)),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let goldreich =
+            GoldreichFhePrg::from_public_graph(&mut circuit, ring_gsw_context, public_graph);
+        let outputs = goldreich.evaluate_uniform(&seed_ciphertexts, &mut circuit);
         circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
         circuit
     }
@@ -166,14 +236,12 @@ where
         // secret-dependent branch is decoded as a BGG value; the public bottom
         // branch, including this centering constant, is added as plaintext
         // after decoder cancellation.
-        let midpoint = BigUint::from(1u64) << (self.prf_mask_output_coeff_bits - 1);
-        let midpoint_poly = M::P::from_biguints(
+        let centered_public_bottom = center_public_bottom(
+            &mut circuit,
             &self.injector.params,
-            &vec![midpoint; self.injector.params.ring_dimension() as usize],
+            decrypted.public_bottom,
+            self.prf_mask_output_coeff_bits,
         );
-        let midpoint_gate = circuit.const_poly(&midpoint_poly);
-        let centered_public_bottom =
-            circuit.sub_gate(decrypted.public_bottom, midpoint_gate).as_single_wire();
         circuit.output(vec![decrypted.secret_dependent, centered_public_bottom]);
         circuit
     }

@@ -9,6 +9,11 @@ use crate::{
         public_key::BggPublicKey,
     },
     circuit::{BatchedWire, PolyCircuit, evaluable::Evaluable},
+    decoder::{
+        bench::{bit_decomposed_refresh_material_counts, bit_decomposed_refresh_material_summary},
+        mask_circuit::build_one_ciphertext_bit_decrypt_circuit,
+        masked_high_bit::decode_centered_masked_matrix,
+    },
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPolyContext},
         fhe::{
@@ -21,9 +26,14 @@ use crate::{
     lookup::PltEvaluator,
     matrix::PolyMatrix,
     noise_refresh::{
-        NoiseRefresher, circuit_decrypt::build_refreshed_wire_digit_all_crt_decrypt,
+        NoiseRefresher,
+        circuit_decrypt::build_refreshed_wire_digit_all_crt_decrypt,
         circuit_merge::build_refreshed_wire_digit_all_crt_merge,
-        circuit_prg::build_goldreich_encrypted_seed_material_ranges,
+        circuit_prg::{
+            build_goldreich_encrypted_seed_error_material_range,
+            build_goldreich_encrypted_seed_mask_material_ranges,
+            build_goldreich_encrypted_seed_material_ranges,
+        },
     },
     poly::{
         Poly, PolyParams,
@@ -531,26 +541,61 @@ where
         let combine_task_count =
             num_slots.checked_mul(crt_depth).expect("noise-refresh combine task count overflow");
 
-        let material_circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
-            self.ring_gsw.clone(),
-            self.seed_bits,
-            self.v_bits,
-            self.graph_seed,
-            self.cbd_n,
-            num_slots,
-            self.debug_reuse_single_material,
-        );
-        let public_material_summary = estimate_public_key_circuit_bench_with_aux::<
-            NaiveBGGPublicKeyVec<M>,
-            PKBE,
-        >(
-            public_key_estimator, self.params(), &material_circuit
-        );
-
         let scalar_target = [BigUint::from(1u32)];
         let pk_matrix_mul = public_key_estimator.estimate_large_scalar_mul(&scalar_target);
         let pk_add = public_key_estimator.estimate_add();
         let pk_sub = public_key_estimator.estimate_sub();
+        let material_seed_bits = if self.debug_reuse_single_material { 5 } else { self.seed_bits };
+        let material_counts = bit_decomposed_refresh_material_counts(
+            num_slots,
+            log_base_q,
+            crt_depth,
+            self.v_bits,
+            self.debug_reuse_single_material,
+        );
+        let error_prg_circuit = build_goldreich_encrypted_seed_error_material_range::<M::P, A>(
+            self.ring_gsw.clone(),
+            material_seed_bits,
+            self.graph_seed,
+            self.cbd_n,
+            0,
+            0,
+            1,
+        );
+        let mask_prg_circuit = build_goldreich_encrypted_seed_mask_material_ranges::<M::P, A>(
+            self.ring_gsw.clone(),
+            material_seed_bits,
+            self.v_bits,
+            self.graph_seed,
+            0,
+            &[(0, 1)],
+        );
+        let decrypt_contribution_circuit = build_one_ciphertext_bit_decrypt_circuit::<M::P, A, M>(
+            self.ring_gsw.clone(),
+            BigUint::from(2u64),
+        );
+        let error_prg_unit = estimate_public_key_circuit_bench_with_aux::<
+            NaiveBGGPublicKeyVec<M>,
+            PKBE,
+        >(public_key_estimator, self.params(), &error_prg_circuit);
+        let mask_prg_unit = estimate_public_key_circuit_bench_with_aux::<
+            NaiveBGGPublicKeyVec<M>,
+            PKBE,
+        >(public_key_estimator, self.params(), &mask_prg_circuit);
+        let decrypt_contribution_unit =
+            estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+                public_key_estimator,
+                self.params(),
+                &decrypt_contribution_circuit,
+            );
+        let public_material_summary = bit_decomposed_refresh_material_summary(
+            error_prg_unit.clone(),
+            mask_prg_unit.clone(),
+            decrypt_contribution_unit.clone(),
+            pk_add.clone(),
+            material_counts,
+            self.v_bits,
+        );
         let a_prime_sampling_unit = measured_a_prime_hash_sampling_unit_summary::<M, HS>(
             self.params(),
             self.hash_key,
@@ -594,8 +639,12 @@ where
             crt_depth,
             log_base_q,
             combine_task_count,
+            ?material_counts,
             ?a_prime_sampling_unit,
             ?a_prime_sampling_stage,
+            ?error_prg_unit,
+            ?mask_prg_unit,
+            ?decrypt_contribution_unit,
             ?public_material_summary,
             ?preprocess_combine_unit,
             ?preprocess_combine_stage,
@@ -645,21 +694,51 @@ where
         let combine_task_count =
             num_slots.checked_mul(crt_depth).expect("noise-refresh combine task count overflow");
 
-        let material_circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
-            self.ring_gsw.clone(),
-            self.seed_bits,
-            self.v_bits,
-            self.graph_seed,
-            self.cbd_n,
-            num_slots,
-            self.debug_reuse_single_material,
-        );
-        let online_material_summary = encoding_estimator.estimate_circuit_bench(&material_circuit);
-
         let scalar_target = [BigUint::from(1u32)];
         let enc_matrix_mul = encoding_estimator.estimate_large_scalar_mul(&scalar_target);
         let enc_add = encoding_estimator.estimate_add();
         let enc_sub = encoding_estimator.estimate_sub();
+        let material_seed_bits = if self.debug_reuse_single_material { 5 } else { self.seed_bits };
+        let material_counts = bit_decomposed_refresh_material_counts(
+            num_slots,
+            log_base_q,
+            crt_depth,
+            self.v_bits,
+            self.debug_reuse_single_material,
+        );
+        let error_prg_circuit = build_goldreich_encrypted_seed_error_material_range::<M::P, A>(
+            self.ring_gsw.clone(),
+            material_seed_bits,
+            self.graph_seed,
+            self.cbd_n,
+            0,
+            0,
+            1,
+        );
+        let mask_prg_circuit = build_goldreich_encrypted_seed_mask_material_ranges::<M::P, A>(
+            self.ring_gsw.clone(),
+            material_seed_bits,
+            self.v_bits,
+            self.graph_seed,
+            0,
+            &[(0, 1)],
+        );
+        let decrypt_contribution_circuit = build_one_ciphertext_bit_decrypt_circuit::<M::P, A, M>(
+            self.ring_gsw.clone(),
+            BigUint::from(2u64),
+        );
+        let error_prg_unit = encoding_estimator.estimate_circuit_bench(&error_prg_circuit);
+        let mask_prg_unit = encoding_estimator.estimate_circuit_bench(&mask_prg_circuit);
+        let decrypt_contribution_unit =
+            encoding_estimator.estimate_circuit_bench(&decrypt_contribution_circuit);
+        let online_material_summary = bit_decomposed_refresh_material_summary(
+            error_prg_unit.clone(),
+            mask_prg_unit.clone(),
+            decrypt_contribution_unit.clone(),
+            enc_add.clone(),
+            material_counts,
+            self.v_bits,
+        );
         let a_prime_sampling_unit = measured_a_prime_hash_sampling_unit_summary::<M, HS>(
             self.params(),
             self.hash_key,
@@ -713,8 +792,12 @@ where
             log_base_q,
             combine_task_count,
             crt_recompose_task_count = num_slots,
+            ?material_counts,
             ?a_prime_sampling_unit,
             ?a_prime_sampling_stage,
+            ?error_prg_unit,
+            ?mask_prg_unit,
+            ?decrypt_contribution_unit,
             ?online_material_summary,
             ?online_combine_unit,
             ?online_combine_stage,
@@ -1989,32 +2072,14 @@ where
         crt_values.iter().all(|value| value.row_size() == 1 && value.col_size() == output_cols),
         "CRT recomposition level vectors must be one-row matrices with a consistent column count"
     );
-    let q: Arc<BigUint> = params.modulus().into();
-    let half_q = q.as_ref() / BigUint::from(2u64);
     let reconst_coeffs = params.reconst_coeffs();
     let rows = (0..num_slots)
         .map(|slot_idx| {
             let mut row = M::zero(params, 1, output_cols);
             for crt_idx in 0..crt_depth {
                 let level = &crt_values[slot_idx * crt_depth + crt_idx];
-                let (level_rows, level_cols) = level.size();
                 let q_i_big = BigUint::from(q_moduli[crt_idx]);
-                let mut rounded = M::zero(params, level_rows, level_cols);
-                for level_row in 0..level_rows {
-                    for level_col in 0..level_cols {
-                        let rounded_coeffs = level
-                            .entry(level_row, level_col)
-                            .coeffs_biguints()
-                            .into_iter()
-                            .map(|coeff| ((&q_i_big * coeff + &half_q) / q.as_ref()) % &q_i_big)
-                            .collect::<Vec<_>>();
-                        rounded.set_entry(
-                            level_row,
-                            level_col,
-                            M::P::from_biguints(params, &rounded_coeffs),
-                        );
-                    }
-                }
+                let rounded = decode_centered_masked_matrix(params, level, &q_i_big);
                 row.add_in_place(
                     &(rounded * constant_poly::<M>(params, reconst_coeffs[crt_idx].clone())),
                 );

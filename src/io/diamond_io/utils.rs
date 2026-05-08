@@ -271,15 +271,13 @@ where
     /// Persist a DiamondIO-owned matrix artifact next to the injector
     /// preprocessing directory.
     pub(super) fn write_io_matrix(dir_path: &Path, id: &str, matrix: &M) {
-        fs::write(Self::io_matrix_path(dir_path, id), matrix.to_compact_bytes())
-            .unwrap_or_else(|err| panic!("DiamondIO failed to write matrix {id}: {err}"));
+        DirectoryDecoderArtifacts::new(dir_path, "diamond_io").write_matrix(id, matrix);
     }
 
     /// Load a DiamondIO-owned matrix artifact produced by `obfuscation`.
     pub(super) fn read_io_matrix(&self, dir_path: &Path, id: &str) -> M {
-        let bytes = fs::read(Self::io_matrix_path(dir_path, id))
-            .unwrap_or_else(|err| panic!("DiamondIO failed to read matrix {id}: {err}"));
-        M::from_compact_bytes(&self.injector.params, &bytes)
+        DirectoryDecoderArtifacts::new(dir_path, "diamond_io")
+            .read_matrix(&self.injector.params, id)
     }
 
     /// Persist every slot of a `NaiveBGGPublicKeyVec` as individual DiamondIO
@@ -731,6 +729,277 @@ where
     /// encodings, one per function output. The caller adds each slot of the
     /// matching mask to the corresponding function output slot before
     /// canceling against the combined decoder.
+    #[cfg_attr(test, allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn compute_prf_mask_seed_encoding(
+        &self,
+        dir_path: &Path,
+        states: &[M],
+        one_vec: &NaiveBGGEncodingVec<M>,
+        k_vec: &NaiveBGGEncodingVec<M>,
+        input_digit_vecs: &[NaiveBGGEncodingVec<M>],
+        enc_seed_wires: Vec<NaiveBGGEncodingVec<M>>,
+        debug_prg_ciphertexts: &[NativeRingGswCiphertext<M::P>],
+        enc_lookup_evaluator: &ENCPE,
+        enc_slot_transfer_evaluator: &ENCST,
+    ) -> (Vec<NaiveBGGEncodingVec<M>>, usize, usize)
+    where
+        M: Send + Sync + 'static,
+        M::P: 'static,
+        ENCPE: PltEvaluator<NaiveBGGEncodingVec<M>>,
+        ENCST: SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
+    {
+        assert!(
+            self.prf_mask_output_coeff_bits > 0,
+            "DiamondIO requires a positive PRF mask output coefficient count"
+        );
+        assert_eq!(
+            input_digit_vecs.len(),
+            self.input_size,
+            "DiamondIO PRF input encoding count must match input_size"
+        );
+        assert!(self.seed_bits > 0, "DiamondIO PRF requires at least one seed bit");
+        assert_eq!(
+            enc_seed_wires.len() % self.seed_bits,
+            0,
+            "DiamondIO encrypted seed wire count must be divisible by seed_bits"
+        );
+        let wire_count = enc_seed_wires.len() / self.seed_bits;
+        let params = &self.injector.params;
+        let (_, _, crt_depth) = params.to_crt();
+        let mut refresh_context_circuit = PolyCircuit::new();
+        let noise_refresher = NoiseRefresherNaiveVec::<M, NestedRnsPoly<M::P>, HS>::new(
+            self.build_ring_gsw_circuit_context(&mut refresh_context_circuit),
+            self.seed_bits,
+            self.noise_refresh_v_bits,
+            self.goldreich_graph_seed,
+            self.noise_refresh_cbd_n,
+            self.noise_refresh_hash_key,
+        );
+        let mut seed_wires = enc_seed_wires;
+        let mut debug_prg_ciphertext_cursor = 0usize;
+        info!(
+            input_size = self.input_size,
+            seed_bits = self.seed_bits,
+            wire_count,
+            slot_count = one_vec.num_slots(),
+            debug_prg = self.debug_encrypt_random_prg_wires(),
+            "DiamondIO PRF encoding path started"
+        );
+        for (round_idx, selector) in input_digit_vecs.iter().enumerate() {
+            let round_started = Instant::now();
+            let full_half_wire_count = self
+                .seed_bits
+                .checked_mul(wire_count)
+                .expect("DiamondIO PRF half wire count overflow");
+            debug!(
+                round_idx,
+                seed_wire_count = seed_wires.len(),
+                full_half_wire_count,
+                "DiamondIO PRF encoding round sampling PRG outputs"
+            );
+            let prg_started = Instant::now();
+            let prg_outputs = if self.debug_encrypt_random_prg_wires() {
+                self.read_debug_prg_encoding_wires(
+                    one_vec,
+                    debug_prg_ciphertexts,
+                    &mut debug_prg_ciphertext_cursor,
+                    2 * self.seed_bits,
+                )
+            } else {
+                self.build_goldreich_prg_range_circuit(
+                    round_idx,
+                    2 * self.seed_bits,
+                    0,
+                    2 * self.seed_bits,
+                )
+                .eval(
+                    &self.injector.params,
+                    one_vec.clone(),
+                    seed_wires.clone(),
+                    Some(enc_lookup_evaluator),
+                    Some(
+                        enc_slot_transfer_evaluator
+                            as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
+                    ),
+                    None,
+                )
+            };
+            debug!(
+                round_idx,
+                prg_output_count = prg_outputs.len(),
+                elapsed_ms = prg_started.elapsed().as_millis(),
+                "DiamondIO PRF encoding round PRG outputs ready"
+            );
+            assert_eq!(
+                prg_outputs.len(),
+                2 * full_half_wire_count,
+                "DiamondIO PRF eval round PRG output count mismatch"
+            );
+            let selected_half_wires = (0..full_half_wire_count)
+                .map(|wire_idx| {
+                    let low = prg_outputs[wire_idx].clone();
+                    let high = prg_outputs[wire_idx + full_half_wire_count].clone();
+                    low.clone() + &(selector.clone() * &(high - &low))
+                })
+                .collect::<Vec<_>>();
+            debug!(
+                round_idx,
+                selected_half_wire_count = selected_half_wires.len(),
+                "DiamondIO PRF encoding round selected PRG half"
+            );
+            let refresh_ids = (0..selected_half_wires.len())
+                .map(|wire_idx| {
+                    let mut id = Vec::with_capacity(32);
+                    id.extend_from_slice(b"DiamondIOPrfRefresh/v1");
+                    id.extend_from_slice(&round_idx.to_le_bytes());
+                    id.extend_from_slice(&wire_idx.to_le_bytes());
+                    id
+                })
+                .collect::<Vec<_>>();
+            let decoder_started = Instant::now();
+            let final_state = states[0].clone();
+            let params_for_decoders = params;
+            let next_seed_wires = noise_refresher.online_eval_many_with_decoder_factory(
+                &refresh_ids,
+                one_vec,
+                &selected_half_wires,
+                &seed_wires,
+                k_vec,
+                |wire_idx| {
+                    (0..one_vec.num_slots())
+                        .flat_map(|slot_idx| {
+                            let final_state = final_state.clone();
+                            (0..crt_depth).map(move |crt_idx| {
+                                let id = format!(
+                                    "prf_round_{round_idx}_wire_{wire_idx}_refresh_preimage_slot_{slot_idx}_crt_{crt_idx}"
+                                );
+                                let bytes = fs::read(Self::io_matrix_path(dir_path, &id))
+                                    .unwrap_or_else(|err| {
+                                        panic!("DiamondIO failed to read matrix {id}: {err}")
+                                    });
+                                let preimage = M::from_compact_bytes(params_for_decoders, &bytes);
+                                final_state.clone() * &preimage
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                },
+                enc_lookup_evaluator,
+                enc_slot_transfer_evaluator,
+            );
+            debug!(
+                round_idx,
+                next_seed_wire_count = next_seed_wires.len(),
+                elapsed_ms = decoder_started.elapsed().as_millis(),
+                "DiamondIO PRF encoding round chunked refresh decoders evaluated"
+            );
+            seed_wires = next_seed_wires;
+            info!(
+                round_idx,
+                next_seed_wire_count = seed_wires.len(),
+                refresh_elapsed_ms = decoder_started.elapsed().as_millis(),
+                elapsed_ms = round_started.elapsed().as_millis(),
+                "DiamondIO PRF encoding round finished"
+            );
+        }
+        (seed_wires, wire_count, debug_prg_ciphertext_cursor)
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn compute_prf_mask_encoding_output_from_seed(
+        &self,
+        output_idx: usize,
+        one_vec: &NaiveBGGEncodingVec<M>,
+        k_vec: &NaiveBGGEncodingVec<M>,
+        seed_wires: &[NaiveBGGEncodingVec<M>],
+        wire_count: usize,
+        full_domain_graph_generator: &mut Option<GoldreichFullDomainRangeGenerator>,
+        debug_prg_ciphertexts: &[NativeRingGswCiphertext<M::P>],
+        debug_prg_ciphertext_cursor: &mut usize,
+        enc_lookup_evaluator: &ENCPE,
+        enc_slot_transfer_evaluator: &ENCST,
+    ) -> (NaiveBGGEncodingVec<M>, NaiveBGGEncodingVec<M>)
+    where
+        M: Send + Sync + 'static,
+        M::P: 'static,
+        ENCPE: PltEvaluator<NaiveBGGEncodingVec<M>>,
+        ENCST: SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
+    {
+        let ring_dim = self.injector.params.ring_dimension() as usize;
+        let output_bit_count = ring_dim
+            .checked_mul(self.prf_mask_output_coeff_bits)
+            .expect("DiamondIO PRF mask bits-per-output overflow");
+        assert!(output_idx < self.output_size, "DiamondIO PRF mask output index out of range");
+        let range_start = output_idx
+            .checked_mul(output_bit_count)
+            .expect("DiamondIO PRF mask output range overflow");
+        let output_started = Instant::now();
+        let mask_output_wires = if self.debug_encrypt_random_prg_wires() {
+            self.read_debug_prg_encoding_wires(
+                one_vec,
+                debug_prg_ciphertexts,
+                debug_prg_ciphertext_cursor,
+                output_bit_count,
+            )
+        } else {
+            let public_graph = full_domain_graph_generator
+                .as_mut()
+                .expect("DiamondIO non-debug final-mask streaming requires a graph generator")
+                .next_range(range_start, output_bit_count);
+            self.build_goldreich_prg_public_graph_circuit(public_graph).eval(
+                &self.injector.params,
+                one_vec.clone(),
+                seed_wires.to_vec(),
+                Some(enc_lookup_evaluator),
+                Some(
+                    enc_slot_transfer_evaluator
+                        as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
+                ),
+                None,
+            )
+        };
+        assert_eq!(
+            mask_output_wires.len(),
+            output_bit_count
+                .checked_mul(wire_count)
+                .expect("DiamondIO PRF mask wire count overflow"),
+            "DiamondIO final mask PRG output count mismatch"
+        );
+        let mut mask_inputs = Vec::with_capacity(1 + mask_output_wires.len());
+        mask_inputs.push(k_vec.clone());
+        mask_inputs.extend(mask_output_wires);
+        let outputs = self
+            .build_prf_mask_circuit()
+            .eval(
+                &self.injector.params,
+                one_vec.clone(),
+                mask_inputs,
+                Some(enc_lookup_evaluator),
+                Some(
+                    enc_slot_transfer_evaluator
+                        as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
+                ),
+                None,
+            )
+            .into_iter()
+            .collect::<Vec<_>>();
+        let [secret_dependent, public_bottom] =
+            outputs.try_into().unwrap_or_else(|outputs: Vec<_>| {
+                panic!(
+                    "DiamondIO final PRF mask circuit must produce two output encodings, got {}",
+                    outputs.len()
+                )
+            });
+        debug!(
+            output_idx,
+            elapsed_ms = output_started.elapsed().as_millis(),
+            "DiamondIO PRF encoding final mask output evaluated"
+        );
+        (secret_dependent, public_bottom)
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn compute_prf_mask_encoding(
         &self,

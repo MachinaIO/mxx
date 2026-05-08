@@ -910,7 +910,7 @@ impl PolyCircuit<DCRTPoly> {
                         let scalar_max =
                             *scalar.resolve_small_scalar(param_bindings).iter().max().unwrap();
                         let scalar_bd = BigDecimal::from(scalar_max);
-                        let scalar_poly = PolyNorm::new(norm_ctx.clone(), scalar_bd);
+                        let scalar_poly = PolyNorm::constant(norm_ctx.clone(), scalar_bd);
                         plaintext_norms
                             .get(&gate.input_gates[0])
                             .unwrap_or_else(|| {
@@ -927,7 +927,7 @@ impl PolyCircuit<DCRTPoly> {
                             .unwrap()
                             .clone();
                         let scalar_bd = BigDecimal::from(num_bigint::BigInt::from(scalar_max));
-                        let scalar_poly = PolyNorm::new(norm_ctx.clone(), scalar_bd);
+                        let scalar_poly = PolyNorm::constant(norm_ctx.clone(), scalar_bd);
                         plaintext_norms
                             .get(&gate.input_gates[0])
                             .unwrap_or_else(|| {
@@ -944,7 +944,7 @@ impl PolyCircuit<DCRTPoly> {
                             .max()
                             .unwrap_or(1);
                         let scalar_bd = BigDecimal::from(scalar_max);
-                        let scalar_poly = PolyNorm::new(norm_ctx.clone(), scalar_bd);
+                        let scalar_poly = PolyNorm::constant(norm_ctx.clone(), scalar_bd);
                         plaintext_norms
                             .get(&gate.input_gates[0])
                             .unwrap_or_else(|| {
@@ -975,7 +975,7 @@ impl PolyCircuit<DCRTPoly> {
                         let plaintext_bd = BigDecimal::from(num_bigint::BigInt::from(
                             plt.max_output_row().1.value().clone(),
                         ));
-                        PolyNorm::new(norm_ctx.clone(), plaintext_bd)
+                        PolyNorm::constant(norm_ctx.clone(), plaintext_bd)
                     }
                     PolyGateType::Input => {
                         panic!("input gate {gate_id} should already have a plaintext norm")

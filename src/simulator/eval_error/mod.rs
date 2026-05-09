@@ -59,6 +59,7 @@ type ErrorNormSubCircuitSummaryCache =
 struct ErrorNormPolyNormKey {
     ctx_id: usize,
     norm: String,
+    is_constant: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -124,7 +125,11 @@ struct ErrorNormSummaryRegistry {
 
 /// Convert a runtime `PolyNorm` into the reduced cache-key representation used by summary caches.
 fn error_norm_poly_norm_key(norm: &PolyNorm) -> ErrorNormPolyNormKey {
-    ErrorNormPolyNormKey { ctx_id: Arc::as_ptr(&norm.ctx) as usize, norm: norm.norm.to_string() }
+    ErrorNormPolyNormKey {
+        ctx_id: Arc::as_ptr(&norm.ctx) as usize,
+        norm: norm.norm.to_string(),
+        is_constant: norm.is_constant,
+    }
 }
 
 /// Build the cache key for one sub-circuit summary request.
@@ -179,8 +184,10 @@ fn validate_input_plaintext_norms_against_ranges(
         for range in ranges {
             let max_norm_bd = BigDecimal::from(num_bigint::BigInt::from(range.norm.clone()));
             normalized.extend(
-                std::iter::repeat_with(|| PolyNorm::new(Arc::clone(norm_ctx), max_norm_bd.clone()))
-                    .take(range.len()),
+                std::iter::repeat_with(|| {
+                    PolyNorm::constant(Arc::clone(norm_ctx), max_norm_bd.clone())
+                })
+                .take(range.len()),
             );
         }
         return Arc::from(normalized);
@@ -205,7 +212,7 @@ fn validate_input_plaintext_norms_against_ranges(
                 actual_norm.norm,
                 max_norm_bd
             );
-            normalized.push(PolyNorm::new(Arc::clone(norm_ctx), max_norm_bd.clone()));
+            normalized.push(PolyNorm::constant(Arc::clone(norm_ctx), max_norm_bd.clone()));
         }
     }
     Arc::from(normalized)
@@ -1009,7 +1016,7 @@ impl ErrorNormSummaryExpr {
         if scalar == &BigDecimal::one() {
             return self.clone();
         }
-        let scalar_poly = PolyNorm::new(self.plaintext_norm.ctx.clone(), scalar.clone());
+        let scalar_poly = PolyNorm::constant(self.plaintext_norm.ctx.clone(), scalar.clone());
         Self {
             plaintext_norm: self.plaintext_norm.clone() * &scalar_poly,
             matrix_expr: self.matrix_expr.transform_scalar(scalar),
@@ -1031,7 +1038,7 @@ impl ErrorNormSummaryExpr {
 
     fn small_scalar_mul_bound(&self, scalar: &[u32]) -> Self {
         let scalar_max = BigDecimal::from(*scalar.iter().max().unwrap());
-        let scalar_poly = PolyNorm::new(self.plaintext_norm.ctx.clone(), scalar_max.clone());
+        let scalar_poly = PolyNorm::constant(self.plaintext_norm.ctx.clone(), scalar_max.clone());
         Self {
             plaintext_norm: self.plaintext_norm.clone() * &scalar_poly,
             matrix_expr: self.matrix_expr.transform_scalar(&scalar_max),
@@ -1041,7 +1048,7 @@ impl ErrorNormSummaryExpr {
     fn large_scalar_mul_bound(&self, scalar: &[BigUint]) -> Self {
         let scalar_max = scalar.iter().max().unwrap().clone();
         let scalar_bd = BigDecimal::from(num_bigint::BigInt::from(scalar_max));
-        let scalar_poly = PolyNorm::new(self.plaintext_norm.ctx.clone(), scalar_bd);
+        let scalar_poly = PolyNorm::constant(self.plaintext_norm.ctx.clone(), scalar_bd);
         Self {
             plaintext_norm: self.plaintext_norm.clone() * &scalar_poly,
             matrix_expr: self.matrix_expr.transform_matrix(&PolyMatrixNorm::gadget_decomposed(

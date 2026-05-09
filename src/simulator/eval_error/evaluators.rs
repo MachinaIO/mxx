@@ -273,7 +273,7 @@ impl PltEvaluator<ErrorNorm> for NormPltLWEEvaluator {
         let matrix_norm = &self.e_b_times_k_high + (&input.matrix_norm * &self.k_low);
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
-        let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);
+        let plaintext_norm = PolyNorm::constant(input.clone_ctx(), plaintext_bd);
         ErrorNorm { matrix_norm, plaintext_norm }
     }
 }
@@ -288,7 +288,7 @@ impl AffinePltEvaluator for NormPltLWEEvaluator {
     ) -> ErrorNormSummaryExpr {
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
-        let plaintext_norm = PolyNorm::new(input.plaintext_norm.ctx.clone(), plaintext_bd);
+        let plaintext_norm = PolyNorm::constant(input.plaintext_norm.ctx.clone(), plaintext_bd);
         let matrix_expr = input
             .matrix_expr
             .transform_matrix(&self.k_low)
@@ -512,7 +512,7 @@ impl PltEvaluator<ErrorNorm> for NormPltGGH15Evaluator {
     ) -> ErrorNorm {
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
-        let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);
+        let plaintext_norm = PolyNorm::constant(input.clone_ctx(), plaintext_bd);
         let plaintext_term = self.input_plaintext_multiplier.clone() * &input.plaintext_norm;
         let matrix_norm =
             &self.const_term + &plaintext_term + &input.matrix_norm * &self.e_input_multiplier;
@@ -530,7 +530,7 @@ impl AffinePltEvaluator for NormPltGGH15Evaluator {
     ) -> ErrorNormSummaryExpr {
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
-        let plaintext_norm = PolyNorm::new(input.plaintext_norm.ctx.clone(), plaintext_bd);
+        let plaintext_norm = PolyNorm::constant(input.plaintext_norm.ctx.clone(), plaintext_bd);
         let plaintext_term = self.input_plaintext_multiplier.clone() * &input.plaintext_norm;
         let matrix_expr = input
             .matrix_expr
@@ -641,7 +641,7 @@ impl PltEvaluator<ErrorNorm> for NormPltCommitEvaluator {
     ) -> ErrorNorm {
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
-        let plaintext_norm = PolyNorm::new(input.clone_ctx(), plaintext_bd);
+        let plaintext_norm = PolyNorm::constant(input.clone_ctx(), plaintext_bd);
         let ctx = input.clone_ctx();
         let m_b = ctx.m_b;
         let m_g = ctx.m_g;
@@ -666,7 +666,7 @@ impl AffinePltEvaluator for NormPltCommitEvaluator {
         let m_g = ctx.m_g;
         let plaintext_bd =
             BigDecimal::from(num_bigint::BigInt::from(plt.max_output_row().1.value().clone()));
-        let plaintext_norm = PolyNorm::new(input.plaintext_norm.ctx.clone(), plaintext_bd);
+        let plaintext_norm = PolyNorm::constant(input.plaintext_norm.ctx.clone(), plaintext_bd);
         let matrix_expr = input
             .matrix_expr
             .transform_matrix(&PolyMatrixNorm::gadget_decomposed(ctx, m_b))

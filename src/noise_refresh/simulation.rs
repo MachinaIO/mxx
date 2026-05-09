@@ -551,6 +551,71 @@ where
     )
 }
 
+/// Simulates fixed-`v_bits` symmetric noise-refresh using a caller-provided representative
+/// material-wire bound.
+///
+/// DiamondIO already evaluates the representative Goldreich material PRG while simulating the
+/// selected-half PRF branch. Passing that bound here keeps fixed-width validation from rebuilding
+/// the equivalent material PRG prefix after the global `v_bits` has already been selected.
+pub fn simulate_symmetric_noise_refresh_error_growth_for_v_bits_with_material_override<A, PE, ST>(
+    ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
+    seed_bits: usize,
+    v_bits: usize,
+    cbd_n: usize,
+    ring_gsw_error_sigma: f64,
+    num_slots: usize,
+    one: ErrorNorm,
+    refreshed_input: ErrorNorm,
+    enc_seeds: &[ErrorNorm],
+    decryption_key: ErrorNorm,
+    decoder: ErrorNorm,
+    active_level_material_wire_error_override: ErrorNorm,
+    plt_evaluator: &PE,
+    slot_transfer_evaluator: &ST,
+) -> NoiseRefreshErrorSimulation
+where
+    A: DecomposeArithmeticGadget<DCRTPoly> + ModularArithmeticPlanner<DCRTPoly>,
+    PE: PltEvaluator<ErrorNorm>,
+    ST: SlotTransferEvaluator<ErrorNorm>,
+{
+    let prg_prefix = build_symmetric_noise_refresh_prg_error_prefix(
+        &ring_gsw,
+        seed_bits,
+        cbd_n,
+        ring_gsw_error_sigma,
+        one.clone(),
+        enc_seeds,
+        Some(active_level_material_wire_error_override),
+        plt_evaluator,
+        slot_transfer_evaluator,
+    );
+    let decrypt_prefix = build_symmetric_noise_refresh_decrypt_prefix(
+        &ring_gsw,
+        &prg_prefix,
+        one.clone(),
+        decryption_key.clone(),
+        plt_evaluator,
+        slot_transfer_evaluator,
+    );
+    simulate_symmetric_noise_refresh_error_growth_for_v_bits_with_prefix(
+        ring_gsw,
+        &prg_prefix,
+        &decrypt_prefix,
+        seed_bits,
+        v_bits,
+        cbd_n,
+        ring_gsw_error_sigma,
+        num_slots,
+        one,
+        refreshed_input,
+        enc_seeds,
+        decryption_key,
+        decoder,
+        plt_evaluator,
+        slot_transfer_evaluator,
+    )
+}
+
 fn simulate_symmetric_noise_refresh_error_growth_for_v_bits_with_prefix<A, PE, ST>(
     ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
     prg_prefix: &SymmetricNoiseRefreshPrgErrorPrefix<A>,

@@ -13,7 +13,7 @@ use crate::gadgets::fhe_prg::goldreich::evaluate_goldreich_uniform_range;
 use crate::{
     circuit::{Evaluable, PolyCircuit},
     decoder::simulation::{
-        DecodeThreshold, centered_mask_magnitude, decode_margin, search_mask_bits_with_simulation,
+        DecodeThreshold, centered_mask_magnitude, decode_margin,
         validate_error_bound_security_margin,
     },
     gadgets::{
@@ -28,7 +28,8 @@ use crate::{
     lookup::PltEvaluator,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     noise_refresh::{
-        NoiseRefreshErrorSimulation, simulate_symmetric_noise_refresh_error_growth,
+        NoiseRefreshErrorSimulation,
+        simulate_symmetric_noise_refresh_error_growth_for_v_bits_with_material_override,
         simulation::{max_safe_noise_refresh_v_bits, minimum_noise_refresh_seed_bits},
     },
     poly::{
@@ -161,16 +162,35 @@ struct DiamondIOMaskIndependentErrorPrefix {
     public_bottom_decryption_error: PolyMatrixNorm,
 }
 
+#[derive(Debug, Clone)]
+struct DiamondIOMaskIndependentErrorBase {
+    cpu_params: DCRTPolyParams,
+    ctx: Arc<SimulatorContext>,
+    input_injection: DiamondInputErrorSimulation,
+    one: ErrorNorm,
+    decryption_key: ErrorNorm,
+    refresh_decoder_error: ErrorNorm,
+    final_decoder_error: ErrorNorm,
+    initial_seed_errors: Vec<ErrorNorm>,
+    function_secret_error: ErrorNorm,
+    public_bottom_decryption_error: PolyMatrixNorm,
+}
+
+#[derive(Debug, Clone)]
+struct DiamondIOPrfRefreshRoundEvaluation {
+    round: DiamondIOPrfRoundErrorSimulation,
+    refreshed_seed: ErrorNorm,
+}
+
 /// Finds the smallest CRT depth whose correctness and security checks pass.
 ///
 /// The search is binary over the inclusive range `[min_crt_depth, max_crt_depth]`. For each
 /// candidate depth, `build_candidate` must construct a DiamondIO instance with matching polynomial
-/// parameters and Ring-GSW context. The candidate first runs
-/// `DiamondIO::max_safe_prf_mask_output_coeff_bits`; if no mask width is valid, the search moves to
-/// larger CRT depths. If mask search succeeds, the certified simulation is checked with
-/// `validate_error_bound_security_margin` for both the final noisy-plaintext bound and every
-/// noise-refresh pre-rounding bound. Passing candidates are recorded and the search continues
-/// toward smaller CRT depths.
+/// parameters and Ring-GSW context. Each candidate first selects one global noise-refresh `v_bits`
+/// from the first PRF refresh round and the steady-state refresh round. With that value fixed, it
+/// searches only the final PRF mask bit width, then revalidates the exact selected protocol with
+/// the minimum seed length derived from those final widths. Passing candidates are recorded and the
+/// search continues toward smaller CRT depths.
 pub fn diamond_io_find_crt_depth<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST, PE, ST, BuildCandidate>(
     min_crt_depth: usize,
     max_crt_depth: usize,
@@ -206,85 +226,151 @@ where
     while low <= high {
         let crt_depth = low + (high - low) / 2;
         info!(crt_depth, low, high, "evaluating DiamondIO CRT-depth candidate");
-        let candidate = build_candidate(crt_depth, max_prf_mask_output_coeff_bits, None);
-        let Some(mask_search) = candidate.max_safe_prf_mask_output_coeff_bits(
+        let provisional_candidate =
+            build_candidate(crt_depth, max_prf_mask_output_coeff_bits, None);
+        let cpu_params = cpu_params_from_poly_params(&provisional_candidate.injector.params);
+        let provisional_base = provisional_candidate.simulate_mask_independent_error_base(
             func_type,
             plt_evaluator,
             slot_transfer_evaluator,
+        );
+        let Some(global_noise_refresh_v_bits) = provisional_candidate
+            .select_global_noise_refresh_v_bits(
+                &provisional_base,
+                security_bit,
+                plt_evaluator,
+                slot_transfer_evaluator,
+            )
+        else {
+            info!(crt_depth, "DiamondIO CRT-depth candidate failed noise-refresh v_bits search");
+            low = crt_depth + 1;
+            continue;
+        };
+        info!(
+            crt_depth,
+            global_noise_refresh_v_bits,
+            "DiamondIO CRT-depth candidate selected fixed noise-refresh v_bits"
+        );
+
+        let mask_search_candidate = build_candidate(
+            crt_depth,
             max_prf_mask_output_coeff_bits,
-        ) else {
-            info!(crt_depth, "DiamondIO CRT-depth candidate failed correctness mask-bit search");
+            Some(global_noise_refresh_v_bits),
+        );
+        let Some(mask_search_prefix) = mask_search_candidate
+            .build_fixed_noise_refresh_prefix_from_base(
+                provisional_base.clone(),
+                global_noise_refresh_v_bits,
+                plt_evaluator,
+                slot_transfer_evaluator,
+            )
+        else {
+            info!(
+                crt_depth,
+                global_noise_refresh_v_bits,
+                "DiamondIO CRT-depth candidate failed fixed-v prefix construction"
+            );
+            low = crt_depth + 1;
+            continue;
+        };
+        let Some(mask_search) = mask_search_candidate
+            .search_final_prf_mask_output_coeff_bits_from_prefix(
+                &mask_search_prefix,
+                max_prf_mask_output_coeff_bits,
+                global_noise_refresh_v_bits,
+                Some(security_bit),
+                plt_evaluator,
+                slot_transfer_evaluator,
+            )
+        else {
+            info!(
+                crt_depth,
+                global_noise_refresh_v_bits,
+                "DiamondIO CRT-depth candidate failed final PRF mask-bit search"
+            );
             low = crt_depth + 1;
             continue;
         };
         let mask_bits = mask_search.prf_mask_output_coeff_bits;
-        let cpu_params = cpu_params_from_poly_params(&candidate.injector.params);
-        let mut final_noise_refresh_v_bits = mask_search.noise_refresh_v_bits;
-        let Some((final_candidate, final_simulation)) = (loop {
-            let final_candidate =
-                build_candidate(crt_depth, mask_bits, Some(final_noise_refresh_v_bits));
-            let Some(final_simulation) = final_candidate
-                .simulate_error_growth_with_prf_mask_output_coeff_bits(
-                    func_type,
-                    mask_bits,
-                    plt_evaluator,
-                    slot_transfer_evaluator,
-                )
-            else {
-                info!(
-                    crt_depth,
-                    mask_bits,
-                    noise_refresh_v_bits = final_noise_refresh_v_bits,
-                    final_seed_bits = final_candidate.seed_bits,
-                    "DiamondIO final minimum-seed validation failed to produce a simulation"
-                );
-                break None;
-            };
-            let reselected_noise_refresh_v_bits = selected_noise_refresh_v_bits(&final_simulation);
-            if reselected_noise_refresh_v_bits < final_noise_refresh_v_bits {
-                info!(
-                    crt_depth,
-                    mask_bits,
-                    previous_noise_refresh_v_bits = final_noise_refresh_v_bits,
-                    reselected_noise_refresh_v_bits,
-                    final_seed_bits = final_candidate.seed_bits,
-                    "DiamondIO final minimum-seed validation reduced noise-refresh v_bits; recomputing seed_bits"
-                );
-                final_noise_refresh_v_bits = reselected_noise_refresh_v_bits;
-                continue;
-            }
-            break Some((final_candidate, final_simulation));
-        }) else {
-            low = crt_depth + 1;
-            continue;
-        };
-        if !diamond_io_security_margins_hold(
+        let final_candidate =
+            build_candidate(crt_depth, mask_bits, Some(global_noise_refresh_v_bits));
+        let expected_seed_bits = minimum_diamond_io_prf_seed_bits(
             &cpu_params,
-            &final_simulation,
+            final_candidate.output_size,
             mask_bits,
-            security_bit,
-        ) {
+            global_noise_refresh_v_bits,
+            final_candidate.noise_refresh_cbd_n,
+        );
+        if final_candidate.seed_bits != expected_seed_bits {
             info!(
                 crt_depth,
                 mask_bits,
-                noise_refresh_v_bits = final_noise_refresh_v_bits,
+                global_noise_refresh_v_bits,
                 final_seed_bits = final_candidate.seed_bits,
-                "DiamondIO final minimum-seed validation failed security margins"
+                expected_seed_bits,
+                "DiamondIO final candidate seed_bits did not match the selected minimum"
             );
             low = crt_depth + 1;
             continue;
         }
+        let final_simulation = final_candidate
+            .build_fixed_noise_refresh_prefix_from_base(
+                provisional_base.clone(),
+                global_noise_refresh_v_bits,
+                plt_evaluator,
+                slot_transfer_evaluator,
+            )
+            .map(|prefix| {
+                final_candidate.finish_error_growth_from_mask_independent_prefix(
+                    &prefix,
+                    mask_bits,
+                    None,
+                    None,
+                    plt_evaluator,
+                    slot_transfer_evaluator,
+                )
+            });
+        let Some(final_simulation) = final_simulation else {
+            info!(
+                crt_depth,
+                mask_bits,
+                global_noise_refresh_v_bits,
+                final_seed_bits = final_candidate.seed_bits,
+                "DiamondIO final fixed-v validation failed to produce a simulation"
+            );
+            low = crt_depth + 1;
+            continue;
+        };
+        if !fixed_noise_refresh_v_bits_match(&final_simulation, global_noise_refresh_v_bits) ||
+            !diamond_io_security_margins_hold(
+                &cpu_params,
+                &final_simulation,
+                mask_bits,
+                security_bit,
+            )
+        {
+            info!(
+                crt_depth,
+                mask_bits,
+                global_noise_refresh_v_bits,
+                final_seed_bits = final_candidate.seed_bits,
+                "DiamondIO final fixed-v validation failed security margins"
+            );
+            low = crt_depth + 1;
+            continue;
+        }
+
         info!(
             crt_depth,
             mask_bits,
-            noise_refresh_v_bits = final_noise_refresh_v_bits,
+            noise_refresh_v_bits = global_noise_refresh_v_bits,
             final_seed_bits = final_candidate.seed_bits,
             "DiamondIO CRT-depth candidate passed final minimum-seed validation"
         );
         found.push(DiamondIOCrtDepthSearchResult {
             crt_depth,
             prf_mask_output_coeff_bits: mask_bits,
-            noise_refresh_v_bits: final_noise_refresh_v_bits,
+            noise_refresh_v_bits: global_noise_refresh_v_bits,
             seed_bits: final_candidate.seed_bits,
             total_noisy_plaintext_error: final_simulation.noisy_plaintext_error.clone(),
             input_injection_projection_error: diamond_io_input_injection_projection_error(
@@ -323,6 +409,7 @@ where
         self.simulate_error_growth_with_prf_mask_output_coeff_bits(
             func_type,
             self.prf_mask_output_coeff_bits,
+            self.noise_refresh_v_bits,
             plt_evaluator,
             slot_transfer_evaluator,
         )
@@ -346,10 +433,38 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
-        let cpu_params = cpu_params_from_poly_params(&self.injector.params);
+        let prefix = self.simulate_mask_independent_error_prefix_fixed_noise_refresh_v_bits(
+            func_type,
+            self.noise_refresh_v_bits,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )?;
+        self.search_final_prf_mask_output_coeff_bits_from_prefix(
+            &prefix,
+            max_bits,
+            self.noise_refresh_v_bits,
+            None,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )
+    }
+
+    fn search_final_prf_mask_output_coeff_bits_from_prefix<PE, ST>(
+        &self,
+        prefix: &DiamondIOMaskIndependentErrorPrefix,
+        max_bits: usize,
+        noise_refresh_v_bits: usize,
+        security_bit: Option<usize>,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Option<DiamondIOPrfMaskOutputCoeffBitsSearchResult>
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
         let max_candidate =
-            max_bits.min(cpu_params.modulus_bits()).min(max_final_mask_coeff_bits_for_seed(
-                &cpu_params,
+            max_bits.min(prefix.cpu_params.modulus_bits()).min(max_final_mask_coeff_bits_for_seed(
+                &prefix.cpu_params,
                 self.output_size,
                 self.seed_bits,
                 max_bits,
@@ -362,15 +477,16 @@ where
             );
             return None;
         }
-        info!(max_bits, max_candidate, "starting DiamondIO PRF mask bit search");
-        let prefix = self.simulate_mask_independent_error_prefix(
-            func_type,
-            plt_evaluator,
-            slot_transfer_evaluator,
-        )?;
+        info!(
+            max_bits,
+            max_candidate,
+            noise_refresh_v_bits,
+            ?security_bit,
+            "starting DiamondIO fixed-v final PRF mask bit search"
+        );
         info!(
             prf_rounds = prefix.prf_refreshes.len(),
-            "DiamondIO PRF mask bit search cached mask-independent prefix"
+            "DiamondIO fixed-v final PRF mask bit search using cached prefix"
         );
         let cached_final_mask_prg_output = self.simulate_representative_prg_output(
             &prefix.cpu_params,
@@ -404,39 +520,55 @@ where
                 bigdecimal_bits_ceil(&cached_final_mask_base_error.matrix_norm.poly_norm.norm),
             "DiamondIO PRF mask bit search cached final-mask representative decrypt"
         );
-        let q: Arc<BigUint> = prefix.cpu_params.modulus().into();
-        let best = search_mask_bits_with_simulation(
-            q.as_ref(),
-            max_candidate,
-            &DecodeThreshold::boolean(),
-            |candidate| {
-                info!(candidate, "evaluating DiamondIO PRF mask bit candidate");
-                self.finish_error_growth_from_mask_independent_prefix(
-                    &prefix,
-                    candidate,
-                    Some(cached_final_mask_prg_output.clone()),
-                    Some(cached_final_mask_base_error.clone()),
-                    plt_evaluator,
-                    slot_transfer_evaluator,
-                )
-            },
-            |simulation| simulation.noisy_plaintext_error.poly_norm.norm.clone(),
-        )
-        .map(|result| {
-            let mask_value = centered_mask_magnitude(result.mask_bits);
-            debug!(
-                candidate = result.mask_bits,
-                noisy_plaintext_error = %result.simulation.noisy_plaintext_error.poly_norm.norm,
-                mask_value = %mask_value,
-                "DiamondIO PRF mask bit candidate selected"
+        let mut low = 1usize;
+        let mut high = max_candidate;
+        let mut best = None;
+        while low <= high {
+            let candidate = low + (high - low) / 2;
+            info!(candidate, "evaluating DiamondIO fixed-v final PRF mask bit candidate");
+            let simulation = self.finish_error_growth_from_mask_independent_prefix(
+                prefix,
+                candidate,
+                Some(cached_final_mask_prg_output.clone()),
+                Some(cached_final_mask_base_error.clone()),
+                plt_evaluator,
+                slot_transfer_evaluator,
             );
-            DiamondIOPrfMaskOutputCoeffBitsSearchResult {
-                prf_mask_output_coeff_bits: result.mask_bits,
-                noise_refresh_v_bits: selected_noise_refresh_v_bits(&result.simulation),
-                simulation: result.simulation,
+            let Some(final_margin) = diamond_io_final_decode_margin(&prefix.cpu_params, candidate)
+            else {
+                if candidate == 1 {
+                    break;
+                }
+                high = candidate - 1;
+                continue;
+            };
+            let error = &simulation.noisy_plaintext_error.poly_norm.norm;
+            let valid = if let Some(security_bit) = security_bit {
+                validate_error_bound_security_margin(&final_margin, error, security_bit)
+            } else {
+                final_margin > *error
+            };
+            debug!(
+                candidate,
+                valid,
+                noisy_plaintext_error = %error,
+                mask_value = %centered_mask_magnitude(candidate),
+                "DiamondIO fixed-v final PRF mask bit candidate evaluated"
+            );
+            if valid {
+                best = Some(DiamondIOPrfMaskOutputCoeffBitsSearchResult {
+                    prf_mask_output_coeff_bits: candidate,
+                    noise_refresh_v_bits,
+                    simulation,
+                });
+                low = candidate + 1;
+            } else if candidate == 1 {
+                break;
+            } else {
+                high = candidate - 1;
             }
-        });
-        info!(found = best.is_some(), "finished DiamondIO PRF mask bit search");
+        }
+        info!(found = best.is_some(), "finished DiamondIO fixed-v final PRF mask bit search");
         best
     }
 
@@ -444,6 +576,7 @@ where
         &self,
         func_type: DiamondIOFuncType,
         prf_mask_output_coeff_bits: usize,
+        noise_refresh_v_bits: usize,
         plt_evaluator: &PE,
         slot_transfer_evaluator: &ST,
     ) -> Option<DiamondIOErrorSimulation>
@@ -476,8 +609,9 @@ where
             return None;
         }
 
-        let prefix = self.simulate_mask_independent_error_prefix(
+        let prefix = self.simulate_mask_independent_error_prefix_fixed_noise_refresh_v_bits(
             func_type,
+            noise_refresh_v_bits,
             plt_evaluator,
             slot_transfer_evaluator,
         )?;
@@ -491,12 +625,12 @@ where
         ))
     }
 
-    fn simulate_mask_independent_error_prefix<PE, ST>(
+    fn simulate_mask_independent_error_base<PE, ST>(
         &self,
         func_type: DiamondIOFuncType,
         plt_evaluator: &PE,
         slot_transfer_evaluator: &ST,
-    ) -> Option<DiamondIOMaskIndependentErrorPrefix>
+    ) -> DiamondIOMaskIndependentErrorBase
     where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
@@ -522,8 +656,7 @@ where
             prefix_required_seed_bits
         );
         let (_, _, crt_depth) = cpu_params.to_crt();
-        let full_active_levels =
-            self.ring_gsw_enable_levels.unwrap_or_else(|| crt_depth - self.ring_gsw_level_offset);
+        let full_active_levels = self.full_active_levels(&cpu_params);
         assert!(
             full_active_levels > 0 && self.ring_gsw_level_offset + full_active_levels <= crt_depth,
             "DiamondIO Ring-GSW active levels must fit in the CRT modulus window"
@@ -548,119 +681,7 @@ where
         let final_decoder_error =
             ErrorNorm::new(PolyNorm::one(ctx.clone()), final_decoder_projection_error);
         let seed_wire_error = self.initial_seed_wire_error(&cpu_params, &one);
-        let mut seed_errors = vec![seed_wire_error.clone(); 5];
-        let mut prf_refreshes = Vec::with_capacity(self.input_size);
-        let mut steady_prf_round_cache: Option<(
-            ErrorNorm,
-            NoiseRefreshErrorSimulation,
-            ErrorNorm,
-        )> = None;
-
-        for round_idx in 0..self.input_size {
-            if round_idx > 1 {
-                if let Some((selected, refresh, refreshed_seed)) = &steady_prf_round_cache {
-                    seed_errors = vec![refreshed_seed.clone(); 5];
-                    info!(
-                        round_idx,
-                        v_bits = refresh.v_bits,
-                        refreshed_seed_error_bits =
-                            bigdecimal_bits_ceil(&refreshed_seed.matrix_norm.poly_norm.norm),
-                        "DiamondIO reusing steady-state PRF refresh error simulation"
-                    );
-                    prf_refreshes.push(DiamondIOPrfRoundErrorSimulation {
-                        round_idx,
-                        representative_selected_prg_output: selected.clone(),
-                        noise_refresh: refresh.clone(),
-                    });
-                    continue;
-                }
-            }
-            // Low and high halves are both one representative Goldreich PRG output evaluated from
-            // the same seed-error profile. The selected output circuit below only needs an
-            // ErrorNorm bound for each encoded branch, so the symmetric high branch can reuse the
-            // low branch bound instead of evaluating the same one-bit PRG circuit twice.
-            let representative_branch = self.simulate_representative_prg_output(
-                &cpu_params,
-                round_idx,
-                2 * self.seed_bits,
-                0,
-                one.clone(),
-                seed_errors.clone(),
-                plt_evaluator,
-                slot_transfer_evaluator,
-            );
-            debug!(
-                round_idx,
-                high_range_start = self.seed_bits,
-                "DiamondIO reusing representative PRG branch error for symmetric high half"
-            );
-            let material_branch = representative_branch.clone();
-            let low = representative_branch.clone();
-            let high = representative_branch;
-            let selected = simulate_selected_half_error_norm(one.clone(), low, high, one.clone());
-            let material_wire_error = scale_error_norm(
-                // Noise-refresh material is generated from the same encrypted seed profile by a
-                // one-output Goldreich PRG. CBD material combines `2 * cbd_n` uniform branches, so
-                // scaling the active-level-extrapolated representative branch is a conservative
-                // bound for both CBD error and mask material wires.
-                material_branch,
-                &BigDecimal::from((2 * self.noise_refresh_cbd_n) as u64),
-            );
-            let mut refresh_context_circuit = PolyCircuit::<DCRTPoly>::new();
-            let refresh = simulate_symmetric_noise_refresh_error_growth(
-                self.build_cpu_ring_gsw_context(
-                    &cpu_params,
-                    &mut refresh_context_circuit,
-                    full_active_levels,
-                ),
-                self.seed_bits,
-                self.noise_refresh_cbd_n,
-                self.ring_gsw_public_key_error_sigma.unwrap_or(0.0),
-                cpu_params.ring_dimension() as usize,
-                one.clone(),
-                selected.clone(),
-                &seed_errors,
-                decryption_key.clone(),
-                refresh_decoder_error.clone(),
-                Some(material_wire_error),
-                plt_evaluator,
-                slot_transfer_evaluator,
-            )?;
-            let worst_rounded_error = refresh
-                .rounded_errors
-                .iter()
-                .max_by(|lhs, rhs| {
-                    lhs.poly_norm
-                        .norm
-                        .partial_cmp(&rhs.poly_norm.norm)
-                        .expect("DiamondIO rounded errors must be comparable")
-                })
-                .expect("noise refresh must produce rounded errors")
-                .clone();
-            let refreshed_seed =
-                ErrorNorm::new(worst_rounded_error.poly_norm.clone(), worst_rounded_error);
-            seed_errors = vec![refreshed_seed.clone(); 5];
-            info!(
-                round_idx,
-                v_bits = refresh.v_bits,
-                refreshed_seed_error_bits =
-                    bigdecimal_bits_ceil(&refreshed_seed.matrix_norm.poly_norm.norm),
-                "DiamondIO PRF refresh error simulation finished"
-            );
-            prf_refreshes.push(DiamondIOPrfRoundErrorSimulation {
-                round_idx,
-                representative_selected_prg_output: selected.clone(),
-                noise_refresh: refresh.clone(),
-            });
-            if round_idx >= 1 {
-                // After the first refresh, every subsequent seed wire has the same rounded CBD
-                // error bound. The Goldreich graph seed changes with the round index, but ErrorNorm
-                // sees the same one-output circuit shape and the same symmetric seed-error profile,
-                // so the representative selected PRG output and refresh result can be reused for
-                // later rounds.
-                steady_prf_round_cache = Some((selected, refresh, refreshed_seed));
-            }
-        }
+        let initial_seed_errors = vec![seed_wire_error.clone(); 5];
 
         let (function_secret_error, function_public_bottom_error) = self
             .simulate_representative_function_output(
@@ -683,23 +704,364 @@ where
         );
         let public_bottom_decryption_error =
             self.simulate_public_bottom_decryption_error(&cpu_params, ctx.clone());
-        info!(
-            prf_rounds = prf_refreshes.len(),
-            "DiamondIO mask-independent error simulation prefix finished"
-        );
+        info!("DiamondIO mask-independent error simulation base finished");
 
-        Some(DiamondIOMaskIndependentErrorPrefix {
+        DiamondIOMaskIndependentErrorBase {
             cpu_params,
             ctx,
             input_injection,
-            prf_refreshes,
             one,
             decryption_key,
+            refresh_decoder_error,
             final_decoder_error,
-            final_seed_errors: seed_errors,
+            initial_seed_errors,
             function_secret_error,
             public_bottom_decryption_error,
+        }
+    }
+
+    fn select_global_noise_refresh_v_bits<PE, ST>(
+        &self,
+        base: &DiamondIOMaskIndependentErrorBase,
+        security_bit: usize,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Option<usize>
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
+        if self.input_size == 0 {
+            return Some(self.noise_refresh_v_bits);
+        }
+        let max_candidate =
+            diamond_io_max_noise_refresh_v_bits_without_pre_rounding_error(&base.cpu_params)?;
+        let first = self.search_prf_refresh_round_fixed_v_bits(
+            base,
+            0,
+            max_candidate,
+            security_bit,
+            &base.initial_seed_errors,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )?;
+        if self.input_size == 1 {
+            return Some(first.round.noise_refresh.v_bits);
+        }
+        let steady_seed_errors = vec![first.refreshed_seed; 5];
+        let steady = self.search_prf_refresh_round_fixed_v_bits(
+            base,
+            1,
+            first.round.noise_refresh.v_bits,
+            security_bit,
+            &steady_seed_errors,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )?;
+        // Each searched round returns its largest security-margin-safe mask width. A single global
+        // fixed width must be no larger than both maxima, so the largest common safe choice is
+        // their minimum. Reducing `v_bits` reduces the centered mask magnitude and the mask-bit
+        // contribution to the simulated pre-rounding error, so it cannot make the rounding margin
+        // worse; final validation below still rechecks the chosen global value end-to-end.
+        Some(first.round.noise_refresh.v_bits.min(steady.round.noise_refresh.v_bits))
+    }
+
+    fn simulate_mask_independent_error_prefix_fixed_noise_refresh_v_bits<PE, ST>(
+        &self,
+        func_type: DiamondIOFuncType,
+        noise_refresh_v_bits: usize,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Option<DiamondIOMaskIndependentErrorPrefix>
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
+        let base = self.simulate_mask_independent_error_base(
+            func_type,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        );
+        self.build_fixed_noise_refresh_prefix_from_base(
+            base,
+            noise_refresh_v_bits,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )
+    }
+
+    fn build_fixed_noise_refresh_prefix_from_base<PE, ST>(
+        &self,
+        base: DiamondIOMaskIndependentErrorBase,
+        noise_refresh_v_bits: usize,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Option<DiamondIOMaskIndependentErrorPrefix>
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
+        let mut prf_refreshes = Vec::with_capacity(self.input_size);
+        let mut final_seed_errors = base.initial_seed_errors.clone();
+        if self.input_size > 0 {
+            let first = self.simulate_prf_refresh_round_fixed(
+                &base,
+                0,
+                noise_refresh_v_bits,
+                &base.initial_seed_errors,
+                plt_evaluator,
+                slot_transfer_evaluator,
+            )?;
+            final_seed_errors = vec![first.refreshed_seed.clone(); 5];
+            prf_refreshes.push(first.round);
+
+            if self.input_size > 1 {
+                // After the first refresh, every seed wire has the same rounded CBD bound. The
+                // second round therefore gives the steady-state representative refresh used for
+                // all later rounds; later graph seeds change, but the error shape does not.
+                let steady = self.simulate_prf_refresh_round_fixed(
+                    &base,
+                    1,
+                    noise_refresh_v_bits,
+                    &final_seed_errors,
+                    plt_evaluator,
+                    slot_transfer_evaluator,
+                )?;
+                final_seed_errors = vec![steady.refreshed_seed.clone(); 5];
+                prf_refreshes.push(steady.round.clone());
+                for round_idx in 2..self.input_size {
+                    info!(
+                        round_idx,
+                        v_bits = steady.round.noise_refresh.v_bits,
+                        refreshed_seed_error_bits =
+                            bigdecimal_bits_ceil(&steady.refreshed_seed.matrix_norm.poly_norm.norm),
+                        "DiamondIO reusing fixed-v steady-state PRF refresh error simulation"
+                    );
+                    prf_refreshes.push(DiamondIOPrfRoundErrorSimulation {
+                        round_idx,
+                        representative_selected_prg_output: steady
+                            .round
+                            .representative_selected_prg_output
+                            .clone(),
+                        noise_refresh: steady.round.noise_refresh.clone(),
+                    });
+                }
+            }
+        }
+        info!(
+            prf_rounds = prf_refreshes.len(),
+            noise_refresh_v_bits,
+            "DiamondIO fixed-v mask-independent error simulation prefix finished"
+        );
+        Some(DiamondIOMaskIndependentErrorPrefix {
+            cpu_params: base.cpu_params,
+            ctx: base.ctx,
+            input_injection: base.input_injection,
+            prf_refreshes,
+            one: base.one,
+            decryption_key: base.decryption_key,
+            final_decoder_error: base.final_decoder_error,
+            final_seed_errors,
+            function_secret_error: base.function_secret_error,
+            public_bottom_decryption_error: base.public_bottom_decryption_error,
         })
+    }
+
+    fn search_prf_refresh_round_fixed_v_bits<PE, ST>(
+        &self,
+        base: &DiamondIOMaskIndependentErrorBase,
+        round_idx: usize,
+        max_candidate: usize,
+        security_bit: usize,
+        seed_errors: &[ErrorNorm],
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Option<DiamondIOPrfRefreshRoundEvaluation>
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
+        let mut low = 1usize;
+        let mut high = max_candidate;
+        let mut best = None;
+        while low <= high {
+            let candidate = low + (high - low) / 2;
+            let Some(evaluation) = self.simulate_prf_refresh_round_fixed(
+                base,
+                round_idx,
+                candidate,
+                seed_errors,
+                plt_evaluator,
+                slot_transfer_evaluator,
+            ) else {
+                if candidate == 1 {
+                    break;
+                }
+                high = candidate - 1;
+                continue;
+            };
+            let valid = diamond_io_noise_refresh_security_margin_holds(
+                &base.cpu_params,
+                &evaluation.round.noise_refresh,
+                security_bit,
+            );
+            debug!(
+                round_idx,
+                candidate, valid, "DiamondIO fixed-v noise-refresh security candidate evaluated"
+            );
+            if valid {
+                best = Some(evaluation);
+                low = candidate + 1;
+            } else if candidate == 1 {
+                break;
+            } else {
+                high = candidate - 1;
+            }
+        }
+        best
+    }
+
+    fn simulate_prf_refresh_round_fixed<PE, ST>(
+        &self,
+        base: &DiamondIOMaskIndependentErrorBase,
+        round_idx: usize,
+        noise_refresh_v_bits: usize,
+        seed_errors: &[ErrorNorm],
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Option<DiamondIOPrfRefreshRoundEvaluation>
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
+        let required_seed_bits = minimum_noise_refresh_seed_bits(
+            &base.cpu_params,
+            noise_refresh_v_bits,
+            self.noise_refresh_cbd_n,
+        );
+        if self.seed_bits < required_seed_bits {
+            info!(
+                round_idx,
+                noise_refresh_v_bits,
+                seed_bits = self.seed_bits,
+                required_seed_bits,
+                "DiamondIO fixed-v PRF refresh rejected unsafe noise-refresh PRG bound"
+            );
+            return None;
+        }
+        let (selected, material_wire_error) = self.simulate_prf_refresh_material_inputs(
+            base,
+            round_idx,
+            seed_errors,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        );
+        let mut refresh_context_circuit = PolyCircuit::<DCRTPoly>::new();
+        let refresh =
+            simulate_symmetric_noise_refresh_error_growth_for_v_bits_with_material_override(
+                self.build_cpu_ring_gsw_context(
+                    &base.cpu_params,
+                    &mut refresh_context_circuit,
+                    self.full_active_levels(&base.cpu_params),
+                ),
+                self.seed_bits,
+                noise_refresh_v_bits,
+                self.noise_refresh_cbd_n,
+                self.ring_gsw_public_key_error_sigma.unwrap_or(0.0),
+                base.cpu_params.ring_dimension() as usize,
+                base.one.clone(),
+                selected.clone(),
+                seed_errors,
+                base.decryption_key.clone(),
+                base.refresh_decoder_error.clone(),
+                material_wire_error,
+                plt_evaluator,
+                slot_transfer_evaluator,
+            );
+        Some(self.finish_prf_refresh_round_evaluation(round_idx, selected, refresh))
+    }
+
+    fn simulate_prf_refresh_material_inputs<PE, ST>(
+        &self,
+        base: &DiamondIOMaskIndependentErrorBase,
+        round_idx: usize,
+        seed_errors: &[ErrorNorm],
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> (ErrorNorm, ErrorNorm)
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
+        // Low and high halves are both one representative Goldreich PRG output evaluated from the
+        // same seed-error profile. The selected output circuit below only needs an ErrorNorm bound
+        // for each encoded branch, so the symmetric high branch can reuse the low branch bound.
+        let representative_branch = self.simulate_representative_prg_output(
+            &base.cpu_params,
+            round_idx,
+            2 * self.seed_bits,
+            0,
+            base.one.clone(),
+            seed_errors.to_vec(),
+            plt_evaluator,
+            slot_transfer_evaluator,
+        );
+        debug!(
+            round_idx,
+            high_range_start = self.seed_bits,
+            "DiamondIO reusing representative PRG branch error for symmetric high half"
+        );
+        let selected = simulate_selected_half_error_norm(
+            base.one.clone(),
+            representative_branch.clone(),
+            representative_branch.clone(),
+            base.one.clone(),
+        );
+        let material_wire_error = scale_error_norm(
+            // Noise-refresh material is generated from the same encrypted seed profile by a
+            // one-output Goldreich PRG. CBD material combines `2 * cbd_n` uniform branches, so
+            // scaling the active-level-extrapolated representative branch is a conservative bound
+            // for both CBD error and mask material wires.
+            representative_branch,
+            &BigDecimal::from((2 * self.noise_refresh_cbd_n) as u64),
+        );
+        (selected, material_wire_error)
+    }
+
+    fn finish_prf_refresh_round_evaluation(
+        &self,
+        round_idx: usize,
+        selected: ErrorNorm,
+        refresh: NoiseRefreshErrorSimulation,
+    ) -> DiamondIOPrfRefreshRoundEvaluation {
+        let worst_rounded_error = refresh
+            .rounded_errors
+            .iter()
+            .max_by(|lhs, rhs| {
+                lhs.poly_norm
+                    .norm
+                    .partial_cmp(&rhs.poly_norm.norm)
+                    .expect("DiamondIO rounded errors must be comparable")
+            })
+            .expect("noise refresh must produce rounded errors")
+            .clone();
+        let refreshed_seed =
+            ErrorNorm::new(worst_rounded_error.poly_norm.clone(), worst_rounded_error);
+        info!(
+            round_idx,
+            v_bits = refresh.v_bits,
+            refreshed_seed_error_bits =
+                bigdecimal_bits_ceil(&refreshed_seed.matrix_norm.poly_norm.norm),
+            "DiamondIO PRF refresh error simulation finished"
+        );
+        DiamondIOPrfRefreshRoundEvaluation {
+            round: DiamondIOPrfRoundErrorSimulation {
+                round_idx,
+                representative_selected_prg_output: selected,
+                noise_refresh: refresh,
+            },
+            refreshed_seed,
+        }
     }
 
     fn finish_error_growth_from_mask_independent_prefix<PE, ST>(
@@ -810,6 +1172,11 @@ where
         // native q coefficient, so max(p_i) - 1 is the tight scalar bound.
         let scalar_bound = BigUint::from(scalar_bound);
         one.large_scalar_mul(&(), &[scalar_bound])
+    }
+
+    fn full_active_levels(&self, params: &DCRTPolyParams) -> usize {
+        let (_, _, crt_depth) = params.to_crt();
+        self.ring_gsw_enable_levels.unwrap_or_else(|| crt_depth - self.ring_gsw_level_offset)
     }
 
     fn build_cpu_ring_gsw_context(
@@ -1168,13 +1535,14 @@ fn diamond_io_input_injection_scalar_projection_error(
     state_error.clone() * &scalar_output_preimage
 }
 
-fn selected_noise_refresh_v_bits(simulation: &DiamondIOErrorSimulation) -> usize {
+fn fixed_noise_refresh_v_bits_match(
+    simulation: &DiamondIOErrorSimulation,
+    noise_refresh_v_bits: usize,
+) -> bool {
     simulation
         .prf_refreshes
         .iter()
-        .map(|refresh| refresh.noise_refresh.v_bits)
-        .min()
-        .expect("DiamondIO simulation must include at least one PRF refresh")
+        .all(|refresh| refresh.noise_refresh.v_bits == noise_refresh_v_bits)
 }
 
 fn diamond_io_security_margins_hold(
@@ -1195,22 +1563,27 @@ fn diamond_io_security_margins_hold(
         return false;
     }
     simulation.prf_refreshes.iter().all(|refresh| {
-        let Some(threshold) =
-            diamond_io_noise_refresh_pre_round_margin(params, refresh.noise_refresh.v_bits)
-        else {
-            return false;
-        };
-        let worst_error = refresh
-            .noise_refresh
-            .pre_round_outputs
-            .iter()
-            .map(|error| error.poly_norm.norm.clone())
-            .max_by(|lhs, rhs| {
-                lhs.partial_cmp(rhs).expect("noise-refresh pre-rounding norms must be comparable")
-            })
-            .expect("noise-refresh simulation must produce at least one pre-round output");
-        validate_error_bound_security_margin(&threshold, &worst_error, security_bit)
+        diamond_io_noise_refresh_security_margin_holds(params, &refresh.noise_refresh, security_bit)
     })
+}
+
+fn diamond_io_noise_refresh_security_margin_holds(
+    params: &DCRTPolyParams,
+    refresh: &NoiseRefreshErrorSimulation,
+    security_bit: usize,
+) -> bool {
+    let Some(threshold) = diamond_io_noise_refresh_pre_round_margin(params, refresh.v_bits) else {
+        return false;
+    };
+    let worst_error = refresh
+        .pre_round_outputs
+        .iter()
+        .map(|error| error.poly_norm.norm.clone())
+        .max_by(|lhs, rhs| {
+            lhs.partial_cmp(rhs).expect("noise-refresh pre-rounding norms must be comparable")
+        })
+        .expect("noise-refresh simulation must produce at least one pre-round output");
+    validate_error_bound_security_margin(&threshold, &worst_error, security_bit)
 }
 
 fn diamond_io_final_decode_margin(
@@ -1530,6 +1903,61 @@ mod tests {
             .expect("DiamondIO error simulation should find a noise-refresh mask size");
 
         assert_eq!(simulation.prf_refreshes.len(), scheme.input_size);
+    }
+
+    #[test]
+    #[ignore = "fixed-v DiamondIO prefix simulation is heavier than default unit tests"]
+    fn test_fixed_v_prefix_uses_selected_v_bits_for_single_round() {
+        let scheme = test_scheme_with_input_count(2, 1);
+        let ctx = simulator_context(&scheme.injector.params);
+        let plt_evaluator =
+            NormPltLWEEvaluator::new(ctx.clone(), &BigDecimal::from_f64(0.0).unwrap());
+        let slot_transfer_evaluator = NormNaiveBggEncodingVecSTEvaluator::new();
+
+        let prefix = scheme
+            .simulate_mask_independent_error_prefix_fixed_noise_refresh_v_bits(
+                DiamondIOFuncType::DebugDecryption,
+                scheme.noise_refresh_v_bits,
+                &plt_evaluator,
+                &slot_transfer_evaluator,
+            )
+            .expect("fixed-v prefix should build with the fixture seed size");
+
+        assert_eq!(prefix.prf_refreshes.len(), 1);
+        assert_eq!(prefix.prf_refreshes[0].round_idx, 0);
+        assert_eq!(prefix.prf_refreshes[0].noise_refresh.v_bits, scheme.noise_refresh_v_bits);
+    }
+
+    #[test]
+    #[ignore = "fixed-v DiamondIO prefix simulation is heavier than default unit tests"]
+    fn test_fixed_v_prefix_reuses_steady_state_without_researching_v_bits() {
+        let scheme = test_scheme_with_input_count(2, 3);
+        let ctx = simulator_context(&scheme.injector.params);
+        let plt_evaluator =
+            NormPltLWEEvaluator::new(ctx.clone(), &BigDecimal::from_f64(0.0).unwrap());
+        let slot_transfer_evaluator = NormNaiveBggEncodingVecSTEvaluator::new();
+
+        let prefix = scheme
+            .simulate_mask_independent_error_prefix_fixed_noise_refresh_v_bits(
+                DiamondIOFuncType::DebugDecryption,
+                scheme.noise_refresh_v_bits,
+                &plt_evaluator,
+                &slot_transfer_evaluator,
+            )
+            .expect("fixed-v prefix should build with the fixture seed size");
+
+        assert_eq!(prefix.prf_refreshes.len(), scheme.input_size);
+        assert_eq!(
+            prefix.prf_refreshes.iter().map(|refresh| refresh.round_idx).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(
+            prefix
+                .prf_refreshes
+                .iter()
+                .all(|refresh| refresh.noise_refresh.v_bits == scheme.noise_refresh_v_bits)
+        );
+        assert_eq!(prefix.prf_refreshes[1].noise_refresh, prefix.prf_refreshes[2].noise_refresh);
     }
 
     #[test]

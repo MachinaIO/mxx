@@ -17,6 +17,7 @@ pub use simulation::{
     NoiseRefreshErrorSimulation, simulate_noise_refresh_error_growth,
     simulate_symmetric_noise_refresh_error_growth,
     simulate_symmetric_noise_refresh_error_growth_for_v_bits,
+    simulate_symmetric_noise_refresh_error_growth_for_v_bits_with_material_override,
 };
 
 /// Refreshes the noise of one slotwise encoding wire.

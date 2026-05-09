@@ -179,7 +179,7 @@ where
     {
         let iterations = iterations.max(1);
         let params = &diamond.injector.params;
-        let shape = DiamondIOBenchShape::from_diamond(diamond);
+        let shape = DiamondIOBenchShape::from_diamond(diamond, diamond.output_size);
         let state_row_size = 2usize
             .checked_mul(DIAMOND_SECRET_SIZE)
             .expect("DiamondIO benchmark state row size overflow");
@@ -480,20 +480,17 @@ where
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
-        match func {
-            DiamondIOFuncType::DebugDecryption => {
-                assert!(
-                    diamond.output_size <= diamond.seed_bits,
-                    "DebugDecryption benchmark output_size must not exceed seed_bits"
-                );
-            }
-        }
+        let function_output_bits = func.output_bits();
+        assert!(
+            function_output_bits > 0,
+            "DiamondIO GoldreichPRF benchmark output_bits must be positive"
+        );
         assert!(
             diamond.prf_mask_output_coeff_bits > 0,
             "DiamondIO bench estimation requires positive prf_mask_output_coeff_bits"
         );
 
-        let shape = DiamondIOBenchShape::from_diamond(diamond);
+        let shape = DiamondIOBenchShape::from_diamond(diamond, function_output_bits);
         info!("starting DiamondIO input-injection benchmark estimation");
         let input_injection = self.estimate_input_injection(diamond, shape.clone());
         info!("completed DiamondIO input-injection benchmark estimation");
@@ -575,7 +572,8 @@ where
                 PrfBenchMode::PublicKeyPreprocess,
             );
 
-        // Corresponds to `circuit.eval(... public keys ...)` for the selected function.
+        // GoldreichPRF function outputs are the suffix of the final PRG stream, so their PRG and
+        // decrypt work is accounted inside `estimate_prf_path`.
         let function_public_key_eval = self
             .estimate_function_circuit::<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
                 diamond,
@@ -620,12 +618,12 @@ where
         ]);
 
         // After the scalar BGG public keys exist, the input-injection trapdoor chain and the
-        // native seed-encryption/lifting branch have no data dependency. The PRF and function
-        // public-key circuit evaluations depend on the lifted seed wires, while projection
-        // preimages wait for the final input-injection trapdoor basis. With enough GPUs, the
-        // lookup bridge can run on the input-injection branch while the PRF/function branch is
-        // still producing public keys; only the refresh-decoder and final-output projection
-        // preimages require both branches to have finished.
+        // native seed-encryption/lifting branch have no data dependency. The PRF public-key path
+        // depends on the lifted seed wires and also contains the GoldreichPRF suffix, while
+        // projection preimages wait for the final input-injection trapdoor basis. With
+        // enough GPUs, the lookup bridge can run on the input-injection branch while the
+        // PRF branch is still producing public keys; only the refresh-decoder and
+        // final-output projection preimages require both branches to have finished.
         let seed_public_side = sequential_summaries(&[
             ring_gsw_public_key_sampling.clone(),
             seed_encryption_and_lift.clone(),
@@ -730,9 +728,8 @@ where
                 PrfBenchMode::EncodingOnline,
             );
 
-        // The concrete eval computes PRF mask encodings and function encodings independently after
-        // all input encodings and lookup evaluators are available. With enough GPUs, these two
-        // branches can occupy separate devices; the final decoder waits for both.
+        // GoldreichPRF function encodings are suffix outputs of the final PRG stream and are
+        // accounted inside `estimate_prf_path`.
         let prf_and_function =
             parallel_summaries(&[prf_encoding_path.total.clone(), function_encoding_eval.clone()]);
 
@@ -782,8 +779,8 @@ where
 
     fn estimate_function_circuit<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
         &self,
-        diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
-        shape: DiamondIOBenchShape,
+        _diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+        _shape: DiamondIOBenchShape,
         func: DiamondIOFuncType,
         mode: PrfBenchMode,
     ) -> CircuitBenchSummary
@@ -799,27 +796,15 @@ where
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
         match func {
-            DiamondIOFuncType::DebugDecryption => {
-                // DebugDecryption decrypts one independent Ring-GSW ciphertext per requested
-                // output bit. Measuring the full representative circuit would allocate all seed
-                // ciphertext inputs at once; measuring the one-ciphertext decrypt primitive and
-                // scaling by `output_size` preserves the work and enough-GPUs latency model.
-                let unit = self
-                    .estimate_prf_mask_decrypt_one_ciphertext_bit_unit::<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
-                        diamond,
-                        &shape,
-                        mode,
-                    );
-                let summary = scale_summary(unit.clone(), diamond.output_size);
+            DiamondIOFuncType::GoldreichPRF { output_bits } => {
+                assert!(output_bits > 0, "DiamondIO GoldreichPRF output_bits must be positive");
                 info!(
                     ?mode,
                     ?func,
-                    output_size = diamond.output_size,
-                    ?unit,
-                    ?summary,
-                    "estimated DiamondIO function benchmark from one Ring-GSW decrypt primitive"
+                    output_bits,
+                    "DiamondIO GoldreichPRF benchmark work is accounted in the final PRF path"
                 );
-                summary
+                CircuitBenchSummary::default()
             }
         }
     }
@@ -1064,12 +1049,17 @@ where
         let noise_refresh =
             repeat_sequential_summary(noise_refresh_per_round.clone(), diamond.input_size);
 
-        // The final PRG output stream contains `output_size * ring_dim *
-        // prf_mask_output_coeff_bits` independent Ring-GSW ciphertext bits. A representative
-        // one-output Goldreich circuit keeps estimator memory bounded and preserves the
-        // enough-GPUs latency rule.
-        let final_mask_prg = scale_summary(prg_unit.clone(), shape.final_mask_prg_output_count());
-        info!(?mode, ?final_mask_prg, "estimated DiamondIO PRF benchmark final-mask PRG");
+        // The final PRG output stream contains the mask prefix followed by the GoldreichPRF
+        // function suffix. The suffix is not an independent function circuit: it is generated from
+        // the same final refreshed seed and the same conceptual PRG output stream.
+        let final_prg = scale_summary(prg_unit.clone(), shape.final_prg_output_count());
+        info!(
+            ?mode,
+            final_mask_outputs = shape.final_mask_prg_output_count(),
+            function_outputs = shape.goldreich_prf_output_count(),
+            ?final_prg,
+            "estimated DiamondIO PRF benchmark final-mask/function PRG"
+        );
 
         // The concrete final-mask decrypt circuit consumes `ring_dim * coeff_bits` encrypted
         // Ring-GSW bit ciphertexts per DiamondIO output. For benchmarking, measure one independent
@@ -1081,7 +1071,7 @@ where
                 final_mask_decrypt_unit.clone(),
                 shape.ring_dim,
                 diamond.prf_mask_output_coeff_bits,
-                diamond.output_size,
+                shape.goldreich_prf_output_count(),
             );
         let final_mask_reduce_add_count =
             bit_decomposed_mask_reduce_add_count(diamond.prf_mask_output_coeff_bits);
@@ -1099,15 +1089,19 @@ where
             Some(sub),
             diamond.prf_mask_output_coeff_bits,
             // `build_prf_mask_circuit` consumes `ring_dim * coeff_bits` encrypted bits and reduces
-            // them into one polynomial mask. `output_size` is therefore the number of independent
-            // polynomial masks; multiplying by `ring_dim` here would double-count coefficient
-            // work.
-            diamond.output_size,
+            // them into one polynomial mask. `shape.output_size` is the selected function output
+            // count, hence also the number of independent final masks; multiplying by `ring_dim`
+            // here would double-count coefficient work.
+            shape.goldreich_prf_output_count(),
         );
         let final_mask_decrypt = sequential_summaries(&[
             final_mask_decrypt_contributions.clone(),
             final_mask_reduction.clone(),
         ]);
+        let final_function_decrypt =
+            scale_summary(final_mask_decrypt_unit.clone(), shape.goldreich_prf_output_count());
+        let final_output_decrypt =
+            parallel_summaries(&[final_mask_decrypt.clone(), final_function_decrypt.clone()]);
         info!(
             ?mode,
             final_mask_decrypt_contribution_count,
@@ -1116,7 +1110,9 @@ where
             ?final_mask_decrypt_contributions,
             ?final_mask_reduction,
             ?final_mask_decrypt,
-            "estimated DiamondIO PRF benchmark final-mask decrypt"
+            ?final_function_decrypt,
+            ?final_output_decrypt,
+            "estimated DiamondIO PRF benchmark final-mask and function decrypt"
         );
 
         // The PRF seed rounds are sequential, because each refresh produces the seed consumed by
@@ -1156,7 +1152,7 @@ where
             ),
         };
         let final_summary =
-            sequential_summaries(&[final_mask_prg.clone(), final_mask_decrypt.clone()]);
+            sequential_summaries(&[final_prg.clone(), final_output_decrypt.clone()]);
         let compute_without_refresh_decoder =
             sequential_summaries(&[round_compute.clone(), final_summary.clone()]);
         let total = match mode {
@@ -1174,8 +1170,9 @@ where
             selected_half_mux,
             refresh_decoder_work,
             noise_refresh,
-            final_mask_prg,
+            final_prg,
             final_mask_decrypt,
+            final_function_decrypt,
             compute_without_refresh_decoder,
             total: total.clone(),
         };
@@ -1375,6 +1372,7 @@ where
             ring_gsw_wire_count = shape.ring_gsw_wire_count,
             selected_prg_output_count = shape.selected_prg_output_count(),
             final_mask_prg_output_count = shape.final_mask_prg_output_count(),
+            final_prg_output_count = shape.final_prg_output_count(),
             ?input_injection_metadata_and_seed_bytes,
             ?input_injection_public_checkpoint_bytes,
             ?input_injection_transition_preimage_bytes,
@@ -1430,9 +1428,9 @@ where
                 diamond.noise_refresh_v_bits,
                 diamond.noise_refresh_cbd_n,
             );
-        let final_mask_prg_outputs = BigUint::from(shape.final_mask_prg_output_count());
+        let final_prg_outputs = BigUint::from(shape.final_prg_output_count());
         let prg_output_count =
-            selected_prg_outputs + noise_refresh_material_prg_outputs + final_mask_prg_outputs;
+            selected_prg_outputs + noise_refresh_material_prg_outputs + final_prg_outputs;
         let total = prg_aux.compact_bytes.clone() * prg_output_count.clone();
         debug!(
             ?prg_aux,
@@ -1498,8 +1496,9 @@ struct DiamondIOPrfBenchEstimateParts {
     selected_half_mux: CircuitBenchSummary,
     refresh_decoder_work: CircuitBenchSummary,
     noise_refresh: CircuitBenchSummary,
-    final_mask_prg: CircuitBenchSummary,
+    final_prg: CircuitBenchSummary,
     final_mask_decrypt: CircuitBenchSummary,
+    final_function_decrypt: CircuitBenchSummary,
     compute_without_refresh_decoder: CircuitBenchSummary,
     total: CircuitBenchSummary,
 }

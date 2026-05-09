@@ -229,6 +229,7 @@ impl DiamondIOGpuBenchConfig {
         minimum_diamond_io_prf_seed_bits(
             params,
             self.output_size,
+            self.output_size,
             prf_mask_output_coeff_bits,
             noise_refresh_v_bits,
             self.noise_refresh_cbd_n,
@@ -763,7 +764,7 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
             cfg.max_crt_depth,
             cfg.prf_mask_output_coeff_bits_search_bound(),
             cfg.security_bits,
-            DiamondIOFuncType::DebugDecryption,
+            DiamondIOFuncType::GoldreichPRF { output_bits: cfg.output_size() },
             |crt_depth, prf_mask_output_coeff_bits, noise_refresh_v_bits| {
                 let search_params =
                     DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
@@ -847,7 +848,8 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         &diamond,
         cfg.bench_iterations,
     );
-    let estimate = diamond_bench_estimator.estimate(&diamond, DiamondIOFuncType::DebugDecryption);
+    let estimate = diamond_bench_estimator
+        .estimate(&diamond, DiamondIOFuncType::GoldreichPRF { output_bits: cfg.output_size() });
 
     info!(
         obfuscate_latency = estimate.obfuscate.latency,

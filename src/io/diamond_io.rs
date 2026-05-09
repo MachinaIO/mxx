@@ -17,8 +17,8 @@ use crate::{
     decoder::{
         artifact::{DecoderArtifactSink, DecoderArtifactSource, DirectoryDecoderArtifacts},
         mask_circuit::{
-            center_public_bottom, decrypt_bit_decomposed_polynomial_parts,
-            mask_plaintext_moduli_from_full_modulus,
+            build_one_ciphertext_bit_decrypt_circuit, center_public_bottom,
+            decrypt_bit_decomposed_polynomial_parts, mask_plaintext_moduli_from_full_modulus,
         },
         masked_high_bit::MaskedHighBitDecoder,
     },
@@ -70,10 +70,30 @@ pub use simulation::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Function families supported by the Diamond iO wrapper.
 pub enum DiamondIOFuncType {
-    /// Debug circuit that decrypts private seed ciphertexts and returns only
-    /// those decrypted seed bits. Explicit public input bits are still used as
-    /// Diamond/PRF inputs, but they are not function outputs.
-    DebugDecryption,
+    /// Debug PRF circuit that starts from the final refreshed DiamondIO PRF
+    /// seed, evaluates an additional Goldreich PRG stream, decrypts those
+    /// encrypted output bits, and returns them as the function outputs.
+    ///
+    /// `output_bits` is the number of suffix PRG bits to decrypt and return.
+    /// The surrounding `DiamondIO::output_size` remains the default benchmark
+    /// configuration, but this function family carries its own output length.
+    GoldreichPRF { output_bits: usize },
+}
+
+impl DiamondIOFuncType {
+    fn output_bits(self) -> usize {
+        match self {
+            Self::GoldreichPRF { output_bits } => output_bits,
+        }
+    }
+}
+
+pub(super) struct DiamondIOPrfPublicKeyPathOutput<M>
+where
+    M: PolyMatrix,
+{
+    pub final_mask_public_keys: Vec<(NaiveBGGPublicKeyVec<M>, NaiveBGGPublicKeyVec<M>)>,
+    pub function_public_keys: Vec<NaiveBGGPublicKeyVec<M>>,
 }
 
 /// Small in-memory handle returned by `DiamondIO::obfuscation`.
@@ -250,23 +270,8 @@ where
             "DiamondIO obfuscation shape validation finished"
         );
 
-        // Function-specific work is restricted to selecting and validating the
-        // circuit. Key sampling, seed encryption, circuit evaluation, and
-        // Diamond preprocessing below are shared across function types.
-        let circuit_started = Instant::now();
-        let circuit = match func {
-            DiamondIOFuncType::DebugDecryption => {
-                assert!(
-                    self.output_size <= self.seed_bits,
-                    "DebugDecryption output_size must not exceed seed_bits"
-                );
-                self.build_debug_decryption_circuit()
-            }
-        };
-        debug!(
-            elapsed_ms = circuit_started.elapsed().as_millis(),
-            "DiamondIO obfuscation selected function circuit"
-        );
+        let function_output_bits = func.output_bits();
+        assert!(function_output_bits > 0, "DiamondIO GoldreichPRF output_bits must be positive");
 
         // Sample the ternary Ring-GSW decryption key `k` and the BGG hash key
         // used to derive all scalar public keys for this obfuscation.
@@ -439,19 +444,22 @@ where
             self.debug_encrypt_random_prg_wires().then_some(&mut debug_prg_ciphertexts);
         #[cfg(not(test))]
         let debug_prg_ciphertext_sink: Option<&mut Vec<NativeRingGswCiphertext<M::P>>> = None;
-        let final_prf_mask_public_key_vecs = self.compute_prf_mask_public_key(
+        let prf_public_key_output = self.compute_prf_mask_public_key(
             Some(dir_path),
             Some(&preprocess_out),
             &one_vec,
             &k_vec,
             &input_digit_vecs,
             &enc_seed_public_keys,
+            function_output_bits,
             self.debug_encrypt_random_prg_wires().then_some(&ring_gsw_public_key),
             debug_prg_ciphertext_sink,
         );
+        let final_prf_mask_public_key_vecs = prf_public_key_output.final_mask_public_keys;
+        let evaluated_public_keys = prf_public_key_output.function_public_keys;
         assert_eq!(
             final_prf_mask_public_key_vecs.len(),
-            self.output_size,
+            function_output_bits,
             "DiamondIO must sample one final PRF mask public key per output"
         );
         info!(
@@ -460,50 +468,15 @@ where
             "DiamondIO obfuscation PRF public-key path finished"
         );
 
-        // Evaluate the selected function circuit over public keys. The inputs
-        // are ordered as the circuit expects: decryption key followed by seed
-        // ciphertext wires. Explicit public input bits are consumed by the
-        // PRF path above, not by `DebugDecryption`.
-        let function_eval_started = Instant::now();
-        let seed_public_key_wires_per_ciphertext = enc_seed_public_keys
-            .len()
-            .checked_div(self.seed_bits)
-            .expect("DiamondIO seed bit count must be positive");
-        assert_eq!(
-            seed_public_key_wires_per_ciphertext * self.seed_bits,
-            enc_seed_public_keys.len(),
-            "DiamondIO encrypted seed public keys must split evenly by seed ciphertext"
-        );
-        let function_seed_public_key_wire_count = self
-            .output_size
-            .checked_mul(seed_public_key_wires_per_ciphertext)
-            .expect("DiamondIO function seed public-key input count overflow");
-        let mut function_inputs = Vec::with_capacity(1 + function_seed_public_key_wire_count);
-        function_inputs.push(NaiveBGGPublicKeyVec::new(params, vec![k_vec.key(0)]));
-        function_inputs
-            .extend(enc_seed_public_keys[..function_seed_public_key_wire_count].iter().cloned());
-        let pk_slot_transfer_evaluator = self
-            .pk_slot_transfer_evaluator
-            .as_ref()
-            .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>);
-        let evaluated_public_keys = circuit.eval(
-            params,
-            one_vec.clone(),
-            function_inputs,
-            self.pk_lookup_evaluator.as_ref(),
-            pk_slot_transfer_evaluator,
-            None,
-        );
         assert_eq!(
             evaluated_public_keys.len(),
-            2 * self.output_size,
+            2 * function_output_bits,
             "DiamondIO evaluated public-key output count mismatch"
         );
         info!(
-            function_input_count = 1 + function_seed_public_key_wire_count,
+            function_output_bits,
             evaluated_output_count = evaluated_public_keys.len(),
-            elapsed_ms = function_eval_started.elapsed().as_millis(),
-            "DiamondIO obfuscation function public-key evaluation finished"
+            "DiamondIO obfuscation GoldreichPRF public-key outputs ready"
         );
         let projection_started = Instant::now();
         let one_plaintext = M::P::const_one(params);
@@ -634,6 +607,7 @@ where
         info!(
             input_len = input.len(),
             output_size = self.output_size,
+            function_output_bits = obf.func_type.output_bits(),
             seed_bits = self.seed_bits,
             "DiamondIO eval started"
         );
@@ -686,10 +660,6 @@ where
         // DiamondIO projection artifacts. Online evaluation does not rerun the
         // function or PRF circuits over public keys.
         let public_key_started = Instant::now();
-        #[cfg(test)]
-        let circuit = match obf.func_type {
-            DiamondIOFuncType::DebugDecryption => self.build_debug_decryption_circuit(),
-        };
         let (one, k_pubkey, input_digit_pubkeys) =
             self.sample_bgg_public_keys(params, obf.bgg_hash_key);
         debug!(
@@ -897,23 +867,15 @@ where
             elapsed_ms = seed_lift_started.elapsed().as_millis(),
             "DiamondIO eval lifted seed ciphertext wires"
         );
-        let seed_wires_per_ciphertext = seed_encoding_inputs
+        let _seed_wires_per_ciphertext = seed_encoding_inputs
             .len()
             .checked_div(self.seed_bits)
             .expect("DiamondIO seed bit count must be positive");
         assert_eq!(
-            seed_wires_per_ciphertext * self.seed_bits,
+            _seed_wires_per_ciphertext * self.seed_bits,
             seed_encoding_inputs.len(),
             "DiamondIO lifted seed wires must split evenly by seed ciphertext"
         );
-        #[cfg(test)]
-        {
-            assert_eq!(
-                circuit.num_input(),
-                1 + self.output_size * seed_wires_per_ciphertext,
-                "DebugDecryption circuit input order must be decryption key followed by seed ciphertext wires"
-            );
-        }
         let digit_encoding_inputs = digit_outputs
             .iter()
             .enumerate()
@@ -968,17 +930,18 @@ where
         let debug_prg_ciphertexts: &[NativeRingGswCiphertext<M::P>] = &[];
         let prf_eval_started = Instant::now();
         #[cfg(test)]
-        let final_prf_mask_encodings = self.compute_prf_mask_encoding(
-            dir_path,
-            &states,
-            &one_encoding_vec,
-            &k_encoding_vec,
-            &digit_encoding_inputs,
-            seed_encoding_inputs.clone(),
-            debug_prg_ciphertexts,
-            &enc_lookup_evaluator,
-            enc_slot_transfer_evaluator,
-        );
+        let (final_prf_mask_seed_wires, final_prf_mask_wire_count, mut final_prf_mask_debug_cursor) =
+            self.compute_prf_mask_seed_encoding(
+                dir_path,
+                &states,
+                &one_encoding_vec,
+                &k_encoding_vec,
+                &digit_encoding_inputs,
+                seed_encoding_inputs.clone(),
+                debug_prg_ciphertexts,
+                &enc_lookup_evaluator,
+                enc_slot_transfer_evaluator,
+            );
         #[cfg(not(test))]
         let (final_prf_mask_seed_wires, final_prf_mask_wire_count, mut final_prf_mask_debug_cursor) =
             self.compute_prf_mask_seed_encoding(
@@ -992,50 +955,77 @@ where
                 &enc_lookup_evaluator,
                 enc_slot_transfer_evaluator,
             );
-        #[cfg(test)]
-        assert_eq!(
-            final_prf_mask_encodings.len(),
-            self.output_size,
-            "DiamondIO eval must compute one final PRF mask encoding per output"
-        );
+        let function_output_bits = obf.func_type.output_bits();
+        assert!(function_output_bits > 0, "DiamondIO GoldreichPRF output_bits must be positive");
         info!(
-            final_prf_mask_count = self.output_size,
+            final_prf_mask_count = function_output_bits,
             elapsed_ms = prf_eval_started.elapsed().as_millis(),
             "DiamondIO eval PRF mask seed path finished"
         );
         let function_eval_started = Instant::now();
         #[cfg(test)]
-        let function_seed_encoding_wire_count = self
-            .output_size
-            .checked_mul(seed_wires_per_ciphertext)
-            .expect("DiamondIO function seed encoding input count overflow");
+        let final_mask_bits_per_output = (params.ring_dimension() as usize)
+            .checked_mul(self.prf_mask_output_coeff_bits)
+            .expect("DiamondIO final mask bits-per-output overflow");
         #[cfg(test)]
-        let mut encoding_function_inputs =
-            Vec::with_capacity(1 + function_seed_encoding_wire_count);
+        let final_mask_output_bits = final_mask_bits_per_output
+            .checked_mul(function_output_bits)
+            .expect("DiamondIO final mask output bit count overflow");
         #[cfg(test)]
-        encoding_function_inputs.push(NaiveBGGEncodingVec::new(params, vec![k_output]));
+        let final_mask_conceptual_output_bits = final_mask_output_bits
+            .checked_add(function_output_bits)
+            .expect("DiamondIO final mask/function conceptual output count overflow");
         #[cfg(test)]
-        encoding_function_inputs
-            .extend(seed_encoding_inputs[..function_seed_encoding_wire_count].iter().cloned());
+        let mut final_mask_graph_generator = if self.debug_encrypt_random_prg_wires() {
+            None
+        } else {
+            Some(GoldreichFullDomainRangeGenerator::new(
+                self.seed_bits,
+                final_mask_conceptual_output_bits,
+                self.goldreich_prg_graph_seed(self.input_size),
+                Default::default(),
+            ))
+        };
         #[cfg(test)]
-        let evaluated_function_encodings = circuit
-            .eval(
-                params,
-                one_encoding_vec.clone(),
-                encoding_function_inputs,
-                Some(&enc_lookup_evaluator),
-                Some(
-                    enc_slot_transfer_evaluator
-                        as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
-                ),
-                None,
-            )
-            .into_iter()
+        let final_prf_mask_encodings = (0..function_output_bits)
+            .map(|output_idx| {
+                self.compute_prf_mask_encoding_output_from_seed(
+                    output_idx,
+                    &one_encoding_vec,
+                    &k_encoding_vec,
+                    &final_prf_mask_seed_wires,
+                    final_prf_mask_wire_count,
+                    &mut final_mask_graph_generator,
+                    debug_prg_ciphertexts,
+                    &mut final_prf_mask_debug_cursor,
+                    &enc_lookup_evaluator,
+                    enc_slot_transfer_evaluator,
+                )
+            })
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        let evaluated_function_encodings = (0..function_output_bits)
+            .flat_map(|output_idx| {
+                self.compute_goldreich_prf_encoding_output_from_seed(
+                    output_idx,
+                    function_output_bits,
+                    final_mask_output_bits,
+                    &one_encoding_vec,
+                    &k_encoding_vec,
+                    &final_prf_mask_seed_wires,
+                    final_prf_mask_wire_count,
+                    &mut final_mask_graph_generator,
+                    debug_prg_ciphertexts,
+                    &mut final_prf_mask_debug_cursor,
+                    &enc_lookup_evaluator,
+                    enc_slot_transfer_evaluator,
+                )
+            })
             .collect::<Vec<_>>();
         #[cfg(test)]
         assert_eq!(
             evaluated_function_encodings.len(),
-            2 * self.output_size,
+            2 * function_output_bits,
             "DiamondIO evaluated encoding count mismatch"
         );
         #[cfg(test)]
@@ -1088,7 +1078,7 @@ where
         // the preimage was sampled during obfuscation, so eval does not rebuild
         // or otherwise depend on output public keys here.
         let decoder_started = Instant::now();
-        let evaluated_output_count = 2 * self.output_size;
+        let evaluated_output_count = 2 * function_output_bits;
         let decoder = MaskedHighBitDecoder::<M, _, _, _>::new(
             params,
             DIAMOND_SECRET_SIZE,
@@ -1203,15 +1193,17 @@ where
 
         #[cfg(not(test))]
         let (outputs, decoder_count) = {
-            let mut outputs = Vec::with_capacity(self.output_size);
+            let mut outputs = Vec::with_capacity(function_output_bits);
             let mut decoder_offset = 0usize;
             let final_mask_bits_per_output = (params.ring_dimension() as usize)
                 .checked_mul(self.prf_mask_output_coeff_bits)
                 .expect("DiamondIO final mask bits-per-output overflow");
-            let final_mask_conceptual_output_bits = self
-                .output_size
-                .checked_mul(final_mask_bits_per_output)
-                .expect("DiamondIO final mask conceptual output count overflow");
+            let final_mask_output_bits = final_mask_bits_per_output
+                .checked_mul(function_output_bits)
+                .expect("DiamondIO final mask output bit count overflow");
+            let final_mask_conceptual_output_bits = final_mask_output_bits
+                .checked_add(function_output_bits)
+                .expect("DiamondIO final mask/function conceptual output count overflow");
             let mut final_mask_graph_generator = if self.debug_encrypt_random_prg_wires() {
                 None
             } else {
@@ -1222,7 +1214,8 @@ where
                     Default::default(),
                 ))
             };
-            for output_idx in 0..self.output_size {
+            let mut mask_compacts = Vec::with_capacity(function_output_bits);
+            for output_idx in 0..function_output_bits {
                 let mask_pair = self.compute_prf_mask_encoding_output_from_seed(
                     output_idx,
                     &one_encoding_vec,
@@ -1235,33 +1228,32 @@ where
                     &enc_lookup_evaluator,
                     enc_slot_transfer_evaluator,
                 );
-                let output_pair = match obf.func_type {
-                    DiamondIOFuncType::DebugDecryption => self
-                        .build_debug_decryption_output_circuit(output_idx)
-                        .eval(
-                            params,
-                            one_encoding_vec.clone(),
-                            std::iter::once(NaiveBGGEncodingVec::new(
-                                params,
-                                vec![k_output.clone()],
-                            ))
-                            .chain(
-                                seed_encoding_inputs[output_idx * seed_wires_per_ciphertext..
-                                    (output_idx + 1) * seed_wires_per_ciphertext]
-                                    .iter()
-                                    .cloned(),
-                            )
-                            .collect::<Vec<_>>(),
-                            Some(&enc_lookup_evaluator),
-                            Some(
-                                enc_slot_transfer_evaluator
-                                    as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
-                            ),
-                            None,
-                        )
-                        .into_iter()
-                        .collect::<Vec<_>>(),
-                };
+                let (mask_secret_dependent, mask_public_bottom) = mask_pair;
+                let secret_slots = (0..mask_secret_dependent.num_slots())
+                    .map(|slot_idx| mask_secret_dependent.encoding(slot_idx).to_compact())
+                    .collect::<Vec<_>>();
+                let public_slots = (0..mask_public_bottom.num_slots())
+                    .map(|slot_idx| mask_public_bottom.encoding(slot_idx).to_compact())
+                    .collect::<Vec<_>>();
+                mask_compacts.push((secret_slots, public_slots));
+            }
+            for (output_idx, (mask_secret_slots, mask_public_slots)) in
+                mask_compacts.into_iter().enumerate()
+            {
+                let output_pair = self.compute_goldreich_prf_encoding_output_from_seed(
+                    output_idx,
+                    function_output_bits,
+                    final_mask_output_bits,
+                    &one_encoding_vec,
+                    &k_encoding_vec,
+                    &final_prf_mask_seed_wires,
+                    final_prf_mask_wire_count,
+                    &mut final_mask_graph_generator,
+                    debug_prg_ciphertexts,
+                    &mut final_prf_mask_debug_cursor,
+                    &enc_lookup_evaluator,
+                    enc_slot_transfer_evaluator,
+                );
                 let [function_secret_dependent, function_public_bottom] =
                     output_pair.try_into().unwrap_or_else(|outputs: Vec<_>| {
                         panic!(
@@ -1269,7 +1261,10 @@ where
                             outputs.len()
                         )
                     });
-                let (mask_secret_dependent, mask_public_bottom) = mask_pair;
+                let mask_secret_dependent =
+                    NaiveBGGEncodingVec::from_compact_slots(params, mask_secret_slots.into_iter());
+                let mask_public_bottom =
+                    NaiveBGGEncodingVec::from_compact_slots(params, mask_public_slots.into_iter());
                 let function_slot_count = function_secret_dependent.num_slots();
                 let public_bottom_slot_count = function_public_bottom.num_slots();
                 let slot_count = mask_secret_dependent.num_slots();
@@ -2067,11 +2062,11 @@ mod tests {
             })),
             Some(NaiveBGGVecSlotTransferEvaluator::new()),
         );
-        let obf = scheme.obfuscation(dir.path(), DiamondIOFuncType::DebugDecryption);
+        let obf = scheme
+            .obfuscation(dir.path(), DiamondIOFuncType::GoldreichPRF { output_bits: output_size });
         let input = vec![true, false];
         let output = scheme.eval(dir.path(), &obf, input.clone());
 
         assert_eq!(output.len(), output_size);
-        assert_eq!(output.as_slice(), obf.original_seed_bits.as_slice());
     }
 }

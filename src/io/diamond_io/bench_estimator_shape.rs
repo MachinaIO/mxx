@@ -58,6 +58,7 @@ pub(super) struct DiamondIOBenchShape {
 impl DiamondIOBenchShape {
     pub(super) fn from_diamond<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
         diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+        function_output_bits: usize,
     ) -> Self
     where
         M: PolyMatrix + Send + Sync + 'static,
@@ -197,7 +198,7 @@ impl DiamondIOBenchShape {
         Self {
             ring_dim,
             input_size: diamond.input_size,
-            output_size: diamond.output_size,
+            output_size: function_output_bits,
             seed_bits: diamond.seed_bits,
             prf_mask_output_coeff_bits: diamond.prf_mask_output_coeff_bits,
             crt_depth,
@@ -446,6 +447,16 @@ impl DiamondIOBenchShape {
         self.final_decoder_count()
             .checked_mul(self.prf_mask_output_coeff_bits)
             .expect("DiamondIO final mask PRG output count overflow")
+    }
+
+    pub(super) fn goldreich_prf_output_count(&self) -> usize {
+        self.output_size
+    }
+
+    pub(super) fn final_prg_output_count(&self) -> usize {
+        self.final_mask_prg_output_count()
+            .checked_add(self.goldreich_prf_output_count())
+            .expect("DiamondIO final mask/function PRG output count overflow")
     }
 
     pub(super) fn selected_prg_output_count(&self) -> usize {

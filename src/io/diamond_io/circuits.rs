@@ -15,33 +15,15 @@ where
         hasher.finalize().into()
     }
 
-    /// Build the debug circuit that decrypts private seed ciphertext inputs.
-    ///
-    /// The explicit iO input bits are PRF/selector inputs for the surrounding
-    /// DiamondIO construction and are intentionally not emitted by this debug
-    /// circuit.
+    /// Build the legacy debug circuit that decrypts private seed ciphertext inputs.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn build_debug_decryption_circuit(&self) -> PolyCircuit<M::P>
     where
         M::P: 'static,
     {
         let mut circuit = PolyCircuit::new();
-        let nested_rns_context = Arc::new(NestedRnsPolyContext::setup(
-            &mut circuit,
-            &self.injector.params,
-            self.ring_gsw_context.p_moduli_bits,
-            self.ring_gsw_context.max_unreduced_muls,
-            self.ring_gsw_context.scale,
-            false,
-            self.ring_gsw_enable_levels,
-        ));
-        let ring_gsw_context = Arc::new(NestedRnsRingGswContext::<M::P>::from_arith_context(
-            &mut circuit,
-            &self.injector.params,
-            self.injector.params.ring_dimension() as usize,
-            nested_rns_context,
-            self.ring_gsw_enable_levels,
-            Some(self.ring_gsw_level_offset),
-        ));
+        let ring_gsw_context = self.build_ring_gsw_circuit_context(&mut circuit);
         let decryption_key = circuit.input(1).at(0).as_single_wire();
         let mut outputs = Vec::with_capacity(2 * self.output_size);
         for _ in 0..self.output_size {
@@ -88,44 +70,6 @@ where
         let goldreich = GoldreichFhePrg::from_public_graph(&mut circuit, ring_gsw_context, graph);
         let outputs = goldreich.evaluate_uniform(&seed_ciphertexts, &mut circuit);
         circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
-        circuit
-    }
-
-    #[cfg_attr(test, allow(dead_code))]
-    pub(super) fn build_debug_decryption_output_circuit(
-        &self,
-        output_idx: usize,
-    ) -> PolyCircuit<M::P>
-    where
-        M::P: 'static,
-    {
-        assert!(
-            output_idx < self.output_size,
-            "DiamondIO DebugDecryption output index must fit in the configured output size"
-        );
-        let mut circuit = PolyCircuit::new();
-        let nested_rns_context = Arc::new(NestedRnsPolyContext::setup(
-            &mut circuit,
-            &self.injector.params,
-            self.ring_gsw_context.p_moduli_bits,
-            self.ring_gsw_context.max_unreduced_muls,
-            self.ring_gsw_context.scale,
-            false,
-            self.ring_gsw_enable_levels,
-        ));
-        let ring_gsw_context = Arc::new(NestedRnsRingGswContext::<M::P>::from_arith_context(
-            &mut circuit,
-            &self.injector.params,
-            self.injector.params.ring_dimension() as usize,
-            nested_rns_context,
-            self.ring_gsw_enable_levels,
-            Some(self.ring_gsw_level_offset),
-        ));
-        let decryption_key = circuit.input(1).at(0).as_single_wire();
-        let ciphertext =
-            RingGswCiphertext::input(ring_gsw_context, Some(BigUint::from(1u64)), &mut circuit);
-        let decrypted = ciphertext.decrypt::<M>(decryption_key, BigUint::from(2u64), &mut circuit);
-        circuit.output(vec![decrypted.secret_dependent, decrypted.public_bottom]);
         circuit
     }
 

@@ -38,7 +38,13 @@ use crate::{
     },
     gadgets::arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
     matrix::PolyMatrix,
-    noise_refresh::naive_vec::NoiseRefreshBenchEstimateParts,
+    noise_refresh::{
+        circuit_prg::{
+            build_representative_goldreich_error_material_circuit,
+            build_representative_goldreich_mask_material_circuit,
+        },
+        naive_vec::NoiseRefreshBenchEstimateParts,
+    },
     poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     slot_transfer::bgg_pubkey::column_chunk_bounds,
@@ -476,9 +482,9 @@ where
     {
         match func {
             DiamondIOFuncType::DebugDecryption => {
-                assert_eq!(
-                    diamond.output_size, diamond.seed_bits,
-                    "DebugDecryption output_size must equal seed_bits for benchmark estimation"
+                assert!(
+                    diamond.output_size <= diamond.seed_bits,
+                    "DebugDecryption benchmark output_size must not exceed seed_bits"
                 );
             }
         }
@@ -794,21 +800,21 @@ where
     {
         match func {
             DiamondIOFuncType::DebugDecryption => {
-                // DebugDecryption decrypts one independent Ring-GSW ciphertext per private seed
-                // bit. Measuring the full representative circuit would allocate all seed
+                // DebugDecryption decrypts one independent Ring-GSW ciphertext per requested
+                // output bit. Measuring the full representative circuit would allocate all seed
                 // ciphertext inputs at once; measuring the one-ciphertext decrypt primitive and
-                // scaling by `seed_bits` preserves the work and enough-GPUs latency model.
+                // scaling by `output_size` preserves the work and enough-GPUs latency model.
                 let unit = self
                     .estimate_prf_mask_decrypt_one_ciphertext_bit_unit::<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
                         diamond,
                         &shape,
                         mode,
                     );
-                let summary = scale_summary(unit.clone(), diamond.seed_bits);
+                let summary = scale_summary(unit.clone(), diamond.output_size);
                 info!(
                     ?mode,
                     ?func,
-                    seed_bits = diamond.seed_bits,
+                    output_size = diamond.output_size,
                     ?unit,
                     ?summary,
                     "estimated DiamondIO function benchmark from one Ring-GSW decrypt primitive"
@@ -927,7 +933,7 @@ where
             "estimated DiamondIO PRF benchmark final-mask decrypt unit from one-bit circuit"
         );
 
-        let prg_circuit = diamond.build_goldreich_prg_range_circuit(0, 1, 0, 1);
+        let prg_circuit = diamond.build_representative_goldreich_prg_one_output_circuit();
         info!(?mode, "built DiamondIO PRF benchmark representative PRG circuit");
         let prg_unit = match mode {
             PrfBenchMode::PublicKeyPreprocess => {
@@ -942,6 +948,42 @@ where
             }
         };
         info!(?mode, ?prg_unit, "estimated DiamondIO PRF benchmark representative PRG unit");
+        let mut noise_refresh_prg_context_circuit = PolyCircuit::new();
+        let noise_refresh_prg_context =
+            diamond.build_ring_gsw_circuit_context(&mut noise_refresh_prg_context_circuit);
+        let error_prg_circuit =
+            build_representative_goldreich_error_material_circuit::<M::P, NestedRnsPoly<M::P>>(
+                noise_refresh_prg_context.clone(),
+                diamond.noise_refresh_cbd_n,
+            );
+        let mask_prg_circuit = build_representative_goldreich_mask_material_circuit::<
+            M::P,
+            NestedRnsPoly<M::P>,
+        >(noise_refresh_prg_context);
+        let (noise_refresh_error_prg_unit, noise_refresh_mask_prg_unit) = match mode {
+            PrfBenchMode::PublicKeyPreprocess => (
+                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+                    self.public_key_estimator,
+                    &diamond.injector.params,
+                    &error_prg_circuit,
+                ),
+                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+                    self.public_key_estimator,
+                    &diamond.injector.params,
+                    &mask_prg_circuit,
+                ),
+            ),
+            PrfBenchMode::EncodingOnline => (
+                self.encoding_estimator.estimate_circuit_bench(&error_prg_circuit),
+                self.encoding_estimator.estimate_circuit_bench(&mask_prg_circuit),
+            ),
+        };
+        info!(
+            ?mode,
+            ?noise_refresh_error_prg_unit,
+            ?noise_refresh_mask_prg_unit,
+            "estimated DiamondIO PRF benchmark noise-refresh representative PRG units"
+        );
         let selected_half_prg_per_round = scale_summary(
             prg_unit.clone(),
             2usize
@@ -989,7 +1031,8 @@ where
                 diamond,
                 shape.clone(),
                 mode,
-                prg_unit.clone(),
+                noise_refresh_error_prg_unit,
+                noise_refresh_mask_prg_unit,
                 final_mask_decrypt_unit.clone(),
             );
         info!(?mode, ?refresh_parts, "finished DiamondIO PRF benchmark noise-refresh estimate");
@@ -1186,7 +1229,8 @@ where
         diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
         shape: DiamondIOBenchShape,
         mode: PrfBenchMode,
-        prg_unit: CircuitBenchSummary,
+        error_prg_unit: CircuitBenchSummary,
+        mask_prg_unit: CircuitBenchSummary,
         decrypt_contribution_unit: CircuitBenchSummary,
     ) -> NoiseRefreshBenchEstimateParts
     where
@@ -1211,8 +1255,8 @@ where
             PrfBenchMode::EncodingOnline => self.encoding_estimator.estimate_add(),
         };
         let material = bit_decomposed_refresh_material_summary(
-            prg_unit.clone(),
-            prg_unit.clone(),
+            error_prg_unit,
+            mask_prg_unit,
             decrypt_contribution_unit.clone(),
             add.clone(),
             material_counts,
@@ -1365,7 +1409,7 @@ where
         TS: PolyTrapdoorSampler<M = M> + Send + Sync,
         PKBE: PublicKeyAuxBenchEstimator<M::P>,
     {
-        let prg_circuit = diamond.build_goldreich_prg_range_circuit(0, 1, 0, 1);
+        let prg_circuit = diamond.build_representative_goldreich_prg_one_output_circuit();
         let prg_aux =
             self.public_key_estimator.estimate_public_lut_sample_aux_matrices_for_circuit(
                 &diamond.injector.params,
@@ -1381,9 +1425,10 @@ where
         // every independent PRG output in the real obfuscated circuit.
         let selected_prg_outputs = BigUint::from(shape.selected_prg_output_count());
         let noise_refresh_material_prg_outputs = shape
-            .sparse_noise_refresh_material_prg_output_count(
+            .sparse_noise_refresh_material_uniform_prg_output_count(
                 diamond.input_size,
                 diamond.noise_refresh_v_bits,
+                diamond.noise_refresh_cbd_n,
             );
         let final_mask_prg_outputs = BigUint::from(shape.final_mask_prg_output_count());
         let prg_output_count =

@@ -44,7 +44,7 @@ where
         ));
         let decryption_key = circuit.input(1).at(0).as_single_wire();
         let mut outputs = Vec::with_capacity(2 * self.output_size);
-        for _ in 0..self.seed_bits {
+        for _ in 0..self.output_size {
             let ciphertext = RingGswCiphertext::input(
                 ring_gsw_context.clone(),
                 Some(BigUint::from(1u64)),
@@ -59,6 +59,38 @@ where
         circuit
     }
 
+    /// Build one representative Goldreich PRG output predicate.
+    ///
+    /// Large benchmark parameter sets can require very large `seed_bits` to satisfy the Goldreich
+    /// output bound for the full final-mask stream. A single TSA output still depends on only five
+    /// seed positions, so benchmark and error simulation representative unit measurements use this
+    /// compact five-input circuit and scale by the requested output count outside the circuit.
+    pub(super) fn build_representative_goldreich_prg_one_output_circuit(&self) -> PolyCircuit<M::P>
+    where
+        M::P: 'static,
+    {
+        let mut circuit = PolyCircuit::new();
+        let ring_gsw_context = self.build_ring_gsw_circuit_context(&mut circuit);
+        let seed_ciphertexts = (0..5)
+            .map(|_| {
+                RingGswCiphertext::input(
+                    ring_gsw_context.clone(),
+                    Some(BigUint::from(1u64)),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let graph = GoldreichGraph::from_edges(
+            5,
+            vec![GoldreichEdge::new([0, 1, 2], [3, 4])],
+            Default::default(),
+        );
+        let goldreich = GoldreichFhePrg::from_public_graph(&mut circuit, ring_gsw_context, graph);
+        let outputs = goldreich.evaluate_uniform(&seed_ciphertexts, &mut circuit);
+        circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
+        circuit
+    }
+
     #[cfg_attr(test, allow(dead_code))]
     pub(super) fn build_debug_decryption_output_circuit(
         &self,
@@ -68,8 +100,8 @@ where
         M::P: 'static,
     {
         assert!(
-            output_idx < self.seed_bits,
-            "DiamondIO DebugDecryption output index must fit in the seed"
+            output_idx < self.output_size,
+            "DiamondIO DebugDecryption output index must fit in the configured output size"
         );
         let mut circuit = PolyCircuit::new();
         let nested_rns_context = Arc::new(NestedRnsPolyContext::setup(

@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
 use bigdecimal::BigDecimal;
+#[cfg(test)]
 use digest::Digest;
+#[cfg(test)]
 use keccak_asm::Keccak256;
 use num_bigint::{BigInt, BigUint};
 use tracing::{debug, info};
 
+#[cfg(test)]
+use crate::gadgets::fhe_prg::goldreich::evaluate_goldreich_uniform_range;
 use crate::{
     circuit::{Evaluable, PolyCircuit},
     decoder::simulation::{
@@ -15,12 +19,18 @@ use crate::{
     gadgets::{
         arith::NestedRnsPolyContext,
         fhe::{ring_gsw::RingGswCiphertext, ring_gsw_nested_rns::NestedRnsRingGswContext},
-        fhe_prg::goldreich::evaluate_goldreich_uniform_range,
+        fhe_prg::goldreich::{
+            GoldreichEdge, GoldreichFhePrg, GoldreichGraph, goldreich_output_bound_holds,
+            minimum_goldreich_input_size,
+        },
     },
     input_injector::DiamondInputErrorSimulation,
     lookup::PltEvaluator,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-    noise_refresh::{NoiseRefreshErrorSimulation, simulate_symmetric_noise_refresh_error_growth},
+    noise_refresh::{
+        NoiseRefreshErrorSimulation, simulate_symmetric_noise_refresh_error_growth,
+        simulation::{max_safe_noise_refresh_v_bits, minimum_noise_refresh_seed_bits},
+    },
     poly::{
         PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -63,6 +73,8 @@ pub struct DiamondIOPrfRoundErrorSimulation {
 pub struct DiamondIOPrfMaskOutputCoeffBitsSearchResult {
     /// Largest PRF mask coefficient bit-width satisfying the final decode margin.
     pub prf_mask_output_coeff_bits: usize,
+    /// Single noise-refresh mask bit-width that is safe for every simulated PRF refresh round.
+    pub noise_refresh_v_bits: usize,
     /// Error simulation evaluated with `prf_mask_output_coeff_bits`.
     pub simulation: DiamondIOErrorSimulation,
 }
@@ -74,6 +86,10 @@ pub struct DiamondIOCrtDepthSearchResult {
     pub crt_depth: usize,
     /// Largest PRF mask coefficient bit-width that was safe at `crt_depth`.
     pub prf_mask_output_coeff_bits: usize,
+    /// Single noise-refresh mask bit-width that is safe for every simulated PRF refresh round.
+    pub noise_refresh_v_bits: usize,
+    /// Minimum PRF seed length that was revalidated for the selected mask widths.
+    pub seed_bits: usize,
     /// Final noisy-plaintext error bound certified for the selected candidate.
     pub total_noisy_plaintext_error: PolyMatrixNorm,
     /// Representative input-injection contribution used to seed the DiamondIO simulation.
@@ -81,6 +97,54 @@ pub struct DiamondIOCrtDepthSearchResult {
     /// This is `input_injection.state_errors[0] * input_injection.output_preimage`, matching the
     /// projected state error used as the `one`, decryption-key, and decoder input bound.
     pub input_injection_projection_error: PolyMatrixNorm,
+}
+
+/// Counts the uniform Goldreich output bits needed for DiamondIO's final PRF mask.
+pub fn diamond_io_final_mask_uniform_output_bits(
+    output_size: usize,
+    ring_dim: usize,
+    prf_mask_output_coeff_bits: usize,
+) -> usize {
+    assert!(output_size > 0, "DiamondIO output_size must be positive");
+    assert!(ring_dim > 0, "DiamondIO ring_dim must be positive");
+    assert!(
+        prf_mask_output_coeff_bits > 0,
+        "DiamondIO PRF mask output coefficient bits must be positive"
+    );
+    output_size
+        .checked_mul(ring_dim)
+        .and_then(|count| count.checked_mul(prf_mask_output_coeff_bits))
+        .expect("DiamondIO final mask uniform output bit count overflow")
+}
+
+/// Returns the minimum seed length satisfying every Goldreich PRG output bound in DiamondIO.
+pub fn minimum_diamond_io_prf_seed_bits(
+    params: &DCRTPolyParams,
+    output_size: usize,
+    prf_mask_output_coeff_bits: usize,
+    noise_refresh_v_bits: usize,
+    cbd_n: usize,
+) -> usize {
+    let ring_dim = params.ring_dimension() as usize;
+    let selected_half_seed_bits = minimum_selected_half_prf_seed_bits();
+    let final_mask_seed_bits =
+        minimum_goldreich_input_size(diamond_io_final_mask_uniform_output_bits(
+            output_size,
+            ring_dim,
+            prf_mask_output_coeff_bits,
+        ));
+    let noise_refresh_seed_bits =
+        minimum_noise_refresh_seed_bits(params, noise_refresh_v_bits, cbd_n);
+    selected_half_seed_bits.max(final_mask_seed_bits).max(noise_refresh_seed_bits)
+}
+
+/// Returns the largest noise-refresh `v_bits` allowed before pre-rounding error is added.
+pub fn diamond_io_max_noise_refresh_v_bits_without_pre_rounding_error(
+    params: &DCRTPolyParams,
+) -> Option<usize> {
+    let zero_pre_rounding =
+        PolyMatrixNorm::new(simulator_context(params), 1, 1, BigDecimal::from(0u32), None);
+    max_safe_noise_refresh_v_bits(params, &zero_pre_rounding)
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +188,8 @@ where
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     PE: PltEvaluator<ErrorNorm>,
     ST: SlotTransferEvaluator<ErrorNorm>,
-    BuildCandidate: FnMut(usize) -> DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+    BuildCandidate:
+        FnMut(usize, usize, Option<usize>) -> DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
 {
     info!(
         min_crt_depth,
@@ -141,7 +206,7 @@ where
     while low <= high {
         let crt_depth = low + (high - low) / 2;
         info!(crt_depth, low, high, "evaluating DiamondIO CRT-depth candidate");
-        let candidate = build_candidate(crt_depth);
+        let candidate = build_candidate(crt_depth, max_prf_mask_output_coeff_bits, None);
         let Some(mask_search) = candidate.max_safe_prf_mask_output_coeff_bits(
             func_type,
             plt_evaluator,
@@ -154,26 +219,79 @@ where
         };
         let mask_bits = mask_search.prf_mask_output_coeff_bits;
         let cpu_params = cpu_params_from_poly_params(&candidate.injector.params);
-        if diamond_io_security_margins_hold(
+        let mut final_noise_refresh_v_bits = mask_search.noise_refresh_v_bits;
+        let Some((final_candidate, final_simulation)) = (loop {
+            let final_candidate =
+                build_candidate(crt_depth, mask_bits, Some(final_noise_refresh_v_bits));
+            let Some(final_simulation) = final_candidate
+                .simulate_error_growth_with_prf_mask_output_coeff_bits(
+                    func_type,
+                    mask_bits,
+                    plt_evaluator,
+                    slot_transfer_evaluator,
+                )
+            else {
+                info!(
+                    crt_depth,
+                    mask_bits,
+                    noise_refresh_v_bits = final_noise_refresh_v_bits,
+                    final_seed_bits = final_candidate.seed_bits,
+                    "DiamondIO final minimum-seed validation failed to produce a simulation"
+                );
+                break None;
+            };
+            let reselected_noise_refresh_v_bits = selected_noise_refresh_v_bits(&final_simulation);
+            if reselected_noise_refresh_v_bits < final_noise_refresh_v_bits {
+                info!(
+                    crt_depth,
+                    mask_bits,
+                    previous_noise_refresh_v_bits = final_noise_refresh_v_bits,
+                    reselected_noise_refresh_v_bits,
+                    final_seed_bits = final_candidate.seed_bits,
+                    "DiamondIO final minimum-seed validation reduced noise-refresh v_bits; recomputing seed_bits"
+                );
+                final_noise_refresh_v_bits = reselected_noise_refresh_v_bits;
+                continue;
+            }
+            break Some((final_candidate, final_simulation));
+        }) else {
+            low = crt_depth + 1;
+            continue;
+        };
+        if !diamond_io_security_margins_hold(
             &cpu_params,
-            &mask_search.simulation,
+            &final_simulation,
             mask_bits,
             security_bit,
         ) {
-            info!(crt_depth, mask_bits, "DiamondIO CRT-depth candidate passed");
-            found.push(DiamondIOCrtDepthSearchResult {
+            info!(
                 crt_depth,
-                prf_mask_output_coeff_bits: mask_bits,
-                total_noisy_plaintext_error: mask_search.simulation.noisy_plaintext_error.clone(),
-                input_injection_projection_error: diamond_io_input_injection_projection_error(
-                    &mask_search.simulation.input_injection,
-                ),
-            });
-            high = crt_depth - 1;
-        } else {
-            info!(crt_depth, mask_bits, "DiamondIO CRT-depth candidate failed security margins");
+                mask_bits,
+                noise_refresh_v_bits = final_noise_refresh_v_bits,
+                final_seed_bits = final_candidate.seed_bits,
+                "DiamondIO final minimum-seed validation failed security margins"
+            );
             low = crt_depth + 1;
+            continue;
         }
+        info!(
+            crt_depth,
+            mask_bits,
+            noise_refresh_v_bits = final_noise_refresh_v_bits,
+            final_seed_bits = final_candidate.seed_bits,
+            "DiamondIO CRT-depth candidate passed final minimum-seed validation"
+        );
+        found.push(DiamondIOCrtDepthSearchResult {
+            crt_depth,
+            prf_mask_output_coeff_bits: mask_bits,
+            noise_refresh_v_bits: final_noise_refresh_v_bits,
+            seed_bits: final_candidate.seed_bits,
+            total_noisy_plaintext_error: final_simulation.noisy_plaintext_error.clone(),
+            input_injection_projection_error: diamond_io_input_injection_projection_error(
+                &final_simulation.input_injection,
+            ),
+        });
+        high = crt_depth - 1;
     }
     let result = found.into_iter().min_by_key(|candidate| candidate.crt_depth);
     info!(found = result.is_some(), "finished DiamondIO CRT-depth search");
@@ -229,7 +347,21 @@ where
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
         let cpu_params = cpu_params_from_poly_params(&self.injector.params);
-        let max_candidate = max_bits.min(cpu_params.modulus_bits());
+        let max_candidate =
+            max_bits.min(cpu_params.modulus_bits()).min(max_final_mask_coeff_bits_for_seed(
+                &cpu_params,
+                self.output_size,
+                self.seed_bits,
+                max_bits,
+            ));
+        if max_candidate == 0 {
+            info!(
+                max_bits,
+                seed_bits = self.seed_bits,
+                "DiamondIO PRF mask bit search found no candidate satisfying Goldreich output bound"
+            );
+            return None;
+        }
         info!(max_bits, max_candidate, "starting DiamondIO PRF mask bit search");
         let prefix = self.simulate_mask_independent_error_prefix(
             func_type,
@@ -300,6 +432,7 @@ where
             );
             DiamondIOPrfMaskOutputCoeffBitsSearchResult {
                 prf_mask_output_coeff_bits: result.mask_bits,
+                noise_refresh_v_bits: selected_noise_refresh_v_bits(&result.simulation),
                 simulation: result.simulation,
             }
         });
@@ -328,6 +461,20 @@ where
             prf_mask_output_coeff_bits > 0,
             "DiamondIO error simulation requires prf_mask_output_coeff_bits > 0"
         );
+        let final_mask_prg_output_bits = diamond_io_final_mask_uniform_output_bits(
+            self.output_size,
+            self.injector.params.ring_dimension() as usize,
+            prf_mask_output_coeff_bits,
+        );
+        if !goldreich_output_bound_holds(self.seed_bits, final_mask_prg_output_bits) {
+            info!(
+                seed_bits = self.seed_bits,
+                final_mask_prg_output_bits,
+                prf_mask_output_coeff_bits,
+                "DiamondIO error simulation rejected unsafe final-mask PRG output bound"
+            );
+            return None;
+        }
 
         let prefix = self.simulate_mask_independent_error_prefix(
             func_type,
@@ -362,6 +509,18 @@ where
         assert!(self.seed_bits > 0, "DiamondIO error simulation requires seed_bits > 0");
 
         let cpu_params = cpu_params_from_poly_params(&self.injector.params);
+        let prefix_required_seed_bits =
+            minimum_selected_half_prf_seed_bits().max(minimum_noise_refresh_seed_bits(
+                &cpu_params,
+                self.noise_refresh_v_bits,
+                self.noise_refresh_cbd_n,
+            ));
+        assert!(
+            self.seed_bits >= prefix_required_seed_bits,
+            "DiamondIO seed_bits {} is below Goldreich PRG safety minimum {} for selected-half PRF and noise refresh",
+            self.seed_bits,
+            prefix_required_seed_bits
+        );
         let (_, _, crt_depth) = cpu_params.to_crt();
         let full_active_levels =
             self.ring_gsw_enable_levels.unwrap_or_else(|| crt_depth - self.ring_gsw_level_offset);
@@ -389,7 +548,7 @@ where
         let final_decoder_error =
             ErrorNorm::new(PolyNorm::one(ctx.clone()), final_decoder_projection_error);
         let seed_wire_error = self.initial_seed_wire_error(&cpu_params, &one);
-        let mut seed_errors = vec![seed_wire_error.clone(); self.seed_bits];
+        let mut seed_errors = vec![seed_wire_error.clone(); 5];
         let mut prf_refreshes = Vec::with_capacity(self.input_size);
         let mut steady_prf_round_cache: Option<(
             ErrorNorm,
@@ -400,7 +559,7 @@ where
         for round_idx in 0..self.input_size {
             if round_idx > 1 {
                 if let Some((selected, refresh, refreshed_seed)) = &steady_prf_round_cache {
-                    seed_errors = vec![refreshed_seed.clone(); self.seed_bits];
+                    seed_errors = vec![refreshed_seed.clone(); 5];
                     info!(
                         round_idx,
                         v_bits = refresh.v_bits,
@@ -455,7 +614,6 @@ where
                     full_active_levels,
                 ),
                 self.seed_bits,
-                self.goldreich_graph_seed,
                 self.noise_refresh_cbd_n,
                 self.ring_gsw_public_key_error_sigma.unwrap_or(0.0),
                 cpu_params.ring_dimension() as usize,
@@ -481,7 +639,7 @@ where
                 .clone();
             let refreshed_seed =
                 ErrorNorm::new(worst_rounded_error.poly_norm.clone(), worst_rounded_error);
-            seed_errors = vec![refreshed_seed.clone(); self.seed_bits];
+            seed_errors = vec![refreshed_seed.clone(); 5];
             info!(
                 round_idx,
                 v_bits = refresh.v_bits,
@@ -699,16 +857,15 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
-        let circuit = self.build_cpu_goldreich_prg_range_circuit(
-            params,
-            round_idx,
-            conceptual_output_bits,
-            range_start,
-            1,
-            1,
+        assert!(
+            seed_errors.len() >= 5,
+            "representative Goldreich PRG error simulation requires at least five seed errors"
         );
-        let wire_count = ring_gsw_wire_count(circuit.num_input(), self.seed_bits);
-        let seed_wire_errors = expand_logical_errors(&seed_errors, wire_count);
+        let circuit = self.build_cpu_representative_goldreich_prg_one_output_circuit(params, 1);
+        let representative_seed_bits = 5usize;
+        let wire_count = ring_gsw_wire_count(circuit.num_input(), representative_seed_bits);
+        let seed_wire_errors =
+            expand_logical_errors(&seed_errors[..representative_seed_bits], wire_count);
         let mut output = eval_first_error_output(
             circuit,
             one,
@@ -732,6 +889,34 @@ where
         output
     }
 
+    fn build_cpu_representative_goldreich_prg_one_output_circuit(
+        &self,
+        params: &DCRTPolyParams,
+        active_levels: usize,
+    ) -> PolyCircuit<DCRTPoly> {
+        let mut circuit = PolyCircuit::new();
+        let ring_gsw_context = self.build_cpu_ring_gsw_context(params, &mut circuit, active_levels);
+        let seed_ciphertexts = (0..5)
+            .map(|_| {
+                RingGswCiphertext::input(
+                    ring_gsw_context.clone(),
+                    Some(BigUint::from(1u64)),
+                    &mut circuit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let graph = GoldreichGraph::from_edges(
+            5,
+            vec![GoldreichEdge::new([0, 1, 2], [3, 4])],
+            Default::default(),
+        );
+        let goldreich = GoldreichFhePrg::from_public_graph(&mut circuit, ring_gsw_context, graph);
+        let outputs = goldreich.evaluate_uniform(&seed_ciphertexts, &mut circuit);
+        circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
+        circuit
+    }
+
+    #[cfg(test)]
     fn build_cpu_goldreich_prg_range_circuit(
         &self,
         params: &DCRTPolyParams,
@@ -917,6 +1102,7 @@ where
         )
     }
 
+    #[cfg(test)]
     fn derive_diamond_goldreich_graph_seed(&self, round_idx: usize) -> [u8; 32] {
         let mut hasher = Keccak256::new();
         hasher.update(b"DiamondIOGoldreichPrfGraph/v1");
@@ -982,6 +1168,15 @@ fn diamond_io_input_injection_scalar_projection_error(
     state_error.clone() * &scalar_output_preimage
 }
 
+fn selected_noise_refresh_v_bits(simulation: &DiamondIOErrorSimulation) -> usize {
+    simulation
+        .prf_refreshes
+        .iter()
+        .map(|refresh| refresh.noise_refresh.v_bits)
+        .min()
+        .expect("DiamondIO simulation must include at least one PRF refresh")
+}
+
 fn diamond_io_security_margins_hold(
     params: &DCRTPolyParams,
     simulation: &DiamondIOErrorSimulation,
@@ -1034,6 +1229,47 @@ fn diamond_io_noise_refresh_pre_round_margin(
     let q_max = q_moduli.iter().copied().max().expect("CRT modulus list must be nonempty");
     let full_q: Arc<BigUint> = params.modulus().into();
     decode_margin(full_q.as_ref(), v_bits, &DecodeThreshold::new(q_max))
+}
+
+fn minimum_selected_half_prf_seed_bits() -> usize {
+    let mut seed_bits = 5usize;
+    while !goldreich_output_bound_holds(
+        seed_bits,
+        seed_bits.checked_mul(2).expect("DiamondIO selected-half PRF output size overflow"),
+    ) {
+        seed_bits =
+            seed_bits.checked_add(1).expect("DiamondIO selected-half PRF seed-bit search overflow");
+    }
+    seed_bits
+}
+
+fn max_final_mask_coeff_bits_for_seed(
+    params: &DCRTPolyParams,
+    output_size: usize,
+    seed_bits: usize,
+    max_bits: usize,
+) -> usize {
+    if max_bits == 0 {
+        return 0;
+    }
+    let ring_dim = params.ring_dimension() as usize;
+    let mut low = 1usize;
+    let mut high = max_bits;
+    let mut best = 0usize;
+    while low <= high {
+        let candidate = low + (high - low) / 2;
+        let output_bits =
+            diamond_io_final_mask_uniform_output_bits(output_size, ring_dim, candidate);
+        if goldreich_output_bound_holds(seed_bits, output_bits) {
+            best = candidate;
+            low = candidate + 1;
+        } else if candidate == 1 {
+            break;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    best
 }
 
 fn eval_first_error_output<PE>(
@@ -1189,7 +1425,7 @@ mod tests {
         TestDiamondIO::new(
             injector,
             input_count,
-            5,
+            6,
             params.clone(),
             ring_gsw_context,
             ring_gsw_width,
@@ -1197,7 +1433,7 @@ mod tests {
             Some(active_levels),
             Some(0.0),
             b"diamond_io_error_simulation_test".to_vec(),
-            5,
+            6,
             1,
             1,
             1,
@@ -1209,6 +1445,49 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn test_minimum_diamond_io_prf_seed_bits_covers_all_prg_uses() {
+        let params = DCRTPolyParams::new(2, 1, 10, 5);
+        let output_size = 3usize;
+        let prf_mask_output_coeff_bits = 2usize;
+        let noise_refresh_v_bits = 1usize;
+        let cbd_n = 1usize;
+        let seed_bits = minimum_diamond_io_prf_seed_bits(
+            &params,
+            output_size,
+            prf_mask_output_coeff_bits,
+            noise_refresh_v_bits,
+            cbd_n,
+        );
+        let ring_dim = params.ring_dimension() as usize;
+
+        assert!(goldreich_output_bound_holds(seed_bits, 2 * seed_bits));
+        assert!(goldreich_output_bound_holds(
+            seed_bits,
+            diamond_io_final_mask_uniform_output_bits(
+                output_size,
+                ring_dim,
+                prf_mask_output_coeff_bits,
+            ),
+        ));
+        assert!(seed_bits >= minimum_noise_refresh_seed_bits(&params, noise_refresh_v_bits, cbd_n));
+
+        let previous = seed_bits - 1;
+        assert!(
+            !goldreich_output_bound_holds(previous, 2 * previous) ||
+                !goldreich_output_bound_holds(
+                    previous,
+                    diamond_io_final_mask_uniform_output_bits(
+                        output_size,
+                        ring_dim,
+                        prf_mask_output_coeff_bits,
+                    ),
+                ) ||
+                previous < minimum_noise_refresh_seed_bits(&params, noise_refresh_v_bits, cbd_n),
+            "one smaller seed length must fail at least one DiamondIO PRG output bound"
+        );
     }
 
     #[test]

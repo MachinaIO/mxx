@@ -30,9 +30,9 @@ use crate::{
         circuit_decrypt::build_refreshed_wire_digit_all_crt_decrypt,
         circuit_merge::build_refreshed_wire_digit_all_crt_merge,
         circuit_prg::{
-            build_goldreich_encrypted_seed_error_material_range,
-            build_goldreich_encrypted_seed_mask_material_ranges,
             build_goldreich_encrypted_seed_material_ranges,
+            build_representative_goldreich_error_material_circuit,
+            build_representative_goldreich_mask_material_circuit,
         },
     },
     poly::{
@@ -545,7 +545,6 @@ where
         let pk_matrix_mul = public_key_estimator.estimate_large_scalar_mul(&scalar_target);
         let pk_add = public_key_estimator.estimate_add();
         let pk_sub = public_key_estimator.estimate_sub();
-        let material_seed_bits = if self.debug_reuse_single_material { 5 } else { self.seed_bits };
         let material_counts = bit_decomposed_refresh_material_counts(
             num_slots,
             log_base_q,
@@ -553,23 +552,12 @@ where
             self.v_bits,
             self.debug_reuse_single_material,
         );
-        let error_prg_circuit = build_goldreich_encrypted_seed_error_material_range::<M::P, A>(
+        let error_prg_circuit = build_representative_goldreich_error_material_circuit::<M::P, A>(
             self.ring_gsw.clone(),
-            material_seed_bits,
-            self.graph_seed,
             self.cbd_n,
-            0,
-            0,
-            1,
         );
-        let mask_prg_circuit = build_goldreich_encrypted_seed_mask_material_ranges::<M::P, A>(
-            self.ring_gsw.clone(),
-            material_seed_bits,
-            self.v_bits,
-            self.graph_seed,
-            0,
-            &[(0, 1)],
-        );
+        let mask_prg_circuit =
+            build_representative_goldreich_mask_material_circuit::<M::P, A>(self.ring_gsw.clone());
         let decrypt_contribution_circuit = build_one_ciphertext_bit_decrypt_circuit::<M::P, A, M>(
             self.ring_gsw.clone(),
             BigUint::from(2u64),
@@ -698,7 +686,6 @@ where
         let enc_matrix_mul = encoding_estimator.estimate_large_scalar_mul(&scalar_target);
         let enc_add = encoding_estimator.estimate_add();
         let enc_sub = encoding_estimator.estimate_sub();
-        let material_seed_bits = if self.debug_reuse_single_material { 5 } else { self.seed_bits };
         let material_counts = bit_decomposed_refresh_material_counts(
             num_slots,
             log_base_q,
@@ -706,23 +693,12 @@ where
             self.v_bits,
             self.debug_reuse_single_material,
         );
-        let error_prg_circuit = build_goldreich_encrypted_seed_error_material_range::<M::P, A>(
+        let error_prg_circuit = build_representative_goldreich_error_material_circuit::<M::P, A>(
             self.ring_gsw.clone(),
-            material_seed_bits,
-            self.graph_seed,
             self.cbd_n,
-            0,
-            0,
-            1,
         );
-        let mask_prg_circuit = build_goldreich_encrypted_seed_mask_material_ranges::<M::P, A>(
-            self.ring_gsw.clone(),
-            material_seed_bits,
-            self.v_bits,
-            self.graph_seed,
-            0,
-            &[(0, 1)],
-        );
+        let mask_prg_circuit =
+            build_representative_goldreich_mask_material_circuit::<M::P, A>(self.ring_gsw.clone());
         let decrypt_contribution_circuit = build_one_ciphertext_bit_decrypt_circuit::<M::P, A, M>(
             self.ring_gsw.clone(),
             BigUint::from(2u64),
@@ -1811,6 +1787,7 @@ where
                 0,
                 1,
                 &[(0, 1)],
+                false,
             ));
         let prg_outputs =
             expand_batched_wires(&circuit.call_sub_circuit(prg_sub_id, seed_wires.clone()));
@@ -1875,6 +1852,7 @@ where
                     error_start,
                     ring_dim,
                     &mask_ranges,
+                    true,
                 ),
             );
             let prg_outputs =
@@ -2261,7 +2239,7 @@ mod tests {
                 Some(active_levels),
                 None,
             ));
-            NoiseRefresherNaiveVec::new(ring_gsw, 5, 1, [0x42; 32], 1, [0x24; 32])
+            NoiseRefresherNaiveVec::new(ring_gsw, 6, 1, [0x42; 32], 1, [0x24; 32])
         }
 
         fn public_key_vec_bench_estimator(

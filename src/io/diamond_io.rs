@@ -33,7 +33,7 @@ use crate::{
             },
         },
         fhe_prg::goldreich::{
-            GoldreichFhePrg, GoldreichFullDomainRangeGenerator, GoldreichGraph,
+            GoldreichEdge, GoldreichFhePrg, GoldreichFullDomainRangeGenerator, GoldreichGraph,
             evaluate_goldreich_uniform_range,
         },
     },
@@ -63,7 +63,8 @@ pub use bench_estimator::{
 pub use simulation::{
     DiamondIOCrtDepthSearchResult, DiamondIOErrorSimulation,
     DiamondIOPrfMaskOutputCoeffBitsSearchResult, DiamondIOPrfRoundErrorSimulation,
-    diamond_io_find_crt_depth,
+    diamond_io_find_crt_depth, diamond_io_max_noise_refresh_v_bits_without_pre_rounding_error,
+    minimum_diamond_io_prf_seed_bits,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,9 +256,9 @@ where
         let circuit_started = Instant::now();
         let circuit = match func {
             DiamondIOFuncType::DebugDecryption => {
-                assert_eq!(
-                    self.output_size, self.seed_bits,
-                    "DebugDecryption output_size must be seed_bits"
+                assert!(
+                    self.output_size <= self.seed_bits,
+                    "DebugDecryption output_size must not exceed seed_bits"
                 );
                 self.build_debug_decryption_circuit()
             }
@@ -464,9 +465,23 @@ where
         // ciphertext wires. Explicit public input bits are consumed by the
         // PRF path above, not by `DebugDecryption`.
         let function_eval_started = Instant::now();
-        let mut function_inputs = Vec::with_capacity(1 + enc_seed_public_keys.len());
+        let seed_public_key_wires_per_ciphertext = enc_seed_public_keys
+            .len()
+            .checked_div(self.seed_bits)
+            .expect("DiamondIO seed bit count must be positive");
+        assert_eq!(
+            seed_public_key_wires_per_ciphertext * self.seed_bits,
+            enc_seed_public_keys.len(),
+            "DiamondIO encrypted seed public keys must split evenly by seed ciphertext"
+        );
+        let function_seed_public_key_wire_count = self
+            .output_size
+            .checked_mul(seed_public_key_wires_per_ciphertext)
+            .expect("DiamondIO function seed public-key input count overflow");
+        let mut function_inputs = Vec::with_capacity(1 + function_seed_public_key_wire_count);
         function_inputs.push(NaiveBGGPublicKeyVec::new(params, vec![k_vec.key(0)]));
-        function_inputs.extend(enc_seed_public_keys.iter().cloned());
+        function_inputs
+            .extend(enc_seed_public_keys[..function_seed_public_key_wire_count].iter().cloned());
         let pk_slot_transfer_evaluator = self
             .pk_slot_transfer_evaluator
             .as_ref()
@@ -485,7 +500,7 @@ where
             "DiamondIO evaluated public-key output count mismatch"
         );
         info!(
-            function_input_count = 1 + enc_seed_public_keys.len(),
+            function_input_count = 1 + function_seed_public_key_wire_count,
             evaluated_output_count = evaluated_public_keys.len(),
             elapsed_ms = function_eval_started.elapsed().as_millis(),
             "DiamondIO obfuscation function public-key evaluation finished"
@@ -895,7 +910,7 @@ where
         {
             assert_eq!(
                 circuit.num_input(),
-                1 + seed_encoding_inputs.len(),
+                1 + self.output_size * seed_wires_per_ciphertext,
                 "DebugDecryption circuit input order must be decryption key followed by seed ciphertext wires"
             );
         }
@@ -990,11 +1005,18 @@ where
         );
         let function_eval_started = Instant::now();
         #[cfg(test)]
-        let mut encoding_function_inputs = Vec::with_capacity(1 + seed_encoding_inputs.len());
+        let function_seed_encoding_wire_count = self
+            .output_size
+            .checked_mul(seed_wires_per_ciphertext)
+            .expect("DiamondIO function seed encoding input count overflow");
+        #[cfg(test)]
+        let mut encoding_function_inputs =
+            Vec::with_capacity(1 + function_seed_encoding_wire_count);
         #[cfg(test)]
         encoding_function_inputs.push(NaiveBGGEncodingVec::new(params, vec![k_output]));
         #[cfg(test)]
-        encoding_function_inputs.extend(seed_encoding_inputs.iter().cloned());
+        encoding_function_inputs
+            .extend(seed_encoding_inputs[..function_seed_encoding_wire_count].iter().cloned());
         #[cfg(test)]
         let evaluated_function_encodings = circuit
             .eval(
@@ -1996,7 +2018,7 @@ mod tests {
         let input_count = 2usize;
         let input_base = 2usize;
         let input_size = 2usize;
-        let seed_bits = 5usize;
+        let seed_bits = 6usize;
         let output_size = seed_bits;
         let injector = TestInjector::new(poly_params.clone(), input_count, input_base, 4.578, 0.0)
             .with_gpu_device_ids(vec![gpu_ids[0]]);

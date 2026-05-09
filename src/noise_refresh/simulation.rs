@@ -1,4 +1,5 @@
 use crate::{
+    circuit::PolyCircuit,
     decoder::simulation::{
         DecodeThreshold, max_safe_mask_bits as max_safe_decoder_mask_bits,
         validate_error_bound_security_margin as validate_decoder_error_bound_security_margin,
@@ -6,15 +7,14 @@ use crate::{
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
         fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
-        fhe_prg::goldreich::GoldreichFheCbdPrg,
+        fhe_prg::goldreich::{
+            GoldreichEdge, GoldreichFhePrg, GoldreichGraph, minimum_goldreich_input_size,
+        },
     },
     lookup::PltEvaluator,
     matrix::dcrt_poly::DCRTPolyMatrix,
     noise_refresh::{
-        circuit_prg::{
-            derive_noise_refresh_graph_seed, evaluate_goldreich_noise_refresh_material_ranges,
-            goldreich_noise_refresh_output_sizes,
-        },
+        circuit_prg::goldreich_noise_refresh_uniform_output_bits,
         naive_vec::build_noise_refresh_material_circuit,
     },
     poly::{PolyParams, dcrt::poly::DCRTPoly},
@@ -62,6 +62,41 @@ pub fn validate_noise_refresh_v_bits(
 ) -> bool {
     max_safe_noise_refresh_v_bits(params, pre_rounding_error)
         .is_some_and(|max_v_bits| v_bits <= max_v_bits)
+}
+
+/// Counts every uniform Goldreich bit drawn from one noise-refresh encrypted seed.
+pub fn noise_refresh_uniform_output_bits(
+    params: &<DCRTPoly as crate::poly::Poly>::Params,
+    v_bits: usize,
+    cbd_n: usize,
+) -> usize {
+    let (_q_moduli, _crt_bits, crt_depth) = params.to_crt();
+    goldreich_noise_refresh_uniform_output_bits(
+        params.ring_dimension() as usize,
+        params.modulus_digits(),
+        crt_depth,
+        v_bits,
+        cbd_n,
+    )
+}
+
+/// Returns the minimum seed length required by the Goldreich output bound for noise refresh.
+pub fn minimum_noise_refresh_seed_bits(
+    params: &<DCRTPoly as crate::poly::Poly>::Params,
+    v_bits: usize,
+    cbd_n: usize,
+) -> usize {
+    minimum_goldreich_input_size(noise_refresh_uniform_output_bits(params, v_bits, cbd_n))
+}
+
+/// Returns the smallest seed length at least `min_seed_bits` that is safe for noise refresh.
+pub fn search_noise_refresh_seed_bits(
+    params: &<DCRTPoly as crate::poly::Poly>::Params,
+    v_bits: usize,
+    cbd_n: usize,
+    min_seed_bits: usize,
+) -> usize {
+    min_seed_bits.max(minimum_noise_refresh_seed_bits(params, v_bits, cbd_n))
 }
 
 /// Checks whether an error bound has the requested security margin below a threshold.
@@ -129,24 +164,31 @@ where
     ST: SlotTransferEvaluator<ErrorNorm>,
 {
     info!(seed_bits, cbd_n, num_slots, "starting noise-refresh error simulation mask-bit search");
-    search_noise_refresh_v_bits(&ring_gsw.params, one.clone_ctx(), "noise-refresh", |candidate| {
-        simulate_noise_refresh_error_growth_for_v_bits(
-            ring_gsw.clone(),
-            seed_bits,
-            candidate,
-            graph_seed,
-            cbd_n,
-            ring_gsw_error_sigma,
-            num_slots,
-            one.clone(),
-            refreshed_input.clone(),
-            enc_seeds,
-            decryption_key.clone(),
-            decoders,
-            plt_evaluator,
-            slot_transfer_evaluator,
-        )
-    })
+    search_noise_refresh_v_bits(
+        &ring_gsw.params,
+        one.clone_ctx(),
+        seed_bits,
+        cbd_n,
+        "noise-refresh",
+        |candidate| {
+            simulate_noise_refresh_error_growth_for_v_bits(
+                ring_gsw.clone(),
+                seed_bits,
+                candidate,
+                graph_seed,
+                cbd_n,
+                ring_gsw_error_sigma,
+                num_slots,
+                one.clone(),
+                refreshed_input.clone(),
+                enc_seeds,
+                decryption_key.clone(),
+                decoders,
+                plt_evaluator,
+                slot_transfer_evaluator,
+            )
+        },
+    )
 }
 
 /// Simulates noise-refresh error growth using the protocol's slot symmetry.
@@ -161,7 +203,6 @@ where
 pub fn simulate_symmetric_noise_refresh_error_growth<A, PE, ST>(
     ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
     seed_bits: usize,
-    graph_seed: [u8; 32],
     cbd_n: usize,
     ring_gsw_error_sigma: f64,
     num_slots: usize,
@@ -187,7 +228,6 @@ where
     let prg_prefix = build_symmetric_noise_refresh_prg_error_prefix(
         &ring_gsw,
         seed_bits,
-        graph_seed,
         cbd_n,
         ring_gsw_error_sigma,
         one.clone(),
@@ -210,6 +250,8 @@ where
     search_noise_refresh_v_bits(
         &ring_gsw.params,
         one.clone_ctx(),
+        seed_bits,
+        cbd_n,
         "symmetric noise-refresh",
         |candidate| {
             simulate_symmetric_noise_refresh_error_growth_for_v_bits_with_prefix(
@@ -218,7 +260,6 @@ where
                 &decrypt_prefix,
                 seed_bits,
                 candidate,
-                graph_seed,
                 cbd_n,
                 ring_gsw_error_sigma,
                 num_slots,
@@ -237,6 +278,8 @@ where
 fn search_noise_refresh_v_bits<F>(
     params: &<DCRTPoly as crate::poly::Poly>::Params,
     ctx: Arc<SimulatorContext>,
+    seed_bits: usize,
+    cbd_n: usize,
     simulation_name: &'static str,
     mut simulate_candidate: F,
 ) -> Option<NoiseRefreshErrorSimulation>
@@ -258,6 +301,21 @@ where
     while low <= high {
         let candidate = low + (high - low) / 2;
         info!(simulation = simulation_name, candidate, low, high, "evaluating v_bits candidate");
+        let required_seed_bits = minimum_noise_refresh_seed_bits(params, candidate, cbd_n);
+        if seed_bits < required_seed_bits {
+            debug!(
+                simulation = simulation_name,
+                candidate,
+                seed_bits,
+                required_seed_bits,
+                "noise-refresh candidate rejected by Goldreich PRG output bound"
+            );
+            if candidate == 1 {
+                break;
+            }
+            high = candidate - 1;
+            continue;
+        }
         let simulation = simulate_candidate(candidate);
         let worst_pre_rounding = worst_pre_rounding_error(&simulation);
         let valid = validate_noise_refresh_v_bits(params, candidate, worst_pre_rounding);
@@ -315,6 +373,11 @@ where
         v_bits, cbd_n, num_slots, "starting fixed-v_bits noise-refresh error simulation"
     );
     assert_eq!(enc_seeds.len(), seed_bits, "encrypted seed norm count mismatch");
+    let required_seed_bits = minimum_noise_refresh_seed_bits(&ring_gsw.params, v_bits, cbd_n);
+    assert!(
+        seed_bits >= required_seed_bits,
+        "noise-refresh seed_bits {seed_bits} is below Goldreich PRG safety minimum {required_seed_bits} for v_bits={v_bits}, cbd_n={cbd_n}"
+    );
     let (_q_moduli, _crt_bits, crt_depth) = ring_gsw.params.to_crt();
     let log_base_q = ring_gsw.params.modulus_digits();
     assert_eq!(
@@ -369,7 +432,6 @@ where
         material_ring_gsw,
         seed_bits,
         v_bits,
-        graph_seed,
         cbd_n,
         ring_gsw_error_sigma,
         num_slots,
@@ -435,7 +497,6 @@ pub fn simulate_symmetric_noise_refresh_error_growth_for_v_bits<A, PE, ST>(
     ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
     seed_bits: usize,
     v_bits: usize,
-    graph_seed: [u8; 32],
     cbd_n: usize,
     ring_gsw_error_sigma: f64,
     num_slots: usize,
@@ -455,7 +516,6 @@ where
     let prg_prefix = build_symmetric_noise_refresh_prg_error_prefix(
         &ring_gsw,
         seed_bits,
-        graph_seed,
         cbd_n,
         ring_gsw_error_sigma,
         one.clone(),
@@ -478,7 +538,6 @@ where
         &decrypt_prefix,
         seed_bits,
         v_bits,
-        graph_seed,
         cbd_n,
         ring_gsw_error_sigma,
         num_slots,
@@ -498,7 +557,6 @@ fn simulate_symmetric_noise_refresh_error_growth_for_v_bits_with_prefix<A, PE, S
     decrypt_prefix: &SymmetricNoiseRefreshDecryptPrefix,
     seed_bits: usize,
     v_bits: usize,
-    _graph_seed: [u8; 32],
     cbd_n: usize,
     _ring_gsw_error_sigma: f64,
     num_slots: usize,
@@ -519,7 +577,19 @@ where
         seed_bits,
         v_bits, cbd_n, num_slots, "starting fixed-v_bits symmetric noise-refresh error simulation"
     );
-    assert_eq!(enc_seeds.len(), seed_bits, "encrypted seed norm count mismatch");
+    assert!(
+        seed_bits >= 5,
+        "symmetric noise-refresh seed_bits must be at least five for representative simulation"
+    );
+    assert!(
+        enc_seeds.len() >= 5,
+        "symmetric noise-refresh representative simulation requires at least five seed norms"
+    );
+    let required_seed_bits = minimum_noise_refresh_seed_bits(&ring_gsw.params, v_bits, cbd_n);
+    assert!(
+        seed_bits >= required_seed_bits,
+        "symmetric noise-refresh seed_bits {seed_bits} is below Goldreich PRG safety minimum {required_seed_bits} for v_bits={v_bits}, cbd_n={cbd_n}"
+    );
     let ring_dim = ring_gsw.params.ring_dimension() as usize;
     assert_eq!(num_slots, ring_dim, "num_slots must match ring_dim");
     let (_q_moduli, _crt_bits, crt_depth) = ring_gsw.params.to_crt();
@@ -690,7 +760,6 @@ where
 fn build_symmetric_noise_refresh_prg_error_prefix<A, PE, ST>(
     ring_gsw: &Arc<RingGswContext<DCRTPoly, A>>,
     seed_bits: usize,
-    graph_seed: [u8; 32],
     cbd_n: usize,
     ring_gsw_error_sigma: f64,
     one: ErrorNorm,
@@ -720,8 +789,6 @@ where
             let mut material_wire_error = representative_material_ciphertext_wire_error(
                 material_ring_gsw.clone(),
                 seed_bits,
-                1,
-                graph_seed,
                 cbd_n,
                 one,
                 enc_seeds,
@@ -739,7 +806,6 @@ where
         representative_symmetric_material_decryption_error_base_norms(
             material_ring_gsw.clone(),
             seed_bits,
-            graph_seed,
             cbd_n,
             ring_gsw_error_sigma,
         );
@@ -764,8 +830,6 @@ where
 fn representative_material_ciphertext_wire_error<A, PE, ST>(
     ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
     seed_bits: usize,
-    v_bits: usize,
-    graph_seed: [u8; 32],
     cbd_n: usize,
     one: ErrorNorm,
     enc_seeds: &[ErrorNorm],
@@ -777,35 +841,31 @@ where
     PE: PltEvaluator<ErrorNorm>,
     ST: SlotTransferEvaluator<ErrorNorm>,
 {
+    assert!(
+        seed_bits >= 5,
+        "noise-refresh representative material simulation requires at least five seed bits"
+    );
+    assert!(
+        enc_seeds.len() >= 5,
+        "noise-refresh representative material simulation requires at least five seed errors"
+    );
     let mut circuit = ring_gsw.fresh_circuit();
-    let encrypted_seeds = (0..seed_bits)
+    let encrypted_seeds = (0..5)
         .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
         .collect::<Vec<_>>();
-    let output_sizes = goldreich_noise_refresh_output_sizes(
-        ring_gsw.params.ring_dimension() as usize,
-        ring_gsw.params.modulus_digits(),
-        ring_gsw.params.to_crt().2,
-        v_bits,
-    );
-    let cbd_seed = derive_noise_refresh_graph_seed(graph_seed, b"NoiseRefreshCBD/v1", 0);
-    let cbd_prf = GoldreichFheCbdPrg::setup_range(
-        &mut circuit,
+    let error = representative_goldreich_cbd_output(
         ring_gsw.clone(),
-        seed_bits,
-        output_sizes.cbd_values,
-        0,
-        1,
-        cbd_seed,
+        &encrypted_seeds,
         cbd_n,
+        &mut circuit,
     );
-    let errors = cbd_prf.evaluate_cbd_prf(&encrypted_seeds, &mut circuit);
     // The symmetric simulator uses the CBD material output as the representative bound for both
     // CBD error ciphertexts and uniform mask ciphertexts. A CBD output combines `2 * cbd_n`
     // Goldreich uniform branches, so it is a conservative representative for a single mask bit
     // while avoiding a second equivalent one-output PRG evaluation.
-    circuit.output(errors.iter().flat_map(|output| output.sub_circuit_wires()));
+    circuit.output(error.sub_circuit_wires());
     let wire_count = representative_ring_gsw_wire_count(ring_gsw);
-    let inputs = enc_seeds
+    let inputs = enc_seeds[..5]
         .iter()
         .flat_map(|seed| std::iter::repeat_n(seed.clone(), wire_count))
         .collect::<Vec<_>>();
@@ -906,37 +966,28 @@ where
 fn representative_symmetric_material_decryption_error_base_norms<A>(
     ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
     seed_bits: usize,
-    graph_seed: [u8; 32],
     cbd_n: usize,
     ring_gsw_error_sigma: f64,
 ) -> (PolyMatrixNorm, PolyMatrixNorm)
 where
     A: DecomposeArithmeticGadget<DCRTPoly> + ModularArithmeticPlanner<DCRTPoly>,
 {
+    assert!(
+        seed_bits >= 5,
+        "symmetric noise-refresh representative decryption simulation requires at least five seed bits"
+    );
     let mut circuit = ring_gsw.fresh_circuit();
     let output_ctx = ring_gsw.randomizer_norm_ctx.clone();
-    let encrypted_seeds = (0..seed_bits)
+    let encrypted_seeds = (0..5)
         .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
         .collect::<Vec<_>>();
-    let output_sizes = goldreich_noise_refresh_output_sizes(
-        ring_gsw.params.ring_dimension() as usize,
-        ring_gsw.params.modulus_digits(),
-        ring_gsw.params.to_crt().2,
-        1,
-    );
-    let cbd_seed = derive_noise_refresh_graph_seed(graph_seed, b"NoiseRefreshCBD/v1", 0);
-    let cbd_prf = GoldreichFheCbdPrg::setup_range(
-        &mut circuit,
+    let error = representative_goldreich_cbd_output(
         ring_gsw.clone(),
-        seed_bits,
-        output_sizes.cbd_values,
-        0,
-        1,
-        cbd_seed,
+        &encrypted_seeds,
         cbd_n,
+        &mut circuit,
     );
-    let errors = cbd_prf.evaluate_cbd_prf(&encrypted_seeds, &mut circuit);
-    let error_norm = errors[0].estimate_decryption_error_norm(ring_gsw_error_sigma);
+    let error_norm = error.estimate_decryption_error_norm(ring_gsw_error_sigma);
     // Reuse the CBD randomizer bound for mask ciphertexts as well. This is intentionally
     // conservative and keeps the representative noise-refresh PRG simulation to one CBD output.
     let mask_norm = error_norm.clone();
@@ -956,6 +1007,93 @@ where
             mask_norm.zero_rows,
         ),
     )
+}
+
+fn representative_goldreich_cbd_output<A>(
+    ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
+    encrypted_seeds: &[RingGswCiphertext<DCRTPoly, A>],
+    cbd_n: usize,
+    circuit: &mut PolyCircuit<DCRTPoly>,
+) -> RingGswCiphertext<DCRTPoly, A>
+where
+    A: DecomposeArithmeticGadget<DCRTPoly> + ModularArithmeticPlanner<DCRTPoly>,
+{
+    assert_eq!(
+        encrypted_seeds.len(),
+        5,
+        "representative Goldreich CBD simulation uses exactly five seed inputs"
+    );
+    assert!(cbd_n > 0, "representative Goldreich CBD simulation requires cbd_n > 0");
+    let positive_terms = (0..cbd_n)
+        .map(|idx| representative_goldreich_output(ring_gsw.clone(), encrypted_seeds, idx, circuit))
+        .collect::<Vec<_>>();
+    let negative_terms = (0..cbd_n)
+        .map(|idx| {
+            representative_goldreich_output(ring_gsw.clone(), encrypted_seeds, cbd_n + idx, circuit)
+        })
+        .collect::<Vec<_>>();
+    let positive = reduce_ring_gsw_add_pairwise(positive_terms, circuit);
+    let negative = reduce_ring_gsw_add_pairwise(negative_terms, circuit);
+    positive.sub(&negative, circuit)
+}
+
+fn representative_goldreich_output<A>(
+    ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
+    encrypted_seeds: &[RingGswCiphertext<DCRTPoly, A>],
+    edge_idx: usize,
+    circuit: &mut PolyCircuit<DCRTPoly>,
+) -> RingGswCiphertext<DCRTPoly, A>
+where
+    A: DecomposeArithmeticGadget<DCRTPoly> + ModularArithmeticPlanner<DCRTPoly>,
+{
+    let graph = GoldreichGraph::from_edges(
+        5,
+        vec![representative_goldreich_edge(edge_idx)],
+        Default::default(),
+    );
+    let goldreich = GoldreichFhePrg::from_public_graph(circuit, ring_gsw, graph);
+    let mut outputs = goldreich.evaluate_uniform(encrypted_seeds, circuit);
+    assert_eq!(outputs.len(), 1, "representative Goldreich graph must produce one output");
+    outputs.remove(0)
+}
+
+fn representative_goldreich_edge(edge_idx: usize) -> GoldreichEdge {
+    const ROLE_SPLITS: [([usize; 3], [usize; 2]); 10] = [
+        ([0, 1, 2], [3, 4]),
+        ([0, 1, 3], [2, 4]),
+        ([0, 1, 4], [2, 3]),
+        ([0, 2, 3], [1, 4]),
+        ([0, 2, 4], [1, 3]),
+        ([0, 3, 4], [1, 2]),
+        ([1, 2, 3], [0, 4]),
+        ([1, 2, 4], [0, 3]),
+        ([1, 3, 4], [0, 2]),
+        ([2, 3, 4], [0, 1]),
+    ];
+    let (xor_inputs, and_inputs) = ROLE_SPLITS[edge_idx % ROLE_SPLITS.len()];
+    GoldreichEdge::new(xor_inputs, and_inputs)
+}
+
+fn reduce_ring_gsw_add_pairwise<A>(
+    mut terms: Vec<RingGswCiphertext<DCRTPoly, A>>,
+    circuit: &mut PolyCircuit<DCRTPoly>,
+) -> RingGswCiphertext<DCRTPoly, A>
+where
+    A: DecomposeArithmeticGadget<DCRTPoly> + ModularArithmeticPlanner<DCRTPoly>,
+{
+    assert!(!terms.is_empty(), "representative Ring-GSW reduction requires at least one term");
+    while terms.len() > 1 {
+        let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+        for pair in terms.chunks(2) {
+            if pair.len() == 2 {
+                next.push(pair[0].add(&pair[1], circuit));
+            } else {
+                next.push(pair[0].clone());
+            }
+        }
+        terms = next;
+    }
+    terms.pop().expect("pairwise Ring-GSW reduction must leave one term")
 }
 
 fn representative_symmetric_material_decryption_error_norm<A>(
@@ -994,7 +1132,6 @@ fn representative_material_decryption_error_norm<A>(
     ring_gsw: Arc<RingGswContext<DCRTPoly, A>>,
     seed_bits: usize,
     v_bits: usize,
-    graph_seed: [u8; 32],
     cbd_n: usize,
     ring_gsw_error_sigma: f64,
     num_slots: usize,
@@ -1006,51 +1143,62 @@ where
     let ring_dim = ring_gsw.params.ring_dimension() as usize;
     assert_eq!(num_slots, ring_dim, "num_slots must match ring_dim");
     let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask q chunk length overflow");
+    assert!(
+        seed_bits >= 5,
+        "noise-refresh representative material decryption simulation requires at least five seed bits"
+    );
 
     let mut circuit = ring_gsw.fresh_circuit();
-    let encrypted_seeds = (0..seed_bits)
+    let encrypted_seeds = (0..5)
         .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
         .collect::<Vec<_>>();
-    let material = evaluate_goldreich_noise_refresh_material_ranges(
-        &mut circuit,
-        ring_gsw,
+    let error = representative_goldreich_cbd_output(
+        ring_gsw.clone(),
         &encrypted_seeds,
-        v_bits,
-        graph_seed,
         cbd_n,
-        0,
-        0,
-        ring_dim,
-        &[(0, mask_q_chunk_len)],
+        &mut circuit,
     );
-    assert_eq!(material.errors.len(), ring_dim);
-    assert_eq!(material.masks.len(), mask_q_chunk_len);
+    let error_norm = error.estimate_decryption_error_norm(ring_gsw_error_sigma);
+    let base = PolyMatrixNorm::new(
+        output_ctx,
+        error_norm.nrow,
+        error_norm.ncol,
+        error_norm.poly_norm.norm,
+        error_norm.zero_rows,
+    );
+    // One representative CBD ciphertext bounds both CBD error ciphertexts and uniform mask
+    // ciphertexts. Noise refresh decrypts one error ciphertext per coefficient and `v_bits` mask
+    // ciphertexts per coefficient, so the collapsed decrypt-error contribution scales by
+    // `ring_dim + ring_dim * v_bits`.
+    base * BigDecimal::from(
+        ring_dim
+            .checked_add(mask_q_chunk_len)
+            .expect("noise-refresh material decryption-error scale overflow") as u64,
+    )
+}
 
-    let mut collapsed_norm =
-        PolyMatrixNorm::new(output_ctx.clone(), 1, 1, BigDecimal::from(0u32), None);
-    for coeff_idx in 0..ring_dim {
-        let error_norm =
-            material.errors[coeff_idx].estimate_decryption_error_norm(ring_gsw_error_sigma);
-        let mut coeff_norm = PolyMatrixNorm::new(
-            output_ctx.clone(),
-            error_norm.nrow,
-            error_norm.ncol,
-            error_norm.poly_norm.norm,
-            error_norm.zero_rows,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        gadgets::fhe_prg::goldreich::goldreich_output_bound_holds,
+        poly::dcrt::params::DCRTPolyParams,
+    };
+
+    #[test]
+    fn test_noise_refresh_seed_bit_search_covers_uniform_output_bits() {
+        let params = DCRTPolyParams::new(2, 1, 10, 5);
+        let v_bits = 2usize;
+        let cbd_n = 3usize;
+        let output_bits = noise_refresh_uniform_output_bits(&params, v_bits, cbd_n);
+        let seed_bits = minimum_noise_refresh_seed_bits(&params, v_bits, cbd_n);
+
+        assert!(goldreich_output_bound_holds(seed_bits, output_bits));
+        assert!(!goldreich_output_bound_holds(seed_bits - 1, output_bits));
+        assert_eq!(
+            search_noise_refresh_seed_bits(&params, v_bits, cbd_n, seed_bits + 7),
+            seed_bits + 7,
+            "search helper must respect caller-provided lower bounds"
         );
-
-        let mask_start = coeff_idx * v_bits;
-        for mask_bit in &material.masks[mask_start..mask_start + v_bits] {
-            let mask_norm = mask_bit.estimate_decryption_error_norm(ring_gsw_error_sigma);
-            coeff_norm += PolyMatrixNorm::new(
-                output_ctx.clone(),
-                mask_norm.nrow,
-                mask_norm.ncol,
-                mask_norm.poly_norm.norm,
-                mask_norm.zero_rows,
-            );
-        }
-        collapsed_norm += coeff_norm;
     }
-    collapsed_norm
 }

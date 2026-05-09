@@ -16,6 +16,8 @@ use mxx::{
     io::diamond_io::{
         DiamondIO, DiamondIOBenchEstimator, DiamondIOFuncType,
         GpuDCRTPolyMatrixNativeBenchEstimator, diamond_io_find_crt_depth,
+        diamond_io_max_noise_refresh_v_bits_without_pre_rounding_error,
+        minimum_diamond_io_prf_seed_bits,
     },
     lookup::{
         PltEvaluator, PublicLut,
@@ -57,7 +59,7 @@ use tracing_subscriber::prelude::*;
 
 const DEFAULT_RING_DIM: u32 = 1 << 16;
 const DEFAULT_INPUT_SIZE: usize = 5;
-const DEFAULT_SEED_BITS: usize = 5;
+const DEFAULT_OUTPUT_SIZE: usize = 6;
 const DEFAULT_CRT_BITS: usize = 28;
 const DEFAULT_BASE_BITS: u32 = 14;
 const DEFAULT_P_MODULI_BITS: usize = 7;
@@ -66,7 +68,6 @@ const DEFAULT_SCALE: u64 = 1 << 8;
 const DEFAULT_MIN_CRT_DEPTH: usize = 1;
 const DEFAULT_MAX_CRT_DEPTH: usize = 64;
 const DEFAULT_SECURITY_BITS: usize = 0;
-const DEFAULT_NOISE_REFRESH_V_BITS: usize = 200;
 const DEFAULT_NOISE_REFRESH_CBD_N: usize = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
@@ -122,7 +123,7 @@ type GpuDiamondIO = DiamondIO<
 struct DiamondIOGpuBenchConfig {
     ring_dim: u32,
     input_size: usize,
-    seed_bits: usize,
+    output_size: usize,
     crt_bits: usize,
     base_bits: u32,
     p_moduli_bits: usize,
@@ -131,7 +132,6 @@ struct DiamondIOGpuBenchConfig {
     min_crt_depth: usize,
     max_crt_depth: usize,
     security_bits: usize,
-    noise_refresh_v_bits: usize,
     noise_refresh_cbd_n: usize,
     bench_iterations: usize,
     error_sigma: f64,
@@ -143,6 +143,8 @@ struct DiamondIOGpuBenchConfig {
 struct DiamondIOGpuBenchSelectedSimulation {
     crt_depth: usize,
     prf_mask_output_coeff_bits: usize,
+    noise_refresh_v_bits: usize,
+    seed_bits: usize,
     noisy_plaintext_error_bits: usize,
     input_injection_error_bits: usize,
 }
@@ -152,7 +154,10 @@ impl DiamondIOGpuBenchConfig {
         let cfg = Self {
             ring_dim: env_or_parse_u32("DIAMOND_IO_GPU_BENCH_RING_DIM", DEFAULT_RING_DIM),
             input_size: env_or_parse_usize("DIAMOND_IO_GPU_BENCH_INPUT_SIZE", DEFAULT_INPUT_SIZE),
-            seed_bits: env_or_parse_usize("DIAMOND_IO_GPU_BENCH_SEED_BITS", DEFAULT_SEED_BITS),
+            output_size: env_or_parse_usize(
+                "DIAMOND_IO_GPU_BENCH_OUTPUT_SIZE",
+                DEFAULT_OUTPUT_SIZE,
+            ),
             crt_bits: env_or_parse_usize("DIAMOND_IO_GPU_BENCH_CRT_BITS", DEFAULT_CRT_BITS),
             base_bits: env_or_parse_u32("DIAMOND_IO_GPU_BENCH_BASE_BITS", DEFAULT_BASE_BITS),
             p_moduli_bits: env_or_parse_usize(
@@ -176,10 +181,6 @@ impl DiamondIOGpuBenchConfig {
                 "DIAMOND_IO_GPU_BENCH_SECURITY_BITS",
                 DEFAULT_SECURITY_BITS,
             ),
-            noise_refresh_v_bits: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_NOISE_REFRESH_V_BITS",
-                DEFAULT_NOISE_REFRESH_V_BITS,
-            ),
             noise_refresh_cbd_n: env_or_parse_usize(
                 "DIAMOND_IO_GPU_BENCH_NOISE_REFRESH_CBD_N",
                 DEFAULT_NOISE_REFRESH_CBD_N,
@@ -197,16 +198,12 @@ impl DiamondIOGpuBenchConfig {
         };
         assert!(cfg.ring_dim > 0, "DIAMOND_IO_GPU_BENCH_RING_DIM must be positive");
         assert!(cfg.input_size > 0, "DIAMOND_IO_GPU_BENCH_INPUT_SIZE must be positive");
-        assert!(cfg.seed_bits > 0, "DIAMOND_IO_GPU_BENCH_SEED_BITS must be positive");
+        assert!(cfg.output_size > 0, "DIAMOND_IO_GPU_BENCH_OUTPUT_SIZE must be positive");
         assert!(cfg.crt_bits > 0, "DIAMOND_IO_GPU_BENCH_CRT_BITS must be positive");
         assert!(cfg.base_bits > 0, "DIAMOND_IO_GPU_BENCH_BASE_BITS must be positive");
         assert!(
             cfg.min_crt_depth <= cfg.max_crt_depth,
             "DIAMOND_IO_GPU_BENCH_MIN_CRT_DEPTH must be <= DIAMOND_IO_GPU_BENCH_MAX_CRT_DEPTH"
-        );
-        assert!(
-            cfg.noise_refresh_v_bits > 0,
-            "DIAMOND_IO_GPU_BENCH_NOISE_REFRESH_V_BITS must be positive"
         );
         assert!(
             cfg.noise_refresh_cbd_n > 0,
@@ -220,7 +217,22 @@ impl DiamondIOGpuBenchConfig {
     }
 
     fn output_size(&self) -> usize {
-        self.seed_bits
+        self.output_size
+    }
+
+    fn seed_bits_for_params(
+        &self,
+        params: &DCRTPolyParams,
+        prf_mask_output_coeff_bits: usize,
+        noise_refresh_v_bits: usize,
+    ) -> usize {
+        minimum_diamond_io_prf_seed_bits(
+            params,
+            self.output_size,
+            prf_mask_output_coeff_bits,
+            noise_refresh_v_bits,
+            self.noise_refresh_cbd_n,
+        )
     }
 
     fn input_base(&self) -> usize {
@@ -234,11 +246,13 @@ impl DiamondIOGpuBenchConfig {
             .max(1)
     }
 
-    fn selected_simulation_from_env() -> Option<DiamondIOGpuBenchSelectedSimulation> {
+    fn selected_simulation_from_env(&self) -> Option<DiamondIOGpuBenchSelectedSimulation> {
         let crt_depth = env_or_parse_optional_usize("DIAMOND_IO_GPU_BENCH_SELECTED_CRT_DEPTH")?;
         let prf_mask_output_coeff_bits = env_or_parse_optional_usize(
             "DIAMOND_IO_GPU_BENCH_SELECTED_PRF_MASK_OUTPUT_COEFF_BITS",
         )?;
+        let noise_refresh_v_bits =
+            env_or_parse_optional_usize("DIAMOND_IO_GPU_BENCH_SELECTED_NOISE_REFRESH_V_BITS")?;
         let noisy_plaintext_error_bits = env_or_parse_optional_usize(
             "DIAMOND_IO_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS",
         )?;
@@ -250,9 +264,18 @@ impl DiamondIOGpuBenchConfig {
             prf_mask_output_coeff_bits > 0,
             "DIAMOND_IO_GPU_BENCH_SELECTED_PRF_MASK_OUTPUT_COEFF_BITS must be positive"
         );
+        assert!(
+            noise_refresh_v_bits > 0,
+            "DIAMOND_IO_GPU_BENCH_SELECTED_NOISE_REFRESH_V_BITS must be positive"
+        );
+        let params = DCRTPolyParams::new(self.ring_dim, crt_depth, self.crt_bits, self.base_bits);
+        let seed_bits =
+            self.seed_bits_for_params(&params, prf_mask_output_coeff_bits, noise_refresh_v_bits);
         Some(DiamondIOGpuBenchSelectedSimulation {
             crt_depth,
             prf_mask_output_coeff_bits,
+            noise_refresh_v_bits,
+            seed_bits,
             noisy_plaintext_error_bits,
             input_injection_error_bits,
         })
@@ -422,6 +445,7 @@ fn build_diamond_io(
     cpu_params: DCRTPolyParams,
     gpu_params: GpuDCRTPolyParams,
     prf_mask_output_coeff_bits: usize,
+    noise_refresh_v_bits: usize,
     gpu_id: i32,
     dir_path: PathBuf,
 ) -> GpuDiamondIO {
@@ -452,6 +476,15 @@ fn build_diamond_io(
         lookup_dir.clone(),
     );
     let enc_lookup_dir = lookup_dir.clone();
+    let seed_bits =
+        cfg.seed_bits_for_params(&cpu_params, prf_mask_output_coeff_bits, noise_refresh_v_bits);
+    info!(
+        output_size = cfg.output_size(),
+        seed_bits,
+        prf_mask_output_coeff_bits,
+        noise_refresh_v_bits,
+        "derived DiamondIO GPU benchmark seed_bits from output_size"
+    );
     DiamondIO::new(
         injector,
         cfg.input_size,
@@ -463,9 +496,9 @@ fn build_diamond_io(
         ring_gsw_enable_levels,
         Some(cfg.error_sigma),
         b"test_gpu_diamond_io".to_vec(),
-        cfg.seed_bits,
+        seed_bits,
         prf_mask_output_coeff_bits,
-        cfg.noise_refresh_v_bits,
+        noise_refresh_v_bits,
         cfg.noise_refresh_cbd_n,
         [0x24; 32],
         [0x25; 32],
@@ -489,6 +522,7 @@ fn build_cpu_diamond_io_for_search(
     cfg: &DiamondIOGpuBenchConfig,
     crt_depth: usize,
     prf_mask_output_coeff_bits: usize,
+    noise_refresh_v_bits: usize,
 ) -> CpuDiamondIO {
     let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
     let (_, _, actual_crt_depth) = params.to_crt();
@@ -509,6 +543,16 @@ fn build_cpu_diamond_io_for_search(
         cfg.trapdoor_sigma,
         cfg.error_sigma,
     );
+    let seed_bits =
+        cfg.seed_bits_for_params(&params, prf_mask_output_coeff_bits, noise_refresh_v_bits);
+    info!(
+        crt_depth,
+        output_size = cfg.output_size(),
+        seed_bits,
+        prf_mask_output_coeff_bits,
+        noise_refresh_v_bits,
+        "derived DiamondIO CPU search seed_bits from output_size"
+    );
     DiamondIO::new(
         injector,
         cfg.input_size,
@@ -520,9 +564,9 @@ fn build_cpu_diamond_io_for_search(
         ring_gsw_enable_levels,
         Some(cfg.error_sigma),
         b"test_gpu_diamond_io_cpu_search".to_vec(),
-        cfg.seed_bits,
+        seed_bits,
         prf_mask_output_coeff_bits,
-        cfg.noise_refresh_v_bits,
+        noise_refresh_v_bits,
         cfg.noise_refresh_cbd_n,
         [0x24; 32],
         [0x25; 32],
@@ -700,10 +744,12 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
     let temp_dir = tempdir().expect("DiamondIO GPU bench test must create a tempdir");
     init_storage_system(temp_dir.path().to_path_buf());
 
-    let selected = if let Some(selected) = DiamondIOGpuBenchConfig::selected_simulation_from_env() {
+    let selected = if let Some(selected) = cfg.selected_simulation_from_env() {
         info!(
             crt_depth = selected.crt_depth,
             prf_mask_output_coeff_bits = selected.prf_mask_output_coeff_bits,
+            noise_refresh_v_bits = selected.noise_refresh_v_bits,
+            final_seed_bits = selected.seed_bits,
             noisy_plaintext_error_bits = selected.noisy_plaintext_error_bits,
             input_injection_error_bits = selected.input_injection_error_bits,
             "DiamondIO selected simulation parameters provided; skipping error simulation"
@@ -718,11 +764,20 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
             cfg.prf_mask_output_coeff_bits_search_bound(),
             cfg.security_bits,
             DiamondIOFuncType::DebugDecryption,
-            |crt_depth| {
+            |crt_depth, prf_mask_output_coeff_bits, noise_refresh_v_bits| {
+                let search_params =
+                    DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
+                let selected_noise_refresh_v_bits = noise_refresh_v_bits.unwrap_or_else(|| {
+                    diamond_io_max_noise_refresh_v_bits_without_pre_rounding_error(&search_params)
+                        .expect(
+                            "DiamondIO CRT-depth search requires a noise-refresh v_bits candidate",
+                        )
+                });
                 build_cpu_diamond_io_for_search(
                     &cfg,
                     crt_depth,
-                    cfg.prf_mask_output_coeff_bits_search_bound(),
+                    prf_mask_output_coeff_bits,
+                    selected_noise_refresh_v_bits,
                 )
             },
             &plt_evaluator,
@@ -732,6 +787,8 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         let selected = DiamondIOGpuBenchSelectedSimulation {
             crt_depth: search.crt_depth,
             prf_mask_output_coeff_bits: search.prf_mask_output_coeff_bits,
+            noise_refresh_v_bits: search.noise_refresh_v_bits,
+            seed_bits: search.seed_bits,
             noisy_plaintext_error_bits: bigdecimal_bits_ceil(
                 &search.total_noisy_plaintext_error.poly_norm.norm,
             ) as usize,
@@ -742,6 +799,8 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         info!(
             crt_depth = selected.crt_depth,
             prf_mask_output_coeff_bits = selected.prf_mask_output_coeff_bits,
+            noise_refresh_v_bits = selected.noise_refresh_v_bits,
+            final_seed_bits = selected.seed_bits,
             noisy_plaintext_error_bits = selected.noisy_plaintext_error_bits,
             input_injection_error_bits = selected.input_injection_error_bits,
             "DiamondIO CRT-depth search selected parameters"
@@ -750,6 +809,15 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
     };
 
     let (cpu_params, gpu_params) = gpu_params_for_crt_depth(&cfg, selected.crt_depth, gpu_id);
+    assert_eq!(
+        cfg.seed_bits_for_params(
+            &cpu_params,
+            selected.prf_mask_output_coeff_bits,
+            selected.noise_refresh_v_bits,
+        ),
+        selected.seed_bits,
+        "selected DiamondIO final seed_bits must match the minimum derived from selected mask widths"
+    );
     let final_dir = temp_dir.path().join("final_estimate");
     ensure_clean_dir(&final_dir);
     init_storage_system(final_dir.clone());
@@ -758,6 +826,7 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         cpu_params,
         gpu_params.clone(),
         selected.prf_mask_output_coeff_bits,
+        selected.noise_refresh_v_bits,
         gpu_id,
         final_dir.clone(),
     );

@@ -455,32 +455,27 @@ impl DiamondIOBenchShape {
             .expect("DiamondIO selected-half PRG output count overflow")
     }
 
-    pub(super) fn sparse_noise_refresh_material_ciphertext_count(&self, v_bits: usize) -> usize {
-        let per_slot_digit_ciphertexts = self
-            .ring_dim
-            .checked_mul(
-                1usize
-                    .checked_add(
-                        self.crt_depth
-                            .checked_mul(v_bits)
-                            .expect("DiamondIO noise-refresh mask ciphertext count overflow"),
-                    )
-                    .expect("DiamondIO noise-refresh material ciphertext count overflow"),
-            )
-            .expect("DiamondIO noise-refresh per-slot material count overflow");
-        self.ring_dim
-            .checked_mul(self.modulus_digits)
-            .and_then(|count| count.checked_mul(per_slot_digit_ciphertexts))
-            .expect("DiamondIO noise-refresh material ciphertext count overflow")
-    }
-
-    pub(super) fn sparse_noise_refresh_material_prg_output_count(
+    pub(super) fn sparse_noise_refresh_material_uniform_prg_output_count(
         &self,
         input_size: usize,
         v_bits: usize,
+        cbd_n: usize,
     ) -> BigUint {
-        BigUint::from(self.sparse_noise_refresh_material_ciphertext_count(v_bits)) *
-            BigUint::from(input_size)
+        let error_ciphertexts = self
+            .ring_dim
+            .checked_mul(self.modulus_digits)
+            .and_then(|count| count.checked_mul(self.ring_dim))
+            .expect("DiamondIO noise-refresh CBD ciphertext count overflow");
+        let mask_ciphertexts = error_ciphertexts
+            .checked_mul(self.crt_depth)
+            .and_then(|count| count.checked_mul(v_bits))
+            .expect("DiamondIO noise-refresh mask ciphertext count overflow");
+        let uniform_outputs = error_ciphertexts
+            .checked_mul(2)
+            .and_then(|count| count.checked_mul(cbd_n))
+            .and_then(|count| count.checked_add(mask_ciphertexts))
+            .expect("DiamondIO noise-refresh uniform PRG output count overflow");
+        BigUint::from(uniform_outputs) * BigUint::from(input_size)
     }
 
     pub(super) fn prf_refresh_decoder_preimage_count(&self) -> usize {

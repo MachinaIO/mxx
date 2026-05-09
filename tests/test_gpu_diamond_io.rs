@@ -59,6 +59,7 @@ use tracing_subscriber::prelude::*;
 
 const DEFAULT_RING_DIM: u32 = 1 << 16;
 const DEFAULT_INPUT_SIZE: usize = 5;
+const DEFAULT_INJECTOR_BATCH_BITS: usize = 1;
 const DEFAULT_OUTPUT_SIZE: usize = 6;
 const DEFAULT_CRT_BITS: usize = 28;
 const DEFAULT_BASE_BITS: u32 = 14;
@@ -123,6 +124,7 @@ type GpuDiamondIO = DiamondIO<
 struct DiamondIOGpuBenchConfig {
     ring_dim: u32,
     input_size: usize,
+    injector_batch_bits: usize,
     output_size: usize,
     crt_bits: usize,
     base_bits: u32,
@@ -154,6 +156,10 @@ impl DiamondIOGpuBenchConfig {
         let cfg = Self {
             ring_dim: env_or_parse_u32("DIAMOND_IO_GPU_BENCH_RING_DIM", DEFAULT_RING_DIM),
             input_size: env_or_parse_usize("DIAMOND_IO_GPU_BENCH_INPUT_SIZE", DEFAULT_INPUT_SIZE),
+            injector_batch_bits: env_or_parse_usize(
+                "DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS",
+                DEFAULT_INJECTOR_BATCH_BITS,
+            ),
             output_size: env_or_parse_usize(
                 "DIAMOND_IO_GPU_BENCH_OUTPUT_SIZE",
                 DEFAULT_OUTPUT_SIZE,
@@ -198,6 +204,19 @@ impl DiamondIOGpuBenchConfig {
         };
         assert!(cfg.ring_dim > 0, "DIAMOND_IO_GPU_BENCH_RING_DIM must be positive");
         assert!(cfg.input_size > 0, "DIAMOND_IO_GPU_BENCH_INPUT_SIZE must be positive");
+        assert!(
+            cfg.injector_batch_bits > 0,
+            "DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS must be positive"
+        );
+        assert!(
+            cfg.injector_batch_bits <= u32::BITS as usize,
+            "DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS must be <= 32"
+        );
+        assert_eq!(
+            cfg.input_size % cfg.injector_batch_bits,
+            0,
+            "DIAMOND_IO_GPU_BENCH_INPUT_SIZE must be divisible by DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS"
+        );
         assert!(cfg.output_size > 0, "DIAMOND_IO_GPU_BENCH_OUTPUT_SIZE must be positive");
         assert!(cfg.crt_bits > 0, "DIAMOND_IO_GPU_BENCH_CRT_BITS must be positive");
         assert!(cfg.base_bits > 0, "DIAMOND_IO_GPU_BENCH_BASE_BITS must be positive");
@@ -237,7 +256,17 @@ impl DiamondIOGpuBenchConfig {
     }
 
     fn input_base(&self) -> usize {
-        2
+        1usize
+            .checked_shl(
+                self.injector_batch_bits
+                    .try_into()
+                    .expect("DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS must fit into u32"),
+            )
+            .expect("DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS overflowed input base")
+    }
+
+    fn injector_input_count(&self) -> usize {
+        self.input_size / self.injector_batch_bits
     }
 
     fn prf_mask_output_coeff_bits_search_bound(&self) -> usize {
@@ -462,8 +491,9 @@ fn build_diamond_io(
         );
     let injector = GpuInjector::new(
         gpu_params.clone(),
-        cfg.input_size,
+        cfg.injector_input_count(),
         cfg.input_base(),
+        cfg.injector_batch_bits,
         cfg.trapdoor_sigma,
         cfg.error_sigma,
     )
@@ -539,8 +569,9 @@ fn build_cpu_diamond_io_for_search(
         );
     let injector = CpuInjector::new(
         params.clone(),
-        cfg.input_size,
+        cfg.injector_input_count(),
         cfg.input_base(),
+        cfg.injector_batch_bits,
         cfg.trapdoor_sigma,
         cfg.error_sigma,
     );

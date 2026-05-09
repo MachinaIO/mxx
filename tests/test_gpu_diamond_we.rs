@@ -49,6 +49,7 @@ use tracing_subscriber::prelude::*;
 const DEFAULT_RING_DIM: u32 = 1 << 16;
 const DEFAULT_CIRCUIT_HEIGHT: usize = 10;
 const DEFAULT_WITNESS_SIZE: usize = 10;
+const DEFAULT_INJECTOR_BATCH_BITS: usize = 1;
 const DEFAULT_CRT_BITS: usize = 28;
 const DEFAULT_BASE_BITS: u32 = 14;
 const DEFAULT_MIN_CRT_DEPTH: usize = 1;
@@ -105,6 +106,7 @@ struct DiamondWEGpuBenchConfig {
     ring_dim: u32,
     circuit_height: usize,
     witness_size: usize,
+    injector_batch_bits: usize,
     crt_bits: usize,
     base_bits: u32,
     min_crt_depth: usize,
@@ -134,6 +136,10 @@ impl DiamondWEGpuBenchConfig {
                 "DIAMOND_WE_GPU_BENCH_WITNESS_SIZE",
                 DEFAULT_WITNESS_SIZE,
             ),
+            injector_batch_bits: env_or_parse_usize(
+                "DIAMOND_WE_GPU_BENCH_INJECTOR_BATCH_BITS",
+                DEFAULT_INJECTOR_BATCH_BITS,
+            ),
             crt_bits: env_or_parse_usize("DIAMOND_WE_GPU_BENCH_CRT_BITS", DEFAULT_CRT_BITS),
             base_bits: env_or_parse_u32("DIAMOND_WE_GPU_BENCH_BASE_BITS", DEFAULT_BASE_BITS),
             min_crt_depth: env_or_parse_usize(
@@ -159,6 +165,19 @@ impl DiamondWEGpuBenchConfig {
         assert!(cfg.circuit_height > 0, "DIAMOND_WE_GPU_BENCH_CIRCUIT_HEIGHT must be positive");
         assert!(cfg.witness_size > 0, "DIAMOND_WE_GPU_BENCH_WITNESS_SIZE must be positive");
         assert!(
+            cfg.injector_batch_bits > 0,
+            "DIAMOND_WE_GPU_BENCH_INJECTOR_BATCH_BITS must be positive"
+        );
+        assert!(
+            cfg.injector_batch_bits <= u32::BITS as usize,
+            "DIAMOND_WE_GPU_BENCH_INJECTOR_BATCH_BITS must be <= 32"
+        );
+        assert_eq!(
+            cfg.witness_size % cfg.injector_batch_bits,
+            0,
+            "DIAMOND_WE_GPU_BENCH_WITNESS_SIZE must be divisible by DIAMOND_WE_GPU_BENCH_INJECTOR_BATCH_BITS"
+        );
+        assert!(
             cfg.witness_size <= cfg.total_input_size(),
             "DIAMOND_WE_GPU_BENCH_WITNESS_SIZE must be <= 2^DIAMOND_WE_GPU_BENCH_CIRCUIT_HEIGHT"
         );
@@ -176,7 +195,17 @@ impl DiamondWEGpuBenchConfig {
     }
 
     fn input_base(&self) -> usize {
-        2
+        1usize
+            .checked_shl(
+                self.injector_batch_bits
+                    .try_into()
+                    .expect("DIAMOND_WE_GPU_BENCH_INJECTOR_BATCH_BITS must fit into u32"),
+            )
+            .expect("DIAMOND_WE_GPU_BENCH_INJECTOR_BATCH_BITS overflowed input base")
+    }
+
+    fn injector_input_count(&self) -> usize {
+        self.witness_size / self.injector_batch_bits
     }
 
     fn total_input_size(&self) -> usize {
@@ -289,8 +318,9 @@ fn build_cpu_diamond_we_for_search(
     let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
     let injector = CpuInjector::new(
         params,
-        cfg.witness_size,
+        cfg.injector_input_count(),
         cfg.input_base(),
+        cfg.injector_batch_bits,
         cfg.trapdoor_sigma,
         cfg.error_sigma,
     );
@@ -305,8 +335,9 @@ fn build_gpu_diamond_we(
 ) -> GpuDiamondWE {
     let injector = GpuInjector::new(
         gpu_params,
-        cfg.witness_size,
+        cfg.injector_input_count(),
         cfg.input_base(),
+        cfg.injector_batch_bits,
         cfg.trapdoor_sigma,
         cfg.error_sigma,
     )

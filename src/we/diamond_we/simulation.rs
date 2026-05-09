@@ -282,7 +282,7 @@ mod tests {
             DCRTPolyUniformSampler,
             DCRTPolyHashSampler<Keccak256>,
             DCRTPolyTrapdoorSampler,
-        >::new(params, 1, 4, 4.578, 0.0);
+        >::new(params, 1, 4, 2, 4.578, 0.0);
         let dir = tempdir().expect("temporary DiamondWE artifact directory should be created");
         let we =
             DiamondWE::new(injector, witness_size, dir.path(), b"diamond_we_sim_test".to_vec());

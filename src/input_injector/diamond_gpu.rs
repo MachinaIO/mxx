@@ -567,7 +567,11 @@ where
         self.ensure_dir(dir_path);
         self.write_metadata(
             dir_path,
-            &super::DiamondInjectorMetadata { input_count: self.input_count, base: self.base },
+            &super::DiamondInjectorMetadata {
+                input_count: self.input_count,
+                base: self.base,
+                batch_bits: self.batch_bits,
+            },
         );
         self.write_bytes(dir_path, self.k_plaintext_id(), &k.to_compact_bytes());
 
@@ -683,6 +687,10 @@ where
             "DiamondInjector metadata input count mismatch"
         );
         assert_eq!(metadata.base, self.base, "DiamondInjector metadata base mismatch");
+        assert_eq!(
+            metadata.batch_bits, self.batch_bits,
+            "DiamondInjector metadata batch_bits mismatch"
+        );
 
         let online_started = Instant::now();
         let state_cols = self.state_col_size(&self.params);
@@ -794,7 +802,7 @@ mod tests {
         let batch_bits = 2;
         let dir = tempdir().expect("temporary directory should be created");
 
-        let injector = TestInjector::new(params.clone(), input_count, base, 4.578, 0.0)
+        let injector = TestInjector::new(params.clone(), input_count, base, batch_bits, 4.578, 0.0)
             .with_gpu_device_ids(gpu_ids.clone());
 
         let k = TestPoly::from_usize_to_constant(&params, 3);

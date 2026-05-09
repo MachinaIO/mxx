@@ -28,7 +28,7 @@ pub struct ErrorNorm {
 impl ErrorNorm {
     pub fn new(plaintext_norm: PolyNorm, matrix_norm: PolyMatrixNorm) -> Self {
         debug_assert_eq!(plaintext_norm.ctx, matrix_norm.clone_ctx());
-        Self { plaintext_norm, matrix_norm }
+        Self { plaintext_norm: plaintext_norm.into_constant(), matrix_norm }
     }
 
     #[inline]
@@ -85,7 +85,7 @@ impl Evaluable for ErrorNorm {
 
     fn small_scalar_mul(&self, _: &Self::Params, scalar: &[u32]) -> Self {
         let scalar_max = BigDecimal::from(*scalar.iter().max().unwrap());
-        let scalar_poly = PolyNorm::new(self.clone_ctx(), scalar_max);
+        let scalar_poly = PolyNorm::constant(self.clone_ctx(), scalar_max);
         ErrorNorm {
             matrix_norm: self.matrix_norm.clone() * &scalar_poly,
             plaintext_norm: self.plaintext_norm.clone() * &scalar_poly,
@@ -95,7 +95,7 @@ impl Evaluable for ErrorNorm {
     fn large_scalar_mul(&self, _: &Self::Params, scalar: &[BigUint]) -> Self {
         let scalar_max = scalar.iter().max().unwrap().clone();
         let scalar_bd = BigDecimal::from(num_bigint::BigInt::from(scalar_max));
-        let scalar_poly = PolyNorm::new(self.clone_ctx(), scalar_bd);
+        let scalar_poly = PolyNorm::constant(self.clone_ctx(), scalar_bd);
         ErrorNorm {
             matrix_norm: self.matrix_norm.clone() *
                 PolyMatrixNorm::gadget_decomposed(self.clone_ctx(), self.ctx().m_g),

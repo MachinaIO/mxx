@@ -23,7 +23,7 @@ impl PolyCircuit<DCRTPoly> {
             PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, e_init_norm.clone(), None),
         );
         let input_error = ErrorNorm::new(
-            PolyNorm::new(ctx.clone(), input_norm_bound.clone()),
+            PolyNorm::constant(ctx.clone(), input_norm_bound.clone()),
             PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, e_init_norm.clone(), None),
         );
         info!("e_init_norm bits {}", bigdecimal_bits_ceil(e_init_norm));

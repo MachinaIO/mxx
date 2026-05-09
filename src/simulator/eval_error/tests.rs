@@ -43,7 +43,7 @@ fn simulate_max_error_norm_via_generic_eval_reference<P: AffinePltEvaluator>(
 }
 
 const E_B_SIGMA: f64 = 4.0;
-const E_INIT_NORM: u32 = 1 << 14;
+const E_INIT_NORM: u32 = 26;
 
 #[test]
 fn test_compute_preimage_norm_uses_optional_sigma() {
@@ -57,6 +57,26 @@ fn test_compute_preimage_norm_uses_optional_sigma() {
 
     assert_eq!(default_norm, explicit_default_norm);
     assert!(larger_sigma_norm > default_norm);
+}
+
+#[test]
+fn test_constant_poly_norm_mul_skips_ring_dim_sqrt() {
+    let ctx = make_ctx();
+    let lhs = PolyNorm::constant(ctx.clone(), BigDecimal::from(3u64));
+    let rhs = PolyNorm::constant(ctx.clone(), BigDecimal::from(5u64));
+    let product = &lhs * &rhs;
+
+    assert_eq!(product.norm, BigDecimal::from(15u64));
+    assert!(product.is_constant);
+
+    let general = PolyNorm::new(ctx.clone(), BigDecimal::from(5u64));
+    let mixed = &lhs * &general;
+    assert_eq!(mixed.norm, BigDecimal::from(15u64));
+    assert!(!mixed.is_constant);
+
+    let general_product = &general * &general;
+    assert_eq!(general_product.norm, BigDecimal::from(25u64) * &ctx.ring_dim_sqrt);
+    assert!(!general_product.is_constant);
 }
 
 #[test]
@@ -169,10 +189,10 @@ fn test_wire_norm_simulator_multiplication_matches_generic_eval() {
 
 #[test]
 fn test_wire_norm_simulator_mul_binary_tree_plaintext_one_matches_generic_eval() {
-    let tree_height = 10usize;
+    let tree_height = 12usize;
     let input_size = 1usize << tree_height;
     let input_plaintext_norm = BigDecimal::one();
-    let ring_dim_sqrt = BigDecimal::from(1u64 << 16);
+    let ring_dim_sqrt = BigDecimal::from(1u64 << 8);
     let base = BigDecimal::from(14u64);
     let secret_size = 1usize;
     let log_base_q = 2usize * 30;

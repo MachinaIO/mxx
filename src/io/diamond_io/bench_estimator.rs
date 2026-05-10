@@ -32,19 +32,14 @@ use crate::{
         bench::{
             bit_decomposed_mask_reduce_add_count, bit_decomposed_polynomial_mask_reduction_summary,
             bit_decomposed_refresh_material_counts, bit_decomposed_refresh_material_summary,
+            goldreich_cbd_error_prg_summary,
             scale_bit_decomposed_polynomial_mask_decrypt_contributions,
         },
         mask_circuit::append_one_ciphertext_bit_decrypt,
     },
     gadgets::arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
     matrix::PolyMatrix,
-    noise_refresh::{
-        circuit_prg::{
-            build_representative_goldreich_error_material_circuit,
-            build_representative_goldreich_mask_material_circuit,
-        },
-        naive_vec::NoiseRefreshBenchEstimateParts,
-    },
+    noise_refresh::naive_vec::NoiseRefreshBenchEstimateParts,
     poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     slot_transfer::bgg_pubkey::column_chunk_bounds,
@@ -933,41 +928,30 @@ where
             }
         };
         info!(?mode, ?prg_unit, "estimated DiamondIO PRF benchmark representative PRG unit");
-        let mut noise_refresh_prg_context_circuit = PolyCircuit::new();
-        let noise_refresh_prg_context =
-            diamond.build_ring_gsw_circuit_context(&mut noise_refresh_prg_context_circuit);
-        let error_prg_circuit =
-            build_representative_goldreich_error_material_circuit::<M::P, NestedRnsPoly<M::P>>(
-                noise_refresh_prg_context.clone(),
-                diamond.noise_refresh_cbd_n,
-            );
-        let mask_prg_circuit = build_representative_goldreich_mask_material_circuit::<
-            M::P,
-            NestedRnsPoly<M::P>,
-        >(noise_refresh_prg_context);
-        let (noise_refresh_error_prg_unit, noise_refresh_mask_prg_unit) = match mode {
+        let (sub, mul, add) = match mode {
             PrfBenchMode::PublicKeyPreprocess => (
-                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
-                    self.public_key_estimator,
-                    &diamond.injector.params,
-                    &error_prg_circuit,
-                ),
-                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
-                    self.public_key_estimator,
-                    &diamond.injector.params,
-                    &mask_prg_circuit,
-                ),
+                self.public_key_estimator.estimate_sub(),
+                self.public_key_estimator.estimate_mul(),
+                self.public_key_estimator.estimate_add(),
             ),
             PrfBenchMode::EncodingOnline => (
-                self.encoding_estimator.estimate_circuit_bench(&error_prg_circuit),
-                self.encoding_estimator.estimate_circuit_bench(&mask_prg_circuit),
+                self.encoding_estimator.estimate_sub(),
+                self.encoding_estimator.estimate_mul(),
+                self.encoding_estimator.estimate_add(),
             ),
         };
+        let noise_refresh_mask_prg_unit = prg_unit.clone();
+        let noise_refresh_error_prg_unit = goldreich_cbd_error_prg_summary(
+            prg_unit.clone(),
+            add.clone(),
+            sub.clone(),
+            diamond.noise_refresh_cbd_n,
+        );
         info!(
             ?mode,
             ?noise_refresh_error_prg_unit,
             ?noise_refresh_mask_prg_unit,
-            "estimated DiamondIO PRF benchmark noise-refresh representative PRG units"
+            "estimated DiamondIO PRF benchmark noise-refresh representative PRG units from one-output PRG unit"
         );
         let selected_half_prg_per_round = scale_summary(
             prg_unit.clone(),
@@ -982,18 +966,6 @@ where
             .seed_bits
             .checked_mul(shape.ring_gsw_wire_count)
             .expect("DiamondIO selected PRG wire count overflow");
-        let (sub, mul, add) = match mode {
-            PrfBenchMode::PublicKeyPreprocess => (
-                self.public_key_estimator.estimate_sub(),
-                self.public_key_estimator.estimate_mul(),
-                self.public_key_estimator.estimate_add(),
-            ),
-            PrfBenchMode::EncodingOnline => (
-                self.encoding_estimator.estimate_sub(),
-                self.encoding_estimator.estimate_mul(),
-                self.encoding_estimator.estimate_add(),
-            ),
-        };
         let selected_half_mux_unit = sequential_summaries(&[
             estimate_summary(sub.clone()),
             estimate_summary(mul.clone()),

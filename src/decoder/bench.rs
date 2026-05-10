@@ -167,6 +167,30 @@ pub(crate) fn bit_decomposed_refresh_material_summary(
     sequential_summaries(&[error_prg, mask_prg, decrypt_contributions, mask_reduction, merge])
 }
 
+/// Estimate the representative CBD error PRG unit from one measured uniform
+/// Goldreich output plus the pairwise additions used to combine CBD terms.
+///
+/// The concrete CBD representative circuit evaluates `cbd_n` positive and
+/// `cbd_n` negative Goldreich outputs, reduces each side with a balanced add
+/// tree, then subtracts the negative sum. This helper keeps that dependency
+/// structure without materializing the full CBD circuit in benchmark
+/// estimation.
+pub(crate) fn goldreich_cbd_error_prg_summary(
+    uniform_output_unit: CircuitBenchSummary,
+    add_unit: CircuitBenchEstimate,
+    sub_unit: CircuitBenchEstimate,
+    cbd_n: usize,
+) -> CircuitBenchSummary {
+    assert!(cbd_n > 0, "CBD representative PRG estimate requires cbd_n > 0");
+    let output_count = cbd_n.checked_mul(2).expect("CBD PRG output count overflow");
+    let prg_outputs = scale_independent_summary(uniform_output_unit, output_count);
+    let positive_reduce = pairwise_reduction_summary(add_unit, cbd_n);
+    let negative_reduce = positive_reduce.clone();
+    let reductions = parallel_summaries(&[positive_reduce, negative_reduce]);
+    let subtract = estimate_summary(sub_unit);
+    sequential_summaries(&[prg_outputs, reductions, subtract])
+}
+
 /// Number of independent Ring-GSW decrypt contributions in a bit-decomposed
 /// polynomial mask.
 ///

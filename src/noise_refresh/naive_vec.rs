@@ -10,7 +10,10 @@ use crate::{
     },
     circuit::{BatchedWire, PolyCircuit, evaluable::Evaluable},
     decoder::{
-        bench::{bit_decomposed_refresh_material_counts, bit_decomposed_refresh_material_summary},
+        bench::{
+            bit_decomposed_refresh_material_counts, bit_decomposed_refresh_material_summary,
+            goldreich_cbd_error_prg_summary,
+        },
         mask_circuit::build_one_ciphertext_bit_decrypt_circuit,
         masked_high_bit::decode_centered_masked_matrix,
     },
@@ -31,7 +34,6 @@ use crate::{
         circuit_merge::build_refreshed_wire_digit_all_crt_merge,
         circuit_prg::{
             build_goldreich_encrypted_seed_material_ranges,
-            build_representative_goldreich_error_material_circuit,
             build_representative_goldreich_mask_material_circuit,
         },
     },
@@ -552,24 +554,22 @@ where
             self.v_bits,
             self.debug_reuse_single_material,
         );
-        let error_prg_circuit = build_representative_goldreich_error_material_circuit::<M::P, A>(
-            self.ring_gsw.clone(),
-            self.cbd_n,
-        );
         let mask_prg_circuit =
             build_representative_goldreich_mask_material_circuit::<M::P, A>(self.ring_gsw.clone());
         let decrypt_contribution_circuit = build_one_ciphertext_bit_decrypt_circuit::<M::P, A, M>(
             self.ring_gsw.clone(),
             BigUint::from(2u64),
         );
-        let error_prg_unit = estimate_public_key_circuit_bench_with_aux::<
-            NaiveBGGPublicKeyVec<M>,
-            PKBE,
-        >(public_key_estimator, self.params(), &error_prg_circuit);
         let mask_prg_unit = estimate_public_key_circuit_bench_with_aux::<
             NaiveBGGPublicKeyVec<M>,
             PKBE,
         >(public_key_estimator, self.params(), &mask_prg_circuit);
+        let error_prg_unit = goldreich_cbd_error_prg_summary(
+            mask_prg_unit.clone(),
+            pk_add.clone(),
+            pk_sub.clone(),
+            self.cbd_n,
+        );
         let decrypt_contribution_unit =
             estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
                 public_key_estimator,
@@ -693,18 +693,19 @@ where
             self.v_bits,
             self.debug_reuse_single_material,
         );
-        let error_prg_circuit = build_representative_goldreich_error_material_circuit::<M::P, A>(
-            self.ring_gsw.clone(),
-            self.cbd_n,
-        );
         let mask_prg_circuit =
             build_representative_goldreich_mask_material_circuit::<M::P, A>(self.ring_gsw.clone());
         let decrypt_contribution_circuit = build_one_ciphertext_bit_decrypt_circuit::<M::P, A, M>(
             self.ring_gsw.clone(),
             BigUint::from(2u64),
         );
-        let error_prg_unit = encoding_estimator.estimate_circuit_bench(&error_prg_circuit);
         let mask_prg_unit = encoding_estimator.estimate_circuit_bench(&mask_prg_circuit);
+        let error_prg_unit = goldreich_cbd_error_prg_summary(
+            mask_prg_unit.clone(),
+            enc_add.clone(),
+            enc_sub.clone(),
+            self.cbd_n,
+        );
         let decrypt_contribution_unit =
             encoding_estimator.estimate_circuit_bench(&decrypt_contribution_circuit);
         let online_material_summary = bit_decomposed_refresh_material_summary(

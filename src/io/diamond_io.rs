@@ -248,14 +248,10 @@ where
         );
         // Validate shape agreements that are independent of the selected
         // function family.
-        assert!(
-            self.injector.base >= 2 && self.injector.base.is_power_of_two(),
-            "DiamondIO requires a power-of-two DiamondInjector base"
-        );
         let injector_input_bit_count = self
             .injector
             .input_count
-            .checked_mul(self.injector.base.trailing_zeros() as usize)
+            .checked_mul(self.injector.batch_bits())
             .expect("DiamondIO injector input bit count overflow");
         assert_eq!(
             self.input_size, injector_input_bit_count,
@@ -623,13 +619,7 @@ where
         );
         let params = &self.injector.params;
         let ring_dim = params.ring_dimension() as usize;
-        let batch_bits = {
-            assert!(
-                self.injector.base >= 2 && self.injector.base.is_power_of_two(),
-                "DiamondIO requires a power-of-two DiamondInjector base"
-            );
-            self.injector.base.trailing_zeros() as usize
-        };
+        let batch_bits = self.injector.batch_bits();
         assert_eq!(
             input.len() % batch_bits,
             0,
@@ -1518,8 +1508,9 @@ mod tests {
         let input_base = 2usize;
         let input_size = 2usize;
         let seed_bits = vec![true];
-        let injector = TestInjector::new(poly_params.clone(), input_count, input_base, 4.578, 0.0)
-            .with_gpu_device_ids(vec![gpu_ids[0]]);
+        let injector =
+            TestInjector::new(poly_params.clone(), input_count, input_base, 1, 4.578, 0.0)
+                .with_gpu_device_ids(vec![gpu_ids[0]]);
         let scheme = TestDiamondIO::new(
             injector,
             input_size,
@@ -1670,8 +1661,9 @@ mod tests {
         let input_base = 2usize;
         let input_size = 2usize;
         let seed_bits = vec![true];
-        let injector = TestInjector::new(poly_params.clone(), input_count, input_base, 4.578, 0.0)
-            .with_gpu_device_ids(vec![gpu_ids[0]]);
+        let injector =
+            TestInjector::new(poly_params.clone(), input_count, input_base, 1, 4.578, 0.0)
+                .with_gpu_device_ids(vec![gpu_ids[0]]);
         let scheme = TestDiamondIO::new(
             injector,
             input_size,
@@ -2015,8 +2007,9 @@ mod tests {
         let input_size = 2usize;
         let seed_bits = 6usize;
         let output_size = seed_bits;
-        let injector = TestInjector::new(poly_params.clone(), input_count, input_base, 4.578, 0.0)
-            .with_gpu_device_ids(vec![gpu_ids[0]]);
+        let injector =
+            TestInjector::new(poly_params.clone(), input_count, input_base, 1, 4.578, 0.0)
+                .with_gpu_device_ids(vec![gpu_ids[0]]);
         let dir = tempdir().expect("DiamondIO GPU test must create a tempdir");
         init_storage_system(dir.path().to_path_buf());
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&poly_params, 4.578);

@@ -237,6 +237,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
         params.clone(),
         input_count,
         input_base,
+        usize::try_from(digit_bits).expect("digit_bits must fit into usize"),
         DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
         DIAMOND_INJECTOR_ERROR_SIGMA,
     )
@@ -674,6 +675,7 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
             params,
             input_count,
             input_base,
+            usize::try_from(digit_bits).expect("digit_bits must fit into usize"),
             DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
             DIAMOND_INJECTOR_ERROR_SIGMA,
         )

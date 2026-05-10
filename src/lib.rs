@@ -31,3 +31,4 @@ pub mod simulator;
 pub mod slot_transfer;
 pub mod storage;
 pub mod utils;
+pub mod we;

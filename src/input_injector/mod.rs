@@ -54,6 +54,7 @@ where
     pub gpu_device_ids: Vec<i32>,
     pub input_count: usize,
     pub base: usize,
+    pub batch_bits: usize,
     pub trapdoor_sigma: f64,
     pub error_sigma: f64,
     _us: PhantomData<US>,
@@ -65,6 +66,7 @@ where
 struct DiamondInjectorMetadata {
     input_count: usize,
     base: usize,
+    batch_bits: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -94,10 +96,24 @@ where
         params: <M::P as Poly>::Params,
         input_count: usize,
         base: usize,
+        batch_bits: usize,
         trapdoor_sigma: f64,
         error_sigma: f64,
     ) -> Self {
         assert!(base > 0, "DiamondInjector base must be positive");
+        assert!(batch_bits > 0, "DiamondInjector batch_bits must be positive");
+        assert!(
+            batch_bits <= u32::BITS as usize,
+            "DiamondInjector batch_bits must fit into u32 input digits"
+        );
+        let required_base = 1usize
+            .checked_shl(
+                batch_bits
+                    .try_into()
+                    .expect("DiamondInjector batch_bits must fit into u32 for base validation"),
+            )
+            .expect("DiamondInjector batch_bits overflowed usize base validation");
+        assert!(base >= required_base, "DiamondInjector base must be at least 2^batch_bits");
         assert!(error_sigma >= 0.0, "DiamondInjector error_sigma must be nonnegative");
         #[cfg(feature = "gpu")]
         let gpu_device_ids = params.device_ids();
@@ -108,6 +124,7 @@ where
             gpu_device_ids,
             input_count,
             base,
+            batch_bits,
             trapdoor_sigma,
             error_sigma,
             _us: PhantomData,
@@ -298,11 +315,7 @@ where
     }
 
     pub fn batch_bits(&self) -> usize {
-        assert!(
-            self.base >= 2 && self.base.is_power_of_two(),
-            "DiamondInjector base must be a power of two greater than one for bit batching"
-        );
-        self.base.trailing_zeros() as usize
+        self.batch_bits
     }
 
     fn expanded_state_count_after_level(&self, level: usize) -> usize {
@@ -732,7 +745,11 @@ where
             self.ensure_dir(dir_path);
             self.write_metadata(
                 dir_path,
-                &DiamondInjectorMetadata { input_count: self.input_count, base: self.base },
+                &DiamondInjectorMetadata {
+                    input_count: self.input_count,
+                    base: self.base,
+                    batch_bits: self.batch_bits,
+                },
             );
             self.write_bytes(dir_path, self.k_plaintext_id(), &k.to_compact_bytes());
 
@@ -852,6 +869,10 @@ where
                 "DiamondInjector metadata input count mismatch"
             );
             assert_eq!(metadata.base, self.base, "DiamondInjector metadata base mismatch");
+            assert_eq!(
+                metadata.batch_bits, self.batch_bits,
+                "DiamondInjector metadata batch_bits mismatch"
+            );
 
             // Start from the persisted empty-prefix seed.
             let mut states = vec![self.read_matrix(dir_path, self.p_epsilon_id())];
@@ -923,7 +944,7 @@ mod tests {
         let batch_bits = 2;
         let dir = tempdir().expect("temporary directory should be created");
 
-        let injector = TestInjector::new(params.clone(), input_count, base, 4.578, 0.0);
+        let injector = TestInjector::new(params.clone(), input_count, base, batch_bits, 4.578, 0.0);
 
         let k = TestPoly::from_usize_to_constant(&params, 3);
 
@@ -976,7 +997,7 @@ mod tests {
     #[test]
     fn test_diamond_injector_simulate_output_error_bounds_matches_repeated_preimage_bound() {
         let params = DCRTPolyParams::default();
-        let injector = TestInjector::new(params.clone(), 3, 4, 4.578, 3.0);
+        let injector = TestInjector::new(params.clone(), 3, 4, 2, 4.578, 3.0);
         let batch_bits = injector.batch_bits();
 
         let simulated = injector.simulate_output_error_bounds();
@@ -1107,7 +1128,14 @@ mod tests {
         let digit_bits = 8u32;
         let input_base = 1usize << digit_bits;
         let params = DCRTPolyParams::new(ring_dim, crt_depth, crt_bits, base_bits);
-        let injector = TestInjector::new(params.clone(), input_count, input_base, 4.578, 4.578);
+        let injector = TestInjector::new(
+            params.clone(),
+            input_count,
+            input_base,
+            digit_bits as usize,
+            4.578,
+            4.578,
+        );
 
         let simulated = injector.simulate_output_error_bounds();
         let projected_errors = simulated

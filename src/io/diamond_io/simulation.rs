@@ -2334,7 +2334,7 @@ mod tests {
             DCRTPolyUniformSampler,
             DCRTPolyHashSampler<Keccak256>,
             DCRTPolyTrapdoorSampler,
-        >::new(params.clone(), input_count, 2, 4.578, 0.0);
+        >::new(params.clone(), input_count, 2, 1, 4.578, 0.0);
         TestDiamondIO::new(
             injector,
             input_count,

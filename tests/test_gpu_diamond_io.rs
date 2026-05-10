@@ -134,6 +134,7 @@ struct DiamondIOGpuBenchConfig {
     security_bits: usize,
     noise_refresh_cbd_n: usize,
     bench_iterations: usize,
+    search_only: bool,
     error_sigma: f64,
     trapdoor_sigma: f64,
     d_secret: usize,
@@ -189,6 +190,7 @@ impl DiamondIOGpuBenchConfig {
                 "DIAMOND_IO_GPU_BENCH_ITERATIONS",
                 DEFAULT_BENCH_ITERATIONS,
             ),
+            search_only: env_or_parse_bool("DIAMOND_IO_GPU_BENCH_SEARCH_ONLY", false),
             error_sigma: env_or_parse_f64("DIAMOND_IO_GPU_BENCH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA),
             trapdoor_sigma: env_or_parse_f64(
                 "DIAMOND_IO_GPU_BENCH_TRAPDOOR_SIGMA",
@@ -326,6 +328,17 @@ fn env_or_parse_usize(key: &str, default: usize) -> usize {
     env::var(key)
         .ok()
         .map(|raw| raw.parse::<usize>().unwrap_or_else(|err| panic!("{key} must be usize: {err}")))
+        .unwrap_or(default)
+}
+
+fn env_or_parse_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .map(|raw| match raw.as_str() {
+            "1" | "true" | "TRUE" | "yes" | "YES" => true,
+            "0" | "false" | "FALSE" | "no" | "NO" => false,
+            _ => panic!("{key} must be a bool-like value: 1/0, true/false, or yes/no"),
+        })
         .unwrap_or(default)
 }
 
@@ -808,6 +821,19 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         );
         selected
     };
+
+    if cfg.search_only {
+        info!(
+            crt_depth = selected.crt_depth,
+            prf_mask_output_coeff_bits = selected.prf_mask_output_coeff_bits,
+            noise_refresh_v_bits = selected.noise_refresh_v_bits,
+            final_seed_bits = selected.seed_bits,
+            noisy_plaintext_error_bits = selected.noisy_plaintext_error_bits,
+            input_injection_error_bits = selected.input_injection_error_bits,
+            "DiamondIO GPU bench search-only mode selected parameters; skipping GPU benchmark estimation"
+        );
+        return;
+    }
 
     let (cpu_params, gpu_params) = gpu_params_for_crt_depth(&cfg, selected.crt_depth, gpu_id);
     assert_eq!(

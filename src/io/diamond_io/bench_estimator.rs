@@ -68,8 +68,8 @@ pub use bench_estimator_native::GpuDCRTPolyMatrixNativeBenchEstimator;
 
 use bench_estimator_shape::{DiamondIOBenchShape, DiamondIOStorageEstimate};
 use bench_estimator_utils::{
-    estimate_summary, parallel_summaries, repeat_sequential_summary, scale_estimate, scale_summary,
-    sequential_summaries,
+    estimate_summary, parallel_summaries, repeat_sequential_summary, scale_estimate,
+    scale_estimate_biguint, scale_summary, scale_summary_biguint, sequential_summaries,
 };
 
 use super::{DIAMOND_SECRET_SIZE, DiamondIO, DiamondIOFuncType};
@@ -1021,25 +1021,24 @@ where
                 final_mask_decrypt_unit.clone(),
             );
         info!(?mode, ?refresh_parts, "finished DiamondIO PRF benchmark noise-refresh estimate");
-        let refresh_decoder_count_per_round = selected_wire_count_per_round
-            .checked_mul(shape.ring_dim)
-            .and_then(|count| count.checked_mul(shape.crt_depth))
-            .expect("DiamondIO refresh decoder count overflow");
+        let refresh_decoder_count_per_round = BigUint::from(selected_wire_count_per_round) *
+            BigUint::from(shape.ring_dim) *
+            BigUint::from(shape.crt_depth);
         let refresh_decoder_work_per_round = match mode {
             PrfBenchMode::PublicKeyPreprocess => sequential_summaries(&[
-                scale_estimate(
+                scale_estimate_biguint(
                     self.full_w_block_hash_sample.clone(),
-                    refresh_decoder_count_per_round,
+                    &refresh_decoder_count_per_round,
                 ),
-                scale_estimate(
+                scale_estimate_biguint(
                     self.final_output_preimage_extend.clone(),
-                    refresh_decoder_count_per_round,
+                    &refresh_decoder_count_per_round,
                 ),
             ]),
-            PrfBenchMode::EncodingOnline => scale_summary(
+            PrfBenchMode::EncodingOnline => scale_summary_biguint(
                 self.native_estimator
                     .estimate_vector_matrix_product(shape.state_col_size, shape.modulus_digits),
-                refresh_decoder_count_per_round,
+                &refresh_decoder_count_per_round,
             ),
         };
         let noise_refresh_per_round = sequential_summaries(&[

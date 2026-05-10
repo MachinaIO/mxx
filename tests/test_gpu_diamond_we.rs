@@ -582,10 +582,14 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
         dec_latency = estimate.dec.latency,
         dec_total_time_nanos = %estimate.dec.total_time,
         dec_max_parallelism = %estimate.dec.max_parallelism,
+        ciphertext_bytes = %estimate.ciphertext_bytes,
+        input_injection_bytes = %estimate.input_injection_bytes,
+        we_preimage_bytes = %estimate.we_preimage_bytes,
         "DiamondWE GPU benchmark estimate"
     );
     assert!(estimate.enc.total_time > BigUint::from(0u32));
     assert!(estimate.dec.total_time > BigUint::from(0u32));
+    assert!(estimate.ciphertext_bytes > BigUint::from(0u32));
 
     let witness = { vec![true; cfg.witness_size] };
     let instance = vec![true; cfg.instance_size()];

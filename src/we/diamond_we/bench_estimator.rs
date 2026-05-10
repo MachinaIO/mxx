@@ -29,6 +29,9 @@ pub struct DiamondWEBenchEstimate {
     pub dec: CircuitBenchSummary,
     pub enc_input_injection: CircuitBenchSummary,
     pub dec_input_injection: CircuitBenchSummary,
+    pub ciphertext_bytes: BigUint,
+    pub input_injection_bytes: BigUint,
+    pub we_preimage_bytes: BigUint,
 }
 
 #[derive(Debug, Clone)]
@@ -127,12 +130,19 @@ where
         let input_injection = self.estimate_input_injection(shape.clone());
         let params = &diamond.injector.params;
         let enc = self.estimate_enc::<M>(params, circuit, shape.clone(), &input_injection);
-        let dec = self.estimate_dec(circuit, shape, &input_injection);
+        let dec = self.estimate_dec(circuit, shape.clone(), &input_injection);
+        let storage = self.estimate_storage(shape);
+        let DiamondWEStorageEstimate {
+            input_injection_bytes, we_preimage_bytes, total_bytes, ..
+        } = storage;
         DiamondWEBenchEstimate {
             enc,
             dec,
             enc_input_injection: input_injection.enc,
             dec_input_injection: input_injection.dec,
+            ciphertext_bytes: total_bytes,
+            input_injection_bytes,
+            we_preimage_bytes,
         }
     }
 
@@ -424,18 +434,45 @@ where
     fn final_preimage_summary_for_width(&self, width: usize) -> CircuitBenchSummary {
         scale_estimate(self.final_preimage_extend_one_column.clone(), width)
     }
+
+    fn estimate_storage(&self, shape: DiamondWEBenchShape) -> DiamondWEStorageEstimate {
+        let input_injection_metadata_and_seed_bytes =
+            shape.input_injection_metadata_and_seed_bytes();
+        let input_injection_bytes = shape.input_injection_bytes();
+        let we_preimage_bytes = shape.we_preimage_bytes();
+        let total_bytes = input_injection_bytes.clone() + &we_preimage_bytes;
+
+        debug!(
+            ?input_injection_metadata_and_seed_bytes,
+            ?input_injection_bytes,
+            ?we_preimage_bytes,
+            ?total_bytes,
+            "estimated DiamondWE ciphertext storage"
+        );
+
+        DiamondWEStorageEstimate {
+            input_injection_metadata_and_seed_bytes,
+            input_injection_bytes,
+            we_preimage_bytes,
+            total_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct DiamondWEBenchShape {
+    ring_dim: usize,
     witness_size: usize,
     instance_size: usize,
     modulus_digits: usize,
+    modulus_bits: u16,
     state_row_size: usize,
     state_col_size: usize,
+    b_public_col_size: usize,
     checkpoint_count: usize,
     transition_matrix_count: usize,
     transition_preimage_chunk_count: usize,
+    input_injection_transition_preimage_bytes: usize,
     transition_ext_w_hash_count: usize,
     online_level_state_counts: Vec<usize>,
     transition_chunk_col_lens: Vec<usize>,
@@ -467,7 +504,12 @@ impl DiamondWEBenchShape {
             "DiamondWE witness_size must match the DiamondInjector bit input count"
         );
         let params = &diamond.injector.params;
+        let ring_dim = params.ring_dimension() as usize;
         let modulus_digits = params.modulus_digits();
+        let modulus_bits = params
+            .modulus_bits()
+            .try_into()
+            .expect("DiamondWE modulus bits must fit in u16 for compact-byte estimates");
         let state_row_size =
             2usize.checked_mul(DIAMOND_SECRET_SIZE).expect("DiamondWE state row size overflow");
         let gadget_col_size = DIAMOND_SECRET_SIZE
@@ -482,6 +524,13 @@ impl DiamondWEBenchShape {
         let transition_chunk_col_lens = (0..chunk_count)
             .map(|chunk_idx| column_chunk_bounds(state_col_size, chunk_idx).1)
             .collect::<Vec<_>>();
+        let transition_chunk_bytes = transition_chunk_col_lens
+            .iter()
+            .map(|&col_len| {
+                matrix_compact_bytes::<M>(params, state_col_size, col_len, modulus_bits)
+            })
+            .collect::<Vec<_>>();
+        let transition_preimage_bytes_per_matrix = transition_chunk_bytes.iter().sum::<usize>();
         let transition_w_chunk_lens = (0..chunk_count)
             .filter_map(|chunk_idx| {
                 let (col_start, col_len) = column_chunk_bounds(state_col_size, chunk_idx);
@@ -536,6 +585,9 @@ impl DiamondWEBenchShape {
                 .expect("DiamondWE transition W hash count overflow");
             online_level_state_counts.push(state_count);
         }
+        let input_injection_transition_preimage_bytes = transition_preimage_bytes_per_matrix
+            .checked_mul(transition_matrix_count)
+            .expect("DiamondWE transition preimage byte count overflow");
         let lookup_bridge_cols = diamond.enc_lookup_base_matrix.as_ref().map(PolyMatrix::col_size);
         assert!(
             diamond.enc_lookup_evaluator_factory.is_none() || lookup_bridge_cols.is_some(),
@@ -545,14 +597,18 @@ impl DiamondWEBenchShape {
             diamond.enc_lookup_evaluator_factory.as_ref().and(lookup_bridge_cols);
 
         Self {
+            ring_dim,
             witness_size: diamond.witness_size,
             instance_size: circuit.num_input() - diamond.witness_size,
             modulus_digits,
+            modulus_bits,
             state_row_size,
             state_col_size,
+            b_public_col_size,
             checkpoint_count: diamond.injector.input_count + 1,
             transition_matrix_count,
             transition_preimage_chunk_count,
+            input_injection_transition_preimage_bytes,
             transition_ext_w_hash_count,
             online_level_state_counts,
             transition_chunk_col_lens,
@@ -564,6 +620,73 @@ impl DiamondWEBenchShape {
 
     fn ordinary_preimage_count(&self) -> usize {
         1usize.checked_add(self.witness_size).expect("DiamondWE ordinary preimage count overflow")
+    }
+
+    fn input_injection_metadata_and_seed_bytes(&self) -> BigUint {
+        let metadata_estimate = 128usize;
+        let hash_key_bytes = 32usize;
+        let p_epsilon_bytes = matrix_compact_bytes_for_shape(
+            self.state_row_size / 2,
+            self.state_col_size,
+            self.ring_dim,
+            self.modulus_bits,
+        );
+        BigUint::from(metadata_estimate + hash_key_bytes + p_epsilon_bytes)
+    }
+
+    fn input_injection_public_checkpoint_bytes(&self) -> usize {
+        matrix_compact_bytes_for_shape(
+            self.state_row_size,
+            self.b_public_col_size,
+            self.ring_dim,
+            self.modulus_bits,
+        )
+        .checked_mul(self.checkpoint_count)
+        .expect("DiamondWE B checkpoint byte count overflow")
+    }
+
+    fn input_injection_bytes(&self) -> BigUint {
+        self.input_injection_metadata_and_seed_bytes() +
+            BigUint::from(self.input_injection_public_checkpoint_bytes()) +
+            BigUint::from(self.input_injection_transition_preimage_bytes)
+    }
+
+    fn we_preimage_bytes(&self) -> BigUint {
+        let ordinary_preimage_bytes = matrix_compact_bytes_for_shape(
+            self.state_col_size,
+            self.modulus_digits,
+            self.ring_dim,
+            self.modulus_bits,
+        );
+        let scalar_preimage_bytes = matrix_compact_bytes_for_shape(
+            self.state_col_size,
+            1,
+            self.ring_dim,
+            self.modulus_bits,
+        );
+        let lookup_preimage_bytes = self
+            .lookup_bridge_cols
+            .map(|lookup_cols| {
+                matrix_compact_bytes_for_shape(
+                    self.b_public_col_size
+                        .checked_add(lookup_cols)
+                        .expect("DiamondWE lookup preimage row count overflow"),
+                    lookup_cols,
+                    self.ring_dim,
+                    self.modulus_bits,
+                )
+            })
+            .unwrap_or(0usize);
+
+        BigUint::from(
+            ordinary_preimage_bytes
+                .checked_mul(self.ordinary_preimage_count())
+                .expect("DiamondWE ordinary preimage byte count overflow"),
+        ) + BigUint::from(
+            scalar_preimage_bytes
+                .checked_mul(2)
+                .expect("DiamondWE scalar preimage byte count overflow"),
+        ) + BigUint::from(lookup_preimage_bytes)
     }
 
     fn estimate_transition_target_building<NBE>(
@@ -615,6 +738,14 @@ impl DiamondWEBenchShape {
             .collect::<Vec<_>>();
         sequential_summaries(levels.as_slice())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiamondWEStorageEstimate {
+    input_injection_metadata_and_seed_bytes: BigUint,
+    input_injection_bytes: BigUint,
+    we_preimage_bytes: BigUint,
+    total_bytes: BigUint,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -747,6 +878,30 @@ where
                 .expect("DiamondWE expanded state count overflow"),
         )
         .expect("DiamondWE expanded state count overflow")
+}
+
+fn matrix_compact_bytes<M>(
+    params: &<M::P as Poly>::Params,
+    nrow: usize,
+    ncol: usize,
+    modulus_bits: u16,
+) -> usize
+where
+    M: PolyMatrix,
+{
+    matrix_compact_bytes_for_shape(nrow, ncol, params.ring_dimension() as usize, modulus_bits)
+}
+
+fn matrix_compact_bytes_for_shape(
+    nrow: usize,
+    ncol: usize,
+    ring_dim: usize,
+    modulus_bits: u16,
+) -> usize {
+    let coeff_count =
+        nrow.checked_mul(ncol).and_then(|count| count.checked_mul(ring_dim)).unwrap_or(usize::MAX);
+    let payload = coeff_count.checked_mul(modulus_bits as usize).unwrap_or(usize::MAX).div_ceil(8);
+    payload + 128
 }
 
 fn bench_estimate<R, F>(iterations: usize, mut op: F) -> CircuitBenchEstimate
@@ -992,12 +1147,13 @@ mod tests {
         NoCircuitEvaluator,
         NoCircuitEvaluator,
     > {
+        assert_eq!(witness_size % 2, 0, "test witness_size must use whole input digits");
         let injector = DiamondInjector::<
             DCRTPolyMatrix,
             DCRTPolyUniformSampler,
             DCRTPolyHashSampler<Keccak256>,
             DCRTPolyTrapdoorSampler,
-        >::new(params, 1, 4, 2, 4.578, 0.0);
+        >::new(params, witness_size / 2, 4, 2, 4.578, 0.0);
         let dir = tempdir().expect("temporary DiamondWE benchmark directory should be created");
         DiamondWE::new(injector, witness_size, dir.path(), b"diamond_we_bench_test".to_vec())
     }
@@ -1048,6 +1204,13 @@ mod tests {
         assert!(!estimate.dec.total_time.is_zero());
         assert!(!estimate.enc_input_injection.total_time.is_zero());
         assert!(!estimate.dec_input_injection.total_time.is_zero());
+        assert!(!estimate.ciphertext_bytes.is_zero());
+        assert!(!estimate.input_injection_bytes.is_zero());
+        assert!(!estimate.we_preimage_bytes.is_zero());
+        assert_eq!(
+            estimate.ciphertext_bytes,
+            estimate.input_injection_bytes.clone() + estimate.we_preimage_bytes.clone()
+        );
         assert!(!estimate.enc.max_parallelism.is_zero());
         assert!(!estimate.dec.max_parallelism.is_zero());
     }
@@ -1065,6 +1228,7 @@ mod tests {
 
         assert!(two_instances.enc.total_time > one_instance.enc.total_time);
         assert!(two_instances.dec.total_time > one_instance.dec.total_time);
+        assert_eq!(two_instances.ciphertext_bytes, one_instance.ciphertext_bytes);
     }
 
     #[test]
@@ -1083,5 +1247,25 @@ mod tests {
 
         assert!(wide_estimate.enc.total_time > narrow_estimate.enc.total_time);
         assert_eq!(wide_estimate.dec.total_time, narrow_estimate.dec.total_time);
+        assert!(wide_estimate.we_preimage_bytes > narrow_estimate.we_preimage_bytes);
+        assert!(wide_estimate.ciphertext_bytes > narrow_estimate.ciphertext_bytes);
+    }
+
+    #[test]
+    fn test_diamond_we_ciphertext_bytes_scale_with_witness_size() {
+        let params = DCRTPolyParams::default();
+        let bgg = DummyBggBenchEstimator;
+        let native = DummyNativeBenchEstimator;
+        let estimator = estimator(&bgg, &native);
+        let small_witness_size = 2;
+        let large_witness_size = 4;
+        let small = diamond_we(params.clone(), small_witness_size);
+        let large = diamond_we(params.clone(), large_witness_size);
+        let small_estimate = estimator.estimate(&small, &circuit(small_witness_size + 1));
+        let large_estimate = estimator.estimate(&large, &circuit(large_witness_size + 1));
+
+        assert!(large_estimate.we_preimage_bytes > small_estimate.we_preimage_bytes);
+        assert!(large_estimate.input_injection_bytes > small_estimate.input_injection_bytes);
+        assert!(large_estimate.ciphertext_bytes > small_estimate.ciphertext_bytes);
     }
 }

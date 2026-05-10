@@ -1,5 +1,4 @@
 pub mod commit_eval;
-#[cfg(test)]
 pub mod debug;
 mod ggh15;
 pub mod ggh15_eval;

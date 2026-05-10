@@ -22,7 +22,7 @@ impl NormBggPolyEncodingSTEvaluator {
 
         let b0_preimage_norm =
             compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(1), None);
-        info!(
+        debug!(
             "{}",
             format!(
                 "BGG poly-encoding slot-transfer preimage norm bits {}",
@@ -119,12 +119,12 @@ impl NormBggPolyEncodingSTEvaluator {
         let input_vector_multiplier = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
         log_matrix_norm_bits("input_vector_multiplier", &input_vector_multiplier);
 
-        info!("BGG poly-encoding slot-transfer const term bits {}", matrix_norm_bits(&const_term));
-        info!(
+        debug!("BGG poly-encoding slot-transfer const term bits {}", matrix_norm_bits(&const_term));
+        debug!(
             "BGG poly-encoding slot-transfer plaintext multiplier bits {}",
             matrix_norm_bits(&transfer_plaintext_multiplier)
         );
-        info!(
+        debug!(
             "BGG poly-encoding slot-transfer input multiplier bits {}",
             matrix_norm_bits(&input_vector_multiplier)
         );
@@ -240,19 +240,19 @@ impl NormPltLWEEvaluator {
             compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None);
         let k_high_norm_bits = bigdecimal_bits_ceil(&k_high_norm);
         let k_low = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g);
-        info!("{}", format!("preimage norm bits {}", k_high_norm_bits));
-        info!(
+        debug!("{}", format!("preimage norm bits {}", k_high_norm_bits));
+        debug!(
             "LWE PLT k_low decomposition norm bits {}",
             bigdecimal_bits_ceil(&k_low.poly_norm.norm)
         );
         let e_b_init = PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * 6, None);
         let e_b_times_k_high =
             &e_b_init * &PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, k_high_norm, None);
-        info!(
+        debug!(
             "LWE PLT const term norm bits {}",
             bigdecimal_bits_ceil(&e_b_times_k_high.poly_norm.norm)
         );
-        info!(
+        debug!(
             "LWE PLT e_input multiplier norm bits {}",
             bigdecimal_bits_ceil(&k_low.poly_norm.norm)
         );
@@ -319,7 +319,7 @@ impl NormPltGGH15Evaluator {
 
         let preimage_norm =
             compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None);
-        info!("{}", format!("preimage norm bits {}", bigdecimal_bits_ceil(&preimage_norm)));
+        debug!("{}", format!("preimage norm bits {}", bigdecimal_bits_ceil(&preimage_norm)));
         let e_b_init =
             PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_b, e_b_sigma * &gaussian_bound, None);
         let s_vec = PolyMatrixNorm::new(
@@ -443,14 +443,14 @@ impl NormPltGGH15Evaluator {
         let mut const_term = const_term_gate2_identity_total.clone();
         const_term += const_term_gate2_t_total.clone();
         const_term += const_term_lut_subtraction_total.clone();
-        info!(
+        debug!(
             "{}",
             format!(
                 "GGH15 PLT const term norm bits {}",
                 bigdecimal_bits_ceil(&const_term.poly_norm.norm)
             )
         );
-        info!(
+        debug!(
             "{}",
             format!(
                 "GGH15 PLT input-plaintext multiplier norm bits {}",
@@ -459,7 +459,7 @@ impl NormPltGGH15Evaluator {
         );
 
         if dump_const_term_breakdown {
-            info!(
+            debug!(
                 "GGH15 const term breakdown bits: gate1_total={} gate1_from_eb={} gate1_from_s={} gate2_identity_total={} gate2_identity_from_eb={} gate2_identity_from_s={} gate2_gy_total={} gate2_gy_from_eb={} gate2_gy_from_s={} gate2_v_total={} gate2_v_from_eb={} gate2_v_from_s={} gate2_vx_total={} gate2_vx_from_eb={} gate2_vx_from_s={} term_gate2_identity={} term_gate2_gy={} term_gate2_v={} term_gate2_t={} term_gate2_vx_input_plaintext_multiplier={} term_lut_subtraction={} const_total={}",
                 gate1_total_bits,
                 gate1_from_eb_bits,
@@ -488,7 +488,7 @@ impl NormPltGGH15Evaluator {
 
         // Corresponds to `input.vector * u_g_decomposed * v_idx` in `public_lookup`.
         let e_input_multiplier = PolyMatrixNorm::gadget_decomposed(ctx.clone(), ctx.m_g) * &v_idx;
-        info!(
+        debug!(
             "{}",
             format!(
                 "GGH15 PLT e_input multiplier norm bits {}",
@@ -624,7 +624,7 @@ impl NormPltCommitEvaluator {
         let preimage =
             PolyMatrixNorm::new(ctx.clone(), ctx.m_b, verifier_norm.nrow, preimage_norm, None);
         let lut_term = &init_error * preimage * verifier_norm + init_error * opening_norm;
-        info!("lut_term norm bits {}", bigdecimal_bits_ceil(&lut_term.poly_norm.norm));
+        debug!("lut_term norm bits {}", bigdecimal_bits_ceil(&lut_term.poly_norm.norm));
         Self { lut_term }
     }
 }

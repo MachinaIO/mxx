@@ -1,6 +1,7 @@
 use crate::{
     bench_estimator::{
-        BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, benchmark_gate_operation,
+        BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
+        benchmark_gate_operation, estimate_public_key_circuit_bench_with_aux,
     },
     bgg::{
         encoding::BggEncoding,
@@ -8,6 +9,14 @@ use crate::{
         public_key::BggPublicKey,
     },
     circuit::{BatchedWire, PolyCircuit, evaluable::Evaluable},
+    decoder::{
+        bench::{
+            bit_decomposed_refresh_material_counts, bit_decomposed_refresh_material_summary,
+            goldreich_cbd_error_prg_summary,
+        },
+        mask_circuit::build_one_ciphertext_bit_decrypt_circuit,
+        masked_high_bit::decode_centered_masked_matrix,
+    },
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPolyContext},
         fhe::{
@@ -20,9 +29,13 @@ use crate::{
     lookup::PltEvaluator,
     matrix::PolyMatrix,
     noise_refresh::{
-        NoiseRefresher, circuit_decrypt::build_refreshed_wire_digit_all_crt_decrypt,
+        NoiseRefresher,
+        circuit_decrypt::build_refreshed_wire_digit_all_crt_decrypt,
         circuit_merge::build_refreshed_wire_digit_all_crt_merge,
-        circuit_prg::build_goldreich_encrypted_seed_material_ranges,
+        circuit_prg::{
+            build_goldreich_encrypted_seed_material_ranges,
+            build_representative_goldreich_mask_material_circuit,
+        },
     },
     poly::{
         Poly, PolyParams,
@@ -179,13 +192,17 @@ where
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NoiseRefreshBenchEstimateParts {
+    pub(crate) material: CircuitBenchSummary,
+    pub(crate) per_refresh: CircuitBenchSummary,
+    pub(crate) total: CircuitBenchSummary,
+}
+
 fn scaled_estimate_summary(unit: CircuitBenchEstimate, task_count: usize) -> CircuitBenchSummary {
-    let total_time = unit.total_time * task_count as f64;
-    let max_parallelism = unit
-        .max_parallelism
-        .checked_mul(task_count as u128)
-        .expect("noise-refresh benchmark parallelism overflowed while scaling a stage");
-    let summary = CircuitBenchSummary::new(total_time, unit.latency, max_parallelism);
+    let total_time = unit.total_time.clone() * BigUint::from(task_count);
+    let max_parallelism = unit.max_parallelism.clone() * BigUint::from(task_count);
+    let summary = CircuitBenchSummary::from_nanos(total_time, unit.latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(unit.peak_vram)
@@ -208,79 +225,93 @@ fn refresh_slot_id(refresh_id: &[u8], label: &[u8], idx: usize) -> Vec<u8> {
     id
 }
 
-fn debug_sample_decoded_refresh_terms<M, HS>(
+fn debug_sample_prg_output_plaintexts<M, HS>(
     params: &<M::P as Poly>::Params,
     hash_key: [u8; 32],
     label: &[u8],
-    num_slots: usize,
-    crt_depth: usize,
-    secret_size: usize,
+    wire_count: usize,
+    slot_count: usize,
 ) -> Vec<M>
 where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M>,
 {
-    let log_base_q = params.modulus_digits();
-    let cols = secret_size
-        .checked_mul(log_base_q)
-        .expect("debug decoded refresh material column count overflow");
-    (0..num_slots * crt_depth)
+    (0..wire_count)
         .into_par_iter()
-        .map(|flat_idx| {
+        .map(|wire_idx| {
             let hash_sampler = HS::new();
             let mut tag = Vec::with_capacity(label.len() + std::mem::size_of::<usize>());
             tag.extend_from_slice(label);
-            tag.extend_from_slice(&flat_idx.to_le_bytes());
-            hash_sampler.sample_hash(
+            tag.extend_from_slice(&wire_idx.to_le_bytes());
+            hash_sampler.sample_hash(params, hash_key, &tag, 1, slot_count, DistType::BitDist)
+        })
+        .collect()
+}
+
+fn debug_sample_prg_output_public_wires<M, HS>(
+    params: &<M::P as Poly>::Params,
+    hash_key: [u8; 32],
+    label: &[u8],
+    wire_count: usize,
+    slot_count: usize,
+    one: &NaiveBGGPublicKeyVec<M>,
+) -> Vec<NaiveBGGPublicKeyVec<M>>
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+{
+    debug_sample_prg_output_plaintexts::<M, HS>(params, hash_key, label, wire_count, slot_count)
+        .into_par_iter()
+        .map(|plaintexts| {
+            NaiveBGGPublicKeyVec::new(
                 params,
-                hash_key,
-                &tag,
-                secret_size,
-                cols,
-                DistType::FinRingDist,
+                (0..slot_count)
+                    .map(|slot_idx| {
+                        one.key(slot_idx).large_scalar_mul(
+                            params,
+                            &plaintexts.entry(0, slot_idx).coeffs_biguints(),
+                        )
+                    })
+                    .collect(),
             )
         })
         .collect()
 }
 
-fn debug_sample_decoded_refresh_encoding_terms<M, HS>(
+fn debug_sample_prg_output_encoding_wires<M, HS>(
     params: &<M::P as Poly>::Params,
     hash_key: [u8; 32],
     label: &[u8],
-    num_slots: usize,
-    crt_depth: usize,
-    secret: &[M::P],
-) -> Vec<M>
+    wire_count: usize,
+    slot_count: usize,
+    one: &NaiveBGGEncodingVec<M>,
+) -> Vec<NaiveBGGEncodingVec<M>>
 where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M>,
 {
-    let public_terms = debug_sample_decoded_refresh_terms::<M, HS>(
-        params,
-        hash_key,
-        label,
-        num_slots,
-        crt_depth,
-        secret.len(),
-    );
-    let secret_vec = M::from_poly_vec_row(params, secret.to_vec());
-    let secret_vec_bytes = Arc::<[u8]>::from(secret_vec.into_compact_bytes());
-    public_terms
+    debug_sample_prg_output_plaintexts::<M, HS>(params, hash_key, label, wire_count, slot_count)
         .into_par_iter()
-        .map(|public_term| {
-            let secret_vec = M::from_compact_bytes(params, secret_vec_bytes.as_ref());
-            secret_vec * public_term
+        .map(|plaintexts| {
+            NaiveBGGEncodingVec::new(
+                params,
+                (0..slot_count)
+                    .map(|slot_idx| {
+                        one.encoding(slot_idx).large_scalar_mul(
+                            params,
+                            &plaintexts.entry(0, slot_idx).coeffs_biguints(),
+                        )
+                    })
+                    .collect(),
+            )
         })
         .collect()
 }
 
 fn scaled_summary(summary: CircuitBenchSummary, task_count: usize) -> CircuitBenchSummary {
-    let total_time = summary.total_time * task_count as f64;
-    let max_parallelism = summary
-        .max_parallelism
-        .checked_mul(task_count as u128)
-        .expect("noise-refresh benchmark parallelism overflowed while scaling a summary");
-    let scaled = CircuitBenchSummary::new(total_time, summary.latency, max_parallelism);
+    let total_time = summary.total_time.clone() * BigUint::from(task_count);
+    let max_parallelism = summary.max_parallelism.clone() * BigUint::from(task_count);
+    let scaled = CircuitBenchSummary::from_nanos(total_time, summary.latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         scaled.with_peak_vram(summary.peak_vram)
@@ -296,10 +327,11 @@ fn expand_batched_wires(wires: &[BatchedWire]) -> Vec<BatchedWire> {
 }
 
 fn sequential_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
-    let total_time = parts.iter().map(|part| part.total_time).sum::<f64>();
+    let total_time = parts.iter().map(|part| part.total_time.clone()).sum::<BigUint>();
     let latency = parts.iter().map(|part| part.latency).sum::<f64>();
-    let max_parallelism = parts.iter().map(|part| part.max_parallelism).max().unwrap_or(0);
-    let summary = CircuitBenchSummary::new(total_time, latency, max_parallelism);
+    let max_parallelism =
+        parts.iter().map(|part| part.max_parallelism.clone()).max().unwrap_or_default();
+    let summary = CircuitBenchSummary::from_nanos(total_time, latency, max_parallelism);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(parts.iter().map(|part| part.peak_vram).max().unwrap_or(0))
@@ -341,7 +373,41 @@ where
     let bench = benchmark_gate_operation(NATIVE_BENCH_ITERATIONS, || {
         crt_recompose_rows::<M>(params, &crt_values, 1)
     });
-    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1);
+    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1u32);
+    #[cfg(feature = "gpu")]
+    {
+        summary.with_peak_vram(bench.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        summary
+    }
+}
+
+fn measured_a_prime_hash_sampling_unit_summary<M, HS>(
+    params: &<M::P as Poly>::Params,
+    hash_key: [u8; 32],
+    secret_size: usize,
+) -> CircuitBenchSummary
+where
+    M: PolyMatrix,
+    HS: PolyHashSampler<[u8; 32], M = M>,
+{
+    let log_base_q = params.modulus_digits();
+    let bench = benchmark_gate_operation(NATIVE_BENCH_ITERATIONS, || {
+        let matrix = HS::new().sample_hash(
+            params,
+            hash_key,
+            b"noise-refresh-bench-a-prime",
+            secret_size,
+            secret_size
+                .checked_mul(log_base_q)
+                .expect("noise-refresh a_prime benchmark column count overflow"),
+            DistType::FinRingDist,
+        );
+        matrix.into_compact_bytes()
+    });
+    let summary = CircuitBenchSummary::new(bench.time, bench.time, 1u32);
     #[cfg(feature = "gpu")]
     {
         summary.with_peak_vram(bench.peak_vram)
@@ -371,7 +437,6 @@ where
     cbd_n: usize,
     hash_key: [u8; 32],
     debug_reuse_single_material: bool,
-    debug_secret: Option<Vec<M::P>>,
     material_circuit: Arc<PolyCircuit<M::P>>,
     _hash_sampler: PhantomData<HS>,
 }
@@ -412,7 +477,6 @@ where
             cbd_n,
             hash_key,
             debug_reuse_single_material,
-            debug_secret: None,
             material_circuit,
             _hash_sampler: PhantomData,
         }
@@ -430,13 +494,6 @@ where
             num_slots,
             self.debug_reuse_single_material,
         ));
-        self
-    }
-
-    pub fn with_debug_secret(mut self, secret: Option<Vec<M::P>>) -> Self {
-        if cfg!(test) {
-            self.debug_secret = secret;
-        }
         self
     }
 
@@ -461,55 +518,108 @@ where
         public_key_estimator: &PKBE,
     ) -> CircuitBenchSummary
     where
-        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + PublicKeyAuxBenchEstimator<M::P> + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M>,
+    {
+        self.estimate_preprocess_bench_parts(public_key_estimator).total
+    }
+
+    pub(crate) fn estimate_preprocess_bench_parts<PKBE>(
+        &self,
+        public_key_estimator: &PKBE,
+    ) -> NoiseRefreshBenchEstimateParts
+    where
+        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + PublicKeyAuxBenchEstimator<M::P> + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M>,
     {
         let num_slots = self.params().ring_dimension() as usize;
         let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
         let log_base_q = self.params().modulus_digits();
+        // The naive-vector refresh paths used by AKY24 and DiamondIO refresh scalar BGG wires:
+        // `one.key(0).matrix.row_size()` and `refreshed_input.key(0).matrix.row_size()` are one in
+        // those call sites. The estimator has no concrete `one` vector, so it measures the same
+        // scalar `A'` hash shape directly.
+        let secret_size = 1usize;
         let combine_task_count =
             num_slots.checked_mul(crt_depth).expect("noise-refresh combine task count overflow");
-
-        let material_circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
-            self.ring_gsw.clone(),
-            self.seed_bits,
-            self.v_bits,
-            self.graph_seed,
-            self.cbd_n,
-            num_slots,
-            self.debug_reuse_single_material,
-        );
-        let public_material_summary =
-            public_key_estimator.estimate_circuit_bench(&material_circuit);
 
         let scalar_target = [BigUint::from(1u32)];
         let pk_matrix_mul = public_key_estimator.estimate_large_scalar_mul(&scalar_target);
         let pk_add = public_key_estimator.estimate_add();
         let pk_sub = public_key_estimator.estimate_sub();
+        let material_counts = bit_decomposed_refresh_material_counts(
+            num_slots,
+            log_base_q,
+            crt_depth,
+            self.v_bits,
+            self.debug_reuse_single_material,
+        );
+        let mask_prg_circuit =
+            build_representative_goldreich_mask_material_circuit::<M::P, A>(self.ring_gsw.clone());
+        let decrypt_contribution_circuit = build_one_ciphertext_bit_decrypt_circuit::<M::P, A, M>(
+            self.ring_gsw.clone(),
+            BigUint::from(2u64),
+        );
+        let mask_prg_unit = estimate_public_key_circuit_bench_with_aux::<
+            NaiveBGGPublicKeyVec<M>,
+            PKBE,
+        >(public_key_estimator, self.params(), &mask_prg_circuit);
+        let error_prg_unit = goldreich_cbd_error_prg_summary(
+            mask_prg_unit.clone(),
+            pk_add.clone(),
+            pk_sub.clone(),
+            self.cbd_n,
+        );
+        let decrypt_contribution_unit =
+            estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+                public_key_estimator,
+                self.params(),
+                &decrypt_contribution_circuit,
+            );
+        let public_material_summary = bit_decomposed_refresh_material_summary(
+            error_prg_unit.clone(),
+            mask_prg_unit.clone(),
+            decrypt_contribution_unit.clone(),
+            pk_add.clone(),
+            material_counts,
+            self.v_bits,
+        );
+        let a_prime_sampling_unit = measured_a_prime_hash_sampling_unit_summary::<M, HS>(
+            self.params(),
+            self.hash_key,
+            secret_size,
+        );
+        let a_prime_sampling_stage = scaled_summary(a_prime_sampling_unit.clone(), num_slots);
         let collapse_add_count = log_base_q
             .checked_mul(num_slots.saturating_sub(1))
             .expect("noise-refresh collapse add count overflow");
         let preprocess_combine_unit = sequential_summaries(&[
             // Compute the public-key one-term for the naive slot vector:
             // `one.keys[slot_idx].matrix_mul((q / q_i) * A')`.
-            estimate_summary(pk_matrix_mul),
+            estimate_summary(pk_matrix_mul.clone()),
             // Compute the refreshed-input public-key term for the naive slot vector:
             // `refreshed_input.keys[slot_idx].matrix_mul((q / q_i) * G)`.
-            estimate_summary(pk_matrix_mul),
+            estimate_summary(pk_matrix_mul.clone()),
             // Apply the one-column target to each of the `log_base_q` decoded material columns.
-            scaled_estimate_summary(pk_matrix_mul, log_base_q),
+            scaled_estimate_summary(pk_matrix_mul.clone(), log_base_q),
             // For each decoded material column, `collapse_slot_matrices` sums `num_slots`
             // rotated slot matrices into one polynomial column; `concat_owned_columns` then only
             // lays those columns side by side and is not modeled as arithmetic.
-            scaled_estimate_summary(pk_add, collapse_add_count),
+            scaled_estimate_summary(pk_add.clone(), collapse_add_count),
             // Add the refreshed-input term and the decoded refresh term.
-            estimate_summary(pk_add),
+            estimate_summary(pk_add.clone()),
             // Subtract the one-term so the public refresh matrix has the intended sign.
-            estimate_summary(pk_sub),
+            estimate_summary(pk_sub.clone()),
         ]);
 
-        let preprocess_combine_stage = scaled_summary(preprocess_combine_unit, combine_task_count);
-        let preprocess_summary =
-            sequential_summaries(&[public_material_summary, preprocess_combine_stage]);
+        let preprocess_combine_stage = sequential_summaries(&[
+            a_prime_sampling_stage.clone(),
+            scaled_summary(preprocess_combine_unit.clone(), combine_task_count),
+        ]);
+        let preprocess_summary = sequential_summaries(&[
+            public_material_summary.clone(),
+            preprocess_combine_stage.clone(),
+        ]);
 
         debug!(
             v_bits = self.v_bits,
@@ -517,6 +627,12 @@ where
             crt_depth,
             log_base_q,
             combine_task_count,
+            ?material_counts,
+            ?a_prime_sampling_unit,
+            ?a_prime_sampling_stage,
+            ?error_prg_unit,
+            ?mask_prg_unit,
+            ?decrypt_contribution_unit,
             ?public_material_summary,
             ?preprocess_combine_unit,
             ?preprocess_combine_stage,
@@ -524,7 +640,11 @@ where
             "estimated naive-vector noise-refresh preprocess benchmark"
         );
 
-        preprocess_summary
+        NoiseRefreshBenchEstimateParts {
+            material: public_material_summary,
+            per_refresh: preprocess_combine_stage,
+            total: preprocess_summary,
+        }
     }
 
     /// Estimates the online-evaluation side of the current naive-vector implementation.
@@ -540,51 +660,91 @@ where
     ) -> CircuitBenchSummary
     where
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M>,
+    {
+        self.estimate_online_eval_bench_parts(encoding_estimator).total
+    }
+
+    pub(crate) fn estimate_online_eval_bench_parts<EncBE>(
+        &self,
+        encoding_estimator: &EncBE,
+    ) -> NoiseRefreshBenchEstimateParts
+    where
+        EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+        HS: PolyHashSampler<[u8; 32], M = M>,
     {
         let num_slots = self.params().ring_dimension() as usize;
         let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
         let log_base_q = self.params().modulus_digits();
+        // See the preprocessing estimator above: online refresh recomputes the same scalar `A'`
+        // matrices from `(refresh_id, slot_idx)` and therefore pays the same hash-sampling unit.
+        let secret_size = 1usize;
         let combine_task_count =
             num_slots.checked_mul(crt_depth).expect("noise-refresh combine task count overflow");
-
-        let material_circuit = build_noise_refresh_material_circuit::<M::P, A, M>(
-            self.ring_gsw.clone(),
-            self.seed_bits,
-            self.v_bits,
-            self.graph_seed,
-            self.cbd_n,
-            num_slots,
-            self.debug_reuse_single_material,
-        );
-        let online_material_summary = encoding_estimator.estimate_circuit_bench(&material_circuit);
 
         let scalar_target = [BigUint::from(1u32)];
         let enc_matrix_mul = encoding_estimator.estimate_large_scalar_mul(&scalar_target);
         let enc_add = encoding_estimator.estimate_add();
         let enc_sub = encoding_estimator.estimate_sub();
+        let material_counts = bit_decomposed_refresh_material_counts(
+            num_slots,
+            log_base_q,
+            crt_depth,
+            self.v_bits,
+            self.debug_reuse_single_material,
+        );
+        let mask_prg_circuit =
+            build_representative_goldreich_mask_material_circuit::<M::P, A>(self.ring_gsw.clone());
+        let decrypt_contribution_circuit = build_one_ciphertext_bit_decrypt_circuit::<M::P, A, M>(
+            self.ring_gsw.clone(),
+            BigUint::from(2u64),
+        );
+        let mask_prg_unit = encoding_estimator.estimate_circuit_bench(&mask_prg_circuit);
+        let error_prg_unit = goldreich_cbd_error_prg_summary(
+            mask_prg_unit.clone(),
+            enc_add.clone(),
+            enc_sub.clone(),
+            self.cbd_n,
+        );
+        let decrypt_contribution_unit =
+            encoding_estimator.estimate_circuit_bench(&decrypt_contribution_circuit);
+        let online_material_summary = bit_decomposed_refresh_material_summary(
+            error_prg_unit.clone(),
+            mask_prg_unit.clone(),
+            decrypt_contribution_unit.clone(),
+            enc_add.clone(),
+            material_counts,
+            self.v_bits,
+        );
+        let a_prime_sampling_unit = measured_a_prime_hash_sampling_unit_summary::<M, HS>(
+            self.params(),
+            self.hash_key,
+            secret_size,
+        );
+        let a_prime_sampling_stage = scaled_summary(a_prime_sampling_unit.clone(), num_slots);
         let collapse_add_count = log_base_q
             .checked_mul(num_slots.saturating_sub(1))
             .expect("noise-refresh collapse add count overflow");
         let online_combine_unit = sequential_summaries(&[
             // Compute the encoding one-term for the naive slot vector:
             // `one.encodings[slot_idx].matrix_mul((q / q_i) * A')`.
-            estimate_summary(enc_matrix_mul),
+            estimate_summary(enc_matrix_mul.clone()),
             // Compute the refreshed-input encoding term for the naive slot vector:
             // `refreshed_input.encodings[slot_idx].matrix_mul((q / q_i) * G)`.
-            estimate_summary(enc_matrix_mul),
+            estimate_summary(enc_matrix_mul.clone()),
             // Apply the one-column target to each of the `log_base_q` decoded material columns.
-            scaled_estimate_summary(enc_matrix_mul, log_base_q),
+            scaled_estimate_summary(enc_matrix_mul.clone(), log_base_q),
             // For each decoded material column, `collapse_slot_matrices` sums `num_slots`
             // rotated slot vectors into one polynomial column; `concat_owned_columns` then only
             // lays those columns side by side and is not modeled as arithmetic.
-            scaled_estimate_summary(enc_add, collapse_add_count),
+            scaled_estimate_summary(enc_add.clone(), collapse_add_count),
             // Add the refreshed-input term and the decoded refresh term.
-            estimate_summary(enc_add),
+            estimate_summary(enc_add.clone()),
             // Subtract the one-term to leave the desired positive `A'` contribution after
             // decoding.
-            estimate_summary(enc_sub),
+            estimate_summary(enc_sub.clone()),
             // Subtract the caller-provided decoder for this `(slot_idx, crt_idx)` level.
-            estimate_summary(enc_sub),
+            estimate_summary(enc_sub.clone()),
         ]);
 
         // Measure the native `crt_recompose_rows` work for one final slot row directly.  This is
@@ -592,13 +752,15 @@ where
         // multiplication, and CRT-level accumulation on raw `M` matrices.
         let online_crt_recompose_unit = measured_crt_recompose_unit_summary::<M>(self.params());
 
-        let online_combine_stage = scaled_summary(online_combine_unit, combine_task_count);
-        let online_crt_stage = scaled_summary(online_crt_recompose_unit, num_slots);
-        let online_summary = sequential_summaries(&[
-            online_material_summary,
-            online_combine_stage,
-            online_crt_stage,
+        let online_combine_stage = sequential_summaries(&[
+            a_prime_sampling_stage.clone(),
+            scaled_summary(online_combine_unit.clone(), combine_task_count),
         ]);
+        let online_crt_stage = scaled_summary(online_crt_recompose_unit.clone(), num_slots);
+        let online_per_refresh =
+            sequential_summaries(&[online_combine_stage.clone(), online_crt_stage.clone()]);
+        let online_summary =
+            sequential_summaries(&[online_material_summary.clone(), online_per_refresh.clone()]);
 
         debug!(
             v_bits = self.v_bits,
@@ -607,6 +769,12 @@ where
             log_base_q,
             combine_task_count,
             crt_recompose_task_count = num_slots,
+            ?material_counts,
+            ?a_prime_sampling_unit,
+            ?a_prime_sampling_stage,
+            ?error_prg_unit,
+            ?mask_prg_unit,
+            ?decrypt_contribution_unit,
             ?online_material_summary,
             ?online_combine_unit,
             ?online_combine_stage,
@@ -616,7 +784,11 @@ where
             "estimated naive-vector noise-refresh online benchmark"
         );
 
-        online_summary
+        NoiseRefreshBenchEstimateParts {
+            material: online_material_summary,
+            per_refresh: online_per_refresh,
+            total: online_summary,
+        }
     }
 }
 
@@ -683,14 +855,72 @@ where
                 num_slots,
                 crt_depth,
                 log_base_q,
-                "naive-vector noise-refresh preprocess_many sampling debug decoded material"
+                "naive-vector noise-refresh preprocess_many sampling debug PRG-output material"
             );
-            let decoded_refresh_terms = debug_sample_decoded_refresh_terms::<M, HS>(
+            let debug_decode_circuit = build_noise_refresh_debug_material_decode_circuit::<
+                M::P,
+                A,
+                M,
+            >(self.ring_gsw.clone(), self.v_bits);
+            let material_input_count = debug_decode_circuit.num_input() - 1;
+            assert_eq!(
+                material_input_count % 2,
+                0,
+                "debug noise-refresh material input count must split into error and mask halves"
+            );
+            let per_material_input_count = material_input_count / 2;
+            let error_wire = debug_sample_prg_output_public_wires::<M, HS>(
                 self.params(),
                 self.hash_key,
-                b"noise-refresh-debug-material",
+                b"noise-refresh-debug-error-material",
+                1,
+                num_slots,
+                one,
+            )
+            .into_iter()
+            .next()
+            .expect("debug noise-refresh must sample one reusable error wire");
+            let mask_wire = debug_sample_prg_output_public_wires::<M, HS>(
+                self.params(),
+                self.hash_key,
+                b"noise-refresh-debug-mask-material",
+                1,
+                num_slots,
+                one,
+            )
+            .into_iter()
+            .next()
+            .expect("debug noise-refresh must sample one reusable mask wire");
+            let mut inputs = Vec::with_capacity(material_input_count + 1);
+            inputs.extend(std::iter::repeat_n(error_wire, per_material_input_count));
+            inputs.extend(std::iter::repeat_n(mask_wire, per_material_input_count));
+            inputs.push(decryption_key.clone());
+            let decoded = debug_decode_circuit.eval(
+                self.params(),
+                one.clone(),
+                inputs,
+                Some(plt_evaluator),
+                Some(
+                    slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>,
+                ),
+                None,
+            );
+            let decoded_row_size = decoded
+                .first()
+                .and_then(|value| (value.num_slots() > 0).then(|| value.key(0).matrix.row_size()))
+                .expect("debug noise-refresh decoded public material must be nonempty");
+            let unit_column_target =
+                M::unit_column_vector(self.params(), decoded_row_size, decoded_row_size - 1);
+            let decoded = decoded
+                .into_iter()
+                .map(|value| value.matrix_mul(self.params(), &unit_column_target))
+                .collect::<Vec<_>>();
+            let decoded_refresh_terms = decoded_refresh_terms_public(
+                self.params(),
+                &decoded,
                 num_slots,
                 crt_depth,
+                log_base_q,
                 secret_size,
             );
             return refresh_ids
@@ -867,24 +1097,73 @@ where
                 num_slots,
                 crt_depth,
                 log_base_q,
-                "naive-vector noise-refresh online_eval_many sampling debug decoded material"
+                "naive-vector noise-refresh online_eval_many sampling debug PRG-output material"
             );
-            let secret = self
-                .debug_secret
-                .as_ref()
-                .expect("debug noise-refresh encoding material requires the BGG secret");
+            let debug_decode_circuit = build_noise_refresh_debug_material_decode_circuit::<
+                M::P,
+                A,
+                M,
+            >(self.ring_gsw.clone(), self.v_bits);
+            let material_input_count = debug_decode_circuit.num_input() - 1;
             assert_eq!(
-                secret.len(),
-                secret_size,
-                "debug noise-refresh secret size must match encoding secret size"
+                material_input_count % 2,
+                0,
+                "debug noise-refresh material input count must split into error and mask halves"
             );
-            let decoded_refresh_terms = debug_sample_decoded_refresh_encoding_terms::<M, HS>(
+            let per_material_input_count = material_input_count / 2;
+            let error_wire = debug_sample_prg_output_encoding_wires::<M, HS>(
                 self.params(),
                 self.hash_key,
-                b"noise-refresh-debug-material",
+                b"noise-refresh-debug-error-material",
+                1,
+                num_slots,
+                one,
+            )
+            .into_iter()
+            .next()
+            .expect("debug noise-refresh must sample one reusable error wire");
+            let mask_wire = debug_sample_prg_output_encoding_wires::<M, HS>(
+                self.params(),
+                self.hash_key,
+                b"noise-refresh-debug-mask-material",
+                1,
+                num_slots,
+                one,
+            )
+            .into_iter()
+            .next()
+            .expect("debug noise-refresh must sample one reusable mask wire");
+            let mut inputs = Vec::with_capacity(material_input_count + 1);
+            inputs.extend(std::iter::repeat_n(error_wire, per_material_input_count));
+            inputs.extend(std::iter::repeat_n(mask_wire, per_material_input_count));
+            inputs.push(decryption_key.clone());
+            let decoded = debug_decode_circuit.eval(
+                self.params(),
+                one.clone(),
+                inputs,
+                Some(plt_evaluator),
+                Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>),
+                None,
+            );
+            let decoded_row_size = decoded
+                .first()
+                .and_then(|value| {
+                    (value.num_slots() > 0).then(|| value.encoding(0).pubkey.matrix.row_size())
+                })
+                .expect("debug noise-refresh decoded encoding material must be nonempty");
+            let unit_column_target =
+                M::unit_column_vector(self.params(), decoded_row_size, decoded_row_size - 1);
+            let decoded = decoded
+                .into_iter()
+                .map(|value| value.matrix_mul(self.params(), &unit_column_target))
+                .collect::<Vec<_>>();
+            let decoded_refresh_terms = decoded_refresh_terms_encoding(
+                self.params(),
+                &decoded,
                 num_slots,
                 crt_depth,
-                secret,
+                log_base_q,
+                secret_size,
             );
             return refresh_ids
                 .par_iter()
@@ -1001,6 +1280,216 @@ where
                 )
             })
             .collect()
+    }
+
+    /// Computes many online refreshes while materializing decoder matrices in
+    /// bounded chunks.
+    ///
+    /// This has the same semantics as `online_eval_many`, but `decoder_factory`
+    /// is called only for the currently processed chunk. It is useful for
+    /// DiamondIO, where decoder matrices are read from disk and multiplied by
+    /// the final Diamond state; building all decoder sets for all refreshed
+    /// wires at once can exhaust GPU memory even though each individual matrix
+    /// is tiny.
+    #[allow(clippy::too_many_arguments)]
+    pub fn online_eval_many_with_decoder_factory<PE, ST, DF>(
+        &self,
+        refresh_ids: &[Vec<u8>],
+        one: &NaiveBGGEncodingVec<M>,
+        refreshed_inputs: &[NaiveBGGEncodingVec<M>],
+        enc_seeds: &[NaiveBGGEncodingVec<M>],
+        decryption_key: &NaiveBGGEncodingVec<M>,
+        decoder_factory: DF,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Vec<NaiveBGGEncodingVec<M>>
+    where
+        PE: PltEvaluator<NaiveBGGEncodingVec<M>>,
+        ST: SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
+        DF: Fn(usize) -> Vec<M> + Sync,
+    {
+        info!(
+            target: "mxx::func_enc::aky24",
+            refresh_id_count = refresh_ids.len(),
+            refreshed_input_count = refreshed_inputs.len(),
+            seed_wire_count = enc_seeds.len(),
+            decoder_chunk_size = crate::env::noise_refresh_decoder_chunk_size(),
+            "naive-vector noise-refresh online_eval_many_with_decoder_factory entered"
+        );
+        assert_eq!(
+            refresh_ids.len(),
+            refreshed_inputs.len(),
+            "refresh id count must match refreshed input count"
+        );
+        let num_slots = refreshed_inputs
+            .first()
+            .expect("online_eval_many_with_decoder_factory requires at least one refreshed input")
+            .num_slots();
+        assert_eq!(
+            num_slots,
+            self.params().ring_dimension() as usize,
+            "Naive noise refresh currently expects one logical slot per ring coefficient"
+        );
+        refreshed_inputs.par_iter().for_each(|input| one.assert_compatible(input));
+        one.assert_compatible(decryption_key);
+        enc_seeds.par_iter().for_each(|seed| one.assert_compatible(seed));
+
+        let (_q_moduli, _crt_bits, crt_depth) = self.params().to_crt();
+        let log_base_q = self.params().modulus_digits();
+        let secret_size = one.encoding(0).pubkey.matrix.row_size();
+        let decoded_refresh_terms = if self.debug_reuse_single_material {
+            info!(
+                target: "mxx::func_enc::aky24",
+                num_slots,
+                crt_depth,
+                log_base_q,
+                "naive-vector noise-refresh chunked online eval sampling debug PRG-output material"
+            );
+            let debug_decode_circuit = build_noise_refresh_debug_material_decode_circuit::<
+                M::P,
+                A,
+                M,
+            >(self.ring_gsw.clone(), self.v_bits);
+            let material_input_count = debug_decode_circuit.num_input() - 1;
+            assert_eq!(
+                material_input_count % 2,
+                0,
+                "debug noise-refresh material input count must split into error and mask halves"
+            );
+            let per_material_input_count = material_input_count / 2;
+            let error_wire = debug_sample_prg_output_encoding_wires::<M, HS>(
+                self.params(),
+                self.hash_key,
+                b"noise-refresh-debug-error-material",
+                1,
+                num_slots,
+                one,
+            )
+            .into_iter()
+            .next()
+            .expect("debug noise-refresh must sample one reusable error wire");
+            let mask_wire = debug_sample_prg_output_encoding_wires::<M, HS>(
+                self.params(),
+                self.hash_key,
+                b"noise-refresh-debug-mask-material",
+                1,
+                num_slots,
+                one,
+            )
+            .into_iter()
+            .next()
+            .expect("debug noise-refresh must sample one reusable mask wire");
+            let mut inputs = Vec::with_capacity(material_input_count + 1);
+            inputs.extend(std::iter::repeat_n(error_wire, per_material_input_count));
+            inputs.extend(std::iter::repeat_n(mask_wire, per_material_input_count));
+            inputs.push(decryption_key.clone());
+            let decoded = debug_decode_circuit.eval(
+                self.params(),
+                one.clone(),
+                inputs,
+                Some(plt_evaluator),
+                Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>),
+                None,
+            );
+            let decoded_row_size = decoded
+                .first()
+                .and_then(|value| {
+                    (value.num_slots() > 0).then(|| value.encoding(0).pubkey.matrix.row_size())
+                })
+                .expect("debug noise-refresh decoded encoding material must be nonempty");
+            let unit_column_target =
+                M::unit_column_vector(self.params(), decoded_row_size, decoded_row_size - 1);
+            let decoded = decoded
+                .into_iter()
+                .map(|value| value.matrix_mul(self.params(), &unit_column_target))
+                .collect::<Vec<_>>();
+            decoded_refresh_terms_encoding(
+                self.params(),
+                &decoded,
+                num_slots,
+                crt_depth,
+                log_base_q,
+                secret_size,
+            )
+        } else {
+            let material_seed_bits = self.seed_bits;
+            let seed_wire_count = enc_seeds
+                .len()
+                .checked_div(self.seed_bits)
+                .expect("noise-refresh seed bit count must be positive");
+            assert_eq!(
+                seed_wire_count * self.seed_bits,
+                enc_seeds.len(),
+                "noise-refresh encrypted seed wire count must be divisible by seed_bits"
+            );
+            let material_seed_wire_count = material_seed_bits
+                .checked_mul(seed_wire_count)
+                .expect("noise-refresh material seed wire count overflow");
+            let mut inputs =
+                enc_seeds[..material_seed_wire_count].par_iter().cloned().collect::<Vec<_>>();
+            inputs.push(decryption_key.clone());
+            let decoded = self.material_circuit.eval(
+                self.params(),
+                one.clone(),
+                inputs,
+                Some(plt_evaluator),
+                Some(slot_transfer_evaluator as &dyn SlotTransferEvaluator<NaiveBGGEncodingVec<M>>),
+                None,
+            );
+            let decoded_row_size = decoded
+                .first()
+                .and_then(|value| {
+                    (value.num_slots() > 0).then(|| value.encoding(0).pubkey.matrix.row_size())
+                })
+                .expect("noise-refresh decoded encoding material must be nonempty");
+            let unit_column_target =
+                M::unit_column_vector(self.params(), decoded_row_size, decoded_row_size - 1);
+            let decoded = decoded
+                .into_iter()
+                .map(|value| value.matrix_mul(self.params(), &unit_column_target))
+                .collect::<Vec<_>>();
+            decoded_refresh_terms_encoding(
+                self.params(),
+                &decoded,
+                num_slots,
+                crt_depth,
+                log_base_q,
+                secret_size,
+            )
+        };
+
+        let chunk_size = crate::env::noise_refresh_decoder_chunk_size();
+        let mut outputs = Vec::with_capacity(refresh_ids.len());
+        for chunk_start in (0..refresh_ids.len()).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(refresh_ids.len());
+            let decoder_started = std::time::Instant::now();
+            let decoder_sets = (chunk_start..chunk_end).map(&decoder_factory).collect::<Vec<_>>();
+            debug!(
+                target: "mxx::func_enc::aky24",
+                chunk_start,
+                chunk_end,
+                decoder_set_count = decoder_sets.len(),
+                decoder_count = decoder_sets.iter().map(Vec::len).sum::<usize>(),
+                elapsed_ms = decoder_started.elapsed().as_millis(),
+                "naive-vector noise-refresh chunked online eval materialized decoder chunk"
+            );
+            let mut chunk_outputs = refresh_ids[chunk_start..chunk_end]
+                .par_iter()
+                .zip(refreshed_inputs[chunk_start..chunk_end].par_iter())
+                .zip(decoder_sets.par_iter())
+                .map(|((refresh_id, refreshed_input), decoders)| {
+                    self.online_from_decoded(
+                        refresh_id,
+                        one,
+                        refreshed_input,
+                        &decoded_refresh_terms,
+                        decoders,
+                    )
+                })
+                .collect::<Vec<_>>();
+            outputs.append(&mut chunk_outputs);
+        }
+        outputs
     }
 
     fn preprocess_from_decoded(
@@ -1299,6 +1788,7 @@ where
                 0,
                 1,
                 &[(0, 1)],
+                false,
             ));
         let prg_outputs =
             expand_batched_wires(&circuit.call_sub_circuit(prg_sub_id, seed_wires.clone()));
@@ -1363,6 +1853,7 @@ where
                     error_start,
                     ring_dim,
                     &mask_ranges,
+                    true,
                 ),
             );
             let prg_outputs =
@@ -1393,6 +1884,51 @@ where
             }
         }
         outputs.extend(by_crt_digit.into_iter().flatten());
+    }
+    circuit.output(outputs);
+    circuit
+}
+
+fn build_noise_refresh_debug_material_decode_circuit<P, A, M>(
+    ring_gsw: Arc<RingGswContext<P, A>>,
+    v_bits: usize,
+) -> PolyCircuit<P>
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+    M: PolyMatrix<P = P>,
+{
+    let ring_dim = ring_gsw.params.ring_dimension() as usize;
+    let mut circuit = ring_gsw.fresh_circuit();
+    let debug_error = RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit);
+    let debug_mask = RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit);
+    let decryption_key = circuit.input(1).at(0).as_single_wire();
+    let decrypt_sub_id = circuit.register_sub_circuit(
+        build_refreshed_wire_digit_all_crt_decrypt::<P, A, M>(ring_gsw.clone(), v_bits),
+    );
+    let merge_sub_id = circuit
+        .register_sub_circuit(build_refreshed_wire_digit_all_crt_merge::<P>(&ring_gsw.params));
+    let log_base_q = ring_gsw.params.modulus_digits();
+    let (_q_moduli, _crt_bits, crt_depth) = ring_gsw.params.to_crt();
+    let mask_q_chunk_len = ring_dim.checked_mul(v_bits).expect("mask q chunk length overflow");
+    let mut decrypt_inputs = Vec::new();
+    decrypt_inputs.push(BatchedWire::single(decryption_key));
+    for _ in 0..ring_dim {
+        decrypt_inputs.extend(debug_error.sub_circuit_wires());
+    }
+    for _ in 0..crt_depth * mask_q_chunk_len {
+        decrypt_inputs.extend(debug_mask.sub_circuit_wires());
+    }
+    let decrypt_outputs = circuit.call_sub_circuit(decrypt_sub_id, decrypt_inputs);
+    let merge_outputs = circuit.call_sub_circuit(merge_sub_id, decrypt_outputs);
+    assert_eq!(merge_outputs.len(), crt_depth);
+    let mut outputs = Vec::new();
+    for _slot_idx in 0..ring_dim {
+        for crt_output in merge_outputs.iter().take(crt_depth) {
+            for _digit_idx in 0..log_base_q {
+                outputs.push(crt_output.clone());
+            }
+        }
     }
     circuit.output(outputs);
     circuit
@@ -1515,32 +2051,14 @@ where
         crt_values.iter().all(|value| value.row_size() == 1 && value.col_size() == output_cols),
         "CRT recomposition level vectors must be one-row matrices with a consistent column count"
     );
-    let q: Arc<BigUint> = params.modulus().into();
-    let half_q = q.as_ref() / BigUint::from(2u64);
     let reconst_coeffs = params.reconst_coeffs();
     let rows = (0..num_slots)
         .map(|slot_idx| {
             let mut row = M::zero(params, 1, output_cols);
             for crt_idx in 0..crt_depth {
                 let level = &crt_values[slot_idx * crt_depth + crt_idx];
-                let (level_rows, level_cols) = level.size();
                 let q_i_big = BigUint::from(q_moduli[crt_idx]);
-                let mut rounded = M::zero(params, level_rows, level_cols);
-                for level_row in 0..level_rows {
-                    for level_col in 0..level_cols {
-                        let rounded_coeffs = level
-                            .entry(level_row, level_col)
-                            .coeffs_biguints()
-                            .into_iter()
-                            .map(|coeff| ((&q_i_big * coeff + &half_q) / q.as_ref()) % &q_i_big)
-                            .collect::<Vec<_>>();
-                        rounded.set_entry(
-                            level_row,
-                            level_col,
-                            M::P::from_biguints(params, &rounded_coeffs),
-                        );
-                    }
-                }
+                let rounded = decode_centered_masked_matrix(params, level, &q_i_big);
                 row.add_in_place(
                     &(rounded * constant_poly::<M>(params, reconst_coeffs[crt_idx].clone())),
                 );
@@ -1722,7 +2240,7 @@ mod tests {
                 Some(active_levels),
                 None,
             ));
-            NoiseRefresherNaiveVec::new(ring_gsw, 5, 1, [0x42; 32], 1, [0x24; 32])
+            NoiseRefresherNaiveVec::new(ring_gsw, 6, 1, [0x42; 32], 1, [0x24; 32])
         }
 
         fn public_key_vec_bench_estimator(
@@ -1853,17 +2371,16 @@ mod tests {
             let summary = refresher.estimate_preprocess_bench(&material_estimator);
             tracing::info!(
                 ?summary,
-                total_time = summary.total_time,
+                total_time_nanos = %summary.total_time,
                 latency = summary.latency,
-                max_parallelism = summary.max_parallelism,
+                max_parallelism = %summary.max_parallelism,
                 "naive-vector noise-refresh preprocess benchmark summary"
             );
 
-            assert!(summary.total_time.is_finite());
-            assert!(summary.total_time > 0.0);
+            assert!(summary.total_time > BigUint::from(0u32));
             assert!(summary.latency.is_finite());
             assert!(summary.latency > 0.0);
-            assert!(summary.max_parallelism > 0);
+            assert!(summary.max_parallelism > BigUint::from(0u32));
         }
 
         #[test]
@@ -1876,23 +2393,21 @@ mod tests {
             let summary = refresher.estimate_online_eval_bench(&material_estimator);
             tracing::info!(
                 ?summary,
-                total_time = summary.total_time,
+                total_time_nanos = %summary.total_time,
                 latency = summary.latency,
-                max_parallelism = summary.max_parallelism,
+                max_parallelism = %summary.max_parallelism,
                 "naive-vector noise-refresh online benchmark summary"
             );
 
-            assert!(summary.total_time.is_finite());
-            assert!(summary.total_time > 0.0);
+            assert!(summary.total_time > BigUint::from(0u32));
             assert!(summary.latency.is_finite());
             assert!(summary.latency > 0.0);
-            assert!(summary.max_parallelism > 0);
+            assert!(summary.max_parallelism > BigUint::from(0u32));
 
             let crt_unit =
                 measured_crt_recompose_unit_summary::<GpuDCRTPolyMatrix>(refresher.params());
-            assert!(crt_unit.total_time.is_finite());
             assert!(crt_unit.latency.is_finite());
-            assert!(crt_unit.max_parallelism > 0);
+            assert!(crt_unit.max_parallelism > BigUint::from(0u32));
         }
     }
 }

@@ -141,7 +141,8 @@ fn test_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_with_noisy_public_
         wire_secret_key,
         BigUint::from(plaintext_modulus),
         &mut circuit,
-    );
+    )
+    .add_in_circuit(&mut circuit);
     circuit.output(vec![decrypted_sum]);
 
     let secret_key = sample_secret_key(&cpu_params);
@@ -242,7 +243,8 @@ fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_with_noisy_
         wire_secret_key,
         BigUint::from(plaintext_modulus),
         &mut circuit,
-    );
+    )
+    .add_in_circuit(&mut circuit);
     circuit.output(vec![decrypted_difference]);
 
     let secret_key = sample_secret_key(&cpu_params);
@@ -344,7 +346,8 @@ fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_with_noisy_pub
         wire_secret_key,
         BigUint::from(plaintext_modulus),
         &mut circuit,
-    );
+    )
+    .add_in_circuit(&mut circuit);
     circuit.output(vec![decrypted_product]);
 
     let secret_key = sample_secret_key(&cpu_params);
@@ -447,7 +450,8 @@ fn test_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_with_n
         wire_secret_key,
         BigUint::from(plaintext_modulus),
         &mut circuit,
-    );
+    )
+    .add_in_circuit(&mut circuit);
     circuit.output(vec![decrypted_product]);
 
     let secret_key = sample_secret_key(&cpu_params);

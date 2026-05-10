@@ -963,6 +963,18 @@ pub struct RingGswCiphertext<P: Poly, A: DecomposeArithmeticGadget<P> + ModularA
     pub max_plaintext: BigUint,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingGswDecryptionParts {
+    pub secret_dependent: GateId,
+    pub public_bottom: GateId,
+}
+
+impl RingGswDecryptionParts {
+    pub fn add_in_circuit<P: Poly>(&self, circuit: &mut PolyCircuit<P>) -> GateId {
+        circuit.add_gate(self.secret_dependent, self.public_bottom).as_single_wire()
+    }
+}
+
 impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>>
     RingGswCiphertext<P, A>
 {
@@ -1496,7 +1508,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         wire_secret_key: GateId,
         plaintext_modulus: BigUint,
         circuit: &mut PolyCircuit<P>,
-    ) -> GateId
+    ) -> RingGswDecryptionParts
     where
         M: PolyMatrix<P = P>,
     {
@@ -1508,7 +1520,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
         wire_secret_key: GateId,
         plaintext_modulus: BigUint,
         circuit: &mut PolyCircuit<P>,
-    ) -> GateId
+    ) -> RingGswDecryptionParts
     where
         M: PolyMatrix<P = P>,
     {
@@ -1535,16 +1547,12 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             gadget_len
         );
 
-        let gadget_constants = A::gadget_matrix::<M>(
+        let gadget_constants = A::gadget_constant_coeffs::<M>(
             &first.ctx.params,
             first.ctx.arith_ctx.as_ref(),
             Some(first.ctx.active_levels),
             Some(first.ctx.level_offset),
-        )
-        .get_row(0)
-        .into_par_iter()
-        .map(|entry| entry.coeffs_biguints()[0].clone())
-        .collect::<Vec<_>>();
+        );
         assert_eq!(
             gadget_constants.len(),
             gadget_len,
@@ -1558,33 +1566,20 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             .iter()
             .fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i)) /
             &plaintext_modulus;
-        let scaled_poly = P::from_biguint_to_constant(&first.ctx.params, scaled);
-        let scaled_g_inverse_matrix = A::gadget_decomposed::<M>(
+        let scaled_g_inverse = A::gadget_decomposed_constant_tower_coeffs::<M>(
             &first.ctx.params,
             first.ctx.arith_ctx.as_ref(),
-            &M::from_poly_vec_column(&first.ctx.params, vec![scaled_poly]),
+            scaled,
             Some(first.ctx.active_levels),
             Some(first.ctx.level_offset),
         );
-        let (scaled_rows, scaled_cols) = scaled_g_inverse_matrix.size();
         assert_eq!(
-            scaled_cols, 1,
-            "scaled gadget decomposition column count {} must equal 1",
-            scaled_cols
+            scaled_g_inverse.len(),
+            gadget_len,
+            "scaled gadget decomposition length {} must match gadget_len {}",
+            scaled_g_inverse.len(),
+            gadget_len
         );
-        let scaled_g_inverse = (0..scaled_rows)
-            .map(|row_idx| {
-                let coeff = scaled_g_inverse_matrix.entry(row_idx, 0).coeffs_biguints()[0].clone();
-                active_q_moduli
-                    .iter()
-                    .map(|&q_i| {
-                        (&coeff % BigUint::from(q_i))
-                            .to_u64()
-                            .expect("scaled gadget decomposition residue must fit in u64")
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
         let batch_secret_key = wire_secret_key;
 
         let mut prepared_tops = Vec::with_capacity(ciphertexts.len());
@@ -1639,17 +1634,33 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
                 circuit.large_scalar_mul(w_times_secret, std::slice::from_ref(gadget_scalar)),
             );
         }
-        let mut sum = circuit.large_scalar_mul(batch_secret_key, &[BigUint::ZERO]);
-        for term in weighted_top_terms {
-            sum = circuit.add_gate(sum, term);
-        }
+        let sum = if weighted_top_terms.is_empty() {
+            circuit.large_scalar_mul(batch_secret_key, &[BigUint::ZERO]).as_single_wire()
+        } else {
+            let mut current_layer =
+                weighted_top_terms.into_iter().map(BatchedWire::as_single_wire).collect::<Vec<_>>();
+            while current_layer.len() > 1 {
+                let mut next_layer = Vec::with_capacity(current_layer.len().div_ceil(2));
+                let mut iter = current_layer.into_iter();
+                while let Some(left) = iter.next() {
+                    if let Some(right) = iter.next() {
+                        next_layer.push(circuit.add_gate(left, right).as_single_wire());
+                    } else {
+                        next_layer.push(left);
+                    }
+                }
+                current_layer = next_layer;
+            }
+            current_layer.pop().expect("non-empty top-term reduction must leave one term")
+        };
         let bottom_inputs = bottom_entries
             .into_iter()
             .map(|bottom_entry| bottom_entry.reconstruct(circuit))
             .collect::<Vec<_>>();
-        let reconstructed_bottom =
-            circuit.slot_reduce_gate(bottom_inputs.as_slice(), first.ctx.num_slots);
-        circuit.add_gate(sum, reconstructed_bottom).as_single_wire()
+        let reconstructed_bottom = circuit
+            .slot_reduce_gate(bottom_inputs.as_slice(), first.ctx.num_slots)
+            .as_single_wire();
+        RingGswDecryptionParts { secret_dependent: sum, public_bottom: reconstructed_bottom }
     }
 
     fn decrypt_linear_combination_row(
@@ -2174,11 +2185,9 @@ mod tests {
         let (params, ctx) = create_test_context(&mut circuit);
         let ciphertext_input = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let wire_secret_key = circuit.input(1).at(0).as_single_wire();
-        let decrypted_input = ciphertext_input.decrypt::<DCRTPolyMatrix>(
-            wire_secret_key,
-            BigUint::from(2u64),
-            &mut circuit,
-        );
+        let decrypted_input = ciphertext_input
+            .decrypt::<DCRTPolyMatrix>(wire_secret_key, BigUint::from(2u64), &mut circuit)
+            .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_input]);
         let secret_key = sample_secret_key(&params);
         let public_key_hash_key = sample_hash_key();
@@ -2196,8 +2205,13 @@ mod tests {
             let ciphertext =
                 encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, plaintext);
             let expected = expected_coeffs(plaintext as u64);
-            let decrypted =
-                decrypt_ciphertext(&params, ctx.nested_rns.as_ref(), &ciphertext, &secret_key, 2);
+            let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
+                &params,
+                ctx.nested_rns.as_ref(),
+                &ciphertext,
+                &secret_key,
+                2,
+            );
             assert_eq!(
                 rounded_coeffs(&decrypted, 2, &q_modulus),
                 expected,
@@ -2245,7 +2259,8 @@ mod tests {
             wire_secret_key,
             BigUint::from(2u64),
             &mut circuit,
-        );
+        )
+        .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_batch]);
 
         let secret_key = sample_secret_key(&params);
@@ -2273,7 +2288,7 @@ mod tests {
                     &public_key,
                     plaintext != 0,
                 );
-                let native_decrypted = decrypt_ciphertext(
+                let native_decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
                     &params,
                     ctx.nested_rns.as_ref(),
                     &ciphertext,
@@ -2333,7 +2348,8 @@ mod tests {
             wire_secret_key,
             BigUint::from(2u64),
             &mut circuit,
-        );
+        )
+        .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_batch]);
 
         let secret_size = 2usize;
@@ -2390,11 +2406,13 @@ mod tests {
         let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let plaintext_modulus = 3u64;
         let sum = lhs.add(&rhs, &mut circuit);
-        let decrypted_sum = sum.decrypt::<DCRTPolyMatrix>(
-            wire_secret_key,
-            BigUint::from(plaintext_modulus),
-            &mut circuit,
-        );
+        let decrypted_sum = sum
+            .decrypt::<DCRTPolyMatrix>(
+                wire_secret_key,
+                BigUint::from(plaintext_modulus),
+                &mut circuit,
+            )
+            .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_sum]);
 
         let secret_key = sample_secret_key(&params);
@@ -2456,11 +2474,13 @@ mod tests {
         let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let plaintext_modulus = 3u64;
         let difference = lhs.sub(&rhs, &mut circuit);
-        let decrypted_difference = difference.decrypt::<DCRTPolyMatrix>(
-            wire_secret_key,
-            BigUint::from(plaintext_modulus),
-            &mut circuit,
-        );
+        let decrypted_difference = difference
+            .decrypt::<DCRTPolyMatrix>(
+                wire_secret_key,
+                BigUint::from(plaintext_modulus),
+                &mut circuit,
+            )
+            .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_difference]);
 
         let secret_key = sample_secret_key(&params);
@@ -2522,11 +2542,13 @@ mod tests {
         let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let plaintext_modulus = 2u64;
         let product = lhs.mul(&rhs, &mut circuit);
-        let decrypted_product = product.decrypt::<DCRTPolyMatrix>(
-            wire_secret_key,
-            BigUint::from(plaintext_modulus),
-            &mut circuit,
-        );
+        let decrypted_product = product
+            .decrypt::<DCRTPolyMatrix>(
+                wire_secret_key,
+                BigUint::from(plaintext_modulus),
+                &mut circuit,
+            )
+            .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_product]);
 
         let secret_key = sample_secret_key(&params);
@@ -2590,11 +2612,13 @@ mod tests {
         let plaintext_modulus = 2u64;
         let product = lhs.mul(&rhs1, &mut circuit);
         let chained_product = product.mul(&rhs2, &mut circuit);
-        let decrypted_product = chained_product.decrypt::<DCRTPolyMatrix>(
-            wire_secret_key,
-            BigUint::from(plaintext_modulus),
-            &mut circuit,
-        );
+        let decrypted_product = chained_product
+            .decrypt::<DCRTPolyMatrix>(
+                wire_secret_key,
+                BigUint::from(plaintext_modulus),
+                &mut circuit,
+            )
+            .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_product]);
 
         let secret_key = sample_secret_key(&params);
@@ -2663,11 +2687,9 @@ mod tests {
         let (params, ctx) = create_montgomery_test_context(&mut circuit);
         let ciphertext_input = MontgomeryRingGswCiphertext::input(ctx.clone(), None, &mut circuit);
         let wire_secret_key = circuit.input(1).at(0).as_single_wire();
-        let decrypted = ciphertext_input.decrypt::<DCRTPolyMatrix>(
-            wire_secret_key,
-            BigUint::from(2u64),
-            &mut circuit,
-        );
+        let decrypted = ciphertext_input
+            .decrypt::<DCRTPolyMatrix>(wire_secret_key, BigUint::from(2u64), &mut circuit)
+            .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted]);
 
         let q_modulus = montgomery_ring_gsw_q_modulus(ctx.as_ref());
@@ -2701,11 +2723,13 @@ mod tests {
         let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let plaintext_modulus = 3u64;
         let sum = lhs.add(&rhs, &mut circuit);
-        let decrypted_sum = sum.decrypt::<DCRTPolyMatrix>(
-            wire_secret_key,
-            BigUint::from(plaintext_modulus),
-            &mut circuit,
-        );
+        let decrypted_sum = sum
+            .decrypt::<DCRTPolyMatrix>(
+                wire_secret_key,
+                BigUint::from(plaintext_modulus),
+                &mut circuit,
+            )
+            .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_sum]);
 
         let (x1, x2) = sample_plaintext_input_pair(plaintext_modulus);
@@ -2746,11 +2770,13 @@ mod tests {
         let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let plaintext_modulus = 3u64;
         let difference = lhs.sub(&rhs, &mut circuit);
-        let decrypted_difference = difference.decrypt::<DCRTPolyMatrix>(
-            wire_secret_key,
-            BigUint::from(plaintext_modulus),
-            &mut circuit,
-        );
+        let decrypted_difference = difference
+            .decrypt::<DCRTPolyMatrix>(
+                wire_secret_key,
+                BigUint::from(plaintext_modulus),
+                &mut circuit,
+            )
+            .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_difference]);
 
         let (x1, x2) = sample_plaintext_input_pair(plaintext_modulus);
@@ -2790,11 +2816,13 @@ mod tests {
         let wire_secret_key = circuit.input(1).at(0).as_single_wire();
         let plaintext_modulus = 2u64;
         let product = lhs.mul(&rhs, &mut circuit);
-        let decrypted_product = product.decrypt::<DCRTPolyMatrix>(
-            wire_secret_key,
-            BigUint::from(plaintext_modulus),
-            &mut circuit,
-        );
+        let decrypted_product = product
+            .decrypt::<DCRTPolyMatrix>(
+                wire_secret_key,
+                BigUint::from(plaintext_modulus),
+                &mut circuit,
+            )
+            .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_product]);
 
         let (x1, x2) = sample_binary_input_pair();
@@ -2836,11 +2864,13 @@ mod tests {
         let plaintext_modulus = 2u64;
         let product = lhs.mul(&rhs1, &mut circuit);
         let chained_product = product.mul(&rhs2, &mut circuit);
-        let decrypted_product = chained_product.decrypt::<DCRTPolyMatrix>(
-            wire_secret_key,
-            BigUint::from(plaintext_modulus),
-            &mut circuit,
-        );
+        let decrypted_product = chained_product
+            .decrypt::<DCRTPolyMatrix>(
+                wire_secret_key,
+                BigUint::from(plaintext_modulus),
+                &mut circuit,
+            )
+            .add_in_circuit(&mut circuit);
         circuit.output(vec![decrypted_product]);
 
         let (x1, x2) = sample_binary_input_pair();

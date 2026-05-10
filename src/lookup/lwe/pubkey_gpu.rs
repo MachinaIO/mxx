@@ -542,6 +542,16 @@ where
 
         let row_size = self.pub_matrix.row_size();
         let chunk_count = k_high_chunk_count::<M>(params, row_size);
+        info!(
+            row_size,
+            modulus_digits = params.modulus_digits(),
+            aux_sampling_chunk_width = crate::env::aux_sampling_chunk_width(),
+            chunk_count,
+            total_lut_entries,
+            total_lut_gates,
+            total_preimages,
+            "estimating LWE GPU public-key LUT auxiliary sampling"
+        );
         let shared = prepare_gpu_device_shared(self, params, row_size);
         let shared_dev = shared
             .first()

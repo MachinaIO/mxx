@@ -658,6 +658,35 @@ fn test_register_and_call_sub_circuit() {
 }
 
 #[test]
+fn test_eval_sub_circuit_call_with_unused_sibling_output() {
+    let params = DCRTPolyParams::default();
+    let poly1 = create_random_poly(&params);
+    let poly2 = create_random_poly(&params);
+
+    let mut sub_circuit = PolyCircuit::new();
+    let sub_inputs = sub_circuit.input(2).to_vec();
+    let add_gate = sub_circuit.add_gate(sub_inputs[0], sub_inputs[1]);
+    let mul_gate = sub_circuit.mul_gate(sub_inputs[0], sub_inputs[1]);
+    sub_circuit.output(vec![add_gate, mul_gate]);
+
+    let mut main_circuit = PolyCircuit::new();
+    let main_inputs = main_circuit.input(2).to_vec();
+    let sub_circuit_id = main_circuit.register_sub_circuit(sub_circuit);
+    let sub_outputs =
+        main_circuit.call_sub_circuit(sub_circuit_id, &[main_inputs[0], main_inputs[1]]);
+    main_circuit.output([sub_outputs[0]]);
+
+    let result = eval_with_const_one(
+        &main_circuit,
+        &params,
+        &[poly1.clone(), poly2.clone()],
+        None::<&PolyPltEvaluator>,
+    );
+
+    assert_eq!(result[0], poly1 + poly2);
+}
+
+#[test]
 fn test_batched_wire_range_helpers() {
     let batch = BatchedWire::from_start_len(GateId(5), 4);
     let (left, right) = batch.split_at(2);

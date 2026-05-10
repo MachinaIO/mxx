@@ -4,9 +4,10 @@ pub mod nested_rns;
 use crate::{
     circuit::{BatchedWire, PolyCircuit, gate::GateId},
     matrix::PolyMatrix,
-    poly::Poly,
+    poly::{Poly, PolyParams},
 };
 use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use std::{fmt::Debug, hash::Hash, sync::Arc};
 
@@ -191,6 +192,68 @@ pub trait DecomposeArithmeticGadget<P: Poly>: ModularArithmeticGadget<P> {
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
     ) -> M;
+
+    fn gadget_constant_coeffs<M: PolyMatrix<P = P>>(
+        params: &P::Params,
+        ctx: &Self::Context,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Vec<BigUint> {
+        Self::gadget_matrix::<M>(params, ctx, enable_levels, level_offset)
+            .get_row(0)
+            .into_par_iter()
+            .map(|entry| entry.coeffs_biguints()[0].clone())
+            .collect()
+    }
+
+    fn gadget_decomposed_constant_tower_coeffs<M: PolyMatrix<P = P>>(
+        params: &P::Params,
+        ctx: &Self::Context,
+        constant: BigUint,
+        enable_levels: Option<usize>,
+        level_offset: Option<usize>,
+    ) -> Vec<Vec<u64>> {
+        let level_offset = level_offset.unwrap_or(0);
+        let active_levels = ctx.active_levels(enable_levels, Some(level_offset));
+        let active_q_moduli = params
+            .to_crt()
+            .0
+            .into_iter()
+            .skip(level_offset)
+            .take(active_levels)
+            .collect::<Vec<_>>();
+        let scaled_poly = P::from_biguint_to_constant(params, constant);
+        let decomposed = Self::gadget_decomposed::<M>(
+            params,
+            ctx,
+            &M::from_poly_vec_column(params, vec![scaled_poly]),
+            enable_levels,
+            Some(level_offset),
+        );
+        let (rows, cols) = decomposed.size();
+        assert_eq!(cols, 1, "gadget decomposition of a constant must have one column");
+        assert_eq!(
+            rows,
+            active_levels * ctx.decomposition_len(),
+            "gadget decomposition row count mismatch"
+        );
+        decomposed
+            .get_column(0)
+            .into_iter()
+            .map(|entry| {
+                let coeff = entry.coeffs_biguints()[0].clone();
+                active_q_moduli
+                    .iter()
+                    .copied()
+                    .map(|q_i| {
+                        (&coeff % BigUint::from(q_i))
+                            .to_u64()
+                            .expect("gadget decomposition residue must fit in u64")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
 
     fn gadget_decomposition_norm_bound(
         ctx: &Self::Context,

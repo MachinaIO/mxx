@@ -23,7 +23,7 @@
 //! `PolyCircuit` is deeper than the abstract Boolean circuit. The implementation therefore keeps
 //! XOR composition balanced instead of chaining it left-to-right.
 use crate::{
-    circuit::{BatchedWire, PolyCircuit},
+    circuit::{BatchedWire, PolyCircuit, gate::GateId},
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
         fhe::{
@@ -31,10 +31,13 @@ use crate::{
             ring_gsw_nested_rns::NestedRnsRingGswCiphertext,
         },
     },
+    matrix::PolyMatrix,
     poly::Poly,
 };
 use digest::Digest;
 use keccak_asm::Keccak256;
+use num_bigint::BigUint;
+use num_traits::Zero;
 use rayon::prelude::*;
 use std::{collections::HashSet, sync::Arc};
 use tracing::debug;
@@ -124,6 +127,46 @@ impl GoldreichGraphGeneration {
     }
 }
 
+/// Returns whether a Goldreich/TSA PRG output length satisfies `m < n^1.4`.
+///
+/// The comparison is evaluated exactly as `m^5 < n^7` to avoid floating-point rounding at the
+/// boundary.
+pub fn goldreich_output_bound_holds(input_size: usize, output_size: usize) -> bool {
+    if input_size < 5 || output_size == 0 {
+        return false;
+    }
+    let output = BigUint::from(output_size);
+    let input = BigUint::from(input_size);
+    output.pow(5) < input.pow(7)
+}
+
+/// Asserts the Goldreich/TSA PRG output-length bound for a named construction site.
+pub fn assert_goldreich_output_bound(input_size: usize, output_size: usize, context: &str) {
+    assert!(
+        goldreich_output_bound_holds(input_size, output_size),
+        "{context} violates Goldreich PRG safety bound m < n^1.4: input_size={input_size}, output_size={output_size}"
+    );
+}
+
+/// Returns the smallest Goldreich/TSA input size `n` satisfying `output_size < n^1.4`.
+pub fn minimum_goldreich_input_size(output_size: usize) -> usize {
+    assert!(output_size > 0, "Goldreich PRG output_size must be positive");
+    let mut high = 5usize;
+    while !goldreich_output_bound_holds(high, output_size) {
+        high = high.checked_mul(2).expect("Goldreich minimum input size search overflow");
+    }
+    let mut low = 5usize;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if goldreich_output_bound_holds(mid, output_size) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    low
+}
+
 /// One public Goldreich/TSA predicate edge.
 ///
 /// The role split is preserved explicitly:
@@ -195,6 +238,103 @@ pub struct GoldreichGraph {
     pub generation: GoldreichGraphGeneration,
 }
 
+/// Stateful generator for contiguous chunks of one full-domain Goldreich graph.
+///
+/// It preserves the exact duplicate-rejection state of full graph generation while allowing callers
+/// to stream chunks without holding every edge or replaying earlier prefixes for each chunk.
+pub struct GoldreichFullDomainRangeGenerator {
+    input_size: usize,
+    conceptual_output_size: usize,
+    full_range_seed: [u8; 32],
+    generation: GoldreichGraphGeneration,
+    stream: GraphSeedStream,
+    accepted_count: usize,
+    seen_role_keys: HashSet<GoldreichEdgeKey>,
+    seen_vertex_sets: Option<HashSet<[usize; 5]>>,
+}
+
+impl GoldreichFullDomainRangeGenerator {
+    pub fn new(
+        input_size: usize,
+        conceptual_output_size: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
+        validate_graph_dimensions(input_size, conceptual_output_size);
+        assert_goldreich_output_bound(
+            input_size,
+            conceptual_output_size,
+            "Goldreich full-domain range generator",
+        );
+        let capacity = generation.max_unique_edges(input_size);
+        assert!(
+            (conceptual_output_size as u128) <= capacity,
+            "requested conceptual Goldreich graph output size {} exceeds unique-edge capacity {} for input_size={input_size}",
+            conceptual_output_size,
+            capacity
+        );
+        let full_range_seed =
+            derive_range_graph_seed(graph_seed, conceptual_output_size, 0, conceptual_output_size);
+        Self {
+            input_size,
+            conceptual_output_size,
+            full_range_seed,
+            generation,
+            stream: GraphSeedStream::new(full_range_seed),
+            accepted_count: 0,
+            seen_role_keys: HashSet::new(),
+            seen_vertex_sets: if generation.reject_same_vertex_set {
+                Some(HashSet::new())
+            } else {
+                None
+            },
+        }
+    }
+
+    pub fn next_range(&mut self, range_start: usize, range_len: usize) -> GoldreichGraph {
+        assert!(range_len > 0, "Goldreich graph output range length must be positive");
+        assert!(
+            range_start >= self.accepted_count,
+            "Goldreich full-domain range generator only supports forward ranges"
+        );
+        let range_end =
+            range_start.checked_add(range_len).expect("Goldreich graph output range end overflow");
+        assert!(
+            range_end <= self.conceptual_output_size,
+            "Goldreich graph output range [{range_start}, {range_end}) exceeds conceptual output size {}",
+            self.conceptual_output_size
+        );
+
+        while self.accepted_count < range_start {
+            sample_next_unique_edge(
+                self.input_size,
+                &mut self.stream,
+                &mut self.seen_role_keys,
+                &mut self.seen_vertex_sets,
+            );
+            self.accepted_count += 1;
+        }
+
+        let mut edges = Vec::with_capacity(range_len);
+        while self.accepted_count < range_end {
+            edges.push(sample_next_unique_edge(
+                self.input_size,
+                &mut self.stream,
+                &mut self.seen_role_keys,
+                &mut self.seen_vertex_sets,
+            ));
+            self.accepted_count += 1;
+        }
+
+        GoldreichGraph {
+            input_size: self.input_size,
+            edges,
+            graph_seed: Some(self.full_range_seed),
+            generation: self.generation,
+        }
+    }
+}
+
 impl GoldreichGraph {
     /// Deterministically generates a public Goldreich graph from `graph_seed`.
     ///
@@ -209,7 +349,26 @@ impl GoldreichGraph {
         graph_seed: [u8; 32],
         generation: GoldreichGraphGeneration,
     ) -> Self {
+        Self::generate_with_output_bound_check(
+            input_size,
+            output_size,
+            graph_seed,
+            generation,
+            true,
+        )
+    }
+
+    fn generate_with_output_bound_check(
+        input_size: usize,
+        output_size: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+        enforce_output_bound: bool,
+    ) -> Self {
         validate_graph_dimensions(input_size, output_size);
+        if enforce_output_bound {
+            assert_goldreich_output_bound(input_size, output_size, "Goldreich graph generation");
+        }
         let capacity = generation.max_unique_edges(input_size);
         assert!(
             (output_size as u128) <= capacity,
@@ -228,30 +387,12 @@ impl GoldreichGraph {
         };
 
         while edges.len() < output_size {
-            let mut sampled = Vec::with_capacity(5);
-            while sampled.len() < 5 {
-                let candidate = stream.sample_below(input_size);
-                if sampled.contains(&candidate) {
-                    continue;
-                }
-                sampled.push(candidate);
-            }
-
-            let edge =
-                GoldreichEdge::new([sampled[0], sampled[1], sampled[2]], [sampled[3], sampled[4]]);
-            let role_aware_key = edge.role_aware_key();
-            if seen_role_keys.contains(&role_aware_key) {
-                continue;
-            }
-            if let Some(seen_vertex_sets) = seen_vertex_sets.as_mut() {
-                let same_vertex_set_key = edge.same_vertex_set_key();
-                if seen_vertex_sets.contains(&same_vertex_set_key) {
-                    continue;
-                }
-                seen_vertex_sets.insert(same_vertex_set_key);
-            }
-            seen_role_keys.insert(role_aware_key);
-            edges.push(edge);
+            edges.push(sample_next_unique_edge(
+                input_size,
+                &mut stream,
+                &mut seen_role_keys,
+                &mut seen_vertex_sets,
+            ));
         }
 
         Self { input_size, edges, graph_seed: Some(graph_seed), generation }
@@ -279,7 +420,53 @@ impl GoldreichGraph {
         graph_seed: [u8; 32],
         generation: GoldreichGraphGeneration,
     ) -> Self {
+        Self::generate_range_with_output_bound_check(
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            generation,
+            true,
+        )
+    }
+
+    pub(crate) fn generate_range_without_output_bound(
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
+        Self::generate_range_with_output_bound_check(
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            generation,
+            false,
+        )
+    }
+
+    fn generate_range_with_output_bound_check(
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+        enforce_output_bound: bool,
+    ) -> Self {
         validate_graph_dimensions(input_size, conceptual_output_size);
+        if enforce_output_bound {
+            assert_goldreich_output_bound(
+                input_size,
+                conceptual_output_size,
+                "Goldreich range graph generation",
+            );
+        }
         assert!(range_len > 0, "Goldreich graph output range length must be positive");
         let range_end =
             range_start.checked_add(range_len).expect("Goldreich graph output range end overflow");
@@ -289,7 +476,57 @@ impl GoldreichGraph {
         );
         let range_seed =
             derive_range_graph_seed(graph_seed, conceptual_output_size, range_start, range_len);
-        Self::generate(input_size, range_len, range_seed, generation)
+        Self::generate_with_output_bound_check(
+            input_size,
+            range_len,
+            range_seed,
+            generation,
+            enforce_output_bound,
+        )
+    }
+
+    /// Generates one interval using the same public graph domain as the full conceptual range.
+    ///
+    /// This is more expensive than [`generate_range`] because it replays full-range generation up
+    /// to `range_start + range_len`, including duplicate-rejection state. It is needed when a
+    /// caller persists artifacts against the full-range graph and later wants to evaluate only one
+    /// contiguous output chunk without changing the graph semantics.
+    pub fn generate_full_domain_range(
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
+        validate_graph_dimensions(input_size, conceptual_output_size);
+        assert_goldreich_output_bound(
+            input_size,
+            conceptual_output_size,
+            "Goldreich full-domain range graph generation",
+        );
+        assert!(range_len > 0, "Goldreich graph output range length must be positive");
+        let range_end =
+            range_start.checked_add(range_len).expect("Goldreich graph output range end overflow");
+        assert!(
+            range_end <= conceptual_output_size,
+            "Goldreich graph output range [{range_start}, {range_end}) exceeds conceptual output size {conceptual_output_size}"
+        );
+        let capacity = generation.max_unique_edges(input_size);
+        assert!(
+            (conceptual_output_size as u128) <= capacity,
+            "requested conceptual Goldreich graph output size {} exceeds unique-edge capacity {} for input_size={input_size}",
+            conceptual_output_size,
+            capacity
+        );
+
+        GoldreichFullDomainRangeGenerator::new(
+            input_size,
+            conceptual_output_size,
+            graph_seed,
+            generation,
+        )
+        .next_range(range_start, range_len)
     }
 
     /// Validates an explicit public Goldreich graph against the same invariants as [`generate`].
@@ -303,6 +540,7 @@ impl GoldreichGraph {
         generation: GoldreichGraphGeneration,
     ) -> Self {
         validate_graph_dimensions(input_size, edges.len());
+        assert_goldreich_output_bound(input_size, edges.len(), "explicit Goldreich graph");
         let capacity = generation.max_unique_edges(input_size);
         assert!(
             (edges.len() as u128) <= capacity,
@@ -443,10 +681,113 @@ where
         graph_seed: [u8; 32],
         generation: GoldreichGraphGeneration,
     ) -> Self {
+        Self::setup_range_with_output_bound_check(
+            circuit,
+            ring_gsw,
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            generation,
+            true,
+        )
+    }
+
+    pub(crate) fn setup_range_without_output_bound(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+    ) -> Self {
+        Self::setup_range_with_output_bound_check(
+            circuit,
+            ring_gsw,
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            GoldreichGraphGeneration::default(),
+            false,
+        )
+    }
+
+    fn setup_range_with_output_bound_check(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+        enforce_output_bound: bool,
+    ) -> Self {
+        Self::from_public_graph_with_output_bound_check(
+            circuit,
+            ring_gsw,
+            if enforce_output_bound {
+                GoldreichGraph::generate_range(
+                    input_size,
+                    conceptual_output_size,
+                    range_start,
+                    range_len,
+                    graph_seed,
+                    generation,
+                )
+            } else {
+                GoldreichGraph::generate_range_without_output_bound(
+                    input_size,
+                    conceptual_output_size,
+                    range_start,
+                    range_len,
+                    graph_seed,
+                    generation,
+                )
+            },
+            enforce_output_bound,
+        )
+    }
+
+    pub fn setup_full_domain_range(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+    ) -> Self {
+        Self::setup_full_domain_range_with_options(
+            circuit,
+            ring_gsw,
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            GoldreichGraphGeneration::default(),
+        )
+    }
+
+    pub fn setup_full_domain_range_with_options(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        generation: GoldreichGraphGeneration,
+    ) -> Self {
         Self::from_public_graph(
             circuit,
             ring_gsw,
-            GoldreichGraph::generate_range(
+            GoldreichGraph::generate_full_domain_range(
                 input_size,
                 conceptual_output_size,
                 range_start,
@@ -460,12 +801,24 @@ where
     /// Builds the PRG from an already validated public graph instead of generating one from a
     /// `graph_seed`.
     pub fn from_public_graph(
-        _circuit: &mut PolyCircuit<P>,
+        circuit: &mut PolyCircuit<P>,
         ring_gsw: Arc<C::Context>,
         public_graph: GoldreichGraph,
     ) -> Self {
+        Self::from_public_graph_with_output_bound_check(circuit, ring_gsw, public_graph, true)
+    }
+
+    fn from_public_graph_with_output_bound_check(
+        _circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        public_graph: GoldreichGraph,
+        enforce_output_bound: bool,
+    ) -> Self {
         let input_size = public_graph.input_size;
         let output_size = public_graph.output_size();
+        if enforce_output_bound {
+            assert_goldreich_output_bound(input_size, output_size, "explicit Goldreich graph");
+        }
         Self { ring_gsw, input_size, output_size, public_graph }
     }
 
@@ -539,6 +892,151 @@ where
     }
 }
 
+/// Adds a nonempty list of scalar wires with a balanced ordinary-addition tree.
+pub(crate) fn sum_gate_ids<P: Poly>(circuit: &mut PolyCircuit<P>, values: &[GateId]) -> GateId {
+    assert!(!values.is_empty(), "at least one gate is required");
+    let mut layer = values.to_vec();
+    while layer.len() > 1 {
+        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
+        let mut chunks = layer.chunks_exact(2);
+        for pair in &mut chunks {
+            next.push(circuit.add_gate(pair[0], pair[1]).as_single_wire());
+        }
+        if let Some(&carry) = chunks.remainder().first() {
+            next.push(carry);
+        }
+        layer = next;
+    }
+    layer[0]
+}
+
+/// Homomorphically evaluates a selected interval of a conceptual Goldreich PRG output.
+///
+/// This helper centralizes the common `setup_range` followed by `evaluate_uniform` pattern used by
+/// callers that only need a contiguous subset of a larger conceptual Goldreich output stream.  The
+/// returned ciphertexts stay encrypted; callers that need a decoded scalar should evaluate this
+/// circuit first, then feed the resulting ciphertexts into
+/// [`decrypt_bit_decomposed_scalar_outputs`] in a separate runtime-safe decrypt circuit.
+pub fn evaluate_goldreich_uniform_range<P, A>(
+    circuit: &mut PolyCircuit<P>,
+    ring_gsw: Arc<RingGswContext<P, A>>,
+    encrypted_seeds: &[RingGswCiphertext<P, A>],
+    conceptual_output_bits: usize,
+    range_start: usize,
+    range_len: usize,
+    graph_seed: [u8; 32],
+) -> Vec<RingGswCiphertext<P, A>>
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+{
+    let goldreich = GoldreichFhePrg::setup_range(
+        circuit,
+        ring_gsw,
+        encrypted_seeds.len(),
+        conceptual_output_bits,
+        range_start,
+        range_len,
+        graph_seed,
+    );
+    goldreich.evaluate_uniform(encrypted_seeds, circuit)
+}
+
+pub(crate) fn evaluate_goldreich_uniform_range_without_output_bound<P, A>(
+    circuit: &mut PolyCircuit<P>,
+    ring_gsw: Arc<RingGswContext<P, A>>,
+    encrypted_seeds: &[RingGswCiphertext<P, A>],
+    conceptual_output_bits: usize,
+    range_start: usize,
+    range_len: usize,
+    graph_seed: [u8; 32],
+) -> Vec<RingGswCiphertext<P, A>>
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+{
+    let goldreich = GoldreichFhePrg::setup_range_without_output_bound(
+        circuit,
+        ring_gsw,
+        encrypted_seeds.len(),
+        conceptual_output_bits,
+        range_start,
+        range_len,
+        graph_seed,
+    );
+    goldreich.evaluate_uniform(encrypted_seeds, circuit)
+}
+
+/// Homomorphically evaluates a selected interval using the full-range graph domain.
+///
+/// Unlike [`evaluate_goldreich_uniform_range`], this helper produces the same public edges as
+/// evaluating the full conceptual range and slicing `[range_start, range_start + range_len)`. It
+/// avoids retaining the full output vector, but it still replays graph generation up to the end of
+/// the requested range so persisted public-key artifacts and online encodings stay aligned.
+pub fn evaluate_goldreich_uniform_full_domain_range<P, A>(
+    circuit: &mut PolyCircuit<P>,
+    ring_gsw: Arc<RingGswContext<P, A>>,
+    encrypted_seeds: &[RingGswCiphertext<P, A>],
+    conceptual_output_bits: usize,
+    range_start: usize,
+    range_len: usize,
+    graph_seed: [u8; 32],
+) -> Vec<RingGswCiphertext<P, A>>
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+{
+    let goldreich = GoldreichFhePrg::setup_full_domain_range(
+        circuit,
+        ring_gsw,
+        encrypted_seeds.len(),
+        conceptual_output_bits,
+        range_start,
+        range_len,
+        graph_seed,
+    );
+    goldreich.evaluate_uniform(encrypted_seeds, circuit)
+}
+
+/// Decrypts encrypted Boolean bits and returns their binary linear recomposition.
+///
+/// Bit `j` is decrypted with `plaintext_moduli[j]`.  The Ring-GSW plaintext modulus selection is
+/// responsible for making that decrypt contribute the intended binary weight, so the circuit only
+/// needs to add the decrypted terms.  This is the scalar counterpart of the bit-decomposed
+/// polynomial mask decode used by noise refresh.
+pub fn decrypt_bit_decomposed_scalar_outputs<P, A, M>(
+    circuit: &mut PolyCircuit<P>,
+    encrypted_bits: &[RingGswCiphertext<P, A>],
+    decryption_key: GateId,
+    plaintext_moduli: &[BigUint],
+) -> GateId
+where
+    P: Poly + 'static,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+    M: PolyMatrix<P = P>,
+{
+    assert!(!encrypted_bits.is_empty(), "at least one encrypted bit is required");
+    assert_eq!(
+        encrypted_bits.len(),
+        plaintext_moduli.len(),
+        "encrypted scalar bit count must match plaintext modulus count"
+    );
+    assert!(
+        plaintext_moduli.iter().all(|modulus| !modulus.is_zero()),
+        "all bit plaintext moduli must be positive"
+    );
+    let bit_terms = encrypted_bits
+        .iter()
+        .zip(plaintext_moduli.iter())
+        .map(|(encrypted_bit, plaintext_modulus)| {
+            encrypted_bit
+                .decrypt::<M>(decryption_key, plaintext_modulus.clone(), circuit)
+                .add_in_circuit(circuit)
+        })
+        .collect::<Vec<_>>();
+    sum_gate_ids(circuit, &bit_terms)
+}
+
 /// Fixed-`n` CBD-style error evaluator built from setup-time Goldreich uniform samplers.
 ///
 /// The wrapped [`GoldreichFhePrg`] remains responsible for evaluating one public Goldreich graph
@@ -593,6 +1091,11 @@ where
         generation: GoldreichGraphGeneration,
     ) -> Self {
         assert!(cbd_n > 0, "Goldreich CBD evaluator requires cbd_n > 0");
+        assert_goldreich_output_bound(
+            input_size,
+            goldreich_cbd_uniform_output_bits(output_size, cbd_n),
+            "Goldreich CBD evaluator",
+        );
         let uniform_prg = GoldreichFhePrg::setup_with_options(
             circuit,
             ring_gsw,
@@ -648,8 +1151,65 @@ where
         cbd_n: usize,
         generation: GoldreichGraphGeneration,
     ) -> Self {
+        Self::setup_range_with_output_bound_check(
+            circuit,
+            ring_gsw,
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            cbd_n,
+            generation,
+            true,
+        )
+    }
+
+    pub(crate) fn setup_range_without_output_bound(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        cbd_n: usize,
+    ) -> Self {
+        Self::setup_range_with_output_bound_check(
+            circuit,
+            ring_gsw,
+            input_size,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            cbd_n,
+            GoldreichGraphGeneration::default(),
+            false,
+        )
+    }
+
+    fn setup_range_with_output_bound_check(
+        circuit: &mut PolyCircuit<P>,
+        ring_gsw: Arc<C::Context>,
+        input_size: usize,
+        conceptual_output_size: usize,
+        range_start: usize,
+        range_len: usize,
+        graph_seed: [u8; 32],
+        cbd_n: usize,
+        generation: GoldreichGraphGeneration,
+        enforce_output_bound: bool,
+    ) -> Self {
         assert!(cbd_n > 0, "Goldreich CBD evaluator requires cbd_n > 0");
-        let uniform_prg = GoldreichFhePrg::setup_range_with_options(
+        if enforce_output_bound {
+            assert_goldreich_output_bound(
+                input_size,
+                goldreich_cbd_uniform_output_bits(conceptual_output_size, cbd_n),
+                "Goldreich CBD range evaluator",
+            );
+        }
+        let uniform_prg = GoldreichFhePrg::setup_range_with_output_bound_check(
             circuit,
             ring_gsw,
             input_size,
@@ -658,6 +1218,7 @@ where
             range_len,
             graph_seed,
             generation,
+            enforce_output_bound,
         );
         let uniform_graphs = derive_distinct_goldreich_graph_ranges(
             input_size,
@@ -667,6 +1228,7 @@ where
             graph_seed,
             generation,
             2 * cbd_n,
+            enforce_output_bound,
         );
         let (cbd_prf_sub_circuit, cbd_output_templates) =
             goldreich_cbd_prf_sub_circuit(&uniform_prg, &uniform_graphs, cbd_n, circuit);
@@ -702,6 +1264,47 @@ where
 fn validate_graph_dimensions(input_size: usize, output_size: usize) {
     assert!(input_size >= 5, "Goldreich graph input_size must be at least 5");
     assert!(output_size > 0, "Goldreich graph output_size must be positive");
+}
+
+fn goldreich_cbd_uniform_output_bits(output_size: usize, cbd_n: usize) -> usize {
+    output_size
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(cbd_n))
+        .expect("Goldreich CBD uniform output size overflow")
+}
+
+fn sample_next_unique_edge(
+    input_size: usize,
+    stream: &mut GraphSeedStream,
+    seen_role_keys: &mut HashSet<GoldreichEdgeKey>,
+    seen_vertex_sets: &mut Option<HashSet<[usize; 5]>>,
+) -> GoldreichEdge {
+    loop {
+        let mut sampled = Vec::with_capacity(5);
+        while sampled.len() < 5 {
+            let candidate = stream.sample_below(input_size);
+            if sampled.contains(&candidate) {
+                continue;
+            }
+            sampled.push(candidate);
+        }
+
+        let edge =
+            GoldreichEdge::new([sampled[0], sampled[1], sampled[2]], [sampled[3], sampled[4]]);
+        let role_aware_key = edge.role_aware_key();
+        if seen_role_keys.contains(&role_aware_key) {
+            continue;
+        }
+        if let Some(seen_vertex_sets) = seen_vertex_sets.as_mut() {
+            let same_vertex_set_key = edge.same_vertex_set_key();
+            if seen_vertex_sets.contains(&same_vertex_set_key) {
+                continue;
+            }
+            seen_vertex_sets.insert(same_vertex_set_key);
+        }
+        seen_role_keys.insert(role_aware_key);
+        return edge;
+    }
 }
 
 fn derive_range_graph_seed(
@@ -867,19 +1470,31 @@ fn derive_distinct_goldreich_graph_ranges(
     graph_seed: [u8; 32],
     generation: GoldreichGraphGeneration,
     sample_count: usize,
+    enforce_output_bound: bool,
 ) -> Vec<GoldreichGraph> {
     let mut graphs = Vec::with_capacity(sample_count);
     let mut counter = 0u64;
     while graphs.len() < sample_count {
         let candidate_seed = derive_graph_seed(graph_seed, counter);
-        let candidate = GoldreichGraph::generate_range(
-            input_size,
-            conceptual_output_size,
-            range_start,
-            range_len,
-            candidate_seed,
-            generation,
-        );
+        let candidate = if enforce_output_bound {
+            GoldreichGraph::generate_range(
+                input_size,
+                conceptual_output_size,
+                range_start,
+                range_len,
+                candidate_seed,
+                generation,
+            )
+        } else {
+            GoldreichGraph::generate_range_without_output_bound(
+                input_size,
+                conceptual_output_size,
+                range_start,
+                range_len,
+                candidate_seed,
+                generation,
+            )
+        };
         counter = counter.wrapping_add(1);
         if graphs.iter().any(|existing| same_graph_structure(existing, &candidate)) {
             continue;
@@ -969,7 +1584,7 @@ mod tests {
         __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
-            arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPolyContext},
+            arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext},
             fhe::ring_gsw_nested_rns::{
                 NativeRingGswCiphertext, NestedRnsRingGswContext as RingGswContext,
                 ciphertext_from_outputs, ciphertext_inputs_from_native, decrypt_ciphertext,
@@ -977,6 +1592,7 @@ mod tests {
             },
         },
         lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
+        matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         slot_transfer::PolyVecSlotTransferEvaluator,
     };
@@ -1093,6 +1709,10 @@ mod tests {
         coeffs
     }
 
+    fn mask_plaintext_moduli_for_test(full_modulus: &BigUint, bit_size: usize) -> Vec<BigUint> {
+        (0..bit_size).map(|bit_idx| full_modulus >> bit_idx).collect()
+    }
+
     fn centered_mod_u64(value: i64, plaintext_modulus: u64) -> u64 {
         let modulus = plaintext_modulus as i64;
         value.rem_euclid(modulus) as u64
@@ -1135,7 +1755,7 @@ mod tests {
         params: &DCRTPolyParams,
         outputs: &[PolyVec<DCRTPoly>],
         width: usize,
-    ) -> Vec<NativeRingGswCiphertext> {
+    ) -> Vec<NativeRingGswCiphertext<DCRTPoly>> {
         let ciphertext_size = 2 * width;
         assert!(
             outputs.len().is_multiple_of(ciphertext_size),
@@ -1145,6 +1765,38 @@ mod tests {
             .par_chunks(ciphertext_size)
             .map(|chunk| ciphertext_from_outputs(params, chunk, width))
             .collect()
+    }
+
+    #[test]
+    fn test_goldreich_output_bound_uses_strict_seven_over_five() {
+        assert!(goldreich_output_bound_holds(5, 9));
+        assert!(!goldreich_output_bound_holds(5, 10));
+        assert_eq!(minimum_goldreich_input_size(9), 5);
+        assert_eq!(minimum_goldreich_input_size(10), 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "violates Goldreich PRG safety bound")]
+    fn test_goldreich_graph_generation_rejects_unsafe_output_size() {
+        let _ = GoldreichGraph::generate(
+            5,
+            10,
+            sample_graph_seed(),
+            GoldreichGraphGeneration::default(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "violates Goldreich PRG safety bound")]
+    fn test_goldreich_range_generation_checks_conceptual_output_size() {
+        let _ = GoldreichGraph::generate_range(
+            5,
+            10,
+            0,
+            1,
+            sample_graph_seed(),
+            GoldreichGraphGeneration::default(),
+        );
     }
 
     #[test]
@@ -1160,12 +1812,10 @@ mod tests {
     fn test_goldreich_graph_range_depends_on_start_without_generating_full_prefix() {
         let graph_seed = sample_graph_seed();
         let options = GoldreichGraphGeneration::default();
-        let first_range =
-            GoldreichGraph::generate_range(10, 1_000_000, 300_000, 4, graph_seed, options);
+        let first_range = GoldreichGraph::generate_range(10, 24, 3, 4, graph_seed, options);
         let repeated_first_range =
-            GoldreichGraph::generate_range(10, 1_000_000, 300_000, 4, graph_seed, options);
-        let second_range =
-            GoldreichGraph::generate_range(10, 1_000_000, 700_000, 4, graph_seed, options);
+            GoldreichGraph::generate_range(10, 24, 3, 4, graph_seed, options);
+        let second_range = GoldreichGraph::generate_range(10, 24, 15, 4, graph_seed, options);
 
         assert_eq!(first_range, repeated_first_range);
         assert_eq!(first_range.edges.len(), 4);
@@ -1173,6 +1823,53 @@ mod tests {
         assert_ne!(
             first_range.edges, second_range.edges,
             "same-width ranges at different starts must use different Goldreich edges"
+        );
+    }
+
+    #[test]
+    fn test_goldreich_graph_full_domain_range_matches_full_range_slice() {
+        let graph_seed = sample_graph_seed();
+        let options = GoldreichGraphGeneration::default();
+        let conceptual_output_size = 32usize;
+        let full_range_seed =
+            derive_range_graph_seed(graph_seed, conceptual_output_size, 0, conceptual_output_size);
+        let full = GoldreichGraph::generate(12, conceptual_output_size, full_range_seed, options);
+        let range_start = 11usize;
+        let range_len = 7usize;
+        let chunk = GoldreichGraph::generate_full_domain_range(
+            12,
+            conceptual_output_size,
+            range_start,
+            range_len,
+            graph_seed,
+            options,
+        );
+
+        assert_eq!(
+            chunk.edges,
+            full.edges[range_start..range_start + range_len],
+            "full-domain range generation must match the corresponding full-range graph slice"
+        );
+
+        let mut generator =
+            GoldreichFullDomainRangeGenerator::new(12, conceptual_output_size, graph_seed, options);
+        let first_chunk = generator.next_range(0, 5);
+        let second_chunk = generator.next_range(5, 9);
+        let later_chunk = generator.next_range(20, 4);
+        assert_eq!(
+            first_chunk.edges,
+            full.edges[0..5],
+            "stateful full-domain streaming must start from the full graph prefix"
+        );
+        assert_eq!(
+            second_chunk.edges,
+            full.edges[5..14],
+            "stateful full-domain streaming must preserve duplicate-rejection state across adjacent chunks"
+        );
+        assert_eq!(
+            later_chunk.edges,
+            full.edges[20..24],
+            "stateful full-domain streaming must preserve duplicate-rejection state while skipping forward"
         );
     }
 
@@ -1304,7 +2001,7 @@ mod tests {
         );
         reconstructed_ciphertexts.par_iter().zip(expected_bits.par_iter()).enumerate().for_each(
             |(idx, (ciphertext, expected_bit))| {
-                let decrypted = decrypt_ciphertext(
+                let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
                     &params,
                     ring_gsw.nested_rns.as_ref(),
                     ciphertext,
@@ -1320,12 +2017,174 @@ mod tests {
         );
     }
 
+    #[sequential_test::sequential]
+    #[test]
+    fn test_evaluate_goldreich_uniform_range_decrypts_to_plaintext_range_reference() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ring_gsw) = create_test_context(&mut circuit);
+        let graph_seed = sample_graph_seed();
+        let input_size = 6usize;
+        let conceptual_output_bits = 8usize;
+        let range_start = 3usize;
+        let range_len = 2usize;
+        let encrypted_inputs = (0..input_size)
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let encrypted_outputs = evaluate_goldreich_uniform_range(
+            &mut circuit,
+            ring_gsw.clone(),
+            &encrypted_inputs,
+            conceptual_output_bits,
+            range_start,
+            range_len,
+            graph_seed,
+        );
+        let reconstructed_outputs = encrypted_outputs
+            .iter()
+            .flat_map(|ciphertext| ciphertext.reconstruct(&mut circuit))
+            .collect::<Vec<_>>();
+        circuit.output(reconstructed_outputs);
+
+        let plaintext_modulus = 2u64;
+        let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let public_key = sample_public_key(
+            &params,
+            ring_gsw.width(),
+            &secret_key,
+            public_key_hash_key,
+            b"goldreich_uniform_range_public_key",
+            None,
+        );
+        let plaintext_inputs = sample_binary_vector(input_size);
+        let expected_graph = GoldreichGraph::generate_range(
+            input_size,
+            conceptual_output_bits,
+            range_start,
+            range_len,
+            graph_seed,
+            GoldreichGraphGeneration::default(),
+        );
+        let expected_bits = evaluate_plaintext_goldreich(&expected_graph, &plaintext_inputs);
+        let native_inputs = plaintext_inputs
+            .par_iter()
+            .map(|bit| {
+                encrypt_plaintext_bit(&params, ring_gsw.nested_rns.as_ref(), &public_key, *bit != 0)
+            })
+            .collect::<Vec<_>>();
+
+        let circuit_inputs = native_inputs
+            .iter()
+            .flat_map(|ciphertext| {
+                ciphertext_inputs_from_native(
+                    &params,
+                    ring_gsw.nested_rns.as_ref(),
+                    ciphertext,
+                    0,
+                    Some(ring_gsw.active_levels),
+                )
+            })
+            .collect::<Vec<_>>();
+        let outputs = eval_outputs(&params, &circuit, circuit_inputs);
+        let reconstructed_ciphertexts =
+            ciphertexts_from_outputs(&params, &outputs, ring_gsw.width());
+        let q_modulus = BigUint::from(ring_gsw.nested_rns.q_moduli()[0]);
+
+        assert_eq!(
+            reconstructed_ciphertexts.len(),
+            range_len,
+            "range helper must reconstruct one ciphertext per selected Goldreich output bit"
+        );
+        reconstructed_ciphertexts
+            .par_iter()
+            .zip(expected_bits.par_iter())
+            .enumerate()
+            .for_each(|(idx, (ciphertext, expected_bit))| {
+                let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
+                    &params,
+                    ring_gsw.nested_rns.as_ref(),
+                    ciphertext,
+                    &secret_key,
+                    plaintext_modulus,
+                );
+                assert_eq!(
+                    rounded_coeffs(&decrypted, plaintext_modulus, &q_modulus),
+                    expected_coeffs(*expected_bit),
+                    "Goldreich range helper output bit {idx} must decrypt to the plaintext range reference"
+                );
+            });
+    }
+
+    #[test]
+    fn test_decrypt_bit_decomposed_scalar_outputs_recomposes_binary_sum() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, ring_gsw) = create_test_context(&mut circuit);
+        let bit_size = 2usize;
+        let encrypted_bits = (0..bit_size)
+            .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let secret_key_wire = circuit.input(1).at(0).as_single_wire();
+        let q_modulus = BigUint::from(ring_gsw.nested_rns.q_moduli()[0]);
+        let plaintext_moduli = mask_plaintext_moduli_for_test(&q_modulus, bit_size);
+        let decrypted_mask =
+            decrypt_bit_decomposed_scalar_outputs::<
+                DCRTPoly,
+                NestedRnsPoly<DCRTPoly>,
+                DCRTPolyMatrix,
+            >(&mut circuit, &encrypted_bits, secret_key_wire, &plaintext_moduli);
+        circuit.output(vec![decrypted_mask]);
+
+        let secret_key = sample_secret_key(&params);
+        let public_key_hash_key = sample_hash_key();
+        let public_key = sample_public_key(
+            &params,
+            ring_gsw.width(),
+            &secret_key,
+            public_key_hash_key,
+            b"goldreich_scalar_decrypt_public_key",
+            None,
+        );
+        let plaintext_bits = [1u64, 1u64];
+        let expected_mask =
+            plaintext_bits.iter().enumerate().map(|(bit_idx, bit)| bit << bit_idx).sum::<u64>();
+        let native_inputs = plaintext_bits
+            .iter()
+            .map(|bit| {
+                encrypt_plaintext_bit(&params, ring_gsw.nested_rns.as_ref(), &public_key, *bit != 0)
+            })
+            .collect::<Vec<_>>();
+        let mut circuit_inputs = native_inputs
+            .iter()
+            .flat_map(|ciphertext| {
+                ciphertext_inputs_from_native(
+                    &params,
+                    ring_gsw.nested_rns.as_ref(),
+                    ciphertext,
+                    0,
+                    Some(ring_gsw.active_levels),
+                )
+            })
+            .collect::<Vec<_>>();
+        circuit_inputs.push(PolyVec::new(vec![secret_key]));
+
+        let outputs = eval_outputs(&params, &circuit, circuit_inputs);
+        assert_eq!(
+            rounded_coeffs(
+                outputs[0].as_slice().first().expect("scalar helper must output one polynomial"),
+                q_modulus.to_u64().expect("test q modulus must fit in u64"),
+                &q_modulus,
+            ),
+            expected_coeffs(expected_mask),
+            "scalar decrypt helper must recompose bit ciphertexts as an ordinary binary integer"
+        );
+    }
+
     #[test]
     fn test_goldreich_cbd_prf_uses_distinct_uniform_graphs() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (_params, ring_gsw) = create_test_context(&mut circuit);
         let cbd_prf: GoldreichFheCbdPrg<DCRTPoly> =
-            GoldreichFheCbdPrg::setup(&mut circuit, ring_gsw, 5, 3, sample_graph_seed(), 2);
+            GoldreichFheCbdPrg::setup(&mut circuit, ring_gsw, 6, 3, sample_graph_seed(), 2);
 
         assert_eq!(
             cbd_prf.uniform_graphs().len(),
@@ -1343,6 +2202,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "violates Goldreich PRG safety bound")]
+    fn test_goldreich_cbd_prf_counts_all_uniform_branches_for_output_bound() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_params, ring_gsw) = create_test_context(&mut circuit);
+        let _ = GoldreichFheCbdPrg::<DCRTPoly>::setup(
+            &mut circuit,
+            ring_gsw,
+            5,
+            3,
+            sample_graph_seed(),
+            2,
+        );
     }
 
     #[sequential_test::sequential]
@@ -1418,7 +2292,7 @@ mod tests {
             .zip(expected_coefficients.par_iter())
             .enumerate()
             .for_each(|(idx, (ciphertext, expected))| {
-                let decrypted = decrypt_ciphertext(
+                let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
                     &params,
                     ring_gsw.nested_rns.as_ref(),
                     ciphertext,

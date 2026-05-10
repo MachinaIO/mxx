@@ -32,13 +32,14 @@ use std::{
 };
 
 use num_bigint::BigUint;
+use num_traits::{ToPrimitive, Zero};
 use rayon::prelude::*;
 use tracing::debug;
 
 use crate::{
     circuit::{
-        Evaluable, GroupedCallExecutionLayer, GroupedExecutionPlan, PolyCircuit, PolyGateType,
-        SubCircuitParamValue,
+        Evaluable, GroupedCallExecutionLayer, GroupedExecutionPlan, PolyCircuit, PolyGateKind,
+        PolyGateType, SubCircuitParamValue,
     },
     poly::Poly,
 };
@@ -59,9 +60,9 @@ struct PreparedBenchSummaryRequest<P: Poly> {
 
 #[derive(Debug, Default)]
 struct CachedSummaryAggregate {
-    total_time: f64,
+    total_time: BigUint,
     max_latency: f64,
-    total_parallelism: u128,
+    total_parallelism: BigUint,
     #[cfg(feature = "gpu")]
     peak_vram: usize,
 }
@@ -72,32 +73,39 @@ pub(crate) struct BenchOperationMeasurement {
     pub peak_vram: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CircuitBenchEstimate {
-    pub total_time: f64,
+    /// Total estimated work in nanoseconds.
+    pub total_time: BigUint,
     pub latency: f64,
-    pub max_parallelism: u128,
+    pub max_parallelism: BigUint,
     #[cfg(feature = "gpu")]
     pub peak_vram: usize,
 }
 
 impl CircuitBenchEstimate {
     pub(crate) fn new(total_time: f64, latency: f64) -> Self {
+        let total_time_nanos = seconds_to_nanos(total_time);
+        Self::from_nanos(total_time_nanos, latency)
+    }
+
+    pub(crate) fn from_nanos(total_time: BigUint, latency: f64) -> Self {
+        let latency_nanos = seconds_to_nanos(latency).max(BigUint::from(1u8));
         Self {
-            total_time,
+            total_time: total_time.clone(),
             latency,
-            max_parallelism: if total_time <= 0.0 || latency <= 0.0 {
-                0
+            max_parallelism: if total_time.is_zero() || latency <= 0.0 {
+                BigUint::zero()
             } else {
-                (total_time / latency).ceil() as u128
+                div_ceil_biguint(&total_time, &latency_nanos)
             },
             #[cfg(feature = "gpu")]
             peak_vram: 0,
         }
     }
 
-    pub(crate) fn with_max_parallelism(mut self, max_parallelism: u128) -> Self {
-        self.max_parallelism = max_parallelism;
+    pub(crate) fn with_max_parallelism<T: Into<BigUint>>(mut self, max_parallelism: T) -> Self {
+        self.max_parallelism = max_parallelism.into();
         self
     }
 
@@ -112,26 +120,39 @@ impl CircuitBenchEstimate {
         self
     }
 
-    fn parallelism_factor(&self) -> u128 {
-        self.max_parallelism
+    fn parallelism_factor(&self) -> BigUint {
+        self.max_parallelism.clone()
+    }
+
+    pub fn total_time_seconds(&self) -> f64 {
+        nanos_to_seconds(&self.total_time)
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CircuitBenchSummary {
-    pub total_time: f64,
+    /// Total estimated work in nanoseconds.
+    pub total_time: BigUint,
     pub latency: f64,
-    pub max_parallelism: u128,
+    pub max_parallelism: BigUint,
     #[cfg(feature = "gpu")]
     pub peak_vram: usize,
 }
 
 impl CircuitBenchSummary {
-    pub(crate) fn new(total_time: f64, latency: f64, max_parallelism: u128) -> Self {
+    pub(crate) fn new<T: Into<BigUint>>(total_time: f64, latency: f64, max_parallelism: T) -> Self {
+        Self::from_nanos(seconds_to_nanos(total_time), latency, max_parallelism)
+    }
+
+    pub(crate) fn from_nanos<T: Into<BigUint>>(
+        total_time: BigUint,
+        latency: f64,
+        max_parallelism: T,
+    ) -> Self {
         Self {
             total_time,
             latency,
-            max_parallelism,
+            max_parallelism: max_parallelism.into(),
             #[cfg(feature = "gpu")]
             peak_vram: 0,
         }
@@ -147,6 +168,73 @@ impl CircuitBenchSummary {
     pub(crate) fn with_peak_vram(self, _peak_vram: usize) -> Self {
         self
     }
+
+    pub fn total_time_seconds(&self) -> f64 {
+        nanos_to_seconds(&self.total_time)
+    }
+}
+
+/// Scale independent representative work while preserving representative latency.
+///
+/// This models work that can be split across enough independent devices or
+/// workers: total work and available parallelism grow with `count`, while the
+/// critical-path latency and peak per-device resource usage stay equal to the
+/// representative unit.
+pub(crate) fn scale_independent_estimate(
+    estimate: CircuitBenchEstimate,
+    count: usize,
+) -> CircuitBenchEstimate {
+    let count = BigUint::from(count);
+    let scaled =
+        CircuitBenchEstimate::from_nanos(estimate.total_time.clone() * &count, estimate.latency)
+            .with_max_parallelism(estimate.max_parallelism.clone() * count);
+    #[cfg(feature = "gpu")]
+    {
+        scaled.with_peak_vram(estimate.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        scaled
+    }
+}
+
+/// Scale an already-composed independent summary while preserving latency.
+pub(crate) fn scale_independent_summary(
+    summary: CircuitBenchSummary,
+    count: usize,
+) -> CircuitBenchSummary {
+    let count = BigUint::from(count);
+    let scaled = CircuitBenchSummary::from_nanos(
+        summary.total_time.clone() * &count,
+        summary.latency,
+        summary.max_parallelism.clone() * count,
+    );
+    #[cfg(feature = "gpu")]
+    {
+        scaled.with_peak_vram(summary.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        scaled
+    }
+}
+
+pub(crate) fn seconds_to_nanos(seconds: f64) -> BigUint {
+    assert!(seconds.is_finite(), "benchmark time must be finite");
+    assert!(seconds >= 0.0, "benchmark time must be non-negative");
+    BigUint::from((seconds * 1_000_000_000.0).ceil() as u128)
+}
+
+pub(crate) fn nanos_to_seconds(nanos: &BigUint) -> f64 {
+    nanos.to_f64().unwrap_or(f64::INFINITY) / 1_000_000_000.0
+}
+
+fn div_ceil_biguint(left: &BigUint, right: &BigUint) -> BigUint {
+    assert!(!right.is_zero(), "division by zero");
+    if left.is_zero() {
+        return BigUint::zero();
+    }
+    (left + right - BigUint::from(1u8)) / right
 }
 
 pub(crate) fn column_parallel_gate_estimate(
@@ -155,10 +243,11 @@ pub(crate) fn column_parallel_gate_estimate(
     rhs_column_count: usize,
 ) -> CircuitBenchEstimate {
     assert!(rhs_column_count > 0, "column-parallel gate estimates require at least one RHS column");
-    const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
     const NANOS_PER_SECOND_U128: u128 = 1_000_000_000;
 
-    let total_nanos = (total_time * NANOS_PER_SECOND).ceil() as u128;
+    let total_nanos = seconds_to_nanos(total_time)
+        .to_u128()
+        .expect("single gate benchmark time must fit u128 nanoseconds");
     let latency =
         total_nanos.div_ceil(rhs_column_count as u128) as f64 / NANOS_PER_SECOND_U128 as f64;
     CircuitBenchEstimate::new(total_time, latency)
@@ -170,7 +259,7 @@ fn bench_summary_cache_get(
     summary_cache: &BenchSummaryCache,
     cache_key: &BenchSummaryCacheKey,
 ) -> Option<CircuitBenchSummary> {
-    summary_cache.read().expect("bench summary cache read lock poisoned").get(cache_key).copied()
+    summary_cache.read().expect("bench summary cache read lock poisoned").get(cache_key).cloned()
 }
 
 fn bench_summary_cache_contains(
@@ -227,10 +316,7 @@ fn aggregate_cached_sub_summaries<P: Poly>(
         .reduce(CachedSummaryAggregate::default, |mut left, right| {
             left.total_time += right.total_time;
             left.max_latency = left.max_latency.max(right.max_latency);
-            left.total_parallelism = left
-                .total_parallelism
-                .checked_add(right.total_parallelism)
-                .expect("layer parallelism overflowed u128 while summing subcircuit requests");
+            left.total_parallelism += right.total_parallelism;
             #[cfg(feature = "gpu")]
             {
                 left.peak_vram = left.peak_vram.max(right.peak_vram);
@@ -241,9 +327,9 @@ fn aggregate_cached_sub_summaries<P: Poly>(
 
 #[derive(Debug, Default)]
 struct RegularGateAggregate {
-    total_time: f64,
+    total_time: BigUint,
     max_latency: f64,
-    total_parallelism: u128,
+    total_parallelism: BigUint,
     #[cfg(feature = "gpu")]
     peak_vram: usize,
 }
@@ -389,13 +475,56 @@ pub trait BenchEstimator<E: Evaluable> {
             "estimate_circuit_bench finished: circuit_ptr={}, outputs={}, total_time={:.6}, latency={:.6}, max_parallelism={}, cache_entries={}, elapsed_ms={:.3}",
             circuit as *const PolyCircuit<E::P> as usize,
             circuit.num_output(),
-            estimate.total_time,
+            estimate.total_time_seconds(),
             estimate.latency,
             estimate.max_parallelism,
             bench_summary_cache_len(&summary_cache),
             start.elapsed().as_secs_f64() * 1000.0
         );
         estimate
+    }
+}
+
+pub trait PublicKeyAuxBenchEstimator<P: Poly> {
+    fn estimate_public_lut_sample_aux_matrices_for_circuit(
+        &self,
+        params: &P::Params,
+        circuit: &PolyCircuit<P>,
+    ) -> SampleAuxBenchEstimate;
+}
+
+pub(crate) fn estimate_public_key_circuit_bench_with_aux<E, B>(
+    estimator: &B,
+    params: &<E::P as Poly>::Params,
+    circuit: &PolyCircuit<E::P>,
+) -> CircuitBenchSummary
+where
+    E: Evaluable,
+    B: BenchEstimator<E> + PublicKeyAuxBenchEstimator<E::P> + Sync,
+{
+    let circuit_eval = estimator.estimate_circuit_bench(circuit);
+    let aux = estimator.estimate_public_lut_sample_aux_matrices_for_circuit(params, circuit);
+    let aux_summary = aux.to_summary();
+    debug!(
+        public_lut_gate_count =
+            circuit.count_gates_by_type_vec().get(&PolyGateKind::PubLut).copied().unwrap_or(0),
+        public_lut_entry_count = circuit.total_registered_public_lut_entries(),
+        ?aux,
+        ?aux_summary,
+        "estimated public-key circuit Public LUT auxiliary sampling"
+    );
+    let summary = CircuitBenchSummary::from_nanos(
+        circuit_eval.total_time + aux_summary.total_time,
+        circuit_eval.latency + aux_summary.latency,
+        circuit_eval.max_parallelism.max(aux_summary.max_parallelism),
+    );
+    #[cfg(feature = "gpu")]
+    {
+        summary.with_peak_vram(circuit_eval.peak_vram.max(aux_summary.peak_vram))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        summary
     }
 }
 
@@ -416,7 +545,7 @@ where
             "estimate_circuit_bench cache hit: circuit_ptr={}, param_bindings={}, total_time={:.6}, latency={:.6}, max_parallelism={}",
             circuit_key.circuit_ptr,
             param_bindings.len(),
-            summary.total_time,
+            summary.total_time_seconds(),
             summary.latency,
             summary.max_parallelism
         );
@@ -424,7 +553,7 @@ where
     }
 
     let start = Instant::now();
-    let mut estimate = CircuitBenchSummary::new(0.0, 0.0, 0);
+    let mut estimate = CircuitBenchSummary::new(0.0, 0.0, 0u32);
     #[cfg(feature = "gpu")]
     let mut peak_vram = 0;
     let grouped_plan = circuit.grouped_execution_plan();
@@ -438,15 +567,12 @@ where
     );
     if !reachable_inputs.is_empty() {
         let input_estimate = estimator.estimate_input();
-        let input_count = reachable_inputs.len() as f64;
-        estimate.total_time += input_estimate.total_time * input_count;
+        let input_count = reachable_inputs.len();
+        estimate.total_time += input_estimate.total_time.clone() * BigUint::from(input_count);
         estimate.latency += input_estimate.latency;
-        estimate.max_parallelism = estimate.max_parallelism.max(
-            input_estimate
-                .parallelism_factor()
-                .checked_mul(reachable_inputs.len() as u128)
-                .expect("input parallelism overflowed u128 while scaling by input count"),
-        );
+        estimate.max_parallelism = estimate
+            .max_parallelism
+            .max(input_estimate.parallelism_factor() * BigUint::from(reachable_inputs.len()));
         #[cfg(feature = "gpu")]
         {
             peak_vram = peak_vram.max(input_estimate.peak_vram);
@@ -456,9 +582,9 @@ where
             circuit_key.circuit_ptr,
             param_bindings.len(),
             reachable_inputs.len(),
-            input_estimate.total_time * input_count,
+            nanos_to_seconds(&(input_estimate.total_time.clone() * BigUint::from(input_count))),
             input_estimate.latency,
-            estimate.total_time,
+            estimate.total_time_seconds(),
             estimate.latency,
             estimate.max_parallelism
         );
@@ -582,13 +708,10 @@ where
                             .map(|(gate_type, count)| {
                                 let gate_estimate =
                                     estimator.estimate_gate_bench_with_bindings(&gate_type, param_bindings);
-                                let gate_total_time = gate_estimate.total_time * count as f64;
-                                let gate_parallelism = gate_estimate
-                                    .parallelism_factor()
-                                    .checked_mul(count as u128)
-                                    .expect(
-                                        "layer parallelism overflowed u128 while scaling by gate count",
-                                    );
+                                let gate_total_time =
+                                    gate_estimate.total_time.clone() * BigUint::from(count);
+                                let gate_parallelism =
+                                    gate_estimate.parallelism_factor() * BigUint::from(count);
                                 debug!(
                                     "estimate_circuit_bench regular gate kind: circuit_ptr={}, param_bindings={}, layer_index={}, gate_type={:?}, count={}, gate_total_time={:.6}, gate_latency={:.6}, gate_parallelism={}",
                                     circuit_key.circuit_ptr,
@@ -596,7 +719,7 @@ where
                                     layer_idx,
                                     gate_type,
                                     count,
-                                    gate_total_time,
+                                    nanos_to_seconds(&gate_total_time),
                                     gate_estimate.latency,
                                     gate_parallelism
                                 );
@@ -611,12 +734,7 @@ where
                             .reduce(RegularGateAggregate::default, |mut left, right| {
                                 left.total_time += right.total_time;
                                 left.max_latency = left.max_latency.max(right.max_latency);
-                                left.total_parallelism = left
-                                    .total_parallelism
-                                    .checked_add(right.total_parallelism)
-                                    .expect(
-                                        "layer parallelism overflowed u128 while summing gate kinds",
-                                    );
+                                left.total_parallelism += right.total_parallelism;
                                 #[cfg(feature = "gpu")]
                                 {
                                     left.peak_vram = left.peak_vram.max(right.peak_vram);
@@ -634,11 +752,11 @@ where
             param_bindings.len(),
             layer_idx,
             direct_requests.len(),
-            direct_aggregate.total_time,
+            nanos_to_seconds(&direct_aggregate.total_time),
             direct_aggregate.max_latency,
             direct_aggregate.total_parallelism,
             summed_requests.len(),
-            summed_aggregate.total_time,
+            nanos_to_seconds(&summed_aggregate.total_time),
             summed_aggregate.max_latency,
             summed_aggregate.total_parallelism
         );
@@ -648,18 +766,16 @@ where
             .max_latency
             .max(summed_aggregate.max_latency)
             .max(regular_aggregate.max_latency);
-        let layer_parallelism = direct_aggregate
-            .total_parallelism
-            .checked_add(summed_aggregate.total_parallelism)
-            .expect("layer parallelism overflowed u128 while summing direct and summed subcircuit requests")
-            .max(regular_aggregate.total_parallelism)
-            ;
+        let sub_circuit_parallelism =
+            direct_aggregate.total_parallelism + summed_aggregate.total_parallelism;
+        let layer_parallelism =
+            sub_circuit_parallelism.max(regular_aggregate.total_parallelism.clone());
         #[cfg(feature = "gpu")]
         {
             peak_vram = peak_vram.max(direct_aggregate.peak_vram).max(summed_aggregate.peak_vram);
         }
 
-        estimate.total_time += regular_aggregate.total_time;
+        estimate.total_time += regular_aggregate.total_time.clone();
         #[cfg(feature = "gpu")]
         {
             peak_vram = peak_vram.max(regular_aggregate.peak_vram);
@@ -670,7 +786,7 @@ where
             param_bindings.len(),
             layer_idx,
             layer_regular_gate_total,
-            regular_aggregate.total_time,
+            nanos_to_seconds(&regular_aggregate.total_time),
             regular_aggregate.max_latency,
             regular_aggregate.total_parallelism
         );
@@ -681,7 +797,7 @@ where
             circuit_key.circuit_ptr,
             param_bindings.len(),
             layer_idx,
-            estimate.total_time,
+            estimate.total_time_seconds(),
             estimate.latency,
             estimate.max_parallelism,
             layer_start.elapsed().as_secs_f64() * 1000.0
@@ -703,12 +819,12 @@ where
         "estimate_circuit_bench cache store: circuit_ptr={}, param_bindings={}, total_time={:.6}, latency={:.6}, max_parallelism={}, elapsed_ms={:.3}",
         circuit_key.circuit_ptr,
         param_bindings.len(),
-        estimate.total_time,
+        estimate.total_time_seconds(),
         estimate.latency,
         estimate.max_parallelism,
         start.elapsed().as_secs_f64() * 1000.0
     );
-    bench_summary_cache_insert(summary_cache, circuit_key, estimate);
+    bench_summary_cache_insert(summary_cache, circuit_key, estimate.clone());
     estimate
 }
 
@@ -723,6 +839,7 @@ mod tests {
         circuit::{PolyCircuit, PolyGateType, SubCircuitParamValue},
         poly::dcrt::poly::DCRTPoly,
     };
+    use num_bigint::BigUint;
     use sequential_test::sequential;
     use std::{
         sync::{
@@ -747,13 +864,17 @@ mod tests {
         CircuitBenchSummary::new(total_time, latency, max_parallelism).with_peak_vram(peak_vram)
     }
 
+    fn nanos(value: u64) -> BigUint {
+        BigUint::from(value)
+    }
+
     #[test]
     fn column_parallel_gate_estimate_uses_ceiling_division_for_latency() {
         let estimate = column_parallel_gate_estimate(0.000000010, 10, 3);
 
-        assert_eq!(estimate.total_time, 0.000000010);
+        assert_eq!(estimate.total_time, nanos(10));
         assert_eq!(estimate.latency, 0.000000004);
-        assert_eq!(estimate.max_parallelism, 3);
+        assert_eq!(estimate.max_parallelism, nanos(3));
         #[cfg(feature = "gpu")]
         assert_eq!(estimate.peak_vram, 4);
     }
@@ -929,9 +1050,9 @@ mod tests {
 
         let estimate = TestBenchEstimator.estimate_circuit_bench(&circuit);
 
-        assert!((estimate.total_time - 10.0).abs() < 1e-9);
+        assert_eq!(estimate.total_time, nanos(10_000_000_000));
         assert!((estimate.latency - 5.2).abs() < 1e-9);
-        assert_eq!(estimate.max_parallelism, 8);
+        assert_eq!(estimate.max_parallelism, nanos(8));
         assert_eq!(estimate, summary(10.0, 5.2, 8, 9));
     }
 
@@ -952,7 +1073,7 @@ mod tests {
         let estimate = ExpandedSubCircuitBenchEstimator.estimate_circuit_bench(&main_circuit);
         let expected = summary(10.0, 6.0, 4, 23);
 
-        assert!((estimate.total_time - expected.total_time).abs() < 1e-9);
+        assert_eq!(estimate.total_time, expected.total_time);
         assert!((estimate.latency - expected.latency).abs() < 1e-9);
         assert_eq!(estimate.max_parallelism, expected.max_parallelism);
         assert_eq!(estimate, expected);
@@ -976,7 +1097,7 @@ mod tests {
         let estimate = ExpandedSubCircuitBenchEstimator.estimate_circuit_bench(&main_circuit);
         let expected = summary(18.0, 6.0, 8, 23);
 
-        assert!((estimate.total_time - expected.total_time).abs() < 1e-9);
+        assert_eq!(estimate.total_time, expected.total_time);
         assert!((estimate.latency - expected.latency).abs() < 1e-9);
         assert_eq!(estimate.max_parallelism, expected.max_parallelism);
         assert_eq!(estimate, expected);

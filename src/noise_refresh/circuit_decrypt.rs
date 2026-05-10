@@ -6,7 +6,11 @@
 //! lives in `circuit_merge` so tests and benchmarks can feed pre-decoded wires directly.
 
 use crate::{
-    circuit::{PolyCircuit, gate::GateId},
+    circuit::PolyCircuit,
+    decoder::mask_circuit::{
+        decrypt_centered_bit_decomposed_polynomial, decrypt_error_coefficients_as_polynomial,
+        mask_plaintext_moduli_from_full_modulus,
+    },
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
         fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
@@ -18,139 +22,32 @@ use num_bigint::BigUint;
 use num_traits::Zero;
 use std::sync::Arc;
 
-/// Adds a nonempty list of scalar wires with the circuit's ordinary addition gate.
-fn sum_gate_ids<P: Poly>(circuit: &mut PolyCircuit<P>, values: &[GateId]) -> GateId {
-    let (first, rest) = values.split_first().expect("at least one gate is required");
-    rest.iter().fold(*first, |acc, value| circuit.add_gate(acc, *value).as_single_wire())
-}
-
-/// Decrypts one coefficient-level error polynomial.
-///
-/// The input layout is exactly `ring_dim` coefficient ciphertexts for one gadget digit.  A single
-/// `decrypt_batch` call decrypts all coefficients and places the recovered coefficient values in
-/// the corresponding slots of one output wire.
-pub fn decrypt_error_coefficients_as_polynomial<P, A, M>(
+fn decrypt_refreshed_wire_digit_crt<P, A, M>(
     circuit: &mut PolyCircuit<P>,
-    encrypted_coefficients: &[RingGswCiphertext<P, A>],
-    decryption_key: GateId,
+    errors: &[RingGswCiphertext<P, A>],
+    masks: &[RingGswCiphertext<P, A>],
+    decryption_key: crate::circuit::gate::GateId,
     plaintext_modulus: BigUint,
-) -> GateId
+    mask_plaintext_moduli: &[BigUint],
+) -> (crate::circuit::gate::GateId, crate::circuit::gate::GateId)
 where
     P: Poly + 'static,
     A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
     M: PolyMatrix<P = P>,
 {
-    assert!(!plaintext_modulus.is_zero(), "plaintext_modulus must be positive");
-    let first_ctx: Arc<RingGswContext<P, A>> = encrypted_coefficients
-        .first()
-        .expect("at least one encrypted coefficient is required")
-        .ctx
-        .clone();
-    let ring_dim = first_ctx.params.ring_dimension() as usize;
-    assert_eq!(
-        encrypted_coefficients.len(),
-        ring_dim,
-        "encrypted coefficient count {} must match ring_dim {}",
-        encrypted_coefficients.len(),
-        ring_dim
-    );
-
-    let ciphertexts = encrypted_coefficients.iter().collect::<Vec<_>>();
-    RingGswCiphertext::decrypt_batch::<M>(
-        ciphertexts.as_slice(),
+    let decrypted_error = decrypt_error_coefficients_as_polynomial::<P, A, M>(
+        circuit,
+        errors,
         decryption_key,
         plaintext_modulus,
+    );
+    let decrypted_mask = decrypt_centered_bit_decomposed_polynomial::<P, A, M>(
         circuit,
-    )
-}
-
-/// Decrypts one bit-decomposed mask polynomial.
-///
-/// The input layout is `ring_dim * bit_size` ciphertexts ordered by coefficient, then bit index.
-/// For each bit index, one `decrypt_batch` call decrypts the `ring_dim` coefficient ciphertexts and
-/// places those coefficient values in one slotwise polynomial wire.  The bit-polynomial wires are
-/// then summed.
-///
-/// Mask bits are decoded against the full coefficient modulus `q`, not against a CRT modulus
-/// `q_i`.  Bit `j` uses plaintext modulus `q / 2^j`, so Ring-GSW decrypt contributes
-/// `2^j * mask_j`.  The merge phase can then add this small unscaled perturbation to a
-/// `q/q_i`-scaled error and rely on rounding to remove the mask.
-pub fn decrypt_bit_decomposed_polynomial<P, A, M>(
-    circuit: &mut PolyCircuit<P>,
-    encrypted_bits: &[RingGswCiphertext<P, A>],
-    decryption_key: GateId,
-    plaintext_moduli: &[BigUint],
-) -> GateId
-where
-    P: Poly + 'static,
-    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
-    M: PolyMatrix<P = P>,
-{
-    let bit_size = plaintext_moduli.len();
-    assert!(bit_size > 0, "bit_size must be positive");
-    assert!(
-        plaintext_moduli.iter().all(|modulus| !modulus.is_zero()),
-        "all bit plaintext moduli must be positive"
+        masks,
+        decryption_key,
+        mask_plaintext_moduli,
     );
-    let first_ctx: Arc<RingGswContext<P, A>> =
-        encrypted_bits.first().expect("at least one encrypted bit is required").ctx.clone();
-    let ring_dim = first_ctx.params.ring_dimension() as usize;
-    let expected_len = ring_dim.checked_mul(bit_size).expect("Ring-GSW bit chunk length overflow");
-    assert_eq!(
-        encrypted_bits.len(),
-        expected_len,
-        "encrypted bit chunk must equal ring_dim * bit_size"
-    );
-    let bit_terms = (0..bit_size)
-        .map(|bit_idx| {
-            let ciphertexts = (0..ring_dim)
-                .map(|coeff_idx| &encrypted_bits[coeff_idx * bit_size + bit_idx])
-                .collect::<Vec<_>>();
-            RingGswCiphertext::decrypt_batch::<M>(
-                ciphertexts.as_slice(),
-                decryption_key,
-                plaintext_moduli[bit_idx].clone(),
-                circuit,
-            )
-        })
-        .collect::<Vec<_>>();
-    sum_gate_ids(circuit, &bit_terms)
-}
-
-/// Decrypts one bit-decomposed scalar mask.
-///
-/// This is the coefficient-free counterpart of `decrypt_bit_decomposed_polynomial`: bit `j` is
-/// decrypted with plaintext modulus `q / 2^j`, so Ring-GSW contributes `2^j * bit_j`, and the
-/// returned wire is the ordinary binary sum of the encrypted mask bits.
-pub fn decrypt_bit_decomposed_scalar<P, A, M>(
-    circuit: &mut PolyCircuit<P>,
-    encrypted_bits: &[RingGswCiphertext<P, A>],
-    decryption_key: GateId,
-    plaintext_moduli: &[BigUint],
-) -> GateId
-where
-    P: Poly + 'static,
-    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
-    M: PolyMatrix<P = P>,
-{
-    assert!(!encrypted_bits.is_empty(), "at least one encrypted bit is required");
-    assert_eq!(
-        encrypted_bits.len(),
-        plaintext_moduli.len(),
-        "encrypted scalar bit count must match plaintext modulus count"
-    );
-    assert!(
-        plaintext_moduli.iter().all(|modulus| !modulus.is_zero()),
-        "all bit plaintext moduli must be positive"
-    );
-    let bit_terms = encrypted_bits
-        .iter()
-        .zip(plaintext_moduli.iter())
-        .map(|(encrypted_bit, plaintext_modulus)| {
-            encrypted_bit.decrypt::<M>(decryption_key, plaintext_modulus.clone(), circuit)
-        })
-        .collect::<Vec<_>>();
-    sum_gate_ids(circuit, &bit_terms)
+    (decrypted_error, decrypted_mask)
 }
 
 /// Builds one CRT-specific decrypt subcircuit for one refreshed wire.
@@ -192,20 +89,17 @@ where
     let mut decrypted_masks = Vec::with_capacity(log_base_q);
     for digit_idx in 0..log_base_q {
         let error_start = digit_idx * ring_dim;
-        decrypted_errors.push(decrypt_error_coefficients_as_polynomial::<P, A, M>(
+        let mask_start = digit_idx * mask_q_chunk_len;
+        let (decrypted_error, decrypted_mask) = decrypt_refreshed_wire_digit_crt::<P, A, M>(
             &mut circuit,
             &errors[error_start..error_start + ring_dim],
-            decryption_key,
-            plaintext_modulus.clone(),
-        ));
-
-        let mask_start = digit_idx * mask_q_chunk_len;
-        decrypted_masks.push(decrypt_bit_decomposed_polynomial::<P, A, M>(
-            &mut circuit,
             &masks[mask_start..mask_start + mask_q_chunk_len],
             decryption_key,
+            plaintext_modulus.clone(),
             &mask_plaintext_moduli,
-        ));
+        );
+        decrypted_errors.push(decrypted_error);
+        decrypted_masks.push(decrypted_mask);
     }
 
     circuit.output(decrypted_errors.iter().chain(decrypted_masks.iter()).copied());
@@ -248,48 +142,22 @@ where
     let mut decrypted_errors = Vec::with_capacity(q_moduli_depth);
     let mut decrypted_masks = Vec::with_capacity(q_moduli_depth);
     for (crt_idx, &q_i) in q_moduli.iter().enumerate() {
-        decrypted_errors.push(decrypt_error_coefficients_as_polynomial::<P, A, M>(
-            &mut circuit,
-            &errors,
-            decryption_key,
-            BigUint::from(q_i),
-        ));
-
         let mask_start =
             crt_idx.checked_mul(mask_q_chunk_len).expect("CRT mask slice start overflow");
         let mask_end =
             mask_start.checked_add(mask_q_chunk_len).expect("CRT mask slice end overflow");
-        decrypted_masks.push(decrypt_bit_decomposed_polynomial::<P, A, M>(
+        let (decrypted_error, decrypted_mask) = decrypt_refreshed_wire_digit_crt::<P, A, M>(
             &mut circuit,
+            &errors,
             &masks[mask_start..mask_end],
             decryption_key,
+            BigUint::from(q_i),
             &mask_plaintext_moduli,
-        ));
+        );
+        decrypted_errors.push(decrypted_error);
+        decrypted_masks.push(decrypted_mask);
     }
 
     circuit.output(decrypted_errors.iter().chain(decrypted_masks.iter()).copied());
     circuit
-}
-
-/// Derives mask bit plaintext moduli from the full coefficient modulus.
-///
-/// Bit indices are zero-based: bit `0` uses plaintext modulus `q`, bit `1` uses `q/2`, and so on.
-/// With Ring-GSW decrypt's `q/plaintext_modulus` scaling, the decoded mask polynomial is therefore
-/// the ordinary binary sum `sum_j 2^j * mask_j`.
-pub fn mask_plaintext_moduli_from_full_modulus(
-    full_modulus: &BigUint,
-    bit_size: usize,
-) -> Vec<BigUint> {
-    assert!(bit_size > 0, "bit_size must be positive");
-    assert!(!full_modulus.is_zero(), "full modulus must be positive");
-    (0..bit_size)
-        .map(|bit_idx| {
-            let modulus = full_modulus >> bit_idx;
-            assert!(
-                !modulus.is_zero(),
-                "full modulus / 2^{bit_idx} must be positive for Ring-GSW decrypt"
-            );
-            modulus
-        })
-        .collect()
 }

@@ -3,7 +3,6 @@
 use bigdecimal::BigDecimal;
 use keccak_asm::Keccak256;
 use mxx::{
-    bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     element::PolyElem,
     input_injector::{DiamondInjector, InputInjector},
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
@@ -42,8 +41,7 @@ type TestInjector = DiamondInjector<
     GpuDCRTPolyTrapdoorSampler,
 >;
 
-const DIAMOND_INJECTOR_DECODER_COUNT: usize = 1;
-const DIAMOND_INJECTOR_SECRET_SIZE: usize = 2;
+const DIAMOND_INJECTOR_SECRET_SIZE: usize = 1;
 const DIAMOND_INJECTOR_TRAPDOOR_SIGMA: f64 = 4.578;
 const DIAMOND_INJECTOR_ERROR_SIGMA: f64 = 4.578;
 const DEFAULT_RING_DIM: u32 = 1u32 << 16;
@@ -112,24 +110,24 @@ fn gpu_params_for_crt_depth(
     )
 }
 
-fn sample_pubkey(
+fn sample_final_w_block(
     params: &GpuDCRTPolyParams,
     hash_key: [u8; 32],
-    tag: &str,
-) -> BggPublicKey<GpuDCRTPolyMatrix> {
-    let matrix = GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+    block_idx: usize,
+    input_count: usize,
+) -> GpuDCRTPolyMatrix {
+    GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
         params,
         hash_key,
-        tag,
-        DIAMOND_INJECTOR_SECRET_SIZE,
+        format!("diamond_w_{block_idx}_{input_count}"),
+        2 * DIAMOND_INJECTOR_SECRET_SIZE,
         DIAMOND_INJECTOR_SECRET_SIZE * params.modulus_digits(),
         DistType::FinRingDist,
-    );
-    BggPublicKey::new(matrix, true)
+    )
 }
 
 fn secret_checkpoint_id(level: usize, digit_value: usize) -> String {
-    format!("diamond_secret_tensor_v2_{level}_{digit_value}")
+    format!("diamond_secret_tensor_{level}_{digit_value}")
 }
 
 fn read_checkpoint_matrix(
@@ -150,7 +148,7 @@ fn reconstruct_secret_product(
     input_digits: &[u32],
 ) -> GpuDCRTPolyMatrix {
     let mut secret_product =
-        read_checkpoint_matrix(params, dir_path, "diamond_secret_epsilon_tensor_v2");
+        read_checkpoint_matrix(params, dir_path, "diamond_secret_epsilon_tensor");
     for (digit_idx, digit_value) in input_digits.iter().copied().enumerate() {
         let digit_secret = read_checkpoint_matrix(
             params,
@@ -204,36 +202,19 @@ fn assert_residual_below_bound(
     );
 }
 
-fn assert_encoding_residual_below_bound(
+fn assert_state_residual_below_bound(
     label: &str,
     params: &GpuDCRTPolyParams,
-    encoding: &BggEncoding<GpuDCRTPolyMatrix>,
-    secret_product: &GpuDCRTPolyMatrix,
-    pubkey: &BggPublicKey<GpuDCRTPolyMatrix>,
-    plaintext: <GpuDCRTPolyMatrix as PolyMatrix>::P,
+    state: &GpuDCRTPolyMatrix,
+    selector: GpuDCRTPolyMatrix,
+    public_matrix: GpuDCRTPolyMatrix,
     max_error: &BigDecimal,
 ) {
-    let gadget = GpuDCRTPolyMatrix::gadget_matrix(params, DIAMOND_INJECTOR_SECRET_SIZE);
-    let s_times_pubkey = secret_product.clone() * &pubkey.matrix;
-    let s_times_plaintext_gadget = (secret_product.clone() * gadget) * plaintext;
-    let residual = encoding.vector.clone() - s_times_pubkey + s_times_plaintext_gadget;
-    assert_residual_below_bound(label, params, &residual, max_error);
-}
-
-fn assert_decoder_residual_below_bound(
-    label: &str,
-    params: &GpuDCRTPolyParams,
-    decoder: &BggEncoding<GpuDCRTPolyMatrix>,
-    secret_product: &GpuDCRTPolyMatrix,
-    pubkey: &BggPublicKey<GpuDCRTPolyMatrix>,
-    max_error: &BigDecimal,
-) {
-    let residual = decoder.vector.clone() - (secret_product.clone() * &pubkey.matrix);
+    let residual = state.clone() - (selector * public_matrix);
     assert_residual_below_bound(label, params, &residual, max_error);
 }
 
 fn verify_gpu_online_eval_errors_below_simulation(
-    hash_key: [u8; 32],
     ring_dim: u32,
     crt_bits: usize,
     base_bits: u32,
@@ -254,29 +235,16 @@ fn verify_gpu_online_eval_errors_below_simulation(
         tempdir().expect("temporary DiamondInjector preprocessing directory should be created");
     let injector = TestInjector::new(
         params.clone(),
-        hash_key,
         input_count,
         input_base,
-        DIAMOND_INJECTOR_DECODER_COUNT,
         DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
         DIAMOND_INJECTOR_ERROR_SIGMA,
-        dir.path().to_path_buf(),
     )
     .with_gpu_device_ids(gpu_ids.to_vec());
 
-    let one_pubkey = sample_pubkey(&params, hash_key, "diamond_plot_one_pubkey");
     let batch_bits =
         usize::try_from(digit_bits).expect("digit_bits must fit into usize for input pubkeys");
-    let input_pubkeys = (0..input_count * batch_bits)
-        .map(|bit_idx| {
-            sample_pubkey(&params, hash_key, &format!("diamond_plot_input_pubkey_{bit_idx}"))
-        })
-        .collect::<Vec<_>>();
-    let decoder_pubkeys = (0..DIAMOND_INJECTOR_DECODER_COUNT)
-        .map(|decoder_idx| {
-            sample_pubkey(&params, hash_key, &format!("diamond_plot_decoder_pubkey_{decoder_idx}"))
-        })
-        .collect::<Vec<_>>();
+    let k = <GpuDCRTPolyMatrix as PolyMatrix>::P::from_usize_to_constant(&params, 3);
     let mut rng = rand::rng();
     let input_digits =
         (0..input_count).map(|_| rng.random_range(0..input_base) as u32).collect::<Vec<_>>();
@@ -287,7 +255,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
         crossing_point.crt_depth, crossing_point.q_bits, input_count, digit_bits
     );
     let preprocess_started = Instant::now();
-    injector.preprocess(&one_pubkey, &input_pubkeys, &decoder_pubkeys);
+    let preprocess_out = injector.preprocess(dir.path(), &k);
     gpu_device_sync();
     info!(
         "diamond injector gpu preprocess: finished, elapsed_s={:.3}",
@@ -300,8 +268,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
         crossing_point.crt_depth, crossing_point.q_bits
     );
     let online_started = Instant::now();
-    let (one_output, input_outputs, decoder_outputs) =
-        injector.online_eval(&input_digits, &one_pubkey, &input_pubkeys, &decoder_pubkeys);
+    let states = injector.online_eval(dir.path(), &preprocess_out, &input_digits);
     gpu_device_sync();
     info!(
         "diamond injector gpu online_eval: finished, elapsed_s={:.3}",
@@ -309,41 +276,45 @@ fn verify_gpu_online_eval_errors_below_simulation(
     );
 
     let secret_product = reconstruct_secret_product(&params, dir.path(), &input_digits);
-    assert_encoding_residual_below_bound(
-        "one",
+    let base_public_matrix = preprocess_out
+        .final_pub_matrix
+        .concat_columns(&[&sample_final_w_block(&params, preprocess_out.hash_key, 0, input_count)]);
+    let base_selector =
+        GpuDCRTPolyMatrix::from_poly_vec_row(&params, vec![secret_product.entry(0, 0), k]);
+    assert_state_residual_below_bound(
+        "base_state",
         &params,
-        &one_output,
-        &secret_product,
-        &one_pubkey,
-        <GpuDCRTPolyMatrix as PolyMatrix>::P::const_one(&params),
+        &states[0],
+        base_selector,
+        base_public_matrix,
         &crossing_point.max_error,
     );
-    assert_eq!(input_outputs.len(), input_count * batch_bits);
     for digit_idx in 0..input_count {
         for bit_idx in 0..batch_bits {
-            let output_idx = digit_idx * batch_bits + bit_idx;
-            let output = &input_outputs[output_idx];
+            let state_idx = injector.bit_state_idx(digit_idx, bit_idx);
             let bit_value = ((input_digits[digit_idx] as usize) >> bit_idx) & 1;
-            assert_encoding_residual_below_bound(
-                &format!("input_bit_{output_idx}"),
+            let bit_plaintext =
+                <GpuDCRTPolyMatrix as PolyMatrix>::P::from_usize_to_constant(&params, bit_value);
+            let bit_selector = GpuDCRTPolyMatrix::from_poly_vec_row(
                 &params,
-                output,
-                &secret_product,
-                &input_pubkeys[output_idx],
-                <GpuDCRTPolyMatrix as PolyMatrix>::P::from_usize_to_constant(&params, bit_value),
+                vec![secret_product.entry(0, 0), secret_product.entry(0, 0) * &bit_plaintext],
+            );
+            let bit_public_matrix =
+                preprocess_out.final_pub_matrix.concat_columns(&[&sample_final_w_block(
+                    &params,
+                    preprocess_out.hash_key,
+                    state_idx,
+                    input_count,
+                )]);
+            assert_state_residual_below_bound(
+                &format!("bit_state_{state_idx}"),
+                &params,
+                &states[state_idx],
+                bit_selector,
+                bit_public_matrix,
                 &crossing_point.max_error,
             );
         }
-    }
-    for (decoder_idx, output) in decoder_outputs.iter().enumerate() {
-        assert_decoder_residual_below_bound(
-            &format!("decoder_{decoder_idx}"),
-            &params,
-            output,
-            &secret_product,
-            &decoder_pubkeys[decoder_idx],
-            &crossing_point.max_error,
-        );
     }
 }
 
@@ -677,7 +648,6 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
     );
 
     let ring_dim = env_or_default_u32("DIAMOND_INJECTOR_RING_DIM", DEFAULT_RING_DIM);
-    let hash_key: [u8; 32] = rand::random();
     let crt_bits = env_or_default_usize("DIAMOND_INJECTOR_CRT_BITS", DEFAULT_CRT_BITS);
     let input_count = env_or_default_usize("DIAMOND_INJECTOR_INPUT_COUNT", DEFAULT_INPUT_COUNT);
     let digit_bits = env_or_default_u32("DIAMOND_INJECTOR_DIGIT_BITS", DEFAULT_DIGIT_BITS);
@@ -702,37 +672,25 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
         let params = gpu_params_for_crt_depth(ring_dim, crt_depth, crt_bits, base_bits, &gpu_ids);
         let injector = TestInjector::new(
             params,
-            hash_key,
             input_count,
             input_base,
-            DIAMOND_INJECTOR_DECODER_COUNT,
             DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
             DIAMOND_INJECTOR_ERROR_SIGMA,
-            std::env::temp_dir(),
         )
         .with_gpu_device_ids(gpu_ids.clone());
         let simulated = injector.simulate_output_error_bounds();
-        let max_input_error = simulated
-            .input_errors
+        let max_error = simulated
+            .state_errors
             .iter()
-            .map(|norm| norm.poly_norm.norm.clone())
+            .map(|state_error| state_error.poly_norm.norm.clone())
             .max()
-            .expect("input error list must be non-empty");
-        let max_decoder_error = simulated
-            .decoder_errors
-            .iter()
-            .map(|norm| norm.poly_norm.norm.clone())
-            .max()
-            .expect("decoder error list must be non-empty");
-        let max_error = std::cmp::max(max_input_error.clone(), max_decoder_error.clone());
+            .expect("state error list must be non-empty");
         let max_error_bits = bigdecimal_bits_ceil(&max_error);
         let q_bits =
             crt_bits.checked_mul(crt_depth).expect("q_bits overflow in DiamondInjector plot test");
 
         info!(
-            "diamond injector plot point: crt_depth={crt_depth}, q_bits={q_bits}, max_input_bits={}, max_decoder_bits={}, max_total_bits={}",
-            bigdecimal_bits_ceil(&max_input_error),
-            bigdecimal_bits_ceil(&max_decoder_error),
+            "diamond injector plot point: crt_depth={crt_depth}, q_bits={q_bits}, max_projected_bits={}",
             bigdecimal_bits_ceil(&max_error),
         );
 
@@ -796,7 +754,6 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
     );
 
     verify_gpu_online_eval_errors_below_simulation(
-        hash_key,
         ring_dim,
         crt_bits,
         base_bits,

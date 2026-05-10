@@ -14,7 +14,11 @@ use crate::{
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner},
         fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
-        fhe_prg::goldreich::{GoldreichFheCbdPrg, GoldreichFhePrg},
+        fhe_prg::goldreich::{
+            GoldreichEdge, GoldreichFheCbdPrg, GoldreichFhePrg, GoldreichGraph,
+            assert_goldreich_output_bound, evaluate_goldreich_uniform_range,
+            evaluate_goldreich_uniform_range_without_output_bound,
+        },
     },
     poly::{Poly, PolyParams},
 };
@@ -77,102 +81,26 @@ pub fn goldreich_noise_refresh_output_sizes(
     GoldreichNoiseRefreshOutputSizes { mask_bits, cbd_values, total }
 }
 
-pub fn goldreich_noise_refresh_output_size(
+/// Counts every uniform Goldreich bit read from the same encrypted noise-refresh seed.
+///
+/// CBD material uses `2 * cbd_n` independent uniform graph streams per CBD value; masks use one
+/// uniform stream per bit.
+pub fn goldreich_noise_refresh_uniform_output_bits(
     ring_dim: usize,
     log_base_q: usize,
     crt_depth: usize,
     v_bits: usize,
+    cbd_n: usize,
 ) -> usize {
-    goldreich_noise_refresh_output_sizes(ring_dim, log_base_q, crt_depth, v_bits).total
-}
-
-/// Builds the Goldreich encrypted-seed expansion circuit.
-///
-/// The returned circuit creates `seed_bits` encrypted Boolean ciphertext inputs internally.  It
-/// then evaluates two domain-separated PRG components on those inputs:
-///
-/// 1. A uniform Goldreich PRG with output size `mask_bits`.
-/// 2. A CBD PRF with output size `cbd_values`. These outputs are encrypted integer error
-///    coefficients rather than encrypted bits.
-///
-/// The circuit output order is `errors`, then `masks`, with each logical ciphertext flattened into
-/// its `sub_circuit_wires()` representation.
-pub fn evaluate_goldreich_encrypted_seeds<P, A>(
-    ring_gsw: Arc<RingGswContext<P, A>>,
-    seed_bits: usize,
-    v_bits: usize,
-    graph_seed: [u8; 32],
-    cbd_n: usize,
-    output_scope_idx: usize,
-) -> PolyCircuit<P>
-where
-    P: Poly + 'static,
-    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
-{
-    build_goldreich_encrypted_seeds_with_output::<P, A>(
-        ring_gsw,
-        seed_bits,
-        v_bits,
-        graph_seed,
-        cbd_n,
-        output_scope_idx,
-    )
-}
-
-pub(crate) fn build_goldreich_encrypted_seeds_with_output<P, A>(
-    ring_gsw: Arc<RingGswContext<P, A>>,
-    seed_bits: usize,
-    v_bits: usize,
-    graph_seed: [u8; 32],
-    cbd_n: usize,
-    output_scope_idx: usize,
-) -> PolyCircuit<P>
-where
-    P: Poly + 'static,
-    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
-{
-    // `output_scope_idx` identifies the logical refresh wire being generated.  It is deliberately
-    // not a mutable "consume" counter: independent builders can derive the same scope id from their
-    // own work item and construct PRG material in parallel without sharing state.
-    //
-    // TODO(noise-refresh): implement graph-collision detection for scoped Goldreich material.  For
-    // now, scopes are domain-separated by hash inputs, but we do not exhaustively compare generated
-    // graph structures across `(domain, output_scope_idx)` pairs because that check is expensive
-    // for benchmark-sized circuits.
-    // This is a standalone subcircuit: all encrypted seed ciphertexts are declared as inputs of the
-    // newly-created circuit rather than being passed in from an outer builder.
-    let mut circuit = ring_gsw.fresh_circuit();
-    let input_size = seed_bits;
-    assert!(input_size >= 5, "Goldreich PRG requires at least five encrypted seed bits");
-
-    // Create one encrypted Ring-GSW Boolean ciphertext input for each seed bit.
-    let encrypted_seeds = (0..seed_bits)
-        .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
-        .collect::<Vec<_>>();
-
-    // Compute the one-wire refresh material size from the Ring-GSW parameters.  The encrypted seed
-    // input count controls the Goldreich PRG input size only; it no longer scales the amount of
-    // material produced by this noise-refresh builder.
-    let scope_counter =
-        u64::try_from(output_scope_idx).expect("noise-refresh output scope index exceeds u64");
-    let material = evaluate_goldreich_noise_refresh_material(
-        &mut circuit,
-        ring_gsw,
-        &encrypted_seeds,
-        v_bits,
-        graph_seed,
-        cbd_n,
-        scope_counter,
-    );
-
-    circuit.output(
-        material
-            .errors
-            .iter()
-            .chain(material.masks.iter())
-            .flat_map(|output| output.sub_circuit_wires()),
-    );
-    circuit
+    assert!(cbd_n > 0, "cbd_n must be positive");
+    let output_sizes =
+        goldreich_noise_refresh_output_sizes(ring_dim, log_base_q, crt_depth, v_bits);
+    output_sizes
+        .cbd_values
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(cbd_n))
+        .and_then(|count| count.checked_add(output_sizes.mask_bits))
+        .expect("Goldreich noise-refresh uniform output size overflow")
 }
 
 pub(crate) fn build_goldreich_encrypted_seed_material_ranges<P, A>(
@@ -185,6 +113,7 @@ pub(crate) fn build_goldreich_encrypted_seed_material_ranges<P, A>(
     error_range_start: usize,
     error_range_len: usize,
     mask_ranges: &[(usize, usize)],
+    enforce_output_bound: bool,
 ) -> PolyCircuit<P>
 where
     P: Poly + 'static,
@@ -195,6 +124,9 @@ where
     assert!(input_size >= 5, "Goldreich PRG requires at least five encrypted seed bits");
     assert!(error_range_len > 0, "noise-refresh error range length must be positive");
     assert!(!mask_ranges.is_empty(), "noise-refresh mask ranges must be nonempty");
+    if enforce_output_bound {
+        assert_noise_refresh_material_prg_output_bound(&ring_gsw, seed_bits, v_bits, cbd_n);
+    }
 
     let encrypted_seeds = (0..seed_bits)
         .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
@@ -213,6 +145,7 @@ where
         error_range_start,
         error_range_len,
         mask_ranges,
+        enforce_output_bound,
     );
 
     circuit.output(
@@ -225,57 +158,26 @@ where
     circuit
 }
 
-pub(crate) fn evaluate_goldreich_noise_refresh_material<P, A>(
-    circuit: &mut PolyCircuit<P>,
+pub(crate) fn build_representative_goldreich_mask_material_circuit<P, A>(
     ring_gsw: Arc<RingGswContext<P, A>>,
-    encrypted_seeds: &[RingGswCiphertext<P, A>],
-    v_bits: usize,
-    graph_seed: [u8; 32],
-    cbd_n: usize,
-    scope_counter: u64,
-) -> GoldreichNoiseRefreshMaterial<P, A>
+) -> PolyCircuit<P>
 where
     P: Poly + 'static,
     A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
 {
-    let input_size = encrypted_seeds.len();
-    assert!(input_size >= 5, "Goldreich PRG requires at least five encrypted seed bits");
-    let output_sizes = goldreich_noise_refresh_output_sizes(
-        ring_gsw.params.ring_dimension() as usize,
-        ring_gsw.params.modulus_digits(),
-        ring_gsw.params.to_crt().2,
-        v_bits,
+    let mut circuit = ring_gsw.fresh_circuit();
+    let encrypted_seeds = (0..5)
+        .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
+        .collect::<Vec<_>>();
+    let graph = GoldreichGraph::from_edges(
+        5,
+        vec![GoldreichEdge::new([0, 1, 2], [3, 4])],
+        Default::default(),
     );
-    let mask_seed =
-        derive_noise_refresh_graph_seed(graph_seed, b"NoiseRefreshMask/v1", scope_counter);
-    let mask_prg = GoldreichFhePrg::setup_range(
-        circuit,
-        ring_gsw.clone(),
-        input_size,
-        output_sizes.mask_bits,
-        0,
-        output_sizes.mask_bits,
-        mask_seed,
-    );
-    let masks = mask_prg.evaluate_uniform(encrypted_seeds, circuit);
-
-    let cbd_seed =
-        derive_noise_refresh_graph_seed(graph_seed, b"NoiseRefreshCBD/v1", scope_counter);
-    let cbd_prf = GoldreichFheCbdPrg::setup_range(
-        circuit,
-        ring_gsw,
-        input_size,
-        output_sizes.cbd_values,
-        0,
-        output_sizes.cbd_values,
-        cbd_seed,
-        cbd_n,
-    );
-    let errors = cbd_prf.evaluate_cbd_prf(encrypted_seeds, circuit);
-    debug_assert_eq!(errors.len() + masks.len(), output_sizes.cbd_values + output_sizes.mask_bits);
-
-    let _ = (mask_prg, cbd_prf);
-    GoldreichNoiseRefreshMaterial { errors, masks }
+    let goldreich = GoldreichFhePrg::from_public_graph(&mut circuit, ring_gsw, graph);
+    let outputs = goldreich.evaluate_uniform(&encrypted_seeds, &mut circuit);
+    circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
+    circuit
 }
 
 pub(crate) fn evaluate_goldreich_noise_refresh_material_ranges<P, A>(
@@ -289,6 +191,7 @@ pub(crate) fn evaluate_goldreich_noise_refresh_material_ranges<P, A>(
     error_range_start: usize,
     error_range_len: usize,
     mask_ranges: &[(usize, usize)],
+    enforce_output_bound: bool,
 ) -> GoldreichNoiseRefreshMaterial<P, A>
 where
     P: Poly + 'static,
@@ -300,6 +203,9 @@ where
     assert!(cbd_n > 0, "cbd_n must be positive");
     assert!(error_range_len > 0, "error range length must be positive");
     assert!(!mask_ranges.is_empty(), "mask ranges must be nonempty");
+    if enforce_output_bound {
+        assert_noise_refresh_material_prg_output_bound(&ring_gsw, input_size, v_bits, cbd_n);
+    }
     let output_sizes = goldreich_noise_refresh_output_sizes(
         ring_gsw.params.ring_dimension() as usize,
         ring_gsw.params.modulus_digits(),
@@ -323,16 +229,29 @@ where
 
     let cbd_seed =
         derive_noise_refresh_graph_seed(graph_seed, b"NoiseRefreshCBD/v1", scope_counter);
-    let cbd_prf = GoldreichFheCbdPrg::setup_range(
-        circuit,
-        ring_gsw.clone(),
-        input_size,
-        output_sizes.cbd_values,
-        error_range_start,
-        error_range_len,
-        cbd_seed,
-        cbd_n,
-    );
+    let cbd_prf = if enforce_output_bound {
+        GoldreichFheCbdPrg::setup_range(
+            circuit,
+            ring_gsw.clone(),
+            input_size,
+            output_sizes.cbd_values,
+            error_range_start,
+            error_range_len,
+            cbd_seed,
+            cbd_n,
+        )
+    } else {
+        GoldreichFheCbdPrg::setup_range_without_output_bound(
+            circuit,
+            ring_gsw.clone(),
+            input_size,
+            output_sizes.cbd_values,
+            error_range_start,
+            error_range_len,
+            cbd_seed,
+            cbd_n,
+        )
+    };
     let errors = cbd_prf.evaluate_cbd_prf(encrypted_seeds, circuit);
 
     let mask_seed =
@@ -340,16 +259,27 @@ where
     let masks = mask_ranges
         .iter()
         .flat_map(|&(mask_start, mask_len)| {
-            let mask_prg = GoldreichFhePrg::setup_range(
-                circuit,
-                ring_gsw.clone(),
-                input_size,
-                output_sizes.mask_bits,
-                mask_start,
-                mask_len,
-                mask_seed,
-            );
-            mask_prg.evaluate_uniform(encrypted_seeds, circuit)
+            if enforce_output_bound {
+                evaluate_goldreich_uniform_range(
+                    circuit,
+                    ring_gsw.clone(),
+                    encrypted_seeds,
+                    output_sizes.mask_bits,
+                    mask_start,
+                    mask_len,
+                    mask_seed,
+                )
+            } else {
+                evaluate_goldreich_uniform_range_without_output_bound(
+                    circuit,
+                    ring_gsw.clone(),
+                    encrypted_seeds,
+                    output_sizes.mask_bits,
+                    mask_start,
+                    mask_len,
+                    mask_seed,
+                )
+            }
         })
         .collect::<Vec<_>>();
     debug_assert_eq!(
@@ -358,6 +288,25 @@ where
     );
 
     GoldreichNoiseRefreshMaterial { errors, masks }
+}
+
+fn assert_noise_refresh_material_prg_output_bound<P, A>(
+    ring_gsw: &RingGswContext<P, A>,
+    seed_bits: usize,
+    v_bits: usize,
+    cbd_n: usize,
+) where
+    P: Poly,
+    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
+{
+    let output_bits = goldreich_noise_refresh_uniform_output_bits(
+        ring_gsw.params.ring_dimension() as usize,
+        ring_gsw.params.modulus_digits(),
+        ring_gsw.params.to_crt().2,
+        v_bits,
+        cbd_n,
+    );
+    assert_goldreich_output_bound(seed_bits, output_bits, "Goldreich noise-refresh material PRG");
 }
 
 pub(crate) fn derive_noise_refresh_graph_seed(

@@ -1,13 +1,12 @@
 use super::DiamondInjector;
 use crate::{
-    bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::{PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     slot_transfer::bgg_pubkey::column_chunk_count,
 };
 use rayon::prelude::*;
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 use tracing::{debug, info};
 
 struct GpuDiamondKStageShared<M, T>
@@ -20,17 +19,6 @@ where
     source_b: M,
     source_trapdoor: T,
     target_b: M,
-}
-
-struct GpuDiamondOutputStageShared<M, T>
-where
-    M: PolyMatrix,
-    T: Send + Sync,
-{
-    device_id: i32,
-    params: <M::P as Poly>::Params,
-    source_b: M,
-    source_trapdoor: T,
 }
 
 struct LoadedDiamondPreprocessChunk<M>
@@ -57,16 +45,11 @@ where
 #[derive(Clone, Copy, Debug)]
 enum DiamondPreprocessChunkTask {
     K { level: usize, digit_value: usize, state_idx: usize, chunk_idx: usize },
-    L { input_idx: usize, chunk_idx: usize },
-    M { decoder_idx: usize, chunk_idx: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum DiamondEvalFamily {
     State(usize),
-    One,
-    Input(usize),
-    Decoder(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -187,32 +170,6 @@ where
             .collect()
     }
 
-    fn prepare_gpu_output_stage_shared(
-        &self,
-        source_b_bytes: &[u8],
-        source_trapdoor_bytes: &[u8],
-    ) -> Vec<GpuDiamondOutputStageShared<M, TS::Trapdoor>> {
-        self.effective_gpu_device_ids()
-            .into_par_iter()
-            .map(|device_id| {
-                let local_params = self.params.params_for_device(device_id);
-                let source_trapdoor = TS::trapdoor_from_bytes(&local_params, source_trapdoor_bytes)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "DiamondInjector failed to decode output-stage trapdoor checkpoint on device {}",
-                            device_id
-                        )
-                    });
-                GpuDiamondOutputStageShared {
-                    device_id,
-                    params: local_params.clone(),
-                    source_b: M::from_compact_bytes(&local_params, source_b_bytes),
-                    source_trapdoor,
-                }
-            })
-            .collect()
-    }
-
     fn prepare_gpu_eval_shared(
         &self,
         family_specs: &HashMap<DiamondEvalFamily, DiamondEvalFamilySpec>,
@@ -237,31 +194,29 @@ where
             DiamondPreprocessChunkTask::K { level, digit_value, state_idx, chunk_idx } => {
                 self.chunk_id(&self.k_id(*level, *digit_value, *state_idx), *chunk_idx)
             }
-            DiamondPreprocessChunkTask::L { input_idx, chunk_idx } => {
-                self.chunk_id(&self.l_id(*input_idx), *chunk_idx)
-            }
-            DiamondPreprocessChunkTask::M { decoder_idx, chunk_idx } => {
-                self.chunk_id(&self.m_id(*decoder_idx), *chunk_idx)
-            }
         }
     }
 
-    fn read_chunk_bytes(&self, id: &str, total_cols: usize) -> Vec<Arc<[u8]>> {
+    fn read_chunk_bytes(&self, dir_path: &Path, id: &str, total_cols: usize) -> Vec<Arc<[u8]>> {
         (0..column_chunk_count(total_cols))
             .map(|chunk_idx| {
-                Arc::<[u8]>::from(self.read_matrix_bytes(&self.chunk_id(id, chunk_idx)))
+                Arc::<[u8]>::from(self.read_matrix_bytes(dir_path, &self.chunk_id(id, chunk_idx)))
             })
             .collect()
     }
 
-    fn store_preprocess_wave(&self, outputs: Vec<ComputedDiamondPreprocessChunk<M>>) -> usize {
+    fn store_preprocess_wave(
+        &self,
+        dir_path: &Path,
+        outputs: Vec<ComputedDiamondPreprocessChunk<M>>,
+    ) -> usize {
         outputs
             .into_par_iter()
             .map(|output| {
                 let store_started = Instant::now();
                 let chunk_id = self.preprocess_chunk_id(&output.task);
                 let bytes = output.output.into_compact_bytes();
-                self.write_matrix_bytes(&chunk_id, &bytes);
+                self.write_matrix_bytes(dir_path, &chunk_id, &bytes);
                 debug!(
                     ?output.task,
                     chunk_id,
@@ -277,6 +232,8 @@ where
 
     fn preprocess_k_stage_gpu(
         &self,
+        dir_path: &Path,
+        hash_key: [u8; 32],
         level: usize,
         tasks: Vec<DiamondPreprocessChunkTask>,
         source_b_bytes: &[u8],
@@ -312,18 +269,13 @@ where
                 .filter_map(|(device_slot, (batch, shared))| {
                     let task = batch.get(wave_idx).copied()?;
                     let load_started = Instant::now();
-                    let (digit_value, state_idx, chunk_idx) = match task {
-                        DiamondPreprocessChunkTask::K {
-                            level: task_level,
-                            digit_value,
-                            state_idx,
-                            chunk_idx,
-                        } => {
-                            debug_assert_eq!(task_level, level);
-                            (digit_value, state_idx, chunk_idx)
-                        }
-                        _ => panic!("non-K task scheduled in K stage: {:?}", task),
-                    };
+                    let DiamondPreprocessChunkTask::K {
+                        level: task_level,
+                        digit_value,
+                        state_idx,
+                        chunk_idx,
+                    } = task;
+                    debug_assert_eq!(task_level, level);
                     let secret_mask = M::from_compact_bytes(
                         &shared.params,
                         secret_mask_bytes
@@ -337,12 +289,18 @@ where
                             .as_ref(),
                     );
                     let ext_matrix = if self.new_bit_idx_for_state(level, state_idx).is_some() {
-                        self.sample_w_block_with_params(&shared.params, 0, level - 1)
+                        self.sample_w_block_with_params(&shared.params, hash_key, 0, level - 1)
                     } else {
-                        self.sample_w_block_with_params(&shared.params, state_idx, level - 1)
+                        self.sample_w_block_with_params(
+                            &shared.params,
+                            hash_key,
+                            state_idx,
+                            level - 1,
+                        )
                     };
                     let target = self.build_k_target_chunk_with_params(
                         &shared.params,
+                        hash_key,
                         level,
                         digit_value,
                         state_idx,
@@ -412,7 +370,7 @@ where
                 },
                 || {
                     previous_outputs_to_store
-                        .map(|outputs| self.store_preprocess_wave(outputs))
+                        .map(|outputs| self.store_preprocess_wave(dir_path, outputs))
                         .unwrap_or(0)
                 },
             );
@@ -432,7 +390,7 @@ where
             next_wave_idx += 1;
         }
         if let Some(outputs) = previous_outputs {
-            completed_tasks += self.store_preprocess_wave(outputs);
+            completed_tasks += self.store_preprocess_wave(dir_path, outputs);
         }
 
         info!(
@@ -442,321 +400,6 @@ where
             progress = preprocess_progress_label(completed_tasks, tasks.len()),
             elapsed_s = maybe_elapsed_s(stage_started),
             "diamond injector gpu preprocess: K stage finished"
-        );
-        completed_tasks
-    }
-
-    fn preprocess_l_stage_gpu(
-        &self,
-        tasks: Vec<DiamondPreprocessChunkTask>,
-        source_b_bytes: &[u8],
-        source_trapdoor_bytes: &[u8],
-        one_bytes: Arc<[u8]>,
-        input_pubkey_bytes: &[Arc<[u8]>],
-    ) -> usize {
-        if tasks.is_empty() {
-            return 0;
-        }
-
-        let stage_started = Instant::now();
-        let trap_sampler = TS::new(&self.params, self.trapdoor_sigma);
-        let shared_by_device =
-            self.prepare_gpu_output_stage_shared(source_b_bytes, source_trapdoor_bytes);
-        let device_count = shared_by_device.len().max(1);
-        let task_batches = round_robin_batches(&tasks, device_count);
-        let wave_count = task_batches.iter().map(Vec::len).max().unwrap_or(0);
-
-        info!(
-            device_count,
-            total_tasks = tasks.len(),
-            progress = preprocess_progress_label(0, tasks.len()),
-            "diamond injector gpu preprocess: L stage starting"
-        );
-
-        let load_wave = |wave_idx: usize| {
-            let loaded_wave = task_batches
-                .par_iter()
-                .zip(shared_by_device.par_iter())
-                .enumerate()
-                .filter_map(|(device_slot, (batch, shared))| {
-                    let task = batch.get(wave_idx).copied()?;
-                    let load_started = Instant::now();
-                    let (input_idx, chunk_idx) = match task {
-                        DiamondPreprocessChunkTask::L { input_idx, chunk_idx } => {
-                            (input_idx, chunk_idx)
-                        }
-                        _ => panic!("non-L task scheduled in L stage: {:?}", task),
-                    };
-                    let ext_matrix = self.sample_w_block_with_params(
-                        &shared.params,
-                        input_idx,
-                        self.input_count,
-                    );
-                    let gadget = M::gadget_matrix(&shared.params, super::DIAMOND_SECRET_SIZE);
-                    let target = if input_idx == 0 {
-                        let one_pubkey = BggPublicKey::new(
-                            M::from_compact_bytes(&shared.params, one_bytes.as_ref()),
-                            false,
-                        );
-                        let target = self.build_one_target_chunk_with_params(
-                            &shared.params,
-                            &one_pubkey,
-                            &gadget,
-                            chunk_idx,
-                        );
-                        drop(one_pubkey);
-                        target
-                    } else {
-                        let pubkey = BggPublicKey::new(
-                            M::from_compact_bytes(
-                                &shared.params,
-                                input_pubkey_bytes[input_idx - 1].as_ref(),
-                            ),
-                            false,
-                        );
-                        let target = self.build_input_target_chunk_with_params(
-                            &shared.params,
-                            &pubkey,
-                            &gadget,
-                            chunk_idx,
-                        );
-                        drop(pubkey);
-                        target
-                    };
-                    drop(gadget);
-                    debug!(
-                        device_id = shared.device_id,
-                        input_idx,
-                        chunk_idx,
-                        load_s = maybe_elapsed_s(load_started),
-                        "diamond injector gpu preprocess: loaded L-stage chunk"
-                    );
-                    Some(LoadedDiamondPreprocessChunk {
-                        device_slot,
-                        task,
-                        ext_matrix,
-                        target,
-                        load_s: maybe_elapsed_s(load_started),
-                    })
-                })
-                .collect::<Vec<_>>();
-            (!loaded_wave.is_empty()).then_some(loaded_wave)
-        };
-
-        let compute_wave = |loaded_wave: Vec<LoadedDiamondPreprocessChunk<M>>| {
-            loaded_wave
-                .into_par_iter()
-                .map(|loaded| {
-                    let shared = &shared_by_device[loaded.device_slot];
-                    let compute_started = Instant::now();
-                    let output = trap_sampler.preimage_extend(
-                        &shared.params,
-                        &shared.source_trapdoor,
-                        &shared.source_b,
-                        &loaded.ext_matrix,
-                        &loaded.target,
-                    );
-                    ComputedDiamondPreprocessChunk {
-                        task: loaded.task,
-                        output,
-                        load_s: loaded.load_s,
-                        compute_s: maybe_elapsed_s(compute_started),
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let mut completed_tasks = 0usize;
-        let mut next_wave_idx = 1usize;
-        let mut current_wave = if wave_count == 0 { None } else { load_wave(0) };
-        let mut previous_outputs = None;
-        while let Some(loaded_wave) = current_wave.take() {
-            let should_load_next = next_wave_idx < wave_count;
-            let previous_outputs_to_store = previous_outputs.take();
-            let wave_started = Instant::now();
-            let ((computed_outputs, next_loaded_wave), stored_now) = rayon::join(
-                || {
-                    rayon::join(
-                        || compute_wave(loaded_wave),
-                        || if should_load_next { load_wave(next_wave_idx) } else { None },
-                    )
-                },
-                || {
-                    previous_outputs_to_store
-                        .map(|outputs| self.store_preprocess_wave(outputs))
-                        .unwrap_or(0)
-                },
-            );
-            completed_tasks += stored_now;
-            info!(
-                wave = next_wave_idx,
-                wave_count,
-                completed_tasks,
-                total_tasks = tasks.len(),
-                progress = preprocess_progress_label(completed_tasks, tasks.len()),
-                elapsed_s = maybe_elapsed_s(wave_started),
-                "diamond injector gpu preprocess: L stage wave completed"
-            );
-            previous_outputs = Some(computed_outputs);
-            current_wave = next_loaded_wave;
-            next_wave_idx += 1;
-        }
-        if let Some(outputs) = previous_outputs {
-            completed_tasks += self.store_preprocess_wave(outputs);
-        }
-
-        info!(
-            completed_tasks,
-            total_tasks = tasks.len(),
-            progress = preprocess_progress_label(completed_tasks, tasks.len()),
-            elapsed_s = maybe_elapsed_s(stage_started),
-            "diamond injector gpu preprocess: L stage finished"
-        );
-        completed_tasks
-    }
-
-    fn preprocess_m_stage_gpu(
-        &self,
-        tasks: Vec<DiamondPreprocessChunkTask>,
-        source_b_bytes: &[u8],
-        source_trapdoor_bytes: &[u8],
-        decoder_pubkey_bytes: &[Arc<[u8]>],
-    ) -> usize {
-        if tasks.is_empty() {
-            return 0;
-        }
-
-        let stage_started = Instant::now();
-        let trap_sampler = TS::new(&self.params, self.trapdoor_sigma);
-        let shared_by_device =
-            self.prepare_gpu_output_stage_shared(source_b_bytes, source_trapdoor_bytes);
-        let device_count = shared_by_device.len().max(1);
-        let task_batches = round_robin_batches(&tasks, device_count);
-        let wave_count = task_batches.iter().map(Vec::len).max().unwrap_or(0);
-
-        info!(
-            device_count,
-            total_tasks = tasks.len(),
-            progress = preprocess_progress_label(0, tasks.len()),
-            "diamond injector gpu preprocess: M stage starting"
-        );
-
-        let load_wave = |wave_idx: usize| {
-            let loaded_wave = task_batches
-                .par_iter()
-                .zip(shared_by_device.par_iter())
-                .enumerate()
-                .filter_map(|(device_slot, (batch, shared))| {
-                    let task = batch.get(wave_idx).copied()?;
-                    let load_started = Instant::now();
-                    let (decoder_idx, chunk_idx) = match task {
-                        DiamondPreprocessChunkTask::M { decoder_idx, chunk_idx } => {
-                            (decoder_idx, chunk_idx)
-                        }
-                        _ => panic!("non-M task scheduled in M stage: {:?}", task),
-                    };
-                    let ext_matrix =
-                        self.sample_w_block_with_params(&shared.params, 0, self.input_count);
-                    let decoder_pubkey = BggPublicKey::new(
-                        M::from_compact_bytes(
-                            &shared.params,
-                            decoder_pubkey_bytes[decoder_idx].as_ref(),
-                        ),
-                        false,
-                    );
-                    let target = self.build_decoder_target_chunk_with_params(
-                        &shared.params,
-                        &decoder_pubkey,
-                        chunk_idx,
-                    );
-                    drop(decoder_pubkey);
-                    debug!(
-                        device_id = shared.device_id,
-                        decoder_idx,
-                        chunk_idx,
-                        load_s = maybe_elapsed_s(load_started),
-                        "diamond injector gpu preprocess: loaded M-stage chunk"
-                    );
-                    Some(LoadedDiamondPreprocessChunk {
-                        device_slot,
-                        task,
-                        ext_matrix,
-                        target,
-                        load_s: maybe_elapsed_s(load_started),
-                    })
-                })
-                .collect::<Vec<_>>();
-            (!loaded_wave.is_empty()).then_some(loaded_wave)
-        };
-
-        let compute_wave = |loaded_wave: Vec<LoadedDiamondPreprocessChunk<M>>| {
-            loaded_wave
-                .into_par_iter()
-                .map(|loaded| {
-                    let shared = &shared_by_device[loaded.device_slot];
-                    let compute_started = Instant::now();
-                    let output = trap_sampler.preimage_extend(
-                        &shared.params,
-                        &shared.source_trapdoor,
-                        &shared.source_b,
-                        &loaded.ext_matrix,
-                        &loaded.target,
-                    );
-                    ComputedDiamondPreprocessChunk {
-                        task: loaded.task,
-                        output,
-                        load_s: loaded.load_s,
-                        compute_s: maybe_elapsed_s(compute_started),
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let mut completed_tasks = 0usize;
-        let mut next_wave_idx = 1usize;
-        let mut current_wave = if wave_count == 0 { None } else { load_wave(0) };
-        let mut previous_outputs = None;
-        while let Some(loaded_wave) = current_wave.take() {
-            let should_load_next = next_wave_idx < wave_count;
-            let previous_outputs_to_store = previous_outputs.take();
-            let wave_started = Instant::now();
-            let ((computed_outputs, next_loaded_wave), stored_now) = rayon::join(
-                || {
-                    rayon::join(
-                        || compute_wave(loaded_wave),
-                        || if should_load_next { load_wave(next_wave_idx) } else { None },
-                    )
-                },
-                || {
-                    previous_outputs_to_store
-                        .map(|outputs| self.store_preprocess_wave(outputs))
-                        .unwrap_or(0)
-                },
-            );
-            completed_tasks += stored_now;
-            info!(
-                wave = next_wave_idx,
-                wave_count,
-                completed_tasks,
-                total_tasks = tasks.len(),
-                progress = preprocess_progress_label(completed_tasks, tasks.len()),
-                elapsed_s = maybe_elapsed_s(wave_started),
-                "diamond injector gpu preprocess: M stage wave completed"
-            );
-            previous_outputs = Some(computed_outputs);
-            current_wave = next_loaded_wave;
-            next_wave_idx += 1;
-        }
-        if let Some(outputs) = previous_outputs {
-            completed_tasks += self.store_preprocess_wave(outputs);
-        }
-
-        info!(
-            completed_tasks,
-            total_tasks = tasks.len(),
-            progress = preprocess_progress_label(completed_tasks, tasks.len()),
-            elapsed_s = maybe_elapsed_s(stage_started),
-            "diamond injector gpu preprocess: M stage finished"
         );
         completed_tasks
     }
@@ -920,37 +563,29 @@ where
             .collect()
     }
 
-    pub(super) fn preprocess_gpu(
-        &self,
-        one: &BggPublicKey<M>,
-        input_digits: &[BggPublicKey<M>],
-        decoders: &[BggPublicKey<M>],
-    ) {
-        self.validate_lengths(input_digits, decoders);
-        self.ensure_dir();
-        self.write_metadata(&super::DiamondInjectorMetadata {
-            input_count: self.input_count,
-            base: self.base,
-            decoder_count: self.decoder_count,
-        });
+    pub(super) fn preprocess_gpu(&self, dir_path: &Path, hash_key: [u8; 32], k: &M::P) {
+        self.ensure_dir(dir_path);
+        self.write_metadata(
+            dir_path,
+            &super::DiamondInjectorMetadata { input_count: self.input_count, base: self.base },
+        );
+        self.write_bytes(dir_path, self.k_plaintext_id(), &k.to_compact_bytes());
 
         let preprocess_started = Instant::now();
         let state_cols = self.state_col_size(&self.params);
-        let output_cols = self.gadget_col_size(&self.params);
-        let input_bit_count = self.input_bit_count();
         info!("diamond injector gpu preprocess: starting");
 
         // Persist the empty-prefix seed once. This seed is not a trapdoor
         // preimage; it is the initial encoding that online evaluation uses as
         // p_{epsilon,0} before any digit transition is applied.
         let secret_epsilon_bytes =
-            self.load_or_sample_secret_epsilon_bytes(self.secret_epsilon_id());
-        if !self.matrix_exists(self.p_epsilon_id()) {
-            let (b0_bytes, _) = self.load_or_sample_b_checkpoint_bytes(0);
+            self.load_or_sample_secret_epsilon_bytes(dir_path, self.secret_epsilon_id());
+        if !self.matrix_exists(dir_path, self.p_epsilon_id()) {
+            let (b0_bytes, _) = self.load_or_sample_b_checkpoint_bytes(dir_path, 0);
             let b0_matrix = M::from_compact_bytes(&self.params, &b0_bytes);
             let secret_epsilon = M::from_compact_bytes(&self.params, &secret_epsilon_bytes);
-            let p_epsilon = self.build_initial_encoding(&b0_matrix, &secret_epsilon);
-            self.write_matrix(self.p_epsilon_id(), &p_epsilon);
+            let p_epsilon = self.build_initial_encoding(hash_key, &b0_matrix, &secret_epsilon, k);
+            self.write_matrix(dir_path, self.p_epsilon_id(), &p_epsilon);
             drop(p_epsilon);
             drop(secret_epsilon);
             drop(b0_matrix);
@@ -968,6 +603,7 @@ where
                     (
                         digit_value,
                         Arc::<[u8]>::from(self.load_or_sample_digit_secret_mask_bytes(
+                            dir_path,
                             &self.digit_secret_id(level, digit_value),
                         )),
                     )
@@ -983,101 +619,34 @@ where
                             state_idx,
                             chunk_idx,
                         };
-                        if !self.matrix_exists(&self.preprocess_chunk_id(&task)) {
+                        if !self.matrix_exists(dir_path, &self.preprocess_chunk_id(&task)) {
                             stage_tasks.push(task);
                         }
                     }
                 }
             }
             total_tasks += stage_tasks.len();
+            let (source_b_bytes, source_trapdoor_bytes) =
+                self.load_or_sample_b_checkpoint_bytes(dir_path, level - 1);
+            let (target_b_bytes, _) = self.load_or_sample_b_checkpoint_bytes(dir_path, level);
             if stage_tasks.is_empty() {
                 info!(
                     level,
                     progress = preprocess_progress_label(0, 0),
                     "diamond injector gpu preprocess: K stage already checkpointed"
                 );
-                continue;
+            } else {
+                completed_tasks += self.preprocess_k_stage_gpu(
+                    dir_path,
+                    hash_key,
+                    level,
+                    stage_tasks,
+                    &source_b_bytes,
+                    &source_trapdoor_bytes,
+                    &target_b_bytes,
+                    &secret_mask_bytes,
+                );
             }
-
-            let (source_b_bytes, source_trapdoor_bytes) =
-                self.load_or_sample_b_checkpoint_bytes(level - 1);
-            let (target_b_bytes, _) = self.load_or_sample_b_checkpoint_bytes(level);
-            completed_tasks += self.preprocess_k_stage_gpu(
-                level,
-                stage_tasks,
-                &source_b_bytes,
-                &source_trapdoor_bytes,
-                &target_b_bytes,
-                &secret_mask_bytes,
-            );
-        }
-
-        // Process every L_j chunk using only the final source trapdoor. The
-        // one/bit input public keys stay on CPU as compact bytes and are loaded per
-        // task immediately before building the target chunk.
-        let mut l_tasks = Vec::new();
-        for input_idx in 0..=input_bit_count {
-            for chunk_idx in 0..column_chunk_count(output_cols) {
-                let task = DiamondPreprocessChunkTask::L { input_idx, chunk_idx };
-                if !self.matrix_exists(&self.preprocess_chunk_id(&task)) {
-                    l_tasks.push(task);
-                }
-            }
-        }
-        total_tasks += l_tasks.len();
-        if l_tasks.is_empty() {
-            info!(
-                progress = preprocess_progress_label(0, 0),
-                "diamond injector gpu preprocess: L stage already checkpointed"
-            );
-        } else {
-            let (source_b_bytes, source_trapdoor_bytes) =
-                self.load_or_sample_b_checkpoint_bytes(self.input_count);
-            let one_bytes = Arc::<[u8]>::from(one.matrix.to_compact_bytes());
-            let input_pubkey_bytes = input_digits
-                .iter()
-                .map(|pubkey| Arc::<[u8]>::from(pubkey.matrix.to_compact_bytes()))
-                .collect::<Vec<_>>();
-            completed_tasks += self.preprocess_l_stage_gpu(
-                l_tasks,
-                &source_b_bytes,
-                &source_trapdoor_bytes,
-                one_bytes,
-                &input_pubkey_bytes,
-            );
-        }
-
-        // Process every decoder chunk against the same final source trapdoor.
-        // Decoder public keys are kept as CPU-side compact bytes and materialized
-        // on a device only for the task that needs them.
-        let mut m_tasks = Vec::new();
-        for decoder_idx in 0..self.decoder_count {
-            for chunk_idx in 0..column_chunk_count(output_cols) {
-                let task = DiamondPreprocessChunkTask::M { decoder_idx, chunk_idx };
-                if !self.matrix_exists(&self.preprocess_chunk_id(&task)) {
-                    m_tasks.push(task);
-                }
-            }
-        }
-        total_tasks += m_tasks.len();
-        if m_tasks.is_empty() {
-            info!(
-                progress = preprocess_progress_label(0, 0),
-                "diamond injector gpu preprocess: M stage already checkpointed"
-            );
-        } else {
-            let (source_b_bytes, source_trapdoor_bytes) =
-                self.load_or_sample_b_checkpoint_bytes(self.input_count);
-            let decoder_pubkey_bytes = decoders
-                .iter()
-                .map(|pubkey| Arc::<[u8]>::from(pubkey.matrix.to_compact_bytes()))
-                .collect::<Vec<_>>();
-            completed_tasks += self.preprocess_m_stage_gpu(
-                m_tasks,
-                &source_b_bytes,
-                &source_trapdoor_bytes,
-                &decoder_pubkey_bytes,
-            );
         }
 
         if total_tasks == 0 {
@@ -1098,29 +667,27 @@ where
 
     pub(super) fn online_eval_gpu(
         &self,
+        dir_path: &Path,
+        preprocess_out: &super::DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
         input_digits: &[u32],
-        one: &BggPublicKey<M>,
-        input_digit_pubkeys: &[BggPublicKey<M>],
-        decoders: &[BggPublicKey<M>],
-    ) -> (BggEncoding<M>, Vec<BggEncoding<M>>, Vec<BggEncoding<M>>) {
-        self.validate_lengths(input_digit_pubkeys, decoders);
+    ) -> Vec<M> {
         self.validate_digits(input_digits);
-        let metadata = self.read_metadata();
+        assert_eq!(
+            self.read_bytes(dir_path, self.preprocess_hash_key_id()).as_slice(),
+            &preprocess_out.hash_key,
+            "DiamondInjector gpu online_eval preprocess hash key mismatch"
+        );
+        let metadata = self.read_metadata(dir_path);
         assert_eq!(
             metadata.input_count, self.input_count,
             "DiamondInjector metadata input count mismatch"
         );
         assert_eq!(metadata.base, self.base, "DiamondInjector metadata base mismatch");
-        assert_eq!(
-            metadata.decoder_count, self.decoder_count,
-            "DiamondInjector metadata decoder count mismatch"
-        );
 
         let online_started = Instant::now();
         let state_cols = self.state_col_size(&self.params);
-        let output_cols = self.gadget_col_size(&self.params);
         // Start from the persisted empty-prefix seed.
-        let mut states = vec![self.read_matrix(self.p_epsilon_id())];
+        let mut states = vec![self.read_matrix(dir_path, self.p_epsilon_id())];
 
         for (digit_idx, digit_value) in input_digits.iter().copied().enumerate() {
             let level = digit_idx + 1;
@@ -1141,7 +708,7 @@ where
                         DiamondEvalFamily::State(state_idx),
                         DiamondEvalFamilySpec {
                             lhs_bytes,
-                            rhs_chunk_bytes: self.read_chunk_bytes(&rhs_id, state_cols),
+                            rhs_chunk_bytes: self.read_chunk_bytes(dir_path, &rhs_id, state_cols),
                         },
                     )
                 })
@@ -1162,97 +729,11 @@ where
                 .collect::<Vec<_>>();
         }
 
-        let p0_bytes = Arc::<[u8]>::from(states[0].to_compact_bytes());
-        let mut family_specs = HashMap::new();
-        // Turn the surviving base branch into the encoding of one.
-        family_specs.insert(
-            DiamondEvalFamily::One,
-            DiamondEvalFamilySpec {
-                lhs_bytes: p0_bytes.clone(),
-                rhs_chunk_bytes: self.read_chunk_bytes(&self.l_id(0), output_cols),
-            },
-        );
-        // Turn each bit-specific branch into the encoding for the chosen bit.
-        for bit_output_idx in 0..self.input_bit_count() {
-            let digit_idx = bit_output_idx / self.batch_bits();
-            let bit_idx = bit_output_idx % self.batch_bits();
-            let state_idx = self.bit_state_idx(digit_idx, bit_idx);
-            family_specs.insert(
-                DiamondEvalFamily::Input(bit_output_idx),
-                DiamondEvalFamilySpec {
-                    lhs_bytes: Arc::<[u8]>::from(states[state_idx].to_compact_bytes()),
-                    rhs_chunk_bytes: self.read_chunk_bytes(&self.l_id(state_idx), output_cols),
-                },
-            );
-        }
-        // Turn the surviving base branch into every decoder output.
-        for decoder_idx in 0..self.decoder_count {
-            family_specs.insert(
-                DiamondEvalFamily::Decoder(decoder_idx),
-                DiamondEvalFamilySpec {
-                    lhs_bytes: p0_bytes.clone(),
-                    rhs_chunk_bytes: self.read_chunk_bytes(&self.m_id(decoder_idx), output_cols),
-                },
-            );
-        }
-        let outputs = self.gpu_left_mul_families(family_specs);
-
-        let one_output = self.build_output_encoding(
-            outputs
-                .get(&DiamondEvalFamily::One)
-                .unwrap_or_else(|| panic!("missing gpu online_eval one output"))
-                .clone(),
-            one.clone(),
-            Some(M::P::const_one(&self.params)),
-        );
-        let digit_outputs = input_digits
-            .iter()
-            .copied()
-            .enumerate()
-            .flat_map(|(digit_idx, digit_value)| {
-                (0..self.batch_bits())
-                    .map(move |bit_idx| (digit_idx, digit_value as usize, bit_idx))
-            })
-            .map(|(digit_idx, digit_value, bit_idx)| {
-                let bit_output_idx = self.bit_pubkey_idx(digit_idx, bit_idx);
-                self.build_output_encoding(
-                    outputs
-                        .get(&DiamondEvalFamily::Input(bit_output_idx))
-                        .unwrap_or_else(|| {
-                            panic!("missing gpu online_eval input output {}", bit_output_idx)
-                        })
-                        .clone(),
-                    input_digit_pubkeys[bit_output_idx].clone(),
-                    Some(M::P::from_usize_to_constant(
-                        &self.params,
-                        self.digit_bit_value(digit_value, bit_idx),
-                    )),
-                )
-            })
-            .collect::<Vec<_>>();
-        let decoder_outputs = decoders
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(decoder_idx, pubkey)| {
-                self.build_output_encoding(
-                    outputs
-                        .get(&DiamondEvalFamily::Decoder(decoder_idx))
-                        .unwrap_or_else(|| {
-                            panic!("missing gpu online_eval decoder output {}", decoder_idx)
-                        })
-                        .clone(),
-                    pubkey,
-                    Some(M::P::const_zero(&self.params)),
-                )
-            })
-            .collect::<Vec<_>>();
-
         info!(
             elapsed_s = online_started.elapsed().as_secs_f64(),
             "diamond injector gpu online_eval: finished"
         );
-        (one_output, digit_outputs, decoder_outputs)
+        states
     }
 }
 
@@ -1261,7 +742,6 @@ mod tests {
     use super::super::{DiamondInjector, InputInjector};
     use crate::{
         __PAIR, __TestState,
-        bgg::public_key::BggPublicKey,
         matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
@@ -1271,7 +751,6 @@ mod tests {
             },
         },
         sampler::{
-            DistType, PolyHashSampler,
             gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
             trapdoor::GpuDCRTPolyTrapdoorSampler,
         },
@@ -1285,22 +764,6 @@ mod tests {
         GpuDCRTPolyHashSampler<Keccak256>,
         GpuDCRTPolyTrapdoorSampler,
     >;
-
-    fn sample_pubkey(
-        params: &GpuDCRTPolyParams,
-        hash_key: [u8; 32],
-        tag: &str,
-    ) -> BggPublicKey<GpuDCRTPolyMatrix> {
-        let matrix = GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
-            params,
-            hash_key,
-            tag,
-            super::super::DIAMOND_SECRET_SIZE,
-            super::super::DIAMOND_SECRET_SIZE * params.modulus_digits(),
-            DistType::FinRingDist,
-        );
-        BggPublicKey::new(matrix, true)
-    }
 
     #[sequential_test::sequential]
     #[test]
@@ -1326,86 +789,63 @@ mod tests {
             Some(1),
         );
 
-        let hash_key = [11u8; 32];
         let input_count = 3;
         let base = 4;
         let batch_bits = 2;
-        let decoder_count = 2;
         let dir = tempdir().expect("temporary directory should be created");
 
-        let injector = TestInjector::new(
-            params.clone(),
-            hash_key,
-            input_count,
-            base,
-            decoder_count,
-            4.578,
-            0.0,
-            dir.path().to_path_buf(),
-        )
-        .with_gpu_device_ids(gpu_ids.clone());
+        let injector = TestInjector::new(params.clone(), input_count, base, 4.578, 0.0)
+            .with_gpu_device_ids(gpu_ids.clone());
 
-        let one_pubkey = sample_pubkey(&params, hash_key, "diamond_gpu_one_pubkey");
-        let input_pubkeys = (0..input_count * batch_bits)
-            .map(|bit_idx| {
-                sample_pubkey(&params, hash_key, &format!("diamond_gpu_input_pubkey_{bit_idx}"))
-            })
-            .collect::<Vec<_>>();
-        let decoder_pubkeys = (0..decoder_count)
-            .map(|decoder_idx| {
-                sample_pubkey(
-                    &params,
-                    hash_key,
-                    &format!("diamond_gpu_decoder_pubkey_{decoder_idx}"),
-                )
-            })
-            .collect::<Vec<_>>();
+        let k = TestPoly::from_usize_to_constant(&params, 3);
 
-        injector.preprocess(&one_pubkey, &input_pubkeys, &decoder_pubkeys);
+        let preprocess_out = injector.preprocess(dir.path(), &k);
 
         let digits = vec![2u32, 1u32, 3u32];
-        let (one_output, digit_outputs, decoder_outputs) =
-            injector.online_eval(&digits, &one_pubkey, &input_pubkeys, &decoder_pubkeys);
-        assert_eq!(digit_outputs.len(), input_count * batch_bits);
-        assert_eq!(decoder_outputs.len(), decoder_count);
+        let states = injector.online_eval(dir.path(), &preprocess_out, &digits);
+        assert_eq!(states.len(), 1 + input_count * batch_bits);
 
-        let mut secret_matrix = injector.read_matrix(injector.secret_epsilon_id());
+        let mut secret_matrix = injector.read_matrix(dir.path(), injector.secret_epsilon_id());
         assert_eq!(secret_matrix.size(), (1, super::super::DIAMOND_SECRET_SIZE));
-        assert_eq!(secret_matrix.entry(0, 1), TestPoly::const_minus_one(&params));
         for (digit_idx, digit_value) in digits.iter().copied().enumerate() {
-            let secret_mask = injector
-                .read_matrix(&injector.digit_secret_id(digit_idx + 1, digit_value as usize));
+            let secret_mask = injector.read_matrix(
+                dir.path(),
+                &injector.digit_secret_id(digit_idx + 1, digit_value as usize),
+            );
             assert_eq!(
                 secret_mask.size(),
                 (super::super::DIAMOND_SECRET_SIZE, super::super::DIAMOND_SECRET_SIZE)
             );
-            assert_eq!(secret_mask.entry(0, 1), TestPoly::const_zero(&params));
-            assert_eq!(secret_mask.entry(1, 0), TestPoly::const_zero(&params));
-            assert_eq!(secret_mask.entry(1, 1), TestPoly::const_one(&params));
             secret_matrix = secret_matrix * secret_mask;
         }
-        let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, super::super::DIAMOND_SECRET_SIZE);
-        let secret_times_gadget = secret_matrix.clone() * &gadget;
-
-        assert_eq!(one_output.vector, secret_matrix.clone() * (&one_pubkey.matrix - &gadget));
-        assert_eq!(one_output.plaintext, Some(TestPoly::const_one(&params)));
+        let base_public_matrix =
+            preprocess_out.final_pub_matrix.concat_columns(&[&injector
+                .sample_w_block_with_params(&params, preprocess_out.hash_key, 0, input_count)]);
+        let base_selector = GpuDCRTPolyMatrix::from_poly_vec_row(
+            &params,
+            vec![secret_matrix.entry(0, 0), k.clone()],
+        );
+        assert_eq!(states[0], base_selector * base_public_matrix);
 
         for digit_idx in 0..input_count {
             for bit_idx in 0..batch_bits {
-                let output_idx = digit_idx * batch_bits + bit_idx;
-                let output = &digit_outputs[output_idx];
+                let state_idx = injector.bit_state_idx(digit_idx, bit_idx);
                 let bit_value = ((digits[digit_idx] as usize) >> bit_idx) & 1;
-                let plaintext = TestPoly::from_usize_to_constant(&params, bit_value);
-                let expected = secret_matrix.clone() * &input_pubkeys[output_idx].matrix -
-                    (secret_times_gadget.clone() * plaintext.clone());
-                assert_eq!(output.vector, expected);
-                assert_eq!(output.plaintext, Some(plaintext));
+                let bit_plaintext = TestPoly::from_usize_to_constant(&params, bit_value);
+                let bit_public_matrix =
+                    preprocess_out.final_pub_matrix.concat_columns(&[&injector
+                        .sample_w_block_with_params(
+                            &params,
+                            preprocess_out.hash_key,
+                            state_idx,
+                            input_count,
+                        )]);
+                let bit_selector = GpuDCRTPolyMatrix::from_poly_vec_row(
+                    &params,
+                    vec![secret_matrix.entry(0, 0), secret_matrix.entry(0, 0) * &bit_plaintext],
+                );
+                assert_eq!(states[state_idx], bit_selector * bit_public_matrix);
             }
-        }
-
-        for (decoder_idx, output) in decoder_outputs.iter().enumerate() {
-            assert_eq!(output.vector, secret_matrix.clone() * &decoder_pubkeys[decoder_idx].matrix);
-            assert_eq!(output.plaintext, Some(TestPoly::const_zero(&params)));
         }
     }
 }

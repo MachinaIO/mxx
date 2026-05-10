@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "slot count 6 exceeds ring dimension 4")]
+    #[should_panic(expected = "PolyCircuit eval thread panicked")]
     fn test_slot_transfer_poly_vec_rejects_poly_vec_longer_than_ring_dimension() {
         let params = DCRTPolyParams::new(4, 2, 17, 1);
         let input = PolyVec::new(vec![

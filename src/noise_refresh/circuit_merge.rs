@@ -17,6 +17,9 @@ use crate::{
 pub fn build_refreshed_wire_merge_subcircuit<P: Poly>(value_count: usize) -> PolyCircuit<P> {
     assert!(value_count > 0, "value_count must be positive");
     let mut circuit = PolyCircuit::<P>::new();
+    // Every decoded error or mask is passed as its own one-wire input. The
+    // `at(0)` below selects the sole wire of each input object; `value_count`
+    // counts how many such inputs exist, not slots inside a batched input.
     let decoded_errors =
         (0..value_count).map(|_| circuit.input(1).at(0).as_single_wire()).collect::<Vec<GateId>>();
     let decoded_masks =

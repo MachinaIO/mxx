@@ -489,18 +489,16 @@ impl DiamondIOBenchShape {
         BigUint::from(uniform_outputs) * BigUint::from(input_size)
     }
 
-    pub(super) fn prf_refresh_decoder_preimage_count(&self) -> usize {
-        self.input_size
-            .checked_mul(self.seed_bits)
-            .and_then(|count| count.checked_mul(self.ring_gsw_wire_count))
-            .and_then(|count| count.checked_mul(self.ring_dim))
-            .and_then(|count| count.checked_mul(self.crt_depth))
-            .expect("DiamondIO PRF refresh decoder count overflow")
+    pub(super) fn prf_refresh_decoder_preimage_count(&self) -> BigUint {
+        BigUint::from(self.input_size) *
+            BigUint::from(self.seed_bits) *
+            BigUint::from(self.ring_gsw_wire_count) *
+            BigUint::from(self.ring_dim) *
+            BigUint::from(self.crt_depth)
     }
 
     pub(super) fn prf_refresh_preimage_bytes(&self) -> BigUint {
-        BigUint::from(self.output_preimage_bytes) *
-            BigUint::from(self.prf_refresh_decoder_preimage_count())
+        BigUint::from(self.output_preimage_bytes) * self.prf_refresh_decoder_preimage_count()
     }
 }
 

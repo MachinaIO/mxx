@@ -158,24 +158,6 @@ where
     circuit
 }
 
-pub(crate) fn build_representative_goldreich_error_material_circuit<P, A>(
-    ring_gsw: Arc<RingGswContext<P, A>>,
-    cbd_n: usize,
-) -> PolyCircuit<P>
-where
-    P: Poly + 'static,
-    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
-{
-    let mut circuit = ring_gsw.fresh_circuit();
-    let encrypted_seeds = (0..5)
-        .map(|_| RingGswCiphertext::input(ring_gsw.clone(), None, &mut circuit))
-        .collect::<Vec<_>>();
-    let output =
-        representative_goldreich_cbd_output(ring_gsw, &encrypted_seeds, cbd_n, &mut circuit);
-    circuit.output(output.sub_circuit_wires());
-    circuit
-}
-
 pub(crate) fn build_representative_goldreich_mask_material_circuit<P, A>(
     ring_gsw: Arc<RingGswContext<P, A>>,
 ) -> PolyCircuit<P>
@@ -306,96 +288,6 @@ where
     );
 
     GoldreichNoiseRefreshMaterial { errors, masks }
-}
-
-fn representative_goldreich_cbd_output<P, A>(
-    ring_gsw: Arc<RingGswContext<P, A>>,
-    encrypted_seeds: &[RingGswCiphertext<P, A>],
-    cbd_n: usize,
-    circuit: &mut PolyCircuit<P>,
-) -> RingGswCiphertext<P, A>
-where
-    P: Poly + 'static,
-    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
-{
-    assert_eq!(
-        encrypted_seeds.len(),
-        5,
-        "representative Goldreich CBD circuit uses exactly five seed inputs"
-    );
-    assert!(cbd_n > 0, "representative Goldreich CBD circuit requires cbd_n > 0");
-    let positive_terms = (0..cbd_n)
-        .map(|idx| representative_goldreich_output(ring_gsw.clone(), encrypted_seeds, idx, circuit))
-        .collect::<Vec<_>>();
-    let negative_terms = (0..cbd_n)
-        .map(|idx| {
-            representative_goldreich_output(ring_gsw.clone(), encrypted_seeds, cbd_n + idx, circuit)
-        })
-        .collect::<Vec<_>>();
-    let positive = reduce_ring_gsw_add_pairwise(positive_terms, circuit);
-    let negative = reduce_ring_gsw_add_pairwise(negative_terms, circuit);
-    positive.sub(&negative, circuit)
-}
-
-fn representative_goldreich_output<P, A>(
-    ring_gsw: Arc<RingGswContext<P, A>>,
-    encrypted_seeds: &[RingGswCiphertext<P, A>],
-    edge_idx: usize,
-    circuit: &mut PolyCircuit<P>,
-) -> RingGswCiphertext<P, A>
-where
-    P: Poly + 'static,
-    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
-{
-    let graph = GoldreichGraph::from_edges(
-        5,
-        vec![representative_goldreich_edge(edge_idx)],
-        Default::default(),
-    );
-    let goldreich = GoldreichFhePrg::from_public_graph(circuit, ring_gsw, graph);
-    let mut outputs = goldreich.evaluate_uniform(encrypted_seeds, circuit);
-    assert_eq!(outputs.len(), 1, "representative Goldreich graph must produce one output");
-    outputs.remove(0)
-}
-
-fn representative_goldreich_edge(edge_idx: usize) -> GoldreichEdge {
-    const ROLE_SPLITS: [([usize; 3], [usize; 2]); 10] = [
-        ([0, 1, 2], [3, 4]),
-        ([0, 1, 3], [2, 4]),
-        ([0, 1, 4], [2, 3]),
-        ([0, 2, 3], [1, 4]),
-        ([0, 2, 4], [1, 3]),
-        ([0, 3, 4], [1, 2]),
-        ([1, 2, 3], [0, 4]),
-        ([1, 2, 4], [0, 3]),
-        ([1, 3, 4], [0, 2]),
-        ([2, 3, 4], [0, 1]),
-    ];
-    let (xor_inputs, and_inputs) = ROLE_SPLITS[edge_idx % ROLE_SPLITS.len()];
-    GoldreichEdge::new(xor_inputs, and_inputs)
-}
-
-fn reduce_ring_gsw_add_pairwise<P, A>(
-    mut terms: Vec<RingGswCiphertext<P, A>>,
-    circuit: &mut PolyCircuit<P>,
-) -> RingGswCiphertext<P, A>
-where
-    P: Poly + 'static,
-    A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>,
-{
-    assert!(!terms.is_empty(), "representative Ring-GSW reduction requires at least one term");
-    while terms.len() > 1 {
-        let mut next = Vec::with_capacity(terms.len().div_ceil(2));
-        for pair in terms.chunks(2) {
-            if pair.len() == 2 {
-                next.push(pair[0].add(&pair[1], circuit));
-            } else {
-                next.push(pair[0].clone());
-            }
-        }
-        terms = next;
-    }
-    terms.pop().expect("pairwise Ring-GSW reduction must leave one term")
 }
 
 fn assert_noise_refresh_material_prg_output_bound<P, A>(

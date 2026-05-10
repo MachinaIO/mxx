@@ -25,8 +25,34 @@ pub(super) fn scale_estimate(estimate: CircuitBenchEstimate, count: usize) -> Ci
     scale_summary(estimate_summary(estimate), count)
 }
 
+pub(super) fn scale_estimate_biguint(
+    estimate: CircuitBenchEstimate,
+    count: &BigUint,
+) -> CircuitBenchSummary {
+    scale_summary_biguint(estimate_summary(estimate), count)
+}
+
 pub(super) fn scale_summary(summary: CircuitBenchSummary, count: usize) -> CircuitBenchSummary {
     scale_independent_summary(summary, count)
+}
+
+pub(super) fn scale_summary_biguint(
+    summary: CircuitBenchSummary,
+    count: &BigUint,
+) -> CircuitBenchSummary {
+    let scaled = CircuitBenchSummary::from_nanos(
+        summary.total_time.clone() * count,
+        summary.latency,
+        summary.max_parallelism.clone() * count,
+    );
+    #[cfg(feature = "gpu")]
+    {
+        scaled.with_peak_vram(summary.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        scaled
+    }
 }
 
 pub(super) fn repeat_sequential_summary(

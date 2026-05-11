@@ -463,7 +463,7 @@ impl DiamondIOBenchShape {
         self.input_size
             .checked_mul(2)
             .and_then(|count| count.checked_mul(self.seed_bits))
-            .expect("DiamondIO selected-half PRG output count overflow")
+            .expect("DiamondIO selected-branch PRG output count overflow")
     }
 
     pub(super) fn sparse_noise_refresh_material_uniform_prg_output_count(
@@ -491,14 +491,24 @@ impl DiamondIOBenchShape {
 
     pub(super) fn prf_refresh_decoder_preimage_count(&self) -> BigUint {
         BigUint::from(self.input_size) *
+            BigUint::from(2usize) *
             BigUint::from(self.seed_bits) *
             BigUint::from(self.ring_gsw_wire_count) *
             BigUint::from(self.ring_dim) *
             BigUint::from(self.crt_depth)
     }
 
+    pub(super) fn prf_branch_rebase_preimage_count(&self) -> BigUint {
+        BigUint::from(self.input_size) *
+            BigUint::from(2usize) *
+            BigUint::from(self.seed_bits) *
+            BigUint::from(self.ring_gsw_wire_count) *
+            BigUint::from(self.ring_dim)
+    }
+
     pub(super) fn prf_refresh_preimage_bytes(&self) -> BigUint {
-        BigUint::from(self.output_preimage_bytes) * self.prf_refresh_decoder_preimage_count()
+        BigUint::from(self.output_preimage_bytes) *
+            (self.prf_refresh_decoder_preimage_count() + self.prf_branch_rebase_preimage_count())
     }
 }
 
@@ -548,4 +558,48 @@ fn matrix_compact_bytes_for_shape(
     // This is a compact upper-ish estimate used when benchmark estimation needs byte lengths
     // without materializing the underlying matrix payload.
     payload + 128
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prf_refresh_preimage_bytes_include_branch_rebase_preimages() {
+        let shape = DiamondIOBenchShape {
+            ring_dim: 7,
+            input_size: 3,
+            output_size: 2,
+            seed_bits: 5,
+            prf_mask_output_coeff_bits: 2,
+            crt_depth: 4,
+            modulus_digits: 6,
+            modulus_bits: 60,
+            state_row_size: 2,
+            state_col_size: 3,
+            b_public_col_size: 4,
+            checkpoint_count: 0,
+            transition_matrix_count: 0,
+            transition_preimage_chunk_count: 0,
+            transition_ext_w_hash_count: 0,
+            transition_target_w_hash_chunk_count: 0,
+            transition_w_hash_max_col_len: 0,
+            input_injection_transition_preimage_bytes: 0,
+            online_level_state_counts: Vec::new(),
+            transition_chunk_col_lens: Vec::new(),
+            output_preimage_bytes: 11,
+            final_decoder_preimage_bytes: 13,
+            lookup_bridge_cols: 0,
+            lookup_bridge_preimage_bytes: 0,
+            ring_gsw_wire_count: 9,
+        };
+        let noise_refresh_count = BigUint::from(3usize * 2 * 5 * 9 * 7 * 4);
+        let branch_rebase_count = BigUint::from(3usize * 2 * 5 * 9 * 7);
+        assert_eq!(shape.prf_refresh_decoder_preimage_count(), noise_refresh_count);
+        assert_eq!(shape.prf_branch_rebase_preimage_count(), branch_rebase_count);
+        assert_eq!(
+            shape.prf_refresh_preimage_bytes(),
+            BigUint::from(11usize) * (noise_refresh_count + branch_rebase_count)
+        );
+    }
 }

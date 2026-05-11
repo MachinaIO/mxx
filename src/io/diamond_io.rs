@@ -9,6 +9,7 @@ use tracing::{debug, info};
 use crate::decoder::masked_high_bit::{MaskedHighBitEvaluatedOutput, MaskedHighBitOnlineInput};
 use crate::{
     bgg::{
+        encoding::BggEncoding,
         naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
         public_key::BggPublicKey,
         sampler::BGGPublicKeySampler,
@@ -927,6 +928,7 @@ where
                 &one_encoding_vec,
                 &k_encoding_vec,
                 &digit_encoding_inputs,
+                input.as_slice(),
                 seed_encoding_inputs.clone(),
                 debug_prg_ciphertexts,
                 &enc_lookup_evaluator,
@@ -940,6 +942,7 @@ where
                 &one_encoding_vec,
                 &k_encoding_vec,
                 &digit_encoding_inputs,
+                input.as_slice(),
                 seed_encoding_inputs.clone(),
                 debug_prg_ciphertexts,
                 &enc_lookup_evaluator,

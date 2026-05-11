@@ -417,6 +417,7 @@ where
             );
             let started = Instant::now();
             let refreshed_outputs = noise_refresher.preprocess_many(
+                params.goldreich_graph_seed,
                 &refresh_ids,
                 &one,
                 &selected_half_wires,
@@ -691,6 +692,7 @@ where
                 decoder_sets.push(decoders);
             }
             next_seed_wires.extend(noise_refresher.online_eval_many(
+                params.goldreich_graph_seed,
                 &refresh_ids,
                 one,
                 &selected_half_wires,

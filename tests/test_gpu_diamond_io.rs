@@ -249,6 +249,7 @@ impl DiamondIOGpuBenchConfig {
     ) -> usize {
         minimum_diamond_io_prf_seed_bits(
             params,
+            self.injector_batch_bits,
             self.output_size,
             self.output_size,
             prf_mask_output_coeff_bits,

@@ -98,6 +98,96 @@ where
         (one, k_pubkey, input_digits)
     }
 
+    fn prf_digit_branch_count(&self) -> usize {
+        1usize
+            .checked_shl(self.injector.batch_bits() as u32)
+            .expect("DiamondIO PRF digit branch count overflow")
+    }
+
+    fn prf_digit_scalar(bit_in_digit: usize) -> u32 {
+        1u32.checked_shl(bit_in_digit as u32).expect("DiamondIO PRF digit selector scalar overflow")
+    }
+
+    fn prf_branch_scalar(branch: usize) -> u32 {
+        u32::try_from(branch).expect("DiamondIO PRF digit branch scalar overflow")
+    }
+
+    pub(super) fn prf_final_round_idx(&self) -> usize {
+        self.injector.input_count
+    }
+
+    pub(super) fn build_prf_digit_public_key_vecs(
+        &self,
+        bit_vecs: &[NaiveBGGPublicKeyVec<M>],
+    ) -> Vec<NaiveBGGPublicKeyVec<M>> {
+        assert_eq!(
+            bit_vecs.len(),
+            self.input_size,
+            "DiamondIO PRF bit public-key count must match input_size"
+        );
+        let batch_bits = self.injector.batch_bits();
+        assert!(batch_bits > 0, "DiamondIO injector batch_bits must be positive");
+        assert_eq!(
+            self.input_size,
+            self.injector
+                .input_count
+                .checked_mul(batch_bits)
+                .expect("DiamondIO injector bit count overflow"),
+            "DiamondIO input_size must match injector digit bit count"
+        );
+        bit_vecs
+            .chunks_exact(batch_bits)
+            .map(|chunk| {
+                let mut digit =
+                    chunk[0].small_scalar_mul(&self.injector.params, &[Self::prf_digit_scalar(0)]);
+                for (bit_in_digit, bit_vec) in chunk.iter().enumerate().skip(1) {
+                    let term = bit_vec.small_scalar_mul(
+                        &self.injector.params,
+                        &[Self::prf_digit_scalar(bit_in_digit)],
+                    );
+                    digit = digit + &term;
+                }
+                digit
+            })
+            .collect()
+    }
+
+    pub(super) fn build_prf_digit_encoding_vecs(
+        &self,
+        bit_vecs: &[NaiveBGGEncodingVec<M>],
+    ) -> Vec<NaiveBGGEncodingVec<M>> {
+        assert_eq!(
+            bit_vecs.len(),
+            self.input_size,
+            "DiamondIO PRF bit encoding count must match input_size"
+        );
+        let batch_bits = self.injector.batch_bits();
+        assert!(batch_bits > 0, "DiamondIO injector batch_bits must be positive");
+        assert_eq!(
+            self.input_size,
+            self.injector
+                .input_count
+                .checked_mul(batch_bits)
+                .expect("DiamondIO injector bit count overflow"),
+            "DiamondIO input_size must match injector digit bit count"
+        );
+        bit_vecs
+            .chunks_exact(batch_bits)
+            .map(|chunk| {
+                let mut digit =
+                    chunk[0].small_scalar_mul(&self.injector.params, &[Self::prf_digit_scalar(0)]);
+                for (bit_in_digit, bit_vec) in chunk.iter().enumerate().skip(1) {
+                    let term = bit_vec.small_scalar_mul(
+                        &self.injector.params,
+                        &[Self::prf_digit_scalar(bit_in_digit)],
+                    );
+                    digit = digit + &term;
+                }
+                digit
+            })
+            .collect()
+    }
+
     /// Expand a scalar BGG public key into one identical key per ring slot.
     pub(super) fn duplicate_public_key(
         params: &<M::P as Poly>::Params,
@@ -352,7 +442,6 @@ where
         round_idx: usize,
         branch: usize,
     ) -> [u8; 32] {
-        assert!(branch < 2, "DiamondIO PRF branch must be a bit");
         let mut hasher = Keccak256::new();
         hasher.update(b"DiamondIOPrfNoiseRefreshMaterial/v1");
         hasher.update(base_seed);
@@ -396,7 +485,6 @@ where
     }
 
     pub(super) fn prf_selected_branch_range(seed_bits: usize, branch: usize) -> (usize, usize) {
-        assert!(branch < 2, "DiamondIO PRF branch must be a bit");
         (
             branch.checked_mul(seed_bits).expect("DiamondIO PRF selected branch range overflow"),
             seed_bits,
@@ -561,11 +649,11 @@ where
     /// Compute the public keys for the PRF seed evolution and one independent
     /// final slotwise polynomial PRF mask per function output.
     ///
-    /// Each round evaluates both Goldreich PRG halves for preprocessing, saves
-    /// branch-specific rebase preimages, and then noise-refreshes one common
-    /// per-wire public key. Eval can later compute only the branch selected by
-    /// the runtime input bit and rebase it before entering the unchanged noise
-    /// refresh path.
+    /// Each round evaluates every packed-digit Goldreich PRG branch for
+    /// preprocessing, saves branch-specific rebase preimages, and then
+    /// noise-refreshes one common per-wire public key. Eval can later compute
+    /// only the branch selected by the runtime input digit and rebase it before
+    /// entering the unchanged noise refresh path.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn compute_prf_mask_public_key(
         &self,
@@ -597,8 +685,8 @@ where
         );
         assert_eq!(
             input_digit_vecs.len(),
-            self.input_size,
-            "DiamondIO PRF input public-key count must match input_size"
+            self.injector.input_count,
+            "DiamondIO PRF input public-key count must match injector input_count"
         );
         assert!(self.seed_bits > 0, "DiamondIO PRF requires at least one seed bit");
         assert_eq!(
@@ -608,6 +696,7 @@ where
         );
         let params = &self.injector.params;
         let wire_count = enc_seed_public_keys.len() / self.seed_bits;
+        let branch_count = self.prf_digit_branch_count();
         let pk_lookup_evaluator = self
             .pk_lookup_evaluator
             .as_ref()
@@ -627,7 +716,8 @@ where
         );
         let mut seed_wires = enc_seed_public_keys.to_vec();
         info!(
-            input_size = self.input_size,
+            input_count = self.injector.input_count,
+            branch_count,
             seed_bits = self.seed_bits,
             wire_count,
             slot_count = one_vec.num_slots(),
@@ -636,14 +726,19 @@ where
         );
         for (round_idx, selector) in input_digit_vecs.iter().enumerate() {
             let round_started = Instant::now();
-            let full_half_wire_count = self
+            let full_branch_wire_count = self
                 .seed_bits
                 .checked_mul(wire_count)
-                .expect("DiamondIO PRF half wire count overflow");
+                .expect("DiamondIO PRF branch wire count overflow");
+            let round_output_bits = self
+                .seed_bits
+                .checked_mul(branch_count)
+                .expect("DiamondIO PRF digit branch output bit count overflow");
             debug!(
                 round_idx,
                 seed_wire_count = seed_wires.len(),
-                full_half_wire_count,
+                full_branch_wire_count,
+                branch_count,
                 "DiamondIO PRF public-key round sampling PRG outputs"
             );
             let prg_started = Instant::now();
@@ -653,7 +748,7 @@ where
                     debug_ring_gsw_public_key.expect(
                         "DiamondIO debug PRG public-key sampling requires Ring-GSW public key",
                     ),
-                    2 * self.seed_bits,
+                    round_output_bits,
                     debug_prg_ciphertexts.as_deref_mut().expect(
                         "DiamondIO debug PRG public-key sampling requires ciphertext storage",
                     ),
@@ -661,9 +756,9 @@ where
             } else {
                 self.build_goldreich_prg_range_circuit(
                     round_idx,
-                    2 * self.seed_bits,
+                    round_output_bits,
                     0,
-                    2 * self.seed_bits,
+                    round_output_bits,
                 )
                 .eval(
                     &self.injector.params,
@@ -684,10 +779,12 @@ where
             );
             assert_eq!(
                 prg_outputs.len(),
-                2 * full_half_wire_count,
+                branch_count
+                    .checked_mul(full_branch_wire_count)
+                    .expect("DiamondIO PRF digit branch wire count overflow"),
                 "DiamondIO PRF round PRG output count mismatch"
             );
-            let common_rebase_wires = (0..full_half_wire_count)
+            let common_rebase_wires = (0..full_branch_wire_count)
                 .map(|wire_idx| {
                     self.prf_common_rebase_public_key_from_public(
                         &prg_outputs[wire_idx],
@@ -706,12 +803,12 @@ where
                 let preprocess_out =
                     preprocess_out.expect("DiamondIO PRF persistence requires preprocess output");
                 let branch_persist_started = Instant::now();
-                for branch in 0..2usize {
-                    let branch_sub =
-                        selector.clone() - &one_vec.small_scalar_mul(params, &[branch as u32]);
+                for branch in 0..branch_count {
+                    let branch_sub = selector.clone() -
+                        &one_vec.small_scalar_mul(params, &[Self::prf_branch_scalar(branch)]);
                     let source_row_size = branch_sub.key(0).matrix.row_size();
-                    for wire_idx in 0..full_half_wire_count {
-                        let prg_wire = &prg_outputs[branch * full_half_wire_count + wire_idx];
+                    for wire_idx in 0..full_branch_wire_count {
+                        let prg_wire = &prg_outputs[branch * full_branch_wire_count + wire_idx];
                         let target_col_size = prg_wire.key(0).matrix.col_size();
                         let mask_matrix = self.prf_branch_mask_matrix(
                             source_row_size,
@@ -757,7 +854,7 @@ where
             let mut next_seed_wires: Option<Vec<NaiveBGGPublicKeyVec<M>>> = None;
             let mut persisted_refresh_preimages = 0usize;
             let persist_started = Instant::now();
-            for branch in 0..2usize {
+            for branch in 0..branch_count {
                 let material_graph_seed =
                     self.prf_noise_refresh_material_graph_seed(round_idx, branch);
                 let refreshed_outputs = noise_refresher.preprocess_many(
@@ -896,7 +993,7 @@ where
             wires
         } else {
             self.build_goldreich_prg_range_circuit(
-                self.input_size,
+                self.prf_final_round_idx(),
                 generated_prg_output_bits,
                 0,
                 generated_prg_output_bits,
@@ -1050,7 +1147,7 @@ where
         one_vec: &NaiveBGGEncodingVec<M>,
         k_vec: &NaiveBGGEncodingVec<M>,
         input_digit_vecs: &[NaiveBGGEncodingVec<M>],
-        input_bits: &[bool],
+        input_digits: &[u32],
         enc_seed_wires: Vec<NaiveBGGEncodingVec<M>>,
         debug_prg_ciphertexts: &[NativeRingGswCiphertext<M::P>],
         enc_lookup_evaluator: &ENCPE,
@@ -1068,13 +1165,13 @@ where
         );
         assert_eq!(
             input_digit_vecs.len(),
-            self.input_size,
-            "DiamondIO PRF input encoding count must match input_size"
+            self.injector.input_count,
+            "DiamondIO PRF input encoding count must match injector input_count"
         );
         assert_eq!(
-            input_bits.len(),
-            self.input_size,
-            "DiamondIO PRF runtime input bit count must match input_size"
+            input_digits.len(),
+            self.injector.input_count,
+            "DiamondIO PRF runtime input digit count must match injector input_count"
         );
         assert!(self.seed_bits > 0, "DiamondIO PRF requires at least one seed bit");
         assert_eq!(
@@ -1085,6 +1182,7 @@ where
         let wire_count = enc_seed_wires.len() / self.seed_bits;
         let params = &self.injector.params;
         let (_, _, crt_depth) = params.to_crt();
+        let branch_count = self.prf_digit_branch_count();
         let mut refresh_context_circuit = PolyCircuit::new();
         let noise_refresher = NoiseRefresherNaiveVec::<M, NestedRnsPoly<M::P>, HS>::new(
             self.build_ring_gsw_circuit_context(&mut refresh_context_circuit),
@@ -1097,7 +1195,8 @@ where
         let mut seed_wires = enc_seed_wires;
         let mut debug_prg_ciphertext_cursor = 0usize;
         info!(
-            input_size = self.input_size,
+            input_count = self.injector.input_count,
+            branch_count,
             seed_bits = self.seed_bits,
             wire_count,
             slot_count = one_vec.num_slots(),
@@ -1106,19 +1205,28 @@ where
         );
         for (round_idx, selector) in input_digit_vecs.iter().enumerate() {
             let round_started = Instant::now();
-            let full_half_wire_count = self
+            let full_branch_wire_count = self
                 .seed_bits
                 .checked_mul(wire_count)
-                .expect("DiamondIO PRF half wire count overflow");
-            let branch = input_bits[round_idx] as usize;
+                .expect("DiamondIO PRF branch wire count overflow");
+            let branch = input_digits[round_idx] as usize;
+            assert!(
+                branch < branch_count,
+                "DiamondIO PRF input digit must be smaller than branch_count"
+            );
             let (branch_start, branch_len) =
                 Self::prf_selected_branch_range(self.seed_bits, branch);
+            let round_output_bits = self
+                .seed_bits
+                .checked_mul(branch_count)
+                .expect("DiamondIO PRF digit branch output bit count overflow");
             debug!(
                 round_idx,
                 branch,
                 seed_wire_count = seed_wires.len(),
-                full_half_wire_count,
-                "DiamondIO PRF encoding round sampling selected PRG half"
+                full_branch_wire_count,
+                branch_count,
+                "DiamondIO PRF encoding round sampling selected PRG branch"
             );
             let prg_started = Instant::now();
             let prg_outputs = if self.debug_encrypt_random_prg_wires() {
@@ -1131,7 +1239,7 @@ where
             } else {
                 self.build_goldreich_prg_range_circuit(
                     round_idx,
-                    2 * self.seed_bits,
+                    round_output_bits,
                     branch_start,
                     branch_len,
                 )
@@ -1156,10 +1264,11 @@ where
             );
             assert_eq!(
                 prg_outputs.len(),
-                full_half_wire_count,
+                full_branch_wire_count,
                 "DiamondIO PRF eval selected branch output count mismatch"
             );
-            let branch_sub = selector.clone() - &one_vec.small_scalar_mul(params, &[branch as u32]);
+            let branch_sub = selector.clone() -
+                &one_vec.small_scalar_mul(params, &[Self::prf_branch_scalar(branch)]);
             let source_row_size = branch_sub.encoding(0).pubkey.matrix.row_size();
             let final_state = states[0].clone();
             let selected_branch_wires = prg_outputs
@@ -1208,7 +1317,7 @@ where
                 round_idx,
                 branch,
                 selected_branch_wire_count = selected_branch_wires.len(),
-                "DiamondIO PRF encoding round rebased selected PRG half"
+                "DiamondIO PRF encoding round rebased selected PRG branch"
             );
             let refresh_ids = (0..selected_branch_wires.len())
                 .map(|wire_idx| Self::prf_refresh_id(round_idx, wire_idx))
@@ -1451,15 +1560,22 @@ mod tests {
     use crate::{
         __PAIR, __TestState,
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
+        circuit::PolyCircuit,
+        gadgets::arith::{ModularArithmeticContext, NestedRnsPolyContext},
+        input_injector::DiamondInjector,
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::{
             Poly,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
-        sampler::{hash::DCRTPolyHashSampler, uniform::DCRTPolyUniformSampler},
+        sampler::{
+            hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
+            uniform::DCRTPolyUniformSampler,
+        },
         utils::{create_random_poly, create_ternary_random_poly},
     };
     use keccak_asm::Keccak256;
+    use std::sync::Arc;
 
     type TestDiamondIO = DiamondIO<
         DCRTPolyMatrix,
@@ -1471,6 +1587,57 @@ mod tests {
         crate::func_enc::NoCircuitEvaluator,
         crate::func_enc::NoCircuitEvaluator,
     >;
+
+    fn test_scheme_with_batch_bits(input_count: usize, batch_bits: usize) -> TestDiamondIO {
+        let params = DCRTPolyParams::new(2, 1, 10, 5);
+        let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
+        let ring_gsw_context = Arc::new(NestedRnsPolyContext::setup(
+            &mut setup_circuit,
+            &params,
+            5,
+            2,
+            1 << 8,
+            false,
+            Some(1),
+        ));
+        let ring_gsw_width = 2 *
+            <NestedRnsPolyContext as ModularArithmeticContext<DCRTPoly>>::gadget_len(
+                ring_gsw_context.as_ref(),
+                Some(1),
+                Some(0),
+            );
+        let injector = DiamondInjector::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(
+            params.clone(), input_count, 1usize << batch_bits, batch_bits, 4.578, 0.0
+        );
+        TestDiamondIO::new(
+            injector,
+            input_count * batch_bits,
+            2,
+            params,
+            ring_gsw_context,
+            ring_gsw_width,
+            0,
+            Some(1),
+            Some(0.0),
+            b"diamond_io_digit_selector_test".to_vec(),
+            6,
+            1,
+            1,
+            1,
+            [0x24; 32],
+            [0x42; 32],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
 
     #[sequential_test::sequential]
     #[test]
@@ -1521,13 +1688,18 @@ mod tests {
     }
 
     #[test]
-    fn test_prf_selected_branch_range_and_debug_cursor_accounting() {
+    fn test_prf_digit_selected_branch_range_and_debug_cursor_accounting() {
         let seed_bits = 11;
         assert_eq!(TestDiamondIO::prf_selected_branch_range(seed_bits, 0), (0, seed_bits));
         assert_eq!(TestDiamondIO::prf_selected_branch_range(seed_bits, 1), (seed_bits, seed_bits));
+        assert_eq!(
+            TestDiamondIO::prf_selected_branch_range(seed_bits, 3),
+            (3 * seed_bits, seed_bits)
+        );
 
+        let branch_count = 4usize;
         let full_round_debug_count =
-            TestDiamondIO::debug_prg_ciphertext_count_for_output_bits(2 * seed_bits);
+            TestDiamondIO::debug_prg_ciphertext_count_for_output_bits(branch_count * seed_bits);
         let selected_branch_debug_count =
             TestDiamondIO::debug_prg_ciphertext_count_for_output_bits(seed_bits);
         assert_eq!(full_round_debug_count, 1);
@@ -1539,13 +1711,85 @@ mod tests {
     }
 
     #[test]
-    fn test_prf_noise_refresh_material_domain_is_branch_specific_but_refresh_id_is_not() {
+    fn test_prf_digit_selector_linear_combination_matches_packed_input() {
+        let scheme = test_scheme_with_batch_bits(2, 2);
+        let params = &scheme.injector.params;
+        let ring_dim = params.ring_dimension() as usize;
+        let input_bits = [true, false, true, true];
+        let packed_digits = [1usize, 3usize];
+        let (one, _k, input_bit_public_keys) = scheme.sample_bgg_public_keys(params, [0x55u8; 32]);
+        let bit_public_vecs = input_bit_public_keys
+            .iter()
+            .map(|key| TestDiamondIO::duplicate_public_key(params, key, ring_dim))
+            .collect::<Vec<_>>();
+        let digit_public_vecs = scheme.build_prf_digit_public_key_vecs(&bit_public_vecs);
+        assert_eq!(digit_public_vecs.len(), packed_digits.len());
+        let expected_first =
+            bit_public_vecs[0].clone() + &bit_public_vecs[1].small_scalar_mul(params, &[2]);
+        let expected_second =
+            bit_public_vecs[2].clone() + &bit_public_vecs[3].small_scalar_mul(params, &[2]);
+        assert_eq!(digit_public_vecs[0], expected_first);
+        assert_eq!(digit_public_vecs[1], expected_second);
+
+        let secrets = vec![create_ternary_random_poly(params)];
+        let encoding_sampler =
+            BGGEncodingSampler::<DCRTPolyUniformSampler>::new(params, &secrets, None);
+        let plaintexts = input_bits
+            .iter()
+            .map(|bit| DCRTPoly::from_usize_to_constant(params, *bit as usize))
+            .collect::<Vec<_>>();
+        let encoding_public_keys = std::iter::once(one.clone())
+            .chain(input_bit_public_keys.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut sampled_encodings =
+            encoding_sampler.sample(params, &encoding_public_keys, &plaintexts);
+        let one_encoding = sampled_encodings.remove(0);
+        let bit_encodings = sampled_encodings;
+        let bit_encoding_vecs = bit_encodings
+            .iter()
+            .map(|encoding| NaiveBGGEncodingVec::new(params, vec![encoding.clone(); ring_dim]))
+            .collect::<Vec<_>>();
+        let digit_encoding_vecs = scheme.build_prf_digit_encoding_vecs(&bit_encoding_vecs);
+        assert_eq!(digit_encoding_vecs.len(), packed_digits.len());
+
+        let one_vec = NaiveBGGEncodingVec::new(params, vec![one_encoding; ring_dim]);
+        for (digit_idx, &digit) in packed_digits.iter().enumerate() {
+            let digit_vec = &digit_encoding_vecs[digit_idx];
+            assert_eq!(
+                digit_vec.encoding(0).pubkey,
+                digit_public_vecs[digit_idx].key(0),
+                "digit public-key and encoding selector construction must agree"
+            );
+            let expected_plaintext = DCRTPoly::from_usize_to_constant(params, digit);
+            assert_eq!(
+                digit_vec
+                    .encoding(0)
+                    .plaintext
+                    .as_ref()
+                    .expect("test digit selector plaintext should be known"),
+                &expected_plaintext
+            );
+            let sub = digit_vec.clone() -
+                &one_vec.small_scalar_mul(params, &[TestDiamondIO::prf_branch_scalar(digit)]);
+            assert_eq!(
+                sub.encoding(0)
+                    .plaintext
+                    .as_ref()
+                    .expect("test digit selector subtraction plaintext should be known"),
+                &DCRTPoly::from_usize_to_constant(params, 0),
+                "digit selector minus the packed input digit must be a zero encoding"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prf_noise_refresh_material_domain_is_digit_branch_specific() {
         let base_seed = [0x42u8; 32];
         let round_idx = 7;
         let branch_zero =
             TestDiamondIO::prf_noise_refresh_material_graph_seed_from_base(base_seed, round_idx, 0);
         let branch_one =
-            TestDiamondIO::prf_noise_refresh_material_graph_seed_from_base(base_seed, round_idx, 1);
+            TestDiamondIO::prf_noise_refresh_material_graph_seed_from_base(base_seed, round_idx, 3);
         let next_round_branch_zero = TestDiamondIO::prf_noise_refresh_material_graph_seed_from_base(
             base_seed,
             round_idx + 1,
@@ -1553,7 +1797,7 @@ mod tests {
         );
         assert_ne!(
             branch_zero, branch_one,
-            "noise-refresh mask/error material must differ for x_i = 0 and x_i = 1"
+            "noise-refresh mask/error material must differ for distinct digit branches"
         );
         assert_ne!(
             branch_zero, next_round_branch_zero,
@@ -1568,7 +1812,7 @@ mod tests {
         );
         assert_ne!(
             TestDiamondIO::prf_refresh_preimage_id(round_idx, 0, 3, 5, 2),
-            TestDiamondIO::prf_refresh_preimage_id(round_idx, 1, 3, 5, 2),
+            TestDiamondIO::prf_refresh_preimage_id(round_idx, 3, 3, 5, 2),
             "refresh preimage artifacts must be branch-specific"
         );
     }

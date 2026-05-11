@@ -142,6 +142,7 @@ pub fn diamond_io_final_prg_uniform_output_bits(
 /// Returns the minimum seed length satisfying every Goldreich PRG output bound in DiamondIO.
 pub fn minimum_diamond_io_prf_seed_bits(
     params: &DCRTPolyParams,
+    input_batch_bits: usize,
     output_size: usize,
     function_output_bits: usize,
     prf_mask_output_coeff_bits: usize,
@@ -149,7 +150,11 @@ pub fn minimum_diamond_io_prf_seed_bits(
     cbd_n: usize,
 ) -> usize {
     let ring_dim = params.ring_dimension() as usize;
-    let seed_refresh_seed_bits = minimum_seed_refresh_prf_seed_bits();
+    let seed_refresh_seed_bits = minimum_seed_refresh_prf_seed_bits(
+        1usize
+            .checked_shl(input_batch_bits as u32)
+            .expect("DiamondIO seed-refresh branch count overflow"),
+    );
     let final_mask_seed_bits =
         minimum_goldreich_input_size(diamond_io_final_prg_uniform_output_bits(
             output_size,
@@ -384,6 +389,7 @@ where
             build_candidate(crt_depth, mask_bits, Some(global_noise_refresh_v_bits));
         let expected_seed_bits = minimum_diamond_io_prf_seed_bits(
             &cpu_params,
+            final_candidate.injector.batch_bits(),
             func_type.output_bits(),
             func_type.output_bits(),
             mask_bits,
@@ -482,6 +488,16 @@ where
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
 {
+    fn prf_round_count(&self) -> usize {
+        self.injector.input_count
+    }
+
+    fn prf_branch_count(&self) -> usize {
+        1usize
+            .checked_shl(self.injector.batch_bits() as u32)
+            .expect("DiamondIO PRF digit branch count overflow")
+    }
+
     /// Simulate DiamondIO error growth for the selected function family.
     ///
     /// Goldreich PRG calls are evaluated only for one representative output ciphertext. Those
@@ -584,7 +600,7 @@ where
         );
         let cached_final_mask_prg_output = self.simulate_representative_prg_output(
             &prefix.cpu_params,
-            self.input_size,
+            self.prf_final_round_idx(),
             func_type
                 .output_bits()
                 .checked_mul(prefix.cpu_params.ring_dimension() as usize)
@@ -742,8 +758,8 @@ where
         assert!(self.seed_bits > 0, "DiamondIO error simulation requires seed_bits > 0");
 
         let cpu_params = cpu_params_from_poly_params(&self.injector.params);
-        let prefix_required_seed_bits =
-            minimum_seed_refresh_prf_seed_bits().max(minimum_noise_refresh_seed_bits(
+        let prefix_required_seed_bits = minimum_seed_refresh_prf_seed_bits(self.prf_branch_count())
+            .max(minimum_noise_refresh_seed_bits(
                 &cpu_params,
                 self.noise_refresh_v_bits,
                 self.noise_refresh_cbd_n,
@@ -818,7 +834,8 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
-        if self.input_size == 0 {
+        let prf_round_count = self.prf_round_count();
+        if prf_round_count == 0 {
             return Some(self.noise_refresh_v_bits);
         }
         let max_candidate =
@@ -833,7 +850,7 @@ where
             plt_evaluator,
             slot_transfer_evaluator,
         )?;
-        if self.input_size == 1 {
+        if prf_round_count == 1 {
             return Some(first.round.noise_refresh.v_bits);
         }
         let steady_seed_errors = vec![first.refreshed_seed; 5];
@@ -892,11 +909,12 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
-        let mut prf_refreshes = Vec::with_capacity(self.input_size);
+        let prf_round_count = self.prf_round_count();
+        let mut prf_refreshes = Vec::with_capacity(prf_round_count);
         let mut final_seed_errors = base.initial_seed_errors.clone();
         let mut final_seed_ciphertext_randomizer_norm =
             base.initial_seed_ciphertext_randomizer_norm.clone();
-        if self.input_size > 0 {
+        if prf_round_count > 0 {
             let first = self.simulate_prf_refresh_round_fixed(
                 &base,
                 0,
@@ -911,7 +929,7 @@ where
                 first.refreshed_seed_ciphertext_randomizer_norm.clone();
             prf_refreshes.push(first.round);
 
-            if self.input_size > 1 {
+            if prf_round_count > 1 {
                 // After the first refresh, every seed wire has the same rounded CBD bound. The
                 // second round therefore gives the steady-state representative refresh used for
                 // all later rounds; later graph seeds change, but the error shape does not.
@@ -928,7 +946,7 @@ where
                 final_seed_ciphertext_randomizer_norm =
                     steady.refreshed_seed_ciphertext_randomizer_norm.clone();
                 prf_refreshes.push(steady.round.clone());
-                for round_idx in 2..self.input_size {
+                for round_idx in 2..prf_round_count {
                     let (
                         representative_selected_prg_ciphertext_decryption_error,
                         refreshed_seed_ciphertext_randomizer_norm,
@@ -1338,7 +1356,9 @@ where
         let representative_branch = self.simulate_representative_prg_output(
             &base.cpu_params,
             round_idx,
-            2 * self.seed_bits,
+            self.prf_branch_count()
+                .checked_mul(self.seed_bits)
+                .expect("DiamondIO seed-refresh PRF output size overflow"),
             0,
             base.one.clone(),
             seed_errors.to_vec(),
@@ -1441,7 +1461,7 @@ where
         let final_mask_prg_output = cached_final_mask_prg_output.unwrap_or_else(|| {
             self.simulate_representative_prg_output(
                 &prefix.cpu_params,
-                self.input_size,
+                self.prf_final_round_idx(),
                 func_type
                     .output_bits()
                     .checked_mul(prefix.cpu_params.ring_dimension() as usize)
@@ -1920,7 +1940,7 @@ where
         };
         let function_prg_output = self.simulate_representative_prg_output(
             params,
-            self.input_size,
+            self.prf_final_round_idx(),
             output_bits,
             0,
             one.clone(),
@@ -2095,11 +2115,14 @@ fn diamond_io_noise_refresh_pre_round_margin(
     decode_margin(full_q.as_ref(), v_bits, &DecodeThreshold::new(q_max))
 }
 
-fn minimum_seed_refresh_prf_seed_bits() -> usize {
+fn minimum_seed_refresh_prf_seed_bits(branch_count: usize) -> usize {
+    assert!(branch_count > 0, "DiamondIO seed-refresh branch count must be positive");
     let mut seed_bits = 5usize;
     while !goldreich_output_bound_holds(
         seed_bits,
-        seed_bits.checked_mul(2).expect("DiamondIO seed-refresh PRF output size overflow"),
+        seed_bits
+            .checked_mul(branch_count)
+            .expect("DiamondIO seed-refresh PRF output size overflow"),
     ) {
         seed_bits =
             seed_bits.checked_add(1).expect("DiamondIO seed-refresh PRF seed-bit search overflow");
@@ -2361,6 +2384,7 @@ mod tests {
         let params = cpu_params_from_poly_params(&scheme.injector.params);
         scheme.seed_bits = scheme.seed_bits.max(minimum_diamond_io_prf_seed_bits(
             &params,
+            scheme.injector.batch_bits(),
             scheme.output_size,
             scheme.output_size,
             scheme.prf_mask_output_coeff_bits,
@@ -2370,14 +2394,17 @@ mod tests {
     }
 
     #[test]
-    fn test_minimum_diamond_io_prf_seed_bits_covers_all_prg_uses() {
+    fn test_minimum_diamond_io_prf_seed_bits_covers_digit_branch_outputs() {
         let params = DCRTPolyParams::new(2, 1, 10, 5);
+        let input_batch_bits = 3usize;
+        let branch_count = 1usize << input_batch_bits;
         let output_size = 3usize;
         let prf_mask_output_coeff_bits = 2usize;
         let noise_refresh_v_bits = 1usize;
         let cbd_n = 1usize;
         let seed_bits = minimum_diamond_io_prf_seed_bits(
             &params,
+            input_batch_bits,
             output_size,
             output_size,
             prf_mask_output_coeff_bits,
@@ -2386,7 +2413,7 @@ mod tests {
         );
         let ring_dim = params.ring_dimension() as usize;
 
-        assert!(goldreich_output_bound_holds(seed_bits, 2 * seed_bits));
+        assert!(goldreich_output_bound_holds(seed_bits, branch_count * seed_bits));
         assert!(goldreich_output_bound_holds(
             seed_bits,
             diamond_io_final_prg_uniform_output_bits(
@@ -2400,7 +2427,7 @@ mod tests {
 
         let previous = seed_bits - 1;
         assert!(
-            !goldreich_output_bound_holds(previous, 2 * previous) ||
+            !goldreich_output_bound_holds(previous, branch_count * previous) ||
                 !goldreich_output_bound_holds(
                     previous,
                     diamond_io_final_prg_uniform_output_bits(
@@ -2413,6 +2440,65 @@ mod tests {
                 previous < minimum_noise_refresh_seed_bits(&params, noise_refresh_v_bits, cbd_n),
             "one smaller seed length must fail at least one DiamondIO PRG output bound"
         );
+    }
+
+    #[test]
+    fn test_prf_final_round_separator_uses_digit_round_count() {
+        let scheme = test_scheme_with_input_count(1, 2);
+        assert_eq!(scheme.injector.batch_bits(), 1);
+
+        let digit_scheme = {
+            let params = DCRTPolyParams::new(2, 1, 10, 5);
+            let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
+            let ring_gsw_context = Arc::new(NestedRnsPolyContext::setup(
+                &mut setup_circuit,
+                &params,
+                5,
+                2,
+                1 << 8,
+                false,
+                Some(1),
+            ));
+            let ring_gsw_width = 2 *
+                <NestedRnsPolyContext as ModularArithmeticContext<DCRTPoly>>::gadget_len(
+                    ring_gsw_context.as_ref(),
+                    Some(1),
+                    Some(0),
+                );
+            let injector = DiamondInjector::<
+                DCRTPolyMatrix,
+                DCRTPolyUniformSampler,
+                DCRTPolyHashSampler<Keccak256>,
+                DCRTPolyTrapdoorSampler,
+            >::new(params.clone(), 2, 4, 2, 4.578, 0.0);
+            TestDiamondIO::new(
+                injector,
+                4,
+                6,
+                params,
+                ring_gsw_context,
+                ring_gsw_width,
+                0,
+                Some(1),
+                Some(0.0),
+                b"diamond_io_final_round_separator_test".to_vec(),
+                6,
+                1,
+                1,
+                1,
+                [0x24; 32],
+                [0x42; 32],
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        assert_eq!(digit_scheme.input_size, 4);
+        assert_eq!(digit_scheme.injector.input_count, 2);
+        assert_ne!(digit_scheme.input_size, digit_scheme.injector.input_count);
+        assert_eq!(digit_scheme.prf_final_round_idx(), digit_scheme.injector.input_count);
     }
 
     #[test]
@@ -2553,7 +2639,7 @@ mod tests {
 
     #[test]
     #[ignore = "full noise-refresh path is intentionally heavier than default unit tests"]
-    fn test_simulate_error_growth_records_one_refresh_per_input_bit() {
+    fn test_simulate_error_growth_records_one_refresh_per_input_digit() {
         let mut scheme = test_scheme(2);
         make_scheme_seed_bound_safe(&mut scheme);
         let ctx = simulator_context(&scheme.injector.params);
@@ -2569,7 +2655,7 @@ mod tests {
             )
             .expect("DiamondIO error simulation should find a noise-refresh mask size");
 
-        assert_eq!(simulation.prf_refreshes.len(), scheme.input_size);
+        assert_eq!(simulation.prf_refreshes.len(), scheme.injector.input_count);
     }
 
     #[test]
@@ -2616,7 +2702,7 @@ mod tests {
             )
             .expect("fixed-v prefix should build with the fixture seed size");
 
-        assert_eq!(prefix.prf_refreshes.len(), scheme.input_size);
+        assert_eq!(prefix.prf_refreshes.len(), scheme.injector.input_count);
         assert_eq!(
             prefix.prf_refreshes.iter().map(|refresh| refresh.round_idx).collect::<Vec<_>>(),
             vec![0, 1, 2]

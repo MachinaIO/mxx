@@ -30,6 +30,8 @@ pub(super) struct DiamondIOStorageEstimate {
 pub(super) struct DiamondIOBenchShape {
     pub(super) ring_dim: usize,
     pub(super) input_size: usize,
+    pub(super) prf_round_count: usize,
+    pub(super) prf_branch_count: usize,
     pub(super) output_size: usize,
     pub(super) seed_bits: usize,
     pub(super) prf_mask_output_coeff_bits: usize,
@@ -69,6 +71,10 @@ impl DiamondIOBenchShape {
     {
         let params = &diamond.injector.params;
         let ring_dim = params.ring_dimension() as usize;
+        let prf_round_count = diamond.injector.input_count;
+        let prf_branch_count = 1usize
+            .checked_shl(diamond.injector.batch_bits() as u32)
+            .expect("DiamondIO PRF digit branch count overflow");
         let (_, _, crt_depth) = params.to_crt();
         let modulus_digits = params.modulus_digits();
         let modulus_bits = params
@@ -198,6 +204,8 @@ impl DiamondIOBenchShape {
         Self {
             ring_dim,
             input_size: diamond.input_size,
+            prf_round_count,
+            prf_branch_count,
             output_size: function_output_bits,
             seed_bits: diamond.seed_bits,
             prf_mask_output_coeff_bits: diamond.prf_mask_output_coeff_bits,
@@ -460,8 +468,8 @@ impl DiamondIOBenchShape {
     }
 
     pub(super) fn selected_prg_output_count(&self) -> usize {
-        self.input_size
-            .checked_mul(2)
+        self.prf_round_count
+            .checked_mul(self.prf_branch_count)
             .and_then(|count| count.checked_mul(self.seed_bits))
             .expect("DiamondIO selected-branch PRG output count overflow")
     }
@@ -490,8 +498,8 @@ impl DiamondIOBenchShape {
     }
 
     pub(super) fn prf_refresh_decoder_preimage_count(&self) -> BigUint {
-        BigUint::from(self.input_size) *
-            BigUint::from(2usize) *
+        BigUint::from(self.prf_round_count) *
+            BigUint::from(self.prf_branch_count) *
             BigUint::from(self.seed_bits) *
             BigUint::from(self.ring_gsw_wire_count) *
             BigUint::from(self.ring_dim) *
@@ -499,8 +507,8 @@ impl DiamondIOBenchShape {
     }
 
     pub(super) fn prf_branch_rebase_preimage_count(&self) -> BigUint {
-        BigUint::from(self.input_size) *
-            BigUint::from(2usize) *
+        BigUint::from(self.prf_round_count) *
+            BigUint::from(self.prf_branch_count) *
             BigUint::from(self.seed_bits) *
             BigUint::from(self.ring_gsw_wire_count) *
             BigUint::from(self.ring_dim)
@@ -565,10 +573,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_prf_refresh_preimage_bytes_include_branch_rebase_preimages() {
+    fn test_prf_refresh_preimage_bytes_scale_with_digit_branch_count() {
         let shape = DiamondIOBenchShape {
             ring_dim: 7,
-            input_size: 3,
+            input_size: 6,
+            prf_round_count: 3,
+            prf_branch_count: 4,
             output_size: 2,
             seed_bits: 5,
             prf_mask_output_coeff_bits: 2,
@@ -593,8 +603,8 @@ mod tests {
             lookup_bridge_preimage_bytes: 0,
             ring_gsw_wire_count: 9,
         };
-        let noise_refresh_count = BigUint::from(3usize * 2 * 5 * 9 * 7 * 4);
-        let branch_rebase_count = BigUint::from(3usize * 2 * 5 * 9 * 7);
+        let noise_refresh_count = BigUint::from(3usize * 4 * 5 * 9 * 7 * 4);
+        let branch_rebase_count = BigUint::from(3usize * 4 * 5 * 9 * 7);
         assert_eq!(shape.prf_refresh_decoder_preimage_count(), noise_refresh_count);
         assert_eq!(shape.prf_branch_rebase_preimage_count(), branch_rebase_count);
         assert_eq!(

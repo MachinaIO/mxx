@@ -279,10 +279,12 @@ where
         let bgg_hash_key = rand::random::<[u8; 32]>();
 
         // Sample scalar BGG public keys for one, k, and every input bit. The
-        // Diamond injector consumes the scalar keys directly.
-        let (one, k_pubkey, input_digits) = self.sample_bgg_public_keys(params, bgg_hash_key);
+        // Diamond injector consumes the scalar bit keys directly; PRF seed
+        // refresh later packs them into one digit selector per injector input.
+        let (one, k_pubkey, input_bit_public_keys) =
+            self.sample_bgg_public_keys(params, bgg_hash_key);
         debug!(
-            input_public_key_count = input_digits.len(),
+            input_public_key_count = input_bit_public_keys.len(),
             elapsed_ms = key_started.elapsed().as_millis(),
             "DiamondIO obfuscation sampled secret and scalar public keys"
         );
@@ -292,12 +294,14 @@ where
         let duplicate_started = Instant::now();
         let one_vec = Self::duplicate_public_key(params, &one, ring_dim);
         let k_vec = Self::duplicate_public_key(params, &k_pubkey, ring_dim);
-        let input_digit_vecs = input_digits
+        let input_bit_vecs = input_bit_public_keys
             .iter()
             .map(|key| Self::duplicate_public_key(params, key, ring_dim))
             .collect::<Vec<_>>();
+        let input_digit_vecs = self.build_prf_digit_public_key_vecs(&input_bit_vecs);
         debug!(
-            duplicated_input_key_count = input_digit_vecs.len(),
+            duplicated_input_key_count = input_bit_vecs.len(),
+            prf_digit_key_count = input_digit_vecs.len(),
             slot_count = ring_dim,
             elapsed_ms = duplicate_started.elapsed().as_millis(),
             "DiamondIO obfuscation duplicated public keys across slots"
@@ -488,7 +492,7 @@ where
             Some(&one_plaintext),
         );
         Self::write_io_matrix(dir_path, Self::k_preimage_id(), &k_preimage);
-        for (bit_idx, pubkey) in input_digits.iter().enumerate() {
+        for (bit_idx, pubkey) in input_bit_public_keys.iter().enumerate() {
             let digit_idx = bit_idx / self.injector.batch_bits();
             let bit_in_digit = bit_idx % self.injector.batch_bits();
             let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
@@ -570,7 +574,7 @@ where
             "DiamondIO decoder preimage count must match secret-dependent evaluated public-key slots"
         );
         info!(
-            input_preimage_count = input_digits.len(),
+            input_preimage_count = input_bit_public_keys.len(),
             decoder_preimage_count = decoder_count,
             elapsed_ms = projection_started.elapsed().as_millis(),
             "DiamondIO obfuscation final projection preimages persisted"
@@ -651,10 +655,10 @@ where
         // DiamondIO projection artifacts. Online evaluation does not rerun the
         // function or PRF circuits over public keys.
         let public_key_started = Instant::now();
-        let (one, k_pubkey, input_digit_pubkeys) =
+        let (one, k_pubkey, input_bit_pubkeys) =
             self.sample_bgg_public_keys(params, obf.bgg_hash_key);
         debug!(
-            input_public_key_count = input_digit_pubkeys.len(),
+            input_public_key_count = input_bit_pubkeys.len(),
             elapsed_ms = public_key_started.elapsed().as_millis(),
             "DiamondIO eval rebuilt scalar public keys"
         );
@@ -727,7 +731,7 @@ where
                 "DiamondIO k encoding must satisfy s_final * A_k - k * G"
             );
         }
-        let digit_outputs = input_digit_pubkeys
+        let digit_outputs = input_bit_pubkeys
             .into_iter()
             .enumerate()
             .map(|(bit_idx, pubkey)| {
@@ -878,8 +882,10 @@ where
                 NaiveBGGEncodingVec::new(params, vec![encoding.clone(); ring_dim])
             })
             .collect::<Vec<_>>();
+        let prf_digit_encoding_inputs = self.build_prf_digit_encoding_vecs(&digit_encoding_inputs);
         debug!(
             digit_encoding_input_count = digit_encoding_inputs.len(),
+            prf_digit_encoding_input_count = prf_digit_encoding_inputs.len(),
             "DiamondIO eval expanded input digit encodings to full-slot vectors"
         );
         info!(
@@ -927,8 +933,8 @@ where
                 &states,
                 &one_encoding_vec,
                 &k_encoding_vec,
-                &digit_encoding_inputs,
-                input.as_slice(),
+                &prf_digit_encoding_inputs,
+                &input_digits,
                 seed_encoding_inputs.clone(),
                 debug_prg_ciphertexts,
                 &enc_lookup_evaluator,
@@ -941,8 +947,8 @@ where
                 &states,
                 &one_encoding_vec,
                 &k_encoding_vec,
-                &digit_encoding_inputs,
-                input.as_slice(),
+                &prf_digit_encoding_inputs,
+                &input_digits,
                 seed_encoding_inputs.clone(),
                 debug_prg_ciphertexts,
                 &enc_lookup_evaluator,
@@ -975,7 +981,7 @@ where
             Some(GoldreichFullDomainRangeGenerator::new(
                 self.seed_bits,
                 final_mask_conceptual_output_bits,
-                self.goldreich_prg_graph_seed(self.input_size),
+                self.goldreich_prg_graph_seed(self.prf_final_round_idx()),
                 Default::default(),
             ))
         };
@@ -1203,7 +1209,7 @@ where
                 Some(GoldreichFullDomainRangeGenerator::new(
                     self.seed_bits,
                     final_mask_conceptual_output_bits,
-                    self.goldreich_prg_graph_seed(self.input_size),
+                    self.goldreich_prg_graph_seed(self.prf_final_round_idx()),
                     Default::default(),
                 ))
             };
@@ -1385,6 +1391,7 @@ mod tests {
 
     use keccak_asm::Keccak256;
     use tempfile::tempdir;
+    use tracing_subscriber::prelude::*;
 
     use super::*;
     use crate::{
@@ -1965,7 +1972,16 @@ mod tests {
     #[ignore = "full DiamondIO PRF-mask GPU roundtrip is expensive"]
     #[sequential_test::sequential]
     async fn test_gpu_diamond_io_debug_decryption_eval_returns_seed_bits() {
-        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+        let log_filter = tracing_subscriber::filter::Targets::new()
+            .with_default(tracing::Level::WARN)
+            .with_target("mxx::io::diamond_io", tracing::Level::INFO)
+            .with_target("mxx::input_injector::gpu", tracing::Level::INFO)
+            .with_target("mxx::noise_refresh::naive_vec", tracing::Level::INFO)
+            .with_target("mxx::storage::write", tracing::Level::INFO);
+        let _ = tracing_subscriber::registry()
+            .with(log_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .try_init();
         let _storage_lock = storage_test_lock().await;
         let gpu_ids = detected_gpu_device_ids();
         assert!(!gpu_ids.is_empty(), "DiamondIO GPU test requires at least one GPU");

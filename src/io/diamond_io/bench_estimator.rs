@@ -954,7 +954,8 @@ where
             "estimated DiamondIO PRF benchmark noise-refresh representative PRG units from one-output PRG unit"
         );
         let selected_branch_prg_output_bits = match mode {
-            PrfBenchMode::PublicKeyPreprocess => 2usize
+            PrfBenchMode::PublicKeyPreprocess => shape
+                .prf_branch_count
                 .checked_mul(diamond.seed_bits)
                 .expect("DiamondIO public PRF branch PRG output count overflow"),
             PrfBenchMode::EncodingOnline => diamond.seed_bits,
@@ -962,14 +963,14 @@ where
         let selected_branch_prg_per_round =
             scale_summary(prg_unit.clone(), selected_branch_prg_output_bits);
         let selected_branch_prg =
-            repeat_sequential_summary(selected_branch_prg_per_round.clone(), diamond.input_size);
+            repeat_sequential_summary(selected_branch_prg_per_round.clone(), shape.prf_round_count);
 
         let selected_wire_count_per_round = diamond
             .seed_bits
             .checked_mul(shape.ring_gsw_wire_count)
             .expect("DiamondIO selected PRG wire count overflow");
         let branch_rebase_branch_count = match mode {
-            PrfBenchMode::PublicKeyPreprocess => 2usize,
+            PrfBenchMode::PublicKeyPreprocess => shape.prf_branch_count,
             PrfBenchMode::EncodingOnline => 1usize,
         };
         let selected_branch_rebase_unit = sequential_summaries(&[
@@ -983,8 +984,10 @@ where
                 .checked_mul(branch_rebase_branch_count)
                 .expect("DiamondIO selected-branch rebase work count overflow"),
         );
-        let selected_branch_rebase =
-            repeat_sequential_summary(selected_branch_rebase_per_round.clone(), diamond.input_size);
+        let selected_branch_rebase = repeat_sequential_summary(
+            selected_branch_rebase_per_round.clone(),
+            shape.prf_round_count,
+        );
         info!(
             ?mode,
             selected_branch_prg_output_bits,
@@ -1006,7 +1009,7 @@ where
             );
         info!(?mode, ?refresh_parts, "finished DiamondIO PRF benchmark noise-refresh estimate");
         let noise_refresh_branch_count = match mode {
-            PrfBenchMode::PublicKeyPreprocess => 2usize,
+            PrfBenchMode::PublicKeyPreprocess => shape.prf_branch_count,
             PrfBenchMode::EncodingOnline => 1usize,
         };
         let noise_refresh_decoder_count_per_round = BigUint::from(selected_wire_count_per_round) *
@@ -1052,7 +1055,7 @@ where
             ),
         ]);
         let noise_refresh =
-            repeat_sequential_summary(noise_refresh_per_round.clone(), diamond.input_size);
+            repeat_sequential_summary(noise_refresh_per_round.clone(), shape.prf_round_count);
 
         // The final PRG output stream contains the mask prefix followed by the GoldreichPRF
         // function suffix. The suffix is not an independent function circuit: it is generated from
@@ -1144,16 +1147,16 @@ where
             noise_refresh_per_round.clone(),
         ]);
         let round_compute =
-            repeat_sequential_summary(round_compute_per_round.clone(), diamond.input_size);
+            repeat_sequential_summary(round_compute_per_round.clone(), shape.prf_round_count);
         let round_summary =
-            repeat_sequential_summary(round_summary_per_round.clone(), diamond.input_size);
+            repeat_sequential_summary(round_summary_per_round.clone(), shape.prf_round_count);
         let refresh_decoder_work = match mode {
             PrfBenchMode::PublicKeyPreprocess => {
-                scale_summary(refresh_decoder_work_per_round.clone(), diamond.input_size)
+                scale_summary(refresh_decoder_work_per_round.clone(), shape.prf_round_count)
             }
             PrfBenchMode::EncodingOnline => repeat_sequential_summary(
                 refresh_decoder_work_per_round.clone(),
-                diamond.input_size,
+                shape.prf_round_count,
             ),
         };
         let final_summary =
@@ -1372,13 +1375,15 @@ where
 
         debug!(
             input_size = diamond.input_size,
+            prf_round_count = shape.prf_round_count,
+            prf_branch_count = shape.prf_branch_count,
             output_size = diamond.output_size,
             seed_bits = diamond.seed_bits,
             ring_gsw_wire_count = shape.ring_gsw_wire_count,
             selected_prg_output_count = shape.selected_prg_output_count(),
             final_mask_prg_output_count = shape.final_mask_prg_output_count(),
             final_prg_output_count = shape.final_prg_output_count(),
-            noise_refresh_branch_count = 2usize,
+            noise_refresh_branch_count = shape.prf_branch_count,
             ?input_injection_metadata_and_seed_bytes,
             ?input_injection_public_checkpoint_bytes,
             ?input_injection_transition_preimage_bytes,
@@ -1430,9 +1435,9 @@ where
         let selected_prg_outputs = BigUint::from(shape.selected_prg_output_count());
         let noise_refresh_material_prg_outputs = shape
             .sparse_noise_refresh_material_uniform_prg_output_count(
-                diamond
-                    .input_size
-                    .checked_mul(2)
+                shape
+                    .prf_round_count
+                    .checked_mul(shape.prf_branch_count)
                     .expect("DiamondIO branch-specific noise-refresh material count overflow"),
                 diamond.noise_refresh_v_bits,
                 diamond.noise_refresh_cbd_n,

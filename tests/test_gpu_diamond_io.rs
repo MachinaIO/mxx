@@ -916,6 +916,13 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         eval_latency = estimate.eval.latency,
         eval_total_time_nanos = %estimate.eval.total_time,
         eval_max_parallelism = %estimate.eval.max_parallelism,
+        obfuscate_input_injection_latency_percent =
+            estimate.obfuscate_input_injection_latency_percent(),
+        obfuscate_input_injection_total_time_percent =
+            estimate.obfuscate_input_injection_total_time_percent(),
+        eval_input_injection_latency_percent = estimate.eval_input_injection_latency_percent(),
+        eval_input_injection_total_time_percent =
+            estimate.eval_input_injection_total_time_percent(),
         obfuscated_circuit_bytes = %estimate.obfuscated_circuit_bytes,
         input_injection_bytes = %estimate.input_injection_bytes,
         "DiamondIO GPU benchmark estimate"

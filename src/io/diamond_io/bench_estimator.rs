@@ -6,6 +6,7 @@ mod bench_estimator_shape;
 mod bench_estimator_utils;
 
 use num_bigint::BigUint;
+use num_traits::{ToPrimitive, Zero};
 use std::time::Instant;
 
 use tracing::{debug, info};
@@ -86,6 +87,55 @@ pub struct DiamondIOBenchEstimate {
     pub obfuscated_circuit_bytes: BigUint,
     /// Compact bytes contributed by the Diamond input-injection artifacts.
     pub input_injection_bytes: BigUint,
+}
+
+impl DiamondIOBenchEstimate {
+    pub fn obfuscate_input_injection_latency_percent(&self) -> f64 {
+        percent_f64(self.obfuscate_input_injection.latency, self.obfuscate.latency)
+    }
+
+    pub fn obfuscate_input_injection_total_time_percent(&self) -> f64 {
+        percent_biguint(&self.obfuscate_input_injection.total_time, &self.obfuscate.total_time)
+    }
+
+    pub fn eval_input_injection_latency_percent(&self) -> f64 {
+        percent_f64(self.eval_input_injection.latency, self.eval.latency)
+    }
+
+    pub fn eval_input_injection_total_time_percent(&self) -> f64 {
+        percent_biguint(&self.eval_input_injection.total_time, &self.eval.total_time)
+    }
+}
+
+fn percent_f64(part: f64, total: f64) -> f64 {
+    if total == 0.0 { 0.0 } else { 100.0 * part / total }
+}
+
+fn percent_biguint(part: &BigUint, total: &BigUint) -> f64 {
+    if total.is_zero() {
+        return 0.0;
+    }
+    if part.is_zero() {
+        return 0.0;
+    }
+
+    // These totals can be hundreds of bits wide. Compare normalized leading bits instead of
+    // converting the whole integer to `f64`, which would often overflow to infinity.
+    const LEADING_BITS: u64 = 128;
+    let part_bits = part.bits();
+    let total_bits = total.bits();
+    let part_shift = part_bits.saturating_sub(LEADING_BITS);
+    let total_shift = total_bits.saturating_sub(LEADING_BITS);
+    let part_leading = (part >> part_shift).to_f64().unwrap_or(f64::INFINITY);
+    let total_leading = (total >> total_shift).to_f64().unwrap_or(f64::INFINITY);
+    let exponent = (part_bits as i64) - (total_bits as i64);
+    if exponent < i32::MIN as i64 {
+        0.0
+    } else if exponent > i32::MAX as i64 {
+        f64::INFINITY
+    } else {
+        100.0 * (part_leading / total_leading) * 2.0_f64.powi(exponent as i32)
+    }
 }
 
 /// Composes existing circuit and noise-refresh estimators into DiamondIO estimates.
@@ -499,14 +549,25 @@ where
         info!("starting DiamondIO eval benchmark estimation");
         let eval = self.estimate_eval(diamond, func, shape, &storage);
         info!("completed DiamondIO eval benchmark estimation");
-        DiamondIOBenchEstimate {
+        let estimate = DiamondIOBenchEstimate {
             obfuscate,
             eval,
             obfuscate_input_injection: input_injection.obfuscate,
             eval_input_injection: input_injection.eval,
             obfuscated_circuit_bytes: storage.total_bytes,
             input_injection_bytes: storage.input_injection_bytes,
-        }
+        };
+        info!(
+            obfuscate_input_injection_latency_percent =
+                estimate.obfuscate_input_injection_latency_percent(),
+            obfuscate_input_injection_total_time_percent =
+                estimate.obfuscate_input_injection_total_time_percent(),
+            eval_input_injection_latency_percent = estimate.eval_input_injection_latency_percent(),
+            eval_input_injection_total_time_percent =
+                estimate.eval_input_injection_total_time_percent(),
+            "DiamondIO benchmark input-injection share"
+        );
+        estimate
     }
 
     fn estimate_obfuscate<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(

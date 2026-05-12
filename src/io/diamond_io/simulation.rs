@@ -1517,6 +1517,11 @@ where
         );
         let noisy_plaintext_error =
             projection_residual_error.clone() + &prefix.final_decoder_error.matrix_norm;
+        let input_injection_projection_error =
+            diamond_io_input_injection_projection_error(&prefix.input_injection);
+        let input_injection_error_bits =
+            bigdecimal_bits_ceil(&input_injection_projection_error.poly_norm.norm);
+        let noisy_plaintext_bits = bigdecimal_bits_ceil(&noisy_plaintext_error.poly_norm.norm);
         info!(
             projected_evaluated_bits =
                 bigdecimal_bits_ceil(&projected_evaluated_error.poly_norm.norm),
@@ -1524,7 +1529,10 @@ where
                 bigdecimal_bits_ceil(&prefix.public_bottom_decryption_error.poly_norm.norm),
             projection_residual_bits =
                 bigdecimal_bits_ceil(&projection_residual_error.poly_norm.norm),
-            noisy_plaintext_bits = bigdecimal_bits_ceil(&noisy_plaintext_error.poly_norm.norm),
+            noisy_plaintext_bits,
+            input_injection_error_bits,
+            input_injection_error_percent_upper_bound =
+                percent_upper_bound_from_bits(input_injection_error_bits, noisy_plaintext_bits),
             "DiamondIO final output error simulation finished"
         );
 
@@ -2044,6 +2052,17 @@ fn diamond_io_input_injection_scalar_projection_error(
         None,
     );
     state_error.clone() * &scalar_output_preimage
+}
+
+fn percent_upper_bound_from_bits(part_bits: u64, total_bits: u64) -> f64 {
+    let exponent = (part_bits as i64) - (total_bits as i64);
+    if exponent < i32::MIN as i64 {
+        0.0
+    } else if exponent > i32::MAX as i64 {
+        f64::INFINITY
+    } else {
+        100.0 * 2.0_f64.powi(exponent as i32)
+    }
 }
 
 fn fixed_noise_refresh_v_bits_match(

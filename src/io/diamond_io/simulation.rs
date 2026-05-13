@@ -142,6 +142,7 @@ pub fn diamond_io_final_prg_uniform_output_bits(
 /// Returns the minimum seed length satisfying every Goldreich PRG output bound in DiamondIO.
 pub fn minimum_diamond_io_prf_seed_bits(
     params: &DCRTPolyParams,
+    input_batch_bits: usize,
     output_size: usize,
     function_output_bits: usize,
     prf_mask_output_coeff_bits: usize,
@@ -149,7 +150,11 @@ pub fn minimum_diamond_io_prf_seed_bits(
     cbd_n: usize,
 ) -> usize {
     let ring_dim = params.ring_dimension() as usize;
-    let selected_half_seed_bits = minimum_selected_half_prf_seed_bits();
+    let seed_refresh_seed_bits = minimum_seed_refresh_prf_seed_bits(
+        1usize
+            .checked_shl(input_batch_bits as u32)
+            .expect("DiamondIO seed-refresh branch count overflow"),
+    );
     let final_mask_seed_bits =
         minimum_goldreich_input_size(diamond_io_final_prg_uniform_output_bits(
             output_size,
@@ -159,7 +164,7 @@ pub fn minimum_diamond_io_prf_seed_bits(
         ));
     let noise_refresh_seed_bits =
         minimum_noise_refresh_seed_bits(params, noise_refresh_v_bits, cbd_n);
-    selected_half_seed_bits.max(final_mask_seed_bits).max(noise_refresh_seed_bits)
+    seed_refresh_seed_bits.max(final_mask_seed_bits).max(noise_refresh_seed_bits)
 }
 
 /// Returns the largest noise-refresh `v_bits` allowed before pre-rounding error is added.
@@ -384,6 +389,7 @@ where
             build_candidate(crt_depth, mask_bits, Some(global_noise_refresh_v_bits));
         let expected_seed_bits = minimum_diamond_io_prf_seed_bits(
             &cpu_params,
+            final_candidate.injector.batch_bits(),
             func_type.output_bits(),
             func_type.output_bits(),
             mask_bits,
@@ -482,6 +488,16 @@ where
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
 {
+    fn prf_round_count(&self) -> usize {
+        self.injector.input_count
+    }
+
+    fn prf_branch_count(&self) -> usize {
+        1usize
+            .checked_shl(self.injector.batch_bits() as u32)
+            .expect("DiamondIO PRF digit branch count overflow")
+    }
+
     /// Simulate DiamondIO error growth for the selected function family.
     ///
     /// Goldreich PRG calls are evaluated only for one representative output ciphertext. Those
@@ -584,7 +600,7 @@ where
         );
         let cached_final_mask_prg_output = self.simulate_representative_prg_output(
             &prefix.cpu_params,
-            self.input_size,
+            self.prf_final_round_idx(),
             func_type
                 .output_bits()
                 .checked_mul(prefix.cpu_params.ring_dimension() as usize)
@@ -742,15 +758,15 @@ where
         assert!(self.seed_bits > 0, "DiamondIO error simulation requires seed_bits > 0");
 
         let cpu_params = cpu_params_from_poly_params(&self.injector.params);
-        let prefix_required_seed_bits =
-            minimum_selected_half_prf_seed_bits().max(minimum_noise_refresh_seed_bits(
+        let prefix_required_seed_bits = minimum_seed_refresh_prf_seed_bits(self.prf_branch_count())
+            .max(minimum_noise_refresh_seed_bits(
                 &cpu_params,
                 self.noise_refresh_v_bits,
                 self.noise_refresh_cbd_n,
             ));
         assert!(
             self.seed_bits >= prefix_required_seed_bits,
-            "DiamondIO seed_bits {} is below Goldreich PRG safety minimum {} for selected-half PRF and noise refresh",
+            "DiamondIO seed_bits {} is below Goldreich PRG safety minimum {} for seed-refresh PRF and noise refresh",
             self.seed_bits,
             prefix_required_seed_bits
         );
@@ -818,7 +834,8 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
-        if self.input_size == 0 {
+        let prf_round_count = self.prf_round_count();
+        if prf_round_count == 0 {
             return Some(self.noise_refresh_v_bits);
         }
         let max_candidate =
@@ -833,7 +850,7 @@ where
             plt_evaluator,
             slot_transfer_evaluator,
         )?;
-        if self.input_size == 1 {
+        if prf_round_count == 1 {
             return Some(first.round.noise_refresh.v_bits);
         }
         let steady_seed_errors = vec![first.refreshed_seed; 5];
@@ -892,11 +909,12 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
-        let mut prf_refreshes = Vec::with_capacity(self.input_size);
+        let prf_round_count = self.prf_round_count();
+        let mut prf_refreshes = Vec::with_capacity(prf_round_count);
         let mut final_seed_errors = base.initial_seed_errors.clone();
         let mut final_seed_ciphertext_randomizer_norm =
             base.initial_seed_ciphertext_randomizer_norm.clone();
-        if self.input_size > 0 {
+        if prf_round_count > 0 {
             let first = self.simulate_prf_refresh_round_fixed(
                 &base,
                 0,
@@ -911,7 +929,7 @@ where
                 first.refreshed_seed_ciphertext_randomizer_norm.clone();
             prf_refreshes.push(first.round);
 
-            if self.input_size > 1 {
+            if prf_round_count > 1 {
                 // After the first refresh, every seed wire has the same rounded CBD bound. The
                 // second round therefore gives the steady-state representative refresh used for
                 // all later rounds; later graph seeds change, but the error shape does not.
@@ -928,7 +946,7 @@ where
                 final_seed_ciphertext_randomizer_norm =
                     steady.refreshed_seed_ciphertext_randomizer_norm.clone();
                 prf_refreshes.push(steady.round.clone());
-                for round_idx in 2..self.input_size {
+                for round_idx in 2..prf_round_count {
                     let (
                         representative_selected_prg_ciphertext_decryption_error,
                         refreshed_seed_ciphertext_randomizer_norm,
@@ -938,17 +956,12 @@ where
                         &base.seed_ciphertext_decomposed_randomizer_norm,
                         base.ctx.clone(),
                     );
-                    let selected_with_ciphertext_decryption_error = self
-                        .add_ciphertext_decryption_residual_to_error_shape(
-                            &steady.round.representative_selected_prg_output,
-                            &representative_selected_prg_ciphertext_decryption_error,
-                        );
-                    let refresh = self.simulate_noise_refresh_from_material_state(
+                    let mut refresh = self.simulate_noise_refresh_from_material_state(
                         base.noise_refresh_ring_gsw_context.clone(),
                         noise_refresh_v_bits,
                         base.cpu_params.ring_dimension() as usize,
                         base.one.clone(),
-                        selected_with_ciphertext_decryption_error.clone(),
+                        steady.round.representative_selected_prg_output.clone(),
                         &final_seed_errors,
                         base.decryption_key.clone(),
                         base.refresh_decoder_error.clone(),
@@ -956,9 +969,13 @@ where
                         plt_evaluator,
                         slot_transfer_evaluator,
                     );
+                    self.add_ciphertext_decryption_residual_to_noise_refresh_pre_rounds(
+                        &mut refresh,
+                        &representative_selected_prg_ciphertext_decryption_error,
+                    );
                     let evaluation = self.finish_prf_refresh_round_evaluation(
                         round_idx,
-                        selected_with_ciphertext_decryption_error,
+                        steady.round.representative_selected_prg_output.clone(),
                         representative_selected_prg_ciphertext_decryption_error,
                         refreshed_seed_ciphertext_randomizer_norm.clone(),
                         refresh,
@@ -1148,21 +1165,16 @@ where
             plt_evaluator,
             slot_transfer_evaluator,
         );
-        let selected_with_ciphertext_decryption_error = self
-            .add_ciphertext_decryption_residual_to_error_shape(
-                &material_state.selected,
-                &material_state.representative_selected_prg_ciphertext_decryption_error,
-            );
         info!(
             round_idx,
             noise_refresh_v_bits, "DiamondIO fixed-v PRF refresh noise-refresh simulation started"
         );
-        let refresh = self.simulate_noise_refresh_from_material_state(
+        let mut refresh = self.simulate_noise_refresh_from_material_state(
             base.noise_refresh_ring_gsw_context.clone(),
             noise_refresh_v_bits,
             base.cpu_params.ring_dimension() as usize,
             base.one.clone(),
-            selected_with_ciphertext_decryption_error.clone(),
+            material_state.selected.clone(),
             seed_errors,
             base.decryption_key.clone(),
             base.refresh_decoder_error.clone(),
@@ -1170,13 +1182,17 @@ where
             plt_evaluator,
             slot_transfer_evaluator,
         );
+        self.add_ciphertext_decryption_residual_to_noise_refresh_pre_rounds(
+            &mut refresh,
+            &material_state.representative_selected_prg_ciphertext_decryption_error,
+        );
         info!(
             round_idx,
             noise_refresh_v_bits, "DiamondIO fixed-v PRF refresh noise-refresh simulation finished"
         );
         Some(self.finish_prf_refresh_round_evaluation(
             round_idx,
-            selected_with_ciphertext_decryption_error,
+            material_state.selected,
             material_state.representative_selected_prg_ciphertext_decryption_error,
             material_state.refreshed_seed_ciphertext_randomizer_norm,
             refresh,
@@ -1190,7 +1206,7 @@ where
         noise_refresh_v_bits: usize,
         num_slots: usize,
         one: ErrorNorm,
-        selected_with_ciphertext_decryption_error: ErrorNorm,
+        selected: ErrorNorm,
         seed_errors: &[ErrorNorm],
         decryption_key: ErrorNorm,
         refresh_decoder_error: ErrorNorm,
@@ -1210,7 +1226,7 @@ where
             self.ring_gsw_public_key_error_sigma.unwrap_or(0.0),
             num_slots,
             one,
-            selected_with_ciphertext_decryption_error,
+            selected,
             seed_errors,
             decryption_key,
             refresh_decoder_error,
@@ -1337,35 +1353,31 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
-        // Low and high halves are both one representative Goldreich PRG output evaluated from the
-        // same seed-error profile. The selected output circuit below only needs an ErrorNorm bound
-        // for each encoded branch, so the symmetric high branch can reuse the low branch bound.
         let representative_branch = self.simulate_representative_prg_output(
             &base.cpu_params,
             round_idx,
-            2 * self.seed_bits,
+            self.prf_branch_count()
+                .checked_mul(self.seed_bits)
+                .expect("DiamondIO seed-refresh PRF output size overflow"),
             0,
             base.one.clone(),
             seed_errors.to_vec(),
             plt_evaluator,
             slot_transfer_evaluator,
         );
-        debug!(
-            round_idx,
-            high_range_start = self.seed_bits,
-            "DiamondIO reusing representative PRG branch error for symmetric high half"
-        );
-        let selected = simulate_selected_half_error_norm(
+        let selected = simulate_selected_branch_rebase_error_norm(
             base.one.clone(),
             representative_branch.clone(),
-            representative_branch.clone(),
-            base.one.clone(),
+            branch_rebase_decoder_error(
+                base.final_decoder_error.clone(),
+                representative_branch.matrix_norm.ncol,
+            ),
         );
         let material_wire_error = scale_error_norm(
-            // Noise-refresh material is generated from the same encrypted seed profile by a
-            // one-output Goldreich PRG. CBD material combines `2 * cbd_n` uniform branches, so
-            // scaling the active-level-extrapolated representative branch is a conservative bound
-            // for both CBD error and mask material wires.
+            // Eval generates only the selected branch's noise-refresh material. The branch domain
+            // changes the sampled mask/error PRG outputs, but not their norm model. CBD material
+            // combines `2 * cbd_n` uniform branches, so scaling the active-level-extrapolated
+            // representative branch is a conservative bound for both CBD error and mask material.
             representative_branch,
             &BigDecimal::from((2 * self.noise_refresh_cbd_n) as u64),
         );
@@ -1392,10 +1404,6 @@ where
             })
             .expect("noise refresh must produce rounded errors")
             .clone();
-        let worst_rounded_error = self.add_ciphertext_decryption_residual_to_matrix_shape(
-            &worst_rounded_error,
-            &representative_selected_prg_ciphertext_decryption_error,
-        );
         let refreshed_seed =
             ErrorNorm::new(worst_rounded_error.poly_norm.clone(), worst_rounded_error);
         info!(
@@ -1406,6 +1414,7 @@ where
             selected_ciphertext_decryption_bits = bigdecimal_bits_ceil(
                 &representative_selected_prg_ciphertext_decryption_error.poly_norm.norm
             ),
+            noise_refresh_material_branch_count_online = 1usize,
             "DiamondIO PRF refresh error simulation finished"
         );
         DiamondIOPrfRefreshRoundEvaluation {
@@ -1421,30 +1430,14 @@ where
         }
     }
 
-    fn add_ciphertext_decryption_residual_to_error_shape(
+    fn add_ciphertext_decryption_residual_to_noise_refresh_pre_rounds(
         &self,
-        error: &ErrorNorm,
+        refresh: &mut NoiseRefreshErrorSimulation,
         residual: &PolyMatrixNorm,
-    ) -> ErrorNorm {
-        let residual_matrix =
-            self.add_ciphertext_decryption_residual_to_matrix_shape(&error.matrix_norm, residual);
-        let residual_plaintext = PolyNorm::new(error.clone_ctx(), residual.poly_norm.norm.clone());
-        error.clone() + ErrorNorm::new(residual_plaintext, residual_matrix)
-    }
-
-    fn add_ciphertext_decryption_residual_to_matrix_shape(
-        &self,
-        target: &PolyMatrixNorm,
-        residual: &PolyMatrixNorm,
-    ) -> PolyMatrixNorm {
-        target.clone() +
-            PolyMatrixNorm::new(
-                target.clone_ctx(),
-                target.nrow,
-                target.ncol,
-                residual.poly_norm.norm.clone(),
-                None,
-            )
+    ) {
+        for pre_round in &mut refresh.pre_round_outputs {
+            pre_round.poly_norm = &pre_round.poly_norm + &residual.poly_norm;
+        }
     }
 
     fn finish_error_growth_from_mask_independent_prefix<PE, ST>(
@@ -1468,7 +1461,7 @@ where
         let final_mask_prg_output = cached_final_mask_prg_output.unwrap_or_else(|| {
             self.simulate_representative_prg_output(
                 &prefix.cpu_params,
-                self.input_size,
+                self.prf_final_round_idx(),
                 func_type
                     .output_bits()
                     .checked_mul(prefix.cpu_params.ring_dimension() as usize)
@@ -1524,6 +1517,11 @@ where
         );
         let noisy_plaintext_error =
             projection_residual_error.clone() + &prefix.final_decoder_error.matrix_norm;
+        let input_injection_projection_error =
+            diamond_io_input_injection_projection_error(&prefix.input_injection);
+        let input_injection_error_bits =
+            bigdecimal_bits_ceil(&input_injection_projection_error.poly_norm.norm);
+        let noisy_plaintext_bits = bigdecimal_bits_ceil(&noisy_plaintext_error.poly_norm.norm);
         info!(
             projected_evaluated_bits =
                 bigdecimal_bits_ceil(&projected_evaluated_error.poly_norm.norm),
@@ -1531,7 +1529,10 @@ where
                 bigdecimal_bits_ceil(&prefix.public_bottom_decryption_error.poly_norm.norm),
             projection_residual_bits =
                 bigdecimal_bits_ceil(&projection_residual_error.poly_norm.norm),
-            noisy_plaintext_bits = bigdecimal_bits_ceil(&noisy_plaintext_error.poly_norm.norm),
+            noisy_plaintext_bits,
+            input_injection_error_bits,
+            input_injection_error_percent_upper_bound =
+                percent_upper_bound_from_bits(input_injection_error_bits, noisy_plaintext_bits),
             "DiamondIO final output error simulation finished"
         );
 
@@ -1947,7 +1948,7 @@ where
         };
         let function_prg_output = self.simulate_representative_prg_output(
             params,
-            self.input_size,
+            self.prf_final_round_idx(),
             output_bits,
             0,
             one.clone(),
@@ -2053,6 +2054,17 @@ fn diamond_io_input_injection_scalar_projection_error(
     state_error.clone() * &scalar_output_preimage
 }
 
+fn percent_upper_bound_from_bits(part_bits: u64, total_bits: u64) -> f64 {
+    let exponent = (part_bits as i64) - (total_bits as i64);
+    if exponent < i32::MIN as i64 {
+        0.0
+    } else if exponent > i32::MAX as i64 {
+        f64::INFINITY
+    } else {
+        100.0 * 2.0_f64.powi(exponent as i32)
+    }
+}
+
 fn fixed_noise_refresh_v_bits_match(
     simulation: &DiamondIOErrorSimulation,
     noise_refresh_v_bits: usize,
@@ -2122,14 +2134,17 @@ fn diamond_io_noise_refresh_pre_round_margin(
     decode_margin(full_q.as_ref(), v_bits, &DecodeThreshold::new(q_max))
 }
 
-fn minimum_selected_half_prf_seed_bits() -> usize {
+fn minimum_seed_refresh_prf_seed_bits(branch_count: usize) -> usize {
+    assert!(branch_count > 0, "DiamondIO seed-refresh branch count must be positive");
     let mut seed_bits = 5usize;
     while !goldreich_output_bound_holds(
         seed_bits,
-        seed_bits.checked_mul(2).expect("DiamondIO selected-half PRF output size overflow"),
+        seed_bits
+            .checked_mul(branch_count)
+            .expect("DiamondIO seed-refresh PRF output size overflow"),
     ) {
         seed_bits =
-            seed_bits.checked_add(1).expect("DiamondIO selected-half PRF seed-bit search overflow");
+            seed_bits.checked_add(1).expect("DiamondIO seed-refresh PRF seed-bit search overflow");
     }
     seed_bits
 }
@@ -2190,30 +2205,54 @@ where
     outputs.remove(0)
 }
 
-fn simulate_selected_half_error_norm(
+fn simulate_selected_branch_rebase_error_norm(
     one: ErrorNorm,
-    low: ErrorNorm,
-    high: ErrorNorm,
-    selector: ErrorNorm,
+    selected_prg: ErrorNorm,
+    rebase_decoder: ErrorNorm,
 ) -> ErrorNorm {
-    let mut circuit = PolyCircuit::<DCRTPoly>::new();
-    let low_wire = circuit.input(1).at(0).as_single_wire();
-    let high_wire = circuit.input(1).at(0).as_single_wire();
-    let selector_wire = circuit.input(1).at(0).as_single_wire();
-    let high_minus_low = circuit.sub_gate(high_wire, low_wire);
-    let selected_delta = circuit.mul_gate(selector_wire, high_minus_low);
-    let selected = circuit.add_gate(low_wire, selected_delta);
-    circuit.output([selected]);
-    let mut outputs = circuit.eval(
-        &(),
-        one,
-        vec![low, high, selector],
-        None::<&crate::simulator::error_norm::NormPltLWEEvaluator>,
-        None,
-        None,
+    // Correct-branch rebasing uses `input_bit - one * b`, which is a zero plaintext encoding
+    // but still carries input-injection projection error. Multiplication by the branch mask uses
+    // the same gadget-decomposed error growth shape as BGG multiplication by a sampled matrix.
+    // In the implementation, the sampled mask has `target_col_size =
+    // prg_wire.pubkey.matrix.col_size()`, so the caller provides a rebase decoder with the same
+    // column shape as the selected PRG wire.
+    let zero_branch_sub = one.clone() - &one;
+    let target_col_size = selected_prg.matrix_norm.ncol;
+    let branch_mask_error = ErrorNorm::new(
+        zero_branch_sub.plaintext_norm.clone(),
+        zero_branch_sub.matrix_norm.clone() *
+            PolyMatrixNorm::gadget_decomposed(zero_branch_sub.clone_ctx(), target_col_size),
     );
-    assert_eq!(outputs.len(), 1, "DiamondIO selector circuit must produce one output");
-    outputs.remove(0)
+    assert_same_matrix_shape(
+        &selected_prg.matrix_norm,
+        &branch_mask_error.matrix_norm,
+        "selected PRG and branch mask error must share a shape",
+    );
+    assert_same_matrix_shape(
+        &selected_prg.matrix_norm,
+        &rebase_decoder.matrix_norm,
+        "selected PRG and rebase decoder error must share a shape",
+    );
+    selected_prg + &branch_mask_error + &rebase_decoder
+}
+
+fn branch_rebase_decoder_error(error: ErrorNorm, target_col_size: usize) -> ErrorNorm {
+    assert!(target_col_size > 0, "target_col_size must be positive");
+    // Branch rebase and final output decoding both sample preimages with
+    // `sample_final_output_preimage`, so they use the same final-trapdoor
+    // per-entry preimage norm bound. Only the target column shape differs:
+    // final output decoding is a scalar projection, while branch rebase must
+    // match the selected PRG wire shape.
+    ErrorNorm::new(
+        error.plaintext_norm,
+        PolyMatrixNorm::new(
+            error.matrix_norm.clone_ctx(),
+            error.matrix_norm.nrow,
+            target_col_size,
+            error.matrix_norm.poly_norm.norm,
+            error.matrix_norm.zero_rows,
+        ),
+    )
 }
 
 fn ring_gsw_and_randomizer_norm(
@@ -2364,6 +2403,7 @@ mod tests {
         let params = cpu_params_from_poly_params(&scheme.injector.params);
         scheme.seed_bits = scheme.seed_bits.max(minimum_diamond_io_prf_seed_bits(
             &params,
+            scheme.injector.batch_bits(),
             scheme.output_size,
             scheme.output_size,
             scheme.prf_mask_output_coeff_bits,
@@ -2373,14 +2413,17 @@ mod tests {
     }
 
     #[test]
-    fn test_minimum_diamond_io_prf_seed_bits_covers_all_prg_uses() {
+    fn test_minimum_diamond_io_prf_seed_bits_covers_digit_branch_outputs() {
         let params = DCRTPolyParams::new(2, 1, 10, 5);
+        let input_batch_bits = 3usize;
+        let branch_count = 1usize << input_batch_bits;
         let output_size = 3usize;
         let prf_mask_output_coeff_bits = 2usize;
         let noise_refresh_v_bits = 1usize;
         let cbd_n = 1usize;
         let seed_bits = minimum_diamond_io_prf_seed_bits(
             &params,
+            input_batch_bits,
             output_size,
             output_size,
             prf_mask_output_coeff_bits,
@@ -2389,7 +2432,7 @@ mod tests {
         );
         let ring_dim = params.ring_dimension() as usize;
 
-        assert!(goldreich_output_bound_holds(seed_bits, 2 * seed_bits));
+        assert!(goldreich_output_bound_holds(seed_bits, branch_count * seed_bits));
         assert!(goldreich_output_bound_holds(
             seed_bits,
             diamond_io_final_prg_uniform_output_bits(
@@ -2403,7 +2446,7 @@ mod tests {
 
         let previous = seed_bits - 1;
         assert!(
-            !goldreich_output_bound_holds(previous, 2 * previous) ||
+            !goldreich_output_bound_holds(previous, branch_count * previous) ||
                 !goldreich_output_bound_holds(
                     previous,
                     diamond_io_final_prg_uniform_output_bits(
@@ -2416,6 +2459,65 @@ mod tests {
                 previous < minimum_noise_refresh_seed_bits(&params, noise_refresh_v_bits, cbd_n),
             "one smaller seed length must fail at least one DiamondIO PRG output bound"
         );
+    }
+
+    #[test]
+    fn test_prf_final_round_separator_uses_digit_round_count() {
+        let scheme = test_scheme_with_input_count(1, 2);
+        assert_eq!(scheme.injector.batch_bits(), 1);
+
+        let digit_scheme = {
+            let params = DCRTPolyParams::new(2, 1, 10, 5);
+            let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
+            let ring_gsw_context = Arc::new(NestedRnsPolyContext::setup(
+                &mut setup_circuit,
+                &params,
+                5,
+                2,
+                1 << 8,
+                false,
+                Some(1),
+            ));
+            let ring_gsw_width = 2 *
+                <NestedRnsPolyContext as ModularArithmeticContext<DCRTPoly>>::gadget_len(
+                    ring_gsw_context.as_ref(),
+                    Some(1),
+                    Some(0),
+                );
+            let injector = DiamondInjector::<
+                DCRTPolyMatrix,
+                DCRTPolyUniformSampler,
+                DCRTPolyHashSampler<Keccak256>,
+                DCRTPolyTrapdoorSampler,
+            >::new(params.clone(), 2, 4, 2, 4.578, 0.0);
+            TestDiamondIO::new(
+                injector,
+                4,
+                6,
+                params,
+                ring_gsw_context,
+                ring_gsw_width,
+                0,
+                Some(1),
+                Some(0.0),
+                b"diamond_io_final_round_separator_test".to_vec(),
+                6,
+                1,
+                1,
+                1,
+                [0x24; 32],
+                [0x42; 32],
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        assert_eq!(digit_scheme.input_size, 4);
+        assert_eq!(digit_scheme.injector.input_count, 2);
+        assert_ne!(digit_scheme.input_size, digit_scheme.injector.input_count);
+        assert_eq!(digit_scheme.prf_final_round_idx(), digit_scheme.injector.input_count);
     }
 
     #[test]
@@ -2452,6 +2554,86 @@ mod tests {
     }
 
     #[test]
+    fn test_selected_branch_rebase_matches_selected_prg_column_shape() {
+        let ctx = simulator_context(&DCRTPolyParams::new(2, 2, 10, 5));
+        let one = ErrorNorm::new(
+            PolyNorm::one(ctx.clone()),
+            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(2u32), None),
+        );
+        let selected_prg = ErrorNorm::new(
+            PolyNorm::one(ctx.clone()),
+            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(3u32), None),
+        );
+        let rebase_decoder = branch_rebase_decoder_error(
+            ErrorNorm::new(
+                PolyNorm::one(ctx.clone()),
+                PolyMatrixNorm::new(ctx.clone(), 1, 1, BigDecimal::from(5u32), None),
+            ),
+            ctx.m_g,
+        );
+        let selected =
+            simulate_selected_branch_rebase_error_norm(one, selected_prg, rebase_decoder);
+        assert_eq!(
+            selected.matrix_norm.ncol, ctx.m_g,
+            "branch rebase decoder and mask error must use the selected PRG column shape"
+        );
+    }
+
+    #[test]
+    fn test_ciphertext_decryption_residual_stays_scalar_in_noise_refresh_pre_rounds() {
+        let ctx = simulator_context(&DCRTPolyParams::new(2, 2, 10, 5));
+        let residual = PolyMatrixNorm::new(ctx.clone(), 1, 1, BigDecimal::from(5u32), None);
+        let mut refresh = NoiseRefreshErrorSimulation {
+            v_bits: 1,
+            pre_round_outputs: vec![PolyMatrixNorm::new(
+                ctx.clone(),
+                1,
+                ctx.m_g,
+                BigDecimal::from(7u32),
+                None,
+            )],
+            rounded_errors: vec![PolyMatrixNorm::new(
+                ctx.clone(),
+                1,
+                ctx.m_g,
+                BigDecimal::from(11u32),
+                None,
+            )],
+        };
+        test_scheme(1).add_ciphertext_decryption_residual_to_noise_refresh_pre_rounds(
+            &mut refresh,
+            &residual,
+        );
+        assert_eq!(refresh.pre_round_outputs[0].ncol, ctx.m_g);
+        assert_eq!(refresh.pre_round_outputs[0].poly_norm.norm, BigDecimal::from(12u32));
+        assert_eq!(
+            refresh.rounded_errors[0].poly_norm.norm,
+            BigDecimal::from(11u32),
+            "ciphertext decryption residual is a scalar pre-rounding perturbation, not refreshed seed BGG error"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "selected PRG and rebase decoder error must share a shape")]
+    fn test_selected_branch_rebase_rejects_unshaped_scalar_decoder() {
+        let ctx = simulator_context(&DCRTPolyParams::new(2, 2, 10, 5));
+        let one = ErrorNorm::new(
+            PolyNorm::one(ctx.clone()),
+            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(2u32), None),
+        );
+        let selected_prg = ErrorNorm::new(
+            PolyNorm::one(ctx.clone()),
+            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, BigDecimal::from(3u32), None),
+        );
+        let scalar_rebase_decoder = ErrorNorm::new(
+            PolyNorm::one(ctx.clone()),
+            PolyMatrixNorm::new(ctx.clone(), 1, 1, BigDecimal::from(5u32), None),
+        );
+        let _ =
+            simulate_selected_branch_rebase_error_norm(one, selected_prg, scalar_rebase_decoder);
+    }
+
+    #[test]
     #[ignore = "full DiamondIO error simulation is heavier than default unit tests"]
     fn test_simulate_error_growth_reuses_input_injector_state_errors() {
         let mut scheme = test_scheme_with_input_count(2, 0);
@@ -2476,7 +2658,7 @@ mod tests {
 
     #[test]
     #[ignore = "full noise-refresh path is intentionally heavier than default unit tests"]
-    fn test_simulate_error_growth_records_one_refresh_per_input_bit() {
+    fn test_simulate_error_growth_records_one_refresh_per_input_digit() {
         let mut scheme = test_scheme(2);
         make_scheme_seed_bound_safe(&mut scheme);
         let ctx = simulator_context(&scheme.injector.params);
@@ -2492,7 +2674,7 @@ mod tests {
             )
             .expect("DiamondIO error simulation should find a noise-refresh mask size");
 
-        assert_eq!(simulation.prf_refreshes.len(), scheme.input_size);
+        assert_eq!(simulation.prf_refreshes.len(), scheme.injector.input_count);
     }
 
     #[test]
@@ -2539,7 +2721,7 @@ mod tests {
             )
             .expect("fixed-v prefix should build with the fixture seed size");
 
-        assert_eq!(prefix.prf_refreshes.len(), scheme.input_size);
+        assert_eq!(prefix.prf_refreshes.len(), scheme.injector.input_count);
         assert_eq!(
             prefix.prf_refreshes.iter().map(|refresh| refresh.round_idx).collect::<Vec<_>>(),
             vec![0, 1, 2]
@@ -2560,15 +2742,6 @@ mod tests {
                     .poly_norm
                     .norm,
             "ciphertext-side FHE noise must keep accumulating across PRF seed rounds"
-        );
-        assert!(
-            prefix.prf_refreshes[2].representative_selected_prg_output.matrix_norm.poly_norm.norm >
-                prefix.prf_refreshes[1]
-                    .representative_selected_prg_output
-                    .matrix_norm
-                    .poly_norm
-                    .norm,
-            "the selected PRG output bound fed into noise refresh must include the accumulated ciphertext-side decryption residual"
         );
         assert!(
             prefix.prf_refreshes[2].noise_refresh.pre_round_outputs[0].poly_norm.norm >

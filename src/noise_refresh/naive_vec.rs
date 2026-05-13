@@ -225,6 +225,13 @@ fn refresh_slot_id(refresh_id: &[u8], label: &[u8], idx: usize) -> Vec<u8> {
     id
 }
 
+fn material_debug_label(base: &[u8], material_graph_seed: [u8; 32]) -> Vec<u8> {
+    let mut label = Vec::with_capacity(base.len() + material_graph_seed.len());
+    label.extend_from_slice(base);
+    label.extend_from_slice(&material_graph_seed);
+    label
+}
+
 fn debug_sample_prg_output_plaintexts<M, HS>(
     params: &<M::P as Poly>::Params,
     hash_key: [u8; 32],
@@ -499,6 +506,25 @@ where
 
     fn params(&self) -> &<M::P as Poly>::Params {
         &self.ring_gsw.params
+    }
+
+    fn material_circuit_for_graph_seed(
+        &self,
+        material_graph_seed: [u8; 32],
+    ) -> Arc<PolyCircuit<M::P>> {
+        if material_graph_seed == self.graph_seed {
+            return self.material_circuit.clone();
+        }
+        let num_slots = self.ring_gsw.params.ring_dimension() as usize;
+        Arc::new(build_noise_refresh_material_circuit::<M::P, A, M>(
+            self.ring_gsw.clone(),
+            self.seed_bits,
+            self.v_bits,
+            material_graph_seed,
+            self.cbd_n,
+            num_slots,
+            self.debug_reuse_single_material,
+        ))
     }
 
     /// Estimates the preprocessing side of the current naive-vector implementation.
@@ -801,6 +827,7 @@ where
 {
     pub fn preprocess_many<PE, ST>(
         &self,
+        material_graph_seed: [u8; 32],
         refresh_ids: &[Vec<u8>],
         one: &NaiveBGGPublicKeyVec<M>,
         refreshed_inputs: &[NaiveBGGPublicKeyVec<M>],
@@ -872,7 +899,7 @@ where
             let error_wire = debug_sample_prg_output_public_wires::<M, HS>(
                 self.params(),
                 self.hash_key,
-                b"noise-refresh-debug-error-material",
+                &material_debug_label(b"noise-refresh-debug-error-material", material_graph_seed),
                 1,
                 num_slots,
                 one,
@@ -883,7 +910,7 @@ where
             let mask_wire = debug_sample_prg_output_public_wires::<M, HS>(
                 self.params(),
                 self.hash_key,
-                b"noise-refresh-debug-mask-material",
+                &material_debug_label(b"noise-refresh-debug-mask-material", material_graph_seed),
                 1,
                 num_slots,
                 one,
@@ -969,13 +996,14 @@ where
         let mut inputs =
             enc_seeds[..material_seed_wire_count].par_iter().cloned().collect::<Vec<_>>();
         inputs.push(decryption_key.clone());
+        let material_circuit = self.material_circuit_for_graph_seed(material_graph_seed);
         info!(
             target: "mxx::func_enc::aky24",
             input_count = inputs.len(),
-            output_count = self.material_circuit.num_output(),
+            output_count = material_circuit.num_output(),
             "naive-vector noise-refresh preprocess_many evaluating cached material circuit once"
         );
-        let decoded = self.material_circuit.eval(
+        let decoded = material_circuit.eval(
             self.params(),
             one.clone(),
             inputs,
@@ -1036,6 +1064,7 @@ where
 
     pub fn online_eval_many<PE, ST>(
         &self,
+        material_graph_seed: [u8; 32],
         refresh_ids: &[Vec<u8>],
         one: &NaiveBGGEncodingVec<M>,
         refreshed_inputs: &[NaiveBGGEncodingVec<M>],
@@ -1114,7 +1143,7 @@ where
             let error_wire = debug_sample_prg_output_encoding_wires::<M, HS>(
                 self.params(),
                 self.hash_key,
-                b"noise-refresh-debug-error-material",
+                &material_debug_label(b"noise-refresh-debug-error-material", material_graph_seed),
                 1,
                 num_slots,
                 one,
@@ -1125,7 +1154,7 @@ where
             let mask_wire = debug_sample_prg_output_encoding_wires::<M, HS>(
                 self.params(),
                 self.hash_key,
-                b"noise-refresh-debug-mask-material",
+                &material_debug_label(b"noise-refresh-debug-mask-material", material_graph_seed),
                 1,
                 num_slots,
                 one,
@@ -1213,13 +1242,14 @@ where
         let mut inputs =
             enc_seeds[..material_seed_wire_count].par_iter().cloned().collect::<Vec<_>>();
         inputs.push(decryption_key.clone());
+        let material_circuit = self.material_circuit_for_graph_seed(material_graph_seed);
         info!(
             target: "mxx::func_enc::aky24",
             input_count = inputs.len(),
-            output_count = self.material_circuit.num_output(),
+            output_count = material_circuit.num_output(),
             "naive-vector noise-refresh online_eval_many evaluating cached material circuit once"
         );
-        let decoded = self.material_circuit.eval(
+        let decoded = material_circuit.eval(
             self.params(),
             one.clone(),
             inputs,
@@ -1294,6 +1324,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn online_eval_many_with_decoder_factory<PE, ST, DF>(
         &self,
+        material_graph_seed: [u8; 32],
         refresh_ids: &[Vec<u8>],
         one: &NaiveBGGEncodingVec<M>,
         refreshed_inputs: &[NaiveBGGEncodingVec<M>],
@@ -1360,7 +1391,7 @@ where
             let error_wire = debug_sample_prg_output_encoding_wires::<M, HS>(
                 self.params(),
                 self.hash_key,
-                b"noise-refresh-debug-error-material",
+                &material_debug_label(b"noise-refresh-debug-error-material", material_graph_seed),
                 1,
                 num_slots,
                 one,
@@ -1371,7 +1402,7 @@ where
             let mask_wire = debug_sample_prg_output_encoding_wires::<M, HS>(
                 self.params(),
                 self.hash_key,
-                b"noise-refresh-debug-mask-material",
+                &material_debug_label(b"noise-refresh-debug-mask-material", material_graph_seed),
                 1,
                 num_slots,
                 one,
@@ -1428,7 +1459,8 @@ where
             let mut inputs =
                 enc_seeds[..material_seed_wire_count].par_iter().cloned().collect::<Vec<_>>();
             inputs.push(decryption_key.clone());
-            let decoded = self.material_circuit.eval(
+            let material_circuit = self.material_circuit_for_graph_seed(material_graph_seed);
+            let decoded = material_circuit.eval(
                 self.params(),
                 one.clone(),
                 inputs,
@@ -1682,6 +1714,7 @@ where
         ST: SlotTransferEvaluator<NaiveBGGPublicKeyVec<M>>,
     {
         self.preprocess_many(
+            self.graph_seed,
             &[refresh_id.to_vec()],
             one,
             std::slice::from_ref(refreshed_input),
@@ -1711,6 +1744,7 @@ where
         ST: SlotTransferEvaluator<NaiveBGGEncodingVec<M>>,
     {
         self.online_eval_many(
+            self.graph_seed,
             &[refresh_id.to_vec()],
             one,
             std::slice::from_ref(refreshed_input),
@@ -2128,6 +2162,21 @@ mod tests {
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
     use num_traits::One;
+
+    #[test]
+    fn material_debug_label_includes_material_graph_seed() {
+        let base = b"noise-refresh-debug-error-material";
+        let seed_zero = [0u8; 32];
+        let seed_one = [1u8; 32];
+        let label_zero = material_debug_label(base, seed_zero);
+        let label_one = material_debug_label(base, seed_one);
+        assert_ne!(
+            label_zero, label_one,
+            "debug noise-refresh material labels must differ by material graph seed"
+        );
+        assert!(label_zero.starts_with(base));
+        assert_eq!(&label_zero[base.len()..], &seed_zero);
+    }
 
     #[test]
     fn crt_recompose_rows_rounds_scaled_level_vectors() {

@@ -68,7 +68,7 @@ const DEFAULT_MAX_UNREDUCED_MULS: usize = 4;
 const DEFAULT_SCALE: u64 = 1 << 8;
 const DEFAULT_MIN_CRT_DEPTH: usize = 1;
 const DEFAULT_MAX_CRT_DEPTH: usize = 64;
-const DEFAULT_SECURITY_BITS: usize = 0;
+const DEFAULT_SECURITY_BITS: usize = 128;
 const DEFAULT_NOISE_REFRESH_CBD_N: usize = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
@@ -249,6 +249,7 @@ impl DiamondIOGpuBenchConfig {
     ) -> usize {
         minimum_diamond_io_prf_seed_bits(
             params,
+            self.injector_batch_bits,
             self.output_size,
             self.output_size,
             prf_mask_output_coeff_bits,
@@ -915,6 +916,13 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         eval_latency = estimate.eval.latency,
         eval_total_time_nanos = %estimate.eval.total_time,
         eval_max_parallelism = %estimate.eval.max_parallelism,
+        obfuscate_input_injection_latency_percent =
+            estimate.obfuscate_input_injection_latency_percent(),
+        obfuscate_input_injection_total_time_percent =
+            estimate.obfuscate_input_injection_total_time_percent(),
+        eval_input_injection_latency_percent = estimate.eval_input_injection_latency_percent(),
+        eval_input_injection_total_time_percent =
+            estimate.eval_input_injection_total_time_percent(),
         obfuscated_circuit_bytes = %estimate.obfuscated_circuit_bytes,
         input_injection_bytes = %estimate.input_injection_bytes,
         "DiamondIO GPU benchmark estimate"

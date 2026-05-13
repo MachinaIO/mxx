@@ -6,6 +6,7 @@ mod bench_estimator_shape;
 mod bench_estimator_utils;
 
 use num_bigint::BigUint;
+use num_traits::{ToPrimitive, Zero};
 use std::time::Instant;
 
 use tracing::{debug, info};
@@ -86,6 +87,55 @@ pub struct DiamondIOBenchEstimate {
     pub obfuscated_circuit_bytes: BigUint,
     /// Compact bytes contributed by the Diamond input-injection artifacts.
     pub input_injection_bytes: BigUint,
+}
+
+impl DiamondIOBenchEstimate {
+    pub fn obfuscate_input_injection_latency_percent(&self) -> f64 {
+        percent_f64(self.obfuscate_input_injection.latency, self.obfuscate.latency)
+    }
+
+    pub fn obfuscate_input_injection_total_time_percent(&self) -> f64 {
+        percent_biguint(&self.obfuscate_input_injection.total_time, &self.obfuscate.total_time)
+    }
+
+    pub fn eval_input_injection_latency_percent(&self) -> f64 {
+        percent_f64(self.eval_input_injection.latency, self.eval.latency)
+    }
+
+    pub fn eval_input_injection_total_time_percent(&self) -> f64 {
+        percent_biguint(&self.eval_input_injection.total_time, &self.eval.total_time)
+    }
+}
+
+fn percent_f64(part: f64, total: f64) -> f64 {
+    if total == 0.0 { 0.0 } else { 100.0 * part / total }
+}
+
+fn percent_biguint(part: &BigUint, total: &BigUint) -> f64 {
+    if total.is_zero() {
+        return 0.0;
+    }
+    if part.is_zero() {
+        return 0.0;
+    }
+
+    // These totals can be hundreds of bits wide. Compare normalized leading bits instead of
+    // converting the whole integer to `f64`, which would often overflow to infinity.
+    const LEADING_BITS: u64 = 128;
+    let part_bits = part.bits();
+    let total_bits = total.bits();
+    let part_shift = part_bits.saturating_sub(LEADING_BITS);
+    let total_shift = total_bits.saturating_sub(LEADING_BITS);
+    let part_leading = (part >> part_shift).to_f64().unwrap_or(f64::INFINITY);
+    let total_leading = (total >> total_shift).to_f64().unwrap_or(f64::INFINITY);
+    let exponent = (part_bits as i64) - (total_bits as i64);
+    if exponent < i32::MIN as i64 {
+        0.0
+    } else if exponent > i32::MAX as i64 {
+        f64::INFINITY
+    } else {
+        100.0 * (part_leading / total_leading) * 2.0_f64.powi(exponent as i32)
+    }
 }
 
 /// Composes existing circuit and noise-refresh estimators into DiamondIO estimates.
@@ -499,14 +549,25 @@ where
         info!("starting DiamondIO eval benchmark estimation");
         let eval = self.estimate_eval(diamond, func, shape, &storage);
         info!("completed DiamondIO eval benchmark estimation");
-        DiamondIOBenchEstimate {
+        let estimate = DiamondIOBenchEstimate {
             obfuscate,
             eval,
             obfuscate_input_injection: input_injection.obfuscate,
             eval_input_injection: input_injection.eval,
             obfuscated_circuit_bytes: storage.total_bytes,
             input_injection_bytes: storage.input_injection_bytes,
-        }
+        };
+        info!(
+            obfuscate_input_injection_latency_percent =
+                estimate.obfuscate_input_injection_latency_percent(),
+            obfuscate_input_injection_total_time_percent =
+                estimate.obfuscate_input_injection_total_time_percent(),
+            eval_input_injection_latency_percent = estimate.eval_input_injection_latency_percent(),
+            eval_input_injection_total_time_percent =
+                estimate.eval_input_injection_total_time_percent(),
+            "DiamondIO benchmark input-injection share"
+        );
+        estimate
     }
 
     fn estimate_obfuscate<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
@@ -953,33 +1014,48 @@ where
             ?noise_refresh_mask_prg_unit,
             "estimated DiamondIO PRF benchmark noise-refresh representative PRG units from one-output PRG unit"
         );
-        let selected_half_prg_per_round = scale_summary(
-            prg_unit.clone(),
-            2usize
+        let selected_branch_prg_output_bits = match mode {
+            PrfBenchMode::PublicKeyPreprocess => shape
+                .prf_branch_count
                 .checked_mul(diamond.seed_bits)
-                .expect("DiamondIO selected-half PRG output count overflow"),
-        );
-        let selected_half_prg =
-            repeat_sequential_summary(selected_half_prg_per_round.clone(), diamond.input_size);
+                .expect("DiamondIO public PRF branch PRG output count overflow"),
+            PrfBenchMode::EncodingOnline => diamond.seed_bits,
+        };
+        let selected_branch_prg_per_round =
+            scale_summary(prg_unit.clone(), selected_branch_prg_output_bits);
+        let selected_branch_prg =
+            repeat_sequential_summary(selected_branch_prg_per_round.clone(), shape.prf_round_count);
 
         let selected_wire_count_per_round = diamond
             .seed_bits
             .checked_mul(shape.ring_gsw_wire_count)
             .expect("DiamondIO selected PRG wire count overflow");
-        let selected_half_mux_unit = sequential_summaries(&[
+        let branch_rebase_branch_count = match mode {
+            PrfBenchMode::PublicKeyPreprocess => shape.prf_branch_count,
+            PrfBenchMode::EncodingOnline => 1usize,
+        };
+        let selected_branch_rebase_unit = sequential_summaries(&[
             estimate_summary(sub.clone()),
             estimate_summary(mul.clone()),
             estimate_summary(add.clone()),
         ]);
-        let selected_half_mux_per_round =
-            scale_summary(selected_half_mux_unit.clone(), selected_wire_count_per_round);
-        let selected_half_mux =
-            repeat_sequential_summary(selected_half_mux_per_round.clone(), diamond.input_size);
+        let selected_branch_rebase_per_round = scale_summary(
+            selected_branch_rebase_unit.clone(),
+            selected_wire_count_per_round
+                .checked_mul(branch_rebase_branch_count)
+                .expect("DiamondIO selected-branch rebase work count overflow"),
+        );
+        let selected_branch_rebase = repeat_sequential_summary(
+            selected_branch_rebase_per_round.clone(),
+            shape.prf_round_count,
+        );
         info!(
             ?mode,
+            selected_branch_prg_output_bits,
             selected_wire_count_per_round,
-            ?selected_half_mux_per_round,
-            "estimated DiamondIO PRF benchmark selected-half mux unit"
+            branch_rebase_branch_count,
+            ?selected_branch_rebase_per_round,
+            "estimated DiamondIO PRF benchmark selected-branch rebase unit"
         );
 
         info!(?mode, "starting DiamondIO PRF benchmark noise-refresh estimate");
@@ -993,32 +1069,54 @@ where
                 final_mask_decrypt_unit.clone(),
             );
         info!(?mode, ?refresh_parts, "finished DiamondIO PRF benchmark noise-refresh estimate");
-        let refresh_decoder_count_per_round = BigUint::from(selected_wire_count_per_round) *
+        let noise_refresh_branch_count = match mode {
+            PrfBenchMode::PublicKeyPreprocess => shape.prf_branch_count,
+            PrfBenchMode::EncodingOnline => 1usize,
+        };
+        let noise_refresh_decoder_count_per_round = BigUint::from(selected_wire_count_per_round) *
+            BigUint::from(noise_refresh_branch_count) *
             BigUint::from(shape.ring_dim) *
             BigUint::from(shape.crt_depth);
+        let branch_rebase_decoder_count_per_round = BigUint::from(selected_wire_count_per_round) *
+            BigUint::from(shape.ring_dim) *
+            BigUint::from(branch_rebase_branch_count);
         let refresh_decoder_work_per_round = match mode {
             PrfBenchMode::PublicKeyPreprocess => sequential_summaries(&[
                 scale_estimate_biguint(
                     self.full_w_block_hash_sample.clone(),
-                    &refresh_decoder_count_per_round,
+                    &(&noise_refresh_decoder_count_per_round +
+                        &branch_rebase_decoder_count_per_round),
                 ),
                 scale_estimate_biguint(
                     self.final_output_preimage_extend.clone(),
-                    &refresh_decoder_count_per_round,
+                    &(&noise_refresh_decoder_count_per_round +
+                        &branch_rebase_decoder_count_per_round),
                 ),
             ]),
-            PrfBenchMode::EncodingOnline => scale_summary_biguint(
-                self.native_estimator
-                    .estimate_vector_matrix_product(shape.state_col_size, shape.modulus_digits),
-                &refresh_decoder_count_per_round,
-            ),
+            PrfBenchMode::EncodingOnline => {
+                let decoder_unit = self
+                    .native_estimator
+                    .estimate_vector_matrix_product(shape.state_col_size, shape.modulus_digits);
+                sequential_summaries(&[
+                    scale_summary_biguint(
+                        decoder_unit.clone(),
+                        &branch_rebase_decoder_count_per_round,
+                    ),
+                    scale_summary_biguint(decoder_unit, &noise_refresh_decoder_count_per_round),
+                ])
+            }
         };
         let noise_refresh_per_round = sequential_summaries(&[
-            refresh_parts.material.clone(),
-            scale_summary(refresh_parts.per_refresh.clone(), selected_wire_count_per_round),
+            scale_summary(refresh_parts.material.clone(), noise_refresh_branch_count),
+            scale_summary(
+                refresh_parts.per_refresh.clone(),
+                selected_wire_count_per_round
+                    .checked_mul(noise_refresh_branch_count)
+                    .expect("DiamondIO noise-refresh branch work count overflow"),
+            ),
         ]);
         let noise_refresh =
-            repeat_sequential_summary(noise_refresh_per_round.clone(), diamond.input_size);
+            repeat_sequential_summary(noise_refresh_per_round.clone(), shape.prf_round_count);
 
         // The final PRG output stream contains the mask prefix followed by the GoldreichPRF
         // function suffix. The suffix is not an independent function circuit: it is generated from
@@ -1092,34 +1190,34 @@ where
         // Ring-GSW wire count.
         let round_compute_per_round = match mode {
             PrfBenchMode::PublicKeyPreprocess => sequential_summaries(&[
-                selected_half_prg_per_round.clone(),
-                selected_half_mux_per_round.clone(),
+                selected_branch_prg_per_round.clone(),
+                selected_branch_rebase_per_round.clone(),
                 noise_refresh_per_round.clone(),
             ]),
             PrfBenchMode::EncodingOnline => sequential_summaries(&[
-                selected_half_prg_per_round.clone(),
-                selected_half_mux_per_round.clone(),
+                selected_branch_prg_per_round.clone(),
+                selected_branch_rebase_per_round.clone(),
                 refresh_decoder_work_per_round.clone(),
                 noise_refresh_per_round.clone(),
             ]),
         };
         let round_summary_per_round = sequential_summaries(&[
-            selected_half_prg_per_round.clone(),
-            selected_half_mux_per_round.clone(),
+            selected_branch_prg_per_round.clone(),
+            selected_branch_rebase_per_round.clone(),
             refresh_decoder_work_per_round.clone(),
             noise_refresh_per_round.clone(),
         ]);
         let round_compute =
-            repeat_sequential_summary(round_compute_per_round.clone(), diamond.input_size);
+            repeat_sequential_summary(round_compute_per_round.clone(), shape.prf_round_count);
         let round_summary =
-            repeat_sequential_summary(round_summary_per_round.clone(), diamond.input_size);
+            repeat_sequential_summary(round_summary_per_round.clone(), shape.prf_round_count);
         let refresh_decoder_work = match mode {
             PrfBenchMode::PublicKeyPreprocess => {
-                scale_summary(refresh_decoder_work_per_round.clone(), diamond.input_size)
+                scale_summary(refresh_decoder_work_per_round.clone(), shape.prf_round_count)
             }
             PrfBenchMode::EncodingOnline => repeat_sequential_summary(
                 refresh_decoder_work_per_round.clone(),
-                diamond.input_size,
+                shape.prf_round_count,
             ),
         };
         let final_summary =
@@ -1137,8 +1235,8 @@ where
         };
 
         let estimate = DiamondIOPrfBenchEstimateParts {
-            selected_half_prg,
-            selected_half_mux,
+            selected_branch_prg,
+            selected_branch_rebase,
             refresh_decoder_work,
             noise_refresh,
             final_prg,
@@ -1338,12 +1436,15 @@ where
 
         debug!(
             input_size = diamond.input_size,
+            prf_round_count = shape.prf_round_count,
+            prf_branch_count = shape.prf_branch_count,
             output_size = diamond.output_size,
             seed_bits = diamond.seed_bits,
             ring_gsw_wire_count = shape.ring_gsw_wire_count,
             selected_prg_output_count = shape.selected_prg_output_count(),
             final_mask_prg_output_count = shape.final_mask_prg_output_count(),
             final_prg_output_count = shape.final_prg_output_count(),
+            noise_refresh_branch_count = shape.prf_branch_count,
             ?input_injection_metadata_and_seed_bytes,
             ?input_injection_public_checkpoint_bytes,
             ?input_injection_transition_preimage_bytes,
@@ -1395,7 +1496,10 @@ where
         let selected_prg_outputs = BigUint::from(shape.selected_prg_output_count());
         let noise_refresh_material_prg_outputs = shape
             .sparse_noise_refresh_material_uniform_prg_output_count(
-                diamond.input_size,
+                shape
+                    .prf_round_count
+                    .checked_mul(shape.prf_branch_count)
+                    .expect("DiamondIO branch-specific noise-refresh material count overflow"),
                 diamond.noise_refresh_v_bits,
                 diamond.noise_refresh_cbd_n,
             );
@@ -1463,8 +1567,8 @@ struct DiamondIOBenchUnitEstimates {
 
 #[derive(Debug, Clone, PartialEq)]
 struct DiamondIOPrfBenchEstimateParts {
-    selected_half_prg: CircuitBenchSummary,
-    selected_half_mux: CircuitBenchSummary,
+    selected_branch_prg: CircuitBenchSummary,
+    selected_branch_rebase: CircuitBenchSummary,
     refresh_decoder_work: CircuitBenchSummary,
     noise_refresh: CircuitBenchSummary,
     final_prg: CircuitBenchSummary,

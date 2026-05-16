@@ -1,7 +1,10 @@
+pub mod aky24_io;
 pub mod diamond_io;
+pub(crate) mod utils;
 
 use std::path::Path;
 
+pub use aky24_io::{Aky24IO, Aky24IOFuncType};
 pub use diamond_io::{DiamondIO, DiamondIOFuncType, DiamondIOObf};
 
 /// Common interface for indistinguishability obfuscation schemes.

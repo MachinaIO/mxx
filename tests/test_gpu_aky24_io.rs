@@ -5,19 +5,23 @@ use keccak_asm::Keccak256;
 use mxx::{
     bench_estimator::{
         BggEncodingBenchEstimator, BggPublicKeyBenchEstimator, BggPublicKeyBenchSamples,
-        NaiveBGGVecBenchEstimator,
+        CircuitBenchEstimate, CircuitBenchSummary, NaiveBGGVecBenchEstimator,
     },
     bgg::{public_key::BggPublicKey, sampler::BGGPublicKeySampler},
     circuit::{PolyCircuit, gate::GateId},
     element::PolyElem,
     func_enc::NoCircuitEvaluator,
-    gadgets::arith::{ModularArithmeticContext, NestedRnsPolyContext},
-    input_injector::DiamondInjector,
-    io::diamond_io::{
-        DiamondIO, DiamondIOBenchEstimator, DiamondIOFuncType,
-        GpuDCRTPolyMatrixNativeBenchEstimator, diamond_io_find_crt_depth,
-        diamond_io_max_noise_refresh_v_bits_without_pre_rounding_error,
-        minimum_diamond_io_prf_seed_bits,
+    gadgets::{
+        arith::{ModularArithmeticContext, NestedRnsPolyContext},
+        fhe::ring_gsw_nested_rns::sample_public_key_columns_with_samplers,
+    },
+    io::{
+        aky24_io::{
+            Aky24IO, Aky24IOBenchEstimator, Aky24IOFuncType, aky24_io_find_crt_depth,
+            aky24_io_max_noise_refresh_v_bits_without_pre_rounding_error,
+            minimum_aky24_io_prf_seed_bits,
+        },
+        diamond_io::GpuDCRTPolyMatrixNativeBenchEstimator,
     },
     lookup::{
         PltEvaluator, PublicLut,
@@ -26,7 +30,7 @@ use mxx::{
             NaiveLWEBGGEncodingVecPltEvaluator, NaiveLWEBGGPublicKeyVecPltEvaluator,
         },
     },
-    matrix::{dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
         dcrt::{
@@ -36,11 +40,9 @@ use mxx::{
         },
     },
     sampler::{
-        PolyTrapdoorSampler,
+        DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
         gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
-        hash::DCRTPolyHashSampler,
-        trapdoor::{DCRTPolyTrapdoorSampler, GpuDCRTPolyTrapdoorSampler},
-        uniform::DCRTPolyUniformSampler,
+        trapdoor::GpuDCRTPolyTrapdoorSampler,
     },
     simulator::error_norm::{ErrorNorm, NormNaiveBggEncodingVecSTEvaluator, NormPltLWEEvaluator},
     slot_transfer::{NaiveBGGVecSlotTransferEvaluator, bgg_pubkey::BggPublicKeySTEvaluator},
@@ -50,8 +52,10 @@ use mxx::{
 use num_bigint::BigUint;
 use std::{
     env, fs,
+    hint::black_box,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use tempfile::tempdir;
 use tracing::info;
@@ -61,7 +65,6 @@ const DEFAULT_RING_DIM: u32 = 1 << 16;
 const DEFAULT_MIN_LOG_RING_DIM: usize = 16;
 const DEFAULT_MAX_LOG_RING_DIM: usize = 16;
 const DEFAULT_INPUT_SIZE: usize = 5;
-const DEFAULT_INJECTOR_BATCH_BITS: usize = 1;
 const DEFAULT_OUTPUT_SIZE: usize = 6;
 const DEFAULT_CRT_BITS: usize = 28;
 const DEFAULT_BASE_BITS: u32 = 14;
@@ -77,28 +80,17 @@ const DEFAULT_ERROR_SIGMA: f64 = 8.0;
 const DEFAULT_TRAPDOOR_SIGMA: f64 = 4.578;
 const DEFAULT_D_SECRET: usize = 1;
 const DEFAULT_HASH_KEY: [u8; 32] = [0x42; 32];
+const AKY24_IO_SECRET_SIZE: usize = 1;
 
 type GpuMatrix = GpuDCRTPolyMatrix;
 type GpuHashSampler = GpuDCRTPolyHashSampler<Keccak256>;
 type CpuMatrix = DCRTPolyMatrix;
-type CpuHashSampler = DCRTPolyHashSampler<Keccak256>;
-type CpuInjector =
-    DiamondInjector<CpuMatrix, DCRTPolyUniformSampler, CpuHashSampler, DCRTPolyTrapdoorSampler>;
-type CpuDiamondIO = DiamondIO<
+type CpuAky24IO = Aky24IO<
     CpuMatrix,
-    DCRTPolyUniformSampler,
-    CpuHashSampler,
-    DCRTPolyTrapdoorSampler,
     NoCircuitEvaluator,
     NoCircuitEvaluator,
     NoCircuitEvaluator,
     NoCircuitEvaluator,
->;
-type GpuInjector = DiamondInjector<
-    GpuMatrix,
-    GpuDCRTPolyUniformSampler,
-    GpuHashSampler,
-    GpuDCRTPolyTrapdoorSampler,
 >;
 type GpuPubKeyPltEvaluator =
     NaiveLWEBGGPublicKeyVecPltEvaluator<GpuMatrix, GpuHashSampler, GpuDCRTPolyTrapdoorSampler>;
@@ -111,11 +103,8 @@ type GpuPubKeySlotEvaluator = BggPublicKeySTEvaluator<
     GpuDCRTPolyTrapdoorSampler,
 >;
 type GpuEncodingPltEvaluator = NaiveLWEBGGEncodingVecPltEvaluator<GpuMatrix, GpuHashSampler>;
-type GpuDiamondIO = DiamondIO<
+type GpuAky24IO = Aky24IO<
     GpuMatrix,
-    GpuDCRTPolyUniformSampler,
-    GpuHashSampler,
-    GpuDCRTPolyTrapdoorSampler,
     GpuPubKeyPltEvaluator,
     NaiveBGGVecSlotTransferEvaluator,
     GpuEncodingPltEvaluator,
@@ -123,13 +112,13 @@ type GpuDiamondIO = DiamondIO<
 >;
 
 #[derive(Debug, Clone)]
-struct DiamondIOGpuBenchConfig {
+struct Aky24IOGpuBenchConfig {
     ring_dim: u32,
     min_log_ring_dim: usize,
     max_log_ring_dim: usize,
     input_size: usize,
-    injector_batch_bits: usize,
     output_size: usize,
+    public_prf_seed_bits: usize,
     crt_bits: usize,
     base_bits: u32,
     p_moduli_bits: usize,
@@ -147,7 +136,7 @@ struct DiamondIOGpuBenchConfig {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct DiamondIOGpuBenchSelectedSimulation {
+struct Aky24IOGpuBenchSelectedSimulation {
     crt_depth: usize,
     ring_dim: u32,
     log_ring_dim: usize,
@@ -157,111 +146,100 @@ struct DiamondIOGpuBenchSelectedSimulation {
     noise_refresh_v_bits: usize,
     seed_bits: usize,
     noisy_plaintext_error_bits: usize,
-    input_injection_error_bits: usize,
+    initial_fresh_error_bits: usize,
 }
 
-impl DiamondIOGpuBenchConfig {
+impl Aky24IOGpuBenchConfig {
     fn from_env() -> Self {
+        let input_size = env_or_parse_usize("AKY24_IO_GPU_BENCH_INPUT_SIZE", DEFAULT_INPUT_SIZE);
         let cfg = Self {
-            ring_dim: env_or_parse_u32("DIAMOND_IO_GPU_BENCH_RING_DIM", DEFAULT_RING_DIM),
+            ring_dim: env_or_parse_u32("AKY24_IO_GPU_BENCH_RING_DIM", DEFAULT_RING_DIM),
             min_log_ring_dim: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_MIN_LOG_RING_DIM",
+                "AKY24_IO_GPU_BENCH_MIN_LOG_RING_DIM",
                 DEFAULT_MIN_LOG_RING_DIM,
             ),
             max_log_ring_dim: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_MAX_LOG_RING_DIM",
+                "AKY24_IO_GPU_BENCH_MAX_LOG_RING_DIM",
                 DEFAULT_MAX_LOG_RING_DIM,
             ),
-            input_size: env_or_parse_usize("DIAMOND_IO_GPU_BENCH_INPUT_SIZE", DEFAULT_INPUT_SIZE),
-            injector_batch_bits: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS",
-                DEFAULT_INJECTOR_BATCH_BITS,
+            input_size,
+            output_size: env_or_parse_usize("AKY24_IO_GPU_BENCH_OUTPUT_SIZE", DEFAULT_OUTPUT_SIZE),
+            public_prf_seed_bits: env_or_parse_usize(
+                "AKY24_IO_GPU_BENCH_PUBLIC_PRF_SEED_BITS",
+                input_size,
             ),
-            output_size: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_OUTPUT_SIZE",
-                DEFAULT_OUTPUT_SIZE,
-            ),
-            crt_bits: env_or_parse_usize("DIAMOND_IO_GPU_BENCH_CRT_BITS", DEFAULT_CRT_BITS),
-            base_bits: env_or_parse_u32("DIAMOND_IO_GPU_BENCH_BASE_BITS", DEFAULT_BASE_BITS),
+            crt_bits: env_or_parse_usize("AKY24_IO_GPU_BENCH_CRT_BITS", DEFAULT_CRT_BITS),
+            base_bits: env_or_parse_u32("AKY24_IO_GPU_BENCH_BASE_BITS", DEFAULT_BASE_BITS),
             p_moduli_bits: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_P_MODULI_BITS",
+                "AKY24_IO_GPU_BENCH_P_MODULI_BITS",
                 DEFAULT_P_MODULI_BITS,
             ),
             max_unreduced_muls: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_MAX_UNREDUCED_MULS",
+                "AKY24_IO_GPU_BENCH_MAX_UNREDUCED_MULS",
                 DEFAULT_MAX_UNREDUCED_MULS,
             ),
-            scale: env_or_parse_u64("DIAMOND_IO_GPU_BENCH_SCALE", DEFAULT_SCALE),
+            scale: env_or_parse_u64("AKY24_IO_GPU_BENCH_SCALE", DEFAULT_SCALE),
             min_crt_depth: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_MIN_CRT_DEPTH",
+                "AKY24_IO_GPU_BENCH_MIN_CRT_DEPTH",
                 DEFAULT_MIN_CRT_DEPTH,
             ),
             max_crt_depth: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_MAX_CRT_DEPTH",
+                "AKY24_IO_GPU_BENCH_MAX_CRT_DEPTH",
                 DEFAULT_MAX_CRT_DEPTH,
             ),
             security_bits: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_SECURITY_BITS",
+                "AKY24_IO_GPU_BENCH_SECURITY_BITS",
                 DEFAULT_SECURITY_BITS,
             ),
             noise_refresh_cbd_n: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_NOISE_REFRESH_CBD_N",
+                "AKY24_IO_GPU_BENCH_NOISE_REFRESH_CBD_N",
                 DEFAULT_NOISE_REFRESH_CBD_N,
             ),
             bench_iterations: env_or_parse_usize(
-                "DIAMOND_IO_GPU_BENCH_ITERATIONS",
+                "AKY24_IO_GPU_BENCH_ITERATIONS",
                 DEFAULT_BENCH_ITERATIONS,
             ),
-            search_only: env_or_parse_bool("DIAMOND_IO_GPU_BENCH_SEARCH_ONLY", false),
-            error_sigma: env_or_parse_f64("DIAMOND_IO_GPU_BENCH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA),
+            search_only: env_or_parse_bool("AKY24_IO_GPU_BENCH_SEARCH_ONLY", false),
+            error_sigma: env_or_parse_f64("AKY24_IO_GPU_BENCH_ERROR_SIGMA", DEFAULT_ERROR_SIGMA),
             trapdoor_sigma: env_or_parse_f64(
-                "DIAMOND_IO_GPU_BENCH_TRAPDOOR_SIGMA",
+                "AKY24_IO_GPU_BENCH_TRAPDOOR_SIGMA",
                 DEFAULT_TRAPDOOR_SIGMA,
             ),
-            d_secret: env_or_parse_usize("DIAMOND_IO_GPU_BENCH_D_SECRET", DEFAULT_D_SECRET),
+            d_secret: env_or_parse_usize("AKY24_IO_GPU_BENCH_D_SECRET", DEFAULT_D_SECRET),
         };
-        assert!(cfg.ring_dim > 0, "DIAMOND_IO_GPU_BENCH_RING_DIM must be positive");
+        assert!(cfg.ring_dim > 0, "AKY24_IO_GPU_BENCH_RING_DIM must be positive");
         assert!(
             cfg.ring_dim.is_power_of_two(),
-            "DIAMOND_IO_GPU_BENCH_RING_DIM must be a power of two"
+            "AKY24_IO_GPU_BENCH_RING_DIM must be a power of two"
         );
         assert!(
             cfg.min_log_ring_dim <= cfg.max_log_ring_dim,
-            "DIAMOND_IO_GPU_BENCH_MIN_LOG_RING_DIM must be <= DIAMOND_IO_GPU_BENCH_MAX_LOG_RING_DIM"
+            "AKY24_IO_GPU_BENCH_MIN_LOG_RING_DIM must be <= AKY24_IO_GPU_BENCH_MAX_LOG_RING_DIM"
         );
         assert!(
             cfg.max_log_ring_dim < u32::BITS as usize,
-            "DIAMOND_IO_GPU_BENCH_MAX_LOG_RING_DIM must be < 32"
+            "AKY24_IO_GPU_BENCH_MAX_LOG_RING_DIM must be < 32"
         );
-        assert!(cfg.input_size > 0, "DIAMOND_IO_GPU_BENCH_INPUT_SIZE must be positive");
+        assert!(cfg.input_size > 0, "AKY24_IO_GPU_BENCH_INPUT_SIZE must be positive");
+        assert!(cfg.output_size > 0, "AKY24_IO_GPU_BENCH_OUTPUT_SIZE must be positive");
         assert!(
-            cfg.injector_batch_bits > 0,
-            "DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS must be positive"
+            cfg.public_prf_seed_bits > 0,
+            "AKY24_IO_GPU_BENCH_PUBLIC_PRF_SEED_BITS must be positive"
         );
-        assert!(
-            cfg.injector_batch_bits <= u32::BITS as usize,
-            "DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS must be <= 32"
-        );
-        assert_eq!(
-            cfg.input_size % cfg.injector_batch_bits,
-            0,
-            "DIAMOND_IO_GPU_BENCH_INPUT_SIZE must be divisible by DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS"
-        );
-        assert!(cfg.output_size > 0, "DIAMOND_IO_GPU_BENCH_OUTPUT_SIZE must be positive");
-        assert!(cfg.crt_bits > 0, "DIAMOND_IO_GPU_BENCH_CRT_BITS must be positive");
-        assert!(cfg.base_bits > 0, "DIAMOND_IO_GPU_BENCH_BASE_BITS must be positive");
+        assert!(cfg.crt_bits > 0, "AKY24_IO_GPU_BENCH_CRT_BITS must be positive");
+        assert!(cfg.base_bits > 0, "AKY24_IO_GPU_BENCH_BASE_BITS must be positive");
         assert!(
             cfg.min_crt_depth <= cfg.max_crt_depth,
-            "DIAMOND_IO_GPU_BENCH_MIN_CRT_DEPTH must be <= DIAMOND_IO_GPU_BENCH_MAX_CRT_DEPTH"
+            "AKY24_IO_GPU_BENCH_MIN_CRT_DEPTH must be <= AKY24_IO_GPU_BENCH_MAX_CRT_DEPTH"
         );
         assert!(
             cfg.noise_refresh_cbd_n > 0,
-            "DIAMOND_IO_GPU_BENCH_NOISE_REFRESH_CBD_N must be positive"
+            "AKY24_IO_GPU_BENCH_NOISE_REFRESH_CBD_N must be positive"
         );
-        assert!(cfg.bench_iterations > 0, "DIAMOND_IO_GPU_BENCH_ITERATIONS must be positive");
-        assert!(cfg.error_sigma >= 0.0, "DIAMOND_IO_GPU_BENCH_ERROR_SIGMA must be nonnegative");
-        assert!(cfg.trapdoor_sigma > 0.0, "DIAMOND_IO_GPU_BENCH_TRAPDOOR_SIGMA must be positive");
-        assert!(cfg.d_secret > 0, "DIAMOND_IO_GPU_BENCH_D_SECRET must be positive");
+        assert!(cfg.bench_iterations > 0, "AKY24_IO_GPU_BENCH_ITERATIONS must be positive");
+        assert!(cfg.error_sigma >= 0.0, "AKY24_IO_GPU_BENCH_ERROR_SIGMA must be nonnegative");
+        assert!(cfg.trapdoor_sigma > 0.0, "AKY24_IO_GPU_BENCH_TRAPDOOR_SIGMA must be positive");
+        assert!(cfg.d_secret > 0, "AKY24_IO_GPU_BENCH_D_SECRET must be positive");
         cfg
     }
 
@@ -275,9 +253,8 @@ impl DiamondIOGpuBenchConfig {
         prf_mask_output_coeff_bits: usize,
         noise_refresh_v_bits: usize,
     ) -> usize {
-        minimum_diamond_io_prf_seed_bits(
+        minimum_aky24_io_prf_seed_bits(
             params,
-            self.injector_batch_bits,
             self.output_size,
             self.output_size,
             prf_mask_output_coeff_bits,
@@ -286,53 +263,36 @@ impl DiamondIOGpuBenchConfig {
         )
     }
 
-    fn input_base(&self) -> usize {
-        1usize
-            .checked_shl(
-                self.injector_batch_bits
-                    .try_into()
-                    .expect("DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS must fit into u32"),
-            )
-            .expect("DIAMOND_IO_GPU_BENCH_INJECTOR_BATCH_BITS overflowed input base")
-    }
-
-    fn injector_input_count(&self) -> usize {
-        self.input_size / self.injector_batch_bits
-    }
-
     fn prf_mask_output_coeff_bits_search_bound(&self) -> usize {
         self.max_crt_depth
             .checked_mul(self.crt_bits)
-            .expect("DiamondIO PRF-mask search bound overflow")
+            .expect("AKY24IO PRF-mask search bound overflow")
             .max(1)
     }
 
-    fn selected_simulation_from_env(&self) -> Option<DiamondIOGpuBenchSelectedSimulation> {
-        let crt_depth = env_or_parse_optional_usize("DIAMOND_IO_GPU_BENCH_SELECTED_CRT_DEPTH")?;
-        let prf_mask_output_coeff_bits = env_or_parse_optional_usize(
-            "DIAMOND_IO_GPU_BENCH_SELECTED_PRF_MASK_OUTPUT_COEFF_BITS",
-        )?;
+    fn selected_simulation_from_env(&self) -> Option<Aky24IOGpuBenchSelectedSimulation> {
+        let crt_depth = env_or_parse_optional_usize("AKY24_IO_GPU_BENCH_SELECTED_CRT_DEPTH")?;
+        let prf_mask_output_coeff_bits =
+            env_or_parse_optional_usize("AKY24_IO_GPU_BENCH_SELECTED_PRF_MASK_OUTPUT_COEFF_BITS")?;
         let noise_refresh_v_bits =
-            env_or_parse_optional_usize("DIAMOND_IO_GPU_BENCH_SELECTED_NOISE_REFRESH_V_BITS")?;
-        let noisy_plaintext_error_bits = env_or_parse_optional_usize(
-            "DIAMOND_IO_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS",
-        )?;
-        let input_injection_error_bits = env_or_parse_optional_usize(
-            "DIAMOND_IO_GPU_BENCH_SELECTED_INPUT_INJECTION_ERROR_BITS",
-        )?;
-        assert!(crt_depth > 0, "DIAMOND_IO_GPU_BENCH_SELECTED_CRT_DEPTH must be positive");
+            env_or_parse_optional_usize("AKY24_IO_GPU_BENCH_SELECTED_NOISE_REFRESH_V_BITS")?;
+        let noisy_plaintext_error_bits =
+            env_or_parse_optional_usize("AKY24_IO_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS")?;
+        let initial_fresh_error_bits =
+            env_or_parse_optional_usize("AKY24_IO_GPU_BENCH_SELECTED_INITIAL_FRESH_ERROR_BITS")?;
+        assert!(crt_depth > 0, "AKY24_IO_GPU_BENCH_SELECTED_CRT_DEPTH must be positive");
         assert!(
             prf_mask_output_coeff_bits > 0,
-            "DIAMOND_IO_GPU_BENCH_SELECTED_PRF_MASK_OUTPUT_COEFF_BITS must be positive"
+            "AKY24_IO_GPU_BENCH_SELECTED_PRF_MASK_OUTPUT_COEFF_BITS must be positive"
         );
         assert!(
             noise_refresh_v_bits > 0,
-            "DIAMOND_IO_GPU_BENCH_SELECTED_NOISE_REFRESH_V_BITS must be positive"
+            "AKY24_IO_GPU_BENCH_SELECTED_NOISE_REFRESH_V_BITS must be positive"
         );
         let params = DCRTPolyParams::new(self.ring_dim, crt_depth, self.crt_bits, self.base_bits);
         let seed_bits =
             self.seed_bits_for_params(&params, prf_mask_output_coeff_bits, noise_refresh_v_bits);
-        Some(DiamondIOGpuBenchSelectedSimulation {
+        Some(Aky24IOGpuBenchSelectedSimulation {
             crt_depth,
             ring_dim: self.ring_dim,
             log_ring_dim: self.ring_dim.ilog2() as usize,
@@ -342,7 +302,7 @@ impl DiamondIOGpuBenchConfig {
             noise_refresh_v_bits,
             seed_bits,
             noisy_plaintext_error_bits,
-            input_injection_error_bits,
+            initial_fresh_error_bits,
         })
     }
 }
@@ -419,13 +379,13 @@ fn env_or_parse_f64(key: &str, default: f64) -> f64 {
 
 fn ensure_clean_dir(dir: &Path) {
     if dir.exists() {
-        fs::remove_dir_all(dir).expect("failed to remove existing DiamondIO GPU bench directory");
+        fs::remove_dir_all(dir).expect("failed to remove existing AKY24IO GPU bench directory");
     }
-    fs::create_dir_all(dir).expect("failed to create DiamondIO GPU bench directory");
+    fs::create_dir_all(dir).expect("failed to create AKY24IO GPU bench directory");
 }
 
 fn gpu_params_for_crt_depth(
-    cfg: &DiamondIOGpuBenchConfig,
+    cfg: &Aky24IOGpuBenchConfig,
     ring_dim: u32,
     crt_depth: usize,
     gpu_id: i32,
@@ -446,7 +406,7 @@ fn gpu_params_for_crt_depth(
 
 fn build_ring_gsw_context(
     params: &GpuDCRTPolyParams,
-    cfg: &DiamondIOGpuBenchConfig,
+    cfg: &Aky24IOGpuBenchConfig,
     active_levels: usize,
 ) -> Arc<NestedRnsPolyContext> {
     let mut setup_circuit = PolyCircuit::<GpuDCRTPoly>::new();
@@ -463,7 +423,7 @@ fn build_ring_gsw_context(
 
 fn build_cpu_ring_gsw_context(
     params: &DCRTPolyParams,
-    cfg: &DiamondIOGpuBenchConfig,
+    cfg: &Aky24IOGpuBenchConfig,
     active_levels: usize,
 ) -> Arc<NestedRnsPolyContext> {
     let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
@@ -481,11 +441,11 @@ fn build_cpu_ring_gsw_context(
 fn build_lwe_pubkey_vec_plt_evaluator(
     params: &GpuDCRTPolyParams,
     hash_key: [u8; 32],
-    d_secret: usize,
+    cfg: &Aky24IOGpuBenchConfig,
     dir_path: PathBuf,
 ) -> (GpuPubKeyPltEvaluator, GpuMatrix) {
-    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(params, DEFAULT_TRAPDOOR_SIGMA);
-    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(params, d_secret);
+    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(params, cfg.trapdoor_sigma);
+    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(params, cfg.d_secret);
     let evaluator = GpuPubKeyPltEvaluator::new(LWEBGGPubKeyPltEvaluator::<
         GpuMatrix,
         GpuHashSampler,
@@ -503,11 +463,11 @@ fn build_lwe_pubkey_vec_plt_evaluator(
 fn build_lwe_scalar_pubkey_plt_evaluator(
     params: &GpuDCRTPolyParams,
     hash_key: [u8; 32],
-    d_secret: usize,
+    cfg: &Aky24IOGpuBenchConfig,
     dir_path: PathBuf,
 ) -> GpuScalarPubKeyPltEvaluator {
-    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(params, DEFAULT_TRAPDOOR_SIGMA);
-    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(params, d_secret);
+    let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(params, cfg.trapdoor_sigma);
+    let (trapdoor, pub_matrix) = trapdoor_sampler.trapdoor(params, cfg.d_secret);
     GpuScalarPubKeyPltEvaluator::new(
         hash_key,
         trapdoor_sampler,
@@ -517,15 +477,14 @@ fn build_lwe_scalar_pubkey_plt_evaluator(
     )
 }
 
-fn build_diamond_io(
-    cfg: &DiamondIOGpuBenchConfig,
+fn build_aky24_io(
+    cfg: &Aky24IOGpuBenchConfig,
     cpu_params: DCRTPolyParams,
     gpu_params: GpuDCRTPolyParams,
     prf_mask_output_coeff_bits: usize,
     noise_refresh_v_bits: usize,
-    gpu_id: i32,
     dir_path: PathBuf,
-) -> GpuDiamondIO {
+) -> GpuAky24IO {
     let crt_depth = gpu_params.crt_depth();
     let ring_gsw_context = build_ring_gsw_context(&gpu_params, cfg, crt_depth);
     let ring_gsw_level_offset = 0usize;
@@ -536,24 +495,12 @@ fn build_diamond_io(
             ring_gsw_enable_levels,
             Some(ring_gsw_level_offset),
         );
-    let injector = GpuInjector::new(
-        gpu_params.clone(),
-        cfg.injector_input_count(),
-        cfg.input_base(),
-        cfg.injector_batch_bits,
-        cfg.trapdoor_sigma,
-        cfg.error_sigma,
-    )
-    .with_gpu_device_ids(vec![gpu_id]);
     let lookup_dir = dir_path.join(format!("lookup_crt{crt_depth}"));
-    fs::create_dir_all(&lookup_dir).expect("failed to create DiamondIO lookup directory");
-    let (pk_lookup_evaluator, lookup_base_matrix) = build_lwe_pubkey_vec_plt_evaluator(
-        &gpu_params,
-        DEFAULT_HASH_KEY,
-        cfg.d_secret,
-        lookup_dir.clone(),
-    );
+    fs::create_dir_all(&lookup_dir).expect("failed to create AKY24IO lookup directory");
+    let (pk_lookup_evaluator, _) =
+        build_lwe_pubkey_vec_plt_evaluator(&gpu_params, DEFAULT_HASH_KEY, cfg, lookup_dir.clone());
     let enc_lookup_dir = lookup_dir.clone();
+    let c_b0 = GpuMatrix::zero(&gpu_params, 1, 1);
     let seed_bits =
         cfg.seed_bits_for_params(&cpu_params, prf_mask_output_coeff_bits, noise_refresh_v_bits);
     info!(
@@ -561,20 +508,21 @@ fn build_diamond_io(
         seed_bits,
         prf_mask_output_coeff_bits,
         noise_refresh_v_bits,
-        "derived DiamondIO GPU benchmark seed_bits from output_size"
+        "derived AKY24IO GPU benchmark seed_bits from output_size"
     );
-    DiamondIO::new(
-        injector,
-        cfg.input_size,
-        cfg.output_size(),
+    Aky24IO::new(
+        gpu_params,
         cpu_params,
         ring_gsw_context,
         ring_gsw_width,
         ring_gsw_level_offset,
         ring_gsw_enable_levels,
         Some(cfg.error_sigma),
-        b"test_gpu_diamond_io".to_vec(),
+        b"test_gpu_aky24_io".to_vec(),
+        cfg.input_size,
+        cfg.output_size(),
         seed_bits,
+        cfg.public_prf_seed_bits,
         prf_mask_output_coeff_bits,
         noise_refresh_v_bits,
         cfg.noise_refresh_cbd_n,
@@ -582,27 +530,24 @@ fn build_diamond_io(
         [0x25; 32],
         Some(pk_lookup_evaluator),
         Some(NaiveBGGVecSlotTransferEvaluator::new()),
-        Some(lookup_base_matrix),
-        Some(Arc::new(move |c_b0| {
-            GpuEncodingPltEvaluator::new(
-                LWEBGGEncodingPltEvaluator::<GpuMatrix, GpuHashSampler>::new(
-                    DEFAULT_HASH_KEY,
-                    enc_lookup_dir.clone(),
-                    c_b0,
-                ),
-            )
-        })),
+        Some(GpuEncodingPltEvaluator::new(
+            LWEBGGEncodingPltEvaluator::<GpuMatrix, GpuHashSampler>::new(
+                DEFAULT_HASH_KEY,
+                enc_lookup_dir,
+                c_b0,
+            ),
+        )),
         Some(NaiveBGGVecSlotTransferEvaluator::new()),
     )
 }
 
-fn build_cpu_diamond_io_for_search(
-    cfg: &DiamondIOGpuBenchConfig,
+fn build_cpu_aky24_io_for_search(
+    cfg: &Aky24IOGpuBenchConfig,
     ring_dim: u32,
     crt_depth: usize,
     prf_mask_output_coeff_bits: usize,
     noise_refresh_v_bits: usize,
-) -> CpuDiamondIO {
+) -> CpuAky24IO {
     let params = DCRTPolyParams::new(ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
     let (_, _, actual_crt_depth) = params.to_crt();
     assert_eq!(actual_crt_depth, crt_depth, "DCRTPolyParams returned an unexpected CRT depth");
@@ -615,14 +560,6 @@ fn build_cpu_diamond_io_for_search(
             ring_gsw_enable_levels,
             Some(ring_gsw_level_offset),
         );
-    let injector = CpuInjector::new(
-        params.clone(),
-        cfg.injector_input_count(),
-        cfg.input_base(),
-        cfg.injector_batch_bits,
-        cfg.trapdoor_sigma,
-        cfg.error_sigma,
-    );
     let seed_bits =
         cfg.seed_bits_for_params(&params, prf_mask_output_coeff_bits, noise_refresh_v_bits);
     info!(
@@ -631,26 +568,26 @@ fn build_cpu_diamond_io_for_search(
         seed_bits,
         prf_mask_output_coeff_bits,
         noise_refresh_v_bits,
-        "derived DiamondIO CPU search seed_bits from output_size"
+        "derived AKY24IO CPU search seed_bits from output_size"
     );
-    DiamondIO::new(
-        injector,
-        cfg.input_size,
-        cfg.output_size(),
+    Aky24IO::new(
+        params.clone(),
         params,
         ring_gsw_context,
         ring_gsw_width,
         ring_gsw_level_offset,
         ring_gsw_enable_levels,
         Some(cfg.error_sigma),
-        b"test_gpu_diamond_io_cpu_search".to_vec(),
+        b"test_gpu_aky24_io_cpu_search".to_vec(),
+        cfg.input_size,
+        cfg.output_size(),
         seed_bits,
+        cfg.public_prf_seed_bits,
         prf_mask_output_coeff_bits,
         noise_refresh_v_bits,
         cfg.noise_refresh_cbd_n,
         [0x24; 32],
         [0x25; 32],
-        None,
         None,
         None,
         None,
@@ -721,7 +658,7 @@ fn constant_and_shared_benchmark_pubkeys(
 
 fn build_public_key_bench_estimator(
     params: &GpuDCRTPolyParams,
-    cfg: &DiamondIOGpuBenchConfig,
+    cfg: &Aky24IOGpuBenchConfig,
     bench_dir: PathBuf,
 ) -> NaiveBGGVecBenchEstimator<
     BggPublicKeyBenchEstimator<GpuMatrix, GpuPubKeyPltEvaluator, GpuPubKeySlotEvaluator>,
@@ -735,15 +672,11 @@ fn build_public_key_bench_estimator(
         DEFAULT_HASH_KEY,
         cfg.d_secret,
         1,
-        b"test_gpu_diamond_io_pubkey_bench",
+        b"test_gpu_aky24_io_pubkey_bench",
     );
     let (public_lut_one, shared_input) = constant_and_shared_benchmark_pubkeys(&public_keys);
-    let scalar_plt_evaluator = build_lwe_scalar_pubkey_plt_evaluator(
-        params,
-        DEFAULT_HASH_KEY,
-        cfg.d_secret,
-        bench_dir.clone(),
-    );
+    let scalar_plt_evaluator =
+        build_lwe_scalar_pubkey_plt_evaluator(params, DEFAULT_HASH_KEY, cfg, bench_dir.clone());
     let scalar_slot_evaluator = GpuPubKeySlotEvaluator::new(
         DEFAULT_HASH_KEY,
         cfg.d_secret,
@@ -753,14 +686,14 @@ fn build_public_key_bench_estimator(
         bench_dir.clone(),
     );
     let (public_lut_estimator, _) =
-        build_lwe_pubkey_vec_plt_evaluator(params, DEFAULT_HASH_KEY, cfg.d_secret, bench_dir);
+        build_lwe_pubkey_vec_plt_evaluator(params, DEFAULT_HASH_KEY, cfg, bench_dir);
     let slot_transfer_estimator = GpuPubKeySlotEvaluator::new(
         DEFAULT_HASH_KEY,
         cfg.d_secret,
         params.ring_dimension() as usize,
         cfg.trapdoor_sigma,
         cfg.error_sigma,
-        PathBuf::from("test_data/test_gpu_diamond_io_slot_transfer_estimator"),
+        PathBuf::from("test_data/test_gpu_aky24_io_slot_transfer_estimator"),
     );
     let scalar_estimator = BggPublicKeyBenchEstimator::benchmark(
         &BggPublicKeyBenchSamples {
@@ -793,20 +726,262 @@ fn build_public_key_bench_estimator(
     NaiveBGGVecBenchEstimator::new(scalar_estimator, params.ring_dimension() as usize)
 }
 
+#[derive(Debug, Clone)]
+struct Aky24IOBenchUnitEstimates {
+    bgg_public_key_sample: CircuitBenchEstimate,
+    ring_gsw_public_key_sample: CircuitBenchEstimate,
+    ring_gsw_encrypt_bit: CircuitBenchEstimate,
+    full_w_block_hash_sample: CircuitBenchEstimate,
+    a_prime_hash_sample: CircuitBenchSummary,
+    final_output_preimage_extend: CircuitBenchEstimate,
+    final_decoder_preimage_extend: CircuitBenchEstimate,
+}
+
+fn bench_estimate_named<R, F>(name: &'static str, iterations: usize, op: F) -> CircuitBenchEstimate
+where
+    F: FnMut() -> R,
+{
+    info!(unit = name, iterations, "starting AKY24IO benchmark unit cost");
+    let start = Instant::now();
+    let time = measure_bench_operation(iterations.max(1), op);
+    let estimate = CircuitBenchEstimate {
+        total_time: seconds_to_nanos(time),
+        latency: time,
+        max_parallelism: BigUint::from(1u32),
+        peak_vram: 0,
+    };
+    info!(
+        unit = name,
+        elapsed = ?start.elapsed(),
+        ?estimate,
+        "finished AKY24IO benchmark unit cost"
+    );
+    estimate
+}
+
+fn seconds_to_nanos(seconds: f64) -> BigUint {
+    BigUint::from((seconds.max(0.0) * 1_000_000_000.0).ceil().max(1.0) as u64)
+}
+
+fn measure_bench_operation<R, F>(iterations: usize, mut op: F) -> f64
+where
+    F: FnMut() -> R,
+{
+    let iterations = iterations.max(1);
+    gpu_device_sync();
+    let start = Instant::now();
+    for _ in 0..iterations {
+        black_box(op());
+    }
+    gpu_device_sync();
+    start.elapsed().as_secs_f64() / iterations as f64
+}
+
+fn scale_independent_estimate(
+    estimate: CircuitBenchEstimate,
+    count: usize,
+) -> CircuitBenchEstimate {
+    let count = BigUint::from(count);
+    CircuitBenchEstimate {
+        total_time: estimate.total_time * &count,
+        latency: estimate.latency,
+        max_parallelism: estimate.max_parallelism * count,
+        peak_vram: estimate.peak_vram,
+    }
+}
+
+fn estimate_to_summary(estimate: CircuitBenchEstimate) -> CircuitBenchSummary {
+    CircuitBenchSummary {
+        total_time: estimate.total_time,
+        latency: estimate.latency,
+        max_parallelism: estimate.max_parallelism,
+        peak_vram: estimate.peak_vram,
+    }
+}
+
+fn sample_native_ternary_secret(
+    params: &GpuDCRTPolyParams,
+    native_params: &DCRTPolyParams,
+) -> DCRTPoly {
+    let secret = GpuDCRTPolyUniformSampler::new().sample_poly(params, &DistType::TernaryDist);
+    DCRTPoly::from_biguints(native_params, &secret.coeffs_biguints())
+}
+
+fn gpu_native_params_from_cpu(
+    native_params: &DCRTPolyParams,
+    params: &GpuDCRTPolyParams,
+) -> GpuDCRTPolyParams {
+    let (moduli, _, _) = native_params.to_crt();
+    GpuDCRTPolyParams::new_with_gpu(
+        native_params.ring_dimension(),
+        moduli,
+        native_params.base_bits(),
+        params.device_ids(),
+        None,
+    )
+}
+
+fn benchmark_aky24_io_unit_costs(
+    aky24: &GpuAky24IO,
+    iterations: usize,
+) -> Aky24IOBenchUnitEstimates {
+    let iterations = iterations.max(1);
+    let params = &aky24.params;
+    let state_row_size = AKY24_IO_SECRET_SIZE;
+    let gadget_col_size = AKY24_IO_SECRET_SIZE
+        .checked_mul(params.modulus_digits())
+        .expect("AKY24IO benchmark gadget column count overflow");
+    info!(
+        iterations,
+        state_row_size,
+        gadget_col_size,
+        modulus_digits = params.modulus_digits(),
+        ring_dimension = params.ring_dimension(),
+        "starting AKY24IO benchmark unit-cost measurement"
+    );
+
+    let trap_sampler = GpuDCRTPolyTrapdoorSampler::new(params, DEFAULT_TRAPDOOR_SIGMA);
+    let (trapdoor, public_matrix) = trap_sampler.trapdoor(params, state_row_size);
+    let ext_matrix = GpuHashSampler::new().sample_hash(
+        params,
+        [0x51u8; 32],
+        b"aky24_io_bench_preimage_extend_ext",
+        state_row_size,
+        gadget_col_size,
+        DistType::FinRingDist,
+    );
+    let one_column_target = GpuMatrix::zero(params, state_row_size, 1);
+    let final_output_preimage_extend_one_col =
+        bench_estimate_named("aky24_final_output_preimage_extend_one_col", iterations, || {
+            let preimage = trap_sampler.preimage_extend(
+                params,
+                &trapdoor,
+                &public_matrix,
+                &ext_matrix,
+                &one_column_target,
+            );
+            preimage.to_compact_bytes()
+        });
+    let final_output_preimage_extend =
+        scale_independent_estimate(final_output_preimage_extend_one_col.clone(), gadget_col_size);
+    let final_decoder_preimage_extend = final_output_preimage_extend_one_col;
+    let full_w_block_hash_sample =
+        bench_estimate_named("aky24_full_w_block_hash_sample", iterations, || {
+            let matrix = GpuHashSampler::new().sample_hash(
+                params,
+                [0x52u8; 32],
+                b"aky24_io_bench_full_w_block_hash",
+                state_row_size,
+                gadget_col_size,
+                DistType::FinRingDist,
+            );
+            matrix.to_compact_bytes()
+        });
+    let a_prime_hash_sample = estimate_to_summary(bench_estimate_named(
+        "aky24_noise_refresh_a_prime_hash_sample",
+        iterations,
+        || {
+            let matrix = GpuHashSampler::new().sample_hash(
+                params,
+                aky24.noise_refresh_hash_key,
+                b"aky24-io-noise-refresh-bench-a-prime",
+                state_row_size,
+                gadget_col_size,
+                DistType::FinRingDist,
+            );
+            matrix.to_compact_bytes()
+        },
+    ));
+    let mut bgg_public_key_tag = aky24.bgg_tag.clone();
+    bgg_public_key_tag.extend_from_slice(b":public_keys");
+    let bgg_public_key_sample =
+        bench_estimate_named("aky24_bgg_public_key_sample", iterations, || {
+            BGGPublicKeySampler::<[u8; 32], GpuHashSampler>::new([0x5au8; 32], 1).sample(
+                params,
+                &bgg_public_key_tag,
+                &[],
+            )
+        });
+    let native_secret = sample_native_ternary_secret(params, &aky24.native_poly_params);
+    let gpu_native_params = gpu_native_params_from_cpu(&aky24.native_poly_params, params);
+    let gpu_secret =
+        GpuDCRTPoly::from_biguints(&gpu_native_params, &native_secret.coeffs_biguints());
+    let ring_gsw_public_key_sample_one_col =
+        bench_estimate_named("aky24_ring_gsw_public_key_sample_one_col", iterations, || {
+            let public_key_col = sample_public_key_columns_with_samplers::<
+                GpuDCRTPoly,
+                GpuDCRTPolyMatrix,
+                GpuHashSampler,
+                GpuDCRTPolyUniformSampler,
+                _,
+            >(
+                &gpu_native_params,
+                aky24.ring_gsw_width,
+                &gpu_secret,
+                [0x6du8; 32],
+                b"aky24_io_bench_ring_gsw_public_key",
+                0,
+                1,
+                aky24.ring_gsw_public_key_error_sigma,
+            );
+            black_box(public_key_col)
+        });
+    let ring_gsw_public_key_sample =
+        scale_independent_estimate(ring_gsw_public_key_sample_one_col, aky24.ring_gsw_width);
+    let ring_gsw_public_key_col = sample_public_key_columns_with_samplers::<
+        GpuDCRTPoly,
+        GpuDCRTPolyMatrix,
+        GpuHashSampler,
+        GpuDCRTPolyUniformSampler,
+        _,
+    >(
+        &gpu_native_params,
+        aky24.ring_gsw_width,
+        &gpu_secret,
+        [0x6du8; 32],
+        b"aky24_io_bench_ring_gsw_public_key",
+        0,
+        1,
+        aky24.ring_gsw_public_key_error_sigma,
+    );
+    let ring_gsw_encrypt_bit_key_col_contribution =
+        bench_estimate_named("aky24_ring_gsw_encrypt_bit_key_col_contribution", iterations, || {
+            let sampler = GpuDCRTPolyUniformSampler::new();
+            let randomizer = sampler.sample_poly(&gpu_native_params, &DistType::BitDist);
+            let top = ring_gsw_public_key_col[0][0].clone() * &randomizer;
+            let bottom = ring_gsw_public_key_col[1][0].clone() * &randomizer;
+            black_box((top, bottom))
+        });
+    let ring_gsw_encrypt_bit_one_ciphertext_col =
+        scale_independent_estimate(ring_gsw_encrypt_bit_key_col_contribution, aky24.ring_gsw_width);
+    let ring_gsw_encrypt_bit =
+        scale_independent_estimate(ring_gsw_encrypt_bit_one_ciphertext_col, aky24.ring_gsw_width);
+
+    Aky24IOBenchUnitEstimates {
+        bgg_public_key_sample,
+        ring_gsw_public_key_sample,
+        ring_gsw_encrypt_bit,
+        full_w_block_hash_sample,
+        a_prime_hash_sample,
+        final_output_preimage_extend,
+        final_decoder_preimage_extend,
+    }
+}
+
 #[tokio::test]
 #[sequential_test::sequential]
-async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
+async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
     let log_filter = tracing_subscriber::filter::Targets::new()
-        .with_target("test_gpu_diamond_io", tracing_subscriber::filter::LevelFilter::INFO)
+        .with_target("test_gpu_aky24_io", tracing_subscriber::filter::LevelFilter::INFO)
         .with_target("mxx", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target("mxx::io::diamond_io", tracing_subscriber::filter::LevelFilter::INFO)
+        .with_target("mxx::io::aky24_io", tracing_subscriber::filter::LevelFilter::INFO)
         .with_target("mxx::io::utils::simulation", tracing_subscriber::filter::LevelFilter::INFO)
         .with_target(
             "mxx::io::diamond_io::bench_estimator_native",
             tracing_subscriber::filter::LevelFilter::INFO,
         )
         .with_target(
-            "mxx::io::diamond_io::bench_estimator",
+            "mxx::io::aky24_io::bench_estimator",
             tracing_subscriber::filter::LevelFilter::INFO,
         )
         .with_target("mxx::bench_estimator", tracing_subscriber::filter::LevelFilter::INFO)
@@ -819,11 +994,11 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         .try_init();
     gpu_device_sync();
 
-    let cfg = DiamondIOGpuBenchConfig::from_env();
-    info!("DiamondIO GPU bench config: {:?}", cfg);
+    let cfg = Aky24IOGpuBenchConfig::from_env();
+    info!("AKY24IO GPU bench config: {:?}", cfg);
     let gpu_id =
-        *detected_gpu_device_ids().first().expect("test_gpu_diamond_io requires at least one GPU");
-    let temp_dir = tempdir().expect("DiamondIO GPU bench test must create a tempdir");
+        *detected_gpu_device_ids().first().expect("test_gpu_aky24_io requires at least one GPU");
+    let temp_dir = tempdir().expect("AKY24IO GPU bench test must create a tempdir");
     init_storage_system(temp_dir.path().to_path_buf());
 
     let selected = if let Some(selected) = cfg.selected_simulation_from_env() {
@@ -837,31 +1012,32 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
             noise_refresh_v_bits = selected.noise_refresh_v_bits,
             final_seed_bits = selected.seed_bits,
             noisy_plaintext_error_bits = selected.noisy_plaintext_error_bits,
-            input_injection_error_bits = selected.input_injection_error_bits,
-            "DiamondIO selected simulation parameters provided; skipping error simulation"
+            initial_fresh_error_bits = selected.initial_fresh_error_bits,
+            "AKY24IO selected simulation parameters provided; skipping error simulation"
         );
         selected
     } else {
         let plt_evaluator = DynamicNormPltLWEEvaluator::new(cfg.error_sigma);
         let slot_transfer_evaluator = NormNaiveBggEncodingVecSTEvaluator::new();
-        let search = diamond_io_find_crt_depth(
+        let search = aky24_io_find_crt_depth(
             cfg.min_crt_depth,
             cfg.max_crt_depth,
             cfg.min_log_ring_dim,
             cfg.max_log_ring_dim,
             cfg.prf_mask_output_coeff_bits_search_bound(),
             cfg.security_bits,
-            DiamondIOFuncType::GoldreichPRF { output_bits: cfg.output_size() },
+            cfg.error_sigma,
+            Aky24IOFuncType::GoldreichPRF { output_bits: cfg.output_size() },
             |ring_dim, crt_depth, prf_mask_output_coeff_bits, noise_refresh_v_bits| {
                 let search_params =
                     DCRTPolyParams::new(ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
                 let selected_noise_refresh_v_bits = noise_refresh_v_bits.unwrap_or_else(|| {
-                    diamond_io_max_noise_refresh_v_bits_without_pre_rounding_error(&search_params)
+                    aky24_io_max_noise_refresh_v_bits_without_pre_rounding_error(&search_params)
                         .expect(
-                            "DiamondIO CRT-depth search requires a noise-refresh v_bits candidate",
+                            "AKY24IO CRT-depth search requires a noise-refresh v_bits candidate",
                         )
                 });
-                build_cpu_diamond_io_for_search(
+                build_cpu_aky24_io_for_search(
                     &cfg,
                     ring_dim,
                     crt_depth,
@@ -872,8 +1048,8 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
             &plt_evaluator,
             &slot_transfer_evaluator,
         )
-        .expect("DiamondIO CRT-depth search must find a valid benchmark candidate");
-        let selected = DiamondIOGpuBenchSelectedSimulation {
+        .expect("AKY24IO CRT-depth search must find a valid benchmark candidate");
+        let selected = Aky24IOGpuBenchSelectedSimulation {
             crt_depth: search.crt_depth,
             ring_dim: search.ring_dim,
             log_ring_dim: search.log_ring_dim,
@@ -885,8 +1061,8 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
             noisy_plaintext_error_bits: bigdecimal_bits_ceil(
                 &search.total_noisy_plaintext_error.poly_norm.norm,
             ) as usize,
-            input_injection_error_bits: bigdecimal_bits_ceil(
-                &search.input_injection_projection_error.poly_norm.norm,
+            initial_fresh_error_bits: bigdecimal_bits_ceil(
+                &search.initial_fresh_error.poly_norm.norm,
             ) as usize,
         };
         info!(
@@ -899,8 +1075,8 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
             noise_refresh_v_bits = selected.noise_refresh_v_bits,
             final_seed_bits = selected.seed_bits,
             noisy_plaintext_error_bits = selected.noisy_plaintext_error_bits,
-            input_injection_error_bits = selected.input_injection_error_bits,
-            "DiamondIO CRT-depth search selected parameters"
+            initial_fresh_error_bits = selected.initial_fresh_error_bits,
+            "AKY24IO CRT-depth search selected parameters"
         );
         selected
     };
@@ -916,8 +1092,8 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
             noise_refresh_v_bits = selected.noise_refresh_v_bits,
             final_seed_bits = selected.seed_bits,
             noisy_plaintext_error_bits = selected.noisy_plaintext_error_bits,
-            input_injection_error_bits = selected.input_injection_error_bits,
-            "DiamondIO GPU bench search-only mode selected parameters; skipping GPU benchmark estimation"
+            initial_fresh_error_bits = selected.initial_fresh_error_bits,
+            "AKY24IO GPU bench search-only mode selected parameters; skipping GPU benchmark estimation"
         );
         return;
     }
@@ -931,18 +1107,17 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
             selected.noise_refresh_v_bits,
         ),
         selected.seed_bits,
-        "selected DiamondIO final seed_bits must match the minimum derived from selected mask widths"
+        "selected AKY24IO final seed_bits must match the minimum derived from selected mask widths"
     );
     let final_dir = temp_dir.path().join("final_estimate");
     ensure_clean_dir(&final_dir);
     init_storage_system(final_dir.clone());
-    let diamond = build_diamond_io(
+    let aky24 = build_aky24_io(
         &cfg,
         cpu_params,
         gpu_params.clone(),
         selected.prf_mask_output_coeff_bits,
         selected.noise_refresh_v_bits,
-        gpu_id,
         final_dir.clone(),
     );
     let public_key_estimator =
@@ -955,15 +1130,21 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
     );
     let native_estimator =
         GpuDCRTPolyMatrixNativeBenchEstimator::new(gpu_params.clone(), cfg.bench_iterations);
-    let diamond_bench_estimator = DiamondIOBenchEstimator::new(
+    let units = benchmark_aky24_io_unit_costs(&aky24, cfg.bench_iterations);
+    let aky24_bench_estimator = Aky24IOBenchEstimator::new(
         &public_key_estimator,
         &encoding_estimator,
         &native_estimator,
-        &diamond,
-        cfg.bench_iterations,
+        units.bgg_public_key_sample,
+        units.ring_gsw_public_key_sample,
+        units.ring_gsw_encrypt_bit,
+        units.full_w_block_hash_sample,
+        units.a_prime_hash_sample,
+        units.final_output_preimage_extend,
+        units.final_decoder_preimage_extend,
     );
-    let estimate = diamond_bench_estimator
-        .estimate(&diamond, DiamondIOFuncType::GoldreichPRF { output_bits: cfg.output_size() });
+    let estimate = aky24_bench_estimator
+        .estimate(&aky24, Aky24IOFuncType::GoldreichPRF { output_bits: cfg.output_size() });
 
     info!(
         obfuscate_latency = estimate.obfuscate.latency,
@@ -972,19 +1153,23 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         eval_latency = estimate.eval.latency,
         eval_total_time_nanos = %estimate.eval.total_time,
         eval_max_parallelism = %estimate.eval.max_parallelism,
-        obfuscate_input_injection_latency_percent =
-            estimate.obfuscate_input_injection_latency_percent(),
-        obfuscate_input_injection_total_time_percent =
-            estimate.obfuscate_input_injection_total_time_percent(),
-        eval_input_injection_latency_percent = estimate.eval_input_injection_latency_percent(),
-        eval_input_injection_total_time_percent =
-            estimate.eval_input_injection_total_time_percent(),
+        fe_to_io_eval_total_time_nanos = %estimate.fe_to_io_eval_total_time,
+        final_fe_eval_total_time_nanos = %estimate.final_fe_eval_total_time,
         obfuscated_circuit_bytes = %estimate.obfuscated_circuit_bytes,
-        input_injection_bytes = %estimate.input_injection_bytes,
-        "DiamondIO GPU benchmark estimate"
+        fe_to_io_obfuscated_circuit_bytes = %estimate.fe_to_io_obfuscated_circuit_bytes,
+        final_fe_obfuscated_circuit_bytes = %estimate.final_fe_obfuscated_circuit_bytes,
+        "AKY24IO GPU benchmark estimate"
     );
     assert!(estimate.obfuscate.total_time >= BigUint::from(0u32));
     assert!(estimate.eval.total_time >= BigUint::from(0u32));
     assert!(estimate.obfuscated_circuit_bytes > BigUint::from(0u32));
-    assert!(estimate.input_injection_bytes > BigUint::from(0u32));
+    assert!(estimate.final_fe_eval_total_time > BigUint::from(0u32));
+    assert!(estimate.final_fe_obfuscated_circuit_bytes > BigUint::from(0u32));
+    if cfg.input_size > 1 {
+        assert!(estimate.fe_to_io_eval_total_time > BigUint::from(0u32));
+        assert!(estimate.fe_to_io_obfuscated_circuit_bytes > BigUint::from(0u32));
+    } else {
+        assert_eq!(estimate.fe_to_io_eval_total_time, BigUint::from(0u32));
+        assert_eq!(estimate.fe_to_io_obfuscated_circuit_bytes, BigUint::from(0u32));
+    }
 }

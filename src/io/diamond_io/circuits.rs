@@ -53,24 +53,11 @@ where
     {
         let mut circuit = PolyCircuit::new();
         let ring_gsw_context = self.build_ring_gsw_circuit_context(&mut circuit);
-        let seed_ciphertexts = (0..5)
-            .map(|_| {
-                RingGswCiphertext::input(
-                    ring_gsw_context.clone(),
-                    Some(BigUint::from(1u64)),
-                    &mut circuit,
-                )
-            })
-            .collect::<Vec<_>>();
-        let graph = GoldreichGraph::from_edges(
+        crate::io::utils::bench_estimator::representative_goldreich_prg_one_output_circuit(
+            circuit,
+            ring_gsw_context,
             5,
-            vec![GoldreichEdge::new([0, 1, 2], [3, 4])],
-            Default::default(),
-        );
-        let goldreich = GoldreichFhePrg::from_public_graph(&mut circuit, ring_gsw_context, graph);
-        let outputs = goldreich.evaluate_uniform(&seed_ciphertexts, &mut circuit);
-        circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
-        circuit
+        )
     }
 
     pub(super) fn build_ring_gsw_circuit_context(

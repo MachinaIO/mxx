@@ -88,6 +88,14 @@ pub struct DiamondIOPrfMaskOutputCoeffBitsSearchResult {
 pub struct DiamondIOCrtDepthSearchResult {
     /// Smallest CRT depth found by the search.
     pub crt_depth: usize,
+    /// Smallest log2 ring dimension that satisfied the lattice-estimator security checks.
+    pub log_ring_dim: usize,
+    /// Ring dimension selected as `1 << log_ring_dim`.
+    pub ring_dim: u32,
+    /// Lattice-estimator security estimate for ternary secret and Gaussian error.
+    pub achieved_secpar_for_gauss: Option<u64>,
+    /// Lattice-estimator security estimate for ternary secret and CBD error.
+    pub achieved_secpar_for_cbd: Option<u64>,
     /// Largest PRF mask coefficient bit-width that was safe at `crt_depth`.
     pub prf_mask_output_coeff_bits: usize,
     /// Single noise-refresh mask bit-width that is safe for every simulated PRF refresh round.
@@ -279,6 +287,8 @@ struct DiamondIOPrfRefreshMaterialState {
 pub fn diamond_io_find_crt_depth<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST, PE, ST, BuildCandidate>(
     min_crt_depth: usize,
     max_crt_depth: usize,
+    min_log_ring_dim: usize,
+    max_log_ring_dim: usize,
     max_prf_mask_output_coeff_bits: usize,
     security_bit: usize,
     func_type: DiamondIOFuncType,
@@ -293,26 +303,64 @@ where
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     PE: PltEvaluator<ErrorNorm>,
     ST: SlotTransferEvaluator<ErrorNorm>,
-    BuildCandidate:
-        FnMut(usize, usize, Option<usize>) -> DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+    BuildCandidate: FnMut(
+        u32,
+        usize,
+        usize,
+        Option<usize>,
+    ) -> DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
 {
     info!(
         min_crt_depth,
         max_crt_depth,
+        min_log_ring_dim,
+        max_log_ring_dim,
         max_prf_mask_output_coeff_bits,
         security_bit,
         "starting DiamondIO CRT-depth search"
     );
+    let force_lattice_check = std::env::var_os("MXX_IO_FORCE_LATTICE_CHECK").is_some();
+    let explicit_log_ring_dim = min_log_ring_dim == max_log_ring_dim && !force_lattice_check;
+    if !explicit_log_ring_dim {
+        sim_utils::assert_lattice_estimator_available("DiamondIO");
+    }
     assert!(min_crt_depth > 0, "minimum CRT depth must be positive");
     assert!(min_crt_depth <= max_crt_depth, "CRT-depth search range must be non-empty");
     let mut low = min_crt_depth;
     let mut high = max_crt_depth;
     let mut found = Vec::new();
+    let mut lattice_cache = sim_utils::SecureRingDimLatticeCache::default();
     while low <= high {
         let crt_depth = low + (high - low) / 2;
         info!(crt_depth, low, high, "evaluating DiamondIO CRT-depth candidate");
+        let min_ring_dim = 1u32
+            .checked_shl(min_log_ring_dim.try_into().expect("min_log_ring_dim must fit in u32"))
+            .expect("minimum ring_dim shift overflow");
+        let probe_candidate =
+            build_candidate(min_ring_dim, crt_depth, max_prf_mask_output_coeff_bits, None);
+        let error_sigma = probe_candidate.injector.error_sigma;
+        let noise_refresh_cbd_n = probe_candidate.noise_refresh_cbd_n;
+        let Some(ring_dim_search) = sim_utils::select_min_secure_ring_dim(
+            "DiamondIO",
+            crt_depth,
+            min_log_ring_dim,
+            max_log_ring_dim,
+            security_bit,
+            error_sigma,
+            noise_refresh_cbd_n,
+            explicit_log_ring_dim,
+            &mut lattice_cache,
+            |ring_dim| {
+                let candidate =
+                    build_candidate(ring_dim, crt_depth, max_prf_mask_output_coeff_bits, None);
+                candidate.injector.params.clone()
+            },
+        ) else {
+            return None;
+        };
+        let ring_dim = ring_dim_search.ring_dim;
         let provisional_candidate =
-            build_candidate(crt_depth, max_prf_mask_output_coeff_bits, None);
+            build_candidate(ring_dim, crt_depth, max_prf_mask_output_coeff_bits, None);
         let cpu_params = cpu_params_from_poly_params(&provisional_candidate.injector.params);
         let provisional_base = provisional_candidate.simulate_mask_independent_error_base(
             func_type,
@@ -333,11 +381,14 @@ where
         };
         info!(
             crt_depth,
+            log_ring_dim = ring_dim_search.log_ring_dim,
+            ring_dim,
             global_noise_refresh_v_bits,
             "DiamondIO CRT-depth candidate selected fixed noise-refresh v_bits"
         );
 
         let mask_search_candidate = build_candidate(
+            ring_dim,
             crt_depth,
             max_prf_mask_output_coeff_bits,
             Some(global_noise_refresh_v_bits),
@@ -380,7 +431,7 @@ where
         };
         let mask_bits = mask_search.prf_mask_output_coeff_bits;
         let final_candidate =
-            build_candidate(crt_depth, mask_bits, Some(global_noise_refresh_v_bits));
+            build_candidate(ring_dim, crt_depth, mask_bits, Some(global_noise_refresh_v_bits));
         let expected_seed_bits = minimum_diamond_io_prf_seed_bits(
             &cpu_params,
             final_candidate.injector.batch_bits(),
@@ -460,6 +511,10 @@ where
         );
         found.push(DiamondIOCrtDepthSearchResult {
             crt_depth,
+            log_ring_dim: ring_dim_search.log_ring_dim,
+            ring_dim,
+            achieved_secpar_for_gauss: ring_dim_search.achieved_secpar_for_gauss,
+            achieved_secpar_for_cbd: ring_dim_search.achieved_secpar_for_cbd,
             prf_mask_output_coeff_bits: mask_bits,
             noise_refresh_v_bits: global_noise_refresh_v_bits,
             seed_bits: final_candidate.seed_bits,

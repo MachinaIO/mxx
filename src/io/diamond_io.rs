@@ -34,7 +34,7 @@ use crate::{
             },
         },
         fhe_prg::goldreich::{
-            GoldreichEdge, GoldreichFhePrg, GoldreichFullDomainRangeGenerator, GoldreichGraph,
+            GoldreichFhePrg, GoldreichFullDomainRangeGenerator, GoldreichGraph,
             evaluate_goldreich_uniform_range,
         },
     },

@@ -1,6 +1,14 @@
 use num_bigint::BigUint;
 use serde_json::{Value, json};
-use std::{path::Path, process::Command, result::Result};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+use std::{
+    path::Path,
+    process::{Command, Stdio},
+    result::Result,
+    thread,
+    time::{Duration, Instant},
+};
 /// Enum describing supported noise distributions.
 /// This mirrors the JSON spec expected by the Python CLI.
 #[derive(Debug, Clone)]
@@ -112,8 +120,13 @@ pub enum EstimatorCliError {
     #[error("UTF-8 error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
 
-    #[error("lattice-estimator-cli exited with code {0:?}. stdout: {1} stderr: {2}")]
-    NonZeroExit(Option<i32>, String, String), // (exit_code, stdout, stderr)
+    #[error(
+        "lattice-estimator-cli exited with code {code:?}, signal {signal:?}. stdout: {stdout} stderr: {stderr}"
+    )]
+    NonZeroExit { code: Option<i32>, signal: Option<i32>, stdout: String, stderr: String },
+
+    #[error("lattice-estimator-cli timed out after {0:?}")]
+    Timeout(Duration),
 
     #[error("parse int error: {0}")]
     ParseInt(#[from] std::num::ParseIntError),
@@ -134,6 +147,21 @@ pub fn run_lattice_estimator_cli_with_path(
     m: Option<&BigUint>,
     exact: bool,
 ) -> Result<u64, EstimatorCliError> {
+    run_lattice_estimator_cli_with_path_and_timeout(
+        cli_path, ring_dim, q, s_dist, e_dist, m, exact, None,
+    )
+}
+
+pub fn run_lattice_estimator_cli_with_path_and_timeout(
+    cli_path: impl AsRef<Path>,
+    ring_dim: &BigUint,
+    q: &BigUint,
+    s_dist: &Distribution,
+    e_dist: &Distribution,
+    m: Option<&BigUint>,
+    exact: bool,
+    timeout: Option<Duration>,
+) -> Result<u64, EstimatorCliError> {
     // Prepare string arguments so they can be passed as discrete argv entries.
     let ring_dim_s = ring_dim.to_str_radix(10);
     let q_s = q.to_str_radix(10);
@@ -151,19 +179,50 @@ pub fn run_lattice_estimator_cli_with_path(
         cmd.arg("--exact");
     }
 
-    // Execute and capture output.
-    let output = cmd.output()?;
+    let output = if let Some(timeout) = timeout {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn()?;
+        let start = Instant::now();
+        loop {
+            if child.try_wait()?.is_some() {
+                break child.wait_with_output()?;
+            }
+            if start.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(EstimatorCliError::Timeout(timeout));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    } else {
+        cmd.output()?
+    };
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
 
     if !output.status.success() {
-        return Err(EstimatorCliError::NonZeroExit(output.status.code(), stdout, stderr));
+        return Err(EstimatorCliError::NonZeroExit {
+            code: output.status.code(),
+            signal: exit_signal(&output.status),
+            stdout,
+            stderr,
+        });
     }
 
     // The CLI may print logs; parse only the last (non-empty) line as integer.
     let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     let secpar: u64 = last_line.parse()?;
     Ok(secpar)
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 /// Convenience wrapper that relies on PATH to find `lattice-estimator-cli`.
@@ -183,6 +242,27 @@ pub fn run_lattice_estimator_cli(
         e_dist,
         m,
         exact,
+    )
+}
+
+pub fn run_lattice_estimator_cli_with_timeout(
+    ring_dim: &BigUint,
+    q: &BigUint,
+    s_dist: &Distribution,
+    e_dist: &Distribution,
+    m: Option<&BigUint>,
+    exact: bool,
+    timeout: Duration,
+) -> Result<u64, EstimatorCliError> {
+    run_lattice_estimator_cli_with_path_and_timeout(
+        "lattice-estimator-cli",
+        ring_dim,
+        q,
+        s_dist,
+        e_dist,
+        m,
+        exact,
+        Some(timeout),
     )
 }
 
@@ -302,8 +382,9 @@ exit {}
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            EstimatorCliError::NonZeroExit(code, stdout, _stderr) => {
+            EstimatorCliError::NonZeroExit { code, signal, stdout, stderr: _stderr } => {
                 assert_eq!(code, Some(1));
+                assert_eq!(signal, None);
                 assert!(stdout.contains("Error: Invalid parameters"));
             }
             _ => panic!("Expected NonZeroExit error"),

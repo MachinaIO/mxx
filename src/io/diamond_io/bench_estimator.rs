@@ -29,14 +29,11 @@ use crate::{
         sampler::BGGPublicKeySampler,
     },
     circuit::PolyCircuit,
-    decoder::{
-        bench::{
-            bit_decomposed_mask_reduce_add_count, bit_decomposed_polynomial_mask_reduction_summary,
-            bit_decomposed_refresh_material_counts, bit_decomposed_refresh_material_summary,
-            goldreich_cbd_error_prg_summary,
-            scale_bit_decomposed_polynomial_mask_decrypt_contributions,
-        },
-        mask_circuit::append_one_ciphertext_bit_decrypt,
+    decoder::bench::{
+        bit_decomposed_mask_reduce_add_count, bit_decomposed_polynomial_mask_reduction_summary,
+        bit_decomposed_refresh_material_counts, bit_decomposed_refresh_material_summary,
+        goldreich_cbd_error_prg_summary,
+        scale_bit_decomposed_polynomial_mask_decrypt_contributions,
     },
     gadgets::arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
     matrix::PolyMatrix,
@@ -62,6 +59,7 @@ pub use bench_estimator_native::DiamondIONativeBenchEstimator;
 #[cfg(feature = "gpu")]
 pub use bench_estimator_native::GpuDCRTPolyMatrixNativeBenchEstimator;
 
+use crate::io::utils::bench_estimator as bench_utils;
 use bench_estimator_shape::{DiamondIOBenchShape, DiamondIOStorageEstimate};
 use bench_estimator_utils::{
     estimate_summary, parallel_summaries, repeat_sequential_summary, scale_estimate,
@@ -1536,13 +1534,7 @@ where
 {
     let mut circuit = PolyCircuit::new();
     let ring_gsw_context = diamond.build_ring_gsw_circuit_context(&mut circuit);
-    let decrypted = append_one_ciphertext_bit_decrypt::<M::P, NestedRnsPoly<M::P>, M>(
-        &mut circuit,
-        ring_gsw_context,
-        BigUint::from(2u64),
-    );
-    circuit.output(vec![decrypted.secret_dependent, decrypted.public_bottom]);
-    circuit
+    bench_utils::prf_mask_decrypt_one_ciphertext_bit_circuit::<M::P, M>(circuit, ring_gsw_context)
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use num_bigint::BigUint;
-use num_traits::Zero;
 
 use crate::{
     bench_estimator::{
@@ -10,26 +9,29 @@ use crate::{
     },
     bgg::naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
     circuit::PolyCircuit,
-    decoder::{
-        bench::{
-            bit_decomposed_mask_reduce_add_count, bit_decomposed_polynomial_mask_reduction_summary,
-            bit_decomposed_refresh_material_counts, bit_decomposed_refresh_material_summary,
-            goldreich_cbd_error_prg_summary,
-            scale_bit_decomposed_polynomial_mask_decrypt_contributions,
-        },
-        mask_circuit::append_one_ciphertext_bit_decrypt,
+    decoder::bench::{
+        bit_decomposed_mask_reduce_add_count, bit_decomposed_polynomial_mask_reduction_summary,
+        bit_decomposed_refresh_material_counts, bit_decomposed_refresh_material_summary,
+        goldreich_cbd_error_prg_summary,
+        scale_bit_decomposed_polynomial_mask_decrypt_contributions,
     },
     gadgets::{
         arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
-        fhe::{ring_gsw::RingGswCiphertext, ring_gsw_nested_rns::NestedRnsRingGswContext},
-        fhe_prg::goldreich::{GoldreichEdge, GoldreichFhePrg, GoldreichGraph},
+        fhe::ring_gsw_nested_rns::NestedRnsRingGswContext,
     },
     matrix::PolyMatrix,
     poly::PolyParams,
 };
 
 use super::{Aky24IO, Aky24IOFuncType};
-use crate::io::diamond_io::DiamondIONativeBenchEstimator;
+use crate::io::{
+    diamond_io::DiamondIONativeBenchEstimator,
+    utils::bench_estimator::{
+        self as bench_utils, estimate_summary, parallel_summaries, repeat_sequential_summary,
+        scale_estimate, scale_estimate_biguint, scale_summary, scale_summary_biguint,
+        sequential_summaries,
+    },
+};
 
 /// Combined AKY24 iO benchmark estimate for obfuscation and eval.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +42,52 @@ pub struct Aky24IOBenchEstimate {
     pub eval: CircuitBenchSummary,
     /// Compact bytes for persisted obfuscated-circuit material modeled by this estimator.
     pub obfuscated_circuit_bytes: BigUint,
+    /// Online evaluation total-time contribution from Section 3.2 FE-to-iO cascade layers.
+    pub fe_to_io_eval_total_time: BigUint,
+    /// Online evaluation total-time contribution from the final FE layer.
+    pub final_fe_eval_total_time: BigUint,
+    /// Compact bytes contributed by Section 3.2 FE-to-iO cascade layers.
+    pub fe_to_io_obfuscated_circuit_bytes: BigUint,
+    /// Compact bytes contributed by the final FE layer.
+    pub final_fe_obfuscated_circuit_bytes: BigUint,
+}
+
+impl Aky24IOBenchEstimate {
+    fn sequential(
+        final_fe: Aky24IOBenchLayerEstimate,
+        fe_to_io: Vec<Aky24IOBenchLayerEstimate>,
+    ) -> Self {
+        let mut layers = Vec::with_capacity(
+            fe_to_io.len().checked_add(1).expect("AKY24IO benchmark layer count overflow"),
+        );
+        layers.extend(fe_to_io.iter().cloned());
+        layers.push(final_fe.clone());
+        let obfuscate_parts =
+            layers.iter().map(|layer| layer.obfuscate.clone()).collect::<Vec<_>>();
+        let eval_parts = layers.iter().map(|layer| layer.eval.clone()).collect::<Vec<_>>();
+        let obfuscated_circuit_bytes =
+            layers.iter().map(|layer| layer.obfuscated_circuit_bytes.clone()).sum::<BigUint>();
+        let fe_to_io_eval_total_time =
+            fe_to_io.iter().map(|layer| layer.eval.total_time.clone()).sum::<BigUint>();
+        let fe_to_io_obfuscated_circuit_bytes =
+            fe_to_io.iter().map(|layer| layer.obfuscated_circuit_bytes.clone()).sum::<BigUint>();
+        Self {
+            obfuscate: sequential_summaries(&obfuscate_parts),
+            eval: sequential_summaries(&eval_parts),
+            obfuscated_circuit_bytes,
+            fe_to_io_eval_total_time,
+            final_fe_eval_total_time: final_fe.eval.total_time,
+            fe_to_io_obfuscated_circuit_bytes,
+            final_fe_obfuscated_circuit_bytes: final_fe.obfuscated_circuit_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Aky24IOBenchLayerEstimate {
+    obfuscate: CircuitBenchSummary,
+    eval: CircuitBenchSummary,
+    obfuscated_circuit_bytes: BigUint,
 }
 
 /// Maintained IO-level AKY24 benchmark estimator.
@@ -104,11 +152,44 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         NBE: DiamondIONativeBenchEstimator,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
-        let shape = Aky24IOBenchShape::from_scheme(scheme, func);
-        let obfuscate = self.estimate_obfuscate(scheme, &shape);
-        let eval = self.estimate_eval(scheme, &shape);
-        let public_lut_aux_bytes = self.estimate_public_lut_aux_storage_bytes(scheme, &shape);
-        Aky24IOBenchEstimate {
+        let final_shape =
+            Aky24IOBenchShape::from_scheme(scheme, scheme.input_size, func.output_bits());
+        let final_fe = self.estimate_layer(scheme, &final_shape);
+        let mut fe_to_io = Vec::with_capacity(final_shape.input_size.saturating_sub(1));
+        for stage_input_count in final_shape.cascade_stage_input_counts() {
+            let stage_shape = Aky24IOBenchShape::from_scheme(
+                scheme,
+                stage_input_count,
+                Aky24IOBenchShape::fe_to_io_output_size_for_stage(
+                    stage_input_count,
+                    final_shape.ring_dim,
+                    final_shape.modulus_bits,
+                    final_shape.modulus_digits,
+                ),
+            );
+            fe_to_io.push(self.estimate_layer(scheme, &stage_shape));
+        }
+        Aky24IOBenchEstimate::sequential(final_fe, fe_to_io)
+    }
+
+    fn estimate_layer<M, PKPE, PKST, ENCPE, ENCST>(
+        &self,
+        scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
+        shape: &Aky24IOBenchShape,
+    ) -> Aky24IOBenchLayerEstimate
+    where
+        M: PolyMatrix + Send + Sync + 'static,
+        M::P: 'static,
+        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
+        EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+        NBE: DiamondIONativeBenchEstimator,
+        NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
+    {
+        let obfuscate = self.estimate_obfuscate(scheme, shape);
+        let eval = self.estimate_eval(scheme, shape);
+        let public_lut_aux_bytes = self.estimate_public_lut_aux_storage_bytes(scheme, shape);
+        Aky24IOBenchLayerEstimate {
             obfuscate,
             eval,
             obfuscated_circuit_bytes: shape.obfuscated_circuit_bytes(public_lut_aux_bytes),
@@ -637,24 +718,7 @@ where
 {
     let mut circuit = PolyCircuit::new();
     let ring_gsw_context = build_ring_gsw_circuit_context(scheme, &mut circuit);
-    let seed_ciphertexts = (0..5)
-        .map(|_| {
-            RingGswCiphertext::input(
-                ring_gsw_context.clone(),
-                Some(BigUint::from(1u64)),
-                &mut circuit,
-            )
-        })
-        .collect::<Vec<_>>();
-    let graph = GoldreichGraph::from_edges(
-        5,
-        vec![GoldreichEdge::new([0, 1, 2], [3, 4])],
-        Default::default(),
-    );
-    let goldreich = GoldreichFhePrg::from_public_graph(&mut circuit, ring_gsw_context, graph);
-    let outputs = goldreich.evaluate_uniform(&seed_ciphertexts, &mut circuit);
-    circuit.output(outputs.iter().flat_map(|output| output.sub_circuit_wires()));
-    circuit
+    bench_utils::representative_goldreich_prg_one_output_circuit(circuit, ring_gsw_context, 5)
 }
 
 fn prf_mask_decrypt_one_ciphertext_bit_circuit<M, PKPE, PKST, ENCPE, ENCST>(
@@ -667,13 +731,7 @@ where
 {
     let mut circuit = PolyCircuit::new();
     let ring_gsw_context = build_ring_gsw_circuit_context(scheme, &mut circuit);
-    let decrypted = append_one_ciphertext_bit_decrypt::<M::P, NestedRnsPoly<M::P>, M>(
-        &mut circuit,
-        ring_gsw_context,
-        BigUint::from(2u64),
-    );
-    circuit.output(vec![decrypted.secret_dependent, decrypted.public_bottom]);
-    circuit
+    bench_utils::prf_mask_decrypt_one_ciphertext_bit_circuit::<M::P, M>(circuit, ring_gsw_context)
 }
 
 fn build_ring_gsw_circuit_context<M, PKPE, PKST, ENCPE, ENCST>(
@@ -724,7 +782,8 @@ struct Aky24IOBenchShape {
 impl Aky24IOBenchShape {
     fn from_scheme<M, PKPE, PKST, ENCPE, ENCST>(
         scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
-        func: Aky24IOFuncType,
+        input_size: usize,
+        output_size: usize,
     ) -> Self
     where
         M: PolyMatrix,
@@ -752,8 +811,8 @@ impl Aky24IOBenchShape {
             .expect("AKY24IO Ring-GSW wire count overflow");
         Self {
             ring_dim,
-            input_size: scheme.input_size,
-            output_size: func.output_bits(),
+            input_size,
+            output_size,
             seed_bits: scheme.seed_bits,
             prf_round_count: scheme.public_prf_seed_bits,
             prf_branch_count: 2,
@@ -766,6 +825,23 @@ impl Aky24IOBenchShape {
             state_col_size,
             ring_gsw_wire_count,
         }
+    }
+
+    fn cascade_stage_input_counts(&self) -> std::ops::Range<usize> {
+        1..self.input_size
+    }
+
+    fn fe_to_io_output_size_for_stage(
+        input_size: usize,
+        ring_dim: usize,
+        modulus_bits: u16,
+        modulus_digits: usize,
+    ) -> usize {
+        input_size
+            .checked_mul(ring_dim)
+            .and_then(|count| count.checked_mul(modulus_bits as usize))
+            .and_then(|count| count.checked_mul(modulus_digits))
+            .expect("AKY24IO FE-to-iO cascade output size overflow")
     }
 
     fn final_decoder_count(&self) -> usize {
@@ -793,13 +869,13 @@ impl Aky24IOBenchShape {
     fn final_projection_preimage_bytes(&self) -> usize {
         let standard_preimages =
             self.input_size.checked_add(2).expect("AKY24IO projection count overflow");
-        let output_preimage_bytes = matrix_compact_bytes_for_shape(
+        let output_preimage_bytes = bench_utils::matrix_compact_bytes_for_shape(
             self.state_col_size,
             self.modulus_digits,
             self.ring_dim,
             self.modulus_bits,
         );
-        let final_decoder_preimage_bytes = matrix_compact_bytes_for_shape(
+        let final_decoder_preimage_bytes = bench_utils::matrix_compact_bytes_for_shape(
             self.state_col_size,
             1,
             self.ring_dim,
@@ -860,7 +936,7 @@ impl Aky24IOBenchShape {
     }
 
     fn prf_refresh_preimage_bytes(&self) -> BigUint {
-        let output_preimage_bytes = matrix_compact_bytes_for_shape(
+        let output_preimage_bytes = bench_utils::matrix_compact_bytes_for_shape(
             self.state_col_size,
             self.modulus_digits,
             self.ring_dim,
@@ -883,116 +959,85 @@ impl Aky24IOBenchShape {
     }
 }
 
-fn matrix_compact_bytes_for_shape(
-    nrow: usize,
-    ncol: usize,
-    ring_dim: usize,
-    modulus_bits: u16,
-) -> usize {
-    let coeff_count =
-        nrow.checked_mul(ncol).and_then(|count| count.checked_mul(ring_dim)).unwrap_or(usize::MAX);
-    let payload = coeff_count.checked_mul(modulus_bits as usize).unwrap_or(usize::MAX).div_ceil(8);
-    payload + 128
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn estimate_summary(estimate: CircuitBenchEstimate) -> CircuitBenchSummary {
-    let summary = CircuitBenchSummary::from_nanos(
-        estimate.total_time,
-        estimate.latency,
-        estimate.max_parallelism,
-    );
-    #[cfg(feature = "gpu")]
-    {
-        summary.with_peak_vram(estimate.peak_vram)
+    fn test_shape(input_size: usize) -> Aky24IOBenchShape {
+        Aky24IOBenchShape {
+            ring_dim: 8,
+            input_size,
+            output_size: 2,
+            seed_bits: 5,
+            prf_round_count: 3,
+            prf_branch_count: 2,
+            prf_mask_output_coeff_bits: 4,
+            noise_refresh_v_bits: 3,
+            cbd_n: 2,
+            crt_depth: 2,
+            modulus_digits: 2,
+            modulus_bits: 16,
+            state_col_size: 4,
+            ring_gsw_wire_count: 6,
+        }
     }
-    #[cfg(not(feature = "gpu"))]
-    {
-        summary
-    }
-}
 
-fn scale_estimate(estimate: CircuitBenchEstimate, count: usize) -> CircuitBenchSummary {
-    scale_summary(estimate_summary(estimate), count)
-}
+    fn summary(total_time: u64, latency: f64, max_parallelism: u64) -> CircuitBenchSummary {
+        CircuitBenchSummary::from_nanos(
+            BigUint::from(total_time),
+            latency,
+            BigUint::from(max_parallelism),
+        )
+    }
 
-fn scale_estimate_biguint(estimate: CircuitBenchEstimate, count: &BigUint) -> CircuitBenchSummary {
-    scale_summary_biguint(estimate_summary(estimate), count)
-}
+    #[test]
+    fn test_cascade_stage_input_counts_exclude_top_layer() {
+        assert_eq!(
+            test_shape(1).cascade_stage_input_counts().collect::<Vec<_>>(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(test_shape(4).cascade_stage_input_counts().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
 
-fn scale_summary(summary: CircuitBenchSummary, count: usize) -> CircuitBenchSummary {
-    let count = BigUint::from(count);
-    let scaled = CircuitBenchSummary::from_nanos(
-        summary.total_time.clone() * &count,
-        summary.latency,
-        summary.max_parallelism.clone() * count,
-    );
-    #[cfg(feature = "gpu")]
-    {
-        scaled.with_peak_vram(summary.peak_vram)
+    #[test]
+    fn test_fe_to_io_stage_output_size_matches_ciphertext_bit_width() {
+        let shape = test_shape(3);
+        assert_eq!(
+            Aky24IOBenchShape::fe_to_io_output_size_for_stage(
+                shape.input_size,
+                shape.ring_dim,
+                shape.modulus_bits,
+                shape.modulus_digits,
+            ),
+            3 * 8 * 16 * 2
+        );
     }
-    #[cfg(not(feature = "gpu"))]
-    {
-        scaled
-    }
-}
 
-fn scale_summary_biguint(summary: CircuitBenchSummary, count: &BigUint) -> CircuitBenchSummary {
-    let scaled = CircuitBenchSummary::from_nanos(
-        summary.total_time.clone() * count,
-        summary.latency,
-        summary.max_parallelism.clone() * count,
-    );
-    #[cfg(feature = "gpu")]
-    {
-        scaled.with_peak_vram(summary.peak_vram)
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        scaled
-    }
-}
+    #[test]
+    fn test_bench_estimate_sequential_adds_and_splits_cascade_layers() {
+        let estimate = Aky24IOBenchEstimate::sequential(
+            Aky24IOBenchLayerEstimate {
+                obfuscate: summary(30, 3.0, 4),
+                eval: summary(40, 4.0, 5),
+                obfuscated_circuit_bytes: BigUint::from(7u64),
+            },
+            vec![Aky24IOBenchLayerEstimate {
+                obfuscate: summary(10, 1.0, 2),
+                eval: summary(20, 2.0, 3),
+                obfuscated_circuit_bytes: BigUint::from(5u64),
+            }],
+        );
 
-fn repeat_sequential_summary(summary: CircuitBenchSummary, count: usize) -> CircuitBenchSummary {
-    let total_time = summary.total_time * BigUint::from(count);
-    let latency = summary.latency * count as f64;
-    let repeated = CircuitBenchSummary::from_nanos(total_time, latency, summary.max_parallelism);
-    #[cfg(feature = "gpu")]
-    {
-        repeated.with_peak_vram(summary.peak_vram)
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        repeated
-    }
-}
-
-fn parallel_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
-    let total_time = parts.iter().map(|part| part.total_time.clone()).sum::<BigUint>();
-    let latency = parts.iter().map(|part| part.latency).fold(0.0f64, f64::max);
-    let max_parallelism = parts.iter().map(|part| part.max_parallelism.clone()).sum::<BigUint>();
-    let summary = CircuitBenchSummary::from_nanos(total_time, latency, max_parallelism);
-    #[cfg(feature = "gpu")]
-    {
-        summary.with_peak_vram(parts.iter().map(|part| part.peak_vram).sum::<usize>())
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        summary
-    }
-}
-
-fn sequential_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
-    let total_time = parts.iter().map(|part| part.total_time.clone()).sum::<BigUint>();
-    let latency = parts.iter().map(|part| part.latency).sum::<f64>();
-    let max_parallelism =
-        parts.iter().map(|part| part.max_parallelism.clone()).max().unwrap_or_else(BigUint::zero);
-    let summary = CircuitBenchSummary::from_nanos(total_time, latency, max_parallelism);
-    #[cfg(feature = "gpu")]
-    {
-        summary.with_peak_vram(parts.iter().map(|part| part.peak_vram).max().unwrap_or(0))
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        summary
+        assert_eq!(estimate.obfuscate.total_time, BigUint::from(40u64));
+        assert_eq!(estimate.obfuscate.latency, 4.0);
+        assert_eq!(estimate.obfuscate.max_parallelism, BigUint::from(4u64));
+        assert_eq!(estimate.eval.total_time, BigUint::from(60u64));
+        assert_eq!(estimate.eval.latency, 6.0);
+        assert_eq!(estimate.eval.max_parallelism, BigUint::from(5u64));
+        assert_eq!(estimate.obfuscated_circuit_bytes, BigUint::from(12u64));
+        assert_eq!(estimate.fe_to_io_eval_total_time, BigUint::from(20u64));
+        assert_eq!(estimate.final_fe_eval_total_time, BigUint::from(40u64));
+        assert_eq!(estimate.fe_to_io_obfuscated_circuit_bytes, BigUint::from(5u64));
+        assert_eq!(estimate.final_fe_obfuscated_circuit_bytes, BigUint::from(7u64));
     }
 }

@@ -15,6 +15,7 @@ use super::{
         estimate_summary, parallel_summaries, scale_summary, sequential_summaries,
     },
 };
+use crate::io::utils::bench_estimator as bench_utils;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DiamondIOStorageEstimate {
@@ -248,7 +249,7 @@ impl DiamondIOBenchShape {
         //   `build_initial_encoding`.
         let metadata_estimate = 128usize;
         let hash_key_bytes = 32usize;
-        let p_epsilon_bytes = matrix_compact_bytes_for_shape(
+        let p_epsilon_bytes = bench_utils::matrix_compact_bytes_for_shape(
             self.state_row_size / 2,
             self.state_col_size,
             self.ring_dim,
@@ -264,7 +265,7 @@ impl DiamondIOBenchShape {
         // than obfuscated-circuit data. Online eval does not multiply by these checkpoints
         // directly; they are counted here only because the current preprocessing implementation
         // persists the public matrices as reusable checkpoint artifacts.
-        matrix_compact_bytes_for_shape(
+        bench_utils::matrix_compact_bytes_for_shape(
             self.state_row_size,
             self.b_public_col_size,
             self.ring_dim,
@@ -551,21 +552,12 @@ where
     // This is only a shape/size estimate. Calling `M::zero_compact_bytes(...).len()` would
     // materialize the full compact-byte payload just to ask for its length, which can exceed the
     // H200 CPU cgroup for large DiamondIO shapes before any benchmark unit is measured.
-    matrix_compact_bytes_for_shape(nrow, ncol, params.ring_dimension() as usize, modulus_bits)
-}
-
-fn matrix_compact_bytes_for_shape(
-    nrow: usize,
-    ncol: usize,
-    ring_dim: usize,
-    modulus_bits: u16,
-) -> usize {
-    let coeff_count =
-        nrow.checked_mul(ncol).and_then(|count| count.checked_mul(ring_dim)).unwrap_or(usize::MAX);
-    let payload = coeff_count.checked_mul(modulus_bits as usize).unwrap_or(usize::MAX).div_ceil(8);
-    // This is a compact upper-ish estimate used when benchmark estimation needs byte lengths
-    // without materializing the underlying matrix payload.
-    payload + 128
+    bench_utils::matrix_compact_bytes_for_shape(
+        nrow,
+        ncol,
+        params.ring_dimension() as usize,
+        modulus_bits,
+    )
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, thread, time::Duration};
 
 use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, BigUint};
@@ -27,9 +27,265 @@ use crate::{
         PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
-    simulator::{SimulatorContext, error_norm::ErrorNorm, poly_matrix_norm::PolyMatrixNorm},
+    simulator::{
+        SimulatorContext,
+        error_norm::ErrorNorm,
+        lattice_estimator::{Distribution, run_lattice_estimator_cli_with_timeout},
+        poly_matrix_norm::PolyMatrixNorm,
+    },
     slot_transfer::SlotTransferEvaluator,
 };
+use tracing::info;
+
+const LATTICE_ESTIMATOR_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SecureRingDimSearchResult {
+    pub log_ring_dim: usize,
+    pub ring_dim: u32,
+    pub achieved_secpar_for_gauss: Option<u64>,
+    pub achieved_secpar_for_cbd: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SecureRingDimLatticeCache {
+    entries: Vec<(usize, SecureRingDimSearchResult)>,
+}
+
+impl SecureRingDimLatticeCache {
+    pub(crate) fn secure_for(
+        &self,
+        crt_depth: usize,
+        log_ring_dim: usize,
+    ) -> Option<SecureRingDimSearchResult> {
+        self.entries
+            .iter()
+            .filter(|(passed_crt_depth, result)| {
+                *passed_crt_depth >= crt_depth && result.log_ring_dim == log_ring_dim
+            })
+            .max_by_key(|(passed_crt_depth, _result)| *passed_crt_depth)
+            .map(|(_passed_crt_depth, result)| *result)
+    }
+
+    pub(crate) fn record(&mut self, crt_depth: usize, result: SecureRingDimSearchResult) {
+        self.entries.push((crt_depth, result));
+    }
+}
+
+pub(crate) fn assert_lattice_estimator_available(protocol_name: &str) {
+    let ring_dim = BigUint::from(1024u32);
+    let q = BigUint::from(3329u32);
+    let s_dist = Distribution::Ternary;
+    let e_dist = Distribution::DiscreteGaussian { stddev: "4".to_string(), mean: None, n: None };
+    info!(
+        protocol_name,
+        ring_dim = %ring_dim,
+        q = %q,
+        "probing lattice-estimator-cli availability"
+    );
+    let achieved_secpar = run_lattice_estimator_cli_with_timeout(
+        &ring_dim,
+        &q,
+        &s_dist,
+        &e_dist,
+        None,
+        false,
+        LATTICE_ESTIMATOR_TIMEOUT,
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "{protocol_name} CRT-depth search requires a working lattice-estimator-cli on PATH. \
+             If SageMath is installed in the `sage` conda environment, run this command inside \
+             that environment, e.g. `conda run -n sage ...` or activate it before running tests. \
+             Lattice estimator probe failed: {err}"
+        )
+    });
+    info!(protocol_name, achieved_secpar, "lattice-estimator-cli availability probe succeeded");
+}
+
+pub(crate) fn select_min_secure_ring_dim<P, BuildParams>(
+    protocol_name: &str,
+    crt_depth: usize,
+    min_log_ring_dim: usize,
+    max_log_ring_dim: usize,
+    security_bits: usize,
+    error_sigma: f64,
+    noise_refresh_cbd_n: usize,
+    skip_lattice_check: bool,
+    lattice_cache: &mut SecureRingDimLatticeCache,
+    mut build_params: BuildParams,
+) -> Option<SecureRingDimSearchResult>
+where
+    P: PolyParams,
+    BuildParams: FnMut(u32) -> P,
+{
+    assert!(
+        min_log_ring_dim <= max_log_ring_dim,
+        "{protocol_name} log-ring-dimension search range must be non-empty"
+    );
+    assert!(
+        max_log_ring_dim < u32::BITS as usize,
+        "{protocol_name} max_log_ring_dim must be less than 32"
+    );
+    assert!(
+        error_sigma >= 0.0,
+        "{protocol_name} lattice-estimator Gaussian stddev must be nonnegative"
+    );
+    assert!(noise_refresh_cbd_n > 0, "{protocol_name} lattice-estimator CBD eta must be positive");
+    if skip_lattice_check {
+        assert_eq!(
+            min_log_ring_dim, max_log_ring_dim,
+            "{protocol_name} explicit lattice-check skip requires a single log_ring_dim"
+        );
+        let ring_dim = 1u32
+            .checked_shl(min_log_ring_dim.try_into().expect("log_ring_dim must fit in u32"))
+            .expect("ring_dim shift overflow");
+        info!(
+            protocol_name,
+            crt_depth,
+            log_ring_dim = min_log_ring_dim,
+            ring_dim,
+            "skipping lattice-estimator security checks because log_ring_dim was explicit"
+        );
+        return Some(SecureRingDimSearchResult {
+            log_ring_dim: min_log_ring_dim,
+            ring_dim,
+            achieved_secpar_for_gauss: None,
+            achieved_secpar_for_cbd: None,
+        });
+    }
+    let s_dist = Distribution::Ternary;
+    let e_dist_gauss =
+        Distribution::DiscreteGaussian { stddev: error_sigma.to_string(), mean: None, n: None };
+    let e_dist_cbd = Distribution::CenteredBinomial {
+        eta: noise_refresh_cbd_n.try_into().expect("noise_refresh_cbd_n must fit in u64"),
+        n: None,
+    };
+    let required_security: u64 = security_bits.try_into().expect("security_bits must fit in u64");
+    let mut low = min_log_ring_dim;
+    let mut high = max_log_ring_dim;
+    let mut found = None;
+    while low <= high {
+        let log_ring_dim = low + (high - low) / 2;
+        let ring_dim = 1u32
+            .checked_shl(log_ring_dim.try_into().expect("log_ring_dim must fit in u32"))
+            .expect("ring_dim shift overflow");
+        if let Some(cached) = lattice_cache.secure_for(crt_depth, log_ring_dim) {
+            info!(
+                protocol_name,
+                crt_depth,
+                log_ring_dim,
+                ring_dim,
+                achieved_secpar_for_gauss = cached.achieved_secpar_for_gauss,
+                achieved_secpar_for_cbd = cached.achieved_secpar_for_cbd,
+                "skipping lattice-estimator security checks using larger CRT-depth cache"
+            );
+            found = Some(cached);
+            if log_ring_dim == 0 {
+                break;
+            }
+            high = log_ring_dim - 1;
+            continue;
+        }
+        let params = build_params(ring_dim);
+        let q: Arc<BigUint> = params.modulus().into();
+        let ring_dim_big = BigUint::from(ring_dim);
+        info!(
+            protocol_name,
+            crt_depth,
+            log_ring_dim,
+            ring_dim,
+            modulus_bits = q.bits(),
+            required_security,
+            error_sigma,
+            noise_refresh_cbd_n,
+            "running lattice-estimator security checks for CRT-depth ring-dimension candidate"
+        );
+        let (achieved_secpar_for_gauss, achieved_secpar_for_cbd) = thread::scope(|scope| {
+            let gauss_handle = scope.spawn(|| {
+                run_lattice_estimator_cli_with_timeout(
+                    &ring_dim_big,
+                    q.as_ref(),
+                    &s_dist,
+                    &e_dist_gauss,
+                    None,
+                    false,
+                    LATTICE_ESTIMATOR_TIMEOUT,
+                )
+            });
+            let cbd_handle = scope.spawn(|| {
+                run_lattice_estimator_cli_with_timeout(
+                    &ring_dim_big,
+                    q.as_ref(),
+                    &s_dist,
+                    &e_dist_cbd,
+                    None,
+                    false,
+                    LATTICE_ESTIMATOR_TIMEOUT,
+                )
+            });
+            (
+                gauss_handle.join().expect("Gaussian lattice-estimator thread panicked"),
+                cbd_handle.join().expect("CBD lattice-estimator thread panicked"),
+            )
+        });
+        match (achieved_secpar_for_gauss, achieved_secpar_for_cbd) {
+            (Ok(achieved_secpar_for_gauss), Ok(achieved_secpar_for_cbd)) => {
+                info!(
+                    protocol_name,
+                    crt_depth,
+                    log_ring_dim,
+                    ring_dim,
+                    achieved_secpar_for_gauss,
+                    achieved_secpar_for_cbd,
+                    required_security,
+                    "evaluated CRT-depth ring-dimension security candidate"
+                );
+                if achieved_secpar_for_gauss >= required_security &&
+                    achieved_secpar_for_cbd >= required_security
+                {
+                    let result = SecureRingDimSearchResult {
+                        log_ring_dim,
+                        ring_dim,
+                        achieved_secpar_for_gauss: Some(achieved_secpar_for_gauss),
+                        achieved_secpar_for_cbd: Some(achieved_secpar_for_cbd),
+                    };
+                    lattice_cache.record(crt_depth, result);
+                    found = Some(result);
+                    if log_ring_dim == 0 {
+                        break;
+                    }
+                    high = log_ring_dim - 1;
+                } else {
+                    low = log_ring_dim + 1;
+                }
+            }
+            (gauss_result, cbd_result) => {
+                info!(
+                    protocol_name,
+                    crt_depth,
+                    log_ring_dim,
+                    ring_dim,
+                    gauss_error = ?gauss_result.err(),
+                    cbd_error = ?cbd_result.err(),
+                    "lattice-estimator failed for CRT-depth ring-dimension candidate"
+                );
+                low = log_ring_dim + 1;
+            }
+        }
+    }
+    if found.is_none() {
+        info!(
+            protocol_name,
+            crt_depth,
+            min_log_ring_dim,
+            max_log_ring_dim,
+            required_security,
+            "no secure ring dimension found for CRT-depth candidate"
+        );
+    }
+    found
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CpuRingGswContextConfig {

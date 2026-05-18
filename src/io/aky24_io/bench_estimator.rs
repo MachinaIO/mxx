@@ -480,7 +480,7 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         ]);
         let noise_refresh =
             repeat_sequential_summary(noise_refresh_per_round.clone(), shape.prf_round_count);
-        let final_prg = scale_summary(prg_unit.clone(), shape.final_prg_output_count());
+        let final_prg = scale_summary_biguint(prg_unit.clone(), &shape.final_prg_output_count());
         let (final_mask_decrypt_contributions, _final_mask_decrypt_contribution_count) =
             scale_bit_decomposed_polynomial_mask_decrypt_contributions(
                 final_mask_decrypt_unit.clone(),
@@ -898,25 +898,21 @@ impl Aky24IOBenchShape {
         self.output_size.checked_mul(self.ring_dim).expect("AKY24IO final decoder count overflow")
     }
 
-    fn final_mask_prg_output_count(&self) -> usize {
-        self.final_decoder_count()
-            .checked_mul(self.prf_mask_output_coeff_bits)
-            .expect("AKY24IO final mask PRG output count overflow")
+    fn final_mask_prg_output_count(&self) -> BigUint {
+        BigUint::from(self.final_decoder_count()) * BigUint::from(self.prf_mask_output_coeff_bits)
     }
 
-    fn final_prg_output_count(&self) -> usize {
-        self.final_mask_prg_output_count()
-            .checked_add(self.output_size)
-            .expect("AKY24IO final PRG output count overflow")
+    fn final_prg_output_count(&self) -> BigUint {
+        self.final_mask_prg_output_count() + BigUint::from(self.output_size)
     }
 
     fn obfuscated_circuit_bytes(&self, public_lut_aux_bytes: BigUint) -> BigUint {
-        BigUint::from(self.final_projection_preimage_bytes()) +
+        self.final_projection_preimage_bytes() +
             self.prf_refresh_preimage_bytes() +
             public_lut_aux_bytes
     }
 
-    fn final_projection_preimage_bytes(&self) -> usize {
+    fn final_projection_preimage_bytes(&self) -> BigUint {
         let standard_preimages =
             self.input_size.checked_add(2).expect("AKY24IO projection count overflow");
         let output_preimage_bytes = bench_utils::matrix_compact_bytes_for_shape(
@@ -931,16 +927,9 @@ impl Aky24IOBenchShape {
             self.ring_dim,
             self.modulus_bits,
         );
-        output_preimage_bytes
-            .checked_mul(standard_preimages)
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    final_decoder_preimage_bytes
-                        .checked_mul(self.final_decoder_count())
-                        .expect("AKY24IO final decoder preimage byte count overflow"),
-                )
-            })
-            .expect("AKY24IO final projection byte count overflow")
+        BigUint::from(output_preimage_bytes) * BigUint::from(standard_preimages) +
+            BigUint::from(final_decoder_preimage_bytes) *
+                BigUint::from(self.final_decoder_count())
     }
 
     fn selected_prg_output_count(&self) -> usize {
@@ -1004,8 +993,7 @@ impl Aky24IOBenchShape {
                     .checked_mul(self.prf_branch_count)
                     .expect("AKY24IO branch-specific noise-refresh material count overflow"),
             );
-        let final_prg_outputs = BigUint::from(self.final_prg_output_count());
-        selected_prg_outputs + noise_refresh_material_prg_outputs + final_prg_outputs
+        selected_prg_outputs + noise_refresh_material_prg_outputs + self.final_prg_output_count()
     }
 }
 
@@ -1150,6 +1138,15 @@ mod tests {
             ),
             3 * 8 * 16 * 2
         );
+    }
+
+    #[test]
+    fn test_large_cascade_storage_counts_use_biguint() {
+        let mut shape = test_shape(1);
+        shape.output_size = usize::MAX / shape.ring_dim / 2;
+
+        assert!(shape.final_projection_preimage_bytes() > BigUint::from(usize::MAX));
+        assert!(shape.final_prg_output_count() > BigUint::from(usize::MAX));
     }
 
     #[test]

@@ -69,6 +69,18 @@ pub struct Aky24IOPrfMaskOutputCoeffBitsSearchResult {
     pub simulation: Aky24IOErrorSimulation,
 }
 
+#[derive(Debug, Clone)]
+struct Aky24IOFinalMaskCache {
+    prg_output: ErrorNorm,
+    base_error: ErrorNorm,
+}
+
+#[derive(Debug, Clone)]
+struct Aky24IOPrfMaskOutputCoeffBitsSearchEvaluation {
+    result: Aky24IOPrfMaskOutputCoeffBitsSearchResult,
+    final_mask_cache: Aky24IOFinalMaskCache,
+}
+
 /// Successful AKY24 iO CRT-depth search result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Aky24IOCrtDepthSearchResult {
@@ -345,7 +357,7 @@ where
             low = crt_depth + 1;
             continue;
         };
-        let mask_bits = mask_search.prf_mask_output_coeff_bits;
+        let mask_bits = mask_search.result.prf_mask_output_coeff_bits;
         let final_candidate =
             build_candidate(ring_dim, crt_depth, mask_bits, Some(global_noise_refresh_v_bits));
         let expected_seed_bits = minimum_aky24_io_prf_seed_bits(
@@ -361,25 +373,39 @@ where
             low = crt_depth + 1;
             continue;
         }
-        let final_simulation = final_candidate
-            .build_fixed_noise_refresh_prefix_from_base(
-                provisional_base.clone(),
+        let final_simulation = if final_candidate
+            .can_reuse_mask_independent_prefix_from(&mask_search_candidate, &cpu_params)
+        {
+            Some(final_candidate.finish_error_growth_from_mask_independent_prefix(
+                &mask_search_prefix,
                 func_type,
-                global_noise_refresh_v_bits,
+                mask_bits,
+                Some(mask_search.final_mask_cache.prg_output.clone()),
+                Some(mask_search.final_mask_cache.base_error.clone()),
                 plt_evaluator,
                 slot_transfer_evaluator,
-            )
-            .map(|prefix| {
-                final_candidate.finish_error_growth_from_mask_independent_prefix(
-                    &prefix,
+            ))
+        } else {
+            final_candidate
+                .build_fixed_noise_refresh_prefix_from_base(
+                    provisional_base.clone(),
                     func_type,
-                    mask_bits,
-                    None,
-                    None,
+                    global_noise_refresh_v_bits,
                     plt_evaluator,
                     slot_transfer_evaluator,
                 )
-            });
+                .map(|prefix| {
+                    final_candidate.finish_error_growth_from_mask_independent_prefix(
+                        &prefix,
+                        func_type,
+                        mask_bits,
+                        None,
+                        None,
+                        plt_evaluator,
+                        slot_transfer_evaluator,
+                    )
+                })
+        };
         let Some(final_simulation) = final_simulation else {
             low = crt_depth + 1;
             continue;
@@ -470,6 +496,7 @@ where
             plt_evaluator,
             slot_transfer_evaluator,
         )
+        .map(|evaluation| evaluation.result)
     }
 
     fn simulate_error_growth_with_prf_mask_output_coeff_bits<PE, ST>(
@@ -1047,7 +1074,7 @@ where
         security_bit: Option<usize>,
         plt_evaluator: &PE,
         slot_transfer_evaluator: &ST,
-    ) -> Option<Aky24IOPrfMaskOutputCoeffBitsSearchResult>
+    ) -> Option<Aky24IOPrfMaskOutputCoeffBitsSearchEvaluation>
     where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
@@ -1118,10 +1145,16 @@ where
                 final_margin > *error
             };
             if valid {
-                best = Some(Aky24IOPrfMaskOutputCoeffBitsSearchResult {
-                    prf_mask_output_coeff_bits: candidate,
-                    noise_refresh_v_bits,
-                    simulation,
+                best = Some(Aky24IOPrfMaskOutputCoeffBitsSearchEvaluation {
+                    result: Aky24IOPrfMaskOutputCoeffBitsSearchResult {
+                        prf_mask_output_coeff_bits: candidate,
+                        noise_refresh_v_bits,
+                        simulation,
+                    },
+                    final_mask_cache: Aky24IOFinalMaskCache {
+                        prg_output: cached_final_mask_prg_output.clone(),
+                        base_error: cached_final_mask_base_error.clone(),
+                    },
                 });
                 low = candidate + 1;
             } else if candidate == 1 {
@@ -1225,6 +1258,36 @@ where
             self.ring_gsw_enable_levels,
             self.ring_gsw_level_offset,
         )
+    }
+
+    fn can_reuse_mask_independent_prefix_from(
+        &self,
+        other: &Self,
+        cpu_params: &DCRTPolyParams,
+    ) -> bool {
+        let self_cpu_params = cpu_params_from_poly_params(&self.params);
+        let other_cpu_params = cpu_params_from_poly_params(&other.params);
+        self_cpu_params == *cpu_params &&
+            other_cpu_params == *cpu_params &&
+            self.input_size == other.input_size &&
+            self.seed_bits == other.seed_bits &&
+            self.prf_batch_bits == other.prf_batch_bits &&
+            self.noise_refresh_v_bits == other.noise_refresh_v_bits &&
+            self.noise_refresh_cbd_n == other.noise_refresh_cbd_n &&
+            self.ring_gsw_enable_levels == other.ring_gsw_enable_levels &&
+            self.ring_gsw_level_offset == other.ring_gsw_level_offset &&
+            self.ring_gsw_public_key_error_sigma == other.ring_gsw_public_key_error_sigma &&
+            self.full_active_levels(cpu_params) == other.full_active_levels(cpu_params) &&
+            self.cpu_ring_gsw_config_matches(other)
+    }
+
+    fn cpu_ring_gsw_config_matches(&self, other: &Self) -> bool {
+        let left = self.cpu_ring_gsw_config();
+        let right = other.cpu_ring_gsw_config();
+        left.p_moduli_bits == right.p_moduli_bits &&
+            left.max_unreduced_muls == right.max_unreduced_muls &&
+            left.scale == right.scale &&
+            left.level_offset == right.level_offset
     }
 
     fn cpu_ring_gsw_config(&self) -> sim_utils::CpuRingGswContextConfig {

@@ -12,3 +12,5 @@
 /revision_logs
 /*.log
 /*.status
+/benches
+/bench

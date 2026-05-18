@@ -83,6 +83,7 @@ const DEFAULT_MAX_CRT_DEPTH: usize = 64;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_D_SECRET: usize = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1;
+const DEFAULT_MUL_DEPTH: usize = 1;
 const DEFAULT_BENCH_SEED: [u8; 32] = [0u8; 32];
 const TRAPDOOR_SIGMA: f64 = 4.578;
 const ERROR_SIM_ACTIVE_LEVELS: usize = 1;
@@ -113,6 +114,7 @@ struct RingGswMulBenchConfig {
     error_sigma: f64,
     d_secret: usize,
     bench_iterations: usize,
+    mul_depth: usize,
     active_levels_override: Option<usize>,
     dir_name_override: Option<String>,
 }
@@ -176,6 +178,8 @@ impl RingGswMulBenchConfig {
             "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_BENCH_ITERATIONS",
             DEFAULT_BENCH_ITERATIONS,
         );
+        let mul_depth =
+            env_or_parse_usize("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MUL_DEPTH", DEFAULT_MUL_DEPTH);
         let active_levels_override = env::var("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_ACTIVE_LEVELS")
             .ok()
             .map(|value| value.trim().to_string())
@@ -208,6 +212,7 @@ impl RingGswMulBenchConfig {
             bench_iterations > 0,
             "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_BENCH_ITERATIONS must be > 0"
         );
+        assert!(mul_depth > 0, "LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MUL_DEPTH must be > 0");
 
         Self {
             ring_dim,
@@ -220,6 +225,7 @@ impl RingGswMulBenchConfig {
             error_sigma,
             d_secret,
             bench_iterations,
+            mul_depth,
             active_levels_override,
             dir_name_override,
         }
@@ -340,12 +346,16 @@ fn build_ring_gsw_mul_circuit<P: Poly + 'static>(
     ));
     let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
-    let product = lhs.mul(&rhs, &mut circuit);
+    let mut product = lhs.mul(&rhs, &mut circuit);
+    for _ in 1..cfg.mul_depth {
+        product = product.mul(&rhs, &mut circuit);
+    }
     let reconstructed_outputs = product.reconstruct(&mut circuit);
     circuit.output(reconstructed_outputs);
     info!(
-        "ring_gsw mul circuit build elapsed_ms={:.3} encrypted_outputs=1",
-        build_start.elapsed().as_secs_f64() * 1000.0
+        "ring_gsw mul circuit build elapsed_ms={:.3} mul_depth={} encrypted_outputs=1",
+        build_start.elapsed().as_secs_f64() * 1000.0,
+        cfg.mul_depth
     );
     (circuit, ctx, vec![product])
 }
@@ -376,12 +386,16 @@ fn build_ring_gsw_mul_probe_circuit<P: Poly + 'static>(
     ));
     let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
-    let product = lhs.mul(&rhs, &mut circuit);
+    let mut product = lhs.mul(&rhs, &mut circuit);
+    for _ in 1..cfg.mul_depth {
+        product = product.mul(&rhs, &mut circuit);
+    }
     let reconstructed_outputs = product.reconstruct(&mut circuit);
     circuit.output(reconstructed_outputs);
     info!(
-        "ring_gsw mul circuit build elapsed_ms={:.3} encrypted_outputs=1",
-        build_start.elapsed().as_secs_f64() * 1000.0
+        "ring_gsw mul circuit build elapsed_ms={:.3} mul_depth={} encrypted_outputs=1",
+        build_start.elapsed().as_secs_f64() * 1000.0,
+        cfg.mul_depth
     );
     (circuit, ctx)
 }
@@ -711,6 +725,12 @@ async fn test_gpu_lwe_nested_rns_ring_gsw_mul_bench() {
     let (active_q_moduli, active_q, _) = active_q_moduli_and_modulus(&params, active_levels);
     let (circuit, ctx, encrypted_outputs) =
         build_ring_gsw_mul_circuit::<GpuDCRTPoly>(&params, &cfg, active_levels);
+    let final_product_fhe_decryption_error = encrypted_outputs
+        .last()
+        .expect("Ring-GSW multiplication circuit must produce a final product")
+        .estimate_decryption_error_norm(cfg.error_sigma)
+        .poly_norm
+        .norm;
     let max_selected_decryption_error = max_bigdecimal(
         encrypted_outputs
             .iter()
@@ -723,6 +743,11 @@ async fn test_gpu_lwe_nested_rns_ring_gsw_mul_bench() {
     let ring_gsw_threshold = &ring_gsw_q / BigUint::from(2u64);
     let ring_gsw_threshold_bd = BigDecimal::from_biguint(ring_gsw_threshold.clone(), 0);
     let selected_decryption_ok = max_selected_decryption_error < ring_gsw_threshold_bd;
+    info!(
+        "ring_gsw_mul final_product_fhe_decryption_error={} final_product_fhe_decryption_error_bits={}",
+        final_product_fhe_decryption_error,
+        bigdecimal_bits_ceil(&final_product_fhe_decryption_error)
+    );
     let gate_counts = circuit.count_gates_by_type_vec();
     let total_lut_entries = circuit.total_registered_public_lut_entries();
     let total_public_lut_gates = gate_counts.get(&PolyGateKind::PubLut).copied().unwrap_or(0);
@@ -733,12 +758,13 @@ async fn test_gpu_lwe_nested_rns_ring_gsw_mul_bench() {
         single_gpu_id, detected_gpu_count, detected_gpu_ids
     );
     info!(
-        "ring_gsw_mul selected crt_depth={} actual_crt_depth={} ring_dim={} num_slots={} active_levels={} crt_bits={} p_moduli_bits={} base_bits={} q_moduli={:?}",
+        "ring_gsw_mul selected crt_depth={} actual_crt_depth={} ring_dim={} num_slots={} active_levels={} mul_depth={} crt_bits={} p_moduli_bits={} base_bits={} q_moduli={:?}",
         crt_depth,
         actual_crt_depth,
         params.ring_dimension(),
         cfg.num_slots(),
         active_levels,
+        cfg.mul_depth,
         cfg.crt_bits,
         cfg.p_moduli_bits,
         cfg.base_bits,

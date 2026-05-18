@@ -47,6 +47,25 @@ fn estimate_summary(estimate: CircuitBenchEstimate) -> CircuitBenchSummary {
     }
 }
 
+fn scale_independent_summary_biguint(
+    summary: CircuitBenchSummary,
+    count: &BigUint,
+) -> CircuitBenchSummary {
+    let scaled = CircuitBenchSummary::from_nanos(
+        summary.total_time.clone() * count,
+        summary.latency,
+        summary.max_parallelism.clone() * count,
+    );
+    #[cfg(feature = "gpu")]
+    {
+        scaled.with_peak_vram(summary.peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        scaled
+    }
+}
+
 fn sequential_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
     let total_time = parts.iter().map(|part| part.total_time.clone()).sum::<BigUint>();
     let latency = parts.iter().map(|part| part.latency).sum::<f64>();
@@ -201,12 +220,9 @@ pub(crate) fn bit_decomposed_polynomial_mask_decrypt_contribution_count(
     ring_dim: usize,
     mask_bits: usize,
     output_count: usize,
-) -> usize {
+) -> BigUint {
     assert!(mask_bits > 0, "mask_bits must be positive");
-    ring_dim
-        .checked_mul(mask_bits)
-        .and_then(|count| count.checked_mul(output_count))
-        .expect("bit-decomposed polynomial mask decrypt contribution count overflow")
+    BigUint::from(ring_dim) * BigUint::from(mask_bits) * BigUint::from(output_count)
 }
 
 /// Scale a representative one-ciphertext-bit decrypt contribution to a full
@@ -216,13 +232,13 @@ pub(crate) fn scale_bit_decomposed_polynomial_mask_decrypt_contributions(
     ring_dim: usize,
     mask_bits: usize,
     output_count: usize,
-) -> (CircuitBenchSummary, usize) {
+) -> (CircuitBenchSummary, BigUint) {
     let contribution_count = bit_decomposed_polynomial_mask_decrypt_contribution_count(
         ring_dim,
         mask_bits,
         output_count,
     );
-    (scale_independent_summary(unit, contribution_count), contribution_count)
+    (scale_independent_summary_biguint(unit, &contribution_count), contribution_count)
 }
 
 /// Number of additions needed to reduce `mask_bits` decrypted bit terms.
@@ -292,4 +308,36 @@ pub(crate) fn bit_decomposed_polynomial_mask_reduction_summary(
         per_polynomial_parts.push(estimate_summary(center_unit));
     }
     scale_independent_summary(sequential_summaries(&per_polynomial_parts), polynomial_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(total_time: u64, latency: f64, max_parallelism: u64) -> CircuitBenchSummary {
+        CircuitBenchSummary::from_nanos(
+            BigUint::from(total_time),
+            latency,
+            BigUint::from(max_parallelism),
+        )
+    }
+
+    #[test]
+    fn mask_decrypt_contribution_count_supports_large_aky24_cascade_outputs() {
+        let output_count = usize::MAX / 2;
+        let contribution_count =
+            bit_decomposed_polynomial_mask_decrypt_contribution_count(65_536, 1_418, output_count);
+        assert!(contribution_count > BigUint::from(usize::MAX));
+
+        let (scaled, returned_count) = scale_bit_decomposed_polynomial_mask_decrypt_contributions(
+            summary(7, 1.25, 3),
+            65_536,
+            1_418,
+            output_count,
+        );
+        assert_eq!(returned_count, contribution_count);
+        assert_eq!(scaled.total_time, &contribution_count * BigUint::from(7u32));
+        assert_eq!(scaled.latency, 1.25);
+        assert_eq!(scaled.max_parallelism, contribution_count * BigUint::from(3u32));
+    }
 }

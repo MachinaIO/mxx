@@ -1171,7 +1171,7 @@ where
             parallel_summaries(&[final_mask_decrypt.clone(), final_function_decrypt.clone()]);
         info!(
             ?mode,
-            final_mask_decrypt_contribution_count,
+            final_mask_decrypt_contribution_count = %final_mask_decrypt_contribution_count,
             final_mask_reduce_add_count,
             ?final_mask_decrypt_unit,
             ?final_mask_decrypt_contributions,

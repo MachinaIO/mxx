@@ -841,17 +841,25 @@ where
         PE: PltEvaluator<ErrorNorm>,
         ST: SlotTransferEvaluator<ErrorNorm>,
     {
+        let material_state = self.prf_refresh_material_state(
+            base,
+            round_idx,
+            seed_errors,
+            seed_ciphertext_randomizer_norm,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        );
         let mut low = 1usize;
         let mut high = max_candidate;
         let mut best = None;
         while low <= high {
             let candidate = low + (high - low) / 2;
-            let Some(evaluation) = self.simulate_prf_refresh_round_fixed(
+            let Some(evaluation) = self.evaluate_prf_refresh_round_from_material_state(
                 base,
                 round_idx,
                 candidate,
                 seed_errors,
-                seed_ciphertext_randomizer_norm,
+                &material_state,
                 plt_evaluator,
                 slot_transfer_evaluator,
             ) else {
@@ -900,6 +908,31 @@ where
             plt_evaluator,
             slot_transfer_evaluator,
         );
+        self.evaluate_prf_refresh_round_from_material_state(
+            base,
+            round_idx,
+            noise_refresh_v_bits,
+            seed_errors,
+            &material_state,
+            plt_evaluator,
+            slot_transfer_evaluator,
+        )
+    }
+
+    fn evaluate_prf_refresh_round_from_material_state<PE, ST>(
+        &self,
+        base: &Aky24IOMaskIndependentErrorBase,
+        round_idx: usize,
+        noise_refresh_v_bits: usize,
+        seed_errors: &[ErrorNorm],
+        material_state: &Aky24IOPrfRefreshMaterialState,
+        plt_evaluator: &PE,
+        slot_transfer_evaluator: &ST,
+    ) -> Option<Aky24IOPrfRefreshRoundEvaluation>
+    where
+        PE: PltEvaluator<ErrorNorm>,
+        ST: SlotTransferEvaluator<ErrorNorm>,
+    {
         let core = sim_utils::simulate_prf_refresh_round_fixed_core(
             &base.cpu_params,
             base.noise_refresh_ring_gsw_context.clone(),
@@ -921,15 +954,17 @@ where
         Some(Aky24IOPrfRefreshRoundEvaluation {
             round: Aky24IOPrfRoundErrorSimulation {
                 round_idx,
-                representative_selected_prg_output: material_state.selected,
+                representative_selected_prg_output: material_state.selected.clone(),
                 representative_selected_prg_ciphertext_decryption_error: material_state
-                    .representative_selected_prg_ciphertext_decryption_error,
+                    .representative_selected_prg_ciphertext_decryption_error
+                    .clone(),
                 noise_refresh: core.refresh,
             },
             refreshed_seed: core.refreshed_seed,
             refreshed_seed_ciphertext_randomizer_norm: material_state
-                .refreshed_seed_ciphertext_randomizer_norm,
-            material_wire_error: material_state.material_wire_error,
+                .refreshed_seed_ciphertext_randomizer_norm
+                .clone(),
+            material_wire_error: material_state.material_wire_error.clone(),
         })
     }
 

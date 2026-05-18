@@ -35,7 +35,6 @@ use super::{Aky24IO, Aky24IOFuncType};
 use crate::io::utils::simulation::{self as sim_utils, assert_same_matrix_shape, scale_error_norm};
 
 const AKY24_IO_SECRET_SIZE: usize = 1;
-const AKY24_IO_PRF_BRANCH_COUNT: usize = 2;
 const REPRESENTATIVE_GOLDREICH_SEED_BITS: usize = 5;
 
 /// Error-growth summary for the conventional AKY24 FE-to-iO online path.
@@ -187,12 +186,14 @@ pub fn minimum_aky24_io_prf_seed_bits(
     params: &DCRTPolyParams,
     output_size: usize,
     function_output_bits: usize,
+    prf_batch_bits: usize,
     prf_mask_output_coeff_bits: usize,
     noise_refresh_v_bits: usize,
     cbd_n: usize,
 ) -> usize {
     let ring_dim = params.ring_dimension() as usize;
-    let seed_refresh_seed_bits = minimum_seed_refresh_prf_seed_bits(AKY24_IO_PRF_BRANCH_COUNT);
+    let seed_refresh_seed_bits =
+        minimum_seed_refresh_prf_seed_bits(aky24_io_prf_branch_count(prf_batch_bits));
     let final_mask_seed_bits =
         minimum_goldreich_input_size(aky24_io_final_prg_uniform_output_bits(
             output_size,
@@ -203,6 +204,15 @@ pub fn minimum_aky24_io_prf_seed_bits(
     let noise_refresh_seed_bits =
         minimum_noise_refresh_seed_bits(params, noise_refresh_v_bits, cbd_n);
     seed_refresh_seed_bits.max(final_mask_seed_bits).max(noise_refresh_seed_bits)
+}
+
+fn aky24_io_prf_branch_count(prf_batch_bits: usize) -> usize {
+    assert!(prf_batch_bits > 0, "AKY24IO prf_batch_bits must be positive");
+    assert!(
+        prf_batch_bits < usize::BITS as usize,
+        "AKY24IO prf_batch_bits must fit in a usize branch count"
+    );
+    1usize.checked_shl(prf_batch_bits as u32).expect("AKY24IO PRF branch count overflow")
 }
 
 /// Returns the largest noise-refresh `v_bits` allowed before pre-rounding error is added.
@@ -342,6 +352,7 @@ where
             &cpu_params,
             func_type.output_bits(),
             func_type.output_bits(),
+            final_candidate.prf_batch_bits,
             mask_bits,
             global_noise_refresh_v_bits,
             final_candidate.noise_refresh_cbd_n,
@@ -408,14 +419,6 @@ impl<M, PKPE, PKST, ENCPE, ENCST> Aky24IO<M, PKPE, PKST, ENCPE, ENCST>
 where
     M: PolyMatrix,
 {
-    fn prf_round_count(&self) -> usize {
-        self.public_prf_seed_bits
-    }
-
-    fn prf_branch_count(&self) -> usize {
-        AKY24_IO_PRF_BRANCH_COUNT
-    }
-
     /// Simulate AKY24 iO error growth for the selected function family.
     pub fn simulate_error_growth<PE, ST>(
         &self,
@@ -1339,7 +1342,7 @@ mod tests {
         NoCircuitEvaluator,
     >;
 
-    fn test_scheme(active_levels: usize, public_prf_seed_bits: usize) -> TestAky24IO {
+    fn test_scheme(active_levels: usize, input_size: usize, prf_batch_bits: usize) -> TestAky24IO {
         let params = DCRTPolyParams::new(2, active_levels, 10, 5);
         let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
         let ring_gsw_context = Arc::new(NestedRnsPolyContext::setup(
@@ -1366,10 +1369,10 @@ mod tests {
             Some(active_levels),
             Some(0.0),
             b"aky24_io_error_simulation_test".to_vec(),
-            1,
+            input_size,
             1,
             6,
-            public_prf_seed_bits,
+            prf_batch_bits,
             1,
             1,
             1,
@@ -1386,6 +1389,7 @@ mod tests {
     fn test_minimum_aky24_io_prf_seed_bits_covers_seed_refresh_outputs() {
         let params = DCRTPolyParams::new(2, 1, 10, 5);
         let output_size = 3usize;
+        let prf_batch_bits = 3usize;
         let prf_mask_output_coeff_bits = 2usize;
         let noise_refresh_v_bits = 1usize;
         let cbd_n = 1usize;
@@ -1393,13 +1397,15 @@ mod tests {
             &params,
             output_size,
             output_size,
+            prf_batch_bits,
             prf_mask_output_coeff_bits,
             noise_refresh_v_bits,
             cbd_n,
         );
         let ring_dim = params.ring_dimension() as usize;
+        let prf_branch_count = aky24_io_prf_branch_count(prf_batch_bits);
 
-        assert!(goldreich_output_bound_holds(seed_bits, AKY24_IO_PRF_BRANCH_COUNT * seed_bits));
+        assert!(goldreich_output_bound_holds(seed_bits, prf_branch_count * seed_bits));
         assert!(goldreich_output_bound_holds(
             seed_bits,
             aky24_io_final_prg_uniform_output_bits(
@@ -1413,14 +1419,16 @@ mod tests {
     }
 
     #[test]
-    fn test_prf_final_round_separator_uses_public_prf_seed_bits() {
-        let scheme = test_scheme(1, 7);
-        assert_eq!(scheme.prf_final_round_idx(), 7);
+    fn test_prf_final_round_separator_uses_batched_public_prf_rounds() {
+        let scheme = test_scheme(1, 12, 4);
+        assert_eq!(scheme.prf_round_count(), 3);
+        assert_eq!(scheme.prf_branch_count(), 16);
+        assert_eq!(scheme.prf_final_round_idx(), 3);
     }
 
     #[test]
     fn test_fresh_error_base_does_not_require_input_injection() {
-        let scheme = test_scheme(1, 1);
+        let scheme = test_scheme(1, 1, 1);
         let base = scheme.simulate_mask_independent_error_base(
             Aky24IOFuncType::GoldreichPRF { output_bits: 1 },
             2.0,
@@ -1441,7 +1449,7 @@ mod tests {
 
     #[test]
     fn test_finish_error_growth_composes_projection_and_decoder_error() {
-        let scheme = test_scheme(1, 1);
+        let scheme = test_scheme(1, 1, 1);
         let params = DCRTPolyParams::new(2, 1, 10, 5);
         let ctx = simulator_context(&params);
         let matrix = |norm: u32, ncol: usize| {

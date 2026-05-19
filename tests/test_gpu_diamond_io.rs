@@ -972,13 +972,18 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         eval_latency = estimate.eval.latency,
         eval_total_time_nanos = %estimate.eval.total_time,
         eval_max_parallelism = %estimate.eval.max_parallelism,
+        obfuscate_input_injection_latency = estimate.obfuscate_input_injection.latency,
         obfuscate_input_injection_total_time_nanos =
             %estimate.obfuscate_input_injection.total_time,
+        obfuscate_input_injection_max_parallelism =
+            %estimate.obfuscate_input_injection.max_parallelism,
         obfuscate_input_injection_latency_percent =
             estimate.obfuscate_input_injection_latency_percent(),
         obfuscate_input_injection_total_time_percent =
             estimate.obfuscate_input_injection_total_time_percent(),
+        eval_input_injection_latency = estimate.eval_input_injection.latency,
         eval_input_injection_total_time_nanos = %estimate.eval_input_injection.total_time,
+        eval_input_injection_max_parallelism = %estimate.eval_input_injection.max_parallelism,
         eval_input_injection_latency_percent = estimate.eval_input_injection_latency_percent(),
         eval_input_injection_total_time_percent =
             estimate.eval_input_injection_total_time_percent(),

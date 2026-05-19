@@ -1158,11 +1158,21 @@ async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
         obfuscate_latency = estimate.obfuscate.latency,
         obfuscate_total_time_nanos = %estimate.obfuscate.total_time,
         obfuscate_max_parallelism = %estimate.obfuscate.max_parallelism,
+        fe_to_io_obfuscate_latency = estimate.fe_to_io_obfuscate.latency,
+        fe_to_io_obfuscate_total_time_nanos = %estimate.fe_to_io_obfuscate_total_time,
+        fe_to_io_obfuscate_max_parallelism = %estimate.fe_to_io_obfuscate.max_parallelism,
+        final_fe_obfuscate_latency = estimate.final_fe_obfuscate.latency,
+        final_fe_obfuscate_total_time_nanos = %estimate.final_fe_obfuscate_total_time,
+        final_fe_obfuscate_max_parallelism = %estimate.final_fe_obfuscate.max_parallelism,
         eval_latency = estimate.eval.latency,
         eval_total_time_nanos = %estimate.eval.total_time,
         eval_max_parallelism = %estimate.eval.max_parallelism,
+        fe_to_io_eval_latency = estimate.fe_to_io_eval.latency,
         fe_to_io_eval_total_time_nanos = %estimate.fe_to_io_eval_total_time,
+        fe_to_io_eval_max_parallelism = %estimate.fe_to_io_eval.max_parallelism,
+        final_fe_eval_latency = estimate.final_fe_eval.latency,
         final_fe_eval_total_time_nanos = %estimate.final_fe_eval_total_time,
+        final_fe_eval_max_parallelism = %estimate.final_fe_eval.max_parallelism,
         obfuscated_circuit_bytes = %estimate.obfuscated_circuit_bytes,
         fe_to_io_obfuscated_circuit_bytes = %estimate.fe_to_io_obfuscated_circuit_bytes,
         final_fe_obfuscated_circuit_bytes = %estimate.final_fe_obfuscated_circuit_bytes,
@@ -1171,12 +1181,15 @@ async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
     assert!(estimate.obfuscate.total_time >= BigUint::from(0u32));
     assert!(estimate.eval.total_time >= BigUint::from(0u32));
     assert!(estimate.obfuscated_circuit_bytes > BigUint::from(0u32));
+    assert!(estimate.final_fe_obfuscate_total_time > BigUint::from(0u32));
     assert!(estimate.final_fe_eval_total_time > BigUint::from(0u32));
     assert!(estimate.final_fe_obfuscated_circuit_bytes > BigUint::from(0u32));
     if cfg.input_size / cfg.prf_batch_bits > 1 {
+        assert!(estimate.fe_to_io_obfuscate_total_time > BigUint::from(0u32));
         assert!(estimate.fe_to_io_eval_total_time > BigUint::from(0u32));
         assert!(estimate.fe_to_io_obfuscated_circuit_bytes > BigUint::from(0u32));
     } else {
+        assert_eq!(estimate.fe_to_io_obfuscate_total_time, BigUint::from(0u32));
         assert_eq!(estimate.fe_to_io_eval_total_time, BigUint::from(0u32));
         assert_eq!(estimate.fe_to_io_obfuscated_circuit_bytes, BigUint::from(0u32));
     }

@@ -42,6 +42,18 @@ pub struct Aky24IOBenchEstimate {
     pub eval: CircuitBenchSummary,
     /// Compact bytes for persisted obfuscated-circuit material modeled by this estimator.
     pub obfuscated_circuit_bytes: BigUint,
+    /// Obfuscation contribution from Section 3.2 FE-to-iO cascade layers.
+    pub fe_to_io_obfuscate: CircuitBenchSummary,
+    /// Obfuscation contribution from the final FE layer.
+    pub final_fe_obfuscate: CircuitBenchSummary,
+    /// Online evaluation contribution from Section 3.2 FE-to-iO cascade layers.
+    pub fe_to_io_eval: CircuitBenchSummary,
+    /// Online evaluation contribution from the final FE layer.
+    pub final_fe_eval: CircuitBenchSummary,
+    /// Obfuscation total-time contribution from Section 3.2 FE-to-iO cascade layers.
+    pub fe_to_io_obfuscate_total_time: BigUint,
+    /// Obfuscation total-time contribution from the final FE layer.
+    pub final_fe_obfuscate_total_time: BigUint,
     /// Online evaluation total-time contribution from Section 3.2 FE-to-iO cascade layers.
     pub fe_to_io_eval_total_time: BigUint,
     /// Online evaluation total-time contribution from the final FE layer.
@@ -67,16 +79,28 @@ impl Aky24IOBenchEstimate {
         let eval_parts = layers.iter().map(|layer| layer.eval.clone()).collect::<Vec<_>>();
         let obfuscated_circuit_bytes =
             layers.iter().map(|layer| layer.obfuscated_circuit_bytes.clone()).sum::<BigUint>();
-        let fe_to_io_eval_total_time =
-            fe_to_io.iter().map(|layer| layer.eval.total_time.clone()).sum::<BigUint>();
+        let fe_to_io_obfuscate_parts =
+            fe_to_io.iter().map(|layer| layer.obfuscate.clone()).collect::<Vec<_>>();
+        let fe_to_io_eval_parts =
+            fe_to_io.iter().map(|layer| layer.eval.clone()).collect::<Vec<_>>();
+        let fe_to_io_obfuscate = sequential_summaries(&fe_to_io_obfuscate_parts);
+        let final_fe_obfuscate = final_fe.obfuscate.clone();
+        let fe_to_io_eval = sequential_summaries(&fe_to_io_eval_parts);
+        let final_fe_eval = final_fe.eval.clone();
         let fe_to_io_obfuscated_circuit_bytes =
             fe_to_io.iter().map(|layer| layer.obfuscated_circuit_bytes.clone()).sum::<BigUint>();
         Self {
             obfuscate: sequential_summaries(&obfuscate_parts),
             eval: sequential_summaries(&eval_parts),
             obfuscated_circuit_bytes,
-            fe_to_io_eval_total_time,
-            final_fe_eval_total_time: final_fe.eval.total_time,
+            fe_to_io_obfuscate_total_time: fe_to_io_obfuscate.total_time.clone(),
+            final_fe_obfuscate_total_time: final_fe_obfuscate.total_time.clone(),
+            fe_to_io_eval_total_time: fe_to_io_eval.total_time.clone(),
+            final_fe_eval_total_time: final_fe_eval.total_time.clone(),
+            fe_to_io_obfuscate,
+            final_fe_obfuscate,
+            fe_to_io_eval,
+            final_fe_eval,
             fe_to_io_obfuscated_circuit_bytes,
             final_fe_obfuscated_circuit_bytes: final_fe.obfuscated_circuit_bytes,
         }
@@ -1171,7 +1195,17 @@ mod tests {
         assert_eq!(estimate.eval.latency, 6.0);
         assert_eq!(estimate.eval.max_parallelism, BigUint::from(5u64));
         assert_eq!(estimate.obfuscated_circuit_bytes, BigUint::from(12u64));
+        assert_eq!(estimate.fe_to_io_obfuscate.latency, 1.0);
+        assert_eq!(estimate.fe_to_io_obfuscate.max_parallelism, BigUint::from(2u64));
+        assert_eq!(estimate.fe_to_io_obfuscate_total_time, BigUint::from(10u64));
+        assert_eq!(estimate.final_fe_obfuscate.latency, 3.0);
+        assert_eq!(estimate.final_fe_obfuscate.max_parallelism, BigUint::from(4u64));
+        assert_eq!(estimate.final_fe_obfuscate_total_time, BigUint::from(30u64));
+        assert_eq!(estimate.fe_to_io_eval.latency, 2.0);
+        assert_eq!(estimate.fe_to_io_eval.max_parallelism, BigUint::from(3u64));
         assert_eq!(estimate.fe_to_io_eval_total_time, BigUint::from(20u64));
+        assert_eq!(estimate.final_fe_eval.latency, 4.0);
+        assert_eq!(estimate.final_fe_eval.max_parallelism, BigUint::from(5u64));
         assert_eq!(estimate.final_fe_eval_total_time, BigUint::from(40u64));
         assert_eq!(estimate.fe_to_io_obfuscated_circuit_bytes, BigUint::from(5u64));
         assert_eq!(estimate.final_fe_obfuscated_circuit_bytes, BigUint::from(7u64));

@@ -597,7 +597,7 @@ where
     pub(super) fn sample_final_output_preimage(
         &self,
         preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
-        block_idx: usize,
+        state_idx: usize,
         pubkey: &BggPublicKey<M>,
         top_gadget_plaintext: Option<&M::P>,
         bottom_gadget_plaintext: Option<&M::P>,
@@ -616,21 +616,11 @@ where
             bottom = bottom - &(gadget * plaintext);
         }
         let target = top.concat_rows(&[&bottom]);
-        let ext_matrix = HS::new().sample_hash(
+        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(state_idx);
+        TS::new(params, self.injector.trapdoor_sigma).preimage(
             params,
-            preprocess_out.hash_key,
-            format!("diamond_w_{}_{}", block_idx, self.injector.input_count),
-            2usize
-                .checked_mul(DIAMOND_SECRET_SIZE)
-                .expect("DiamondIO final state row count overflow"),
-            final_gadget_col_size,
-            DistType::FinRingDist,
-        );
-        TS::new(params, self.injector.trapdoor_sigma).preimage_extend(
-            params,
-            &preprocess_out.final_trapdoor,
-            &preprocess_out.final_pub_matrix,
-            &ext_matrix,
+            trapdoor,
+            public_matrix,
             &target,
         )
     }

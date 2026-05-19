@@ -40,10 +40,8 @@ pub struct DiamondWEBenchEstimator<'a, PKBE, EncBE, NBE> {
     pub encoding_estimator: &'a EncBE,
     pub native_estimator: &'a NBE,
     pub trapdoor_checkpoint: CircuitBenchEstimate,
-    pub trapdoor_preimage_extend: CircuitBenchEstimate,
-    pub final_preimage_extend_one_column: CircuitBenchEstimate,
-    pub w_hash_one_column: CircuitBenchEstimate,
-    pub transition_w_chunk_hash_sample: CircuitBenchEstimate,
+    pub trapdoor_preimage: CircuitBenchEstimate,
+    pub final_preimage_one_column: CircuitBenchEstimate,
     pub bgg_public_key_sample: CircuitBenchEstimate,
     pub scalar_matrix_hash_sample: CircuitBenchEstimate,
 }
@@ -75,10 +73,8 @@ where
             encoding_estimator,
             native_estimator,
             trapdoor_checkpoint: units.trapdoor_checkpoint,
-            trapdoor_preimage_extend: units.trapdoor_preimage_extend,
-            final_preimage_extend_one_column: units.final_preimage_extend_one_column,
-            w_hash_one_column: units.w_hash_one_column,
-            transition_w_chunk_hash_sample: units.transition_w_chunk_hash_sample,
+            trapdoor_preimage: units.trapdoor_preimage,
+            final_preimage_one_column: units.final_preimage_one_column,
             bgg_public_key_sample: units.bgg_public_key_sample,
             scalar_matrix_hash_sample: units.scalar_matrix_hash_sample,
         }
@@ -90,10 +86,8 @@ where
         encoding_estimator: &'a EncBE,
         native_estimator: &'a NBE,
         trapdoor_checkpoint: CircuitBenchEstimate,
-        trapdoor_preimage_extend: CircuitBenchEstimate,
-        final_preimage_extend_one_column: CircuitBenchEstimate,
-        w_hash_one_column: CircuitBenchEstimate,
-        transition_w_chunk_hash_sample: CircuitBenchEstimate,
+        trapdoor_preimage: CircuitBenchEstimate,
+        final_preimage_one_column: CircuitBenchEstimate,
         bgg_public_key_sample: CircuitBenchEstimate,
         scalar_matrix_hash_sample: CircuitBenchEstimate,
     ) -> Self {
@@ -102,10 +96,8 @@ where
             encoding_estimator,
             native_estimator,
             trapdoor_checkpoint,
-            trapdoor_preimage_extend,
-            final_preimage_extend_one_column,
-            w_hash_one_column,
-            transition_w_chunk_hash_sample,
+            trapdoor_preimage,
+            final_preimage_one_column,
             bgg_public_key_sample,
             scalar_matrix_hash_sample,
         }
@@ -292,26 +284,14 @@ where
             ]),
             shape.ordinary_preimage_count(),
         );
-        let ordinary_hashing = scale_summary(
-            self.w_hash_summary_for_width(shape.modulus_digits),
-            shape.ordinary_preimage_count(),
-        );
         let ordinary_preimages = scale_summary(
             self.final_preimage_summary_for_width(shape.modulus_digits),
             shape.ordinary_preimage_count(),
         );
-        let k_hashing = self.w_hash_summary_for_width(shape.modulus_digits);
         let k_preimage = self.final_preimage_summary_for_width(1);
 
-        let mut parts = vec![
-            ordinary_hashing,
-            ordinary_target_building,
-            ordinary_preimages,
-            k_hashing,
-            k_preimage,
-        ];
+        let mut parts = vec![ordinary_target_building, ordinary_preimages, k_preimage];
         if let Some(lookup_cols) = shape.lookup_bridge_cols {
-            parts.push(self.w_hash_summary_for_width(lookup_cols));
             parts.push(self.final_preimage_summary_for_width(lookup_cols));
         }
         parallel_summaries(parts.as_slice())
@@ -329,10 +309,7 @@ where
                 .estimate_vector_matrix_product(shape.modulus_digits, DIAMOND_SECRET_SIZE),
             estimate_summary(self.native_estimator.estimate_vector_add(DIAMOND_SECRET_SIZE)),
         ]);
-        sequential_summaries(&[
-            parallel_summaries(&[self.w_hash_summary_for_width(shape.modulus_digits), target]),
-            self.final_preimage_summary_for_width(1),
-        ])
+        sequential_summaries(&[target, self.final_preimage_summary_for_width(1)])
     }
 
     fn estimate_dec_circuit_input_path<M>(
@@ -387,38 +364,16 @@ where
         let checkpoint_sampling =
             scale_estimate(self.trapdoor_checkpoint.clone(), shape.checkpoint_count);
         let initial_state = sequential_summaries(&[
-            self.w_hash_summary_for_width(shape.modulus_digits),
             self.native_estimator
                 .estimate_vector_matrix_product(shape.state_row_size, shape.state_col_size),
             estimate_summary(self.native_estimator.estimate_vector_add(shape.state_col_size)),
         ]);
-        let transition_ext_w_hash_sampling = scale_summary(
-            self.w_hash_summary_for_width(shape.modulus_digits),
-            shape.transition_ext_w_hash_count,
-        );
-        let transition_w_hash_per_matrix = shape
-            .transition_w_chunk_col_lens
-            .par_iter()
-            .map(|&col_len| self.w_hash_summary_for_width(col_len))
-            .collect::<Vec<_>>();
-        let transition_target_w_hash_sampling = scale_summary(
-            parallel_summaries(transition_w_hash_per_matrix.as_slice()),
-            shape.transition_matrix_count,
-        );
         let transition_target_building =
             shape.estimate_transition_target_building(self.native_estimator);
-        let transition_preimages = scale_estimate(
-            self.trapdoor_preimage_extend.clone(),
-            shape.transition_preimage_chunk_count,
-        );
-        let transition_stage = sequential_summaries(&[
-            parallel_summaries(&[
-                transition_ext_w_hash_sampling,
-                transition_target_w_hash_sampling,
-            ]),
-            transition_target_building,
-            transition_preimages,
-        ]);
+        let transition_preimages =
+            scale_estimate(self.trapdoor_preimage.clone(), shape.transition_preimage_chunk_count);
+        let transition_stage =
+            sequential_summaries(&[transition_target_building, transition_preimages]);
         let enc = sequential_summaries(&[
             checkpoint_sampling.clone(),
             parallel_summaries(&[initial_state.clone(), transition_stage.clone()]),
@@ -427,12 +382,8 @@ where
         DiamondWEInputInjectionBenchEstimateParts { enc, dec }
     }
 
-    fn w_hash_summary_for_width(&self, width: usize) -> CircuitBenchSummary {
-        scale_estimate(self.w_hash_one_column.clone(), width)
-    }
-
     fn final_preimage_summary_for_width(&self, width: usize) -> CircuitBenchSummary {
-        scale_estimate(self.final_preimage_extend_one_column.clone(), width)
+        scale_estimate(self.final_preimage_one_column.clone(), width)
     }
 
     fn estimate_storage(&self, shape: DiamondWEBenchShape) -> DiamondWEStorageEstimate {
@@ -470,13 +421,12 @@ struct DiamondWEBenchShape {
     state_col_size: usize,
     b_public_col_size: usize,
     checkpoint_count: usize,
+    final_checkpoint_count: usize,
     transition_matrix_count: usize,
     transition_preimage_chunk_count: usize,
     input_injection_transition_preimage_bytes: usize,
-    transition_ext_w_hash_count: usize,
     online_level_state_counts: Vec<usize>,
     transition_chunk_col_lens: Vec<usize>,
-    transition_w_chunk_col_lens: Vec<usize>,
     lookup_bridge_cols: Option<usize>,
     dec_lookup_bridge_cols: Option<usize>,
 }
@@ -512,14 +462,10 @@ impl DiamondWEBenchShape {
             .expect("DiamondWE modulus bits must fit in u16 for compact-byte estimates");
         let state_row_size =
             2usize.checked_mul(DIAMOND_SECRET_SIZE).expect("DiamondWE state row size overflow");
-        let gadget_col_size = DIAMOND_SECRET_SIZE
-            .checked_mul(modulus_digits)
-            .expect("DiamondWE gadget column count overflow");
         let b_public_col_size = state_row_size
             .checked_mul(modulus_digits + 2)
             .expect("DiamondWE B public column count overflow");
-        let state_col_size =
-            b_public_col_size.checked_add(gadget_col_size).expect("DiamondWE state cols overflow");
+        let state_col_size = b_public_col_size;
         let chunk_count = column_chunk_count(state_col_size);
         let transition_chunk_col_lens = (0..chunk_count)
             .map(|chunk_idx| column_chunk_bounds(state_col_size, chunk_idx).1)
@@ -531,26 +477,11 @@ impl DiamondWEBenchShape {
             })
             .collect::<Vec<_>>();
         let transition_preimage_bytes_per_matrix = transition_chunk_bytes.iter().sum::<usize>();
-        let transition_w_chunk_lens = (0..chunk_count)
-            .filter_map(|chunk_idx| {
-                let (col_start, col_len) = column_chunk_bounds(state_col_size, chunk_idx);
-                let col_end = col_start + col_len;
-                let w_start = b_public_col_size;
-                if col_end <= w_start {
-                    None
-                } else {
-                    let w_len = col_end - col_start.max(w_start);
-                    (w_len > 0).then_some(w_len)
-                }
-            })
-            .collect::<Vec<_>>();
         let mut transition_matrix_count = 0usize;
         let mut transition_preimage_chunk_count = 0usize;
-        let mut transition_ext_w_hash_count = 0usize;
         let mut online_level_state_counts = Vec::with_capacity(diamond.injector.input_count);
         for level in 1..=diamond.injector.input_count {
-            let state_count = expanded_state_count_after_level(diamond, level);
-            let old_state_count = state_count.saturating_sub(diamond.injector.batch_bits());
+            let state_count = state_count_at_level(diamond, level);
             transition_matrix_count = transition_matrix_count
                 .checked_add(
                     diamond
@@ -570,21 +501,13 @@ impl DiamondWEBenchShape {
                         .expect("DiamondWE transition chunk count overflow"),
                 )
                 .expect("DiamondWE transition chunk count overflow");
-            transition_ext_w_hash_count = transition_ext_w_hash_count
-                .checked_add(
-                    diamond
-                        .injector
-                        .base
-                        .checked_mul(
-                            old_state_count
-                                .checked_add(1)
-                                .expect("DiamondWE transition W hash count overflow"),
-                        )
-                        .expect("DiamondWE transition W hash count overflow"),
-                )
-                .expect("DiamondWE transition W hash count overflow");
             online_level_state_counts.push(state_count);
         }
+        let checkpoint_count = (0..=diamond.injector.input_count)
+            .map(|level| state_count_at_level(diamond, level))
+            .try_fold(0usize, |acc, count| acc.checked_add(count))
+            .expect("DiamondWE checkpoint count overflow");
+        let final_checkpoint_count = state_count_at_level(diamond, diamond.injector.input_count);
         let input_injection_transition_preimage_bytes = transition_preimage_bytes_per_matrix
             .checked_mul(transition_matrix_count)
             .expect("DiamondWE transition preimage byte count overflow");
@@ -605,14 +528,13 @@ impl DiamondWEBenchShape {
             state_row_size,
             state_col_size,
             b_public_col_size,
-            checkpoint_count: diamond.injector.input_count + 1,
+            checkpoint_count,
+            final_checkpoint_count,
             transition_matrix_count,
             transition_preimage_chunk_count,
             input_injection_transition_preimage_bytes,
-            transition_ext_w_hash_count,
             online_level_state_counts,
             transition_chunk_col_lens,
-            transition_w_chunk_col_lens: transition_w_chunk_lens,
             lookup_bridge_cols,
             dec_lookup_bridge_cols,
         }
@@ -624,14 +546,13 @@ impl DiamondWEBenchShape {
 
     fn input_injection_metadata_and_seed_bytes(&self) -> BigUint {
         let metadata_estimate = 128usize;
-        let hash_key_bytes = 32usize;
         let p_epsilon_bytes = matrix_compact_bytes_for_shape(
             self.state_row_size / 2,
             self.state_col_size,
             self.ring_dim,
             self.modulus_bits,
         );
-        BigUint::from(metadata_estimate + hash_key_bytes + p_epsilon_bytes)
+        BigUint::from(metadata_estimate + p_epsilon_bytes)
     }
 
     fn input_injection_public_checkpoint_bytes(&self) -> usize {
@@ -641,7 +562,7 @@ impl DiamondWEBenchShape {
             self.ring_dim,
             self.modulus_bits,
         )
-        .checked_mul(self.checkpoint_count)
+        .checked_mul(self.final_checkpoint_count)
         .expect("DiamondWE B checkpoint byte count overflow")
     }
 
@@ -668,9 +589,7 @@ impl DiamondWEBenchShape {
             .lookup_bridge_cols
             .map(|lookup_cols| {
                 matrix_compact_bytes_for_shape(
-                    self.b_public_col_size
-                        .checked_add(lookup_cols)
-                        .expect("DiamondWE lookup preimage row count overflow"),
+                    self.state_col_size,
                     lookup_cols,
                     self.ring_dim,
                     self.modulus_bits,
@@ -757,10 +676,8 @@ struct DiamondWEInputInjectionBenchEstimateParts {
 #[derive(Debug, Clone)]
 struct DiamondWEBenchUnitEstimates {
     trapdoor_checkpoint: CircuitBenchEstimate,
-    trapdoor_preimage_extend: CircuitBenchEstimate,
-    final_preimage_extend_one_column: CircuitBenchEstimate,
-    w_hash_one_column: CircuitBenchEstimate,
-    transition_w_chunk_hash_sample: CircuitBenchEstimate,
+    trapdoor_preimage: CircuitBenchEstimate,
+    final_preimage_one_column: CircuitBenchEstimate,
     bgg_public_key_sample: CircuitBenchEstimate,
     scalar_matrix_hash_sample: CircuitBenchEstimate,
 }
@@ -790,47 +707,22 @@ impl DiamondWEBenchUnitEstimates {
 
         let trap_sampler = TS::new(params, diamond.injector.trapdoor_sigma);
         let (trapdoor, public_matrix) = trap_sampler.trapdoor(params, state_row_size);
-        let ext_matrix = HS::new().sample_hash(
-            params,
-            [0x71u8; 32],
-            b"diamond_we_bench_preimage_ext",
-            state_row_size,
-            modulus_digits,
-            DistType::FinRingDist,
-        );
         let one_column_target = M::zero(params, state_row_size, 1);
         let preimage_one_column = bench_estimate(iterations, || {
-            let preimage = trap_sampler.preimage_extend(
-                params,
-                &trapdoor,
-                &public_matrix,
-                &ext_matrix,
-                &one_column_target,
-            );
+            let preimage =
+                trap_sampler.preimage(params, &trapdoor, &public_matrix, &one_column_target);
             black_box(preimage.to_compact_bytes())
         });
-        let transition_preimage_extend = scale_independent_estimate(
+        let transition_preimage = scale_independent_estimate(
             preimage_one_column.clone(),
             column_chunk_bounds(
                 state_row_size
                     .checked_mul(modulus_digits + 2)
-                    .and_then(|b_cols| b_cols.checked_add(modulus_digits))
                     .expect("DiamondWE benchmark state col overflow"),
                 0,
             )
             .1,
         );
-        let w_hash_one_column = bench_estimate(iterations, || {
-            let matrix = HS::new().sample_hash(
-                params,
-                [0x72u8; 32],
-                b"diamond_we_bench_w_hash_one_column",
-                state_row_size,
-                1,
-                DistType::FinRingDist,
-            );
-            black_box(matrix.to_compact_bytes())
-        });
         let bgg_public_key_sample = bench_estimate(iterations, || {
             BGGPublicKeySampler::<[u8; 32], HS>::new([0x73u8; 32], DIAMOND_SECRET_SIZE).sample(
                 params,
@@ -851,17 +743,15 @@ impl DiamondWEBenchUnitEstimates {
         });
         Self {
             trapdoor_checkpoint,
-            trapdoor_preimage_extend: transition_preimage_extend,
-            final_preimage_extend_one_column: preimage_one_column,
-            w_hash_one_column: w_hash_one_column.clone(),
-            transition_w_chunk_hash_sample: w_hash_one_column,
+            trapdoor_preimage: transition_preimage,
+            final_preimage_one_column: preimage_one_column,
             bgg_public_key_sample,
             scalar_matrix_hash_sample,
         }
     }
 }
 
-fn expanded_state_count_after_level<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+fn state_count_at_level<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
     diamond: &DiamondWE<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
     level: usize,
 ) -> usize
@@ -1177,8 +1067,6 @@ mod tests {
             unit(3.0),
             unit(4.0),
             unit(5.0),
-            unit(6.0),
-            unit(7.0),
         )
     }
 

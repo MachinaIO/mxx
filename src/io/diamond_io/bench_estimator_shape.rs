@@ -43,11 +43,9 @@ pub(super) struct DiamondIOBenchShape {
     pub(super) state_col_size: usize,
     pub(super) b_public_col_size: usize,
     pub(super) checkpoint_count: usize,
+    pub(super) final_checkpoint_count: usize,
     pub(super) transition_matrix_count: usize,
     pub(super) transition_preimage_chunk_count: usize,
-    pub(super) transition_ext_w_hash_count: usize,
-    pub(super) transition_target_w_hash_chunk_count: usize,
-    pub(super) transition_w_hash_max_col_len: usize,
     pub(super) input_injection_transition_preimage_bytes: usize,
     pub(super) online_level_state_counts: Vec<usize>,
     pub(super) transition_chunk_col_lens: Vec<usize>,
@@ -84,14 +82,10 @@ impl DiamondIOBenchShape {
             .expect("DiamondIO modulus bits must fit in u16 for compact-byte estimates");
         let state_row_size =
             2usize.checked_mul(DIAMOND_SECRET_SIZE).expect("DiamondIO state row size overflow");
-        let gadget_col_size = DIAMOND_SECRET_SIZE
-            .checked_mul(modulus_digits)
-            .expect("DiamondIO gadget column count overflow");
         let b_public_col_size = state_row_size
             .checked_mul(modulus_digits + 2)
             .expect("DiamondIO B public column count overflow");
-        let state_col_size =
-            b_public_col_size.checked_add(gadget_col_size).expect("DiamondIO state cols overflow");
+        let state_col_size = b_public_col_size;
         let chunk_count = column_chunk_count(state_col_size);
         let transition_chunk_col_lens = (0..chunk_count)
             .map(|chunk_idx| column_chunk_bounds(state_col_size, chunk_idx).1)
@@ -103,27 +97,11 @@ impl DiamondIOBenchShape {
             })
             .collect::<Vec<_>>();
         let transition_preimage_bytes_per_matrix = transition_chunk_bytes.iter().sum::<usize>();
-        let transition_w_chunk_lens = (0..chunk_count)
-            .filter_map(|chunk_idx| {
-                let (col_start, col_len) = column_chunk_bounds(state_col_size, chunk_idx);
-                let col_end = col_start + col_len;
-                let w_start = b_public_col_size;
-                (col_end > w_start)
-                    .then_some(col_end - col_start.max(w_start))
-                    .filter(|&w_len| w_len > 0)
-            })
-            .collect::<Vec<_>>();
-        let transition_w_hash_chunks_per_matrix = transition_w_chunk_lens.len();
-        let transition_w_hash_max_col_len =
-            transition_w_chunk_lens.iter().copied().max().unwrap_or(1);
-
         let mut transition_preimage_chunk_count = 0usize;
         let mut transition_matrix_count = 0usize;
-        let mut transition_ext_w_hash_count = 0usize;
         let mut online_level_state_counts = Vec::with_capacity(diamond.injector.input_count);
         for level in 1..=diamond.injector.input_count {
-            let state_count = expanded_state_count_after_level(diamond, level);
-            let old_state_count = state_count.saturating_sub(diamond.injector.batch_bits());
+            let state_count = state_count_at_level(diamond, level);
             transition_matrix_count = transition_matrix_count
                 .checked_add(
                     diamond
@@ -143,29 +121,13 @@ impl DiamondIOBenchShape {
                         .expect("DiamondIO transition chunk count overflow"),
                 )
                 .expect("DiamondIO transition chunk count overflow");
-            // `DiamondInjector::preprocess` materializes one full hashed W block for the previous
-            // empty-prefix state before iterating states, then one more full W block for every
-            // non-new state. New states reuse that first previous-level block. These matrices are
-            // deterministic hash-derived public data, so storage does not count them, but their
-            // sampling work is part of preprocessing latency and total work.
-            transition_ext_w_hash_count = transition_ext_w_hash_count
-                .checked_add(
-                    diamond
-                        .injector
-                        .base
-                        .checked_mul(
-                            old_state_count
-                                .checked_add(1)
-                                .expect("DiamondIO transition W hash count overflow"),
-                        )
-                        .expect("DiamondIO transition W hash count overflow"),
-                )
-                .expect("DiamondIO transition W hash count overflow");
             online_level_state_counts.push(state_count);
         }
-        let transition_target_w_hash_chunk_count = transition_matrix_count
-            .checked_mul(transition_w_hash_chunks_per_matrix)
-            .expect("DiamondIO transition target W hash chunk count overflow");
+        let checkpoint_count = (0..=diamond.injector.input_count)
+            .map(|level| state_count_at_level(diamond, level))
+            .try_fold(0usize, |acc, count| acc.checked_add(count))
+            .expect("DiamondIO checkpoint count overflow");
+        let final_checkpoint_count = state_count_at_level(diamond, diamond.injector.input_count);
 
         let input_injection_transition_preimage_bytes = transition_preimage_bytes_per_matrix
             .checked_mul(transition_matrix_count)
@@ -216,12 +178,10 @@ impl DiamondIOBenchShape {
             state_row_size,
             state_col_size,
             b_public_col_size,
-            checkpoint_count: diamond.injector.input_count + 1,
+            checkpoint_count,
+            final_checkpoint_count,
             transition_matrix_count,
             transition_preimage_chunk_count,
-            transition_ext_w_hash_count,
-            transition_target_w_hash_chunk_count,
-            transition_w_hash_max_col_len,
             input_injection_transition_preimage_bytes,
             online_level_state_counts,
             transition_chunk_col_lens,
@@ -240,48 +200,42 @@ impl DiamondIOBenchShape {
         // * `metadata_estimate` is a fixed conservative allowance for the JSON metadata written by
         //   `DiamondInjector::write_metadata`; it stores only `input_count` and `base`, so the
         //   actual encoded file is tiny and independent of the polynomial parameters.
-        // * `hash_key_bytes` is the 32-byte `diamond_preprocess_hash_key`. It is needed at eval
-        //   time to check that the selected preprocessed transition chunks belong to the same
-        //   deterministic hash-derived public side.
-        // * `p_epsilon_bytes` estimates `diamond_p_epsilon_tensor_0`, the initial empty-prefix
+        // * `p_epsilon_bytes` estimates `diamond_initial_state_tensor`, the initial empty-prefix
         //   state read before the first input digit is applied. Its shape is `(state_row_size / 2)
         //   x state_col_size`, matching the secret-side half-state produced by
         //   `build_initial_encoding`.
         let metadata_estimate = 128usize;
-        let hash_key_bytes = 32usize;
         let p_epsilon_bytes = bench_utils::matrix_compact_bytes_for_shape(
             self.state_row_size / 2,
             self.state_col_size,
             self.ring_dim,
             self.modulus_bits,
         );
-        BigUint::from(metadata_estimate + hash_key_bytes + p_epsilon_bytes)
+        BigUint::from(metadata_estimate + p_epsilon_bytes)
     }
 
     pub(super) fn input_injection_public_checkpoint_bytes(&self) -> usize {
-        // This counts the public `B` checkpoint matrices persisted by
-        // `DiamondInjector::load_or_sample_b_checkpoint` for levels `0..=input_count`. The matching
-        // trapdoors are intentionally not counted because they are preprocessing secrets rather
-        // than obfuscated-circuit data. Online eval does not multiply by these checkpoints
-        // directly; they are counted here only because the current preprocessing implementation
-        // persists the public matrices as reusable checkpoint artifacts.
+        // Only final-level public `B` checkpoint matrices are included in the obfuscated circuit.
+        // Intermediate-level checkpoints are preprocessing artifacts used to sample transition
+        // preimages and are intentionally not counted here. Trapdoors are preprocessing secrets and
+        // are also excluded.
         bench_utils::matrix_compact_bytes_for_shape(
             self.state_row_size,
             self.b_public_col_size,
             self.ring_dim,
             self.modulus_bits,
         )
-        .checked_mul(self.checkpoint_count)
+        .checked_mul(self.final_checkpoint_count)
         .expect("DiamondIO B checkpoint byte count overflow")
     }
 
     pub(super) fn input_injection_bytes(&self) -> BigUint {
         // Input-injection persisted bytes are grouped by the artifacts that survive preprocessing:
         //
-        // 1. Small metadata, the 32-byte hash key, and the empty-prefix seed state `p_epsilon`.
-        // 2. Public `B` checkpoint matrices for the per-level trapdoor chain, excluding trapdoors.
-        // 3. Chunked transition preimages `diamond_k_bit_tensor_*`, which are the large artifacts
-        //    read by online eval to advance the selected input-dependent branch states.
+        // 1. Small metadata and the empty-prefix seed state `p_epsilon`.
+        // 2. Final-level public `B` checkpoint matrices, excluding trapdoors.
+        // 3. Chunked transition preimages `diamond_transition_tensor_*`, which are the large
+        //    artifacts read by online eval to advance the selected input-dependent branch states.
         self.input_injection_metadata_and_seed_bytes() +
             BigUint::from(self.input_injection_public_checkpoint_bytes()) +
             BigUint::from(self.input_injection_transition_preimage_bytes)
@@ -521,7 +475,7 @@ impl DiamondIOBenchShape {
     }
 }
 
-fn expanded_state_count_after_level<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
+fn state_count_at_level<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
     diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
     level: usize,
 ) -> usize
@@ -581,11 +535,9 @@ mod tests {
             state_col_size: 3,
             b_public_col_size: 4,
             checkpoint_count: 0,
+            final_checkpoint_count: 0,
             transition_matrix_count: 0,
             transition_preimage_chunk_count: 0,
-            transition_ext_w_hash_count: 0,
-            transition_target_w_hash_chunk_count: 0,
-            transition_w_hash_max_col_len: 0,
             input_injection_transition_preimage_bytes: 0,
             online_level_state_counts: Vec::new(),
             transition_chunk_col_lens: Vec::new(),

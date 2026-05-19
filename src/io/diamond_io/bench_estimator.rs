@@ -150,18 +150,14 @@ pub struct DiamondIOBenchEstimator<'a, PKBE, EncBE, NBE> {
     pub encoding_estimator: &'a EncBE,
     /// Cost model for sampling one Diamond trapdoor/public-matrix checkpoint.
     pub trapdoor_checkpoint: CircuitBenchEstimate,
-    /// Cost model for one `preimage_extend` call.
-    pub trapdoor_preimage_extend: CircuitBenchEstimate,
-    /// Cost model for one ordinary final-output `preimage_extend` call.
-    pub final_output_preimage_extend: CircuitBenchEstimate,
-    /// Cost model for one final decoder `preimage_extend` call with a one-column target.
-    pub final_decoder_preimage_extend: CircuitBenchEstimate,
-    /// Cost model for the lookup-table bridge `preimage_extend` call.
-    pub lookup_bridge_preimage_extend: CircuitBenchEstimate,
-    /// Cost model for hashing one full Diamond W block.
-    pub full_w_block_hash_sample: CircuitBenchEstimate,
-    /// Cost model for hashing one W-column chunk used while building transition targets.
-    pub transition_w_chunk_hash_sample: CircuitBenchEstimate,
+    /// Cost model for one transition trapdoor `preimage` call.
+    pub trapdoor_preimage: CircuitBenchEstimate,
+    /// Cost model for one ordinary final-output `preimage` call.
+    pub final_output_preimage: CircuitBenchEstimate,
+    /// Cost model for one final decoder `preimage` call with a one-column target.
+    pub final_decoder_preimage: CircuitBenchEstimate,
+    /// Cost model for the lookup-table bridge `preimage` call.
+    pub lookup_bridge_preimage: CircuitBenchEstimate,
     /// Size-aware estimator for native polynomial-vector arithmetic.
     pub native_estimator: &'a NBE,
     /// Cost model for sampling one scalar BGG public key.
@@ -197,12 +193,10 @@ where
             encoding_estimator,
             native_estimator,
             trapdoor_checkpoint: units.trapdoor_checkpoint,
-            trapdoor_preimage_extend: units.trapdoor_preimage_extend,
-            final_output_preimage_extend: units.final_output_preimage_extend,
-            final_decoder_preimage_extend: units.final_decoder_preimage_extend,
-            lookup_bridge_preimage_extend: units.lookup_bridge_preimage_extend,
-            full_w_block_hash_sample: units.full_w_block_hash_sample,
-            transition_w_chunk_hash_sample: units.transition_w_chunk_hash_sample,
+            trapdoor_preimage: units.trapdoor_preimage,
+            final_output_preimage: units.final_output_preimage,
+            final_decoder_preimage: units.final_decoder_preimage,
+            lookup_bridge_preimage: units.lookup_bridge_preimage,
             bgg_public_key_sample: units.bgg_public_key_sample,
             ring_gsw_public_key_sample: units.ring_gsw_public_key_sample,
             ring_gsw_encrypt_bit: units.ring_gsw_encrypt_bit,
@@ -235,7 +229,6 @@ where
             gadget_col_size,
             state_col_size = shape.state_col_size,
             transition_chunk_len = column_chunk_bounds(shape.state_col_size, 0).1,
-            transition_w_hash_max_col_len = shape.transition_w_hash_max_col_len,
             lookup_bridge_cols = shape.lookup_bridge_cols,
             modulus_digits = params.modulus_digits(),
             ring_dimension = params.ring_dimension(),
@@ -253,95 +246,25 @@ where
 
         let trap_sampler = TS::new(params, diamond.injector.trapdoor_sigma);
         let (trapdoor, public_matrix) = trap_sampler.trapdoor(params, state_row_size);
-        let ext_matrix = HS::new().sample_hash(
-            params,
-            [0x51u8; 32],
-            b"diamond_io_bench_preimage_extend_ext",
-            state_row_size,
-            gadget_col_size,
-            DistType::FinRingDist,
-        );
         let transition_chunk_len = column_chunk_bounds(shape.state_col_size, 0).1;
         let one_column_target = M::zero(params, state_row_size, 1);
 
-        // Measure `preimage_extend` with one target column and compact serialization, then scale
+        // Measure `preimage` with one target column and compact serialization, then scale
         // the parallel work by the real target width while keeping latency at the measured one-
         // column value. Running the full-width serialized benchmark can exceed the H200 pod's CPU
         // cgroup memory limit before the estimator reaches the final composed estimate.
-        let trapdoor_preimage_extend_one_col =
-            bench_estimate_named("trapdoor_preimage_extend_one_col", iterations, || {
-                let preimage = trap_sampler.preimage_extend(
-                    params,
-                    &trapdoor,
-                    &public_matrix,
-                    &ext_matrix,
-                    &one_column_target,
-                );
-                preimage.to_compact_bytes()
-            });
-        let trapdoor_preimage_extend =
-            scale_independent_estimate(trapdoor_preimage_extend_one_col, transition_chunk_len);
-
-        let final_output_preimage_extend_one_col =
-            bench_estimate_named("final_output_preimage_extend_one_col", iterations, || {
-                let preimage = trap_sampler.preimage_extend(
-                    params,
-                    &trapdoor,
-                    &public_matrix,
-                    &ext_matrix,
-                    &one_column_target,
-                );
-                preimage.to_compact_bytes()
-            });
-        let final_output_preimage_extend = scale_independent_estimate(
-            final_output_preimage_extend_one_col.clone(),
-            gadget_col_size,
-        );
-        let final_decoder_preimage_extend = final_output_preimage_extend_one_col;
-
-        let lookup_bridge_preimage_extend_one_col =
-            bench_estimate_named("lookup_bridge_preimage_extend_one_col", iterations, || {
-                let preimage = trap_sampler.preimage_extend(
-                    params,
-                    &trapdoor,
-                    &public_matrix,
-                    &ext_matrix,
-                    &one_column_target,
-                );
-                preimage.to_compact_bytes()
-            });
-        let lookup_bridge_preimage_extend = scale_independent_estimate(
-            lookup_bridge_preimage_extend_one_col,
-            shape.lookup_bridge_cols,
-        );
-
-        let full_w_block_hash_sample =
-            bench_estimate_named("full_w_block_hash_sample", iterations, || {
-                let matrix = HS::new().sample_hash(
-                    params,
-                    [0x52u8; 32],
-                    b"diamond_io_bench_full_w_block_hash",
-                    state_row_size,
-                    gadget_col_size,
-                    DistType::FinRingDist,
-                );
-                matrix.to_compact_bytes()
-            });
-
-        let transition_w_chunk_hash_sample =
-            bench_estimate_named("transition_w_chunk_hash_sample", iterations, || {
-                let matrix = HS::new().sample_hash_columns(
-                    params,
-                    [0x53u8; 32],
-                    b"diamond_io_bench_transition_w_chunk_hash",
-                    state_row_size,
-                    gadget_col_size,
-                    0,
-                    shape.transition_w_hash_max_col_len,
-                    DistType::FinRingDist,
-                );
-                matrix.to_compact_bytes()
-            });
+        let preimage_one_col = bench_estimate_named("preimage_one_col", iterations, || {
+            let preimage =
+                trap_sampler.preimage(params, &trapdoor, &public_matrix, &one_column_target);
+            preimage.to_compact_bytes()
+        });
+        let trapdoor_preimage =
+            scale_independent_estimate(preimage_one_col.clone(), transition_chunk_len);
+        let final_output_preimage =
+            scale_independent_estimate(preimage_one_col.clone(), gadget_col_size);
+        let final_decoder_preimage = preimage_one_col.clone();
+        let lookup_bridge_preimage =
+            scale_independent_estimate(preimage_one_col, shape.lookup_bridge_cols);
 
         let mut bgg_public_key_tag = diamond.bgg_tag.clone();
         bgg_public_key_tag.extend_from_slice(b":public_keys");
@@ -480,12 +403,10 @@ where
 
         debug!(
             ?trapdoor_checkpoint,
-            ?trapdoor_preimage_extend,
-            ?final_output_preimage_extend,
-            ?final_decoder_preimage_extend,
-            ?lookup_bridge_preimage_extend,
-            ?full_w_block_hash_sample,
-            ?transition_w_chunk_hash_sample,
+            ?trapdoor_preimage,
+            ?final_output_preimage,
+            ?final_decoder_preimage,
+            ?lookup_bridge_preimage,
             ?bgg_public_key_sample,
             ?ring_gsw_public_key_sample,
             ?ring_gsw_encrypt_bit,
@@ -494,12 +415,10 @@ where
 
         DiamondIOBenchUnitEstimates {
             trapdoor_checkpoint,
-            trapdoor_preimage_extend,
-            final_output_preimage_extend,
-            final_decoder_preimage_extend,
-            lookup_bridge_preimage_extend,
-            full_w_block_hash_sample,
-            transition_w_chunk_hash_sample,
+            trapdoor_preimage,
+            final_output_preimage,
+            final_decoder_preimage,
+            lookup_bridge_preimage,
             bgg_public_key_sample,
             ring_gsw_public_key_sample,
             ring_gsw_encrypt_bit,
@@ -638,36 +557,15 @@ where
 
         let final_projection_standard_preimages = shape.final_projection_standard_preimage_count();
         let final_projection_decoder_preimages = shape.final_decoder_count();
-        let lookup_bridge_hash_sampling = estimate_summary(self.full_w_block_hash_sample.clone());
-        let lookup_bridge_preimage = estimate_summary(self.lookup_bridge_preimage_extend.clone());
-        let lookup_bridge_work = sequential_summaries(&[
-            lookup_bridge_hash_sampling.clone(),
-            lookup_bridge_preimage.clone(),
-        ]);
-        let final_projection_hash_sampling = scale_estimate(
-            self.full_w_block_hash_sample.clone(),
-            final_projection_standard_preimages
-                .checked_add(final_projection_decoder_preimages)
-                .expect("DiamondIO final projection hash count overflow"),
-        );
+        let lookup_bridge_work = estimate_summary(self.lookup_bridge_preimage.clone());
         let final_projection_target_building =
             shape.estimate_final_projection_target_building(self.native_estimator);
         let final_projection_preimages = parallel_summaries(&[
-            scale_estimate(
-                self.final_output_preimage_extend.clone(),
-                final_projection_standard_preimages,
-            ),
-            scale_estimate(
-                self.final_decoder_preimage_extend.clone(),
-                final_projection_decoder_preimages,
-            ),
-        ]);
-        let final_projection_inputs = parallel_summaries(&[
-            final_projection_hash_sampling.clone(),
-            final_projection_target_building.clone(),
+            scale_estimate(self.final_output_preimage.clone(), final_projection_standard_preimages),
+            scale_estimate(self.final_decoder_preimage.clone(), final_projection_decoder_preimages),
         ]);
         let final_projection_work = sequential_summaries(&[
-            final_projection_inputs.clone(),
+            final_projection_target_building.clone(),
             final_projection_preimages.clone(),
         ]);
 
@@ -712,10 +610,7 @@ where
             ?function_public_key_eval,
             final_projection_standard_preimages,
             final_projection_decoder_preimages,
-            ?lookup_bridge_hash_sampling,
-            ?lookup_bridge_preimage,
             ?lookup_bridge_work,
-            ?final_projection_hash_sampling,
             ?final_projection_target_building,
             ?final_projection_preimages,
             ?final_projection_work,
@@ -865,7 +760,7 @@ where
 
     fn estimate_input_injection<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(
         &self,
-        diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+        _diamond: &DiamondIO<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
         shape: DiamondIOBenchShape,
     ) -> DiamondIOInputInjectionBenchEstimateParts
     where
@@ -875,16 +770,13 @@ where
         HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
         TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     {
-        // Corresponds to `load_or_sample_b_checkpoint` for levels `0..=input_count`. Checkpoints
-        // do not depend on each other, so enough GPUs can sample them concurrently.
+        // Corresponds to `load_or_sample_b_checkpoint` for every level/state pair.
         let checkpoint_sampling =
-            scale_estimate(self.trapdoor_checkpoint.clone(), diamond.injector.input_count + 1);
+            scale_estimate(self.trapdoor_checkpoint.clone(), shape.checkpoint_count);
 
         // Corresponds to `build_initial_encoding`: one native product plus an error addition for
-        // the empty prefix state. The W block is deterministic hash-derived public data, so it is
-        // regenerated rather than stored, but preprocessing still pays the sampling cost.
+        // the empty prefix state.
         let initial_state = sequential_summaries(&[
-            estimate_summary(self.full_w_block_hash_sample.clone()),
             self.native_estimator
                 .estimate_vector_matrix_product(shape.state_row_size, shape.state_col_size),
             estimate_summary(self.native_estimator.estimate_vector_add(shape.state_col_size)),
@@ -893,29 +785,14 @@ where
         // Corresponds to `build_k_target_chunk_with_params` for every level/digit/state/chunk.
         // Target construction precedes the matching preimage sample, but all chunks in a stage are
         // independent.
-        let transition_ext_w_hash_sampling = scale_estimate(
-            self.full_w_block_hash_sample.clone(),
-            shape.transition_ext_w_hash_count,
-        );
-        let transition_target_w_hash_sampling = scale_estimate(
-            self.transition_w_chunk_hash_sample.clone(),
-            shape.transition_target_w_hash_chunk_count,
-        );
         let transition_target_building =
             shape.estimate_transition_target_building(self.native_estimator);
 
-        // Corresponds to the chunked `preimage_extend` calls inside `DiamondInjector::preprocess`.
-        let transition_preimages = scale_estimate(
-            self.trapdoor_preimage_extend.clone(),
-            shape.transition_preimage_chunk_count,
-        );
+        // Corresponds to the chunked `preimage` calls inside `DiamondInjector::preprocess`.
+        let transition_preimages =
+            scale_estimate(self.trapdoor_preimage.clone(), shape.transition_preimage_chunk_count);
 
-        let transition_public_hashing = parallel_summaries(&[
-            transition_ext_w_hash_sampling.clone(),
-            transition_target_w_hash_sampling.clone(),
-        ]);
         let transition_stage = sequential_summaries(&[
-            transition_public_hashing.clone(),
             transition_target_building.clone(),
             transition_preimages.clone(),
         ]);
@@ -927,8 +804,6 @@ where
         debug!(
             ?checkpoint_sampling,
             ?initial_state,
-            ?transition_ext_w_hash_sampling,
-            ?transition_target_w_hash_sampling,
             ?transition_target_building,
             ?transition_preimages,
             ?preprocess_total,
@@ -1079,18 +954,10 @@ where
             BigUint::from(shape.ring_dim) *
             BigUint::from(branch_rebase_branch_count);
         let refresh_decoder_work_per_round = match mode {
-            PrfBenchMode::PublicKeyPreprocess => sequential_summaries(&[
-                scale_estimate_biguint(
-                    self.full_w_block_hash_sample.clone(),
-                    &(&noise_refresh_decoder_count_per_round +
-                        &branch_rebase_decoder_count_per_round),
-                ),
-                scale_estimate_biguint(
-                    self.final_output_preimage_extend.clone(),
-                    &(&noise_refresh_decoder_count_per_round +
-                        &branch_rebase_decoder_count_per_round),
-                ),
-            ]),
+            PrfBenchMode::PublicKeyPreprocess => scale_estimate_biguint(
+                self.final_output_preimage.clone(),
+                &(&noise_refresh_decoder_count_per_round + &branch_rebase_decoder_count_per_round),
+            ),
             PrfBenchMode::EncodingOnline => {
                 let decoder_unit = self
                     .native_estimator
@@ -1546,12 +1413,10 @@ struct DiamondIOInputInjectionBenchEstimateParts {
 #[derive(Debug, Clone)]
 struct DiamondIOBenchUnitEstimates {
     trapdoor_checkpoint: CircuitBenchEstimate,
-    trapdoor_preimage_extend: CircuitBenchEstimate,
-    final_output_preimage_extend: CircuitBenchEstimate,
-    final_decoder_preimage_extend: CircuitBenchEstimate,
-    lookup_bridge_preimage_extend: CircuitBenchEstimate,
-    full_w_block_hash_sample: CircuitBenchEstimate,
-    transition_w_chunk_hash_sample: CircuitBenchEstimate,
+    trapdoor_preimage: CircuitBenchEstimate,
+    final_output_preimage: CircuitBenchEstimate,
+    final_decoder_preimage: CircuitBenchEstimate,
+    lookup_bridge_preimage: CircuitBenchEstimate,
     bgg_public_key_sample: CircuitBenchEstimate,
     ring_gsw_public_key_sample: CircuitBenchEstimate,
     ring_gsw_encrypt_bit: CircuitBenchEstimate,

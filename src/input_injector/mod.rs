@@ -72,17 +72,38 @@ struct DiamondInjectorMetadata {
 #[derive(Debug, Clone)]
 /// Compact in-memory data returned by Diamond preprocessing.
 ///
-/// `hash_key` identifies the hash-derived transition public matrices, while
-/// `final_trapdoor` and `final_pub_matrix` are the trapdoor pair for the final
-/// Diamond state basis. Callers use that pair to sample their own final output
-/// projection preimages.
+/// Callers use the final state-specific trapdoor public bases to sample their
+/// own final output projection preimages.
 pub struct DiamondInjectorPreprocessOut<M, T>
 where
     M: PolyMatrix,
 {
-    pub hash_key: [u8; 32],
-    pub final_trapdoor: T,
-    pub final_pub_matrix: M,
+    pub final_trapdoors: Vec<T>,
+    pub final_pub_matrices: Vec<M>,
+}
+
+impl<M, T> DiamondInjectorPreprocessOut<M, T>
+where
+    M: PolyMatrix,
+{
+    pub fn final_state_count(&self) -> usize {
+        debug_assert_eq!(
+            self.final_trapdoors.len(),
+            self.final_pub_matrices.len(),
+            "DiamondInjector final checkpoint vector length mismatch"
+        );
+        self.final_pub_matrices.len()
+    }
+
+    pub fn final_checkpoint(&self, state_idx: usize) -> (&T, &M) {
+        assert!(
+            state_idx < self.final_state_count(),
+            "DiamondInjector final state index out of range: {} >= {}",
+            state_idx,
+            self.final_state_count()
+        );
+        (&self.final_trapdoors[state_idx], &self.final_pub_matrices[state_idx])
+    }
 }
 
 impl<M, US, HS, TS> DiamondInjector<M, US, HS, TS>
@@ -175,6 +196,26 @@ where
         serde_json::from_slice(&bytes).expect("DiamondInjector metadata should decode")
     }
 
+    fn current_metadata(&self) -> DiamondInjectorMetadata {
+        DiamondInjectorMetadata {
+            input_count: self.input_count,
+            base: self.base,
+            batch_bits: self.batch_bits,
+        }
+    }
+
+    fn assert_current_metadata(&self, metadata: &DiamondInjectorMetadata) {
+        assert_eq!(
+            metadata.input_count, self.input_count,
+            "DiamondInjector metadata input count mismatch"
+        );
+        assert_eq!(metadata.base, self.base, "DiamondInjector metadata base mismatch");
+        assert_eq!(
+            metadata.batch_bits, self.batch_bits,
+            "DiamondInjector metadata batch_bits mismatch"
+        );
+    }
+
     fn write_matrix(&self, dir_path: &Path, id: &str, matrix: &M) {
         self.write_matrix_bytes(dir_path, id, &matrix.to_compact_bytes());
     }
@@ -232,8 +273,6 @@ where
 
     fn state_col_size(&self, params: &<M::P as Poly>::Params) -> usize {
         self.b_public_col_size(params)
-            .checked_add(self.gadget_col_size(params))
-            .expect("DiamondInjector state column count overflow")
     }
 
     fn chunk_id(&self, id: &str, chunk_idx: usize) -> String {
@@ -248,42 +287,24 @@ where
         format!("diamond_secret_tensor_{level}_{digit_value}")
     }
 
-    fn b_matrix_id(&self, level: usize) -> String {
-        format!("diamond_b_tensor_{level}")
+    fn b_matrix_id(&self, level: usize, state_idx: usize) -> String {
+        format!("diamond_b_tensor_{level}_{state_idx}")
     }
 
-    fn b_trapdoor_id(&self, level: usize) -> String {
-        format!("diamond_b_tensor_{level}_trapdoor")
+    fn b_trapdoor_id(&self, level: usize, state_idx: usize) -> String {
+        format!("diamond_b_tensor_{level}_{state_idx}_trapdoor")
     }
 
     fn p_epsilon_id(&self) -> &'static str {
-        "diamond_p_epsilon_tensor_0"
+        "diamond_initial_state_tensor"
     }
 
     fn k_plaintext_id(&self) -> &'static str {
         "diamond_k_plaintext"
     }
 
-    fn preprocess_hash_key_id(&self) -> &'static str {
-        "diamond_preprocess_hash_key"
-    }
-
     fn k_id(&self, level: usize, digit_value: usize, state_idx: usize) -> String {
-        format!("diamond_k_bit_tensor_{level}_{digit_value}_{state_idx}")
-    }
-
-    fn load_or_sample_preprocess_hash_key(&self, dir_path: &Path) -> [u8; 32] {
-        let id = self.preprocess_hash_key_id();
-        if self.bytes_exists(dir_path, id) {
-            let bytes = self.read_bytes(dir_path, id);
-            return bytes
-                .as_slice()
-                .try_into()
-                .unwrap_or_else(|_| panic!("DiamondInjector preprocess hash key must be 32 bytes"));
-        }
-        let hash_key = rand::random::<[u8; 32]>();
-        self.write_bytes(dir_path, id, &hash_key);
-        hash_key
+        format!("diamond_transition_tensor_{level}_{digit_value}_{state_idx}")
     }
 
     fn sample_secret_epsilon_with_params(&self, params: &<M::P as Poly>::Params) -> M {
@@ -318,7 +339,7 @@ where
         self.batch_bits
     }
 
-    fn expanded_state_count_after_level(&self, level: usize) -> usize {
+    fn state_count_at_level(&self, level: usize) -> usize {
         1usize
             .checked_add(
                 level
@@ -364,6 +385,11 @@ where
         let end =
             first.checked_add(self.batch_bits()).expect("DiamondInjector bit state index overflow");
         if (first..end).contains(&state_idx) { Some(state_idx - first) } else { None }
+    }
+
+    fn transition_source_state_idx(&self, level: usize, state_idx: usize) -> usize {
+        assert!(level > 0, "DiamondInjector transition level must be positive");
+        if self.new_bit_idx_for_state(level, state_idx).is_some() { 0 } else { state_idx }
     }
 
     pub fn digit_bit_value(&self, digit_value: usize, bit_idx: usize) -> usize {
@@ -437,19 +463,22 @@ where
     }
 
     #[cfg(not(feature = "gpu"))]
-    fn load_or_sample_b_checkpoint(&self, dir_path: &Path, level: usize) -> (TS::Trapdoor, M) {
-        // Checkpoint one trapdoor public matrix per level. Later preimage
-        // sampling uses this stored pair as the source side of a
-        // preimage_extend call, while the hashed W blocks are reconstructed on
-        // demand.
-        let matrix_id = self.b_matrix_id(level);
-        let trapdoor_id = self.b_trapdoor_id(level);
+    fn load_or_sample_b_checkpoint(
+        &self,
+        dir_path: &Path,
+        level: usize,
+        state_idx: usize,
+    ) -> (TS::Trapdoor, M) {
+        // Checkpoint one trapdoor public matrix per level/state. Later
+        // preimage sampling uses this stored pair directly.
+        let matrix_id = self.b_matrix_id(level, state_idx);
+        let trapdoor_id = self.b_trapdoor_id(level, state_idx);
         if self.matrix_exists(dir_path, &matrix_id) && self.bytes_exists(dir_path, &trapdoor_id) {
             let trapdoor =
                 TS::trapdoor_from_bytes(&self.params, &self.read_bytes(dir_path, &trapdoor_id))
                     .unwrap_or_else(|| {
                         panic!(
-                            "DiamondInjector failed to decode trapdoor checkpoint for level {level}"
+                            "DiamondInjector failed to decode trapdoor checkpoint for level {level}, state {state_idx}"
                         )
                     });
             let matrix = self.read_matrix(dir_path, &matrix_id);
@@ -468,9 +497,10 @@ where
         &self,
         dir_path: &Path,
         level: usize,
+        state_idx: usize,
     ) -> (Vec<u8>, Vec<u8>) {
-        let matrix_id = self.b_matrix_id(level);
-        let trapdoor_id = self.b_trapdoor_id(level);
+        let matrix_id = self.b_matrix_id(level, state_idx);
+        let trapdoor_id = self.b_trapdoor_id(level, state_idx);
         if self.matrix_exists(dir_path, &matrix_id) && self.bytes_exists(dir_path, &trapdoor_id) {
             return (
                 self.read_matrix_bytes(dir_path, &matrix_id),
@@ -487,87 +517,21 @@ where
         (matrix_bytes, trapdoor_bytes)
     }
 
-    fn sample_w_block_with_params(
-        &self,
-        params: &<M::P as Poly>::Params,
-        hash_key: [u8; 32],
-        block_idx: usize,
-        level: usize,
-    ) -> M {
-        // Reconstruct one deterministic hashed extension block W_{block_idx,
-        // level}. This keeps preprocessing storage focused on preimages rather
-        // than on the hash-derived public side.
-        HS::new().sample_hash(
-            params,
-            hash_key,
-            format!("diamond_w_{block_idx}_{level}"),
-            self.state_row_size(),
-            self.gadget_col_size(params),
-            DistType::FinRingDist,
-        )
-    }
-
-    fn sample_w_block_columns_with_params(
-        &self,
-        params: &<M::P as Poly>::Params,
-        hash_key: [u8; 32],
-        block_idx: usize,
-        level: usize,
-        col_start: usize,
-        col_len: usize,
-    ) -> M {
-        HS::new().sample_hash_columns(
-            params,
-            hash_key,
-            format!("diamond_w_{block_idx}_{level}"),
-            self.state_row_size(),
-            self.gadget_col_size(params),
-            col_start,
-            col_len,
-            DistType::FinRingDist,
-        )
-    }
-
     fn state_public_chunk_with_params(
         &self,
         params: &<M::P as Poly>::Params,
-        hash_key: [u8; 32],
         b_matrix: &M,
-        block_idx: usize,
-        level: usize,
         chunk_idx: usize,
     ) -> M {
-        // Materialize a column slice of the effective public matrix
-        // (B_level | W_{block_idx, level}). Transition matrices, one-outputs,
-        // bit-outputs, and decoder outputs are all sampled against this
-        // concatenated view.
         let total_cols = self.state_col_size(params);
-        let b_cols = self.b_public_col_size(params);
         let (col_start, col_len) = column_chunk_bounds(total_cols, chunk_idx);
         let col_end = col_start + col_len;
-        if col_end <= b_cols {
-            return b_matrix.slice_columns(col_start, col_end);
-        }
-        if col_start >= b_cols {
-            return self.sample_w_block_columns_with_params(
-                params,
-                hash_key,
-                block_idx,
-                level,
-                col_start - b_cols,
-                col_len,
-            );
-        }
-        let b_chunk = b_matrix.slice_columns(col_start, b_cols);
-        let w_chunk = self.sample_w_block_columns_with_params(
-            params,
-            hash_key,
-            block_idx,
-            level,
-            0,
-            col_end - b_cols,
+        debug_assert_eq!(
+            b_matrix.col_size(),
+            total_cols,
+            "DiamondInjector B matrix column count must equal state_col_size"
         );
-        b_chunk.concat_columns(&[&w_chunk])
+        b_matrix.slice_columns(col_start, col_end)
     }
 
     fn transition_selector_with_params(
@@ -609,19 +573,12 @@ where
         top.concat_rows(&[&bottom])
     }
 
-    fn build_initial_encoding(
-        &self,
-        hash_key: [u8; 32],
-        b0_matrix: &M,
-        secret_epsilon: &M,
-        k: &M::P,
-    ) -> M {
+    fn build_initial_encoding(&self, b0_matrix: &M, secret_epsilon: &M, k: &M::P) -> M {
         // Build the state that represents the empty input prefix. It is the
         // only online-evaluation seed that exists before any digit is chosen.
         let selector =
             M::from_poly_vec_row(&self.params, vec![secret_epsilon.entry(0, 0), k.clone()]);
-        let w00 = self.sample_w_block_with_params(&self.params, hash_key, 0, 0);
-        let mut p_epsilon = selector * b0_matrix.concat_columns(&[&w00]);
+        let mut p_epsilon = selector * b0_matrix;
         p_epsilon.add_in_place(&self.sample_error_matrix_with_dims(
             &self.params,
             1,
@@ -633,7 +590,6 @@ where
     fn build_k_target_chunk_with_params(
         &self,
         params: &<M::P as Poly>::Params,
-        hash_key: [u8; 32],
         level: usize,
         digit_value: usize,
         state_idx: usize,
@@ -645,9 +601,7 @@ where
         // transition matrix. Existing branches use the identity-style selector,
         // while each newly born branch for the current digit uses the special
         // selector above so one chosen bit is embedded into that path.
-        let public_chunk = self.state_public_chunk_with_params(
-            params, hash_key, b_matrix, state_idx, level, chunk_idx,
-        );
+        let public_chunk = self.state_public_chunk_with_params(params, b_matrix, chunk_idx);
         let selector = if let Some(bit_idx) = self.new_bit_idx_for_state(level, state_idx) {
             let bit_value = self.digit_bit_value(digit_value, bit_idx);
             self.special_transition_selector_with_params(params, bit_value, secret_mask)
@@ -726,42 +680,47 @@ where
     type State = M;
 
     fn preprocess(&self, dir_path: &Path, k: &M::P) -> Self::PreprocessOut {
-        let hash_key = self.load_or_sample_preprocess_hash_key(dir_path);
         #[cfg(feature = "gpu")]
         {
-            self.preprocess_gpu(dir_path, hash_key, k);
-            let (final_pub_matrix_bytes, final_trapdoor_bytes) =
-                self.load_or_sample_b_checkpoint_bytes(dir_path, self.input_count);
-            return DiamondInjectorPreprocessOut {
-                hash_key,
-                final_trapdoor: TS::trapdoor_from_bytes(&self.params, &final_trapdoor_bytes)
-                    .expect("DiamondInjector final trapdoor checkpoint must decode"),
-                final_pub_matrix: M::from_compact_bytes(&self.params, &final_pub_matrix_bytes),
-            };
+            self.preprocess_gpu(dir_path, k);
+            let mut final_trapdoors =
+                Vec::with_capacity(self.state_count_at_level(self.input_count));
+            let mut final_pub_matrices =
+                Vec::with_capacity(self.state_count_at_level(self.input_count));
+            for state_idx in 0..self.state_count_at_level(self.input_count) {
+                let (final_pub_matrix_bytes, final_trapdoor_bytes) =
+                    self.load_or_sample_b_checkpoint_bytes(dir_path, self.input_count, state_idx);
+                final_trapdoors.push(
+                    TS::trapdoor_from_bytes(&self.params, &final_trapdoor_bytes)
+                        .expect("DiamondInjector final trapdoor checkpoint must decode"),
+                );
+                final_pub_matrices
+                    .push(M::from_compact_bytes(&self.params, &final_pub_matrix_bytes));
+            }
+            return DiamondInjectorPreprocessOut { final_trapdoors, final_pub_matrices };
         }
 
         #[cfg(not(feature = "gpu"))]
         {
             self.ensure_dir(dir_path);
-            self.write_metadata(
-                dir_path,
-                &DiamondInjectorMetadata {
-                    input_count: self.input_count,
-                    base: self.base,
-                    batch_bits: self.batch_bits,
-                },
-            );
+            self.write_metadata(dir_path, &self.current_metadata());
             self.write_bytes(dir_path, self.k_plaintext_id(), &k.to_compact_bytes());
 
             let trap_sampler = TS::new(&self.params, self.trapdoor_sigma);
             let mut b_checkpoints = Vec::with_capacity(self.input_count + 1);
             let mut trapdoors = Vec::with_capacity(self.input_count + 1);
-            // Load or sample the per-level trapdoor checkpoints that all later
-            // preimage samplers will reference.
             for level in 0..=self.input_count {
-                let (trapdoor, b_matrix) = self.load_or_sample_b_checkpoint(dir_path, level);
-                trapdoors.push(trapdoor);
-                b_checkpoints.push(b_matrix);
+                let state_count = self.state_count_at_level(level);
+                let mut level_b = Vec::with_capacity(state_count);
+                let mut level_t = Vec::with_capacity(state_count);
+                for state_idx in 0..state_count {
+                    let (trapdoor, b_matrix) =
+                        self.load_or_sample_b_checkpoint(dir_path, level, state_idx);
+                    level_t.push(trapdoor);
+                    level_b.push(b_matrix);
+                }
+                trapdoors.push(level_t);
+                b_checkpoints.push(level_b);
             }
 
             // Sample the empty-prefix seed once and persist it if it does not
@@ -772,7 +731,7 @@ where
                 self.write_matrix(
                     dir_path,
                     self.p_epsilon_id(),
-                    &self.build_initial_encoding(hash_key, &b_checkpoints[0], &secret_epsilon, k),
+                    &self.build_initial_encoding(&b_checkpoints[0][0], &secret_epsilon, k),
                 );
             }
 
@@ -788,23 +747,12 @@ where
                         dir_path,
                         &self.digit_secret_id(level, digit_value),
                     );
-                    let prev_ext_w0 =
-                        self.sample_w_block_with_params(&self.params, hash_key, 0, level - 1);
-                    for state_idx in 0..self.expanded_state_count_after_level(level) {
+                    for state_idx in 0..self.state_count_at_level(level) {
                         let k_id = self.k_id(level, digit_value, state_idx);
                         if self.has_all_chunks(dir_path, &k_id, state_cols) {
                             continue;
                         }
-                        let ext_matrix = if self.new_bit_idx_for_state(level, state_idx).is_some() {
-                            &prev_ext_w0
-                        } else {
-                            &self.sample_w_block_with_params(
-                                &self.params,
-                                hash_key,
-                                state_idx,
-                                level - 1,
-                            )
-                        };
+                        let source_state_idx = self.transition_source_state_idx(level, state_idx);
                         for chunk_idx in 0..column_chunk_count(state_cols) {
                             let chunk_id = self.chunk_id(&k_id, chunk_idx);
                             if self.matrix_exists(dir_path, &chunk_id) {
@@ -812,19 +760,17 @@ where
                             }
                             let target_chunk = self.build_k_target_chunk_with_params(
                                 &self.params,
-                                hash_key,
                                 level,
                                 digit_value,
                                 state_idx,
                                 &secret_mask,
-                                &b_checkpoints[level],
+                                &b_checkpoints[level][state_idx],
                                 chunk_idx,
                             );
-                            let k_chunk = trap_sampler.preimage_extend(
+                            let k_chunk = trap_sampler.preimage(
                                 &self.params,
-                                &trapdoors[level - 1],
-                                &b_checkpoints[level - 1],
-                                ext_matrix,
+                                &trapdoors[level - 1][source_state_idx],
+                                &b_checkpoints[level - 1][source_state_idx],
                                 &target_chunk,
                             );
                             self.write_matrix(dir_path, &chunk_id, &k_chunk);
@@ -833,13 +779,12 @@ where
                 }
             }
             DiamondInjectorPreprocessOut {
-                hash_key,
-                final_trapdoor: trapdoors
+                final_trapdoors: trapdoors
                     .pop()
-                    .expect("DiamondInjector must keep final trapdoor checkpoint"),
-                final_pub_matrix: b_checkpoints
+                    .expect("DiamondInjector must keep final trapdoor checkpoints"),
+                final_pub_matrices: b_checkpoints
                     .pop()
-                    .expect("DiamondInjector must keep final public matrix checkpoint"),
+                    .expect("DiamondInjector must keep final public matrix checkpoints"),
             }
         }
     }
@@ -859,20 +804,12 @@ where
         {
             self.validate_digits(input_digits);
             assert_eq!(
-                self.read_bytes(dir_path, self.preprocess_hash_key_id()).as_slice(),
-                &preprocess_out.hash_key,
-                "DiamondInjector online_eval preprocess hash key mismatch"
+                preprocess_out.final_state_count(),
+                self.state_count_at_level(self.input_count),
+                "DiamondInjector final checkpoint count mismatch"
             );
             let metadata = self.read_metadata(dir_path);
-            assert_eq!(
-                metadata.input_count, self.input_count,
-                "DiamondInjector metadata input count mismatch"
-            );
-            assert_eq!(metadata.base, self.base, "DiamondInjector metadata base mismatch");
-            assert_eq!(
-                metadata.batch_bits, self.batch_bits,
-                "DiamondInjector metadata batch_bits mismatch"
-            );
+            self.assert_current_metadata(&metadata);
 
             // Start from the persisted empty-prefix seed.
             let mut states = vec![self.read_matrix(dir_path, self.p_epsilon_id())];
@@ -881,12 +818,11 @@ where
                 let level = digit_idx + 1;
                 let prev_states = std::mem::take(&mut states);
                 let prev_p0 = prev_states[0].clone();
-                let mut next_states =
-                    Vec::with_capacity(self.expanded_state_count_after_level(level));
+                let mut next_states = Vec::with_capacity(self.state_count_at_level(level));
                 // Advance every currently alive branch through the transition
                 // matrix for the chosen digit, and spawn the new branch that
                 // records each bit of the current digit.
-                for state_idx in 0..self.expanded_state_count_after_level(level) {
+                for state_idx in 0..self.state_count_at_level(level) {
                     let lhs = if self.new_bit_idx_for_state(level, state_idx).is_some() {
                         prev_p0.clone()
                     } else {
@@ -965,9 +901,7 @@ mod tests {
             assert_eq!(secret_mask.size(), (DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE));
             secret_matrix = secret_matrix * secret_mask;
         }
-        let base_public_matrix =
-            preprocess_out.final_pub_matrix.concat_columns(&[&injector
-                .sample_w_block_with_params(&params, preprocess_out.hash_key, 0, input_count)]);
+        let base_public_matrix = preprocess_out.final_pub_matrices[0].clone();
         let base_selector =
             DCRTPolyMatrix::from_poly_vec_row(&params, vec![secret_matrix.entry(0, 0), k.clone()]);
         assert_eq!(states[0], base_selector * base_public_matrix);
@@ -977,14 +911,7 @@ mod tests {
                 let state_idx = injector.bit_state_idx(digit_idx, bit_idx);
                 let bit_value = ((digits[digit_idx] as usize) >> bit_idx) & 1;
                 let bit_plaintext = TestPoly::from_usize_to_constant(&params, bit_value);
-                let bit_public_matrix =
-                    preprocess_out.final_pub_matrix.concat_columns(&[&injector
-                        .sample_w_block_with_params(
-                            &params,
-                            preprocess_out.hash_key,
-                            state_idx,
-                            input_count,
-                        )]);
+                let bit_public_matrix = preprocess_out.final_pub_matrices[state_idx].clone();
                 let bit_selector = DCRTPolyMatrix::from_poly_vec_row(
                     &params,
                     vec![secret_matrix.entry(0, 0), secret_matrix.entry(0, 0) * &bit_plaintext],

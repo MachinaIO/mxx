@@ -180,24 +180,6 @@ where
         "we_enc_lookup_base_preimage"
     }
 
-    fn sample_w_block(
-        &self,
-        preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
-        block_idx: usize,
-        cols: usize,
-    ) -> M {
-        HS::new().sample_hash(
-            &self.injector.params,
-            preprocess_out.hash_key,
-            format!("diamond_w_{}_{}", block_idx, self.injector.input_count),
-            2usize
-                .checked_mul(DIAMOND_SECRET_SIZE)
-                .expect("DiamondWE final state row count overflow"),
-            cols,
-            DistType::FinRingDist,
-        )
-    }
-
     fn sample_bgg_public_keys(
         &self,
         hash_key: [u8; 32],
@@ -226,7 +208,7 @@ where
     fn sample_output_preimage(
         &self,
         preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
-        block_idx: usize,
+        state_idx: usize,
         pubkey: &BggPublicKey<M>,
         top_gadget_plaintext: Option<&M::P>,
         bottom_gadget_plaintext: Option<&M::P>,
@@ -245,11 +227,11 @@ where
             bottom = bottom - &(gadget * plaintext);
         }
         let target = top.concat_rows(&[&bottom]);
-        TS::new(params, self.injector.trapdoor_sigma).preimage_extend(
+        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(state_idx);
+        TS::new(params, self.injector.trapdoor_sigma).preimage(
             params,
-            &preprocess_out.final_trapdoor,
-            &preprocess_out.final_pub_matrix,
-            &self.sample_w_block(preprocess_out, block_idx, cols),
+            trapdoor,
+            public_matrix,
             &target,
         )
     }
@@ -267,14 +249,11 @@ where
         );
         let identity = M::identity(params, DIAMOND_SECRET_SIZE, None);
         let target = k_pubkey.matrix.concat_rows(&[&identity]);
-        let ext_cols = DIAMOND_SECRET_SIZE
-            .checked_mul(params.modulus_digits())
-            .expect("DiamondWE final W block column count overflow");
-        TS::new(params, self.injector.trapdoor_sigma).preimage_extend(
+        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(0);
+        TS::new(params, self.injector.trapdoor_sigma).preimage(
             params,
-            &preprocess_out.final_trapdoor,
-            &preprocess_out.final_pub_matrix,
-            &self.sample_w_block(preprocess_out, 0, ext_cols),
+            trapdoor,
+            public_matrix,
             &target,
         )
     }
@@ -287,14 +266,11 @@ where
         let params = &self.injector.params;
         let bottom = M::zero(params, DIAMOND_SECRET_SIZE, dec_pubkey_matrix.col_size());
         let target = dec_pubkey_matrix.concat_rows(&[&bottom]);
-        let ext_cols = DIAMOND_SECRET_SIZE
-            .checked_mul(params.modulus_digits())
-            .expect("DiamondWE final W block column count overflow");
-        TS::new(params, self.injector.trapdoor_sigma).preimage_extend(
+        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(0);
+        TS::new(params, self.injector.trapdoor_sigma).preimage(
             params,
-            &preprocess_out.final_trapdoor,
-            &preprocess_out.final_pub_matrix,
-            &self.sample_w_block(preprocess_out, 0, ext_cols),
+            trapdoor,
+            public_matrix,
             &target,
         )
     }
@@ -312,11 +288,11 @@ where
         let params = &self.injector.params;
         let lookup_bottom = M::zero(params, DIAMOND_SECRET_SIZE, lookup_base_matrix.col_size());
         let target = lookup_base_matrix.concat_rows(&[&lookup_bottom]);
-        TS::new(params, self.injector.trapdoor_sigma).preimage_extend(
+        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(0);
+        TS::new(params, self.injector.trapdoor_sigma).preimage(
             params,
-            &preprocess_out.final_trapdoor,
-            &preprocess_out.final_pub_matrix,
-            &self.sample_w_block(preprocess_out, 0, target.col_size()),
+            trapdoor,
+            public_matrix,
             &target,
         )
     }

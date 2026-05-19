@@ -14,7 +14,6 @@ use mxx::{
         },
     },
     sampler::{
-        DistType, PolyHashSampler,
         gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
         trapdoor::GpuDCRTPolyTrapdoorSampler,
     },
@@ -41,7 +40,6 @@ type TestInjector = DiamondInjector<
     GpuDCRTPolyTrapdoorSampler,
 >;
 
-const DIAMOND_INJECTOR_SECRET_SIZE: usize = 1;
 const DIAMOND_INJECTOR_TRAPDOOR_SIGMA: f64 = 4.578;
 const DIAMOND_INJECTOR_ERROR_SIGMA: f64 = 4.578;
 const DEFAULT_RING_DIM: u32 = 1u32 << 16;
@@ -107,22 +105,6 @@ fn gpu_params_for_crt_depth(
         cpu_params.base_bits(),
         vec![gpu_ids[0]],
         Some(1),
-    )
-}
-
-fn sample_final_w_block(
-    params: &GpuDCRTPolyParams,
-    hash_key: [u8; 32],
-    block_idx: usize,
-    input_count: usize,
-) -> GpuDCRTPolyMatrix {
-    GpuDCRTPolyHashSampler::<Keccak256>::new().sample_hash(
-        params,
-        hash_key,
-        format!("diamond_w_{block_idx}_{input_count}"),
-        2 * DIAMOND_INJECTOR_SECRET_SIZE,
-        DIAMOND_INJECTOR_SECRET_SIZE * params.modulus_digits(),
-        DistType::FinRingDist,
     )
 }
 
@@ -277,9 +259,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
     );
 
     let secret_product = reconstruct_secret_product(&params, dir.path(), &input_digits);
-    let base_public_matrix = preprocess_out
-        .final_pub_matrix
-        .concat_columns(&[&sample_final_w_block(&params, preprocess_out.hash_key, 0, input_count)]);
+    let base_public_matrix = preprocess_out.final_pub_matrices[0].clone();
     let base_selector =
         GpuDCRTPolyMatrix::from_poly_vec_row(&params, vec![secret_product.entry(0, 0), k]);
     assert_state_residual_below_bound(
@@ -300,13 +280,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
                 &params,
                 vec![secret_product.entry(0, 0), secret_product.entry(0, 0) * &bit_plaintext],
             );
-            let bit_public_matrix =
-                preprocess_out.final_pub_matrix.concat_columns(&[&sample_final_w_block(
-                    &params,
-                    preprocess_out.hash_key,
-                    state_idx,
-                    input_count,
-                )]);
+            let bit_public_matrix = preprocess_out.final_pub_matrices[state_idx].clone();
             assert_state_residual_below_bound(
                 &format!("bit_state_{state_idx}"),
                 &params,

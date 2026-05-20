@@ -73,8 +73,8 @@ pub struct Aky24IO<
     pub output_size: usize,
     /// Number of private PRF seed bits encrypted into Ring-GSW ciphertexts.
     pub seed_bits: usize,
-    /// Number of public PRF seed bits, hence PRF seed-refresh rounds.
-    pub public_prf_seed_bits: usize,
+    /// Number of input bits processed by one seed-refresh round.
+    pub prf_batch_bits: usize,
     /// Number of bit-decomposed PRF mask output coefficients to compute.
     pub prf_mask_output_coeff_bits: usize,
     /// Number of low bits retained in the noise-refresh rounding material.
@@ -113,7 +113,7 @@ where
         input_size: usize,
         output_size: usize,
         seed_bits: usize,
-        public_prf_seed_bits: usize,
+        prf_batch_bits: usize,
         prf_mask_output_coeff_bits: usize,
         noise_refresh_v_bits: usize,
         noise_refresh_cbd_n: usize,
@@ -127,7 +127,16 @@ where
         assert!(input_size > 0, "AKY24IO input_size must be positive");
         assert!(output_size > 0, "AKY24IO output_size must be positive");
         assert!(seed_bits > 0, "AKY24IO seed_bits must be positive");
-        assert!(public_prf_seed_bits > 0, "AKY24IO public_prf_seed_bits must be positive");
+        assert!(prf_batch_bits > 0, "AKY24IO prf_batch_bits must be positive");
+        assert!(
+            prf_batch_bits < usize::BITS as usize,
+            "AKY24IO prf_batch_bits must fit in a usize branch count"
+        );
+        assert_eq!(
+            input_size % prf_batch_bits,
+            0,
+            "AKY24IO input_size must be divisible by prf_batch_bits"
+        );
         assert!(
             prf_mask_output_coeff_bits > 0,
             "AKY24IO prf_mask_output_coeff_bits must be positive"
@@ -146,7 +155,7 @@ where
             input_size,
             output_size,
             seed_bits,
-            public_prf_seed_bits,
+            prf_batch_bits,
             prf_mask_output_coeff_bits,
             noise_refresh_v_bits,
             noise_refresh_cbd_n,
@@ -160,7 +169,15 @@ where
         }
     }
 
+    pub(crate) fn prf_round_count(&self) -> usize {
+        self.input_size / self.prf_batch_bits
+    }
+
+    pub(crate) fn prf_branch_count(&self) -> usize {
+        1usize.checked_shl(self.prf_batch_bits as u32).expect("AKY24IO PRF branch count overflow")
+    }
+
     pub(crate) fn prf_final_round_idx(&self) -> usize {
-        self.public_prf_seed_bits
+        self.prf_round_count()
     }
 }

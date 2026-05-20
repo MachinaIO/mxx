@@ -42,6 +42,18 @@ pub struct Aky24IOBenchEstimate {
     pub eval: CircuitBenchSummary,
     /// Compact bytes for persisted obfuscated-circuit material modeled by this estimator.
     pub obfuscated_circuit_bytes: BigUint,
+    /// Obfuscation contribution from Section 3.2 FE-to-iO cascade layers.
+    pub fe_to_io_obfuscate: CircuitBenchSummary,
+    /// Obfuscation contribution from the final FE layer.
+    pub final_fe_obfuscate: CircuitBenchSummary,
+    /// Online evaluation contribution from Section 3.2 FE-to-iO cascade layers.
+    pub fe_to_io_eval: CircuitBenchSummary,
+    /// Online evaluation contribution from the final FE layer.
+    pub final_fe_eval: CircuitBenchSummary,
+    /// Obfuscation total-time contribution from Section 3.2 FE-to-iO cascade layers.
+    pub fe_to_io_obfuscate_total_time: BigUint,
+    /// Obfuscation total-time contribution from the final FE layer.
+    pub final_fe_obfuscate_total_time: BigUint,
     /// Online evaluation total-time contribution from Section 3.2 FE-to-iO cascade layers.
     pub fe_to_io_eval_total_time: BigUint,
     /// Online evaluation total-time contribution from the final FE layer.
@@ -67,16 +79,28 @@ impl Aky24IOBenchEstimate {
         let eval_parts = layers.iter().map(|layer| layer.eval.clone()).collect::<Vec<_>>();
         let obfuscated_circuit_bytes =
             layers.iter().map(|layer| layer.obfuscated_circuit_bytes.clone()).sum::<BigUint>();
-        let fe_to_io_eval_total_time =
-            fe_to_io.iter().map(|layer| layer.eval.total_time.clone()).sum::<BigUint>();
+        let fe_to_io_obfuscate_parts =
+            fe_to_io.iter().map(|layer| layer.obfuscate.clone()).collect::<Vec<_>>();
+        let fe_to_io_eval_parts =
+            fe_to_io.iter().map(|layer| layer.eval.clone()).collect::<Vec<_>>();
+        let fe_to_io_obfuscate = sequential_summaries(&fe_to_io_obfuscate_parts);
+        let final_fe_obfuscate = final_fe.obfuscate.clone();
+        let fe_to_io_eval = sequential_summaries(&fe_to_io_eval_parts);
+        let final_fe_eval = final_fe.eval.clone();
         let fe_to_io_obfuscated_circuit_bytes =
             fe_to_io.iter().map(|layer| layer.obfuscated_circuit_bytes.clone()).sum::<BigUint>();
         Self {
             obfuscate: sequential_summaries(&obfuscate_parts),
             eval: sequential_summaries(&eval_parts),
             obfuscated_circuit_bytes,
-            fe_to_io_eval_total_time,
-            final_fe_eval_total_time: final_fe.eval.total_time,
+            fe_to_io_obfuscate_total_time: fe_to_io_obfuscate.total_time.clone(),
+            final_fe_obfuscate_total_time: final_fe_obfuscate.total_time.clone(),
+            fe_to_io_eval_total_time: fe_to_io_eval.total_time.clone(),
+            final_fe_eval_total_time: final_fe_eval.total_time.clone(),
+            fe_to_io_obfuscate,
+            final_fe_obfuscate,
+            fe_to_io_eval,
+            final_fe_eval,
             fe_to_io_obfuscated_circuit_bytes,
             final_fe_obfuscated_circuit_bytes: final_fe.obfuscated_circuit_bytes,
         }
@@ -154,8 +178,9 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
     {
         let final_shape =
             Aky24IOBenchShape::from_scheme(scheme, scheme.input_size, func.output_bits());
-        let final_fe = self.estimate_layer(scheme, &final_shape);
-        let mut fe_to_io = Vec::with_capacity(final_shape.input_size.saturating_sub(1));
+        let prf_units = self.estimate_prf_bench_units(scheme);
+        let final_fe = self.estimate_layer(scheme, &final_shape, &prf_units);
+        let mut fe_to_io = Vec::with_capacity(final_shape.prf_round_count.saturating_sub(1));
         for stage_input_count in final_shape.cascade_stage_input_counts() {
             let stage_shape = Aky24IOBenchShape::from_scheme(
                 scheme,
@@ -167,15 +192,77 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
                     final_shape.modulus_digits,
                 ),
             );
-            fe_to_io.push(self.estimate_layer(scheme, &stage_shape));
+            fe_to_io.push(self.estimate_layer(scheme, &stage_shape, &prf_units));
         }
         Aky24IOBenchEstimate::sequential(final_fe, fe_to_io)
+    }
+
+    fn estimate_prf_bench_units<M, PKPE, PKST, ENCPE, ENCST>(
+        &self,
+        scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
+    ) -> Aky24IOPrfBenchUnits
+    where
+        M: PolyMatrix + Send + Sync + 'static,
+        M::P: 'static,
+        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
+        PKBE: PublicKeyAuxBenchEstimator<M::P>,
+        EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
+        NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
+    {
+        let prg_circuit = build_representative_goldreich_prg_one_output_circuit(scheme);
+        let prf_mask_decrypt_circuit = prf_mask_decrypt_one_ciphertext_bit_circuit(scheme);
+        let prg_aux = self
+            .public_key_estimator
+            .estimate_public_lut_sample_aux_matrices_for_circuit(&scheme.params, &prg_circuit);
+        let scalar_one = vec![BigUint::from(1u32); scheme.params.ring_dimension() as usize];
+        let scalar_target = [BigUint::from(1u32)];
+        let pk_seed_lift_unit = self.public_key_estimator.estimate_large_scalar_mul(&scalar_one);
+        let enc_seed_lift_unit = self.encoding_estimator.estimate_large_scalar_mul(&scalar_one);
+        let pk_noise_refresh_matrix_mul =
+            self.public_key_estimator.estimate_large_scalar_mul(&scalar_target);
+        let enc_noise_refresh_matrix_mul =
+            self.encoding_estimator.estimate_large_scalar_mul(&scalar_target);
+        Aky24IOPrfBenchUnits {
+            public_key_preprocess: Aky24IOPrfBenchModeUnits {
+                final_mask_decrypt_unit: estimate_public_key_circuit_bench_with_aux::<
+                    NaiveBGGPublicKeyVec<M>,
+                    PKBE,
+                >(
+                    self.public_key_estimator,
+                    &scheme.params,
+                    &prf_mask_decrypt_circuit,
+                ),
+                prg_unit: estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
+                    self.public_key_estimator,
+                    &scheme.params,
+                    &prg_circuit,
+                ),
+                add: self.public_key_estimator.estimate_add(),
+                sub: self.public_key_estimator.estimate_sub(),
+                mul: self.public_key_estimator.estimate_mul(),
+                seed_lift_unit: pk_seed_lift_unit,
+                noise_refresh_matrix_mul_unit: pk_noise_refresh_matrix_mul,
+            },
+            encoding_online: Aky24IOPrfBenchModeUnits {
+                final_mask_decrypt_unit: self
+                    .encoding_estimator
+                    .estimate_circuit_bench(&prf_mask_decrypt_circuit),
+                prg_unit: self.encoding_estimator.estimate_circuit_bench(&prg_circuit),
+                add: self.encoding_estimator.estimate_add(),
+                sub: self.encoding_estimator.estimate_sub(),
+                mul: self.encoding_estimator.estimate_mul(),
+                seed_lift_unit: enc_seed_lift_unit,
+                noise_refresh_matrix_mul_unit: enc_noise_refresh_matrix_mul,
+            },
+            public_lut_prg_aux_compact_bytes: prg_aux.compact_bytes,
+        }
     }
 
     fn estimate_layer<M, PKPE, PKST, ENCPE, ENCST>(
         &self,
         scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
         shape: &Aky24IOBenchShape,
+        prf_units: &Aky24IOPrfBenchUnits,
     ) -> Aky24IOBenchLayerEstimate
     where
         M: PolyMatrix + Send + Sync + 'static,
@@ -186,9 +273,12 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         NBE: DiamondIONativeBenchEstimator,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
-        let obfuscate = self.estimate_obfuscate(scheme, shape);
-        let eval = self.estimate_eval(scheme, shape);
-        let public_lut_aux_bytes = self.estimate_public_lut_aux_storage_bytes(scheme, shape);
+        let obfuscate = self.estimate_obfuscate(scheme, shape, &prf_units.public_key_preprocess);
+        let eval = self.estimate_eval(scheme, shape, &prf_units.encoding_online);
+        let public_lut_aux_bytes = self.estimate_public_lut_aux_storage_bytes(
+            shape,
+            &prf_units.public_lut_prg_aux_compact_bytes,
+        );
         Aky24IOBenchLayerEstimate {
             obfuscate,
             eval,
@@ -200,6 +290,7 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         &self,
         scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
         shape: &Aky24IOBenchShape,
+        prf_units: &Aky24IOPrfBenchModeUnits,
     ) -> CircuitBenchSummary
     where
         M: PolyMatrix + Send + Sync + 'static,
@@ -210,7 +301,6 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         NBE: DiamondIONativeBenchEstimator,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
-        let scalar_one = vec![BigUint::from(1u32); shape.ring_dim];
         let bgg_public_keys = scale_estimate(
             self.bgg_public_key_sample.clone(),
             shape.input_size.checked_add(2).expect("AKY24IO public-key count overflow"),
@@ -219,7 +309,7 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
             estimate_summary(self.ring_gsw_public_key_sample.clone());
         let seed_encrypt = scale_estimate(self.ring_gsw_encrypt_bit.clone(), shape.seed_bits);
         let seed_lift = scale_estimate(
-            self.public_key_estimator.estimate_large_scalar_mul(scalar_one.as_slice()),
+            prf_units.seed_lift_unit.clone(),
             shape
                 .seed_bits
                 .checked_mul(shape.ring_gsw_wire_count)
@@ -231,6 +321,7 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
             scheme,
             shape,
             PrfBenchMode::PublicKeyPreprocess,
+            prf_units,
         );
         let final_projection = self.estimate_final_projection_preprocess(shape);
         sequential_summaries(&[
@@ -245,6 +336,7 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         &self,
         _scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
         shape: &Aky24IOBenchShape,
+        prf_units: &Aky24IOPrfBenchModeUnits,
     ) -> CircuitBenchSummary
     where
         M: PolyMatrix + Send + Sync + 'static,
@@ -254,14 +346,13 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
         NBE: DiamondIONativeBenchEstimator,
     {
-        let scalar_one = vec![BigUint::from(1u32); shape.ring_dim];
         let input_projection = scale_summary(
             self.native_estimator
                 .estimate_vector_matrix_product(shape.state_col_size, shape.modulus_digits),
             shape.input_size.checked_add(2).expect("AKY24IO input projection count overflow"),
         );
         let seed_lift = scale_estimate(
-            self.encoding_estimator.estimate_large_scalar_mul(scalar_one.as_slice()),
+            prf_units.seed_lift_unit.clone(),
             shape
                 .seed_bits
                 .checked_mul(shape.ring_gsw_wire_count)
@@ -271,6 +362,7 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
             _scheme,
             shape,
             PrfBenchMode::EncodingOnline,
+            prf_units,
         );
         let decoder_projection = scale_summary(
             self.native_estimator.estimate_vector_matrix_product(shape.state_col_size, 1),
@@ -295,9 +387,10 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
 
     fn estimate_prf_path<M, PKPE, PKST, ENCPE, ENCST>(
         &self,
-        scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
+        _scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
         shape: &Aky24IOBenchShape,
         mode: PrfBenchMode,
+        units: &Aky24IOPrfBenchModeUnits,
     ) -> Aky24IOPrfBenchEstimateParts
     where
         M: PolyMatrix + Send + Sync + 'static,
@@ -308,35 +401,11 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         NBE: DiamondIONativeBenchEstimator,
         NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
     {
-        let final_mask_decrypt_unit = self
-            .estimate_prf_mask_decrypt_one_ciphertext_bit_unit::<M, PKPE, PKST, ENCPE, ENCST>(
-                scheme, mode,
-            );
-        let prg_circuit = build_representative_goldreich_prg_one_output_circuit(scheme);
-        let prg_unit = match mode {
-            PrfBenchMode::PublicKeyPreprocess => {
-                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
-                    self.public_key_estimator,
-                    &scheme.params,
-                    &prg_circuit,
-                )
-            }
-            PrfBenchMode::EncodingOnline => {
-                self.encoding_estimator.estimate_circuit_bench(&prg_circuit)
-            }
-        };
-        let (add, sub, mul) = match mode {
-            PrfBenchMode::PublicKeyPreprocess => (
-                self.public_key_estimator.estimate_add(),
-                self.public_key_estimator.estimate_sub(),
-                self.public_key_estimator.estimate_mul(),
-            ),
-            PrfBenchMode::EncodingOnline => (
-                self.encoding_estimator.estimate_add(),
-                self.encoding_estimator.estimate_sub(),
-                self.encoding_estimator.estimate_mul(),
-            ),
-        };
+        let final_mask_decrypt_unit = units.final_mask_decrypt_unit.clone();
+        let prg_unit = units.prg_unit.clone();
+        let add = units.add.clone();
+        let sub = units.sub.clone();
+        let mul = units.mul.clone();
         let noise_refresh_mask_prg_unit = prg_unit.clone();
         let noise_refresh_error_prg_unit = goldreich_cbd_error_prg_summary(
             prg_unit.clone(),
@@ -379,12 +448,13 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
             shape.prf_round_count,
         );
         let refresh_parts = self.estimate_noise_refresh_sparse::<M, PKPE, PKST, ENCPE, ENCST>(
-            scheme,
+            _scheme,
             shape,
             mode,
             noise_refresh_error_prg_unit,
             noise_refresh_mask_prg_unit,
             final_mask_decrypt_unit.clone(),
+            units,
         );
         let noise_refresh_branch_count = match mode {
             PrfBenchMode::PublicKeyPreprocess => shape.prf_branch_count,
@@ -434,7 +504,7 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         ]);
         let noise_refresh =
             repeat_sequential_summary(noise_refresh_per_round.clone(), shape.prf_round_count);
-        let final_prg = scale_summary(prg_unit.clone(), shape.final_prg_output_count());
+        let final_prg = scale_summary_biguint(prg_unit.clone(), &shape.final_prg_output_count());
         let (final_mask_decrypt_contributions, _final_mask_decrypt_contribution_count) =
             scale_bit_decomposed_polynomial_mask_decrypt_contributions(
                 final_mask_decrypt_unit.clone(),
@@ -511,34 +581,6 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         }
     }
 
-    fn estimate_prf_mask_decrypt_one_ciphertext_bit_unit<M, PKPE, PKST, ENCPE, ENCST>(
-        &self,
-        scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
-        mode: PrfBenchMode,
-    ) -> CircuitBenchSummary
-    where
-        M: PolyMatrix + Send + Sync + 'static,
-        M::P: 'static,
-        PKBE: BenchEstimator<NaiveBGGPublicKeyVec<M>> + Sync,
-        PKBE: PublicKeyAuxBenchEstimator<M::P>,
-        EncBE: BenchEstimator<NaiveBGGEncodingVec<M>> + Sync,
-        NestedRnsPoly<M::P>: DecomposeArithmeticGadget<M::P> + ModularArithmeticPlanner<M::P>,
-    {
-        let circuit = prf_mask_decrypt_one_ciphertext_bit_circuit(scheme);
-        match mode {
-            PrfBenchMode::PublicKeyPreprocess => {
-                estimate_public_key_circuit_bench_with_aux::<NaiveBGGPublicKeyVec<M>, PKBE>(
-                    self.public_key_estimator,
-                    &scheme.params,
-                    &circuit,
-                )
-            }
-            PrfBenchMode::EncodingOnline => {
-                self.encoding_estimator.estimate_circuit_bench(&circuit)
-            }
-        }
-    }
-
     fn estimate_noise_refresh_sparse<M, PKPE, PKST, ENCPE, ENCST>(
         &self,
         _scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
@@ -547,6 +589,7 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         error_prg_unit: CircuitBenchSummary,
         mask_prg_unit: CircuitBenchSummary,
         decrypt_contribution_unit: CircuitBenchSummary,
+        units: &Aky24IOPrfBenchModeUnits,
     ) -> NoiseRefreshBenchEstimateParts
     where
         M: PolyMatrix + Send + Sync + 'static,
@@ -562,10 +605,7 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
             shape.noise_refresh_v_bits,
             false,
         );
-        let add = match mode {
-            PrfBenchMode::PublicKeyPreprocess => self.public_key_estimator.estimate_add(),
-            PrfBenchMode::EncodingOnline => self.encoding_estimator.estimate_add(),
-        };
+        let add = units.add.clone();
         let material = bit_decomposed_refresh_material_summary(
             error_prg_unit,
             mask_prg_unit,
@@ -574,7 +614,6 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
             material_counts,
             shape.noise_refresh_v_bits,
         );
-        let scalar_target = [BigUint::from(1u32)];
         let combine_task_count = shape
             .ring_dim
             .checked_mul(shape.crt_depth)
@@ -587,17 +626,23 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
             .expect("AKY24IO noise-refresh collapse add count overflow");
         let per_refresh = match mode {
             PrfBenchMode::PublicKeyPreprocess => {
-                let pk_matrix_mul =
-                    self.public_key_estimator.estimate_large_scalar_mul(&scalar_target);
-                let pk_add = self.public_key_estimator.estimate_add();
-                let pk_sub = self.public_key_estimator.estimate_sub();
                 let combine_unit = sequential_summaries(&[
-                    estimate_summary(pk_matrix_mul.clone()),
-                    estimate_summary(pk_matrix_mul.clone()),
-                    scale_estimate(pk_matrix_mul, shape.modulus_digits),
-                    scale_estimate(pk_add.clone(), collapse_add_count),
-                    estimate_summary(pk_add),
-                    estimate_summary(pk_sub),
+                    // Compute the public-key one-term: `one.key(...).matrix_mul((q / q_i) * A')`.
+                    estimate_summary(units.noise_refresh_matrix_mul_unit.clone()),
+                    // Compute the refreshed-input public-key term:
+                    // `refreshed_input.key(...).matrix_mul((q / q_i) * G)`.
+                    estimate_summary(units.noise_refresh_matrix_mul_unit.clone()),
+                    // Apply the one-column target to each decoded material column.
+                    scale_estimate(
+                        units.noise_refresh_matrix_mul_unit.clone(),
+                        shape.modulus_digits,
+                    ),
+                    // Collapse the ring-position contributions into one accumulator.
+                    scale_estimate(units.add.clone(), collapse_add_count),
+                    // Add the refreshed share into the collapsed accumulator.
+                    estimate_summary(units.add.clone()),
+                    // Subtract the mask share to finish the refreshed ciphertext entry.
+                    estimate_summary(units.sub.clone()),
                 ]);
                 sequential_summaries(&[
                     a_prime_sampling_stage.clone(),
@@ -605,19 +650,28 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
                 ])
             }
             PrfBenchMode::EncodingOnline => {
-                let enc_matrix_mul =
-                    self.encoding_estimator.estimate_large_scalar_mul(&scalar_target);
-                let enc_add = self.encoding_estimator.estimate_add();
-                let enc_sub = self.encoding_estimator.estimate_sub();
                 let crt_recompose = self.native_estimator.estimate_vector_add(shape.modulus_digits);
                 let combine_unit = sequential_summaries(&[
-                    estimate_summary(enc_matrix_mul.clone()),
-                    estimate_summary(enc_matrix_mul.clone()),
-                    scale_estimate(enc_matrix_mul, shape.modulus_digits),
-                    scale_estimate(enc_add.clone(), collapse_add_count),
-                    estimate_summary(enc_add),
-                    estimate_summary(enc_sub.clone()),
-                    estimate_summary(enc_sub),
+                    // Compute the encoding one-term:
+                    // `one.encoding(...).matrix_mul((q / q_i) * A')`.
+                    estimate_summary(units.noise_refresh_matrix_mul_unit.clone()),
+                    // Compute the refreshed-input encoding term:
+                    // `refreshed_input.encoding(...).matrix_mul((q / q_i) * G)`.
+                    estimate_summary(units.noise_refresh_matrix_mul_unit.clone()),
+                    // Apply the one-column target to each decoded material column.
+                    scale_estimate(
+                        units.noise_refresh_matrix_mul_unit.clone(),
+                        shape.modulus_digits,
+                    ),
+                    // Collapse the ring-position contributions into one accumulator.
+                    scale_estimate(units.add.clone(), collapse_add_count),
+                    // Add the refreshed share into the collapsed accumulator.
+                    estimate_summary(units.add.clone()),
+                    // Subtract the mask share before native recomposition.
+                    estimate_summary(units.sub.clone()),
+                    // Remove the pre-recomposition value from the encoding accumulator.
+                    estimate_summary(units.sub.clone()),
+                    // Recompose the CRT digits into the native refreshed ciphertext entry.
                     estimate_summary(crt_recompose),
                 ]);
                 sequential_summaries(&[
@@ -661,25 +715,16 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
         sequential_summaries(&[inputs, preimages])
     }
 
-    fn estimate_public_lut_aux_storage_bytes<M, PKPE, PKST, ENCPE, ENCST>(
+    fn estimate_public_lut_aux_storage_bytes(
         &self,
-        scheme: &Aky24IO<M, PKPE, PKST, ENCPE, ENCST>,
         shape: &Aky24IOBenchShape,
-    ) -> BigUint
-    where
-        M: PolyMatrix + Send + Sync + 'static,
-        M::P: 'static,
-        PKBE: PublicKeyAuxBenchEstimator<M::P>,
-    {
-        let prg_circuit = build_representative_goldreich_prg_one_output_circuit(scheme);
-        let prg_aux = self
-            .public_key_estimator
-            .estimate_public_lut_sample_aux_matrices_for_circuit(&scheme.params, &prg_circuit);
-        if prg_aux.compact_bytes == BigUint::default() {
+        prg_aux_compact_bytes: &BigUint,
+    ) -> BigUint {
+        if prg_aux_compact_bytes == &BigUint::default() {
             return BigUint::default();
         }
 
-        prg_aux.compact_bytes.clone() * shape.public_lut_prg_output_count()
+        prg_aux_compact_bytes * shape.public_lut_prg_output_count()
     }
 }
 
@@ -687,6 +732,24 @@ impl<'a, PKBE, EncBE, NBE> Aky24IOBenchEstimator<'a, PKBE, EncBE, NBE> {
 enum PrfBenchMode {
     PublicKeyPreprocess,
     EncodingOnline,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Aky24IOPrfBenchUnits {
+    public_key_preprocess: Aky24IOPrfBenchModeUnits,
+    encoding_online: Aky24IOPrfBenchModeUnits,
+    public_lut_prg_aux_compact_bytes: BigUint,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Aky24IOPrfBenchModeUnits {
+    final_mask_decrypt_unit: CircuitBenchSummary,
+    prg_unit: CircuitBenchSummary,
+    add: CircuitBenchEstimate,
+    sub: CircuitBenchEstimate,
+    mul: CircuitBenchEstimate,
+    seed_lift_unit: CircuitBenchEstimate,
+    noise_refresh_matrix_mul_unit: CircuitBenchEstimate,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -767,6 +830,7 @@ struct Aky24IOBenchShape {
     input_size: usize,
     output_size: usize,
     seed_bits: usize,
+    prf_batch_bits: usize,
     prf_round_count: usize,
     prf_branch_count: usize,
     prf_mask_output_coeff_bits: usize,
@@ -809,13 +873,19 @@ impl Aky24IOBenchShape {
             .and_then(|count| count.checked_mul(ring_gsw_active_levels))
             .and_then(|count| count.checked_mul(scheme.ring_gsw_context.p_moduli.len()))
             .expect("AKY24IO Ring-GSW wire count overflow");
+        assert_eq!(
+            input_size % scheme.prf_batch_bits,
+            0,
+            "AKY24IO benchmark layer input_size must be divisible by prf_batch_bits"
+        );
         Self {
             ring_dim,
             input_size,
             output_size,
             seed_bits: scheme.seed_bits,
-            prf_round_count: scheme.public_prf_seed_bits,
-            prf_branch_count: 2,
+            prf_batch_bits: scheme.prf_batch_bits,
+            prf_round_count: input_size / scheme.prf_batch_bits,
+            prf_branch_count: scheme.prf_branch_count(),
             prf_mask_output_coeff_bits: scheme.prf_mask_output_coeff_bits,
             noise_refresh_v_bits: scheme.noise_refresh_v_bits,
             cbd_n: scheme.noise_refresh_cbd_n,
@@ -827,8 +897,12 @@ impl Aky24IOBenchShape {
         }
     }
 
-    fn cascade_stage_input_counts(&self) -> std::ops::Range<usize> {
-        1..self.input_size
+    fn cascade_stage_input_counts(&self) -> impl Iterator<Item = usize> + '_ {
+        (1..self.prf_round_count).map(|round_count| {
+            round_count
+                .checked_mul(self.prf_batch_bits)
+                .expect("AKY24IO cascade stage input size overflow")
+        })
     }
 
     fn fe_to_io_output_size_for_stage(
@@ -848,25 +922,21 @@ impl Aky24IOBenchShape {
         self.output_size.checked_mul(self.ring_dim).expect("AKY24IO final decoder count overflow")
     }
 
-    fn final_mask_prg_output_count(&self) -> usize {
-        self.final_decoder_count()
-            .checked_mul(self.prf_mask_output_coeff_bits)
-            .expect("AKY24IO final mask PRG output count overflow")
+    fn final_mask_prg_output_count(&self) -> BigUint {
+        BigUint::from(self.final_decoder_count()) * BigUint::from(self.prf_mask_output_coeff_bits)
     }
 
-    fn final_prg_output_count(&self) -> usize {
-        self.final_mask_prg_output_count()
-            .checked_add(self.output_size)
-            .expect("AKY24IO final PRG output count overflow")
+    fn final_prg_output_count(&self) -> BigUint {
+        self.final_mask_prg_output_count() + BigUint::from(self.output_size)
     }
 
     fn obfuscated_circuit_bytes(&self, public_lut_aux_bytes: BigUint) -> BigUint {
-        BigUint::from(self.final_projection_preimage_bytes()) +
+        self.final_projection_preimage_bytes() +
             self.prf_refresh_preimage_bytes() +
             public_lut_aux_bytes
     }
 
-    fn final_projection_preimage_bytes(&self) -> usize {
+    fn final_projection_preimage_bytes(&self) -> BigUint {
         let standard_preimages =
             self.input_size.checked_add(2).expect("AKY24IO projection count overflow");
         let output_preimage_bytes = bench_utils::matrix_compact_bytes_for_shape(
@@ -881,16 +951,9 @@ impl Aky24IOBenchShape {
             self.ring_dim,
             self.modulus_bits,
         );
-        output_preimage_bytes
-            .checked_mul(standard_preimages)
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    final_decoder_preimage_bytes
-                        .checked_mul(self.final_decoder_count())
-                        .expect("AKY24IO final decoder preimage byte count overflow"),
-                )
-            })
-            .expect("AKY24IO final projection byte count overflow")
+        BigUint::from(output_preimage_bytes) * BigUint::from(standard_preimages) +
+            BigUint::from(final_decoder_preimage_bytes) *
+                BigUint::from(self.final_decoder_count())
     }
 
     fn selected_prg_output_count(&self) -> usize {
@@ -954,14 +1017,70 @@ impl Aky24IOBenchShape {
                     .checked_mul(self.prf_branch_count)
                     .expect("AKY24IO branch-specific noise-refresh material count overflow"),
             );
-        let final_prg_outputs = BigUint::from(self.final_prg_output_count());
-        selected_prg_outputs + noise_refresh_material_prg_outputs + final_prg_outputs
+        selected_prg_outputs + noise_refresh_material_prg_outputs + self.final_prg_output_count()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        func_enc::NoCircuitEvaluator,
+        gadgets::arith::{ModularArithmeticContext, NestedRnsPolyContext},
+        matrix::dcrt_poly::DCRTPolyMatrix,
+        poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    };
+
+    type TestAky24IO = Aky24IO<
+        DCRTPolyMatrix,
+        NoCircuitEvaluator,
+        NoCircuitEvaluator,
+        NoCircuitEvaluator,
+        NoCircuitEvaluator,
+    >;
+
+    fn test_scheme(input_size: usize, prf_batch_bits: usize) -> TestAky24IO {
+        let params = DCRTPolyParams::new(2, 1, 10, 5);
+        let mut setup_circuit = PolyCircuit::<DCRTPoly>::new();
+        let ring_gsw_context = Arc::new(NestedRnsPolyContext::setup(
+            &mut setup_circuit,
+            &params,
+            5,
+            2,
+            1 << 8,
+            false,
+            Some(1),
+        ));
+        let ring_gsw_width = 2 *
+            <NestedRnsPolyContext as ModularArithmeticContext<DCRTPoly>>::gadget_len(
+                ring_gsw_context.as_ref(),
+                Some(1),
+                Some(0),
+            );
+        TestAky24IO::new(
+            params.clone(),
+            params,
+            ring_gsw_context,
+            ring_gsw_width,
+            0,
+            Some(1),
+            Some(0.0),
+            b"aky24_io_bench_estimator_test".to_vec(),
+            input_size,
+            1,
+            6,
+            prf_batch_bits,
+            1,
+            1,
+            1,
+            [0x24; 32],
+            [0x42; 32],
+            None,
+            None,
+            None,
+            None,
+        )
+    }
 
     fn test_shape(input_size: usize) -> Aky24IOBenchShape {
         Aky24IOBenchShape {
@@ -969,7 +1088,8 @@ mod tests {
             input_size,
             output_size: 2,
             seed_bits: 5,
-            prf_round_count: 3,
+            prf_batch_bits: 1,
+            prf_round_count: input_size,
             prf_branch_count: 2,
             prf_mask_output_coeff_bits: 4,
             noise_refresh_v_bits: 3,
@@ -979,6 +1099,14 @@ mod tests {
             modulus_bits: 16,
             state_col_size: 4,
             ring_gsw_wire_count: 6,
+        }
+    }
+
+    fn batched_test_shape(input_size: usize, prf_batch_bits: usize) -> Aky24IOBenchShape {
+        Aky24IOBenchShape {
+            prf_batch_bits,
+            prf_round_count: input_size / prf_batch_bits,
+            ..test_shape(input_size)
         }
     }
 
@@ -1000,6 +1128,29 @@ mod tests {
     }
 
     #[test]
+    fn test_cascade_stage_input_counts_follow_batch_boundaries() {
+        assert_eq!(
+            batched_test_shape(12, 4).cascade_stage_input_counts().collect::<Vec<_>>(),
+            vec![4, 8]
+        );
+        assert_eq!(
+            batched_test_shape(4, 4).cascade_stage_input_counts().collect::<Vec<_>>(),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn test_from_scheme_uses_layer_input_size_for_prf_round_count() {
+        let scheme = test_scheme(12, 4);
+        let final_shape = Aky24IOBenchShape::from_scheme(&scheme, 12, 1);
+        let stage_shape = Aky24IOBenchShape::from_scheme(&scheme, 4, 1);
+
+        assert_eq!(final_shape.prf_round_count, 3);
+        assert_eq!(stage_shape.prf_round_count, 1);
+        assert_eq!(stage_shape.prf_branch_count, 16);
+    }
+
+    #[test]
     fn test_fe_to_io_stage_output_size_matches_ciphertext_bit_width() {
         let shape = test_shape(3);
         assert_eq!(
@@ -1011,6 +1162,15 @@ mod tests {
             ),
             3 * 8 * 16 * 2
         );
+    }
+
+    #[test]
+    fn test_large_cascade_storage_counts_use_biguint() {
+        let mut shape = test_shape(1);
+        shape.output_size = usize::MAX / shape.ring_dim / 2;
+
+        assert!(shape.final_projection_preimage_bytes() > BigUint::from(usize::MAX));
+        assert!(shape.final_prg_output_count() > BigUint::from(usize::MAX));
     }
 
     #[test]
@@ -1035,7 +1195,17 @@ mod tests {
         assert_eq!(estimate.eval.latency, 6.0);
         assert_eq!(estimate.eval.max_parallelism, BigUint::from(5u64));
         assert_eq!(estimate.obfuscated_circuit_bytes, BigUint::from(12u64));
+        assert_eq!(estimate.fe_to_io_obfuscate.latency, 1.0);
+        assert_eq!(estimate.fe_to_io_obfuscate.max_parallelism, BigUint::from(2u64));
+        assert_eq!(estimate.fe_to_io_obfuscate_total_time, BigUint::from(10u64));
+        assert_eq!(estimate.final_fe_obfuscate.latency, 3.0);
+        assert_eq!(estimate.final_fe_obfuscate.max_parallelism, BigUint::from(4u64));
+        assert_eq!(estimate.final_fe_obfuscate_total_time, BigUint::from(30u64));
+        assert_eq!(estimate.fe_to_io_eval.latency, 2.0);
+        assert_eq!(estimate.fe_to_io_eval.max_parallelism, BigUint::from(3u64));
         assert_eq!(estimate.fe_to_io_eval_total_time, BigUint::from(20u64));
+        assert_eq!(estimate.final_fe_eval.latency, 4.0);
+        assert_eq!(estimate.final_fe_eval.max_parallelism, BigUint::from(5u64));
         assert_eq!(estimate.final_fe_eval_total_time, BigUint::from(40u64));
         assert_eq!(estimate.fe_to_io_obfuscated_circuit_bytes, BigUint::from(5u64));
         assert_eq!(estimate.final_fe_obfuscated_circuit_bytes, BigUint::from(7u64));

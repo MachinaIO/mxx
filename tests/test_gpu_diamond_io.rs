@@ -972,10 +972,21 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
         eval_latency = estimate.eval.latency,
         eval_total_time_nanos = %estimate.eval.total_time,
         eval_max_parallelism = %estimate.eval.max_parallelism,
+        obfuscate_input_injection_latency = estimate.obfuscate_input_injection.latency,
+        obfuscate_input_injection_total_time_nanos =
+            %estimate.obfuscate_input_injection.total_time,
+        obfuscate_input_injection_max_parallelism =
+            %estimate.obfuscate_input_injection.max_parallelism,
         obfuscate_input_injection_latency_percent =
             estimate.obfuscate_input_injection_latency_percent(),
         obfuscate_input_injection_total_time_percent =
             estimate.obfuscate_input_injection_total_time_percent(),
+        eval_input_injection_latency = estimate.eval_input_injection.latency,
+        eval_input_injection_total_time_nanos = %estimate.eval_input_injection.total_time,
+        eval_input_injection_max_parallelism = %estimate.eval_input_injection.max_parallelism,
+        final_fe_eval_latency = estimate.final_fe_eval.latency,
+        final_fe_eval_total_time_nanos = %estimate.final_fe_eval.total_time,
+        final_fe_eval_max_parallelism = %estimate.final_fe_eval.max_parallelism,
         eval_input_injection_latency_percent = estimate.eval_input_injection_latency_percent(),
         eval_input_injection_total_time_percent =
             estimate.eval_input_injection_total_time_percent(),
@@ -985,6 +996,7 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
     );
     assert!(estimate.obfuscate.total_time >= BigUint::from(0u32));
     assert!(estimate.eval.total_time >= BigUint::from(0u32));
+    assert!(estimate.final_fe_eval.total_time > BigUint::from(0u32));
     assert!(estimate.obfuscated_circuit_bytes > BigUint::from(0u32));
     assert!(estimate.input_injection_bytes > BigUint::from(0u32));
 }

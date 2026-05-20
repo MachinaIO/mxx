@@ -66,6 +66,7 @@ const DEFAULT_MIN_LOG_RING_DIM: usize = 16;
 const DEFAULT_MAX_LOG_RING_DIM: usize = 16;
 const DEFAULT_INPUT_SIZE: usize = 5;
 const DEFAULT_OUTPUT_SIZE: usize = 6;
+const DEFAULT_PRF_BATCH_BITS: usize = 1;
 const DEFAULT_CRT_BITS: usize = 28;
 const DEFAULT_BASE_BITS: u32 = 14;
 const DEFAULT_P_MODULI_BITS: usize = 7;
@@ -118,7 +119,7 @@ struct Aky24IOGpuBenchConfig {
     max_log_ring_dim: usize,
     input_size: usize,
     output_size: usize,
-    public_prf_seed_bits: usize,
+    prf_batch_bits: usize,
     crt_bits: usize,
     base_bits: u32,
     p_moduli_bits: usize,
@@ -164,9 +165,9 @@ impl Aky24IOGpuBenchConfig {
             ),
             input_size,
             output_size: env_or_parse_usize("AKY24_IO_GPU_BENCH_OUTPUT_SIZE", DEFAULT_OUTPUT_SIZE),
-            public_prf_seed_bits: env_or_parse_usize(
-                "AKY24_IO_GPU_BENCH_PUBLIC_PRF_SEED_BITS",
-                input_size,
+            prf_batch_bits: env_or_parse_usize(
+                "AKY24_IO_GPU_BENCH_PRF_BATCH_BITS",
+                DEFAULT_PRF_BATCH_BITS,
             ),
             crt_bits: env_or_parse_usize("AKY24_IO_GPU_BENCH_CRT_BITS", DEFAULT_CRT_BITS),
             base_bits: env_or_parse_u32("AKY24_IO_GPU_BENCH_BASE_BITS", DEFAULT_BASE_BITS),
@@ -222,9 +223,15 @@ impl Aky24IOGpuBenchConfig {
         );
         assert!(cfg.input_size > 0, "AKY24_IO_GPU_BENCH_INPUT_SIZE must be positive");
         assert!(cfg.output_size > 0, "AKY24_IO_GPU_BENCH_OUTPUT_SIZE must be positive");
+        assert!(cfg.prf_batch_bits > 0, "AKY24_IO_GPU_BENCH_PRF_BATCH_BITS must be positive");
         assert!(
-            cfg.public_prf_seed_bits > 0,
-            "AKY24_IO_GPU_BENCH_PUBLIC_PRF_SEED_BITS must be positive"
+            cfg.prf_batch_bits < usize::BITS as usize,
+            "AKY24_IO_GPU_BENCH_PRF_BATCH_BITS must fit in a usize branch count"
+        );
+        assert_eq!(
+            cfg.input_size % cfg.prf_batch_bits,
+            0,
+            "AKY24_IO_GPU_BENCH_INPUT_SIZE must be divisible by AKY24_IO_GPU_BENCH_PRF_BATCH_BITS"
         );
         assert!(cfg.crt_bits > 0, "AKY24_IO_GPU_BENCH_CRT_BITS must be positive");
         assert!(cfg.base_bits > 0, "AKY24_IO_GPU_BENCH_BASE_BITS must be positive");
@@ -257,6 +264,7 @@ impl Aky24IOGpuBenchConfig {
             params,
             self.output_size,
             self.output_size,
+            self.prf_batch_bits,
             prf_mask_output_coeff_bits,
             noise_refresh_v_bits,
             self.noise_refresh_cbd_n,
@@ -522,7 +530,7 @@ fn build_aky24_io(
         cfg.input_size,
         cfg.output_size(),
         seed_bits,
-        cfg.public_prf_seed_bits,
+        cfg.prf_batch_bits,
         prf_mask_output_coeff_bits,
         noise_refresh_v_bits,
         cfg.noise_refresh_cbd_n,
@@ -582,7 +590,7 @@ fn build_cpu_aky24_io_for_search(
         cfg.input_size,
         cfg.output_size(),
         seed_bits,
-        cfg.public_prf_seed_bits,
+        cfg.prf_batch_bits,
         prf_mask_output_coeff_bits,
         noise_refresh_v_bits,
         cfg.noise_refresh_cbd_n,
@@ -1150,11 +1158,21 @@ async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
         obfuscate_latency = estimate.obfuscate.latency,
         obfuscate_total_time_nanos = %estimate.obfuscate.total_time,
         obfuscate_max_parallelism = %estimate.obfuscate.max_parallelism,
+        fe_to_io_obfuscate_latency = estimate.fe_to_io_obfuscate.latency,
+        fe_to_io_obfuscate_total_time_nanos = %estimate.fe_to_io_obfuscate_total_time,
+        fe_to_io_obfuscate_max_parallelism = %estimate.fe_to_io_obfuscate.max_parallelism,
+        final_fe_obfuscate_latency = estimate.final_fe_obfuscate.latency,
+        final_fe_obfuscate_total_time_nanos = %estimate.final_fe_obfuscate_total_time,
+        final_fe_obfuscate_max_parallelism = %estimate.final_fe_obfuscate.max_parallelism,
         eval_latency = estimate.eval.latency,
         eval_total_time_nanos = %estimate.eval.total_time,
         eval_max_parallelism = %estimate.eval.max_parallelism,
+        fe_to_io_eval_latency = estimate.fe_to_io_eval.latency,
         fe_to_io_eval_total_time_nanos = %estimate.fe_to_io_eval_total_time,
+        fe_to_io_eval_max_parallelism = %estimate.fe_to_io_eval.max_parallelism,
+        final_fe_eval_latency = estimate.final_fe_eval.latency,
         final_fe_eval_total_time_nanos = %estimate.final_fe_eval_total_time,
+        final_fe_eval_max_parallelism = %estimate.final_fe_eval.max_parallelism,
         obfuscated_circuit_bytes = %estimate.obfuscated_circuit_bytes,
         fe_to_io_obfuscated_circuit_bytes = %estimate.fe_to_io_obfuscated_circuit_bytes,
         final_fe_obfuscated_circuit_bytes = %estimate.final_fe_obfuscated_circuit_bytes,
@@ -1163,12 +1181,15 @@ async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
     assert!(estimate.obfuscate.total_time >= BigUint::from(0u32));
     assert!(estimate.eval.total_time >= BigUint::from(0u32));
     assert!(estimate.obfuscated_circuit_bytes > BigUint::from(0u32));
+    assert!(estimate.final_fe_obfuscate_total_time > BigUint::from(0u32));
     assert!(estimate.final_fe_eval_total_time > BigUint::from(0u32));
     assert!(estimate.final_fe_obfuscated_circuit_bytes > BigUint::from(0u32));
-    if cfg.input_size > 1 {
+    if cfg.input_size / cfg.prf_batch_bits > 1 {
+        assert!(estimate.fe_to_io_obfuscate_total_time > BigUint::from(0u32));
         assert!(estimate.fe_to_io_eval_total_time > BigUint::from(0u32));
         assert!(estimate.fe_to_io_obfuscated_circuit_bytes > BigUint::from(0u32));
     } else {
+        assert_eq!(estimate.fe_to_io_obfuscate_total_time, BigUint::from(0u32));
         assert_eq!(estimate.fe_to_io_eval_total_time, BigUint::from(0u32));
         assert_eq!(estimate.fe_to_io_obfuscated_circuit_bytes, BigUint::from(0u32));
     }

@@ -107,8 +107,9 @@ pub struct DiamondIOObf<M, T>
 where
     M: PolyMatrix,
 {
-    /// Hash key sampled by `DiamondInjector::preprocess` and required by
-    /// `DiamondInjector::online_eval` to identify the persisted preimages.
+    /// Final state-specific trapdoor public bases returned by
+    /// `DiamondInjector::preprocess`. Large transition preimage matrices are
+    /// stored under the artifact directory passed to obfuscation.
     pub preprocess_out: DiamondInjectorPreprocessOut<M, T>,
     /// Hash key used to deterministically sample the BGG public keys in this
     /// obfuscation instance.
@@ -405,24 +406,11 @@ where
         let lookup_top = enc_lookup_base_matrix.clone();
         let lookup_bottom = M::zero(params, DIAMOND_SECRET_SIZE, lookup_top.col_size());
         let lookup_target = lookup_top.concat_rows(&[&lookup_bottom]);
-        let final_w_block_col_size = DIAMOND_SECRET_SIZE
-            .checked_mul(params.modulus_digits())
-            .expect("DiamondIO final W block column count overflow");
-        let lookup_ext_matrix = HS::new().sample_hash(
+        let (lookup_trapdoor, lookup_public_matrix) = preprocess_out.final_checkpoint(0);
+        let lookup_base_preimage = TS::new(params, self.injector.trapdoor_sigma).preimage(
             params,
-            preprocess_out.hash_key,
-            format!("diamond_w_{}_{}", 0, self.injector.input_count),
-            2usize
-                .checked_mul(DIAMOND_SECRET_SIZE)
-                .expect("DiamondIO lookup bridge state row count overflow"),
-            final_w_block_col_size,
-            DistType::FinRingDist,
-        );
-        let lookup_base_preimage = TS::new(params, self.injector.trapdoor_sigma).preimage_extend(
-            params,
-            &preprocess_out.final_trapdoor,
-            &preprocess_out.final_pub_matrix,
-            &lookup_ext_matrix,
+            lookup_trapdoor,
+            lookup_public_matrix,
             &lookup_target,
         );
         Self::write_io_matrix(dir_path, Self::enc_lookup_base_preimage_id(), &lookup_base_preimage);
@@ -505,30 +493,16 @@ where
             );
             Self::write_io_matrix(dir_path, &Self::input_preimage_id(bit_idx), &preimage);
         }
-        let final_w_block_col_size = DIAMOND_SECRET_SIZE
-            .checked_mul(params.modulus_digits())
-            .expect("DiamondIO final W block column count overflow");
-        let final_state_row_count = 2usize
-            .checked_mul(DIAMOND_SECRET_SIZE)
-            .expect("DiamondIO final state row count overflow");
         let decoder = MaskedHighBitDecoder::<M, _, _, _>::new(
             params,
             DIAMOND_SECRET_SIZE,
             DirectoryDecoderArtifacts::new(dir_path, "diamond_io"),
             |_, target| {
-                let ext_matrix = HS::new().sample_hash(
+                let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(0);
+                TS::new(params, self.injector.trapdoor_sigma).preimage(
                     params,
-                    preprocess_out.hash_key,
-                    format!("diamond_w_{}_{}", 0, self.injector.input_count),
-                    final_state_row_count,
-                    final_w_block_col_size,
-                    DistType::FinRingDist,
-                );
-                TS::new(params, self.injector.trapdoor_sigma).preimage_extend(
-                    params,
-                    &preprocess_out.final_trapdoor,
-                    &preprocess_out.final_pub_matrix,
-                    &ext_matrix,
+                    trapdoor,
+                    public_matrix,
                     target,
                 )
             },

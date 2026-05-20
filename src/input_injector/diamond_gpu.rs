@@ -16,9 +16,9 @@ where
 {
     device_id: i32,
     params: <M::P as Poly>::Params,
-    source_b: M,
-    source_trapdoor: T,
-    target_b: M,
+    source_b_by_state: Vec<M>,
+    source_trapdoor_by_state: Vec<T>,
+    target_b_by_state: Vec<M>,
 }
 
 struct LoadedDiamondPreprocessChunk<M>
@@ -27,7 +27,6 @@ where
 {
     device_slot: usize,
     task: DiamondPreprocessChunkTask,
-    ext_matrix: M,
     target: M,
     load_s: f64,
 }
@@ -144,27 +143,39 @@ where
 
     fn prepare_gpu_k_stage_shared(
         &self,
-        source_b_bytes: &[u8],
-        source_trapdoor_bytes: &[u8],
-        target_b_bytes: &[u8],
+        source_checkpoint_bytes: &[(Arc<[u8]>, Arc<[u8]>)],
+        target_b_bytes: &[Arc<[u8]>],
     ) -> Vec<GpuDiamondKStageShared<M, TS::Trapdoor>> {
         self.effective_gpu_device_ids()
             .into_par_iter()
             .map(|device_id| {
                 let local_params = self.params.params_for_device(device_id);
-                let source_trapdoor = TS::trapdoor_from_bytes(&local_params, source_trapdoor_bytes)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "DiamondInjector failed to decode K-stage trapdoor checkpoint on device {}",
-                            device_id
-                        )
-                    });
+                let source_b_by_state = source_checkpoint_bytes
+                    .iter()
+                    .map(|(b_bytes, _)| M::from_compact_bytes(&local_params, b_bytes.as_ref()))
+                    .collect::<Vec<_>>();
+                let source_trapdoor_by_state = source_checkpoint_bytes
+                    .iter()
+                    .map(|(_, trapdoor_bytes)| {
+                        TS::trapdoor_from_bytes(&local_params, trapdoor_bytes.as_ref())
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "DiamondInjector failed to decode K-stage trapdoor checkpoint on device {}",
+                                    device_id
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let target_b_by_state = target_b_bytes
+                    .iter()
+                    .map(|bytes| M::from_compact_bytes(&local_params, bytes.as_ref()))
+                    .collect::<Vec<_>>();
                 GpuDiamondKStageShared {
                     device_id,
                     params: local_params.clone(),
-                    source_b: M::from_compact_bytes(&local_params, source_b_bytes),
-                    source_trapdoor,
-                    target_b: M::from_compact_bytes(&local_params, target_b_bytes),
+                    source_b_by_state,
+                    source_trapdoor_by_state,
+                    target_b_by_state,
                 }
             })
             .collect()
@@ -233,12 +244,10 @@ where
     fn preprocess_k_stage_gpu(
         &self,
         dir_path: &Path,
-        hash_key: [u8; 32],
         level: usize,
         tasks: Vec<DiamondPreprocessChunkTask>,
-        source_b_bytes: &[u8],
-        source_trapdoor_bytes: &[u8],
-        target_b_bytes: &[u8],
+        source_checkpoint_bytes: &[(Arc<[u8]>, Arc<[u8]>)],
+        target_b_bytes: &[Arc<[u8]>],
         secret_mask_bytes: &HashMap<usize, Arc<[u8]>>,
     ) -> usize {
         if tasks.is_empty() {
@@ -248,7 +257,7 @@ where
         let stage_started = Instant::now();
         let trap_sampler = TS::new(&self.params, self.trapdoor_sigma);
         let shared_by_device =
-            self.prepare_gpu_k_stage_shared(source_b_bytes, source_trapdoor_bytes, target_b_bytes);
+            self.prepare_gpu_k_stage_shared(source_checkpoint_bytes, target_b_bytes);
         let device_count = shared_by_device.len().max(1);
         let task_batches = round_robin_batches(&tasks, device_count);
         let wave_count = task_batches.iter().map(Vec::len).max().unwrap_or(0);
@@ -288,24 +297,13 @@ where
                             })
                             .as_ref(),
                     );
-                    let ext_matrix = if self.new_bit_idx_for_state(level, state_idx).is_some() {
-                        self.sample_w_block_with_params(&shared.params, hash_key, 0, level - 1)
-                    } else {
-                        self.sample_w_block_with_params(
-                            &shared.params,
-                            hash_key,
-                            state_idx,
-                            level - 1,
-                        )
-                    };
                     let target = self.build_k_target_chunk_with_params(
                         &shared.params,
-                        hash_key,
                         level,
                         digit_value,
                         state_idx,
                         &secret_mask,
-                        &shared.target_b,
+                        &shared.target_b_by_state[state_idx],
                         chunk_idx,
                     );
                     drop(secret_mask);
@@ -321,7 +319,6 @@ where
                     Some(LoadedDiamondPreprocessChunk {
                         device_slot,
                         task,
-                        ext_matrix,
                         target,
                         load_s: maybe_elapsed_s(load_started),
                     })
@@ -336,11 +333,12 @@ where
                 .map(|loaded| {
                     let shared = &shared_by_device[loaded.device_slot];
                     let compute_started = Instant::now();
-                    let output = trap_sampler.preimage_extend(
+                    let DiamondPreprocessChunkTask::K { level, state_idx, .. } = loaded.task;
+                    let source_state_idx = self.transition_source_state_idx(level, state_idx);
+                    let output = trap_sampler.preimage(
                         &shared.params,
-                        &shared.source_trapdoor,
-                        &shared.source_b,
-                        &loaded.ext_matrix,
+                        &shared.source_trapdoor_by_state[source_state_idx],
+                        &shared.source_b_by_state[source_state_idx],
                         &loaded.target,
                     );
                     ComputedDiamondPreprocessChunk {
@@ -563,16 +561,9 @@ where
             .collect()
     }
 
-    pub(super) fn preprocess_gpu(&self, dir_path: &Path, hash_key: [u8; 32], k: &M::P) {
+    pub(super) fn preprocess_gpu(&self, dir_path: &Path, k: &M::P) {
         self.ensure_dir(dir_path);
-        self.write_metadata(
-            dir_path,
-            &super::DiamondInjectorMetadata {
-                input_count: self.input_count,
-                base: self.base,
-                batch_bits: self.batch_bits,
-            },
-        );
+        self.write_metadata(dir_path, &self.current_metadata());
         self.write_bytes(dir_path, self.k_plaintext_id(), &k.to_compact_bytes());
 
         let preprocess_started = Instant::now();
@@ -585,10 +576,10 @@ where
         let secret_epsilon_bytes =
             self.load_or_sample_secret_epsilon_bytes(dir_path, self.secret_epsilon_id());
         if !self.matrix_exists(dir_path, self.p_epsilon_id()) {
-            let (b0_bytes, _) = self.load_or_sample_b_checkpoint_bytes(dir_path, 0);
+            let (b0_bytes, _) = self.load_or_sample_b_checkpoint_bytes(dir_path, 0, 0);
             let b0_matrix = M::from_compact_bytes(&self.params, &b0_bytes);
             let secret_epsilon = M::from_compact_bytes(&self.params, &secret_epsilon_bytes);
-            let p_epsilon = self.build_initial_encoding(hash_key, &b0_matrix, &secret_epsilon, k);
+            let p_epsilon = self.build_initial_encoding(&b0_matrix, &secret_epsilon, k);
             self.write_matrix(dir_path, self.p_epsilon_id(), &p_epsilon);
             drop(p_epsilon);
             drop(secret_epsilon);
@@ -615,7 +606,7 @@ where
                 .collect::<HashMap<_, _>>();
             let mut stage_tasks = Vec::new();
             for digit_value in 0..self.base {
-                for state_idx in 0..self.expanded_state_count_after_level(level) {
+                for state_idx in 0..self.state_count_at_level(level) {
                     for chunk_idx in 0..column_chunk_count(state_cols) {
                         let task = DiamondPreprocessChunkTask::K {
                             level,
@@ -630,9 +621,20 @@ where
                 }
             }
             total_tasks += stage_tasks.len();
-            let (source_b_bytes, source_trapdoor_bytes) =
-                self.load_or_sample_b_checkpoint_bytes(dir_path, level - 1);
-            let (target_b_bytes, _) = self.load_or_sample_b_checkpoint_bytes(dir_path, level);
+            let source_checkpoint_bytes = (0..self.state_count_at_level(level - 1))
+                .map(|source_idx| {
+                    let (b_bytes, t_bytes) =
+                        self.load_or_sample_b_checkpoint_bytes(dir_path, level - 1, source_idx);
+                    (Arc::<[u8]>::from(b_bytes), Arc::<[u8]>::from(t_bytes))
+                })
+                .collect::<Vec<_>>();
+            let target_b_bytes = (0..self.state_count_at_level(level))
+                .map(|state_idx| {
+                    let (b_bytes, _) =
+                        self.load_or_sample_b_checkpoint_bytes(dir_path, level, state_idx);
+                    Arc::<[u8]>::from(b_bytes)
+                })
+                .collect::<Vec<_>>();
             if stage_tasks.is_empty() {
                 info!(
                     level,
@@ -642,11 +644,9 @@ where
             } else {
                 completed_tasks += self.preprocess_k_stage_gpu(
                     dir_path,
-                    hash_key,
                     level,
                     stage_tasks,
-                    &source_b_bytes,
-                    &source_trapdoor_bytes,
+                    &source_checkpoint_bytes,
                     &target_b_bytes,
                     &secret_mask_bytes,
                 );
@@ -677,20 +677,12 @@ where
     ) -> Vec<M> {
         self.validate_digits(input_digits);
         assert_eq!(
-            self.read_bytes(dir_path, self.preprocess_hash_key_id()).as_slice(),
-            &preprocess_out.hash_key,
-            "DiamondInjector gpu online_eval preprocess hash key mismatch"
+            preprocess_out.final_state_count(),
+            self.state_count_at_level(self.input_count),
+            "DiamondInjector final checkpoint count mismatch"
         );
         let metadata = self.read_metadata(dir_path);
-        assert_eq!(
-            metadata.input_count, self.input_count,
-            "DiamondInjector metadata input count mismatch"
-        );
-        assert_eq!(metadata.base, self.base, "DiamondInjector metadata base mismatch");
-        assert_eq!(
-            metadata.batch_bits, self.batch_bits,
-            "DiamondInjector metadata batch_bits mismatch"
-        );
+        self.assert_current_metadata(&metadata);
 
         let online_started = Instant::now();
         let state_cols = self.state_col_size(&self.params);
@@ -704,7 +696,7 @@ where
             // Schedule one matrix-product family per active branch. The helper
             // below splits the right-hand-side chunks across devices and then
             // reassembles each branch on CPU from compact bytes.
-            let family_specs = (0..self.expanded_state_count_after_level(level))
+            let family_specs = (0..self.state_count_at_level(level))
                 .map(|state_idx| {
                     let lhs_bytes = if self.new_bit_idx_for_state(level, state_idx).is_some() {
                         prev_p0_bytes.clone()
@@ -722,7 +714,7 @@ where
                 })
                 .collect::<HashMap<_, _>>();
             let outputs = self.gpu_left_mul_families(family_specs);
-            states = (0..self.expanded_state_count_after_level(level))
+            states = (0..self.state_count_at_level(level))
                 .map(|state_idx| {
                     outputs
                         .get(&DiamondEvalFamily::State(state_idx))
@@ -826,9 +818,7 @@ mod tests {
             );
             secret_matrix = secret_matrix * secret_mask;
         }
-        let base_public_matrix =
-            preprocess_out.final_pub_matrix.concat_columns(&[&injector
-                .sample_w_block_with_params(&params, preprocess_out.hash_key, 0, input_count)]);
+        let base_public_matrix = preprocess_out.final_pub_matrices[0].clone();
         let base_selector = GpuDCRTPolyMatrix::from_poly_vec_row(
             &params,
             vec![secret_matrix.entry(0, 0), k.clone()],
@@ -840,14 +830,7 @@ mod tests {
                 let state_idx = injector.bit_state_idx(digit_idx, bit_idx);
                 let bit_value = ((digits[digit_idx] as usize) >> bit_idx) & 1;
                 let bit_plaintext = TestPoly::from_usize_to_constant(&params, bit_value);
-                let bit_public_matrix =
-                    preprocess_out.final_pub_matrix.concat_columns(&[&injector
-                        .sample_w_block_with_params(
-                            &params,
-                            preprocess_out.hash_key,
-                            state_idx,
-                            input_count,
-                        )]);
+                let bit_public_matrix = preprocess_out.final_pub_matrices[state_idx].clone();
                 let bit_selector = GpuDCRTPolyMatrix::from_poly_vec_row(
                     &params,
                     vec![secret_matrix.entry(0, 0), secret_matrix.entry(0, 0) * &bit_plaintext],

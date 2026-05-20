@@ -178,6 +178,7 @@ where
         );
 
         let input_injection = self.injector.simulate_output_error_bounds();
+        // B-only final projection preimage: B_{input_count,state_idx} * R = target.
         let ctx = input_injection.output_preimage.clone_ctx();
         let one_plaintext = PolyNorm::one(ctx.clone());
         let q = self.injector.params.modulus();

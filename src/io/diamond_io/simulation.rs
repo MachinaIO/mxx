@@ -106,8 +106,8 @@ pub struct DiamondIOCrtDepthSearchResult {
     pub total_noisy_plaintext_error: PolyMatrixNorm,
     /// Representative input-injection contribution used to seed the DiamondIO simulation.
     ///
-    /// This is `input_injection.state_errors[0] * input_injection.output_preimage`, matching the
-    /// projected state error used as the `one`, decryption-key, and decoder input bound.
+    /// This is `input_injection.state_errors[0] * input_injection.output_preimage`, where
+    /// `output_preimage` is the B-only final projection preimage for state 0.
     pub input_injection_projection_error: PolyMatrixNorm,
 }
 
@@ -1728,6 +1728,7 @@ fn simulator_context(params: &DCRTPolyParams) -> Arc<SimulatorContext> {
 fn diamond_io_input_injection_projection_error(
     input_injection: &DiamondInputErrorSimulation,
 ) -> PolyMatrixNorm {
+    // State 0 final B-only projection error.
     input_injection
         .state_errors
         .first()

@@ -81,10 +81,18 @@ pub struct DiamondIOBenchEstimate {
     pub obfuscate_input_injection: CircuitBenchSummary,
     /// Input-injection online evaluation work performed during `DiamondIO::eval`.
     pub eval_input_injection: CircuitBenchSummary,
+    /// Eval work after input-injection, modeled as the final FE portion for comparisons.
+    pub final_fe_eval: CircuitBenchSummary,
     /// Total compact bytes written as the persisted obfuscated circuit artifacts.
     pub obfuscated_circuit_bytes: BigUint,
     /// Compact bytes contributed by the Diamond input-injection artifacts.
     pub input_injection_bytes: BigUint,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DiamondIOEvalBenchEstimateParts {
+    total: CircuitBenchSummary,
+    final_fe: CircuitBenchSummary,
 }
 
 impl DiamondIOBenchEstimate {
@@ -549,9 +557,10 @@ where
         info!("completed DiamondIO eval benchmark estimation");
         let estimate = DiamondIOBenchEstimate {
             obfuscate,
-            eval,
+            eval: eval.total,
             obfuscate_input_injection: input_injection.obfuscate,
             eval_input_injection: input_injection.eval,
+            final_fe_eval: eval.final_fe,
             obfuscated_circuit_bytes: storage.total_bytes,
             input_injection_bytes: storage.input_injection_bytes,
         };
@@ -568,6 +577,9 @@ where
             eval_input_injection_latency = estimate.eval_input_injection.latency,
             eval_input_injection_total_time_nanos = %estimate.eval_input_injection.total_time,
             eval_input_injection_max_parallelism = %estimate.eval_input_injection.max_parallelism,
+            final_fe_eval_latency = estimate.final_fe_eval.latency,
+            final_fe_eval_total_time_nanos = %estimate.final_fe_eval.total_time,
+            final_fe_eval_max_parallelism = %estimate.final_fe_eval.max_parallelism,
             eval_input_injection_latency_percent = estimate.eval_input_injection_latency_percent(),
             eval_input_injection_total_time_percent =
                 estimate.eval_input_injection_total_time_percent(),
@@ -741,7 +753,7 @@ where
         func: DiamondIOFuncType,
         shape: DiamondIOBenchShape,
         _persisted_storage: &DiamondIOStorageEstimate,
-    ) -> CircuitBenchSummary
+    ) -> DiamondIOEvalBenchEstimateParts
     where
         M: PolyMatrix + Send + Sync + 'static,
         M::P: 'static,
@@ -815,14 +827,14 @@ where
         ]);
         let final_decode = scale_summary(final_decode_unit.clone(), shape.final_decoder_count());
 
-        let total = sequential_summaries(&[
-            input_injection.clone(),
+        let final_fe = sequential_summaries(&[
             input_encoding_projection.clone(),
             seed_ciphertext_lift.clone(),
             prf_and_function.clone(),
             decoder_projection.clone(),
             final_decode.clone(),
         ]);
+        let total = sequential_summaries(&[input_injection.clone(), final_fe.clone()]);
 
         debug!(
             ?input_injection,
@@ -832,11 +844,12 @@ where
             ?function_encoding_eval,
             ?decoder_projection,
             ?final_decode,
+            ?final_fe,
             ?total,
             "estimated DiamondIO eval benchmark"
         );
 
-        total
+        DiamondIOEvalBenchEstimateParts { total, final_fe }
     }
 
     fn estimate_function_circuit<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>(

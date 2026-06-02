@@ -1,46 +1,112 @@
-# mxx: Lattice-Based Cryptography Library
+# mxx
 
-This library is intended to support primitive-level lattice-based cryptography developed by Machina-iO. `mxx` is a primitive library upon which we may build more complex constructions, potentially for academic papers.
+`mxx` is a Rust and CUDA library for lattice-cryptography research and implementation work at Machina iO. It provides primitive-level building blocks for polynomial and matrix arithmetic, trapdoor sampling, key-homomorphic encodings, and higher-level constructions of lattice-based schemes.
 
-Applications of `mxx` include:
-- [Diamond iO](https://github.com/MachinaIO/diamond-io)
+Specifically, this repository provides implementations of the following works:
+- [BGG+ encodings](https://eprint.iacr.org/2014/356.pdf), available at `src/bgg/`
+- [WEE25 matrix commitment](https://eprint.iacr.org/2025/509.pdf), available at `src/commit/`.
+- [Lookup-table evaluation over BGG+ encodings](https://eprint.iacr.org/2025/1870.pdf) available at `src/lookup/`.
+- Evaluation and decryption of [GSW-FHE](https://eprint.iacr.org/2013/340.pdf) over BGG+ encodings, following [this construction](https://eprint.iacr.org/2015/029.pdf), available at `src/gadgets/fhe/`.
+- Benchmark estimation for pseudorandom obfuscation based on [AKY24](https://eprint.iacr.org/2024/1720.pdf), available at `src/io/aky24_io/`.
+- Benchmark estimation for [Diamond iO](https://eprint.iacr.org/2025/236.pdf), available at `src/io/diamond_io/`.
 
-### Prerequisites
-- [OpenFHE](https://openfhe-development.readthedocs.io/en/latest/sphinx_rsts/intro/installation/installation.html) (System install required in `usr/local/lib`), make sure to install our [fork](https://github.com/MachinaIO/openfhe-development/tree/feat/improve_determinant) in `feat/improve_determinant` branch
 
-### Codex Workflow Note
+## Requirements
 
-To use the repository-local stop hook workflow, build Codex from source at commit `9a44a7e499f18eaed5d06aabb5acf9184deb06b8` or any newer commit in the Codex repository.
+- Rust with support for edition 2024.
+- OpenFHE C++ libraries installed in the system location expected by `build.rs`. Follow the [OpenFHE installation guide](https://openfhe-development.readthedocs.io/en/latest/sphinx_rsts/intro/installation/installation.html), but run those steps against our fork, [MachinaIO/openfhe-development](https://github.com/MachinaIO/openfhe-development), rather than the upstream OpenFHE repository. The build script links `OPENFHEpke`, `OPENFHEbinfhe`, and `OPENFHEcore`.
+- OpenMP support through the system C/C++ toolchain.
+- For GPU builds, a CUDA toolkit with `nvcc` and the CUDA runtime libraries.
 
-## Overview
+## Cargo Features
 
-### Matrix Element
+The default feature set is CPU-only and keeps matrix backing storage in memory.
 
-In the LWE setting, matrix elements are integers, and in the RLWE setting, matrix elements are polynomials. Since we want matrix elements to be generic over types, we define basic common functionality as a trait.
+| Feature | Effect |
+| --- | --- |
+| `disk` | Enables disk-backed matrix storage through `libc` and `memmap2`. Without this feature, `src/matrix/base/memory.rs` is used. |
+| `gpu` | Enables CUDA-backed polynomial/matrix paths, GPU samplers, GPU lookup and BGG paths, GPU-aware circuit evaluation, and native CUDA compilation from `cuda/`. |
 
-### Matrix
+GPU builds use these environment variables. Their defaults are defined in `build.rs`.
 
-The core of lattice operations is represented as a matrix. Both disk-based and memory (RAM)-based storage are supported as two options.
+| Variable | Purpose |
+| --- | --- |
+| `CUDA_ARCH` | CUDA SM architecture passed to `nvcc`. |
+| `CUDA_HOME` | CUDA installation root used to locate `nvcc` and libraries. |
+| `CUDA_LIB_DIR` | CUDA library directory linked by Cargo. |
+| `NVCC` | Explicit CUDA compiler path. |
 
-### Sampler
+Runtime parallelism and batching are also controlled by environment helpers in `src/env.rs`, including `MXX_CIRCUIT_PARALLEL_GATES`, `LUT_PREIMAGE_CHUNK_SIZE`, `GGH15_GATE_PARALLELISM`, `BGG_POLY_ENCODING_SLOT_PARALLELISM`, `SLOT_TRANSFER_SLOT_PARALLELISM`, `AUX_SAMPLING_CHUNK_WIDTH`, and `MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH`.
 
-For basic matrix sampling, there are:
+<!-- ## Repository Layout
 
-1. Hash sampler  
-2. Uniform sampler  
+The public Rust surface is organized from `src/lib.rs`:
 
-The trapdoor sampler is used for lattice trapdoor sampling techniques (detailed in the algorithm described in [Implementing Token-Based Obfuscation under (Ring) LWE](https://eprint.iacr.org/2018/1222.pdf)).
+| Path | Main responsibility |
+| --- | --- |
+| `src/poly/` | Polynomial traits and DCRT polynomial implementations backed by OpenFHE parameters and CRT decomposition. |
+| `src/matrix/` | Generic matrix traits, integer and DCRT-polynomial matrices, memory/disk storage, and GPU DCRT matrix support behind `gpu`. |
+| `src/sampler/` | Hash, uniform, and trapdoor samplers, including OpenFHE-backed Gaussian routines and GPU trapdoor paths. |
+| `src/bgg/` | BGG-style encodings, public keys, polynomial encodings, digit conversion, and sampler integration. |
+| `src/lookup/` | Public lookup-table machinery, LWE and GGH15 lookup encodings, commit/eval helpers, and debug tooling. |
+| `src/circuit/` | Arithmetic gate definitions, evaluable polynomial objects, serialized circuit support, and polynomial-circuit construction/evaluation. |
+| `src/gadgets/` | Arithmetic, convolution multiplication, FHE/RingGSW, Goldreich PRG, and secret inner-product gadgets. |
+| `src/func_enc/` | Functional-encryption workflows, currently including AKY24 key generation, decryption benchmarking, and error simulation helpers. |
+| `src/io/` | Diamond iO and AKY24 IO workflows, simulations, benchmark estimators, and circuit utilities. |
+| `src/we/` | Witness-encryption workflows, including Diamond WE simulation and benchmark estimation. |
+| `src/decoder/` | Decoder artifacts, masked high-bit decoding, mask circuits, PRG support, simulation, and benchmark support. |
+| `src/noise_refresh/` | Circuit decrypt, merge, PRG, naive-vector, and simulation components for noise refresh. |
+| `src/input_injector/` | Input injection and Diamond GPU injection paths. |
+| `src/slot_transfer/` | Slot-transfer BGG public keys, polynomial encodings, and polynomial-vector helpers. |
+| `src/commit/` | Commitment schemes, including WEE25. |
+| `src/bench_estimator/` | Estimators for BGG encodings, BGG public keys, naive vectors, and GPU-aware costs. |
+| `src/simulator/` | Lattice estimation, norm estimation, and evaluation-error simulation tools. |
+| `src/storage/` | Binary read/write helpers for repository data artifacts. |
+| `cuda/` | CUDA runtime, ChaCha, and matrix kernels for arithmetic, NTT, decomposition, sampling, trapdoor, and serialization paths. |
+| `benches/` | CPU/GPU matrix multiplication and preimage benchmarks declared in `Cargo.toml`. |
+| `tests/` | Integration-style regression and GPU tests. Run these only when a task explicitly calls for them. | -->
 
-### BGG+ Encoding
+## Common Commands
 
-An encoding scheme introduced in [Fully Key-Homomorphic Encryption, Arithmetic Circuit ABE, and Compact Garbled Circuits](https://eprint.iacr.org/2014/356.pdf), known as BGG+ encoding.
+CPU-only type checking:
 
-### Circuit
+```sh
+cargo check
+```
 
-Arithmetic circuits that can be evaluated homomorphically through arithmetic gate operations.
+Type check with disk-backed storage:
+
+```sh
+cargo check --features disk
+```
+
+Type check with CUDA support:
+
+```sh
+cargo check --features gpu
+```
+
+Run a targeted unit test by name when validating a narrow change:
+
+```sh
+cargo test <test_name>
+```
+
+Format Rust code when Rust files are changed:
+
+```sh
+cargo +nightly fmt --all
+```
+
+Run benchmarks explicitly by bench target:
+
+```sh
+cargo bench --bench bench_matrix_mul_cpu
+cargo bench --bench bench_preimage_cpu
+cargo bench --features gpu --bench bench_matrix_mul_gpu
+cargo bench --features gpu --bench bench_preimage_gpu
+```
 
 ## License
 
-<sup>
-Licensed under the [MIT license](./LICENSE).
-</sup>
+The Cargo manifest declares `MIT OR Apache-2.0`. See `LICENSE` for the checked-in license text.

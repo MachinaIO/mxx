@@ -1,6 +1,7 @@
 use crate::{
     circuit::{Evaluable, PolyCircuit},
     input_injector::DiamondInputErrorSimulation,
+    io::utils::simulation as sim_utils,
     lookup::PltEvaluator,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
@@ -36,6 +37,10 @@ pub struct DiamondWEErrorSimulation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiamondWECrtDepthSearchResult {
     pub crt_depth: usize,
+    pub log_ring_dim: usize,
+    pub ring_dim: u32,
+    pub achieved_secpar_for_gauss: Option<u64>,
+    pub achieved_secpar_for_cbd: Option<u64>,
     pub simulation: DiamondWEErrorSimulation,
 }
 
@@ -54,6 +59,9 @@ fn diamond_we_correctness_margin_holds(
 pub fn diamond_we_find_crt_depth<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST, PE, ST, BuildCandidate>(
     min_crt_depth: usize,
     max_crt_depth: usize,
+    min_log_ring_dim: usize,
+    max_log_ring_dim: usize,
+    security_bits: usize,
     circuit: &PolyCircuit<DCRTPoly>,
     mut build_candidate: BuildCandidate,
     plt_evaluator: Option<&PE>,
@@ -66,18 +74,48 @@ where
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     PE: PltEvaluator<ErrorNorm>,
     ST: SlotTransferEvaluator<ErrorNorm>,
-    BuildCandidate: FnMut(usize) -> DiamondWE<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
+    BuildCandidate: FnMut(u32, usize) -> DiamondWE<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST>,
 {
     assert!(min_crt_depth > 0, "minimum CRT depth must be positive");
     assert!(min_crt_depth <= max_crt_depth, "CRT-depth search range must be non-empty");
     info!(
         min_crt_depth,
-        max_crt_depth, "starting DiamondWE CRT-depth search with q/4 correctness margin"
+        max_crt_depth,
+        min_log_ring_dim,
+        max_log_ring_dim,
+        security_bits,
+        "starting DiamondWE CRT-depth search with q/4 correctness margin"
     );
+    let force_lattice_check = std::env::var_os("MXX_IO_FORCE_LATTICE_CHECK").is_some();
+    let explicit_log_ring_dim = min_log_ring_dim == max_log_ring_dim && !force_lattice_check;
+    if !explicit_log_ring_dim {
+        sim_utils::assert_lattice_estimator_available("DiamondWE");
+    }
+    let mut lattice_cache = sim_utils::SecureRingDimLatticeCache::default();
     let mut high = max_crt_depth;
     let upper_valid = loop {
         info!(crt_depth = high, "evaluating DiamondWE CRT-depth upper-bound candidate");
-        let candidate = build_candidate(high);
+        let min_ring_dim = 1u32
+            .checked_shl(min_log_ring_dim.try_into().expect("min_log_ring_dim must fit in u32"))
+            .expect("minimum ring_dim shift overflow");
+        let probe_candidate = build_candidate(min_ring_dim, high);
+        let Some(ring_dim_search) = sim_utils::select_min_secure_ring_dim_gaussian_only(
+            "DiamondWE",
+            high,
+            min_log_ring_dim,
+            max_log_ring_dim,
+            security_bits,
+            probe_candidate.injector.error_sigma,
+            explicit_log_ring_dim,
+            &mut lattice_cache,
+            |ring_dim| {
+                let candidate = build_candidate(ring_dim, high);
+                candidate.injector.params.clone()
+            },
+        ) else {
+            return None;
+        };
+        let candidate = build_candidate(ring_dim_search.ring_dim, high);
         let slot_transfer_evaluator = slot_transfer_evaluator
             .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<ErrorNorm>);
         let simulation =
@@ -92,7 +130,14 @@ where
             "DiamondWE CRT-depth upper-bound candidate evaluated"
         );
         if valid {
-            break DiamondWECrtDepthSearchResult { crt_depth: high, simulation };
+            break DiamondWECrtDepthSearchResult {
+                crt_depth: high,
+                log_ring_dim: ring_dim_search.log_ring_dim,
+                ring_dim: ring_dim_search.ring_dim,
+                achieved_secpar_for_gauss: ring_dim_search.achieved_secpar_for_gauss,
+                achieved_secpar_for_cbd: ring_dim_search.achieved_secpar_for_cbd,
+                simulation,
+            };
         }
         let next_high =
             high.checked_mul(2).expect("DiamondWE CRT-depth search upper bound overflowed usize");
@@ -110,7 +155,27 @@ where
     while low <= high {
         let crt_depth = low + (high - low) / 2;
         info!(crt_depth, low, high, "evaluating DiamondWE CRT-depth candidate");
-        let candidate = build_candidate(crt_depth);
+        let min_ring_dim = 1u32
+            .checked_shl(min_log_ring_dim.try_into().expect("min_log_ring_dim must fit in u32"))
+            .expect("minimum ring_dim shift overflow");
+        let probe_candidate = build_candidate(min_ring_dim, crt_depth);
+        let Some(ring_dim_search) = sim_utils::select_min_secure_ring_dim_gaussian_only(
+            "DiamondWE",
+            crt_depth,
+            min_log_ring_dim,
+            max_log_ring_dim,
+            security_bits,
+            probe_candidate.injector.error_sigma,
+            explicit_log_ring_dim,
+            &mut lattice_cache,
+            |ring_dim| {
+                let candidate = build_candidate(ring_dim, crt_depth);
+                candidate.injector.params.clone()
+            },
+        ) else {
+            return None;
+        };
+        let candidate = build_candidate(ring_dim_search.ring_dim, crt_depth);
         let slot_transfer_evaluator = slot_transfer_evaluator
             .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<ErrorNorm>);
         let simulation =
@@ -125,7 +190,14 @@ where
             "DiamondWE CRT-depth candidate evaluated"
         );
         if valid {
-            result = Some(DiamondWECrtDepthSearchResult { crt_depth, simulation });
+            result = Some(DiamondWECrtDepthSearchResult {
+                crt_depth,
+                log_ring_dim: ring_dim_search.log_ring_dim,
+                ring_dim: ring_dim_search.ring_dim,
+                achieved_secpar_for_gauss: ring_dim_search.achieved_secpar_for_gauss,
+                achieved_secpar_for_cbd: ring_dim_search.achieved_secpar_for_cbd,
+                simulation,
+            });
             if crt_depth == min_crt_depth {
                 break;
             }

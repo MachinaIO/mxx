@@ -69,8 +69,6 @@ use bench_estimator_utils::{
 
 use super::{DIAMOND_SECRET_SIZE, DiamondIO, DiamondIOFuncType};
 
-const NATIVE_BENCH_ITERATIONS: usize = 1;
-
 /// Combined DiamondIO benchmark estimate for `obfuscation` and `eval`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiamondIOBenchEstimate {
@@ -177,6 +175,7 @@ pub struct DiamondIOBenchEstimator<'a, PKBE, EncBE, NBE> {
     pub ring_gsw_encrypt_bit: CircuitBenchEstimate,
     /// Cost model for the complete Diamond input-injection preprocessing and online work.
     pub(crate) input_injection_units: DiamondInputInjectionBenchUnitEstimates,
+    bench_iterations: usize,
 }
 
 impl<'a, PKBE, EncBE, NBE> DiamondIOBenchEstimator<'a, PKBE, EncBE, NBE>
@@ -212,6 +211,7 @@ where
             ring_gsw_public_key_sample: units.ring_gsw_public_key_sample,
             ring_gsw_encrypt_bit: units.ring_gsw_encrypt_bit,
             input_injection_units: units.input_injection_units,
+            bench_iterations: iterations.max(1),
         }
     }
 
@@ -1202,6 +1202,7 @@ where
             &diamond.injector.params,
             diamond.noise_refresh_hash_key,
             1,
+            self.bench_iterations,
         );
         let a_prime_sampling_stage = scale_summary(a_prime_sampling_unit.clone(), shape.ring_dim);
 
@@ -1460,13 +1461,14 @@ fn measured_a_prime_hash_sampling_unit_summary<M, HS>(
     params: &<M::P as Poly>::Params,
     hash_key: [u8; 32],
     secret_size: usize,
+    iterations: usize,
 ) -> CircuitBenchSummary
 where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M>,
 {
     let log_base_q = params.modulus_digits();
-    let bench = benchmark_gate_operation(NATIVE_BENCH_ITERATIONS, || {
+    let bench = benchmark_gate_operation(iterations.max(1), || {
         let matrix = HS::new().sample_hash(
             params,
             hash_key,

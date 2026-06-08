@@ -49,8 +49,6 @@ use rayon::prelude::*;
 use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, info};
 
-const NATIVE_BENCH_ITERATIONS: usize = 1;
-
 pub fn debug_sample_prg_public_key_wires<M, HS>(
     params: &<M::P as Poly>::Params,
     hash_key: [u8; 32],
@@ -349,7 +347,10 @@ fn sequential_summaries(parts: &[CircuitBenchSummary]) -> CircuitBenchSummary {
     }
 }
 
-fn measured_crt_recompose_unit_summary<M>(params: &<M::P as Poly>::Params) -> CircuitBenchSummary
+fn measured_crt_recompose_unit_summary<M>(
+    params: &<M::P as Poly>::Params,
+    iterations: usize,
+) -> CircuitBenchSummary
 where
     M: PolyMatrix,
 {
@@ -377,7 +378,7 @@ where
             M::from_poly_vec_row(params, row)
         })
         .collect::<Vec<_>>();
-    let bench = benchmark_gate_operation(NATIVE_BENCH_ITERATIONS, || {
+    let bench = benchmark_gate_operation(iterations.max(1), || {
         crt_recompose_rows::<M>(params, &crt_values, 1)
     });
     let summary = CircuitBenchSummary::new(bench.time, bench.time, 1u32);
@@ -395,13 +396,14 @@ fn measured_a_prime_hash_sampling_unit_summary<M, HS>(
     params: &<M::P as Poly>::Params,
     hash_key: [u8; 32],
     secret_size: usize,
+    iterations: usize,
 ) -> CircuitBenchSummary
 where
     M: PolyMatrix,
     HS: PolyHashSampler<[u8; 32], M = M>,
 {
     let log_base_q = params.modulus_digits();
-    let bench = benchmark_gate_operation(NATIVE_BENCH_ITERATIONS, || {
+    let bench = benchmark_gate_operation(iterations.max(1), || {
         let matrix = HS::new().sample_hash(
             params,
             hash_key,
@@ -444,6 +446,7 @@ where
     cbd_n: usize,
     hash_key: [u8; 32],
     debug_reuse_single_material: bool,
+    bench_iterations: usize,
     material_circuit: Arc<PolyCircuit<M::P>>,
     _hash_sampler: PhantomData<HS>,
 }
@@ -484,9 +487,15 @@ where
             cbd_n,
             hash_key,
             debug_reuse_single_material,
+            bench_iterations: 1,
             material_circuit,
             _hash_sampler: PhantomData,
         }
+    }
+
+    pub fn with_bench_iterations(mut self, iterations: usize) -> Self {
+        self.bench_iterations = iterations.max(1);
+        self
     }
 
     pub fn with_debug_reuse_single_material(mut self, enabled: bool) -> Self {
@@ -614,6 +623,7 @@ where
             self.params(),
             self.hash_key,
             secret_size,
+            self.bench_iterations,
         );
         let a_prime_sampling_stage = scaled_summary(a_prime_sampling_unit.clone(), num_slots);
         let collapse_add_count = log_base_q
@@ -746,6 +756,7 @@ where
             self.params(),
             self.hash_key,
             secret_size,
+            self.bench_iterations,
         );
         let a_prime_sampling_stage = scaled_summary(a_prime_sampling_unit.clone(), num_slots);
         let collapse_add_count = log_base_q
@@ -776,7 +787,8 @@ where
         // Measure the native `crt_recompose_rows` work for one final slot row directly.  This is
         // not a BGG encoding gate: it performs coefficient rounding, reconstruction-coefficient
         // multiplication, and CRT-level accumulation on raw `M` matrices.
-        let online_crt_recompose_unit = measured_crt_recompose_unit_summary::<M>(self.params());
+        let online_crt_recompose_unit =
+            measured_crt_recompose_unit_summary::<M>(self.params(), self.bench_iterations);
 
         let online_combine_stage = sequential_summaries(&[
             a_prime_sampling_stage.clone(),
@@ -2454,7 +2466,7 @@ mod tests {
             assert!(summary.max_parallelism > BigUint::from(0u32));
 
             let crt_unit =
-                measured_crt_recompose_unit_summary::<GpuDCRTPolyMatrix>(refresher.params());
+                measured_crt_recompose_unit_summary::<GpuDCRTPolyMatrix>(refresher.params(), 1);
             assert!(crt_unit.latency.is_finite());
             assert!(crt_unit.max_parallelism > BigUint::from(0u32));
         }

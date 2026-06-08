@@ -66,6 +66,8 @@ pub struct Aky24DecBenchEstimator<'a, EncBE> {
     pub native_matrix_add: CircuitBenchEstimate,
     /// Cost model for one native matrix subtraction in the final decode path.
     pub native_matrix_sub: CircuitBenchEstimate,
+    /// Number of times to measure native representative units before averaging their cost.
+    pub bench_iterations: usize,
 }
 
 impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
@@ -75,8 +77,15 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
         native_matrix_mul: CircuitBenchEstimate,
         native_matrix_add: CircuitBenchEstimate,
         native_matrix_sub: CircuitBenchEstimate,
+        bench_iterations: usize,
     ) -> Self {
-        Self { encoding_estimator, native_matrix_mul, native_matrix_add, native_matrix_sub }
+        Self {
+            encoding_estimator,
+            native_matrix_mul,
+            native_matrix_add,
+            native_matrix_sub,
+            bench_iterations: bench_iterations.max(1),
+        }
     }
 
     /// Estimates all major AKY24 decryption stages for `func` under the supplied shape.
@@ -179,7 +188,8 @@ impl<'a, EncBE> Aky24DecBenchEstimator<'a, EncBE> {
             params.goldreich_graph_seed,
             params.noise_refresh_cbd_n,
             params.noise_refresh_hash_key,
-        );
+        )
+        .with_bench_iterations(self.bench_iterations);
         let unit = refresher.estimate_online_eval_bench(self.encoding_estimator);
         scale_summary(unit, shape.public_prf_seed_bits * generated_seed_bits * shape.wire_count)
     }

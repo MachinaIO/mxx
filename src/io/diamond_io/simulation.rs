@@ -703,23 +703,18 @@ where
                 plt_evaluator,
                 slot_transfer_evaluator,
             );
-            let Some(final_margin) = diamond_io_final_decode_margin(&prefix.cpu_params, candidate)
-            else {
-                if candidate == 1 {
-                    break;
-                }
-                high = candidate - 1;
-                continue;
-            };
             let error = &simulation.noisy_plaintext_error.poly_norm.norm;
-            let valid = if let Some(security_bit) = security_bit {
-                validate_error_bound_security_margin(&final_margin, error, security_bit)
-            } else {
-                final_margin > *error
-            };
+            let max_valid_bits = sim_utils::final_mask_coeff_bits_for_error_margin(
+                &prefix.cpu_params,
+                error,
+                security_bit,
+                max_candidate,
+            );
+            let valid = max_valid_bits.is_some_and(|max_valid_bits| candidate <= max_valid_bits);
             debug!(
                 candidate,
                 valid,
+                ?max_valid_bits,
                 noisy_plaintext_error = %error,
                 mask_value = %centered_mask_magnitude(candidate),
                 "DiamondIO fixed-v final PRF mask bit candidate evaluated"
@@ -734,7 +729,7 @@ where
             } else if candidate == 1 {
                 break;
             } else {
-                high = candidate - 1;
+                high = max_valid_bits.unwrap_or(0).min(candidate - 1);
             }
         }
         info!(found = best.is_some(), "finished DiamondIO fixed-v final PRF mask bit search");
@@ -1176,11 +1171,16 @@ where
                 high = candidate - 1;
                 continue;
             };
-            let valid = diamond_io_noise_refresh_security_margin_holds(
-                &base.cpu_params,
+            let worst_pre_rounding_error = sim_utils::noise_refresh_worst_pre_rounding_error_bound(
                 &evaluation.round.noise_refresh,
-                security_bit,
             );
+            let max_valid_bits = sim_utils::noise_refresh_v_bits_for_error_margin(
+                &base.cpu_params,
+                &worst_pre_rounding_error,
+                Some(security_bit),
+                max_candidate,
+            );
+            let valid = max_valid_bits.is_some_and(|max_valid_bits| candidate <= max_valid_bits);
             info!(
                 round_idx,
                 candidate,
@@ -1203,7 +1203,7 @@ where
             } else if candidate == 1 {
                 break;
             } else {
-                high = candidate - 1;
+                high = max_valid_bits.unwrap_or(0).min(candidate - 1);
             }
         }
         best

@@ -8,7 +8,10 @@ use crate::{
     circuit::{Evaluable, PolyCircuit},
     decoder::{
         mask_circuit::build_one_ciphertext_bit_decrypt_circuit,
-        simulation::{DecodeThreshold, decode_margin, validate_error_bound_security_margin},
+        simulation::{
+            DecodeThreshold, decode_margin, decode_threshold,
+            max_centered_mask_bits_for_available_range,
+        },
     },
     gadgets::{
         arith::{NestedRnsPoly, NestedRnsPolyContext},
@@ -489,6 +492,19 @@ pub(crate) fn final_decode_margin(
     decode_margin(q.as_ref(), prf_mask_output_coeff_bits, &DecodeThreshold::boolean())
 }
 
+pub(crate) fn final_mask_coeff_bits_for_error_margin(
+    params: &DCRTPolyParams,
+    error_bound: &BigDecimal,
+    security_bit: Option<usize>,
+    max_bits: usize,
+) -> Option<usize> {
+    let q: Arc<BigUint> = params.modulus().into();
+    let reserved_error = scaled_error_bound(error_bound, security_bit);
+    let available = decode_threshold(q.as_ref(), &DecodeThreshold::boolean()) - reserved_error;
+    max_centered_mask_bits_for_available_range(&available, max_bits)
+}
+
+#[cfg(test)]
 pub(crate) fn noise_refresh_pre_round_margin(
     params: &DCRTPolyParams,
     v_bits: usize,
@@ -499,23 +515,57 @@ pub(crate) fn noise_refresh_pre_round_margin(
     decode_margin(full_q.as_ref(), v_bits, &DecodeThreshold::new(q_max))
 }
 
+pub(crate) fn noise_refresh_v_bits_for_error_margin(
+    params: &DCRTPolyParams,
+    pre_rounding_error: &BigDecimal,
+    security_bit: Option<usize>,
+    max_bits: usize,
+) -> Option<usize> {
+    let (q_moduli, _crt_bits, _crt_depth) = params.to_crt();
+    let q_max = q_moduli.iter().copied().max().expect("CRT modulus list must be nonempty");
+    let full_q: Arc<BigUint> = params.modulus().into();
+    let reserved_error = scaled_error_bound(pre_rounding_error, security_bit);
+    let available =
+        decode_threshold(full_q.as_ref(), &DecodeThreshold::new(q_max)) - reserved_error;
+    max_centered_mask_bits_for_available_range(&available, max_bits)
+}
+
 pub(crate) fn noise_refresh_security_margin_holds(
     params: &DCRTPolyParams,
     refresh: &NoiseRefreshErrorSimulation,
     security_bit: usize,
 ) -> bool {
-    let Some(threshold) = noise_refresh_pre_round_margin(params, refresh.v_bits) else {
-        return false;
-    };
-    let worst_error = refresh
+    noise_refresh_v_bits_for_error_margin(
+        params,
+        &noise_refresh_worst_pre_rounding_error_bound(refresh),
+        Some(security_bit),
+        params.modulus_bits(),
+    )
+    .is_some_and(|max_bits| refresh.v_bits <= max_bits)
+}
+
+pub(crate) fn noise_refresh_worst_pre_rounding_error_bound(
+    refresh: &NoiseRefreshErrorSimulation,
+) -> BigDecimal {
+    refresh
         .pre_round_outputs
         .iter()
         .map(|error| error.poly_norm.norm.clone())
         .max_by(|lhs, rhs| {
             lhs.partial_cmp(rhs).expect("noise-refresh pre-rounding norms must be comparable")
         })
-        .expect("noise-refresh simulation must produce at least one pre-round output");
-    validate_error_bound_security_margin(&threshold, &worst_error, security_bit)
+        .expect("noise-refresh simulation must produce at least one pre-round output")
+}
+
+fn scaled_error_bound(error_bound: &BigDecimal, security_bit: Option<usize>) -> BigDecimal {
+    match security_bit {
+        Some(security_bit) => {
+            let security_factor =
+                BigDecimal::from(BigInt::from(BigUint::from(1u32) << security_bit));
+            error_bound * security_factor
+        }
+        None => error_bound.clone(),
+    }
 }
 
 pub(crate) fn minimum_seed_refresh_prf_seed_bits(
@@ -1148,4 +1198,92 @@ pub(crate) fn ring_gsw_wire_count(flat_input_count: usize, logical_bit_count: us
         "flattened Ring-GSW input count must be divisible by logical bit count"
     );
     flat_input_count / logical_bit_count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_mask_bits_are_chosen_after_reserving_security_error_margin() {
+        let params = DCRTPolyParams::new(2, 1, 10, 5);
+        let max_bits = params.modulus_bits();
+        let unreserved = final_mask_coeff_bits_for_error_margin(
+            &params,
+            &BigDecimal::from(0u32),
+            None,
+            max_bits,
+        )
+        .expect("zero-error mask width should fit");
+        let reserved = final_mask_coeff_bits_for_error_margin(
+            &params,
+            &BigDecimal::from(1u32),
+            Some(4),
+            max_bits,
+        )
+        .expect("security-reserved mask width should fit");
+
+        assert!(reserved <= unreserved);
+        assert!(
+            final_decode_margin(&params, reserved).expect("reserved margin should exist") >=
+                BigDecimal::from(16u32)
+        );
+
+        let q: Arc<BigUint> = params.modulus().into();
+        let exact_available = BigDecimal::from(128u32);
+        let exact_error =
+            decode_threshold(q.as_ref(), &DecodeThreshold::boolean()) - exact_available;
+        assert_eq!(
+            final_mask_coeff_bits_for_error_margin(&params, &exact_error, None, max_bits),
+            Some(8),
+            "a final-mask range exactly equal to 2^(k - 1) must select k"
+        );
+        if reserved < max_bits {
+            assert!(
+                final_decode_margin(&params, reserved + 1)
+                    .is_none_or(|margin| margin < BigDecimal::from(16u32))
+            );
+        }
+    }
+
+    #[test]
+    fn noise_refresh_bits_are_chosen_after_reserving_security_error_margin() {
+        let params = DCRTPolyParams::new(2, 2, 20, 5);
+        let max_bits = params.modulus_bits();
+        let unreserved =
+            noise_refresh_v_bits_for_error_margin(&params, &BigDecimal::from(0u32), None, max_bits)
+                .expect("zero-error noise-refresh mask width should fit");
+        let reserved = noise_refresh_v_bits_for_error_margin(
+            &params,
+            &BigDecimal::from(1u32),
+            Some(4),
+            max_bits,
+        )
+        .expect("security-reserved noise-refresh mask width should fit");
+
+        assert!(reserved <= unreserved);
+        assert!(
+            noise_refresh_pre_round_margin(&params, reserved)
+                .expect("reserved margin should exist") >=
+                BigDecimal::from(16u32)
+        );
+
+        let (q_moduli, _crt_bits, _crt_depth) = params.to_crt();
+        let q_max = q_moduli.iter().copied().max().expect("CRT moduli must be nonempty");
+        let full_q: Arc<BigUint> = params.modulus().into();
+        let exact_available = BigDecimal::from(128u32);
+        let exact_error =
+            decode_threshold(full_q.as_ref(), &DecodeThreshold::new(q_max)) - exact_available;
+        assert_eq!(
+            noise_refresh_v_bits_for_error_margin(&params, &exact_error, None, max_bits),
+            Some(8),
+            "a noise-refresh range exactly equal to 2^(k - 1) must select k"
+        );
+        if reserved < max_bits {
+            assert!(
+                noise_refresh_pre_round_margin(&params, reserved + 1)
+                    .is_none_or(|margin| margin < BigDecimal::from(16u32))
+            );
+        }
+    }
 }

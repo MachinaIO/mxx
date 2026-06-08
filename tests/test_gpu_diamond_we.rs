@@ -54,6 +54,7 @@ const DEFAULT_CRT_BITS: usize = 28;
 const DEFAULT_BASE_BITS: u32 = 14;
 const DEFAULT_MIN_CRT_DEPTH: usize = 1;
 const DEFAULT_MAX_CRT_DEPTH: usize = 64;
+const DEFAULT_SECURITY_BITS: usize = 100;
 const DEFAULT_BENCH_ITERATIONS: usize = 1;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_TRAPDOOR_SIGMA: f64 = 4.578;
@@ -104,6 +105,8 @@ type GpuPubKeySlotEvaluator = BggPublicKeySTEvaluator<
 #[derive(Debug, Clone)]
 struct DiamondWEGpuBenchConfig {
     ring_dim: u32,
+    min_log_ring_dim: usize,
+    max_log_ring_dim: usize,
     circuit_height: usize,
     witness_size: usize,
     injector_batch_bits: usize,
@@ -111,6 +114,7 @@ struct DiamondWEGpuBenchConfig {
     base_bits: u32,
     min_crt_depth: usize,
     max_crt_depth: usize,
+    security_bits: usize,
     bench_iterations: usize,
     error_sigma: f64,
     trapdoor_sigma: f64,
@@ -120,14 +124,26 @@ struct DiamondWEGpuBenchConfig {
 #[derive(Debug, Clone, Copy)]
 struct DiamondWEGpuBenchSelectedSimulation {
     crt_depth: usize,
+    ring_dim: u32,
+    log_ring_dim: usize,
+    achieved_secpar_for_gauss: Option<u64>,
+    achieved_secpar_for_cbd: Option<u64>,
     noisy_plaintext_error_bits: usize,
     input_injection_error_bits: usize,
 }
 
 impl DiamondWEGpuBenchConfig {
     fn from_env() -> Self {
+        let ring_dim = env_or_parse_u32("DIAMOND_WE_GPU_BENCH_RING_DIM", DEFAULT_RING_DIM);
+        assert!(ring_dim > 0, "DIAMOND_WE_GPU_BENCH_RING_DIM must be positive");
+        assert!(ring_dim.is_power_of_two(), "DIAMOND_WE_GPU_BENCH_RING_DIM must be a power of two");
+        let default_log_ring_dim = ring_dim.trailing_zeros() as usize;
         let cfg = Self {
-            ring_dim: env_or_parse_u32("DIAMOND_WE_GPU_BENCH_RING_DIM", DEFAULT_RING_DIM),
+            ring_dim,
+            min_log_ring_dim: env_or_parse_optional_usize("DIAMOND_WE_GPU_BENCH_MIN_LOG_RING_DIM")
+                .unwrap_or(default_log_ring_dim),
+            max_log_ring_dim: env_or_parse_optional_usize("DIAMOND_WE_GPU_BENCH_MAX_LOG_RING_DIM")
+                .unwrap_or(default_log_ring_dim),
             circuit_height: env_or_parse_usize(
                 "DIAMOND_WE_GPU_BENCH_CIRCUIT_HEIGHT",
                 DEFAULT_CIRCUIT_HEIGHT,
@@ -150,6 +166,10 @@ impl DiamondWEGpuBenchConfig {
                 "DIAMOND_WE_GPU_BENCH_MAX_CRT_DEPTH",
                 DEFAULT_MAX_CRT_DEPTH,
             ),
+            security_bits: env_or_parse_usize(
+                "DIAMOND_WE_GPU_BENCH_SECURITY_BITS",
+                DEFAULT_SECURITY_BITS,
+            ),
             bench_iterations: env_or_parse_usize(
                 "DIAMOND_WE_GPU_BENCH_ITERATIONS",
                 DEFAULT_BENCH_ITERATIONS,
@@ -161,7 +181,14 @@ impl DiamondWEGpuBenchConfig {
             ),
             d_secret: env_or_parse_usize("DIAMOND_WE_GPU_BENCH_D_SECRET", DEFAULT_D_SECRET),
         };
-        assert!(cfg.ring_dim > 0, "DIAMOND_WE_GPU_BENCH_RING_DIM must be positive");
+        assert!(
+            cfg.min_log_ring_dim <= cfg.max_log_ring_dim,
+            "DIAMOND_WE_GPU_BENCH_MIN_LOG_RING_DIM must be <= DIAMOND_WE_GPU_BENCH_MAX_LOG_RING_DIM"
+        );
+        assert!(
+            cfg.max_log_ring_dim < u32::BITS as usize,
+            "DIAMOND_WE_GPU_BENCH_MAX_LOG_RING_DIM must be < 32"
+        );
         assert!(cfg.circuit_height > 0, "DIAMOND_WE_GPU_BENCH_CIRCUIT_HEIGHT must be positive");
         assert!(cfg.witness_size > 0, "DIAMOND_WE_GPU_BENCH_WITNESS_SIZE must be positive");
         assert!(
@@ -187,6 +214,7 @@ impl DiamondWEGpuBenchConfig {
             cfg.min_crt_depth <= cfg.max_crt_depth,
             "DIAMOND_WE_GPU_BENCH_MIN_CRT_DEPTH must be <= DIAMOND_WE_GPU_BENCH_MAX_CRT_DEPTH"
         );
+        assert!(cfg.security_bits > 0, "DIAMOND_WE_GPU_BENCH_SECURITY_BITS must be positive");
         assert!(cfg.bench_iterations > 0, "DIAMOND_WE_GPU_BENCH_ITERATIONS must be positive");
         assert!(cfg.error_sigma >= 0.0, "DIAMOND_WE_GPU_BENCH_ERROR_SIGMA must be nonnegative");
         assert!(cfg.trapdoor_sigma > 0.0, "DIAMOND_WE_GPU_BENCH_TRAPDOOR_SIGMA must be positive");
@@ -224,6 +252,21 @@ impl DiamondWEGpuBenchConfig {
 
     fn selected_simulation_from_env(&self) -> Option<DiamondWEGpuBenchSelectedSimulation> {
         let crt_depth = env_or_parse_optional_usize("DIAMOND_WE_GPU_BENCH_SELECTED_CRT_DEPTH")?;
+        let ring_dim = env_or_parse_optional_u32("DIAMOND_WE_GPU_BENCH_SELECTED_RING_DIM")
+            .unwrap_or(self.ring_dim);
+        let log_ring_dim =
+            env_or_parse_optional_usize("DIAMOND_WE_GPU_BENCH_SELECTED_LOG_RING_DIM")
+                .unwrap_or_else(|| {
+                    assert!(
+                        ring_dim.is_power_of_two(),
+                        "DIAMOND_WE_GPU_BENCH_SELECTED_RING_DIM must be a power of two"
+                    );
+                    ring_dim.trailing_zeros() as usize
+                });
+        let achieved_secpar_for_gauss =
+            env_or_parse_optional_u64("DIAMOND_WE_GPU_BENCH_SELECTED_ACHIEVED_SECPAR_FOR_GAUSS");
+        let achieved_secpar_for_cbd =
+            env_or_parse_optional_u64("DIAMOND_WE_GPU_BENCH_SELECTED_ACHIEVED_SECPAR_FOR_CBD");
         let noisy_plaintext_error_bits =
             env_or_parse_optional_usize("DIAMOND_WE_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS")
                 .unwrap_or(0);
@@ -233,6 +276,10 @@ impl DiamondWEGpuBenchConfig {
         assert!(crt_depth > 0, "DIAMOND_WE_GPU_BENCH_SELECTED_CRT_DEPTH must be positive");
         Some(DiamondWEGpuBenchSelectedSimulation {
             crt_depth,
+            ring_dim,
+            log_ring_dim,
+            achieved_secpar_for_gauss,
+            achieved_secpar_for_cbd,
             noisy_plaintext_error_bits,
             input_injection_error_bits,
         })
@@ -257,6 +304,18 @@ fn env_or_parse_optional_usize(key: &str) -> Option<usize> {
     env::var(key)
         .ok()
         .map(|raw| raw.parse::<usize>().unwrap_or_else(|err| panic!("{key} must be usize: {err}")))
+}
+
+fn env_or_parse_optional_u32(key: &str) -> Option<u32> {
+    env::var(key)
+        .ok()
+        .map(|raw| raw.parse::<u32>().unwrap_or_else(|err| panic!("{key} must be u32: {err}")))
+}
+
+fn env_or_parse_optional_u64(key: &str) -> Option<u64> {
+    env::var(key)
+        .ok()
+        .map(|raw| raw.parse::<u64>().unwrap_or_else(|err| panic!("{key} must be u64: {err}")))
 }
 
 fn env_or_parse_f64(key: &str, default: f64) -> f64 {
@@ -312,10 +371,11 @@ fn build_circuit<P: Poly>(height: usize) -> PolyCircuit<P> {
 
 fn build_cpu_diamond_we_for_search(
     cfg: &DiamondWEGpuBenchConfig,
+    ring_dim: u32,
     crt_depth: usize,
     dir_path: PathBuf,
 ) -> CpuDiamondWE {
-    let params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
+    let params = DCRTPolyParams::new(ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
     let injector = CpuInjector::new(
         params,
         cfg.injector_input_count(),
@@ -487,6 +547,7 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
     let log_filter = tracing_subscriber::filter::Targets::new()
         .with_target("test_gpu_diamond_we", tracing_subscriber::filter::LevelFilter::INFO)
         .with_target("mxx::we::diamond_we", tracing_subscriber::filter::LevelFilter::INFO)
+        .with_target("mxx::io::utils::simulation", tracing_subscriber::filter::LevelFilter::INFO)
         .with_target(
             "mxx::we::diamond_we::bench_estimator",
             tracing_subscriber::filter::LevelFilter::DEBUG,
@@ -511,6 +572,10 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
     let selected = if let Some(selected) = cfg.selected_simulation_from_env() {
         info!(
             crt_depth = selected.crt_depth,
+            log_ring_dim = selected.log_ring_dim,
+            ring_dim = selected.ring_dim,
+            achieved_secpar_for_gauss = selected.achieved_secpar_for_gauss,
+            achieved_secpar_for_cbd = selected.achieved_secpar_for_cbd,
             noisy_plaintext_error_bits = selected.noisy_plaintext_error_bits,
             input_injection_error_bits = selected.input_injection_error_bits,
             "DiamondWE selected simulation parameters provided; skipping error simulation"
@@ -521,9 +586,17 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
         let search = diamond_we_find_crt_depth(
             cfg.min_crt_depth,
             cfg.max_crt_depth,
+            cfg.min_log_ring_dim,
+            cfg.max_log_ring_dim,
+            cfg.security_bits,
             &cpu_circuit,
-            |crt_depth| {
-                build_cpu_diamond_we_for_search(&cfg, crt_depth, search_dir.join("candidate"))
+            |ring_dim, crt_depth| {
+                build_cpu_diamond_we_for_search(
+                    &cfg,
+                    ring_dim,
+                    crt_depth,
+                    search_dir.join("candidate"),
+                )
             },
             None::<&NoCircuitEvaluator>,
             None::<&NoCircuitEvaluator>,
@@ -531,6 +604,10 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
         .expect("DiamondWE CRT-depth search must find a valid benchmark candidate");
         let selected = DiamondWEGpuBenchSelectedSimulation {
             crt_depth: search.crt_depth,
+            ring_dim: search.ring_dim,
+            log_ring_dim: search.log_ring_dim,
+            achieved_secpar_for_gauss: search.achieved_secpar_for_gauss,
+            achieved_secpar_for_cbd: search.achieved_secpar_for_cbd,
             noisy_plaintext_error_bits: bigdecimal_bits_ceil(
                 &search.simulation.noisy_plaintext_error.poly_norm.norm,
             ) as usize,
@@ -540,6 +617,10 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
         };
         info!(
             crt_depth = selected.crt_depth,
+            log_ring_dim = selected.log_ring_dim,
+            ring_dim = selected.ring_dim,
+            achieved_secpar_for_gauss = selected.achieved_secpar_for_gauss,
+            achieved_secpar_for_cbd = selected.achieved_secpar_for_cbd,
             noisy_plaintext_error_bits = selected.noisy_plaintext_error_bits,
             input_injection_error_bits = selected.input_injection_error_bits,
             "DiamondWE CRT-depth search selected parameters"
@@ -547,7 +628,9 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
         selected
     };
 
-    let (_cpu_params, gpu_params) = gpu_params_for_crt_depth(&cfg, selected.crt_depth, gpu_id);
+    let selected_cfg = DiamondWEGpuBenchConfig { ring_dim: selected.ring_dim, ..cfg.clone() };
+    let (_cpu_params, gpu_params) =
+        gpu_params_for_crt_depth(&selected_cfg, selected.crt_depth, gpu_id);
     let final_dir = artifact_dir_from_env(temp_dir.path().join("final_estimate"));
     ensure_dir(&final_dir);
     info!(

@@ -10,6 +10,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{fs, marker::PhantomData, path::Path};
 
+pub(crate) mod bench_estimator;
 #[cfg(feature = "gpu")]
 #[path = "diamond_gpu.rs"]
 mod gpu;

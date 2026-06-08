@@ -36,6 +36,7 @@ use crate::{
         scale_bit_decomposed_polynomial_mask_decrypt_contributions,
     },
     gadgets::arith::{DecomposeArithmeticGadget, ModularArithmeticPlanner, NestedRnsPoly},
+    input_injector::bench_estimator::DiamondInputInjectionBenchUnitEstimates,
     matrix::PolyMatrix,
     noise_refresh::naive_vec::NoiseRefreshBenchEstimateParts,
     poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
@@ -174,6 +175,8 @@ pub struct DiamondIOBenchEstimator<'a, PKBE, EncBE, NBE> {
     pub ring_gsw_public_key_sample: CircuitBenchEstimate,
     /// Cost model for encrypting one native Ring-GSW seed bit.
     pub ring_gsw_encrypt_bit: CircuitBenchEstimate,
+    /// Cost model for the complete Diamond input-injection preprocessing and online work.
+    pub(crate) input_injection_units: DiamondInputInjectionBenchUnitEstimates,
 }
 
 impl<'a, PKBE, EncBE, NBE> DiamondIOBenchEstimator<'a, PKBE, EncBE, NBE>
@@ -208,6 +211,7 @@ where
             bgg_public_key_sample: units.bgg_public_key_sample,
             ring_gsw_public_key_sample: units.ring_gsw_public_key_sample,
             ring_gsw_encrypt_bit: units.ring_gsw_encrypt_bit,
+            input_injection_units: units.input_injection_units,
         }
     }
 
@@ -243,36 +247,25 @@ where
             "starting DiamondIO benchmark unit-cost measurement"
         );
 
-        // Mirrors `DiamondInjector::load_or_sample_b_checkpoint`: sample one trapdoor/public
-        // matrix pair for the Diamond state row size, then serialize both artifacts because the
-        // concrete preprocessing path persists them as checkpoint files.
-        let trapdoor_checkpoint = bench_estimate_named("trapdoor_checkpoint", iterations, || {
-            let trap_sampler = TS::new(params, diamond.injector.trapdoor_sigma);
-            let (trapdoor, matrix) = trap_sampler.trapdoor(params, state_row_size);
-            (TS::trapdoor_to_bytes(&trapdoor), matrix.to_compact_bytes())
-        });
-
-        let trap_sampler = TS::new(params, diamond.injector.trapdoor_sigma);
-        let (trapdoor, public_matrix) = trap_sampler.trapdoor(params, state_row_size);
-        let transition_chunk_len = column_chunk_bounds(shape.state_col_size, 0).1;
-        let one_column_target = M::zero(params, state_row_size, 1);
-
-        // Measure `preimage` with one target column and compact serialization, then scale
-        // the parallel work by the real target width while keeping latency at the measured one-
-        // column value. Running the full-width serialized benchmark can exceed the H200 pod's CPU
-        // cgroup memory limit before the estimator reaches the final composed estimate.
-        let preimage_one_col = bench_estimate_named("preimage_one_col", iterations, || {
-            let preimage =
-                trap_sampler.preimage(params, &trapdoor, &public_matrix, &one_column_target);
-            preimage.to_compact_bytes()
-        });
-        let trapdoor_preimage =
-            scale_independent_estimate(preimage_one_col.clone(), transition_chunk_len);
-        let final_output_preimage =
-            scale_independent_estimate(preimage_one_col.clone(), gadget_col_size);
-        let final_decoder_preimage = preimage_one_col.clone();
-        let lookup_bridge_preimage =
-            scale_independent_estimate(preimage_one_col, shape.lookup_bridge_cols);
+        let input_injection_units = DiamondInputInjectionBenchUnitEstimates::benchmark::<M, US, TS>(
+            params,
+            diamond.injector.trapdoor_sigma,
+            diamond.injector.error_sigma,
+            iterations,
+            state_row_size,
+            shape.state_col_size,
+        );
+        let trapdoor_checkpoint = input_injection_units.trapdoor_checkpoint.clone();
+        let trapdoor_preimage = input_injection_units.transition_preimage.clone();
+        let final_output_preimage = scale_independent_estimate(
+            input_injection_units.preimage_one_column.clone(),
+            gadget_col_size,
+        );
+        let final_decoder_preimage = input_injection_units.preimage_one_column.clone();
+        let lookup_bridge_preimage = scale_independent_estimate(
+            input_injection_units.preimage_one_column.clone(),
+            shape.lookup_bridge_cols,
+        );
 
         let mut bgg_public_key_tag = diamond.bgg_tag.clone();
         bgg_public_key_tag.extend_from_slice(b":public_keys");
@@ -418,6 +411,7 @@ where
             ?bgg_public_key_sample,
             ?ring_gsw_public_key_sample,
             ?ring_gsw_encrypt_bit,
+            ?input_injection_units,
             "measured DiamondIO benchmark unit costs"
         );
 
@@ -430,6 +424,7 @@ where
             bgg_public_key_sample,
             ring_gsw_public_key_sample,
             ring_gsw_encrypt_bit,
+            input_injection_units,
         }
     }
 
@@ -664,7 +659,10 @@ where
         let ring_dim = params.ring_dimension() as usize;
         let scalar_one = vec![BigUint::from(1u32); ring_dim];
 
-        let input_injection = shape.estimate_online_input_injection(self.native_estimator);
+        let input_injection = self
+            .input_injection_units
+            .estimate(self.native_estimator, &shape.input_injection_bench_shape())
+            .online;
 
         // Corresponds to reading one/k/input/lookup preimages and multiplying `states[0]` (or the
         // selected bit state) by each preimage to build BGG encodings for the remaining circuit.
@@ -791,50 +789,26 @@ where
         HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
         TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     {
-        // Corresponds to `load_or_sample_b_checkpoint` for every level/state pair.
-        let checkpoint_sampling =
-            scale_estimate(self.trapdoor_checkpoint.clone(), shape.checkpoint_count);
-
-        // Corresponds to `build_initial_encoding`: one native product plus an error addition for
-        // the empty prefix state.
-        let initial_state = sequential_summaries(&[
-            self.native_estimator
-                .estimate_vector_matrix_product(shape.state_row_size, shape.state_col_size),
-            estimate_summary(self.native_estimator.estimate_vector_add(shape.state_col_size)),
-        ]);
-
-        // Corresponds to `build_k_target_chunk_with_params` for every level/digit/state/chunk.
-        // Target construction precedes the matching preimage sample, but all chunks in a stage are
-        // independent.
-        let transition_target_building =
-            shape.estimate_transition_target_building(self.native_estimator);
-
-        // Corresponds to the chunked `preimage` calls inside `DiamondInjector::preprocess`.
-        let transition_preimages =
-            scale_estimate(self.trapdoor_preimage.clone(), shape.transition_preimage_chunk_count);
-
-        let transition_stage = sequential_summaries(&[
-            transition_target_building.clone(),
-            transition_preimages.clone(),
-        ]);
-        let body = parallel_summaries(&[initial_state.clone(), transition_stage.clone()]);
-        let preprocess_total = sequential_summaries(&[checkpoint_sampling.clone(), body.clone()]);
-
-        let online_eval_total = shape.estimate_online_input_injection(self.native_estimator);
+        let input_injection = self
+            .input_injection_units
+            .estimate(self.native_estimator, &shape.input_injection_bench_shape());
 
         debug!(
-            ?checkpoint_sampling,
-            ?initial_state,
-            ?transition_target_building,
-            ?transition_preimages,
-            ?preprocess_total,
-            ?online_eval_total,
+            checkpoint_sampling = ?input_injection.checkpoint_sampling,
+            preprocess_artifact_materialization = ?input_injection.preprocess_artifact_materialization,
+            initial_state = ?input_injection.initial_state,
+            transition_target_building = ?input_injection.transition_target_building,
+            transition_preimages = ?input_injection.transition_preimages,
+            online_artifact_materialization = ?input_injection.online_artifact_materialization,
+            online_state_transitions = ?input_injection.online_state_transitions,
+            preprocess_total = ?input_injection.preprocess,
+            online_eval_total = ?input_injection.online,
             "estimated DiamondIO input-injection benchmark"
         );
 
         DiamondIOInputInjectionBenchEstimateParts {
-            obfuscate: preprocess_total,
-            eval: online_eval_total,
+            obfuscate: input_injection.preprocess,
+            eval: input_injection.online,
         }
     }
 
@@ -1441,6 +1415,7 @@ struct DiamondIOBenchUnitEstimates {
     bgg_public_key_sample: CircuitBenchEstimate,
     ring_gsw_public_key_sample: CircuitBenchEstimate,
     ring_gsw_encrypt_bit: CircuitBenchEstimate,
+    input_injection_units: DiamondInputInjectionBenchUnitEstimates,
 }
 
 #[derive(Debug, Clone, PartialEq)]

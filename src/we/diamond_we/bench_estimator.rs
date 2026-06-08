@@ -9,11 +9,16 @@ use crate::{
     bench_estimator::{
         BenchEstimator, CircuitBenchEstimate, CircuitBenchSummary, PublicKeyAuxBenchEstimator,
         benchmark_gate_operation, estimate_public_key_circuit_bench_with_aux,
-        scale_independent_estimate, scale_independent_summary,
+        scale_independent_summary,
     },
     bgg::{encoding::BggEncoding, public_key::BggPublicKey, sampler::BGGPublicKeySampler},
     circuit::PolyCircuit,
-    input_injector::DIAMOND_SECRET_SIZE,
+    input_injector::{
+        DIAMOND_SECRET_SIZE,
+        bench_estimator::{
+            DiamondInputInjectionBenchShape, DiamondInputInjectionBenchUnitEstimates,
+        },
+    },
     io::diamond_io::DiamondIONativeBenchEstimator,
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -44,6 +49,7 @@ pub struct DiamondWEBenchEstimator<'a, PKBE, EncBE, NBE> {
     pub final_preimage_one_column: CircuitBenchEstimate,
     pub bgg_public_key_sample: CircuitBenchEstimate,
     pub scalar_matrix_hash_sample: CircuitBenchEstimate,
+    input_injection_units: DiamondInputInjectionBenchUnitEstimates,
 }
 
 impl<'a, PKBE, EncBE, NBE> DiamondWEBenchEstimator<'a, PKBE, EncBE, NBE>
@@ -77,29 +83,7 @@ where
             final_preimage_one_column: units.final_preimage_one_column,
             bgg_public_key_sample: units.bgg_public_key_sample,
             scalar_matrix_hash_sample: units.scalar_matrix_hash_sample,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_unit_costs(
-        public_key_estimator: &'a PKBE,
-        encoding_estimator: &'a EncBE,
-        native_estimator: &'a NBE,
-        trapdoor_checkpoint: CircuitBenchEstimate,
-        trapdoor_preimage: CircuitBenchEstimate,
-        final_preimage_one_column: CircuitBenchEstimate,
-        bgg_public_key_sample: CircuitBenchEstimate,
-        scalar_matrix_hash_sample: CircuitBenchEstimate,
-    ) -> Self {
-        Self {
-            public_key_estimator,
-            encoding_estimator,
-            native_estimator,
-            trapdoor_checkpoint,
-            trapdoor_preimage,
-            final_preimage_one_column,
-            bgg_public_key_sample,
-            scalar_matrix_hash_sample,
+            input_injection_units: units.input_injection_units,
         }
     }
 
@@ -361,25 +345,13 @@ where
         &self,
         shape: DiamondWEBenchShape,
     ) -> DiamondWEInputInjectionBenchEstimateParts {
-        let checkpoint_sampling =
-            scale_estimate(self.trapdoor_checkpoint.clone(), shape.checkpoint_count);
-        let initial_state = sequential_summaries(&[
-            self.native_estimator
-                .estimate_vector_matrix_product(shape.state_row_size, shape.state_col_size),
-            estimate_summary(self.native_estimator.estimate_vector_add(shape.state_col_size)),
-        ]);
-        let transition_target_building =
-            shape.estimate_transition_target_building(self.native_estimator);
-        let transition_preimages =
-            scale_estimate(self.trapdoor_preimage.clone(), shape.transition_preimage_chunk_count);
-        let transition_stage =
-            sequential_summaries(&[transition_target_building, transition_preimages]);
-        let enc = sequential_summaries(&[
-            checkpoint_sampling.clone(),
-            parallel_summaries(&[initial_state.clone(), transition_stage.clone()]),
-        ]);
-        let dec = shape.estimate_online_input_injection(self.native_estimator);
-        DiamondWEInputInjectionBenchEstimateParts { enc, dec }
+        let input_injection = self
+            .input_injection_units
+            .estimate(self.native_estimator, &shape.input_injection_bench_shape());
+        DiamondWEInputInjectionBenchEstimateParts {
+            enc: input_injection.preprocess,
+            dec: input_injection.online,
+        }
     }
 
     fn final_preimage_summary_for_width(&self, width: usize) -> CircuitBenchSummary {
@@ -420,6 +392,9 @@ struct DiamondWEBenchShape {
     state_row_size: usize,
     state_col_size: usize,
     b_public_col_size: usize,
+    input_count: usize,
+    branch_count: usize,
+    input_injection_device_count: usize,
     checkpoint_count: usize,
     final_checkpoint_count: usize,
     transition_matrix_count: usize,
@@ -454,6 +429,14 @@ impl DiamondWEBenchShape {
             "DiamondWE witness_size must match the DiamondInjector bit input count"
         );
         let params = &diamond.injector.params;
+        #[cfg(feature = "gpu")]
+        let input_injection_device_count = if diamond.injector.gpu_device_ids.is_empty() {
+            params.device_ids().len().max(1)
+        } else {
+            diamond.injector.gpu_device_ids.len().max(1)
+        };
+        #[cfg(not(feature = "gpu"))]
+        let input_injection_device_count = 1usize;
         let ring_dim = params.ring_dimension() as usize;
         let modulus_digits = params.modulus_digits();
         let modulus_bits = params
@@ -528,6 +511,9 @@ impl DiamondWEBenchShape {
             state_row_size,
             state_col_size,
             b_public_col_size,
+            input_count: diamond.injector.input_count,
+            branch_count: diamond.injector.base,
+            input_injection_device_count,
             checkpoint_count,
             final_checkpoint_count,
             transition_matrix_count,
@@ -608,54 +594,27 @@ impl DiamondWEBenchShape {
         ) + BigUint::from(lookup_preimage_bytes)
     }
 
-    fn estimate_transition_target_building<NBE>(
-        &self,
-        native_estimator: &NBE,
-    ) -> CircuitBenchSummary
-    where
-        NBE: DiamondIONativeBenchEstimator + Sync,
-    {
-        let per_transition_matrix = self
-            .transition_chunk_col_lens
-            .iter()
-            .map(|&col_len| {
-                sequential_summaries(&[
-                    native_estimator.estimate_row_parallel_matrix_product(
-                        self.state_row_size,
-                        self.state_row_size,
-                        col_len,
-                    ),
-                    estimate_summary(
-                        native_estimator
-                            .estimate_vector_add(self.state_row_size.saturating_mul(col_len)),
-                    ),
-                ])
-            })
-            .collect::<Vec<_>>();
-        scale_summary(
-            parallel_summaries(per_transition_matrix.as_slice()),
-            self.transition_matrix_count,
-        )
-    }
-
-    fn estimate_online_input_injection<NBE>(&self, native_estimator: &NBE) -> CircuitBenchSummary
-    where
-        NBE: DiamondIONativeBenchEstimator + Sync,
-    {
-        let per_state = self
-            .transition_chunk_col_lens
-            .iter()
-            .map(|&col_len| {
-                native_estimator.estimate_vector_matrix_product(self.state_col_size, col_len)
-            })
-            .collect::<Vec<_>>();
-        let per_state = parallel_summaries(per_state.as_slice());
-        let levels = self
-            .online_level_state_counts
-            .iter()
-            .map(|&state_count| scale_summary(per_state.clone(), state_count))
-            .collect::<Vec<_>>();
-        sequential_summaries(levels.as_slice())
+    fn input_injection_bench_shape(&self) -> DiamondInputInjectionBenchShape {
+        DiamondInputInjectionBenchShape {
+            state_row_size: self.state_row_size,
+            state_col_size: self.state_col_size,
+            checkpoint_count: self.checkpoint_count,
+            final_checkpoint_count: self.final_checkpoint_count,
+            transition_matrix_count: self.transition_matrix_count,
+            transition_preimage_chunk_count: self.transition_preimage_chunk_count,
+            // `DiamondInjector::preprocess` materializes one empty-prefix `secret_epsilon`,
+            // then one digit secret mask for each `(input digit round, digit value)` pair.
+            // The digit mask is loaded once outside the state loop and reused for every state at
+            // that level/value, so the count is `input_count * branch_count + 1`, not per state.
+            secret_mask_materialize_count: self
+                .input_count
+                .checked_mul(self.branch_count)
+                .and_then(|count| count.checked_add(1))
+                .expect("DiamondWE secret mask materialization count overflow"),
+            device_count: self.input_injection_device_count,
+            online_level_state_counts: self.online_level_state_counts.clone(),
+            transition_chunk_col_lens: self.transition_chunk_col_lens.clone(),
+        }
     }
 }
 
@@ -680,6 +639,7 @@ struct DiamondWEBenchUnitEstimates {
     final_preimage_one_column: CircuitBenchEstimate,
     bgg_public_key_sample: CircuitBenchEstimate,
     scalar_matrix_hash_sample: CircuitBenchEstimate,
+    input_injection_units: DiamondInputInjectionBenchUnitEstimates,
 }
 
 impl DiamondWEBenchUnitEstimates {
@@ -699,30 +659,20 @@ impl DiamondWEBenchUnitEstimates {
         let state_row_size =
             2usize.checked_mul(DIAMOND_SECRET_SIZE).expect("DiamondWE state row size overflow");
         let modulus_digits = params.modulus_digits();
-        let trapdoor_checkpoint = bench_estimate(iterations, || {
-            let trap_sampler = TS::new(params, diamond.injector.trapdoor_sigma);
-            let (trapdoor, matrix) = trap_sampler.trapdoor(params, state_row_size);
-            black_box((TS::trapdoor_to_bytes(&trapdoor), matrix.to_compact_bytes()))
-        });
-
-        let trap_sampler = TS::new(params, diamond.injector.trapdoor_sigma);
-        let (trapdoor, public_matrix) = trap_sampler.trapdoor(params, state_row_size);
-        let one_column_target = M::zero(params, state_row_size, 1);
-        let preimage_one_column = bench_estimate(iterations, || {
-            let preimage =
-                trap_sampler.preimage(params, &trapdoor, &public_matrix, &one_column_target);
-            black_box(preimage.to_compact_bytes())
-        });
-        let transition_preimage = scale_independent_estimate(
-            preimage_one_column.clone(),
-            column_chunk_bounds(
-                state_row_size
-                    .checked_mul(modulus_digits + 2)
-                    .expect("DiamondWE benchmark state col overflow"),
-                0,
-            )
-            .1,
+        let state_col_size = state_row_size
+            .checked_mul(modulus_digits + 2)
+            .expect("DiamondWE benchmark state col overflow");
+        let input_injection_units = DiamondInputInjectionBenchUnitEstimates::benchmark::<M, US, TS>(
+            params,
+            diamond.injector.trapdoor_sigma,
+            diamond.injector.error_sigma,
+            iterations,
+            state_row_size,
+            state_col_size,
         );
+        let trapdoor_checkpoint = input_injection_units.trapdoor_checkpoint.clone();
+        let transition_preimage = input_injection_units.transition_preimage.clone();
+        let preimage_one_column = input_injection_units.preimage_one_column.clone();
         let bgg_public_key_sample = bench_estimate(iterations, || {
             BGGPublicKeySampler::<[u8; 32], HS>::new([0x73u8; 32], DIAMOND_SECRET_SIZE).sample(
                 params,
@@ -747,6 +697,7 @@ impl DiamondWEBenchUnitEstimates {
             final_preimage_one_column: preimage_one_column,
             bgg_public_key_sample,
             scalar_matrix_hash_sample,
+            input_injection_units,
         }
     }
 }
@@ -1058,16 +1009,43 @@ mod tests {
         DummyNativeBenchEstimator,
     > {
         let unit = |seconds| CircuitBenchEstimate::new(seconds, seconds);
-        DiamondWEBenchEstimator::with_unit_costs(
-            bgg,
-            bgg,
-            native,
-            unit(1.0),
-            unit(2.0),
-            unit(3.0),
-            unit(4.0),
-            unit(5.0),
-        )
+        let trapdoor_checkpoint = unit(1.0);
+        let trapdoor_preimage = unit(2.0);
+        let final_preimage_one_column = unit(3.0);
+        let small_input_injection_unit = || unit(0.25);
+        let input_injection_units = DiamondInputInjectionBenchUnitEstimates {
+            trapdoor_checkpoint: trapdoor_checkpoint.clone(),
+            transition_preimage: trapdoor_preimage.clone(),
+            preimage_one_column: final_preimage_one_column.clone(),
+            checkpoint_artifact_persist: small_input_injection_unit(),
+            stage_public_checkpoint_decode: small_input_injection_unit(),
+            stage_trapdoor_checkpoint_decode: small_input_injection_unit(),
+            final_public_checkpoint_decode: small_input_injection_unit(),
+            final_trapdoor_checkpoint_decode: small_input_injection_unit(),
+            secret_mask_materialize: small_input_injection_unit(),
+            transition_secret_mask_decode: small_input_injection_unit(),
+            initial_error_sample: small_input_injection_unit(),
+            initial_state_persist: small_input_injection_unit(),
+            transition_error_sample: small_input_injection_unit(),
+            transition_preimage_persist: small_input_injection_unit(),
+            online_initial_state_read_decode: small_input_injection_unit(),
+            online_lhs_state_serialize: small_input_injection_unit(),
+            online_lhs_state_decode: small_input_injection_unit(),
+            online_rhs_chunk_read_decode: small_input_injection_unit(),
+            online_output_chunk_serialize: small_input_injection_unit(),
+            online_output_recompose: small_input_injection_unit(),
+        };
+        DiamondWEBenchEstimator {
+            public_key_estimator: bgg,
+            encoding_estimator: bgg,
+            native_estimator: native,
+            trapdoor_checkpoint,
+            trapdoor_preimage,
+            final_preimage_one_column,
+            bgg_public_key_sample: unit(4.0),
+            scalar_matrix_hash_sample: unit(5.0),
+            input_injection_units,
+        }
     }
 
     fn circuit(input_count: usize) -> PolyCircuit<DCRTPoly> {

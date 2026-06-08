@@ -9,6 +9,7 @@ use bigdecimal::BigDecimal;
 use digest::Digest;
 #[cfg(test)]
 use keccak_asm::Keccak256;
+#[cfg(test)]
 use num_bigint::BigUint;
 use tracing::{debug, info};
 
@@ -18,8 +19,7 @@ use crate::{
     circuit::PolyCircuit,
     decoder::simulation::{centered_mask_magnitude, validate_error_bound_security_margin},
     gadgets::{
-        arith::NestedRnsPolyContext,
-        fhe::{ring_gsw::RingGswCiphertext, ring_gsw_nested_rns::NestedRnsRingGswContext},
+        fhe::ring_gsw_nested_rns::NestedRnsRingGswContext,
         fhe_prg::goldreich::{goldreich_output_bound_holds, minimum_goldreich_input_size},
     },
     input_injector::DiamondInputErrorSimulation,
@@ -43,10 +43,14 @@ use crate::{
 };
 
 use super::{DIAMOND_SECRET_SIZE, DiamondIO, DiamondIOFuncType};
-use crate::io::utils::simulation::{
-    self as sim_utils, assert_same_matrix_shape, branch_rebase_decoder_error,
-    expand_logical_errors, ring_gsw_wire_count, scale_error_norm,
-    simulate_selected_branch_rebase_error_norm,
+use crate::io::utils::simulation::{self as sim_utils, assert_same_matrix_shape, scale_error_norm};
+#[cfg(test)]
+use crate::{
+    gadgets::{arith::NestedRnsPolyContext, fhe::ring_gsw::RingGswCiphertext},
+    io::utils::simulation::{
+        branch_rebase_decoder_error, expand_logical_errors, ring_gsw_wire_count,
+        simulate_selected_branch_rebase_error_norm,
+    },
 };
 
 /// Error-growth summary for the DiamondIO online path.
@@ -1833,6 +1837,7 @@ fn max_final_mask_coeff_bits_for_seed(
     )
 }
 
+#[cfg(test)]
 fn eval_first_error_output<PE>(
     circuit: PolyCircuit<DCRTPoly>,
     one: ErrorNorm,

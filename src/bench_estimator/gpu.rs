@@ -5,6 +5,7 @@ use std::{
 };
 
 use super::{BenchOperationMeasurement, measure_bench_operation, measure_samples_with_interval};
+use crate::poly::dcrt::gpu::gpu_device_sync;
 
 unsafe extern "C" {
     fn gpu_device_count(out_count: *mut c_int) -> c_int;
@@ -95,7 +96,10 @@ where
     F: FnMut() -> R,
 {
     let (time, samples) = measure_gpu_vram_usage(Duration::from_millis(1), move || {
-        measure_bench_operation(iterations, || op())
+        gpu_device_sync();
+        let time = measure_bench_operation(iterations, || op());
+        gpu_device_sync();
+        time
     })
     .expect("GPU VRAM sampling failed while benchmarking a gate operation");
     BenchOperationMeasurement { time, peak_vram: peak_total_used_vram(&samples) }

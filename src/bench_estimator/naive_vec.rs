@@ -77,6 +77,130 @@ fn scale_single_slot_estimate_with_io(
     }
 }
 
+fn sequential_repeated_estimate(parts: &[(CircuitBenchEstimate, usize)]) -> CircuitBenchEstimate {
+    let mut total_time = BigUint::from(0u32);
+    let mut latency = 0.0;
+    let mut max_parallelism = BigUint::from(0u32);
+    #[cfg(feature = "gpu")]
+    let mut peak_vram = 0usize;
+
+    for (estimate, count) in parts {
+        total_time += estimate.total_time.clone() * BigUint::from(*count);
+        latency += estimate.latency * *count as f64;
+        max_parallelism += estimate.max_parallelism.clone() * BigUint::from(*count);
+        #[cfg(feature = "gpu")]
+        {
+            peak_vram = peak_vram.max(estimate.peak_vram);
+        }
+    }
+
+    let result =
+        CircuitBenchEstimate::from_nanos(total_time, latency).with_max_parallelism(max_parallelism);
+    #[cfg(feature = "gpu")]
+    {
+        result.with_peak_vram(peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        result
+    }
+}
+
+fn parallel_slot_estimate(parts: &[CircuitBenchEstimate]) -> CircuitBenchEstimate {
+    assert!(!parts.is_empty(), "parallel slot estimate requires at least one part");
+    let mut total_time = BigUint::from(0u32);
+    let mut latency = 0.0f64;
+    let mut max_parallelism = BigUint::from(0u32);
+    #[cfg(feature = "gpu")]
+    let mut peak_vram = 0usize;
+
+    for estimate in parts {
+        total_time += estimate.total_time.clone();
+        latency = latency.max(estimate.latency);
+        max_parallelism += estimate.max_parallelism.clone();
+        #[cfg(feature = "gpu")]
+        {
+            peak_vram = peak_vram.max(estimate.peak_vram);
+        }
+    }
+
+    let result =
+        CircuitBenchEstimate::from_nanos(total_time, latency).with_max_parallelism(max_parallelism);
+    #[cfg(feature = "gpu")]
+    {
+        result.with_peak_vram(peak_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        result
+    }
+}
+
+fn add_parallel_slot_io(
+    estimate: CircuitBenchEstimate,
+    slot_count: usize,
+    slot_io: &NaiveBGGVecSlotIoBenchEstimates,
+) -> CircuitBenchEstimate {
+    assert!(slot_count > 0, "parallel slot IO estimate requires at least one slot");
+    let total_time = estimate.total_time.clone() +
+        slot_io.load.total_time.clone() * BigUint::from(slot_count) +
+        slot_io.store.total_time.clone() * BigUint::from(slot_count);
+    let latency = estimate.latency + slot_io.load.latency + slot_io.store.latency;
+    let max_parallelism = estimate.max_parallelism.clone() +
+        slot_io.load.max_parallelism.clone() * BigUint::from(slot_count) +
+        slot_io.store.max_parallelism.clone() * BigUint::from(slot_count);
+    let result =
+        CircuitBenchEstimate::from_nanos(total_time, latency).with_max_parallelism(max_parallelism);
+    #[cfg(feature = "gpu")]
+    {
+        result.with_peak_vram(
+            estimate.peak_vram.max(slot_io.load.peak_vram).max(slot_io.store.peak_vram),
+        )
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        result
+    }
+}
+
+fn naive_slot_transfer_core_estimate<E, BE>(
+    inner: &BE,
+    src_slots: &[(u32, Option<u32>)],
+) -> CircuitBenchEstimate
+where
+    E: crate::circuit::Evaluable,
+    BE: BenchEstimator<E>,
+{
+    assert!(!src_slots.is_empty(), "slot_transfer requires at least one destination slot");
+    let per_slot = src_slots
+        .iter()
+        .map(|(_src_slot, scalar)| match scalar {
+            Some(scalar) => inner.estimate_small_scalar_mul(&[*scalar]),
+            None => inner.estimate_slot_transfer(&[(0, None)]),
+        })
+        .collect::<Vec<_>>();
+    parallel_slot_estimate(&per_slot)
+}
+
+fn naive_slot_reduce_core_estimate<E, BE>(inner: &BE, num_slots: usize) -> CircuitBenchEstimate
+where
+    E: crate::circuit::Evaluable,
+    BE: BenchEstimator<E>,
+{
+    assert!(num_slots > 0, "slot_reduce num_slots must be positive");
+
+    // Runtime slot_reduce builds one sparse scalar product for every source slot,
+    // then adds those slot terms into one output for each input vector.
+    let mut representative_selector = vec![0u32; num_slots];
+    representative_selector[0] = 1;
+    let small_scalar_terms = inner.estimate_small_scalar_mul(&representative_selector);
+    let add_terms = inner.estimate_add();
+    sequential_repeated_estimate(&[
+        (small_scalar_terms, num_slots),
+        (add_terms, num_slots.saturating_sub(1)),
+    ])
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NaiveBGGVecSlotIoBenchEstimates {
     pub load: CircuitBenchEstimate,
@@ -201,7 +325,8 @@ where
             self.num_slots,
             "NaiveBGGVecBenchEstimator::estimate_slot_transfer requires src_slots.len() == num_slots"
         );
-        self.scale_with_io(self.inner.estimate_slot_transfer(&src_slots[..1]), self.num_slots, 1, 1)
+        let core = naive_slot_transfer_core_estimate::<BggPublicKey<M>, _>(&self.inner, src_slots);
+        add_parallel_slot_io(core, self.num_slots, &self.slot_io)
     }
 
     fn estimate_slot_reduce(&self, input_count: usize, num_slots: usize) -> CircuitBenchEstimate {
@@ -210,7 +335,8 @@ where
             num_slots, self.num_slots,
             "NaiveBGGVecBenchEstimator::estimate_slot_reduce requires num_slots == estimator num_slots"
         );
-        self.scale_with_io(self.inner.estimate_slot_reduce(1, num_slots), input_count, num_slots, 1)
+        let core = naive_slot_reduce_core_estimate::<BggPublicKey<M>, _>(&self.inner, num_slots);
+        self.scale_with_io(core, input_count, num_slots, 1)
     }
 
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
@@ -270,7 +396,8 @@ where
             self.num_slots,
             "NaiveBGGVecBenchEstimator::estimate_slot_transfer requires src_slots.len() == num_slots"
         );
-        self.scale_with_io(self.inner.estimate_slot_transfer(&src_slots[..1]), self.num_slots, 1, 1)
+        let core = naive_slot_transfer_core_estimate::<BggEncoding<M>, _>(&self.inner, src_slots);
+        add_parallel_slot_io(core, self.num_slots, &self.slot_io)
     }
 
     fn estimate_slot_reduce(&self, input_count: usize, num_slots: usize) -> CircuitBenchEstimate {
@@ -279,7 +406,8 @@ where
             num_slots, self.num_slots,
             "NaiveBGGVecBenchEstimator::estimate_slot_reduce requires num_slots == estimator num_slots"
         );
-        self.scale_with_io(self.inner.estimate_slot_reduce(1, num_slots), input_count, num_slots, 1)
+        let core = naive_slot_reduce_core_estimate::<BggEncoding<M>, _>(&self.inner, num_slots);
+        self.scale_with_io(core, input_count, num_slots, 1)
     }
 
     fn estimate_public_lookup(&self, lut_id: usize) -> CircuitBenchEstimate {
@@ -472,15 +600,15 @@ mod tests {
             &estimator, &[(0, None), (1, None), (2, Some(3))]
         );
         assert_eq!(slot_transfer.latency, 7.0);
-        assert_eq!(slot_transfer.total_time, nanos(21_000_000_000));
+        assert_eq!(slot_transfer.total_time, nanos(19_000_000_000));
         assert_eq!(slot_transfer.max_parallelism, nanos(3));
 
         let slot_reduce = <NaiveBGGVecBenchEstimator<_> as BenchEstimator<
             NaiveBGGPublicKeyVec<DCRTPolyMatrix>,
         >>::estimate_slot_reduce(&estimator, 2, 3);
-        assert_eq!(slot_reduce.latency, 9.0);
-        assert_eq!(slot_reduce.total_time, nanos(18_000_000_000));
-        assert_eq!(slot_reduce.max_parallelism, nanos(8));
+        assert_eq!(slot_reduce.latency, 19.0);
+        assert_eq!(slot_reduce.total_time, nanos(38_000_000_000));
+        assert_eq!(slot_reduce.max_parallelism, nanos(10));
 
         let routed_slot_reduce = <NaiveBGGVecBenchEstimator<_> as BenchEstimator<
             NaiveBGGPublicKeyVec<DCRTPolyMatrix>,
@@ -488,9 +616,9 @@ mod tests {
             &estimator,
             &PolyGateType::SlotReduce { num_slots: 3, input_count: 2 },
         );
-        assert_eq!(routed_slot_reduce.latency, 9.0);
-        assert_eq!(routed_slot_reduce.total_time, nanos(18_000_000_000));
-        assert_eq!(routed_slot_reduce.max_parallelism, nanos(8));
+        assert_eq!(routed_slot_reduce.latency, 19.0);
+        assert_eq!(routed_slot_reduce.total_time, nanos(38_000_000_000));
+        assert_eq!(routed_slot_reduce.max_parallelism, nanos(10));
     }
 
     #[test]
@@ -519,12 +647,21 @@ mod tests {
         assert_eq!(public_lookup.total_time, nanos(26_250_000_000));
         assert_eq!(public_lookup.max_parallelism, nanos(12));
 
+        let slot_transfer = <NaiveBGGVecBenchEstimator<_> as BenchEstimator<
+            NaiveBGGPublicKeyVec<DCRTPolyMatrix>,
+        >>::estimate_slot_transfer(
+            &estimator, &[(0, None), (1, None), (2, Some(3))]
+        );
+        assert_eq!(slot_transfer.latency, 7.75);
+        assert_eq!(slot_transfer.total_time, nanos(21_250_000_000));
+        assert_eq!(slot_transfer.max_parallelism, nanos(9));
+
         let slot_reduce = <NaiveBGGVecBenchEstimator<_> as BenchEstimator<
             NaiveBGGPublicKeyVec<DCRTPolyMatrix>,
         >>::estimate_slot_reduce(&estimator, 2, 3);
-        assert_eq!(slot_reduce.latency, 10.75);
-        assert_eq!(slot_reduce.total_time, nanos(21_500_000_000));
-        assert_eq!(slot_reduce.max_parallelism, nanos(16));
+        assert_eq!(slot_reduce.latency, 20.75);
+        assert_eq!(slot_reduce.total_time, nanos(41_500_000_000));
+        assert_eq!(slot_reduce.max_parallelism, nanos(18));
     }
 
     #[tokio::test]

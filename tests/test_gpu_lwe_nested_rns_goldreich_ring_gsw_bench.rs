@@ -939,7 +939,7 @@ async fn test_gpu_lwe_nested_rns_goldreich_ring_gsw_bench() {
     );
 
     let encoding_scalar_bench =
-        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&params, cfg.bench_iterations);
+        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&params, cfg.bench_iterations, || ());
     let encoding_vec_bench_estimator =
         NaiveBGGVecBenchEstimator::new(encoding_scalar_bench, cfg.num_slots());
     let poly_circuit_bench = encoding_vec_bench_estimator.estimate_circuit_bench(&circuit);

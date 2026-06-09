@@ -265,9 +265,9 @@ where
         security_bit,
         "starting AKY24IO CRT-depth search"
     );
-    let force_lattice_check = std::env::var_os("MXX_IO_FORCE_LATTICE_CHECK").is_some();
-    let explicit_log_ring_dim = min_log_ring_dim == max_log_ring_dim && !force_lattice_check;
-    if !explicit_log_ring_dim {
+    let skip_lattice_check = min_log_ring_dim == max_log_ring_dim &&
+        std::env::var_os("MXX_IO_SKIP_LATTICE_CHECK_FOR_EXPLICIT_LOG_RING_DIM").is_some();
+    if !skip_lattice_check {
         sim_utils::assert_lattice_estimator_available("AKY24IO");
     }
     assert!(min_crt_depth > 0, "minimum CRT depth must be positive");
@@ -293,7 +293,7 @@ where
             security_bit,
             error_sigma,
             noise_refresh_cbd_n,
-            explicit_log_ring_dim,
+            skip_lattice_check,
             &mut lattice_cache,
             |ring_dim| {
                 let candidate =

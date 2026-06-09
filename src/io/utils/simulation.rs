@@ -148,7 +148,7 @@ where
             crt_depth,
             log_ring_dim = min_log_ring_dim,
             ring_dim,
-            "skipping lattice-estimator security checks because log_ring_dim was explicit"
+            "skipping lattice-estimator security checks because an explicit single-log-ring-dim skip was requested"
         );
         return Some(SecureRingDimSearchResult {
             log_ring_dim: min_log_ring_dim,
@@ -330,7 +330,7 @@ where
             crt_depth,
             log_ring_dim = min_log_ring_dim,
             ring_dim,
-            "skipping Gaussian lattice-estimator security check because log_ring_dim was explicit"
+            "skipping Gaussian lattice-estimator security check because an explicit single-log-ring-dim skip was requested"
         );
         return Some(SecureRingDimSearchResult {
             log_ring_dim: min_log_ring_dim,

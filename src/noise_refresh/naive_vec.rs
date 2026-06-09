@@ -2418,7 +2418,7 @@ mod tests {
             params: &GpuDCRTPolyParams,
             num_slots: usize,
         ) -> NaiveBGGVecBenchEstimator<BggEncodingBenchEstimator<GpuDCRTPolyMatrix>> {
-            let scalar_estimator = BggEncodingBenchEstimator::benchmark(params, 1);
+            let scalar_estimator = BggEncodingBenchEstimator::benchmark(params, 1, || ());
             NaiveBGGVecBenchEstimator::new(scalar_estimator, num_slots)
         }
 

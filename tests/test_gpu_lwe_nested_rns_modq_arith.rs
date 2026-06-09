@@ -752,7 +752,7 @@ async fn test_gpu_lwe_nested_rns_modq_arith() {
     );
 
     let encoding_scalar_bench =
-        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&params, cfg.bench_iterations);
+        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&params, cfg.bench_iterations, || ());
     let encoding_circuit_bench = encoding_scalar_bench.estimate_circuit_bench(&circuit);
     info!(
         "modq_arith scalar bgg encoding circuit bench estimate: total_time={:.6} latency={:.6} max_parallelism={} peak_vram={}",

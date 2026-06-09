@@ -6,8 +6,13 @@ use mxx::{
     bench_estimator::{
         BggEncodingBenchEstimator, BggPublicKeyBenchEstimator, BggPublicKeyBenchSamples,
         CircuitBenchEstimate, CircuitBenchSummary, NaiveBGGVecBenchEstimator,
+        PublicLutSampleAuxBenchEstimator,
     },
-    bgg::{public_key::BggPublicKey, sampler::BGGPublicKeySampler},
+    bgg::{
+        naive_vec::NaiveBGGEncodingVec,
+        public_key::BggPublicKey,
+        sampler::{BGGEncodingSampler, BGGPublicKeySampler},
+    },
     circuit::{PolyCircuit, gate::GateId},
     element::PolyElem,
     func_enc::NoCircuitEvaluator,
@@ -46,7 +51,7 @@ use mxx::{
     },
     simulator::error_norm::{ErrorNorm, NormNaiveBggEncodingVecSTEvaluator, NormPltLWEEvaluator},
     slot_transfer::{NaiveBGGVecSlotTransferEvaluator, bgg_pubkey::BggPublicKeySTEvaluator},
-    storage::write::init_storage_system,
+    storage::write::{init_storage_system, wait_for_all_writes},
     utils::bigdecimal_bits_ceil,
 };
 use num_bigint::BigUint;
@@ -76,7 +81,7 @@ const DEFAULT_MIN_CRT_DEPTH: usize = 1;
 const DEFAULT_MAX_CRT_DEPTH: usize = 64;
 const DEFAULT_SECURITY_BITS: usize = 100;
 const DEFAULT_NOISE_REFRESH_CBD_N: usize = 2;
-const DEFAULT_BENCH_ITERATIONS: usize = 1;
+const DEFAULT_BENCH_ITERATIONS: usize = 5;
 const DEFAULT_ERROR_SIGMA: f64 = 8.0;
 const DEFAULT_TRAPDOOR_SIGMA: f64 = 4.578;
 const DEFAULT_D_SECRET: usize = 1;
@@ -976,6 +981,65 @@ fn benchmark_aky24_io_unit_costs(
     }
 }
 
+async fn build_naive_vec_encoding_bench_estimator(
+    params: &GpuDCRTPolyParams,
+    cfg: &Aky24IOGpuBenchConfig,
+    bench_dir: PathBuf,
+) -> NaiveBGGVecBenchEstimator<BggEncodingBenchEstimator<GpuMatrix>> {
+    ensure_clean_dir(&bench_dir);
+
+    let (public_lut, public_lut_id, public_lut_gate_id) =
+        build_benchmark_public_lookup_gate(params);
+    let public_key_sampler =
+        BGGPublicKeySampler::<_, GpuHashSampler>::new(DEFAULT_HASH_KEY, cfg.d_secret);
+    let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+    let secrets =
+        uniform_sampler.sample_uniform(params, 1, cfg.d_secret, DistType::TernaryDist).get_row(0);
+    let plaintexts = vec![GpuDCRTPoly::from_usize_to_constant(params, 2)];
+    let public_keys =
+        public_key_sampler.sample(params, b"test_gpu_aky24_io_encoding_bench", &[true]);
+    let encoding_sampler =
+        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(params, &secrets, None);
+    let encodings = encoding_sampler.sample(params, &public_keys, &plaintexts);
+
+    let (public_lut_aux_writer, lookup_base_matrix) =
+        build_lwe_pubkey_vec_plt_evaluator(params, DEFAULT_HASH_KEY, cfg, bench_dir.clone());
+    public_lut_aux_writer.write_dummy_aux_for_poly_encode_bench(
+        params,
+        &public_lut,
+        &[plaintexts[0].const_coeff_u64()],
+        public_lut_id,
+        public_lut_gate_id,
+        cfg.error_sigma,
+    );
+    wait_for_all_writes(bench_dir.clone())
+        .await
+        .expect("AKY24IO encoding public lookup benchmark aux writes must flush");
+
+    let secret_vec = GpuMatrix::from_poly_vec_row(params, secrets);
+    let c_b = secret_vec * &lookup_base_matrix;
+    let encoding_evaluator = GpuEncodingPltEvaluator::new(LWEBGGEncodingPltEvaluator::<
+        GpuMatrix,
+        GpuHashSampler,
+    >::new(
+        DEFAULT_HASH_KEY, bench_dir, c_b
+    ));
+    let one = NaiveBGGEncodingVec::new(params, vec![encodings[0].clone()]);
+    let input = NaiveBGGEncodingVec::new(params, vec![encodings[1].clone()]);
+    let scalar_estimator =
+        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(params, cfg.bench_iterations, || {
+            encoding_evaluator.public_lookup(
+                params,
+                &public_lut,
+                &one,
+                &input,
+                public_lut_gate_id,
+                public_lut_id,
+            )
+        });
+    NaiveBGGVecBenchEstimator::new(scalar_estimator, params.ring_dimension() as usize)
+}
+
 #[tokio::test]
 #[sequential_test::sequential]
 async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
@@ -1130,12 +1194,12 @@ async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
     );
     let public_key_estimator =
         build_public_key_bench_estimator(&gpu_params, &cfg, final_dir.join("pubkey_bench"));
-    let encoding_scalar_estimator =
-        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&gpu_params, cfg.bench_iterations);
-    let encoding_estimator = NaiveBGGVecBenchEstimator::new(
-        encoding_scalar_estimator,
-        gpu_params.ring_dimension() as usize,
-    );
+    let encoding_estimator = build_naive_vec_encoding_bench_estimator(
+        &gpu_params,
+        &cfg,
+        final_dir.join("encoding_bench"),
+    )
+    .await;
     let native_estimator =
         GpuDCRTPolyMatrixNativeBenchEstimator::new(gpu_params.clone(), cfg.bench_iterations);
     let units = benchmark_aky24_io_unit_costs(&aky24, cfg.bench_iterations);

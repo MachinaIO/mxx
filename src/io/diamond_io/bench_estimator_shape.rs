@@ -15,7 +15,10 @@ use super::{
         estimate_summary, parallel_summaries, scale_summary, sequential_summaries,
     },
 };
-use crate::io::utils::bench_estimator as bench_utils;
+use crate::{
+    input_injector::bench_estimator::DiamondInputInjectionBenchShape,
+    io::utils::bench_estimator as bench_utils,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DiamondIOStorageEstimate {
@@ -33,6 +36,7 @@ pub(super) struct DiamondIOBenchShape {
     pub(super) input_size: usize,
     pub(super) prf_round_count: usize,
     pub(super) prf_branch_count: usize,
+    pub(super) input_injection_device_count: usize,
     pub(super) output_size: usize,
     pub(super) seed_bits: usize,
     pub(super) prf_mask_output_coeff_bits: usize,
@@ -69,6 +73,14 @@ impl DiamondIOBenchShape {
         TS: PolyTrapdoorSampler<M = M> + Send + Sync,
     {
         let params = &diamond.injector.params;
+        #[cfg(feature = "gpu")]
+        let input_injection_device_count = if diamond.injector.gpu_device_ids.is_empty() {
+            params.device_ids().len().max(1)
+        } else {
+            diamond.injector.gpu_device_ids.len().max(1)
+        };
+        #[cfg(not(feature = "gpu"))]
+        let input_injection_device_count = 1usize;
         let ring_dim = params.ring_dimension() as usize;
         let prf_round_count = diamond.injector.input_count;
         let prf_branch_count = 1usize
@@ -169,6 +181,7 @@ impl DiamondIOBenchShape {
             input_size: diamond.input_size,
             prf_round_count,
             prf_branch_count,
+            input_injection_device_count,
             output_size: function_output_bits,
             seed_bits: diamond.seed_bits,
             prf_mask_output_coeff_bits: diamond.prf_mask_output_coeff_bits,
@@ -241,55 +254,27 @@ impl DiamondIOBenchShape {
             BigUint::from(self.input_injection_transition_preimage_bytes)
     }
 
-    pub(super) fn estimate_transition_target_building<NBE>(
-        &self,
-        native_estimator: &NBE,
-    ) -> CircuitBenchSummary
-    where
-        NBE: DiamondIONativeBenchEstimator,
-    {
-        let per_transition_matrix = self
-            .transition_chunk_col_lens
-            .iter()
-            .map(|&col_len| {
-                sequential_summaries(&[
-                    native_estimator.estimate_row_parallel_matrix_product(
-                        self.state_row_size,
-                        self.state_row_size,
-                        col_len,
-                    ),
-                    estimate_summary(
-                        native_estimator
-                            .estimate_vector_add(self.state_row_size.saturating_mul(col_len)),
-                    ),
-                ])
-            })
-            .collect::<Vec<_>>();
-        let per_transition_matrix = parallel_summaries(per_transition_matrix.as_slice());
-        scale_summary(per_transition_matrix, self.transition_matrix_count)
-    }
-
-    pub(super) fn estimate_online_input_injection<NBE>(
-        &self,
-        native_estimator: &NBE,
-    ) -> CircuitBenchSummary
-    where
-        NBE: DiamondIONativeBenchEstimator,
-    {
-        let per_state = self
-            .transition_chunk_col_lens
-            .iter()
-            .map(|&col_len| {
-                native_estimator.estimate_vector_matrix_product(self.state_col_size, col_len)
-            })
-            .collect::<Vec<_>>();
-        let per_state = parallel_summaries(per_state.as_slice());
-        let levels = self
-            .online_level_state_counts
-            .iter()
-            .map(|&state_count| scale_summary(per_state.clone(), state_count))
-            .collect::<Vec<_>>();
-        sequential_summaries(levels.as_slice())
+    pub(super) fn input_injection_bench_shape(&self) -> DiamondInputInjectionBenchShape {
+        DiamondInputInjectionBenchShape {
+            state_row_size: self.state_row_size,
+            state_col_size: self.state_col_size,
+            checkpoint_count: self.checkpoint_count,
+            final_checkpoint_count: self.final_checkpoint_count,
+            transition_matrix_count: self.transition_matrix_count,
+            transition_preimage_chunk_count: self.transition_preimage_chunk_count,
+            // `DiamondInjector::preprocess` materializes one empty-prefix `secret_epsilon`,
+            // then one digit secret mask for each `(input digit round, digit value)` pair.
+            // The digit mask is loaded once outside the state loop and reused for every state at
+            // that level/value, so the count is `round_count * branch_count + 1`, not per state.
+            secret_mask_materialize_count: self
+                .prf_round_count
+                .checked_mul(self.prf_branch_count)
+                .and_then(|count| count.checked_add(1))
+                .expect("DiamondIO secret mask materialization count overflow"),
+            device_count: self.input_injection_device_count,
+            online_level_state_counts: self.online_level_state_counts.clone(),
+            transition_chunk_col_lens: self.transition_chunk_col_lens.clone(),
+        }
     }
 
     pub(super) fn estimate_input_encoding_projection<NBE>(
@@ -525,6 +510,7 @@ mod tests {
             input_size: 6,
             prf_round_count: 3,
             prf_branch_count: 4,
+            input_injection_device_count: 1,
             output_size: 2,
             seed_bits: 5,
             prf_mask_output_coeff_bits: 2,

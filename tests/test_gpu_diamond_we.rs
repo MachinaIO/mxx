@@ -55,7 +55,7 @@ const DEFAULT_BASE_BITS: u32 = 14;
 const DEFAULT_MIN_CRT_DEPTH: usize = 1;
 const DEFAULT_MAX_CRT_DEPTH: usize = 64;
 const DEFAULT_SECURITY_BITS: usize = 100;
-const DEFAULT_BENCH_ITERATIONS: usize = 1;
+const DEFAULT_BENCH_ITERATIONS: usize = 5;
 const DEFAULT_ERROR_SIGMA: f64 = 4.0;
 const DEFAULT_TRAPDOOR_SIGMA: f64 = 4.578;
 const DEFAULT_D_SECRET: usize = 1;
@@ -646,7 +646,7 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
         build_public_key_bench_estimator(&gpu_params, &cfg, final_dir.join("pubkey_bench"));
     info!("starting DiamondWE GPU encoding bench estimator construction");
     let encoding_estimator =
-        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&gpu_params, cfg.bench_iterations);
+        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&gpu_params, cfg.bench_iterations, || ());
     info!("starting DiamondWE GPU native bench estimator construction");
     let native_estimator =
         GpuDCRTPolyMatrixNativeBenchEstimator::new(gpu_params.clone(), cfg.bench_iterations);

@@ -9,6 +9,7 @@ use bigdecimal::BigDecimal;
 use digest::Digest;
 #[cfg(test)]
 use keccak_asm::Keccak256;
+#[cfg(test)]
 use num_bigint::BigUint;
 use tracing::{debug, info};
 
@@ -18,8 +19,7 @@ use crate::{
     circuit::PolyCircuit,
     decoder::simulation::{centered_mask_magnitude, validate_error_bound_security_margin},
     gadgets::{
-        arith::NestedRnsPolyContext,
-        fhe::{ring_gsw::RingGswCiphertext, ring_gsw_nested_rns::NestedRnsRingGswContext},
+        fhe::ring_gsw_nested_rns::NestedRnsRingGswContext,
         fhe_prg::goldreich::{goldreich_output_bound_holds, minimum_goldreich_input_size},
     },
     input_injector::DiamondInputErrorSimulation,
@@ -43,10 +43,14 @@ use crate::{
 };
 
 use super::{DIAMOND_SECRET_SIZE, DiamondIO, DiamondIOFuncType};
-use crate::io::utils::simulation::{
-    self as sim_utils, assert_same_matrix_shape, branch_rebase_decoder_error,
-    expand_logical_errors, ring_gsw_wire_count, scale_error_norm,
-    simulate_selected_branch_rebase_error_norm,
+use crate::io::utils::simulation::{self as sim_utils, assert_same_matrix_shape, scale_error_norm};
+#[cfg(test)]
+use crate::{
+    gadgets::{arith::NestedRnsPolyContext, fhe::ring_gsw::RingGswCiphertext},
+    io::utils::simulation::{
+        branch_rebase_decoder_error, expand_logical_errors, ring_gsw_wire_count,
+        simulate_selected_branch_rebase_error_norm,
+    },
 };
 
 /// Error-growth summary for the DiamondIO online path.
@@ -319,9 +323,9 @@ where
         security_bit,
         "starting DiamondIO CRT-depth search"
     );
-    let force_lattice_check = std::env::var_os("MXX_IO_FORCE_LATTICE_CHECK").is_some();
-    let explicit_log_ring_dim = min_log_ring_dim == max_log_ring_dim && !force_lattice_check;
-    if !explicit_log_ring_dim {
+    let skip_lattice_check = min_log_ring_dim == max_log_ring_dim &&
+        std::env::var_os("MXX_IO_SKIP_LATTICE_CHECK_FOR_EXPLICIT_LOG_RING_DIM").is_some();
+    if !skip_lattice_check {
         sim_utils::assert_lattice_estimator_available("DiamondIO");
     }
     assert!(min_crt_depth > 0, "minimum CRT depth must be positive");
@@ -348,7 +352,7 @@ where
             security_bit,
             error_sigma,
             noise_refresh_cbd_n,
-            explicit_log_ring_dim,
+            skip_lattice_check,
             &mut lattice_cache,
             |ring_dim| {
                 let candidate =
@@ -699,23 +703,18 @@ where
                 plt_evaluator,
                 slot_transfer_evaluator,
             );
-            let Some(final_margin) = diamond_io_final_decode_margin(&prefix.cpu_params, candidate)
-            else {
-                if candidate == 1 {
-                    break;
-                }
-                high = candidate - 1;
-                continue;
-            };
             let error = &simulation.noisy_plaintext_error.poly_norm.norm;
-            let valid = if let Some(security_bit) = security_bit {
-                validate_error_bound_security_margin(&final_margin, error, security_bit)
-            } else {
-                final_margin > *error
-            };
+            let max_valid_bits = sim_utils::final_mask_coeff_bits_for_error_margin(
+                &prefix.cpu_params,
+                error,
+                security_bit,
+                max_candidate,
+            );
+            let valid = max_valid_bits.is_some_and(|max_valid_bits| candidate <= max_valid_bits);
             debug!(
                 candidate,
                 valid,
+                ?max_valid_bits,
                 noisy_plaintext_error = %error,
                 mask_value = %centered_mask_magnitude(candidate),
                 "DiamondIO fixed-v final PRF mask bit candidate evaluated"
@@ -730,7 +729,7 @@ where
             } else if candidate == 1 {
                 break;
             } else {
-                high = candidate - 1;
+                high = max_valid_bits.unwrap_or(0).min(candidate - 1);
             }
         }
         info!(found = best.is_some(), "finished DiamondIO fixed-v final PRF mask bit search");
@@ -1172,11 +1171,16 @@ where
                 high = candidate - 1;
                 continue;
             };
-            let valid = diamond_io_noise_refresh_security_margin_holds(
-                &base.cpu_params,
+            let worst_pre_rounding_error = sim_utils::noise_refresh_worst_pre_rounding_error_bound(
                 &evaluation.round.noise_refresh,
-                security_bit,
             );
+            let max_valid_bits = sim_utils::noise_refresh_v_bits_for_error_margin(
+                &base.cpu_params,
+                &worst_pre_rounding_error,
+                Some(security_bit),
+                max_candidate,
+            );
+            let valid = max_valid_bits.is_some_and(|max_valid_bits| candidate <= max_valid_bits);
             info!(
                 round_idx,
                 candidate,
@@ -1199,7 +1203,7 @@ where
             } else if candidate == 1 {
                 break;
             } else {
-                high = candidate - 1;
+                high = max_valid_bits.unwrap_or(0).min(candidate - 1);
             }
         }
         best
@@ -1833,6 +1837,7 @@ fn max_final_mask_coeff_bits_for_seed(
     )
 }
 
+#[cfg(test)]
 fn eval_first_error_output<PE>(
     circuit: PolyCircuit<DCRTPoly>,
     one: ErrorNorm,

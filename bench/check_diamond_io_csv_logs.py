@@ -26,6 +26,18 @@ BENCHMARK_FIELDS = [
     "input_injection_bytes",
 ]
 
+OPTIONAL_BENCHMARK_FIELDS = [
+    "obfuscate_input_injection_latency",
+    "obfuscate_input_injection_total_time_nanos",
+    "obfuscate_input_injection_max_parallelism",
+    "eval_input_injection_latency",
+    "eval_input_injection_total_time_nanos",
+    "eval_input_injection_max_parallelism",
+    "final_fe_eval_latency",
+    "final_fe_eval_total_time_nanos",
+    "final_fe_eval_max_parallelism",
+]
+
 CONFIG_CHECKS = [
     ("ring_dim_config", "ring_dim"),
     ("min_log_ring_dim", "min_log_ring_dim"),
@@ -238,6 +250,13 @@ def check_benchmark(row: dict[str, str], root: Path, errors: list[str]) -> int:
     estimate = parse_kv_line(last_line_with(text, "DiamondIO GPU benchmark estimate"))
     for field in BENCHMARK_FIELDS:
         csv_column = f"benchmark_estimation_{field}"
+        require_match(errors, data_no, "benchmark estimate", csv_column, row[csv_column], field, estimate)
+        checks += 1
+
+    for field in OPTIONAL_BENCHMARK_FIELDS:
+        csv_column = f"benchmark_estimation_{field}"
+        if csv_column not in row:
+            continue
         require_match(errors, data_no, "benchmark estimate", csv_column, row[csv_column], field, estimate)
         checks += 1
 

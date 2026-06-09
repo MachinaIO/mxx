@@ -67,12 +67,18 @@ pub struct Aky24KeygenBenchEstimator<'a, PKBE> {
     /// The keygen estimator scales this unit cost by the number of refresh decoder preimages plus
     /// the final function-output preimage.
     pub trapdoor_preimage: CircuitBenchEstimate,
+    /// Number of times to measure native representative units before averaging their cost.
+    pub bench_iterations: usize,
 }
 
 impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
     /// Creates a keygen estimator from an existing public-key-vector estimator and preimage cost.
-    pub fn new(public_key_estimator: &'a PKBE, trapdoor_preimage: CircuitBenchEstimate) -> Self {
-        Self { public_key_estimator, trapdoor_preimage }
+    pub fn new(
+        public_key_estimator: &'a PKBE,
+        trapdoor_preimage: CircuitBenchEstimate,
+        bench_iterations: usize,
+    ) -> Self {
+        Self { public_key_estimator, trapdoor_preimage, bench_iterations: bench_iterations.max(1) }
     }
 
     /// Estimates all major AKY24 keygen stages for `func` under the supplied shape.
@@ -187,7 +193,8 @@ impl<'a, PKBE> Aky24KeygenBenchEstimator<'a, PKBE> {
             params.goldreich_graph_seed,
             params.noise_refresh_cbd_n,
             params.noise_refresh_hash_key,
-        );
+        )
+        .with_bench_iterations(self.bench_iterations);
         let unit = refresher.estimate_preprocess_bench(self.public_key_estimator);
         scale_summary(unit, shape.public_prf_seed_bits * generated_seed_bits * shape.wire_count)
     }

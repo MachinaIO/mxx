@@ -66,6 +66,20 @@ pub fn max_safe_mask_bits(
     max_centered_mask_bits_strictly_below(&available, max_bits)
 }
 
+/// Chooses the largest bit-decomposed centered-mask width whose range does not
+/// exceed an already-reserved margin.
+///
+/// If `available` is the range left after reserving correctness or security
+/// error, this returns the largest `k <= max_bits` such that
+/// `2^(k - 1) <= available`. This is the implementation form of choosing
+/// `k = 1 + floor(log2(available))`, capped by `max_bits`.
+pub fn max_centered_mask_bits_for_available_range(
+    available: &BigDecimal,
+    max_bits: usize,
+) -> Option<usize> {
+    max_centered_mask_bits_at_most(available, max_bits)
+}
+
 /// Checks whether an error bound has the requested security margin below a threshold.
 pub fn validate_error_bound_security_margin(
     threshold: &BigDecimal,
@@ -89,7 +103,7 @@ where
     G: FnMut(&S) -> BigDecimal,
 {
     let zero = BigDecimal::from(0u32);
-    let max_candidate = max_safe_mask_bits(full_modulus, &zero, max_bits, threshold)?;
+    let max_candidate = max_mask_bits_after_error_margin(full_modulus, &zero, max_bits, threshold)?;
     let mut low = 1usize;
     let mut high = max_candidate;
     let mut best = None;
@@ -97,18 +111,29 @@ where
         let candidate = low + (high - low) / 2;
         let simulation = simulate(candidate);
         let error = error_bound(&simulation);
-        let valid = max_safe_mask_bits(full_modulus, &error, max_bits, threshold)
-            .is_some_and(|max_valid| candidate <= max_valid);
+        let max_valid_bits =
+            max_mask_bits_after_error_margin(full_modulus, &error, max_bits, threshold);
+        let valid = max_valid_bits.is_some_and(|max_valid| candidate <= max_valid);
         if valid {
             best = Some(MaskBitSearchResult { mask_bits: candidate, simulation });
             low = candidate + 1;
         } else if candidate == 1 {
             break;
         } else {
-            high = candidate - 1;
+            high = max_valid_bits.unwrap_or(0).min(candidate - 1);
         }
     }
     best
+}
+
+fn max_mask_bits_after_error_margin(
+    full_modulus: &BigUint,
+    error_margin: &BigDecimal,
+    max_bits: usize,
+    threshold: &DecodeThreshold,
+) -> Option<usize> {
+    let available = decode_threshold(full_modulus, threshold) - error_margin;
+    max_centered_mask_bits_for_available_range(&available, max_bits)
 }
 
 fn max_centered_mask_bits_strictly_below(available: &BigDecimal, max_bits: usize) -> Option<usize> {
@@ -120,6 +145,18 @@ fn max_centered_mask_bits_strictly_below(available: &BigDecimal, max_bits: usize
         bound -= 1u32;
     }
     if bound < BigUint::from(2u32) {
+        return None;
+    }
+    let max_exponent = (bound.bits() as usize).saturating_sub(1).min(max_bits);
+    Some((max_exponent + 1).min(max_bits))
+}
+
+fn max_centered_mask_bits_at_most(available: &BigDecimal, max_bits: usize) -> Option<usize> {
+    if available < &BigDecimal::from(1u32) {
+        return None;
+    }
+    let bound = floor_positive_decimal(available).to_biguint()?;
+    if bound < BigUint::from(1u32) {
         return None;
     }
     let max_exponent = (bound.bits() as usize).saturating_sub(1).min(max_bits);
@@ -152,7 +189,8 @@ mod tests {
     use num_bigint::BigUint;
 
     use super::{
-        DecodeThreshold, centered_mask_magnitude, decode_margin, max_safe_mask_bits,
+        DecodeThreshold, centered_mask_magnitude, decode_margin,
+        max_centered_mask_bits_for_available_range, max_safe_mask_bits,
         search_mask_bits_with_simulation,
     };
 
@@ -182,6 +220,22 @@ mod tests {
     }
 
     #[test]
+    fn max_centered_mask_bits_selects_largest_power_below_available_range() {
+        assert_eq!(
+            max_centered_mask_bits_for_available_range(&BigDecimal::from(129u32), 32),
+            Some(8)
+        );
+        assert_eq!(
+            max_centered_mask_bits_for_available_range(&BigDecimal::from(128u32), 32),
+            Some(8)
+        );
+        assert_eq!(
+            max_centered_mask_bits_for_available_range(&BigDecimal::from(1024u32), 5),
+            Some(5)
+        );
+    }
+
+    #[test]
     fn search_mask_bits_uses_simulated_error_bound() {
         let q = BigUint::from(1024u32);
         let result = search_mask_bits_with_simulation(
@@ -192,6 +246,20 @@ mod tests {
             |bits| BigDecimal::from(*bits as u32),
         )
         .expect("search should find a candidate");
+        assert_eq!(result.mask_bits, 8);
+    }
+
+    #[test]
+    fn search_mask_bits_accepts_exact_power_of_two_available_range() {
+        let q = BigUint::from(1024u32);
+        let result = search_mask_bits_with_simulation(
+            &q,
+            32,
+            &DecodeThreshold::boolean(),
+            |bits| bits,
+            |_bits| BigDecimal::from(128u32),
+        )
+        .expect("search should find an exact-boundary candidate");
         assert_eq!(result.mask_bits, 8);
     }
 }

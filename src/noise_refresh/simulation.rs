@@ -1,7 +1,7 @@
 use crate::{
     circuit::PolyCircuit,
     decoder::simulation::{
-        DecodeThreshold, max_safe_mask_bits as max_safe_decoder_mask_bits,
+        DecodeThreshold, decode_threshold, max_centered_mask_bits_for_available_range,
         validate_error_bound_security_margin as validate_decoder_error_bound_security_margin,
     },
     gadgets::{
@@ -34,7 +34,7 @@ use tracing::{debug, info};
 /// rounded back modulo every CRT factor, the conservative sufficient condition is:
 ///
 /// ```text
-/// 2^(v_bits - 1) + pre_rounding_error < full_q / (2 * q_max)
+/// 2^(v_bits - 1) + pre_rounding_error <= full_q / (2 * q_max)
 /// ```
 ///
 /// where `full_q` is the full DCRT modulus and `q_max` is the largest CRT factor. The ideal
@@ -46,12 +46,9 @@ pub fn max_safe_noise_refresh_v_bits(
     let (q_moduli, _crt_bits, _crt_depth) = params.to_crt();
     let q_max = q_moduli.iter().copied().max().expect("CRT modulus list must be nonempty");
     let full_q: Arc<BigUint> = params.modulus().into();
-    max_safe_decoder_mask_bits(
-        full_q.as_ref(),
-        &pre_rounding_error.poly_norm.norm,
-        params.modulus_bits(),
-        &DecodeThreshold::new(q_max),
-    )
+    let available = decode_threshold(full_q.as_ref(), &DecodeThreshold::new(q_max)) -
+        &pre_rounding_error.poly_norm.norm;
+    max_centered_mask_bits_for_available_range(&available, params.modulus_bits())
 }
 
 /// Checks whether a proposed mask bit-size satisfies the conservative rounding-away bound.
@@ -318,11 +315,13 @@ where
         }
         let simulation = simulate_candidate(candidate);
         let worst_pre_rounding = worst_pre_rounding_error(&simulation);
-        let valid = validate_noise_refresh_v_bits(params, candidate, worst_pre_rounding);
+        let max_valid_bits = max_safe_noise_refresh_v_bits(params, worst_pre_rounding);
+        let valid = max_valid_bits.is_some_and(|max_valid_bits| candidate <= max_valid_bits);
         debug!(
             simulation = simulation_name,
             candidate,
             valid,
+            ?max_valid_bits,
             worst_pre_rounding_norm = %worst_pre_rounding.poly_norm.norm,
             "noise-refresh candidate evaluated"
         );
@@ -332,7 +331,7 @@ where
         } else if candidate == 1 {
             break;
         } else {
-            high = candidate - 1;
+            high = max_valid_bits.unwrap_or(0).min(candidate - 1);
         }
     }
     info!(
@@ -1249,6 +1248,27 @@ mod tests {
         gadgets::fhe_prg::goldreich::goldreich_output_bound_holds,
         poly::dcrt::params::DCRTPolyParams,
     };
+
+    #[test]
+    fn test_max_safe_noise_refresh_v_bits_accepts_exact_power_of_two_available_range() {
+        let params = DCRTPolyParams::new(2, 2, 20, 5);
+        let (q_moduli, _crt_bits, _crt_depth) = params.to_crt();
+        let q_max = q_moduli.iter().copied().max().expect("CRT moduli must be nonempty");
+        let full_q: Arc<BigUint> = params.modulus().into();
+        let exact_available = BigDecimal::from(128u32);
+        let pre_rounding_error =
+            decode_threshold(full_q.as_ref(), &DecodeThreshold::new(q_max)) - exact_available;
+        let ctx = Arc::new(SimulatorContext::new(
+            BigDecimal::from(1u32),
+            BigDecimal::from(2u32),
+            1,
+            1,
+            1,
+        ));
+        let pre_rounding = PolyMatrixNorm::new(ctx, 1, 1, pre_rounding_error, None);
+
+        assert_eq!(max_safe_noise_refresh_v_bits(&params, &pre_rounding), Some(8));
+    }
 
     #[test]
     fn test_noise_refresh_seed_bit_search_covers_uniform_output_bits() {

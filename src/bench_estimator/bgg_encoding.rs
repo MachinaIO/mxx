@@ -51,7 +51,19 @@ impl<M> BggEncodingBenchEstimator<M>
 where
     M: PolyMatrix,
 {
-    pub fn benchmark(params: &<M::P as Poly>::Params, iterations: usize) -> Self {
+    /// Benchmarks scalar BGG encoding operations.
+    ///
+    /// `public_lookup_op` must execute the representative public-LUT lookup for the concrete
+    /// encoding layer being estimated. Scalar `BggEncoding` does not define that operation by
+    /// itself, while vector and packed encodings provide concrete lookup evaluators.
+    pub fn benchmark<R, F>(
+        params: &<M::P as Poly>::Params,
+        iterations: usize,
+        public_lookup_op: F,
+    ) -> Self
+    where
+        F: FnMut() -> R,
+    {
         let matrix = M::gadget_matrix(params, 1);
         let pubkey = BggPublicKey::new(matrix.clone(), true);
         let plaintext_a = M::P::from_usize_to_constant(params, 2);
@@ -107,10 +119,9 @@ where
             "BggEncodingBenchEstimator::benchmark finished large scalar mul"
         );
 
-        // Scalar `BggEncoding` does not have its own slot-transfer or public-LUT benchmark
-        // evaluator. The naive-vector wrapper supplies the slot structure, so these single-scalar
-        // placeholders keep the estimate type complete without introducing packed
-        // `BggPolyEncoding` machinery in callers that benchmark naive vectors.
+        // Scalar `BggEncoding` does not have its own slot-transfer evaluator. The naive-vector
+        // wrapper supplies slot structure, so this single-scalar clone cost keeps the estimate type
+        // complete without introducing packed `BggPolyEncoding` machinery in scalar callers.
         info!("BggEncodingBenchEstimator::benchmark starting slot-transfer placeholder");
         let started = Instant::now();
         let slot_transfer = benchmark_gate_operation(iterations, || enc_a.clone());
@@ -119,13 +130,15 @@ where
             peak_vram = slot_transfer.peak_vram,
             "BggEncodingBenchEstimator::benchmark finished slot-transfer placeholder"
         );
-        info!("BggEncodingBenchEstimator::benchmark starting public-LUT placeholder");
+
+        info!("BggEncodingBenchEstimator::benchmark starting public-LUT lookup");
         let started = Instant::now();
-        let public_lut = benchmark_gate_operation(iterations, || enc_b.clone());
+        let mut public_lookup_op = public_lookup_op;
+        let public_lut = benchmark_gate_operation(iterations, || public_lookup_op());
         info!(
             elapsed = ?started.elapsed(),
             peak_vram = public_lut.peak_vram,
-            "BggEncodingBenchEstimator::benchmark finished public-LUT placeholder"
+            "BggEncodingBenchEstimator::benchmark finished public-LUT lookup"
         );
 
         Self {

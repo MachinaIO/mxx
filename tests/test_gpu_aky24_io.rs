@@ -987,6 +987,7 @@ async fn build_naive_vec_encoding_bench_estimator(
     bench_dir: PathBuf,
 ) -> NaiveBGGVecBenchEstimator<BggEncodingBenchEstimator<GpuMatrix>> {
     ensure_clean_dir(&bench_dir);
+    init_storage_system(bench_dir.clone());
 
     let (public_lut, public_lut_id, public_lut_gate_id) =
         build_benchmark_public_lookup_gate(params);
@@ -1064,12 +1065,8 @@ async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
         .with(log_filter)
         .with(tracing_subscriber::fmt::layer())
         .try_init();
-    gpu_device_sync();
-
     let cfg = Aky24IOGpuBenchConfig::from_env();
     info!("AKY24IO GPU bench config: {:?}", cfg);
-    let gpu_id =
-        *detected_gpu_device_ids().first().expect("test_gpu_aky24_io requires at least one GPU");
     let temp_dir = tempdir().expect("AKY24IO GPU bench test must create a tempdir");
     init_storage_system(temp_dir.path().to_path_buf());
 
@@ -1170,6 +1167,9 @@ async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
         return;
     }
 
+    gpu_device_sync();
+    let gpu_id =
+        *detected_gpu_device_ids().first().expect("test_gpu_aky24_io requires at least one GPU");
     let (cpu_params, gpu_params) =
         gpu_params_for_crt_depth(&cfg, selected.ring_dim, selected.crt_depth, gpu_id);
     assert_eq!(

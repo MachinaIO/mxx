@@ -165,6 +165,10 @@ def values_match(csv_value: str, log_value: str) -> bool:
     return left == right
 
 
+def is_archived(row: dict[str, str]) -> bool:
+    return row.get("archived", "").strip().lower() in {"1", "true", "yes", "y"}
+
+
 def require_match(
     errors: list[str],
     data_no: str,
@@ -271,7 +275,7 @@ def main() -> int:
         csv_path = root / csv_path
 
     with csv_path.open(newline="") as f:
-        rows = list(csv.DictReader(f))
+        rows = [row for row in csv.DictReader(f) if not is_archived(row)]
 
     errors: list[str] = []
     check_count = 0

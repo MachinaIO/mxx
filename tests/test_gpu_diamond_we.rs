@@ -336,7 +336,7 @@ fn artifact_dir_from_env(default: PathBuf) -> PathBuf {
 fn gpu_params_for_crt_depth(
     cfg: &DiamondWEGpuBenchConfig,
     crt_depth: usize,
-    gpu_id: i32,
+    gpu_ids: Vec<i32>,
 ) -> (DCRTPolyParams, GpuDCRTPolyParams) {
     let cpu_params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
     let (moduli, _, actual_depth) = cpu_params.to_crt();
@@ -345,7 +345,7 @@ fn gpu_params_for_crt_depth(
         cpu_params.ring_dimension(),
         moduli,
         cpu_params.base_bits(),
-        vec![gpu_id],
+        gpu_ids,
         Some(1),
     );
     assert_eq!(gpu_params.modulus(), cpu_params.modulus());
@@ -390,7 +390,7 @@ fn build_cpu_diamond_we_for_search(
 fn build_gpu_diamond_we(
     cfg: &DiamondWEGpuBenchConfig,
     gpu_params: GpuDCRTPolyParams,
-    gpu_id: i32,
+    gpu_ids: Vec<i32>,
     dir_path: PathBuf,
 ) -> GpuDiamondWE {
     let injector = GpuInjector::new(
@@ -401,7 +401,7 @@ fn build_gpu_diamond_we(
         cfg.trapdoor_sigma,
         cfg.error_sigma,
     )
-    .with_gpu_device_ids(vec![gpu_id]);
+    .with_gpu_device_ids(gpu_ids);
     DiamondWE::new(injector, cfg.witness_size, dir_path, b"test_gpu_diamond_we".to_vec())
 }
 
@@ -553,8 +553,9 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
 
     let cfg = DiamondWEGpuBenchConfig::from_env();
     info!("DiamondWE GPU bench config: {:?}", cfg);
-    let gpu_id =
-        *detected_gpu_device_ids().first().expect("test_gpu_diamond_we requires at least one GPU");
+    let gpu_ids = detected_gpu_device_ids();
+    assert!(!gpu_ids.is_empty(), "test_gpu_diamond_we requires at least one GPU");
+    info!(?gpu_ids, gpu_count = gpu_ids.len(), "DiamondWE GPU devices selected");
     let temp_dir = tempdir().expect("DiamondWE GPU bench test must create a tempdir");
     init_storage_system(temp_dir.path().to_path_buf());
 
@@ -620,7 +621,7 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
 
     let selected_cfg = DiamondWEGpuBenchConfig { ring_dim: selected.ring_dim, ..cfg.clone() };
     let (_cpu_params, gpu_params) =
-        gpu_params_for_crt_depth(&selected_cfg, selected.crt_depth, gpu_id);
+        gpu_params_for_crt_depth(&selected_cfg, selected.crt_depth, gpu_ids.clone());
     let final_dir = artifact_dir_from_env(temp_dir.path().join("final_estimate"));
     ensure_dir(&final_dir);
     info!(
@@ -628,7 +629,8 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
         "DiamondWE GPU artifact directory selected"
     );
     init_storage_system(final_dir.clone());
-    let diamond = build_gpu_diamond_we(&cfg, gpu_params.clone(), gpu_id, final_dir.clone());
+    let diamond =
+        build_gpu_diamond_we(&cfg, gpu_params.clone(), gpu_ids.clone(), final_dir.clone());
     let gpu_circuit = build_circuit::<GpuDCRTPoly>(cfg.circuit_height);
 
     info!("starting DiamondWE GPU public-key bench estimator construction");

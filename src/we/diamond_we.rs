@@ -161,6 +161,25 @@ where
         M::from_compact_bytes(&self.injector.params, &bytes)
     }
 
+    fn matrix_from_staging_bytes(&self, bytes: &[u8]) -> M {
+        M::from_cpu_staging_bytes(&self.injector.params, bytes)
+    }
+
+    fn online_eval_state_bytes(
+        &self,
+        ct: &DiamondWECiphertext<M, TS::Trapdoor>,
+        witness_digits: &[u32],
+    ) -> Vec<Vec<u8>> {
+        let states =
+            self.injector.online_eval(&self.artifact_dir, &ct.preprocess_out, witness_digits);
+        assert_eq!(
+            states.len(),
+            1 + self.witness_size,
+            "DiamondWE final Diamond state count mismatch"
+        );
+        states.into_iter().map(M::into_cpu_staging_bytes).collect()
+    }
+
     fn remove_matrix_if_exists(&self, id: &str) {
         match std::fs::remove_file(self.matrix_path(id)) {
             Ok(()) => {}
@@ -388,11 +407,22 @@ where
         BggPublicKey::new(matrix, true)
     }
 
+    fn k_public_key_columns(&self) -> usize {
+        self.bgg_public_key_columns()
+    }
+
     fn sample_k_public_key(&self, hash_key: [u8; 32]) -> BggPublicKey<M> {
         let params = &self.injector.params;
         let mut k_tag = self.bgg_tag.clone();
         k_tag.extend_from_slice(b":k_public_key");
-        let k_matrix = HS::new().sample_hash(params, hash_key, &k_tag, 1, 1, DistType::FinRingDist);
+        let k_matrix = HS::new().sample_hash(
+            params,
+            hash_key,
+            &k_tag,
+            1,
+            self.k_public_key_columns(),
+            DistType::FinRingDist,
+        );
         BggPublicKey::new(k_matrix, false)
     }
 
@@ -432,13 +462,14 @@ where
 
     fn k_preimage_target(&self, k_pubkey: &BggPublicKey<M>) -> M {
         let params = &self.injector.params;
+        let columns = self.k_public_key_columns();
         assert_eq!(
             k_pubkey.matrix.size(),
-            (DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE),
-            "DiamondWE k public key must be a 1 x 1 public matrix"
+            (DIAMOND_SECRET_SIZE, columns),
+            "DiamondWE k public key must match k_public_key_columns"
         );
-        let identity = M::identity(params, DIAMOND_SECRET_SIZE, None);
-        k_pubkey.matrix.concat_rows(&[&identity])
+        let identity_selector = M::unit_row_vector(params, columns, 0);
+        k_pubkey.matrix.concat_rows(&[&identity_selector])
     }
 
     fn decoder_preimage_target(&self, dec_pubkey_matrix: &M) -> M {
@@ -458,10 +489,23 @@ where
         lookup_base_matrix.concat_rows(&[&lookup_bottom])
     }
 
-    fn sample_r(&self, hash_key: [u8; 32]) -> M {
+    fn sample_r_columns(&self, hash_key: [u8; 32], col_start: usize, col_len: usize) -> M {
         let mut tag = self.bgg_tag.clone();
         tag.extend_from_slice(b":r");
-        HS::new().sample_hash(&self.injector.params, hash_key, &tag, 1, 1, DistType::FinRingDist)
+        HS::new().sample_hash_columns(
+            &self.injector.params,
+            hash_key,
+            &tag,
+            1,
+            self.k_public_key_columns(),
+            col_start,
+            col_len,
+            DistType::FinRingDist,
+        )
+    }
+
+    fn sample_r(&self, hash_key: [u8; 32]) -> M {
+        self.sample_r_columns(hash_key, 0, self.k_public_key_columns())
     }
 
     fn instance_pubkeys(&self, one: &BggPublicKey<M>, instance: &[bool]) -> Vec<BggPublicKey<M>> {
@@ -643,15 +687,13 @@ where
         );
         let params = &self.injector.params;
         let witness_digits = self.pack_witness_digits(witness);
-        let states =
-            self.injector.online_eval(&self.artifact_dir, &ct.preprocess_out, &witness_digits);
-        assert_eq!(
-            states.len(),
-            1 + self.witness_size,
-            "DiamondWE final Diamond state count mismatch"
-        );
-        let mut states = states.into_iter().map(Some).collect::<Vec<_>>();
-        let root_state = states[0].take().expect("DiamondWE root state must be present");
+        let mut state_bytes = self
+            .online_eval_state_bytes(ct, &witness_digits)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let root_state_bytes =
+            state_bytes[0].take().expect("DiamondWE root state bytes must be present");
 
         let one_pubkey = self.sample_bgg_public_key(ct.hash_key, 0);
         let mut input_encodings =
@@ -665,9 +707,12 @@ where
                 params,
                 self.injector.digit_bit_value(witness_digits[digit_idx] as usize, bit_in_digit),
             );
-            let state = states[state_idx]
-                .take()
-                .expect("DiamondWE witness state must be present exactly once");
+            let state = self.matrix_from_staging_bytes(
+                state_bytes[state_idx]
+                    .take()
+                    .expect("DiamondWE witness state bytes must be present exactly once")
+                    .as_ref(),
+            );
             let vector = self.left_mul_preimage(
                 &state,
                 &Self::witness_preimage_id(bit_idx),
@@ -680,23 +725,16 @@ where
                 Some(plaintext),
             ));
         }
-        drop(states);
+        drop(state_bytes);
 
-        let one_encoding = self.injector.build_output_encoding(
-            self.left_mul_preimage(
-                &root_state,
-                Self::one_preimage_id(),
-                one_pubkey.matrix.col_size(),
-            ),
-            one_pubkey,
-            Some(M::P::const_one(params)),
+        let root_state = self.matrix_from_staging_bytes(&root_state_bytes);
+        let one_vector = self.left_mul_preimage(
+            &root_state,
+            Self::one_preimage_id(),
+            one_pubkey.matrix.col_size(),
         );
-        input_encodings.extend(self.instance_encodings(&one_encoding, &ct.instance));
-
-        let out_encoding = {
-            let owned_enc_lookup_evaluator = if let Some(factory) =
-                self.enc_lookup_evaluator_factory.as_ref()
-            {
+        let owned_enc_lookup_evaluator =
+            if let Some(factory) = self.enc_lookup_evaluator_factory.as_ref() {
                 let lookup_base_cols = self
                     .enc_lookup_base_matrix
                     .as_ref()
@@ -711,55 +749,62 @@ where
             } else {
                 None
             };
-            let enc_lookup_evaluator =
-                owned_enc_lookup_evaluator.as_ref().or(self.enc_lookup_evaluator.as_ref());
-
-            ct.circuit
-                .eval(
-                    params,
-                    one_encoding.clone(),
-                    input_encodings,
-                    enc_lookup_evaluator,
-                    self.enc_slot_transfer_evaluator
-                        .as_ref()
-                        .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<BggEncoding<M>>),
-                    None,
-                )
-                .into_iter()
-                .next()
-                .expect("DiamondWE circuit must produce one output encoding")
-        };
-        let k_pubkey = self.sample_k_public_key(ct.hash_key);
-        let k_encoding = self.injector.build_output_encoding(
-            self.left_mul_preimage(&root_state, Self::k_preimage_id(), k_pubkey.matrix.col_size()),
-            k_pubkey,
-            None,
+        let k_public_key_columns = self.k_public_key_columns();
+        let k_vector = self.left_mul_preimage_columns(
+            &root_state,
+            Self::k_preimage_id(),
+            k_public_key_columns,
+            0,
+            1,
         );
-        let r = self.sample_r(ct.hash_key);
-        let r_decode_col = r.slice_columns(0, 1);
-        drop(r);
-        let BggEncoding { vector: one_vector, .. } = one_encoding;
-        let BggEncoding { vector: out_vector, .. } = out_encoding;
-        let dec_term_vector = one_vector - &out_vector;
-        drop(out_vector);
-        let dec_term_projection = dec_term_vector.mul_decompose(&r_decode_col);
-        drop(dec_term_vector);
-        drop(r_decode_col);
-        let BggEncoding { vector: k_vector, .. } = k_encoding;
-        let decoder_total_cols = k_vector.col_size();
-        let mut dec_encoding_vector = k_vector.slice_columns(0, 1);
-        drop(k_vector);
-        dec_encoding_vector.add_in_place(&dec_term_projection);
-        drop(dec_term_projection);
         let decoder = self.left_mul_preimage_columns(
             &root_state,
             Self::decoder_preimage_id(),
-            decoder_total_cols,
+            k_public_key_columns,
             0,
             1,
         );
         drop(root_state);
-        let noisy_plaintext = decoder - &dec_encoding_vector;
+
+        let one_encoding = self.injector.build_output_encoding(
+            one_vector,
+            one_pubkey,
+            Some(M::P::const_one(params)),
+        );
+        input_encodings.extend(self.instance_encodings(&one_encoding, &ct.instance));
+
+        let enc_lookup_evaluator =
+            owned_enc_lookup_evaluator.as_ref().or(self.enc_lookup_evaluator.as_ref());
+        let out_encoding = ct
+            .circuit
+            .eval(
+                params,
+                one_encoding.clone(),
+                input_encodings,
+                enc_lookup_evaluator,
+                self.enc_slot_transfer_evaluator
+                    .as_ref()
+                    .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<BggEncoding<M>>),
+                None,
+            )
+            .into_iter()
+            .next()
+            .expect("DiamondWE circuit must produce one output encoding");
+        drop(owned_enc_lookup_evaluator);
+
+        let r_decode_col = self.sample_r_columns(ct.hash_key, 0, 1);
+        let BggEncoding { vector: mut dec_term_vector, .. } = one_encoding;
+        let BggEncoding { vector: out_vector, .. } = out_encoding;
+        dec_term_vector.sub_in_place(&out_vector);
+        drop(out_vector);
+        let dec_term_projection = dec_term_vector.mul_decompose(&r_decode_col);
+        drop(dec_term_vector);
+        drop(r_decode_col);
+        let mut dec_encoding_vector = k_vector;
+        dec_encoding_vector.add_in_place(&dec_term_projection);
+        drop(dec_term_projection);
+        let mut noisy_plaintext = decoder;
+        noisy_plaintext.sub_in_place(&dec_encoding_vector);
         drop(dec_encoding_vector);
         self.decode_noisy_bool(&noisy_plaintext)
     }
@@ -861,7 +906,7 @@ mod tests {
             hash_key,
             &k_tag,
             1,
-            1,
+            we.k_public_key_columns(),
             DistType::FinRingDist,
         );
         assert_eq!(k_pubkey, BggPublicKey::new(expected_k, false));

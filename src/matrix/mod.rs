@@ -66,6 +66,10 @@ pub trait PolyMatrix:
         *self = self.clone() + rhs;
     }
 
+    fn sub_in_place(&mut self, rhs: &Self) {
+        *self = self.clone() - rhs;
+    }
+
     fn copy_block_from(
         &mut self,
         src: &Self,

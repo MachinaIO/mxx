@@ -938,6 +938,10 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         GpuDCRTPolyMatrix::add_in_place(self, rhs);
     }
 
+    fn sub_in_place(&mut self, rhs: &Self) {
+        GpuDCRTPolyMatrix::sub_in_place(self, rhs);
+    }
+
     fn copy_block_from(
         &mut self,
         src: &Self,

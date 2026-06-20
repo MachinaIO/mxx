@@ -685,8 +685,15 @@ where
             ct.circuit.num_input(),
             "DiamondWE witness_size + instance length must match the circuit input size"
         );
+        let started = std::time::Instant::now();
         let params = &self.injector.params;
         let witness_digits = self.pack_witness_digits(witness);
+        info!(
+            witness_size = self.witness_size,
+            instance_len = ct.instance.len(),
+            circuit_inputs = ct.circuit.num_input(),
+            "diamond we dec: begin online_eval"
+        );
         let mut state_bytes = self
             .online_eval_state_bytes(ct, &witness_digits)
             .into_iter()
@@ -694,12 +701,48 @@ where
             .collect::<Vec<_>>();
         let root_state_bytes =
             state_bytes[0].take().expect("DiamondWE root state bytes must be present");
+        let state_byte_lens = state_bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, bytes)| bytes.as_ref().map(|bytes| (idx, bytes.len())))
+            .collect::<Vec<_>>();
+        info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            state_count = state_bytes.len(),
+            root_state_bytes = root_state_bytes.len(),
+            ?state_byte_lens,
+            bgg_public_key_columns = self.bgg_public_key_columns(),
+            k_public_key_columns = self.k_public_key_columns(),
+            "diamond we dec: online_eval states staged"
+        );
 
+        info!(
+            rows = DIAMOND_SECRET_SIZE,
+            cols = self.bgg_public_key_columns(),
+            "diamond we dec: sample one public key begin"
+        );
         let one_pubkey = self.sample_bgg_public_key(ct.hash_key, 0);
+        info!(
+            rows = one_pubkey.matrix.row_size(),
+            cols = one_pubkey.matrix.col_size(),
+            "diamond we dec: sample one public key done"
+        );
         let mut input_encodings =
             Vec::with_capacity(self.witness_size.saturating_add(ct.instance.len()));
         for bit_idx in 0..self.witness_size {
+            info!(
+                bit_idx,
+                rows = DIAMOND_SECRET_SIZE,
+                cols = self.bgg_public_key_columns(),
+                "diamond we dec: sample witness public key begin"
+            );
             let pubkey = self.sample_bgg_public_key(ct.hash_key, bit_idx + 1);
+            info!(
+                bit_idx,
+                rows = pubkey.matrix.row_size(),
+                cols = pubkey.matrix.col_size(),
+                "diamond we dec: sample witness public key done"
+            );
             let digit_idx = bit_idx / self.injector.batch_bits();
             let bit_in_digit = bit_idx % self.injector.batch_bits();
             let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
@@ -707,31 +750,80 @@ where
                 params,
                 self.injector.digit_bit_value(witness_digits[digit_idx] as usize, bit_in_digit),
             );
-            let state = self.matrix_from_staging_bytes(
-                state_bytes[state_idx]
-                    .take()
-                    .expect("DiamondWE witness state bytes must be present exactly once")
-                    .as_ref(),
+            let staged = state_bytes[state_idx]
+                .take()
+                .expect("DiamondWE witness state bytes must be present exactly once");
+            info!(
+                bit_idx,
+                state_idx,
+                staged_bytes = staged.len(),
+                "diamond we dec: reload witness state begin"
+            );
+            let state = self.matrix_from_staging_bytes(staged.as_ref());
+            info!(
+                bit_idx,
+                state_idx,
+                rows = state.row_size(),
+                cols = state.col_size(),
+                "diamond we dec: reload witness state done"
+            );
+            info!(
+                bit_idx,
+                preimage_id = %Self::witness_preimage_id(bit_idx),
+                total_cols = pubkey.matrix.col_size(),
+                "diamond we dec: witness left_mul_preimage begin"
             );
             let vector = self.left_mul_preimage(
                 &state,
                 &Self::witness_preimage_id(bit_idx),
                 pubkey.matrix.col_size(),
             );
+            info!(
+                bit_idx,
+                rows = vector.row_size(),
+                cols = vector.col_size(),
+                "diamond we dec: witness left_mul_preimage done"
+            );
             drop(state);
+            info!(bit_idx, "diamond we dec: build witness output encoding begin");
             input_encodings.push(self.injector.build_output_encoding(
                 vector,
                 pubkey,
                 Some(plaintext),
             ));
+            info!(
+                bit_idx,
+                input_encoding_count = input_encodings.len(),
+                "diamond we dec: build witness output encoding done"
+            );
         }
         drop(state_bytes);
+        info!(
+            input_encoding_count = input_encodings.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "diamond we dec: witness encodings complete"
+        );
 
+        info!(staged_bytes = root_state_bytes.len(), "diamond we dec: reload root state begin");
         let root_state = self.matrix_from_staging_bytes(&root_state_bytes);
+        info!(
+            rows = root_state.row_size(),
+            cols = root_state.col_size(),
+            "diamond we dec: reload root state done"
+        );
+        info!(
+            total_cols = one_pubkey.matrix.col_size(),
+            "diamond we dec: one left_mul_preimage begin"
+        );
         let one_vector = self.left_mul_preimage(
             &root_state,
             Self::one_preimage_id(),
             one_pubkey.matrix.col_size(),
+        );
+        info!(
+            rows = one_vector.row_size(),
+            cols = one_vector.col_size(),
+            "diamond we dec: one left_mul_preimage done"
         );
         let owned_enc_lookup_evaluator =
             if let Some(factory) = self.enc_lookup_evaluator_factory.as_ref() {
@@ -740,22 +832,49 @@ where
                     .as_ref()
                     .expect("DiamondWE encoding lookup-base preimage requires a lookup base matrix")
                     .col_size();
+                info!(lookup_base_cols, "diamond we dec: lookup-base left_mul_preimage begin");
                 let c_b0 = self.left_mul_preimage(
                     &root_state,
                     Self::enc_lookup_base_preimage_id(),
                     lookup_base_cols,
                 );
-                Some(factory(c_b0))
+                info!(
+                    rows = c_b0.row_size(),
+                    cols = c_b0.col_size(),
+                    "diamond we dec: lookup-base left_mul_preimage done"
+                );
+                info!("diamond we dec: build owned encoding lookup evaluator begin");
+                let evaluator = factory(c_b0);
+                info!("diamond we dec: build owned encoding lookup evaluator done");
+                Some(evaluator)
             } else {
+                info!("diamond we dec: no owned encoding lookup evaluator needed");
                 None
             };
         let k_public_key_columns = self.k_public_key_columns();
+        info!(
+            total_cols = k_public_key_columns,
+            col_start = 0usize,
+            col_len = 1usize,
+            "diamond we dec: k left_mul_preimage_columns begin"
+        );
         let k_vector = self.left_mul_preimage_columns(
             &root_state,
             Self::k_preimage_id(),
             k_public_key_columns,
             0,
             1,
+        );
+        info!(
+            rows = k_vector.row_size(),
+            cols = k_vector.col_size(),
+            "diamond we dec: k left_mul_preimage_columns done"
+        );
+        info!(
+            total_cols = k_public_key_columns,
+            col_start = 0usize,
+            col_len = 1usize,
+            "diamond we dec: decoder left_mul_preimage_columns begin"
         );
         let decoder = self.left_mul_preimage_columns(
             &root_state,
@@ -764,17 +883,47 @@ where
             0,
             1,
         );
+        info!(
+            rows = decoder.row_size(),
+            cols = decoder.col_size(),
+            "diamond we dec: decoder left_mul_preimage_columns done"
+        );
         drop(root_state);
+        info!("diamond we dec: root state dropped");
 
+        info!("diamond we dec: build one output encoding begin");
         let one_encoding = self.injector.build_output_encoding(
             one_vector,
             one_pubkey,
             Some(M::P::const_one(params)),
         );
+        info!(
+            vector_rows = one_encoding.vector.row_size(),
+            vector_cols = one_encoding.vector.col_size(),
+            pubkey_rows = one_encoding.pubkey.matrix.row_size(),
+            pubkey_cols = one_encoding.pubkey.matrix.col_size(),
+            "diamond we dec: build one output encoding done"
+        );
+        info!(
+            instance_len = ct.instance.len(),
+            input_encoding_count = input_encodings.len(),
+            "diamond we dec: extend instance encodings begin"
+        );
         input_encodings.extend(self.instance_encodings(&one_encoding, &ct.instance));
+        info!(
+            input_encoding_count = input_encodings.len(),
+            "diamond we dec: extend instance encodings done"
+        );
 
         let enc_lookup_evaluator =
             owned_enc_lookup_evaluator.as_ref().or(self.enc_lookup_evaluator.as_ref());
+        info!(
+            input_encoding_count = input_encodings.len(),
+            has_enc_lookup_evaluator = enc_lookup_evaluator.is_some(),
+            has_enc_slot_transfer_evaluator = self.enc_slot_transfer_evaluator.is_some(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "diamond we dec: circuit eval begin"
+        );
         let out_encoding = ct
             .circuit
             .eval(
@@ -790,23 +939,76 @@ where
             .into_iter()
             .next()
             .expect("DiamondWE circuit must produce one output encoding");
+        info!(
+            vector_rows = out_encoding.vector.row_size(),
+            vector_cols = out_encoding.vector.col_size(),
+            pubkey_rows = out_encoding.pubkey.matrix.row_size(),
+            pubkey_cols = out_encoding.pubkey.matrix.col_size(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "diamond we dec: circuit eval done"
+        );
         drop(owned_enc_lookup_evaluator);
+        info!("diamond we dec: owned lookup evaluator dropped");
 
+        info!("diamond we dec: sample r decode column begin");
         let r_decode_col = self.sample_r_columns(ct.hash_key, 0, 1);
+        info!(
+            rows = r_decode_col.row_size(),
+            cols = r_decode_col.col_size(),
+            "diamond we dec: sample r decode column done"
+        );
         let BggEncoding { vector: mut dec_term_vector, .. } = one_encoding;
         let BggEncoding { vector: out_vector, .. } = out_encoding;
+        info!(
+            dec_term_rows = dec_term_vector.row_size(),
+            dec_term_cols = dec_term_vector.col_size(),
+            out_rows = out_vector.row_size(),
+            out_cols = out_vector.col_size(),
+            "diamond we dec: subtract output vector begin"
+        );
         dec_term_vector.sub_in_place(&out_vector);
+        info!("diamond we dec: subtract output vector done");
         drop(out_vector);
+        info!("diamond we dec: dropped output vector");
+        info!("diamond we dec: dec term mul_decompose begin");
         let dec_term_projection = dec_term_vector.mul_decompose(&r_decode_col);
+        info!(
+            rows = dec_term_projection.row_size(),
+            cols = dec_term_projection.col_size(),
+            "diamond we dec: dec term mul_decompose done"
+        );
         drop(dec_term_vector);
         drop(r_decode_col);
+        info!("diamond we dec: dropped dec term vector and r decode column");
         let mut dec_encoding_vector = k_vector;
+        info!(
+            rows = dec_encoding_vector.row_size(),
+            cols = dec_encoding_vector.col_size(),
+            "diamond we dec: add dec term projection begin"
+        );
         dec_encoding_vector.add_in_place(&dec_term_projection);
+        info!("diamond we dec: add dec term projection done");
         drop(dec_term_projection);
         let mut noisy_plaintext = decoder;
+        info!(
+            rows = noisy_plaintext.row_size(),
+            cols = noisy_plaintext.col_size(),
+            "diamond we dec: subtract dec encoding from decoder begin"
+        );
         noisy_plaintext.sub_in_place(&dec_encoding_vector);
+        info!("diamond we dec: subtract dec encoding from decoder done");
         drop(dec_encoding_vector);
-        self.decode_noisy_bool(&noisy_plaintext)
+        info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "diamond we dec: decode noisy bool begin"
+        );
+        let decoded = self.decode_noisy_bool(&noisy_plaintext);
+        info!(
+            decoded,
+            elapsed_ms = started.elapsed().as_millis(),
+            "diamond we dec: decode noisy bool done"
+        );
+        decoded
     }
 }
 

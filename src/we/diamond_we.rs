@@ -4,7 +4,7 @@ use num_bigint::BigUint;
 use tracing::info;
 
 use crate::{
-    bgg::{encoding::BggEncoding, public_key::BggPublicKey, sampler::BGGPublicKeySampler},
+    bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     circuit::{Evaluable, PolyCircuit},
     func_enc::NoCircuitEvaluator,
     input_injector::{
@@ -351,28 +351,60 @@ where
         self.left_mul_preimage_columns(lhs, id, total_cols, 0, total_cols)
     }
 
+    fn bgg_public_key_columns(&self) -> usize {
+        DIAMOND_SECRET_SIZE
+            .checked_mul(self.injector.params.modulus_digits())
+            .expect("DiamondWE public-key column count overflow")
+    }
+
+    fn sample_bgg_public_key(&self, hash_key: [u8; 32], idx: usize) -> BggPublicKey<M> {
+        let params = &self.injector.params;
+        let mut tag = self.bgg_tag.clone();
+        tag.extend_from_slice(b":witness_public_keys");
+        let columns = self.bgg_public_key_columns();
+        let total_keys =
+            self.witness_size.checked_add(1).expect("DiamondWE public-key count overflow");
+        assert!(
+            idx < total_keys,
+            "DiamondWE public-key index out of bounds: idx={}, total={}",
+            idx,
+            total_keys
+        );
+        let total_cols = columns
+            .checked_mul(total_keys)
+            .expect("DiamondWE public-key total column count overflow");
+        let col_start =
+            columns.checked_mul(idx).expect("DiamondWE public-key column start overflow");
+        let matrix = HS::new().sample_hash_columns(
+            params,
+            hash_key,
+            &tag,
+            DIAMOND_SECRET_SIZE,
+            total_cols,
+            col_start,
+            columns,
+            DistType::FinRingDist,
+        );
+        BggPublicKey::new(matrix, true)
+    }
+
+    fn sample_k_public_key(&self, hash_key: [u8; 32]) -> BggPublicKey<M> {
+        let params = &self.injector.params;
+        let mut k_tag = self.bgg_tag.clone();
+        k_tag.extend_from_slice(b":k_public_key");
+        let k_matrix = HS::new().sample_hash(params, hash_key, &k_tag, 1, 1, DistType::FinRingDist);
+        BggPublicKey::new(k_matrix, false)
+    }
+
     fn sample_bgg_public_keys(
         &self,
         hash_key: [u8; 32],
     ) -> (BggPublicKey<M>, BggPublicKey<M>, Vec<BggPublicKey<M>>) {
-        let params = &self.injector.params;
-        let mut tag = self.bgg_tag.clone();
-        tag.extend_from_slice(b":witness_public_keys");
-        let reveal_plaintexts = vec![true; self.witness_size];
-        let sampled = BGGPublicKeySampler::<[u8; 32], HS>::new(hash_key, DIAMOND_SECRET_SIZE)
-            .sample(params, &tag, &reveal_plaintexts);
-        assert_eq!(
-            sampled.len(),
-            self.witness_size + 1,
-            "DiamondWE public-key sampler must return one and all witness keys"
-        );
-        let one = sampled[0].clone();
-        let witness_pubkeys = sampled[1..].to_vec();
-
-        let mut k_tag = self.bgg_tag.clone();
-        k_tag.extend_from_slice(b":k_public_key");
-        let k_matrix = HS::new().sample_hash(params, hash_key, &k_tag, 1, 1, DistType::FinRingDist);
-        let k_pubkey = BggPublicKey::new(k_matrix, false);
+        let one = self.sample_bgg_public_key(hash_key, 0);
+        let witness_pubkeys = (0..self.witness_size)
+            .map(|bit_idx| self.sample_bgg_public_key(hash_key, bit_idx + 1))
+            .collect();
+        let k_pubkey = self.sample_k_public_key(hash_key);
         (one, k_pubkey, witness_pubkeys)
     }
 
@@ -621,10 +653,11 @@ where
         let mut states = states.into_iter().map(Some).collect::<Vec<_>>();
         let root_state = states[0].take().expect("DiamondWE root state must be present");
 
-        let (one_pubkey, k_pubkey, witness_pubkeys) = self.sample_bgg_public_keys(ct.hash_key);
+        let one_pubkey = self.sample_bgg_public_key(ct.hash_key, 0);
         let mut input_encodings =
-            Vec::with_capacity(witness_pubkeys.len().saturating_add(ct.instance.len()));
-        for (bit_idx, pubkey) in witness_pubkeys.into_iter().enumerate() {
+            Vec::with_capacity(self.witness_size.saturating_add(ct.instance.len()));
+        for bit_idx in 0..self.witness_size {
+            let pubkey = self.sample_bgg_public_key(ct.hash_key, bit_idx + 1);
             let digit_idx = bit_idx / self.injector.batch_bits();
             let bit_in_digit = bit_idx % self.injector.batch_bits();
             let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
@@ -657,11 +690,6 @@ where
             ),
             one_pubkey,
             Some(M::P::const_one(params)),
-        );
-        let k_encoding = self.injector.build_output_encoding(
-            self.left_mul_preimage(&root_state, Self::k_preimage_id(), k_pubkey.matrix.col_size()),
-            k_pubkey,
-            None,
         );
         input_encodings.extend(self.instance_encodings(&one_encoding, &ct.instance));
 
@@ -701,6 +729,12 @@ where
                 .next()
                 .expect("DiamondWE circuit must produce one output encoding")
         };
+        let k_pubkey = self.sample_k_public_key(ct.hash_key);
+        let k_encoding = self.injector.build_output_encoding(
+            self.left_mul_preimage(&root_state, Self::k_preimage_id(), k_pubkey.matrix.col_size()),
+            k_pubkey,
+            None,
+        );
         let r = self.sample_r(ct.hash_key);
         let r_decode_col = r.slice_columns(0, 1);
         drop(r);
@@ -740,6 +774,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        bgg::sampler::BGGPublicKeySampler,
         circuit::PolyCircuit,
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -783,6 +818,54 @@ mod tests {
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
     >;
+
+    #[test]
+    fn test_diamond_we_column_window_public_keys_match_contiguous_sampler() {
+        let params = DCRTPolyParams::default();
+        let witness_size = 3;
+        let hash_key = [7u8; 32];
+        let tag = b"diamond_we_public_key_columns_test".to_vec();
+
+        let injector = DiamondInjector::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(params.clone(), 1, 4, 2, 4.578, 0.0);
+        let dir = tempdir().expect("temporary DiamondWE artifact directory should be created");
+        let we = DiamondWE::new(injector, witness_size, dir.path(), tag.clone());
+
+        let mut full_tag = tag;
+        full_tag.extend_from_slice(b":witness_public_keys");
+        let expected = BGGPublicKeySampler::<[u8; 32], DCRTPolyHashSampler<Keccak256>>::new(
+            hash_key,
+            DIAMOND_SECRET_SIZE,
+        )
+        .sample(&params, &full_tag, &vec![true; witness_size]);
+
+        let actual_one = we.sample_bgg_public_key(hash_key, 0);
+        assert_eq!(actual_one, expected[0]);
+        for bit_idx in 0..witness_size {
+            let actual = we.sample_bgg_public_key(hash_key, bit_idx + 1);
+            assert_eq!(actual, expected[bit_idx + 1]);
+        }
+
+        let (one, k_pubkey, witness_pubkeys) = we.sample_bgg_public_keys(hash_key);
+        assert_eq!(one, expected[0]);
+        assert_eq!(witness_pubkeys, expected[1..].to_vec());
+
+        let mut k_tag = we.bgg_tag.clone();
+        k_tag.extend_from_slice(b":k_public_key");
+        let expected_k = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+            &params,
+            hash_key,
+            &k_tag,
+            1,
+            1,
+            DistType::FinRingDist,
+        );
+        assert_eq!(k_pubkey, BggPublicKey::new(expected_k, false));
+    }
 
     #[test]
     fn test_diamond_we_constant_one_circuit_round_trip() {

@@ -222,12 +222,6 @@ where
         (col_start, col_len)
     }
 
-    fn concat_column_chunks(chunks: Vec<M>) -> M {
-        let mut chunk_iter = chunks.into_iter();
-        let first = chunk_iter.next().expect("DiamondWE chunk list must be non-empty");
-        first.concat_columns_owned(chunk_iter.collect())
-    }
-
     fn sample_target_preimage(
         &self,
         preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
@@ -280,9 +274,36 @@ where
         }
     }
 
-    fn left_mul_preimage(&self, lhs: &M, id: &str, total_cols: usize) -> M {
+    fn left_mul_preimage_columns(
+        &self,
+        lhs: &M,
+        id: &str,
+        total_cols: usize,
+        col_start: usize,
+        col_len: usize,
+    ) -> M {
+        assert!(col_len > 0, "DiamondWE preimage projection must request columns");
+        let col_end = col_start
+            .checked_add(col_len)
+            .expect("DiamondWE preimage projection column range overflow");
+        assert!(
+            col_end <= total_cols,
+            "DiamondWE preimage projection out of range: total_cols={total_cols}, col_start={col_start}, col_len={col_len}"
+        );
+
         if self.matrix_path(id).exists() {
-            return lhs.clone() * &self.read_matrix(id);
+            let preimage = self.read_matrix(id);
+            assert_eq!(
+                preimage.col_size(),
+                total_cols,
+                "DiamondWE full preimage artifact {id} has unexpected column count"
+            );
+            let preimage = if col_start == 0 && col_len == total_cols {
+                preimage
+            } else {
+                preimage.slice_columns(col_start, col_end)
+            };
+            return lhs.clone() * &preimage;
         }
 
         let chunk_cols = Self::preimage_chunk_cols(total_cols).unwrap_or_else(|| {
@@ -290,21 +311,44 @@ where
                 "DiamondWE missing full preimage artifact {id} and chunking is disabled for total_cols={total_cols}"
             )
         });
-        let chunk_count = Self::preimage_chunk_count(total_cols, chunk_cols);
-        let chunks = (0..chunk_count)
-            .map(|chunk_idx| {
-                let (_, expected_cols) =
-                    Self::preimage_chunk_bounds(total_cols, chunk_cols, chunk_idx);
-                let preimage_chunk = self.read_matrix(&Self::preimage_chunk_id(id, chunk_idx));
-                assert_eq!(
-                    preimage_chunk.col_size(),
-                    expected_cols,
-                    "DiamondWE preimage chunk {chunk_idx} for {id} has unexpected column count"
-                );
-                lhs.clone() * &preimage_chunk
-            })
-            .collect::<Vec<_>>();
-        Self::concat_column_chunks(chunks)
+        let first_chunk = col_start / chunk_cols;
+        let last_chunk = (col_end - 1) / chunk_cols;
+        let mut out = M::zero(&self.injector.params, lhs.row_size(), col_len);
+        for chunk_idx in first_chunk..=last_chunk {
+            let (chunk_col_start, expected_cols) =
+                Self::preimage_chunk_bounds(total_cols, chunk_cols, chunk_idx);
+            let chunk_col_end = chunk_col_start + expected_cols;
+            let overlap_start = col_start.max(chunk_col_start);
+            let overlap_end = col_end.min(chunk_col_end);
+            let overlap_len = overlap_end - overlap_start;
+            let preimage_chunk = self.read_matrix(&Self::preimage_chunk_id(id, chunk_idx));
+            assert_eq!(
+                preimage_chunk.col_size(),
+                expected_cols,
+                "DiamondWE preimage chunk {chunk_idx} for {id} has unexpected column count"
+            );
+            let local_start = overlap_start - chunk_col_start;
+            let preimage_chunk = if local_start == 0 && overlap_len == expected_cols {
+                preimage_chunk
+            } else {
+                preimage_chunk.slice_columns(local_start, local_start + overlap_len)
+            };
+            let projected_chunk = lhs.clone() * &preimage_chunk;
+            out.copy_block_from(
+                &projected_chunk,
+                0,
+                overlap_start - col_start,
+                0,
+                0,
+                lhs.row_size(),
+                overlap_len,
+            );
+        }
+        out
+    }
+
+    fn left_mul_preimage(&self, lhs: &M, id: &str, total_cols: usize) -> M {
+        self.left_mul_preimage_columns(lhs, id, total_cols, 0, total_cols)
     }
 
     fn sample_bgg_public_keys(
@@ -574,11 +618,40 @@ where
             1 + self.witness_size,
             "DiamondWE final Diamond state count mismatch"
         );
+        let mut states = states.into_iter().map(Some).collect::<Vec<_>>();
+        let root_state = states[0].take().expect("DiamondWE root state must be present");
 
         let (one_pubkey, k_pubkey, witness_pubkeys) = self.sample_bgg_public_keys(ct.hash_key);
+        let mut input_encodings =
+            Vec::with_capacity(witness_pubkeys.len().saturating_add(ct.instance.len()));
+        for (bit_idx, pubkey) in witness_pubkeys.into_iter().enumerate() {
+            let digit_idx = bit_idx / self.injector.batch_bits();
+            let bit_in_digit = bit_idx % self.injector.batch_bits();
+            let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
+            let plaintext = M::P::from_usize_to_constant(
+                params,
+                self.injector.digit_bit_value(witness_digits[digit_idx] as usize, bit_in_digit),
+            );
+            let state = states[state_idx]
+                .take()
+                .expect("DiamondWE witness state must be present exactly once");
+            let vector = self.left_mul_preimage(
+                &state,
+                &Self::witness_preimage_id(bit_idx),
+                pubkey.matrix.col_size(),
+            );
+            drop(state);
+            input_encodings.push(self.injector.build_output_encoding(
+                vector,
+                pubkey,
+                Some(plaintext),
+            ));
+        }
+        drop(states);
+
         let one_encoding = self.injector.build_output_encoding(
             self.left_mul_preimage(
-                &states[0],
+                &root_state,
                 Self::one_preimage_id(),
                 one_pubkey.matrix.col_size(),
             ),
@@ -586,75 +659,74 @@ where
             Some(M::P::const_one(params)),
         );
         let k_encoding = self.injector.build_output_encoding(
-            self.left_mul_preimage(&states[0], Self::k_preimage_id(), k_pubkey.matrix.col_size()),
+            self.left_mul_preimage(&root_state, Self::k_preimage_id(), k_pubkey.matrix.col_size()),
             k_pubkey,
             None,
         );
-        let mut input_encodings = witness_pubkeys
-            .into_iter()
-            .enumerate()
-            .map(|(bit_idx, pubkey)| {
-                let digit_idx = bit_idx / self.injector.batch_bits();
-                let bit_in_digit = bit_idx % self.injector.batch_bits();
-                let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
-                let plaintext = M::P::from_usize_to_constant(
-                    params,
-                    self.injector.digit_bit_value(witness_digits[digit_idx] as usize, bit_in_digit),
-                );
-                self.injector.build_output_encoding(
-                    self.left_mul_preimage(
-                        &states[state_idx],
-                        &Self::witness_preimage_id(bit_idx),
-                        pubkey.matrix.col_size(),
-                    ),
-                    pubkey,
-                    Some(plaintext),
-                )
-            })
-            .collect::<Vec<_>>();
         input_encodings.extend(self.instance_encodings(&one_encoding, &ct.instance));
 
-        let owned_enc_lookup_evaluator =
-            self.enc_lookup_evaluator_factory.as_ref().map(|factory| {
+        let out_encoding = {
+            let owned_enc_lookup_evaluator = if let Some(factory) =
+                self.enc_lookup_evaluator_factory.as_ref()
+            {
                 let lookup_base_cols = self
                     .enc_lookup_base_matrix
                     .as_ref()
                     .expect("DiamondWE encoding lookup-base preimage requires a lookup base matrix")
                     .col_size();
                 let c_b0 = self.left_mul_preimage(
-                    &states[0],
+                    &root_state,
                     Self::enc_lookup_base_preimage_id(),
                     lookup_base_cols,
                 );
-                factory(c_b0)
-            });
-        let enc_lookup_evaluator =
-            owned_enc_lookup_evaluator.as_ref().or(self.enc_lookup_evaluator.as_ref());
+                Some(factory(c_b0))
+            } else {
+                None
+            };
+            let enc_lookup_evaluator =
+                owned_enc_lookup_evaluator.as_ref().or(self.enc_lookup_evaluator.as_ref());
 
-        let out_encoding = ct
-            .circuit
-            .eval(
-                params,
-                one_encoding.clone(),
-                input_encodings,
-                enc_lookup_evaluator,
-                self.enc_slot_transfer_evaluator
-                    .as_ref()
-                    .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<BggEncoding<M>>),
-                None,
-            )
-            .into_iter()
-            .next()
-            .expect("DiamondWE circuit must produce one output encoding");
+            ct.circuit
+                .eval(
+                    params,
+                    one_encoding.clone(),
+                    input_encodings,
+                    enc_lookup_evaluator,
+                    self.enc_slot_transfer_evaluator
+                        .as_ref()
+                        .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<BggEncoding<M>>),
+                    None,
+                )
+                .into_iter()
+                .next()
+                .expect("DiamondWE circuit must produce one output encoding")
+        };
         let r = self.sample_r(ct.hash_key);
-        let dec_term = one_encoding - &out_encoding;
-        let dec_encoding_vector = k_encoding.vector + &dec_term.vector.mul_decompose(&r);
-        let decoder = self.left_mul_preimage(
-            &states[0],
+        let r_decode_col = r.slice_columns(0, 1);
+        drop(r);
+        let BggEncoding { vector: one_vector, .. } = one_encoding;
+        let BggEncoding { vector: out_vector, .. } = out_encoding;
+        let dec_term_vector = one_vector - &out_vector;
+        drop(out_vector);
+        let dec_term_projection = dec_term_vector.mul_decompose(&r_decode_col);
+        drop(dec_term_vector);
+        drop(r_decode_col);
+        let BggEncoding { vector: k_vector, .. } = k_encoding;
+        let decoder_total_cols = k_vector.col_size();
+        let mut dec_encoding_vector = k_vector.slice_columns(0, 1);
+        drop(k_vector);
+        dec_encoding_vector.add_in_place(&dec_term_projection);
+        drop(dec_term_projection);
+        let decoder = self.left_mul_preimage_columns(
+            &root_state,
             Self::decoder_preimage_id(),
-            dec_encoding_vector.col_size(),
+            decoder_total_cols,
+            0,
+            1,
         );
+        drop(root_state);
         let noisy_plaintext = decoder - &dec_encoding_vector;
+        drop(dec_encoding_vector);
         self.decode_noisy_bool(&noisy_plaintext)
     }
 }

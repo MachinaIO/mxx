@@ -1,6 +1,7 @@
 use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 
 use num_bigint::BigUint;
+use tracing::info;
 
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey, sampler::BGGPublicKeySampler},
@@ -160,6 +161,14 @@ where
         M::from_compact_bytes(&self.injector.params, &bytes)
     }
 
+    fn remove_matrix_if_exists(&self, id: &str) {
+        match std::fs::remove_file(self.matrix_path(id)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("DiamondWE failed to remove stale matrix {id}: {err}"),
+        }
+    }
+
     fn one_preimage_id() -> &'static str {
         "we_one_preimage"
     }
@@ -178,6 +187,124 @@ where
 
     fn enc_lookup_base_preimage_id() -> &'static str {
         "we_enc_lookup_base_preimage"
+    }
+
+    fn preimage_chunk_id(id: &str, chunk_idx: usize) -> String {
+        format!("{id}_chunk{chunk_idx}")
+    }
+
+    fn preimage_chunk_cols(total_cols: usize) -> Option<usize> {
+        let chunk_cols = crate::env::aux_sampling_chunk_width().min(total_cols);
+        (chunk_cols < total_cols).then_some(chunk_cols)
+    }
+
+    fn preimage_chunk_count(total_cols: usize, chunk_cols: usize) -> usize {
+        assert!(total_cols > 0, "DiamondWE preimage total column count must be positive");
+        total_cols.div_ceil(chunk_cols)
+    }
+
+    fn preimage_chunk_bounds(
+        total_cols: usize,
+        chunk_cols: usize,
+        chunk_idx: usize,
+    ) -> (usize, usize) {
+        assert!(chunk_cols > 0, "DiamondWE preimage chunk column count must be positive");
+        let col_start =
+            chunk_idx.checked_mul(chunk_cols).expect("DiamondWE preimage chunk start overflow");
+        assert!(
+            col_start < total_cols,
+            "DiamondWE preimage chunk index out of range: total_cols={}, chunk_cols={}, chunk_idx={}",
+            total_cols,
+            chunk_cols,
+            chunk_idx
+        );
+        let col_len = (total_cols - col_start).min(chunk_cols);
+        (col_start, col_len)
+    }
+
+    fn concat_column_chunks(chunks: Vec<M>) -> M {
+        let mut chunk_iter = chunks.into_iter();
+        let first = chunk_iter.next().expect("DiamondWE chunk list must be non-empty");
+        first.concat_columns_owned(chunk_iter.collect())
+    }
+
+    fn sample_target_preimage(
+        &self,
+        preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
+        state_idx: usize,
+        target: &M,
+    ) -> M {
+        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(state_idx);
+        TS::new(&self.injector.params, self.injector.trapdoor_sigma).preimage(
+            &self.injector.params,
+            trapdoor,
+            public_matrix,
+            target,
+        )
+    }
+
+    fn sample_and_write_preimage(
+        &self,
+        id: &str,
+        preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
+        state_idx: usize,
+        target: &M,
+    ) {
+        let total_cols = target.col_size();
+        if let Some(chunk_cols) = Self::preimage_chunk_cols(total_cols) {
+            let chunk_count = Self::preimage_chunk_count(total_cols, chunk_cols);
+            self.remove_matrix_if_exists(id);
+            info!(
+                id,
+                total_cols, chunk_cols, chunk_count, "diamond we final preimage: sampling chunks"
+            );
+            for chunk_idx in 0..chunk_count {
+                let (col_start, col_len) =
+                    Self::preimage_chunk_bounds(total_cols, chunk_cols, chunk_idx);
+                info!(
+                    id,
+                    chunk_idx = chunk_idx + 1,
+                    chunk_count,
+                    col_start,
+                    col_len,
+                    "diamond we final preimage: sampling chunk"
+                );
+                let target_chunk = target.slice_columns(col_start, col_start + col_len);
+                let preimage =
+                    self.sample_target_preimage(preprocess_out, state_idx, &target_chunk);
+                self.write_matrix(&Self::preimage_chunk_id(id, chunk_idx), &preimage);
+            }
+        } else {
+            let preimage = self.sample_target_preimage(preprocess_out, state_idx, target);
+            self.write_matrix(id, &preimage);
+        }
+    }
+
+    fn left_mul_preimage(&self, lhs: &M, id: &str, total_cols: usize) -> M {
+        if self.matrix_path(id).exists() {
+            return lhs.clone() * &self.read_matrix(id);
+        }
+
+        let chunk_cols = Self::preimage_chunk_cols(total_cols).unwrap_or_else(|| {
+            panic!(
+                "DiamondWE missing full preimage artifact {id} and chunking is disabled for total_cols={total_cols}"
+            )
+        });
+        let chunk_count = Self::preimage_chunk_count(total_cols, chunk_cols);
+        let chunks = (0..chunk_count)
+            .map(|chunk_idx| {
+                let (_, expected_cols) =
+                    Self::preimage_chunk_bounds(total_cols, chunk_cols, chunk_idx);
+                let preimage_chunk = self.read_matrix(&Self::preimage_chunk_id(id, chunk_idx));
+                assert_eq!(
+                    preimage_chunk.col_size(),
+                    expected_cols,
+                    "DiamondWE preimage chunk {chunk_idx} for {id} has unexpected column count"
+                );
+                lhs.clone() * &preimage_chunk
+            })
+            .collect::<Vec<_>>();
+        Self::concat_column_chunks(chunks)
     }
 
     fn sample_bgg_public_keys(
@@ -205,10 +332,8 @@ where
         (one, k_pubkey, witness_pubkeys)
     }
 
-    fn sample_output_preimage(
+    fn output_preimage_target(
         &self,
-        preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
-        state_idx: usize,
         pubkey: &BggPublicKey<M>,
         top_gadget_plaintext: Option<&M::P>,
         bottom_gadget_plaintext: Option<&M::P>,
@@ -226,21 +351,10 @@ where
         if let Some(plaintext) = bottom_gadget_plaintext {
             bottom = bottom - &(gadget * plaintext);
         }
-        let target = top.concat_rows(&[&bottom]);
-        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(state_idx);
-        TS::new(params, self.injector.trapdoor_sigma).preimage(
-            params,
-            trapdoor,
-            public_matrix,
-            &target,
-        )
+        top.concat_rows(&[&bottom])
     }
 
-    fn sample_k_preimage(
-        &self,
-        preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
-        k_pubkey: &BggPublicKey<M>,
-    ) -> M {
+    fn k_preimage_target(&self, k_pubkey: &BggPublicKey<M>) -> M {
         let params = &self.injector.params;
         assert_eq!(
             k_pubkey.matrix.size(),
@@ -248,38 +362,16 @@ where
             "DiamondWE k public key must be a 1 x 1 public matrix"
         );
         let identity = M::identity(params, DIAMOND_SECRET_SIZE, None);
-        let target = k_pubkey.matrix.concat_rows(&[&identity]);
-        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(0);
-        TS::new(params, self.injector.trapdoor_sigma).preimage(
-            params,
-            trapdoor,
-            public_matrix,
-            &target,
-        )
+        k_pubkey.matrix.concat_rows(&[&identity])
     }
 
-    fn sample_decoder_preimage(
-        &self,
-        preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
-        dec_pubkey_matrix: &M,
-    ) -> M {
+    fn decoder_preimage_target(&self, dec_pubkey_matrix: &M) -> M {
         let params = &self.injector.params;
         let bottom = M::zero(params, DIAMOND_SECRET_SIZE, dec_pubkey_matrix.col_size());
-        let target = dec_pubkey_matrix.concat_rows(&[&bottom]);
-        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(0);
-        TS::new(params, self.injector.trapdoor_sigma).preimage(
-            params,
-            trapdoor,
-            public_matrix,
-            &target,
-        )
+        dec_pubkey_matrix.concat_rows(&[&bottom])
     }
 
-    fn sample_lookup_base_preimage(
-        &self,
-        preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
-        lookup_base_matrix: &M,
-    ) -> M {
+    fn lookup_base_preimage_target(&self, lookup_base_matrix: &M) -> M {
         assert_eq!(
             lookup_base_matrix.row_size(),
             DIAMOND_SECRET_SIZE,
@@ -287,14 +379,7 @@ where
         );
         let params = &self.injector.params;
         let lookup_bottom = M::zero(params, DIAMOND_SECRET_SIZE, lookup_base_matrix.col_size());
-        let target = lookup_base_matrix.concat_rows(&[&lookup_bottom]);
-        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(0);
-        TS::new(params, self.injector.trapdoor_sigma).preimage(
-            params,
-            trapdoor,
-            public_matrix,
-            &target,
-        )
+        lookup_base_matrix.concat_rows(&[&lookup_bottom])
     }
 
     fn sample_r(&self, hash_key: [u8; 32]) -> M {
@@ -422,40 +507,53 @@ where
             .expect("DiamondWE circuit must produce one output public key");
 
         let one_plaintext = M::P::const_one(params);
-        let one_preimage = self.sample_output_preimage(
+        let one_preimage_target =
+            self.output_preimage_target(&one_pubkey, Some(&one_plaintext), None);
+        self.sample_and_write_preimage(
+            Self::one_preimage_id(),
             &preprocess_out,
             0,
-            &one_pubkey,
-            Some(&one_plaintext),
-            None,
+            &one_preimage_target,
         );
-        self.write_matrix(Self::one_preimage_id(), &one_preimage);
         for (bit_idx, pubkey) in witness_pubkeys.iter().enumerate() {
             let digit_idx = bit_idx / self.injector.batch_bits();
             let bit_in_digit = bit_idx % self.injector.batch_bits();
             let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
-            let preimage = self.sample_output_preimage(
+            let preimage_target = self.output_preimage_target(pubkey, None, Some(&one_plaintext));
+            self.sample_and_write_preimage(
+                &Self::witness_preimage_id(bit_idx),
                 &preprocess_out,
                 state_idx,
-                pubkey,
-                None,
-                Some(&one_plaintext),
+                &preimage_target,
             );
-            self.write_matrix(&Self::witness_preimage_id(bit_idx), &preimage);
         }
-        let k_preimage = self.sample_k_preimage(&preprocess_out, &k_pubkey);
-        self.write_matrix(Self::k_preimage_id(), &k_preimage);
+        let k_preimage_target = self.k_preimage_target(&k_pubkey);
+        self.sample_and_write_preimage(
+            Self::k_preimage_id(),
+            &preprocess_out,
+            0,
+            &k_preimage_target,
+        );
         if let Some(lookup_base_matrix) = self.enc_lookup_base_matrix.as_ref() {
-            let lookup_base_preimage =
-                self.sample_lookup_base_preimage(&preprocess_out, lookup_base_matrix);
-            self.write_matrix(Self::enc_lookup_base_preimage_id(), &lookup_base_preimage);
+            let lookup_base_preimage_target = self.lookup_base_preimage_target(lookup_base_matrix);
+            self.sample_and_write_preimage(
+                Self::enc_lookup_base_preimage_id(),
+                &preprocess_out,
+                0,
+                &lookup_base_preimage_target,
+            );
         }
 
         let r = self.sample_r(hash_key);
         let dec_term = one_pubkey - &out_pubkey;
         let dec_pubkey_matrix = k_pubkey.matrix + &dec_term.matrix.mul_decompose(&r);
-        let decoder_preimage = self.sample_decoder_preimage(&preprocess_out, &dec_pubkey_matrix);
-        self.write_matrix(Self::decoder_preimage_id(), &decoder_preimage);
+        let decoder_preimage_target = self.decoder_preimage_target(&dec_pubkey_matrix);
+        self.sample_and_write_preimage(
+            Self::decoder_preimage_id(),
+            &preprocess_out,
+            0,
+            &decoder_preimage_target,
+        );
 
         DiamondWECiphertext { circuit, instance: instance.clone(), hash_key, preprocess_out }
     }
@@ -479,12 +577,16 @@ where
 
         let (one_pubkey, k_pubkey, witness_pubkeys) = self.sample_bgg_public_keys(ct.hash_key);
         let one_encoding = self.injector.build_output_encoding(
-            states[0].clone() * &self.read_matrix(Self::one_preimage_id()),
+            self.left_mul_preimage(
+                &states[0],
+                Self::one_preimage_id(),
+                one_pubkey.matrix.col_size(),
+            ),
             one_pubkey,
             Some(M::P::const_one(params)),
         );
         let k_encoding = self.injector.build_output_encoding(
-            states[0].clone() * &self.read_matrix(Self::k_preimage_id()),
+            self.left_mul_preimage(&states[0], Self::k_preimage_id(), k_pubkey.matrix.col_size()),
             k_pubkey,
             None,
         );
@@ -500,8 +602,11 @@ where
                     self.injector.digit_bit_value(witness_digits[digit_idx] as usize, bit_in_digit),
                 );
                 self.injector.build_output_encoding(
-                    states[state_idx].clone() *
-                        &self.read_matrix(&Self::witness_preimage_id(bit_idx)),
+                    self.left_mul_preimage(
+                        &states[state_idx],
+                        &Self::witness_preimage_id(bit_idx),
+                        pubkey.matrix.col_size(),
+                    ),
                     pubkey,
                     Some(plaintext),
                 )
@@ -511,8 +616,16 @@ where
 
         let owned_enc_lookup_evaluator =
             self.enc_lookup_evaluator_factory.as_ref().map(|factory| {
-                let lookup_base_preimage = self.read_matrix(Self::enc_lookup_base_preimage_id());
-                let c_b0 = states[0].clone() * &lookup_base_preimage;
+                let lookup_base_cols = self
+                    .enc_lookup_base_matrix
+                    .as_ref()
+                    .expect("DiamondWE encoding lookup-base preimage requires a lookup base matrix")
+                    .col_size();
+                let c_b0 = self.left_mul_preimage(
+                    &states[0],
+                    Self::enc_lookup_base_preimage_id(),
+                    lookup_base_cols,
+                );
                 factory(c_b0)
             });
         let enc_lookup_evaluator =
@@ -536,7 +649,11 @@ where
         let r = self.sample_r(ct.hash_key);
         let dec_term = one_encoding - &out_encoding;
         let dec_encoding_vector = k_encoding.vector + &dec_term.vector.mul_decompose(&r);
-        let decoder = states[0].clone() * &self.read_matrix(Self::decoder_preimage_id());
+        let decoder = self.left_mul_preimage(
+            &states[0],
+            Self::decoder_preimage_id(),
+            dec_encoding_vector.col_size(),
+        );
         let noisy_plaintext = decoder - &dec_encoding_vector;
         self.decode_noisy_bool(&noisy_plaintext)
     }
@@ -544,6 +661,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use keccak_asm::Keccak256;
     use tempfile::tempdir;
 
@@ -558,8 +677,44 @@ mod tests {
         },
     };
 
+    fn diamond_we_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_value: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old_value = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_value {
+                unsafe { std::env::set_var(self.key, value) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    type TestDiamondWE = DiamondWE<
+        DCRTPolyMatrix,
+        DCRTPolyUniformSampler,
+        DCRTPolyHashSampler<Keccak256>,
+        DCRTPolyTrapdoorSampler,
+    >;
+
     #[test]
     fn test_diamond_we_constant_one_circuit_round_trip() {
+        let _env_lock = diamond_we_env_lock().lock().expect("DiamondWE env lock poisoned");
         let params = DCRTPolyParams::default();
         let witness_size = 2;
         let instance = vec![true];
@@ -586,7 +741,64 @@ mod tests {
     }
 
     #[test]
+    fn test_diamond_we_chunked_preimages_round_trip_and_artifacts() {
+        let _env_lock = diamond_we_env_lock().lock().expect("DiamondWE env lock poisoned");
+        let _chunk_cols = EnvVarGuard::set("AUX_SAMPLING_CHUNK_WIDTH", "20");
+
+        let params = DCRTPolyParams::default();
+        let witness_size = 2;
+        let instance = vec![true];
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        circuit.input(witness_size + instance.len());
+        let one = circuit.const_one_gate();
+        circuit.output(vec![one]);
+
+        let witness = vec![false, true];
+        let injector = DiamondInjector::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(params.clone(), 1, 4, 2, 4.578, 0.0);
+        let dir = tempdir().expect("temporary DiamondWE artifact directory should be created");
+        let we = DiamondWE::new(
+            injector,
+            witness_size,
+            dir.path(),
+            b"diamond_we_chunked_preimage_test".to_vec(),
+        );
+
+        let ct = we.enc(&true, circuit, &instance);
+        assert_eq!(we.dec(&ct, &witness), true);
+
+        let total_cols = params.modulus_digits();
+        let chunk_cols = crate::env::aux_sampling_chunk_width().min(total_cols);
+        let chunk_count = TestDiamondWE::preimage_chunk_count(total_cols, chunk_cols);
+        assert_eq!(chunk_cols, 20);
+        assert_eq!(chunk_count, 2);
+        assert!(
+            !we.matrix_path(TestDiamondWE::one_preimage_id()).exists(),
+            "chunked preimage mode should not write the legacy full one-preimage artifact"
+        );
+        assert!(
+            !dir.path()
+                .join(format!("{}.preimage_chunks.json", TestDiamondWE::one_preimage_id()))
+                .exists(),
+            "chunked preimage mode should not write extra JSON metadata"
+        );
+        for chunk_idx in 0..chunk_count {
+            let chunk_id =
+                TestDiamondWE::preimage_chunk_id(TestDiamondWE::one_preimage_id(), chunk_idx);
+            assert!(
+                we.matrix_path(&chunk_id).exists(),
+                "chunked one-preimage artifact {chunk_id} should exist"
+            );
+        }
+    }
+
+    #[test]
     fn test_diamond_we_witness_dependent_circuit_round_trip() {
+        let _env_lock = diamond_we_env_lock().lock().expect("DiamondWE env lock poisoned");
         let params = DCRTPolyParams::default();
         let witness_size = 2;
         let instance = vec![false];

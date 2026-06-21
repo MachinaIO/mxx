@@ -515,13 +515,6 @@ where
             .collect()
     }
 
-    fn instance_encodings(&self, one: &BggEncoding<M>, instance: &[bool]) -> Vec<BggEncoding<M>> {
-        instance
-            .iter()
-            .map(|bit| one.small_scalar_mul(&self.injector.params, &[*bit as u32]))
-            .collect()
-    }
-
     fn pack_witness_digits(&self, witness: &[bool]) -> Vec<u32> {
         let batch_bits = self.injector.batch_bits();
         assert_eq!(
@@ -907,18 +900,27 @@ where
         info!(
             instance_len = ct.instance.len(),
             input_encoding_count = input_encodings.len(),
-            "diamond we dec: extend instance encodings begin"
+            "diamond we dec: compact input encodings begin"
         );
-        input_encodings.extend(self.instance_encodings(&one_encoding, &ct.instance));
+        let zero_encoding_compact = one_encoding.small_scalar_mul(params, &[0]).to_compact();
+        let one_encoding_compact = one_encoding.to_compact();
+        let mut input_encoding_compacts =
+            input_encodings.into_iter().map(Evaluable::to_compact).collect::<Vec<_>>();
+        let witness_input_count = input_encoding_compacts.len();
+        input_encoding_compacts.extend(ct.instance.iter().map(|bit| {
+            if *bit { one_encoding_compact.clone() } else { zero_encoding_compact.clone() }
+        }));
         info!(
-            input_encoding_count = input_encodings.len(),
-            "diamond we dec: extend instance encodings done"
+            witness_input_count,
+            instance_len = ct.instance.len(),
+            input_encoding_count = input_encoding_compacts.len(),
+            "diamond we dec: compact input encodings done"
         );
 
         let enc_lookup_evaluator =
             owned_enc_lookup_evaluator.as_ref().or(self.enc_lookup_evaluator.as_ref());
         info!(
-            input_encoding_count = input_encodings.len(),
+            input_encoding_count = input_encoding_compacts.len(),
             has_enc_lookup_evaluator = enc_lookup_evaluator.is_some(),
             has_enc_slot_transfer_evaluator = self.enc_slot_transfer_evaluator.is_some(),
             elapsed_ms = started.elapsed().as_millis(),
@@ -926,10 +928,10 @@ where
         );
         let out_encoding = ct
             .circuit
-            .eval(
+            .eval_from_compacts(
                 params,
-                one_encoding.clone(),
-                input_encodings,
+                one_encoding_compact.clone(),
+                input_encoding_compacts,
                 enc_lookup_evaluator,
                 self.enc_slot_transfer_evaluator
                     .as_ref()
@@ -939,6 +941,7 @@ where
             .into_iter()
             .next()
             .expect("DiamondWE circuit must produce one output encoding");
+        let one_encoding = BggEncoding::<M>::from_compact(params, &one_encoding_compact);
         info!(
             vector_rows = out_encoding.vector.row_size(),
             vector_cols = out_encoding.vector.col_size(),

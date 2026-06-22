@@ -552,6 +552,64 @@ where
         let three_quarter_q = &quarter_q * 3u32;
         !(coeff < quarter_q || coeff > three_quarter_q)
     }
+
+    fn centered_distance_to_zero(
+        value: &BigUint,
+        modulus: &BigUint,
+        half_modulus: &BigUint,
+    ) -> BigUint {
+        if value > half_modulus { modulus - value } else { value.clone() }
+    }
+
+    fn log_noisy_plaintext_error_diagnostic(&self, noisy_plaintext: &M) {
+        let Some(expected_msg) =
+            std::env::var("DIAMOND_WE_GPU_BENCH_EXPECTED_MSG").ok().and_then(|raw| {
+                match raw.as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                }
+            })
+        else {
+            return;
+        };
+        let selected_bound_bits =
+            std::env::var("DIAMOND_WE_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok());
+        let q = self.injector.params.modulus();
+        let q: std::sync::Arc<BigUint> = q.into();
+        let q = q.as_ref();
+        let half_q = q / 2u32;
+        let coeffs = noisy_plaintext.entry(0, 0).coeffs_biguints();
+        let mut max_error = BigUint::from(0u32);
+        let mut decode_coeff_error = BigUint::from(0u32);
+        for (coeff_idx, coeff) in coeffs.iter().enumerate() {
+            let error = if expected_msg && coeff_idx == 0 {
+                if coeff >= &half_q { coeff - &half_q } else { &half_q - coeff }
+            } else {
+                Self::centered_distance_to_zero(coeff, q, &half_q)
+            };
+            if coeff_idx == 0 {
+                decode_coeff_error = error.clone();
+            }
+            if error > max_error {
+                max_error = error;
+            }
+        }
+        let decode_coeff_error_bits = decode_coeff_error.bits();
+        let max_poly_error_bits = max_error.bits();
+        let within_selected_bound =
+            selected_bound_bits.map(|bound_bits| max_poly_error_bits <= bound_bits);
+        info!(
+            expected_msg,
+            decode_coeff_error_bits,
+            max_poly_error_bits,
+            selected_bound_bits,
+            within_selected_bound,
+            "diamond we dec: noisy plaintext error diagnostic"
+        );
+    }
 }
 
 impl<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST> WitnessEnc<M::P>
@@ -1005,6 +1063,7 @@ where
             elapsed_ms = started.elapsed().as_millis(),
             "diamond we dec: decode noisy bool begin"
         );
+        self.log_noisy_plaintext_error_diagnostic(&noisy_plaintext);
         let decoded = self.decode_noisy_bool(&noisy_plaintext);
         info!(
             decoded,

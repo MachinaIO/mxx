@@ -132,6 +132,29 @@ struct DiamondWEGpuBenchSelectedSimulation {
     input_injection_error_bits: usize,
 }
 
+struct EnvVarGuard {
+    key: &'static str,
+    old_value: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old_value = env::var(key).ok();
+        unsafe { env::set_var(key, value) };
+        Self { key, old_value }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(value) = &self.old_value {
+            unsafe { env::set_var(self.key, value) };
+        } else {
+            unsafe { env::remove_var(self.key) };
+        }
+    }
+}
+
 impl DiamondWEGpuBenchConfig {
     fn from_env() -> Self {
         let ring_dim = env_or_parse_u32("DIAMOND_WE_GPU_BENCH_RING_DIM", DEFAULT_RING_DIM);
@@ -673,6 +696,8 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
     let ct = diamond.enc(&msg, gpu_circuit, &instance);
     gpu_device_sync();
     info!("starting DiamondWE GPU dec");
+    let _expected_msg_guard =
+        EnvVarGuard::set("DIAMOND_WE_GPU_BENCH_EXPECTED_MSG", if msg { "true" } else { "false" });
     let decoded = diamond.dec(&ct, &witness);
     gpu_device_sync();
     info!(msg, decoded, "DiamondWE GPU round trip finished");

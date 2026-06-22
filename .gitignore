@@ -12,4 +12,5 @@
 /revision_logs
 /*.log
 /*.status
+/tmp_*.sh
 /bench

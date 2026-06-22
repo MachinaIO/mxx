@@ -59,7 +59,7 @@ use std::{
 };
 use tempfile::tempdir;
 use tracing::info;
-use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, prelude::*};
 
 const DEFAULT_RING_DIM: u32 = 1 << 16;
 const DEFAULT_MIN_LOG_RING_DIM: usize = 16;
@@ -864,23 +864,7 @@ async fn build_naive_vec_encoding_bench_estimator(
 #[tokio::test]
 #[sequential_test::sequential]
 async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
-    let log_filter = tracing_subscriber::filter::Targets::new()
-        .with_target("test_gpu_diamond_io", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target("mxx", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target("mxx::io::diamond_io", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target("mxx::io::utils::simulation", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target(
-            "mxx::io::diamond_io::bench_estimator_native",
-            tracing_subscriber::filter::LevelFilter::INFO,
-        )
-        .with_target(
-            "mxx::io::diamond_io::bench_estimator",
-            tracing_subscriber::filter::LevelFilter::INFO,
-        )
-        .with_target("mxx::bench_estimator", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target("mxx::noise_refresh", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target("mxx::storage::write", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_default(tracing_subscriber::filter::LevelFilter::WARN);
+    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::registry()
         .with(log_filter)
         .with(tracing_subscriber::fmt::layer())

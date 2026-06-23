@@ -237,7 +237,7 @@ fn find_crt_depth_for_simple_slot_transfer(cfg: &SlotTransferConfig) -> DCRTPoly
     let ring_dim_sqrt = BigDecimal::from_u32(cfg.ring_dim).unwrap().sqrt().unwrap();
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
     let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
-    let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
+    let e_init_norm = error_sigma.clone();
     let input_bound =
         BigDecimal::from(*INPUT_CONSTANTS.iter().max().expect("input constants must not be empty"));
 
@@ -273,7 +273,7 @@ fn find_crt_depth_for_simple_slot_transfer(cfg: &SlotTransferConfig) -> DCRTPoly
         assert_eq!(out_errors.len(), 1);
 
         let threshold = params.modulus().as_ref() / BigUint::from(2u64 * q_max);
-        let error = &out_errors[0].matrix_norm.poly_norm.norm;
+        let error = &out_errors[0].matrix_norm.maximum_coefficient_bound();
         info!(
             "crt_depth={} q_bits={} max_error_bits={} threshold_bits={}",
             crt_depth,

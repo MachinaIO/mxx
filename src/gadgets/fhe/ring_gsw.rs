@@ -2045,7 +2045,7 @@ mod tests {
         assert_eq!(input.randomizer_norm, ctx.fresh_randomizer_norm());
         assert_eq!(input.randomizer_norm.nrow, ctx.width());
         assert_eq!(input.randomizer_norm.ncol, ctx.width());
-        assert_eq!(input.randomizer_norm.poly_norm.norm, BigDecimal::from(1u64));
+        assert_eq!(input.randomizer_norm.poly_norm.sigma, BigDecimal::from(1u64));
         assert_eq!(input.max_plaintext, BigUint::from(1u64));
     }
 
@@ -2059,12 +2059,12 @@ mod tests {
         assert_eq!(estimated.nrow, 1);
         assert_eq!(estimated.ncol, 1);
         assert_eq!(estimated.ctx(), ctx.randomizer_norm_ctx.as_ref());
-        assert!(estimated.poly_norm.norm > BigDecimal::from(0u64));
+        assert!(estimated.poly_norm.sigma > BigDecimal::from(0u64));
 
         let zero_sigma = input.estimate_decryption_error_norm(0.0);
         assert_eq!(zero_sigma.nrow, 1);
         assert_eq!(zero_sigma.ncol, 1);
-        assert_eq!(zero_sigma.poly_norm.norm, BigDecimal::from(0u64));
+        assert_eq!(zero_sigma.poly_norm.sigma, BigDecimal::from(0u64));
     }
 
     #[test]

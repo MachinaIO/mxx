@@ -127,13 +127,13 @@ fn test_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_with_noisy_public_
     let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let sum = lhs.add(&rhs, &mut circuit);
     let estimated_error = sum.estimate_decryption_error_norm(error_sigma);
-    let estimated_error_norm = &estimated_error.poly_norm.norm;
+    let estimated_error_bound = estimated_error.maximum_coefficient_bound();
     let q_modulus = active_q_modulus(ctx.nested_rns.as_ref());
     let threshold = q_over_two_p_threshold(&q_modulus, plaintext_modulus);
     assert!(
-        estimated_error_norm < &q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
-        "estimated add decryption error {} must stay below q/(2p) {}",
-        estimated_error_norm,
+        estimated_error_bound < q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
+        "estimated add decryption error bound {} must stay below q/(2p) {}",
+        estimated_error_bound,
         threshold
     );
     let wire_secret_key = circuit.input(1).at(0).as_single_wire();
@@ -229,13 +229,13 @@ fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_with_noisy_
     let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let difference = lhs.sub(&rhs, &mut circuit);
     let estimated_error = difference.estimate_decryption_error_norm(error_sigma);
-    let estimated_error_norm = &estimated_error.poly_norm.norm;
+    let estimated_error_bound = estimated_error.maximum_coefficient_bound();
     let q_modulus = active_q_modulus(ctx.nested_rns.as_ref());
     let threshold = q_over_two_p_threshold(&q_modulus, plaintext_modulus);
     assert!(
-        estimated_error_norm < &q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
-        "estimated sub decryption error {} must stay below q/(2p) {}",
-        estimated_error_norm,
+        estimated_error_bound < q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
+        "estimated sub decryption error bound {} must stay below q/(2p) {}",
+        estimated_error_bound,
         threshold
     );
     let wire_secret_key = circuit.input(1).at(0).as_single_wire();
@@ -332,13 +332,13 @@ fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_with_noisy_pub
     let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let product = lhs.mul(&rhs, &mut circuit);
     let estimated_error = product.estimate_decryption_error_norm(error_sigma);
-    let estimated_error_norm = &estimated_error.poly_norm.norm;
+    let estimated_error_bound = estimated_error.maximum_coefficient_bound();
     let q_modulus = active_q_modulus(ctx.nested_rns.as_ref());
     let threshold = q_over_two_p_threshold(&q_modulus, plaintext_modulus);
     assert!(
-        estimated_error_norm < &q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
-        "estimated mul decryption error {} must stay below q/(2p) {}",
-        estimated_error_norm,
+        estimated_error_bound < q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
+        "estimated mul decryption error bound {} must stay below q/(2p) {}",
+        estimated_error_bound,
         threshold
     );
     let wire_secret_key = circuit.input(1).at(0).as_single_wire();
@@ -436,13 +436,13 @@ fn test_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_with_n
     let rhs2 = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let chained_product = lhs.mul(&rhs1, &mut circuit).mul(&rhs2, &mut circuit);
     let estimated_error = chained_product.estimate_decryption_error_norm(error_sigma);
-    let estimated_error_norm = &estimated_error.poly_norm.norm;
+    let estimated_error_bound = estimated_error.maximum_coefficient_bound();
     let q_modulus = active_q_modulus(ctx.nested_rns.as_ref());
     let threshold = q_over_two_p_threshold(&q_modulus, plaintext_modulus);
     assert!(
-        estimated_error_norm < &q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
-        "estimated chained-mul decryption error {} must stay below q/(2p) {}",
-        estimated_error_norm,
+        estimated_error_bound < q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
+        "estimated chained-mul decryption error bound {} must stay below q/(2p) {}",
+        estimated_error_bound,
         threshold
     );
     let wire_secret_key = circuit.input(1).at(0).as_single_wire();

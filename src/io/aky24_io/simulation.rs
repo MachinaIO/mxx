@@ -23,7 +23,7 @@ use crate::{
     },
     simulator::{
         SimulatorContext,
-        error_norm::{ErrorNorm, compute_preimage_norm},
+        error_norm::{ErrorNorm, compute_preimage_sigma},
         poly_matrix_norm::PolyMatrixNorm,
         poly_norm::PolyNorm,
     },
@@ -42,7 +42,7 @@ const REPRESENTATIVE_GOLDREICH_SEED_BITS: usize = 5;
 pub struct Aky24IOErrorSimulation {
     /// Fresh encoding error that replaces DiamondIO input-injection state error.
     pub initial_fresh_error: ErrorNorm,
-    /// Final decoder term derived from fresh `c_b0` error and output preimage norm.
+    /// Final decoder term derived from fresh `c_b0` error and output preimage sigma.
     pub final_decoder_error: PolyMatrixNorm,
     /// Representative noise-refresh simulation per PRF seed-refresh round.
     pub prf_refreshes: Vec<Aky24IOPrfRoundErrorSimulation>,
@@ -589,14 +589,14 @@ where
         let decryption_key = initial_fresh_error.clone();
         let refresh_decoder_error = initial_fresh_error.clone();
         let c_b0_error = PolyMatrixNorm::sample_gauss(ctx.clone(), 1, ctx.m_b, sigma);
-        let output_preimage_norm = PolyMatrixNorm::new(
+        let output_preimage_sigma = PolyMatrixNorm::new(
             ctx.clone(),
             ctx.m_b,
             1,
-            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None),
+            compute_preimage_sigma(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None),
             None,
         );
-        let final_decoder_projection_error = c_b0_error * &output_preimage_norm;
+        let final_decoder_projection_error = c_b0_error * &output_preimage_sigma;
         let final_decoder_error =
             ErrorNorm::new(PolyNorm::one(ctx.clone()), final_decoder_projection_error);
         let seed_wire_error = sim_utils::initial_seed_wire_error(
@@ -616,9 +616,9 @@ where
         );
         info!(
             initial_fresh_error_bits =
-                bigdecimal_bits_ceil(&initial_fresh_error.matrix_norm.poly_norm.norm),
+                bigdecimal_bits_ceil(&initial_fresh_error.matrix_norm.maximum_coefficient_bound()),
             final_decoder_error_bits =
-                bigdecimal_bits_ceil(&final_decoder_error.matrix_norm.poly_norm.norm),
+                bigdecimal_bits_ceil(&final_decoder_error.matrix_norm.maximum_coefficient_bound()),
             "AKY24IO fresh initial error simulation base finished"
         );
 
@@ -1135,7 +1135,7 @@ where
                 plt_evaluator,
                 slot_transfer_evaluator,
             );
-            let error = &simulation.noisy_plaintext_error.poly_norm.norm;
+            let error = &simulation.noisy_plaintext_error.maximum_coefficient_bound();
             let max_valid_bits = sim_utils::final_mask_coeff_bits_for_error_margin(
                 &prefix.cpu_params,
                 error,
@@ -1237,8 +1237,9 @@ where
             projection_residual_error.clone() + &prefix.final_decoder_error.matrix_norm;
         info!(
             projection_residual_bits =
-                bigdecimal_bits_ceil(&projection_residual_error.poly_norm.norm),
-            noisy_plaintext_bits = bigdecimal_bits_ceil(&noisy_plaintext_error.poly_norm.norm),
+                bigdecimal_bits_ceil(&projection_residual_error.maximum_coefficient_bound()),
+            noisy_plaintext_bits =
+                bigdecimal_bits_ceil(&noisy_plaintext_error.maximum_coefficient_bound()),
             "AKY24IO final output error simulation finished"
         );
 
@@ -1372,7 +1373,7 @@ fn aky24_io_security_margins_hold(
     };
     if !validate_error_bound_security_margin(
         &final_threshold,
-        &simulation.noisy_plaintext_error.poly_norm.norm,
+        &simulation.noisy_plaintext_error.maximum_coefficient_bound(),
         security_bit,
     ) {
         return false;
@@ -1538,9 +1539,13 @@ mod tests {
         assert_eq!(base.final_decoder_error.matrix_norm.nrow, 1);
         assert_eq!(base.final_decoder_error.matrix_norm.ncol, 1);
         assert_eq!(
-            base.initial_fresh_error.matrix_norm.poly_norm.norm,
+            base.initial_fresh_error.matrix_norm.poly_norm.sigma,
+            BigDecimal::from_f64(2.0).unwrap()
+        );
+        assert_eq!(
+            base.initial_fresh_error.matrix_norm.maximum_coefficient_bound(),
             BigDecimal::from_f64(13.0).unwrap(),
-            "fresh initial ErrorNorm must come directly from 6.5 * error_sigma"
+            "fresh initial ErrorNorm public bound must come from the canonical maximum coefficient bound of error_sigma"
         );
     }
 

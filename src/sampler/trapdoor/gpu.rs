@@ -487,7 +487,9 @@ mod tests {
                 params::DCRTPolyParams,
             },
         },
-        simulator::error_norm::compute_preimage_norm,
+        simulator::{
+            error_norm::compute_preimage_sigma, poly_norm::maximum_coefficient_bound_from_sigma,
+        },
     };
     use bigdecimal::{BigDecimal, FromPrimitive};
     use num_bigint::{BigInt, BigUint};
@@ -705,8 +707,8 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound =
-            compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, bound_sigma);
+        let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, bound_sigma);
+        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
         let modulus = params.modulus();
 
         for sample_idx in 0..4usize {
@@ -723,14 +725,14 @@ mod tests {
                         let centered_abs = if value < neg { value } else { neg };
                         let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_norm_bound,
-                            "preimage coeff exceeds compute_preimage_norm bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
+                            centered_bd < preimage_bound,
+                            "preimage coeff exceeds preimage maximum coefficient bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
                             sample_idx,
                             i,
                             j,
                             k,
                             centered_abs,
-                            preimage_norm_bound
+                            preimage_bound
                         );
                     }
                 }
@@ -740,20 +742,20 @@ mod tests {
 
     #[test]
     #[sequential]
-    fn test_gpu_preimage_coefficients_below_compute_preimage_norm() {
+    fn test_gpu_preimage_coefficients_below_compute_preimage_sigma() {
         assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(SIGMA, None);
     }
 
     #[test]
     #[sequential]
-    fn test_gpu_preimage_coefficients_below_compute_preimage_norm_non_default_sigma() {
+    fn test_gpu_preimage_coefficients_below_compute_preimage_sigma_non_default_sigma() {
         let sigma = SIGMA * 1.25;
         assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(sigma, Some(sigma));
     }
 
     #[test]
     #[sequential]
-    fn test_gpu_p_hat_coefficients_below_compute_preimage_norm() {
+    fn test_gpu_p_hat_coefficients_below_compute_preimage_sigma() {
         gpu_device_sync();
         let size = 2usize;
         let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
@@ -767,7 +769,8 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, None);
+        let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, None);
+        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
         let modulus = params.modulus();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
@@ -795,14 +798,14 @@ mod tests {
                         let centered_abs = if value < neg { value } else { neg };
                         let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_norm_bound,
-                            "p_hat coeff exceeds compute_preimage_norm bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
+                            centered_bd < preimage_bound,
+                            "p_hat coeff exceeds preimage maximum coefficient bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
                             sample_idx,
                             i,
                             j,
                             coeff_idx,
                             centered_abs,
-                            preimage_norm_bound
+                            preimage_bound
                         );
                     }
                 }
@@ -831,7 +834,8 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << base_params.base_bits(), 0);
         let m_g = (size * base_params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, None);
+        let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, None);
+        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
         let modulus = base_params.modulus();
 
         struct DeviceCase {
@@ -893,15 +897,15 @@ mod tests {
                         let centered_abs = if value < neg { value } else { neg };
                         let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_norm_bound,
-                            "restored preimage coeff exceeds compute_preimage_norm bound (src_device={}, dst_device={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={})",
+                            centered_bd < preimage_bound,
+                            "restored preimage coeff exceeds preimage maximum coefficient bound (src_device={}, dst_device={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={})",
                             case.src_device,
                             case.dst_device,
                             i,
                             j,
                             coeff_idx,
                             centered_abs,
-                            preimage_norm_bound
+                            preimage_bound
                         );
                     }
                 }

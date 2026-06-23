@@ -852,7 +852,7 @@ mod tests {
             uniform::DCRTPolyUniformSampler,
         },
         simulator::{
-            SimulatorContext, error_norm::compute_preimage_norm, poly_matrix_norm::PolyMatrixNorm,
+            SimulatorContext, error_norm::compute_preimage_sigma, poly_matrix_norm::PolyMatrixNorm,
         },
         utils::bigdecimal_bits_ceil,
     };
@@ -952,7 +952,7 @@ mod tests {
             state_cols,
             BigDecimal::from_f64(injector.error_sigma).expect("error_sigma must be finite"),
         );
-        let expected_preimage_norm = compute_preimage_norm(
+        let expected_preimage_sigma = compute_preimage_sigma(
             &ctx.ring_dim_sqrt,
             ctx.m_g as u64,
             &ctx.base,
@@ -963,11 +963,16 @@ mod tests {
             ctx.clone(),
             state_cols,
             state_cols,
-            expected_preimage_norm.clone(),
+            expected_preimage_sigma.clone(),
             None,
         );
-        let expected_output =
-            PolyMatrixNorm::new(ctx.clone(), state_cols, gadget_cols, expected_preimage_norm, None);
+        let expected_output = PolyMatrixNorm::new(
+            ctx.clone(),
+            state_cols,
+            gadget_cols,
+            expected_preimage_sigma,
+            None,
+        );
         let expected_regular_selector = PolyMatrixNorm::new(
             ctx.clone(),
             injector.state_row_size(),
@@ -1073,7 +1078,7 @@ mod tests {
             .collect::<Vec<_>>();
         let max_error = projected_errors
             .iter()
-            .map(|norm| norm.poly_norm.norm.clone())
+            .map(|norm| norm.maximum_coefficient_bound())
             .max()
             .expect("state error list must be non-empty");
 

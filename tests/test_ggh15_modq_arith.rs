@@ -166,7 +166,7 @@ fn find_crt_depth_for_modq_arith(
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << base_bits, 0);
     let error_sigma = BigDecimal::from_f64(ERROR_SIGMA).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << P_MODULI_BITS) - 1);
-    let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
+    let e_init_norm = error_sigma.clone();
 
     for crt_depth in 1..=MAX_CRT_DEPTH {
         let params = DCRTPolyParams::new(RING_DIM, crt_depth, crt_bits, base_bits);
@@ -199,7 +199,7 @@ fn find_crt_depth_for_modq_arith(
         assert_eq!(out_errors.len(), 1);
 
         let threshold = full_q.as_ref() / BigUint::from(2u64 * q_max);
-        let error = &out_errors[0].matrix_norm.poly_norm.norm;
+        let error = &out_errors[0].matrix_norm.maximum_coefficient_bound();
         let max_error_bits = bigdecimal_bits_ceil(error);
         let all_ok = *error < BigDecimal::from_biguint(threshold, 0);
 

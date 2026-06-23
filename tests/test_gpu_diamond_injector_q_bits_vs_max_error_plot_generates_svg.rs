@@ -71,6 +71,45 @@ fn env_or_default_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_or_default_f64(key: &str, default: f64) -> f64 {
+    env::var(key)
+        .map(|raw| raw.parse::<f64>().unwrap_or_else(|e| panic!("{key} must be a valid f64: {e}")))
+        .unwrap_or(default)
+}
+
+fn env_or_optional_usize(key: &str) -> Option<usize> {
+    env::var(key).ok().map(|raw| {
+        raw.parse::<usize>().unwrap_or_else(|e| panic!("{key} must be a valid usize: {e}"))
+    })
+}
+
+fn selected_error_point_from_env(crt_bits: usize) -> Option<ErrorPoint> {
+    match (
+        env_or_optional_usize("DIAMOND_INJECTOR_SELECTED_CRT_DEPTH"),
+        env_or_optional_usize("DIAMOND_INJECTOR_SELECTED_MAX_ERROR_BITS"),
+    ) {
+        (None, None) => None,
+        (Some(crt_depth), Some(max_error_bits)) => {
+            assert!(crt_depth > 0, "DIAMOND_INJECTOR_SELECTED_CRT_DEPTH must be positive");
+            assert!(
+                max_error_bits > 0,
+                "DIAMOND_INJECTOR_SELECTED_MAX_ERROR_BITS must be positive"
+            );
+            let q_bits = crt_bits
+                .checked_mul(crt_depth)
+                .expect("selected q_bits overflow in DiamondInjector plot test");
+            let max_error_int = (BigUint::from(1u8) << max_error_bits) - BigUint::from(1u8);
+            let max_error = BigDecimal::from_biguint(max_error_int, 0);
+            let max_error_bits = bigdecimal_bits_ceil(&max_error);
+            Some(ErrorPoint { crt_depth, q_bits, max_error_bits, max_error })
+        }
+        _ => panic!(
+            "DIAMOND_INJECTOR_SELECTED_CRT_DEPTH and \
+             DIAMOND_INJECTOR_SELECTED_MAX_ERROR_BITS must be set together"
+        ),
+    }
+}
+
 fn output_path_from_env() -> PathBuf {
     env::var("DIAMOND_INJECTOR_ERROR_PLOT_PATH")
         .map(PathBuf::from)
@@ -205,6 +244,8 @@ fn verify_gpu_online_eval_errors_below_simulation(
     digit_bits: u32,
     crossing_point: &ErrorPoint,
     gpu_ids: &[i32],
+    trapdoor_sigma: f64,
+    error_sigma: f64,
 ) {
     assert!(
         input_base <= u32::MAX as usize,
@@ -220,8 +261,8 @@ fn verify_gpu_online_eval_errors_below_simulation(
         input_count,
         input_base,
         usize::try_from(digit_bits).expect("digit_bits must fit into usize"),
-        DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
-        DIAMOND_INJECTOR_ERROR_SIGMA,
+        trapdoor_sigma,
+        error_sigma,
     )
     .with_gpu_device_ids(gpu_ids.to_vec());
 
@@ -626,6 +667,12 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
     let crt_bits = env_or_default_usize("DIAMOND_INJECTOR_CRT_BITS", DEFAULT_CRT_BITS);
     let input_count = env_or_default_usize("DIAMOND_INJECTOR_INPUT_COUNT", DEFAULT_INPUT_COUNT);
     let digit_bits = env_or_default_u32("DIAMOND_INJECTOR_DIGIT_BITS", DEFAULT_DIGIT_BITS);
+    let trapdoor_sigma =
+        env_or_default_f64("DIAMOND_INJECTOR_TRAPDOOR_SIGMA", DIAMOND_INJECTOR_TRAPDOOR_SIGMA);
+    let error_sigma =
+        env_or_default_f64("DIAMOND_INJECTOR_ERROR_SIGMA", DIAMOND_INJECTOR_ERROR_SIGMA);
+    assert!(trapdoor_sigma > 0.0, "DIAMOND_INJECTOR_TRAPDOOR_SIGMA must be positive");
+    assert!(error_sigma >= 0.0, "DIAMOND_INJECTOR_ERROR_SIGMA must be nonnegative");
     let min_crt_depth =
         env_or_default_usize("DIAMOND_INJECTOR_MIN_CRT_DEPTH", DEFAULT_MIN_CRT_DEPTH);
     let max_crt_depth =
@@ -642,36 +689,51 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
         .unwrap_or_else(|| panic!("DIAMOND_INJECTOR_DIGIT_BITS={} is too large", digit_bits));
     let output_path = output_path_from_env();
 
-    let mut points = Vec::with_capacity(max_crt_depth - min_crt_depth + 1);
-    for crt_depth in min_crt_depth..=max_crt_depth {
-        let params = gpu_params_for_crt_depth(ring_dim, crt_depth, crt_bits, base_bits, &gpu_ids);
-        let injector = TestInjector::new(
-            params,
-            input_count,
-            input_base,
-            usize::try_from(digit_bits).expect("digit_bits must fit into usize"),
-            DIAMOND_INJECTOR_TRAPDOOR_SIGMA,
-            DIAMOND_INJECTOR_ERROR_SIGMA,
-        )
-        .with_gpu_device_ids(gpu_ids.clone());
-        let simulated = injector.simulate_output_error_bounds();
-        let max_error = simulated
-            .state_errors
-            .iter()
-            .map(|state_error| state_error.poly_norm.norm.clone())
-            .max()
-            .expect("state error list must be non-empty");
-        let max_error_bits = bigdecimal_bits_ceil(&max_error);
-        let q_bits =
-            crt_bits.checked_mul(crt_depth).expect("q_bits overflow in DiamondInjector plot test");
-
+    let selected_error_point = selected_error_point_from_env(crt_bits);
+    let used_selected_simulation = selected_error_point.is_some();
+    let points = if let Some(point) = selected_error_point {
         info!(
-            "diamond injector plot point: crt_depth={crt_depth}, q_bits={q_bits}, max_projected_bits={}",
-            bigdecimal_bits_ceil(&max_error),
+            crt_depth = point.crt_depth,
+            q_bits = point.q_bits,
+            max_error_bits = point.max_error_bits,
+            "diamond injector selected simulation point provided; skipping error simulation"
         );
+        vec![point]
+    } else {
+        let mut points = Vec::with_capacity(max_crt_depth - min_crt_depth + 1);
+        for crt_depth in min_crt_depth..=max_crt_depth {
+            let params =
+                gpu_params_for_crt_depth(ring_dim, crt_depth, crt_bits, base_bits, &gpu_ids);
+            let injector = TestInjector::new(
+                params,
+                input_count,
+                input_base,
+                usize::try_from(digit_bits).expect("digit_bits must fit into usize"),
+                trapdoor_sigma,
+                error_sigma,
+            )
+            .with_gpu_device_ids(gpu_ids.clone());
+            let simulated = injector.simulate_output_error_bounds();
+            let max_error = simulated
+                .state_errors
+                .iter()
+                .map(|state_error| state_error.maximum_coefficient_bound())
+                .max()
+                .expect("state error list must be non-empty");
+            let max_error_bits = bigdecimal_bits_ceil(&max_error);
+            let q_bits = crt_bits
+                .checked_mul(crt_depth)
+                .expect("q_bits overflow in DiamondInjector plot test");
 
-        points.push(ErrorPoint { crt_depth, q_bits, max_error_bits, max_error });
-    }
+            info!(
+                "diamond injector plot point: crt_depth={crt_depth}, q_bits={q_bits}, max_projected_bits={}",
+                bigdecimal_bits_ceil(&max_error),
+            );
+
+            points.push(ErrorPoint { crt_depth, q_bits, max_error_bits, max_error });
+        }
+        points
+    };
 
     write_svg_plot(&points, &output_path, ring_dim, crt_bits, base_bits, input_count, digit_bits);
 
@@ -681,9 +743,10 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
         written.contains("<svg") &&
             written.contains("DiamondInjector q_bits vs max_error_bits") &&
             written.contains("stroke=\"#9ca3af\"") &&
-            written.contains("max_error_bits &gt; q_bits") &&
-            written.contains("max_error_bits &lt; q_bits") &&
-            written.contains("stroke-dasharray=\"10 8\""),
+            (used_selected_simulation ||
+                (written.contains("max_error_bits &gt; q_bits") &&
+                    written.contains("max_error_bits &lt; q_bits") &&
+                    written.contains("stroke-dasharray=\"10 8\""))),
         "generated plot should be a readable SVG with the expected title"
     );
     let crossing_point = if let Some(highlighted_point) =
@@ -738,6 +801,8 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
         digit_bits,
         crossing_point,
         &gpu_ids,
+        trapdoor_sigma,
+        error_sigma,
     );
     gpu_device_sync();
 }

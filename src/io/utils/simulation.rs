@@ -550,9 +550,9 @@ pub(crate) fn noise_refresh_worst_pre_rounding_error_bound(
     refresh
         .pre_round_outputs
         .iter()
-        .map(|error| error.poly_norm.norm.clone())
+        .map(|error| error.maximum_coefficient_bound())
         .max_by(|lhs, rhs| {
-            lhs.partial_cmp(rhs).expect("noise-refresh pre-rounding norms must be comparable")
+            lhs.partial_cmp(rhs).expect("noise-refresh pre-rounding bounds must be comparable")
         })
         .expect("noise-refresh simulation must produce at least one pre-round output")
 }
@@ -682,7 +682,7 @@ pub(crate) fn branch_rebase_decoder_error(error: ErrorNorm, target_col_size: usi
             error.matrix_norm.clone_ctx(),
             error.matrix_norm.nrow,
             target_col_size,
-            error.matrix_norm.poly_norm.norm,
+            error.matrix_norm.poly_norm.sigma,
             error.matrix_norm.zero_rows,
         ),
     )
@@ -734,7 +734,7 @@ pub(crate) fn ciphertext_decryption_error_from_randomizer(
         randomizer_norm.clone_ctx(),
         bottom_half_randomizer.ncol,
         1,
-        decomposed_randomizer_norm.poly_norm.norm.clone(),
+        decomposed_randomizer_norm.poly_norm.sigma.clone(),
         None,
     );
     let public_key_error = PolyMatrixNorm::sample_gauss(
@@ -748,7 +748,7 @@ pub(crate) fn ciphertext_decryption_error_from_randomizer(
         output_ctx,
         1,
         1,
-        raw.poly_norm.norm * BigDecimal::from(full_active_levels as u64),
+        raw.poly_norm.sigma * BigDecimal::from(full_active_levels as u64),
         None,
     )
 }
@@ -1071,8 +1071,8 @@ pub(crate) fn refreshed_seed_from_noise_refresh(
         .iter()
         .max_by(|lhs, rhs| {
             lhs.poly_norm
-                .norm
-                .partial_cmp(&rhs.poly_norm.norm)
+                .sigma
+                .partial_cmp(&rhs.poly_norm.sigma)
                 .unwrap_or_else(|| panic!("{protocol_name} rounded errors must be comparable"))
         })
         .expect("noise refresh must produce rounded errors")

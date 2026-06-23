@@ -20,7 +20,7 @@ use crate::{
     poly::{PolyParams, dcrt::poly::DCRTPoly},
     simulator::{
         SimulatorContext,
-        error_norm::{ErrorNorm, compute_preimage_norm},
+        error_norm::{ErrorNorm, compute_preimage_sigma},
         poly_matrix_norm::PolyMatrixNorm,
         poly_norm::PolyNorm,
     },
@@ -41,9 +41,9 @@ pub struct Aky24CrtDepthSearchCandidate<TD> {
     pub inputs: Aky24DecErrorSimulationInputs,
     /// Error-norm representation of the circuit constant one.
     pub one: ErrorNorm,
-    /// Error bound for the Ring-GSW decryption-key input.
+    /// Raw sigma-mode error norm for the Ring-GSW decryption-key input.
     pub decryption_key: ErrorNorm,
-    /// Decoder error bounds in the layout expected by the noise-refresh simulator.
+    /// Raw sigma-mode decoder errors in the layout expected by the noise-refresh simulator.
     pub decoders: Vec<ErrorNorm>,
 }
 
@@ -77,16 +77,16 @@ pub struct Aky24DecErrorSimulation {
     /// The vector contains at most two entries. Entry `0` is the first refresh from the caller's
     /// initial PRF-seed error norms. Entry `1`, when present, is the second refresh, which also
     /// represents later rounds because the refreshed PRF-seed error input is then the same CBD
-    /// rounded-error bound in every subsequent round.
+    /// rounded-error sigma-mode norm in every subsequent round.
     pub prf_seed_bit_refreshes: Vec<NoiseRefreshErrorSimulation>,
-    /// Final conservative error bound before AKY24 bit decoding.
+    /// Final raw sigma-mode error before AKY24 bit decoding.
     ///
-    /// This bound adds the function-evaluation output error, the final PRG mask decode/recompose
+    /// This value adds the function-evaluation output error, the final PRG mask decode/recompose
     /// error for the selected `prf_mask_output_coeff_bits`, and the `c_b0 * output_preimage`
     /// functional-key decoder term. The PRF mask value range itself is not included here; callers
-    /// that search for a valid mask width compare this bound and the candidate mask range against
-    /// the `q / 4` margin.
-    pub error_bound: PolyMatrixNorm,
+    /// that search for a valid mask width convert this value to a maximum coefficient bound exactly
+    /// once before comparing it and the candidate mask range against the `q / 4` margin.
+    pub error: PolyMatrixNorm,
 }
 
 /// Inputs needed by the top-level AKY24 decryption error simulation.
@@ -96,30 +96,30 @@ pub struct Aky24DecErrorSimulation {
 /// seed refresh path, final mask PRG/decrypt path, and final decoder arithmetic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Aky24DecErrorSimulationInputs {
-    /// Error bound of the ciphertext `c_b0` term used by AKY24 decoder preimages.
+    /// Raw sigma-mode error norm of the ciphertext `c_b0` term used by AKY24 decoder preimages.
     pub c_b0_error_norm: PolyMatrixNorm,
-    /// Error bounds for the inputs to `build_func_circuit`, in circuit input order.
+    /// Raw sigma-mode errors for the inputs to `build_func_circuit`, in circuit input order.
     ///
     /// For the current AKY24 decryption path this means the functional decryption-key encoding
     /// followed by the message input encodings.
     pub func_input_error_norms: Vec<ErrorNorm>,
-    /// Error bounds for the current encrypted private PRF-seed bits before public PRF traversal.
+    /// Raw sigma-mode errors for the current encrypted private PRF-seed bits before public PRF traversal.
     ///
     /// The top-level simulator assumes this vector is uniform across all PRF seed bits and asserts
     /// that invariant before relying on PRG output symmetry.
     pub prf_seed_error_norms: Vec<ErrorNorm>,
     /// AKY24 function whose circuit should be evaluated in the error simulator.
     pub func: Aky24Func,
-    /// Norm bound for the functional-key output preimage used in the final `c_b0 * preimage`
+    /// Raw sigma-mode norm for the functional-key output preimage used in the final `c_b0 * preimage`
     /// decoder term.
-    pub output_preimage_norm: PolyMatrixNorm,
+    pub output_preimage_sigma: PolyMatrixNorm,
 }
 
 impl Aky24DecErrorSimulationInputs {
     /// Builds standard AKY24 decryption error-simulation inputs from AKY24 parameters.
     ///
     /// This constructor derives the ciphertext `c_b0` error, function input encoding errors,
-    /// initial PRF-seed encoding errors, and final functional-key preimage norm from the parameter
+    /// initial PRF-seed encoding errors, and final functional-key preimage sigma from the parameter
     /// dimensions and Gaussian widths. The public PRF seed is intentionally not included because
     /// the simulator uses the all-zero public-seed branch without changing the error size.
     pub fn new_from_params<TD>(params: &Aky24Params<DCRTPolyMatrix, TD>, func: Aky24Func) -> Self {
@@ -157,11 +157,11 @@ impl Aky24DecErrorSimulationInputs {
             },
         );
         let func_input_count = build_func_circuit(params, &func).num_input();
-        let output_preimage_norm = PolyMatrixNorm::new(
+        let output_preimage_sigma = PolyMatrixNorm::new(
             ctx.clone(),
             ctx.m_b,
             func.output_size(),
-            compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None),
+            compute_preimage_sigma(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None),
             None,
         );
         Self {
@@ -169,7 +169,7 @@ impl Aky24DecErrorSimulationInputs {
             func_input_error_norms: vec![encoding_error_norm.clone(); func_input_count],
             prf_seed_error_norms: vec![encoding_error_norm; params.prf_seed_bits()],
             func,
-            output_preimage_norm,
+            output_preimage_sigma,
         }
     }
 }
@@ -265,7 +265,7 @@ where
         slot_transfer_evaluator,
     );
     debug!(
-        function_error = %function_error.poly_norm.norm,
+        function_error = %function_error.poly_norm.sigma,
         "AKY24 function error simulation finished"
     );
     let first_seed_error = inputs
@@ -319,8 +319,8 @@ where
             .iter()
             .max_by(|lhs, rhs| {
                 lhs.poly_norm
-                    .norm
-                    .partial_cmp(&rhs.poly_norm.norm)
+                    .sigma
+                    .partial_cmp(&rhs.poly_norm.sigma)
                     .expect("noise-refresh rounded-error norms must be comparable")
             })
             .expect("noise-refresh simulation must produce at least one rounded error")
@@ -371,13 +371,14 @@ where
     let final_mask_encoding_error = mask_outputs.remove(0).matrix_norm;
     let final_mask_error = final_mask_encoding_error.clone() *
         PolyMatrixNorm::gadget_decomposed(final_mask_encoding_error.clone_ctx(), 1);
-    let decoder_error = inputs.c_b0_error_norm * &inputs.output_preimage_norm;
-    let error_bound = function_error + final_mask_error + decoder_error;
+    let decoder_error = inputs.c_b0_error_norm * &inputs.output_preimage_sigma;
+    let error = function_error + final_mask_error + decoder_error;
     info!(
-        error_bound = %error_bound.poly_norm.norm,
+        error_sigma = %error.poly_norm.sigma,
+        error_bound = %error.maximum_coefficient_bound(),
         "finished AKY24 decryption error simulation"
     );
-    Some(Aky24DecErrorSimulation { prf_seed_bit_refreshes, error_bound })
+    Some(Aky24DecErrorSimulation { prf_seed_bit_refreshes, error })
 }
 
 /// Searches for the largest PRF mask coefficient bit-width that satisfies the AKY24 decode margin.
@@ -436,7 +437,7 @@ where
         |simulation| {
             simulation
                 .as_ref()
-                .map(|simulation| simulation.error_bound.poly_norm.norm.clone())
+                .map(|simulation| simulation.error.maximum_coefficient_bound())
                 .unwrap_or_else(|| biguint_to_decimal(q.as_ref()))
         },
     )
@@ -447,7 +448,8 @@ where
         let simulation = result.simulation?;
         debug!(
             candidate = result.mask_bits,
-            error_bound = %simulation.error_bound.poly_norm.norm,
+            error_sigma = %simulation.error.poly_norm.sigma,
+            error_bound = %simulation.error.maximum_coefficient_bound(),
             "AKY24 PRF mask bit candidate selected"
         );
         Some(Aky24PrfMaskOutputCoeffBitsSearchResult {
@@ -560,7 +562,7 @@ fn aky24_security_margins_hold<TD>(
     };
     if !validate_error_bound_security_margin(
         &final_threshold,
-        &simulation.error_bound.poly_norm.norm,
+        &simulation.error.maximum_coefficient_bound(),
         security_bit,
     ) {
         return false;
@@ -573,9 +575,9 @@ fn aky24_security_margins_hold<TD>(
         let worst_error = refresh
             .pre_round_outputs
             .iter()
-            .map(|error| error.poly_norm.norm.clone())
+            .map(|error| error.maximum_coefficient_bound())
             .max_by(|lhs, rhs| {
-                lhs.partial_cmp(rhs).expect("noise-refresh pre-rounding norms must be comparable")
+                lhs.partial_cmp(rhs).expect("noise-refresh pre-rounding bounds must be comparable")
             })
             .expect("noise-refresh simulation must produce at least one pre-round output");
         validate_error_bound_security_margin(&threshold, &worst_error, security_bit)

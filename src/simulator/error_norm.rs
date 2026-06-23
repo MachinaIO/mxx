@@ -14,7 +14,7 @@ use std::{
 pub use super::eval_error::{
     AffinePltEvaluator, AffineSlotTransferEvaluator, NormBggPolyEncodingSTEvaluator,
     NormNaiveBggEncodingVecSTEvaluator, NormPltCommitEvaluator, NormPltGGH15Evaluator,
-    NormPltLWEEvaluator, compute_preimage_norm,
+    NormPltLWEEvaluator, compute_preimage_sigma,
 };
 
 // Note: h_norm and plaintext_norm computed here can be larger than the modulus .
@@ -28,7 +28,7 @@ pub struct ErrorNorm {
 impl ErrorNorm {
     pub fn new(plaintext_norm: PolyNorm, matrix_norm: PolyMatrixNorm) -> Self {
         debug_assert_eq!(plaintext_norm.ctx, matrix_norm.clone_ctx());
-        Self { plaintext_norm: plaintext_norm.into_constant(), matrix_norm }
+        Self { plaintext_norm: plaintext_norm.into_constant_poly(), matrix_norm }
     }
 
     #[inline]

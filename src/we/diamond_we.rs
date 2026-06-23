@@ -468,7 +468,9 @@ where
             (DIAMOND_SECRET_SIZE, columns),
             "DiamondWE k public key must match k_public_key_columns"
         );
-        let identity_selector = M::unit_row_vector(params, columns, 0);
+        let q: Arc<BigUint> = params.modulus().into();
+        let scale = M::P::from_biguint_to_constant(params, q.as_ref() / 2u32);
+        let identity_selector = M::unit_row_vector(params, columns, 0) * &scale;
         k_pubkey.matrix.concat_rows(&[&identity_selector])
     }
 
@@ -649,12 +651,7 @@ where
         );
 
         let params = &self.injector.params;
-        let k = if *msg {
-            let q: std::sync::Arc<BigUint> = params.modulus().into();
-            M::P::from_biguint_to_constant(params, q.as_ref() / 2u32)
-        } else {
-            M::P::const_zero(params)
-        };
+        let k = if *msg { M::P::const_one(params) } else { M::P::const_zero(params) };
         let preprocess_out = self.injector.preprocess(&self.artifact_dir, &k);
         let hash_key = rand::random::<[u8; 32]>();
         let (one_pubkey, k_pubkey, witness_pubkeys) = self.sample_bgg_public_keys(hash_key);
@@ -1175,6 +1172,41 @@ mod tests {
             DistType::FinRingDist,
         );
         assert_eq!(k_pubkey, BggPublicKey::new(expected_k, false));
+    }
+
+    #[test]
+    fn test_diamond_we_k_preimage_target_uses_hidden_plaintext_selector() {
+        let params = DCRTPolyParams::default();
+        let witness_size = 2;
+        let hash_key = [9u8; 32];
+
+        let injector = DiamondInjector::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(params.clone(), 1, 4, 2, 4.578, 0.0);
+        let dir = tempdir().expect("temporary DiamondWE artifact directory should be created");
+        let we = DiamondWE::new(
+            injector,
+            witness_size,
+            dir.path(),
+            b"diamond_we_k_preimage_target_test".to_vec(),
+        );
+
+        let k_pubkey = we.sample_k_public_key(hash_key);
+        let target = we.k_preimage_target(&k_pubkey);
+        let columns = we.k_public_key_columns();
+        assert_eq!(target.size(), (2 * DIAMOND_SECRET_SIZE, columns));
+        assert_eq!(target.slice_rows(0, DIAMOND_SECRET_SIZE), k_pubkey.matrix);
+
+        let q: std::sync::Arc<BigUint> = params.modulus().into();
+        let scale = DCRTPoly::from_biguint_to_constant(&params, q.as_ref() / 2u32);
+        let expected_bottom = DCRTPolyMatrix::unit_row_vector(&params, columns, 0) * &scale;
+        assert_eq!(
+            target.slice_rows(DIAMOND_SECRET_SIZE, 2 * DIAMOND_SECRET_SIZE),
+            expected_bottom
+        );
     }
 
     #[test]

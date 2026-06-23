@@ -363,6 +363,12 @@ mod tests {
             DiamondWE::new(injector, witness_size, dir.path(), b"diamond_we_sim_test".to_vec());
 
         let simulation = we.simulate_error_growth(&circuit, None::<&NoCircuitEvaluator>, None);
+        let q: std::sync::Arc<BigUint> = we.injector.params.modulus().into();
+        let expected_hidden_plaintext = PolyNorm::constant(
+            simulation.k_encoding_error.clone_ctx(),
+            BigDecimal::from(BigInt::from(q.as_ref() / 2u32)),
+        );
+        assert_eq!(simulation.k_encoding_error.plaintext_norm, expected_hidden_plaintext);
         assert_eq!(simulation.input_injection.state_errors.len(), 1 + witness_size);
         assert_eq!(simulation.witness_encoding_errors.len(), witness_size);
         assert_eq!(simulation.instance_encoding_errors.len(), 1);

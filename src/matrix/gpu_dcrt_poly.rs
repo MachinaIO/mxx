@@ -2195,6 +2195,89 @@ mod tests {
         assert_eq!(rebuilt, full);
     }
 
+    fn first_cpu_coeff_tower_residue(
+        params: &DCRTPolyParams,
+        poly: &DCRTPoly,
+        tower_idx: usize,
+    ) -> u64 {
+        let (moduli, _, _) = params.to_crt();
+        (poly.coeffs()[0].value() % moduli[tower_idx])
+            .to_u64()
+            .expect("tower residue must fit in u64")
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_decompose_matches_cpu_balanced_digits() {
+        gpu_device_sync();
+        let params = DCRTPolyParams::new(128, 2, 17, 3);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let gpu_matrix = GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            vec![vec![GpuDCRTPoly::from_usize_to_constant(&gpu_params, 12)]],
+        );
+        let cpu_matrix = gpu_matrix.to_cpu_matrix();
+
+        assert_eq!(gpu_matrix.decompose().to_cpu_matrix(), cpu_matrix.decompose());
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_decompose_balanced_odd_for_centered_inputs() {
+        gpu_device_sync();
+        let params = DCRTPolyParams::new(128, 2, 17, 3);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let modulus = gpu_params.modulus();
+        let x = GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            vec![vec![GpuDCRTPoly::from_usize_to_constant(&gpu_params, 12)]],
+        );
+        let minus_x = GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            vec![vec![GpuDCRTPoly::from_biguint_to_constant(
+                &gpu_params,
+                modulus.as_ref() - BigUint::from(12u32),
+            )]],
+        );
+
+        assert_eq!(minus_x.decompose(), -x.decompose());
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_decompose_balanced_round_to_even_tie_digits() {
+        gpu_device_sync();
+        let params = DCRTPolyParams::new(128, 2, 17, 3);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let (moduli, _, _) = params.to_crt();
+        let digits_per_tower = params.crt_bits().div_ceil(params.base_bits() as usize);
+        let x = GpuDCRTPolyMatrix::from_poly_vec(
+            &gpu_params,
+            vec![vec![GpuDCRTPoly::from_usize_to_constant(&gpu_params, 12)]],
+        );
+        let decomposed_cpu = x.decompose().to_cpu_matrix();
+
+        let first_digit = decomposed_cpu.entry(0, 0);
+        let second_digit = decomposed_cpu.entry(1, 0);
+        assert_eq!(first_cpu_coeff_tower_residue(&params, &first_digit, 0), moduli[0] - 4);
+        assert_eq!(first_cpu_coeff_tower_residue(&params, &first_digit, 1), moduli[1] - 4);
+        assert_eq!(first_cpu_coeff_tower_residue(&params, &second_digit, 0), 2);
+        assert_eq!(first_cpu_coeff_tower_residue(&params, &second_digit, 1), 2);
+
+        let second_tower_first_digit = decomposed_cpu.entry(digits_per_tower, 0);
+        let second_tower_second_digit = decomposed_cpu.entry(digits_per_tower + 1, 0);
+        assert_eq!(
+            first_cpu_coeff_tower_residue(&params, &second_tower_first_digit, 0),
+            moduli[0] - 4
+        );
+        assert_eq!(
+            first_cpu_coeff_tower_residue(&params, &second_tower_first_digit, 1),
+            moduli[1] - 4
+        );
+        assert_eq!(first_cpu_coeff_tower_residue(&params, &second_tower_second_digit, 0), 2);
+        assert_eq!(first_cpu_coeff_tower_residue(&params, &second_tower_second_digit, 1), 2);
+    }
+
     #[test]
     #[sequential]
     fn test_gpu_matrix_small_decompose_chunk_matches_full_small_decompose() {

@@ -1128,10 +1128,10 @@ async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
             noise_refresh_v_bits: search.noise_refresh_v_bits,
             seed_bits: search.seed_bits,
             noisy_plaintext_error_bits: bigdecimal_bits_ceil(
-                &search.total_noisy_plaintext_error.poly_norm.norm,
+                &search.total_noisy_plaintext_error.maximum_coefficient_bound(),
             ) as usize,
             initial_fresh_error_bits: bigdecimal_bits_ceil(
-                &search.initial_fresh_error.poly_norm.norm,
+                &search.initial_fresh_error.maximum_coefficient_bound(),
             ) as usize,
         };
         info!(

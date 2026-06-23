@@ -623,10 +623,10 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
             achieved_secpar_for_gauss: search.achieved_secpar_for_gauss,
             achieved_secpar_for_cbd: search.achieved_secpar_for_cbd,
             noisy_plaintext_error_bits: bigdecimal_bits_ceil(
-                &search.simulation.noisy_plaintext_error.poly_norm.norm,
+                &search.simulation.noisy_plaintext_error_bound,
             ) as usize,
             input_injection_error_bits: bigdecimal_bits_ceil(
-                &search.simulation.input_injection.state_errors[0].poly_norm.norm,
+                &search.simulation.input_injection.state_errors[0].maximum_coefficient_bound(),
             ) as usize,
         };
         info!(

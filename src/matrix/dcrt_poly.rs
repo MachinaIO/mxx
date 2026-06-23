@@ -9,7 +9,8 @@ use crate::{
     utils::block_size,
 };
 use itertools::Itertools;
-use num_traits::ToPrimitive;
+use num_bigint::BigUint;
+use num_traits::{ToPrimitive, Zero};
 use openfhe::ffi::{DCRTPolyGadgetVector, MatrixGen, SetMatrixElement};
 use rayon::prelude::*;
 use std::{io::Read, ops::Range, path::Path};
@@ -175,7 +176,7 @@ impl PolyMatrix for DCRTPolyMatrix {
                 .map(|i| {
                     parallel_iter!(0..ncol)
                         .map(|j| {
-                            self.dcrt_decompose_poly(&entries[i][j], base_bits)
+                            self.dcrt_small_decompose_poly_unsigned(&entries[i][j], base_bits)
                                 .into_iter()
                                 .take(k)
                                 .collect::<Vec<_>>()
@@ -450,10 +451,120 @@ impl DCRTPolyMatrix {
         DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(g_vec_cpp))
     }
 
+    fn mod_inverse_u64(value: u64, modulus: u64) -> u64 {
+        let mut t = 0i128;
+        let mut new_t = 1i128;
+        let mut r = modulus as i128;
+        let mut new_r = value as i128;
+        while new_r != 0 {
+            let quotient = r / new_r;
+            let old_t = t;
+            t = new_t;
+            new_t = old_t - quotient * new_t;
+            let old_r = r;
+            r = new_r;
+            new_r = old_r - quotient * new_r;
+        }
+        assert_eq!(r, 1, "CRT modulus component must be invertible");
+        if t < 0 {
+            t += modulus as i128;
+        }
+        t as u64
+    }
+
+    fn crt_reconstruct_residues(moduli: &[u64], modulus: &BigUint, residues: &[u64]) -> BigUint {
+        debug_assert_eq!(moduli.len(), residues.len());
+        let mut acc = BigUint::zero();
+        for (&tower_modulus, &residue) in moduli.iter().zip(residues) {
+            if residue == 0 {
+                continue;
+            }
+            let tower_modulus_big = BigUint::from(tower_modulus);
+            let partial_modulus = modulus / &tower_modulus_big;
+            let partial_modulus_mod_tower = (&partial_modulus % tower_modulus)
+                .to_u64()
+                .expect("partial CRT modulus residue must fit in u64");
+            let inv = Self::mod_inverse_u64(partial_modulus_mod_tower, tower_modulus);
+            acc += BigUint::from(residue) * &partial_modulus * BigUint::from(inv);
+        }
+        acc % modulus
+    }
+
+    fn centered_lift_residue(residue: u64, modulus: u64) -> i128 {
+        let residue = residue as i128;
+        let modulus = modulus as i128;
+        if residue * 2 > modulus { residue - modulus } else { residue }
+    }
+
+    fn balanced_digit_step(value: i128, base: i128) -> (i128, i128) {
+        let floor_quotient = value.div_euclid(base);
+        let remainder = value.rem_euclid(base);
+        let half = base / 2;
+        if remainder < half {
+            (remainder, floor_quotient)
+        } else if remainder > half {
+            (remainder - base, floor_quotient + 1)
+        } else if floor_quotient % 2 == 0 {
+            (half, floor_quotient)
+        } else {
+            (half - base, floor_quotient + 1)
+        }
+    }
+
+    fn signed_digit_to_residue(digit: i128, modulus: u64) -> u64 {
+        let modulus_i = modulus as i128;
+        let residue = digit.rem_euclid(modulus_i);
+        residue as u64
+    }
+
     fn dcrt_decompose_poly(&self, poly: &DCRTPoly, base_bits: u32) -> Vec<DCRTPoly> {
-        // Use OpenFHE's native decomposition for consistency with its gadget vector,
-        // but clamp each digit to its valid bit-width, especially for the most-significant
-        // digit when base_bits does not divide crt_bits.
+        let (moduli, _, crt_depth) = self.params.to_crt();
+        debug_assert_eq!(moduli.len(), crt_depth);
+        let digits_per_tower = self.params.crt_bits().div_ceil(base_bits as usize);
+        let log_base_q = digits_per_tower * crt_depth;
+        let base = 1i128.checked_shl(base_bits).expect("base_bits must fit in i128 shift");
+        let modulus = self.params.modulus();
+        let coeffs = poly.coeffs();
+        let per_digit_coeffs = parallel_iter!(0..log_base_q)
+            .map(|digit_idx| {
+                let tower_idx = digit_idx / digits_per_tower;
+                let local_digit_idx = digit_idx % digits_per_tower;
+                coeffs
+                    .iter()
+                    .map(|coeff| {
+                        let residue = (coeff.value() % moduli[tower_idx])
+                            .to_u64()
+                            .expect("CRT tower residue must fit in u64");
+                        let mut value = Self::centered_lift_residue(residue, moduli[tower_idx]);
+                        let mut digit = 0i128;
+                        for idx in 0..=local_digit_idx {
+                            let (current_digit, next) = Self::balanced_digit_step(value, base);
+                            if idx == local_digit_idx {
+                                digit = current_digit;
+                            }
+                            value = next;
+                        }
+                        if local_digit_idx + 1 == digits_per_tower {
+                            debug_assert_eq!(value, 0, "balanced decomposition carry must vanish");
+                        }
+                        let residues = moduli
+                            .iter()
+                            .map(|&tower_modulus| {
+                                Self::signed_digit_to_residue(digit, tower_modulus)
+                            })
+                            .collect::<Vec<_>>();
+                        Self::crt_reconstruct_residues(&moduli, &modulus, &residues).to_u64_digits()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        per_digit_coeffs
+            .iter()
+            .map(|coeff_values| DCRTPoly::poly_gen_from_vec(&self.params, coeff_values))
+            .collect()
+    }
+
+    fn dcrt_small_decompose_poly_unsigned(&self, poly: &DCRTPoly, base_bits: u32) -> Vec<DCRTPoly> {
         let decomposed = poly.get_poly().Decompose(base_bits);
         let cpp_decomposed = CppMatrix::new(decomposed);
         let decompose_last_mask = match self.params.decompose_last_mask() {
@@ -464,30 +575,21 @@ impl DCRTPolyMatrix {
                     .collect();
             }
         };
+        let decompose_last_mask = BigUint::from(decompose_last_mask);
         let digits_per_tower = self.params.crt_bits().div_ceil(base_bits as usize);
         let last_digit_in_tower = digits_per_tower - 1;
         parallel_iter!(0..cpp_decomposed.ncol())
             .map(|idx| {
                 let digit_poly = cpp_decomposed.entry(0, idx);
-                // Determine effective bit-width for this digit within its CRT tower
                 if idx % digits_per_tower != last_digit_in_tower {
                     return digit_poly;
                 }
-
-                // Clamp the coefficients of this digit to the mask (u64 assumed)
-                let masked_values: Vec<Vec<u64>> = digit_poly
+                let coeffs = digit_poly
                     .coeffs()
-                    .into_par_iter()
-                    .map(|c| {
-                        let value = c
-                            .value()
-                            .to_u64()
-                            .expect("coefficient must fit in u64 for masked decomposition");
-                        vec![value & decompose_last_mask]
-                    })
-                    .collect();
-
-                DCRTPoly::poly_gen_from_vec(&self.params, &masked_values)
+                    .into_iter()
+                    .map(|elem| (elem.value() & &decompose_last_mask).to_u64_digits())
+                    .collect::<Vec<_>>();
+                DCRTPoly::poly_gen_from_vec(&self.params, &coeffs)
             })
             .collect()
     }
@@ -598,6 +700,62 @@ mod tests {
         assert_eq!(expected_matrix.size().0, 2);
         assert_eq!(expected_matrix.size().1, 8);
         assert_eq!(matrix, expected_matrix);
+    }
+
+    fn first_coeff_tower_residue(
+        params: &DCRTPolyParams,
+        poly: &DCRTPoly,
+        tower_idx: usize,
+    ) -> u64 {
+        let (moduli, _, _) = params.to_crt();
+        (poly.coeffs()[0].value() % moduli[tower_idx])
+            .to_u64()
+            .expect("tower residue must fit in u64")
+    }
+
+    #[test]
+    fn test_matrix_decompose_balanced_odd_for_centered_inputs() {
+        let params = DCRTPolyParams::new(4, 2, 17, 3);
+        let modulus = params.modulus();
+        let x = DCRTPolyMatrix::from_poly_vec(
+            &params,
+            vec![vec![DCRTPoly::from_usize_to_constant(&params, 12)]],
+        );
+        let minus_x = DCRTPolyMatrix::from_poly_vec(
+            &params,
+            vec![vec![DCRTPoly::from_biguint_to_constant(
+                &params,
+                modulus.as_ref() - BigUint::from(12u32),
+            )]],
+        );
+
+        assert_eq!(minus_x.decompose(), -x.decompose());
+    }
+
+    #[test]
+    fn test_matrix_decompose_balanced_round_to_even_tie_digits() {
+        let params = DCRTPolyParams::new(4, 2, 17, 3);
+        let (moduli, _, _) = params.to_crt();
+        let digits_per_tower = params.crt_bits().div_ceil(params.base_bits() as usize);
+        let x = DCRTPolyMatrix::from_poly_vec(
+            &params,
+            vec![vec![DCRTPoly::from_usize_to_constant(&params, 12)]],
+        );
+        let decomposed = x.decompose();
+
+        // 12 = (-4) + 8 * 2 because the first quotient is odd at the B/2 tie.
+        let first_digit = decomposed.entry(0, 0);
+        let second_digit = decomposed.entry(1, 0);
+        assert_eq!(first_coeff_tower_residue(&params, &first_digit, 0), moduli[0] - 4);
+        assert_eq!(first_coeff_tower_residue(&params, &first_digit, 1), moduli[1] - 4);
+        assert_eq!(first_coeff_tower_residue(&params, &second_digit, 0), 2);
+        assert_eq!(first_coeff_tower_residue(&params, &second_digit, 1), 2);
+
+        // The same constant is represented independently in each CRT tower.
+        let second_tower_first_digit = decomposed.entry(digits_per_tower, 0);
+        let second_tower_second_digit = decomposed.entry(digits_per_tower + 1, 0);
+        assert_eq!(first_coeff_tower_residue(&params, &second_tower_first_digit, 1), moduli[1] - 4);
+        assert_eq!(first_coeff_tower_residue(&params, &second_tower_second_digit, 1), 2);
     }
 
     #[test]

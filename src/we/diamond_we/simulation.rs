@@ -18,9 +18,11 @@ use super::DiamondWE;
 /// Error-growth summary for the DiamondWE online decryption path.
 ///
 /// DiamondWE does not use the DiamondIO PRF/noise-refresh path, so this
-/// simulation records the Diamond input-injection bounds, the per-input BGG
-/// encoding bounds used to evaluate the witness circuit, the circuit output
-/// bound, and the final decoder cancellation bound.
+/// simulation records the Diamond input-injection sigma-mode norms, the
+/// per-input BGG encoding norms used to evaluate the witness circuit, the
+/// circuit output norm, and the final decoder cancellation norm. The final
+/// noisy plaintext sigma is converted once to a maximum coefficient bound for
+/// correctness checks and selected-parameter reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiamondWEErrorSimulation {
     pub input_injection: DiamondInputErrorSimulation,
@@ -32,6 +34,7 @@ pub struct DiamondWEErrorSimulation {
     pub dec_encoding_error: ErrorNorm,
     pub decoder_projection_error: PolyMatrixNorm,
     pub noisy_plaintext_error: PolyMatrixNorm,
+    pub noisy_plaintext_error_bound: BigDecimal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +48,7 @@ pub struct DiamondWECrtDepthSearchResult {
 }
 
 fn diamond_we_decode_margin(params: &<DCRTPoly as Poly>::Params) -> BigDecimal {
-    let q: std::sync::Arc<BigUint> = params.modulus().into();
+    let q: std::sync::Arc<BigUint> = params.modulus();
     BigDecimal::from(BigInt::from(q.as_ref() / 4u32))
 }
 
@@ -53,7 +56,7 @@ fn diamond_we_correctness_margin_holds(
     simulation: &DiamondWEErrorSimulation,
     margin: &BigDecimal,
 ) -> bool {
-    simulation.noisy_plaintext_error.poly_norm.norm < *margin
+    simulation.noisy_plaintext_error_bound < *margin
 }
 
 pub fn diamond_we_find_crt_depth<M, US, HS, TS, PKPE, PKST, ENCPE, ENCST, PE, ST, BuildCandidate>(
@@ -99,7 +102,7 @@ where
             .checked_shl(min_log_ring_dim.try_into().expect("min_log_ring_dim must fit in u32"))
             .expect("minimum ring_dim shift overflow");
         let probe_candidate = build_candidate(min_ring_dim, high);
-        let Some(ring_dim_search) = sim_utils::select_min_secure_ring_dim_gaussian_only(
+        let ring_dim_search = sim_utils::select_min_secure_ring_dim_gaussian_only(
             "DiamondWE",
             high,
             min_log_ring_dim,
@@ -112,9 +115,7 @@ where
                 let candidate = build_candidate(ring_dim, high);
                 candidate.injector.params.clone()
             },
-        ) else {
-            return None;
-        };
+        )?;
         let candidate = build_candidate(ring_dim_search.ring_dim, high);
         let slot_transfer_evaluator = slot_transfer_evaluator
             .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<ErrorNorm>);
@@ -125,7 +126,8 @@ where
         debug!(
             crt_depth = high,
             valid,
-            noisy_plaintext_error = %simulation.noisy_plaintext_error.poly_norm.norm,
+            noisy_plaintext_error_sigma = %simulation.noisy_plaintext_error.poly_norm.sigma,
+            noisy_plaintext_error_bound = %simulation.noisy_plaintext_error_bound,
             decode_margin = %margin,
             "DiamondWE CRT-depth upper-bound candidate evaluated"
         );
@@ -159,7 +161,7 @@ where
             .checked_shl(min_log_ring_dim.try_into().expect("min_log_ring_dim must fit in u32"))
             .expect("minimum ring_dim shift overflow");
         let probe_candidate = build_candidate(min_ring_dim, crt_depth);
-        let Some(ring_dim_search) = sim_utils::select_min_secure_ring_dim_gaussian_only(
+        let ring_dim_search = sim_utils::select_min_secure_ring_dim_gaussian_only(
             "DiamondWE",
             crt_depth,
             min_log_ring_dim,
@@ -172,9 +174,7 @@ where
                 let candidate = build_candidate(ring_dim, crt_depth);
                 candidate.injector.params.clone()
             },
-        ) else {
-            return None;
-        };
+        )?;
         let candidate = build_candidate(ring_dim_search.ring_dim, crt_depth);
         let slot_transfer_evaluator = slot_transfer_evaluator
             .map(|evaluator| evaluator as &dyn SlotTransferEvaluator<ErrorNorm>);
@@ -185,7 +185,8 @@ where
         debug!(
             crt_depth,
             valid,
-            noisy_plaintext_error = %simulation.noisy_plaintext_error.poly_norm.norm,
+            noisy_plaintext_error_sigma = %simulation.noisy_plaintext_error.poly_norm.sigma,
+            noisy_plaintext_error_bound = %simulation.noisy_plaintext_error_bound,
             decode_margin = %margin,
             "DiamondWE CRT-depth candidate evaluated"
         );
@@ -254,14 +255,13 @@ where
         let ctx = input_injection.output_preimage.clone_ctx();
         let one_plaintext = PolyNorm::one(ctx.clone());
         let q = self.injector.params.modulus();
-        let q: std::sync::Arc<num_bigint::BigUint> = q.into();
         let hidden_plaintext =
             PolyNorm::constant(ctx.clone(), BigDecimal::from(BigInt::from(q.as_ref() / 2u32)));
         let k_preimage = PolyMatrixNorm::new(
             ctx.clone(),
             input_injection.output_preimage.nrow,
             1,
-            input_injection.output_preimage.poly_norm.norm.clone(),
+            input_injection.output_preimage.poly_norm.sigma.clone(),
             None,
         );
 
@@ -308,6 +308,7 @@ where
         let dec_encoding_matrix = k_encoding_error.matrix_norm.clone() + &r_scaled_difference;
         let decoder_projection_error = input_injection.state_errors[0].clone() * &k_preimage;
         let noisy_plaintext_error = decoder_projection_error.clone() + &dec_encoding_matrix;
+        let noisy_plaintext_error_bound = noisy_plaintext_error.maximum_coefficient_bound();
 
         DiamondWEErrorSimulation {
             input_injection,
@@ -319,6 +320,7 @@ where
             dec_encoding_error: ErrorNorm::new(hidden_plaintext, dec_encoding_matrix),
             decoder_projection_error,
             noisy_plaintext_error,
+            noisy_plaintext_error_bound,
         }
     }
 }

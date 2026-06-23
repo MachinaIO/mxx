@@ -717,7 +717,7 @@ fn test_gpu_diamond_injector_q_bits_vs_max_error_plot_generates_svg() {
             let max_error = simulated
                 .state_errors
                 .iter()
-                .map(|state_error| state_error.poly_norm.norm.clone())
+                .map(|state_error| state_error.maximum_coefficient_bound())
                 .max()
                 .expect("state error list must be non-empty");
             let max_error_bits = bigdecimal_bits_ceil(&max_error);

@@ -54,12 +54,12 @@ type ErrorNormSubCircuitSummaryCache =
 /// Hash-friendly identity for one `PolyNorm`.
 ///
 /// The summary cache needs a stable key, but `PolyNorm` itself contains shared context and big
-/// decimal state. The cache only cares about the simulator context identity and the textual bound,
-/// so this key strips the runtime object down to those two stable components.
+/// decimal state. The cache only cares about the simulator context identity, raw sigma, and
+/// constant-polynomial flag, so this key strips the runtime object down to those stable components.
 struct ErrorNormPolyNormKey {
     ctx_id: usize,
-    norm: String,
-    is_constant: bool,
+    sigma: String,
+    is_constant_poly: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -127,16 +127,16 @@ struct ErrorNormSummaryRegistry {
 fn error_norm_poly_norm_key(norm: &PolyNorm) -> ErrorNormPolyNormKey {
     ErrorNormPolyNormKey {
         ctx_id: Arc::as_ptr(&norm.ctx) as usize,
-        norm: norm.norm.to_string(),
-        is_constant: norm.is_constant,
+        sigma: norm.sigma.to_string(),
+        is_constant_poly: norm.is_constant_poly,
     }
 }
 
 /// Build the cache key for one sub-circuit summary request.
 ///
 /// This intentionally captures only the circuit identity plus the caller-observed plaintext
-/// profile. If two call sites expose the same input bounds, they can share the exact same affine
-/// summary.
+/// profile. If two call sites expose the same input sigma profiles, they can share the exact same
+/// affine summary.
 fn error_norm_sub_circuit_summary_cache_key(
     circuit_key: usize,
     sub_circuit_id: usize,
@@ -205,11 +205,12 @@ fn validate_input_plaintext_norms_against_ranges(
         for (offset, actual_norm) in
             actual_input_plaintext_norms[range.start..range.end].iter().enumerate()
         {
+            let actual_bound = actual_norm.max_coefficients_bound();
             assert!(
-                actual_norm.norm <= max_norm_bd,
+                actual_bound <= max_norm_bd,
                 "{context}: input plaintext norm at index {} exceeds declared max (actual={}, max={})",
                 range.start + offset,
-                actual_norm.norm,
+                actual_bound,
                 max_norm_bd
             );
             normalized.push(PolyNorm::constant(Arc::clone(norm_ctx), max_norm_bd.clone()));
@@ -259,15 +260,7 @@ fn normalize_sub_circuit_input_plaintext_norms(
 /// summed sub-circuit calls: similar profiles are likely to share cache entries and have similar
 /// substitution costs.
 fn error_norm_summary_profile_max_bits(input_plaintext_norms: &[PolyNorm]) -> u64 {
-    input_plaintext_norms.iter().map(|norm| bigdecimal_bits_ceil(&norm.norm)).max().unwrap_or(0)
-}
-
-/// Fixed Gaussian tail multiplier used when turning simulator noise parameters into hard bounds.
-///
-/// This session does not change the bound itself; the helper exists only so all extracted files use
-/// the exact same constant and the intent remains visible near the error simulator.
-fn gaussian_tail_bound_factor() -> BigDecimal {
-    BigDecimal::from_f32(6.5).unwrap()
+    input_plaintext_norms.iter().map(|norm| bigdecimal_bits_ceil(&norm.sigma)).max().unwrap_or(0)
 }
 
 /// Resolve the `input_idx`-th input of a direct sub-circuit call that uses a shared-prefix input
@@ -972,9 +965,9 @@ impl AffineErrorNormExpr {
 #[derive(Debug, Clone)]
 /// Reusable symbolic error bound for one gate or one sub-circuit output.
 ///
-/// The plaintext component is already concrete for the profiled input bounds. The matrix component
-/// stays affine in the caller inputs, which allows `ErrorNormSubCircuitSummary` to substitute or
-/// remap many outputs without rerunning the full simulator.
+/// The plaintext component is already concrete for the profiled input sigma profile. The matrix
+/// component stays affine in the caller inputs, which allows `ErrorNormSubCircuitSummary` to
+/// substitute or remap many outputs without rerunning the full simulator.
 pub struct ErrorNormSummaryExpr {
     plaintext_norm: PolyNorm,
     matrix_expr: AffineErrorNormExpr,
@@ -1470,9 +1463,10 @@ struct PolyNormRun {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Run-length encoded plaintext profile for summary cache keys.
 ///
-/// Large shared-prefix call groups often repeat the same plaintext bounds many times. Compressing
-/// those runs reduces both cache-key allocation cost and temporary cloning during summary
-/// preparation, while `materialize` reconstructs the exact flat list when the simulator needs it.
+/// Large shared-prefix call groups often repeat the same plaintext sigma profiles many times.
+/// Compressing those runs reduces both cache-key allocation cost and temporary cloning during
+/// summary preparation, while `materialize` reconstructs the exact flat list when the simulator
+/// needs it.
 struct CompressedPolyNormRuns {
     total_len: usize,
     runs: Arc<[PolyNormRun]>,
@@ -1521,7 +1515,7 @@ impl CompressedPolyNormRuns {
 ///
 /// The `SharedPrefix` variant mirrors the circuit representation used by direct sub-circuit calls:
 /// one reusable prefix input-set plus a call-local suffix. Keeping that distinction here lets the
-/// summary preparation path reuse compressed prefix bounds across many calls.
+/// summary preparation path reuse compressed prefix sigma profiles across many calls.
 enum ErrorNormInputPlaintextProfile {
     Flat(CompressedPolyNormRuns),
     SharedPrefix { prefix_norms: CompressedPolyNormRuns, suffix_norms: CompressedPolyNormRuns },
@@ -1572,7 +1566,7 @@ mod summary;
 
 pub use evaluators::{
     NormBggPolyEncodingSTEvaluator, NormNaiveBggEncodingVecSTEvaluator, NormPltCommitEvaluator,
-    NormPltGGH15Evaluator, NormPltLWEEvaluator, compute_preimage_norm,
+    NormPltGGH15Evaluator, NormPltLWEEvaluator, compute_preimage_sigma,
 };
 
 #[cfg(test)]

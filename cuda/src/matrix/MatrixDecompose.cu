@@ -29,6 +29,55 @@ namespace
     constexpr size_t kDecomposeMaxGridZ = 65535;
 }
 
+__device__ __forceinline__ int64_t centered_lift_u64(uint64_t residue, uint64_t modulus)
+{
+    __int128 value = static_cast<__int128>(residue);
+    if (static_cast<unsigned __int128>(residue) * 2U > static_cast<unsigned __int128>(modulus))
+    {
+        value -= static_cast<__int128>(modulus);
+    }
+    return static_cast<int64_t>(value);
+}
+
+__device__ __forceinline__ int64_t balanced_digit_step(int64_t value, int64_t base, int64_t *next)
+{
+    int64_t quotient = value / base;
+    int64_t remainder = value % base;
+    if (remainder < 0)
+    {
+        remainder += base;
+        quotient -= 1;
+    }
+    const int64_t half = base / 2;
+    if (remainder < half)
+    {
+        *next = quotient;
+        return remainder;
+    }
+    if (remainder > half)
+    {
+        *next = quotient + 1;
+        return remainder - base;
+    }
+    if ((quotient & 1LL) == 0)
+    {
+        *next = quotient;
+        return half;
+    }
+    *next = quotient + 1;
+    return half - base;
+}
+
+__device__ __forceinline__ uint64_t signed_digit_to_residue(int64_t digit, uint64_t modulus)
+{
+    if (digit >= 0)
+    {
+        return static_cast<uint64_t>(digit) % modulus;
+    }
+    const uint64_t magnitude = static_cast<uint64_t>(-digit) % modulus;
+    return magnitude == 0 ? 0 : modulus - magnitude;
+}
+
 __global__ void matrix_decompose_all_slots_kernel(
     const uint8_t *src_base,
     uint8_t *const *dst_bases,
@@ -45,8 +94,10 @@ __global__ void matrix_decompose_all_slots_kernel(
     size_t out_cols,
     size_t log_base_q,
     uint32_t src_bits,
+    uint64_t src_modulus,
     uint32_t base_bits,
     uint32_t digits_per_tower,
+    bool balanced,
     size_t src_digit_offset_base,
     size_t poly_offset,
     size_t slot_offset)
@@ -92,18 +143,39 @@ __global__ void matrix_decompose_all_slots_kernel(
 
     const uint64_t residue =
         matrix_load_limb_u64(src_base, poly_idx, coeff_idx, src_stride_bytes, src_coeff_bytes);
-    const uint32_t shift = digit_idx * base_bits;
-    uint64_t mask = 0;
-    if (shift < src_bits)
+    uint64_t digit = 0;
+    if (balanced)
     {
-        const uint32_t remaining = src_bits - shift;
-        const uint32_t digit_bits = min(base_bits, remaining);
-        mask = digit_bits >= 64 ? ~uint64_t{0} : ((uint64_t{1} << digit_bits) - 1);
+        int64_t value = centered_lift_u64(residue, src_modulus);
+        int64_t signed_digit = 0;
+        const int64_t base = int64_t{1} << base_bits;
+        for (uint32_t idx = 0; idx <= digit_idx; ++idx)
+        {
+            int64_t next = 0;
+            const int64_t current_digit = balanced_digit_step(value, base, &next);
+            if (idx == digit_idx)
+            {
+                signed_digit = current_digit;
+            }
+            value = next;
+        }
+        digit = signed_digit_to_residue(signed_digit, out_modulus);
     }
-    uint64_t digit = shift >= 64 ? 0 : ((residue >> shift) & mask);
-    if (out_modulus != 0 && digit >= out_modulus)
+    else
     {
-        digit %= out_modulus;
+        const uint32_t shift = digit_idx * base_bits;
+        uint64_t mask = 0;
+        if (shift < src_bits)
+        {
+            const uint32_t remaining = src_bits - shift;
+            const uint32_t digit_bits = min(base_bits, remaining);
+            mask = digit_bits >= 64 ? ~uint64_t{0} : ((uint64_t{1} << digit_bits) - 1);
+        }
+        digit = shift >= 64 ? 0 : ((residue >> shift) & mask);
+        if (out_modulus != 0 && digit >= out_modulus)
+        {
+            digit %= out_modulus;
+        }
     }
 
     const size_t row = poly_idx / src_cols;
@@ -128,8 +200,10 @@ int launch_decompose_all_slots_kernel(
     size_t out_cols,
     size_t log_base_q,
     uint32_t src_bits,
+    uint64_t src_modulus,
     uint32_t base_bits,
     uint32_t digits_per_tower,
+    bool balanced,
     size_t src_digit_offset_base,
     cudaStream_t stream)
 {
@@ -194,8 +268,10 @@ int launch_decompose_all_slots_kernel(
                 out_cols,
                 log_base_q,
                 src_bits,
+                src_modulus,
                 base_bits,
                 digits_per_tower,
+                balanced,
                 src_digit_offset_base,
                 poly_offset,
                 slot_offset);
@@ -1284,8 +1360,10 @@ static int gpu_matrix_decompose_base_impl(
             out->cols,
             out_log_base_q,
             src_bits,
+            src->ctx->moduli[src_idx],
             base_bits,
             digits_per_tower,
+            !small,
             src_digit_offset_base,
             dispatch_stream);
         if (status != 0)

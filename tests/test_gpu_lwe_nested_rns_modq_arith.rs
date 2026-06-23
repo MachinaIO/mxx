@@ -395,7 +395,7 @@ fn probe_crt_depth_for_modq_arith(
 
     let threshold = full_q.as_ref() / BigUint::from(2u64 * q_max);
     let threshold_bd = BigDecimal::from_biguint(threshold.clone(), 0);
-    let max_eval_error = out_errors[0].matrix_norm.poly_norm.norm.clone();
+    let max_eval_error = out_errors[0].matrix_norm.maximum_coefficient_bound();
     let corrected_max_eval_error =
         corrected_max_eval_error_for_active_levels(&max_eval_error, active_levels);
     let eval_ok = corrected_max_eval_error < threshold_bd;
@@ -426,7 +426,7 @@ fn find_crt_depth_for_modq_arith(
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
     let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
     let input_bound = BigDecimal::from((1u64 << cfg.p_moduli_bits) - 1);
-    let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
+    let e_init_norm = error_sigma.clone();
 
     if let Some(raw_crt_depth) = env::var("CRT_DEPTH").ok().filter(|value| !value.trim().is_empty())
     {

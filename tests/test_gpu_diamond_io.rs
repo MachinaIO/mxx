@@ -931,10 +931,10 @@ async fn test_gpu_diamond_io_error_search_and_bench_estimate() {
             noise_refresh_v_bits: search.noise_refresh_v_bits,
             seed_bits: search.seed_bits,
             noisy_plaintext_error_bits: bigdecimal_bits_ceil(
-                &search.total_noisy_plaintext_error.poly_norm.norm,
+                &search.total_noisy_plaintext_error.maximum_coefficient_bound(),
             ) as usize,
             input_injection_error_bits: bigdecimal_bits_ceil(
-                &search.input_injection_projection_error.poly_norm.norm,
+                &search.input_injection_projection_error.maximum_coefficient_bound(),
             ) as usize,
         };
         info!(

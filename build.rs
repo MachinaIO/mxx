@@ -62,7 +62,7 @@ fn main() {
             .flag("-std=c++17")
             .flag("-Xcompiler")
             .flag("-fPIC")
-            .flag(&format!("-arch=sm_{cuda_arch}"));
+            .flag(format!("-arch=sm_{cuda_arch}"));
         if !debug_build {
             build.flag("-lineinfo");
         }

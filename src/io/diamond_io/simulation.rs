@@ -668,8 +668,9 @@ where
         );
         info!(
             max_candidate,
-            final_mask_prg_bits =
-                bigdecimal_bits_ceil(&cached_final_mask_prg_output.matrix_norm.poly_norm.norm),
+            final_mask_prg_bits = bigdecimal_bits_ceil(
+                &cached_final_mask_prg_output.matrix_norm.maximum_coefficient_bound()
+            ),
             "DiamondIO PRF mask bit search cached final-mask representative PRG"
         );
         let cached_final_mask_base_error = sim_utils::simulate_final_mask_base_error(
@@ -684,8 +685,9 @@ where
             "DiamondIO",
         );
         info!(
-            final_mask_base_bits =
-                bigdecimal_bits_ceil(&cached_final_mask_base_error.matrix_norm.poly_norm.norm),
+            final_mask_base_bits = bigdecimal_bits_ceil(
+                &cached_final_mask_base_error.matrix_norm.maximum_coefficient_bound()
+            ),
             "DiamondIO PRF mask bit search cached final-mask representative decrypt"
         );
         let mut low = 1usize;
@@ -703,7 +705,7 @@ where
                 plt_evaluator,
                 slot_transfer_evaluator,
             );
-            let error = &simulation.noisy_plaintext_error.poly_norm.norm;
+            let error = &simulation.noisy_plaintext_error.maximum_coefficient_bound();
             let max_valid_bits = sim_utils::final_mask_coeff_bits_for_error_margin(
                 &prefix.cpu_params,
                 error,
@@ -833,7 +835,7 @@ where
         info!(
             state_count = input_injection.state_errors.len(),
             projected_state_error_bits =
-                bigdecimal_bits_ceil(&projected_state_error.poly_norm.norm),
+                bigdecimal_bits_ceil(&projected_state_error.maximum_coefficient_bound()),
             "DiamondIO input-injection error simulation finished"
         );
         debug!(state_errors = ?input_injection.state_errors, "DiamondIO simulated state errors");
@@ -1054,14 +1056,13 @@ where
                         round_idx,
                         v_bits = evaluation.round.noise_refresh.v_bits,
                         refreshed_seed_error_bits = bigdecimal_bits_ceil(
-                            &evaluation.refreshed_seed.matrix_norm.poly_norm.norm
+                            &evaluation.refreshed_seed.matrix_norm.maximum_coefficient_bound()
                         ),
                         selected_ciphertext_decryption_bits = bigdecimal_bits_ceil(
                             &evaluation
                                 .round
                                 .representative_selected_prg_ciphertext_decryption_error
-                                .poly_norm
-                                .norm
+                                .maximum_coefficient_bound()
                         ),
                         "DiamondIO reusing fixed-v steady-state PRF refresh error simulation"
                     );
@@ -1105,14 +1106,16 @@ where
                 self.ring_gsw_public_key_error_sigma.unwrap_or(0.0),
             );
         info!(
-            function_secret_bits =
-                bigdecimal_bits_ceil(&function_secret_error.matrix_norm.poly_norm.norm),
+            function_secret_bits = bigdecimal_bits_ceil(
+                &function_secret_error.matrix_norm.maximum_coefficient_bound()
+            ),
             function_public_bottom_plaintext_bits =
-                bigdecimal_bits_ceil(&function_public_bottom_error.plaintext_norm.norm),
-            function_public_bottom_encoding_bits =
-                bigdecimal_bits_ceil(&function_public_bottom_error.matrix_norm.poly_norm.norm),
+                bigdecimal_bits_ceil(&function_public_bottom_error.plaintext_norm.sigma),
+            function_public_bottom_encoding_bits = bigdecimal_bits_ceil(
+                &function_public_bottom_error.matrix_norm.maximum_coefficient_bound()
+            ),
             accumulated_public_bottom_decryption_bits =
-                bigdecimal_bits_ceil(&public_bottom_decryption_error.poly_norm.norm),
+                bigdecimal_bits_ceil(&public_bottom_decryption_error.maximum_coefficient_bound()),
             "DiamondIO representative GoldreichPRF output error simulation finished"
         );
         Some(DiamondIOMaskIndependentErrorPrefix {
@@ -1186,14 +1189,17 @@ where
                 candidate,
                 valid,
                 selected_prg_bits = bigdecimal_bits_ceil(
-                    &evaluation.round.representative_selected_prg_output.matrix_norm.poly_norm.norm
+                    &evaluation
+                        .round
+                        .representative_selected_prg_output
+                        .matrix_norm
+                        .maximum_coefficient_bound()
                 ),
                 selected_ciphertext_decryption_bits = bigdecimal_bits_ceil(
                     &evaluation
                         .round
                         .representative_selected_prg_ciphertext_decryption_error
-                        .poly_norm
-                        .norm
+                        .maximum_coefficient_bound()
                 ),
                 "DiamondIO fixed-v noise-refresh security candidate evaluated"
             );
@@ -1261,12 +1267,11 @@ where
             round_idx,
             v_bits = core.refresh.v_bits,
             refreshed_seed_error_bits =
-                bigdecimal_bits_ceil(&core.refreshed_seed.matrix_norm.poly_norm.norm),
+                bigdecimal_bits_ceil(&core.refreshed_seed.matrix_norm.maximum_coefficient_bound()),
             selected_ciphertext_decryption_bits = bigdecimal_bits_ceil(
                 &material_state
                     .representative_selected_prg_ciphertext_decryption_error
-                    .poly_norm
-                    .norm
+                    .maximum_coefficient_bound()
             ),
             noise_refresh_material_branch_count_online = 1usize,
             "DiamondIO PRF refresh error simulation finished"
@@ -1333,7 +1338,8 @@ where
         info!(
             round_idx,
             selected_ciphertext_decryption_bits = bigdecimal_bits_ceil(
-                &representative_selected_prg_ciphertext_decryption_error.poly_norm.norm
+                &representative_selected_prg_ciphertext_decryption_error
+                    .maximum_coefficient_bound()
             ),
             "DiamondIO fixed-v PRF refresh representative ciphertext-state simulation finished"
         );
@@ -1347,9 +1353,10 @@ where
         );
         info!(
             round_idx,
-            selected_prg_bits = bigdecimal_bits_ceil(&selected.matrix_norm.poly_norm.norm),
+            selected_prg_bits =
+                bigdecimal_bits_ceil(&selected.matrix_norm.maximum_coefficient_bound()),
             material_wire_bits =
-                bigdecimal_bits_ceil(&material_wire_error.matrix_norm.poly_norm.norm),
+                bigdecimal_bits_ceil(&material_wire_error.matrix_norm.maximum_coefficient_bound()),
             "DiamondIO fixed-v PRF refresh material-input simulation finished"
         );
         let state = DiamondIOPrfRefreshMaterialState {
@@ -1381,13 +1388,13 @@ where
                 .unwrap_or_else(|| "None".to_string()),
             seed_error_matrix_norms: seed_errors
                 .iter()
-                .map(|error| error.matrix_norm.poly_norm.norm.to_string())
+                .map(|error| error.matrix_norm.poly_norm.sigma.to_string())
                 .collect(),
             seed_ciphertext_randomizer_rows: seed_ciphertext_randomizer_norm.nrow,
             seed_ciphertext_randomizer_cols: seed_ciphertext_randomizer_norm.ncol,
             seed_ciphertext_randomizer_norm: seed_ciphertext_randomizer_norm
                 .poly_norm
-                .norm
+                .sigma
                 .to_string(),
         }
     }
@@ -1461,8 +1468,9 @@ where
         });
         info!(
             prf_mask_output_coeff_bits,
-            final_mask_prg_bits =
-                bigdecimal_bits_ceil(&final_mask_prg_output.matrix_norm.poly_norm.norm),
+            final_mask_prg_bits = bigdecimal_bits_ceil(
+                &final_mask_prg_output.matrix_norm.maximum_coefficient_bound()
+            ),
             "DiamondIO final mask representative PRG error simulation finished"
         );
         let final_mask_base_error = cached_final_mask_base_error.unwrap_or_else(|| {
@@ -1507,15 +1515,17 @@ where
         let input_injection_projection_error =
             diamond_io_input_injection_projection_error(&prefix.input_injection);
         let input_injection_error_bits =
-            bigdecimal_bits_ceil(&input_injection_projection_error.poly_norm.norm);
-        let noisy_plaintext_bits = bigdecimal_bits_ceil(&noisy_plaintext_error.poly_norm.norm);
+            bigdecimal_bits_ceil(&input_injection_projection_error.maximum_coefficient_bound());
+        let noisy_plaintext_bits =
+            bigdecimal_bits_ceil(&noisy_plaintext_error.maximum_coefficient_bound());
         info!(
             projected_evaluated_bits =
-                bigdecimal_bits_ceil(&projected_evaluated_error.poly_norm.norm),
-            public_bottom_decryption_bits =
-                bigdecimal_bits_ceil(&prefix.public_bottom_decryption_error.poly_norm.norm),
+                bigdecimal_bits_ceil(&projected_evaluated_error.maximum_coefficient_bound()),
+            public_bottom_decryption_bits = bigdecimal_bits_ceil(
+                &prefix.public_bottom_decryption_error.maximum_coefficient_bound()
+            ),
             projection_residual_bits =
-                bigdecimal_bits_ceil(&projection_residual_error.poly_norm.norm),
+                bigdecimal_bits_ceil(&projection_residual_error.maximum_coefficient_bound()),
             noisy_plaintext_bits,
             input_injection_error_bits,
             input_injection_error_percent_upper_bound =
@@ -1588,7 +1598,8 @@ where
                 round_idx,
                 conceptual_output_bits,
                 range_start,
-                output_error_bits = bigdecimal_bits_ceil(&cached.matrix_norm.poly_norm.norm),
+                output_error_bits =
+                    bigdecimal_bits_ceil(&cached.matrix_norm.maximum_coefficient_bound()),
                 "DiamondIO representative Goldreich PRG ErrorNorm cache hit"
             );
             return cached;
@@ -1640,7 +1651,8 @@ where
             range_start,
             simulated_active_levels = 1usize,
             extrapolated_active_levels = full_active_levels,
-            output_error_bits = bigdecimal_bits_ceil(&output.matrix_norm.poly_norm.norm),
+            output_error_bits =
+                bigdecimal_bits_ceil(&output.matrix_norm.maximum_coefficient_bound()),
             "DiamondIO representative Goldreich PRG error simulated"
         );
         output_cache
@@ -1662,11 +1674,11 @@ where
             seed_bits: self.seed_bits,
             ring_gsw_level_offset: self.ring_gsw_level_offset,
             full_active_levels,
-            one_plaintext_norm: one.plaintext_norm.norm.to_string(),
-            one_matrix_norm: one.matrix_norm.poly_norm.norm.to_string(),
+            one_plaintext_norm: one.plaintext_norm.sigma.to_string(),
+            one_matrix_norm: one.matrix_norm.maximum_coefficient_bound().to_string(),
             seed_error_matrix_norms: seed_errors
                 .iter()
-                .map(|error| error.matrix_norm.poly_norm.norm.to_string())
+                .map(|error| error.matrix_norm.poly_norm.sigma.to_string())
                 .collect(),
         }
     }
@@ -1752,7 +1764,7 @@ fn diamond_io_input_injection_scalar_projection_error(
         input_injection.output_preimage.clone_ctx(),
         input_injection.output_preimage.nrow,
         1,
-        input_injection.output_preimage.poly_norm.norm.clone(),
+        input_injection.output_preimage.poly_norm.sigma.clone(),
         None,
     );
     state_error.clone() * &scalar_output_preimage
@@ -1791,7 +1803,7 @@ fn diamond_io_security_margins_hold(
     };
     if !validate_error_bound_security_margin(
         &final_threshold,
-        &simulation.noisy_plaintext_error.poly_norm.norm,
+        &simulation.noisy_plaintext_error.maximum_coefficient_bound(),
         security_bit,
     ) {
         return false;
@@ -2085,11 +2097,11 @@ mod tests {
             );
 
         assert!(
-            second_seed_randomizer.poly_norm.norm > first_seed_randomizer.poly_norm.norm,
+            second_seed_randomizer.poly_norm.sigma > first_seed_randomizer.poly_norm.sigma,
             "the refreshed next_seed Ring-GSW ciphertext must carry accumulated randomizer noise"
         );
         assert!(
-            second_decryption_error.poly_norm.norm > first_decryption_error.poly_norm.norm,
+            second_decryption_error.poly_norm.sigma > first_decryption_error.poly_norm.sigma,
             "PRF ciphertext-side decryption error must grow from one seed round to the next"
         );
     }
@@ -2146,9 +2158,9 @@ mod tests {
             &residual,
         );
         assert_eq!(refresh.pre_round_outputs[0].ncol, ctx.m_g);
-        assert_eq!(refresh.pre_round_outputs[0].poly_norm.norm, BigDecimal::from(12u32));
+        assert_eq!(refresh.pre_round_outputs[0].poly_norm.sigma, BigDecimal::from(12u32));
         assert_eq!(
-            refresh.rounded_errors[0].poly_norm.norm,
+            refresh.rounded_errors[0].poly_norm.sigma,
             BigDecimal::from(11u32),
             "ciphertext decryption residual is a scalar pre-rounding perturbation, not refreshed seed BGG error"
         );
@@ -2277,16 +2289,16 @@ mod tests {
             prefix.prf_refreshes[2]
                 .representative_selected_prg_ciphertext_decryption_error
                 .poly_norm
-                .norm >
+                .sigma >
                 prefix.prf_refreshes[1]
                     .representative_selected_prg_ciphertext_decryption_error
                     .poly_norm
-                    .norm,
+                    .sigma,
             "ciphertext-side FHE noise must keep accumulating across PRF seed rounds"
         );
         assert!(
-            prefix.prf_refreshes[2].noise_refresh.pre_round_outputs[0].poly_norm.norm >
-                prefix.prf_refreshes[1].noise_refresh.pre_round_outputs[0].poly_norm.norm,
+            prefix.prf_refreshes[2].noise_refresh.pre_round_outputs[0].poly_norm.sigma >
+                prefix.prf_refreshes[1].noise_refresh.pre_round_outputs[0].poly_norm.sigma,
             "noise-refresh pre-round error must grow when the underlying seed ciphertext decryption residual grows"
         );
     }

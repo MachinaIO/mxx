@@ -11,6 +11,7 @@ use crate::{
     utils::bigdecimal_bits_ceil,
 };
 use bigdecimal::BigDecimal;
+use num_bigint::BigUint;
 
 fn make_ctx() -> Arc<SimulatorContext> {
     // secpar_sqrt=50, ring_dim_sqrt=1024, base=32, log_base_q=(128/32)*7 = 28
@@ -46,14 +47,24 @@ const E_B_SIGMA: f64 = 4.0;
 const E_INIT_NORM: u32 = 26;
 
 #[test]
-fn test_compute_preimage_norm_uses_optional_sigma() {
+fn test_poly_norm_sample_gauss_keeps_raw_sigma_and_canonical_bound() {
+    let ctx = make_ctx();
+    let sigma = BigDecimal::from(4u64);
+    let sampled = PolyNorm::sample_gauss(ctx, sigma.clone());
+
+    assert_eq!(sampled.sigma, sigma);
+    assert_eq!(sampled.maximum_coefficient_bound(), BigDecimal::from(26u64));
+}
+
+#[test]
+fn test_compute_preimage_sigma_uses_optional_sigma() {
     let ctx = make_ctx();
     let default_norm =
-        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None);
+        compute_preimage_sigma(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, None);
     let explicit_default_norm =
-        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, Some(4.578));
+        compute_preimage_sigma(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, Some(4.578));
     let larger_sigma_norm =
-        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, Some(6.0));
+        compute_preimage_sigma(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, None, Some(6.0));
 
     assert_eq!(default_norm, explicit_default_norm);
     assert!(larger_sigma_norm > default_norm);
@@ -66,17 +77,50 @@ fn test_constant_poly_norm_mul_skips_ring_dim_sqrt() {
     let rhs = PolyNorm::constant(ctx.clone(), BigDecimal::from(5u64));
     let product = &lhs * &rhs;
 
-    assert_eq!(product.norm, BigDecimal::from(15u64));
-    assert!(product.is_constant);
+    assert_eq!(product.sigma, BigDecimal::from(15u64));
+    assert!(product.is_constant_poly);
 
     let general = PolyNorm::new(ctx.clone(), BigDecimal::from(5u64));
     let mixed = &lhs * &general;
-    assert_eq!(mixed.norm, BigDecimal::from(15u64));
-    assert!(!mixed.is_constant);
+    assert_eq!(mixed.sigma, BigDecimal::from(15u64));
+    assert!(!mixed.is_constant_poly);
 
     let general_product = &general * &general;
-    assert_eq!(general_product.norm, BigDecimal::from(25u64) * &ctx.ring_dim_sqrt);
-    assert!(!general_product.is_constant);
+    assert_eq!(general_product.sigma, BigDecimal::from(25u64) * &ctx.ring_dim_sqrt);
+    assert!(!general_product.is_constant_poly);
+}
+
+#[test]
+fn test_sub_circuit_plaintext_range_accepts_constant_at_declared_max() {
+    let ctx = make_ctx();
+    let ranges = vec![SubCircuitInputMaxPlaintextNormRange::new(0, 1, BigUint::from(7u64))];
+    let actual = vec![PolyNorm::constant(ctx.clone(), BigDecimal::from(7u64))];
+
+    let normalized = validate_input_plaintext_norms_against_ranges(
+        &ranges,
+        &actual,
+        &ctx,
+        "constant plaintext range test",
+    );
+
+    assert_eq!(normalized.len(), 1);
+    assert_eq!(normalized[0].sigma, BigDecimal::from(7u64));
+    assert!(normalized[0].is_constant_poly);
+}
+
+#[test]
+#[should_panic(expected = "exceeds declared max")]
+fn test_sub_circuit_plaintext_range_rejects_nonconstant_public_bound_above_declared_max() {
+    let ctx = make_ctx();
+    let ranges = vec![SubCircuitInputMaxPlaintextNormRange::new(0, 1, BigUint::from(12u64))];
+    let actual = vec![PolyNorm::new(ctx.clone(), BigDecimal::from(2u64))];
+
+    validate_input_plaintext_norms_against_ranges(
+        &ranges,
+        &actual,
+        &ctx,
+        "nonconstant plaintext range test",
+    );
 }
 
 #[test]
@@ -241,7 +285,7 @@ fn test_wire_norm_simulator_mul_binary_tree_plaintext_one_matches_generic_eval()
     assert_eq!(simulated, generic);
     println!(
         "mul_binary_tree_output_error_bits={}",
-        bigdecimal_bits_ceil(&simulated[0].matrix_norm.poly_norm.norm)
+        bigdecimal_bits_ceil(&simulated[0].matrix_norm.poly_norm.sigma)
     );
 }
 
@@ -269,36 +313,36 @@ fn test_wire_norm_slot_transfer_matches_bgg_poly_encoding_bound() {
 
     let out = evaluator.slot_transfer(&(), &input, &src_slots, GateId(0));
 
-    let b0_preimage_norm =
-        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(1), None);
+    let b0_preimage_sigma =
+        compute_preimage_sigma(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(1), None);
     let s_vec = PolyMatrixNorm::new(ctx.clone(), 1, ctx.secret_size, BigDecimal::one(), None);
     let gate_preimage =
-        PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, b0_preimage_norm.clone(), None);
+        PolyMatrixNorm::new(ctx.clone(), ctx.m_b, ctx.m_g, b0_preimage_sigma.clone(), None);
     let gate_target_error = PolyMatrixNorm::new(
         ctx.clone(),
         ctx.secret_size,
         ctx.m_g,
-        BigDecimal::from_f64(E_B_SIGMA * 6.5).unwrap(),
+        BigDecimal::from_f64(E_B_SIGMA).unwrap(),
         None,
     );
     let slot_preimage_b0 =
-        PolyMatrixNorm::new(ctx.clone(), ctx.m_b, 2 * ctx.m_b, b0_preimage_norm.clone(), None);
-    let b1_preimage_norm =
-        compute_preimage_norm(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(2), None);
+        PolyMatrixNorm::new(ctx.clone(), ctx.m_b, 2 * ctx.m_b, b0_preimage_sigma.clone(), None);
+    let b1_preimage_sigma =
+        compute_preimage_sigma(&ctx.ring_dim_sqrt, ctx.m_g as u64, &ctx.base, Some(2), None);
     let slot_preimage_b1 =
-        PolyMatrixNorm::new(ctx.clone(), ctx.m_b * 2, ctx.m_g, b1_preimage_norm.clone(), None);
+        PolyMatrixNorm::new(ctx.clone(), ctx.m_b * 2, ctx.m_g, b1_preimage_sigma.clone(), None);
     let slot_preimage_b0_target_error = PolyMatrixNorm::new(
         ctx.clone(),
         ctx.secret_size,
         ctx.m_b * 2,
-        BigDecimal::from_f64(E_B_SIGMA * 6.5).unwrap(),
+        BigDecimal::from_f64(E_B_SIGMA).unwrap(),
         None,
     );
     let slot_preimage_b1_target_error = PolyMatrixNorm::new(
         ctx.clone(),
         ctx.secret_size * 2,
         ctx.m_g,
-        BigDecimal::from_f64(E_B_SIGMA * 6.5).unwrap(),
+        BigDecimal::from_f64(E_B_SIGMA).unwrap(),
         None,
     );
     let slot_secret_and_identity = PolyMatrixNorm::new(
@@ -441,7 +485,7 @@ fn test_wire_norm_lwe_plt_bounds() {
     );
     assert_eq!(out.len(), 1);
     // Bound must be max output coeff across LUT entries (7)
-    assert_eq!(out[0].plaintext_norm.norm, BigDecimal::from(7u64));
+    assert_eq!(out[0].plaintext_norm.sigma, BigDecimal::from(7u64));
 }
 
 #[test]
@@ -498,7 +542,7 @@ fn test_wire_norm_ggh15_plt_bounds() {
     );
     assert_eq!(out.len(), 1);
     // Bound must be max output coeff across LUT entries (7)
-    assert_eq!(out[0].plaintext_norm.norm, BigDecimal::from(7u64));
+    assert_eq!(out[0].plaintext_norm.sigma, BigDecimal::from(7u64));
 }
 
 #[test]
@@ -552,7 +596,7 @@ fn test_wire_norm_simulator_ggh15_plt_uses_lut_plaintext_bound() {
         None,
     );
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].plaintext_norm.norm, BigDecimal::from(7u64));
+    assert_eq!(out[0].plaintext_norm.sigma, BigDecimal::from(7u64));
 }
 
 #[test]
@@ -772,5 +816,5 @@ fn test_wire_norm_commit_plt_bounds() {
     );
     assert_eq!(out.len(), 1);
     // Bound must be max output coeff across LUT entries (7)
-    assert_eq!(out[0].plaintext_norm.norm, BigDecimal::from(7u64));
+    assert_eq!(out[0].plaintext_norm.sigma, BigDecimal::from(7u64));
 }

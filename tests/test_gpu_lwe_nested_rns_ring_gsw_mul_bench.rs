@@ -555,6 +555,14 @@ fn find_crt_depth_for_ring_gsw_mul_bench(cfg: &RingGswMulBenchConfig) -> (usize,
     );
 }
 
+fn sample_aux_max_parallelism(total_time: f64, latency: f64) -> BigUint {
+    if total_time <= 0.0 || latency <= 0.0 {
+        BigUint::from(0u8)
+    } else {
+        BigUint::from((total_time / latency).ceil() as u128)
+    }
+}
+
 fn log_lattice_estimator_security_for_selected_crt_depth(
     params: &DCRTPolyParams,
     cfg: &RingGswMulBenchConfig,
@@ -1045,6 +1053,26 @@ async fn test_gpu_lwe_nested_rns_ring_gsw_mul_bench() {
         pubkey_circuit_bench.latency,
         pubkey_circuit_bench.max_parallelism,
         pubkey_circuit_bench.peak_vram
+    );
+    let pubkey_slot_transfer_aux_total_time = pubkey_slot_transfer_aux_slot_time.total_time *
+        cfg.num_slots() as f64 +
+        pubkey_slot_transfer_aux_gate_time.total_time * total_slot_transfer_gates as f64;
+    let pubkey_slot_transfer_aux_latency =
+        pubkey_slot_transfer_aux_slot_time.latency + pubkey_slot_transfer_aux_gate_time.latency;
+    let pubkey_sample_aux_total_time =
+        pubkey_public_lut_aux_estimate.total_time + pubkey_slot_transfer_aux_total_time;
+    let pubkey_sample_aux_latency =
+        pubkey_public_lut_aux_estimate.latency + pubkey_slot_transfer_aux_latency;
+    let pubkey_sample_aux_max_parallelism =
+        sample_aux_max_parallelism(pubkey_sample_aux_total_time, pubkey_sample_aux_latency);
+    let pubkey_preprocess_total_time =
+        pubkey_circuit_bench.total_time_seconds() + pubkey_sample_aux_total_time;
+    let pubkey_preprocess_latency = pubkey_circuit_bench.latency + pubkey_sample_aux_latency;
+    let pubkey_preprocess_max_parallelism =
+        pubkey_circuit_bench.max_parallelism.clone().max(pubkey_sample_aux_max_parallelism);
+    info!(
+        "ring_gsw_mul naive bgg pubkey vec preprocess bench estimate: total_time_sec={:.6} latency_sec={:.6} max_parallelism={}",
+        pubkey_preprocess_total_time, pubkey_preprocess_latency, pubkey_preprocess_max_parallelism
     );
 
     let encoding_vec_bench_estimator =

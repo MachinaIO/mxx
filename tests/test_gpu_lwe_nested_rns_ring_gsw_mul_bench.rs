@@ -14,7 +14,7 @@ use mxx::{
             NaiveBGGPublicKeyVecSampler,
         },
         public_key::BggPublicKey,
-        sampler::BGGPublicKeySampler,
+        sampler::{BGGEncodingSampler, BGGPublicKeySampler},
     },
     circuit::{PolyCircuit, PolyGateKind, evaluable::PolyVec, gate::GateId},
     element::PolyElem,
@@ -27,7 +27,7 @@ use mxx::{
         },
     },
     lookup::{
-        PublicLut,
+        PltEvaluator, PublicLut,
         lwe::{
             LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator,
             NaiveLWEBGGEncodingVecPltEvaluator, NaiveLWEBGGPublicKeyVecPltEvaluator,
@@ -55,6 +55,7 @@ use mxx::{
     simulator::{
         SimulatorContext,
         error_norm::{NormNaiveBggEncodingVecSTEvaluator, NormPltLWEEvaluator},
+        lattice_estimator::{Distribution, run_lattice_estimator_cli_with_timeout},
     },
     slot_transfer::{
         NaiveBGGVecSlotTransferEvaluator, PolyVecSlotTransferEvaluator,
@@ -69,7 +70,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::{debug, info};
 
@@ -87,6 +88,7 @@ const DEFAULT_MUL_DEPTH: usize = 1;
 const DEFAULT_BENCH_SEED: [u8; 32] = [0u8; 32];
 const TRAPDOOR_SIGMA: f64 = 4.578;
 const ERROR_SIM_ACTIVE_LEVELS: usize = 1;
+const LATTICE_ESTIMATOR_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 type GpuMatrix = GpuDCRTPolyMatrix;
 type GpuHashSampler = GpuDCRTPolyHashSampler<Keccak256>;
@@ -538,6 +540,46 @@ fn find_crt_depth_for_ring_gsw_mul_bench(cfg: &RingGswMulBenchConfig) -> (usize,
     );
 }
 
+fn log_lattice_estimator_security_for_selected_crt_depth(
+    params: &DCRTPolyParams,
+    cfg: &RingGswMulBenchConfig,
+    crt_depth: usize,
+) {
+    let q = params.modulus();
+    let ring_dim = BigUint::from(params.ring_dimension());
+    let s_dist = Distribution::Ternary;
+    let e_dist =
+        Distribution::DiscreteGaussian { stddev: cfg.error_sigma.to_string(), mean: None, n: None };
+    info!(
+        crt_depth,
+        ring_dim = params.ring_dimension(),
+        modulus_bits = q.bits(),
+        error_sigma = cfg.error_sigma,
+        "running lattice-estimator security check for selected nested-RNS Ring-GSW multiplication parameters"
+    );
+    let achieved_secpar_for_gauss = run_lattice_estimator_cli_with_timeout(
+        &ring_dim,
+        q.as_ref(),
+        &s_dist,
+        &e_dist,
+        None,
+        false,
+        LATTICE_ESTIMATOR_TIMEOUT,
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "nested-RNS Ring-GSW multiplication benchmark requires a working lattice-estimator-cli on PATH to log the selected CRT-depth security level; failed: {err}"
+        )
+    });
+    info!(
+        crt_depth,
+        ring_dim = params.ring_dimension(),
+        modulus_bits = q.bits(),
+        achieved_secpar_for_gauss,
+        "nested-RNS Ring-GSW multiplication selected parameter lattice-estimator security"
+    );
+}
+
 fn build_lwe_pubkey_vec_plt_evaluator(
     params: &GpuDCRTPolyParams,
     hash_key: [u8; 32],
@@ -637,6 +679,74 @@ fn constant_and_shared_benchmark_pubkeys(
     (&pubkeys[0], &pubkeys[1])
 }
 
+async fn build_naive_vec_encoding_bench_estimator(
+    params: &GpuDCRTPolyParams,
+    cfg: &RingGswMulBenchConfig,
+    bench_dir: PathBuf,
+) -> NaiveBGGVecBenchEstimator<BggEncodingBenchEstimator<GpuMatrix>> {
+    if bench_dir.exists() {
+        fs::remove_dir_all(&bench_dir).expect("failed to clear encoding benchmark directory");
+    }
+    fs::create_dir_all(&bench_dir).expect("failed to create encoding benchmark directory");
+    init_storage_system(bench_dir.clone());
+
+    let (public_lut, public_lut_id, public_lut_gate_id) =
+        build_benchmark_public_lookup_gate(params);
+    let public_key_sampler =
+        BGGPublicKeySampler::<_, GpuHashSampler>::new(DEFAULT_BENCH_SEED, cfg.d_secret);
+    let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+    let secrets =
+        uniform_sampler.sample_uniform(params, 1, cfg.d_secret, DistType::TernaryDist).get_row(0);
+    let plaintexts = vec![GpuDCRTPoly::from_usize_to_constant(params, 2)];
+    let public_keys =
+        public_key_sampler.sample(params, b"LWE_NESTED_RNS_RING_GSW_MUL_ENCODING_BENCH", &[true]);
+    let encoding_sampler =
+        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(params, &secrets, None);
+    let encodings = encoding_sampler.sample(params, &public_keys, &plaintexts);
+
+    let public_lut_aux_writer = build_lwe_pubkey_vec_plt_evaluator(
+        params,
+        DEFAULT_BENCH_SEED,
+        cfg.d_secret,
+        bench_dir.clone(),
+    );
+    let lookup_base_matrix = Arc::clone(&public_lut_aux_writer.inner.pub_matrix);
+    public_lut_aux_writer.write_dummy_aux_for_poly_encode_bench(
+        params,
+        &public_lut,
+        &[plaintexts[0].const_coeff_u64()],
+        public_lut_id,
+        public_lut_gate_id,
+        cfg.error_sigma,
+    );
+    wait_for_all_writes(bench_dir.clone())
+        .await
+        .expect("Ring-GSW multiplication encoding public lookup benchmark aux writes must flush");
+
+    let secret_vec = GpuMatrix::from_poly_vec_row(params, secrets);
+    let c_b = secret_vec * lookup_base_matrix.as_ref();
+    let encoding_evaluator = GpuEncodingPltEvaluator::new(LWEBGGEncodingPltEvaluator::<
+        GpuMatrix,
+        GpuHashSampler,
+    >::new(
+        DEFAULT_BENCH_SEED, bench_dir, c_b
+    ));
+    let one = NaiveBGGEncodingVec::new(params, vec![encodings[0].clone()]);
+    let input = NaiveBGGEncodingVec::new(params, vec![encodings[1].clone()]);
+    let scalar_estimator =
+        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(params, cfg.bench_iterations, || {
+            encoding_evaluator.public_lookup(
+                params,
+                &public_lut,
+                &one,
+                &input,
+                public_lut_gate_id,
+                public_lut_id,
+            )
+        });
+    NaiveBGGVecBenchEstimator::new(scalar_estimator, cfg.num_slots())
+}
+
 fn round_div_biguint(value: &BigUint, divisor: &BigUint) -> BigUint {
     let half = divisor / BigUint::from(2u64);
     (value + half) / divisor
@@ -700,6 +810,7 @@ async fn test_gpu_lwe_nested_rns_ring_gsw_mul_bench() {
     info!("nested-RNS ring_gsw mul bench config: {:?}", cfg);
 
     let (crt_depth, cpu_params) = find_crt_depth_for_ring_gsw_mul_bench(&cfg);
+    log_lattice_estimator_security_for_selected_crt_depth(&cpu_params, &cfg, crt_depth);
     let (moduli, _, _) = cpu_params.to_crt();
     let detected_gpu_ids = detected_gpu_device_ids();
     let detected_gpu_count = detected_gpu_device_count();
@@ -789,6 +900,12 @@ async fn test_gpu_lwe_nested_rns_ring_gsw_mul_bench() {
         bigdecimal_bits_ceil(&max_selected_decryption_error),
         bigdecimal_bits_ceil(&BigDecimal::from_biguint(ring_gsw_threshold, 0)),
         selected_decryption_ok
+    );
+    assert!(
+        selected_decryption_ok,
+        "selected Ring-GSW multiplication ciphertext decryption error exceeds q/2: error_bits={}, threshold_bits={}",
+        bigdecimal_bits_ceil(&max_selected_decryption_error),
+        bigdecimal_bits_ceil(&ring_gsw_threshold_bd)
     );
 
     let mul_bench_dir = Path::new(&cfg.bench_dir_base(crt_depth)).join("ring_gsw_mul");
@@ -905,10 +1022,9 @@ async fn test_gpu_lwe_nested_rns_ring_gsw_mul_bench() {
         pubkey_circuit_bench.peak_vram
     );
 
-    let encoding_scalar_bench =
-        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&params, cfg.bench_iterations, || ());
     let encoding_vec_bench_estimator =
-        NaiveBGGVecBenchEstimator::new(encoding_scalar_bench, cfg.num_slots());
+        build_naive_vec_encoding_bench_estimator(&params, &cfg, mul_bench_dir.join("encoding"))
+            .await;
     let poly_circuit_bench = encoding_vec_bench_estimator.estimate_circuit_bench(&circuit);
     info!(
         "ring_gsw_mul naive bgg encoding vec circuit bench estimate: total_time={:.6} latency={:.6} max_parallelism={} peak_vram={}",

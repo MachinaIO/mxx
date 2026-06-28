@@ -117,6 +117,7 @@ struct RingGswMulBenchConfig {
     d_secret: usize,
     bench_iterations: usize,
     mul_depth: usize,
+    skip_lattice_estimator: bool,
     active_levels_override: Option<usize>,
     dir_name_override: Option<String>,
 }
@@ -151,6 +152,17 @@ fn env_or_parse_f64(key: &str, default: f64) -> f64 {
     }
 }
 
+fn env_or_parse_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .map(|raw| match raw.as_str() {
+            "1" | "true" | "TRUE" | "yes" | "YES" => true,
+            "0" | "false" | "FALSE" | "no" | "NO" => false,
+            _ => panic!("{key} must be a bool-like value: 1/0, true/false, or yes/no"),
+        })
+        .unwrap_or(default)
+}
+
 impl RingGswMulBenchConfig {
     fn from_env() -> Self {
         let ring_dim =
@@ -182,6 +194,8 @@ impl RingGswMulBenchConfig {
         );
         let mul_depth =
             env_or_parse_usize("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_MUL_DEPTH", DEFAULT_MUL_DEPTH);
+        let skip_lattice_estimator =
+            env_or_parse_bool("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_SKIP_LATTICE_ESTIMATOR", false);
         let active_levels_override = env::var("LWE_NESTED_RNS_RING_GSW_MUL_BENCH_ACTIVE_LEVELS")
             .ok()
             .map(|value| value.trim().to_string())
@@ -228,6 +242,7 @@ impl RingGswMulBenchConfig {
             d_secret,
             bench_iterations,
             mul_depth,
+            skip_lattice_estimator,
             active_levels_override,
             dir_name_override,
         }
@@ -545,6 +560,16 @@ fn log_lattice_estimator_security_for_selected_crt_depth(
     cfg: &RingGswMulBenchConfig,
     crt_depth: usize,
 ) {
+    if cfg.skip_lattice_estimator {
+        info!(
+            crt_depth,
+            ring_dim = params.ring_dimension(),
+            modulus_bits = params.modulus_bits(),
+            "skipping lattice-estimator security check because LWE_NESTED_RNS_RING_GSW_MUL_BENCH_SKIP_LATTICE_ESTIMATOR was requested"
+        );
+        return;
+    }
+
     let q = params.modulus();
     let ring_dim = BigUint::from(params.ring_dimension());
     let s_dist = Distribution::Ternary;

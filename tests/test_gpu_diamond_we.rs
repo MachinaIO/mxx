@@ -558,6 +558,7 @@ async fn build_encoding_bench_estimator(
         fs::remove_dir_all(&bench_dir).expect("failed to clear DiamondWE encoding bench directory");
     }
     ensure_dir(&bench_dir);
+    init_storage_system(bench_dir.clone());
 
     let (public_lut, public_lut_id, public_lut_gate_id) =
         build_benchmark_public_lookup_gate(params);

@@ -17,7 +17,7 @@ use mxx::{
         DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
     },
     lookup::{
-        PublicLut,
+        PltEvaluator, PublicLut,
         lwe::{LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator},
         poly::PolyPltEvaluator,
     },
@@ -38,7 +38,11 @@ use mxx::{
         gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
         trapdoor::GpuDCRTPolyTrapdoorSampler,
     },
-    simulator::{SimulatorContext, error_norm::NormPltLWEEvaluator},
+    simulator::{
+        SimulatorContext,
+        error_norm::NormPltLWEEvaluator,
+        lattice_estimator::{Distribution, run_lattice_estimator_cli_with_timeout},
+    },
     slot_transfer::bgg_pubkey::BggPublicKeySTEvaluator,
     storage::write::{init_storage_system, wait_for_all_writes},
     utils::bigdecimal_bits_ceil,
@@ -48,7 +52,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::{debug, info};
 
@@ -66,6 +70,7 @@ const DEFAULT_BENCH_ITERATIONS: usize = 1;
 const DEFAULT_BENCH_SEED: [u8; 32] = [0u8; 32];
 const TRAPDOOR_SIGMA: f64 = 4.578;
 const ERROR_SIM_ACTIVE_LEVELS: usize = 1;
+const LATTICE_ESTIMATOR_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const ACTUAL_HASH_KEY_CHECKPOINT_FILE: &str = "actual_lwe_hash_key.bin";
 const ACTUAL_TRAPDOOR_CHECKPOINT_FILE: &str = "actual_lwe_trapdoor.bin";
 const ACTUAL_PUB_MATRIX_CHECKPOINT_FILE: &str = "actual_lwe_pub_matrix.bin";
@@ -74,6 +79,7 @@ type GpuMatrix = GpuDCRTPolyMatrix;
 type GpuHashSampler = GpuDCRTPolyHashSampler<Keccak256>;
 type GpuScalarPubKeyPltEvaluator =
     LWEBGGPubKeyPltEvaluator<GpuMatrix, GpuHashSampler, GpuDCRTPolyTrapdoorSampler>;
+type GpuEncodingPltEvaluator = LWEBGGEncodingPltEvaluator<GpuMatrix, GpuHashSampler>;
 type GpuPubKeySlotEvaluator = BggPublicKeySTEvaluator<
     GpuMatrix,
     GpuDCRTPolyUniformSampler,
@@ -487,6 +493,46 @@ fn find_crt_depth_for_modq_arith(
     );
 }
 
+fn log_lattice_estimator_security_for_selected_crt_depth(
+    params: &DCRTPolyParams,
+    cfg: &ModqArithConfig,
+    crt_depth: usize,
+) {
+    let q = params.modulus();
+    let ring_dim = BigUint::from(params.ring_dimension());
+    let s_dist = Distribution::Ternary;
+    let e_dist =
+        Distribution::DiscreteGaussian { stddev: cfg.error_sigma.to_string(), mean: None, n: None };
+    info!(
+        crt_depth,
+        ring_dim = params.ring_dimension(),
+        modulus_bits = q.bits(),
+        error_sigma = cfg.error_sigma,
+        "running lattice-estimator security check for selected nested-RNS modq arithmetic parameters"
+    );
+    let achieved_secpar_for_gauss = run_lattice_estimator_cli_with_timeout(
+        &ring_dim,
+        q.as_ref(),
+        &s_dist,
+        &e_dist,
+        None,
+        false,
+        LATTICE_ESTIMATOR_TIMEOUT,
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "nested-RNS modq arithmetic benchmark requires a working lattice-estimator-cli on PATH to log the selected CRT-depth security level; failed: {err}"
+        )
+    });
+    info!(
+        crt_depth,
+        ring_dim = params.ring_dimension(),
+        modulus_bits = q.bits(),
+        achieved_secpar_for_gauss,
+        "nested-RNS modq arithmetic selected parameter lattice-estimator security"
+    );
+}
+
 fn build_lwe_scalar_pubkey_plt_evaluator(
     params: &GpuDCRTPolyParams,
     hash_key: [u8; 32],
@@ -565,6 +611,69 @@ fn constant_and_shared_benchmark_pubkeys(
     (&pubkeys[0], &pubkeys[1])
 }
 
+async fn build_encoding_bench_estimator(
+    params: &GpuDCRTPolyParams,
+    cfg: &ModqArithConfig,
+    bench_dir: PathBuf,
+) -> BggEncodingBenchEstimator<GpuMatrix> {
+    if bench_dir.exists() {
+        fs::remove_dir_all(&bench_dir)
+            .expect("failed to clear modq arithmetic encoding bench directory");
+    }
+    fs::create_dir_all(&bench_dir)
+        .expect("failed to create modq arithmetic encoding bench directory");
+    init_storage_system(bench_dir.clone());
+
+    let (public_lut, public_lut_id, public_lut_gate_id) =
+        build_benchmark_public_lookup_gate(params);
+    let public_key_sampler =
+        BGGPublicKeySampler::<_, GpuHashSampler>::new(DEFAULT_BENCH_SEED, cfg.d_secret);
+    let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+    let secrets =
+        uniform_sampler.sample_uniform(params, 1, cfg.d_secret, DistType::TernaryDist).get_row(0);
+    let plaintexts = vec![GpuDCRTPoly::from_usize_to_constant(params, 2)];
+    let public_keys =
+        public_key_sampler.sample(params, b"LWE_NESTED_RNS_MODQ_ARITH_ENCODING_BENCH", &[true]);
+    let encoding_sampler =
+        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(params, &secrets, None);
+    let encodings = encoding_sampler.sample(params, &public_keys, &plaintexts);
+
+    let public_lut_aux_writer = build_lwe_scalar_pubkey_plt_evaluator(
+        params,
+        DEFAULT_BENCH_SEED,
+        cfg.d_secret,
+        bench_dir.clone(),
+    );
+    let lookup_base_matrix = Arc::clone(&public_lut_aux_writer.pub_matrix);
+    public_lut_aux_writer.write_dummy_aux_for_poly_encode_bench(
+        params,
+        &public_lut,
+        &[plaintexts[0].const_coeff_u64()],
+        public_lut_id,
+        public_lut_gate_id,
+        cfg.error_sigma,
+    );
+    wait_for_all_writes(bench_dir.clone())
+        .await
+        .expect("modq arithmetic encoding public lookup benchmark aux writes must flush");
+
+    let secret_vec = GpuMatrix::from_poly_vec_row(params, secrets);
+    let c_b = secret_vec * lookup_base_matrix.as_ref();
+    let encoding_evaluator = GpuEncodingPltEvaluator::new(DEFAULT_BENCH_SEED, bench_dir, c_b);
+    let one = encodings[0].clone();
+    let input = encodings[1].clone();
+    BggEncodingBenchEstimator::<GpuMatrix>::benchmark(params, cfg.bench_iterations, || {
+        encoding_evaluator.public_lookup(
+            params,
+            &public_lut,
+            &one,
+            &input,
+            public_lut_gate_id,
+            public_lut_id,
+        )
+    })
+}
+
 fn round_div_biguint(value: &BigUint, divisor: &BigUint) -> BigUint {
     let half = divisor / BigUint::from(2u64);
     (value + half) / divisor
@@ -582,6 +691,7 @@ async fn test_gpu_lwe_nested_rns_modq_arith() {
         .checked_shl(cfg.height as u32)
         .expect("LWE_NESTED_RNS_MODQ_ARITH_HEIGHT is too large");
     let (crt_depth, cpu_params) = find_crt_depth_for_modq_arith(&cfg, q_level);
+    log_lattice_estimator_security_for_selected_crt_depth(&cpu_params, &cfg, crt_depth);
     let (moduli, _, _) = cpu_params.to_crt();
     let detected_gpu_ids = detected_gpu_device_ids();
     let detected_gpu_count = detected_gpu_device_count();
@@ -752,7 +862,7 @@ async fn test_gpu_lwe_nested_rns_modq_arith() {
     );
 
     let encoding_scalar_bench =
-        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&params, cfg.bench_iterations, || ());
+        build_encoding_bench_estimator(&params, &cfg, dir.join("encoding_bench")).await;
     let encoding_circuit_bench = encoding_scalar_bench.estimate_circuit_bench(&circuit);
     info!(
         "modq_arith scalar bgg encoding circuit bench estimate: total_time={:.6} latency={:.6} max_parallelism={} peak_vram={}",

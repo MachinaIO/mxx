@@ -1080,6 +1080,20 @@ where
                 shape.prf_round_count,
             ),
         };
+        let homomorphic_prf = sequential_summaries(&[round_summary.clone(), final_prg.clone()]);
+        info!(
+            ?mode,
+            homomorphic_prf_total_time_nanos = %homomorphic_prf.total_time,
+            homomorphic_prf_latency = homomorphic_prf.latency,
+            homomorphic_prf_max_parallelism = %homomorphic_prf.max_parallelism,
+            final_mask_total_time_nanos = %final_mask_decrypt.total_time,
+            final_mask_latency = final_mask_decrypt.latency,
+            final_mask_max_parallelism = %final_mask_decrypt.max_parallelism,
+            function_outputs_total_time_nanos = %final_function_decrypt.total_time,
+            function_outputs_latency = final_function_decrypt.latency,
+            function_outputs_max_parallelism = %final_function_decrypt.max_parallelism,
+            "estimated DiamondIO PRF final-FE 3-way breakdown"
+        );
         let final_summary =
             sequential_summaries(&[final_prg.clone(), final_output_decrypt.clone()]);
         let compute_without_refresh_decoder =

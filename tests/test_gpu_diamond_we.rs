@@ -4,15 +4,22 @@ use keccak_asm::Keccak256;
 use mxx::{
     bench_estimator::{
         BggEncodingBenchEstimator, BggPublicKeyBenchEstimator, BggPublicKeyBenchSamples,
+        PublicLutSampleAuxBenchEstimator,
     },
-    bgg::{public_key::BggPublicKey, sampler::BGGPublicKeySampler},
+    bgg::{
+        public_key::BggPublicKey,
+        sampler::{BGGEncodingSampler, BGGPublicKeySampler},
+    },
     circuit::{PolyCircuit, gate::GateId},
     element::PolyElem,
     func_enc::NoCircuitEvaluator,
     input_injector::DiamondInjector,
     io::diamond_io::GpuDCRTPolyMatrixNativeBenchEstimator,
-    lookup::{PublicLut, lwe::LWEBGGPubKeyPltEvaluator},
-    matrix::{dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+    lookup::{
+        PltEvaluator, PublicLut,
+        lwe::{LWEBGGEncodingPltEvaluator, LWEBGGPubKeyPltEvaluator},
+    },
+    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
         dcrt::{
@@ -22,14 +29,14 @@ use mxx::{
         },
     },
     sampler::{
-        PolyTrapdoorSampler,
+        DistType, PolyTrapdoorSampler, PolyUniformSampler,
         gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
         hash::DCRTPolyHashSampler,
         trapdoor::{DCRTPolyTrapdoorSampler, GpuDCRTPolyTrapdoorSampler},
         uniform::DCRTPolyUniformSampler,
     },
     slot_transfer::bgg_pubkey::BggPublicKeySTEvaluator,
-    storage::write::init_storage_system,
+    storage::write::{init_storage_system, wait_for_all_writes},
     utils::bigdecimal_bits_ceil,
     we::{
         DiamondWE, WitnessEnc,
@@ -95,6 +102,7 @@ type GpuDiamondWE = DiamondWE<
 >;
 type GpuPubKeyPltEvaluator =
     LWEBGGPubKeyPltEvaluator<GpuMatrix, GpuHashSampler, GpuDCRTPolyTrapdoorSampler>;
+type GpuEncodingPltEvaluator = LWEBGGEncodingPltEvaluator<GpuMatrix, GpuHashSampler>;
 type GpuPubKeySlotEvaluator = BggPublicKeySTEvaluator<
     GpuMatrix,
     GpuDCRTPolyUniformSampler,
@@ -541,6 +549,67 @@ fn build_public_key_bench_estimator(
     )
 }
 
+async fn build_encoding_bench_estimator(
+    params: &GpuDCRTPolyParams,
+    cfg: &DiamondWEGpuBenchConfig,
+    bench_dir: PathBuf,
+) -> BggEncodingBenchEstimator<GpuMatrix> {
+    if bench_dir.exists() {
+        fs::remove_dir_all(&bench_dir).expect("failed to clear DiamondWE encoding bench directory");
+    }
+    ensure_dir(&bench_dir);
+    init_storage_system(bench_dir.clone());
+
+    let (public_lut, public_lut_id, public_lut_gate_id) =
+        build_benchmark_public_lookup_gate(params);
+    let public_key_sampler =
+        BGGPublicKeySampler::<_, GpuHashSampler>::new(DEFAULT_HASH_KEY, cfg.d_secret);
+    let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+    let secrets =
+        uniform_sampler.sample_uniform(params, 1, cfg.d_secret, DistType::TernaryDist).get_row(0);
+    let plaintexts = vec![GpuDCRTPoly::from_usize_to_constant(params, 2)];
+    let public_keys =
+        public_key_sampler.sample(params, b"test_gpu_diamond_we_encoding_bench", &[true]);
+    let encoding_sampler =
+        BGGEncodingSampler::<GpuDCRTPolyUniformSampler>::new(params, &secrets, None);
+    let encodings = encoding_sampler.sample(params, &public_keys, &plaintexts);
+
+    let public_lut_aux_writer = build_lwe_scalar_pubkey_plt_evaluator(
+        params,
+        DEFAULT_HASH_KEY,
+        cfg.d_secret,
+        bench_dir.clone(),
+    );
+    let lookup_base_matrix = Arc::clone(&public_lut_aux_writer.pub_matrix);
+    public_lut_aux_writer.write_dummy_aux_for_poly_encode_bench(
+        params,
+        &public_lut,
+        &[plaintexts[0].const_coeff_u64()],
+        public_lut_id,
+        public_lut_gate_id,
+        cfg.error_sigma,
+    );
+    wait_for_all_writes(bench_dir.clone())
+        .await
+        .expect("DiamondWE encoding public lookup benchmark aux writes must flush");
+
+    let secret_vec = GpuMatrix::from_poly_vec_row(params, secrets);
+    let c_b = secret_vec * lookup_base_matrix.as_ref();
+    let encoding_evaluator = GpuEncodingPltEvaluator::new(DEFAULT_HASH_KEY, bench_dir, c_b);
+    let one = encodings[0].clone();
+    let input = encodings[1].clone();
+    BggEncodingBenchEstimator::<GpuMatrix>::benchmark(params, cfg.bench_iterations, || {
+        encoding_evaluator.public_lookup(
+            params,
+            &public_lut,
+            &one,
+            &input,
+            public_lut_gate_id,
+            public_lut_id,
+        )
+    })
+}
+
 #[tokio::test]
 #[sequential_test::sequential]
 async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
@@ -646,7 +715,7 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
         build_public_key_bench_estimator(&gpu_params, &cfg, final_dir.join("pubkey_bench"));
     info!("starting DiamondWE GPU encoding bench estimator construction");
     let encoding_estimator =
-        BggEncodingBenchEstimator::<GpuMatrix>::benchmark(&gpu_params, cfg.bench_iterations, || ());
+        build_encoding_bench_estimator(&gpu_params, &cfg, final_dir.join("encoding_bench")).await;
     info!("starting DiamondWE GPU native bench estimator construction");
     let native_estimator =
         GpuDCRTPolyMatrixNativeBenchEstimator::new(gpu_params.clone(), cfg.bench_iterations);

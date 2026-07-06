@@ -34,7 +34,7 @@ else
 fi
 
 if [[ $run_python -eq 1 ]]; then
-  python3 -m unittest discover -s scripts/lib/codex_workflow/tests -p 'test_*.py'
+  python3 -m unittest discover -s scripts/lib/tests -p 'test_*.py'
 fi
 
 if [[ $run_rust -eq 1 ]]; then

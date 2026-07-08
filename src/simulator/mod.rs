@@ -1,12 +1,14 @@
 use bigdecimal::BigDecimal;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod dependency_set;
 pub mod error_norm;
 pub mod eval_error;
 pub mod lattice_estimator;
 pub mod poly_matrix_norm;
 pub mod poly_norm;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SimulatorContext {
     // pub secpar_sqrt: BigDecimal,
     pub ring_dim_sqrt: BigDecimal,
@@ -32,4 +34,23 @@ impl SimulatorContext {
 
         Self { ring_dim_sqrt, base, secret_size, log_base_q, log_base_q_small, m_g, m_b }
     }
+
+    pub fn fresh_source_id(&self) -> dependency_set::SourceId {
+        static SOURCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        dependency_set::SourceId(SOURCE_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
 }
+
+impl PartialEq for SimulatorContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.ring_dim_sqrt == other.ring_dim_sqrt &&
+            self.base == other.base &&
+            self.secret_size == other.secret_size &&
+            self.log_base_q == other.log_base_q &&
+            self.m_g == other.m_g &&
+            self.m_b == other.m_b &&
+            self.log_base_q_small == other.log_base_q_small
+    }
+}
+
+impl Eq for SimulatorContext {}

@@ -870,6 +870,21 @@ mod tests {
         DCRTPolyTrapdoorSampler,
     >;
 
+    fn assert_poly_matrix_bound_eq(actual: &PolyMatrixNorm, expected: &PolyMatrixNorm) {
+        assert_eq!(actual.nrow, expected.nrow);
+        assert_eq!(actual.ncol, expected.ncol);
+        assert_eq!(actual.ncol_sqrt, expected.ncol_sqrt);
+        assert_eq!(actual.poly_norm, expected.poly_norm);
+        assert_eq!(actual.zero_rows, expected.zero_rows);
+    }
+
+    fn assert_poly_matrix_bounds_eq(actual: &[PolyMatrixNorm], expected: &[PolyMatrixNorm]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_poly_matrix_bound_eq(actual, expected);
+        }
+    }
+
     #[sequential_test::sequential]
     #[test]
     fn test_diamond_injector_online_eval_returns_exact_bgg_relations() {
@@ -959,14 +974,14 @@ mod tests {
             Some(injector.state_row_size() / DIAMOND_SECRET_SIZE),
             None,
         );
-        let expected_transition = PolyMatrixNorm::new(
+        let expected_transition = PolyMatrixNorm::fresh_preimage(
             ctx.clone(),
             state_cols,
             state_cols,
             expected_preimage_sigma.clone(),
             None,
         );
-        let expected_output = PolyMatrixNorm::new(
+        let expected_output = PolyMatrixNorm::fresh_preimage(
             ctx.clone(),
             state_cols,
             gadget_cols,
@@ -1045,9 +1060,9 @@ mod tests {
             expected_state_errors = next_state_errors;
         }
 
-        assert_eq!(simulated.state_errors, expected_state_errors);
-        assert_eq!(simulated.secret_state_factors, expected_secret_factors);
-        assert_eq!(simulated.output_preimage, expected_output);
+        assert_poly_matrix_bounds_eq(&simulated.state_errors, &expected_state_errors);
+        assert_poly_matrix_bounds_eq(&simulated.secret_state_factors, &expected_secret_factors);
+        assert_poly_matrix_bound_eq(&simulated.output_preimage, &expected_output);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use super::{
-    SimulatorContext, error_norm::ErrorNorm, poly_matrix_norm::PolyMatrixNorm, poly_norm::PolyNorm,
+    SimulatorContext, dependency_set::DependencySet, error_norm::ErrorNorm,
+    poly_matrix_norm::PolyMatrixNorm, poly_norm::PolyNorm,
 };
 use crate::{
     circuit::{
@@ -16,7 +17,7 @@ use crate::{
 use bigdecimal::BigDecimal;
 use dashmap::DashMap;
 use num_bigint::BigUint;
-use num_traits::{FromPrimitive, One};
+use num_traits::{FromPrimitive, One, Zero};
 use rayon::{
     iter::{
         IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
@@ -962,6 +963,228 @@ impl AffineErrorNormExpr {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ErrorNormPubkeySummary {
+    deps: DependencySet,
+    input_indices: Vec<usize>,
+    is_pubkey_random: bool,
+}
+
+impl ErrorNormPubkeySummary {
+    fn empty() -> Self {
+        Self { deps: DependencySet::empty(), input_indices: Vec::new(), is_pubkey_random: false }
+    }
+
+    fn from_error_norm(value: &ErrorNorm) -> Self {
+        Self {
+            deps: value.pubkey_deps.clone(),
+            input_indices: Vec::new(),
+            is_pubkey_random: value.is_pubkey_random,
+        }
+    }
+
+    fn input(input_idx: usize) -> Self {
+        Self {
+            deps: DependencySet::empty(),
+            input_indices: vec![input_idx],
+            is_pubkey_random: true,
+        }
+    }
+
+    fn fresh_random(ctx: &SimulatorContext) -> Self {
+        Self {
+            deps: DependencySet::singleton(ctx.fresh_source_id()),
+            input_indices: Vec::new(),
+            is_pubkey_random: true,
+        }
+    }
+
+    fn union_input_indices(lhs: &[usize], rhs: &[usize]) -> Vec<usize> {
+        let mut out = Vec::with_capacity(lhs.len() + rhs.len());
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < lhs.len() || j < rhs.len() {
+            let next = match (lhs.get(i), rhs.get(j)) {
+                (Some(l), Some(r)) => match l.cmp(r) {
+                    std::cmp::Ordering::Less => {
+                        i += 1;
+                        *l
+                    }
+                    std::cmp::Ordering::Greater => {
+                        j += 1;
+                        *r
+                    }
+                    std::cmp::Ordering::Equal => {
+                        i += 1;
+                        j += 1;
+                        *l
+                    }
+                },
+                (Some(l), None) => {
+                    i += 1;
+                    *l
+                }
+                (None, Some(r)) => {
+                    j += 1;
+                    *r
+                }
+                (None, None) => break,
+            };
+            if out.last().copied() != Some(next) {
+                out.push(next);
+            }
+        }
+        out
+    }
+
+    fn deterministic_union(&self, rhs: &Self) -> Self {
+        Self {
+            deps: self.deps.union(&rhs.deps),
+            input_indices: Self::union_input_indices(&self.input_indices, &rhs.input_indices),
+            is_pubkey_random: false,
+        }
+    }
+
+    fn scale(&self, scalar: &BigDecimal) -> Self {
+        if scalar.is_zero() {
+            return Self::empty();
+        }
+        Self {
+            deps: self.deps.clone(),
+            input_indices: self.input_indices.clone(),
+            is_pubkey_random: false,
+        }
+    }
+
+    fn small_scalar_mul(&self, scalar: &BigDecimal) -> Self {
+        if scalar.is_zero() {
+            return Self::empty();
+        }
+        Self {
+            deps: self.deps.clone(),
+            input_indices: self.input_indices.clone(),
+            is_pubkey_random: self.is_pubkey_random,
+        }
+    }
+
+    fn remap_input_indices(&self, input_sources: &[usize]) -> Self {
+        let mut remapped = self
+            .input_indices
+            .iter()
+            .map(|input_idx| {
+                *input_sources.get(*input_idx).unwrap_or_else(|| {
+                    panic!(
+                        "error-norm summary input index {input_idx} out of range during metadata remap"
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        remapped.sort_unstable();
+        remapped.dedup();
+        Self {
+            deps: self.deps.clone(),
+            input_indices: remapped,
+            is_pubkey_random: self.is_pubkey_random,
+        }
+    }
+
+    fn substitute_exprs(&self, actual_inputs: &[Arc<ErrorNormSummaryExpr>]) -> Self {
+        if self.is_pubkey_random &&
+            self.deps == DependencySet::empty() &&
+            self.input_indices.len() == 1
+        {
+            return actual_inputs
+                .get(self.input_indices[0])
+                .unwrap_or_else(|| {
+                    panic!(
+                        "error-norm summary input index {} out of range during metadata substitution",
+                        self.input_indices[0]
+                    )
+                })
+                .pubkey_summary
+                .clone();
+        }
+        let mut out = Self {
+            deps: self.deps.clone(),
+            input_indices: Vec::new(),
+            is_pubkey_random: self.is_pubkey_random && self.input_indices.is_empty(),
+        };
+        for input_idx in &self.input_indices {
+            let input = actual_inputs.get(*input_idx).unwrap_or_else(|| {
+                panic!(
+                    "error-norm summary input index {input_idx} out of range during metadata substitution"
+                )
+            });
+            out = out.deterministic_union(&input.pubkey_summary);
+        }
+        out
+    }
+
+    fn substitute_inputs_with_cached<F>(
+        &self,
+        actual_input_at: &F,
+        cache: &mut HashMap<usize, ErrorNormPubkeySummary>,
+    ) -> Self
+    where
+        F: Fn(usize) -> Arc<ErrorNormSummaryExpr> + Sync,
+    {
+        if self.is_pubkey_random &&
+            self.deps == DependencySet::empty() &&
+            self.input_indices.len() == 1
+        {
+            return cache
+                .entry(self.input_indices[0])
+                .or_insert_with(|| actual_input_at(self.input_indices[0]).pubkey_summary.clone())
+                .clone();
+        }
+        let mut out = Self {
+            deps: self.deps.clone(),
+            input_indices: Vec::new(),
+            is_pubkey_random: self.is_pubkey_random && self.input_indices.is_empty(),
+        };
+        for input_idx in &self.input_indices {
+            let input_summary = cache
+                .entry(*input_idx)
+                .or_insert_with(|| actual_input_at(*input_idx).pubkey_summary.clone())
+                .clone();
+            out = out.deterministic_union(&input_summary);
+        }
+        out
+    }
+
+    fn rhs_pubkey_gadget_norm(&self, gadget_poly: PolyNorm) -> PolyMatrixNorm {
+        let ctx = gadget_poly.ctx.clone();
+        let deps =
+            if self.input_indices.is_empty() { self.deps.clone() } else { DependencySet::Unknown };
+        PolyMatrixNorm::from_parts(ctx.m_g, ctx.m_g, gadget_poly, None, deps, self.is_pubkey_random)
+    }
+
+    fn evaluate_with_cached<F>(
+        &self,
+        input_error_norm_at: &F,
+        cache: &mut HashMap<usize, ErrorNorm>,
+    ) -> (DependencySet, bool)
+    where
+        F: Fn(usize) -> ErrorNorm + Sync,
+    {
+        if self.is_pubkey_random &&
+            self.deps == DependencySet::empty() &&
+            self.input_indices.len() == 1
+        {
+            let input = cache
+                .entry(self.input_indices[0])
+                .or_insert_with(|| input_error_norm_at(self.input_indices[0]));
+            return (input.pubkey_deps.clone(), input.is_pubkey_random);
+        }
+        let mut deps = self.deps.clone();
+        for input_idx in &self.input_indices {
+            let input = cache.entry(*input_idx).or_insert_with(|| input_error_norm_at(*input_idx));
+            deps = deps.union(&input.pubkey_deps);
+        }
+        (deps, self.is_pubkey_random && self.input_indices.is_empty())
+    }
+}
+
 #[derive(Debug, Clone)]
 /// Reusable symbolic error bound for one gate or one sub-circuit output.
 ///
@@ -971,6 +1194,7 @@ impl AffineErrorNormExpr {
 pub struct ErrorNormSummaryExpr {
     plaintext_norm: PolyNorm,
     matrix_expr: AffineErrorNormExpr,
+    pubkey_summary: ErrorNormPubkeySummary,
 }
 
 impl ErrorNormSummaryExpr {
@@ -984,24 +1208,44 @@ impl ErrorNormSummaryExpr {
 
     fn constant(value: ErrorNorm) -> Self {
         Self {
+            pubkey_summary: ErrorNormPubkeySummary::from_error_norm(&value),
             plaintext_norm: value.plaintext_norm,
             matrix_expr: AffineErrorNormExpr::constant(value.matrix_norm),
         }
     }
 
     fn input_with_plaintext_norm(input_idx: usize, plaintext_norm: PolyNorm) -> Self {
-        Self { plaintext_norm, matrix_expr: AffineErrorNormExpr::input(input_idx) }
+        Self {
+            plaintext_norm,
+            matrix_expr: AffineErrorNormExpr::input(input_idx),
+            pubkey_summary: ErrorNormPubkeySummary::input(input_idx),
+        }
+    }
+
+    fn fresh_lut_output(plaintext_norm: PolyNorm, matrix_expr: AffineErrorNormExpr) -> Self {
+        let pubkey_summary = ErrorNormPubkeySummary::fresh_random(&plaintext_norm.ctx);
+        Self { plaintext_norm, matrix_expr, pubkey_summary }
+    }
+
+    fn deterministic_pubkey(
+        plaintext_norm: PolyNorm,
+        matrix_expr: AffineErrorNormExpr,
+        pubkey_summary: ErrorNormPubkeySummary,
+    ) -> Self {
+        Self { plaintext_norm, matrix_expr, pubkey_summary }
     }
 
     fn add_bound(&self, rhs: &Self) -> Self {
         Self {
             plaintext_norm: &self.plaintext_norm + &rhs.plaintext_norm,
             matrix_expr: self.matrix_expr.add_expr(&rhs.matrix_expr),
+            pubkey_summary: self.pubkey_summary.deterministic_union(&rhs.pubkey_summary),
         }
     }
 
     fn add_assign_bound(&mut self, rhs: Self) {
         self.plaintext_norm = &self.plaintext_norm + &rhs.plaintext_norm;
+        self.pubkey_summary = self.pubkey_summary.deterministic_union(&rhs.pubkey_summary);
         self.matrix_expr.add_assign_expr(rhs.matrix_expr);
     }
 
@@ -1013,19 +1257,25 @@ impl ErrorNormSummaryExpr {
         Self {
             plaintext_norm: self.plaintext_norm.clone() * &scalar_poly,
             matrix_expr: self.matrix_expr.transform_scalar(scalar),
+            pubkey_summary: self.pubkey_summary.scale(scalar),
         }
     }
 
     fn mul_bound(&self, rhs: &Self) -> Self {
+        let rhs_gadget = rhs.pubkey_summary.rhs_pubkey_gadget_norm(
+            PolyMatrixNorm::gadget_decomposed(
+                self.plaintext_norm.ctx.clone(),
+                self.plaintext_norm.ctx.m_g,
+            )
+            .poly_norm,
+        );
         Self {
             plaintext_norm: &self.plaintext_norm * &rhs.plaintext_norm,
             matrix_expr: self
                 .matrix_expr
-                .transform_matrix(&PolyMatrixNorm::gadget_decomposed(
-                    self.plaintext_norm.ctx.clone(),
-                    self.plaintext_norm.ctx.m_g,
-                ))
+                .transform_matrix(&rhs_gadget)
                 .add_expr(&rhs.matrix_expr.transform_poly(&self.plaintext_norm)),
+            pubkey_summary: self.pubkey_summary.deterministic_union(&rhs.pubkey_summary),
         }
     }
 
@@ -1035,19 +1285,21 @@ impl ErrorNormSummaryExpr {
         Self {
             plaintext_norm: self.plaintext_norm.clone() * &scalar_poly,
             matrix_expr: self.matrix_expr.transform_scalar(&scalar_max),
+            pubkey_summary: self.pubkey_summary.small_scalar_mul(&scalar_max),
         }
     }
 
     fn large_scalar_mul_bound(&self, scalar: &[BigUint]) -> Self {
         let scalar_max = scalar.iter().max().unwrap().clone();
         let scalar_bd = BigDecimal::from(num_bigint::BigInt::from(scalar_max));
-        let scalar_poly = PolyNorm::constant(self.plaintext_norm.ctx.clone(), scalar_bd);
+        let scalar_poly = PolyNorm::constant(self.plaintext_norm.ctx.clone(), scalar_bd.clone());
         Self {
             plaintext_norm: self.plaintext_norm.clone() * &scalar_poly,
             matrix_expr: self.matrix_expr.transform_matrix(&PolyMatrixNorm::gadget_decomposed(
                 self.plaintext_norm.ctx.clone(),
                 self.plaintext_norm.ctx.m_g,
             )),
+            pubkey_summary: self.pubkey_summary.scale(&scalar_bd),
         }
     }
 
@@ -1059,9 +1311,13 @@ impl ErrorNormSummaryExpr {
     where
         F: Fn(usize) -> Arc<ErrorNormSummaryExpr> + Sync,
     {
+        let mut pubkey_cache = HashMap::<usize, ErrorNormPubkeySummary>::new();
         Self {
             plaintext_norm: self.plaintext_norm.clone(),
             matrix_expr: self.matrix_expr.substitute_inputs_with_cached(actual_input_at, cache),
+            pubkey_summary: self
+                .pubkey_summary
+                .substitute_inputs_with_cached(actual_input_at, &mut pubkey_cache),
         }
     }
 
@@ -1073,6 +1329,7 @@ impl ErrorNormSummaryExpr {
         Self {
             plaintext_norm: self.plaintext_norm.clone(),
             matrix_expr: self.matrix_expr.remap_input_indices(input_sources),
+            pubkey_summary: self.pubkey_summary.remap_input_indices(input_sources),
         }
     }
 }
@@ -1196,6 +1453,7 @@ impl ErrorNormSubCircuitSummary {
     fn compose_output_range_shared(
         &self,
         output_range: std::ops::Range<usize>,
+        actual_inputs: &[Arc<ErrorNormSummaryExpr>],
         input_sources: &[AffineErrorNormExpr],
     ) -> Vec<Arc<ErrorNormSummaryExpr>> {
         let outputs = &self.outputs[output_range];
@@ -1254,6 +1512,7 @@ impl ErrorNormSubCircuitSummary {
             Arc::new(ErrorNormSummaryExpr {
                 plaintext_norm: expr.plaintext_norm.clone(),
                 matrix_expr,
+                pubkey_summary: expr.pubkey_summary.substitute_exprs(actual_inputs),
             })
         };
         if outputs.len() < ERROR_NORM_EXPR_PAR_BATCH_SIZE {
@@ -1281,7 +1540,11 @@ impl ErrorNormSubCircuitSummary {
             return self.remap_output_range_shared(output_range, input_sources.as_ref());
         }
         if let Some(input_sources) = Self::small_affine_input_sources(actual_inputs) {
-            return self.compose_output_range_shared(output_range, input_sources.as_ref());
+            return self.compose_output_range_shared(
+                output_range,
+                actual_inputs,
+                input_sources.as_ref(),
+            );
         }
         self.substitute_output_range_with_input_fn(output_range, &|input_idx| {
             actual_inputs
@@ -1313,7 +1576,11 @@ impl ErrorNormSubCircuitSummary {
         }
         if let Some(input_sources) = Self::small_affine_input_sources(actual_inputs) {
             return self
-                .compose_output_range_shared(output_idx..output_idx + 1, input_sources.as_ref())
+                .compose_output_range_shared(
+                    output_idx..output_idx + 1,
+                    actual_inputs,
+                    input_sources.as_ref(),
+                )
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| {
@@ -1383,20 +1650,30 @@ impl ErrorNormSubCircuitSummary {
     fn evaluate_output_range_with_shared_cache<F>(
         &self,
         output_range: std::ops::Range<usize>,
-        input_matrix_norm_at: &F,
+        input_error_norm_at: &F,
     ) -> Vec<ErrorNorm>
     where
-        F: Fn(usize) -> PolyMatrixNorm + Sync,
+        F: Fn(usize) -> ErrorNorm + Sync,
     {
         let outputs = &self.outputs[output_range];
         if outputs.len() < ERROR_NORM_EXPR_PAR_BATCH_SIZE {
             outputs
                 .par_iter()
                 .map(|expr| {
-                    let mut cache = HashMap::<usize, PolyMatrixNorm>::new();
-                    ErrorNorm::new(
+                    let mut matrix_cache = HashMap::<usize, PolyMatrixNorm>::new();
+                    let matrix_norm = expr.matrix_expr.evaluate_with_cached(
+                        &|input_idx| input_error_norm_at(input_idx).matrix_norm,
+                        &mut matrix_cache,
+                    );
+                    let mut pubkey_cache = HashMap::<usize, ErrorNorm>::new();
+                    let (pubkey_deps, is_pubkey_random) = expr
+                        .pubkey_summary
+                        .evaluate_with_cached(input_error_norm_at, &mut pubkey_cache);
+                    ErrorNorm::from_parts(
                         expr.plaintext_norm.clone(),
-                        expr.matrix_expr.evaluate_with_cached(input_matrix_norm_at, &mut cache),
+                        matrix_norm,
+                        pubkey_deps,
+                        is_pubkey_random,
                     )
                 })
                 .collect()
@@ -1404,14 +1681,23 @@ impl ErrorNormSubCircuitSummary {
             outputs
                 .par_chunks(ERROR_NORM_EXPR_PAR_BATCH_SIZE)
                 .map(|expr_chunk| {
-                    let mut cache = HashMap::<usize, PolyMatrixNorm>::new();
+                    let mut matrix_cache = HashMap::<usize, PolyMatrixNorm>::new();
+                    let mut pubkey_cache = HashMap::<usize, ErrorNorm>::new();
                     expr_chunk
                         .iter()
                         .map(|expr| {
-                            ErrorNorm::new(
+                            let matrix_norm = expr.matrix_expr.evaluate_with_cached(
+                                &|input_idx| input_error_norm_at(input_idx).matrix_norm,
+                                &mut matrix_cache,
+                            );
+                            let (pubkey_deps, is_pubkey_random) = expr
+                                .pubkey_summary
+                                .evaluate_with_cached(input_error_norm_at, &mut pubkey_cache);
+                            ErrorNorm::from_parts(
                                 expr.plaintext_norm.clone(),
-                                expr.matrix_expr
-                                    .evaluate_with_cached(input_matrix_norm_at, &mut cache),
+                                matrix_norm,
+                                pubkey_deps,
+                                is_pubkey_random,
                             )
                         })
                         .collect::<Vec<_>>()
@@ -1566,7 +1852,7 @@ mod summary;
 
 pub use evaluators::{
     NormBggPolyEncodingSTEvaluator, NormNaiveBggEncodingVecSTEvaluator, NormPltCommitEvaluator,
-    NormPltGGH15Evaluator, NormPltLWEEvaluator, compute_preimage_sigma,
+    NormPltGGH15Evaluator, NormPltLWEEvaluator, compute_preimage_norm, compute_preimage_sigma,
 };
 
 #[cfg(test)]

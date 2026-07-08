@@ -2,7 +2,7 @@ use std::{sync::Arc, thread, time::Duration};
 
 use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, BigUint};
-use num_traits::FromPrimitive;
+use num_traits::{FromPrimitive, Zero};
 
 use crate::{
     circuit::{Evaluable, PolyCircuit},
@@ -32,6 +32,7 @@ use crate::{
     },
     simulator::{
         SimulatorContext,
+        dependency_set::DependencySet,
         error_norm::ErrorNorm,
         lattice_estimator::{Distribution, run_lattice_estimator_cli_with_timeout},
         poly_matrix_norm::PolyMatrixNorm,
@@ -1159,10 +1160,16 @@ pub(crate) fn expand_logical_errors(
 }
 
 pub(crate) fn scale_error_norm(input: ErrorNorm, scale: &BigDecimal) -> ErrorNorm {
-    ErrorNorm {
-        plaintext_norm: input.plaintext_norm * scale,
-        matrix_norm: input.matrix_norm * scale,
-    }
+    let scale_is_zero = scale.is_zero();
+    let pubkey_deps =
+        if scale_is_zero { DependencySet::empty() } else { input.pubkey_deps.clone() };
+    let is_pubkey_random = if scale_is_zero { false } else { input.is_pubkey_random };
+    ErrorNorm::from_parts(
+        input.plaintext_norm * scale,
+        input.matrix_norm * scale,
+        pubkey_deps,
+        is_pubkey_random,
+    )
 }
 
 pub(crate) fn assert_same_matrix_shape(lhs: &PolyMatrixNorm, rhs: &PolyMatrixNorm, message: &str) {

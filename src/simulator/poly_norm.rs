@@ -6,34 +6,44 @@ use std::{
     sync::Arc,
 };
 
-pub fn maximum_coefficient_bound_from_sigma(sigma: &BigDecimal) -> BigDecimal {
+pub fn high_probability_envelope_from_sigma(sigma: &BigDecimal) -> BigDecimal {
     assert!(*sigma >= BigDecimal::zero(), "sigma must be nonnegative");
     sigma * BigDecimal::from(13u64) / BigDecimal::from(2u64)
+}
+
+pub fn maximum_coefficient_bound_from_sigma(sigma: &BigDecimal) -> BigDecimal {
+    high_probability_envelope_from_sigma(sigma)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolyNorm {
     pub ctx: Arc<SimulatorContext>,
+    pub norm: BigDecimal,
     pub sigma: BigDecimal,
+    pub is_const_poly: bool,
     pub is_constant_poly: bool,
 }
 
 impl PolyNorm {
-    fn assert_nonnegative_sigma(sigma: &BigDecimal) {
-        assert!(*sigma >= BigDecimal::zero(), "sigma must be nonnegative");
+    fn assert_nonnegative_norm(norm: &BigDecimal) {
+        assert!(*norm >= BigDecimal::zero(), "norm must be nonnegative");
     }
 
-    pub fn new(ctx: Arc<SimulatorContext>, sigma: BigDecimal) -> Self {
-        Self::assert_nonnegative_sigma(&sigma);
-        PolyNorm { ctx, sigma, is_constant_poly: false }
+    fn from_norm(ctx: Arc<SimulatorContext>, norm: BigDecimal, is_const_poly: bool) -> Self {
+        Self::assert_nonnegative_norm(&norm);
+        PolyNorm { ctx, sigma: norm.clone(), norm, is_const_poly, is_constant_poly: is_const_poly }
     }
 
-    pub fn constant(ctx: Arc<SimulatorContext>, sigma: BigDecimal) -> Self {
-        Self::assert_nonnegative_sigma(&sigma);
-        PolyNorm { ctx, sigma, is_constant_poly: true }
+    pub fn new(ctx: Arc<SimulatorContext>, norm: BigDecimal) -> Self {
+        Self::from_norm(ctx, norm, false)
+    }
+
+    pub fn constant(ctx: Arc<SimulatorContext>, norm: BigDecimal) -> Self {
+        Self::from_norm(ctx, norm, true)
     }
 
     pub fn into_constant_poly(mut self) -> Self {
+        self.is_const_poly = true;
         self.is_constant_poly = true;
         self
     }
@@ -43,59 +53,58 @@ impl PolyNorm {
     }
 
     pub fn sample_gauss(ctx: Arc<SimulatorContext>, sigma: BigDecimal) -> Self {
-        Self::assert_nonnegative_sigma(&sigma);
-        PolyNorm { ctx, sigma, is_constant_poly: false }
+        Self::from_norm(ctx, high_probability_envelope_from_sigma(&sigma), false)
     }
 
     pub fn maximum_coefficient_bound(&self) -> BigDecimal {
-        maximum_coefficient_bound_from_sigma(&self.sigma)
+        self.norm.clone()
     }
 
     pub fn max_coefficients_bound(&self) -> BigDecimal {
-        if self.is_constant_poly { self.sigma.clone() } else { self.maximum_coefficient_bound() }
+        self.norm.clone()
     }
 }
 
 impl_binop_with_refs!(PolyNorm => Add::add(self, rhs: &PolyNorm) -> PolyNorm {
     assert!(self.ctx == rhs.ctx, "ctx must match");
-    PolyNorm {
-        ctx: self.ctx.clone(),
-        sigma: &self.sigma + &rhs.sigma,
-        is_constant_poly: self.is_constant_poly && rhs.is_constant_poly,
-    }
+    PolyNorm::from_norm(
+        self.ctx.clone(),
+        &self.norm + &rhs.norm,
+        self.is_const_poly && rhs.is_const_poly,
+    )
 });
 
 impl AddAssign for PolyNorm {
     fn add_assign(&mut self, rhs: Self) {
         assert!(self.ctx == rhs.ctx, "ctx must match");
-        self.sigma += rhs.sigma;
-        self.is_constant_poly = self.is_constant_poly && rhs.is_constant_poly;
+        self.norm += rhs.norm;
+        self.sigma = self.norm.clone();
+        self.is_const_poly = self.is_const_poly && rhs.is_const_poly;
+        self.is_constant_poly = self.is_const_poly;
     }
 }
 
 impl_binop_with_refs!(PolyNorm => Mul::mul(self, rhs: &PolyNorm) -> PolyNorm {
     assert!(self.ctx == rhs.ctx, "ctx must match");
-    let mut sigma = &self.sigma * &rhs.sigma;
-    if !self.is_constant_poly && !rhs.is_constant_poly {
-        sigma *= &self.ctx.ring_dim_sqrt;
+    let mut norm = &self.norm * &rhs.norm;
+    if !self.is_const_poly && !rhs.is_const_poly {
+        norm *= &self.ctx.ring_dim_sqrt;
     }
-    PolyNorm {
-        ctx: self.ctx.clone(),
-        sigma,
-        is_constant_poly: self.is_constant_poly && rhs.is_constant_poly,
-    }
+    PolyNorm::from_norm(self.ctx.clone(), norm, self.is_const_poly && rhs.is_const_poly)
 });
 
 impl MulAssign for PolyNorm {
     fn mul_assign(&mut self, rhs: Self) {
         assert!(self.ctx == rhs.ctx, "ctx must match");
-        let lhs_is_constant_poly = self.is_constant_poly;
-        let rhs_is_constant_poly = rhs.is_constant_poly;
-        self.sigma = &self.sigma * rhs.sigma;
-        if !lhs_is_constant_poly && !rhs_is_constant_poly {
-            self.sigma *= &self.ctx.ring_dim_sqrt;
+        let lhs_is_const_poly = self.is_const_poly;
+        let rhs_is_const_poly = rhs.is_const_poly;
+        self.norm = &self.norm * rhs.norm;
+        if !lhs_is_const_poly && !rhs_is_const_poly {
+            self.norm *= &self.ctx.ring_dim_sqrt;
         }
-        self.is_constant_poly = lhs_is_constant_poly && rhs_is_constant_poly;
+        self.sigma = self.norm.clone();
+        self.is_const_poly = lhs_is_const_poly && rhs_is_const_poly;
+        self.is_constant_poly = self.is_const_poly;
     }
 }
 
@@ -109,15 +118,15 @@ impl Mul<BigDecimal> for PolyNorm {
 impl Mul<&BigDecimal> for PolyNorm {
     type Output = Self;
     fn mul(self, rhs: &BigDecimal) -> Self::Output {
-        Self::assert_nonnegative_sigma(rhs);
-        PolyNorm { ctx: self.ctx, sigma: self.sigma * rhs, is_constant_poly: self.is_constant_poly }
+        Self::assert_nonnegative_norm(rhs);
+        PolyNorm::from_norm(self.ctx, self.norm * rhs, self.is_const_poly)
     }
 }
 
 impl Mul<PolyNorm> for BigDecimal {
     type Output = PolyNorm;
     fn mul(self, rhs: PolyNorm) -> Self::Output {
-        PolyNorm::assert_nonnegative_sigma(&self);
-        PolyNorm { ctx: rhs.ctx, sigma: rhs.sigma * self, is_constant_poly: rhs.is_constant_poly }
+        PolyNorm::assert_nonnegative_norm(&self);
+        PolyNorm::from_norm(rhs.ctx, rhs.norm * self, rhs.is_const_poly)
     }
 }

@@ -1760,12 +1760,13 @@ fn diamond_io_input_injection_scalar_projection_error(
         .state_errors
         .first()
         .expect("DiamondIO input injection must produce a base final state error");
-    let scalar_output_preimage = PolyMatrixNorm::new(
-        input_injection.output_preimage.clone_ctx(),
+    let scalar_output_preimage = PolyMatrixNorm::from_parts(
         input_injection.output_preimage.nrow,
         1,
-        input_injection.output_preimage.poly_norm.sigma.clone(),
+        input_injection.output_preimage.poly_norm.clone(),
         None,
+        input_injection.output_preimage.deps.clone(),
+        input_injection.output_preimage.clt_ready,
     );
     state_error.clone() * &scalar_output_preimage
 }

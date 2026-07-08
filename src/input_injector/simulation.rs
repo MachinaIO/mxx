@@ -16,10 +16,10 @@ use tracing::debug;
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Error-growth summary for Diamond state insertion.
 ///
-/// The simulator exposes raw sigma-mode error norms for the final Diamond
-/// states and the generic one-step final projection preimage sigma. Callers
-/// that own output projections combine these values internally, then convert
-/// to a maximum coefficient bound at public correctness/reporting boundaries.
+/// The simulator exposes envelope-mode error norms for the final Diamond
+/// states and the generic one-step final projection preimage norm. Callers
+/// that own output projections combine these values internally and read the
+/// public maximum coefficient bound directly from the norm.
 pub struct DiamondInputErrorSimulation {
     /// Final propagated error for each Diamond state branch.
     pub state_errors: Vec<PolyMatrixNorm>,
@@ -30,7 +30,7 @@ pub struct DiamondInputErrorSimulation {
     /// for the final online secret, such as noise-refresh rounding analysis,
     /// should use the factor for the branch they decode from.
     pub secret_state_factors: Vec<PolyMatrixNorm>,
-    /// Generic final projection preimage sigma from the final state basis to a
+    /// Generic final projection preimage norm from the final state basis to a
     /// single BGG output public key.
     pub output_preimage: PolyMatrixNorm,
 }
@@ -70,10 +70,20 @@ where
             Some(self.state_row_size() / DIAMOND_SECRET_SIZE),
             None,
         );
-        let transition_preimage =
-            PolyMatrixNorm::new(ctx.clone(), state_cols, state_cols, preimage_sigma.clone(), None);
-        let output_preimage =
-            PolyMatrixNorm::new(ctx.clone(), state_cols, gadget_cols, preimage_sigma, None);
+        let transition_preimage = PolyMatrixNorm::fresh_preimage(
+            ctx.clone(),
+            state_cols,
+            state_cols,
+            preimage_sigma.clone(),
+            None,
+        );
+        let output_preimage = PolyMatrixNorm::fresh_preimage(
+            ctx.clone(),
+            state_cols,
+            gadget_cols,
+            preimage_sigma,
+            None,
+        );
         let transition_target_error = PolyMatrixNorm::sample_gauss(
             ctx.clone(),
             self.state_row_size(),

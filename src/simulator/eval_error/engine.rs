@@ -314,7 +314,7 @@ impl PolyCircuit<DCRTPoly> {
                                                         suffix,
                                                         input_idx,
                                                     );
-                                                self.clone_error_norm_matrix_norm_for_gate(
+                                                self.clone_error_norm_value_for_gate(
                                                     input_id,
                                                     &wires,
                                                     &input_gate_positions,
@@ -497,7 +497,7 @@ impl PolyCircuit<DCRTPoly> {
                                                         input_ids.as_ref(),
                                                         input_idx,
                                                     );
-                                                    self.clone_error_norm_matrix_norm_for_gate(
+                                                    self.clone_error_norm_value_for_gate(
                                                         input_id,
                                                         &wires,
                                                         &input_gate_positions,

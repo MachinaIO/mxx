@@ -257,12 +257,13 @@ where
         let q = self.injector.params.modulus();
         let hidden_plaintext =
             PolyNorm::constant(ctx.clone(), BigDecimal::from(BigInt::from(q.as_ref() / 2u32)));
-        let k_preimage = PolyMatrixNorm::new(
-            ctx.clone(),
+        let k_preimage = PolyMatrixNorm::from_parts(
             input_injection.output_preimage.nrow,
             1,
-            input_injection.output_preimage.poly_norm.sigma.clone(),
+            input_injection.output_preimage.poly_norm.clone(),
             None,
+            input_injection.output_preimage.deps.clone(),
+            input_injection.output_preimage.clt_ready,
         );
 
         let projected_state_error = |state_idx: usize| {

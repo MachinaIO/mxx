@@ -589,7 +589,7 @@ where
         let decryption_key = initial_fresh_error.clone();
         let refresh_decoder_error = initial_fresh_error.clone();
         let c_b0_error = PolyMatrixNorm::sample_gauss(ctx.clone(), 1, ctx.m_b, sigma);
-        let output_preimage_sigma = PolyMatrixNorm::new(
+        let output_preimage_sigma = PolyMatrixNorm::fresh_preimage(
             ctx.clone(),
             ctx.m_b,
             1,
@@ -1539,13 +1539,13 @@ mod tests {
         assert_eq!(base.final_decoder_error.matrix_norm.nrow, 1);
         assert_eq!(base.final_decoder_error.matrix_norm.ncol, 1);
         assert_eq!(
-            base.initial_fresh_error.matrix_norm.poly_norm.sigma,
-            BigDecimal::from_f64(2.0).unwrap()
+            base.initial_fresh_error.matrix_norm.poly_norm.norm,
+            BigDecimal::from_f64(13.0).unwrap()
         );
         assert_eq!(
             base.initial_fresh_error.matrix_norm.maximum_coefficient_bound(),
             BigDecimal::from_f64(13.0).unwrap(),
-            "fresh initial ErrorNorm public bound must come from the canonical maximum coefficient bound of error_sigma"
+            "fresh initial ErrorNorm public bound stores the high-probability envelope directly"
         );
     }
 

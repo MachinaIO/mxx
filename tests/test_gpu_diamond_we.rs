@@ -298,13 +298,23 @@ impl DiamondWEGpuBenchConfig {
             env_or_parse_optional_u64("DIAMOND_WE_GPU_BENCH_SELECTED_ACHIEVED_SECPAR_FOR_GAUSS");
         let achieved_secpar_for_cbd =
             env_or_parse_optional_u64("DIAMOND_WE_GPU_BENCH_SELECTED_ACHIEVED_SECPAR_FOR_CBD");
-        let noisy_plaintext_error_bits =
-            env_or_parse_optional_usize("DIAMOND_WE_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS")
-                .unwrap_or(0);
-        let input_injection_error_bits =
-            env_or_parse_optional_usize("DIAMOND_WE_GPU_BENCH_SELECTED_INPUT_INJECTION_ERROR_BITS")
-                .unwrap_or(0);
+        let noisy_plaintext_error_bits = env_or_parse_optional_usize(
+            "DIAMOND_WE_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS",
+        )
+        .expect("DIAMOND_WE_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS must be set with selected CRT depth");
+        let input_injection_error_bits = env_or_parse_optional_usize(
+            "DIAMOND_WE_GPU_BENCH_SELECTED_INPUT_INJECTION_ERROR_BITS",
+        )
+        .expect("DIAMOND_WE_GPU_BENCH_SELECTED_INPUT_INJECTION_ERROR_BITS must be set with selected CRT depth");
         assert!(crt_depth > 0, "DIAMOND_WE_GPU_BENCH_SELECTED_CRT_DEPTH must be positive");
+        assert!(
+            noisy_plaintext_error_bits > 0,
+            "DIAMOND_WE_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS must be positive"
+        );
+        assert!(
+            input_injection_error_bits > 0,
+            "DIAMOND_WE_GPU_BENCH_SELECTED_INPUT_INJECTION_ERROR_BITS must be positive"
+        );
         Some(DiamondWEGpuBenchSelectedSimulation {
             crt_depth,
             ring_dim,

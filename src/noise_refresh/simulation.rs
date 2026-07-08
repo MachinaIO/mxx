@@ -18,11 +18,15 @@ use crate::{
         naive_vec::build_noise_refresh_material_circuit,
     },
     poly::{PolyParams, dcrt::poly::DCRTPoly},
-    simulator::{SimulatorContext, error_norm::ErrorNorm, poly_matrix_norm::PolyMatrixNorm},
+    simulator::{
+        SimulatorContext, dependency_set::DependencySet, error_norm::ErrorNorm,
+        poly_matrix_norm::PolyMatrixNorm,
+    },
     slot_transfer::SlotTransferEvaluator,
 };
 use bigdecimal::BigDecimal;
 use num_bigint::BigUint;
+use num_traits::Zero;
 use rayon::prelude::*;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -758,10 +762,16 @@ fn extrapolate_matrix_norms_to_active_levels(norms: &mut [PolyMatrixNorm], activ
 }
 
 fn scale_error_norm(input: ErrorNorm, scale: &BigDecimal) -> ErrorNorm {
-    ErrorNorm {
-        plaintext_norm: input.plaintext_norm * scale,
-        matrix_norm: input.matrix_norm * scale,
-    }
+    let scale_is_zero = scale.is_zero();
+    let pubkey_deps =
+        if scale_is_zero { DependencySet::empty() } else { input.pubkey_deps.clone() };
+    let is_pubkey_random = if scale_is_zero { false } else { input.is_pubkey_random };
+    ErrorNorm::from_parts(
+        input.plaintext_norm * scale,
+        input.matrix_norm * scale,
+        pubkey_deps,
+        is_pubkey_random,
+    )
 }
 
 struct SymmetricNoiseRefreshPrgErrorPrefix<A>

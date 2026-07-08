@@ -157,7 +157,7 @@ impl Aky24DecErrorSimulationInputs {
             },
         );
         let func_input_count = build_func_circuit(params, &func).num_input();
-        let output_preimage_sigma = PolyMatrixNorm::new(
+        let output_preimage_sigma = PolyMatrixNorm::fresh_preimage(
             ctx.clone(),
             ctx.m_b,
             func.output_size(),

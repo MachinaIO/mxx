@@ -79,8 +79,9 @@ pub struct DiamondInjectorPreprocessOut<M, T>
 where
     M: PolyMatrix,
 {
-    pub final_trapdoors: Vec<T>,
-    pub final_pub_matrices: Vec<M>,
+    final_trapdoor_bytes: Vec<Vec<u8>>,
+    final_pub_matrix_bytes: Vec<Vec<u8>>,
+    _marker: PhantomData<(M, T)>,
 }
 
 impl<M, T> DiamondInjectorPreprocessOut<M, T>
@@ -89,21 +90,31 @@ where
 {
     pub fn final_state_count(&self) -> usize {
         debug_assert_eq!(
-            self.final_trapdoors.len(),
-            self.final_pub_matrices.len(),
+            self.final_trapdoor_bytes.len(),
+            self.final_pub_matrix_bytes.len(),
             "DiamondInjector final checkpoint vector length mismatch"
         );
-        self.final_pub_matrices.len()
+        self.final_pub_matrix_bytes.len()
     }
 
-    pub fn final_checkpoint(&self, state_idx: usize) -> (&T, &M) {
+    pub fn final_trapdoor_bytes(&self, state_idx: usize) -> &[u8] {
         assert!(
             state_idx < self.final_state_count(),
             "DiamondInjector final state index out of range: {} >= {}",
             state_idx,
             self.final_state_count()
         );
-        (&self.final_trapdoors[state_idx], &self.final_pub_matrices[state_idx])
+        &self.final_trapdoor_bytes[state_idx]
+    }
+
+    pub fn final_public_matrix(&self, params: &<M::P as Poly>::Params, state_idx: usize) -> M {
+        assert!(
+            state_idx < self.final_state_count(),
+            "DiamondInjector final state index out of range: {} >= {}",
+            state_idx,
+            self.final_state_count()
+        );
+        M::from_compact_bytes(params, &self.final_pub_matrix_bytes[state_idx])
     }
 }
 
@@ -684,21 +695,21 @@ where
         #[cfg(feature = "gpu")]
         {
             self.preprocess_gpu(dir_path, k);
-            let mut final_trapdoors =
+            let mut final_trapdoor_bytes =
                 Vec::with_capacity(self.state_count_at_level(self.input_count));
-            let mut final_pub_matrices =
+            let mut final_pub_matrix_bytes =
                 Vec::with_capacity(self.state_count_at_level(self.input_count));
             for state_idx in 0..self.state_count_at_level(self.input_count) {
-                let (final_pub_matrix_bytes, final_trapdoor_bytes) =
+                let (public_matrix_bytes, trapdoor_bytes) =
                     self.load_or_sample_b_checkpoint_bytes(dir_path, self.input_count, state_idx);
-                final_trapdoors.push(
-                    TS::trapdoor_from_bytes(&self.params, &final_trapdoor_bytes)
-                        .expect("DiamondInjector final trapdoor checkpoint must decode"),
-                );
-                final_pub_matrices
-                    .push(M::from_compact_bytes(&self.params, &final_pub_matrix_bytes));
+                final_trapdoor_bytes.push(trapdoor_bytes);
+                final_pub_matrix_bytes.push(public_matrix_bytes);
             }
-            return DiamondInjectorPreprocessOut { final_trapdoors, final_pub_matrices };
+            return DiamondInjectorPreprocessOut {
+                final_trapdoor_bytes,
+                final_pub_matrix_bytes,
+                _marker: PhantomData,
+            };
         }
 
         #[cfg(not(feature = "gpu"))]
@@ -780,12 +791,19 @@ where
                 }
             }
             DiamondInjectorPreprocessOut {
-                final_trapdoors: trapdoors
+                final_trapdoor_bytes: trapdoors
                     .pop()
-                    .expect("DiamondInjector must keep final trapdoor checkpoints"),
-                final_pub_matrices: b_checkpoints
+                    .expect("DiamondInjector must keep final trapdoor checkpoints")
+                    .into_iter()
+                    .map(|trapdoor| TS::trapdoor_to_bytes(&trapdoor))
+                    .collect(),
+                final_pub_matrix_bytes: b_checkpoints
                     .pop()
-                    .expect("DiamondInjector must keep final public matrix checkpoints"),
+                    .expect("DiamondInjector must keep final public matrix checkpoints")
+                    .into_iter()
+                    .map(|matrix| matrix.to_compact_bytes())
+                    .collect(),
+                _marker: PhantomData,
             }
         }
     }
@@ -852,7 +870,7 @@ mod tests {
             uniform::DCRTPolyUniformSampler,
         },
         simulator::{
-            SimulatorContext, error_norm::compute_preimage_norm, poly_matrix_norm::PolyMatrixNorm,
+            SimulatorContext, error_norm::compute_preimage_sigma, poly_matrix_norm::PolyMatrixNorm,
         },
         utils::bigdecimal_bits_ceil,
     };
@@ -869,6 +887,21 @@ mod tests {
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
     >;
+
+    fn assert_poly_matrix_bound_eq(actual: &PolyMatrixNorm, expected: &PolyMatrixNorm) {
+        assert_eq!(actual.nrow, expected.nrow);
+        assert_eq!(actual.ncol, expected.ncol);
+        assert_eq!(actual.ncol_sqrt, expected.ncol_sqrt);
+        assert_eq!(actual.poly_norm, expected.poly_norm);
+        assert_eq!(actual.zero_rows, expected.zero_rows);
+    }
+
+    fn assert_poly_matrix_bounds_eq(actual: &[PolyMatrixNorm], expected: &[PolyMatrixNorm]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_poly_matrix_bound_eq(actual, expected);
+        }
+    }
 
     #[sequential_test::sequential]
     #[test]
@@ -902,7 +935,7 @@ mod tests {
             assert_eq!(secret_mask.size(), (DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE));
             secret_matrix = secret_matrix * secret_mask;
         }
-        let base_public_matrix = preprocess_out.final_pub_matrices[0].clone();
+        let base_public_matrix = preprocess_out.final_public_matrix(&injector.params, 0);
         let base_selector =
             DCRTPolyMatrix::from_poly_vec_row(&params, vec![secret_matrix.entry(0, 0), k.clone()]);
         assert_eq!(states[0], base_selector * base_public_matrix);
@@ -912,7 +945,8 @@ mod tests {
                 let state_idx = injector.bit_state_idx(digit_idx, bit_idx);
                 let bit_value = ((digits[digit_idx] as usize) >> bit_idx) & 1;
                 let bit_plaintext = TestPoly::from_usize_to_constant(&params, bit_value);
-                let bit_public_matrix = preprocess_out.final_pub_matrices[state_idx].clone();
+                let bit_public_matrix =
+                    preprocess_out.final_public_matrix(&injector.params, state_idx);
                 let bit_selector = DCRTPolyMatrix::from_poly_vec_row(
                     &params,
                     vec![secret_matrix.entry(0, 0), secret_matrix.entry(0, 0) * &bit_plaintext],
@@ -952,22 +986,27 @@ mod tests {
             state_cols,
             BigDecimal::from_f64(injector.error_sigma).expect("error_sigma must be finite"),
         );
-        let expected_preimage_norm = compute_preimage_norm(
+        let expected_preimage_sigma = compute_preimage_sigma(
             &ctx.ring_dim_sqrt,
             ctx.m_g as u64,
             &ctx.base,
             Some(injector.state_row_size() / DIAMOND_SECRET_SIZE),
             None,
         );
-        let expected_transition = PolyMatrixNorm::new(
+        let expected_transition = PolyMatrixNorm::fresh_preimage(
             ctx.clone(),
             state_cols,
             state_cols,
-            expected_preimage_norm.clone(),
+            expected_preimage_sigma.clone(),
             None,
         );
-        let expected_output =
-            PolyMatrixNorm::new(ctx.clone(), state_cols, gadget_cols, expected_preimage_norm, None);
+        let expected_output = PolyMatrixNorm::fresh_preimage(
+            ctx.clone(),
+            state_cols,
+            gadget_cols,
+            expected_preimage_sigma,
+            None,
+        );
         let expected_regular_selector = PolyMatrixNorm::new(
             ctx.clone(),
             injector.state_row_size(),
@@ -1040,9 +1079,9 @@ mod tests {
             expected_state_errors = next_state_errors;
         }
 
-        assert_eq!(simulated.state_errors, expected_state_errors);
-        assert_eq!(simulated.secret_state_factors, expected_secret_factors);
-        assert_eq!(simulated.output_preimage, expected_output);
+        assert_poly_matrix_bounds_eq(&simulated.state_errors, &expected_state_errors);
+        assert_poly_matrix_bounds_eq(&simulated.secret_state_factors, &expected_secret_factors);
+        assert_poly_matrix_bound_eq(&simulated.output_preimage, &expected_output);
     }
 
     #[test]
@@ -1073,7 +1112,7 @@ mod tests {
             .collect::<Vec<_>>();
         let max_error = projected_errors
             .iter()
-            .map(|norm| norm.poly_norm.norm.clone())
+            .map(|norm| norm.maximum_coefficient_bound())
             .max()
             .expect("state error list must be non-empty");
 

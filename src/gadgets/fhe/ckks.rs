@@ -13,7 +13,9 @@ use crate::{
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+    simulator::poly_norm::maximum_coefficient_bound_from_sigma,
 };
+use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use num_bigint::BigUint;
 use std::sync::Arc;
 
@@ -173,7 +175,10 @@ impl<P: Poly + 'static> CKKSContext<P> {
     }
 
     fn initial_ciphertext_error_bound(&self) -> BigUint {
-        BigUint::from((6.5 * self.error_sigma).ceil() as u64)
+        let sigma = BigDecimal::from_f64(self.error_sigma)
+            .expect("CKKS error sigma must be finite");
+        let bound = maximum_coefficient_bound_from_sigma(&sigma);
+        BigUint::from(bound.ceil().to_u64().expect("CKKS error bound must fit in u64"))
     }
 
     fn q_window_modulus(&self, level_offset: usize, active_levels: usize) -> BigUint {

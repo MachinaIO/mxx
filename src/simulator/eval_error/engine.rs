@@ -11,8 +11,8 @@ impl PolyCircuit<DCRTPoly> {
     ///
     /// The key optimization is that nested sub-circuits are not re-simulated from scratch for each
     /// call. Instead, `ErrorNormSubCircuitSummary` captures each sub-circuit once as an affine map
-    /// from input bounds to output bounds, and this function substitutes actual caller inputs into
-    /// that cached summary.
+    /// from input sigma profiles to output sigma profiles, and this function substitutes actual
+    /// caller inputs into that cached summary.
     pub(super) fn eval_max_error_norm<P: AffinePltEvaluator>(
         &self,
         one_error: ErrorNorm,
@@ -314,7 +314,7 @@ impl PolyCircuit<DCRTPoly> {
                                                         suffix,
                                                         input_idx,
                                                     );
-                                                self.clone_error_norm_matrix_norm_for_gate(
+                                                self.clone_error_norm_value_for_gate(
                                                     input_id,
                                                     &wires,
                                                     &input_gate_positions,
@@ -497,7 +497,7 @@ impl PolyCircuit<DCRTPoly> {
                                                         input_ids.as_ref(),
                                                         input_idx,
                                                     );
-                                                    self.clone_error_norm_matrix_norm_for_gate(
+                                                    self.clone_error_norm_value_for_gate(
                                                         input_id,
                                                         &wires,
                                                         &input_gate_positions,

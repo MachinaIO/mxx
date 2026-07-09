@@ -4,7 +4,7 @@ use crate::{
     poly::PolyParams,
     sampler::{PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     simulator::{
-        SimulatorContext, error_norm::compute_preimage_norm, poly_matrix_norm::PolyMatrixNorm,
+        SimulatorContext, error_norm::compute_preimage_sigma, poly_matrix_norm::PolyMatrixNorm,
     },
 };
 use bigdecimal::BigDecimal;
@@ -16,18 +16,18 @@ use tracing::debug;
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Error-growth summary for Diamond state insertion.
 ///
-/// The simulator exposes the final Diamond state bounds and the generic
-/// one-step final projection preimage bound. Callers that own output
-/// projections can combine these values for their concrete one, k, input, or
-/// decoder outputs.
+/// The simulator exposes envelope-mode error norms for the final Diamond
+/// states and the generic one-step final projection preimage norm. Callers
+/// that own output projections combine these values internally and read the
+/// public maximum coefficient bound directly from the norm.
 pub struct DiamondInputErrorSimulation {
     /// Final propagated error for each Diamond state branch.
     pub state_errors: Vec<PolyMatrixNorm>,
     /// Final secret-selector norm for each Diamond state branch.
     ///
     /// These factors model the product of the secret transition matrices that
-    /// multiply the sampled Gaussian target errors. Callers that need a bound
-    /// on the final online secret, such as noise-refresh rounding analysis,
+    /// multiply the sampled Gaussian target errors. Callers that need a norm
+    /// for the final online secret, such as noise-refresh rounding analysis,
     /// should use the factor for the branch they decode from.
     pub secret_state_factors: Vec<PolyMatrixNorm>,
     /// Generic final projection preimage norm from the final state basis to a
@@ -63,17 +63,27 @@ where
             .expect("DiamondInjector error_sigma must be finite");
         let initial_state_error =
             PolyMatrixNorm::sample_gauss(ctx.clone(), 1, state_cols, initial_sigma);
-        let preimage_norm = compute_preimage_norm(
+        let preimage_sigma = compute_preimage_sigma(
             &ctx.ring_dim_sqrt,
             ctx.m_g as u64,
             &ctx.base,
             Some(self.state_row_size() / DIAMOND_SECRET_SIZE),
             None,
         );
-        let transition_preimage =
-            PolyMatrixNorm::new(ctx.clone(), state_cols, state_cols, preimage_norm.clone(), None);
-        let output_preimage =
-            PolyMatrixNorm::new(ctx.clone(), state_cols, gadget_cols, preimage_norm, None);
+        let transition_preimage = PolyMatrixNorm::fresh_preimage(
+            ctx.clone(),
+            state_cols,
+            state_cols,
+            preimage_sigma.clone(),
+            None,
+        );
+        let output_preimage = PolyMatrixNorm::fresh_preimage(
+            ctx.clone(),
+            state_cols,
+            gadget_cols,
+            preimage_sigma,
+            None,
+        );
         let transition_target_error = PolyMatrixNorm::sample_gauss(
             ctx.clone(),
             self.state_row_size(),
@@ -160,7 +170,7 @@ where
             ?secret_state_factors,
             ?state_errors,
             ?output_preimage,
-            "diamond input-insertion simulator final state bounds",
+            "diamond input-insertion simulator final state sigmas",
         );
 
         DiamondInputErrorSimulation { state_errors, secret_state_factors, output_preimage }

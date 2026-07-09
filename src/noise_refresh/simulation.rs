@@ -18,11 +18,15 @@ use crate::{
         naive_vec::build_noise_refresh_material_circuit,
     },
     poly::{PolyParams, dcrt::poly::DCRTPoly},
-    simulator::{SimulatorContext, error_norm::ErrorNorm, poly_matrix_norm::PolyMatrixNorm},
+    simulator::{
+        SimulatorContext, dependency_set::DependencySet, error_norm::ErrorNorm,
+        poly_matrix_norm::PolyMatrixNorm,
+    },
     slot_transfer::SlotTransferEvaluator,
 };
 use bigdecimal::BigDecimal;
 use num_bigint::BigUint;
+use num_traits::Zero;
 use rayon::prelude::*;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -47,7 +51,7 @@ pub fn max_safe_noise_refresh_v_bits(
     let q_max = q_moduli.iter().copied().max().expect("CRT modulus list must be nonempty");
     let full_q: Arc<BigUint> = params.modulus().into();
     let available = decode_threshold(full_q.as_ref(), &DecodeThreshold::new(q_max)) -
-        &pre_rounding_error.poly_norm.norm;
+        pre_rounding_error.maximum_coefficient_bound();
     max_centered_mask_bits_for_available_range(&available, params.modulus_bits())
 }
 
@@ -322,7 +326,7 @@ where
             candidate,
             valid,
             ?max_valid_bits,
-            worst_pre_rounding_norm = %worst_pre_rounding.poly_norm.norm,
+            worst_pre_rounding_norm = %worst_pre_rounding.poly_norm.sigma,
             "noise-refresh candidate evaluated"
         );
         if valid {
@@ -469,7 +473,7 @@ where
                 let collapsed_column = collapsed_column + &material_decryption_error;
                 refresh_nrow = Some(collapsed_column.nrow);
                 refresh_ncol += collapsed_column.ncol;
-                refresh_entry_norm += collapsed_column.poly_norm.norm;
+                refresh_entry_norm += collapsed_column.poly_norm.sigma;
             }
             let refresh_term = PolyMatrixNorm::new(
                 ctx.clone(),
@@ -689,7 +693,7 @@ where
     for _ in 0..log_base_q {
         refresh_nrow = Some(collapsed_column.nrow);
         refresh_ncol += collapsed_column.ncol;
-        refresh_norm += collapsed_column.poly_norm.norm.clone();
+        refresh_norm += collapsed_column.poly_norm.sigma.clone();
     }
     let refresh_term = PolyMatrixNorm::new(
         ctx.clone(),
@@ -719,8 +723,8 @@ fn worst_pre_rounding_error(simulation: &NoiseRefreshErrorSimulation) -> &PolyMa
         .iter()
         .max_by(|lhs, rhs| {
             lhs.poly_norm
-                .norm
-                .partial_cmp(&rhs.poly_norm.norm)
+                .sigma
+                .partial_cmp(&rhs.poly_norm.sigma)
                 .expect("noise-refresh pre-rounding norms must be comparable")
         })
         .expect("simulation must produce at least one pre-round output")
@@ -758,10 +762,16 @@ fn extrapolate_matrix_norms_to_active_levels(norms: &mut [PolyMatrixNorm], activ
 }
 
 fn scale_error_norm(input: ErrorNorm, scale: &BigDecimal) -> ErrorNorm {
-    ErrorNorm {
-        plaintext_norm: input.plaintext_norm * scale,
-        matrix_norm: input.matrix_norm * scale,
-    }
+    let scale_is_zero = scale.is_zero();
+    let pubkey_deps =
+        if scale_is_zero { DependencySet::empty() } else { input.pubkey_deps.clone() };
+    let is_pubkey_random = if scale_is_zero { false } else { input.is_pubkey_random };
+    ErrorNorm::from_parts(
+        input.plaintext_norm * scale,
+        input.matrix_norm * scale,
+        pubkey_deps,
+        is_pubkey_random,
+    )
 }
 
 struct SymmetricNoiseRefreshPrgErrorPrefix<A>
@@ -951,8 +961,8 @@ where
         .max_by(|lhs, rhs| {
             lhs.matrix_norm
                 .poly_norm
-                .norm
-                .partial_cmp(&rhs.matrix_norm.poly_norm.norm)
+                .sigma
+                .partial_cmp(&rhs.matrix_norm.poly_norm.sigma)
                 .expect("representative material norms must be comparable")
         })
         .expect("representative material circuit must produce output wires")
@@ -1060,14 +1070,14 @@ where
             output_ctx.clone(),
             error_norm.nrow,
             error_norm.ncol,
-            error_norm.poly_norm.norm,
+            error_norm.poly_norm.sigma,
             error_norm.zero_rows,
         ),
         PolyMatrixNorm::new(
             output_ctx,
             mask_norm.nrow,
             mask_norm.ncol,
-            mask_norm.poly_norm.norm,
+            mask_norm.poly_norm.sigma,
             mask_norm.zero_rows,
         ),
     )
@@ -1186,8 +1196,8 @@ where
             .material_error_decryption_error
             .ncol
             .max(prg_prefix.material_mask_decryption_error.ncol),
-        prg_prefix.material_error_decryption_error.poly_norm.norm.clone() * coefficient_scale +
-            prg_prefix.material_mask_decryption_error.poly_norm.norm.clone() * mask_scale,
+        prg_prefix.material_error_decryption_error.poly_norm.sigma.clone() * coefficient_scale +
+            prg_prefix.material_mask_decryption_error.poly_norm.sigma.clone() * mask_scale,
         None,
     )
 }
@@ -1227,7 +1237,7 @@ where
         output_ctx,
         error_norm.nrow,
         error_norm.ncol,
-        error_norm.poly_norm.norm,
+        error_norm.poly_norm.sigma,
         error_norm.zero_rows,
     );
     // One representative CBD ciphertext bounds both CBD error ciphertexts and uniform mask
@@ -1250,14 +1260,12 @@ mod tests {
     };
 
     #[test]
-    fn test_max_safe_noise_refresh_v_bits_accepts_exact_power_of_two_available_range() {
+    fn test_max_safe_noise_refresh_v_bits_reserves_maximum_coefficient_bound() {
         let params = DCRTPolyParams::new(2, 2, 20, 5);
         let (q_moduli, _crt_bits, _crt_depth) = params.to_crt();
         let q_max = q_moduli.iter().copied().max().expect("CRT moduli must be nonempty");
         let full_q: Arc<BigUint> = params.modulus().into();
-        let exact_available = BigDecimal::from(128u32);
-        let pre_rounding_error =
-            decode_threshold(full_q.as_ref(), &DecodeThreshold::new(q_max)) - exact_available;
+        let threshold = decode_threshold(full_q.as_ref(), &DecodeThreshold::new(q_max));
         let ctx = Arc::new(SimulatorContext::new(
             BigDecimal::from(1u32),
             BigDecimal::from(2u32),
@@ -1265,9 +1273,12 @@ mod tests {
             1,
             1,
         ));
-        let pre_rounding = PolyMatrixNorm::new(ctx, 1, 1, pre_rounding_error, None);
+        let pre_rounding = PolyMatrixNorm::new(ctx, 1, 1, BigDecimal::from(2u32), None);
+        let expected_available = threshold - pre_rounding.maximum_coefficient_bound();
+        let expected =
+            max_centered_mask_bits_for_available_range(&expected_available, params.modulus_bits());
 
-        assert_eq!(max_safe_noise_refresh_v_bits(&params, &pre_rounding), Some(8));
+        assert_eq!(max_safe_noise_refresh_v_bits(&params, &pre_rounding), expected);
     }
 
     #[test]

@@ -19,12 +19,38 @@ impl<P: Poly> PolyCircuit<P> {
         PE: PltEvaluator<E>,
         PE: Sync,
     {
+        let one_compact = one.to_compact();
+        let input_compacts = inputs.into_iter().map(E::to_compact).collect();
+        self.eval_from_compacts(
+            params,
+            one_compact,
+            input_compacts,
+            plt_evaluator,
+            slot_transfer_evaluator,
+            parallel_gates,
+        )
+    }
+
+    pub fn eval_from_compacts<E, PE>(
+        &self,
+        params: &E::Params,
+        one_compact: E::Compact,
+        input_compacts: Vec<E::Compact>,
+        plt_evaluator: Option<&PE>,
+        slot_transfer_evaluator: Option<&dyn SlotTransferEvaluator<E>>,
+        parallel_gates: Option<usize>,
+    ) -> Vec<E>
+    where
+        E: Evaluable<P = P>,
+        E::Compact: Send + Sync,
+        PE: PltEvaluator<E>,
+        PE: Sync,
+    {
         let (call_id_base, gate_id_base) = self.eval_gate_id_bases();
         let parallel_gates = crate::env::resolve_circuit_parallel_gates(parallel_gates);
-        let one_compact = Arc::new(one.to_compact());
+        let one_compact = Arc::new(one_compact);
         let one = Arc::new(E::from_compact(params, one_compact.as_ref()));
-        let input_compacts =
-            inputs.into_iter().map(|input| Arc::new(input.to_compact())).collect::<Vec<_>>();
+        let input_compacts = input_compacts.into_iter().map(Arc::new).collect::<Vec<_>>();
         let scoped_gate_ids = self.build_scoped_gate_id_map(&call_id_base, &gate_id_base);
         let call_prefix = ScopedGateKey::from(0u32);
         let outputs = std::thread::scope(|scope| {
@@ -902,32 +928,11 @@ impl<P: Poly> PolyCircuit<P> {
                             .iter()
                             .copied()
                             .for_each(|gate_id| eval_gate(gate_id, eval_params, eval_one));
-                    } else if !regular_chunks.is_empty() {
-                        let mut loaded_curr = Some(load_chunk(regular_chunks[0]));
-                        let mut computed_prev: Option<Vec<ComputedGateCtx<E>>> = None;
-                        for chunk_idx in 0..regular_chunks.len() {
-                            let to_store = computed_prev.take();
-                            let to_compute =
-                                loaded_curr.take().expect("loaded chunk missing in pipeline");
-                            let next_chunk = regular_chunks.get(chunk_idx + 1).copied();
-                            let ((), (computed_curr, loaded_next)) = rayon::join(
-                                || {
-                                    if let Some(computed_chunk) = to_store {
-                                        store_chunk(computed_chunk);
-                                    }
-                                },
-                                || {
-                                    rayon::join(
-                                        || compute_chunk(to_compute),
-                                        || next_chunk.map(load_chunk),
-                                    )
-                                },
-                            );
-                            computed_prev = Some(computed_curr);
-                            loaded_curr = loaded_next;
-                        }
-                        if let Some(last_chunk) = computed_prev.take() {
-                            store_chunk(last_chunk);
+                    } else {
+                        for chunk in regular_chunks {
+                            let loaded = load_chunk(chunk);
+                            let computed = compute_chunk(loaded);
+                            store_chunk(computed);
                         }
                     }
                 }

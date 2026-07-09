@@ -256,14 +256,14 @@ where
         )
     }
 
-    fn sample_and_write_preimage(
+    fn sample_and_write_preimage_columns(
         &self,
         id: &str,
         preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
         state_idx: usize,
-        target: &M,
+        total_cols: usize,
+        mut target_columns: impl FnMut(usize, usize) -> M,
     ) {
-        let total_cols = target.col_size();
         if let Some(chunk_cols) = Self::preimage_chunk_cols(total_cols) {
             let chunk_count = Self::preimage_chunk_count(total_cols, chunk_cols);
             self.remove_matrix_if_exists(id);
@@ -282,13 +282,14 @@ where
                     col_len,
                     "diamond we final preimage: sampling chunk"
                 );
-                let target_chunk = target.slice_columns(col_start, col_start + col_len);
+                let target_chunk = target_columns(col_start, col_len);
                 let preimage =
                     self.sample_target_preimage(preprocess_out, state_idx, &target_chunk);
                 self.write_matrix(&Self::preimage_chunk_id(id, chunk_idx), &preimage);
             }
         } else {
-            let preimage = self.sample_target_preimage(preprocess_out, state_idx, target);
+            let target = target_columns(0, total_cols);
+            let preimage = self.sample_target_preimage(preprocess_out, state_idx, &target);
             self.write_matrix(id, &preimage);
         }
     }
@@ -439,29 +440,56 @@ where
         (one, k_pubkey, witness_pubkeys)
     }
 
-    fn output_preimage_target(
+    fn gadget_row_columns(params: &<M::P as Poly>::Params, col_start: usize, col_len: usize) -> M {
+        assert_eq!(
+            DIAMOND_SECRET_SIZE, 1,
+            "DiamondWE gadget row chunks assume the current one-row Diamond secret"
+        );
+        let col_end =
+            col_start.checked_add(col_len).expect("DiamondWE gadget column range overflow");
+        assert!(
+            col_end <= params.modulus_digits(),
+            "DiamondWE gadget column range out of bounds: col_start={col_start}, col_len={col_len}, modulus_digits={}",
+            params.modulus_digits()
+        );
+        M::from_poly_vec_row(
+            params,
+            (col_start..col_end)
+                .map(|digit| M::P::from_power_of_base_to_constant(params, digit))
+                .collect(),
+        )
+    }
+
+    fn output_preimage_target_columns(
         &self,
         pubkey: &BggPublicKey<M>,
         top_gadget_plaintext: Option<&M::P>,
         bottom_gadget_plaintext: Option<&M::P>,
+        col_start: usize,
+        col_len: usize,
     ) -> M {
         let params = &self.injector.params;
-        let gadget = M::gadget_matrix(params, DIAMOND_SECRET_SIZE);
-        let cols = DIAMOND_SECRET_SIZE
-            .checked_mul(params.modulus_digits())
-            .expect("DiamondWE final gadget column count overflow");
-        let mut top = pubkey.matrix.clone();
+        let col_end =
+            col_start.checked_add(col_len).expect("DiamondWE target column range overflow");
+        let mut top = pubkey.matrix.slice_columns(col_start, col_end);
         if let Some(plaintext) = top_gadget_plaintext {
-            top = top - &(gadget.clone() * plaintext);
+            let gadget = Self::gadget_row_columns(params, col_start, col_len);
+            top = top - &(gadget * plaintext);
         }
-        let mut bottom = M::zero(params, DIAMOND_SECRET_SIZE, cols);
+        let mut bottom = M::zero(params, DIAMOND_SECRET_SIZE, col_len);
         if let Some(plaintext) = bottom_gadget_plaintext {
+            let gadget = Self::gadget_row_columns(params, col_start, col_len);
             bottom = bottom - &(gadget * plaintext);
         }
-        top.concat_rows(&[&bottom])
+        top.concat_rows_owned(vec![bottom])
     }
 
-    fn k_preimage_target(&self, k_pubkey: &BggPublicKey<M>) -> M {
+    fn k_preimage_target_columns(
+        &self,
+        k_pubkey: &BggPublicKey<M>,
+        col_start: usize,
+        col_len: usize,
+    ) -> M {
         let params = &self.injector.params;
         let columns = self.k_public_key_columns();
         assert_eq!(
@@ -469,27 +497,55 @@ where
             (DIAMOND_SECRET_SIZE, columns),
             "DiamondWE k public key must match k_public_key_columns"
         );
+        let col_end =
+            col_start.checked_add(col_len).expect("DiamondWE k target column range overflow");
+        assert!(
+            col_end <= columns,
+            "DiamondWE k target column range out of bounds: col_start={col_start}, col_len={col_len}, columns={columns}"
+        );
         let q: Arc<BigUint> = params.modulus().into();
         let scale = M::P::from_biguint_to_constant(params, q.as_ref() / 2u32);
-        let identity_selector = M::unit_row_vector(params, columns, 0) * &scale;
-        k_pubkey.matrix.concat_rows(&[&identity_selector])
+        let zero = M::P::const_zero(params);
+        let selector = M::from_poly_vec_row(
+            params,
+            (col_start..col_end)
+                .map(|column| if column == 0 { scale.clone() } else { zero.clone() })
+                .collect(),
+        );
+        k_pubkey.matrix.slice_columns(col_start, col_end).concat_rows_owned(vec![selector])
     }
 
-    fn decoder_preimage_target(&self, dec_pubkey_matrix: &M) -> M {
+    fn decoder_preimage_target_columns(
+        &self,
+        dec_pubkey_matrix: &M,
+        col_start: usize,
+        col_len: usize,
+    ) -> M {
         let params = &self.injector.params;
-        let bottom = M::zero(params, DIAMOND_SECRET_SIZE, dec_pubkey_matrix.col_size());
-        dec_pubkey_matrix.concat_rows(&[&bottom])
+        let col_end =
+            col_start.checked_add(col_len).expect("DiamondWE decoder target range overflow");
+        let top = dec_pubkey_matrix.slice_columns(col_start, col_end);
+        let bottom = M::zero(params, DIAMOND_SECRET_SIZE, col_len);
+        top.concat_rows_owned(vec![bottom])
     }
 
-    fn lookup_base_preimage_target(&self, lookup_base_matrix: &M) -> M {
+    fn lookup_base_preimage_target_columns(
+        &self,
+        lookup_base_matrix: &M,
+        col_start: usize,
+        col_len: usize,
+    ) -> M {
         assert_eq!(
             lookup_base_matrix.row_size(),
             DIAMOND_SECRET_SIZE,
             "DiamondWE lookup base matrix row count must match the Diamond secret size"
         );
         let params = &self.injector.params;
-        let lookup_bottom = M::zero(params, DIAMOND_SECRET_SIZE, lookup_base_matrix.col_size());
-        lookup_base_matrix.concat_rows(&[&lookup_bottom])
+        let col_end =
+            col_start.checked_add(col_len).expect("DiamondWE lookup target range overflow");
+        let top = lookup_base_matrix.slice_columns(col_start, col_end);
+        let bottom = M::zero(params, DIAMOND_SECRET_SIZE, col_len);
+        top.concat_rows_owned(vec![bottom])
     }
 
     fn sample_r_columns(&self, hash_key: [u8; 32], col_start: usize, col_len: usize) -> M {
@@ -676,54 +732,73 @@ where
             .expect("DiamondWE circuit must produce one output public key");
 
         let one_plaintext = M::P::const_one(params);
-        let one_preimage_target =
-            self.output_preimage_target(&one_pubkey, Some(&one_plaintext), None);
-        self.sample_and_write_preimage(
+        self.sample_and_write_preimage_columns(
             Self::one_preimage_id(),
             &preprocess_out,
             0,
-            &one_preimage_target,
+            one_pubkey.matrix.col_size(),
+            |col_start, col_len| {
+                self.output_preimage_target_columns(
+                    &one_pubkey,
+                    Some(&one_plaintext),
+                    None,
+                    col_start,
+                    col_len,
+                )
+            },
         );
         for bit_idx in 0..self.witness_size {
             let pubkey = self.sample_bgg_public_key(hash_key, bit_idx + 1);
             let digit_idx = bit_idx / self.injector.batch_bits();
             let bit_in_digit = bit_idx % self.injector.batch_bits();
             let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
-            let preimage_target = self.output_preimage_target(&pubkey, None, Some(&one_plaintext));
-            self.sample_and_write_preimage(
+            self.sample_and_write_preimage_columns(
                 &Self::witness_preimage_id(bit_idx),
                 &preprocess_out,
                 state_idx,
-                &preimage_target,
+                pubkey.matrix.col_size(),
+                |col_start, col_len| {
+                    self.output_preimage_target_columns(
+                        &pubkey,
+                        None,
+                        Some(&one_plaintext),
+                        col_start,
+                        col_len,
+                    )
+                },
             );
         }
         let k_pubkey = self.sample_k_public_key(hash_key);
-        let k_preimage_target = self.k_preimage_target(&k_pubkey);
-        self.sample_and_write_preimage(
+        self.sample_and_write_preimage_columns(
             Self::k_preimage_id(),
             &preprocess_out,
             0,
-            &k_preimage_target,
+            k_pubkey.matrix.col_size(),
+            |col_start, col_len| self.k_preimage_target_columns(&k_pubkey, col_start, col_len),
         );
         if let Some(lookup_base_matrix) = self.enc_lookup_base_matrix.as_ref() {
-            let lookup_base_preimage_target = self.lookup_base_preimage_target(lookup_base_matrix);
-            self.sample_and_write_preimage(
+            self.sample_and_write_preimage_columns(
                 Self::enc_lookup_base_preimage_id(),
                 &preprocess_out,
                 0,
-                &lookup_base_preimage_target,
+                lookup_base_matrix.col_size(),
+                |col_start, col_len| {
+                    self.lookup_base_preimage_target_columns(lookup_base_matrix, col_start, col_len)
+                },
             );
         }
 
         let r = self.sample_r(hash_key);
         let dec_term = one_pubkey - &out_pubkey;
         let dec_pubkey_matrix = k_pubkey.matrix + &dec_term.matrix.mul_decompose(&r);
-        let decoder_preimage_target = self.decoder_preimage_target(&dec_pubkey_matrix);
-        self.sample_and_write_preimage(
+        self.sample_and_write_preimage_columns(
             Self::decoder_preimage_id(),
             &preprocess_out,
             0,
-            &decoder_preimage_target,
+            dec_pubkey_matrix.col_size(),
+            |col_start, col_len| {
+                self.decoder_preimage_target_columns(&dec_pubkey_matrix, col_start, col_len)
+            },
         );
 
         DiamondWECiphertext { circuit, instance: instance.clone(), hash_key, preprocess_out }
@@ -1194,8 +1269,8 @@ mod tests {
         );
 
         let k_pubkey = we.sample_k_public_key(hash_key);
-        let target = we.k_preimage_target(&k_pubkey);
         let columns = we.k_public_key_columns();
+        let target = we.k_preimage_target_columns(&k_pubkey, 0, columns);
         assert_eq!(target.size(), (2 * DIAMOND_SECRET_SIZE, columns));
         assert_eq!(target.slice_rows(0, DIAMOND_SECRET_SIZE), k_pubkey.matrix);
 

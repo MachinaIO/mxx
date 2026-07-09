@@ -928,32 +928,11 @@ impl<P: Poly> PolyCircuit<P> {
                             .iter()
                             .copied()
                             .for_each(|gate_id| eval_gate(gate_id, eval_params, eval_one));
-                    } else if !regular_chunks.is_empty() {
-                        let mut loaded_curr = Some(load_chunk(regular_chunks[0]));
-                        let mut computed_prev: Option<Vec<ComputedGateCtx<E>>> = None;
-                        for chunk_idx in 0..regular_chunks.len() {
-                            let to_store = computed_prev.take();
-                            let to_compute =
-                                loaded_curr.take().expect("loaded chunk missing in pipeline");
-                            let next_chunk = regular_chunks.get(chunk_idx + 1).copied();
-                            let ((), (computed_curr, loaded_next)) = rayon::join(
-                                || {
-                                    if let Some(computed_chunk) = to_store {
-                                        store_chunk(computed_chunk);
-                                    }
-                                },
-                                || {
-                                    rayon::join(
-                                        || compute_chunk(to_compute),
-                                        || next_chunk.map(load_chunk),
-                                    )
-                                },
-                            );
-                            computed_prev = Some(computed_curr);
-                            loaded_curr = loaded_next;
-                        }
-                        if let Some(last_chunk) = computed_prev.take() {
-                            store_chunk(last_chunk);
+                    } else {
+                        for chunk in regular_chunks {
+                            let loaded = load_chunk(chunk);
+                            let computed = compute_chunk(loaded);
+                            store_chunk(computed);
                         }
                     }
                 }

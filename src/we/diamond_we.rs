@@ -426,6 +426,7 @@ where
         BggPublicKey::new(k_matrix, false)
     }
 
+    #[cfg(test)]
     fn sample_bgg_public_keys(
         &self,
         hash_key: [u8; 32],
@@ -508,13 +509,6 @@ where
 
     fn sample_r(&self, hash_key: [u8; 32]) -> M {
         self.sample_r_columns(hash_key, 0, self.k_public_key_columns())
-    }
-
-    fn instance_pubkeys(&self, one: &BggPublicKey<M>, instance: &[bool]) -> Vec<BggPublicKey<M>> {
-        instance
-            .iter()
-            .map(|bit| one.small_scalar_mul(&self.injector.params, &[*bit as u32]))
-            .collect()
     }
 
     fn pack_witness_digits(&self, witness: &[bool]) -> Vec<u32> {
@@ -654,16 +648,23 @@ where
         let k = if *msg { M::P::const_one(params) } else { M::P::const_zero(params) };
         let preprocess_out = self.injector.preprocess(&self.artifact_dir, &k);
         let hash_key = rand::random::<[u8; 32]>();
-        let (one_pubkey, k_pubkey, witness_pubkeys) = self.sample_bgg_public_keys(hash_key);
-        let instance_pubkeys = self.instance_pubkeys(&one_pubkey, instance);
-        let mut input_pubkeys = witness_pubkeys.clone();
-        input_pubkeys.extend(instance_pubkeys);
+        let one_pubkey = self.sample_bgg_public_key(hash_key, 0);
+        let one_pubkey_compact = one_pubkey.clone().to_compact();
+        let zero_pubkey_compact = one_pubkey.small_scalar_mul(params, &[0]).to_compact();
+        let mut input_pubkey_compacts = Vec::with_capacity(circuit.num_input());
+        for bit_idx in 0..self.witness_size {
+            input_pubkey_compacts
+                .push(self.sample_bgg_public_key(hash_key, bit_idx + 1).to_compact());
+        }
+        input_pubkey_compacts.extend(instance.iter().map(|bit| {
+            if *bit { one_pubkey_compact.clone() } else { zero_pubkey_compact.clone() }
+        }));
 
         let out_pubkey = circuit
-            .eval(
+            .eval_from_compacts(
                 params,
-                one_pubkey.clone(),
-                input_pubkeys,
+                one_pubkey_compact,
+                input_pubkey_compacts,
                 self.pk_lookup_evaluator.as_ref(),
                 self.pk_slot_transfer_evaluator
                     .as_ref()
@@ -683,11 +684,12 @@ where
             0,
             &one_preimage_target,
         );
-        for (bit_idx, pubkey) in witness_pubkeys.iter().enumerate() {
+        for bit_idx in 0..self.witness_size {
+            let pubkey = self.sample_bgg_public_key(hash_key, bit_idx + 1);
             let digit_idx = bit_idx / self.injector.batch_bits();
             let bit_in_digit = bit_idx % self.injector.batch_bits();
             let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
-            let preimage_target = self.output_preimage_target(pubkey, None, Some(&one_plaintext));
+            let preimage_target = self.output_preimage_target(&pubkey, None, Some(&one_plaintext));
             self.sample_and_write_preimage(
                 &Self::witness_preimage_id(bit_idx),
                 &preprocess_out,
@@ -695,6 +697,7 @@ where
                 &preimage_target,
             );
         }
+        let k_pubkey = self.sample_k_public_key(hash_key);
         let k_preimage_target = self.k_preimage_target(&k_pubkey);
         self.sample_and_write_preimage(
             Self::k_preimage_id(),
@@ -775,7 +778,7 @@ where
             cols = one_pubkey.matrix.col_size(),
             "diamond we dec: sample one public key done"
         );
-        let mut input_encodings =
+        let mut input_encoding_compacts =
             Vec::with_capacity(self.witness_size.saturating_add(ct.instance.len()));
         for bit_idx in 0..self.witness_size {
             info!(
@@ -834,20 +837,18 @@ where
             );
             drop(state);
             info!(bit_idx, "diamond we dec: build witness output encoding begin");
-            input_encodings.push(self.injector.build_output_encoding(
-                vector,
-                pubkey,
-                Some(plaintext),
-            ));
+            let encoding = self.injector.build_output_encoding(vector, pubkey, Some(plaintext));
+            info!(bit_idx, "diamond we dec: compact witness output encoding begin");
+            input_encoding_compacts.push(encoding.to_compact());
             info!(
                 bit_idx,
-                input_encoding_count = input_encodings.len(),
+                input_encoding_count = input_encoding_compacts.len(),
                 "diamond we dec: build witness output encoding done"
             );
         }
         drop(state_bytes);
         info!(
-            input_encoding_count = input_encodings.len(),
+            input_encoding_count = input_encoding_compacts.len(),
             elapsed_ms = started.elapsed().as_millis(),
             "diamond we dec: witness encodings complete"
         );
@@ -954,13 +955,11 @@ where
         );
         info!(
             instance_len = ct.instance.len(),
-            input_encoding_count = input_encodings.len(),
+            input_encoding_count = input_encoding_compacts.len(),
             "diamond we dec: compact input encodings begin"
         );
         let zero_encoding_compact = one_encoding.small_scalar_mul(params, &[0]).to_compact();
         let one_encoding_compact = one_encoding.to_compact();
-        let mut input_encoding_compacts =
-            input_encodings.into_iter().map(Evaluable::to_compact).collect::<Vec<_>>();
         let witness_input_count = input_encoding_compacts.len();
         input_encoding_compacts.extend(ct.instance.iter().map(|bit| {
             if *bit { one_encoding_compact.clone() } else { zero_encoding_compact.clone() }

@@ -406,11 +406,14 @@ where
         let lookup_top = enc_lookup_base_matrix.clone();
         let lookup_bottom = M::zero(params, DIAMOND_SECRET_SIZE, lookup_top.col_size());
         let lookup_target = lookup_top.concat_rows(&[&lookup_bottom]);
-        let (lookup_trapdoor, lookup_public_matrix) = preprocess_out.final_checkpoint(0);
+        let lookup_trapdoor =
+            TS::trapdoor_from_bytes(params, preprocess_out.final_trapdoor_bytes(0))
+                .expect("DiamondInjector final trapdoor checkpoint must decode");
+        let lookup_public_matrix = preprocess_out.final_public_matrix(params, 0);
         let lookup_base_preimage = TS::new(params, self.injector.trapdoor_sigma).preimage(
             params,
-            lookup_trapdoor,
-            lookup_public_matrix,
+            &lookup_trapdoor,
+            &lookup_public_matrix,
             &lookup_target,
         );
         Self::write_io_matrix(dir_path, Self::enc_lookup_base_preimage_id(), &lookup_base_preimage);
@@ -498,11 +501,14 @@ where
             DIAMOND_SECRET_SIZE,
             DirectoryDecoderArtifacts::new(dir_path, "diamond_io"),
             |_, target| {
-                let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(0);
+                let trapdoor =
+                    TS::trapdoor_from_bytes(params, preprocess_out.final_trapdoor_bytes(0))
+                        .expect("DiamondInjector final trapdoor checkpoint must decode");
+                let public_matrix = preprocess_out.final_public_matrix(params, 0);
                 TS::new(params, self.injector.trapdoor_sigma).preimage(
                     params,
-                    trapdoor,
-                    public_matrix,
+                    &trapdoor,
+                    &public_matrix,
                     target,
                 )
             },

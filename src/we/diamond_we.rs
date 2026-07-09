@@ -247,11 +247,16 @@ where
         state_idx: usize,
         target: &M,
     ) -> M {
-        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(state_idx);
+        let trapdoor = TS::trapdoor_from_bytes(
+            &self.injector.params,
+            preprocess_out.final_trapdoor_bytes(state_idx),
+        )
+        .expect("DiamondInjector final trapdoor checkpoint must decode");
+        let public_matrix = preprocess_out.final_public_matrix(&self.injector.params, state_idx);
         TS::new(&self.injector.params, self.injector.trapdoor_sigma).preimage(
             &self.injector.params,
-            trapdoor,
-            public_matrix,
+            &trapdoor,
+            &public_matrix,
             target,
         )
     }

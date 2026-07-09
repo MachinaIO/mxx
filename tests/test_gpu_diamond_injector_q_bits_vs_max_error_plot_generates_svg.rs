@@ -300,7 +300,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
     );
 
     let secret_product = reconstruct_secret_product(&params, dir.path(), &input_digits);
-    let base_public_matrix = preprocess_out.final_pub_matrices[0].clone();
+    let base_public_matrix = preprocess_out.final_public_matrix(&injector.params, 0);
     let base_selector =
         GpuDCRTPolyMatrix::from_poly_vec_row(&params, vec![secret_product.entry(0, 0), k]);
     assert_state_residual_below_bound(
@@ -321,7 +321,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
                 &params,
                 vec![secret_product.entry(0, 0), secret_product.entry(0, 0) * &bit_plaintext],
             );
-            let bit_public_matrix = preprocess_out.final_pub_matrices[state_idx].clone();
+            let bit_public_matrix = preprocess_out.final_public_matrix(&injector.params, state_idx);
             assert_state_residual_below_bound(
                 &format!("bit_state_{state_idx}"),
                 &params,

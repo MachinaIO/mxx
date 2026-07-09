@@ -827,7 +827,7 @@ mod tests {
             );
             secret_matrix = secret_matrix * secret_mask;
         }
-        let base_public_matrix = preprocess_out.final_pub_matrices[0].clone();
+        let base_public_matrix = preprocess_out.final_public_matrix(&injector.params, 0);
         let base_selector = GpuDCRTPolyMatrix::from_poly_vec_row(
             &params,
             vec![secret_matrix.entry(0, 0), k.clone()],
@@ -839,7 +839,8 @@ mod tests {
                 let state_idx = injector.bit_state_idx(digit_idx, bit_idx);
                 let bit_value = ((digits[digit_idx] as usize) >> bit_idx) & 1;
                 let bit_plaintext = TestPoly::from_usize_to_constant(&params, bit_value);
-                let bit_public_matrix = preprocess_out.final_pub_matrices[state_idx].clone();
+                let bit_public_matrix =
+                    preprocess_out.final_public_matrix(&injector.params, state_idx);
                 let bit_selector = GpuDCRTPolyMatrix::from_poly_vec_row(
                     &params,
                     vec![secret_matrix.entry(0, 0), secret_matrix.entry(0, 0) * &bit_plaintext],

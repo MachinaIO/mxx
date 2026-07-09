@@ -616,11 +616,14 @@ where
             bottom = bottom - &(gadget * plaintext);
         }
         let target = top.concat_rows(&[&bottom]);
-        let (trapdoor, public_matrix) = preprocess_out.final_checkpoint(state_idx);
+        let trapdoor =
+            TS::trapdoor_from_bytes(params, preprocess_out.final_trapdoor_bytes(state_idx))
+                .expect("DiamondInjector final trapdoor checkpoint must decode");
+        let public_matrix = preprocess_out.final_public_matrix(params, state_idx);
         TS::new(params, self.injector.trapdoor_sigma).preimage(
             params,
-            trapdoor,
-            public_matrix,
+            &trapdoor,
+            &public_matrix,
             &target,
         )
     }

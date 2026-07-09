@@ -273,28 +273,53 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         );
 
         let perturb_start = Instant::now();
-        let perturbed_syndrome = {
-            let p1_rows = p1.row_size();
-            let p2_rows = p2.row_size();
-            debug_assert_eq!(
-                public_matrix.col_size(),
-                p1_rows + p2_rows,
-                "public matrix columns must match perturbation rows",
-            );
-            let public_left = public_matrix.slice(0, d, 0, p1_rows);
+        let p1_rows = p1.row_size();
+        let p2_rows = p2.row_size();
+        debug_assert_eq!(
+            public_matrix.col_size(),
+            p1_rows + p2_rows,
+            "public matrix columns must match perturbation rows",
+        );
+        let mut perturbed_syndrome = target.clone();
+        {
             let public_right = public_matrix.slice(0, d, p1_rows, p1_rows + p2_rows);
-            let p_hat_image = (&public_left * &p1) + (&public_right * &p2);
-            let p_hat_image = if p_hat_image.col_size() == target_cols {
-                p_hat_image
+            let right_image = &public_right * &p2;
+            let right_image = if right_image.col_size() == target_cols {
+                right_image
             } else {
-                p_hat_image.slice_columns(0, target_cols)
+                right_image.slice_columns(0, target_cols)
             };
-            target - &p_hat_image
-        };
+            perturbed_syndrome.sub_in_place(&right_image);
+        }
+        {
+            let public_left = public_matrix.slice(0, d, 0, p1_rows);
+            let left_image = &public_left * &p1;
+            let left_image = if left_image.col_size() == target_cols {
+                left_image
+            } else {
+                left_image.slice_columns(0, target_cols)
+            };
+            perturbed_syndrome.sub_in_place(&left_image);
+        }
         tracing::debug!(
             elapsed_ms = perturb_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: computed perturbed_syndrome"
         );
+
+        let assemble_start = Instant::now();
+        let p1_level = p1.level();
+        let p1_is_ntt = p1.is_ntt();
+        let mut out = GpuDCRTPolyMatrix::new_empty_with_state(
+            params,
+            p1_rows + p2_rows,
+            target_cols,
+            p1_level,
+            p1_is_ntt,
+        );
+        out.copy_block_from(&p1, 0, 0, 0, 0, p1_rows, target_cols);
+        out.copy_block_from(&p2, p1_rows, 0, 0, 0, p2_rows, target_cols);
+        drop(p1);
+        drop(p2);
 
         let gauss_start = Instant::now();
         let z_hat_mat =
@@ -310,19 +335,6 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             elapsed_ms = r_mul_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: computed r * z_hat"
         );
-        let assemble_start = Instant::now();
-        let mut out = GpuDCRTPolyMatrix::new_empty_with_state(
-            params,
-            p1.row_size() + p2.row_size(),
-            target_cols,
-            p1.level(),
-            p1.is_ntt(),
-        );
-        out.copy_block_from(&p1, 0, 0, 0, 0, p1.row_size(), target_cols);
-        out.copy_block_from(&p2, p1.row_size(), 0, 0, 0, p2.row_size(), target_cols);
-        drop(p1);
-        drop(p2);
-
         out.add_block_from(&r_z_hat, 0, 0, 0, 0, r_z_hat.row_size(), target_cols);
         tracing::debug!(
             elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,

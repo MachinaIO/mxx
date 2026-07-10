@@ -600,21 +600,19 @@ where
         let state_cols = self.state_col_size(&self.params);
         info!("diamond injector gpu preprocess: starting");
 
-        // Persist the empty-prefix seed once. This seed is not a trapdoor
-        // preimage; it is the initial encoding that online evaluation uses as
-        // p_{epsilon,0} before any digit transition is applied.
+        // The empty-prefix seed embeds the encrypted message k. Rebuild it for
+        // every encryption while reusing the message-independent secret and B
+        // checkpoint.
         let secret_epsilon_bytes =
             self.load_or_sample_secret_epsilon_bytes(dir_path, self.secret_epsilon_id());
-        if !self.matrix_exists(dir_path, self.p_epsilon_id()) {
-            let (b0_bytes, _) = self.load_or_sample_b_checkpoint_bytes(dir_path, 0, 0);
-            let b0_matrix = M::from_compact_bytes(&self.params, &b0_bytes);
-            let secret_epsilon = M::from_compact_bytes(&self.params, &secret_epsilon_bytes);
-            let p_epsilon = self.build_initial_encoding(&b0_matrix, &secret_epsilon, k);
-            self.write_matrix(dir_path, self.p_epsilon_id(), &p_epsilon);
-            drop(p_epsilon);
-            drop(secret_epsilon);
-            drop(b0_matrix);
-        }
+        let (b0_bytes, _) = self.load_or_sample_b_checkpoint_bytes(dir_path, 0, 0);
+        let b0_matrix = M::from_compact_bytes(&self.params, &b0_bytes);
+        let secret_epsilon = M::from_compact_bytes(&self.params, &secret_epsilon_bytes);
+        let p_epsilon = self.build_initial_encoding(&b0_matrix, &secret_epsilon, k);
+        self.write_matrix(dir_path, self.p_epsilon_id(), &p_epsilon);
+        drop(p_epsilon);
+        drop(secret_epsilon);
+        drop(b0_matrix);
 
         let mut total_tasks = 0usize;
         let mut completed_tasks = 0usize;

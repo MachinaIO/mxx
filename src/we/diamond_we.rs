@@ -457,12 +457,9 @@ where
             "DiamondWE gadget column range out of bounds: col_start={col_start}, col_len={col_len}, modulus_digits={}",
             params.modulus_digits()
         );
-        M::from_poly_vec_row(
-            params,
-            (col_start..col_end)
-                .map(|digit| M::P::from_power_of_base_to_constant(params, digit))
-                .collect(),
-        )
+        // Full DCRT gadget columns are tower-local CRT idempotents. A global
+        // base power is not equivalent once the modulus has multiple towers.
+        M::gadget_matrix(params, DIAMOND_SECRET_SIZE).slice_columns(col_start, col_end)
     }
 
     fn output_preimage_target_columns(
@@ -1204,6 +1201,21 @@ mod tests {
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
     >;
+
+    #[test]
+    fn test_diamond_we_gadget_row_chunks_match_full_dcrt_gadget() {
+        let params = DCRTPolyParams::default();
+        let full = DCRTPolyMatrix::gadget_matrix(&params, DIAMOND_SECRET_SIZE);
+
+        for col_start in 0..params.modulus_digits() {
+            let col_len = (params.modulus_digits() - col_start).min(3);
+            assert_eq!(
+                TestDiamondWE::gadget_row_columns(&params, col_start, col_len),
+                full.slice_columns(col_start, col_start + col_len),
+                "DiamondWE gadget chunk must preserve tower-local DCRT columns at {col_start}"
+            );
+        }
+    }
 
     #[test]
     fn test_diamond_we_column_window_public_keys_match_contiguous_sampler() {

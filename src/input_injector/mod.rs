@@ -735,17 +735,16 @@ where
                 b_checkpoints.push(level_b);
             }
 
-            // Sample the empty-prefix seed once and persist it if it does not
-            // already exist.
+            // The empty-prefix seed embeds the encrypted message k. Rebuild it
+            // for every encryption while reusing the message-independent
+            // secret and B checkpoint.
             let secret_epsilon =
                 self.load_or_sample_secret_epsilon(dir_path, self.secret_epsilon_id());
-            if !self.matrix_exists(dir_path, self.p_epsilon_id()) {
-                self.write_matrix(
-                    dir_path,
-                    self.p_epsilon_id(),
-                    &self.build_initial_encoding(&b_checkpoints[0][0], &secret_epsilon, k),
-                );
-            }
+            self.write_matrix(
+                dir_path,
+                self.p_epsilon_id(),
+                &self.build_initial_encoding(&b_checkpoints[0][0], &secret_epsilon, k),
+            );
 
             let state_cols = self.state_col_size(&self.params);
 
@@ -887,6 +886,7 @@ mod tests {
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
     >;
+    type TestPoly = <DCRTPolyMatrix as PolyMatrix>::P;
 
     fn assert_poly_matrix_bound_eq(actual: &PolyMatrixNorm, expected: &PolyMatrixNorm) {
         assert_eq!(actual.nrow, expected.nrow);
@@ -906,8 +906,6 @@ mod tests {
     #[sequential_test::sequential]
     #[test]
     fn test_diamond_injector_online_eval_returns_exact_bgg_relations() {
-        type TestPoly = <DCRTPolyMatrix as PolyMatrix>::P;
-
         let params = DCRTPolyParams::default();
         let input_count = 3;
         let base = 4;
@@ -959,7 +957,7 @@ mod tests {
     #[test]
     fn test_diamond_injector_simulate_output_error_bounds_matches_repeated_preimage_bound() {
         let params = DCRTPolyParams::default();
-        let injector = TestInjector::new(params.clone(), 3, 4, 2, 4.578, 3.0);
+        let injector = TestInjector::new(params.clone(), 3, 4, 2, 6.0, 3.0);
         let batch_bits = injector.batch_bits();
 
         let simulated = injector.simulate_output_error_bounds();
@@ -991,7 +989,7 @@ mod tests {
             ctx.m_g as u64,
             &ctx.base,
             Some(injector.state_row_size() / DIAMOND_SECRET_SIZE),
-            None,
+            Some(injector.trapdoor_sigma),
         );
         let expected_transition = PolyMatrixNorm::fresh_preimage(
             ctx.clone(),
@@ -1082,6 +1080,31 @@ mod tests {
         assert_poly_matrix_bounds_eq(&simulated.state_errors, &expected_state_errors);
         assert_poly_matrix_bounds_eq(&simulated.secret_state_factors, &expected_secret_factors);
         assert_poly_matrix_bound_eq(&simulated.output_preimage, &expected_output);
+    }
+
+    #[test]
+    fn test_diamond_injector_preprocess_refreshes_message_dependent_initial_state() {
+        let params = DCRTPolyParams::default();
+        let injector = TestInjector::new(params.clone(), 1, 2, 1, 4.578, 0.0);
+        let dir = tempdir().expect("temporary directory should be created");
+        let zero = TestPoly::const_zero(&params);
+        let one = TestPoly::const_one(&params);
+
+        injector.preprocess(dir.path(), &one);
+        let initial_one = injector.read_matrix(dir.path(), injector.p_epsilon_id());
+        injector.preprocess(dir.path(), &zero);
+        let initial_zero = injector.read_matrix(dir.path(), injector.p_epsilon_id());
+
+        let secret = injector.read_matrix(dir.path(), injector.secret_epsilon_id());
+        let b0 = injector.read_matrix(dir.path(), &injector.b_matrix_id(0, 0));
+        let expected_zero =
+            DCRTPolyMatrix::from_poly_vec_row(&params, vec![secret.entry(0, 0), zero]) * &b0;
+        let expected_one =
+            DCRTPolyMatrix::from_poly_vec_row(&params, vec![secret.entry(0, 0), one]) * &b0;
+
+        assert_eq!(initial_one, expected_one);
+        assert_eq!(initial_zero, expected_zero);
+        assert_ne!(initial_one, initial_zero);
     }
 
     #[test]

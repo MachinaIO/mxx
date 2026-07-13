@@ -560,6 +560,11 @@ where
             store_wave(outputs);
         }
 
+        // Each shared device context owns every input state for this level.
+        // Release those matrices before assembling the next-level states on
+        // the base device so both complete levels are not resident at once.
+        drop(shared_by_device);
+
         family_specs
             .into_iter()
             .map(|(family, spec)| {

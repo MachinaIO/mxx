@@ -58,7 +58,7 @@ struct DiamondEvalTask {
 }
 
 struct DiamondEvalFamilySpec {
-    lhs_bytes: Arc<[u8]>,
+    lhs_chunk_bytes: Vec<Arc<[u8]>>,
     rhs_chunk_bytes: Vec<Arc<[u8]>>,
 }
 
@@ -68,7 +68,7 @@ where
 {
     device_id: i32,
     params: <M::P as Poly>::Params,
-    lhs_by_family: HashMap<DiamondEvalFamily, M>,
+    lhs: M,
 }
 
 struct LoadedDiamondEvalTask<M>
@@ -143,19 +143,17 @@ where
 
     fn prepare_gpu_eval_shared(
         &self,
-        family_specs: &HashMap<DiamondEvalFamily, DiamondEvalFamilySpec>,
+        spec: &DiamondEvalFamilySpec,
     ) -> Vec<GpuDiamondEvalShared<M>> {
         self.effective_gpu_device_ids()
             .into_par_iter()
             .map(|device_id| {
                 let local_params = self.params.params_for_device(device_id);
-                let lhs_by_family = family_specs
-                    .iter()
-                    .map(|(family, spec)| {
-                        (*family, M::from_compact_bytes(&local_params, spec.lhs_bytes.as_ref()))
-                    })
-                    .collect::<HashMap<_, _>>();
-                GpuDiamondEvalShared { device_id, params: local_params, lhs_by_family }
+                let lhs = concat_chunk_bytes_on_base::<M, Arc<[u8]>>(
+                    &local_params,
+                    spec.lhs_chunk_bytes.clone(),
+                );
+                GpuDiamondEvalShared { device_id, params: local_params, lhs }
             })
             .collect()
     }
@@ -435,165 +433,137 @@ where
     fn gpu_left_mul_families(
         &self,
         family_specs: HashMap<DiamondEvalFamily, DiamondEvalFamilySpec>,
-    ) -> HashMap<DiamondEvalFamily, M> {
+    ) -> HashMap<DiamondEvalFamily, Vec<Vec<u8>>> {
         if family_specs.is_empty() {
             return HashMap::new();
         }
 
-        let shared_by_device = self.prepare_gpu_eval_shared(&family_specs);
-        let device_count = shared_by_device.len().max(1);
-        let tasks = family_specs
-            .iter()
-            .flat_map(|(family, spec)| {
-                (0..spec.rhs_chunk_bytes.len())
-                    .map(move |chunk_idx| DiamondEvalTask { family: *family, chunk_idx })
-            })
-            .collect::<Vec<_>>();
-        let task_batches = round_robin_batches(&tasks, device_count);
-        let wave_count = task_batches.iter().map(Vec::len).max().unwrap_or(0);
-
-        let load_wave = |wave_idx: usize| {
-            let loaded_wave = task_batches
-                .par_iter()
-                .zip(shared_by_device.par_iter())
-                .enumerate()
-                .filter_map(|(device_slot, (batch, shared))| {
-                    let task = batch.get(wave_idx).copied()?;
-                    let load_started = Instant::now();
-                    let rhs_bytes = family_specs
-                        .get(&task.family)
-                        .unwrap_or_else(|| {
-                            panic!("missing rhs bytes for diamond eval family {:?}", task.family)
-                        })
-                        .rhs_chunk_bytes[task.chunk_idx]
-                        .clone();
-                    let rhs_chunk = M::from_compact_bytes(&shared.params, rhs_bytes.as_ref());
-                    debug!(
-                        device_id = shared.device_id,
-                        family = ?task.family,
-                        chunk_idx = task.chunk_idx,
-                        load_s = maybe_elapsed_s(load_started),
-                        "diamond injector gpu online_eval: loaded rhs chunk"
-                    );
-                    Some(LoadedDiamondEvalTask {
-                        device_slot,
-                        task,
-                        rhs_chunk,
-                        load_s: maybe_elapsed_s(load_started),
-                    })
-                })
+        let mut family_outputs = HashMap::with_capacity(family_specs.len());
+        for (family, spec) in family_specs {
+            // Keep only one input state resident on each GPU. The number of
+            // Diamond states grows with every witness digit, so replicating all
+            // families on every device makes VRAM grow with witness size.
+            let shared_by_device = self.prepare_gpu_eval_shared(&spec);
+            let device_count = shared_by_device.len().max(1);
+            let tasks = (0..spec.rhs_chunk_bytes.len())
+                .map(|chunk_idx| DiamondEvalTask { family, chunk_idx })
                 .collect::<Vec<_>>();
-            (!loaded_wave.is_empty()).then_some(loaded_wave)
-        };
+            let task_batches = round_robin_batches(&tasks, device_count);
+            let wave_count = task_batches.iter().map(Vec::len).max().unwrap_or(0);
 
-        let compute_wave = |loaded_wave: Vec<LoadedDiamondEvalTask<M>>| {
-            loaded_wave
-                .into_par_iter()
-                .map(|loaded| {
-                    let shared = &shared_by_device[loaded.device_slot];
-                    let compute_started = Instant::now();
-                    let lhs = shared.lhs_by_family.get(&loaded.task.family).unwrap_or_else(|| {
-                        panic!("missing lhs for diamond eval family {:?}", loaded.task.family)
-                    });
-                    let output = lhs.clone() * &loaded.rhs_chunk;
-                    ComputedDiamondEvalTask {
-                        task: loaded.task,
-                        output,
-                        load_s: loaded.load_s,
-                        compute_s: maybe_elapsed_s(compute_started),
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
+            let load_wave = |wave_idx: usize| {
+                let loaded_wave = task_batches
+                    .par_iter()
+                    .zip(shared_by_device.par_iter())
+                    .enumerate()
+                    .filter_map(|(device_slot, (batch, shared))| {
+                        let task = batch.get(wave_idx).copied()?;
+                        let load_started = Instant::now();
+                        let rhs_bytes = spec.rhs_chunk_bytes[task.chunk_idx].clone();
+                        let rhs_chunk = M::from_compact_bytes(&shared.params, rhs_bytes.as_ref());
+                        debug!(
+                            device_id = shared.device_id,
+                            family = ?task.family,
+                            chunk_idx = task.chunk_idx,
+                            load_s = maybe_elapsed_s(load_started),
+                            "diamond injector gpu online_eval: loaded rhs chunk"
+                        );
+                        Some(LoadedDiamondEvalTask {
+                            device_slot,
+                            task,
+                            rhs_chunk,
+                            load_s: maybe_elapsed_s(load_started),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (!loaded_wave.is_empty()).then_some(loaded_wave)
+            };
 
-        let mut output_buffers = family_specs
-            .iter()
-            .map(|(family, spec)| (*family, vec![None; spec.rhs_chunk_bytes.len()]))
-            .collect::<HashMap<_, _>>();
+            let compute_wave = |loaded_wave: Vec<LoadedDiamondEvalTask<M>>| {
+                loaded_wave
+                    .into_par_iter()
+                    .map(|loaded| {
+                        let shared = &shared_by_device[loaded.device_slot];
+                        let compute_started = Instant::now();
+                        let output = shared.lhs.clone() * &loaded.rhs_chunk;
+                        ComputedDiamondEvalTask {
+                            task: loaded.task,
+                            output,
+                            load_s: loaded.load_s,
+                            compute_s: maybe_elapsed_s(compute_started),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
 
-        let mut store_wave = |outputs: Vec<ComputedDiamondEvalTask<M>>| {
-            for output in outputs {
-                let store_started = Instant::now();
-                let bytes = output.output.into_compact_bytes();
-                output_buffers.get_mut(&output.task.family).unwrap_or_else(|| {
-                    panic!("missing output buffer for diamond eval family {:?}", output.task.family)
-                })[output.task.chunk_idx] = Some(bytes);
-                debug!(
-                    family = ?output.task.family,
-                    chunk_idx = output.task.chunk_idx,
-                    load_s = output.load_s,
-                    compute_s = output.compute_s,
-                    store_s = maybe_elapsed_s(store_started),
-                    "diamond injector gpu online_eval: stored chunk"
+            let mut output_buffer = vec![None; spec.rhs_chunk_bytes.len()];
+            let mut store_wave = |outputs: Vec<ComputedDiamondEvalTask<M>>| {
+                for output in outputs {
+                    let store_started = Instant::now();
+                    let bytes = output.output.into_compact_bytes();
+                    output_buffer[output.task.chunk_idx] = Some(bytes);
+                    debug!(
+                        family = ?output.task.family,
+                        chunk_idx = output.task.chunk_idx,
+                        load_s = output.load_s,
+                        compute_s = output.compute_s,
+                        store_s = maybe_elapsed_s(store_started),
+                        "diamond injector gpu online_eval: stored chunk"
+                    );
+                }
+            };
+
+            let mut next_wave_idx = 1usize;
+            let mut current_wave = if wave_count == 0 { None } else { load_wave(0) };
+            let mut previous_outputs = None;
+            while let Some(loaded_wave) = current_wave.take() {
+                let should_load_next = next_wave_idx < wave_count;
+                let previous_outputs_to_store = previous_outputs.take();
+                let ((computed_outputs, next_loaded_wave), ()) = rayon::join(
+                    || {
+                        rayon::join(
+                            || compute_wave(loaded_wave),
+                            || if should_load_next { load_wave(next_wave_idx) } else { None },
+                        )
+                    },
+                    || {
+                        if let Some(outputs) = previous_outputs_to_store {
+                            store_wave(outputs);
+                        }
+                    },
                 );
+                info!(
+                    family = ?family,
+                    wave = next_wave_idx,
+                    wave_count,
+                    "diamond injector gpu online_eval: wave completed"
+                );
+                previous_outputs = Some(computed_outputs);
+                current_wave = next_loaded_wave;
+                next_wave_idx += 1;
             }
-        };
+            if let Some(outputs) = previous_outputs {
+                store_wave(outputs);
+            }
+            drop(shared_by_device);
 
-        let mut next_wave_idx = 1usize;
-        let mut current_wave = if wave_count == 0 { None } else { load_wave(0) };
-        let mut previous_outputs = None;
-        while let Some(loaded_wave) = current_wave.take() {
-            let should_load_next = next_wave_idx < wave_count;
-            let previous_outputs_to_store = previous_outputs.take();
-            let ((computed_outputs, next_loaded_wave), ()) = rayon::join(
-                || {
-                    rayon::join(
-                        || compute_wave(loaded_wave),
-                        || if should_load_next { load_wave(next_wave_idx) } else { None },
-                    )
-                },
-                || {
-                    if let Some(outputs) = previous_outputs_to_store {
-                        store_wave(outputs);
-                    }
-                },
-            );
-            info!(
-                wave = next_wave_idx,
-                wave_count, "diamond injector gpu online_eval: wave completed"
-            );
-            previous_outputs = Some(computed_outputs);
-            current_wave = next_loaded_wave;
-            next_wave_idx += 1;
-        }
-        if let Some(outputs) = previous_outputs {
-            store_wave(outputs);
-        }
-
-        // Each shared device context owns every input state for this level.
-        // Release those matrices before assembling the next-level states on
-        // the base device so both complete levels are not resident at once.
-        drop(shared_by_device);
-
-        family_specs
-            .into_iter()
-            .map(|(family, spec)| {
-                let assembled = concat_chunk_bytes_on_base::<M, Vec<u8>>(
-                    &self.params,
-                    output_buffers
-                        .remove(&family)
-                        .unwrap_or_else(|| {
-                            panic!("missing assembled output buffer for {:?}", family)
+            family_outputs.insert(
+                family,
+                output_buffer
+                    .into_iter()
+                    .enumerate()
+                    .map(|(chunk_idx, bytes)| {
+                        bytes.unwrap_or_else(|| {
+                            panic!(
+                                "missing chunk {} for diamond eval family {:?}",
+                                chunk_idx, family
+                            )
                         })
-                        .into_iter()
-                        .enumerate()
-                        .map(|(chunk_idx, bytes)| {
-                            bytes.unwrap_or_else(|| {
-                                panic!(
-                                    "missing chunk {} for diamond eval family {:?}",
-                                    chunk_idx, family
-                                )
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                );
-                debug_assert_eq!(
-                    assembled.col_size(),
-                    spec.rhs_chunk_bytes.len().min(1) * 0 + assembled.col_size()
-                );
-                (family, assembled)
-            })
-            .collect()
+                    })
+                    .collect(),
+            );
+        }
+        family_outputs
     }
 
     pub(super) fn preprocess_gpu(&self, dir_path: &Path, k: &M::P) {
@@ -681,12 +651,12 @@ where
         );
     }
 
-    pub(super) fn online_eval_gpu(
+    fn online_eval_gpu_chunks(
         &self,
         dir_path: &Path,
         preprocess_out: &super::DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
         input_digits: &[u32],
-    ) -> Vec<M> {
+    ) -> Vec<Vec<Arc<[u8]>>> {
         self.validate_digits(input_digits);
         assert_eq!(
             preprocess_out.final_state_count(),
@@ -698,45 +668,50 @@ where
 
         let online_started = Instant::now();
         let state_cols = self.state_col_size(&self.params);
-        // Start from the persisted empty-prefix seed.
-        let mut states = vec![self.read_matrix(dir_path, self.p_epsilon_id())];
+        // Keep states as compact chunks between levels. Reconstructing every
+        // state on the base GPU makes VRAM grow with the witness size.
+        let mut states =
+            vec![vec![Arc::<[u8]>::from(self.read_matrix_bytes(dir_path, self.p_epsilon_id()))]];
 
         for (digit_idx, digit_value) in input_digits.iter().copied().enumerate() {
             let level = digit_idx + 1;
             let prev_states = std::mem::take(&mut states);
-            let prev_p0_bytes = Arc::<[u8]>::from(prev_states[0].to_compact_bytes());
+            let prev_p0_bytes = prev_states[0].clone();
             // Schedule one matrix-product family per active branch. The helper
-            // below splits the right-hand-side chunks across devices and then
-            // reassembles each branch on CPU from compact bytes.
+            // below streams one family at a time across all devices and keeps
+            // its output as compact chunks for the next level.
             let family_specs = (0..self.state_count_at_level(level))
                 .map(|state_idx| {
-                    let lhs_bytes = if self.new_bit_idx_for_state(level, state_idx).is_some() {
+                    let lhs_chunk_bytes = if self.new_bit_idx_for_state(level, state_idx).is_some()
+                    {
                         prev_p0_bytes.clone()
                     } else {
-                        Arc::<[u8]>::from(prev_states[state_idx].to_compact_bytes())
+                        prev_states[state_idx].clone()
                     };
                     let rhs_id = self.k_id(level, digit_value as usize, state_idx);
                     (
                         DiamondEvalFamily::State(state_idx),
                         DiamondEvalFamilySpec {
-                            lhs_bytes,
+                            lhs_chunk_bytes,
                             rhs_chunk_bytes: self.read_chunk_bytes(dir_path, &rhs_id, state_cols),
                         },
                     )
                 })
                 .collect::<HashMap<_, _>>();
-            let outputs = self.gpu_left_mul_families(family_specs);
+            let mut outputs = self.gpu_left_mul_families(family_specs);
             states = (0..self.state_count_at_level(level))
                 .map(|state_idx| {
                     outputs
-                        .get(&DiamondEvalFamily::State(state_idx))
+                        .remove(&DiamondEvalFamily::State(state_idx))
                         .unwrap_or_else(|| {
                             panic!(
                                 "missing gpu online_eval state output for level {}, state {}",
                                 level, state_idx
                             )
                         })
-                        .clone()
+                        .into_iter()
+                        .map(Arc::<[u8]>::from)
+                        .collect()
                 })
                 .collect::<Vec<_>>();
         }
@@ -746,6 +721,33 @@ where
             "diamond injector gpu online_eval: finished"
         );
         states
+    }
+
+    pub(super) fn online_eval_gpu(
+        &self,
+        dir_path: &Path,
+        preprocess_out: &super::DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
+        input_digits: &[u32],
+    ) -> Vec<M> {
+        self.online_eval_gpu_chunks(dir_path, preprocess_out, input_digits)
+            .into_iter()
+            .map(|chunks| concat_chunk_bytes_on_base::<M, Arc<[u8]>>(&self.params, chunks))
+            .collect()
+    }
+
+    pub(super) fn online_eval_gpu_staging_bytes(
+        &self,
+        dir_path: &Path,
+        preprocess_out: &super::DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
+        input_digits: &[u32],
+    ) -> Vec<Vec<u8>> {
+        self.online_eval_gpu_chunks(dir_path, preprocess_out, input_digits)
+            .into_iter()
+            .map(|chunks| {
+                concat_chunk_bytes_on_base::<M, Arc<[u8]>>(&self.params, chunks)
+                    .into_cpu_staging_bytes()
+            })
+            .collect()
     }
 }
 

@@ -125,6 +125,26 @@ where
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
 {
+    pub(crate) fn online_eval_staging_bytes(
+        &self,
+        dir_path: &Path,
+        preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
+        input_digits: &[u32],
+    ) -> Vec<Vec<u8>> {
+        #[cfg(feature = "gpu")]
+        {
+            return self.online_eval_gpu_staging_bytes(dir_path, preprocess_out, input_digits);
+        }
+
+        #[cfg(not(feature = "gpu"))]
+        {
+            self.online_eval(dir_path, preprocess_out, input_digits)
+                .into_iter()
+                .map(M::into_cpu_staging_bytes)
+                .collect()
+        }
+    }
+
     pub fn new(
         params: <M::P as Poly>::Params,
         input_count: usize,
@@ -237,6 +257,7 @@ where
             .unwrap_or_else(|err| panic!("DiamondInjector failed to write matrix {id}: {err}"));
     }
 
+    #[cfg(not(feature = "gpu"))]
     fn read_matrix(&self, dir_path: &Path, id: &str) -> M {
         let bytes = self.read_matrix_bytes(dir_path, id);
         M::from_compact_bytes(&self.params, &bytes)

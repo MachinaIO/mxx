@@ -170,14 +170,17 @@ where
         ct: &DiamondWECiphertext<M, TS::Trapdoor>,
         witness_digits: &[u32],
     ) -> Vec<Vec<u8>> {
-        let states =
-            self.injector.online_eval(&self.artifact_dir, &ct.preprocess_out, witness_digits);
+        let states = self.injector.online_eval_staging_bytes(
+            &self.artifact_dir,
+            &ct.preprocess_out,
+            witness_digits,
+        );
         assert_eq!(
             states.len(),
             1 + self.witness_size,
             "DiamondWE final Diamond state count mismatch"
         );
-        states.into_iter().map(M::into_cpu_staging_bytes).collect()
+        states
     }
 
     fn remove_matrix_if_exists(&self, id: &str) {

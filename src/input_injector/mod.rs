@@ -257,7 +257,7 @@ where
             .unwrap_or_else(|err| panic!("DiamondInjector failed to write matrix {id}: {err}"));
     }
 
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(any(not(feature = "gpu"), test))]
     fn read_matrix(&self, dir_path: &Path, id: &str) -> M {
         let bytes = self.read_matrix_bytes(dir_path, id);
         M::from_compact_bytes(&self.params, &bytes)

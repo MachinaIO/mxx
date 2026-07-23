@@ -1,3 +1,6 @@
+use digest::Digest;
+use keccak_asm::Keccak256;
+use serde::{Deserialize, Serialize};
 use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 
 use num_bigint::BigUint;
@@ -5,7 +8,7 @@ use tracing::info;
 
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
-    circuit::{Evaluable, PolyCircuit},
+    circuit::{Evaluable, PolyCircuit, serde::SerializablePolyCircuit},
     func_enc::NoCircuitEvaluator,
     input_injector::{
         DIAMOND_SECRET_SIZE, DiamondInjector, DiamondInjectorPreprocessOut, InputInjector,
@@ -25,6 +28,52 @@ pub use bench_estimator::{DiamondWEBenchEstimate, DiamondWEBenchEstimator};
 pub use simulation::{
     DiamondWECrtDepthSearchResult, DiamondWEErrorSimulation, diamond_we_find_crt_depth,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DiamondWEEncCheckpoint {
+    msg: bool,
+    instance: Vec<bool>,
+    target_witness: Option<Vec<bool>>,
+    circuit_json: String,
+    hash_key: [u8; 32],
+    preimage_chunk_width: usize,
+    bgg_tag: Vec<u8>,
+    witness_size: usize,
+    injector_input_count: usize,
+    injector_base: usize,
+    injector_batch_bits: usize,
+    ring_dimension: u32,
+    base_bits: u32,
+    modulus_bits: usize,
+    modulus_digits: usize,
+    crt_moduli: Vec<u64>,
+    crt_modulus_bits: usize,
+    crt_depth: usize,
+    trapdoor_sigma_bits: u64,
+    error_sigma_bits: u64,
+    lookup_base_hash: Option<[u8; 32]>,
+    matrix_type: String,
+    uniform_sampler_type: String,
+    hash_sampler_type: String,
+    trapdoor_sampler_type: String,
+    pk_lookup_evaluator_type: String,
+    pk_slot_transfer_evaluator_type: String,
+    enc_lookup_evaluator_type: String,
+    enc_slot_transfer_evaluator_type: String,
+    evaluator_checkpoint_id: Vec<u8>,
+    pk_lookup_evaluator_enabled: bool,
+    pk_slot_transfer_evaluator_enabled: bool,
+    enc_lookup_evaluator_factory_enabled: bool,
+    enc_lookup_evaluator_enabled: bool,
+    enc_slot_transfer_evaluator_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DiamondWEStorageAccounting {
+    transition_preimage_bytes: u128,
+    final_preimage_bytes: u128,
+    total_preimage_bytes: u128,
+}
 
 #[derive(Debug, Clone)]
 pub struct DiamondWECiphertext<M, T>
@@ -57,8 +106,10 @@ pub struct DiamondWE<
     pub witness_size: usize,
     pub artifact_dir: PathBuf,
     pub bgg_tag: Vec<u8>,
+    pub evaluator_checkpoint_id: Vec<u8>,
     pub pk_lookup_evaluator: Option<PKPE>,
     pub pk_slot_transfer_evaluator: Option<PKST>,
+    pub target_witness: Option<Vec<bool>>,
     pub enc_lookup_base_matrix: Option<M>,
     pub enc_lookup_evaluator_factory: Option<Arc<dyn Fn(M) -> ENCPE + Send + Sync>>,
     pub enc_lookup_evaluator: Option<ENCPE>,
@@ -88,16 +139,19 @@ where
         witness_size: usize,
         artifact_dir: impl Into<PathBuf>,
         bgg_tag: Vec<u8>,
+        target_witness: Option<Vec<bool>>,
     ) -> Self {
         Self {
             injector,
             witness_size,
             artifact_dir: artifact_dir.into(),
             bgg_tag,
+            evaluator_checkpoint_id: Vec::new(),
             pk_lookup_evaluator: None,
             pk_slot_transfer_evaluator: None,
             enc_lookup_base_matrix: None,
             enc_lookup_evaluator_factory: None,
+            target_witness,
             enc_lookup_evaluator: None,
             enc_slot_transfer_evaluator: None,
             _m: PhantomData,
@@ -118,6 +172,8 @@ where
         witness_size: usize,
         artifact_dir: impl Into<PathBuf>,
         bgg_tag: Vec<u8>,
+        evaluator_checkpoint_id: Vec<u8>,
+        target_witness: Option<Vec<bool>>,
         pk_lookup_evaluator: Option<PKPE>,
         pk_slot_transfer_evaluator: Option<PKST>,
         enc_lookup_base_matrix: Option<M>,
@@ -125,14 +181,25 @@ where
         enc_lookup_evaluator: Option<ENCPE>,
         enc_slot_transfer_evaluator: Option<ENCST>,
     ) -> Self {
+        let has_evaluator_state = pk_lookup_evaluator.is_some() ||
+            pk_slot_transfer_evaluator.is_some() ||
+            enc_lookup_evaluator_factory.is_some() ||
+            enc_lookup_evaluator.is_some() ||
+            enc_slot_transfer_evaluator.is_some();
+        assert!(
+            !has_evaluator_state || !evaluator_checkpoint_id.is_empty(),
+            "DiamondWE evaluator_checkpoint_id must identify evaluator configuration and state"
+        );
         Self {
             injector,
             witness_size,
             artifact_dir: artifact_dir.into(),
             bgg_tag,
+            evaluator_checkpoint_id,
             pk_lookup_evaluator,
             pk_slot_transfer_evaluator,
             enc_lookup_base_matrix,
+            target_witness,
             enc_lookup_evaluator_factory,
             enc_lookup_evaluator,
             enc_slot_transfer_evaluator,
@@ -144,15 +211,135 @@ where
         self.artifact_dir.join(format!("{id}.matrixbin"))
     }
 
-    fn write_matrix(&self, id: &str, matrix: &M) {
+    fn enc_checkpoint_path(&self) -> PathBuf {
+        self.artifact_dir.join("diamond_we_enc_checkpoint.json")
+    }
+
+    fn enc_complete_path(&self) -> PathBuf {
+        self.artifact_dir.join("diamond_we_enc_complete")
+    }
+
+    fn current_enc_checkpoint(
+        &self,
+        msg: bool,
+        circuit: &PolyCircuit<M::P>,
+        instance: &[bool],
+        hash_key: [u8; 32],
+    ) -> DiamondWEEncCheckpoint {
+        let params = &self.injector.params;
+        let (crt_moduli, crt_modulus_bits, crt_depth) = params.to_crt();
+        let lookup_base_hash = self.enc_lookup_base_matrix.as_ref().map(|matrix| {
+            let digest = Keccak256::digest(matrix.to_compact_bytes());
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&digest);
+            hash
+        });
+        DiamondWEEncCheckpoint {
+            msg,
+            instance: instance.to_vec(),
+            target_witness: self.target_witness.clone(),
+            circuit_json: SerializablePolyCircuit::from_circuit(circuit.clone()).to_json_str(),
+            hash_key,
+            preimage_chunk_width: crate::env::aux_sampling_chunk_width(),
+            bgg_tag: self.bgg_tag.clone(),
+            witness_size: self.witness_size,
+            injector_input_count: self.injector.input_count,
+            injector_base: self.injector.base,
+            injector_batch_bits: self.injector.batch_bits,
+            ring_dimension: params.ring_dimension(),
+            base_bits: params.base_bits(),
+            modulus_bits: params.modulus_bits(),
+            modulus_digits: params.modulus_digits(),
+            crt_moduli,
+            crt_modulus_bits,
+            crt_depth,
+            trapdoor_sigma_bits: self.injector.trapdoor_sigma.to_bits(),
+            error_sigma_bits: self.injector.error_sigma.to_bits(),
+            lookup_base_hash,
+            matrix_type: std::any::type_name::<M>().to_owned(),
+            uniform_sampler_type: std::any::type_name::<US>().to_owned(),
+            hash_sampler_type: std::any::type_name::<HS>().to_owned(),
+            trapdoor_sampler_type: std::any::type_name::<TS>().to_owned(),
+            pk_lookup_evaluator_type: std::any::type_name::<PKPE>().to_owned(),
+            pk_slot_transfer_evaluator_type: std::any::type_name::<PKST>().to_owned(),
+            enc_lookup_evaluator_type: std::any::type_name::<ENCPE>().to_owned(),
+            enc_slot_transfer_evaluator_type: std::any::type_name::<ENCST>().to_owned(),
+            evaluator_checkpoint_id: self.evaluator_checkpoint_id.clone(),
+            pk_lookup_evaluator_enabled: self.pk_lookup_evaluator.is_some(),
+            pk_slot_transfer_evaluator_enabled: self.pk_slot_transfer_evaluator.is_some(),
+            enc_lookup_evaluator_factory_enabled: self.enc_lookup_evaluator_factory.is_some(),
+            enc_lookup_evaluator_enabled: self.enc_lookup_evaluator.is_some(),
+            enc_slot_transfer_evaluator_enabled: self.enc_slot_transfer_evaluator.is_some(),
+        }
+    }
+
+    fn prepare_enc_checkpoint(
+        &self,
+        msg: bool,
+        circuit: &PolyCircuit<M::P>,
+        instance: &[bool],
+    ) -> [u8; 32] {
         std::fs::create_dir_all(&self.artifact_dir).unwrap_or_else(|err| {
             panic!(
                 "DiamondWE failed to create artifact directory {}: {err}",
                 self.artifact_dir.display()
             )
         });
-        std::fs::write(self.matrix_path(id), matrix.to_compact_bytes())
-            .unwrap_or_else(|err| panic!("DiamondWE failed to write matrix {id}: {err}"));
+        assert!(
+            !self.enc_complete_path().exists(),
+            "DiamondWE encryption session is already complete; use a new artifact directory for a fresh end-to-end measurement"
+        );
+        let path = self.enc_checkpoint_path();
+        if path.exists() {
+            let bytes = std::fs::read(&path).unwrap_or_else(|err| {
+                panic!("DiamondWE failed to read checkpoint {}: {err}", path.display())
+            });
+            let checkpoint: DiamondWEEncCheckpoint = serde_json::from_slice(&bytes)
+                .expect("DiamondWE encryption checkpoint should decode");
+            let expected = self.current_enc_checkpoint(msg, circuit, instance, checkpoint.hash_key);
+            assert_eq!(
+                checkpoint, expected,
+                "DiamondWE encryption checkpoint configuration mismatch; use a separate artifact directory"
+            );
+            return checkpoint.hash_key;
+        }
+        let checkpoint = self.current_enc_checkpoint(msg, circuit, instance, rand::random());
+        let bytes = serde_json::to_vec_pretty(&checkpoint)
+            .expect("DiamondWE encryption checkpoint should serialize");
+        crate::utils::write_bytes_atomic(&path, &bytes);
+        checkpoint.hash_key
+    }
+
+    fn session_prefix(hash_key: [u8; 32]) -> String {
+        let hash = hash_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        format!("diamond_we_session_{hash}")
+    }
+
+    fn session_preimage_id(hash_key: [u8; 32], id: &str) -> String {
+        format!("{}_{}", Self::session_prefix(hash_key), id)
+    }
+
+    fn storage_accounting_path(&self, hash_key: [u8; 32]) -> PathBuf {
+        self.artifact_dir
+            .join(format!("{}_storage_accounting.json", Self::session_prefix(hash_key)))
+    }
+
+    fn mark_enc_complete(&self) {
+        crate::utils::write_bytes_atomic(&self.enc_complete_path(), b"complete\n");
+    }
+
+    fn write_matrix(&self, id: &str, matrix: &M) -> u64 {
+        std::fs::create_dir_all(&self.artifact_dir).unwrap_or_else(|err| {
+            panic!(
+                "DiamondWE failed to create artifact directory {}: {err}",
+                self.artifact_dir.display()
+            )
+        });
+        let bytes = matrix.to_compact_bytes();
+        let stored_bytes =
+            u64::try_from(bytes.len()).expect("DiamondWE matrix artifact size must fit u64");
+        crate::utils::write_bytes_atomic(&self.matrix_path(id), &bytes);
+        stored_bytes
     }
 
     fn read_matrix(&self, id: &str) -> M {
@@ -184,7 +371,12 @@ where
     }
 
     fn remove_matrix_if_exists(&self, id: &str) {
-        match std::fs::remove_file(self.matrix_path(id)) {
+        let path = self.matrix_path(id);
+        #[cfg(test)]
+        if path.exists() {
+            crate::utils::observe_file_before_delete(&path);
+        }
+        match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => panic!("DiamondWE failed to remove stale matrix {id}: {err}"),
@@ -280,6 +472,16 @@ where
                 total_cols, chunk_cols, chunk_count, "diamond we final preimage: sampling chunks"
             );
             for chunk_idx in 0..chunk_count {
+                let chunk_id = Self::preimage_chunk_id(id, chunk_idx);
+                if self.matrix_path(&chunk_id).exists() {
+                    info!(
+                        id,
+                        chunk_idx = chunk_idx + 1,
+                        chunk_count,
+                        "diamond we final preimage: resumed chunk"
+                    );
+                    continue;
+                }
                 let (col_start, col_len) =
                     Self::preimage_chunk_bounds(total_cols, chunk_cols, chunk_idx);
                 info!(
@@ -293,13 +495,60 @@ where
                 let target_chunk = target_columns(col_start, col_len);
                 let preimage =
                     self.sample_target_preimage(preprocess_out, state_idx, &target_chunk);
-                self.write_matrix(&Self::preimage_chunk_id(id, chunk_idx), &preimage);
+                self.write_matrix(&chunk_id, &preimage);
             }
         } else {
+            if self.matrix_path(id).exists() {
+                return;
+            }
             let target = target_columns(0, total_cols);
             let preimage = self.sample_target_preimage(preprocess_out, state_idx, &target);
             self.write_matrix(id, &preimage);
         }
+    }
+
+    fn write_storage_accounting(
+        &self,
+        hash_key: [u8; 32],
+        transition_preimage_bytes: u128,
+    ) -> DiamondWEStorageAccounting {
+        let prefix = Self::session_prefix(hash_key);
+        let retained_final_bytes = std::fs::read_dir(&self.artifact_dir)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "DiamondWE failed to list artifact directory {}: {err}",
+                    self.artifact_dir.display()
+                )
+            })
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix) && name.ends_with(".matrixbin")
+            })
+            .map(|entry| {
+                u128::from(
+                    entry
+                        .metadata()
+                        .unwrap_or_else(|err| {
+                            panic!("DiamondWE failed to stat {}: {err}", entry.path().display())
+                        })
+                        .len(),
+                )
+            })
+            .sum::<u128>();
+        let final_preimage_bytes = retained_final_bytes;
+        let accounting = DiamondWEStorageAccounting {
+            transition_preimage_bytes,
+            final_preimage_bytes,
+            total_preimage_bytes: transition_preimage_bytes
+                .checked_add(final_preimage_bytes)
+                .expect("DiamondWE total preimage byte count overflow"),
+        };
+        let bytes = serde_json::to_vec_pretty(&accounting)
+            .expect("DiamondWE storage accounting should serialize");
+        crate::utils::write_bytes_atomic(&self.storage_accounting_path(hash_key), &bytes);
+        accounting
     }
 
     fn left_mul_preimage_columns(
@@ -704,11 +953,20 @@ where
             self.injector.input_count * self.injector.batch_bits(),
             "DiamondWE witness_size must match the DiamondInjector bit input count"
         );
-
+        if let Some(target_witness) = self.target_witness.as_ref() {
+            assert_eq!(
+                target_witness.len(),
+                self.witness_size,
+                "DiamondWE target witness length must match witness_size"
+            );
+        }
+        let retained_input_digits =
+            self.target_witness.as_ref().map(|witness| self.pack_witness_digits(witness));
+        let hash_key = self.prepare_enc_checkpoint(*msg, &circuit, instance);
         let params = &self.injector.params;
         let k = if *msg { M::P::const_one(params) } else { M::P::const_zero(params) };
-        let preprocess_out = self.injector.preprocess(&self.artifact_dir, &k);
-        let hash_key = rand::random::<[u8; 32]>();
+        let preprocess_out =
+            self.injector.preprocess(&self.artifact_dir, &k, retained_input_digits.as_deref());
         let one_pubkey = self.sample_bgg_public_key(hash_key, 0);
         let one_pubkey_compact = one_pubkey.clone().to_compact();
         let zero_pubkey_compact = one_pubkey.small_scalar_mul(params, &[0]).to_compact();
@@ -737,8 +995,9 @@ where
             .expect("DiamondWE circuit must produce one output public key");
 
         let one_plaintext = M::P::const_one(params);
+        let one_preimage_id = Self::session_preimage_id(hash_key, Self::one_preimage_id());
         self.sample_and_write_preimage_columns(
-            Self::one_preimage_id(),
+            &one_preimage_id,
             &preprocess_out,
             0,
             one_pubkey.matrix.col_size(),
@@ -757,8 +1016,10 @@ where
             let digit_idx = bit_idx / self.injector.batch_bits();
             let bit_in_digit = bit_idx % self.injector.batch_bits();
             let state_idx = self.injector.bit_state_idx(digit_idx, bit_in_digit);
+            let witness_preimage_id =
+                Self::session_preimage_id(hash_key, &Self::witness_preimage_id(bit_idx));
             self.sample_and_write_preimage_columns(
-                &Self::witness_preimage_id(bit_idx),
+                &witness_preimage_id,
                 &preprocess_out,
                 state_idx,
                 pubkey.matrix.col_size(),
@@ -774,16 +1035,19 @@ where
             );
         }
         let k_pubkey = self.sample_k_public_key(hash_key);
+        let k_preimage_id = Self::session_preimage_id(hash_key, Self::k_preimage_id());
         self.sample_and_write_preimage_columns(
-            Self::k_preimage_id(),
+            &k_preimage_id,
             &preprocess_out,
             0,
             k_pubkey.matrix.col_size(),
             |col_start, col_len| self.k_preimage_target_columns(&k_pubkey, col_start, col_len),
         );
         if let Some(lookup_base_matrix) = self.enc_lookup_base_matrix.as_ref() {
+            let lookup_preimage_id =
+                Self::session_preimage_id(hash_key, Self::enc_lookup_base_preimage_id());
             self.sample_and_write_preimage_columns(
-                Self::enc_lookup_base_preimage_id(),
+                &lookup_preimage_id,
                 &preprocess_out,
                 0,
                 lookup_base_matrix.col_size(),
@@ -796,8 +1060,9 @@ where
         let r = self.sample_r(hash_key);
         let dec_term = one_pubkey - &out_pubkey;
         let dec_pubkey_matrix = k_pubkey.matrix + &dec_term.matrix.mul_decompose(&r);
+        let decoder_preimage_id = Self::session_preimage_id(hash_key, Self::decoder_preimage_id());
         self.sample_and_write_preimage_columns(
-            Self::decoder_preimage_id(),
+            &decoder_preimage_id,
             &preprocess_out,
             0,
             dec_pubkey_matrix.col_size(),
@@ -805,12 +1070,30 @@ where
                 self.decoder_preimage_target_columns(&dec_pubkey_matrix, col_start, col_len)
             },
         );
+        let transition_preimage_bytes = self.injector.generated_transition_preimage_bytes(
+            &self.artifact_dir,
+            retained_input_digits.as_deref(),
+        );
+        let storage_accounting = self.write_storage_accounting(hash_key, transition_preimage_bytes);
+        info!(
+            transition_preimage_bytes = %storage_accounting.transition_preimage_bytes,
+            final_preimage_bytes = %storage_accounting.final_preimage_bytes,
+            total_preimage_bytes = %storage_accounting.total_preimage_bytes,
+            "diamond we enc: actual saved preimage bytes"
+        );
+        self.mark_enc_complete();
 
         DiamondWECiphertext { circuit, instance: instance.clone(), hash_key, preprocess_out }
     }
 
     fn dec(&self, ct: &Self::Ciphertext, witness: &Self::Wtns) -> Self::Msg {
         assert_eq!(ct.circuit.num_output(), 1, "DiamondWE currently requires one circuit output");
+        if let Some(target_witness) = self.target_witness.as_ref() {
+            assert_eq!(
+                witness, target_witness,
+                "DiamondWE fixed-witness artifacts can only decrypt the witness selected at encryption time"
+            );
+        }
         assert_eq!(
             self.witness_size + ct.instance.len(),
             ct.circuit.num_input(),
@@ -818,6 +1101,7 @@ where
         );
         let started = std::time::Instant::now();
         let params = &self.injector.params;
+        let one_preimage_id = Self::session_preimage_id(ct.hash_key, Self::one_preimage_id());
         let witness_digits = self.pack_witness_digits(witness);
         info!(
             witness_size = self.witness_size,
@@ -900,15 +1184,17 @@ where
             );
             info!(
                 bit_idx,
-                preimage_id = %Self::witness_preimage_id(bit_idx),
+                preimage_id = %Self::session_preimage_id(
+                    ct.hash_key,
+                    &Self::witness_preimage_id(bit_idx),
+                ),
                 total_cols = pubkey.matrix.col_size(),
                 "diamond we dec: witness left_mul_preimage begin"
             );
-            let vector = self.left_mul_preimage(
-                &state,
-                &Self::witness_preimage_id(bit_idx),
-                pubkey.matrix.col_size(),
-            );
+            let witness_preimage_id =
+                Self::session_preimage_id(ct.hash_key, &Self::witness_preimage_id(bit_idx));
+            let vector =
+                self.left_mul_preimage(&state, &witness_preimage_id, pubkey.matrix.col_size());
             info!(
                 bit_idx,
                 rows = vector.row_size(),
@@ -944,42 +1230,38 @@ where
             total_cols = one_pubkey.matrix.col_size(),
             "diamond we dec: one left_mul_preimage begin"
         );
-        let one_vector = self.left_mul_preimage(
-            &root_state,
-            Self::one_preimage_id(),
-            one_pubkey.matrix.col_size(),
-        );
+        let one_vector =
+            self.left_mul_preimage(&root_state, &one_preimage_id, one_pubkey.matrix.col_size());
         info!(
             rows = one_vector.row_size(),
             cols = one_vector.col_size(),
             "diamond we dec: one left_mul_preimage done"
         );
-        let owned_enc_lookup_evaluator =
-            if let Some(factory) = self.enc_lookup_evaluator_factory.as_ref() {
-                let lookup_base_cols = self
-                    .enc_lookup_base_matrix
-                    .as_ref()
-                    .expect("DiamondWE encoding lookup-base preimage requires a lookup base matrix")
-                    .col_size();
-                info!(lookup_base_cols, "diamond we dec: lookup-base left_mul_preimage begin");
-                let c_b0 = self.left_mul_preimage(
-                    &root_state,
-                    Self::enc_lookup_base_preimage_id(),
-                    lookup_base_cols,
-                );
-                info!(
-                    rows = c_b0.row_size(),
-                    cols = c_b0.col_size(),
-                    "diamond we dec: lookup-base left_mul_preimage done"
-                );
-                info!("diamond we dec: build owned encoding lookup evaluator begin");
-                let evaluator = factory(c_b0);
-                info!("diamond we dec: build owned encoding lookup evaluator done");
-                Some(evaluator)
-            } else {
-                info!("diamond we dec: no owned encoding lookup evaluator needed");
-                None
-            };
+        let owned_enc_lookup_evaluator = if let Some(factory) =
+            self.enc_lookup_evaluator_factory.as_ref()
+        {
+            let lookup_base_cols = self
+                .enc_lookup_base_matrix
+                .as_ref()
+                .expect("DiamondWE encoding lookup-base preimage requires a lookup base matrix")
+                .col_size();
+            info!(lookup_base_cols, "diamond we dec: lookup-base left_mul_preimage begin");
+            let lookup_preimage_id =
+                Self::session_preimage_id(ct.hash_key, Self::enc_lookup_base_preimage_id());
+            let c_b0 = self.left_mul_preimage(&root_state, &lookup_preimage_id, lookup_base_cols);
+            info!(
+                rows = c_b0.row_size(),
+                cols = c_b0.col_size(),
+                "diamond we dec: lookup-base left_mul_preimage done"
+            );
+            info!("diamond we dec: build owned encoding lookup evaluator begin");
+            let evaluator = factory(c_b0);
+            info!("diamond we dec: build owned encoding lookup evaluator done");
+            Some(evaluator)
+        } else {
+            info!("diamond we dec: no owned encoding lookup evaluator needed");
+            None
+        };
         let k_public_key_columns = self.k_public_key_columns();
         info!(
             total_cols = k_public_key_columns,
@@ -987,13 +1269,9 @@ where
             col_len = 1usize,
             "diamond we dec: k left_mul_preimage_columns begin"
         );
-        let k_vector = self.left_mul_preimage_columns(
-            &root_state,
-            Self::k_preimage_id(),
-            k_public_key_columns,
-            0,
-            1,
-        );
+        let k_preimage_id = Self::session_preimage_id(ct.hash_key, Self::k_preimage_id());
+        let k_vector =
+            self.left_mul_preimage_columns(&root_state, &k_preimage_id, k_public_key_columns, 0, 1);
         info!(
             rows = k_vector.row_size(),
             cols = k_vector.col_size(),
@@ -1005,9 +1283,11 @@ where
             col_len = 1usize,
             "diamond we dec: decoder left_mul_preimage_columns begin"
         );
+        let decoder_preimage_id =
+            Self::session_preimage_id(ct.hash_key, Self::decoder_preimage_id());
         let decoder = self.left_mul_preimage_columns(
             &root_state,
-            Self::decoder_preimage_id(),
+            &decoder_preimage_id,
             k_public_key_columns,
             0,
             1,
@@ -1234,7 +1514,7 @@ mod tests {
             DCRTPolyTrapdoorSampler,
         >::new(params.clone(), 1, 4, 2, 4.578, 0.0);
         let dir = tempdir().expect("temporary DiamondWE artifact directory should be created");
-        let we = DiamondWE::new(injector, witness_size, dir.path(), tag.clone());
+        let we = DiamondWE::new(injector, witness_size, dir.path(), tag.clone(), None);
 
         let mut full_tag = tag;
         full_tag.extend_from_slice(b":witness_public_keys");
@@ -1286,6 +1566,7 @@ mod tests {
             witness_size,
             dir.path(),
             b"diamond_we_k_preimage_target_test".to_vec(),
+            None,
         );
 
         let k_pubkey = we.sample_k_public_key(hash_key);
@@ -1324,9 +1605,117 @@ mod tests {
                 DCRTPolyTrapdoorSampler,
             >::new(params.clone(), 1, 4, 2, 4.578, 0.0);
             let dir = tempdir().expect("temporary DiamondWE artifact directory should be created");
-            let we =
-                DiamondWE::new(injector, witness_size, dir.path(), b"diamond_we_test".to_vec());
+            let we = DiamondWE::new(
+                injector,
+                witness_size,
+                dir.path(),
+                b"diamond_we_test".to_vec(),
+                Some(witness.clone()),
+            );
+            crate::utils::start_pre_delete_file_length_observer();
             let ct = we.enc(&msg, circuit.clone(), &instance);
+            let observed_deleted_bytes = crate::utils::take_pre_delete_file_lengths()
+                .into_iter()
+                .map(|(path, bytes)| {
+                    let id = path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .expect("observed deleted artifact must have a UTF-8 stem")
+                        .to_owned();
+                    (id, bytes)
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            let final_columns = we.k_public_key_columns();
+            for id in [
+                TestDiamondWE::session_preimage_id(ct.hash_key, TestDiamondWE::k_preimage_id()),
+                TestDiamondWE::session_preimage_id(
+                    ct.hash_key,
+                    TestDiamondWE::decoder_preimage_id(),
+                ),
+            ] {
+                if let Some(chunk_cols) = TestDiamondWE::preimage_chunk_cols(final_columns) {
+                    for chunk_idx in
+                        0..TestDiamondWE::preimage_chunk_count(final_columns, chunk_cols)
+                    {
+                        assert!(
+                            we.matrix_path(&TestDiamondWE::preimage_chunk_id(&id, chunk_idx))
+                                .exists(),
+                            "full final preimage chunk must remain checkpointed"
+                        );
+                    }
+                } else {
+                    assert!(
+                        we.matrix_path(&id).exists(),
+                        "full final preimage must remain checkpointed"
+                    );
+                }
+            }
+            assert!(
+                std::fs::read_dir(dir.path())
+                    .expect("artifact directory should be readable")
+                    .filter_map(Result::ok)
+                    .all(|entry| !entry.file_name().to_string_lossy().contains("retained_col0")),
+                "fixed-witness mode must not create first-column-only artifacts"
+            );
+            let session_prefix = TestDiamondWE::session_prefix(ct.hash_key);
+            let observed_deleted_transition_bytes = observed_deleted_bytes
+                .iter()
+                .filter(|(id, _)| id.starts_with("diamond_transition_tensor_"))
+                .map(|(_, bytes)| u128::from(*bytes))
+                .sum::<u128>();
+            assert!(
+                observed_deleted_bytes
+                    .keys()
+                    .all(|id| id.starts_with("diamond_transition_tensor_")),
+                "only unselected transition preimages should be deleted"
+            );
+            let mut retained_transition_bytes = 0u128;
+            let mut retained_final_bytes = 0u128;
+            for entry in std::fs::read_dir(dir.path())
+                .expect("artifact directory should be readable")
+                .filter_map(Result::ok)
+            {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let bytes = u128::from(
+                    entry.metadata().expect("retained artifact metadata should be readable").len(),
+                );
+                if name.starts_with("diamond_transition_tensor_") && name.ends_with(".matrixbin") {
+                    retained_transition_bytes += bytes;
+                } else if name.starts_with(&session_prefix) && name.ends_with(".matrixbin") {
+                    retained_final_bytes += bytes;
+                }
+            }
+            assert_eq!(
+                observed_deleted_bytes.len(),
+                observed_deleted_bytes
+                    .keys()
+                    .filter(|id| {
+                        id.starts_with("diamond_transition_tensor_") ||
+                            id.starts_with(&session_prefix)
+                    })
+                    .count(),
+                "the observer should capture only intentionally pruned preimages"
+            );
+            let accounting: DiamondWEStorageAccounting = serde_json::from_slice(
+                &std::fs::read(we.storage_accounting_path(ct.hash_key))
+                    .expect("storage accounting should be readable"),
+            )
+            .expect("storage accounting should decode");
+            assert_eq!(
+                accounting.transition_preimage_bytes,
+                observed_deleted_transition_bytes + retained_transition_bytes,
+                "transition accounting must include exact deleted and retained file lengths"
+            );
+            assert_eq!(
+                accounting.final_preimage_bytes, retained_final_bytes,
+                "final accounting must equal the exact retained final preimage file lengths"
+            );
+            assert_eq!(
+                accounting.total_preimage_bytes,
+                observed_deleted_transition_bytes +
+                    retained_transition_bytes +
+                    retained_final_bytes
+            );
             assert_eq!(we.dec(&ct, &witness), msg);
         }
     }
@@ -1358,9 +1747,10 @@ mod tests {
             witness_size,
             dir.path(),
             b"diamond_we_chunked_preimage_test".to_vec(),
+            None,
         );
 
-        let ct = we.enc(&true, circuit, &instance);
+        let ct = we.enc(&true, circuit.clone(), &instance);
         assert_eq!(we.dec(&ct, &witness), true);
 
         let total_cols = params.modulus_digits();
@@ -1368,6 +1758,8 @@ mod tests {
         let chunk_count = TestDiamondWE::preimage_chunk_count(total_cols, chunk_cols);
         assert_eq!(chunk_cols, 20);
         assert_eq!(chunk_count, 2);
+        let one_preimage_id =
+            TestDiamondWE::session_preimage_id(ct.hash_key, TestDiamondWE::one_preimage_id());
         assert!(
             !we.matrix_path(TestDiamondWE::one_preimage_id()).exists(),
             "chunked preimage mode should not write the legacy full one-preimage artifact"
@@ -1379,13 +1771,88 @@ mod tests {
             "chunked preimage mode should not write extra JSON metadata"
         );
         for chunk_idx in 0..chunk_count {
-            let chunk_id =
-                TestDiamondWE::preimage_chunk_id(TestDiamondWE::one_preimage_id(), chunk_idx);
+            let chunk_id = TestDiamondWE::preimage_chunk_id(&one_preimage_id, chunk_idx);
             assert!(
                 we.matrix_path(&chunk_id).exists(),
                 "chunked one-preimage artifact {chunk_id} should exist"
             );
         }
+        let retained_chunk_id = TestDiamondWE::preimage_chunk_id(&one_preimage_id, 0);
+        let missing_chunk_id = TestDiamondWE::preimage_chunk_id(&one_preimage_id, 1);
+        let retained_bytes = std::fs::read(we.matrix_path(&retained_chunk_id))
+            .expect("retained final-preimage chunk should be readable");
+        std::fs::remove_file(we.matrix_path(&missing_chunk_id))
+            .expect("test should remove one final-preimage chunk");
+        std::fs::remove_file(we.enc_complete_path())
+            .expect("test should remove the encryption completion marker");
+
+        for (tag, error_sigma) in [
+            (b"diamond_we_mismatched_tag".to_vec(), 0.0),
+            (b"diamond_we_chunked_preimage_test".to_vec(), 1.0),
+        ] {
+            let mismatched_injector =
+                DiamondInjector::<
+                    DCRTPolyMatrix,
+                    DCRTPolyUniformSampler,
+                    DCRTPolyHashSampler<Keccak256>,
+                    DCRTPolyTrapdoorSampler,
+                >::new(params.clone(), 1, 4, 2, 4.578, error_sigma);
+            let mismatched_we =
+                DiamondWE::new(mismatched_injector, witness_size, dir.path(), tag, None);
+            let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mismatched_we.enc(&true, circuit.clone(), &instance)
+            }));
+            assert!(
+                mismatch.is_err(),
+                "resume must reject a changed BGG tag or injector parameter"
+            );
+        }
+        let mismatched_injector = DiamondInjector::<
+            DCRTPolyMatrix,
+            DCRTPolyUniformSampler,
+            DCRTPolyHashSampler<Keccak256>,
+            DCRTPolyTrapdoorSampler,
+        >::new(params.clone(), 1, 4, 2, 4.578, 0.0);
+        let evaluator_mismatch_we = TestDiamondWE::with_evaluators(
+            mismatched_injector,
+            witness_size,
+            dir.path(),
+            b"diamond_we_chunked_preimage_test".to_vec(),
+            b"different-evaluator-state".to_vec(),
+            None,
+            Some(NoCircuitEvaluator),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let evaluator_mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            evaluator_mismatch_we.enc(&true, circuit.clone(), &instance)
+        }));
+        assert!(
+            evaluator_mismatch.is_err(),
+            "resume must reject changed evaluator presence or checkpoint identity"
+        );
+
+        let resumed_ct = we.enc(&true, circuit.clone(), &instance);
+        assert_eq!(resumed_ct.hash_key, ct.hash_key, "resume must reuse the session hash key");
+        assert_eq!(
+            std::fs::read(we.matrix_path(&retained_chunk_id))
+                .expect("retained final-preimage chunk should remain readable"),
+            retained_bytes,
+            "resume must not overwrite completed final-preimage chunks"
+        );
+        assert!(we.matrix_path(&missing_chunk_id).exists());
+        assert!(we.enc_complete_path().exists());
+        assert_eq!(we.dec(&resumed_ct, &witness), true);
+        let completed_rerun = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            we.enc(&true, circuit, &instance)
+        }));
+        assert!(
+            completed_rerun.is_err(),
+            "a completed encryption session must require a fresh artifact directory"
+        );
     }
 
     #[test]
@@ -1414,6 +1881,7 @@ mod tests {
                 witness_size,
                 dir.path(),
                 b"diamond_we_witness_test".to_vec(),
+                Some(witness.clone()),
             );
             let ct = we.enc(&msg, circuit.clone(), &instance);
             assert_eq!(we.dec(&ct, &witness), msg);

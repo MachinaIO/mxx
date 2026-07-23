@@ -166,6 +166,31 @@ where
         }
     }
 
+    fn preprocess_task_index(&self, task: &DiamondPreprocessChunkTask) -> u64 {
+        match task {
+            DiamondPreprocessChunkTask::K { level, digit_value, state_idx, chunk_idx } => self
+                .transition_task_index(
+                    *level,
+                    *digit_value,
+                    *state_idx,
+                    *chunk_idx,
+                    column_chunk_count(self.state_col_size(&self.params)),
+                ),
+        }
+    }
+
+    fn retain_preprocess_task(
+        &self,
+        task: &DiamondPreprocessChunkTask,
+        retained_input_digits: Option<&[u32]>,
+    ) -> bool {
+        match (task, retained_input_digits) {
+            (_, None) => true,
+            (DiamondPreprocessChunkTask::K { level, digit_value, .. }, Some(digits)) => {
+                digits[*level - 1] as usize == *digit_value
+            }
+        }
+    }
     fn read_chunk_bytes(&self, dir_path: &Path, id: &str, total_cols: usize) -> Vec<Arc<[u8]>> {
         (0..column_chunk_count(total_cols))
             .map(|chunk_idx| {
@@ -178,30 +203,52 @@ where
         &self,
         dir_path: &Path,
         outputs: Vec<ComputedDiamondPreprocessChunk<M>>,
+        retained_input_digits: Option<&[u32]>,
     ) -> usize {
-        outputs
+        let stored = outputs
             .into_par_iter()
             .map(|output| {
                 let store_started = Instant::now();
                 let chunk_id = self.preprocess_chunk_id(&output.task);
                 let bytes = output.output.into_compact_bytes();
+                let stored_bytes = u64::try_from(bytes.len())
+                    .expect("DiamondInjector GPU transition chunk size must fit u64");
                 self.write_matrix_bytes(dir_path, &chunk_id, &bytes);
                 debug!(
                     ?output.task,
-                    chunk_id,
+                    chunk_id = %chunk_id,
                     load_s = output.load_s,
                     compute_s = output.compute_s,
                     store_s = maybe_elapsed_s(store_started),
                     "diamond injector gpu preprocess: stored chunk"
                 );
-                1usize
+                (output.task, chunk_id, stored_bytes)
             })
-            .sum::<usize>()
+            .collect::<Vec<_>>();
+        let discarded = stored
+            .iter()
+            .filter(|(task, _, _)| !self.retain_preprocess_task(task, retained_input_digits))
+            .map(|(task, chunk_id, stored_bytes)| {
+                (self.preprocess_task_index(task), *stored_bytes, chunk_id.clone())
+            })
+            .collect::<Vec<_>>();
+        self.record_discarded_transition_tasks(
+            dir_path,
+            &discarded
+                .iter()
+                .map(|(task_index, stored_bytes, _)| (*task_index, *stored_bytes))
+                .collect::<Vec<_>>(),
+        );
+        discarded
+            .par_iter()
+            .for_each(|(_, _, chunk_id)| self.remove_matrix_checkpoint(dir_path, chunk_id));
+        stored.len()
     }
 
     fn preprocess_k_stage_gpu(
         &self,
         dir_path: &Path,
+        retained_input_digits: Option<&[u32]>,
         level: usize,
         tasks: Vec<DiamondPreprocessChunkTask>,
         secret_mask_bytes: &HashMap<usize, Arc<[u8]>>,
@@ -383,7 +430,9 @@ where
                     },
                     || {
                         previous_outputs_to_store
-                            .map(|outputs| self.store_preprocess_wave(dir_path, outputs))
+                            .map(|outputs| {
+                                self.store_preprocess_wave(dir_path, outputs, retained_input_digits)
+                            })
                             .unwrap_or(0)
                     },
                 );
@@ -404,7 +453,8 @@ where
                 next_wave_idx += 1;
             }
             if let Some(outputs) = previous_outputs {
-                completed_tasks += self.store_preprocess_wave(dir_path, outputs);
+                completed_tasks +=
+                    self.store_preprocess_wave(dir_path, outputs, retained_input_digits);
             }
 
             info!(
@@ -566,10 +616,16 @@ where
         family_outputs
     }
 
-    pub(super) fn preprocess_gpu(&self, dir_path: &Path, k: &M::P) {
+    pub(super) fn preprocess_gpu(
+        &self,
+        dir_path: &Path,
+        k: &M::P,
+        retained_input_digits: Option<&[u32]>,
+    ) {
         self.ensure_dir(dir_path);
-        self.write_metadata(dir_path, &self.current_metadata());
+        self.prepare_metadata(dir_path, retained_input_digits);
         self.write_bytes(dir_path, self.k_plaintext_id(), &k.to_compact_bytes());
+        let mut discarded_tasks = self.load_discarded_transition_tasks(dir_path);
 
         let preprocess_started = Instant::now();
         let state_cols = self.state_col_size(&self.params);
@@ -607,6 +663,7 @@ where
                 })
                 .collect::<HashMap<_, _>>();
             let mut stage_tasks = Vec::new();
+            let mut adopted_discarded = Vec::new();
             for digit_value in 0..self.base {
                 for state_idx in 0..self.state_count_at_level(level) {
                     for chunk_idx in 0..column_chunk_count(state_cols) {
@@ -616,12 +673,44 @@ where
                             state_idx,
                             chunk_idx,
                         };
-                        if !self.matrix_exists(dir_path, &self.preprocess_chunk_id(&task)) {
-                            stage_tasks.push(task);
+                        let chunk_id = self.preprocess_chunk_id(&task);
+                        let retain_transition =
+                            self.retain_preprocess_task(&task, retained_input_digits);
+                        let task_index = self.preprocess_task_index(&task);
+                        if !retain_transition && discarded_tasks.contains_key(&task_index) {
+                            self.remove_matrix_checkpoint(dir_path, &chunk_id);
+                            continue;
                         }
+                        if self.matrix_exists(dir_path, &chunk_id) {
+                            if !retain_transition {
+                                let stored_bytes = std::fs::metadata(
+                                    self.matrix_path(dir_path, &chunk_id),
+                                )
+                                .unwrap_or_else(|err| {
+                                    panic!(
+                                        "DiamondInjector failed to stat matrix {chunk_id}: {err}"
+                                    )
+                                })
+                                .len();
+                                adopted_discarded.push((task_index, stored_bytes, chunk_id));
+                                discarded_tasks.insert(task_index, stored_bytes);
+                            }
+                            continue;
+                        }
+                        stage_tasks.push(task);
                     }
                 }
             }
+            self.record_discarded_transition_tasks(
+                dir_path,
+                &adopted_discarded
+                    .iter()
+                    .map(|(task_index, stored_bytes, _)| (*task_index, *stored_bytes))
+                    .collect::<Vec<_>>(),
+            );
+            adopted_discarded.par_iter().for_each(|(_, _, chunk_id)| {
+                self.remove_matrix_checkpoint(dir_path, chunk_id);
+            });
             total_tasks += stage_tasks.len();
             if stage_tasks.is_empty() {
                 info!(
@@ -630,8 +719,13 @@ where
                     "diamond injector gpu preprocess: K stage already checkpointed"
                 );
             } else {
-                completed_tasks +=
-                    self.preprocess_k_stage_gpu(dir_path, level, stage_tasks, &secret_mask_bytes);
+                completed_tasks += self.preprocess_k_stage_gpu(
+                    dir_path,
+                    retained_input_digits,
+                    level,
+                    stage_tasks,
+                    &secret_mask_bytes,
+                );
             }
         }
 
@@ -677,32 +771,28 @@ where
             let level = digit_idx + 1;
             let prev_states = std::mem::take(&mut states);
             let prev_p0_bytes = prev_states[0].clone();
-            // Schedule one matrix-product family per active branch. The helper
-            // below streams one family at a time across all devices and keeps
-            // its output as compact chunks for the next level.
-            let family_specs = (0..self.state_count_at_level(level))
-                .map(|state_idx| {
-                    let lhs_chunk_bytes = if self.new_bit_idx_for_state(level, state_idx).is_some()
-                    {
-                        prev_p0_bytes.clone()
-                    } else {
-                        prev_states[state_idx].clone()
-                    };
-                    let rhs_id = self.k_id(level, digit_value as usize, state_idx);
-                    (
-                        DiamondEvalFamily::State(state_idx),
-                        DiamondEvalFamilySpec {
-                            lhs_chunk_bytes,
-                            rhs_chunk_bytes: self.read_chunk_bytes(dir_path, &rhs_id, state_cols),
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            let mut outputs = self.gpu_left_mul_families(family_specs);
-            states = (0..self.state_count_at_level(level))
-                .map(|state_idx| {
+            // Load and evaluate exactly one transition family at a time. At
+            // large witness sizes a level contains hundreds of families, and
+            // eagerly loading every RHS would require terabytes of host RAM.
+            let mut next_states = Vec::with_capacity(self.state_count_at_level(level));
+            for state_idx in 0..self.state_count_at_level(level) {
+                let lhs_chunk_bytes = if self.new_bit_idx_for_state(level, state_idx).is_some() {
+                    prev_p0_bytes.clone()
+                } else {
+                    prev_states[state_idx].clone()
+                };
+                let rhs_id = self.k_id(level, digit_value as usize, state_idx);
+                let family = DiamondEvalFamily::State(state_idx);
+                let mut outputs = self.gpu_left_mul_families(HashMap::from([(
+                    family,
+                    DiamondEvalFamilySpec {
+                        lhs_chunk_bytes,
+                        rhs_chunk_bytes: self.read_chunk_bytes(dir_path, &rhs_id, state_cols),
+                    },
+                )]));
+                next_states.push(
                     outputs
-                        .remove(&DiamondEvalFamily::State(state_idx))
+                        .remove(&family)
                         .unwrap_or_else(|| {
                             panic!(
                                 "missing gpu online_eval state output for level {}, state {}",
@@ -711,9 +801,10 @@ where
                         })
                         .into_iter()
                         .map(Arc::<[u8]>::from)
-                        .collect()
-                })
-                .collect::<Vec<_>>();
+                        .collect(),
+                );
+            }
+            states = next_states;
         }
 
         info!(
@@ -813,7 +904,7 @@ mod tests {
 
         let k = TestPoly::from_usize_to_constant(&params, 3);
 
-        let preprocess_out = injector.preprocess(dir.path(), &k);
+        let preprocess_out = injector.preprocess(dir.path(), &k, None);
 
         let digits = vec![2u32, 1u32, 3u32];
         let states = injector.online_eval(dir.path(), &preprocess_out, &digits);

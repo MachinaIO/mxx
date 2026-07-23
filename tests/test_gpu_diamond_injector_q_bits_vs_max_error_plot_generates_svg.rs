@@ -279,7 +279,7 @@ fn verify_gpu_online_eval_errors_below_simulation(
         crossing_point.crt_depth, crossing_point.q_bits, input_count, digit_bits
     );
     let preprocess_started = Instant::now();
-    let preprocess_out = injector.preprocess(dir.path(), &k);
+    let preprocess_out = injector.preprocess(dir.path(), &k, None);
     gpu_device_sync();
     info!(
         "diamond injector gpu preprocess: finished, elapsed_s={:.3}",

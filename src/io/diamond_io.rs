@@ -388,7 +388,7 @@ where
         // sampled here because they depend on the selected function's public
         // keys and the PRF mask public key.
         let preprocess_started = Instant::now();
-        let preprocess_out = self.injector.preprocess(dir_path, &k);
+        let preprocess_out = self.injector.preprocess(dir_path, &k, None);
         info!(
             elapsed_ms = preprocess_started.elapsed().as_millis(),
             "DiamondIO obfuscation Diamond preprocessing finished"

@@ -425,7 +425,13 @@ fn build_cpu_diamond_we_for_search(
         cfg.trapdoor_sigma,
         cfg.error_sigma,
     );
-    DiamondWE::new(injector, cfg.witness_size, dir_path, b"test_gpu_diamond_we_cpu_search".to_vec())
+    DiamondWE::new(
+        injector,
+        cfg.witness_size,
+        dir_path,
+        b"test_gpu_diamond_we_cpu_search".to_vec(),
+        None,
+    )
 }
 
 fn build_gpu_diamond_we(
@@ -443,7 +449,13 @@ fn build_gpu_diamond_we(
         cfg.error_sigma,
     )
     .with_gpu_device_ids(gpu_ids);
-    DiamondWE::new(injector, cfg.witness_size, dir_path, b"test_gpu_diamond_we".to_vec())
+    DiamondWE::new(
+        injector,
+        cfg.witness_size,
+        dir_path,
+        b"test_gpu_diamond_we".to_vec(),
+        Some(vec![true; cfg.witness_size]),
+    )
 }
 
 fn build_benchmark_public_lut(params: &GpuDCRTPolyParams) -> PublicLut<GpuDCRTPoly> {
@@ -772,12 +784,43 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
     let instance = vec![true; cfg.instance_size()];
     let msg = rand::random::<bool>();
     info!(msg, "starting DiamondWE GPU enc");
-    let ct = diamond.enc(&msg, gpu_circuit, &instance);
+    let ct = diamond.enc(&msg, gpu_circuit.clone(), &instance);
     gpu_device_sync();
+    let one_preimage_path = fs::read_dir(&final_dir)
+        .expect("DiamondWE artifact directory should be readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                name.starts_with("diamond_we_session_") &&
+                    name.contains("_we_one_preimage") &&
+                    name.ends_with(".matrixbin")
+            })
+        })
+        .expect("session-qualified one-preimage artifact should exist");
+    fs::remove_file(&one_preimage_path)
+        .expect("test should remove one saved preimage to simulate interruption");
+    fs::remove_file(final_dir.join("diamond_we_enc_complete"))
+        .expect("test should remove the encryption completion marker");
+    let resumed_ct = diamond.enc(&msg, gpu_circuit, &instance);
+    gpu_device_sync();
+    assert_eq!(resumed_ct.hash_key, ct.hash_key);
+    assert!(one_preimage_path.exists());
+    assert_eq!(
+        fs::read_dir(&final_dir)
+            .expect("DiamondWE artifact directory should be readable")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().ends_with("_storage_accounting.json")
+            })
+            .count(),
+        1,
+        "the resumed session must publish one actual-byte accounting artifact"
+    );
     info!("starting DiamondWE GPU dec");
     let _expected_msg_guard =
         EnvVarGuard::set("DIAMOND_WE_GPU_BENCH_EXPECTED_MSG", if msg { "true" } else { "false" });
-    let decoded = diamond.dec(&ct, &witness);
+    let decoded = diamond.dec(&resumed_ct, &witness);
     gpu_device_sync();
     info!(msg, decoded, "DiamondWE GPU round trip finished");
     assert_eq!(decoded, msg);

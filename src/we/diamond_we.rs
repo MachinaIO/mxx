@@ -1,7 +1,14 @@
 use digest::Digest;
 use keccak_asm::Keccak256;
 use serde::{Deserialize, Serialize};
-use std::{marker::PhantomData, path::PathBuf, sync::Arc};
+use std::{
+    io::Write,
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::{Arc, mpsc},
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use num_bigint::BigUint;
 use tracing::info;
@@ -37,6 +44,8 @@ struct DiamondWEEncCheckpoint {
     circuit_json: String,
     hash_key: [u8; 32],
     preimage_chunk_width: usize,
+    enc_timing_heartbeat_millis: u64,
+    retain_full_final_preimages: bool,
     bgg_tag: Vec<u8>,
     witness_size: usize,
     injector_input_count: usize,
@@ -73,6 +82,157 @@ struct DiamondWEStorageAccounting {
     transition_preimage_bytes: u128,
     final_preimage_bytes: u128,
     total_preimage_bytes: u128,
+}
+
+const ENC_TIMING_RECORD_SIZE: usize = 2 * std::mem::size_of::<u64>();
+const ENC_TIMING_INVOCATION_TAG: u64 = 1;
+const ENC_TIMING_ACTIVE_NANOS_TAG: u64 = 2;
+const ENC_TIMING_HEARTBEAT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct DiamondWEEncTimingAccounting {
+    invocation_count: u64,
+    active_time_nanos: u128,
+}
+
+struct DiamondWEEncTimer {
+    stop_tx: Option<mpsc::Sender<()>>,
+    join_handle: Option<JoinHandle<DiamondWEEncTimingAccounting>>,
+}
+
+impl DiamondWEEncTimer {
+    fn start(path: PathBuf, invocation_started: Instant) -> Self {
+        let mut accounting = load_enc_timing_journal(&path);
+        append_enc_timing_record(&path, ENC_TIMING_INVOCATION_TAG, 1);
+        accounting.invocation_count = accounting
+            .invocation_count
+            .checked_add(1)
+            .expect("DiamondWE encryption invocation count overflow");
+
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let join_handle = std::thread::Builder::new()
+            .name("diamond-we-enc-timer".to_owned())
+            .spawn(move || {
+                let mut last_checkpoint = invocation_started;
+                loop {
+                    match stop_rx.recv_timeout(ENC_TIMING_HEARTBEAT) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            checkpoint_enc_elapsed(&path, &mut accounting, &mut last_checkpoint);
+                        }
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            checkpoint_enc_elapsed(&path, &mut accounting, &mut last_checkpoint);
+                            return accounting;
+                        }
+                    }
+                }
+            })
+            .expect("DiamondWE encryption timing thread should start");
+        Self { stop_tx: Some(stop_tx), join_handle: Some(join_handle) }
+    }
+
+    fn finish(mut self) -> DiamondWEEncTimingAccounting {
+        self.stop_tx
+            .take()
+            .expect("DiamondWE encryption timing stop sender should exist")
+            .send(())
+            .expect("DiamondWE encryption timing thread should still be running");
+        self.join_handle
+            .take()
+            .expect("DiamondWE encryption timing join handle should exist")
+            .join()
+            .expect("DiamondWE encryption timing thread should finish")
+    }
+}
+
+impl Drop for DiamondWEEncTimer {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
+}
+
+fn append_enc_timing_record(path: &Path, tag: u64, value: u64) {
+    let mut file =
+        std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap_or_else(|err| {
+            panic!("DiamondWE failed to open timing journal {}: {err}", path.display())
+        });
+    let mut record = [0u8; ENC_TIMING_RECORD_SIZE];
+    record[..8].copy_from_slice(&tag.to_le_bytes());
+    record[8..].copy_from_slice(&value.to_le_bytes());
+    file.write_all(&record).unwrap_or_else(|err| {
+        panic!("DiamondWE failed to append timing journal {}: {err}", path.display())
+    });
+    file.sync_all().unwrap_or_else(|err| {
+        panic!("DiamondWE failed to sync timing journal {}: {err}", path.display())
+    });
+}
+
+fn load_enc_timing_journal(path: &Path) -> DiamondWEEncTimingAccounting {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return DiamondWEEncTimingAccounting::default();
+        }
+        Err(err) => {
+            panic!("DiamondWE failed to read timing journal {}: {err}", path.display())
+        }
+    };
+    let complete_len = bytes.len() / ENC_TIMING_RECORD_SIZE * ENC_TIMING_RECORD_SIZE;
+    if complete_len != bytes.len() {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap_or_else(|err| {
+            panic!("DiamondWE failed to repair timing journal {}: {err}", path.display())
+        });
+        file.set_len(complete_len as u64).unwrap_or_else(|err| {
+            panic!("DiamondWE failed to truncate timing journal {}: {err}", path.display())
+        });
+        file.sync_all().unwrap_or_else(|err| {
+            panic!("DiamondWE failed to sync repaired timing journal {}: {err}", path.display())
+        });
+    }
+
+    let mut accounting = DiamondWEEncTimingAccounting::default();
+    for record in bytes[..complete_len].chunks_exact(ENC_TIMING_RECORD_SIZE) {
+        let tag = u64::from_le_bytes(record[..8].try_into().unwrap());
+        let value = u64::from_le_bytes(record[8..].try_into().unwrap());
+        match tag {
+            ENC_TIMING_INVOCATION_TAG => {
+                accounting.invocation_count = accounting
+                    .invocation_count
+                    .checked_add(value)
+                    .expect("DiamondWE encryption invocation count overflow");
+            }
+            ENC_TIMING_ACTIVE_NANOS_TAG => {
+                accounting.active_time_nanos = accounting
+                    .active_time_nanos
+                    .checked_add(u128::from(value))
+                    .expect("DiamondWE encryption active time overflow");
+            }
+            _ => panic!("DiamondWE timing journal has unknown record tag {tag}"),
+        }
+    }
+    accounting
+}
+
+fn checkpoint_enc_elapsed(
+    path: &Path,
+    accounting: &mut DiamondWEEncTimingAccounting,
+    last_checkpoint: &mut Instant,
+) {
+    let now = Instant::now();
+    let elapsed_nanos = u64::try_from(now.duration_since(*last_checkpoint).as_nanos())
+        .expect("DiamondWE timing heartbeat interval must fit u64 nanoseconds");
+    if elapsed_nanos > 0 {
+        append_enc_timing_record(path, ENC_TIMING_ACTIVE_NANOS_TAG, elapsed_nanos);
+        accounting.active_time_nanos = accounting
+            .active_time_nanos
+            .checked_add(u128::from(elapsed_nanos))
+            .expect("DiamondWE encryption active time overflow");
+    }
+    *last_checkpoint = now;
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +401,9 @@ where
             circuit_json: SerializablePolyCircuit::from_circuit(circuit.clone()).to_json_str(),
             hash_key,
             preimage_chunk_width: crate::env::aux_sampling_chunk_width(),
+            enc_timing_heartbeat_millis: u64::try_from(ENC_TIMING_HEARTBEAT.as_millis())
+                .expect("DiamondWE timing heartbeat milliseconds must fit u64"),
+            retain_full_final_preimages: true,
             bgg_tag: self.bgg_tag.clone(),
             witness_size: self.witness_size,
             injector_input_count: self.injector.input_count,
@@ -322,6 +485,24 @@ where
     fn storage_accounting_path(&self, hash_key: [u8; 32]) -> PathBuf {
         self.artifact_dir
             .join(format!("{}_storage_accounting.json", Self::session_prefix(hash_key)))
+    }
+
+    fn enc_timing_journal_path(&self, hash_key: [u8; 32]) -> PathBuf {
+        self.artifact_dir.join(format!("{}_enc_timing.journal", Self::session_prefix(hash_key)))
+    }
+
+    fn enc_timing_accounting_path(&self, hash_key: [u8; 32]) -> PathBuf {
+        self.artifact_dir.join(format!("{}_enc_timing.json", Self::session_prefix(hash_key)))
+    }
+
+    fn write_enc_timing_accounting(
+        &self,
+        hash_key: [u8; 32],
+        accounting: &DiamondWEEncTimingAccounting,
+    ) {
+        let bytes = serde_json::to_vec_pretty(accounting)
+            .expect("DiamondWE encryption timing accounting should serialize");
+        crate::utils::write_bytes_atomic(&self.enc_timing_accounting_path(hash_key), &bytes);
     }
 
     fn mark_enc_complete(&self) {
@@ -942,6 +1123,7 @@ where
         circuit: PolyCircuit<M::P>,
         instance: &Self::Inst,
     ) -> Self::Ciphertext {
+        let invocation_started = Instant::now();
         assert_eq!(circuit.num_output(), 1, "DiamondWE currently requires one circuit output");
         assert_eq!(
             self.witness_size + instance.len(),
@@ -963,6 +1145,8 @@ where
         let retained_input_digits =
             self.target_witness.as_ref().map(|witness| self.pack_witness_digits(witness));
         let hash_key = self.prepare_enc_checkpoint(*msg, &circuit, instance);
+        let enc_timer =
+            DiamondWEEncTimer::start(self.enc_timing_journal_path(hash_key), invocation_started);
         let params = &self.injector.params;
         let k = if *msg { M::P::const_one(params) } else { M::P::const_zero(params) };
         let preprocess_out =
@@ -1080,6 +1264,15 @@ where
             final_preimage_bytes = %storage_accounting.final_preimage_bytes,
             total_preimage_bytes = %storage_accounting.total_preimage_bytes,
             "diamond we enc: actual saved preimage bytes"
+        );
+        let timing_accounting = enc_timer.finish();
+        self.write_enc_timing_accounting(hash_key, &timing_accounting);
+        info!(
+            invocation_count = timing_accounting.invocation_count,
+            cumulative_active_time_nanos = %timing_accounting.active_time_nanos,
+            cumulative_active_time_seconds =
+                timing_accounting.active_time_nanos as f64 / 1_000_000_000.0,
+            "diamond we enc: cumulative active execution time"
         );
         self.mark_enc_complete();
 
@@ -1752,6 +1945,13 @@ mod tests {
 
         let ct = we.enc(&true, circuit.clone(), &instance);
         assert_eq!(we.dec(&ct, &witness), true);
+        let first_timing: DiamondWEEncTimingAccounting = serde_json::from_slice(
+            &std::fs::read(we.enc_timing_accounting_path(ct.hash_key))
+                .expect("first encryption timing accounting should be readable"),
+        )
+        .expect("first encryption timing accounting should decode");
+        assert_eq!(first_timing.invocation_count, 1);
+        assert!(first_timing.active_time_nanos > 0);
 
         let total_cols = params.modulus_digits();
         let chunk_cols = crate::env::aux_sampling_chunk_width().min(total_cols);
@@ -1785,6 +1985,14 @@ mod tests {
             .expect("test should remove one final-preimage chunk");
         std::fs::remove_file(we.enc_complete_path())
             .expect("test should remove the encryption completion marker");
+        let timing_journal_path = we.enc_timing_journal_path(ct.hash_key);
+        let mut timing_journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&timing_journal_path)
+            .expect("timing journal should open for torn-tail simulation");
+        timing_journal.write_all(&[0xa5; 7]).expect("torn timing-journal tail should be written");
+        timing_journal.sync_all().expect("torn timing-journal tail should sync");
+        drop(timing_journal);
 
         for (tag, error_sigma) in [
             (b"diamond_we_mismatched_tag".to_vec(), 0.0),
@@ -1837,6 +2045,24 @@ mod tests {
 
         let resumed_ct = we.enc(&true, circuit.clone(), &instance);
         assert_eq!(resumed_ct.hash_key, ct.hash_key, "resume must reuse the session hash key");
+        let resumed_timing: DiamondWEEncTimingAccounting = serde_json::from_slice(
+            &std::fs::read(we.enc_timing_accounting_path(ct.hash_key))
+                .expect("resumed encryption timing accounting should be readable"),
+        )
+        .expect("resumed encryption timing accounting should decode");
+        assert_eq!(resumed_timing.invocation_count, 2);
+        assert!(
+            resumed_timing.active_time_nanos > first_timing.active_time_nanos,
+            "resume must add the new invocation active time to the persisted total"
+        );
+        assert_eq!(
+            std::fs::metadata(&timing_journal_path)
+                .expect("repaired timing journal should exist")
+                .len() as usize %
+                ENC_TIMING_RECORD_SIZE,
+            0,
+            "resume must repair a torn timing-journal tail"
+        );
         assert_eq!(
             std::fs::read(we.matrix_path(&retained_chunk_id))
                 .expect("retained final-preimage chunk should remain readable"),

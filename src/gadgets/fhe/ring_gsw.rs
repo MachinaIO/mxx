@@ -1698,7 +1698,6 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         bgg::public_key::BggPublicKey,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
@@ -2178,7 +2177,7 @@ mod tests {
         let _ = lhs.xor(&rhs, &mut circuit);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_encrypt_roundtrip_matches_circuit_and_native_decrypt_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2239,7 +2238,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_decrypt_batch_with_ring_dim_ciphertexts_packs_decryptions_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2333,7 +2332,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_decrypt_batch_bgg_public_key_output_column_count() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2396,7 +2395,7 @@ mod tests {
         assert_eq!(outputs[0].matrix.col_size(), secret_size * m_g);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2464,7 +2463,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2532,7 +2531,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2600,7 +2599,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2924,7 +2923,7 @@ mod tests {
         assert_eq!(ctx.width() % (MUL_COLUMN_SUBCIRCUIT_BATCH * MUL_COLUMN_SUBCIRCUIT_BATCH), 2);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_nested_rns_ring_gsw_mul_large_circuit_metrics() {
@@ -2993,7 +2992,7 @@ mod tests {
         println!("mul 2 vs mul 1 depth increase: {}", mul2_depth - mul1_depth);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_carry_arith_ring_gsw_mul_large_circuit_metrics() {

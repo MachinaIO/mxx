@@ -468,7 +468,6 @@ where
 mod tests {
     use super::{BggPublicKeyBenchEstimator, total_lut_preimage_count};
     use crate::{
-        __PAIR, __TestState,
         bench_estimator::{
             BenchEstimator, CircuitBenchEstimate, PublicLutSampleAuxBenchEstimator,
             SampleAuxBenchEstimate, SlotTransferSampleAuxBenchEstimator,
@@ -504,7 +503,7 @@ mod tests {
     #[cfg(not(feature = "gpu"))]
     use keccak_asm::Keccak256;
     use num_bigint::BigUint;
-    use sequential_test::sequential;
+    use serial_test::serial as sequential;
     use std::{marker::PhantomData, sync::Arc};
     #[cfg(any(feature = "gpu", not(feature = "gpu")))]
     use tempfile::tempdir;

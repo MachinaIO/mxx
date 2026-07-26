@@ -34,7 +34,7 @@ tempfile = { version = "3.19.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-sequential-test = "0.2.4"
+serial_test = { version = "3.5.0", default-features = false }
 
 [build-dependencies]
 cc = "1"

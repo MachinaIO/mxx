@@ -278,7 +278,6 @@ pub(crate) fn gauss_samp_gq_arb_base(
 mod test {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         element::PolyElem,
         poly::PolyParams,
         sampler::{PolyUniformSampler, uniform::DCRTPolyUniformSampler},
@@ -318,7 +317,7 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_trapdoor_generation() {
         let size: usize = 3;
         let params = DCRTPolyParams::default();
@@ -361,7 +360,7 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_trapdoor_round_trip_bytes() {
         let size: usize = 3;
         let params = DCRTPolyParams::default();
@@ -377,7 +376,7 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_preimage_generation_square() {
         let params = DCRTPolyParams::default();
         let size = 3;
@@ -411,7 +410,7 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_preimage_generation_non_square_target_lt() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -449,7 +448,7 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_preimage_generation_non_square_target_gt_multiple() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -489,7 +488,7 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_preimage_generation_non_square_target_gt_non_multiple() {
         let params = DCRTPolyParams::default();
         let size = 4;
@@ -528,7 +527,7 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_preimage_generation_base_8() {
         let params = DCRTPolyParams::new(4, 2, 17, 3);
         let size = 4;
@@ -567,7 +566,7 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_preimage_generation_base_1024() {
         let params = DCRTPolyParams::new(4, 2, 17, 10);
         let size = 4;
@@ -606,7 +605,7 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_preimage_sampler_parameters_follow_instance_sigma() {
         let params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
         let base = 1u32 << params.base_bits();
@@ -675,20 +674,20 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_preimage_coefficients_below_compute_preimage_sigma() {
         assert_preimage_reconstructs_target_and_respects_norm_bound(SIGMA, None);
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_preimage_coefficients_below_compute_preimage_sigma_non_default_sigma() {
         let sigma = SIGMA * 1.25;
         assert_preimage_reconstructs_target_and_respects_norm_bound(sigma, Some(sigma));
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_p_hat_coefficients_below_compute_preimage_sigma() {
         let size = 2usize;
         let params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
@@ -761,7 +760,7 @@ mod test {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_preimage_generation_extend() {
         let params = DCRTPolyParams::default();
         let size = 3;

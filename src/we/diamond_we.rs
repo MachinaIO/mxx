@@ -1632,7 +1632,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         bgg::sampler::BGGPublicKeySampler,
         circuit::PolyCircuit,
         matrix::dcrt_poly::DCRTPolyMatrix,
@@ -1914,7 +1913,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_diamond_we_chunked_preimages_round_trip_and_artifacts() {
         let _env_lock = diamond_we_env_lock().lock().expect("DiamondWE env lock poisoned");
         let _chunk_cols = EnvVarGuard::set("AUX_SAMPLING_CHUNK_WIDTH", "20");

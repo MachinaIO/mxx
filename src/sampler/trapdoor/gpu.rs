@@ -489,7 +489,6 @@ fn sample_pert_square_mat_gpu_native_parts(
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         element::PolyElem,
         matrix::PolyMatrix,
         poly::{
@@ -505,7 +504,7 @@ mod tests {
     };
     use bigdecimal::{BigDecimal, FromPrimitive};
     use num_bigint::{BigInt, BigUint};
-    use sequential_test::sequential;
+    use serial_test::serial as sequential;
 
     const SIGMA: f64 = 4.578;
 

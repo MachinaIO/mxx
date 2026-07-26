@@ -498,7 +498,6 @@ impl<M: PolyMatrix> Evaluable for BggPolyEncoding<M> {
 mod tests {
     use super::BggPolyEncoding;
     use crate::{
-        __PAIR, __TestState,
         bgg::{encoding::BggEncoding, public_key::BggPublicKey, sampler::BGGPublicKeySampler},
         circuit::evaluable::Evaluable,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -549,7 +548,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("Failed to write matrix file {path:?}"));
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_poly_encoding_constructor_and_concat_vector() {
         let key: [u8; 32] = rand::random();
@@ -592,7 +591,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_poly_encoding_arithmetic() {
         let key: [u8; 32] = rand::random();
@@ -691,7 +690,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_poly_encoding_evaluable_roundtrip_and_ops() {
         let key: [u8; 32] = rand::random();
@@ -740,7 +739,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_poly_encoding_read_from_files() {
         let key: [u8; 32] = rand::random();

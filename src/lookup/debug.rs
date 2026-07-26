@@ -359,7 +359,6 @@ where
 mod tests {
     use super::{DebugNaiveBGGEncodingVecPltEvaluator, DebugNaiveBGGPublicKeyVecPltEvaluator};
     use crate::{
-        __PAIR, __TestState,
         bgg::{
             naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
             sampler::{BGGEncodingSampler, BGGPublicKeySampler},
@@ -405,7 +404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_debug_naive_bgg_vec_lookup_satisfies_output_vector_relation() {
         let _storage_lock = storage_test_lock().await;
         let params = DCRTPolyParams::default();

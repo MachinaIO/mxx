@@ -846,7 +846,6 @@ where
 mod tests {
     use super::super::{DiamondInjector, InputInjector};
     use crate::{
-        __PAIR, __TestState,
         matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
@@ -870,7 +869,7 @@ mod tests {
         GpuDCRTPolyTrapdoorSampler,
     >;
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_gpu_diamond_injector_online_eval_returns_exact_bgg_relations() {
         type TestPoly = <GpuDCRTPolyMatrix as PolyMatrix>::P;

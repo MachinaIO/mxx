@@ -1377,7 +1377,6 @@ where
 mod tests {
     use super::slot_device_ids;
     use crate::{
-        __PAIR, __TestState,
         bgg::{
             poly_encoding::BggPolyEncoding,
             public_key::BggPublicKey,
@@ -1458,7 +1457,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_slot_transfer_bgg_poly_encoding_gpu_uses_detected_gpu_ids() {
         let detected_gpu_ids = detected_gpu_device_ids();
@@ -1482,7 +1481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_slot_transfer_bgg_poly_encoding_gpu_runs_on_gpu_repeatedly() {
         let detected_gpu_ids = detected_gpu_device_ids();
         assert!(

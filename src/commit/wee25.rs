@@ -1222,7 +1222,6 @@ where
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::params::DCRTPolyParams,
         sampler::{trapdoor::sampler::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler},
@@ -1268,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_wee25_zero_commit_verify() {
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 2, 17, 15);
@@ -1323,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_wee25_random_commit_verify() {
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 2, 17, 15);
@@ -1386,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_wee25_random_invalid_commit_verify() {
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 2, 17, 15);
@@ -1454,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_wee25_random_partial_open_verify() {
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 2, 17, 15);
@@ -1523,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_wee25_commit_cache_load_open_verify() {
         let _ = tracing_subscriber::fmt::try_init();
         let params = DCRTPolyParams::new(4, 2, 17, 15);

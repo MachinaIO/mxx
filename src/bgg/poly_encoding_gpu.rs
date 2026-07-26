@@ -51,12 +51,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{effective_slot_parallelism_gpu, slot_device_ids};
-    use crate::{
-        __PAIR, __TestState,
-        poly::{
-            PolyParams,
-            dcrt::{gpu::detected_gpu_device_ids, params::DCRTPolyParams},
-        },
+    use crate::poly::{
+        PolyParams,
+        dcrt::{gpu::detected_gpu_device_ids, params::DCRTPolyParams},
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,7 +98,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_slot_device_ids_uses_detected_gpu_ids() {
         let detected_gpu_ids = detected_gpu_device_ids();
@@ -125,7 +122,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_effective_slot_parallelism_gpu_uses_detected_gpu_ids() {
         let detected_count = detected_gpu_device_ids().len().max(1);

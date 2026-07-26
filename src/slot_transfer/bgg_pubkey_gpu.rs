@@ -1249,7 +1249,6 @@ where
 mod tests {
     use super::sharded_batch_device_idx;
     use crate::{
-        __PAIR, __TestState,
         bgg::public_key::BggPublicKey,
         circuit::{PolyCircuit, evaluable::Evaluable, gate::GateId},
         lookup::{PltEvaluator, PublicLut},
@@ -1394,7 +1393,7 @@ mod tests {
         assert_eq!(sharded_batch_device_idx(3, 0, 3), 0);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn bgg_public_key_st_evaluator_uses_parallel_slot_transfer_path_with_gpu_feature() {
         gpu_device_sync();
@@ -1482,7 +1481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn bgg_public_key_st_evaluator_samples_aux_matrices_with_gpu_feature() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();

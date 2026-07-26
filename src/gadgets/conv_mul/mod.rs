@@ -520,7 +520,6 @@ where
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         circuit::{PolyCircuit, PolyGateKind, evaluable::PolyVec},
         gadgets::arith::{
             NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
@@ -701,7 +700,7 @@ mod tests {
         reduce_terms_pairwise(diagonal_terms, circuit)
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_negacyclic_diagonal_matches_matrix_diagonal() {
         let num_slots = 4usize;
@@ -734,7 +733,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_negacyclic_conv_mul_matches_direct_product() {
         let num_slots = 4usize;
@@ -772,7 +771,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_negacyclic_conv_mul_respects_enable_levels() {
         let num_slots = 4usize;
@@ -818,7 +817,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_negacyclic_conv_mul_respects_enable_levels_with_nonzero_level_offset() {
         let num_slots = 2usize;
@@ -883,7 +882,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_negacyclic_conv_mul_right_sparse_matches_manual_pipeline() {
         let num_slots = 4usize;
@@ -949,7 +948,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_negacyclic_conv_mul_right_sparse_does_not_increase_non_free_depth() {
         let num_slots = 4usize;
@@ -1003,7 +1002,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     // #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_negacyclic_conv_mul_large_circuit_metrics() {

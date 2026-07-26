@@ -1375,7 +1375,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         bgg::{encoding::BggEncoding, sampler::BGGEncodingSampler},
         circuit::evaluable::PolyVec,
         gadgets::{
@@ -1457,7 +1456,7 @@ mod tests {
         coeffs
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_gpu_diamond_io_debug_decryption_polyvec_eval_returns_seed_bits() {
         let gpu_ids = detected_gpu_device_ids();
@@ -1609,7 +1608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_gpu_diamond_io_debug_decryption_bgg_eval_returns_expected_vectors() {
         let _storage_lock = storage_test_lock().await;
         let gpu_ids = detected_gpu_device_ids();
@@ -1950,7 +1949,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "full DiamondIO PRF-mask GPU roundtrip is expensive"]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_gpu_diamond_io_debug_decryption_eval_returns_seed_bits() {
         let log_filter = tracing_subscriber::filter::Targets::new()
             .with_default(tracing::Level::WARN)

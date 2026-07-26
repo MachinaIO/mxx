@@ -1124,7 +1124,6 @@ where
 mod tests {
     use super::{DIAMOND_SECRET_SIZE, DiamondInjector, InputInjector};
     use crate::{
-        __PAIR, __TestState,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
         sampler::{
@@ -1166,7 +1165,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_diamond_injector_online_eval_returns_exact_bgg_relations() {
         let params = DCRTPolyParams::default();
@@ -1217,7 +1216,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_diamond_injector_retains_selected_transitions_and_journals_deleted_paths() {
         let params = DCRTPolyParams::default();

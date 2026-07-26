@@ -57,7 +57,6 @@ impl<M: PolyMatrix> DigitsToInt<M::P> for BggEncoding<M> {
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -98,7 +97,7 @@ mod tests {
         assert_eq!(result, expected, "digits_to_int result does not match expected value 13");
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_publickey_digits_to_int() {
         // Create parameters for testing
@@ -140,7 +139,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_encoding_digits_to_int_static() {
         // Create parameters for testing
@@ -179,7 +178,7 @@ mod tests {
         assert_eq!(result.plaintext.unwrap(), int_poly);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bggencoding_digits_to_int_random() {
         // Create parameters for testing

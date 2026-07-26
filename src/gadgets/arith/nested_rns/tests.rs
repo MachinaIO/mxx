@@ -1,6 +1,5 @@
 use super::{encoding::sample_crt_primes_mul_budget_bound, *};
 use crate::{
-    __PAIR, __TestState,
     circuit::{PolyGateKind, evaluable::PolyVec},
     gadgets::arith::encode_nested_rns_poly_with_offset,
     lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
@@ -293,7 +292,7 @@ fn div_ceil_biguint_by_u64(value: BigUint, divisor: u64) -> BigUint {
     (value + adjustment) / BigUint::from(divisor)
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_add_auto_reduce_maxes() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -304,7 +303,7 @@ fn test_nested_rns_poly_add_auto_reduce_maxes() {
     test_nested_rns_poly_add_generic(circuit, params, ctx, a_value, b_value);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_add_auto_reduce_random() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -316,7 +315,7 @@ fn test_nested_rns_poly_add_auto_reduce_random() {
     test_nested_rns_poly_add_generic(circuit, params, ctx, a_value, b_value);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_sub_auto_reduce_maxes() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -327,7 +326,7 @@ fn test_nested_rns_poly_sub_auto_reduce_maxes() {
     test_nested_rns_poly_sub_generic(circuit, params, ctx, a_value, b_value);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_sub_auto_reduce_random() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -339,7 +338,7 @@ fn test_nested_rns_poly_sub_auto_reduce_random() {
     test_nested_rns_poly_sub_generic(circuit, params, ctx, a_value, b_value);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_mul_auto_reduce_maxes() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -350,7 +349,7 @@ fn test_nested_rns_poly_mul_auto_reduce_maxes() {
     test_nested_rns_poly_mul_generic(circuit, params, ctx, a_value, b_value);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_mul_auto_reduce_random() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -362,7 +361,7 @@ fn test_nested_rns_poly_mul_auto_reduce_random() {
     test_nested_rns_poly_mul_generic(circuit, params, ctx, a_value, b_value);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_mul_auto_reduce_reconstruct_maxes() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -373,7 +372,7 @@ fn test_nested_rns_poly_mul_auto_reduce_reconstruct_maxes() {
     test_nested_rns_poly_mul_reconstruct_generic(circuit, params, ctx, a_value, b_value);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_mul_right_sparse_matches_generic_mul() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -406,7 +405,7 @@ fn test_nested_rns_poly_mul_right_sparse_matches_generic_mul() {
     }
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_mul_right_sparse_uses_fewer_gates_than_generic_mul() {
     let right_q_idx = 0usize;
@@ -455,7 +454,7 @@ fn test_nested_rns_poly_mul_right_sparse_uses_fewer_gates_than_generic_mul() {
     );
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 #[should_panic(expected = "mul_right_sparse requires the right operand to be zero outside q_idx")]
 fn test_nested_rns_poly_mul_right_sparse_requires_sparse_rhs() {
@@ -506,7 +505,7 @@ fn build_manual_conv_mul_right_decomposed_many(
         .collect()
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_conv_mul_right_decomposed_many_matches_manual_pipeline() {
     let q_level = Some(1usize);
@@ -621,7 +620,7 @@ fn test_nested_rns_poly_conv_mul_right_decomposed_many_matches_manual_pipeline()
     assert_eq!(fused_eval, manual_eval);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_conv_mul_right_decomposed_many_does_not_increase_non_free_depth() {
     let q_level = Some(1usize);
@@ -687,7 +686,7 @@ fn test_nested_rns_poly_conv_mul_right_decomposed_many_does_not_increase_non_fre
     );
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_gadget_decompose_unreduced_matches_explicit_lazy_reduce() {
     let q_level = Some(1usize);
@@ -768,7 +767,7 @@ fn test_nested_rns_poly_gadget_decompose_unreduced_matches_explicit_lazy_reduce(
     assert!(num_slots > 0);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_gadget_decompose_unreduced_does_not_increase_non_free_depth() {
     let q_level = Some(1usize);
@@ -808,7 +807,7 @@ fn test_nested_rns_poly_gadget_decompose_unreduced_does_not_increase_non_free_de
     );
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_conv_mul_right_decomposed_many_unreduced_matches_explicit_lazy_reduce() {
     let q_level = Some(1usize);
@@ -930,7 +929,7 @@ fn test_nested_rns_poly_conv_mul_right_decomposed_many_unreduced_matches_explici
     assert_eq!(fused_eval, manual_eval);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_conv_mul_right_decomposed_many_unreduced_does_not_increase_non_free_depth()
 {
@@ -1003,7 +1002,7 @@ fn test_nested_rns_poly_conv_mul_right_decomposed_many_unreduced_does_not_increa
     );
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_const_mul_auto_reduce_random() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -1023,7 +1022,7 @@ fn test_nested_rns_poly_const_mul_auto_reduce_random() {
     test_nested_rns_poly_const_mul_generic(circuit, params, ctx, a_value, tower_constants);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_respects_q_level() {
     let q_level = 2usize;
@@ -1061,7 +1060,7 @@ fn test_nested_rns_poly_respects_q_level() {
     test_nested_rns_poly_mul_generic(random_circuit, params, random_ctx, a_value, b_value);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_input_and_full_reduce_track_max_plaintexts() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -1075,7 +1074,7 @@ fn test_nested_rns_poly_input_and_full_reduce_track_max_plaintexts() {
     assert_eq!(reduced.max_plaintexts, ctx.full_reduce_max_plaintexts);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_gadget_decomposition_reconstructs_random_inputs() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -1097,7 +1096,7 @@ fn test_nested_rns_poly_gadget_decomposition_reconstructs_random_inputs() {
     }
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_gadget_vector_matrix_matches_reconstructed_poly_vec_outputs() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -1130,7 +1129,7 @@ fn test_nested_rns_gadget_vector_matrix_matches_reconstructed_poly_vec_outputs()
     assert_eq!(reconstructed, expected);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_gadget_decomposed_matrix_matches_reconstructed_poly_vec_outputs() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -1216,7 +1215,7 @@ fn test_nested_rns_gadget_decomposed_matrix_matches_reconstructed_poly_vec_outpu
     assert_eq!(reconstructed, expected);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_gadget_decomposed_random_fin_ring_matrix_matches_reconstructed_poly_vec_outputs()
 {
@@ -1259,7 +1258,7 @@ fn test_nested_rns_gadget_decomposed_random_fin_ring_matrix_matches_reconstructe
     assert_eq!(reconstructed, expected);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_gadget_decomposition_large_circuit_metrics() {
     let crt_bits = 24usize;
@@ -1284,7 +1283,7 @@ fn test_nested_rns_poly_gadget_decomposition_large_circuit_metrics() {
     println!("gate counts {:?}", circuit.count_gates_by_type_vec());
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_reconstruct_auto_reduce_matches_manual_full_reduce() {
     let q_level = 1usize;
@@ -1334,7 +1333,7 @@ fn test_nested_rns_poly_reconstruct_auto_reduce_matches_manual_full_reduce() {
     assert_eq!(auto_circuit.count_gates_by_type_vec(), manual_circuit.count_gates_by_type_vec());
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_slot_transfer_tracks_distinct_q_level_bounds() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -1350,7 +1349,7 @@ fn test_nested_rns_poly_slot_transfer_tracks_distinct_q_level_bounds() {
     assert_eq!(transferred.max_plaintexts, expected);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_slot_transfer_auto_reduce_matches_manual_full_reduce() {
     let q_level = 1usize;
@@ -1391,7 +1390,7 @@ fn test_nested_rns_poly_slot_transfer_auto_reduce_matches_manual_full_reduce() {
     assert_eq!(auto_circuit.count_gates_by_type_vec(), manual_circuit.count_gates_by_type_vec());
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_sequential_add_auto_reduce_runs_full_reduce_once() {
     let q_level = 1usize;
@@ -1511,7 +1510,7 @@ fn test_nested_rns_poly_sequential_add_auto_reduce_runs_full_reduce_once() {
     assert_eq!(auto_circuit.count_gates_by_type_vec(), manual_circuit.count_gates_by_type_vec());
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_encode_nested_rns_poly_compact_bytes_matches_polys() {
     let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
@@ -1536,7 +1535,7 @@ fn test_encode_nested_rns_poly_compact_bytes_matches_polys() {
     assert_eq!(actual, expected);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_sample_crt_primes_respects_configured_mul_budget() {
     let q_max = 43u64;
@@ -1554,7 +1553,7 @@ fn test_sample_crt_primes_respects_configured_mul_budget() {
     assert!(smaller_budget_prod < prod);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_sequential_mul_auto_reduce_uses_extended_mul_budget() {
     let q_level = 1usize;
@@ -1855,7 +1854,7 @@ fn test_nested_rns_poly_const_mul_generic(
     }
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_nested_rns_poly_mul_with_enable_levels_field() {
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -1889,7 +1888,7 @@ fn test_nested_rns_poly_mul_with_enable_levels_field() {
     assert_eq!(output_coeffs[0].clone() % &q_level_modulus, expected);
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 #[should_panic(expected = "mismatched enable_levels")]
 fn test_nested_rns_poly_binary_ops_require_matching_enable_levels() {

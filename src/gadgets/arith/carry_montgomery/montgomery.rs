@@ -1179,7 +1179,6 @@ pub fn encode_montgomery_poly_with_window<P: Poly>(
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         element::PolyElem,
         gadgets::arith::{DecomposeArithmeticGadget, ModularArithmeticGadget},
         lookup::poly::PolyPltEvaluator,
@@ -1510,63 +1509,63 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_roundtrip_reconstruct_full_depth() {
         let params = default_test_params();
         run_roundtrip_cases(params, LIMB_BIT_SIZE, None, 0);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_roundtrip_reconstruct_partial_levels() {
         let params = default_test_params();
         run_roundtrip_cases(params, LIMB_BIT_SIZE, Some(2), 1);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_add_reconstruct_full_depth() {
         let params = default_test_params();
         run_add_cases(params, LIMB_BIT_SIZE, None, 0);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_add_reconstruct_partial_levels() {
         let params = default_test_params();
         run_add_cases(params, LIMB_BIT_SIZE, Some(2), 1);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_sub_reconstruct_full_depth() {
         let params = default_test_params();
         run_sub_cases(params, LIMB_BIT_SIZE, None, 0);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_sub_reconstruct_partial_levels() {
         let params = default_test_params();
         run_sub_cases(params, LIMB_BIT_SIZE, Some(2), 1);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_mul_reconstruct_full_depth() {
         let params = default_test_params();
         run_mul_cases(params, LIMB_BIT_SIZE, None, 0);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_mul_reconstruct_partial_levels() {
         let params = default_test_params();
         run_mul_cases(params, LIMB_BIT_SIZE, Some(2), 1);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_roundtrip_reconstruct_full_depth_limb1() {
         let params = default_test_params();
@@ -1575,7 +1574,7 @@ mod tests {
         test_montgomery_roundtrip_case_with_window(params, 1, None, 0, value);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_gadget_decompose_identity_full_depth() {
         let params = default_test_params();
@@ -1590,7 +1589,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_montgomery_gadget_decompose_identity_partial_levels() {
         let params = default_test_params();

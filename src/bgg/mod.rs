@@ -8,7 +8,6 @@ pub mod sampler;
 #[cfg(test)]
 mod tests {
     use crate::{
-        __PAIR, __TestState,
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
         lookup::lwe_eval::LWEBGGEncodingPltEvaluator,
@@ -22,7 +21,7 @@ mod tests {
     };
     use keccak_asm::Keccak256;
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_pub_key_addition() {
         let key: [u8; 32] = rand::random();
@@ -49,7 +48,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_pub_key_multiplication() {
         let key: [u8; 32] = rand::random();
@@ -76,7 +75,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_encoding_sampling() {
         let input_size = 10_usize;
@@ -110,7 +109,7 @@ mod tests {
         )
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_encoding_addition() {
         let key: [u8; 32] = rand::random();
@@ -150,7 +149,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_encoding_multiplication() {
         let key: [u8; 32] = rand::random();
@@ -188,7 +187,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_evaluable_bgg_add() {
         let params = DCRTPolyParams::default();
@@ -222,7 +221,7 @@ mod tests {
         assert_eq!(result[0].plaintext.as_ref().unwrap(), expected.plaintext.as_ref().unwrap());
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_evaluable_bgg_sub() {
         let params = DCRTPolyParams::default();
@@ -256,7 +255,7 @@ mod tests {
         assert_eq!(result[0].plaintext.as_ref().unwrap(), expected.plaintext.as_ref().unwrap());
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_evaluable_bgg_mul() {
         let params = DCRTPolyParams::default();
@@ -290,7 +289,7 @@ mod tests {
         assert_eq!(result[0].plaintext.as_ref().unwrap(), expected.plaintext.as_ref().unwrap());
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_evaluable_bgg_circuit_operations() {
         let params = DCRTPolyParams::default();
@@ -328,7 +327,7 @@ mod tests {
         assert_eq!(result[0].plaintext.as_ref().unwrap(), expected.plaintext.as_ref().unwrap());
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_evaluable_bgg_complex_circuit() {
         let params = DCRTPolyParams::default();
@@ -374,7 +373,7 @@ mod tests {
         assert_eq!(result[0].plaintext.as_ref().unwrap(), expected.plaintext.as_ref().unwrap());
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_evaluable_bgg_multiple_input_calls_with_nonconsecutive_gate_ids() {
         let params = DCRTPolyParams::default();
@@ -414,7 +413,7 @@ mod tests {
         assert_eq!(result[0].plaintext.as_ref().unwrap(), expected.plaintext.as_ref().unwrap());
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_evaluable_bgg_register_and_call_sub_circuit() {
         let params = DCRTPolyParams::default();
@@ -458,7 +457,7 @@ mod tests {
         assert_eq!(result[0].plaintext.as_ref().unwrap(), expected.plaintext.as_ref().unwrap());
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_evaluable_bgg_nested_sub_circuits() {
         let params = DCRTPolyParams::default();

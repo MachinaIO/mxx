@@ -656,7 +656,7 @@ async fn build_encoding_bench_estimator(
 }
 
 #[tokio::test]
-#[sequential_test::sequential]
+#[serial_test::serial]
 async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
     let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::registry()

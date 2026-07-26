@@ -1042,7 +1042,7 @@ async fn build_naive_vec_encoding_bench_estimator(
 }
 
 #[tokio::test]
-#[sequential_test::sequential]
+#[serial_test::serial]
 async fn test_gpu_aky24_io_error_search_and_bench_estimate() {
     let log_filter = tracing_subscriber::filter::Targets::new()
         .with_target("test_gpu_aky24_io", tracing_subscriber::filter::LevelFilter::INFO)

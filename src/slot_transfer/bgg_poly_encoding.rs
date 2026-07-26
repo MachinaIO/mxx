@@ -677,7 +677,6 @@ where
 mod tests {
     use super::BggPolyEncodingSTEvaluator;
     use crate::{
-        __PAIR, __TestState,
         bgg::{
             encoding::BggEncoding,
             poly_encoding::BggPolyEncoding,
@@ -742,7 +741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_slot_transfer_bgg_poly_encoding_matches_slot_relation() {
         let _storage_lock = storage_test_lock().await;
 
@@ -882,7 +881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_slot_transfer_bgg_poly_encoding_single_output_slot_matches_weighted_sum() {
         let _storage_lock = storage_test_lock().await;
 
@@ -1038,7 +1037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_slot_reduce_bgg_poly_encoding_matches_slot_relation() {
         let _storage_lock = storage_test_lock().await;
 

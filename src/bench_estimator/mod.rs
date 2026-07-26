@@ -835,12 +835,11 @@ mod tests {
         measure_samples_with_interval,
     };
     use crate::{
-        __PAIR, __TestState,
         circuit::{PolyCircuit, PolyGateType, SubCircuitParamValue},
         poly::dcrt::poly::DCRTPoly,
     };
     use num_bigint::BigUint;
-    use sequential_test::sequential;
+    use serial_test::serial as sequential;
     use std::{
         sync::{
             Arc,

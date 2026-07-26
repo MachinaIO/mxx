@@ -32,7 +32,7 @@ use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
 use rayon::prelude::*;
 #[cfg(test)]
-use sequential_test::sequential;
+use serial_test::serial as sequential;
 use std::{
     fmt::Debug,
     ops::{Add, Mul, Neg, Range, Sub},
@@ -1939,7 +1939,6 @@ fn one_rns_bytes(params: &GpuDCRTPolyParams) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         element::{PolyElem, finite_ring::FinRingElem},
         poly::dcrt::gpu::{detected_gpu_device_ids, gpu_device_sync},
     };

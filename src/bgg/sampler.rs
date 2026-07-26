@@ -415,7 +415,6 @@ where
 mod tests {
     use super::{BGGPolyEncodingSampler, BGGPublicKeySampler};
     use crate::{
-        __PAIR, __TestState,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{Poly, dcrt::params::DCRTPolyParams},
         sampler::{
@@ -427,7 +426,7 @@ mod tests {
     use keccak_asm::Keccak256;
     use std::sync::Arc;
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_poly_encoding_sampler_rejects_ragged_plaintexts() {
         let params = DCRTPolyParams::default();
@@ -461,7 +460,7 @@ mod tests {
         ));
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_bgg_poly_encoding_sampler_relation_with_slot_secret_mats() {
         let params = DCRTPolyParams::default();

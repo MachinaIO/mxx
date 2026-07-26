@@ -648,7 +648,6 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
             arith::DEFAULT_MAX_UNREDUCED_MULS,
@@ -1081,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_add_returns_ciphertext_that_decrypts_to_expected_slotwise_sum() {
         let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
         let secret_key = sample_ternary_secret_key(&params);
@@ -1133,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_add_with_input_c0_error_keeps_decrypted_coeff_error_within_bound() {
         let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
         let secret_key = sample_ternary_secret_key(&params);
@@ -1221,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_pre_relinearization_tuple_matches_exact_plaintext_product() {
         let mul_relin_extra_levels = 1;
         let params = DCRTPolyParams::new(
@@ -1295,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_pre_relinearization_tuple_with_input_c0_error_keeps_decrypted_coeff_error_within_bound()
      {
         let mul_relin_extra_levels = 1;
@@ -1406,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_keeps_decrypted_coeff_error_within_bound_for_scaled_plaintext_product() {
         let mul_relin_extra_levels = 1;
         let crt_bits = 24usize;
@@ -1552,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_keeps_decrypted_coeff_error_within_bound_for_scaled_plaintext_product_with_input_c0_error()
      {
         let mul_relin_extra_levels = 1;
@@ -1701,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_then_rescale_keeps_decrypted_coeff_error_within_bound() {
         let mul_relin_extra_levels = 1;
         let crt_bits = 24usize;
@@ -1855,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_then_rescale_keeps_decrypted_coeff_error_within_bound_with_input_c0_error() {
         let mul_relin_extra_levels = 1;
         let crt_bits = 24usize;
@@ -2005,7 +2004,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_relinearize_d2_via_mod_up_down_keeps_decrypted_coeff_error_within_bound() {
         let mul_relin_extra_levels = 1;
         let params = DCRTPolyParams::new(
@@ -2158,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_rescale_returns_ciphertext_that_decrypts_to_expected_exact_division() {
         let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
         let secret_key = sample_ternary_secret_key(&params);

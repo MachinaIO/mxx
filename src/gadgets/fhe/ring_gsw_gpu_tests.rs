@@ -108,7 +108,7 @@ fn gpu_expected_coeffs(expected: u64) -> Vec<u64> {
     coeffs
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_with_noisy_public_key() {
     let error_sigma = 4.0;
@@ -210,7 +210,7 @@ fn test_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_with_noisy_public_
     );
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_with_noisy_public_key() {
     let error_sigma = 4.0;
@@ -312,7 +312,7 @@ fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_with_noisy_
     );
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 #[ignore = "This test is currently ignored because it is too slow"]
 fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_with_noisy_public_key() {
@@ -415,7 +415,7 @@ fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_with_noisy_pub
     );
 }
 
-#[sequential_test::sequential]
+#[serial_test::serial]
 #[test]
 #[ignore = "This test is currently ignored because it is too slow"]
 fn test_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_with_noisy_public_key() {

@@ -49,7 +49,6 @@ where
 mod tests {
     use super::build_refreshed_wire_digit_all_crt_merge;
     use crate::{
-        __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::fhe_prg::goldreich::{GoldreichGraph, GoldreichGraphGeneration},
         lookup::poly_vec::PolyVecPltEvaluator,
@@ -215,7 +214,7 @@ mod tests {
         circuit
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn merge_gpu_recovers_native_prg_errors_after_shared_mask_rounding() {
         let cpu_params = DCRTPolyParams::new(RING_DIM, CRT_DEPTH, CRT_BITS, BASE_BITS);

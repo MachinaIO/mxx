@@ -666,7 +666,6 @@ impl<M: PolyMatrix> Evaluable for NaiveBGGEncodingVec<M> {
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         circuit::{PolyCircuit, gate::GateId},
         element::PolyElem,
         lookup::{
@@ -714,7 +713,7 @@ mod tests {
         init_storage_system(dir.to_path_buf());
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_naive_bgg_public_key_vec_slot_transfer_shuffles_slots() {
         let params = DCRTPolyParams::default();
@@ -732,7 +731,7 @@ mod tests {
         assert_eq!(output.key(1), input.key(0));
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_naive_bgg_public_key_vec_sampler_matches_scalar_flatten_layout() {
         let params = DCRTPolyParams::default();
@@ -769,7 +768,7 @@ mod tests {
         assert_ne!(vector_keys[0].key(1), vector_keys[0].key(2));
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_naive_bgg_encoding_vec_slot_transfer_shuffles_slots() {
         let params = DCRTPolyParams::default();
@@ -798,7 +797,7 @@ mod tests {
         assert_eq!(output.encoding(1).plaintext, input.encoding(2).plaintext);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_naive_bgg_encoding_vec_sampler_matches_scalar_flatten_layout() {
         let params = DCRTPolyParams::default();
@@ -857,7 +856,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_naive_bgg_public_key_vec_slot_reduce_matches_manual_reduction() {
         let params = DCRTPolyParams::default();
@@ -890,7 +889,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_naive_bgg_encoding_vec_slot_reduce_matches_manual_reduction() {
         let params = DCRTPolyParams::default();
@@ -944,7 +943,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_naive_bgg_public_key_vec_lwe_lookup_uses_slot_namespace() {
         let params = DCRTPolyParams::default();
@@ -994,7 +993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_naive_bgg_vec_lwe_public_lookup_matches_slotwise_evaluation() {
         let _storage_lock = storage_test_lock().await;
         let params = DCRTPolyParams::default();

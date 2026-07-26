@@ -419,7 +419,6 @@ where
 mod tests {
     use super::{NaiveBGGVecBenchEstimator, NaiveBGGVecSlotIoBenchEstimates};
     use crate::{
-        __PAIR, __TestState,
         bench_estimator::{
             BenchEstimator, CircuitBenchEstimate, PublicLutSampleAuxBenchEstimator,
             benchmark_gate_operation,
@@ -453,7 +452,7 @@ mod tests {
     };
     use keccak_asm::Keccak256;
     use num_bigint::BigUint;
-    use sequential_test::sequential;
+    use serial_test::serial as sequential;
     use std::{fs, path::Path, sync::Arc};
 
     const SIGMA: f64 = 4.578;

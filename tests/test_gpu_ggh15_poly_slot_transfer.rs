@@ -312,7 +312,7 @@ fn expected_slot_outputs() -> Vec<u64> {
 }
 
 #[tokio::test]
-#[sequential_test::sequential]
+#[serial_test::serial]
 async fn test_gpu_ggh15_poly_slot_transfer() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
     gpu_device_sync();

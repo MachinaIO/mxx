@@ -15,7 +15,6 @@ pub use pubkey::GGH15BGGPubKeyPltEvaluator;
 #[cfg(test)]
 mod tests {
     use crate::{
-        __PAIR, __TestState,
         bgg::sampler::{BGGEncodingSampler, BGGPolyEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
         lookup::PublicLut,
@@ -78,7 +77,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_ggh15_plt_eval_single_input() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();
@@ -190,7 +189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_ggh15_plt_eval_multi_inputs() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();
@@ -311,7 +310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_ggh15_poly_encoding_plt_eval_matches_single_slot_evaluator() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();

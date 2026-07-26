@@ -1551,7 +1551,6 @@ where
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
         gadgets::arith::{ModularArithmeticContext, NestedRnsPolyContext},
@@ -1632,7 +1631,7 @@ mod tests {
         )
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_prf_selected_branch_rebase_uses_common_minus_branch_sign() {
         let params = DCRTPolyParams::default();

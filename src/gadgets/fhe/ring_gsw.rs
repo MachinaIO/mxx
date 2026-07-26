@@ -2428,8 +2428,6 @@ mod tests {
 
         let (x1, x2) = sample_binary_input_pair();
         let expected = (x1 + x2) % plaintext_modulus;
-        let lhs_tag = format!("add_circuit_lhs_{x1}_{x2}");
-        let rhs_tag = format!("add_circuit_rhs_{x1}_{x2}");
         let lhs_native =
             encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
         let rhs_native =
@@ -2496,8 +2494,6 @@ mod tests {
 
         let (x1, x2) = sample_binary_input_pair();
         let expected = (x1 + plaintext_modulus - x2) % plaintext_modulus;
-        let lhs_tag = format!("sub_circuit_lhs_{x1}_{x2}");
-        let rhs_tag = format!("sub_circuit_rhs_{x1}_{x2}");
         let lhs_native =
             encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
         let rhs_native =
@@ -2564,8 +2560,6 @@ mod tests {
 
         let (x1, x2) = sample_binary_input_pair();
         let expected = (x1 * x2) % plaintext_modulus;
-        let lhs_tag = format!("mul_circuit_lhs_{x1}_{x2}");
-        let rhs_tag = format!("mul_circuit_rhs_{x1}_{x2}");
         let lhs_native =
             encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
         let rhs_native =
@@ -2635,9 +2629,6 @@ mod tests {
         let (x1, x2) = sample_binary_input_pair();
         let x3 = 1u64;
         let expected = (x1 * x2 * x3) % plaintext_modulus;
-        let lhs_tag = format!("chain_mul_circuit_lhs_{x1}_{x2}_{x3}");
-        let rhs1_tag = format!("chain_mul_circuit_rhs1_{x1}_{x2}_{x3}");
-        let rhs2_tag = format!("chain_mul_circuit_rhs2_{x1}_{x2}_{x3}");
         let lhs_native =
             encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
         let rhs1_native =

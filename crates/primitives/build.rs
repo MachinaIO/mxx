@@ -11,9 +11,6 @@ fn main() {
     println!("cargo::rustc-link-lib=dylib=OPENFHEcore");
     println!("cargo::rustc-link-lib=dylib=gomp");
 
-    // necessary to avoid LD_LIBRARY_PATH
-    println!("cargo::rustc-link-arg=-Wl,-rpath,/usr/local/lib");
-
     if env::var("CARGO_FEATURE_GPU").is_ok() {
         println!("cargo::rerun-if-changed=cuda/src/Runtime.cu");
         println!("cargo::rerun-if-changed=cuda/src/ChaCha.cu");

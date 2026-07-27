@@ -1,33 +1,62 @@
 # mxx
 
-`mxx` is a Rust and CUDA library for lattice-cryptography research and implementation work at Machina iO. It provides primitive-level building blocks for polynomial and matrix arithmetic, trapdoor sampling, key-homomorphic encodings, and higher-level constructions of lattice-based schemes.
+`mxx` is a Rust and CUDA workspace for lattice-cryptography research and implementation work at Machina iO. It contains low-level polynomial, matrix, sampling, and GPU operations; reusable cryptographic gadgets; and application-level FE, WE, and iO constructions.
 
-Specifically, this repository provides implementations of the following works:
-- [BGG+ encodings](https://eprint.iacr.org/2014/356.pdf), available at `src/bgg/`
-- [WEE25 matrix commitment](https://eprint.iacr.org/2025/509.pdf), available at `src/commit/`.
-- [Lookup-table evaluation over BGG+ encodings](https://eprint.iacr.org/2025/1870.pdf) available at `src/lookup/`.
-- Evaluation and decryption of [GSW-FHE](https://eprint.iacr.org/2013/340.pdf) over BGG+ encodings, following [this construction](https://eprint.iacr.org/2015/029.pdf), available at `src/gadgets/fhe/`.
-- Benchmark estimation for pseudorandom obfuscation based on [AKY24](https://eprint.iacr.org/2024/1720.pdf), available at `src/io/aky24_io/`.
-- Benchmark estimation for [Diamond iO](https://eprint.iacr.org/2025/236.pdf), available at `src/io/diamond_io/`.
+The repository includes:
 
+- [BGG+ encodings](https://eprint.iacr.org/2014/356.pdf) in `crates/gadgets/src/bgg/`.
+- [WEE25 matrix commitment](https://eprint.iacr.org/2025/509.pdf) in `crates/gadgets/src/commit/`.
+- [Lookup-table evaluation over BGG+ encodings](https://eprint.iacr.org/2025/1870.pdf) in `crates/gadgets/src/lookup/`.
+- Evaluation and decryption of [GSW-FHE](https://eprint.iacr.org/2013/340.pdf) over BGG+ encodings, following [this construction](https://eprint.iacr.org/2015/029.pdf), in `crates/gadgets/src/circuit_gadgets/fhe/`.
+- Diamond witness encryption in `crates/we/`.
+- Benchmark estimation for pseudorandom obfuscation based on [AKY24](https://eprint.iacr.org/2024/1720.pdf) in `crates/io/src/aky24_io/`.
+- Benchmark estimation for [Diamond iO](https://eprint.iacr.org/2025/236.pdf) in `crates/io/src/diamond_io/`.
+
+## Workspace layout
+
+The repository is a virtual Cargo workspace with five crates and no root facade crate:
+
+| Crate | Responsibility |
+| --- | --- |
+| `mxx-primitives` | Polynomial and matrix representations, samplers, analytical sampling bounds, OpenFHE integration, and all native CUDA kernels and wrappers. |
+| `mxx-gadgets` | BGG encodings, circuits, circuit gadgets, lookup, decoding, noise refresh, input injection, slot transfer, commitments, storage, simulation, and benchmark models. |
+| `mxx-func-enc` | Functional-encryption interfaces and constructions. AKY24 remains disabled until its shared-decoder migration is complete. |
+| `mxx-we` | Witness-encryption interfaces and Diamond WE. |
+| `mxx-io` | Indistinguishability-obfuscation interfaces, AKY24 iO estimation, and Diamond iO. |
+
+The dependency direction is strictly:
+
+```text
+mxx-primitives
+      ^
+      |
+mxx-gadgets
+      ^
+      |
+      +-- mxx-func-enc
+      +-- mxx-we
+      +-- mxx-io
+```
+
+The three application crates do not depend on one another. See `docs/architecture.md` for the detailed directory map and boundary rules.
 
 ## Requirements
 
-- Rust with support for edition 2024.
-- OpenFHE C++ libraries installed in the system location expected by `build.rs`. Follow the [OpenFHE installation guide](https://openfhe-development.readthedocs.io/en/latest/sphinx_rsts/intro/installation/installation.html), but run those steps against our fork, [MachinaIO/openfhe-development](https://github.com/MachinaIO/openfhe-development), rather than the upstream OpenFHE repository. The build script links `OPENFHEpke`, `OPENFHEbinfhe`, and `OPENFHEcore`.
+- Rust with edition 2024 support.
+- OpenFHE C++ libraries installed in the system location expected by `crates/primitives/build.rs`. Follow the [OpenFHE installation guide](https://openfhe-development.readthedocs.io/en/latest/sphinx_rsts/intro/installation/installation.html), but use [MachinaIO/openfhe-development](https://github.com/MachinaIO/openfhe-development) instead of the upstream repository.
 - OpenMP support through the system C/C++ toolchain.
 - For GPU builds, a CUDA toolkit with `nvcc` and the CUDA runtime libraries.
 
-## Cargo Features
+## Cargo features
 
-The default feature set is CPU-only and keeps matrix backing storage in memory.
+Every crate exposes the same opt-in feature names. Application crates forward them to their lower-level dependencies.
 
 | Feature | Effect |
 | --- | --- |
-| `disk` | Enables disk-backed matrix storage through `libc` and `memmap2`. Without this feature, `src/matrix/base/memory.rs` is used. |
-| `gpu` | Enables CUDA-backed polynomial/matrix paths, GPU samplers, GPU lookup and BGG paths, GPU-aware circuit evaluation, and native CUDA compilation from `cuda/`. |
+| `disk` | Enables disk-backed primitive matrix storage through `libc` and `memmap2`. |
+| `gpu` | Enables CUDA-backed primitive operations and GPU implementations in dependent crates. Native CUDA compilation is owned by `mxx-primitives`. |
 
-GPU builds use these environment variables. Their defaults are defined in `build.rs`.
+GPU build configuration is handled by `crates/primitives/build.rs` and `crates/primitives/cuda/`.
 
 | Variable | Purpose |
 | --- | --- |
@@ -36,77 +65,51 @@ GPU builds use these environment variables. Their defaults are defined in `build
 | `CUDA_LIB_DIR` | CUDA library directory linked by Cargo. |
 | `NVCC` | Explicit CUDA compiler path. |
 
-Runtime parallelism and batching are also controlled by environment helpers in `src/env.rs`, including `MXX_CIRCUIT_PARALLEL_GATES`, `LUT_PREIMAGE_CHUNK_SIZE`, `GGH15_GATE_PARALLELISM`, `BGG_POLY_ENCODING_SLOT_PARALLELISM`, `SLOT_TRANSFER_SLOT_PARALLELISM`, `AUX_SAMPLING_CHUNK_WIDTH`, and `MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH`.
+Runtime parallelism and batching helpers are split between `crates/primitives/src/env.rs` for primitive operations and `crates/gadgets/src/env.rs` for gadget-level workloads.
 
-<!-- ## Repository Layout
+## Common commands
 
-The public Rust surface is organized from `src/lib.rs`:
-
-| Path | Main responsibility |
-| --- | --- |
-| `src/poly/` | Polynomial traits and DCRT polynomial implementations backed by OpenFHE parameters and CRT decomposition. |
-| `src/matrix/` | Generic matrix traits, integer and DCRT-polynomial matrices, memory/disk storage, and GPU DCRT matrix support behind `gpu`. |
-| `src/sampler/` | Hash, uniform, and trapdoor samplers, including OpenFHE-backed Gaussian routines and GPU trapdoor paths. |
-| `src/bgg/` | BGG-style encodings, public keys, polynomial encodings, digit conversion, and sampler integration. |
-| `src/lookup/` | Public lookup-table machinery, LWE and GGH15 lookup encodings, commit/eval helpers, and debug tooling. |
-| `src/circuit/` | Arithmetic gate definitions, evaluable polynomial objects, serialized circuit support, and polynomial-circuit construction/evaluation. |
-| `src/gadgets/` | Arithmetic, convolution multiplication, FHE/RingGSW, Goldreich PRG, and secret inner-product gadgets. |
-| `src/func_enc/` | Functional-encryption workflows, currently including AKY24 key generation, decryption benchmarking, and error simulation helpers. |
-| `src/io/` | Diamond iO and AKY24 IO workflows, simulations, benchmark estimators, and circuit utilities. |
-| `src/we/` | Witness-encryption workflows, including Diamond WE simulation and benchmark estimation. |
-| `src/decoder/` | Decoder artifacts, masked high-bit decoding, mask circuits, PRG support, simulation, and benchmark support. |
-| `src/noise_refresh/` | Circuit decrypt, merge, PRG, naive-vector, and simulation components for noise refresh. |
-| `src/input_injector/` | Input injection and Diamond GPU injection paths. |
-| `src/slot_transfer/` | Slot-transfer BGG public keys, polynomial encodings, and polynomial-vector helpers. |
-| `src/commit/` | Commitment schemes, including WEE25. |
-| `src/bench_estimator/` | Estimators for BGG encodings, BGG public keys, naive vectors, and GPU-aware costs. |
-| `src/simulator/` | Lattice estimation, norm estimation, and evaluation-error simulation tools. |
-| `src/storage/` | Binary read/write helpers for repository data artifacts. |
-| `cuda/` | CUDA runtime, ChaCha, and matrix kernels for arithmetic, NTT, decomposition, sampling, trapdoor, and serialization paths. |
-| `benches/` | CPU/GPU matrix multiplication and preimage benchmarks declared in `Cargo.toml`. |
-| `tests/` | Integration-style regression and GPU tests. Run these only when a task explicitly calls for them. | -->
-
-## Common Commands
-
-CPU-only type checking:
+Type-check the complete CPU workspace:
 
 ```sh
-cargo check
+cargo check --workspace
 ```
 
-Type check with disk-backed storage:
+Type-check all crates with disk-backed storage:
 
 ```sh
-cargo check --features disk
+cargo check --workspace --features disk
 ```
 
-Type check with CUDA support:
+Type-check all crates with CUDA support:
 
 ```sh
-cargo check --features gpu
+cargo check --workspace --features gpu
 ```
 
-Run a targeted unit test by name when validating a narrow change:
+Run a targeted unit test in its owning crate:
 
 ```sh
-cargo test <test_name>
+cargo test -p mxx-gadgets --lib <test_name>
 ```
 
-Format Rust code when Rust files are changed:
+Format Rust code:
 
 ```sh
 cargo +nightly fmt --all
 ```
 
-Run benchmarks explicitly by bench target:
+Run primitive benchmarks explicitly:
 
 ```sh
-cargo bench --bench bench_matrix_mul_cpu
-cargo bench --bench bench_preimage_cpu
-cargo bench --features gpu --bench bench_matrix_mul_gpu
-cargo bench --features gpu --bench bench_preimage_gpu
+cargo bench -p mxx-primitives --bench bench_matrix_mul_cpu
+cargo bench -p mxx-primitives --bench bench_preimage_cpu
+cargo bench -p mxx-primitives --features gpu --bench bench_matrix_mul_gpu
+cargo bench -p mxx-primitives --features gpu --bench bench_preimage_gpu
 ```
+
+Integration tests live under each owning crate's `tests/` directory. Run them only when the task explicitly requires them.
 
 ## License
 
-The Cargo manifest declares `MIT OR Apache-2.0`. See `LICENSE` for the checked-in license text.
+The workspace crates are licensed under `MIT OR Apache-2.0`. See `LICENSE`.

@@ -3,6 +3,12 @@
 ## Repository Purpose
 This repository provides implementations for lattice-cryptography operations (polynomial and matrix operations, preimage samplings, BGG+ encodings, and more), written in Rust and CUDA.
 
+## Workspace Architecture
+- The authoritative crate map and dependency rules are documented in `docs/architecture.md`.
+- The workspace has exactly five crates: `mxx-primitives`, `mxx-gadgets`, `mxx-func-enc`, `mxx-we`, and `mxx-io`. Do not add a root facade crate.
+- Keep dependencies layered: primitives have no workspace dependencies; gadgets depend only on primitives; application crates depend on primitives and gadgets but never on one another.
+- The reusable gadget layer is `crates/gadgets/`; its circuit-specific gadget module is `circuit_gadgets`.
+
 ## Global Requirements
 - All documentation in this repository, along with git commit messages and PRs, must be written in English.
 - When documenting file paths, use only paths relative to the repository top directory. Do not write absolute paths in documentation.

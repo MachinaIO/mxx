@@ -15,11 +15,12 @@ Unless the user explicitly asks for review, act as the builder.
 ## Design & Code Style
 - Modify existing functions and types instead of adding variants (`new_with_*`, `*_with_shared_inputs`, wrapper structs/traits). Extend `new` with `Option` arguments when needed.
 - No backward compatibility: delete legacy formats, fallbacks, and version markers outright.
-- Reuse existing environment variables; define all env vars in `env.rs` with explanatory comments.
+- Reuse existing environment variables; define primitive-operation env vars in `crates/primitives/src/env.rs`, gadget-level env vars in `crates/gadgets/src/env.rs`, and application-specific env vars in the owning crate, with explanatory comments.
 - Inline private functions that are called once or only a few lines long. Keep files under ~2000 lines excluding tests.
 - Delete unused code, arguments, and imports immediately; never silence warnings with `_`. Remove all debug-only scaffolding (extra syncs, flags, timing logs) before finishing.
 - Rename anything misleading; names must describe what the value or bound is, not which paper theorem it came from.
-- GPU-only code lives in files with "gpu" in the name. CUDA headers (`.cuh`) declare only cross-file and Rust-facing functions; bodies go in `cuda/src/*.cu`.
+- GPU-only code lives in files with "gpu" in the name. CUDA headers (`.cuh`) declare only cross-file and Rust-facing functions; bodies go in `crates/primitives/cuda/src/*.cu`.
+- Preserve the dependency direction in `docs/architecture.md`. Shared application code moves down to the lowest natural layer; application crates never depend on one another.
 
 ## Parallelism & Performance
 - Parallelize every loop with rayon unless ownership or peak memory forbids it. Refactors must never reduce parallelism unless the user explicitly requests lower or configurable parallelism, for example to reduce peak memory usage.
@@ -40,8 +41,8 @@ Unless the user explicitly asks for review, act as the builder.
 ## Testing
 - Use `scripts/run_tests.sh` as a reference for repository validation expectations and helper behavior.
 - GPU unit tests must run outside the sandbox because the local GPU is invisible inside it.
-- For CUDA/sync-related changes: compile once (`cargo test -r --no-run --features gpu`), then run the built binary directly N consecutive times with the identical command (300 for sync bugs, 3-5 for round-trip smoke checks). Run all N even if one fails and report failure counts.
-- Both `cargo test -r --no-run` and the `--features gpu` variant must be warning-free.
+- For CUDA/sync-related changes: compile once (`cargo test -r --workspace --lib --features gpu --no-run`), then run the built binary directly N consecutive times with the identical command (300 for sync bugs, 3-5 for round-trip smoke checks). Run all N even if one fails and report failure counts.
+- Both `cargo test -r --workspace --lib --no-run` and the `--features gpu` variant must be warning-free.
 - Test names use the established prefixes (e.g. `test_gpu_*`); tests live in the file defining the tested item.
 - Test parameters must be overridable via env vars with small defaults. No fixed seeds: sample randomly per run.
 - Expected values come from existing trusted primitives or round-trips, never from hand-rolled reference implementations. Never weaken or modify existing tests, or move GPU work to CPU, to make tests pass.

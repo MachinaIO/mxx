@@ -389,7 +389,7 @@ fn probe_crt_depth_for_goldreich_ring_gsw_bench(
     let max_eval_error = max_bigdecimal(
         out_errors
             .par_iter()
-            .map(|error| error.matrix_norm.poly_norm.norm.clone())
+            .map(|error| error.matrix_norm.maximum_coefficient_bound())
             .collect::<Vec<_>>(),
     );
     let corrected_max_eval_error =
@@ -529,7 +529,7 @@ fn find_crt_depth_for_goldreich_ring_gsw_bench(
     let ring_dim_sqrt = BigDecimal::from_u32(cfg.ring_dim).unwrap().sqrt().unwrap();
     let base = BigDecimal::from_biguint(BigUint::from(1u32) << cfg.base_bits, 0);
     let error_sigma = BigDecimal::from_f64(cfg.error_sigma).expect("valid error sigma");
-    let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
+    let e_init_norm = error_sigma.clone();
 
     if let Some(raw_crt_depth) = env::var("CRT_DEPTH").ok().filter(|value| !value.trim().is_empty())
     {
@@ -776,7 +776,9 @@ async fn test_gpu_lwe_nested_rns_goldreich_ring_gsw_bench() {
         encrypted_outputs
             .iter()
             .map(|ciphertext| {
-                ciphertext.estimate_decryption_error_norm(cfg.error_sigma).poly_norm.norm
+                ciphertext
+                    .estimate_decryption_error_norm(cfg.error_sigma)
+                    .maximum_coefficient_bound()
             })
             .collect::<Vec<_>>(),
     );

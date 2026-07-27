@@ -38,7 +38,6 @@ where
 mod tests {
     use super::super::{encode_nested_rns_poly, encode_nested_rns_poly_compact_bytes};
     use crate::{
-        __PAIR, __TestState,
         gadgets::arith::DEFAULT_MAX_UNREDUCED_MULS,
         poly::{
             Poly, PolyParams,
@@ -56,7 +55,7 @@ mod tests {
     const BASE_BITS: u32 = 6;
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_gpu_encode_nested_rns_poly_compact_bytes_matches_cpu_bytes() {
         let _ = tracing_subscriber::fmt::try_init();
         gpu_device_sync();

@@ -256,7 +256,6 @@ fn sample_gpu_matrix_with_seed_columns(
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         element::PolyElem,
         matrix::PolyMatrix,
         poly::{
@@ -266,7 +265,7 @@ mod tests {
     };
     use keccak_asm::Keccak256;
     use num_bigint::BigUint;
-    use sequential_test::sequential;
+    use serial_test::serial as sequential;
 
     fn gpu_test_params() -> DCRTPolyParams {
         DCRTPolyParams::new(128, 2, 16, 8)

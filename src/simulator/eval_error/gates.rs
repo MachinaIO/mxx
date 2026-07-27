@@ -22,9 +22,15 @@ impl PolyCircuit<DCRTPoly> {
             PolyNorm::one(ctx.clone()),
             PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, e_init_norm.clone(), None),
         );
-        let input_error = ErrorNorm::new(
+        let input_error = ErrorNorm::fresh_input(
             PolyNorm::constant(ctx.clone(), input_norm_bound.clone()),
-            PolyMatrixNorm::new(ctx.clone(), 1, ctx.m_g, e_init_norm.clone(), None),
+            PolyMatrixNorm::fresh_random_with_norm(
+                ctx.clone(),
+                1,
+                ctx.m_g,
+                e_init_norm.clone(),
+                None,
+            ),
         );
         info!("e_init_norm bits {}", bigdecimal_bits_ceil(e_init_norm));
         info!("input_norm_bound bits {}", bigdecimal_bits_ceil(&input_norm_bound));
@@ -225,33 +231,6 @@ impl PolyCircuit<DCRTPoly> {
                 .clone();
         }
         panic!("error-norm value missing for gate {gate_id}")
-    }
-
-    /// Clone only the matrix-norm component for one gate.
-    ///
-    /// Summary construction often needs just the matrix half of an `ErrorNorm`, so this helper
-    /// keeps that access pattern explicit and avoids rebuilding the full value object in
-    /// callers.
-    pub(super) fn clone_error_norm_matrix_norm_for_gate(
-        &self,
-        gate_id: GateId,
-        wires: &ErrorNormWireStore,
-        input_gate_positions: &ErrorNormInputGatePositions,
-        input_values: &[Option<Arc<ErrorNorm>>],
-    ) -> PolyMatrixNorm {
-        if let Some(value) = wires.get(gate_id) {
-            return value.matrix_norm.clone();
-        }
-        if let Some(&input_idx) = input_gate_positions.get(&gate_id) {
-            return input_values[input_idx]
-                .as_ref()
-                .unwrap_or_else(|| {
-                    panic!("error-norm matrix norm missing for input gate {gate_id}")
-                })
-                .matrix_norm
-                .clone();
-        }
-        panic!("error-norm matrix norm missing for gate {gate_id}")
     }
 
     /// Clone only the plaintext-norm component for one concrete gate value.

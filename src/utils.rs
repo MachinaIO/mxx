@@ -18,11 +18,88 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Zero};
 use rand::Rng;
 use std::{
+    fs,
     future::Future,
+    io::Write,
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::debug;
+
+/// Persist bytes through a same-directory temporary file and atomically publish them.
+///
+/// A process interrupted before `rename` leaves no partially written checkpoint at
+/// `path`, so existence remains a valid completion test for resumable jobs.
+pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or_else(|| {
+        panic!("atomic output path must have a UTF-8 file name: {}", path.display())
+    });
+    let temporary_path = path.with_file_name(format!(".{file_name}.tmp"));
+    let mut file = fs::File::create(&temporary_path).unwrap_or_else(|err| {
+        panic!("failed to create atomic temporary file {}: {err}", temporary_path.display())
+    });
+    file.write_all(bytes).unwrap_or_else(|err| {
+        panic!("failed to write atomic temporary file {}: {err}", temporary_path.display())
+    });
+    file.sync_all().unwrap_or_else(|err| {
+        panic!("failed to sync atomic temporary file {}: {err}", temporary_path.display())
+    });
+    drop(file);
+    fs::rename(&temporary_path, path).unwrap_or_else(|err| {
+        panic!(
+            "failed to publish atomic file {} as {}: {err}",
+            temporary_path.display(),
+            path.display()
+        )
+    });
+    let parent = path.parent().unwrap_or_else(|| {
+        panic!("atomic output path must have a parent directory: {}", path.display())
+    });
+    fs::File::open(parent)
+        .unwrap_or_else(|err| {
+            panic!("failed to open atomic output directory {}: {err}", parent.display())
+        })
+        .sync_all()
+        .unwrap_or_else(|err| {
+            panic!("failed to sync atomic output directory {}: {err}", parent.display())
+        });
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRE_DELETE_FILE_LENGTHS:
+        std::cell::RefCell<Option<Vec<(std::path::PathBuf, u64)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn start_pre_delete_file_length_observer() {
+    PRE_DELETE_FILE_LENGTHS.with(|observations| {
+        *observations.borrow_mut() = Some(Vec::new());
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn observe_file_before_delete(path: &Path) {
+    PRE_DELETE_FILE_LENGTHS.with(|observations| {
+        let mut observations = observations.borrow_mut();
+        if let Some(observations) = observations.as_mut() {
+            let bytes = fs::metadata(path)
+                .unwrap_or_else(|err| {
+                    panic!("failed to stat observed deletion {}: {err}", path.display())
+                })
+                .len();
+            observations.push((path.to_path_buf(), bytes));
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_pre_delete_file_lengths() -> Vec<(std::path::PathBuf, u64)> {
+    PRE_DELETE_FILE_LENGTHS
+        .with(|observations| observations.borrow_mut().take().unwrap_or_default())
+}
 
 /// ideal thread chunk size for parallel
 pub fn chunk_size_for(original: usize) -> usize {

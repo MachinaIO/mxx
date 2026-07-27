@@ -1953,12 +1953,11 @@ where
 mod tests {
     use super::effective_gpu_slot_parallelism;
     use crate::{
-        __PAIR, __TestState,
         lookup::ggh15::{public_lookup_gpu_device_ids, public_lookup_round_robin_device_slot},
         poly::dcrt::gpu::detected_gpu_device_ids,
     };
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ggh15_slot_device_ids_uses_detected_gpu_ids() {
         let detected_gpu_ids = detected_gpu_device_ids();
@@ -1991,7 +1990,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ggh15_effective_gpu_slot_parallelism_clamps_to_detected_gpus() {
         let detected_count = detected_gpu_device_ids().len().max(1);

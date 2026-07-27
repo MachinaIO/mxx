@@ -1,14 +1,12 @@
-#[cfg(not(feature = "gpu"))]
-use crate::slot_transfer::bgg_pubkey::column_chunk_count;
 use crate::{
     bgg::{encoding::BggEncoding, public_key::BggPublicKey},
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
     sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
-    slot_transfer::bgg_pubkey::column_chunk_bounds,
+    slot_transfer::bgg_pubkey::{column_chunk_bounds, column_chunk_count},
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, marker::PhantomData, path::Path};
+use std::{collections::HashMap, fs, fs::OpenOptions, io::Write, marker::PhantomData, path::Path};
 
 pub(crate) mod bench_estimator;
 #[cfg(feature = "gpu")]
@@ -27,7 +25,12 @@ pub trait InputInjector<P> {
 
     /// Precompute and persist the transition matrices needed to advance the
     /// Diamond state for every possible input digit.
-    fn preprocess(&self, dir_path: &Path, k: &P) -> Self::PreprocessOut;
+    fn preprocess(
+        &self,
+        dir_path: &Path,
+        k: &P,
+        retained_input_digits: Option<&[u32]>,
+    ) -> Self::PreprocessOut;
 
     /// Rebuild the final Diamond states for the chosen input digits from the
     /// persisted transition matrices.
@@ -68,6 +71,17 @@ struct DiamondInjectorMetadata {
     input_count: usize,
     base: usize,
     batch_bits: usize,
+    retained_input_digits: Option<Vec<u32>>,
+    ring_dimension: u32,
+    base_bits: u32,
+    modulus_bits: usize,
+    modulus_digits: usize,
+    crt_moduli: Vec<u64>,
+    crt_modulus_bits: usize,
+    crt_depth: usize,
+    trapdoor_sigma_bits: u64,
+    error_sigma_bits: u64,
+    transition_chunk_width: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -79,8 +93,9 @@ pub struct DiamondInjectorPreprocessOut<M, T>
 where
     M: PolyMatrix,
 {
-    pub final_trapdoors: Vec<T>,
-    pub final_pub_matrices: Vec<M>,
+    final_trapdoor_bytes: Vec<Vec<u8>>,
+    final_pub_matrix_bytes: Vec<Vec<u8>>,
+    _marker: PhantomData<(M, T)>,
 }
 
 impl<M, T> DiamondInjectorPreprocessOut<M, T>
@@ -89,21 +104,31 @@ where
 {
     pub fn final_state_count(&self) -> usize {
         debug_assert_eq!(
-            self.final_trapdoors.len(),
-            self.final_pub_matrices.len(),
+            self.final_trapdoor_bytes.len(),
+            self.final_pub_matrix_bytes.len(),
             "DiamondInjector final checkpoint vector length mismatch"
         );
-        self.final_pub_matrices.len()
+        self.final_pub_matrix_bytes.len()
     }
 
-    pub fn final_checkpoint(&self, state_idx: usize) -> (&T, &M) {
+    pub fn final_trapdoor_bytes(&self, state_idx: usize) -> &[u8] {
         assert!(
             state_idx < self.final_state_count(),
             "DiamondInjector final state index out of range: {} >= {}",
             state_idx,
             self.final_state_count()
         );
-        (&self.final_trapdoors[state_idx], &self.final_pub_matrices[state_idx])
+        &self.final_trapdoor_bytes[state_idx]
+    }
+
+    pub fn final_public_matrix(&self, params: &<M::P as Poly>::Params, state_idx: usize) -> M {
+        assert!(
+            state_idx < self.final_state_count(),
+            "DiamondInjector final state index out of range: {} >= {}",
+            state_idx,
+            self.final_state_count()
+        );
+        M::from_compact_bytes(params, &self.final_pub_matrix_bytes[state_idx])
     }
 }
 
@@ -114,6 +139,26 @@ where
     HS: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     TS: PolyTrapdoorSampler<M = M> + Send + Sync,
 {
+    pub(crate) fn online_eval_staging_bytes(
+        &self,
+        dir_path: &Path,
+        preprocess_out: &DiamondInjectorPreprocessOut<M, TS::Trapdoor>,
+        input_digits: &[u32],
+    ) -> Vec<Vec<u8>> {
+        #[cfg(feature = "gpu")]
+        {
+            return self.online_eval_gpu_staging_bytes(dir_path, preprocess_out, input_digits);
+        }
+
+        #[cfg(not(feature = "gpu"))]
+        {
+            self.online_eval(dir_path, preprocess_out, input_digits)
+                .into_iter()
+                .map(M::into_cpu_staging_bytes)
+                .collect()
+        }
+    }
+
     pub fn new(
         params: <M::P as Poly>::Params,
         input_count: usize,
@@ -187,8 +232,7 @@ where
     fn write_metadata(&self, dir_path: &Path, metadata: &DiamondInjectorMetadata) {
         let bytes =
             serde_json::to_vec_pretty(metadata).expect("DiamondInjector metadata should serialize");
-        fs::write(self.metadata_path(dir_path), bytes)
-            .expect("DiamondInjector metadata should be written");
+        crate::utils::write_bytes_atomic(&self.metadata_path(dir_path), &bytes);
     }
 
     fn read_metadata(&self, dir_path: &Path) -> DiamondInjectorMetadata {
@@ -197,11 +241,39 @@ where
         serde_json::from_slice(&bytes).expect("DiamondInjector metadata should decode")
     }
 
-    fn current_metadata(&self) -> DiamondInjectorMetadata {
+    fn current_metadata(&self, retained_input_digits: Option<&[u32]>) -> DiamondInjectorMetadata {
+        let (crt_moduli, crt_modulus_bits, crt_depth) = self.params.to_crt();
         DiamondInjectorMetadata {
             input_count: self.input_count,
             base: self.base,
             batch_bits: self.batch_bits,
+            retained_input_digits: retained_input_digits.map(<[u32]>::to_vec),
+            ring_dimension: self.params.ring_dimension(),
+            base_bits: self.params.base_bits(),
+            modulus_bits: self.params.modulus_bits(),
+            modulus_digits: self.params.modulus_digits(),
+            crt_moduli,
+            crt_modulus_bits,
+            crt_depth,
+            trapdoor_sigma_bits: self.trapdoor_sigma.to_bits(),
+            error_sigma_bits: self.error_sigma.to_bits(),
+            transition_chunk_width: crate::env::aux_sampling_chunk_width(),
+        }
+    }
+
+    fn prepare_metadata(&self, dir_path: &Path, retained_input_digits: Option<&[u32]>) {
+        if let Some(input_digits) = retained_input_digits {
+            self.validate_digits(input_digits);
+        }
+        let current = self.current_metadata(retained_input_digits);
+        if self.metadata_path(dir_path).exists() {
+            let stored = self.read_metadata(dir_path);
+            assert_eq!(
+                stored, current,
+                "DiamondInjector checkpoint configuration mismatch; use a separate artifact directory"
+            );
+        } else {
+            self.write_metadata(dir_path, &current);
         }
     }
 
@@ -222,10 +294,10 @@ where
     }
 
     fn write_matrix_bytes(&self, dir_path: &Path, id: &str, bytes: &[u8]) {
-        fs::write(self.matrix_path(dir_path, id), bytes)
-            .unwrap_or_else(|err| panic!("DiamondInjector failed to write matrix {id}: {err}"));
+        crate::utils::write_bytes_atomic(&self.matrix_path(dir_path, id), bytes);
     }
 
+    #[cfg(any(not(feature = "gpu"), test))]
     fn read_matrix(&self, dir_path: &Path, id: &str) -> M {
         let bytes = self.read_matrix_bytes(dir_path, id);
         M::from_compact_bytes(&self.params, &bytes)
@@ -237,8 +309,7 @@ where
     }
 
     fn write_bytes(&self, dir_path: &Path, id: &str, bytes: &[u8]) {
-        fs::write(self.bytes_path(dir_path, id), bytes)
-            .unwrap_or_else(|err| panic!("DiamondInjector failed to write bytes {id}: {err}"));
+        crate::utils::write_bytes_atomic(&self.bytes_path(dir_path, id), bytes);
     }
 
     fn read_bytes(&self, dir_path: &Path, id: &str) -> Vec<u8> {
@@ -296,6 +367,10 @@ where
         format!("diamond_b_tensor_{level}_{state_idx}_trapdoor")
     }
 
+    fn b_checkpoint_complete_id(&self, level: usize, state_idx: usize) -> String {
+        format!("diamond_b_tensor_{level}_{state_idx}_pair_complete")
+    }
+
     fn p_epsilon_id(&self) -> &'static str {
         "diamond_initial_state_tensor"
     }
@@ -306,6 +381,152 @@ where
 
     fn k_id(&self, level: usize, digit_value: usize, state_idx: usize) -> String {
         format!("diamond_transition_tensor_{level}_{digit_value}_{state_idx}")
+    }
+
+    fn discard_journal_path(&self, dir_path: &Path) -> std::path::PathBuf {
+        dir_path.join("diamond_discarded_transition_chunks.journal")
+    }
+
+    fn transition_task_index(
+        &self,
+        level: usize,
+        digit_value: usize,
+        state_idx: usize,
+        chunk_idx: usize,
+        chunk_count: usize,
+    ) -> u64 {
+        let previous_states = (1..level)
+            .map(|previous_level| self.state_count_at_level(previous_level))
+            .sum::<usize>();
+        let task_index = previous_states
+            .checked_mul(self.base)
+            .and_then(|value| {
+                digit_value
+                    .checked_mul(self.state_count_at_level(level))
+                    .and_then(|level_offset| value.checked_add(level_offset))
+            })
+            .and_then(|value| value.checked_add(state_idx))
+            .and_then(|value| value.checked_mul(chunk_count))
+            .and_then(|value| value.checked_add(chunk_idx))
+            .expect("DiamondInjector transition task index overflow");
+        u64::try_from(task_index).expect("DiamondInjector transition task index must fit u64")
+    }
+
+    fn load_discarded_transition_tasks(&self, dir_path: &Path) -> HashMap<u64, u64> {
+        const RECORD_SIZE: usize = 2 * size_of::<u64>();
+        let path = self.discard_journal_path(dir_path);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+            Err(err) => panic!("DiamondInjector failed to read {}: {err}", path.display()),
+        };
+        let complete_len = bytes.len() / RECORD_SIZE * RECORD_SIZE;
+        if complete_len != bytes.len() {
+            let file = OpenOptions::new().write(true).open(&path).unwrap_or_else(|err| {
+                panic!("DiamondInjector failed to repair {}: {err}", path.display())
+            });
+            file.set_len(complete_len as u64).unwrap_or_else(|err| {
+                panic!("DiamondInjector failed to truncate {}: {err}", path.display())
+            });
+            file.sync_all().unwrap_or_else(|err| {
+                panic!("DiamondInjector failed to sync repaired {}: {err}", path.display())
+            });
+        }
+        bytes[..complete_len]
+            .chunks_exact(RECORD_SIZE)
+            .map(|record| {
+                let task_index = u64::from_le_bytes(record[..8].try_into().unwrap());
+                let stored_bytes = u64::from_le_bytes(record[8..].try_into().unwrap());
+                (task_index, stored_bytes)
+            })
+            .collect()
+    }
+
+    fn record_discarded_transition_tasks(&self, dir_path: &Path, tasks: &[(u64, u64)]) {
+        if tasks.is_empty() {
+            return;
+        }
+        let path = self.discard_journal_path(dir_path);
+        let mut file =
+            OpenOptions::new().create(true).append(true).open(&path).unwrap_or_else(|err| {
+                panic!("DiamondInjector failed to open {}: {err}", path.display())
+            });
+        for (task_index, stored_bytes) in tasks {
+            file.write_all(&task_index.to_le_bytes()).unwrap_or_else(|err| {
+                panic!("DiamondInjector failed to append {}: {err}", path.display())
+            });
+            file.write_all(&stored_bytes.to_le_bytes()).unwrap_or_else(|err| {
+                panic!("DiamondInjector failed to append {}: {err}", path.display())
+            });
+        }
+        file.sync_all().unwrap_or_else(|err| {
+            panic!("DiamondInjector failed to sync {}: {err}", path.display())
+        });
+    }
+
+    pub(crate) fn generated_transition_preimage_bytes(
+        &self,
+        dir_path: &Path,
+        retained_input_digits: Option<&[u32]>,
+    ) -> u128 {
+        let discarded_bytes = self
+            .load_discarded_transition_tasks(dir_path)
+            .into_values()
+            .map(u128::from)
+            .sum::<u128>();
+        let state_cols = self.state_col_size(&self.params);
+        let chunk_count = column_chunk_count(state_cols);
+        let mut retained_bytes = 0u128;
+        for level in 1..=self.input_count {
+            for digit_value in 0..self.base {
+                let retained = retained_input_digits
+                    .map(|digits| digits[level - 1] as usize == digit_value)
+                    .unwrap_or(true);
+                if !retained {
+                    continue;
+                }
+                for state_idx in 0..self.state_count_at_level(level) {
+                    let id = self.k_id(level, digit_value, state_idx);
+                    for chunk_idx in 0..chunk_count {
+                        let chunk_id = self.chunk_id(&id, chunk_idx);
+                        let bytes = fs::metadata(self.matrix_path(dir_path, &chunk_id))
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "DiamondInjector failed to stat retained matrix {chunk_id}: {err}"
+                                )
+                            })
+                            .len();
+                        retained_bytes = retained_bytes
+                            .checked_add(u128::from(bytes))
+                            .expect("DiamondInjector generated byte count overflow");
+                    }
+                }
+            }
+        }
+        discarded_bytes
+            .checked_add(retained_bytes)
+            .expect("DiamondInjector generated byte count overflow")
+    }
+
+    fn remove_matrix_checkpoint(&self, dir_path: &Path, id: &str) {
+        let path = self.matrix_path(dir_path, id);
+        #[cfg(test)]
+        if path.exists() {
+            crate::utils::observe_file_before_delete(&path);
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("DiamondInjector failed to remove matrix {id}: {err}"),
+        }
+    }
+
+    fn remove_bytes_checkpoint(&self, dir_path: &Path, id: &str) {
+        match fs::remove_file(self.bytes_path(dir_path, id)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("DiamondInjector failed to remove bytes {id}: {err}"),
+        }
     }
 
     fn sample_secret_epsilon_with_params(&self, params: &<M::P as Poly>::Params) -> M {
@@ -474,7 +695,11 @@ where
         // preimage sampling uses this stored pair directly.
         let matrix_id = self.b_matrix_id(level, state_idx);
         let trapdoor_id = self.b_trapdoor_id(level, state_idx);
-        if self.matrix_exists(dir_path, &matrix_id) && self.bytes_exists(dir_path, &trapdoor_id) {
+        let complete_id = self.b_checkpoint_complete_id(level, state_idx);
+        let pair_is_complete = self.matrix_exists(dir_path, &matrix_id) &&
+            self.bytes_exists(dir_path, &trapdoor_id) &&
+            self.bytes_exists(dir_path, &complete_id);
+        if pair_is_complete {
             let trapdoor =
                 TS::trapdoor_from_bytes(&self.params, &self.read_bytes(dir_path, &trapdoor_id))
                     .unwrap_or_else(|| {
@@ -482,14 +707,17 @@ where
                             "DiamondInjector failed to decode trapdoor checkpoint for level {level}, state {state_idx}"
                         )
                     });
-            let matrix = self.read_matrix(dir_path, &matrix_id);
-            return (trapdoor, matrix);
+            return (trapdoor, self.read_matrix(dir_path, &matrix_id));
         }
+        self.remove_matrix_checkpoint(dir_path, &matrix_id);
+        self.remove_bytes_checkpoint(dir_path, &trapdoor_id);
+        self.remove_bytes_checkpoint(dir_path, &complete_id);
 
         let trap_sampler = TS::new(&self.params, self.trapdoor_sigma);
         let (trapdoor, matrix) = trap_sampler.trapdoor(&self.params, self.state_row_size());
         self.write_bytes(dir_path, &trapdoor_id, &TS::trapdoor_to_bytes(&trapdoor));
         self.write_matrix(dir_path, &matrix_id, &matrix);
+        self.write_bytes(dir_path, &complete_id, b"complete\n");
         (trapdoor, matrix)
     }
 
@@ -502,12 +730,19 @@ where
     ) -> (Vec<u8>, Vec<u8>) {
         let matrix_id = self.b_matrix_id(level, state_idx);
         let trapdoor_id = self.b_trapdoor_id(level, state_idx);
-        if self.matrix_exists(dir_path, &matrix_id) && self.bytes_exists(dir_path, &trapdoor_id) {
+        let complete_id = self.b_checkpoint_complete_id(level, state_idx);
+        let pair_is_complete = self.matrix_exists(dir_path, &matrix_id) &&
+            self.bytes_exists(dir_path, &trapdoor_id) &&
+            self.bytes_exists(dir_path, &complete_id);
+        if pair_is_complete {
             return (
                 self.read_matrix_bytes(dir_path, &matrix_id),
                 self.read_bytes(dir_path, &trapdoor_id),
             );
         }
+        self.remove_matrix_checkpoint(dir_path, &matrix_id);
+        self.remove_bytes_checkpoint(dir_path, &trapdoor_id);
+        self.remove_bytes_checkpoint(dir_path, &complete_id);
 
         let trap_sampler = TS::new(&self.params, self.trapdoor_sigma);
         let (trapdoor, matrix) = trap_sampler.trapdoor(&self.params, self.state_row_size());
@@ -515,6 +750,7 @@ where
         let matrix_bytes = matrix.to_compact_bytes();
         self.write_bytes(dir_path, &trapdoor_id, &trapdoor_bytes);
         self.write_matrix_bytes(dir_path, &matrix_id, &matrix_bytes);
+        self.write_bytes(dir_path, &complete_id, b"complete\n");
         (matrix_bytes, trapdoor_bytes)
     }
 
@@ -622,12 +858,6 @@ where
     }
 
     #[cfg(not(feature = "gpu"))]
-    fn has_all_chunks(&self, dir_path: &Path, id: &str, total_cols: usize) -> bool {
-        (0..column_chunk_count(total_cols))
-            .all(|chunk_idx| self.matrix_exists(dir_path, &self.chunk_id(id, chunk_idx)))
-    }
-
-    #[cfg(not(feature = "gpu"))]
     fn left_mul_checkpointed_cpu(
         &self,
         dir_path: &Path,
@@ -680,31 +910,37 @@ where
     type PreprocessOut = DiamondInjectorPreprocessOut<M, TS::Trapdoor>;
     type State = M;
 
-    fn preprocess(&self, dir_path: &Path, k: &M::P) -> Self::PreprocessOut {
+    fn preprocess(
+        &self,
+        dir_path: &Path,
+        k: &M::P,
+        retained_input_digits: Option<&[u32]>,
+    ) -> Self::PreprocessOut {
         #[cfg(feature = "gpu")]
         {
-            self.preprocess_gpu(dir_path, k);
-            let mut final_trapdoors =
+            self.preprocess_gpu(dir_path, k, retained_input_digits);
+            let mut final_trapdoor_bytes =
                 Vec::with_capacity(self.state_count_at_level(self.input_count));
-            let mut final_pub_matrices =
+            let mut final_pub_matrix_bytes =
                 Vec::with_capacity(self.state_count_at_level(self.input_count));
             for state_idx in 0..self.state_count_at_level(self.input_count) {
-                let (final_pub_matrix_bytes, final_trapdoor_bytes) =
+                let (public_matrix_bytes, trapdoor_bytes) =
                     self.load_or_sample_b_checkpoint_bytes(dir_path, self.input_count, state_idx);
-                final_trapdoors.push(
-                    TS::trapdoor_from_bytes(&self.params, &final_trapdoor_bytes)
-                        .expect("DiamondInjector final trapdoor checkpoint must decode"),
-                );
-                final_pub_matrices
-                    .push(M::from_compact_bytes(&self.params, &final_pub_matrix_bytes));
+                final_trapdoor_bytes.push(trapdoor_bytes);
+                final_pub_matrix_bytes.push(public_matrix_bytes);
             }
-            return DiamondInjectorPreprocessOut { final_trapdoors, final_pub_matrices };
+            return DiamondInjectorPreprocessOut {
+                final_trapdoor_bytes,
+                final_pub_matrix_bytes,
+                _marker: PhantomData,
+            };
         }
 
         #[cfg(not(feature = "gpu"))]
         {
             self.ensure_dir(dir_path);
-            self.write_metadata(dir_path, &self.current_metadata());
+            self.prepare_metadata(dir_path, retained_input_digits);
+            let mut discarded_tasks = self.load_discarded_transition_tasks(dir_path);
             self.write_bytes(dir_path, self.k_plaintext_id(), &k.to_compact_bytes());
 
             let trap_sampler = TS::new(&self.params, self.trapdoor_sigma);
@@ -724,17 +960,16 @@ where
                 b_checkpoints.push(level_b);
             }
 
-            // Sample the empty-prefix seed once and persist it if it does not
-            // already exist.
+            // The empty-prefix seed embeds the encrypted message k. Rebuild it
+            // for every encryption while reusing the message-independent
+            // secret and B checkpoint.
             let secret_epsilon =
                 self.load_or_sample_secret_epsilon(dir_path, self.secret_epsilon_id());
-            if !self.matrix_exists(dir_path, self.p_epsilon_id()) {
-                self.write_matrix(
-                    dir_path,
-                    self.p_epsilon_id(),
-                    &self.build_initial_encoding(&b_checkpoints[0][0], &secret_epsilon, k),
-                );
-            }
+            self.write_matrix(
+                dir_path,
+                self.p_epsilon_id(),
+                &self.build_initial_encoding(&b_checkpoints[0][0], &secret_epsilon, k),
+            );
 
             let state_cols = self.state_col_size(&self.params);
 
@@ -750,13 +985,40 @@ where
                     );
                     for state_idx in 0..self.state_count_at_level(level) {
                         let k_id = self.k_id(level, digit_value, state_idx);
-                        if self.has_all_chunks(dir_path, &k_id, state_cols) {
-                            continue;
-                        }
                         let source_state_idx = self.transition_source_state_idx(level, state_idx);
-                        for chunk_idx in 0..column_chunk_count(state_cols) {
+                        let chunk_count = column_chunk_count(state_cols);
+                        let retain_transition = retained_input_digits
+                            .map(|digits| digits[level - 1] as usize == digit_value)
+                            .unwrap_or(true);
+                        for chunk_idx in 0..chunk_count {
                             let chunk_id = self.chunk_id(&k_id, chunk_idx);
+                            let task_index = self.transition_task_index(
+                                level,
+                                digit_value,
+                                state_idx,
+                                chunk_idx,
+                                chunk_count,
+                            );
+                            if !retain_transition && discarded_tasks.contains_key(&task_index) {
+                                self.remove_matrix_checkpoint(dir_path, &chunk_id);
+                                continue;
+                            }
                             if self.matrix_exists(dir_path, &chunk_id) {
+                                if !retain_transition {
+                                    let stored_bytes = fs::metadata(
+                                        self.matrix_path(dir_path, &chunk_id),
+                                    )
+                                    .unwrap_or_else(|err| {
+                                        panic!("DiamondInjector failed to stat matrix {chunk_id}: {err}")
+                                    })
+                                    .len();
+                                    self.record_discarded_transition_tasks(
+                                        dir_path,
+                                        &[(task_index, stored_bytes)],
+                                    );
+                                    discarded_tasks.insert(task_index, stored_bytes);
+                                    self.remove_matrix_checkpoint(dir_path, &chunk_id);
+                                }
                                 continue;
                             }
                             let target_chunk = self.build_k_target_chunk_with_params(
@@ -774,18 +1036,36 @@ where
                                 &b_checkpoints[level - 1][source_state_idx],
                                 &target_chunk,
                             );
-                            self.write_matrix(dir_path, &chunk_id, &k_chunk);
+                            let k_chunk_bytes = k_chunk.to_compact_bytes();
+                            let stored_bytes = u64::try_from(k_chunk_bytes.len())
+                                .expect("DiamondInjector transition chunk size must fit u64");
+                            self.write_matrix_bytes(dir_path, &chunk_id, &k_chunk_bytes);
+                            if !retain_transition {
+                                self.record_discarded_transition_tasks(
+                                    dir_path,
+                                    &[(task_index, stored_bytes)],
+                                );
+                                discarded_tasks.insert(task_index, stored_bytes);
+                                self.remove_matrix_checkpoint(dir_path, &chunk_id);
+                            }
                         }
                     }
                 }
             }
             DiamondInjectorPreprocessOut {
-                final_trapdoors: trapdoors
+                final_trapdoor_bytes: trapdoors
                     .pop()
-                    .expect("DiamondInjector must keep final trapdoor checkpoints"),
-                final_pub_matrices: b_checkpoints
+                    .expect("DiamondInjector must keep final trapdoor checkpoints")
+                    .into_iter()
+                    .map(|trapdoor| TS::trapdoor_to_bytes(&trapdoor))
+                    .collect(),
+                final_pub_matrix_bytes: b_checkpoints
                     .pop()
-                    .expect("DiamondInjector must keep final public matrix checkpoints"),
+                    .expect("DiamondInjector must keep final public matrix checkpoints")
+                    .into_iter()
+                    .map(|matrix| matrix.to_compact_bytes())
+                    .collect(),
+                _marker: PhantomData,
             }
         }
     }
@@ -844,7 +1124,6 @@ where
 mod tests {
     use super::{DIAMOND_SECRET_SIZE, DiamondInjector, InputInjector};
     use crate::{
-        __PAIR, __TestState,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
         sampler::{
@@ -852,7 +1131,7 @@ mod tests {
             uniform::DCRTPolyUniformSampler,
         },
         simulator::{
-            SimulatorContext, error_norm::compute_preimage_norm, poly_matrix_norm::PolyMatrixNorm,
+            SimulatorContext, error_norm::compute_preimage_sigma, poly_matrix_norm::PolyMatrixNorm,
         },
         utils::bigdecimal_bits_ceil,
     };
@@ -860,7 +1139,7 @@ mod tests {
     use keccak_asm::Keccak256;
     use num_bigint::{BigInt, BigUint};
     use num_traits::FromPrimitive;
-    use std::sync::Arc;
+    use std::{io::Write as _, sync::Arc};
     use tempfile::tempdir;
 
     type TestInjector = DiamondInjector<
@@ -869,12 +1148,26 @@ mod tests {
         DCRTPolyHashSampler<Keccak256>,
         DCRTPolyTrapdoorSampler,
     >;
+    type TestPoly = <DCRTPolyMatrix as PolyMatrix>::P;
 
-    #[sequential_test::sequential]
+    fn assert_poly_matrix_bound_eq(actual: &PolyMatrixNorm, expected: &PolyMatrixNorm) {
+        assert_eq!(actual.nrow, expected.nrow);
+        assert_eq!(actual.ncol, expected.ncol);
+        assert_eq!(actual.ncol_sqrt, expected.ncol_sqrt);
+        assert_eq!(actual.poly_norm, expected.poly_norm);
+        assert_eq!(actual.zero_rows, expected.zero_rows);
+    }
+
+    fn assert_poly_matrix_bounds_eq(actual: &[PolyMatrixNorm], expected: &[PolyMatrixNorm]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_poly_matrix_bound_eq(actual, expected);
+        }
+    }
+
+    #[serial_test::serial]
     #[test]
     fn test_diamond_injector_online_eval_returns_exact_bgg_relations() {
-        type TestPoly = <DCRTPolyMatrix as PolyMatrix>::P;
-
         let params = DCRTPolyParams::default();
         let input_count = 3;
         let base = 4;
@@ -885,7 +1178,7 @@ mod tests {
 
         let k = TestPoly::from_usize_to_constant(&params, 3);
 
-        let preprocess_out = injector.preprocess(dir.path(), &k);
+        let preprocess_out = injector.preprocess(dir.path(), &k, None);
 
         let digits = vec![1u32, 3u32, 2u32];
         let states = injector.online_eval(dir.path(), &preprocess_out, &digits);
@@ -902,7 +1195,7 @@ mod tests {
             assert_eq!(secret_mask.size(), (DIAMOND_SECRET_SIZE, DIAMOND_SECRET_SIZE));
             secret_matrix = secret_matrix * secret_mask;
         }
-        let base_public_matrix = preprocess_out.final_pub_matrices[0].clone();
+        let base_public_matrix = preprocess_out.final_public_matrix(&injector.params, 0);
         let base_selector =
             DCRTPolyMatrix::from_poly_vec_row(&params, vec![secret_matrix.entry(0, 0), k.clone()]);
         assert_eq!(states[0], base_selector * base_public_matrix);
@@ -912,7 +1205,8 @@ mod tests {
                 let state_idx = injector.bit_state_idx(digit_idx, bit_idx);
                 let bit_value = ((digits[digit_idx] as usize) >> bit_idx) & 1;
                 let bit_plaintext = TestPoly::from_usize_to_constant(&params, bit_value);
-                let bit_public_matrix = preprocess_out.final_pub_matrices[state_idx].clone();
+                let bit_public_matrix =
+                    preprocess_out.final_public_matrix(&injector.params, state_idx);
                 let bit_selector = DCRTPolyMatrix::from_poly_vec_row(
                     &params,
                     vec![secret_matrix.entry(0, 0), secret_matrix.entry(0, 0) * &bit_plaintext],
@@ -922,10 +1216,145 @@ mod tests {
         }
     }
 
+    #[serial_test::serial]
+    #[test]
+    fn test_diamond_injector_retains_selected_transitions_and_journals_deleted_paths() {
+        let params = DCRTPolyParams::default();
+        let input_count = 1;
+        let base = 4;
+        let batch_bits = 2;
+        let retained_digits = [2u32];
+        let dir = tempdir().expect("temporary directory should be created");
+        let injector = TestInjector::new(params.clone(), input_count, base, batch_bits, 4.578, 0.0);
+        let k = TestPoly::const_one(&params);
+
+        crate::utils::start_pre_delete_file_length_observer();
+        let preprocess_out = injector.preprocess(dir.path(), &k, Some(&retained_digits));
+        let observed_deleted_bytes = crate::utils::take_pre_delete_file_lengths()
+            .into_iter()
+            .map(|(path, bytes)| {
+                let id = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .expect("observed deleted artifact must have a UTF-8 stem")
+                    .to_owned();
+                (id, bytes)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let state_cols = injector.state_col_size(&params);
+        let chunk_count = crate::slot_transfer::bgg_pubkey::column_chunk_count(state_cols);
+        let state_count = injector.state_count_at_level(1);
+        let journal_records = injector.load_discarded_transition_tasks(dir.path());
+        let mut retained_bytes = 0u128;
+        for digit_value in 0..base {
+            for state_idx in 0..state_count {
+                for chunk_idx in 0..chunk_count {
+                    let chunk_id =
+                        injector.chunk_id(&injector.k_id(1, digit_value, state_idx), chunk_idx);
+                    let task_index = injector.transition_task_index(
+                        1,
+                        digit_value,
+                        state_idx,
+                        chunk_idx,
+                        chunk_count,
+                    );
+                    assert_eq!(
+                        injector.matrix_exists(dir.path(), &chunk_id),
+                        digit_value == retained_digits[0] as usize,
+                        "only the selected transition should remain on disk"
+                    );
+                    if digit_value == retained_digits[0] as usize {
+                        retained_bytes += u128::from(
+                            std::fs::metadata(injector.matrix_path(dir.path(), &chunk_id))
+                                .expect("retained transition artifact should exist")
+                                .len(),
+                        );
+                    } else {
+                        assert_eq!(
+                            journal_records[&task_index], observed_deleted_bytes[&chunk_id],
+                            "journal bytes must equal the same file's observed pre-deletion length"
+                        );
+                    }
+                }
+            }
+        }
+        let journal_path = injector.discard_journal_path(dir.path());
+        let expected_discarded = (base - 1) * state_count * chunk_count;
+        assert_eq!(
+            std::fs::read(&journal_path).expect("discard journal should exist").len(),
+            expected_discarded * 2 * size_of::<u64>()
+        );
+        let generated_bytes =
+            injector.generated_transition_preimage_bytes(dir.path(), Some(&retained_digits));
+        assert_eq!(
+            generated_bytes,
+            retained_bytes + observed_deleted_bytes.values().copied().map(u128::from).sum::<u128>(),
+            "accounting must equal independently observed pre-deletion transition file lengths"
+        );
+
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .expect("discard journal should open for torn-tail simulation");
+        journal.write_all(&[0xa5; 7]).expect("torn discard-journal tail should be written");
+        journal.sync_all().expect("torn discard-journal tail should sync");
+        drop(journal);
+
+        injector.preprocess(dir.path(), &k, Some(&retained_digits));
+        assert_eq!(
+            std::fs::read(&journal_path).expect("discard journal should remain readable").len(),
+            expected_discarded * 2 * size_of::<u64>(),
+            "resume must repair the torn tail without regenerating or re-journaling deleted transitions"
+        );
+        assert_eq!(
+            injector.generated_transition_preimage_bytes(dir.path(), Some(&retained_digits)),
+            generated_bytes,
+            "resume must preserve the actual generated byte total"
+        );
+        let states = injector.online_eval(dir.path(), &preprocess_out, &retained_digits);
+        assert_eq!(states.len(), 1 + input_count * batch_bits);
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    #[test]
+    fn test_diamond_injector_repairs_incomplete_b_checkpoint_pair() {
+        let params = DCRTPolyParams::default();
+        let dir = tempdir().expect("temporary directory should be created");
+        let injector = TestInjector::new(params.clone(), 1, 2, 1, 4.578, 0.0);
+        let k = TestPoly::const_one(&params);
+        injector.preprocess(dir.path(), &k, None);
+
+        let matrix_id = injector.b_matrix_id(1, 0);
+        let trapdoor_id = injector.b_trapdoor_id(1, 0);
+        let complete_id = injector.b_checkpoint_complete_id(1, 0);
+        assert!(injector.matrix_exists(dir.path(), &matrix_id));
+        assert!(injector.bytes_exists(dir.path(), &trapdoor_id));
+        assert!(injector.bytes_exists(dir.path(), &complete_id));
+
+        injector.remove_bytes_checkpoint(dir.path(), &trapdoor_id);
+        injector.remove_bytes_checkpoint(dir.path(), &complete_id);
+        assert!(
+            injector.matrix_exists(dir.path(), &matrix_id),
+            "test setup must leave only the public matrix from an interrupted pair"
+        );
+
+        let (_trapdoor, matrix) = injector.load_or_sample_b_checkpoint(dir.path(), 1, 0);
+        assert_eq!(
+            injector.read_matrix(dir.path(), &matrix_id),
+            matrix,
+            "the returned public matrix must be the fully persisted replacement"
+        );
+        assert!(injector.bytes_exists(dir.path(), &trapdoor_id));
+        assert!(
+            injector.bytes_exists(dir.path(), &complete_id),
+            "the pair completion marker must be written after both components"
+        );
+    }
+
     #[test]
     fn test_diamond_injector_simulate_output_error_bounds_matches_repeated_preimage_bound() {
         let params = DCRTPolyParams::default();
-        let injector = TestInjector::new(params.clone(), 3, 4, 2, 4.578, 3.0);
+        let injector = TestInjector::new(params.clone(), 3, 4, 2, 6.0, 3.0);
         let batch_bits = injector.batch_bits();
 
         let simulated = injector.simulate_output_error_bounds();
@@ -952,22 +1381,27 @@ mod tests {
             state_cols,
             BigDecimal::from_f64(injector.error_sigma).expect("error_sigma must be finite"),
         );
-        let expected_preimage_norm = compute_preimage_norm(
+        let expected_preimage_sigma = compute_preimage_sigma(
             &ctx.ring_dim_sqrt,
             ctx.m_g as u64,
             &ctx.base,
             Some(injector.state_row_size() / DIAMOND_SECRET_SIZE),
-            None,
+            Some(injector.trapdoor_sigma),
         );
-        let expected_transition = PolyMatrixNorm::new(
+        let expected_transition = PolyMatrixNorm::fresh_preimage(
             ctx.clone(),
             state_cols,
             state_cols,
-            expected_preimage_norm.clone(),
+            expected_preimage_sigma.clone(),
             None,
         );
-        let expected_output =
-            PolyMatrixNorm::new(ctx.clone(), state_cols, gadget_cols, expected_preimage_norm, None);
+        let expected_output = PolyMatrixNorm::fresh_preimage(
+            ctx.clone(),
+            state_cols,
+            gadget_cols,
+            expected_preimage_sigma,
+            None,
+        );
         let expected_regular_selector = PolyMatrixNorm::new(
             ctx.clone(),
             injector.state_row_size(),
@@ -1040,9 +1474,34 @@ mod tests {
             expected_state_errors = next_state_errors;
         }
 
-        assert_eq!(simulated.state_errors, expected_state_errors);
-        assert_eq!(simulated.secret_state_factors, expected_secret_factors);
-        assert_eq!(simulated.output_preimage, expected_output);
+        assert_poly_matrix_bounds_eq(&simulated.state_errors, &expected_state_errors);
+        assert_poly_matrix_bounds_eq(&simulated.secret_state_factors, &expected_secret_factors);
+        assert_poly_matrix_bound_eq(&simulated.output_preimage, &expected_output);
+    }
+
+    #[test]
+    fn test_diamond_injector_preprocess_refreshes_message_dependent_initial_state() {
+        let params = DCRTPolyParams::default();
+        let injector = TestInjector::new(params.clone(), 1, 2, 1, 4.578, 0.0);
+        let dir = tempdir().expect("temporary directory should be created");
+        let zero = TestPoly::const_zero(&params);
+        let one = TestPoly::const_one(&params);
+
+        injector.preprocess(dir.path(), &one, None);
+        let initial_one = injector.read_matrix(dir.path(), injector.p_epsilon_id());
+        injector.preprocess(dir.path(), &zero, None);
+        let initial_zero = injector.read_matrix(dir.path(), injector.p_epsilon_id());
+
+        let secret = injector.read_matrix(dir.path(), injector.secret_epsilon_id());
+        let b0 = injector.read_matrix(dir.path(), &injector.b_matrix_id(0, 0));
+        let expected_zero =
+            DCRTPolyMatrix::from_poly_vec_row(&params, vec![secret.entry(0, 0), zero]) * &b0;
+        let expected_one =
+            DCRTPolyMatrix::from_poly_vec_row(&params, vec![secret.entry(0, 0), one]) * &b0;
+
+        assert_eq!(initial_one, expected_one);
+        assert_eq!(initial_zero, expected_zero);
+        assert_ne!(initial_one, initial_zero);
     }
 
     #[test]
@@ -1073,7 +1532,7 @@ mod tests {
             .collect::<Vec<_>>();
         let max_error = projected_errors
             .iter()
-            .map(|norm| norm.poly_norm.norm.clone())
+            .map(|norm| norm.maximum_coefficient_bound())
             .max()
             .expect("state error list must be non-empty");
 

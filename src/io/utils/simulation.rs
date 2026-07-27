@@ -2,7 +2,7 @@ use std::{sync::Arc, thread, time::Duration};
 
 use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, BigUint};
-use num_traits::FromPrimitive;
+use num_traits::{FromPrimitive, Zero};
 
 use crate::{
     circuit::{Evaluable, PolyCircuit},
@@ -32,6 +32,7 @@ use crate::{
     },
     simulator::{
         SimulatorContext,
+        dependency_set::DependencySet,
         error_norm::ErrorNorm,
         lattice_estimator::{Distribution, run_lattice_estimator_cli_with_timeout},
         poly_matrix_norm::PolyMatrixNorm,
@@ -550,9 +551,9 @@ pub(crate) fn noise_refresh_worst_pre_rounding_error_bound(
     refresh
         .pre_round_outputs
         .iter()
-        .map(|error| error.poly_norm.norm.clone())
+        .map(|error| error.maximum_coefficient_bound())
         .max_by(|lhs, rhs| {
-            lhs.partial_cmp(rhs).expect("noise-refresh pre-rounding norms must be comparable")
+            lhs.partial_cmp(rhs).expect("noise-refresh pre-rounding bounds must be comparable")
         })
         .expect("noise-refresh simulation must produce at least one pre-round output")
 }
@@ -682,7 +683,7 @@ pub(crate) fn branch_rebase_decoder_error(error: ErrorNorm, target_col_size: usi
             error.matrix_norm.clone_ctx(),
             error.matrix_norm.nrow,
             target_col_size,
-            error.matrix_norm.poly_norm.norm,
+            error.matrix_norm.poly_norm.sigma,
             error.matrix_norm.zero_rows,
         ),
     )
@@ -734,7 +735,7 @@ pub(crate) fn ciphertext_decryption_error_from_randomizer(
         randomizer_norm.clone_ctx(),
         bottom_half_randomizer.ncol,
         1,
-        decomposed_randomizer_norm.poly_norm.norm.clone(),
+        decomposed_randomizer_norm.poly_norm.sigma.clone(),
         None,
     );
     let public_key_error = PolyMatrixNorm::sample_gauss(
@@ -748,7 +749,7 @@ pub(crate) fn ciphertext_decryption_error_from_randomizer(
         output_ctx,
         1,
         1,
-        raw.poly_norm.norm * BigDecimal::from(full_active_levels as u64),
+        raw.poly_norm.sigma * BigDecimal::from(full_active_levels as u64),
         None,
     )
 }
@@ -1071,8 +1072,8 @@ pub(crate) fn refreshed_seed_from_noise_refresh(
         .iter()
         .max_by(|lhs, rhs| {
             lhs.poly_norm
-                .norm
-                .partial_cmp(&rhs.poly_norm.norm)
+                .sigma
+                .partial_cmp(&rhs.poly_norm.sigma)
                 .unwrap_or_else(|| panic!("{protocol_name} rounded errors must be comparable"))
         })
         .expect("noise refresh must produce rounded errors")
@@ -1159,10 +1160,16 @@ pub(crate) fn expand_logical_errors(
 }
 
 pub(crate) fn scale_error_norm(input: ErrorNorm, scale: &BigDecimal) -> ErrorNorm {
-    ErrorNorm {
-        plaintext_norm: input.plaintext_norm * scale,
-        matrix_norm: input.matrix_norm * scale,
-    }
+    let scale_is_zero = scale.is_zero();
+    let pubkey_deps =
+        if scale_is_zero { DependencySet::empty() } else { input.pubkey_deps.clone() };
+    let is_pubkey_random = if scale_is_zero { false } else { input.is_pubkey_random };
+    ErrorNorm::from_parts(
+        input.plaintext_norm * scale,
+        input.matrix_norm * scale,
+        pubkey_deps,
+        is_pubkey_random,
+    )
 }
 
 pub(crate) fn assert_same_matrix_shape(lhs: &PolyMatrixNorm, rhs: &PolyMatrixNorm, message: &str) {

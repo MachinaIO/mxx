@@ -1581,7 +1581,6 @@ impl GraphSeedStream {
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
             arith::{DEFAULT_MAX_UNREDUCED_MULS, NestedRnsPoly, NestedRnsPolyContext},
@@ -1939,7 +1938,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_goldreich_ring_gsw_output_decrypts_to_plaintext_reference() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2017,7 +2016,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_evaluate_goldreich_uniform_range_decrypts_to_plaintext_range_reference() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2219,7 +2218,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_goldreich_cbd_prf_output_decrypts_to_plaintext_reference() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2307,7 +2306,7 @@ mod tests {
             });
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_goldreich_ring_gsw_large_circuit_non_free_depth_metrics() {

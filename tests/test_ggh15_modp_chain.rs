@@ -126,7 +126,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
         ));
         let plt_evaluator =
             NormPltGGH15Evaluator::new(ctx.clone(), &error_sigma, &error_sigma, None);
-        let e_init_norm = &error_sigma * BigDecimal::from_f32(6.5).unwrap();
+        let e_init_norm = error_sigma.clone();
         let input_bound = BigDecimal::from((P - 1) as u64);
 
         let out_errors = circuit.simulate_max_error_norm(
@@ -140,7 +140,7 @@ fn find_crt_depth_for_modp_chain() -> (usize, DCRTPolyParams, PolyCircuit<DCRTPo
 
         let max_error = out_errors
             .into_iter()
-            .map(|e| e.matrix_norm.poly_norm.norm)
+            .map(|e| e.matrix_norm.maximum_coefficient_bound())
             .max_by(|a, b| a.partial_cmp(b).expect("comparable BigDecimal"))
             .expect("non-empty output");
         let q_over_2p_bd = BigDecimal::from_biguint(q_over_2p.clone(), 0);

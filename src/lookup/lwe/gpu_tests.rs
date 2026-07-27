@@ -3,7 +3,6 @@ use super::{
     derive_k_low, k_high_chunk_count, read_k_high_row,
 };
 use crate::{
-    __PAIR, __TestState,
     bench_estimator::{BggPolyEncodingBenchSamples, PolyEncodingPublicLutBenchEstimator},
     bgg::sampler::{BGGEncodingSampler, BGGPolyEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
@@ -47,7 +46,7 @@ fn setup_lsb_bit_lut(t_n: usize, params: &GpuDCRTPolyParams) -> PublicLut<GpuDCR
 const SIGMA: f64 = 4.578;
 
 #[tokio::test]
-#[sequential_test::sequential]
+#[serial_test::serial]
 async fn test_gpu_lwe_plt_eval() {
     let _storage_lock = storage_test_lock().await;
     let _ = tracing_subscriber::fmt::try_init();
@@ -168,7 +167,7 @@ async fn test_gpu_lwe_plt_eval() {
 }
 
 #[tokio::test]
-#[sequential_test::sequential]
+#[serial_test::serial]
 async fn test_gpu_lwe_poly_encoding_plt_eval() {
     let _storage_lock = storage_test_lock().await;
     let _ = tracing_subscriber::fmt::try_init();

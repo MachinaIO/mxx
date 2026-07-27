@@ -835,12 +835,11 @@ mod tests {
         measure_samples_with_interval,
     };
     use crate::{
-        __PAIR, __TestState,
         circuit::{PolyCircuit, PolyGateType, SubCircuitParamValue},
         poly::dcrt::poly::DCRTPoly,
     };
     use num_bigint::BigUint;
-    use sequential_test::sequential;
+    use serial_test::serial as sequential;
     use std::{
         sync::{
             Arc,
@@ -913,7 +912,7 @@ mod tests {
             &self,
             _src_slots: &[(u32, Option<u32>)],
         ) -> CircuitBenchEstimate {
-            bench(6.0, 6.5, 17)
+            bench(6.0, 6.6, 17)
         }
 
         fn estimate_slot_reduce(

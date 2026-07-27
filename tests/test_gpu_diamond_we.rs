@@ -51,7 +51,7 @@ use std::{
 };
 use tempfile::tempdir;
 use tracing::info;
-use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, prelude::*};
 
 const DEFAULT_RING_DIM: u32 = 1 << 16;
 const DEFAULT_CIRCUIT_HEIGHT: usize = 10;
@@ -138,6 +138,29 @@ struct DiamondWEGpuBenchSelectedSimulation {
     achieved_secpar_for_cbd: Option<u64>,
     noisy_plaintext_error_bits: usize,
     input_injection_error_bits: usize,
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    old_value: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old_value = env::var(key).ok();
+        unsafe { env::set_var(key, value) };
+        Self { key, old_value }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(value) = &self.old_value {
+            unsafe { env::set_var(self.key, value) };
+        } else {
+            unsafe { env::remove_var(self.key) };
+        }
+    }
 }
 
 impl DiamondWEGpuBenchConfig {
@@ -275,13 +298,23 @@ impl DiamondWEGpuBenchConfig {
             env_or_parse_optional_u64("DIAMOND_WE_GPU_BENCH_SELECTED_ACHIEVED_SECPAR_FOR_GAUSS");
         let achieved_secpar_for_cbd =
             env_or_parse_optional_u64("DIAMOND_WE_GPU_BENCH_SELECTED_ACHIEVED_SECPAR_FOR_CBD");
-        let noisy_plaintext_error_bits =
-            env_or_parse_optional_usize("DIAMOND_WE_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS")
-                .unwrap_or(0);
-        let input_injection_error_bits =
-            env_or_parse_optional_usize("DIAMOND_WE_GPU_BENCH_SELECTED_INPUT_INJECTION_ERROR_BITS")
-                .unwrap_or(0);
+        let noisy_plaintext_error_bits = env_or_parse_optional_usize(
+            "DIAMOND_WE_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS",
+        )
+        .expect("DIAMOND_WE_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS must be set with selected CRT depth");
+        let input_injection_error_bits = env_or_parse_optional_usize(
+            "DIAMOND_WE_GPU_BENCH_SELECTED_INPUT_INJECTION_ERROR_BITS",
+        )
+        .expect("DIAMOND_WE_GPU_BENCH_SELECTED_INPUT_INJECTION_ERROR_BITS must be set with selected CRT depth");
         assert!(crt_depth > 0, "DIAMOND_WE_GPU_BENCH_SELECTED_CRT_DEPTH must be positive");
+        assert!(
+            noisy_plaintext_error_bits > 0,
+            "DIAMOND_WE_GPU_BENCH_SELECTED_NOISY_PLAINTEXT_ERROR_BITS must be positive"
+        );
+        assert!(
+            input_injection_error_bits > 0,
+            "DIAMOND_WE_GPU_BENCH_SELECTED_INPUT_INJECTION_ERROR_BITS must be positive"
+        );
         Some(DiamondWEGpuBenchSelectedSimulation {
             crt_depth,
             ring_dim,
@@ -344,7 +377,7 @@ fn artifact_dir_from_env(default: PathBuf) -> PathBuf {
 fn gpu_params_for_crt_depth(
     cfg: &DiamondWEGpuBenchConfig,
     crt_depth: usize,
-    gpu_id: i32,
+    gpu_ids: Vec<i32>,
 ) -> (DCRTPolyParams, GpuDCRTPolyParams) {
     let cpu_params = DCRTPolyParams::new(cfg.ring_dim, crt_depth, cfg.crt_bits, cfg.base_bits);
     let (moduli, _, actual_depth) = cpu_params.to_crt();
@@ -353,7 +386,7 @@ fn gpu_params_for_crt_depth(
         cpu_params.ring_dimension(),
         moduli,
         cpu_params.base_bits(),
-        vec![gpu_id],
+        gpu_ids,
         Some(1),
     );
     assert_eq!(gpu_params.modulus(), cpu_params.modulus());
@@ -392,13 +425,19 @@ fn build_cpu_diamond_we_for_search(
         cfg.trapdoor_sigma,
         cfg.error_sigma,
     );
-    DiamondWE::new(injector, cfg.witness_size, dir_path, b"test_gpu_diamond_we_cpu_search".to_vec())
+    DiamondWE::new(
+        injector,
+        cfg.witness_size,
+        dir_path,
+        b"test_gpu_diamond_we_cpu_search".to_vec(),
+        None,
+    )
 }
 
 fn build_gpu_diamond_we(
     cfg: &DiamondWEGpuBenchConfig,
     gpu_params: GpuDCRTPolyParams,
-    gpu_id: i32,
+    gpu_ids: Vec<i32>,
     dir_path: PathBuf,
 ) -> GpuDiamondWE {
     let injector = GpuInjector::new(
@@ -409,8 +448,14 @@ fn build_gpu_diamond_we(
         cfg.trapdoor_sigma,
         cfg.error_sigma,
     )
-    .with_gpu_device_ids(vec![gpu_id]);
-    DiamondWE::new(injector, cfg.witness_size, dir_path, b"test_gpu_diamond_we".to_vec())
+    .with_gpu_device_ids(gpu_ids);
+    DiamondWE::new(
+        injector,
+        cfg.witness_size,
+        dir_path,
+        b"test_gpu_diamond_we".to_vec(),
+        Some(vec![true; cfg.witness_size]),
+    )
 }
 
 fn build_benchmark_public_lut(params: &GpuDCRTPolyParams) -> PublicLut<GpuDCRTPoly> {
@@ -611,19 +656,9 @@ async fn build_encoding_bench_estimator(
 }
 
 #[tokio::test]
-#[sequential_test::sequential]
+#[serial_test::serial]
 async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
-    let log_filter = tracing_subscriber::filter::Targets::new()
-        .with_target("test_gpu_diamond_we", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target("mxx::we::diamond_we", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target("mxx::io::utils::simulation", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target(
-            "mxx::we::diamond_we::bench_estimator",
-            tracing_subscriber::filter::LevelFilter::DEBUG,
-        )
-        .with_target("mxx::bench_estimator", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_target("mxx::storage::write", tracing_subscriber::filter::LevelFilter::INFO)
-        .with_default(tracing_subscriber::filter::LevelFilter::WARN);
+    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::registry()
         .with(log_filter)
         .with(tracing_subscriber::fmt::layer())
@@ -632,8 +667,9 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
 
     let cfg = DiamondWEGpuBenchConfig::from_env();
     info!("DiamondWE GPU bench config: {:?}", cfg);
-    let gpu_id =
-        *detected_gpu_device_ids().first().expect("test_gpu_diamond_we requires at least one GPU");
+    let gpu_ids = detected_gpu_device_ids();
+    assert!(!gpu_ids.is_empty(), "test_gpu_diamond_we requires at least one GPU");
+    info!(?gpu_ids, gpu_count = gpu_ids.len(), "DiamondWE GPU devices selected");
     let temp_dir = tempdir().expect("DiamondWE GPU bench test must create a tempdir");
     init_storage_system(temp_dir.path().to_path_buf());
 
@@ -678,10 +714,10 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
             achieved_secpar_for_gauss: search.achieved_secpar_for_gauss,
             achieved_secpar_for_cbd: search.achieved_secpar_for_cbd,
             noisy_plaintext_error_bits: bigdecimal_bits_ceil(
-                &search.simulation.noisy_plaintext_error.poly_norm.norm,
+                &search.simulation.noisy_plaintext_error_bound,
             ) as usize,
             input_injection_error_bits: bigdecimal_bits_ceil(
-                &search.simulation.input_injection.state_errors[0].poly_norm.norm,
+                &search.simulation.input_injection.state_errors[0].maximum_coefficient_bound(),
             ) as usize,
         };
         info!(
@@ -699,7 +735,7 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
 
     let selected_cfg = DiamondWEGpuBenchConfig { ring_dim: selected.ring_dim, ..cfg.clone() };
     let (_cpu_params, gpu_params) =
-        gpu_params_for_crt_depth(&selected_cfg, selected.crt_depth, gpu_id);
+        gpu_params_for_crt_depth(&selected_cfg, selected.crt_depth, gpu_ids.clone());
     let final_dir = artifact_dir_from_env(temp_dir.path().join("final_estimate"));
     ensure_dir(&final_dir);
     info!(
@@ -707,7 +743,8 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
         "DiamondWE GPU artifact directory selected"
     );
     init_storage_system(final_dir.clone());
-    let diamond = build_gpu_diamond_we(&cfg, gpu_params.clone(), gpu_id, final_dir.clone());
+    let diamond =
+        build_gpu_diamond_we(&cfg, gpu_params.clone(), gpu_ids.clone(), final_dir.clone());
     let gpu_circuit = build_circuit::<GpuDCRTPoly>(cfg.circuit_height);
 
     info!("starting DiamondWE GPU public-key bench estimator construction");
@@ -747,10 +784,43 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
     let instance = vec![true; cfg.instance_size()];
     let msg = rand::random::<bool>();
     info!(msg, "starting DiamondWE GPU enc");
-    let ct = diamond.enc(&msg, gpu_circuit, &instance);
+    let ct = diamond.enc(&msg, gpu_circuit.clone(), &instance);
     gpu_device_sync();
+    let one_preimage_path = fs::read_dir(&final_dir)
+        .expect("DiamondWE artifact directory should be readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                name.starts_with("diamond_we_session_") &&
+                    name.contains("_we_one_preimage") &&
+                    name.ends_with(".matrixbin")
+            })
+        })
+        .expect("session-qualified one-preimage artifact should exist");
+    fs::remove_file(&one_preimage_path)
+        .expect("test should remove one saved preimage to simulate interruption");
+    fs::remove_file(final_dir.join("diamond_we_enc_complete"))
+        .expect("test should remove the encryption completion marker");
+    let resumed_ct = diamond.enc(&msg, gpu_circuit, &instance);
+    gpu_device_sync();
+    assert_eq!(resumed_ct.hash_key, ct.hash_key);
+    assert!(one_preimage_path.exists());
+    assert_eq!(
+        fs::read_dir(&final_dir)
+            .expect("DiamondWE artifact directory should be readable")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().ends_with("_storage_accounting.json")
+            })
+            .count(),
+        1,
+        "the resumed session must publish one actual-byte accounting artifact"
+    );
     info!("starting DiamondWE GPU dec");
-    let decoded = diamond.dec(&ct, &witness);
+    let _expected_msg_guard =
+        EnvVarGuard::set("DIAMOND_WE_GPU_BENCH_EXPECTED_MSG", if msg { "true" } else { "false" });
+    let decoded = diamond.dec(&resumed_ct, &witness);
     gpu_device_sync();
     info!(msg, decoded, "DiamondWE GPU round trip finished");
     assert_eq!(decoded, msg);

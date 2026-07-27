@@ -525,12 +525,11 @@ where
 mod tests {
     use super::{BggPolyEncodingBenchEstimator, validate_single_slot_shape};
     use crate::{
-        __PAIR, __TestState,
         bench_estimator::{BenchEstimator, CircuitBenchEstimate},
         matrix::dcrt_poly::DCRTPolyMatrix,
     };
     use num_bigint::BigUint;
-    use sequential_test::sequential;
+    use serial_test::serial as sequential;
     use std::marker::PhantomData;
 
     fn test_estimator() -> BggPolyEncodingBenchEstimator<DCRTPolyMatrix> {

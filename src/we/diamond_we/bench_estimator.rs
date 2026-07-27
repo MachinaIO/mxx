@@ -908,7 +908,7 @@ mod tests {
         }
 
         fn estimate_large_scalar_mul(&self, _scalar: &[BigUint]) -> CircuitBenchEstimate {
-            CircuitBenchEstimate::new(6.5, 6.5)
+            CircuitBenchEstimate::new(6.6, 6.6)
         }
 
         fn estimate_slot_transfer(
@@ -996,7 +996,7 @@ mod tests {
             DCRTPolyTrapdoorSampler,
         >::new(params, witness_size / 2, 4, 2, 4.578, 0.0);
         let dir = tempdir().expect("temporary DiamondWE benchmark directory should be created");
-        DiamondWE::new(injector, witness_size, dir.path(), b"diamond_we_bench_test".to_vec())
+        DiamondWE::new(injector, witness_size, dir.path(), b"diamond_we_bench_test".to_vec(), None)
     }
 
     fn estimator<'a>(

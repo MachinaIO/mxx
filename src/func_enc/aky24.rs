@@ -1534,7 +1534,6 @@ where
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         gadgets::arith::ModularArithmeticContext,
         lookup::debug::{
             DebugNaiveBGGEncodingVecPltEvaluator, DebugNaiveBGGPublicKeyVecPltEvaluator,
@@ -1587,7 +1586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_aky24_debug_identity_decrypts_random_bit() {
         let log_filter = tracing_subscriber::filter::Targets::new()
             .with_target("mxx::func_enc::aky24", tracing::Level::DEBUG)

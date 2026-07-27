@@ -9,7 +9,7 @@ use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive};
 use rayon::prelude::*;
 #[cfg(test)]
-use sequential_test::sequential;
+use serial_test::serial as sequential;
 use std::{
     collections::HashMap,
     ffi::CStr,
@@ -1197,7 +1197,6 @@ impl MulAssign<&GpuDCRTPoly> for GpuDCRTPoly {
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };

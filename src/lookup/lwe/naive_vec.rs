@@ -182,7 +182,6 @@ where
 mod tests {
     use super::{NaiveLWEBGGEncodingVecPltEvaluator, NaiveLWEBGGPublicKeyVecPltEvaluator};
     use crate::{
-        __PAIR, __TestState,
         bgg::{
             encoding::BggEncoding,
             naive_vec::{NaiveBGGEncodingVec, NaiveBGGPublicKeyVec},
@@ -231,7 +230,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_naive_lwe_bgg_vec_lookup_output_vectors_match_plaintext_relation() {
         let _storage_lock = storage_test_lock().await;
         let params = DCRTPolyParams::default();

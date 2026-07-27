@@ -1257,7 +1257,6 @@ where
 mod tests {
     use super::{BggPublicKeySTEvaluator, trapdoor_public_column_count};
     use crate::{
-        __PAIR, __TestState,
         bgg::public_key::BggPublicKey,
         circuit::PolyCircuit,
         lookup::{PltEvaluator, PublicLut},
@@ -1347,7 +1346,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_slot_transfer_bgg_public_key_records_gate_state_and_hashes_output_matrix() {
         let params = DCRTPolyParams::default();
@@ -1417,7 +1416,7 @@ mod tests {
         assert_eq!(stored.src_slots, src_slots);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_slot_transfer_bgg_public_key_accepts_smaller_output_slot_count() {
         let params = DCRTPolyParams::default();
@@ -1493,7 +1492,7 @@ mod tests {
         assert_eq!(stored.src_slots, src_slots);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_slot_reduce_bgg_public_key_records_state_and_hashes_output_matrix() {
         let params = DCRTPolyParams::default();
@@ -1577,7 +1576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_slot_reduce_bgg_public_key_samples_aux_matrices() {
         let _storage_lock = storage_test_lock().await;
 
@@ -1698,7 +1697,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     #[should_panic(expected = "output slot count 3 exceeds evaluator num_slots 2")]
     fn test_slot_transfer_bgg_public_key_rejects_output_slot_count_exceeding_num_slots() {
@@ -1738,7 +1737,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     #[should_panic(
         expected = "source slot index 2 out of range for evaluator num_slots 2 at dst_slot 0"
@@ -1785,7 +1784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_slot_transfer_bgg_public_key_samples_and_persists_aux_matrices() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();

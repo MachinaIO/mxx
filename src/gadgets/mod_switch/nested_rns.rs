@@ -418,7 +418,6 @@ impl<P: Poly> NestedRnsPoly<P> {
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         circuit::PolyCircuit,
         lookup::poly::PolyPltEvaluator,
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -586,7 +585,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_mod_switch_nested_rns_mod_up_levels_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -598,7 +597,7 @@ mod tests {
         test_mod_switch_nested_rns_mod_up_levels_generic(circuit, params, ctx, value);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_mod_switch_nested_rns_mod_up_levels_zero() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -606,7 +605,7 @@ mod tests {
         test_mod_switch_nested_rns_mod_up_levels_generic(circuit, params, ctx, BigUint::ZERO);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_mod_switch_nested_rns_mod_up_levels_max() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -616,7 +615,7 @@ mod tests {
         test_mod_switch_nested_rns_mod_up_levels_generic(circuit, params, ctx, value);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_mod_switch_nested_rns_mod_down_one_level_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -626,7 +625,7 @@ mod tests {
         test_mod_switch_nested_rns_mod_down_one_level_generic(circuit, params, ctx, value);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_mod_switch_nested_rns_mod_down_one_level_zero() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -634,7 +633,7 @@ mod tests {
         test_mod_switch_nested_rns_mod_down_one_level_generic(circuit, params, ctx, BigUint::ZERO);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_mod_switch_nested_rns_mod_down_one_level_max() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -701,7 +700,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_mod_switch_nested_rns_mod_down_levels_random() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -711,7 +710,7 @@ mod tests {
         test_mod_switch_nested_rns_mod_down_levels_generic(circuit, params, ctx, value);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_mod_switch_nested_rns_mod_down_levels_zero() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -719,7 +718,7 @@ mod tests {
         test_mod_switch_nested_rns_mod_down_levels_generic(circuit, params, ctx, BigUint::ZERO);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_mod_switch_nested_rns_mod_down_levels_max() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();

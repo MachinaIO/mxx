@@ -468,7 +468,6 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        __PAIR, __TestState,
         circuit::PolyGateKind,
         gadgets::{
             arith::DEFAULT_MAX_UNREDUCED_MULS,
@@ -764,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_inverse_mod_up_forward_round_trip_keeps_coeff_error_within_mod_up_bound() {
         let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -838,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_inverse_mod_down_forward_round_trip_keeps_coeff_error_within_mod_down_bound() {
         let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -910,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_for_num_slots_2_single_tower()
      {
         let params = DCRTPolyParams::new(2, 1, 17, BASE_BITS);
@@ -937,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_for_num_slots_16_multi_tower()
      {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
@@ -964,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_for_num_slots_16_single_tower_51_bit_modulus()
      {
         let params = DCRTPolyParams::new(16, 1, 51, BASE_BITS);
@@ -995,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_when_num_slots_is_smaller_than_ring_dimension()
      {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
@@ -1045,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_forward_inverse_round_trip_reconstructs_original_input_for_num_slots_2_and_16() {
         for (ring_dimension, crt_depth, num_slots) in
             [(2u32, 1usize, 2usize), (16u32, 2usize, 16usize)]
@@ -1078,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_forward_inverse_round_trip_reconstructs_original_input_with_reduced_active_levels()
     {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
@@ -1112,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_with_reduced_active_levels()
     {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
@@ -1146,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_with_reduced_active_levels_when_num_slots_is_smaller_than_ring_dimension()
      {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
@@ -1184,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ntt_inverse_reconstruct_matches_from_biguints_eval_coeffs() {
         let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -1213,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[should_panic(expected = "num_slots must be a power of two")]
     fn test_ntt_forward_ntt_rejects_non_power_of_two_num_slots() {
         let params = DCRTPolyParams::new(8, 1, 17, BASE_BITS);

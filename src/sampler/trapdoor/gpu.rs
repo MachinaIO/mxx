@@ -273,28 +273,53 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         );
 
         let perturb_start = Instant::now();
-        let perturbed_syndrome = {
-            let p1_rows = p1.row_size();
-            let p2_rows = p2.row_size();
-            debug_assert_eq!(
-                public_matrix.col_size(),
-                p1_rows + p2_rows,
-                "public matrix columns must match perturbation rows",
-            );
-            let public_left = public_matrix.slice(0, d, 0, p1_rows);
+        let p1_rows = p1.row_size();
+        let p2_rows = p2.row_size();
+        debug_assert_eq!(
+            public_matrix.col_size(),
+            p1_rows + p2_rows,
+            "public matrix columns must match perturbation rows",
+        );
+        let mut perturbed_syndrome = target.clone();
+        {
             let public_right = public_matrix.slice(0, d, p1_rows, p1_rows + p2_rows);
-            let p_hat_image = (&public_left * &p1) + (&public_right * &p2);
-            let p_hat_image = if p_hat_image.col_size() == target_cols {
-                p_hat_image
+            let right_image = &public_right * &p2;
+            let right_image = if right_image.col_size() == target_cols {
+                right_image
             } else {
-                p_hat_image.slice_columns(0, target_cols)
+                right_image.slice_columns(0, target_cols)
             };
-            target - &p_hat_image
-        };
+            perturbed_syndrome.sub_in_place(&right_image);
+        }
+        {
+            let public_left = public_matrix.slice(0, d, 0, p1_rows);
+            let left_image = &public_left * &p1;
+            let left_image = if left_image.col_size() == target_cols {
+                left_image
+            } else {
+                left_image.slice_columns(0, target_cols)
+            };
+            perturbed_syndrome.sub_in_place(&left_image);
+        }
         tracing::debug!(
             elapsed_ms = perturb_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: computed perturbed_syndrome"
         );
+
+        let assemble_start = Instant::now();
+        let p1_level = p1.level();
+        let p1_is_ntt = p1.is_ntt();
+        let mut out = GpuDCRTPolyMatrix::new_empty_with_state(
+            params,
+            p1_rows + p2_rows,
+            target_cols,
+            p1_level,
+            p1_is_ntt,
+        );
+        out.copy_block_from(&p1, 0, 0, 0, 0, p1_rows, target_cols);
+        out.copy_block_from(&p2, p1_rows, 0, 0, 0, p2_rows, target_cols);
+        drop(p1);
+        drop(p2);
 
         let gauss_start = Instant::now();
         let z_hat_mat =
@@ -310,19 +335,6 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             elapsed_ms = r_mul_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: computed r * z_hat"
         );
-        let assemble_start = Instant::now();
-        let mut out = GpuDCRTPolyMatrix::new_empty_with_state(
-            params,
-            p1.row_size() + p2.row_size(),
-            target_cols,
-            p1.level(),
-            p1.is_ntt(),
-        );
-        out.copy_block_from(&p1, 0, 0, 0, 0, p1.row_size(), target_cols);
-        out.copy_block_from(&p2, p1.row_size(), 0, 0, 0, p2.row_size(), target_cols);
-        drop(p1);
-        drop(p2);
-
         out.add_block_from(&r_z_hat, 0, 0, 0, 0, r_z_hat.row_size(), target_cols);
         tracing::debug!(
             elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
@@ -477,7 +489,6 @@ fn sample_pert_square_mat_gpu_native_parts(
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         element::PolyElem,
         matrix::PolyMatrix,
         poly::{
@@ -487,11 +498,13 @@ mod tests {
                 params::DCRTPolyParams,
             },
         },
-        simulator::error_norm::compute_preimage_norm,
+        simulator::{
+            error_norm::compute_preimage_sigma, poly_norm::maximum_coefficient_bound_from_sigma,
+        },
     };
     use bigdecimal::{BigDecimal, FromPrimitive};
     use num_bigint::{BigInt, BigUint};
-    use sequential_test::sequential;
+    use serial_test::serial as sequential;
 
     const SIGMA: f64 = 4.578;
 
@@ -705,8 +718,8 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound =
-            compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, bound_sigma);
+        let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, bound_sigma);
+        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
         let modulus = params.modulus();
 
         for sample_idx in 0..4usize {
@@ -723,14 +736,14 @@ mod tests {
                         let centered_abs = if value < neg { value } else { neg };
                         let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_norm_bound,
-                            "preimage coeff exceeds compute_preimage_norm bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
+                            centered_bd < preimage_bound,
+                            "preimage coeff exceeds preimage maximum coefficient bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
                             sample_idx,
                             i,
                             j,
                             k,
                             centered_abs,
-                            preimage_norm_bound
+                            preimage_bound
                         );
                     }
                 }
@@ -740,20 +753,20 @@ mod tests {
 
     #[test]
     #[sequential]
-    fn test_gpu_preimage_coefficients_below_compute_preimage_norm() {
+    fn test_gpu_preimage_coefficients_below_compute_preimage_sigma() {
         assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(SIGMA, None);
     }
 
     #[test]
     #[sequential]
-    fn test_gpu_preimage_coefficients_below_compute_preimage_norm_non_default_sigma() {
+    fn test_gpu_preimage_coefficients_below_compute_preimage_sigma_non_default_sigma() {
         let sigma = SIGMA * 1.25;
         assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(sigma, Some(sigma));
     }
 
     #[test]
     #[sequential]
-    fn test_gpu_p_hat_coefficients_below_compute_preimage_norm() {
+    fn test_gpu_p_hat_coefficients_below_compute_preimage_sigma() {
         gpu_device_sync();
         let size = 2usize;
         let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
@@ -767,7 +780,8 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, None);
+        let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, None);
+        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
         let modulus = params.modulus();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
@@ -795,14 +809,14 @@ mod tests {
                         let centered_abs = if value < neg { value } else { neg };
                         let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_norm_bound,
-                            "p_hat coeff exceeds compute_preimage_norm bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
+                            centered_bd < preimage_bound,
+                            "p_hat coeff exceeds preimage maximum coefficient bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
                             sample_idx,
                             i,
                             j,
                             coeff_idx,
                             centered_abs,
-                            preimage_norm_bound
+                            preimage_bound
                         );
                     }
                 }
@@ -831,7 +845,8 @@ mod tests {
             .expect("ring dimension sqrt should exist");
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << base_params.base_bits(), 0);
         let m_g = (size * base_params.modulus_digits()) as u64;
-        let preimage_norm_bound = compute_preimage_norm(&ring_dim_sqrt, m_g, &base, None, None);
+        let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, None);
+        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
         let modulus = base_params.modulus();
 
         struct DeviceCase {
@@ -893,15 +908,15 @@ mod tests {
                         let centered_abs = if value < neg { value } else { neg };
                         let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_norm_bound,
-                            "restored preimage coeff exceeds compute_preimage_norm bound (src_device={}, dst_device={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={})",
+                            centered_bd < preimage_bound,
+                            "restored preimage coeff exceeds preimage maximum coefficient bound (src_device={}, dst_device={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={})",
                             case.src_device,
                             case.dst_device,
                             i,
                             j,
                             coeff_idx,
                             centered_abs,
-                            preimage_norm_bound
+                            preimage_bound
                         );
                     }
                 }

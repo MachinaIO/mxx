@@ -13,7 +13,9 @@ use crate::{
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+    simulator::poly_norm::maximum_coefficient_bound_from_sigma,
 };
+use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use num_bigint::BigUint;
 use std::sync::Arc;
 
@@ -173,7 +175,10 @@ impl<P: Poly + 'static> CKKSContext<P> {
     }
 
     fn initial_ciphertext_error_bound(&self) -> BigUint {
-        BigUint::from((6.5 * self.error_sigma).ceil() as u64)
+        let sigma = BigDecimal::from_f64(self.error_sigma)
+            .expect("CKKS error sigma must be finite");
+        let bound = maximum_coefficient_bound_from_sigma(&sigma);
+        BigUint::from(bound.ceil().to_u64().expect("CKKS error bound must fit in u64"))
     }
 
     fn q_window_modulus(&self, level_offset: usize, active_levels: usize) -> BigUint {
@@ -643,7 +648,6 @@ impl<P: Poly + 'static> CKKSCiphertext<P> {
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
             arith::DEFAULT_MAX_UNREDUCED_MULS,
@@ -1076,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_add_returns_ciphertext_that_decrypts_to_expected_slotwise_sum() {
         let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
         let secret_key = sample_ternary_secret_key(&params);
@@ -1128,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_add_with_input_c0_error_keeps_decrypted_coeff_error_within_bound() {
         let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
         let secret_key = sample_ternary_secret_key(&params);
@@ -1216,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_pre_relinearization_tuple_matches_exact_plaintext_product() {
         let mul_relin_extra_levels = 1;
         let params = DCRTPolyParams::new(
@@ -1290,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_pre_relinearization_tuple_with_input_c0_error_keeps_decrypted_coeff_error_within_bound()
      {
         let mul_relin_extra_levels = 1;
@@ -1401,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_keeps_decrypted_coeff_error_within_bound_for_scaled_plaintext_product() {
         let mul_relin_extra_levels = 1;
         let crt_bits = 24usize;
@@ -1547,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_keeps_decrypted_coeff_error_within_bound_for_scaled_plaintext_product_with_input_c0_error()
      {
         let mul_relin_extra_levels = 1;
@@ -1696,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_then_rescale_keeps_decrypted_coeff_error_within_bound() {
         let mul_relin_extra_levels = 1;
         let crt_bits = 24usize;
@@ -1850,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_mul_then_rescale_keeps_decrypted_coeff_error_within_bound_with_input_c0_error() {
         let mul_relin_extra_levels = 1;
         let crt_bits = 24usize;
@@ -2000,7 +2004,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_relinearize_d2_via_mod_up_down_keeps_decrypted_coeff_error_within_bound() {
         let mul_relin_extra_levels = 1;
         let params = DCRTPolyParams::new(
@@ -2153,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     fn test_ckks_rescale_returns_ciphertext_that_decrypts_to_expected_exact_division() {
         let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
         let secret_key = sample_ternary_secret_key(&params);

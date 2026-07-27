@@ -1,5 +1,4 @@
 use crate::{
-    __PAIR, __TestState,
     bgg::sampler::{BGGEncodingSampler, BGGPolyEncodingSampler, BGGPublicKeySampler},
     circuit::PolyCircuit,
     lookup::PublicLut,
@@ -46,7 +45,7 @@ fn setup_lsb_bit_lut_gpu(t_n: usize, params: &GpuDCRTPolyParams) -> PublicLut<Gp
 }
 
 #[tokio::test]
-#[sequential_test::sequential]
+#[serial_test::serial]
 async fn test_gpu_ggh15_plt_eval_multi_inputs() {
     let _storage_lock = storage_test_lock().await;
     let _ = tracing_subscriber::fmt::try_init();
@@ -176,7 +175,7 @@ async fn test_gpu_ggh15_plt_eval_multi_inputs() {
 }
 
 #[tokio::test]
-#[sequential_test::sequential]
+#[serial_test::serial]
 async fn test_gpu_ggh15_poly_encoding_plt_eval_slot_secret_relation() {
     let _storage_lock = storage_test_lock().await;
     let _ = tracing_subscriber::fmt::try_init();

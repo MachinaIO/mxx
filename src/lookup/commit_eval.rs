@@ -640,7 +640,6 @@ fn derive_canceler_matrix<M: PolyMatrix>(
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         bgg::sampler::{BGGEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
         matrix::dcrt_poly::DCRTPolyMatrix,
@@ -676,7 +675,7 @@ mod tests {
     const SIGMA: f64 = 4.578;
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_commit_plt_eval_single_input() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();
@@ -825,7 +824,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_commit_plt_eval_multi_inputs() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();

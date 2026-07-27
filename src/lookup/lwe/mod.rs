@@ -36,7 +36,6 @@ mod tests {
         derive_k_low, k_high_chunk_count, read_k_high_row,
     };
     use crate::{
-        __PAIR, __TestState,
         bench_estimator::{BggPolyEncodingBenchSamples, PolyEncodingPublicLutBenchEstimator},
         bgg::sampler::{BGGEncodingSampler, BGGPolyEncodingSampler, BGGPublicKeySampler},
         circuit::PolyCircuit,
@@ -77,7 +76,7 @@ mod tests {
     const SIGMA: f64 = 4.578;
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_lwe_plt_eval() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();
@@ -191,7 +190,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     async fn test_lwe_poly_encoding_plt_eval() {
         let _storage_lock = storage_test_lock().await;
         let _ = tracing_subscriber::fmt::try_init();

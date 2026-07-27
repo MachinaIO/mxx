@@ -174,9 +174,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{effective_gauss_sigma, effective_slot_parallelism_gpu_with_requested};
-    use crate::{__PAIR, __TestState, poly::dcrt::gpu::detected_gpu_device_ids};
+    use crate::poly::dcrt::gpu::detected_gpu_device_ids;
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_effective_slot_parallelism_gpu_uses_detected_gpu_ids() {
         let detected_count = detected_gpu_device_ids().len().max(1);

@@ -1698,7 +1698,6 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
 mod tests {
     use super::*;
     use crate::{
-        __PAIR, __TestState,
         bgg::public_key::BggPublicKey,
         circuit::{PolyCircuit, evaluable::PolyVec},
         gadgets::{
@@ -2045,7 +2044,7 @@ mod tests {
         assert_eq!(input.randomizer_norm, ctx.fresh_randomizer_norm());
         assert_eq!(input.randomizer_norm.nrow, ctx.width());
         assert_eq!(input.randomizer_norm.ncol, ctx.width());
-        assert_eq!(input.randomizer_norm.poly_norm.norm, BigDecimal::from(1u64));
+        assert_eq!(input.randomizer_norm.poly_norm.sigma, BigDecimal::from(1u64));
         assert_eq!(input.max_plaintext, BigUint::from(1u64));
     }
 
@@ -2059,12 +2058,12 @@ mod tests {
         assert_eq!(estimated.nrow, 1);
         assert_eq!(estimated.ncol, 1);
         assert_eq!(estimated.ctx(), ctx.randomizer_norm_ctx.as_ref());
-        assert!(estimated.poly_norm.norm > BigDecimal::from(0u64));
+        assert!(estimated.poly_norm.sigma > BigDecimal::from(0u64));
 
         let zero_sigma = input.estimate_decryption_error_norm(0.0);
         assert_eq!(zero_sigma.nrow, 1);
         assert_eq!(zero_sigma.ncol, 1);
-        assert_eq!(zero_sigma.poly_norm.norm, BigDecimal::from(0u64));
+        assert_eq!(zero_sigma.poly_norm.sigma, BigDecimal::from(0u64));
     }
 
     #[test]
@@ -2178,7 +2177,7 @@ mod tests {
         let _ = lhs.xor(&rhs, &mut circuit);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_encrypt_roundtrip_matches_circuit_and_native_decrypt_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2239,7 +2238,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_decrypt_batch_with_ring_dim_ciphertexts_packs_decryptions_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2333,7 +2332,7 @@ mod tests {
         }
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_decrypt_batch_bgg_public_key_output_column_count() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2396,7 +2395,7 @@ mod tests {
         assert_eq!(outputs[0].matrix.col_size(), secret_size * m_g);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2429,8 +2428,6 @@ mod tests {
 
         let (x1, x2) = sample_binary_input_pair();
         let expected = (x1 + x2) % plaintext_modulus;
-        let lhs_tag = format!("add_circuit_lhs_{x1}_{x2}");
-        let rhs_tag = format!("add_circuit_rhs_{x1}_{x2}");
         let lhs_native =
             encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
         let rhs_native =
@@ -2464,7 +2461,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2497,8 +2494,6 @@ mod tests {
 
         let (x1, x2) = sample_binary_input_pair();
         let expected = (x1 + plaintext_modulus - x2) % plaintext_modulus;
-        let lhs_tag = format!("sub_circuit_lhs_{x1}_{x2}");
-        let rhs_tag = format!("sub_circuit_rhs_{x1}_{x2}");
         let lhs_native =
             encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
         let rhs_native =
@@ -2532,7 +2527,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2565,8 +2560,6 @@ mod tests {
 
         let (x1, x2) = sample_binary_input_pair();
         let expected = (x1 * x2) % plaintext_modulus;
-        let lhs_tag = format!("mul_circuit_lhs_{x1}_{x2}");
-        let rhs_tag = format!("mul_circuit_rhs_{x1}_{x2}");
         let lhs_native =
             encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
         let rhs_native =
@@ -2600,7 +2593,7 @@ mod tests {
         );
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     fn test_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_without_error() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -2636,9 +2629,6 @@ mod tests {
         let (x1, x2) = sample_binary_input_pair();
         let x3 = 1u64;
         let expected = (x1 * x2 * x3) % plaintext_modulus;
-        let lhs_tag = format!("chain_mul_circuit_lhs_{x1}_{x2}_{x3}");
-        let rhs1_tag = format!("chain_mul_circuit_rhs1_{x1}_{x2}_{x3}");
-        let rhs2_tag = format!("chain_mul_circuit_rhs2_{x1}_{x2}_{x3}");
         let lhs_native =
             encrypt_plaintext_bit(&params, ctx.nested_rns.as_ref(), &public_key, x1 != 0);
         let rhs1_native =
@@ -2924,7 +2914,7 @@ mod tests {
         assert_eq!(ctx.width() % (MUL_COLUMN_SUBCIRCUIT_BATCH * MUL_COLUMN_SUBCIRCUIT_BATCH), 2);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_nested_rns_ring_gsw_mul_large_circuit_metrics() {
@@ -2993,7 +2983,7 @@ mod tests {
         println!("mul 2 vs mul 1 depth increase: {}", mul2_depth - mul1_depth);
     }
 
-    #[sequential_test::sequential]
+    #[serial_test::serial]
     #[test]
     #[ignore = "expensive circuit-structure reporting test; run with --ignored --nocapture"]
     fn test_carry_arith_ring_gsw_mul_large_circuit_metrics() {

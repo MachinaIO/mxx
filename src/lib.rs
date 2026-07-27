@@ -1,14 +1,6 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 
-#[cfg(test)]
-use sequential_test::sequential;
-
-#[cfg(test)]
-#[test]
-#[sequential]
-fn __sequential_anchor() {}
-
 pub mod bench_estimator;
 pub mod bgg;
 pub mod circuit;

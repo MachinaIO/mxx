@@ -213,6 +213,27 @@ unsafe extern "C" {
         seed: GpuRngSeed,
         out: *mut GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_mul_vertical_pair(
+        out: *mut GpuMatrixOpaque,
+        top: *const GpuMatrixOpaque,
+        bottom: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_preimage_residual(
+        out: *mut GpuMatrixOpaque,
+        target: *const GpuMatrixOpaque,
+        public_matrix: *const GpuMatrixOpaque,
+        p1: *const GpuMatrixOpaque,
+        p2: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_preimage_assemble(
+        out: *mut GpuMatrixOpaque,
+        p1: *const GpuMatrixOpaque,
+        p2: *const GpuMatrixOpaque,
+        r: *const GpuMatrixOpaque,
+        e: *const GpuMatrixOpaque,
+        z: *const GpuMatrixOpaque,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_sample_distribution(
         out: *mut GpuMatrixOpaque,
         dist_type: c_int,

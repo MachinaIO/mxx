@@ -17,10 +17,11 @@ use crate::{
                 gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_small_gadget,
                 gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
                 gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
-                gpu_matrix_mul_scalar, gpu_matrix_ntt_all, gpu_matrix_sample_distribution,
-                gpu_matrix_sample_distribution_columns, gpu_matrix_sample_p1_full_cached,
-                gpu_matrix_store_compact_bytes, gpu_matrix_store_const_coeff_batch,
-                gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                gpu_matrix_mul_scalar, gpu_matrix_mul_vertical_pair, gpu_matrix_ntt_all,
+                gpu_matrix_preimage_assemble, gpu_matrix_preimage_residual,
+                gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_columns,
+                gpu_matrix_sample_p1_full_cached, gpu_matrix_store_compact_bytes,
+                gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -570,6 +571,100 @@ impl GpuDCRTPolyMatrix {
         tp2.intt_all_in_place();
         let status = unsafe { gpu_matrix_sample_p1_full_cached(cache.raw, tp2.raw, seed, out.raw) };
         check_status(status, "gpu_matrix_sample_p1_full_cached");
+        out
+    }
+
+    pub(crate) fn mul_vertical_pair(top: &Self, bottom: &Self, rhs: &Self) -> Self {
+        debug_assert_eq!(top.params, bottom.params, "vertical pair params mismatch");
+        debug_assert_eq!(top.params, rhs.params, "vertical pair RHS params mismatch");
+        debug_assert_eq!(top.ncol, bottom.ncol, "vertical pair inner dimensions mismatch");
+        debug_assert_eq!(top.ncol, rhs.nrow, "vertical pair multiplication mismatch");
+        debug_assert_eq!(top.level, bottom.level, "vertical pair levels mismatch");
+        debug_assert_eq!(top.level, rhs.level, "vertical pair RHS level mismatch");
+        debug_assert!(top.is_ntt && bottom.is_ntt && rhs.is_ntt, "vertical pair requires Eval");
+        let out = Self::new_empty_with_state(
+            &top.params,
+            top.nrow + bottom.nrow,
+            rhs.ncol,
+            top.level,
+            true,
+        );
+        if out.nrow == 0 || out.ncol == 0 || top.ncol == 0 {
+            return out;
+        }
+        let status = unsafe { gpu_matrix_mul_vertical_pair(out.raw, top.raw, bottom.raw, rhs.raw) };
+        check_status(status, "gpu_matrix_mul_vertical_pair");
+        out
+    }
+
+    pub(crate) fn preimage_residual(
+        target: &Self,
+        public_matrix: &Self,
+        p1: &Self,
+        p2: &Self,
+    ) -> Self {
+        debug_assert_eq!(target.params, public_matrix.params, "preimage residual params mismatch");
+        debug_assert_eq!(target.params, p1.params, "preimage residual p1 params mismatch");
+        debug_assert_eq!(target.params, p2.params, "preimage residual p2 params mismatch");
+        debug_assert_eq!(target.nrow, public_matrix.nrow, "preimage residual row mismatch");
+        debug_assert!(target.ncol <= p1.ncol, "preimage residual p1 columns mismatch");
+        debug_assert!(target.ncol <= p2.ncol, "preimage residual p2 columns mismatch");
+        debug_assert_eq!(
+            public_matrix.ncol,
+            p1.nrow + p2.nrow,
+            "preimage residual inner dimensions mismatch"
+        );
+        debug_assert_eq!(target.level, public_matrix.level, "preimage residual level mismatch");
+        debug_assert_eq!(target.level, p1.level, "preimage residual p1 level mismatch");
+        debug_assert_eq!(target.level, p2.level, "preimage residual p2 level mismatch");
+        debug_assert!(
+            target.is_ntt && public_matrix.is_ntt && p1.is_ntt && p2.is_ntt,
+            "preimage residual requires Eval"
+        );
+        let out = Self::new_empty_with_state(
+            &target.params,
+            target.nrow,
+            target.ncol,
+            target.level,
+            true,
+        );
+        if out.nrow == 0 || out.ncol == 0 {
+            return out;
+        }
+        let status = unsafe {
+            gpu_matrix_preimage_residual(out.raw, target.raw, public_matrix.raw, p1.raw, p2.raw)
+        };
+        check_status(status, "gpu_matrix_preimage_residual");
+        out
+    }
+
+    pub(crate) fn preimage_assemble(p1: &Self, p2: &Self, r: &Self, e: &Self, z: &Self) -> Self {
+        debug_assert_eq!(p1.params, p2.params, "preimage assemble params mismatch");
+        debug_assert_eq!(p1.params, r.params, "preimage assemble r params mismatch");
+        debug_assert_eq!(p1.params, e.params, "preimage assemble e params mismatch");
+        debug_assert_eq!(p1.params, z.params, "preimage assemble z params mismatch");
+        debug_assert_eq!(r.nrow, e.nrow, "preimage assemble trapdoor row mismatch");
+        debug_assert_eq!(r.ncol, e.ncol, "preimage assemble trapdoor column mismatch");
+        debug_assert_eq!(p1.nrow, r.nrow + e.nrow, "preimage assemble p1 row mismatch");
+        debug_assert_eq!(p2.nrow, z.nrow, "preimage assemble p2/z row mismatch");
+        debug_assert_eq!(r.ncol, z.nrow, "preimage assemble correction mismatch");
+        debug_assert_eq!(p1.ncol, p2.ncol, "preimage assemble p2 columns mismatch");
+        debug_assert!(z.ncol <= p1.ncol, "preimage assemble z columns mismatch");
+        debug_assert_eq!(p1.level, p2.level, "preimage assemble p2 level mismatch");
+        debug_assert_eq!(p1.level, r.level, "preimage assemble r level mismatch");
+        debug_assert_eq!(p1.level, e.level, "preimage assemble e level mismatch");
+        debug_assert_eq!(p1.level, z.level, "preimage assemble z level mismatch");
+        debug_assert!(
+            p1.is_ntt && p2.is_ntt && r.is_ntt && e.is_ntt && z.is_ntt,
+            "preimage assemble requires Eval"
+        );
+        let out = Self::new_empty_with_state(&p1.params, p1.nrow + p2.nrow, z.ncol, p1.level, true);
+        if out.nrow == 0 || out.ncol == 0 {
+            return out;
+        }
+        let status =
+            unsafe { gpu_matrix_preimage_assemble(out.raw, p1.raw, p2.raw, r.raw, e.raw, z.raw) };
+        check_status(status, "gpu_matrix_preimage_assemble");
         out
     }
 
@@ -1960,6 +2055,64 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[..8].copy_from_slice(&base.wrapping_add(offset).to_le_bytes());
         GpuRngSeed::from_bytes(bytes)
+    }
+
+    fn gpu_constant_matrix(
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        ncol: usize,
+        offset: usize,
+    ) -> GpuDCRTPolyMatrix {
+        GpuDCRTPolyMatrix::from_poly_vec(
+            params,
+            (0..nrow)
+                .map(|row| {
+                    (0..ncol)
+                        .map(|col| {
+                            GpuDCRTPoly::from_usize_to_constant(
+                                params,
+                                offset + row * ncol + col + 1,
+                            )
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_fused_matrix_primitives_match_composition() {
+        gpu_device_sync();
+        let gpu_params = gpu_params_from_cpu(&gpu_test_params());
+        let cols = 5usize;
+
+        let top = gpu_constant_matrix(&gpu_params, 2, 3, 0);
+        let bottom = gpu_constant_matrix(&gpu_params, 1, 3, 20);
+        let rhs = gpu_constant_matrix(&gpu_params, 3, cols, 40);
+        let expected_pair = top.concat_rows(&[&bottom]) * &rhs;
+        let actual_pair = GpuDCRTPolyMatrix::mul_vertical_pair(&top, &bottom, &rhs);
+        assert_eq!(actual_pair, expected_pair);
+
+        let target = gpu_constant_matrix(&gpu_params, 2, cols, 70);
+        let public_matrix = gpu_constant_matrix(&gpu_params, 2, 5, 100);
+        let p1 = gpu_constant_matrix(&gpu_params, 2, cols, 130);
+        let p2 = gpu_constant_matrix(&gpu_params, 3, cols, 170);
+        let expected_residual = &(&target - &(&public_matrix.slice(0, 2, 0, 2) * &p1)) -
+            &(&public_matrix.slice(0, 2, 2, 5) * &p2);
+        let actual_residual =
+            GpuDCRTPolyMatrix::preimage_residual(&target, &public_matrix, &p1, &p2);
+        assert_eq!(actual_residual, expected_residual);
+
+        let p1 = gpu_constant_matrix(&gpu_params, 4, cols, 220);
+        let p2 = gpu_constant_matrix(&gpu_params, 3, cols, 280);
+        let r = gpu_constant_matrix(&gpu_params, 2, 3, 330);
+        let e = gpu_constant_matrix(&gpu_params, 2, 3, 350);
+        let z = gpu_constant_matrix(&gpu_params, 3, cols, 370);
+        let top_correction = (&r * &z).concat_rows(&[&(&e * &z)]);
+        let expected_assembly = (&p1 + &top_correction).concat_rows(&[&(&p2 + &z)]);
+        let actual_assembly = GpuDCRTPolyMatrix::preimage_assemble(&p1, &p2, &r, &e, &z);
+        assert_eq!(actual_assembly, expected_assembly);
     }
 
     #[test]

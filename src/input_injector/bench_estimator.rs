@@ -1,4 +1,9 @@
-use std::{fs, hint::black_box, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    hint::black_box,
+    time::Instant,
+};
 
 use num_bigint::BigUint;
 use num_traits::Zero;
@@ -67,6 +72,9 @@ pub(crate) struct DiamondInputInjectionBenchUnitEstimates {
     pub(crate) online_rhs_chunk_read_decode: CircuitBenchEstimate,
     pub(crate) online_output_chunk_serialize: CircuitBenchEstimate,
     pub(crate) online_output_recompose: CircuitBenchEstimate,
+    pub(crate) checkpoint_matrix_compact_bytes: usize,
+    pub(crate) initial_state_compact_bytes: usize,
+    pub(crate) preimage_compact_bytes_by_width: BTreeMap<usize, usize>,
 }
 
 impl DiamondInputInjectionBenchShape {
@@ -182,6 +190,7 @@ impl DiamondInputInjectionBenchUnitEstimates {
         iterations: usize,
         state_row_size: usize,
         state_col_size: usize,
+        representative_preimage_widths: &[usize],
     ) -> Self
     where
         M: PolyMatrix + Send + Sync + 'static,
@@ -201,10 +210,50 @@ impl DiamondInputInjectionBenchUnitEstimates {
         let trap_sampler = TS::new(params, trapdoor_sigma);
         let (trapdoor, checkpoint_matrix) = trap_sampler.trapdoor(params, state_row_size);
         let checkpoint_matrix_bytes = checkpoint_matrix.to_compact_bytes();
+        let checkpoint_matrix_compact_bytes = checkpoint_matrix_bytes.len();
         let checkpoint_trapdoor_bytes = TS::trapdoor_to_bytes(&trapdoor);
-        let initial_state_bytes = M::zero(params, 1, state_col_size).to_compact_bytes();
-        let transition_preimage_bytes =
-            M::zero(params, state_col_size, transition_chunk_len).to_compact_bytes();
+        let initial_state_bytes =
+            US::new().sample_uniform(params, 1, state_col_size, DistType::FinRingDist);
+        let initial_state_bytes = initial_state_bytes.to_compact_bytes();
+        let initial_state_compact_bytes = initial_state_bytes.len();
+        let requested_total_widths =
+            representative_preimage_widths.iter().copied().collect::<BTreeSet<_>>();
+        let mut requested_total_widths = requested_total_widths;
+        requested_total_widths.insert(state_col_size);
+        assert!(
+            requested_total_widths.iter().all(|&width| width > 0),
+            "representative preimage widths must be positive"
+        );
+        // Encryption persists each auxiliary-sampling chunk as an independent compact matrix.
+        // Measure every distinct chunk width that can actually be written rather than
+        // materializing a potentially OOM-inducing full-width preimage or extrapolating across
+        // serializer-specific headers and coefficient widths.
+        let persisted_chunk_widths = requested_total_widths
+            .into_iter()
+            .flat_map(|total_width| {
+                (0..column_chunk_count(total_width))
+                    .map(move |chunk_idx| column_chunk_bounds(total_width, chunk_idx).1)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut preimage_compact_bytes_by_width = BTreeMap::new();
+        let mut transition_preimage_bytes = None;
+        for width in persisted_chunk_widths {
+            let target = M::zero(params, state_row_size, width);
+            let bytes = trap_sampler
+                .preimage(params, &trapdoor, &checkpoint_matrix, &target)
+                .to_compact_bytes();
+            info!(
+                width,
+                compact_bytes = bytes.len(),
+                "measured representative Diamond preimage compact bytes"
+            );
+            preimage_compact_bytes_by_width.insert(width, bytes.len());
+            if width == transition_chunk_len {
+                transition_preimage_bytes = Some(bytes);
+            }
+        }
+        let transition_preimage_bytes = transition_preimage_bytes
+            .expect("transition preimage compact bytes must include the first chunk width");
         let output_chunk_bytes_by_col = (0..column_chunk_count(state_col_size))
             .map(|chunk_idx| {
                 let (_, col_len) = column_chunk_bounds(state_col_size, chunk_idx);
@@ -290,7 +339,26 @@ impl DiamondInputInjectionBenchUnitEstimates {
             online_rhs_chunk_read_decode,
             online_output_chunk_serialize,
             online_output_recompose,
+            checkpoint_matrix_compact_bytes,
+            initial_state_compact_bytes,
+            preimage_compact_bytes_by_width,
         }
+    }
+
+    pub(crate) fn preimage_compact_bytes(&self, width: usize) -> usize {
+        *self
+            .preimage_compact_bytes_by_width
+            .get(&width)
+            .unwrap_or_else(|| panic!("missing representative compact-byte size for width {width}"))
+    }
+
+    pub(crate) fn chunked_preimage_compact_bytes(&self, total_width: usize) -> usize {
+        (0..column_chunk_count(total_width))
+            .try_fold(0usize, |total, chunk_idx| {
+                let (_, chunk_width) = column_chunk_bounds(total_width, chunk_idx);
+                total.checked_add(self.preimage_compact_bytes(chunk_width))
+            })
+            .expect("chunked compact preimage byte count overflow")
     }
 
     pub(crate) fn estimate<NBE>(

@@ -254,6 +254,7 @@ where
             iterations,
             state_row_size,
             shape.state_col_size,
+            &[],
         );
         let trapdoor_checkpoint = input_injection_units.trapdoor_checkpoint.clone();
         let trapdoor_preimage = input_injection_units.transition_preimage.clone();

@@ -358,24 +358,20 @@ namespace
         }
     }
 
-    __global__ void matrix_preimage_assemble_top_kernel(
-        const uint8_t *p1_base,
+    __global__ void matrix_preimage_add_correction_top_kernel(
         const uint8_t *r_base,
         const uint8_t *e_base,
         const uint8_t *z_base,
         uint8_t *out_base,
         size_t d,
         size_t inner,
-        size_t p1_cols,
         size_t z_cols,
         size_t out_cols,
         size_t n,
-        size_t p1_stride_bytes,
         size_t r_stride_bytes,
         size_t e_stride_bytes,
         size_t z_stride_bytes,
         size_t out_stride_bytes,
-        uint8_t p1_coeff_bytes,
         uint8_t r_coeff_bytes,
         uint8_t e_coeff_bytes,
         uint8_t z_coeff_bytes,
@@ -401,11 +397,11 @@ namespace
             if (row < top_rows && col < out_cols)
             {
                 acc = matrix_load_limb_u64(
-                    p1_base,
-                    row * p1_cols + col,
+                    out_base,
+                    row * out_cols + col,
                     coeff_idx,
-                    p1_stride_bytes,
-                    p1_coeff_bytes);
+                    out_stride_bytes,
+                    out_coeff_bytes);
             }
 
             for (size_t k0 = 0; k0 < inner; k0 += kPreimageTileK)
@@ -489,26 +485,22 @@ namespace
         }
     }
 
-    __global__ void matrix_preimage_assemble_bottom_kernel(
-        const uint8_t *p2_base,
+    __global__ void matrix_preimage_add_correction_bottom_kernel(
         const uint8_t *z_base,
         uint8_t *out_base,
-        size_t p1_rows,
-        size_t p2_rows,
-        size_t p2_cols,
+        size_t top_rows,
+        size_t z_rows,
         size_t z_cols,
         size_t out_cols,
         size_t n,
-        size_t p2_stride_bytes,
         size_t z_stride_bytes,
         size_t out_stride_bytes,
-        uint8_t p2_coeff_bytes,
         uint8_t z_coeff_bytes,
         uint8_t out_coeff_bytes,
         uint64_t modulus)
     {
         const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        const size_t total = p2_rows * out_cols * n;
+        const size_t total = z_rows * out_cols * n;
         if (idx >= total)
         {
             return;
@@ -517,12 +509,13 @@ namespace
         const size_t out_poly_idx = idx / n;
         const size_t row = out_poly_idx / out_cols;
         const size_t col = out_poly_idx % out_cols;
-        const uint64_t p2_value = matrix_load_limb_u64(
-            p2_base,
-            row * p2_cols + col,
+        const size_t out_entry = top_rows * out_cols + out_poly_idx;
+        const uint64_t base_value = matrix_load_limb_u64(
+            out_base,
+            out_entry,
             coeff_idx,
-            p2_stride_bytes,
-            p2_coeff_bytes);
+            out_stride_bytes,
+            out_coeff_bytes);
         const uint64_t z_value = matrix_load_limb_u64(
             z_base,
             row * z_cols + col,
@@ -531,11 +524,11 @@ namespace
             z_coeff_bytes);
         matrix_store_limb_u64(
             out_base,
-            p1_rows * out_cols + out_poly_idx,
+            out_entry,
             coeff_idx,
             out_stride_bytes,
             out_coeff_bytes,
-            add_mod_u64(p2_value, z_value, modulus));
+            add_mod_u64(base_value, z_value, modulus));
     }
 
     int preimage_const_limb_view(
@@ -2519,39 +2512,35 @@ extern "C" int gpu_matrix_preimage_residual(
     return 0;
 }
 
-extern "C" int gpu_matrix_preimage_assemble(
+extern "C" int gpu_matrix_preimage_add_correction(
     GpuMatrix *out,
-    const GpuMatrix *p1,
-    const GpuMatrix *p2,
     const GpuMatrix *r,
     const GpuMatrix *e,
     const GpuMatrix *z)
 {
-    if (!out || !p1 || !p2 || !r || !e || !z)
+    if (!out || !r || !e || !z)
     {
-        return set_error("invalid gpu_matrix_preimage_assemble arguments");
+        return set_error("invalid gpu_matrix_preimage_add_correction arguments");
     }
-    if (p1->ctx != p2->ctx || p1->ctx != r->ctx || p1->ctx != e->ctx || p1->ctx != z->ctx ||
-        p1->ctx != out->ctx || p1->level != p2->level || p1->level != r->level ||
-        p1->level != e->level || p1->level != z->level || p1->level != out->level)
+    if (out->ctx != r->ctx || out->ctx != e->ctx || out->ctx != z->ctx ||
+        out->level != r->level || out->level != e->level || out->level != z->level)
     {
-        return set_error("context mismatch in gpu_matrix_preimage_assemble");
+        return set_error("context mismatch in gpu_matrix_preimage_add_correction");
     }
-    if (p1->format != GPU_POLY_FORMAT_EVAL || p2->format != GPU_POLY_FORMAT_EVAL ||
-        r->format != GPU_POLY_FORMAT_EVAL || e->format != GPU_POLY_FORMAT_EVAL ||
+    if (out->format != GPU_POLY_FORMAT_EVAL || r->format != GPU_POLY_FORMAT_EVAL ||
+        e->format != GPU_POLY_FORMAT_EVAL ||
         z->format != GPU_POLY_FORMAT_EVAL)
     {
-        return set_error("gpu_matrix_preimage_assemble requires Eval inputs");
+        return set_error("gpu_matrix_preimage_add_correction requires Eval inputs");
     }
-    if (r->rows != e->rows || r->cols != e->cols || p1->rows != r->rows + e->rows ||
-        p2->rows != z->rows || r->cols != z->rows || p1->cols != p2->cols ||
-        z->cols > p1->cols || out->rows != p1->rows + p2->rows || out->cols != z->cols)
+    if (r->rows != e->rows || r->cols != e->cols || r->cols != z->rows ||
+        out->rows != r->rows + e->rows + z->rows || out->cols != z->cols)
     {
-        return set_error("shape mismatch in gpu_matrix_preimage_assemble");
+        return set_error("shape mismatch in gpu_matrix_preimage_add_correction");
     }
-    if (!p1->ctx || p1->level < 0)
+    if (!out->ctx || out->level < 0)
     {
-        return set_error("invalid context in gpu_matrix_preimage_assemble");
+        return set_error("invalid context in gpu_matrix_preimage_add_correction");
     }
     if (out->rows == 0 || out->cols == 0)
     {
@@ -2559,22 +2548,22 @@ extern "C" int gpu_matrix_preimage_assemble(
         return 0;
     }
 
-    const size_t n = static_cast<size_t>(p1->ctx->N);
-    const size_t crt_depth = static_cast<size_t>(p1->level + 1);
-    if (p1->ctx->limb_gpu_ids.size() < crt_depth || p1->ctx->moduli.size() < crt_depth)
+    const size_t n = static_cast<size_t>(out->ctx->N);
+    const size_t crt_depth = static_cast<size_t>(out->level + 1);
+    if (out->ctx->limb_gpu_ids.size() < crt_depth || out->ctx->moduli.size() < crt_depth)
     {
-        return set_error("unexpected context size in gpu_matrix_preimage_assemble");
+        return set_error("unexpected context size in gpu_matrix_preimage_add_correction");
     }
 
     for (size_t limb = 0; limb < crt_depth; ++limb)
     {
-        const dim3 limb_id = p1->ctx->limb_gpu_ids[limb];
-        const GpuMatrix *inputs[] = {p1, p2, r, e, z};
-        const uint8_t *bases[5] = {};
-        size_t strides[5] = {};
-        uint8_t coeff_bytes[5] = {};
-        int devices[5] = {};
-        for (size_t input_idx = 0; input_idx < 5; ++input_idx)
+        const dim3 limb_id = out->ctx->limb_gpu_ids[limb];
+        const GpuMatrix *inputs[] = {r, e, z};
+        const uint8_t *bases[3] = {};
+        size_t strides[3] = {};
+        uint8_t coeff_bytes[3] = {};
+        int devices[3] = {};
+        for (size_t input_idx = 0; input_idx < 3; ++input_idx)
         {
             int status = preimage_const_limb_view(
                 inputs[input_idx],
@@ -2605,15 +2594,20 @@ extern "C" int gpu_matrix_preimage_assemble(
         {
             return status;
         }
-        for (size_t input_idx = 0; input_idx < 5; ++input_idx)
+        status = matrix_wait_limb_stream(out, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        for (size_t input_idx = 0; input_idx < 3; ++input_idx)
         {
             if (devices[input_idx] != out_device)
             {
-                return set_error("device mismatch in gpu_matrix_preimage_assemble");
+                return set_error("device mismatch in gpu_matrix_preimage_add_correction");
             }
             if (coeff_bytes[input_idx] != out_coeff_bytes)
             {
-                return set_error("coefficient width mismatch in gpu_matrix_preimage_assemble");
+                return set_error("coefficient width mismatch in gpu_matrix_preimage_add_correction");
             }
             status = matrix_wait_limb_stream(inputs[input_idx], limb_id, out_device, stream);
             if (status != 0)
@@ -2630,58 +2624,51 @@ extern "C" int gpu_matrix_preimage_assemble(
         const dim3 top_threads(kPreimageTileN, kPreimageTileM);
         const dim3 top_blocks(
             static_cast<unsigned int>((out->cols + kPreimageTileN - 1) / kPreimageTileN),
-            static_cast<unsigned int>((p1->rows + kPreimageTileM - 1) / kPreimageTileM),
+            static_cast<unsigned int>(
+                (r->rows + e->rows + kPreimageTileM - 1) / kPreimageTileM),
             static_cast<unsigned int>(std::min<size_t>(n, 65535)));
-        matrix_preimage_assemble_top_kernel<<<top_blocks, top_threads, 0, stream>>>(
+        matrix_preimage_add_correction_top_kernel<<<top_blocks, top_threads, 0, stream>>>(
             bases[0],
+            bases[1],
             bases[2],
-            bases[3],
-            bases[4],
             out_base,
             r->rows,
             z->rows,
-            p1->cols,
             z->cols,
             out->cols,
             n,
             strides[0],
+            strides[1],
             strides[2],
-            strides[3],
-            strides[4],
             out_stride,
             coeff_bytes[0],
+            coeff_bytes[1],
             coeff_bytes[2],
-            coeff_bytes[3],
-            coeff_bytes[4],
             out_coeff_bytes,
-            p1->ctx->moduli[limb]);
+            out->ctx->moduli[limb]);
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
 
-        const size_t bottom_entry_count = p2->rows * out->cols * n;
+        const size_t bottom_entry_count = z->rows * out->cols * n;
         const int bottom_threads = 256;
         const unsigned int bottom_blocks =
             static_cast<unsigned int>((bottom_entry_count + bottom_threads - 1) / bottom_threads);
-        matrix_preimage_assemble_bottom_kernel<<<bottom_blocks, bottom_threads, 0, stream>>>(
-            bases[1],
-            bases[4],
+        matrix_preimage_add_correction_bottom_kernel<<<bottom_blocks, bottom_threads, 0, stream>>>(
+            bases[2],
             out_base,
-            p1->rows,
-            p2->rows,
-            p2->cols,
+            r->rows + e->rows,
+            z->rows,
             z->cols,
             out->cols,
             n,
-            strides[1],
-            strides[4],
+            strides[2],
             out_stride,
-            coeff_bytes[1],
-            coeff_bytes[4],
+            coeff_bytes[2],
             out_coeff_bytes,
-            p1->ctx->moduli[limb]);
+            out->ctx->moduli[limb]);
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {

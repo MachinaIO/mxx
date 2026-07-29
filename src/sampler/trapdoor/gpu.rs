@@ -287,6 +287,9 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             "gpu preimage: computed perturbed_syndrome"
         );
 
+        // Materialize the final layout before sampling z so p1/p2 can be released before the
+        // largest correction buffers are live. The correction itself remains one fused kernel.
+        let mut out = GpuDCRTPolyMatrix::preimage_output_from_perturbation(p1, p2, target_cols);
         let assemble_start = Instant::now();
         let gauss_start = Instant::now();
         let z_hat_mat =
@@ -296,8 +299,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             "gpu preimage: sampled z_hat_mat with gauss_samp_gq_arb_base"
         );
 
-        let out =
-            GpuDCRTPolyMatrix::preimage_assemble(&p1, &p2, &trapdoor.r, &trapdoor.e, &z_hat_mat);
+        out.preimage_add_correction(&trapdoor.r, &trapdoor.e, &z_hat_mat);
         tracing::debug!(
             elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: assembled output matrix with fused correction"

@@ -18,7 +18,7 @@ use crate::{
                 gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
                 gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
                 gpu_matrix_mul_scalar, gpu_matrix_mul_vertical_pair, gpu_matrix_ntt_all,
-                gpu_matrix_preimage_assemble, gpu_matrix_preimage_residual,
+                gpu_matrix_preimage_add_correction, gpu_matrix_preimage_residual,
                 gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_columns,
                 gpu_matrix_sample_p1_full_cached, gpu_matrix_store_compact_bytes,
                 gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
@@ -638,34 +638,52 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
-    pub(crate) fn preimage_assemble(p1: &Self, p2: &Self, r: &Self, e: &Self, z: &Self) -> Self {
+    pub(crate) fn preimage_output_from_perturbation(
+        p1: Self,
+        p2: Self,
+        target_cols: usize,
+    ) -> Self {
         debug_assert_eq!(p1.params, p2.params, "preimage assemble params mismatch");
-        debug_assert_eq!(p1.params, r.params, "preimage assemble r params mismatch");
-        debug_assert_eq!(p1.params, e.params, "preimage assemble e params mismatch");
-        debug_assert_eq!(p1.params, z.params, "preimage assemble z params mismatch");
-        debug_assert_eq!(r.nrow, e.nrow, "preimage assemble trapdoor row mismatch");
-        debug_assert_eq!(r.ncol, e.ncol, "preimage assemble trapdoor column mismatch");
-        debug_assert_eq!(p1.nrow, r.nrow + e.nrow, "preimage assemble p1 row mismatch");
-        debug_assert_eq!(p2.nrow, z.nrow, "preimage assemble p2/z row mismatch");
-        debug_assert_eq!(r.ncol, z.nrow, "preimage assemble correction mismatch");
         debug_assert_eq!(p1.ncol, p2.ncol, "preimage assemble p2 columns mismatch");
-        debug_assert!(z.ncol <= p1.ncol, "preimage assemble z columns mismatch");
+        debug_assert!(target_cols <= p1.ncol, "preimage assemble target columns mismatch");
         debug_assert_eq!(p1.level, p2.level, "preimage assemble p2 level mismatch");
-        debug_assert_eq!(p1.level, r.level, "preimage assemble r level mismatch");
-        debug_assert_eq!(p1.level, e.level, "preimage assemble e level mismatch");
-        debug_assert_eq!(p1.level, z.level, "preimage assemble z level mismatch");
-        debug_assert!(
-            p1.is_ntt && p2.is_ntt && r.is_ntt && e.is_ntt && z.is_ntt,
-            "preimage assemble requires Eval"
-        );
-        let out = Self::new_empty_with_state(&p1.params, p1.nrow + p2.nrow, z.ncol, p1.level, true);
-        if out.nrow == 0 || out.ncol == 0 {
-            return out;
+        debug_assert!(p1.is_ntt && p2.is_ntt, "preimage assemble requires Eval");
+        let p1_rows = p1.nrow;
+        let p2_rows = p2.nrow;
+        let mut out =
+            Self::new_empty_with_state(&p1.params, p1_rows + p2_rows, target_cols, p1.level, true);
+        if out.nrow != 0 && out.ncol != 0 {
+            out.copy_block_from(&p1, 0, 0, 0, 0, p1_rows, target_cols);
+            out.copy_block_from(&p2, p1_rows, 0, 0, 0, p2_rows, target_cols);
         }
-        let status =
-            unsafe { gpu_matrix_preimage_assemble(out.raw, p1.raw, p2.raw, r.raw, e.raw, z.raw) };
-        check_status(status, "gpu_matrix_preimage_assemble");
         out
+    }
+
+    pub(crate) fn preimage_add_correction(&mut self, r: &Self, e: &Self, z: &Self) {
+        debug_assert_eq!(self.params, r.params, "preimage correction r params mismatch");
+        debug_assert_eq!(self.params, e.params, "preimage correction e params mismatch");
+        debug_assert_eq!(self.params, z.params, "preimage correction z params mismatch");
+        debug_assert_eq!(r.nrow, e.nrow, "preimage correction trapdoor row mismatch");
+        debug_assert_eq!(r.ncol, e.ncol, "preimage correction trapdoor column mismatch");
+        debug_assert_eq!(r.ncol, z.nrow, "preimage correction inner dimension mismatch");
+        debug_assert_eq!(
+            self.nrow,
+            r.nrow + e.nrow + z.nrow,
+            "preimage correction output row mismatch"
+        );
+        debug_assert_eq!(self.ncol, z.ncol, "preimage correction output column mismatch");
+        debug_assert_eq!(self.level, r.level, "preimage correction r level mismatch");
+        debug_assert_eq!(self.level, e.level, "preimage correction e level mismatch");
+        debug_assert_eq!(self.level, z.level, "preimage correction z level mismatch");
+        debug_assert!(
+            self.is_ntt && r.is_ntt && e.is_ntt && z.is_ntt,
+            "preimage correction requires Eval"
+        );
+        if self.nrow == 0 || self.ncol == 0 {
+            return;
+        }
+        let status = unsafe { gpu_matrix_preimage_add_correction(self.raw, r.raw, e.raw, z.raw) };
+        check_status(status, "gpu_matrix_preimage_add_correction");
     }
 
     pub(crate) fn store_rns_bytes(&self, bytes_out: &mut [u8], bytes_per_poly: usize, format: i32) {
@@ -2111,7 +2129,9 @@ mod tests {
         let z = gpu_constant_matrix(&gpu_params, 3, cols, 370);
         let top_correction = (&r * &z).concat_rows(&[&(&e * &z)]);
         let expected_assembly = (&p1 + &top_correction).concat_rows(&[&(&p2 + &z)]);
-        let actual_assembly = GpuDCRTPolyMatrix::preimage_assemble(&p1, &p2, &r, &e, &z);
+        let mut actual_assembly =
+            GpuDCRTPolyMatrix::preimage_output_from_perturbation(p1.clone(), p2.clone(), cols);
+        actual_assembly.preimage_add_correction(&r, &e, &z);
         assert_eq!(actual_assembly, expected_assembly);
     }
 

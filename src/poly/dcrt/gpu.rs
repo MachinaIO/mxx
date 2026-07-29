@@ -226,10 +226,8 @@ unsafe extern "C" {
         p1: *const GpuMatrixOpaque,
         p2: *const GpuMatrixOpaque,
     ) -> c_int;
-    pub(crate) fn gpu_matrix_preimage_assemble(
+    pub(crate) fn gpu_matrix_preimage_add_correction(
         out: *mut GpuMatrixOpaque,
-        p1: *const GpuMatrixOpaque,
-        p2: *const GpuMatrixOpaque,
         r: *const GpuMatrixOpaque,
         e: *const GpuMatrixOpaque,
         z: *const GpuMatrixOpaque,

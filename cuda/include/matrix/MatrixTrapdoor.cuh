@@ -112,10 +112,8 @@ extern "C"
         const GpuMatrix *p1,
         const GpuMatrix *p2);
 
-    int gpu_matrix_preimage_assemble(
+    int gpu_matrix_preimage_add_correction(
         GpuMatrix *out,
-        const GpuMatrix *p1,
-        const GpuMatrix *p2,
         const GpuMatrix *r,
         const GpuMatrix *e,
         const GpuMatrix *z);

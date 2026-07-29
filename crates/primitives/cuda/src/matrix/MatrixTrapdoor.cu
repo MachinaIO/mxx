@@ -92,6 +92,500 @@ struct GpuP1CovarianceCache
     double *update_coeff = nullptr;  // [coeff][sampled_row][updated_row]
 };
 
+namespace
+{
+    // These are CUDA block-shape constants, not a preimage chunk limit. Every
+    // kernel below receives the runtime column count selected by
+    // AUX_SAMPLING_CHUNK_WIDTH and covers any final partial tile.
+    constexpr int kPreimageTileM = 4;
+    constexpr int kPreimageTileN = 32;
+    constexpr int kPreimageTileK = 16;
+
+    __device__ __forceinline__ uint64_t sub_mod_preimage_u64(
+        uint64_t lhs,
+        uint64_t rhs,
+        uint64_t modulus)
+    {
+        return lhs >= rhs ? lhs - rhs : modulus - (rhs - lhs);
+    }
+
+    __global__ void matrix_mul_vertical_pair_kernel(
+        const uint8_t *top_base,
+        const uint8_t *bottom_base,
+        const uint8_t *rhs_base,
+        uint8_t *out_base,
+        size_t top_rows,
+        size_t bottom_rows,
+        size_t inner,
+        size_t cols,
+        size_t n,
+        size_t top_stride_bytes,
+        size_t bottom_stride_bytes,
+        size_t rhs_stride_bytes,
+        size_t out_stride_bytes,
+        uint8_t top_coeff_bytes,
+        uint8_t bottom_coeff_bytes,
+        uint8_t rhs_coeff_bytes,
+        uint8_t out_coeff_bytes,
+        uint64_t modulus)
+    {
+        __shared__ uint64_t lhs_tile[kPreimageTileM][kPreimageTileK];
+        __shared__ uint64_t rhs_tile[kPreimageTileK][kPreimageTileN];
+
+        const size_t row_base = static_cast<size_t>(blockIdx.y) * kPreimageTileM;
+        const size_t col_base = static_cast<size_t>(blockIdx.x) * kPreimageTileN;
+        const size_t row = row_base + threadIdx.y;
+        const size_t col = col_base + threadIdx.x;
+        const size_t total_rows = top_rows + bottom_rows;
+        const int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
+        const int thread_count = blockDim.x * blockDim.y;
+
+        for (size_t coeff_idx = static_cast<size_t>(blockIdx.z);
+             coeff_idx < n;
+             coeff_idx += static_cast<size_t>(gridDim.z))
+        {
+            uint64_t acc = 0;
+            for (size_t k0 = 0; k0 < inner; k0 += kPreimageTileK)
+            {
+                for (int i = tid; i < kPreimageTileM * kPreimageTileK; i += thread_count)
+                {
+                    const int local_row = i / kPreimageTileK;
+                    const int local_k = i - local_row * kPreimageTileK;
+                    const size_t input_row = row_base + static_cast<size_t>(local_row);
+                    const size_t input_k = k0 + static_cast<size_t>(local_k);
+                    uint64_t value = 0;
+                    if (input_row < total_rows && input_k < inner)
+                    {
+                        if (input_row < top_rows)
+                        {
+                            value = matrix_load_limb_u64(
+                                top_base,
+                                input_row * inner + input_k,
+                                coeff_idx,
+                                top_stride_bytes,
+                                top_coeff_bytes);
+                        }
+                        else
+                        {
+                            value = matrix_load_limb_u64(
+                                bottom_base,
+                                (input_row - top_rows) * inner + input_k,
+                                coeff_idx,
+                                bottom_stride_bytes,
+                                bottom_coeff_bytes);
+                        }
+                    }
+                    lhs_tile[local_row][local_k] = value;
+                }
+                for (int i = tid; i < kPreimageTileK * kPreimageTileN; i += thread_count)
+                {
+                    const int local_k = i / kPreimageTileN;
+                    const int local_col = i - local_k * kPreimageTileN;
+                    const size_t input_k = k0 + static_cast<size_t>(local_k);
+                    const size_t input_col = col_base + static_cast<size_t>(local_col);
+                    uint64_t value = 0;
+                    if (input_k < inner && input_col < cols)
+                    {
+                        value = matrix_load_limb_u64(
+                            rhs_base,
+                            input_k * cols + input_col,
+                            coeff_idx,
+                            rhs_stride_bytes,
+                            rhs_coeff_bytes);
+                    }
+                    rhs_tile[local_k][local_col] = value;
+                }
+                __syncthreads();
+
+                if (row < total_rows && col < cols)
+                {
+                    for (int local_k = 0; local_k < kPreimageTileK; ++local_k)
+                    {
+                        acc = add_mod_u64(
+                            acc,
+                            mul_mod_u64(
+                                lhs_tile[threadIdx.y][local_k],
+                                rhs_tile[local_k][threadIdx.x],
+                                modulus),
+                            modulus);
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (row < total_rows && col < cols)
+            {
+                matrix_store_limb_u64(
+                    out_base,
+                    row * cols + col,
+                    coeff_idx,
+                    out_stride_bytes,
+                    out_coeff_bytes,
+                    acc);
+            }
+        }
+    }
+
+    __global__ void matrix_preimage_residual_kernel(
+        const uint8_t *target_base,
+        const uint8_t *public_base,
+        const uint8_t *p1_base,
+        const uint8_t *p2_base,
+        uint8_t *out_base,
+        size_t rows,
+        size_t p1_rows,
+        size_t p2_rows,
+        size_t p1_cols,
+        size_t p2_cols,
+        size_t out_cols,
+        size_t n,
+        size_t target_stride_bytes,
+        size_t public_stride_bytes,
+        size_t p1_stride_bytes,
+        size_t p2_stride_bytes,
+        size_t out_stride_bytes,
+        uint8_t target_coeff_bytes,
+        uint8_t public_coeff_bytes,
+        uint8_t p1_coeff_bytes,
+        uint8_t p2_coeff_bytes,
+        uint8_t out_coeff_bytes,
+        uint64_t modulus)
+    {
+        __shared__ uint64_t public_tile[kPreimageTileM][kPreimageTileK];
+        __shared__ uint64_t perturbation_tile[kPreimageTileK][kPreimageTileN];
+
+        const size_t row_base = static_cast<size_t>(blockIdx.y) * kPreimageTileM;
+        const size_t col_base = static_cast<size_t>(blockIdx.x) * kPreimageTileN;
+        const size_t row = row_base + threadIdx.y;
+        const size_t col = col_base + threadIdx.x;
+        const size_t inner = p1_rows + p2_rows;
+        const int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
+        const int thread_count = blockDim.x * blockDim.y;
+
+        for (size_t coeff_idx = static_cast<size_t>(blockIdx.z);
+             coeff_idx < n;
+             coeff_idx += static_cast<size_t>(gridDim.z))
+        {
+            uint64_t acc = 0;
+            if (row < rows && col < out_cols)
+            {
+                acc = matrix_load_limb_u64(
+                    target_base,
+                    row * out_cols + col,
+                    coeff_idx,
+                    target_stride_bytes,
+                    target_coeff_bytes);
+            }
+
+            for (size_t k0 = 0; k0 < inner; k0 += kPreimageTileK)
+            {
+                for (int i = tid; i < kPreimageTileM * kPreimageTileK; i += thread_count)
+                {
+                    const int local_row = i / kPreimageTileK;
+                    const int local_k = i - local_row * kPreimageTileK;
+                    const size_t input_row = row_base + static_cast<size_t>(local_row);
+                    const size_t input_k = k0 + static_cast<size_t>(local_k);
+                    uint64_t value = 0;
+                    if (input_row < rows && input_k < inner)
+                    {
+                        value = matrix_load_limb_u64(
+                            public_base,
+                            input_row * inner + input_k,
+                            coeff_idx,
+                            public_stride_bytes,
+                            public_coeff_bytes);
+                    }
+                    public_tile[local_row][local_k] = value;
+                }
+                for (int i = tid; i < kPreimageTileK * kPreimageTileN; i += thread_count)
+                {
+                    const int local_k = i / kPreimageTileN;
+                    const int local_col = i - local_k * kPreimageTileN;
+                    const size_t input_k = k0 + static_cast<size_t>(local_k);
+                    const size_t input_col = col_base + static_cast<size_t>(local_col);
+                    uint64_t value = 0;
+                    if (input_k < inner && input_col < out_cols)
+                    {
+                        if (input_k < p1_rows)
+                        {
+                            value = matrix_load_limb_u64(
+                                p1_base,
+                                input_k * p1_cols + input_col,
+                                coeff_idx,
+                                p1_stride_bytes,
+                                p1_coeff_bytes);
+                        }
+                        else
+                        {
+                            value = matrix_load_limb_u64(
+                                p2_base,
+                                (input_k - p1_rows) * p2_cols + input_col,
+                                coeff_idx,
+                                p2_stride_bytes,
+                                p2_coeff_bytes);
+                        }
+                    }
+                    perturbation_tile[local_k][local_col] = value;
+                }
+                __syncthreads();
+
+                if (row < rows && col < out_cols)
+                {
+                    for (int local_k = 0; local_k < kPreimageTileK; ++local_k)
+                    {
+                        acc = sub_mod_preimage_u64(
+                            acc,
+                            mul_mod_u64(
+                                public_tile[threadIdx.y][local_k],
+                                perturbation_tile[local_k][threadIdx.x],
+                                modulus),
+                            modulus);
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (row < rows && col < out_cols)
+            {
+                matrix_store_limb_u64(
+                    out_base,
+                    row * out_cols + col,
+                    coeff_idx,
+                    out_stride_bytes,
+                    out_coeff_bytes,
+                    acc);
+            }
+        }
+    }
+
+    __global__ void matrix_preimage_add_correction_top_kernel(
+        const uint8_t *r_base,
+        const uint8_t *e_base,
+        const uint8_t *z_base,
+        uint8_t *out_base,
+        size_t d,
+        size_t inner,
+        size_t z_cols,
+        size_t out_cols,
+        size_t n,
+        size_t r_stride_bytes,
+        size_t e_stride_bytes,
+        size_t z_stride_bytes,
+        size_t out_stride_bytes,
+        uint8_t r_coeff_bytes,
+        uint8_t e_coeff_bytes,
+        uint8_t z_coeff_bytes,
+        uint8_t out_coeff_bytes,
+        uint64_t modulus)
+    {
+        __shared__ uint64_t trapdoor_tile[kPreimageTileM][kPreimageTileK];
+        __shared__ uint64_t z_tile[kPreimageTileK][kPreimageTileN];
+
+        const size_t row_base = static_cast<size_t>(blockIdx.y) * kPreimageTileM;
+        const size_t col_base = static_cast<size_t>(blockIdx.x) * kPreimageTileN;
+        const size_t row = row_base + threadIdx.y;
+        const size_t col = col_base + threadIdx.x;
+        const size_t top_rows = 2 * d;
+        const int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
+        const int thread_count = blockDim.x * blockDim.y;
+
+        for (size_t coeff_idx = static_cast<size_t>(blockIdx.z);
+             coeff_idx < n;
+             coeff_idx += static_cast<size_t>(gridDim.z))
+        {
+            uint64_t acc = 0;
+            if (row < top_rows && col < out_cols)
+            {
+                acc = matrix_load_limb_u64(
+                    out_base,
+                    row * out_cols + col,
+                    coeff_idx,
+                    out_stride_bytes,
+                    out_coeff_bytes);
+            }
+
+            for (size_t k0 = 0; k0 < inner; k0 += kPreimageTileK)
+            {
+                for (int i = tid; i < kPreimageTileM * kPreimageTileK; i += thread_count)
+                {
+                    const int local_row = i / kPreimageTileK;
+                    const int local_k = i - local_row * kPreimageTileK;
+                    const size_t input_row = row_base + static_cast<size_t>(local_row);
+                    const size_t input_k = k0 + static_cast<size_t>(local_k);
+                    uint64_t value = 0;
+                    if (input_row < top_rows && input_k < inner)
+                    {
+                        if (input_row < d)
+                        {
+                            value = matrix_load_limb_u64(
+                                r_base,
+                                input_row * inner + input_k,
+                                coeff_idx,
+                                r_stride_bytes,
+                                r_coeff_bytes);
+                        }
+                        else
+                        {
+                            value = matrix_load_limb_u64(
+                                e_base,
+                                (input_row - d) * inner + input_k,
+                                coeff_idx,
+                                e_stride_bytes,
+                                e_coeff_bytes);
+                        }
+                    }
+                    trapdoor_tile[local_row][local_k] = value;
+                }
+                for (int i = tid; i < kPreimageTileK * kPreimageTileN; i += thread_count)
+                {
+                    const int local_k = i / kPreimageTileN;
+                    const int local_col = i - local_k * kPreimageTileN;
+                    const size_t input_k = k0 + static_cast<size_t>(local_k);
+                    const size_t input_col = col_base + static_cast<size_t>(local_col);
+                    uint64_t value = 0;
+                    if (input_k < inner && input_col < out_cols)
+                    {
+                        value = matrix_load_limb_u64(
+                            z_base,
+                            input_k * z_cols + input_col,
+                            coeff_idx,
+                            z_stride_bytes,
+                            z_coeff_bytes);
+                    }
+                    z_tile[local_k][local_col] = value;
+                }
+                __syncthreads();
+
+                if (row < top_rows && col < out_cols)
+                {
+                    for (int local_k = 0; local_k < kPreimageTileK; ++local_k)
+                    {
+                        acc = add_mod_u64(
+                            acc,
+                            mul_mod_u64(
+                                trapdoor_tile[threadIdx.y][local_k],
+                                z_tile[local_k][threadIdx.x],
+                                modulus),
+                            modulus);
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (row < top_rows && col < out_cols)
+            {
+                matrix_store_limb_u64(
+                    out_base,
+                    row * out_cols + col,
+                    coeff_idx,
+                    out_stride_bytes,
+                    out_coeff_bytes,
+                    acc);
+            }
+        }
+    }
+
+    __global__ void matrix_preimage_add_correction_bottom_kernel(
+        const uint8_t *z_base,
+        uint8_t *out_base,
+        size_t top_rows,
+        size_t z_rows,
+        size_t z_cols,
+        size_t out_cols,
+        size_t n,
+        size_t z_stride_bytes,
+        size_t out_stride_bytes,
+        uint8_t z_coeff_bytes,
+        uint8_t out_coeff_bytes,
+        uint64_t modulus)
+    {
+        const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t total = z_rows * out_cols * n;
+        if (idx >= total)
+        {
+            return;
+        }
+        const size_t coeff_idx = idx % n;
+        const size_t out_poly_idx = idx / n;
+        const size_t row = out_poly_idx / out_cols;
+        const size_t col = out_poly_idx % out_cols;
+        const size_t out_entry = top_rows * out_cols + out_poly_idx;
+        const uint64_t base_value = matrix_load_limb_u64(
+            out_base,
+            out_entry,
+            coeff_idx,
+            out_stride_bytes,
+            out_coeff_bytes);
+        const uint64_t z_value = matrix_load_limb_u64(
+            z_base,
+            row * z_cols + col,
+            coeff_idx,
+            z_stride_bytes,
+            z_coeff_bytes);
+        matrix_store_limb_u64(
+            out_base,
+            out_entry,
+            coeff_idx,
+            out_stride_bytes,
+            out_coeff_bytes,
+            add_mod_u64(base_value, z_value, modulus));
+    }
+
+    int preimage_const_limb_view(
+        const GpuMatrix *matrix,
+        const dim3 &limb_id,
+        const uint8_t **base,
+        size_t *stride_bytes,
+        uint8_t *coeff_bytes,
+        int *device)
+    {
+        if (!matrix || !base || !stride_bytes || !coeff_bytes || !device)
+        {
+            return set_error("invalid preimage_const_limb_view arguments");
+        }
+        *base = matrix_limb_ptr_by_id(matrix, 0, limb_id);
+        if (!*base)
+        {
+            return set_error("null matrix limb in preimage_const_limb_view");
+        }
+        if (!matrix_limb_metadata_by_id(matrix, limb_id, stride_bytes, coeff_bytes))
+        {
+            return set_error("invalid matrix limb metadata in preimage_const_limb_view");
+        }
+        return matrix_limb_device(matrix, limb_id, device);
+    }
+
+    int preimage_mut_limb_view(
+        GpuMatrix *matrix,
+        const dim3 &limb_id,
+        uint8_t **base,
+        size_t *stride_bytes,
+        uint8_t *coeff_bytes,
+        int *device,
+        cudaStream_t *stream)
+    {
+        if (!matrix || !base || !stride_bytes || !coeff_bytes || !device || !stream)
+        {
+            return set_error("invalid preimage_mut_limb_view arguments");
+        }
+        *base = matrix_limb_ptr_by_id(matrix, 0, limb_id);
+        if (!*base)
+        {
+            return set_error("null matrix limb in preimage_mut_limb_view");
+        }
+        if (!matrix_limb_metadata_by_id(matrix, limb_id, stride_bytes, coeff_bytes))
+        {
+            return set_error("invalid matrix limb metadata in preimage_mut_limb_view");
+        }
+        int status = matrix_limb_device(matrix, limb_id, device);
+        if (status != 0)
+        {
+            return status;
+        }
+        return matrix_limb_stream(matrix, limb_id, stream);
+    }
+}
+
 __global__ void matrix_precompute_p1_covariance_kernel(
     const uint8_t *a_base,
     const uint8_t *b_base,
@@ -1668,6 +2162,535 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
     return 0;
 }
 
+
+extern "C" int gpu_matrix_mul_vertical_pair(
+    GpuMatrix *out,
+    const GpuMatrix *top,
+    const GpuMatrix *bottom,
+    const GpuMatrix *rhs)
+{
+    if (!out || !top || !bottom || !rhs)
+    {
+        return set_error("invalid gpu_matrix_mul_vertical_pair arguments");
+    }
+    if (top->ctx != bottom->ctx || top->ctx != rhs->ctx || top->ctx != out->ctx ||
+        top->level != bottom->level || top->level != rhs->level || top->level != out->level)
+    {
+        return set_error("context mismatch in gpu_matrix_mul_vertical_pair");
+    }
+    if (top->format != GPU_POLY_FORMAT_EVAL || bottom->format != GPU_POLY_FORMAT_EVAL ||
+        rhs->format != GPU_POLY_FORMAT_EVAL)
+    {
+        return set_error("gpu_matrix_mul_vertical_pair requires Eval inputs");
+    }
+    if (top->cols != bottom->cols || top->cols != rhs->rows ||
+        out->rows != top->rows + bottom->rows || out->cols != rhs->cols)
+    {
+        return set_error("shape mismatch in gpu_matrix_mul_vertical_pair");
+    }
+    if (!top->ctx || top->level < 0)
+    {
+        return set_error("invalid context in gpu_matrix_mul_vertical_pair");
+    }
+    if (out->rows == 0 || out->cols == 0 || top->cols == 0)
+    {
+        out->format = GPU_POLY_FORMAT_EVAL;
+        return 0;
+    }
+
+    const size_t n = static_cast<size_t>(top->ctx->N);
+    const size_t crt_depth = static_cast<size_t>(top->level + 1);
+    if (top->ctx->limb_gpu_ids.size() < crt_depth || top->ctx->moduli.size() < crt_depth)
+    {
+        return set_error("unexpected context size in gpu_matrix_mul_vertical_pair");
+    }
+
+    for (size_t limb = 0; limb < crt_depth; ++limb)
+    {
+        const dim3 limb_id = top->ctx->limb_gpu_ids[limb];
+        const uint8_t *top_base = nullptr;
+        const uint8_t *bottom_base = nullptr;
+        const uint8_t *rhs_base = nullptr;
+        uint8_t *out_base = nullptr;
+        size_t top_stride = 0;
+        size_t bottom_stride = 0;
+        size_t rhs_stride = 0;
+        size_t out_stride = 0;
+        uint8_t top_coeff_bytes = 0;
+        uint8_t bottom_coeff_bytes = 0;
+        uint8_t rhs_coeff_bytes = 0;
+        uint8_t out_coeff_bytes = 0;
+        int top_device = -1;
+        int bottom_device = -1;
+        int rhs_device = -1;
+        int out_device = -1;
+        cudaStream_t stream = nullptr;
+        int status = preimage_const_limb_view(
+            top,
+            limb_id,
+            &top_base,
+            &top_stride,
+            &top_coeff_bytes,
+            &top_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = preimage_const_limb_view(
+            bottom,
+            limb_id,
+            &bottom_base,
+            &bottom_stride,
+            &bottom_coeff_bytes,
+            &bottom_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = preimage_const_limb_view(
+            rhs,
+            limb_id,
+            &rhs_base,
+            &rhs_stride,
+            &rhs_coeff_bytes,
+            &rhs_device);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = preimage_mut_limb_view(
+            out,
+            limb_id,
+            &out_base,
+            &out_stride,
+            &out_coeff_bytes,
+            &out_device,
+            &stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        if (top_device != out_device || bottom_device != out_device || rhs_device != out_device)
+        {
+            return set_error("device mismatch in gpu_matrix_mul_vertical_pair");
+        }
+        if (top_coeff_bytes != bottom_coeff_bytes || top_coeff_bytes != rhs_coeff_bytes ||
+            top_coeff_bytes != out_coeff_bytes)
+        {
+            return set_error("coefficient width mismatch in gpu_matrix_mul_vertical_pair");
+        }
+        status = matrix_wait_limb_stream(top, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_wait_limb_stream(bottom, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+
+        cudaError_t err = cudaSetDevice(out_device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        const dim3 threads(kPreimageTileN, kPreimageTileM);
+        const dim3 blocks(
+            static_cast<unsigned int>((out->cols + kPreimageTileN - 1) / kPreimageTileN),
+            static_cast<unsigned int>((out->rows + kPreimageTileM - 1) / kPreimageTileM),
+            static_cast<unsigned int>(std::min<size_t>(n, 65535)));
+        matrix_mul_vertical_pair_kernel<<<blocks, threads, 0, stream>>>(
+            top_base,
+            bottom_base,
+            rhs_base,
+            out_base,
+            top->rows,
+            bottom->rows,
+            top->cols,
+            out->cols,
+            n,
+            top_stride,
+            bottom_stride,
+            rhs_stride,
+            out_stride,
+            top_coeff_bytes,
+            bottom_coeff_bytes,
+            rhs_coeff_bytes,
+            out_coeff_bytes,
+            top->ctx->moduli[limb]);
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        status = matrix_track_limb_consumer(top, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_track_limb_consumer(bottom, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_track_limb_consumer(rhs, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_record_limb_write(out, limb_id, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+    out->format = GPU_POLY_FORMAT_EVAL;
+    return 0;
+}
+
+extern "C" int gpu_matrix_preimage_residual(
+    GpuMatrix *out,
+    const GpuMatrix *target,
+    const GpuMatrix *public_matrix,
+    const GpuMatrix *p1,
+    const GpuMatrix *p2)
+{
+    if (!out || !target || !public_matrix || !p1 || !p2)
+    {
+        return set_error("invalid gpu_matrix_preimage_residual arguments");
+    }
+    if (target->ctx != public_matrix->ctx || target->ctx != p1->ctx || target->ctx != p2->ctx ||
+        target->ctx != out->ctx || target->level != public_matrix->level ||
+        target->level != p1->level || target->level != p2->level || target->level != out->level)
+    {
+        return set_error("context mismatch in gpu_matrix_preimage_residual");
+    }
+    if (target->format != GPU_POLY_FORMAT_EVAL || public_matrix->format != GPU_POLY_FORMAT_EVAL ||
+        p1->format != GPU_POLY_FORMAT_EVAL || p2->format != GPU_POLY_FORMAT_EVAL)
+    {
+        return set_error("gpu_matrix_preimage_residual requires Eval inputs");
+    }
+    if (target->rows != public_matrix->rows || target->rows != out->rows ||
+        target->cols > p1->cols || target->cols > p2->cols || target->cols != out->cols ||
+        public_matrix->cols != p1->rows + p2->rows)
+    {
+        return set_error("shape mismatch in gpu_matrix_preimage_residual");
+    }
+    if (!target->ctx || target->level < 0)
+    {
+        return set_error("invalid context in gpu_matrix_preimage_residual");
+    }
+    if (out->rows == 0 || out->cols == 0)
+    {
+        out->format = GPU_POLY_FORMAT_EVAL;
+        return 0;
+    }
+
+    const size_t n = static_cast<size_t>(target->ctx->N);
+    const size_t crt_depth = static_cast<size_t>(target->level + 1);
+    if (target->ctx->limb_gpu_ids.size() < crt_depth || target->ctx->moduli.size() < crt_depth)
+    {
+        return set_error("unexpected context size in gpu_matrix_preimage_residual");
+    }
+
+    for (size_t limb = 0; limb < crt_depth; ++limb)
+    {
+        const dim3 limb_id = target->ctx->limb_gpu_ids[limb];
+        const GpuMatrix *inputs[] = {target, public_matrix, p1, p2};
+        const uint8_t *bases[4] = {};
+        size_t strides[4] = {};
+        uint8_t coeff_bytes[4] = {};
+        int devices[4] = {};
+        for (size_t input_idx = 0; input_idx < 4; ++input_idx)
+        {
+            int status = preimage_const_limb_view(
+                inputs[input_idx],
+                limb_id,
+                &bases[input_idx],
+                &strides[input_idx],
+                &coeff_bytes[input_idx],
+                &devices[input_idx]);
+            if (status != 0)
+            {
+                return status;
+            }
+        }
+        uint8_t *out_base = nullptr;
+        size_t out_stride = 0;
+        uint8_t out_coeff_bytes = 0;
+        int out_device = -1;
+        cudaStream_t stream = nullptr;
+        int status = preimage_mut_limb_view(
+            out,
+            limb_id,
+            &out_base,
+            &out_stride,
+            &out_coeff_bytes,
+            &out_device,
+            &stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        for (size_t input_idx = 0; input_idx < 4; ++input_idx)
+        {
+            if (devices[input_idx] != out_device)
+            {
+                return set_error("device mismatch in gpu_matrix_preimage_residual");
+            }
+            if (coeff_bytes[input_idx] != out_coeff_bytes)
+            {
+                return set_error("coefficient width mismatch in gpu_matrix_preimage_residual");
+            }
+            status = matrix_wait_limb_stream(inputs[input_idx], limb_id, out_device, stream);
+            if (status != 0)
+            {
+                return status;
+            }
+        }
+
+        cudaError_t err = cudaSetDevice(out_device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        const dim3 threads(kPreimageTileN, kPreimageTileM);
+        const dim3 blocks(
+            static_cast<unsigned int>((out->cols + kPreimageTileN - 1) / kPreimageTileN),
+            static_cast<unsigned int>((out->rows + kPreimageTileM - 1) / kPreimageTileM),
+            static_cast<unsigned int>(std::min<size_t>(n, 65535)));
+        matrix_preimage_residual_kernel<<<blocks, threads, 0, stream>>>(
+            bases[0],
+            bases[1],
+            bases[2],
+            bases[3],
+            out_base,
+            out->rows,
+            p1->rows,
+            p2->rows,
+            p1->cols,
+            p2->cols,
+            out->cols,
+            n,
+            strides[0],
+            strides[1],
+            strides[2],
+            strides[3],
+            out_stride,
+            coeff_bytes[0],
+            coeff_bytes[1],
+            coeff_bytes[2],
+            coeff_bytes[3],
+            out_coeff_bytes,
+            target->ctx->moduli[limb]);
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        for (const GpuMatrix *input : inputs)
+        {
+            status = matrix_track_limb_consumer(input, limb_id, out_device, stream);
+            if (status != 0)
+            {
+                return status;
+            }
+        }
+        status = matrix_record_limb_write(out, limb_id, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+    out->format = GPU_POLY_FORMAT_EVAL;
+    return 0;
+}
+
+extern "C" int gpu_matrix_preimage_add_correction(
+    GpuMatrix *out,
+    const GpuMatrix *r,
+    const GpuMatrix *e,
+    const GpuMatrix *z)
+{
+    if (!out || !r || !e || !z)
+    {
+        return set_error("invalid gpu_matrix_preimage_add_correction arguments");
+    }
+    if (out->ctx != r->ctx || out->ctx != e->ctx || out->ctx != z->ctx ||
+        out->level != r->level || out->level != e->level || out->level != z->level)
+    {
+        return set_error("context mismatch in gpu_matrix_preimage_add_correction");
+    }
+    if (out->format != GPU_POLY_FORMAT_EVAL || r->format != GPU_POLY_FORMAT_EVAL ||
+        e->format != GPU_POLY_FORMAT_EVAL ||
+        z->format != GPU_POLY_FORMAT_EVAL)
+    {
+        return set_error("gpu_matrix_preimage_add_correction requires Eval inputs");
+    }
+    if (r->rows != e->rows || r->cols != e->cols || r->cols != z->rows ||
+        out->rows != r->rows + e->rows + z->rows || out->cols != z->cols)
+    {
+        return set_error("shape mismatch in gpu_matrix_preimage_add_correction");
+    }
+    if (!out->ctx || out->level < 0)
+    {
+        return set_error("invalid context in gpu_matrix_preimage_add_correction");
+    }
+    if (out->rows == 0 || out->cols == 0)
+    {
+        out->format = GPU_POLY_FORMAT_EVAL;
+        return 0;
+    }
+
+    const size_t n = static_cast<size_t>(out->ctx->N);
+    const size_t crt_depth = static_cast<size_t>(out->level + 1);
+    if (out->ctx->limb_gpu_ids.size() < crt_depth || out->ctx->moduli.size() < crt_depth)
+    {
+        return set_error("unexpected context size in gpu_matrix_preimage_add_correction");
+    }
+
+    for (size_t limb = 0; limb < crt_depth; ++limb)
+    {
+        const dim3 limb_id = out->ctx->limb_gpu_ids[limb];
+        const GpuMatrix *inputs[] = {r, e, z};
+        const uint8_t *bases[3] = {};
+        size_t strides[3] = {};
+        uint8_t coeff_bytes[3] = {};
+        int devices[3] = {};
+        for (size_t input_idx = 0; input_idx < 3; ++input_idx)
+        {
+            int status = preimage_const_limb_view(
+                inputs[input_idx],
+                limb_id,
+                &bases[input_idx],
+                &strides[input_idx],
+                &coeff_bytes[input_idx],
+                &devices[input_idx]);
+            if (status != 0)
+            {
+                return status;
+            }
+        }
+        uint8_t *out_base = nullptr;
+        size_t out_stride = 0;
+        uint8_t out_coeff_bytes = 0;
+        int out_device = -1;
+        cudaStream_t stream = nullptr;
+        int status = preimage_mut_limb_view(
+            out,
+            limb_id,
+            &out_base,
+            &out_stride,
+            &out_coeff_bytes,
+            &out_device,
+            &stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_wait_limb_stream(out, limb_id, out_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        for (size_t input_idx = 0; input_idx < 3; ++input_idx)
+        {
+            if (devices[input_idx] != out_device)
+            {
+                return set_error("device mismatch in gpu_matrix_preimage_add_correction");
+            }
+            if (coeff_bytes[input_idx] != out_coeff_bytes)
+            {
+                return set_error("coefficient width mismatch in gpu_matrix_preimage_add_correction");
+            }
+            status = matrix_wait_limb_stream(inputs[input_idx], limb_id, out_device, stream);
+            if (status != 0)
+            {
+                return status;
+            }
+        }
+
+        cudaError_t err = cudaSetDevice(out_device);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        const dim3 top_threads(kPreimageTileN, kPreimageTileM);
+        const dim3 top_blocks(
+            static_cast<unsigned int>((out->cols + kPreimageTileN - 1) / kPreimageTileN),
+            static_cast<unsigned int>(
+                (r->rows + e->rows + kPreimageTileM - 1) / kPreimageTileM),
+            static_cast<unsigned int>(std::min<size_t>(n, 65535)));
+        matrix_preimage_add_correction_top_kernel<<<top_blocks, top_threads, 0, stream>>>(
+            bases[0],
+            bases[1],
+            bases[2],
+            out_base,
+            r->rows,
+            z->rows,
+            z->cols,
+            out->cols,
+            n,
+            strides[0],
+            strides[1],
+            strides[2],
+            out_stride,
+            coeff_bytes[0],
+            coeff_bytes[1],
+            coeff_bytes[2],
+            out_coeff_bytes,
+            out->ctx->moduli[limb]);
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+
+        const size_t bottom_entry_count = z->rows * out->cols * n;
+        const int bottom_threads = 256;
+        const unsigned int bottom_blocks =
+            static_cast<unsigned int>((bottom_entry_count + bottom_threads - 1) / bottom_threads);
+        matrix_preimage_add_correction_bottom_kernel<<<bottom_blocks, bottom_threads, 0, stream>>>(
+            bases[2],
+            out_base,
+            r->rows + e->rows,
+            z->rows,
+            z->cols,
+            out->cols,
+            n,
+            strides[2],
+            out_stride,
+            coeff_bytes[2],
+            out_coeff_bytes,
+            out->ctx->moduli[limb]);
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        for (const GpuMatrix *input : inputs)
+        {
+            status = matrix_track_limb_consumer(input, limb_id, out_device, stream);
+            if (status != 0)
+            {
+                return status;
+            }
+        }
+        status = matrix_record_limb_write(out, limb_id, stream);
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+    out->format = GPU_POLY_FORMAT_EVAL;
+    return 0;
+}
 
 extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     GpuMatrix *src,

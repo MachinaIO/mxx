@@ -10,7 +10,7 @@ default = []
 gpu = ["mxx-primitives/gpu"]
 
 [dependencies]
-mxx-graph-ir.workspace = true
+mxx-ir-core.workspace = true
 mxx-primitives.workspace = true
 keccak-asm.workspace = true
 num-bigint.workspace = true

@@ -1,4 +1,4 @@
-use mxx_graph_ir::{
+use mxx_ir_core::{
     ParamEnv,
     node::{ConcatAxis, ConstantMatrix, HashVariant, IndexRange, SampleRange},
     types::ConcreteMatrixType,
@@ -177,7 +177,7 @@ pub enum RuntimeValue<B: Backend> {
         gadget_small: Option<bool>,
     },
     LazyArtifact {
-        production: mxx_graph_ir::artifact::ProductionId,
+        production: mxx_ir_core::artifact::ProductionId,
         name: String,
         index: Option<usize>,
         matrix_type: ConcreteMatrixType,

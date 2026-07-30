@@ -1,5 +1,5 @@
 use super::{Backend, PreimageRequest};
-use mxx_graph_ir::{
+use mxx_ir_core::{
     ParamEnv,
     node::{ConcatAxis, ConstantMatrix, HashVariant, IndexRange, SampleRange},
     types::ConcreteMatrixType,

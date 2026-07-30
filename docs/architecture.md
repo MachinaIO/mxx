@@ -7,23 +7,23 @@ This repository is a virtual Cargo workspace. It intentionally has no root packa
 Arrows below point from a consumer to one of its dependencies:
 
 ```text
-mxx-runtime          -> mxx-graph-ir, mxx-primitives
-mxx-graph-symboric    -> mxx-graph-ir
-mxx-bench-estimator  -> mxx-graph-ir, mxx-runtime
+mxx-runtime          -> mxx-ir-core, mxx-primitives
+mxx-ir-symbolic    -> mxx-ir-core
+mxx-bench-estimator  -> mxx-ir-core, mxx-runtime
 mxx-gadgets          -> mxx-primitives
-mxx-bgg              -> mxx-graph-ir, mxx-gadgets
+mxx-bgg              -> mxx-ir-core, mxx-gadgets
 application crates   -> graph, execution, primitive, gadget, and BGG layers
 ```
 
 Dependencies follow these rules:
 
-- `mxx-graph-ir` has no dependency on another workspace crate.
-- `mxx-runtime` depends on `mxx-graph-ir` and `mxx-primitives`.
-- `mxx-graph-symboric` depends only on `mxx-graph-ir`.
-- `mxx-bench-estimator` depends on `mxx-graph-ir` and reuses the runtime liveness schedule.
+- `mxx-ir-core` has no dependency on another workspace crate.
+- `mxx-runtime` depends on `mxx-ir-core` and `mxx-primitives`.
+- `mxx-ir-symbolic` depends only on `mxx-ir-core`.
+- `mxx-bench-estimator` depends on `mxx-ir-core` and reuses the runtime liveness schedule.
 - `mxx-primitives` has no dependency on another workspace crate.
 - `mxx-gadgets` depends only on `mxx-primitives`.
-- `mxx-bgg` depends on `mxx-graph-ir` and `mxx-gadgets`.
+- `mxx-bgg` depends on `mxx-ir-core` and `mxx-gadgets`.
 - `mxx-func-enc`, `mxx-we`, and `mxx-io` may depend on the graph,
   execution, primitive, gadget, and BGG compiler layers.
 - Application crates must not depend on one another.
@@ -54,8 +54,8 @@ GPU implementations of primitive operations stay in this crate even when a highe
 
 | Crate | Path | Responsibility |
 | --- | --- | --- |
-| `mxx-graph-ir` | `crates/graph-ir/` | Executable typed graph structure, exact compile expressions, concrete type and shape validation, canonical identities, and runtime artifact manifests. This is the core Graph IR. |
-| `mxx-graph-symboric` | `crates/graph-symboric/` | Optional symbolic atom and term identities, elaboration, rewrite machinery, conservative internal boundedness metadata, and cross-graph symbolic manifests. It does not provide noise or residual analysis and does not define BGG-, Diamond-, or AKY-specific invariants. |
+| `mxx-ir-core` | `crates/ir-core/` | Executable typed graph structure, exact compile expressions, concrete type and shape validation, canonical identities, and runtime artifact manifests. This is the core Graph IR. |
+| `mxx-ir-symbolic` | `crates/ir-symbolic/` | Optional symbolic atom and term identities, elaboration, rewrite machinery, conservative internal boundedness metadata, and cross-graph symbolic manifests. It does not provide noise or residual analysis and does not define BGG-, Diamond-, or AKY-specific invariants. |
 | `mxx-runtime` | `crates/runtime/` | CPU/GPU graph execution over existing primitive APIs, transcript recording/replay, shared liveness, indexed artifact-family persistence, and manifest production. |
 | `mxx-bench-estimator` | `crates/bench-estimator/` | Per-node measurement composition, binding-sensitive subgraph reuse, critical paths, parallel waves, and persistent/workspace peak modeling. |
 | `mxx-bgg` | `crates/bgg/` | BGG+ public-key and encoding wire bundles plus recursive `PolyCircuit` graph lowering. Lookup and slot-transfer gates receive an explicit scheme-specific lowering context because `PolyCircuit` does not own their preprocessing state. Concrete BGG arithmetic remains owned by `mxx-gadgets`. |
@@ -65,6 +65,58 @@ from the modulus and base. DCRT small decomposition is different: its width is
 defined per CRT tower and cannot be recovered from the aggregate modulus.
 Those nodes therefore accept an optional compile-time `digit_count`; DCRT
 small-gadget graph builders must set it explicitly.
+
+#### Symbolic overlays
+
+`mxx-ir-symbolic` can optionally apply a `SymbolicOverlay` while elaborating
+an unchanged executable Graph IR. An overlay never becomes a graph node and
+does not affect the Graph IR spec hash or runtime behavior.
+
+- A **fold** replaces selected terms with a derived fold atom whose
+  `DefExpr::Fold` retains the exact replaced expression. It is an identity by
+  construction and is therefore a symbolic fact.
+- An **unfold** replaces a wire description with an assumed term list that may
+  contain shared virtual atoms. It is an axiom. The local assumption hash and
+  all transitively imported assumption digests are retained in elaboration
+  results and symbolic manifests.
+
+This fact/axiom distinction is the overlay trust boundary. An empty
+`assumption_digests` set is the only indication that a result is
+assumption-free; merely importing and re-exporting a result cannot erase its
+provenance.
+
+Fold validation:
+
+| Check | Result |
+| --- | --- |
+| Expected and actual canonical term lists differ | Error with both descriptions |
+| Groups overlap, omit a position, or use an invalid position | Error |
+| A signal group lacks a common non-scalar suffix or has a large prefix | Error |
+| A residual group contains a large atom | Error |
+| A selector targets a non-matrix wire or overlaps another selector | Error |
+| A folded prefix carries preimage references | Warning |
+| A selector matches no concrete wire | Warning |
+
+Unfold validation:
+
+| Check | Result |
+| --- | --- |
+| A factor chain does not compose to the selected wire type | Error |
+| An assumed preimage does not satisfy `uniform × preimage = target` by type | Error |
+| Assumed preimage targets form a cycle | Error |
+| Bounded/large character differs from the current description | Error |
+| A tighter bounded description is assumed | Warning |
+| A non-source description is replaced without `replace_derived` | Error |
+| A non-source description is replaced with `replace_derived` | Warning |
+| A preimage description is discarded | Warning |
+| A virtual declaration is invalid or references an undeclared virtual | Error |
+| A virtual atom, assumed term list, or selector is unused | Warning |
+
+Symbolic manifests use content-derived atom and term-list identifiers, retain
+the original production namespace of re-exported records, and export the
+complete closure of definitions, dependencies, uniforms, and preimage targets.
+Multiple projections of one production merge only when their interpretation
+digests and every overlapping record agree.
 
 ### `mxx-gadgets`
 

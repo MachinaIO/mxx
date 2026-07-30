@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, btree_map::Entry};
 use thiserror::Error;
 
-pub use mxx_graph_ir::node::IndexRange;
+pub use mxx_ir_core::node::IndexRange;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ViewDescriptor {

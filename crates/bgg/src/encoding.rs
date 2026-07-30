@@ -1,5 +1,5 @@
 use crate::{BggPublicKeyCompiler, BggPublicKeyWire, GraphBuilder, MatrixWire};
-use mxx_graph_ir::node::MatrixBinaryOp;
+use mxx_ir_core::node::MatrixBinaryOp;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,21 +130,21 @@ impl BggEncodingCompiler {
         input: &BggEncodingWire,
         scalar: &MatrixWire,
     ) -> BggEncodingWire {
-        let gadget_type = mxx_graph_ir::types::MatrixType {
+        let gadget_type = mxx_ir_core::types::MatrixType {
             rows: input.pubkey.matrix.matrix_type.rows.clone(),
             columns: self.public_key.decomposed_type.rows.clone(),
             ..input.pubkey.matrix.matrix_type.clone()
         };
         let gadget = builder.constant_matrix(
             gadget_type.clone(),
-            mxx_graph_ir::node::ConstantMatrix::Gadget {
+            mxx_ir_core::node::ConstantMatrix::Gadget {
                 base: self.public_key.base.clone(),
                 small: false,
             },
         );
         let scalar_gadget =
             builder.matrix_binary(MatrixBinaryOp::Multiply, &gadget, scalar, gadget_type.clone());
-        let scalar_decomposed_type = mxx_graph_ir::types::MatrixType {
+        let scalar_decomposed_type = mxx_ir_core::types::MatrixType {
             rows: gadget_type.columns.clone(),
             columns: gadget_type.columns.clone(),
             ..gadget_type
@@ -192,7 +192,7 @@ fn componentwise_plaintext(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_graph_ir::{IntExpr, node::NodeKind, types::MatrixType};
+    use mxx_ir_core::{IntExpr, node::NodeKind, types::MatrixType};
 
     fn matrix_type(rows: i64, columns: i64) -> MatrixType {
         MatrixType {
@@ -245,12 +245,12 @@ mod tests {
     }
 
     trait NodeWire {
-        fn into_wire(&self) -> mxx_graph_ir::WireRef;
+        fn into_wire(&self) -> mxx_ir_core::WireRef;
     }
 
-    impl NodeWire for mxx_graph_ir::node::Node {
-        fn into_wire(&self) -> mxx_graph_ir::WireRef {
-            mxx_graph_ir::WireRef { node: self.id, port: mxx_graph_ir::Port(0) }
+    impl NodeWire for mxx_ir_core::node::Node {
+        fn into_wire(&self) -> mxx_ir_core::WireRef {
+            mxx_ir_core::WireRef { node: self.id, port: mxx_ir_core::Port(0) }
         }
     }
 }

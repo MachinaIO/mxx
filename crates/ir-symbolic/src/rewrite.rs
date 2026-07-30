@@ -22,7 +22,7 @@ impl TargetTermLists for TermListResolver {
     fn resolve(&self, _preimage: &crate::atom::AtomId, target: &TargetRef) -> Option<&TermList> {
         match target {
             TargetRef::Local(wire) => self.local.get(wire),
-            TargetRef::Imported { .. } => self.imported.get(target),
+            TargetRef::Imported { .. } | TargetRef::Assumed(_) => self.imported.get(target),
         }
     }
 }
@@ -173,15 +173,21 @@ mod tests {
     fn different_productions_do_not_rewrite() {
         let production =
             |nonce| ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [nonce; 32] };
-        let a_first =
-            AtomId::Imported { production_id: production(1), manifest_atom_id: ManifestAtomId(0) };
-        let a_second =
-            AtomId::Imported { production_id: production(2), manifest_atom_id: ManifestAtomId(0) };
-        let k_second =
-            AtomId::Imported { production_id: production(2), manifest_atom_id: ManifestAtomId(1) };
+        let a_first = AtomId::Imported {
+            production_id: production(1),
+            manifest_atom_id: ManifestAtomId([0; 32]),
+        };
+        let a_second = AtomId::Imported {
+            production_id: production(2),
+            manifest_atom_id: ManifestAtomId([0; 32]),
+        };
+        let k_second = AtomId::Imported {
+            production_id: production(2),
+            manifest_atom_id: ManifestAtomId([1; 32]),
+        };
         let target = TargetRef::Imported {
             production_id: production(2),
-            term_list_id: crate::atom::TermListId(0),
+            term_list_id: crate::atom::TermListId([0; 32]),
         };
         let mut atoms = AtomTable::default();
         atoms.insert(atom(a_first.clone(), AtomKind::Large, None));

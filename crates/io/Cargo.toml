@@ -11,7 +11,7 @@ disk = ["mxx-primitives/disk", "mxx-gadgets/disk"]
 gpu = ["mxx-primitives/gpu", "mxx-gadgets/gpu"]
 
 [dependencies]
-mxx-graph-ir.workspace = true
+mxx-ir-core.workspace = true
 mxx-bgg.workspace = true
 mxx-primitives.workspace = true
 mxx-gadgets.workspace = true

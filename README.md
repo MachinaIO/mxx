@@ -18,8 +18,8 @@ The repository is a virtual Cargo workspace with no root facade crate:
 
 | Crate | Responsibility |
 | --- | --- |
-| `mxx-graph-ir` | Executable typed graph IR, exact compile expressions, concrete validation, and artifact manifests. |
-| `mxx-graph-symboric` | Optional symbolic-term elaboration, rewrite, and cross-graph identity operations over Graph IR. |
+| `mxx-ir-core` | Executable typed graph IR, exact compile expressions, concrete validation, and artifact manifests. |
+| `mxx-ir-symbolic` | Optional symbolic-term elaboration, rewrite, and cross-graph identity operations over Graph IR. |
 | `mxx-runtime` | CPU/GPU execution, reproducible sampling transcripts, liveness, and indexed artifact-family persistence. |
 | `mxx-bench-estimator` | Binding-sensitive measured graph-cost composition, critical paths, parallel waves, and memory peaks. |
 | `mxx-primitives` | Polynomial and matrix representations, samplers, analytical sampling bounds, OpenFHE integration, and all native CUDA kernels and wrappers. |
@@ -32,11 +32,11 @@ The repository is a virtual Cargo workspace with no root facade crate:
 The principal dependency directions are shown with consumers on the left:
 
 ```text
-mxx-runtime          -> mxx-graph-ir, mxx-primitives
-mxx-graph-symboric    -> mxx-graph-ir
-mxx-bench-estimator  -> mxx-graph-ir, mxx-runtime
+mxx-runtime          -> mxx-ir-core, mxx-primitives
+mxx-ir-symbolic    -> mxx-ir-core
+mxx-bench-estimator  -> mxx-ir-core, mxx-runtime
 mxx-gadgets          -> mxx-primitives
-mxx-bgg              -> mxx-graph-ir, mxx-gadgets
+mxx-bgg              -> mxx-ir-core, mxx-gadgets
 mxx-func-enc/we/io   -> lower layers, never one another
 ```
 

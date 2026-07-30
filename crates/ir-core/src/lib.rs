@@ -2,7 +2,7 @@
 //!
 //! This crate owns executable graph structure, compile expressions, concrete
 //! type validation, canonical identities, and runtime artifact metadata.
-//! Optional symbolic-term operations live in `mxx-graph-symboric`.
+//! Optional symbolic-term operations live in `mxx-ir-symbolic`.
 
 pub mod artifact;
 pub mod checks;

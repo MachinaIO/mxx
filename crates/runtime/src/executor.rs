@@ -4,7 +4,7 @@ use crate::{
     liveness,
     transcript::{DrawSite, RecordedValue, SamplingMode, TranscriptError},
 };
-use mxx_graph_ir::{
+use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
     artifact::ProductionId,
     expr::euclidean_div_rem,
@@ -253,9 +253,9 @@ where
         output_families: &BTreeMap<String, Vec<RuntimeValue<B>>>,
     ) -> Result<Option<ProductionId>, ExecutionError> {
         let spec_hash =
-            mxx_graph_ir::encoding::spec_hash(&self.validated.source, &self.validated.bindings)
+            mxx_ir_core::encoding::spec_hash(&self.validated.source, &self.validated.bindings)
                 .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
-        let production = mxx_graph_ir::artifact::production_id(spec_hash, rand::random());
+        let production = mxx_ir_core::artifact::production_id(spec_hash, rand::random());
         let mut artifacts = BTreeMap::new();
         'outputs: for (name, output_wire) in &self.validated.outputs {
             if let Some(members) = output_families.get(name) {
@@ -289,7 +289,7 @@ where
                 }
                 artifacts.insert(
                     name.clone(),
-                    mxx_graph_ir::artifact::ExportArtifact {
+                    mxx_ir_core::artifact::ExportArtifact {
                         wire: family_wires[0].clone(),
                         wire_type: matrix_type,
                         family: Some(family_wires),
@@ -315,7 +315,7 @@ where
                 .map_err(Self::artifact_error)?;
             artifacts.insert(
                 name.clone(),
-                mxx_graph_ir::artifact::ExportArtifact {
+                mxx_ir_core::artifact::ExportArtifact {
                     wire,
                     wire_type: matrix_type,
                     family: None,
@@ -327,7 +327,7 @@ where
         if artifacts.is_empty() {
             return Ok(None);
         }
-        let manifest = mxx_graph_ir::artifact::export_manifest(production.clone(), &artifacts);
+        let manifest = mxx_ir_core::artifact::export_manifest(production.clone(), &artifacts);
         self.artifact_store.store_manifest(manifest).map_err(Self::artifact_error)?;
         Ok(Some(production))
     }
@@ -403,7 +403,7 @@ where
                     .backend
                     .constant_matrix(
                         &ty,
-                        &mxx_graph_ir::node::ConstantMatrix::Gadget {
+                        &mxx_ir_core::node::ConstantMatrix::Gadget {
                             base: match &node.kind {
                                 NodeKind::GadgetTrapdoor { base, .. } => base.clone(),
                                 _ => unreachable!(),
@@ -1145,7 +1145,7 @@ where
     fn child_env(
         &self,
         parent: &ParamEnv,
-        bindings: &[(String, mxx_graph_ir::IntExpr)],
+        bindings: &[(String, mxx_ir_core::IntExpr)],
         loop_index: Option<(&str, usize)>,
         node: NodeId,
     ) -> Result<ParamEnv, ExecutionError> {
@@ -1164,7 +1164,7 @@ where
     fn eval_usize(
         &self,
         node: NodeId,
-        expression: &mxx_graph_ir::IntExpr,
+        expression: &mxx_ir_core::IntExpr,
         env: &ParamEnv,
     ) -> Result<usize, ExecutionError> {
         expression
@@ -1208,7 +1208,7 @@ mod tests {
         backend::poly::cpu_backend,
         transcript::{SamplingMode, TranscriptRecorder},
     };
-    use mxx_graph_ir::{
+    use mxx_ir_core::{
         Graph,
         artifact::{ProductionId, SpecHash},
         graph::{CompileParameter, CompileParameterKind},
@@ -1230,13 +1230,13 @@ mod tests {
     fn matrix_type(parameters: &DCRTPolyParams) -> MatrixType {
         let modulus: Arc<num_bigint::BigUint> = parameters.modulus().into();
         MatrixType {
-            modulus: mxx_graph_ir::IntExpr::constant(BigInt::from_biguint(
+            modulus: mxx_ir_core::IntExpr::constant(BigInt::from_biguint(
                 Sign::Plus,
                 modulus.as_ref().clone(),
             )),
-            ring_dimension: mxx_graph_ir::IntExpr::constant(parameters.ring_dimension()),
-            rows: mxx_graph_ir::IntExpr::constant(1),
-            columns: mxx_graph_ir::IntExpr::constant(1),
+            ring_dimension: mxx_ir_core::IntExpr::constant(parameters.ring_dimension()),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
         }
     }
 
@@ -1366,8 +1366,8 @@ mod tests {
                 id: NodeId(1),
                 kind: NodeKind::TrapdoorSample {
                     matrix_type: matrix_type(&parameters),
-                    sigma: mxx_graph_ir::RealExpr::Rational(
-                        mxx_graph_ir::expr::Rational::new(BigInt::from(4), BigInt::from(1))
+                    sigma: mxx_ir_core::RealExpr::Rational(
+                        mxx_ir_core::expr::Rational::new(BigInt::from(4), BigInt::from(1))
                             .expect("rational"),
                     ),
                 },
@@ -1413,15 +1413,15 @@ mod tests {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let digits = parameters.modulus_digits();
         let mut public_type = matrix_type(&parameters);
-        public_type.columns = mxx_graph_ir::IntExpr::constant(2 + digits);
+        public_type.columns = mxx_ir_core::IntExpr::constant(2 + digits);
         let target_type = matrix_type(&parameters);
         let preimage_type = MatrixType {
-            rows: mxx_graph_ir::IntExpr::constant(2 + digits),
-            columns: mxx_graph_ir::IntExpr::constant(1),
+            rows: mxx_ir_core::IntExpr::constant(2 + digits),
+            columns: mxx_ir_core::IntExpr::constant(1),
             ..target_type.clone()
         };
-        let sigma = mxx_graph_ir::RealExpr::Rational(
-            mxx_graph_ir::expr::Rational::new(BigInt::from(4), BigInt::one())
+        let sigma = mxx_ir_core::RealExpr::Rational(
+            mxx_ir_core::expr::Rational::new(BigInt::from(4), BigInt::one())
                 .expect("positive sigma"),
         );
         let common_nodes = || {
@@ -1479,7 +1479,7 @@ mod tests {
             let output = if expanded {
                 nodes.push(Node {
                     id: NodeId(8),
-                    kind: NodeKind::Select { count: mxx_graph_ir::IntExpr::constant(2) },
+                    kind: NodeKind::Select { count: mxx_ir_core::IntExpr::constant(2) },
                     args: vec![wire(1, 0), wire(4, 0), wire(5, 0)],
                 });
                 wire(8, 0)
@@ -1487,12 +1487,12 @@ mod tests {
                 nodes.extend([
                     Node {
                         id: NodeId(8),
-                        kind: NodeKind::Select { count: mxx_graph_ir::IntExpr::constant(2) },
+                        kind: NodeKind::Select { count: mxx_ir_core::IntExpr::constant(2) },
                         args: vec![wire(1, 0), wire(2, 0), wire(3, 0)],
                     },
                     Node {
                         id: NodeId(9),
-                        kind: NodeKind::Select { count: mxx_graph_ir::IntExpr::constant(2) },
+                        kind: NodeKind::Select { count: mxx_ir_core::IntExpr::constant(2) },
                         args: vec![wire(1, 0), wire(6, 0), wire(7, 0)],
                     },
                     Node {
@@ -1561,7 +1561,7 @@ mod tests {
                     id: NodeId(1),
                     kind: NodeKind::ConstantMatrix {
                         matrix_type: ty.clone(),
-                        value: mxx_graph_ir::node::ConstantMatrix::Identity,
+                        value: mxx_ir_core::node::ConstantMatrix::Identity,
                     },
                     args: Vec::new(),
                 },
@@ -1569,8 +1569,8 @@ mod tests {
                     id: NodeId(2),
                     kind: NodeKind::ConstantMatrix {
                         matrix_type: ty,
-                        value: mxx_graph_ir::node::ConstantMatrix::Rotation {
-                            exponent: mxx_graph_ir::IntExpr::constant(1),
+                        value: mxx_ir_core::node::ConstantMatrix::Rotation {
+                            exponent: mxx_ir_core::IntExpr::constant(1),
                         },
                     },
                     args: Vec::new(),
@@ -1635,7 +1635,7 @@ mod tests {
                         artifact: Some(ArtifactInput {
                             production_id: production.clone(),
                             artifact_name: "family".to_owned(),
-                            family_count: Some(mxx_graph_ir::IntExpr::constant(2)),
+                            family_count: Some(mxx_ir_core::IntExpr::constant(2)),
                         }),
                     },
                     args: Vec::new(),
@@ -1647,7 +1647,7 @@ mod tests {
                 },
                 Node {
                     id: NodeId(3),
-                    kind: NodeKind::Select { count: mxx_graph_ir::IntExpr::constant(2) },
+                    kind: NodeKind::Select { count: mxx_ir_core::IntExpr::constant(2) },
                     args: vec![wire(2, 0), wire(1, 0), wire(1, 1)],
                 },
             ],
@@ -1702,13 +1702,13 @@ mod tests {
     fn gadget_trapdoor_executes_as_exact_gadget_decomposition() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let mut scalar_type = matrix_type(&parameters);
-        scalar_type.rows = mxx_graph_ir::IntExpr::constant(1);
-        scalar_type.columns = mxx_graph_ir::IntExpr::constant(1);
+        scalar_type.rows = mxx_ir_core::IntExpr::constant(1);
+        scalar_type.columns = mxx_ir_core::IntExpr::constant(1);
         let mut gadget_type = scalar_type.clone();
-        gadget_type.columns = mxx_graph_ir::IntExpr::constant(parameters.modulus_digits());
+        gadget_type.columns = mxx_ir_core::IntExpr::constant(parameters.modulus_digits());
         let preimage_type = MatrixType {
-            rows: mxx_graph_ir::IntExpr::constant(parameters.modulus_digits()),
-            columns: mxx_graph_ir::IntExpr::constant(1),
+            rows: mxx_ir_core::IntExpr::constant(parameters.modulus_digits()),
+            columns: mxx_ir_core::IntExpr::constant(1),
             ..scalar_type.clone()
         };
         let graph = Graph {
@@ -1720,7 +1720,7 @@ mod tests {
                     id: NodeId(1),
                     kind: NodeKind::ConstantMatrix {
                         matrix_type: scalar_type,
-                        value: mxx_graph_ir::node::ConstantMatrix::Identity,
+                        value: mxx_ir_core::node::ConstantMatrix::Identity,
                     },
                     args: Vec::new(),
                 },
@@ -1728,7 +1728,7 @@ mod tests {
                     id: NodeId(2),
                     kind: NodeKind::GadgetTrapdoor {
                         matrix_type: gadget_type,
-                        base: mxx_graph_ir::IntExpr::constant(
+                        base: mxx_ir_core::IntExpr::constant(
                             BigInt::one() << parameters.base_bits(),
                         ),
                     },
@@ -1762,17 +1762,17 @@ mod tests {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let plain_type = matrix_type(&parameters);
         let decomposed_type = MatrixType {
-            rows: mxx_graph_ir::IntExpr::constant(parameters.modulus_digits()),
+            rows: mxx_ir_core::IntExpr::constant(parameters.modulus_digits()),
             ..plain_type.clone()
         };
-        let base = mxx_graph_ir::IntExpr::constant(BigInt::one() << parameters.base_bits());
+        let base = mxx_ir_core::IntExpr::constant(BigInt::one() << parameters.base_bits());
         let hash = |id, matrix_type, variant, base| Node {
             id: NodeId(id),
             kind: NodeKind::HashSample {
                 matrix_type,
                 variant,
                 tag_prefix: b"hash-conformance".to_vec(),
-                tag_expressions: vec![mxx_graph_ir::IntExpr::constant(7)],
+                tag_expressions: vec![mxx_ir_core::IntExpr::constant(7)],
                 base,
                 digit_count: None,
             },
@@ -1783,20 +1783,20 @@ mod tests {
             parameters: Vec::new(),
             input_types: BTreeMap::from([(
                 "key".to_owned(),
-                WireType::Bytes { length: mxx_graph_ir::IntExpr::constant(32) },
+                WireType::Bytes { length: mxx_ir_core::IntExpr::constant(32) },
             )]),
             nodes: vec![
                 Node {
                     id: NodeId(1),
                     kind: NodeKind::Input {
                         name: "key".to_owned(),
-                        wire_type: WireType::Bytes { length: mxx_graph_ir::IntExpr::constant(32) },
+                        wire_type: WireType::Bytes { length: mxx_ir_core::IntExpr::constant(32) },
                         artifact: None,
                     },
                     args: Vec::new(),
                 },
-                hash(2, plain_type, mxx_graph_ir::node::HashVariant::Plain, None),
-                hash(3, decomposed_type, mxx_graph_ir::node::HashVariant::Decomposed, Some(base)),
+                hash(2, plain_type, mxx_ir_core::node::HashVariant::Plain, None),
+                hash(3, decomposed_type, mxx_ir_core::node::HashVariant::Decomposed, Some(base)),
             ],
             outputs: BTreeMap::from([
                 ("plain".to_owned(), wire(2, 0)),
@@ -1840,18 +1840,18 @@ mod tests {
                     id: NodeId(1),
                     kind: NodeKind::ConstantMatrix {
                         matrix_type: matrix_type(&parameters),
-                        value: mxx_graph_ir::node::ConstantMatrix::Identity,
+                        value: mxx_ir_core::node::ConstantMatrix::Identity,
                     },
                     args: Vec::new(),
                 },
                 Node {
                     id: NodeId(2),
                     kind: NodeKind::GadgetDecompose {
-                        base: mxx_graph_ir::IntExpr::constant(
+                        base: mxx_ir_core::IntExpr::constant(
                             BigInt::one() << parameters.base_bits(),
                         ),
                         small: true,
-                        digit_count: Some(mxx_graph_ir::IntExpr::constant(digit_count)),
+                        digit_count: Some(mxx_ir_core::IntExpr::constant(digit_count)),
                     },
                     args: vec![wire(1, 0)],
                 },
@@ -1878,8 +1878,8 @@ mod tests {
     fn deterministic_matrix_nodes_match_direct_cpu_operations() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let scalar = matrix_type(&parameters);
-        let row = MatrixType { columns: mxx_graph_ir::IntExpr::constant(2), ..scalar.clone() };
-        let column = MatrixType { rows: mxx_graph_ir::IntExpr::constant(2), ..scalar.clone() };
+        let row = MatrixType { columns: mxx_ir_core::IntExpr::constant(2), ..scalar.clone() };
+        let column = MatrixType { rows: mxx_ir_core::IntExpr::constant(2), ..scalar.clone() };
         let graph = Graph {
             name: "deterministic-node-conformance".to_owned(),
             parameters: Vec::new(),
@@ -1889,7 +1889,7 @@ mod tests {
                     id: NodeId(1),
                     kind: NodeKind::ConstantMatrix {
                         matrix_type: scalar.clone(),
-                        value: mxx_graph_ir::node::ConstantMatrix::Identity,
+                        value: mxx_ir_core::node::ConstantMatrix::Identity,
                     },
                     args: Vec::new(),
                 },
@@ -1897,8 +1897,8 @@ mod tests {
                     id: NodeId(2),
                     kind: NodeKind::ConstantMatrix {
                         matrix_type: scalar.clone(),
-                        value: mxx_graph_ir::node::ConstantMatrix::Rotation {
-                            exponent: mxx_graph_ir::IntExpr::constant(1),
+                        value: mxx_ir_core::node::ConstantMatrix::Rotation {
+                            exponent: mxx_ir_core::IntExpr::constant(1),
                         },
                     },
                     args: Vec::new(),
@@ -1921,7 +1921,7 @@ mod tests {
                 Node { id: NodeId(6), kind: NodeKind::MatrixNegate, args: vec![wire(2, 0)] },
                 Node {
                     id: NodeId(7),
-                    kind: NodeKind::MatrixScale { scalar: mxx_graph_ir::IntExpr::constant(3) },
+                    kind: NodeKind::MatrixScale { scalar: mxx_ir_core::IntExpr::constant(3) },
                     args: vec![wire(2, 0)],
                 },
                 Node { id: NodeId(8), kind: NodeKind::Transpose, args: vec![wire(2, 0)] },
@@ -1942,23 +1942,23 @@ mod tests {
                 Node {
                     id: NodeId(12),
                     kind: NodeKind::Reshape {
-                        rows: mxx_graph_ir::IntExpr::constant(2),
-                        columns: mxx_graph_ir::IntExpr::constant(1),
+                        rows: mxx_ir_core::IntExpr::constant(2),
+                        columns: mxx_ir_core::IntExpr::constant(1),
                     },
                     args: vec![wire(11, 0)],
                 },
                 Node {
                     id: NodeId(13),
                     kind: NodeKind::ExtractCoefficient {
-                        position: mxx_graph_ir::IntExpr::constant(0),
+                        position: mxx_ir_core::IntExpr::constant(0),
                     },
                     args: vec![wire(3, 0)],
                 },
                 Node {
                     id: NodeId(14),
                     kind: NodeKind::ThresholdDecode {
-                        plaintext_modulus: mxx_graph_ir::IntExpr::constant(2),
-                        length: mxx_graph_ir::IntExpr::constant(2),
+                        plaintext_modulus: mxx_ir_core::IntExpr::constant(2),
+                        length: mxx_ir_core::IntExpr::constant(2),
                         output_bool: false,
                     },
                     args: vec![wire(3, 0)],
@@ -1984,8 +1984,8 @@ mod tests {
         };
         // Keep the declared shapes visible in the test: the elaborator derives
         // exactly these types for concat and reshape.
-        assert_eq!(row.columns, mxx_graph_ir::IntExpr::constant(2));
-        assert_eq!(column.rows, mxx_graph_ir::IntExpr::constant(2));
+        assert_eq!(row.columns, mxx_ir_core::IntExpr::constant(2));
+        assert_eq!(column.rows, mxx_ir_core::IntExpr::constant(2));
         let validated = validate(&graph, &ParamEnv::default()).expect("validation");
         let mut backend = cpu_backend([parameters.clone()]);
         let mut store = MemoryArtifactStore::default();
@@ -2052,8 +2052,8 @@ mod tests {
                     id: NodeId(1),
                     kind: NodeKind::ConstantMatrix {
                         matrix_type: source_type,
-                        value: mxx_graph_ir::node::ConstantMatrix::Rotation {
-                            exponent: mxx_graph_ir::IntExpr::constant(1),
+                        value: mxx_ir_core::node::ConstantMatrix::Rotation {
+                            exponent: mxx_ir_core::IntExpr::constant(1),
                         },
                     },
                     args: Vec::new(),
@@ -2061,7 +2061,7 @@ mod tests {
                 Node {
                     id: NodeId(2),
                     kind: NodeKind::ModUp {
-                        target_modulus: mxx_graph_ir::IntExpr::constant(BigInt::from_biguint(
+                        target_modulus: mxx_ir_core::IntExpr::constant(BigInt::from_biguint(
                             Sign::Plus,
                             target_modulus.as_ref().clone(),
                         )),
@@ -2071,7 +2071,7 @@ mod tests {
                 Node {
                     id: NodeId(3),
                     kind: NodeKind::ModDown {
-                        target_modulus: mxx_graph_ir::IntExpr::constant(BigInt::from_biguint(
+                        target_modulus: mxx_ir_core::IntExpr::constant(BigInt::from_biguint(
                             Sign::Plus,
                             source_modulus.as_ref().clone(),
                         )),
@@ -2113,8 +2113,8 @@ mod tests {
     #[test]
     fn scalar_nodes_follow_normative_runtime_arithmetic() {
         let rational = |numerator, denominator| {
-            mxx_graph_ir::RealExpr::Rational(
-                mxx_graph_ir::expr::Rational::new(
+            mxx_ir_core::RealExpr::Rational(
+                mxx_ir_core::expr::Rational::new(
                     BigInt::from(numerator),
                     BigInt::from(denominator),
                 )
@@ -2166,7 +2166,7 @@ mod tests {
                 },
                 Node {
                     id: NodeId(11),
-                    kind: NodeKind::BitExtract { bit: mxx_graph_ir::IntExpr::constant(1) },
+                    kind: NodeKind::BitExtract { bit: mxx_ir_core::IntExpr::constant(1) },
                     args: vec![wire(4, 0)],
                 },
             ],
@@ -2263,8 +2263,8 @@ mod tests {
                 id: NodeId(1),
                 kind: NodeKind::ConstantMatrix {
                     matrix_type: matrix_type(&parameters),
-                    value: mxx_graph_ir::node::ConstantMatrix::Rotation {
-                        exponent: mxx_graph_ir::IntExpr::Var("i".to_owned()),
+                    value: mxx_ir_core::node::ConstantMatrix::Rotation {
+                        exponent: mxx_ir_core::IntExpr::Var("i".to_owned()),
                     },
                 },
                 args: Vec::new(),
@@ -2279,9 +2279,9 @@ mod tests {
             input_types: BTreeMap::new(),
             nodes: vec![Node {
                 id: NodeId(10),
-                kind: NodeKind::ParallelLoop(mxx_graph_ir::node::ParallelLoop {
+                kind: NodeKind::ParallelLoop(mxx_ir_core::node::ParallelLoop {
                     graph: body.name.clone(),
-                    count: mxx_graph_ir::IntExpr::constant(3),
+                    count: mxx_ir_core::IntExpr::constant(3),
                     index_variable: "i".to_owned(),
                     bindings: Vec::new(),
                 }),
@@ -2321,15 +2321,15 @@ mod tests {
     fn parallel_loop_batches_preimage_nodes_across_iterations() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let mut public_type = matrix_type(&parameters);
-        public_type.columns = mxx_graph_ir::IntExpr::constant(2 + parameters.modulus_digits());
+        public_type.columns = mxx_ir_core::IntExpr::constant(2 + parameters.modulus_digits());
         let target_type = matrix_type(&parameters);
         let preimage_type = MatrixType {
             rows: public_type.columns.clone(),
-            columns: mxx_graph_ir::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
             ..target_type.clone()
         };
-        let sigma = mxx_graph_ir::RealExpr::Rational(
-            mxx_graph_ir::expr::Rational::new(BigInt::from(4), BigInt::one())
+        let sigma = mxx_ir_core::RealExpr::Rational(
+            mxx_ir_core::expr::Rational::new(BigInt::from(4), BigInt::one())
                 .expect("positive sigma"),
         );
         let trapdoor_wire_type =
@@ -2393,9 +2393,9 @@ mod tests {
                 },
                 Node {
                     id: NodeId(10),
-                    kind: NodeKind::ParallelLoop(mxx_graph_ir::node::ParallelLoop {
+                    kind: NodeKind::ParallelLoop(mxx_ir_core::node::ParallelLoop {
                         graph: body.name.clone(),
-                        count: mxx_graph_ir::IntExpr::constant(3),
+                        count: mxx_ir_core::IntExpr::constant(3),
                         index_variable: "i".to_owned(),
                         bindings: Vec::new(),
                     }),
@@ -2466,8 +2466,8 @@ mod tests {
             cpu_parameters.base_bits(),
         );
         let hash_type = MatrixType {
-            rows: mxx_graph_ir::IntExpr::constant(2),
-            columns: mxx_graph_ir::IntExpr::constant(3),
+            rows: mxx_ir_core::IntExpr::constant(2),
+            columns: mxx_ir_core::IntExpr::constant(3),
             ..matrix_type(&cpu_parameters)
         };
         let graph = Graph {
@@ -2475,14 +2475,14 @@ mod tests {
             parameters: Vec::new(),
             input_types: BTreeMap::from([(
                 "key".to_owned(),
-                WireType::Bytes { length: mxx_graph_ir::IntExpr::constant(32) },
+                WireType::Bytes { length: mxx_ir_core::IntExpr::constant(32) },
             )]),
             nodes: vec![
                 Node {
                     id: NodeId(1),
                     kind: NodeKind::Input {
                         name: "key".to_owned(),
-                        wire_type: WireType::Bytes { length: mxx_graph_ir::IntExpr::constant(32) },
+                        wire_type: WireType::Bytes { length: mxx_ir_core::IntExpr::constant(32) },
                         artifact: None,
                     },
                     args: Vec::new(),
@@ -2491,9 +2491,9 @@ mod tests {
                     id: NodeId(2),
                     kind: NodeKind::HashSample {
                         matrix_type: hash_type,
-                        variant: mxx_graph_ir::node::HashVariant::Plain,
+                        variant: mxx_ir_core::node::HashVariant::Plain,
                         tag_prefix: b"runtime-cpu-gpu".to_vec(),
-                        tag_expressions: vec![mxx_graph_ir::IntExpr::constant(11)],
+                        tag_expressions: vec![mxx_ir_core::IntExpr::constant(11)],
                         base: None,
                         digit_count: None,
                     },

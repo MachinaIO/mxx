@@ -1,4 +1,4 @@
-//! Concrete execution support for `mxx-graph-ir`.
+//! Concrete execution support for `mxx-ir-core`.
 
 pub mod artifact;
 pub mod backend;

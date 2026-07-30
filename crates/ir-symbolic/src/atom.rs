@@ -1,4 +1,5 @@
 use crate::{
+    overlay::AssumedTermListId,
     serde_support,
     term::TermList,
     types::{ConcreteMatrixType, NodeId, WireRef},
@@ -8,17 +9,17 @@ use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use mxx_graph_ir::{
+pub use mxx_ir_core::{
     artifact::{ProductionId, SpecHash},
     node::ConcatAxis,
     types::InstantiationFrame,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct ManifestAtomId(pub u64);
+pub struct ManifestAtomId(#[serde(with = "serde_support::hex32")] pub [u8; 32]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct TermListId(pub u64);
+pub struct TermListId(#[serde(with = "serde_support::hex32")] pub [u8; 32]);
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct SelectionDomain {
@@ -46,6 +47,15 @@ pub enum AtomId {
     Imported {
         production_id: ProductionId,
         manifest_atom_id: ManifestAtomId,
+    },
+    Virtual {
+        name: String,
+    },
+    Overlay {
+        instantiation_path: Vec<InstantiationFrame>,
+        node: NodeId,
+        port: u32,
+        group_index: u32,
     },
     Indicator {
         domain: SelectionDomain,
@@ -111,15 +121,16 @@ pub enum DefExpr {
         #[serde(with = "serde_support::bigint")]
         target_modulus: BigInt,
     },
+    Fold(TermList),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tag", content = "value")]
+#[allow(clippy::large_enum_variant)]
 pub enum AtomClass {
     Source,
     Derived { definition: DefExpr },
-    Ghost { definition: DefExpr },
-    OpaqueImported,
+    Assumed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -127,6 +138,7 @@ pub enum AtomClass {
 pub enum TargetRef {
     Local(WireRef),
     Imported { production_id: ProductionId, term_list_id: TermListId },
+    Assumed(AssumedTermListId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -194,5 +206,9 @@ impl AtomTable {
 
     pub fn contains_key(&self, id: &AtomId) -> bool {
         self.atoms.contains_key(id)
+    }
+
+    pub fn remove(&mut self, id: &AtomId) -> Option<Atom> {
+        self.atoms.remove(id)
     }
 }

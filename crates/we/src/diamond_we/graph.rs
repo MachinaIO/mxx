@@ -9,7 +9,7 @@ use mxx_bgg::{
     MatrixWire, OutputFamilyError, PolyCircuitCompiler, TrapdoorWire,
 };
 use mxx_gadgets::{Poly, circuit::PolyCircuit};
-use mxx_graph_ir::{
+use mxx_ir_core::{
     Graph, IntExpr, Port, WireRef,
     artifact::ProductionId,
     expr::RealExpr,
@@ -939,7 +939,7 @@ fn special_selector(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_graph_ir::{
+    use mxx_ir_core::{
         ParamEnv,
         artifact::{ExportArtifact, SpecHash, export_manifest},
         node::NodeKind,
@@ -1081,7 +1081,7 @@ mod tests {
         let evaluation =
             build_we_evaluation_graph(&config, &names, production_id.clone(), &circuit)
                 .expect("evaluation graph");
-        let validated = mxx_graph_ir::validate_with_manifests(
+        let validated = mxx_ir_core::validate_with_manifests(
             &evaluation,
             &ParamEnv::default(),
             &std::collections::BTreeMap::from([(production_id, manifest)]),

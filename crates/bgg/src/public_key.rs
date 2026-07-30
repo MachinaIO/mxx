@@ -1,5 +1,5 @@
 use crate::{GraphBuilder, MatrixWire};
-use mxx_graph_ir::{IntExpr, node::MatrixBinaryOp, types::MatrixType};
+use mxx_ir_core::{IntExpr, node::MatrixBinaryOp, types::MatrixType};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BggPublicKeyWire {
@@ -95,7 +95,7 @@ impl BggPublicKeyCompiler {
         };
         let gadget = builder.constant_matrix(
             gadget_type.clone(),
-            mxx_graph_ir::node::ConstantMatrix::Gadget { base: self.base.clone(), small: false },
+            mxx_ir_core::node::ConstantMatrix::Gadget { base: self.base.clone(), small: false },
         );
         let scalar_gadget =
             builder.matrix_binary(MatrixBinaryOp::Multiply, &gadget, scalar, gadget_type.clone());

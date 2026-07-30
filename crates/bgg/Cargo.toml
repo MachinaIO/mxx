@@ -6,7 +6,7 @@ license.workspace = true
 description = "BGG+ graph templates and PolyCircuit lowering for mxx"
 
 [dependencies]
-mxx-graph-ir.workspace = true
+mxx-ir-core.workspace = true
 mxx-gadgets.workspace = true
 num-bigint.workspace = true
 thiserror.workspace = true

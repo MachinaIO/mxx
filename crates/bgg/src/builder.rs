@@ -1,4 +1,4 @@
-use mxx_graph_ir::{
+use mxx_ir_core::{
     Graph, NodeId, Port, WireRef, WireType,
     artifact::ProductionId,
     expr::RealExpr,
@@ -84,7 +84,7 @@ impl GraphBuilder {
         matrix_type: MatrixType,
         production_id: ProductionId,
         artifact_name: impl Into<String>,
-        count: mxx_graph_ir::IntExpr,
+        count: mxx_ir_core::IntExpr,
         concrete_count: usize,
     ) -> Vec<MatrixWire> {
         let name = name.into();
@@ -149,7 +149,7 @@ impl GraphBuilder {
 
     pub fn bytes_input(&mut self, name: impl Into<String>, length: usize) -> WireRef {
         let name = name.into();
-        let wire_type = WireType::Bytes { length: mxx_graph_ir::IntExpr::constant(length) };
+        let wire_type = WireType::Bytes { length: mxx_ir_core::IntExpr::constant(length) };
         self.graph.input_types.insert(name.clone(), wire_type.clone());
         self.push(NodeKind::Input { name, wire_type, artifact: None }, Vec::new())
     }
@@ -158,7 +158,7 @@ impl GraphBuilder {
         self.push(NodeKind::BoolToInt, vec![value])
     }
 
-    pub fn bit_extract(&mut self, value: WireRef, bit: mxx_graph_ir::IntExpr) -> WireRef {
+    pub fn bit_extract(&mut self, value: WireRef, bit: mxx_ir_core::IntExpr) -> WireRef {
         self.push(NodeKind::BitExtract { bit }, vec![value])
     }
 
@@ -173,11 +173,7 @@ impl GraphBuilder {
         MatrixWire { wire, matrix_type: output_type }
     }
 
-    pub fn matrix_scale(
-        &mut self,
-        input: &MatrixWire,
-        scalar: mxx_graph_ir::IntExpr,
-    ) -> MatrixWire {
+    pub fn matrix_scale(&mut self, input: &MatrixWire, scalar: mxx_ir_core::IntExpr) -> MatrixWire {
         let wire = self.push(NodeKind::MatrixScale { scalar }, vec![input.wire]);
         MatrixWire { wire, matrix_type: input.matrix_type.clone() }
     }
@@ -227,9 +223,9 @@ impl GraphBuilder {
         matrix_type: MatrixType,
         variant: HashVariant,
         tag_prefix: Vec<u8>,
-        tag_expressions: Vec<mxx_graph_ir::IntExpr>,
-        base: Option<mxx_graph_ir::IntExpr>,
-        digit_count: Option<mxx_graph_ir::IntExpr>,
+        tag_expressions: Vec<mxx_ir_core::IntExpr>,
+        base: Option<mxx_ir_core::IntExpr>,
+        digit_count: Option<mxx_ir_core::IntExpr>,
     ) -> MatrixWire {
         let wire = self.push(
             NodeKind::HashSample {
@@ -287,10 +283,8 @@ impl GraphBuilder {
         let mut args = Vec::with_capacity(branches.len() + 1);
         args.push(index);
         args.extend(branches.iter().map(|branch| branch.wire));
-        let wire = self.push(
-            NodeKind::Select { count: mxx_graph_ir::IntExpr::constant(branches.len()) },
-            args,
-        );
+        let wire = self
+            .push(NodeKind::Select { count: mxx_ir_core::IntExpr::constant(branches.len()) }, args);
         MatrixWire { wire, matrix_type: first.matrix_type.clone() }
     }
 
@@ -309,15 +303,15 @@ impl GraphBuilder {
         };
         let monomial = self.constant_matrix(
             matrix_type.clone(),
-            ConstantMatrix::Rotation { exponent: mxx_graph_ir::IntExpr::constant(exponent) },
+            ConstantMatrix::Rotation { exponent: mxx_ir_core::IntExpr::constant(exponent) },
         );
-        let mut sum = self.matrix_scale(&monomial, mxx_graph_ir::IntExpr::constant(coefficient));
+        let mut sum = self.matrix_scale(&monomial, mxx_ir_core::IntExpr::constant(coefficient));
         for (exponent, coefficient) in nonzero {
             let monomial = self.constant_matrix(
                 matrix_type.clone(),
-                ConstantMatrix::Rotation { exponent: mxx_graph_ir::IntExpr::constant(exponent) },
+                ConstantMatrix::Rotation { exponent: mxx_ir_core::IntExpr::constant(exponent) },
             );
-            let term = self.matrix_scale(&monomial, mxx_graph_ir::IntExpr::constant(coefficient));
+            let term = self.matrix_scale(&monomial, mxx_ir_core::IntExpr::constant(coefficient));
             sum = self.matrix_binary(MatrixBinaryOp::Add, &sum, &term, matrix_type.clone());
         }
         sum
@@ -326,7 +320,7 @@ impl GraphBuilder {
     pub fn gadget_decompose(
         &mut self,
         input: &MatrixWire,
-        base: mxx_graph_ir::IntExpr,
+        base: mxx_ir_core::IntExpr,
         output_type: MatrixType,
     ) -> MatrixWire {
         self.gadget_decompose_with_layout(input, base, false, None, output_type)
@@ -335,9 +329,9 @@ impl GraphBuilder {
     pub fn gadget_decompose_with_layout(
         &mut self,
         input: &MatrixWire,
-        base: mxx_graph_ir::IntExpr,
+        base: mxx_ir_core::IntExpr,
         small: bool,
-        digit_count: Option<mxx_graph_ir::IntExpr>,
+        digit_count: Option<mxx_ir_core::IntExpr>,
         output_type: MatrixType,
     ) -> MatrixWire {
         let wire =
@@ -386,8 +380,8 @@ impl GraphBuilder {
     pub fn threshold_decode(
         &mut self,
         input: &MatrixWire,
-        plaintext_modulus: mxx_graph_ir::IntExpr,
-        length: mxx_graph_ir::IntExpr,
+        plaintext_modulus: mxx_ir_core::IntExpr,
+        length: mxx_ir_core::IntExpr,
         output_bool: bool,
     ) -> WireRef {
         self.push(
@@ -431,15 +425,15 @@ impl GraphBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_graph_ir::{ParamEnv, validate};
+    use mxx_ir_core::{ParamEnv, validate};
 
     #[test]
     fn core_builder_emits_a_valid_compound_matrix_expression() {
         let matrix_type = MatrixType {
-            modulus: mxx_graph_ir::IntExpr::constant(17),
-            ring_dimension: mxx_graph_ir::IntExpr::constant(8),
-            rows: mxx_graph_ir::IntExpr::constant(1),
-            columns: mxx_graph_ir::IntExpr::constant(1),
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(8),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
         };
         let range = SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) };
         let mut builder = GraphBuilder::new("reduce-compound", Vec::new());

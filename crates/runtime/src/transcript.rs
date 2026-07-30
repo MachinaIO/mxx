@@ -1,4 +1,4 @@
-use mxx_graph_ir::types::{ConcreteMatrixType, InstantiationFrame, NodeId, Port};
+use mxx_ir_core::types::{ConcreteMatrixType, InstantiationFrame, NodeId, Port};
 use std::collections::BTreeMap;
 use thiserror::Error;
 

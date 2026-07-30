@@ -1,4 +1,4 @@
-use mxx_graph_ir::{graph::Graph, types::WireRef};
+use mxx_ir_core::{graph::Graph, types::WireRef};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

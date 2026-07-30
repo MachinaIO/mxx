@@ -4,7 +4,7 @@ use crate::graph::{
     IoArtifactNames, IoGraphBuildError, IoGraphConfig, build_evaluation_graph,
     build_obfuscation_graph,
 };
-use mxx_graph_ir::{Graph, IntExpr, artifact::ProductionId, expr::RealExpr};
+use mxx_ir_core::{Graph, IntExpr, artifact::ProductionId, expr::RealExpr};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Aky24IOGraphConfig {
@@ -86,7 +86,7 @@ pub fn build_aky24_io_evaluation_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_graph_ir::{
+    use mxx_ir_core::{
         ParamEnv,
         artifact::{SpecHash, export_validated_manifest},
         validate, validate_with_manifests,

@@ -1,4 +1,4 @@
-use mxx_graph_ir::{
+use mxx_ir_core::{
     artifact::{Manifest, ProductionId},
     types::ConcreteMatrixType,
 };

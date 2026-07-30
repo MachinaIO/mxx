@@ -5,7 +5,7 @@ use mxx_gadgets::{
     Poly,
     circuit::{GateParamSource, PolyCircuit, PolyGateType, SubCircuitParamValue, gate::GateId},
 };
-use mxx_graph_ir::node::MatrixBinaryOp;
+use mxx_ir_core::node::MatrixBinaryOp;
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -757,7 +757,7 @@ fn scalar_u32_bound(
     builder: &mut GraphBuilder,
     source: &GateParamSource<Vec<u32>>,
     bindings: &[SubCircuitParamValue],
-    ambient: &mxx_graph_ir::types::MatrixType,
+    ambient: &mxx_ir_core::types::MatrixType,
 ) -> crate::MatrixWire {
     builder.constant_polynomial(
         scalar_type(ambient),
@@ -769,7 +769,7 @@ fn scalar_biguint_bound(
     builder: &mut GraphBuilder,
     source: &GateParamSource<Vec<num_bigint::BigUint>>,
     bindings: &[SubCircuitParamValue],
-    ambient: &mxx_graph_ir::types::MatrixType,
+    ambient: &mxx_ir_core::types::MatrixType,
 ) -> crate::MatrixWire {
     builder.constant_polynomial(
         scalar_type(ambient),
@@ -839,7 +839,7 @@ fn scalar_u32(
     builder: &mut GraphBuilder,
     gate: usize,
     source: &GateParamSource<Vec<u32>>,
-    ambient: &mxx_graph_ir::types::MatrixType,
+    ambient: &mxx_ir_core::types::MatrixType,
 ) -> Result<crate::MatrixWire, CircuitCompileError> {
     let GateParamSource::Const(coefficients) = source else {
         return Err(CircuitCompileError::MissingGateContext {
@@ -857,7 +857,7 @@ fn scalar_biguint(
     builder: &mut GraphBuilder,
     gate: usize,
     source: &GateParamSource<Vec<num_bigint::BigUint>>,
-    ambient: &mxx_graph_ir::types::MatrixType,
+    ambient: &mxx_ir_core::types::MatrixType,
 ) -> Result<crate::MatrixWire, CircuitCompileError> {
     let GateParamSource::Const(coefficients) = source else {
         return Err(CircuitCompileError::MissingGateContext {
@@ -871,12 +871,12 @@ fn scalar_biguint(
     ))
 }
 
-fn scalar_type(ambient: &mxx_graph_ir::types::MatrixType) -> mxx_graph_ir::types::MatrixType {
-    mxx_graph_ir::types::MatrixType {
+fn scalar_type(ambient: &mxx_ir_core::types::MatrixType) -> mxx_ir_core::types::MatrixType {
+    mxx_ir_core::types::MatrixType {
         modulus: ambient.modulus.clone(),
         ring_dimension: ambient.ring_dimension.clone(),
-        rows: mxx_graph_ir::IntExpr::constant(1),
-        columns: mxx_graph_ir::IntExpr::constant(1),
+        rows: mxx_ir_core::IntExpr::constant(1),
+        columns: mxx_ir_core::IntExpr::constant(1),
     }
 }
 
@@ -935,7 +935,7 @@ fn gate_kind_name(kind: &PolyGateType) -> &'static str {
 mod tests {
     use super::*;
     use mxx_gadgets::bgg::{encoding::BggEncoding, public_key::BggPublicKey};
-    use mxx_graph_ir::{IntExpr, ParamEnv, types::MatrixType};
+    use mxx_ir_core::{IntExpr, ParamEnv, types::MatrixType};
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -1066,12 +1066,12 @@ mod tests {
         let graph = builder.finish();
         assert!(matches!(
             graph.nodes.last().expect("add node").kind,
-            mxx_graph_ir::node::NodeKind::SubgraphCall(_)
+            mxx_ir_core::node::NodeKind::SubgraphCall(_)
         ));
         let add_template = graph.subgraphs.get("bgg-public-key-add").expect("shared add template");
         assert!(add_template.nodes.iter().any(|node| matches!(
             node.kind,
-            mxx_graph_ir::node::NodeKind::MatrixBinary(mxx_graph_ir::node::MatrixBinaryOp::Add)
+            mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Add)
         )));
     }
 
@@ -1105,7 +1105,7 @@ mod tests {
             graph
                 .nodes
                 .iter()
-                .filter(|node| matches!(node.kind, mxx_graph_ir::node::NodeKind::SubgraphCall(_)))
+                .filter(|node| matches!(node.kind, mxx_ir_core::node::NodeKind::SubgraphCall(_)))
                 .count(),
             2
         );
@@ -1149,7 +1149,7 @@ mod tests {
         builder.output("plaintext", output.plaintext.as_ref().expect("revealed plaintext"));
         let graph = builder.finish();
         assert_eq!(graph.subgraphs.len(), 1);
-        let elaborated = mxx_graph_ir::validate(&graph, &ParamEnv::default()).expect("validation");
+        let elaborated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
 
         let lhs_vector = polynomial_row(&parameters, columns, 0);
         let lhs_pubkey = polynomial_row(&parameters, columns, 1);

@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/graph-ir",
-    "crates/graph-symboric",
+    "crates/ir-core",
+    "crates/ir-symbolic",
     "crates/runtime",
     "crates/bench-estimator",
     "crates/bgg",
@@ -24,8 +24,8 @@ mxx-gadgets = { path = "crates/gadgets" }
 mxx-func-enc = { path = "crates/func-enc" }
 mxx-we = { path = "crates/we" }
 mxx-io = { path = "crates/io" }
-mxx-graph-ir = { path = "crates/graph-ir" }
-mxx-graph-symboric = { path = "crates/graph-symboric" }
+mxx-ir-core = { path = "crates/ir-core" }
+mxx-ir-symbolic = { path = "crates/ir-symbolic" }
 mxx-runtime = { path = "crates/runtime" }
 mxx-bench-estimator = { path = "crates/bench-estimator" }
 mxx-bgg = { path = "crates/bgg" }

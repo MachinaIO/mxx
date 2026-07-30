@@ -1,6 +1,6 @@
 pub mod harness;
 
-use mxx_graph_ir::{
+use mxx_ir_core::{
     ParamEnv, ValidatedGraph, encoding,
     graph::Graph,
     node::{Node, NodeKind},
@@ -80,7 +80,7 @@ pub enum EstimateError {
     #[error("measurement backend failed: {0}")]
     Backend(String),
     #[error("subgraph {name} does not exist at node {node:?}")]
-    MissingSubgraph { node: mxx_graph_ir::NodeId, name: String },
+    MissingSubgraph { node: mxx_ir_core::NodeId, name: String },
     #[error("compile expression failed: {0}")]
     Expression(String),
     #[error("canonical cache key failed: {0}")]
@@ -151,12 +151,12 @@ impl CacheKey {
         let mut relevant = ParamEnv::default();
         for parameter in &graph.parameters {
             match parameter.kind {
-                mxx_graph_ir::graph::CompileParameterKind::Integer => {
+                mxx_ir_core::graph::CompileParameterKind::Integer => {
                     if let Some(value) = bindings.integers.get(&parameter.name) {
                         relevant.integers.insert(parameter.name.clone(), value.clone());
                     }
                 }
-                mxx_graph_ir::graph::CompileParameterKind::Real => {
+                mxx_ir_core::graph::CompileParameterKind::Real => {
                     if let Some(value) = bindings.reals.get(&parameter.name) {
                         relevant.reals.insert(parameter.name.clone(), value.clone());
                     }
@@ -479,7 +479,7 @@ fn materializes_all_lazy_matrix_arguments(node: &Node) -> bool {
 
 fn child_bindings(
     parent: &ParamEnv,
-    bindings: &[(String, mxx_graph_ir::IntExpr)],
+    bindings: &[(String, mxx_ir_core::IntExpr)],
     loop_index: Option<(&str, usize)>,
 ) -> Result<ParamEnv, EstimateError> {
     let mut child = parent.clone();
@@ -498,7 +498,7 @@ fn child_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_graph_ir::{
+    use mxx_ir_core::{
         ParamEnv,
         artifact::{ProductionId, SpecHash},
         graph::{CompileParameter, CompileParameterKind, Graph},
@@ -580,7 +580,7 @@ mod tests {
             real_constants: BTreeMap::new(),
         };
         graph.subgraphs.insert("body".to_owned(), Box::new(body()));
-        let validated = mxx_graph_ir::validate(&graph, &ParamEnv::default()).expect("validation");
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
         let mut backend = CountingBackend::default();
         let report =
             estimate(&validated, &mut backend, &EstimateConfig::default()).expect("estimate");
@@ -605,7 +605,7 @@ mod tests {
                 id: NodeId(10),
                 kind: NodeKind::ParallelLoop(ParallelLoop {
                     graph: "body".to_owned(),
-                    count: mxx_graph_ir::IntExpr::constant(5),
+                    count: mxx_ir_core::IntExpr::constant(5),
                     index_variable: "i".to_owned(),
                     bindings: Vec::new(),
                 }),
@@ -619,7 +619,7 @@ mod tests {
             real_constants: BTreeMap::new(),
         };
         graph.subgraphs.insert("body".to_owned(), Box::new(body()));
-        let validated = mxx_graph_ir::validate(&graph, &ParamEnv::default()).expect("validation");
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
         let mut backend = CountingBackend::default();
         let report = estimate(
             &validated,
@@ -674,13 +674,13 @@ mod tests {
                 id: NodeId(10),
                 kind: NodeKind::ParallelLoop(ParallelLoop {
                     graph: "body".to_owned(),
-                    count: mxx_graph_ir::IntExpr::constant(3),
+                    count: mxx_ir_core::IntExpr::constant(3),
                     index_variable: "i".to_owned(),
                     bindings: vec![(
                         "size".to_owned(),
-                        mxx_graph_ir::IntExpr::Add(
-                            Box::new(mxx_graph_ir::IntExpr::Var("i".to_owned())),
-                            Box::new(mxx_graph_ir::IntExpr::constant(1)),
+                        mxx_ir_core::IntExpr::Add(
+                            Box::new(mxx_ir_core::IntExpr::Var("i".to_owned())),
+                            Box::new(mxx_ir_core::IntExpr::constant(1)),
                         ),
                     )],
                 }),
@@ -694,7 +694,7 @@ mod tests {
             real_constants: BTreeMap::new(),
         };
         graph.subgraphs.insert("body".to_owned(), Box::new(child));
-        let validated = mxx_graph_ir::validate(&graph, &ParamEnv::default()).expect("validation");
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
         let mut backend = BindingBackend::default();
         let report = estimate(
             &validated,
@@ -732,10 +732,10 @@ mod tests {
         let production = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [9; 32] };
         let matrix = ConcreteMatrixType::scalar(BigInt::from(17), 8);
         let matrix_type = MatrixType {
-            modulus: mxx_graph_ir::IntExpr::constant(17),
-            ring_dimension: mxx_graph_ir::IntExpr::constant(8),
-            rows: mxx_graph_ir::IntExpr::constant(1),
-            columns: mxx_graph_ir::IntExpr::constant(1),
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(8),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
         };
         let source = Graph {
             name: "lazy-family-memory".to_owned(),
@@ -746,11 +746,11 @@ mod tests {
                     id: NodeId(1),
                     kind: NodeKind::Input {
                         name: "family".to_owned(),
-                        wire_type: mxx_graph_ir::WireType::Matrix(matrix_type),
+                        wire_type: mxx_ir_core::WireType::Matrix(matrix_type),
                         artifact: Some(ArtifactInput {
                             production_id: production,
                             artifact_name: "family".to_owned(),
-                            family_count: Some(mxx_graph_ir::IntExpr::constant(3)),
+                            family_count: Some(mxx_ir_core::IntExpr::constant(3)),
                         }),
                     },
                     args: Vec::new(),
@@ -762,7 +762,7 @@ mod tests {
                 },
                 Node {
                     id: NodeId(3),
-                    kind: NodeKind::Select { count: mxx_graph_ir::IntExpr::constant(3) },
+                    kind: NodeKind::Select { count: mxx_ir_core::IntExpr::constant(3) },
                     args: vec![
                         wire(2),
                         WireRef { node: NodeId(1), port: Port(0) },
@@ -856,10 +856,10 @@ mod tests {
         let production = ProductionId { spec_hash: SpecHash([5; 32]), execution_nonce: [6; 32] };
         let matrix = ConcreteMatrixType::scalar(BigInt::from(17), 8);
         let matrix_type = MatrixType {
-            modulus: mxx_graph_ir::IntExpr::constant(17),
-            ring_dimension: mxx_graph_ir::IntExpr::constant(8),
-            rows: mxx_graph_ir::IntExpr::constant(1),
-            columns: mxx_graph_ir::IntExpr::constant(1),
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(8),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
         };
         let source = Graph {
             name: "lazy-direct-use-memory".to_owned(),
@@ -870,7 +870,7 @@ mod tests {
                     id: NodeId(1),
                     kind: NodeKind::Input {
                         name: "artifact".to_owned(),
-                        wire_type: mxx_graph_ir::WireType::Matrix(matrix_type),
+                        wire_type: mxx_ir_core::WireType::Matrix(matrix_type),
                         artifact: Some(ArtifactInput {
                             production_id: production,
                             artifact_name: "artifact".to_owned(),
@@ -935,24 +935,24 @@ mod tests {
         }
 
         let matrix_type = MatrixType {
-            modulus: mxx_graph_ir::IntExpr::constant(17),
-            ring_dimension: mxx_graph_ir::IntExpr::constant(8),
-            rows: mxx_graph_ir::IntExpr::constant(dimension),
-            columns: mxx_graph_ir::IntExpr::constant(dimension),
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(8),
+            rows: mxx_ir_core::IntExpr::constant(dimension),
+            columns: mxx_ir_core::IntExpr::constant(dimension),
         };
         let graph = Graph {
             name: "analytic-memory-monotonicity".to_owned(),
             parameters: Vec::new(),
             input_types: BTreeMap::from([
-                ("left".to_owned(), mxx_graph_ir::WireType::Matrix(matrix_type.clone())),
-                ("right".to_owned(), mxx_graph_ir::WireType::Matrix(matrix_type.clone())),
+                ("left".to_owned(), mxx_ir_core::WireType::Matrix(matrix_type.clone())),
+                ("right".to_owned(), mxx_ir_core::WireType::Matrix(matrix_type.clone())),
             ]),
             nodes: vec![
                 Node {
                     id: NodeId(1),
                     kind: NodeKind::Input {
                         name: "left".to_owned(),
-                        wire_type: mxx_graph_ir::WireType::Matrix(matrix_type.clone()),
+                        wire_type: mxx_ir_core::WireType::Matrix(matrix_type.clone()),
                         artifact: None,
                     },
                     args: Vec::new(),
@@ -961,14 +961,14 @@ mod tests {
                     id: NodeId(2),
                     kind: NodeKind::Input {
                         name: "right".to_owned(),
-                        wire_type: mxx_graph_ir::WireType::Matrix(matrix_type),
+                        wire_type: mxx_ir_core::WireType::Matrix(matrix_type),
                         artifact: None,
                     },
                     args: Vec::new(),
                 },
                 Node {
                     id: NodeId(3),
-                    kind: NodeKind::MatrixBinary(mxx_graph_ir::node::MatrixBinaryOp::Add),
+                    kind: NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Add),
                     args: vec![wire(1), wire(2)],
                 },
             ],
@@ -976,7 +976,7 @@ mod tests {
             subgraphs: BTreeMap::new(),
             real_constants: BTreeMap::new(),
         };
-        let validated = mxx_graph_ir::validate(&graph, &ParamEnv::default()).expect("validation");
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
         estimate(&validated, &mut AnalyticMemoryBackend, &EstimateConfig::default())
             .expect("estimate")
     }

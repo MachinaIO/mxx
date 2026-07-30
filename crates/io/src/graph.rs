@@ -7,7 +7,7 @@
 //! public configuration types and map them into this representation.
 
 use mxx_bgg::{GraphBuilder, OutputFamilyError};
-use mxx_graph_ir::{
+use mxx_ir_core::{
     Graph, IntExpr,
     artifact::ProductionId,
     expr::RealExpr,
@@ -220,7 +220,7 @@ pub(crate) fn build_evaluation_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_graph_ir::{ParamEnv, artifact::Manifest, validate, validate_with_manifests};
+    use mxx_ir_core::{ParamEnv, artifact::Manifest, validate, validate_with_manifests};
     use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
     use mxx_runtime::{
         RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,

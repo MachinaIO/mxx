@@ -11,6 +11,8 @@ disk = ["mxx-primitives/disk", "mxx-gadgets/disk"]
 gpu = ["mxx-primitives/gpu", "mxx-gadgets/gpu"]
 
 [dependencies]
+mxx-graph-ir.workspace = true
+mxx-bgg.workspace = true
 mxx-primitives.workspace = true
 mxx-gadgets.workspace = true
 bigdecimal.workspace = true
@@ -22,8 +24,10 @@ rand.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
+mxx-runtime.workspace = true
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
 mxx-gadgets = { workspace = true, features = ["test-support"] }
 serial_test.workspace = true

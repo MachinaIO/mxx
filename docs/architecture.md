@@ -4,21 +4,28 @@ This repository is a virtual Cargo workspace. It intentionally has no root packa
 
 ## Dependency layers
 
+Arrows below point from a consumer to one of its dependencies:
+
 ```text
-Level 1: mxx-primitives
-             ^
-             |
-Level 2: mxx-gadgets
-             ^
-             |
-Level 3: mxx-func-enc   mxx-we   mxx-io
+mxx-runtime          -> mxx-graph-ir, mxx-primitives
+mxx-graph-symboric    -> mxx-graph-ir
+mxx-bench-estimator  -> mxx-graph-ir, mxx-runtime
+mxx-gadgets          -> mxx-primitives
+mxx-bgg              -> mxx-graph-ir, mxx-gadgets
+application crates   -> graph, execution, primitive, gadget, and BGG layers
 ```
 
-Dependencies may only point upward in this diagram:
+Dependencies follow these rules:
 
+- `mxx-graph-ir` has no dependency on another workspace crate.
+- `mxx-runtime` depends on `mxx-graph-ir` and `mxx-primitives`.
+- `mxx-graph-symboric` depends only on `mxx-graph-ir`.
+- `mxx-bench-estimator` depends on `mxx-graph-ir` and reuses the runtime liveness schedule.
 - `mxx-primitives` has no dependency on another workspace crate.
 - `mxx-gadgets` depends only on `mxx-primitives`.
-- `mxx-func-enc`, `mxx-we`, and `mxx-io` depend on `mxx-primitives` and `mxx-gadgets`.
+- `mxx-bgg` depends on `mxx-graph-ir` and `mxx-gadgets`.
+- `mxx-func-enc`, `mxx-we`, and `mxx-io` may depend on the graph,
+  execution, primitive, gadget, and BGG compiler layers.
 - Application crates must not depend on one another.
 
 Code shared by two application crates belongs in the lowest layer that can express it naturally. For example, the native polynomial-matrix benchmark interface and common iO/WE error-simulation helpers live in `mxx-gadgets`, while CUDA matrix measurements live beside the reusable benchmark interface instead of in `mxx-io`.
@@ -42,6 +49,22 @@ Code shared by two application crates belongs in the lowest layer that can expre
 | `crates/primitives/benches/` | Primitive CPU/GPU matrix and preimage benchmarks. |
 
 GPU implementations of primitive operations stay in this crate even when a higher-level crate is their main caller.
+
+### Graph infrastructure
+
+| Crate | Path | Responsibility |
+| --- | --- | --- |
+| `mxx-graph-ir` | `crates/graph-ir/` | Executable typed graph structure, exact compile expressions, concrete type and shape validation, canonical identities, and runtime artifact manifests. This is the core Graph IR. |
+| `mxx-graph-symboric` | `crates/graph-symboric/` | Optional symbolic atom and term identities, elaboration, rewrite machinery, conservative internal boundedness metadata, and cross-graph symbolic manifests. It does not provide noise or residual analysis and does not define BGG-, Diamond-, or AKY-specific invariants. |
+| `mxx-runtime` | `crates/runtime/` | CPU/GPU graph execution over existing primitive APIs, transcript recording/replay, shared liveness, indexed artifact-family persistence, and manifest production. |
+| `mxx-bench-estimator` | `crates/bench-estimator/` | Per-node measurement composition, binding-sensitive subgraph reuse, critical paths, parallel waves, and persistent/workspace peak modeling. |
+| `mxx-bgg` | `crates/bgg/` | BGG+ public-key and encoding wire bundles plus recursive `PolyCircuit` graph lowering. Lookup and slot-transfer gates receive an explicit scheme-specific lowering context because `PolyCircuit` does not own their preprocessing state. Concrete BGG arithmetic remains owned by `mxx-gadgets`. |
+
+`GadgetDecompose` and decomposed hash nodes normally derive their digit count
+from the modulus and base. DCRT small decomposition is different: its width is
+defined per CRT tower and cannot be recovered from the aggregate modulus.
+Those nodes therefore accept an optional compile-time `digit_count`; DCRT
+small-gadget graph builders must set it explicitly.
 
 ### `mxx-gadgets`
 
@@ -72,9 +95,16 @@ The former circuit-gadget directory is now `crates/gadgets/src/circuit_gadgets/`
 | `mxx-we` | `crates/we/src/diamond_we*` | Witness-encryption trait, Diamond WE, simulation, and estimates. |
 | `mxx-io` | `crates/io/src/aky24_io*`, `crates/io/src/diamond_io*` | iO trait, AKY24 iO models, Diamond iO, simulations, and estimates. |
 
+Diamond WE provides key-generation and evaluation graph builders. Diamond iO
+and the maintained AKY24 model provide obfuscation and evaluation graph
+builders for their common artifact-backed state-transition path. These core
+graphs remain executable without optional symbolic elaboration.
+
 ## Features and native build ownership
 
-All five crates define `disk` and `gpu` features. Upper crates only forward those features to their dependencies. `mxx-primitives` is the sole owner of:
+Crates with concrete storage or device behavior define `disk` or `gpu`
+features as needed. Upper crates only forward those features to their
+dependencies. `mxx-primitives` is the sole owner of:
 
 - OpenFHE linkage;
 - `cc` build dependencies;

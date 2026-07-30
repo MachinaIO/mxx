@@ -24,4 +24,4 @@ pub mod utils;
 #[cfg(test)]
 pub(crate) use mxx_primitives::rlwe_enc;
 pub(crate) use mxx_primitives::{element, matrix, poly, sampler};
-pub use mxx_primitives::{impl_binop_with_refs, parallel_iter};
+pub use mxx_primitives::{impl_binop_with_refs, parallel_iter, poly::Poly};

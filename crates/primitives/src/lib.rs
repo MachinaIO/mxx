@@ -9,6 +9,7 @@
 pub mod element;
 pub mod env;
 pub mod matrix;
+pub mod modulus;
 pub(crate) mod openfhe_guard;
 pub mod poly;
 pub mod rlwe_enc;

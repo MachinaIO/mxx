@@ -14,28 +14,30 @@ The repository includes:
 
 ## Workspace layout
 
-The repository is a virtual Cargo workspace with five crates and no root facade crate:
+The repository is a virtual Cargo workspace with no root facade crate:
 
 | Crate | Responsibility |
 | --- | --- |
+| `mxx-graph-ir` | Executable typed graph IR, exact compile expressions, concrete validation, and artifact manifests. |
+| `mxx-graph-symboric` | Optional symbolic-term elaboration, rewrite, and cross-graph identity operations over Graph IR. |
+| `mxx-runtime` | CPU/GPU execution, reproducible sampling transcripts, liveness, and indexed artifact-family persistence. |
+| `mxx-bench-estimator` | Binding-sensitive measured graph-cost composition, critical paths, parallel waves, and memory peaks. |
 | `mxx-primitives` | Polynomial and matrix representations, samplers, analytical sampling bounds, OpenFHE integration, and all native CUDA kernels and wrappers. |
 | `mxx-gadgets` | BGG encodings, circuits, circuit gadgets, lookup, decoding, noise refresh, input injection, slot transfer, commitments, storage, simulation, and benchmark models. |
+| `mxx-bgg` | Graph compilers for BGG+ wire bundles and `PolyCircuit`, with explicit scheme contexts for lookup and slot-transfer lowering. |
 | `mxx-func-enc` | Functional-encryption interfaces and constructions. AKY24 remains disabled until its shared-decoder migration is complete. |
 | `mxx-we` | Witness-encryption interfaces and Diamond WE. |
 | `mxx-io` | Indistinguishability-obfuscation interfaces, AKY24 iO estimation, and Diamond iO. |
 
-The dependency direction is strictly:
+The principal dependency directions are shown with consumers on the left:
 
 ```text
-mxx-primitives
-      ^
-      |
-mxx-gadgets
-      ^
-      |
-      +-- mxx-func-enc
-      +-- mxx-we
-      +-- mxx-io
+mxx-runtime          -> mxx-graph-ir, mxx-primitives
+mxx-graph-symboric    -> mxx-graph-ir
+mxx-bench-estimator  -> mxx-graph-ir, mxx-runtime
+mxx-gadgets          -> mxx-primitives
+mxx-bgg              -> mxx-graph-ir, mxx-gadgets
+mxx-func-enc/we/io   -> lower layers, never one another
 ```
 
 The three application crates do not depend on one another. See `docs/architecture.md` for the detailed directory map and boundary rules.
@@ -49,7 +51,9 @@ The three application crates do not depend on one another. See `docs/architectur
 
 ## Cargo features
 
-Every crate exposes the same opt-in feature names. Application crates forward them to their lower-level dependencies.
+Crates with concrete storage or device behavior expose the relevant opt-in
+feature names. Application crates forward them to their lower-level
+dependencies.
 
 | Feature | Effect |
 | --- | --- |

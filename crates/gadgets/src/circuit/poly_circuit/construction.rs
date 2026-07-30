@@ -77,7 +77,8 @@ impl<P: Poly> PolyCircuit<P> {
         input_gate_ids
     }
 
-    pub(crate) fn output_gate_ids(&self) -> &[GateId] {
+    /// Returns the circuit outputs in their declared order.
+    pub fn output_gate_ids(&self) -> &[GateId] {
         &self.output_ids
     }
 

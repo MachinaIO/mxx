@@ -1,0 +1,16 @@
+[package]
+name = "mxx-bgg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BGG+ graph templates and PolyCircuit lowering for mxx"
+
+[dependencies]
+mxx-graph-ir.workspace = true
+mxx-gadgets.workspace = true
+num-bigint.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+mxx-primitives.workspace = true
+mxx-runtime.workspace = true

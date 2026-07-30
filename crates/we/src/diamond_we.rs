@@ -29,6 +29,7 @@ use crate::{
 use super::WitnessEnc;
 
 pub mod bench_estimator;
+pub mod graph;
 pub mod simulation;
 pub use bench_estimator::{DiamondWEBenchEstimate, DiamondWEBenchEstimator};
 pub use simulation::{

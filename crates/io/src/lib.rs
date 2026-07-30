@@ -2,6 +2,7 @@ pub mod aky24_io;
 pub mod diamond_io;
 #[cfg(test)]
 pub(crate) mod env;
+mod graph;
 pub(crate) mod utils;
 
 #[cfg(all(test, feature = "gpu"))]

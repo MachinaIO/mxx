@@ -52,6 +52,7 @@ use super::Obfuscation;
 
 pub mod bench_estimator;
 mod circuits;
+pub mod graph;
 pub mod simulation;
 mod utils;
 

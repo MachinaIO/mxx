@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/graph-ir",
+    "crates/graph-symboric",
+    "crates/runtime",
+    "crates/bench-estimator",
+    "crates/bgg",
     "crates/primitives",
     "crates/gadgets",
     "crates/func-enc",
@@ -19,6 +24,11 @@ mxx-gadgets = { path = "crates/gadgets" }
 mxx-func-enc = { path = "crates/func-enc" }
 mxx-we = { path = "crates/we" }
 mxx-io = { path = "crates/io" }
+mxx-graph-ir = { path = "crates/graph-ir" }
+mxx-graph-symboric = { path = "crates/graph-symboric" }
+mxx-runtime = { path = "crates/runtime" }
+mxx-bench-estimator = { path = "crates/bench-estimator" }
+mxx-bgg = { path = "crates/bgg" }
 bigdecimal = "0.4"
 bincode = "2.0.1"
 bitvec = "1"
@@ -31,12 +41,14 @@ libc = "0.2"
 memory-stats = "1.2.0"
 memmap2 = "0.9.5"
 num-bigint = { version = "0.4.6", features = ["serde", "rand"] }
+num-integer = "0.1"
 num-traits = "0.2.19"
 openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git" }
 rand = { version = "0.9.0", features = ["std_rng"] }
 rayon = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 serial_test = { version = "3.5.0", default-features = false }
 tempfile = "3.19.1"
 thiserror = "1"

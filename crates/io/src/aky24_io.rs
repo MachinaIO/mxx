@@ -8,6 +8,7 @@ use crate::{
 };
 
 pub mod bench_estimator;
+pub mod graph;
 pub mod simulation;
 
 pub use bench_estimator::{Aky24IOBenchEstimate, Aky24IOBenchEstimator};

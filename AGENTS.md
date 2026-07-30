@@ -5,8 +5,10 @@ This repository provides implementations for lattice-cryptography operations (po
 
 ## Workspace Architecture
 - The authoritative crate map and dependency rules are documented in `docs/architecture.md`.
-- The workspace has exactly five crates: `mxx-primitives`, `mxx-gadgets`, `mxx-func-enc`, `mxx-we`, and `mxx-io`. Do not add a root facade crate.
-- Keep dependencies layered: primitives have no workspace dependencies; gadgets depend only on primitives; application crates depend on primitives and gadgets but never on one another.
+- The workspace has no root facade crate. The authoritative crate list is the
+  workspace member list in `Cargo.toml`.
+- Keep dependencies layered as documented in `docs/architecture.md`;
+  application crates never depend on one another.
 - The reusable gadget layer is `crates/gadgets/`; its circuit-specific gadget module is `circuit_gadgets`.
 
 ## Global Requirements

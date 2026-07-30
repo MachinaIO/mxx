@@ -8,6 +8,13 @@ use std::{borrow::Cow, fmt::Display};
 )]
 pub struct GateId(pub(crate) usize);
 
+impl GateId {
+    /// Returns the stable numeric identifier assigned by `PolyCircuit`.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
 impl Display for GateId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}", self.0)

@@ -153,7 +153,8 @@ impl<P: Poly> PolyCircuit<P> {
         stored.as_ref().num_output()
     }
 
-    pub(crate) fn lookup_table(&self, lut_id: usize) -> Arc<PublicLut<P>> {
+    /// Returns a shared, read-only lookup table for external circuit compilers.
+    pub fn lookup_table(&self, lut_id: usize) -> Arc<PublicLut<P>> {
         self.lookup_registry.lookups.get(&lut_id).expect("lookup table missing").clone()
     }
 
@@ -257,7 +258,8 @@ impl<P: Poly> PolyCircuit<P> {
         })
     }
 
-    pub(crate) fn sub_circuit_call_info(&self, call_id: usize) -> SubCircuitCallInfo {
+    /// Returns the immutable metadata needed to lower one sub-circuit call.
+    pub fn sub_circuit_call_info(&self, call_id: usize) -> SubCircuitCallInfo {
         let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
         SubCircuitCallInfo {
             sub_circuit_id: call.sub_circuit_id,
@@ -268,10 +270,8 @@ impl<P: Poly> PolyCircuit<P> {
         }
     }
 
-    pub(crate) fn summed_sub_circuit_call_info(
-        &self,
-        summed_call_id: usize,
-    ) -> SummedSubCircuitCallInfo {
+    /// Returns the immutable metadata needed to lower a summed sub-circuit call.
+    pub fn summed_sub_circuit_call_info(&self, summed_call_id: usize) -> SummedSubCircuitCallInfo {
         let call = self
             .summed_sub_circuit_calls
             .get(&summed_call_id)
@@ -453,7 +453,8 @@ impl<P: Poly> PolyCircuit<P> {
             .collect()
     }
 
-    pub(crate) fn registered_sub_circuit_ref(&self, circuit_id: usize) -> Arc<Self> {
+    /// Returns a shared, read-only registered sub-circuit.
+    pub fn registered_sub_circuit_ref(&self, circuit_id: usize) -> Arc<Self> {
         self.sub_circuit_registry.get(circuit_id)
     }
 

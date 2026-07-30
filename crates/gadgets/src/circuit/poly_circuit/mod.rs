@@ -399,12 +399,12 @@ pub(crate) struct SubCircuitCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SubCircuitCallInfo {
-    pub(crate) sub_circuit_id: usize,
-    pub(crate) inputs: Vec<BatchedWire>,
-    pub(crate) param_bindings: Arc<[SubCircuitParamValue]>,
-    pub(crate) input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
-    pub(crate) output_gate_ids: Vec<GateId>,
+pub struct SubCircuitCallInfo {
+    pub sub_circuit_id: usize,
+    pub inputs: Vec<BatchedWire>,
+    pub param_bindings: Arc<[SubCircuitParamValue]>,
+    pub input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
+    pub output_gate_ids: Vec<GateId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,12 +419,12 @@ pub(crate) struct SummedSubCircuitCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SummedSubCircuitCallInfo {
-    pub(crate) sub_circuit_id: usize,
-    pub(crate) call_inputs: Vec<Vec<BatchedWire>>,
-    pub(crate) param_bindings: Vec<Arc<[SubCircuitParamValue]>>,
-    pub(crate) input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
-    pub(crate) output_gate_ids: Vec<GateId>,
+pub struct SummedSubCircuitCallInfo {
+    pub sub_circuit_id: usize,
+    pub call_inputs: Vec<Vec<BatchedWire>>,
+    pub param_bindings: Vec<Arc<[SubCircuitParamValue]>>,
+    pub input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
+    pub output_gate_ids: Vec<GateId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -60,7 +60,7 @@ type ErrorNormSubCircuitSummaryCache =
 struct ErrorNormPolyNormKey {
     ctx_id: usize,
     sigma: String,
-    is_constant_poly: bool,
+    is_const_poly: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -129,7 +129,7 @@ fn error_norm_poly_norm_key(norm: &PolyNorm) -> ErrorNormPolyNormKey {
     ErrorNormPolyNormKey {
         ctx_id: Arc::as_ptr(&norm.ctx) as usize,
         sigma: norm.sigma.to_string(),
-        is_constant_poly: norm.is_constant_poly,
+        is_const_poly: norm.is_const_poly,
     }
 }
 

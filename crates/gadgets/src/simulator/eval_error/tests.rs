@@ -124,16 +124,16 @@ fn test_constant_poly_norm_mul_skips_ring_dim_sqrt() {
     let product = &lhs * &rhs;
 
     assert_eq!(product.sigma, BigDecimal::from(15u64));
-    assert!(product.is_constant_poly);
+    assert!(product.is_const_poly);
 
     let general = PolyNorm::new(ctx.clone(), BigDecimal::from(5u64));
     let mixed = &lhs * &general;
     assert_eq!(mixed.sigma, BigDecimal::from(15u64));
-    assert!(!mixed.is_constant_poly);
+    assert!(!mixed.is_const_poly);
 
     let general_product = &general * &general;
     assert_eq!(general_product.sigma, BigDecimal::from(25u64) * &ctx.ring_dim_sqrt);
-    assert!(!general_product.is_constant_poly);
+    assert!(!general_product.is_const_poly);
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn test_sub_circuit_plaintext_range_accepts_constant_at_declared_max() {
 
     assert_eq!(normalized.len(), 1);
     assert_eq!(normalized[0].sigma, BigDecimal::from(7u64));
-    assert!(normalized[0].is_constant_poly);
+    assert!(normalized[0].is_const_poly);
 }
 
 #[test]

@@ -38,7 +38,20 @@ pub struct VirtualAtomDecl {
 #[serde(tag = "tag", content = "value")]
 pub enum VirtualKind {
     Large,
-    Bounded { norm: RealExpr },
+    Bounded {
+        norm: RealExpr,
+        is_const_poly: bool,
+        zero_rows: Option<IntExpr>,
+        dependencies: DeclaredDependencyLabels,
+        clt_ready: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub enum DeclaredDependencyLabels {
+    Known(BTreeSet<String>),
+    Unknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -64,14 +77,14 @@ pub struct FoldSpec {
 #[serde(tag = "tag", content = "value")]
 pub enum FoldGroup {
     Signal { terms: BTreeSet<usize>, suffix_len: u32 },
-    Residual { terms: BTreeSet<usize> },
+    Noise { terms: BTreeSet<usize> },
     Keep { terms: BTreeSet<usize> },
 }
 
 impl FoldGroup {
     pub(crate) fn terms(&self) -> &BTreeSet<usize> {
         match self {
-            Self::Signal { terms, .. } | Self::Residual { terms } | Self::Keep { terms } => terms,
+            Self::Signal { terms, .. } | Self::Noise { terms } | Self::Keep { terms } => terms,
         }
     }
 }
@@ -347,7 +360,7 @@ fn validate_assumed_cycles(overlay: &SymbolicOverlay) -> Result<(), String> {
 pub(crate) type OverlayHashes = (Option<[u8; 32]>, Option<[u8; 32]>);
 
 pub(crate) fn overlay_hashes(overlay: &SymbolicOverlay) -> Result<OverlayHashes, String> {
-    const OVERLAY_FORMAT_VERSION: u32 = 1;
+    const OVERLAY_FORMAT_VERSION: u32 = 2;
     if overlay.is_empty() {
         return Ok((None, None));
     }

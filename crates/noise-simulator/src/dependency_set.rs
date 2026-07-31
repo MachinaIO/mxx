@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SourceId(pub u64);
+pub struct SourceId(pub [u8; 32]);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DependencySet {
@@ -14,6 +14,12 @@ impl DependencySet {
 
     pub fn singleton(source_id: SourceId) -> Self {
         DependencySet::Known(vec![source_id])
+    }
+
+    pub fn known(mut source_ids: Vec<SourceId>) -> Self {
+        source_ids.sort_unstable();
+        source_ids.dedup();
+        DependencySet::Known(source_ids)
     }
 
     pub fn is_disjoint(&self, other: &Self) -> bool {

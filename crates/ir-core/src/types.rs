@@ -65,9 +65,16 @@ pub enum WireType {
     Int,
     Real,
     Bool,
-    Bytes { length: IntExpr },
+    Bytes {
+        length: IntExpr,
+    },
     Matrix(MatrixType),
-    Trapdoor { matrix: MatrixType, sigma: crate::expr::RealExpr },
+    Trapdoor {
+        matrix: MatrixType,
+        sigma: crate::expr::RealExpr,
+        gadget_base: IntExpr,
+        digit_count: IntExpr,
+    },
     Preimage(MatrixType),
 }
 
@@ -80,9 +87,17 @@ pub enum ConcreteWireType {
     Int,
     Real,
     Bool,
-    Bytes { length: usize },
+    Bytes {
+        length: usize,
+    },
     Matrix(ConcreteMatrixType),
-    Trapdoor { matrix: ConcreteMatrixType, sigma: RealExpr },
+    Trapdoor {
+        matrix: ConcreteMatrixType,
+        sigma: RealExpr,
+        #[serde(with = "serde_support::bigint")]
+        gadget_base: BigInt,
+        digit_count: usize,
+    },
     Preimage(ConcreteMatrixType),
 }
 

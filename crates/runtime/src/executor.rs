@@ -15,7 +15,7 @@ use mxx_ir_core::{
     },
 };
 use num_bigint::{BigInt, Sign};
-use num_traits::{One, ToPrimitive, Zero};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -33,6 +33,8 @@ type TrapdoorParts<B> = (
     <B as Backend>::Matrix,
     ConcreteMatrixType,
     f64,
+    BigInt,
+    usize,
     Option<bool>,
 );
 
@@ -396,9 +398,10 @@ where
                 self.put(values, node.id, 0, RuntimeValue::Matrix(matrix));
             }
             NodeKind::GadgetTrapdoor { .. } => {
-                let ty = self.trapdoor_type(path, WireRef { node: node.id, port: Port(0) })?;
-                let sigma =
-                    self.trapdoor_sigma(path, WireRef { node: node.id, port: Port(0) }, env)?;
+                let trapdoor_wire = WireRef { node: node.id, port: Port(0) };
+                let ty = self.trapdoor_type(path, trapdoor_wire)?;
+                let sigma = self.trapdoor_sigma(path, trapdoor_wire, env)?;
+                let (gadget_base, digit_count) = self.trapdoor_layout(path, trapdoor_wire)?;
                 let public = self
                     .backend
                     .constant_matrix(
@@ -422,6 +425,8 @@ where
                         public,
                         matrix_type: ty,
                         sigma,
+                        gadget_base,
+                        digit_count,
                         gadget_small: Some(false),
                     },
                 );
@@ -596,15 +601,27 @@ where
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::Matrix(value));
             }
-            NodeKind::TrapdoorSample { sigma, .. } => {
+            NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, .. } => {
                 let matrix_wire = WireRef { node: node.id, port: Port(0) };
                 let trapdoor_wire = WireRef { node: node.id, port: Port(1) };
                 let ty = self.matrix_type(path, matrix_wire)?;
                 let sigma = sigma
                     .evaluate_f64(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
-                let (public, secret) =
-                    self.sample_trapdoor(path, matrix_wire, trapdoor_wire, &ty, sigma)?;
+                let gadget_base = gadget_base
+                    .evaluate(env)
+                    .map_err(|error| self.expression_error(node.id, error))?
+                    .abs();
+                let digit_count = self.eval_usize(node.id, digit_count, env)?;
+                let (public, secret) = self.sample_trapdoor(
+                    path,
+                    matrix_wire,
+                    trapdoor_wire,
+                    &ty,
+                    sigma,
+                    &gadget_base,
+                    digit_count,
+                )?;
                 self.put(values, node.id, 0, RuntimeValue::Matrix(public.clone()));
                 self.put(
                     values,
@@ -615,12 +632,14 @@ where
                         public,
                         matrix_type: ty,
                         sigma,
+                        gadget_base,
+                        digit_count,
                         gadget_small: None,
                     },
                 );
             }
             NodeKind::PreimageSample { .. } => {
-                let (secret, public, _, sigma, gadget_small) =
+                let (secret, public, _, sigma, gadget_base, digit_count, gadget_small) =
                     self.trapdoor(values, node.args[0])?;
                 let target = self.matrix(values, node.args[1])?;
                 let wire = WireRef { node: node.id, port: Port(0) };
@@ -631,7 +650,15 @@ where
                     let secret =
                         secret.as_ref().expect("sampled trapdoor must carry secret material");
                     self.sample_matrix(path, wire, &ty, |backend| {
-                        backend.sample_preimage(&ty, sigma, secret, &public, &target)
+                        backend.sample_preimage(
+                            &ty,
+                            sigma,
+                            &gadget_base,
+                            digit_count,
+                            secret,
+                            &public,
+                            &target,
+                        )
                     })?
                 };
                 self.put(values, node.id, 0, RuntimeValue::Matrix(value));
@@ -763,7 +790,7 @@ where
 
         let mut pending = Vec::new();
         for instance in 0..values.len() {
-            let (secret, public, _, sigma, gadget_small) =
+            let (secret, public, _, sigma, gadget_base, digit_count, gadget_small) =
                 self.trapdoor(&values[instance], node.args[0])?;
             let target = self.matrix(&mut values[instance], node.args[1])?;
             let wire = WireRef { node: node.id, port: Port(0) };
@@ -781,6 +808,8 @@ where
                 request: PreimageRequest {
                     matrix_type,
                     sigma,
+                    gadget_base,
+                    digit_count,
                     trapdoor: secret.expect("sampled trapdoor must carry secret material"),
                     public,
                     target,
@@ -917,6 +946,8 @@ where
         trapdoor_wire: WireRef,
         ty: &ConcreteMatrixType,
         sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
     ) -> Result<(B::Matrix, B::Trapdoor), ExecutionError> {
         let matrix_site = DrawSite {
             instantiation_path: path.to_vec(),
@@ -929,12 +960,15 @@ where
             port: trapdoor_wire.port,
         };
         match &mut self.sampling_mode {
-            SamplingMode::Fresh => {
-                self.backend.sample_trapdoor(ty, sigma).map_err(Self::backend_error)
-            }
+            SamplingMode::Fresh => self
+                .backend
+                .sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                .map_err(Self::backend_error),
             SamplingMode::Record(recorder) => {
-                let (public, secret) =
-                    self.backend.sample_trapdoor(ty, sigma).map_err(Self::backend_error)?;
+                let (public, secret) = self
+                    .backend
+                    .sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                    .map_err(Self::backend_error)?;
                 let public_bytes = self.backend.matrix_to_bytes(&public);
                 recorder.record(
                     matrix_site,
@@ -1073,9 +1107,15 @@ where
         wire: WireRef,
     ) -> Result<TrapdoorParts<B>, ExecutionError> {
         match self.value(values, wire)? {
-            RuntimeValue::Trapdoor { secret, public, matrix_type, sigma, gadget_small } => {
-                Ok((secret, public, matrix_type, sigma, gadget_small))
-            }
+            RuntimeValue::Trapdoor {
+                secret,
+                public,
+                matrix_type,
+                sigma,
+                gadget_base,
+                digit_count,
+                gadget_small,
+            } => Ok((secret, public, matrix_type, sigma, gadget_base, digit_count, gadget_small)),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
     }
@@ -1121,6 +1161,20 @@ where
         match self.validated.wires.get(&id) {
             Some(ConcreteWireType::Trapdoor { sigma, .. }) => {
                 sigma.evaluate_f64(env).map_err(|error| self.expression_error(wire.node, error))
+            }
+            _ => Err(ExecutionError::MissingMetadata(id)),
+        }
+    }
+
+    fn trapdoor_layout(
+        &self,
+        path: &[InstantiationFrame],
+        wire: WireRef,
+    ) -> Result<(BigInt, usize), ExecutionError> {
+        let id = WireId { instantiation_path: path.to_vec(), wire };
+        match self.validated.wires.get(&id) {
+            Some(ConcreteWireType::Trapdoor { gadget_base, digit_count, .. }) => {
+                Ok((gadget_base.clone(), *digit_count))
             }
             _ => Err(ExecutionError::MissingMetadata(id)),
         }
@@ -1358,6 +1412,8 @@ mod tests {
     #[test]
     fn trapdoor_transcript_replays_serialized_secret_and_public_values() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let mut public_type = matrix_type(&parameters);
+        public_type.columns = mxx_ir_core::IntExpr::constant(2 + parameters.modulus_digits());
         let graph = Graph {
             name: "trapdoor-transcript".to_owned(),
             parameters: Vec::new(),
@@ -1365,11 +1421,15 @@ mod tests {
             nodes: vec![Node {
                 id: NodeId(1),
                 kind: NodeKind::TrapdoorSample {
-                    matrix_type: matrix_type(&parameters),
+                    matrix_type: public_type,
                     sigma: mxx_ir_core::RealExpr::Rational(
                         mxx_ir_core::expr::Rational::new(BigInt::from(4), BigInt::from(1))
                             .expect("rational"),
                     ),
+                    gadget_base: mxx_ir_core::IntExpr::constant(
+                        BigInt::one() << parameters.base_bits(),
+                    ),
+                    digit_count: mxx_ir_core::IntExpr::constant(parameters.modulus_digits()),
                 },
                 args: Vec::new(),
             }],
@@ -1436,6 +1496,10 @@ mod tests {
                     kind: NodeKind::TrapdoorSample {
                         matrix_type: public_type.clone(),
                         sigma: sigma.clone(),
+                        gadget_base: mxx_ir_core::IntExpr::constant(
+                            BigInt::one() << parameters.base_bits(),
+                        ),
+                        digit_count: mxx_ir_core::IntExpr::constant(digits),
                     },
                     args: Vec::new(),
                 },
@@ -1444,6 +1508,10 @@ mod tests {
                     kind: NodeKind::TrapdoorSample {
                         matrix_type: public_type.clone(),
                         sigma: sigma.clone(),
+                        gadget_base: mxx_ir_core::IntExpr::constant(
+                            BigInt::one() << parameters.base_bits(),
+                        ),
+                        digit_count: mxx_ir_core::IntExpr::constant(digits),
                     },
                     args: Vec::new(),
                 },
@@ -2332,8 +2400,12 @@ mod tests {
             mxx_ir_core::expr::Rational::new(BigInt::from(4), BigInt::one())
                 .expect("positive sigma"),
         );
-        let trapdoor_wire_type =
-            WireType::Trapdoor { matrix: public_type.clone(), sigma: sigma.clone() };
+        let trapdoor_wire_type = WireType::Trapdoor {
+            matrix: public_type.clone(),
+            sigma: sigma.clone(),
+            gadget_base: mxx_ir_core::IntExpr::constant(BigInt::one() << parameters.base_bits()),
+            digit_count: mxx_ir_core::IntExpr::constant(parameters.modulus_digits()),
+        };
         let body = Graph {
             name: "preimage-body".to_owned(),
             parameters: vec![CompileParameter {
@@ -2380,7 +2452,14 @@ mod tests {
             nodes: vec![
                 Node {
                     id: NodeId(1),
-                    kind: NodeKind::TrapdoorSample { matrix_type: public_type, sigma },
+                    kind: NodeKind::TrapdoorSample {
+                        matrix_type: public_type,
+                        sigma,
+                        gadget_base: mxx_ir_core::IntExpr::constant(
+                            BigInt::one() << parameters.base_bits(),
+                        ),
+                        digit_count: mxx_ir_core::IntExpr::constant(parameters.modulus_digits()),
+                    },
                     args: Vec::new(),
                 },
                 Node {

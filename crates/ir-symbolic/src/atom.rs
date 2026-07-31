@@ -3,7 +3,10 @@ use crate::{
     serde_support,
     term::TermList,
     types::{ConcreteMatrixType, NodeId, WireRef},
-    ubound::UBound,
+};
+use mxx_ir_core::{
+    expr::RealExpr,
+    node::{ConstantMatrix, HashVariant},
 };
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
@@ -67,7 +70,101 @@ pub enum AtomId {
 #[serde(tag = "tag", content = "value")]
 pub enum AtomKind {
     Large,
-    Bounded { norm: UBound },
+    Bounded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub enum ExternalSourceKind {
+    Matrix,
+    Preimage,
+    TrapdoorUniform,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub enum SourceKind {
+    ConstantMatrix {
+        value: ConstantMatrix,
+    },
+    UniformSample {
+        #[serde(with = "serde_support::bigint")]
+        minimum: BigInt,
+        #[serde(with = "serde_support::bigint")]
+        maximum: BigInt,
+    },
+    GaussianSample {
+        sigma: RealExpr,
+    },
+    TrapdoorUniform {
+        sigma: RealExpr,
+        #[serde(with = "serde_support::bigint")]
+        gadget_base: BigInt,
+        digit_count: usize,
+    },
+    PreimageSample {
+        trapdoor_sigma: RealExpr,
+        #[serde(with = "serde_support::bigint")]
+        gadget_base: BigInt,
+        digit_count: usize,
+        public_matrix_rows: usize,
+        target_block_rows: usize,
+        zero_rows: Option<usize>,
+    },
+    GadgetDecomposition {
+        #[serde(with = "serde_support::bigint")]
+        base: BigInt,
+        digit_count: usize,
+        small: bool,
+    },
+    HashSample {
+        variant: HashVariant,
+        #[serde(with = "serde_support::optional_bigint")]
+        base: Option<BigInt>,
+        digit_count: Option<usize>,
+    },
+    HashTarget {
+        variant: HashVariant,
+    },
+    External {
+        kind: ExternalSourceKind,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub enum DeclaredDependencyRef {
+    Local(String),
+    Imported { production_id: ProductionId, label: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub enum DeclaredDependencies {
+    Known(BTreeSet<DeclaredDependencyRef>),
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssumedMetadata {
+    pub norm: RealExpr,
+    pub is_const_poly: bool,
+    pub zero_rows: Option<usize>,
+    pub dependencies: DeclaredDependencies,
+    pub clt_ready: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub enum SelectionDomainRef {
+    Local(SelectionDomain),
+    Imported { production_id: ProductionId, domain: SelectionDomain },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndicatorRole {
+    pub domain: SelectionDomainRef,
+    pub branch: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -106,7 +203,7 @@ pub enum DefExpr {
         branch: u64,
     },
     ModDownError {
-        input: WireRef,
+        input: TermList,
         signal: TermList,
         #[serde(with = "serde_support::bigint")]
         source_modulus: BigInt,
@@ -114,7 +211,7 @@ pub enum DefExpr {
         target_modulus: BigInt,
     },
     ModUpError {
-        input: WireRef,
+        input: TermList,
         lifted: TermList,
         #[serde(with = "serde_support::bigint")]
         source_modulus: BigInt,
@@ -128,9 +225,9 @@ pub enum DefExpr {
 #[serde(tag = "tag", content = "value")]
 #[allow(clippy::large_enum_variant)]
 pub enum AtomClass {
-    Source,
+    Source { source: SourceKind },
     Derived { definition: DefExpr },
-    Assumed,
+    Assumed { metadata: Option<AssumedMetadata> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -155,16 +252,10 @@ pub struct Atom {
     pub matrix_type: ConcreteMatrixType,
     pub dependencies: BTreeSet<AtomId>,
     pub preimage_refs: Option<PreimageRefs>,
+    pub indicator: Option<IndicatorRole>,
 }
 
 impl Atom {
-    pub fn norm(&self) -> Option<&UBound> {
-        match &self.kind {
-            AtomKind::Large => None,
-            AtomKind::Bounded { norm } => Some(norm),
-        }
-    }
-
     pub fn is_large(&self) -> bool {
         matches!(self.kind, AtomKind::Large)
     }

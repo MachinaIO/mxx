@@ -34,6 +34,8 @@ pub struct DiamondInjectorGraphConfig {
     pub base: usize,
     pub batch_bits: usize,
     pub trapdoor_sigma: RealExpr,
+    pub gadget_base: IntExpr,
+    pub gadget_digit_count: IntExpr,
     pub error_sigma: RealExpr,
 }
 
@@ -223,7 +225,12 @@ pub fn build_preprocessing_graph(
         checkpoints.push(
             (0..count)
                 .map(|_| {
-                    builder.trapdoor_sample(public_type.clone(), config.trapdoor_sigma.clone())
+                    builder.trapdoor_sample(
+                        public_type.clone(),
+                        config.trapdoor_sigma.clone(),
+                        config.gadget_base.clone(),
+                        config.gadget_digit_count.clone(),
+                    )
                 })
                 .collect(),
         );
@@ -545,14 +552,18 @@ fn trapdoor_checkpoints(
     config: &DiamondInjectorGraphConfig,
 ) -> Result<Vec<Vec<TrapdoorWire>>, DiamondInjectorGraphError> {
     let mut samples = graph.nodes.iter().filter_map(|node| match &node.kind {
-        NodeKind::TrapdoorSample { matrix_type, sigma } => Some(TrapdoorWire {
-            wire: WireRef { node: node.id, port: Port(1) },
-            public: MatrixWire {
-                wire: WireRef { node: node.id, port: Port(0) },
-                matrix_type: matrix_type.clone(),
-            },
-            sigma: sigma.clone(),
-        }),
+        NodeKind::TrapdoorSample { matrix_type, sigma, gadget_base, digit_count } => {
+            Some(TrapdoorWire {
+                wire: WireRef { node: node.id, port: Port(1) },
+                public: MatrixWire {
+                    wire: WireRef { node: node.id, port: Port(0) },
+                    matrix_type: matrix_type.clone(),
+                },
+                sigma: sigma.clone(),
+                gadget_base: gadget_base.clone(),
+                digit_count: digit_count.clone(),
+            })
+        }
         _ => None,
     });
     let mut checkpoints = Vec::with_capacity(config.input_count + 1);
@@ -958,6 +969,8 @@ mod tests {
             base: 2,
             batch_bits: 1,
             trapdoor_sigma: RealExpr::FromInt(IntExpr::constant(4)),
+            gadget_base: IntExpr::constant(2),
+            gadget_digit_count: IntExpr::constant(7),
             error_sigma: RealExpr::FromInt(IntExpr::constant(1)),
         }
     }

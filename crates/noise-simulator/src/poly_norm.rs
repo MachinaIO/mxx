@@ -1,5 +1,6 @@
-use crate::{impl_binop_with_refs, simulator::SimulatorContext};
+use crate::SimulatorContext;
 use bigdecimal::BigDecimal;
+use mxx_primitives::impl_binop_with_refs;
 use num_traits::{One, Zero};
 use std::{
     ops::{Add, AddAssign, Mul, MulAssign},
@@ -16,7 +17,6 @@ pub struct PolyNorm {
     pub norm: BigDecimal,
     pub sigma: BigDecimal,
     pub is_const_poly: bool,
-    pub is_constant_poly: bool,
 }
 
 impl PolyNorm {
@@ -26,7 +26,7 @@ impl PolyNorm {
 
     fn from_norm(ctx: Arc<SimulatorContext>, norm: BigDecimal, is_const_poly: bool) -> Self {
         Self::assert_nonnegative_norm(&norm);
-        PolyNorm { ctx, sigma: norm.clone(), norm, is_const_poly, is_constant_poly: is_const_poly }
+        PolyNorm { ctx, sigma: norm.clone(), norm, is_const_poly }
     }
 
     pub fn new(ctx: Arc<SimulatorContext>, norm: BigDecimal) -> Self {
@@ -39,7 +39,6 @@ impl PolyNorm {
 
     pub fn into_constant_poly(mut self) -> Self {
         self.is_const_poly = true;
-        self.is_constant_poly = true;
         self
     }
 
@@ -75,7 +74,6 @@ impl AddAssign for PolyNorm {
         self.norm += rhs.norm;
         self.sigma = self.norm.clone();
         self.is_const_poly = self.is_const_poly && rhs.is_const_poly;
-        self.is_constant_poly = self.is_const_poly;
     }
 }
 
@@ -99,7 +97,6 @@ impl MulAssign for PolyNorm {
         }
         self.sigma = self.norm.clone();
         self.is_const_poly = lhs_is_const_poly && rhs_is_const_poly;
-        self.is_constant_poly = self.is_const_poly;
     }
 }
 

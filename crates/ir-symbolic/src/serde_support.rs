@@ -1,4 +1,4 @@
-use num_bigint::{BigInt, BigUint};
+use num_bigint::BigInt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 use std::str::FromStr;
 
@@ -136,15 +136,24 @@ pub(crate) mod bigint {
     }
 }
 
-pub(crate) mod biguint {
+pub(crate) mod optional_bigint {
     use super::*;
 
-    pub fn serialize<S: Serializer>(value: &BigUint, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&value.to_string())
+    pub fn serialize<S: Serializer>(
+        value: &Option<BigInt>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serializer.serialize_some(&value.to_string()),
+            None => serializer.serialize_none(),
+        }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BigUint, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        BigUint::from_str(&value).map_err(D::Error::custom)
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<BigInt>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| BigInt::from_str(&value).map_err(D::Error::custom))
+            .transpose()
     }
 }

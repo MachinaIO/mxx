@@ -14,6 +14,8 @@ mod poly_gpu;
 pub struct PreimageRequest<M, T> {
     pub matrix_type: ConcreteMatrixType,
     pub sigma: f64,
+    pub gadget_base: BigInt,
+    pub digit_count: usize,
     pub trapdoor: T,
     pub public: M,
     pub target: M,
@@ -96,11 +98,15 @@ pub trait Backend {
         &mut self,
         ty: &ConcreteMatrixType,
         sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
     ) -> Result<(Self::Matrix, Self::Trapdoor), Self::Error>;
     fn sample_preimage(
         &mut self,
         ty: &ConcreteMatrixType,
         sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
         trapdoor: &Self::Trapdoor,
         public: &Self::Matrix,
         target: &Self::Matrix,
@@ -115,6 +121,8 @@ pub trait Backend {
                 self.sample_preimage(
                     &request.matrix_type,
                     request.sigma,
+                    &request.gadget_base,
+                    request.digit_count,
                     &request.trapdoor,
                     &request.public,
                     &request.target,
@@ -174,6 +182,8 @@ pub enum RuntimeValue<B: Backend> {
         public: B::Matrix,
         matrix_type: ConcreteMatrixType,
         sigma: f64,
+        gadget_base: BigInt,
+        digit_count: usize,
         gadget_small: Option<bool>,
     },
     LazyArtifact {
@@ -192,11 +202,21 @@ impl<B: Backend> Clone for RuntimeValue<B> {
             Self::Bool(value) => Self::Bool(*value),
             Self::Bytes(value) => Self::Bytes(value.clone()),
             Self::Matrix(value) => Self::Matrix(value.clone()),
-            Self::Trapdoor { secret, public, matrix_type, sigma, gadget_small } => Self::Trapdoor {
+            Self::Trapdoor {
+                secret,
+                public,
+                matrix_type,
+                sigma,
+                gadget_base,
+                digit_count,
+                gadget_small,
+            } => Self::Trapdoor {
                 secret: secret.clone(),
                 public: public.clone(),
                 matrix_type: matrix_type.clone(),
                 sigma: *sigma,
+                gadget_base: gadget_base.clone(),
+                digit_count: *digit_count,
                 gadget_small: *gadget_small,
             },
             Self::LazyArtifact { production, name, index, matrix_type } => Self::LazyArtifact {

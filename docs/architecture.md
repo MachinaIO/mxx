@@ -9,8 +9,9 @@ Arrows below point from a consumer to one of its dependencies:
 ```text
 mxx-runtime          -> mxx-ir-core, mxx-primitives
 mxx-ir-symbolic    -> mxx-ir-core
+mxx-noise-simulator -> mxx-ir-symbolic, mxx-primitives
 mxx-bench-estimator  -> mxx-ir-core, mxx-runtime
-mxx-gadgets          -> mxx-primitives
+mxx-gadgets          -> mxx-primitives, mxx-noise-simulator
 mxx-bgg              -> mxx-ir-core, mxx-gadgets
 application crates   -> graph, execution, primitive, gadget, and BGG layers
 ```
@@ -20,9 +21,11 @@ Dependencies follow these rules:
 - `mxx-ir-core` has no dependency on another workspace crate.
 - `mxx-runtime` depends on `mxx-ir-core` and `mxx-primitives`.
 - `mxx-ir-symbolic` depends only on `mxx-ir-core`.
+- `mxx-noise-simulator` depends on `mxx-ir-symbolic` and `mxx-primitives`.
 - `mxx-bench-estimator` depends on `mxx-ir-core` and reuses the runtime liveness schedule.
 - `mxx-primitives` has no dependency on another workspace crate.
-- `mxx-gadgets` depends only on `mxx-primitives`.
+- `mxx-gadgets` depends on `mxx-primitives` and re-exports the historical norm
+  kernel from `mxx-noise-simulator` for existing callers.
 - `mxx-bgg` depends on `mxx-ir-core` and `mxx-gadgets`.
 - `mxx-func-enc`, `mxx-we`, and `mxx-io` may depend on the graph,
   execution, primitive, gadget, and BGG compiler layers.
@@ -55,10 +58,15 @@ GPU implementations of primitive operations stay in this crate even when a highe
 | Crate | Path | Responsibility |
 | --- | --- | --- |
 | `mxx-ir-core` | `crates/ir-core/` | Executable typed graph structure, exact compile expressions, concrete type and shape validation, canonical identities, and runtime artifact manifests. This is the core Graph IR. |
-| `mxx-ir-symbolic` | `crates/ir-symbolic/` | Optional symbolic atom and term identities, elaboration, rewrite machinery, conservative internal boundedness metadata, and cross-graph symbolic manifests. It does not provide noise or residual analysis and does not define BGG-, Diamond-, or AKY-specific invariants. |
+| `mxx-ir-symbolic` | `crates/ir-symbolic/` | Optional symbolic atom and term identities, source provenance, elaboration, rewrite machinery, and cross-graph symbolic manifests. It retains only the structural `Large`/`Bounded` classification and performs no numerical bound calculation. It does not define BGG-, Diamond-, or AKY-specific invariants. |
+| `mxx-noise-simulator` | `crates/noise-simulator/` | Target-driven numerical analysis of elaborated symbolic graphs. It owns all magnitude arithmetic, declared virtual-atom metadata, stable statistical dependencies, selection branch joins, threshold-decode reports, and the historical `PolyNorm`/`PolyMatrixNorm` rules. |
 | `mxx-runtime` | `crates/runtime/` | CPU/GPU graph execution over existing primitive APIs, transcript recording/replay, shared liveness, indexed artifact-family persistence, and manifest production. |
 | `mxx-bench-estimator` | `crates/bench-estimator/` | Per-node measurement composition, binding-sensitive subgraph reuse, critical paths, parallel waves, and persistent/workspace peak modeling. |
 | `mxx-bgg` | `crates/bgg/` | BGG+ public-key and encoding wire bundles plus recursive `PolyCircuit` graph lowering. Lookup and slot-transfer gates receive an explicit scheme-specific lowering context because `PolyCircuit` does not own their preprocessing state. Concrete BGG arithmetic remains owned by `mxx-gadgets`. |
+
+Trapdoor types and sampling nodes carry `gadget_base` and `digit_count`
+explicitly. The runtime validates those values against the concrete backend
+parameters before calling the unchanged trapdoor or preimage sampler.
 
 `GadgetDecompose` and decomposed hash nodes normally derive their digit count
 from the modulus and base. DCRT small decomposition is different: its width is
@@ -92,7 +100,8 @@ Fold validation:
 | Expected and actual canonical term lists differ | Error with both descriptions |
 | Groups overlap, omit a position, or use an invalid position | Error |
 | A signal group lacks a common non-scalar suffix or has a large prefix | Error |
-| A residual group contains a large atom | Error |
+| A noise group contains a large atom | Error |
+| A whole-signal group (`suffix_len = 0`) contains standalone noise | Error |
 | A selector targets a non-matrix wire or overlaps another selector | Error |
 | A folded prefix carries preimage references | Warning |
 | A selector matches no concrete wire | Warning |
@@ -105,7 +114,6 @@ Unfold validation:
 | An assumed preimage does not satisfy `uniform × preimage = target` by type | Error |
 | Assumed preimage targets form a cycle | Error |
 | Bounded/large character differs from the current description | Error |
-| A tighter bounded description is assumed | Warning |
 | A non-source description is replaced without `replace_derived` | Error |
 | A non-source description is replaced with `replace_derived` | Warning |
 | A preimage description is discarded | Warning |
@@ -117,6 +125,42 @@ the original production namespace of re-exported records, and export the
 complete closure of definitions, dependencies, uniforms, and preimage targets.
 Multiple projections of one production merge only when their interpretation
 digests and every overlapping record agree.
+
+Symbolic manifest format version 3 exports self-contained source parameters,
+assumed bounded metadata, and selection-domain roles. Locally declared
+dependency labels and selection domains are qualified by their production
+identity during export, and re-export preserves that origin.
+
+#### Noise simulation
+
+`mxx-noise-simulator::simulate` evaluates only matrix graph outputs and the
+inputs of instantiated `ThresholdDecode` nodes. Atom results are memoized.
+Reports distinguish signal from noise and state that their values are
+high-probability coefficient envelopes using the existing CLT eligibility
+rules, not worst-case bounds.
+
+- Gaussian samples use the existing `6.5 * sigma` envelope.
+- Preimage samples derive sigma from the explicit trapdoor sigma, gadget base,
+  digit count, public-matrix row count, and target block-row count, then apply
+  the same `6.5` envelope.
+- Balanced gadget digits retain
+  `6.5 * sqrt((base^2 + 2) / 12)`.
+- Selection joins use the maximum branch norm. Dependencies are unioned,
+  `is_const_poly` is combined with logical AND, equal `zero_rows` metadata is
+  retained, and the joined result is not CLT-ready.
+- Exact rational `RealExpr` values convert directly to `BigDecimal`; square
+  roots use `BigDecimal::sqrt` without an intermediate `f64`.
+- A bounded external input requires imported manifest metadata or an unfold
+  assumption. The simulator does not guess a bound.
+- Unknown modulus-switch shapes are reported as unsupported instead of being
+  assigned a new universal formula.
+
+Opaque tensor nodes are unsupported in the initial symbolic elaborator.
+Concat, reshape, and folds reject any operation that would hide a signal/noise
+mixture inside one atom. The range-versus-modulus comparison for
+`UniformSample` remains in `mxx-ir-symbolic` because it determines the
+structural `Large`/`Bounded` classification rather than a numerical noise
+bound.
 
 ### `mxx-gadgets`
 
@@ -134,7 +178,7 @@ digests and every overlapping record agree.
 | `crates/gadgets/src/slot_transfer/` | Public-key and encoding slot transfer. |
 | `crates/gadgets/src/commit/` | Commitment components, including WEE25. |
 | `crates/gadgets/src/bench_estimator/` | Reusable circuit and native-operation benchmark models. |
-| `crates/gadgets/src/simulator/` | Norm, lattice-security, and shared application simulation utilities. |
+| `crates/gadgets/src/simulator/` | Lattice-security and shared application simulation utilities, plus compatibility re-exports of the generic norm kernel owned by `mxx-noise-simulator`. |
 | `crates/gadgets/src/storage/` | Artifact storage helpers. |
 
 The former circuit-gadget directory is now `crates/gadgets/src/circuit_gadgets/` so that the crate name `mxx-gadgets` describes the full layer rather than one nested directory.

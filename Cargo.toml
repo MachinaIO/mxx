@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/ir-core",
     "crates/ir-symbolic",
+    "crates/noise-simulator",
     "crates/runtime",
     "crates/bench-estimator",
     "crates/bgg",
@@ -26,6 +27,7 @@ mxx-we = { path = "crates/we" }
 mxx-io = { path = "crates/io" }
 mxx-ir-core = { path = "crates/ir-core" }
 mxx-ir-symbolic = { path = "crates/ir-symbolic" }
+mxx-noise-simulator = { path = "crates/noise-simulator" }
 mxx-runtime = { path = "crates/runtime" }
 mxx-bench-estimator = { path = "crates/bench-estimator" }
 mxx-bgg = { path = "crates/bgg" }

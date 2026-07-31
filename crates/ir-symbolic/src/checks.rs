@@ -13,7 +13,6 @@ pub enum WarningKind {
     DroppedPreimageReferences,
     RuntimeSelectBoundsCheck,
     ReplacedDerivedDescription,
-    StrengthenedBound,
     UnusedOverlaySelector,
     UnusedVirtualAtom,
     UnusedAssumedTermList,

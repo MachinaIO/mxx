@@ -20,6 +20,7 @@ The repository is a virtual Cargo workspace with no root facade crate:
 | --- | --- |
 | `mxx-ir-core` | Executable typed graph IR, exact compile expressions, concrete validation, and artifact manifests. |
 | `mxx-ir-symbolic` | Optional symbolic-term elaboration, rewrite, and cross-graph identity operations over Graph IR. |
+| `mxx-noise-simulator` | Numerical noise analysis over elaborated symbolic IR using the existing polynomial and matrix norm rules. |
 | `mxx-runtime` | CPU/GPU execution, reproducible sampling transcripts, liveness, and indexed artifact-family persistence. |
 | `mxx-bench-estimator` | Binding-sensitive measured graph-cost composition, critical paths, parallel waves, and memory peaks. |
 | `mxx-primitives` | Polynomial and matrix representations, samplers, analytical sampling bounds, OpenFHE integration, and all native CUDA kernels and wrappers. |
@@ -34,8 +35,9 @@ The principal dependency directions are shown with consumers on the left:
 ```text
 mxx-runtime          -> mxx-ir-core, mxx-primitives
 mxx-ir-symbolic    -> mxx-ir-core
+mxx-noise-simulator -> mxx-ir-symbolic, mxx-primitives
 mxx-bench-estimator  -> mxx-ir-core, mxx-runtime
-mxx-gadgets          -> mxx-primitives
+mxx-gadgets          -> mxx-primitives, mxx-noise-simulator
 mxx-bgg              -> mxx-ir-core, mxx-gadgets
 mxx-func-enc/we/io   -> lower layers, never one another
 ```

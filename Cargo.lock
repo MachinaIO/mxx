@@ -517,6 +517,7 @@ dependencies = [
  "itertools",
  "keccak-asm",
  "memory-stats",
+ "mxx-noise-simulator",
  "mxx-primitives",
  "num-bigint",
  "num-traits",
@@ -580,6 +581,22 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "mxx-noise-simulator"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "mxx-ir-symbolic",
+ "mxx-primitives",
+ "num-bigint",
+ "num-traits",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

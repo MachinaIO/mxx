@@ -40,6 +40,15 @@ pub enum PolyBackendError {
     TrapdoorDeserialization,
     #[error("matrix is empty")]
     EmptyMatrix,
+    #[error(
+        "declared gadget layout base={declared_base}, digits={declared_digits} does not match backend base={backend_base}, digits={backend_digits}"
+    )]
+    GadgetLayoutMismatch {
+        declared_base: BigInt,
+        declared_digits: usize,
+        backend_base: BigInt,
+        backend_digits: usize,
+    },
     #[error(transparent)]
     ModulusRaise(#[from] ModulusRaiseError),
 }
@@ -103,6 +112,24 @@ where
             ring_dimension: matrix_type.ring_dimension,
         };
         self.parameters.get(&key).ok_or(PolyBackendError::MissingParameters(key))
+    }
+
+    pub(super) fn validate_gadget_layout(
+        parameters: &<M::P as Poly>::Params,
+        gadget_base: &BigInt,
+        digit_count: usize,
+    ) -> Result<(), PolyBackendError> {
+        let backend_base = BigInt::one() << parameters.base_bits() as usize;
+        let backend_digits = parameters.modulus_digits();
+        if gadget_base != &backend_base || digit_count != backend_digits {
+            return Err(PolyBackendError::GadgetLayoutMismatch {
+                declared_base: gadget_base.clone(),
+                declared_digits: digit_count,
+                backend_base,
+                backend_digits,
+            });
+        }
+        Ok(())
     }
 
     fn parameters_for_matrix(
@@ -358,8 +385,11 @@ where
         &mut self,
         ty: &ConcreteMatrixType,
         sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
     ) -> Result<(M, T::Trapdoor), Self::Error> {
         let parameters = self.parameters(ty)?;
+        Self::validate_gadget_layout(parameters, gadget_base, digit_count)?;
         let sampler = T::new(parameters, sigma);
         let (trapdoor, public) = sampler.trapdoor(parameters, ty.rows);
         Ok((public, trapdoor))
@@ -369,11 +399,14 @@ where
         &mut self,
         ty: &ConcreteMatrixType,
         sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
         trapdoor: &T::Trapdoor,
         public: &M,
         target: &M,
     ) -> Result<M, Self::Error> {
         let parameters = self.parameters(ty)?;
+        Self::validate_gadget_layout(parameters, gadget_base, digit_count)?;
         let sampler = T::new(parameters, sigma);
         Ok(sampler.preimage(parameters, trapdoor, public, target))
     }
@@ -394,6 +427,8 @@ where
                     self.sample_preimage(
                         &request.matrix_type,
                         request.sigma,
+                        &request.gadget_base,
+                        request.digit_count,
                         &request.trapdoor,
                         &request.public,
                         &request.target,

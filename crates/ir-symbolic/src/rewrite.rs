@@ -103,11 +103,12 @@ mod tests {
     use super::*;
     use crate::{
         atom::{
-            Atom, AtomClass, AtomId, AtomKind, ManifestAtomId, PreimageRefs, ProductionId, SpecHash,
+            Atom, AtomClass, AtomId, AtomKind, ManifestAtomId, PreimageRefs, ProductionId,
+            SourceKind, SpecHash,
         },
+        node::ConstantMatrix,
         term::Factor,
         types::{ConcreteMatrixType, NodeId, Port},
-        ubound::UBound,
     };
     use num_bigint::BigInt;
     use std::collections::BTreeSet;
@@ -119,7 +120,9 @@ mod tests {
     fn atom(id: AtomId, kind: AtomKind, refs: Option<PreimageRefs>) -> Atom {
         Atom {
             id,
-            class: AtomClass::Source,
+            class: AtomClass::Source {
+                source: SourceKind::ConstantMatrix { value: ConstantMatrix::Identity },
+            },
             kind,
             matrix_type: ConcreteMatrixType {
                 modulus: BigInt::from(17),
@@ -129,6 +132,7 @@ mod tests {
             },
             dependencies: BTreeSet::new(),
             preimage_refs: refs,
+            indicator: None,
         }
     }
 
@@ -142,7 +146,7 @@ mod tests {
         atoms.insert(atom(uniform.clone(), AtomKind::Large, None));
         atoms.insert(atom(
             preimage.clone(),
-            AtomKind::Bounded { norm: UBound::one() },
+            AtomKind::Bounded,
             Some(PreimageRefs { uniform: uniform.clone(), target: TargetRef::Local(target_wire) }),
         ));
         atoms.insert(atom(target_atom.clone(), AtomKind::Large, None));
@@ -194,7 +198,7 @@ mod tests {
         atoms.insert(atom(a_second.clone(), AtomKind::Large, None));
         atoms.insert(atom(
             k_second.clone(),
-            AtomKind::Bounded { norm: UBound::one() },
+            AtomKind::Bounded,
             Some(PreimageRefs { uniform: a_second, target }),
         ));
         let input = TermList {
@@ -220,7 +224,7 @@ mod tests {
         atoms.insert(atom(uniform.clone(), AtomKind::Large, None));
         atoms.insert(atom(
             preimage.clone(),
-            AtomKind::Bounded { norm: UBound::one() },
+            AtomKind::Bounded,
             Some(PreimageRefs { uniform: uniform.clone(), target: TargetRef::Local(target) }),
         ));
         let terms = TermList {

@@ -23,16 +23,20 @@ where
     let Some(first) = requests.first() else {
         return Ok(Vec::new());
     };
-    if requests
-        .iter()
-        .any(|request| request.matrix_type != first.matrix_type || request.sigma != first.sigma)
-    {
+    if requests.iter().any(|request| {
+        request.matrix_type != first.matrix_type ||
+            request.sigma != first.sigma ||
+            request.gadget_base != first.gadget_base ||
+            request.digit_count != first.digit_count
+    }) {
         return requests
             .into_iter()
             .map(|request| {
                 backend.sample_preimage(
                     &request.matrix_type,
                     request.sigma,
+                    &request.gadget_base,
+                    request.digit_count,
                     &request.trapdoor,
                     &request.public,
                     &request.target,
@@ -41,6 +45,11 @@ where
             .collect();
     }
     let parameters = backend.parameters(&first.matrix_type)?;
+    PolyBackend::<M, U, H, T>::validate_gadget_layout(
+        parameters,
+        &first.gadget_base,
+        first.digit_count,
+    )?;
     let sampler = T::new(parameters, first.sigma);
     let batched = requests
         .iter()

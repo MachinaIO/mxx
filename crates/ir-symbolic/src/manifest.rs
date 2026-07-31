@@ -1,7 +1,9 @@
 use crate::{
     atom::{
-        Atom, AtomClass, AtomId, AtomKind, AtomTable, ConcatAxis, DefExpr, ManifestAtomId,
-        PreimageRefs, ProductionId, SpecHash, TargetRef, TermListId,
+        AssumedMetadata, Atom, AtomClass, AtomId, AtomKind, AtomTable, ConcatAxis,
+        DeclaredDependencies, DeclaredDependencyRef, DefExpr, IndicatorRole, ManifestAtomId,
+        PreimageRefs, ProductionId, SelectionDomainRef, SourceKind, SpecHash, TargetRef,
+        TermListId,
     },
     overlay::AssumedTermListId,
     serde_support,
@@ -14,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
 use thiserror::Error;
 
-pub const SYMBOLIC_MANIFEST_VERSION: u32 = 2;
+pub const SYMBOLIC_MANIFEST_VERSION: u32 = 3;
 pub type InterpretationDigest = (Option<[u8; 32]>, Option<[u8; 32]>);
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -82,14 +84,15 @@ pub struct ManifestAtom {
     pub matrix_type: ConcreteMatrixType,
     pub dependencies: BTreeSet<ManifestAtomRef>,
     pub preimage_refs: Option<ManifestPreimageRefs>,
+    pub indicator: Option<IndicatorRole>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tag", content = "value")]
 pub enum ManifestAtomClass {
-    Source,
+    Source { source: SourceKind },
     Derived { definition: ManifestDefExpr },
-    Assumed,
+    Assumed { metadata: Option<AssumedMetadata> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -130,13 +133,13 @@ pub enum ManifestDefExpr {
         branch: u64,
     },
     ModDownError {
-        input: WireRef,
+        input: ManifestTermList,
         signal: ManifestTermList,
         source_modulus: String,
         target_modulus: String,
     },
     ModUpError {
-        input: WireRef,
+        input: ManifestTermList,
         lifted: ManifestTermList,
         source_modulus: String,
         target_modulus: String,
@@ -524,8 +527,10 @@ pub fn export_manifest(
                 };
                 target_queue.push_back((preimage.target.clone(), local_wire));
             }
-            atom_records
-                .insert(reference, export_atom(atom, &mut atom_origins, &mut term_origins)?);
+            atom_records.insert(
+                reference,
+                export_atom(atom, &production_id, &mut atom_origins, &mut term_origins)?,
+            );
         }
     }
 
@@ -599,12 +604,17 @@ fn atom_ref(
 
 fn export_atom(
     atom: &Atom,
+    production_id: &ProductionId,
     atom_origins: &mut BTreeMap<ManifestAtomId, AtomId>,
     term_origins: &mut BTreeMap<TermListId, LocalTermListOrigin>,
 ) -> Result<ManifestAtom, ManifestError> {
     let class = match &atom.class {
-        AtomClass::Source => ManifestAtomClass::Source,
-        AtomClass::Assumed => ManifestAtomClass::Assumed,
+        AtomClass::Source { source } => ManifestAtomClass::Source { source: source.clone() },
+        AtomClass::Assumed { metadata } => ManifestAtomClass::Assumed {
+            metadata: metadata
+                .as_ref()
+                .map(|metadata| namespace_assumed_metadata(metadata, production_id)),
+        },
         AtomClass::Derived { definition } => {
             ManifestAtomClass::Derived { definition: export_definition(definition, atom_origins)? }
         }
@@ -644,7 +654,44 @@ fn export_atom(
         matrix_type: atom.matrix_type.clone(),
         dependencies,
         preimage_refs,
+        indicator: atom
+            .indicator
+            .as_ref()
+            .map(|indicator| namespace_indicator(indicator, production_id)),
     })
+}
+
+fn namespace_assumed_metadata(
+    metadata: &AssumedMetadata,
+    production_id: &ProductionId,
+) -> AssumedMetadata {
+    let dependencies = match &metadata.dependencies {
+        DeclaredDependencies::Unknown => DeclaredDependencies::Unknown,
+        DeclaredDependencies::Known(labels) => DeclaredDependencies::Known(
+            labels
+                .iter()
+                .map(|label| match label {
+                    DeclaredDependencyRef::Local(label) => DeclaredDependencyRef::Imported {
+                        production_id: production_id.clone(),
+                        label: label.clone(),
+                    },
+                    imported @ DeclaredDependencyRef::Imported { .. } => imported.clone(),
+                })
+                .collect(),
+        ),
+    };
+    AssumedMetadata { dependencies, ..metadata.clone() }
+}
+
+fn namespace_indicator(indicator: &IndicatorRole, production_id: &ProductionId) -> IndicatorRole {
+    let domain = match &indicator.domain {
+        SelectionDomainRef::Local(domain) => SelectionDomainRef::Imported {
+            production_id: production_id.clone(),
+            domain: domain.clone(),
+        },
+        imported @ SelectionDomainRef::Imported { .. } => imported.clone(),
+    };
+    IndicatorRole { domain, branch: indicator.branch }
 }
 
 fn export_definition(
@@ -688,7 +735,7 @@ fn export_definition(
         }
         DefExpr::ModDownError { input, signal, source_modulus, target_modulus } => {
             ManifestDefExpr::ModDownError {
-                input: *input,
+                input: export_terms(input)?,
                 signal: export_terms(signal)?,
                 source_modulus: source_modulus.to_string(),
                 target_modulus: target_modulus.to_string(),
@@ -696,7 +743,7 @@ fn export_definition(
         }
         DefExpr::ModUpError { input, lifted, source_modulus, target_modulus } => {
             ManifestDefExpr::ModUpError {
-                input: *input,
+                input: export_terms(input)?,
                 lifted: export_terms(lifted)?,
                 source_modulus: source_modulus.to_string(),
                 target_modulus: target_modulus.to_string(),
@@ -714,8 +761,16 @@ fn definition_atoms(definition: &DefExpr) -> Vec<AtomId> {
         DefExpr::Reshape { input, .. } |
         DefExpr::ModDownImage { source: input, .. } |
         DefExpr::ModUpLift { source: input, .. } => vec![input.clone()],
-        DefExpr::ModDownError { signal, .. } => referenced_atoms(signal),
-        DefExpr::ModUpError { lifted, .. } => referenced_atoms(lifted),
+        DefExpr::ModDownError { input, signal, .. } => {
+            let mut atoms = referenced_atoms(input);
+            atoms.extend(referenced_atoms(signal));
+            atoms
+        }
+        DefExpr::ModUpError { input, lifted, .. } => {
+            let mut atoms = referenced_atoms(input);
+            atoms.extend(referenced_atoms(lifted));
+            atoms
+        }
         DefExpr::Indicator { .. } => Vec::new(),
     }
 }
@@ -904,8 +959,10 @@ pub fn import_manifest(manifest: &Manifest) -> Result<ImportedManifest, Manifest
     for (reference, record) in &manifest.atoms {
         let id = atom_id(reference);
         let class = match &record.class {
-            ManifestAtomClass::Source => AtomClass::Source,
-            ManifestAtomClass::Assumed => AtomClass::Assumed,
+            ManifestAtomClass::Source { source } => AtomClass::Source { source: source.clone() },
+            ManifestAtomClass::Assumed { metadata } => {
+                AtomClass::Assumed { metadata: metadata.clone() }
+            }
             ManifestAtomClass::Derived { definition } => AtomClass::Derived {
                 definition: import_definition(definition, &manifest.atoms, &atom_id)?,
             },
@@ -939,6 +996,7 @@ pub fn import_manifest(manifest: &Manifest) -> Result<ImportedManifest, Manifest
             matrix_type: record.matrix_type.clone(),
             dependencies,
             preimage_refs,
+            indicator: record.indicator.clone(),
         });
     }
     let artifacts = manifest
@@ -1066,7 +1124,7 @@ fn import_definition(
         }
         ManifestDefExpr::ModDownError { input, signal, source_modulus, target_modulus } => {
             DefExpr::ModDownError {
-                input: *input,
+                input: import_terms(input, records, atom_id)?,
                 signal: import_terms(signal, records, atom_id)?,
                 source_modulus: parse_integer(source_modulus)?,
                 target_modulus: parse_integer(target_modulus)?,
@@ -1074,7 +1132,7 @@ fn import_definition(
         }
         ManifestDefExpr::ModUpError { input, lifted, source_modulus, target_modulus } => {
             DefExpr::ModUpError {
-                input: *input,
+                input: import_terms(input, records, atom_id)?,
                 lifted: import_terms(lifted, records, atom_id)?,
                 source_modulus: parse_integer(source_modulus)?,
                 target_modulus: parse_integer(target_modulus)?,
@@ -1092,13 +1150,21 @@ fn parse_integer(value: &str) -> Result<BigInt, ManifestError> {
 mod tests {
     use super::*;
     use crate::{
-        atom::{AtomClass, AtomKind},
+        atom::{
+            AssumedMetadata, AtomClass, AtomKind, DeclaredDependencies, DeclaredDependencyRef,
+            IndicatorRole, SelectionDomain, SelectionDomainRef, SourceKind,
+        },
+        expr::{IntExpr, RealExpr},
+        node::ConstantMatrix,
         types::{InstantiationFrame, NodeId, Port},
-        ubound::UBound,
     };
 
     fn matrix_type() -> ConcreteMatrixType {
         ConcreteMatrixType { modulus: BigInt::from(97), ring_dimension: 8, rows: 2, columns: 2 }
+    }
+
+    fn source_kind() -> SourceKind {
+        SourceKind::ConstantMatrix { value: ConstantMatrix::Identity }
     }
 
     #[test]
@@ -1178,11 +1244,12 @@ mod tests {
             atoms: BTreeMap::from([(
                 atom_ref.clone(),
                 ManifestAtom {
-                    class: ManifestAtomClass::Source,
-                    kind: AtomKind::Bounded { norm: UBound::one() },
+                    class: ManifestAtomClass::Source { source: source_kind() },
+                    kind: AtomKind::Bounded,
                     matrix_type: matrix_type(),
                     dependencies: BTreeSet::new(),
                     preimage_refs: None,
+                    indicator: None,
                 },
             )]),
             term_lists: BTreeMap::from([(
@@ -1214,21 +1281,23 @@ mod tests {
         let mut atoms = AtomTable::default();
         atoms.insert(Atom {
             id: source.clone(),
-            class: AtomClass::Source,
-            kind: AtomKind::Bounded { norm: UBound::one() },
+            class: AtomClass::Source { source: source_kind() },
+            kind: AtomKind::Bounded,
             matrix_type: matrix_type(),
             dependencies: BTreeSet::new(),
             preimage_refs: None,
+            indicator: None,
         });
         atoms.insert(Atom {
             id: derived.clone(),
             class: AtomClass::Derived {
                 definition: DefExpr::TermList(TermList::atom(source.clone())),
             },
-            kind: AtomKind::Bounded { norm: UBound::one() },
+            kind: AtomKind::Bounded,
             matrix_type: matrix_type(),
             dependencies: BTreeSet::from([source]),
             preimage_refs: None,
+            indicator: None,
         });
         let wire = WireId {
             instantiation_path: Vec::new(),
@@ -1258,6 +1327,82 @@ mod tests {
     }
 
     #[test]
+    fn export_namespaces_declared_dependencies_and_selection_domains() {
+        let production = production_id(SpecHash([21; 32]), [22; 32]);
+        let id = AtomId::Virtual { name: "branch".to_owned() };
+        let domain = SelectionDomain {
+            index_wire: WireRef { node: NodeId(9), port: Port(0) },
+            instantiation_path: Vec::new(),
+            count: 2,
+            modulus: BigInt::from(97),
+            ring_dimension: 8,
+        };
+        let mut atoms = AtomTable::default();
+        atoms.insert(Atom {
+            id: id.clone(),
+            class: AtomClass::Assumed {
+                metadata: Some(AssumedMetadata {
+                    norm: RealExpr::FromInt(IntExpr::constant(1)),
+                    is_const_poly: true,
+                    zero_rows: None,
+                    dependencies: DeclaredDependencies::Known(BTreeSet::from([
+                        DeclaredDependencyRef::Local("shared".to_owned()),
+                    ])),
+                    clt_ready: false,
+                }),
+            },
+            kind: AtomKind::Bounded,
+            matrix_type: matrix_type(),
+            dependencies: BTreeSet::new(),
+            preimage_refs: None,
+            indicator: Some(IndicatorRole {
+                domain: SelectionDomainRef::Local(domain.clone()),
+                branch: 1,
+            }),
+        });
+        let wire = WireId {
+            instantiation_path: Vec::new(),
+            wire: WireRef { node: NodeId(1), port: Port(0) },
+        };
+        let manifest = export_manifest(
+            production.clone(),
+            &BTreeMap::from([(
+                "x".to_owned(),
+                ExportArtifact {
+                    wire: wire.clone(),
+                    wire_type: matrix_type(),
+                    family: None,
+                    content_hash: None,
+                    layout: None,
+                },
+            )]),
+            &BTreeMap::from([(wire, TermList::atom(id))]),
+            &BTreeMap::new(),
+            &atoms,
+            &ManifestMetadata::default(),
+        )
+        .expect("export");
+        let record = manifest.atoms.values().next().expect("exported atom");
+        let ManifestAtomClass::Assumed { metadata: Some(metadata) } = &record.class else {
+            panic!("assumed metadata")
+        };
+        assert_eq!(
+            metadata.dependencies,
+            DeclaredDependencies::Known(BTreeSet::from([DeclaredDependencyRef::Imported {
+                production_id: production.clone(),
+                label: "shared".to_owned(),
+            }]))
+        );
+        assert_eq!(
+            record.indicator,
+            Some(IndicatorRole {
+                domain: SelectionDomainRef::Imported { production_id: production, domain },
+                branch: 1,
+            })
+        );
+    }
+
+    #[test]
     fn manifest_json_uses_hex_digests_and_round_trips_reference_keyed_maps() {
         let production = production_id(SpecHash([1; 32]), [2; 32]);
         let atom_ref = ManifestAtomRef::Local(ManifestAtomId([3; 32]));
@@ -1279,11 +1424,12 @@ mod tests {
             atoms: BTreeMap::from([(
                 atom_ref.clone(),
                 ManifestAtom {
-                    class: ManifestAtomClass::Source,
+                    class: ManifestAtomClass::Source { source: source_kind() },
                     kind: AtomKind::Large,
                     matrix_type: matrix_type(),
                     dependencies: BTreeSet::new(),
                     preimage_refs: None,
+                    indicator: None,
                 },
             )]),
             term_lists: BTreeMap::from([(
@@ -1351,12 +1497,12 @@ mod tests {
         let mut atoms = AtomTable::default();
         for (id, kind) in [
             (uniform.clone(), AtomKind::Large),
-            (preimage.clone(), AtomKind::Bounded { norm: UBound::one() }),
-            (error.clone(), AtomKind::Bounded { norm: UBound::one() }),
+            (preimage.clone(), AtomKind::Bounded),
+            (error.clone(), AtomKind::Bounded),
         ] {
             atoms.insert(Atom {
                 id: id.clone(),
-                class: AtomClass::Assumed,
+                class: AtomClass::Assumed { metadata: None },
                 kind,
                 matrix_type: matrix_type(),
                 dependencies: BTreeSet::new(),
@@ -1364,6 +1510,7 @@ mod tests {
                     uniform: uniform.clone(),
                     target: TargetRef::Assumed(assumed_id.clone()),
                 }),
+                indicator: None,
             });
         }
         let target = TermList {

@@ -2,8 +2,9 @@ use super::{
     dependency_set::DependencySet,
     poly_norm::{PolyNorm, high_probability_envelope_from_sigma},
 };
-use crate::{impl_binop_with_refs, simulator::SimulatorContext};
+use crate::SimulatorContext;
 use bigdecimal::BigDecimal;
+use mxx_primitives::impl_binop_with_refs;
 use num_traits::Zero;
 use std::{
     ops::{Add, AddAssign, Mul, MulAssign},

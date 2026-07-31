@@ -1,5 +1,5 @@
 use crate::{
-    atom::{AtomId, AtomTable, SelectionDomain},
+    atom::{AtomId, AtomTable, SelectionDomainRef},
     serde_support,
 };
 use num_bigint::BigInt;
@@ -225,7 +225,7 @@ impl TermList {
                 let atom = atoms
                     .get(&factor.atom)
                     .ok_or_else(|| TermError::MissingAtom(factor.atom.clone()))?;
-                if atom.norm().is_some() {
+                if !atom.is_large() {
                     factor.view.get_or_insert_with(ViewDescriptor::default).modulus_cast =
                         Some(target_modulus.clone());
                 }
@@ -255,7 +255,7 @@ fn canonicalize_factors(
 ) -> Result<Option<Vec<Factor>>, TermError> {
     let mut scalars = Vec::new();
     let mut non_scalars = Vec::new();
-    let mut indicators = BTreeMap::<SelectionDomain, u64>::new();
+    let mut indicators = BTreeMap::<SelectionDomainRef, u64>::new();
 
     for mut factor in factors {
         if factor.view.as_ref().is_some_and(ViewDescriptor::is_identity) {
@@ -264,13 +264,13 @@ fn canonicalize_factors(
         let atom =
             atoms.get(&factor.atom).ok_or_else(|| TermError::MissingAtom(factor.atom.clone()))?;
         if atom.matrix_type.is_scalar() {
-            if let AtomId::Indicator { domain, branch } = &factor.atom {
-                match indicators.entry(domain.clone()) {
+            if let Some(indicator) = &atom.indicator {
+                match indicators.entry(indicator.domain.clone()) {
                     Entry::Vacant(entry) => {
-                        entry.insert(*branch);
+                        entry.insert(indicator.branch);
                         scalars.push(factor);
                     }
-                    Entry::Occupied(entry) if *entry.get() == *branch => {}
+                    Entry::Occupied(entry) if *entry.get() == indicator.branch => {}
                     Entry::Occupied(_) => return Ok(None),
                 }
             } else {
@@ -327,17 +327,26 @@ mod optional_bigint {
 mod tests {
     use super::*;
     use crate::{
-        atom::{Atom, AtomClass, AtomKind},
+        atom::{Atom, AtomClass, AtomKind, SelectionDomain},
+        node::ConstantMatrix,
         types::ConcreteMatrixType,
-        ubound::UBound,
     };
     use std::collections::BTreeSet;
 
     fn insert_atom(table: &mut AtomTable, id: AtomId, scalar: bool) {
+        let indicator = match &id {
+            AtomId::Indicator { domain, branch } => Some(crate::atom::IndicatorRole {
+                domain: crate::atom::SelectionDomainRef::Local(domain.clone()),
+                branch: *branch,
+            }),
+            _ => None,
+        };
         table.insert(Atom {
             id,
-            class: AtomClass::Source,
-            kind: AtomKind::Bounded { norm: UBound::one() },
+            class: AtomClass::Source {
+                source: crate::atom::SourceKind::ConstantMatrix { value: ConstantMatrix::Identity },
+            },
+            kind: AtomKind::Bounded,
             matrix_type: ConcreteMatrixType {
                 modulus: BigInt::from(97),
                 ring_dimension: 8,
@@ -346,6 +355,7 @@ mod tests {
             },
             dependencies: BTreeSet::new(),
             preimage_refs: None,
+            indicator,
         });
     }
 

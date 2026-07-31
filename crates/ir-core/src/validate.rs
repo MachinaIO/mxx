@@ -206,9 +206,15 @@ impl Validator<'_> {
             }
             NodeKind::GadgetTrapdoor { matrix_type, base } => {
                 let matrix = concrete_matrix(matrix_type, bindings)?;
-                if base.evaluate(bindings)?.abs() <= BigInt::one() {
+                let gadget_base = base.evaluate(bindings)?.abs();
+                if gadget_base <= BigInt::one() {
                     return self.node_error(node.id, "gadget base must be greater than one");
                 }
+                if !matrix.columns.is_multiple_of(matrix.rows) {
+                    return self
+                        .node_error(node.id, "gadget trapdoor columns must be divisible by rows");
+                }
+                let digit_count = matrix.columns / matrix.rows;
                 self.insert(
                     values,
                     path,
@@ -217,6 +223,8 @@ impl Validator<'_> {
                     ConcreteWireType::Trapdoor {
                         matrix,
                         sigma: crate::expr::RealExpr::FromInt(base.clone()),
+                        gadget_base,
+                        digit_count,
                     },
                 );
             }
@@ -398,16 +406,48 @@ impl Validator<'_> {
                     ConcreteWireType::Matrix(concrete_matrix(matrix_type, bindings)?),
                 );
             }
-            NodeKind::TrapdoorSample { matrix_type, sigma } => {
+            NodeKind::TrapdoorSample { matrix_type, sigma, gadget_base, digit_count } => {
                 require_positive_real(sigma.evaluate_f64(bindings)?, node.id, "trapdoor sigma")?;
+                let gadget_base = gadget_base.evaluate(bindings)?.abs();
+                if gadget_base <= BigInt::one() {
+                    return self.node_error(node.id, "gadget base must be greater than one");
+                }
+                let digit_count = positive_usize(
+                    digit_count.evaluate(bindings)?,
+                    "trapdoor digit count",
+                    node.id,
+                )?;
                 let matrix = concrete_matrix(matrix_type, bindings)?;
+                let expected_columns = matrix
+                    .rows
+                    .checked_mul(digit_count.checked_add(2).ok_or_else(|| {
+                        ValidationError::Node {
+                            node: node.id,
+                            message: "trapdoor public matrix width overflow".to_owned(),
+                        }
+                    })?)
+                    .ok_or_else(|| ValidationError::Node {
+                        node: node.id,
+                        message: "trapdoor public matrix width overflow".to_owned(),
+                    })?;
+                if matrix.columns != expected_columns {
+                    return self.node_error(
+                        node.id,
+                        "trapdoor public matrix columns must equal rows * (digit_count + 2)",
+                    );
+                }
                 self.insert(values, path, node.id, 0, ConcreteWireType::Matrix(matrix.clone()));
                 self.insert(
                     values,
                     path,
                     node.id,
                     1,
-                    ConcreteWireType::Trapdoor { matrix, sigma: sigma.clone() },
+                    ConcreteWireType::Trapdoor {
+                        matrix,
+                        sigma: sigma.clone(),
+                        gadget_base,
+                        digit_count,
+                    },
                 );
             }
             NodeKind::PreimageSample { matrix_type } => {
@@ -728,11 +768,22 @@ fn concrete_wire(
             length: positive_usize(length.evaluate(env)?, "byte-string length", NodeId(0))?,
         },
         WireType::Matrix(matrix) => ConcreteWireType::Matrix(concrete_matrix(matrix, env)?),
-        WireType::Trapdoor { matrix, sigma } => {
+        WireType::Trapdoor { matrix, sigma, gadget_base, digit_count } => {
             require_positive_real(sigma.evaluate_f64(env)?, NodeId(0), "trapdoor sigma")?;
+            let gadget_base = gadget_base.evaluate(env)?.abs();
+            if gadget_base <= BigInt::one() {
+                return Err(ValidationError::Node {
+                    node: NodeId(0),
+                    message: "gadget base must be greater than one".to_owned(),
+                });
+            }
+            let digit_count =
+                positive_usize(digit_count.evaluate(env)?, "trapdoor digit count", NodeId(0))?;
             ConcreteWireType::Trapdoor {
                 matrix: concrete_matrix(matrix, env)?,
                 sigma: sigma.clone(),
+                gadget_base,
+                digit_count,
             }
         }
         WireType::Preimage(matrix) => ConcreteWireType::Preimage(concrete_matrix(matrix, env)?),

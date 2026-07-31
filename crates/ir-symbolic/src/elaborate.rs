@@ -1,9 +1,10 @@
 use crate::{
     atom::{
-        Atom, AtomClass, AtomId, AtomKind, AtomTable, ConcatAxis, DefExpr, InstantiationFrame,
-        PreimageRefs, SelectionDomain, TargetRef,
+        AssumedMetadata, Atom, AtomClass, AtomId, AtomKind, AtomTable, ConcatAxis,
+        DeclaredDependencies, DeclaredDependencyRef, DefExpr, ExternalSourceKind, IndicatorRole,
+        InstantiationFrame, PreimageRefs, SelectionDomain, SelectionDomainRef, SourceKind,
+        TargetRef,
     },
-    bounds::{BoundError, sum_norm, term_norm},
     checks::{
         CheckError, ElaborationWarning, WarningKind, check_add_shape, check_mod_down_normal_form,
         check_topological, is_reduced, multiplication_type,
@@ -25,7 +26,6 @@ use crate::{
     types::{
         ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port, WireId, WireRef, WireType,
     },
-    ubound::UBound,
 };
 use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -48,7 +48,7 @@ pub struct ElaboratedGraph {
     pub outputs: BTreeMap<String, WireRef>,
     pub atoms: AtomTable,
     pub warnings: Vec<ElaborationWarning>,
-    pub ring_expansion: UBound,
+    pub decode_targets: Vec<DecodeTarget>,
     pub target_terms: BTreeMap<TargetRef, TermList>,
     #[serde(with = "crate::serde_support::optional_hex32")]
     pub overlay_hash: Option<[u8; 32]>,
@@ -58,6 +58,14 @@ pub struct ElaboratedGraph {
     pub assumption_digests: BTreeSet<[u8; 32]>,
     #[serde(with = "crate::manifest::interpretation_digest_map")]
     pub interpretation_digests: BTreeMap<crate::atom::ProductionId, InterpretationDigest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DecodeTarget {
+    pub input: WireId,
+    #[serde(with = "crate::serde_support::bigint")]
+    pub plaintext_modulus: BigInt,
+    pub length: usize,
 }
 
 impl ElaboratedGraph {
@@ -97,10 +105,6 @@ pub enum ElaborationError {
     Terms(#[from] TermError),
     #[error(transparent)]
     Rewrite(#[from] RewriteError),
-    #[error(transparent)]
-    SymbolicBound(#[from] BoundError),
-    #[error(transparent)]
-    Bound(#[from] crate::ubound::UBoundError),
     #[error("node {node:?}: {message}")]
     Node { node: NodeId, message: String },
     #[error("wire {wire:?} is unavailable while elaborating node {node:?}")]
@@ -129,7 +133,13 @@ struct MatrixValue {
 struct TrapdoorValue {
     ty: ConcreteWireType,
     uniform: AtomId,
-    sigma: UBound,
+    origin: TrapdoorOrigin,
+}
+
+#[derive(Clone)]
+enum TrapdoorOrigin {
+    Sampled,
+    Gadget { base: BigInt, digit_count: usize, small: bool },
 }
 
 #[derive(Clone)]
@@ -170,11 +180,17 @@ pub fn elaborate_with_overlay(
                 message: format!("virtual atom {name} has an invalid matrix type: {error}"),
             }
         })?;
-        if let VirtualKind::Bounded { norm } = &declaration.kind {
-            evaluate_bound(norm, bindings).map_err(|error| ElaborationError::Overlay {
+        if let VirtualKind::Bounded { norm, zero_rows, .. } = &declaration.kind {
+            close_real_expr(norm, bindings).map_err(|error| ElaborationError::Overlay {
                 entry: None,
                 message: format!("virtual atom {name} has an invalid bound: {error}"),
             })?;
+            if let Some(zero_rows) = zero_rows {
+                zero_rows.evaluate(bindings).map_err(|error| ElaborationError::Overlay {
+                    entry: None,
+                    message: format!("virtual atom {name} has invalid zero_rows: {error}"),
+                })?;
+            }
         }
     }
     check_topological(graph).map_err(|error| contextualize_check(error, &[]))?;
@@ -221,7 +237,7 @@ pub fn elaborate_with_overlay(
         atoms: AtomTable::default(),
         warnings: Vec::new(),
         path: Vec::new(),
-        ring_expansion: ring_expansion(graph, bindings)?,
+        decode_targets: Vec::new(),
         assumed_terms: BTreeMap::new(),
         overlay,
         overlay_matches: vec![0; overlay.entries.len()],
@@ -319,7 +335,7 @@ pub fn elaborate_with_overlay(
         outputs: graph.outputs.clone(),
         atoms: state.atoms,
         warnings: state.warnings,
-        ring_expansion: state.ring_expansion,
+        decode_targets: state.decode_targets,
         target_terms,
         overlay_hash,
         assumption_hash,
@@ -339,7 +355,7 @@ struct State<'a> {
     atoms: AtomTable,
     warnings: Vec<ElaborationWarning>,
     path: Vec<InstantiationFrame>,
-    ring_expansion: UBound,
+    decode_targets: Vec<DecodeTarget>,
     assumed_terms: BTreeMap<TargetRef, TermList>,
     overlay: &'a SymbolicOverlay,
     overlay_matches: Vec<usize>,
@@ -391,8 +407,7 @@ impl State<'_> {
                 let terms = if matches!(value, ConstantMatrix::Zero) {
                     TermList::zero()
                 } else {
-                    let norm = constant_norm(value, &ty, self.bindings)?;
-                    let id = self.constant_atom(value, &ty, norm)?;
+                    let id = self.constant_atom(value, &ty)?;
                     TermList::atom(id)
                 };
                 self.insert_matrix(node.id, 0, ty, terms, false);
@@ -400,7 +415,8 @@ impl State<'_> {
             NodeKind::GadgetTrapdoor { matrix_type, base } => {
                 let ty = concrete_matrix(matrix_type, self.bindings)?;
                 let gadget = self.gadget_atom(&ty, base, false)?;
-                let sigma = UBound::from_integer(&base.evaluate(self.bindings)?.abs())?;
+                let gadget_base = base.evaluate(self.bindings)?.abs();
+                let digit_count = ty.columns / ty.rows;
                 self.insert_value(
                     node.id,
                     0,
@@ -408,9 +424,15 @@ impl State<'_> {
                         ty: ConcreteWireType::Trapdoor {
                             matrix: ty,
                             sigma: RealExpr::FromInt(base.clone()),
+                            gadget_base: gadget_base.clone(),
+                            digit_count,
                         },
                         uniform: gadget,
-                        sigma,
+                        origin: TrapdoorOrigin::Gadget {
+                            base: gadget_base,
+                            digit_count,
+                            small: false,
+                        },
                     }),
                 );
             }
@@ -460,7 +482,9 @@ impl State<'_> {
                 let terms = input.terms.slice(*rows, *columns, &self.atoms)?;
                 self.insert_matrix(node.id, 0, ty, terms, false);
             }
-            NodeKind::Tensor => self.derived_matrix(node, "tensor", None)?,
+            NodeKind::Tensor => {
+                return self.node_error(node.id, "tensor is unsupported by symbolic elaboration");
+            }
             NodeKind::Concat { axis } => self.derived_matrix(node, "concat", Some(*axis))?,
             NodeKind::Reshape { rows, columns } => {
                 let input = self.matrix_argument(node, 0)?;
@@ -472,8 +496,16 @@ impl State<'_> {
                     return self.node_error(node.id, "reshape changes the element count");
                 }
                 let input_atom = self.definition_atom(node.id, 1, &input)?;
-                let kind =
-                    self.atoms.get(&input_atom).expect("definition atom was inserted").kind.clone();
+                let kind = match classify_terms(&input.terms, &self.atoms)? {
+                    TermClass::Signal => AtomKind::Large,
+                    TermClass::Zero | TermClass::Noise => AtomKind::Bounded,
+                    TermClass::Mixed => {
+                        return self.node_error(
+                            node.id,
+                            "reshape cannot combine signal and noise into one opaque atom",
+                        );
+                    }
+                };
                 let ty = ConcreteMatrixType { rows, columns, ..input.ty };
                 let id = self.derived_atom(
                     node.id,
@@ -494,15 +526,31 @@ impl State<'_> {
                 let kind = if &maximum * BigInt::from(2) >= ty.modulus {
                     AtomKind::Large
                 } else {
-                    AtomKind::Bounded { norm: UBound::from_integer(&maximum)? }
+                    AtomKind::Bounded
                 };
-                let id = self.source_atom(node.id, 0, ty.clone(), kind, None);
+                let id = self.source_atom(
+                    node.id,
+                    0,
+                    ty.clone(),
+                    kind,
+                    SourceKind::UniformSample {
+                        minimum: range.minimum.clone(),
+                        maximum: range.maximum.clone(),
+                    },
+                    None,
+                );
                 self.insert_matrix(node.id, 0, ty, TermList::atom(id), false);
             }
             NodeKind::GaussianSample { matrix_type, sigma } => {
                 let ty = concrete_matrix(matrix_type, self.bindings)?;
-                let norm = gaussian_norm(evaluate_bound(sigma, self.bindings)?, &ty);
-                let id = self.source_atom(node.id, 0, ty.clone(), AtomKind::Bounded { norm }, None);
+                let id = self.source_atom(
+                    node.id,
+                    0,
+                    ty.clone(),
+                    AtomKind::Bounded,
+                    SourceKind::GaussianSample { sigma: close_real_expr(sigma, self.bindings)? },
+                    None,
+                );
                 self.insert_matrix(node.id, 0, ty, TermList::atom(id), false);
             }
             NodeKind::HashSample {
@@ -518,17 +566,39 @@ impl State<'_> {
                 }
                 self.hash_sample(node, matrix_type, *variant, base.as_ref(), digit_count.as_ref())?
             }
-            NodeKind::TrapdoorSample { matrix_type, sigma } => {
+            NodeKind::TrapdoorSample { matrix_type, sigma, gadget_base, digit_count } => {
                 let ty = concrete_matrix(matrix_type, self.bindings)?;
-                let uniform = self.source_atom(node.id, 0, ty.clone(), AtomKind::Large, None);
+                let gadget_base_value = gadget_base.evaluate(self.bindings)?.abs();
+                let digit_count_value = positive_usize(
+                    digit_count.evaluate(self.bindings)?,
+                    "trapdoor digit count",
+                    node.id,
+                )?;
+                let uniform = self.source_atom(
+                    node.id,
+                    0,
+                    ty.clone(),
+                    AtomKind::Large,
+                    SourceKind::TrapdoorUniform {
+                        sigma: close_real_expr(sigma, self.bindings)?,
+                        gadget_base: gadget_base_value.clone(),
+                        digit_count: digit_count_value,
+                    },
+                    None,
+                );
                 self.insert_matrix(node.id, 0, ty.clone(), TermList::atom(uniform.clone()), false);
                 self.insert_value(
                     node.id,
                     1,
                     Value::Trapdoor(TrapdoorValue {
-                        ty: ConcreteWireType::Trapdoor { matrix: ty, sigma: sigma.clone() },
+                        ty: ConcreteWireType::Trapdoor {
+                            matrix: ty,
+                            sigma: sigma.clone(),
+                            gadget_base: gadget_base_value,
+                            digit_count: digit_count_value,
+                        },
                         uniform,
-                        sigma: evaluate_bound(sigma, self.bindings)?,
+                        origin: TrapdoorOrigin::Sampled,
                     }),
                 );
             }
@@ -546,13 +616,30 @@ impl State<'_> {
                 check_add_shape(&product, &target_value.ty)?;
                 let refs =
                     PreimageRefs { uniform: trapdoor.uniform, target: TargetRef::Local(target) };
-                let id = self.source_atom(
-                    node.id,
-                    0,
-                    ty.clone(),
-                    AtomKind::Bounded { norm: trapdoor.sigma },
-                    Some(refs),
-                );
+                let ConcreteWireType::Trapdoor { sigma, gadget_base, digit_count, .. } =
+                    &trapdoor.ty
+                else {
+                    unreachable!("trapdoor value has trapdoor type")
+                };
+                let source = match &trapdoor.origin {
+                    TrapdoorOrigin::Sampled => SourceKind::PreimageSample {
+                        trapdoor_sigma: close_real_expr(sigma, self.bindings)?,
+                        gadget_base: gadget_base.clone(),
+                        digit_count: *digit_count,
+                        public_matrix_rows: uniform_type.rows,
+                        target_block_rows: target_value.ty.rows / uniform_type.rows,
+                        zero_rows: None,
+                    },
+                    TrapdoorOrigin::Gadget { base, digit_count, small } => {
+                        SourceKind::GadgetDecomposition {
+                            base: base.clone(),
+                            digit_count: *digit_count,
+                            small: *small,
+                        }
+                    }
+                };
+                let id =
+                    self.source_atom(node.id, 0, ty.clone(), AtomKind::Bounded, source, Some(refs));
                 self.insert_matrix(node.id, 0, ty, TermList::atom(id), true);
             }
             NodeKind::GadgetDecompose { base, small, digit_count } => {
@@ -582,12 +669,16 @@ impl State<'_> {
                     ..input.ty.clone()
                 };
                 let gadget = self.gadget_atom(&gadget_ty, base, *small)?;
-                let norm = UBound::from_ratio(&base_value, &BigInt::from(2))?;
                 let id = self.source_atom(
                     node.id,
                     0,
                     output_ty.clone(),
-                    AtomKind::Bounded { norm },
+                    AtomKind::Bounded,
+                    SourceKind::GadgetDecomposition {
+                        base: base_value,
+                        digit_count: digits,
+                        small: *small,
+                    },
                     Some(PreimageRefs { uniform: gadget, target: TargetRef::Local(target) }),
                 );
                 self.insert_matrix(node.id, 0, output_ty, TermList::atom(id), true);
@@ -626,6 +717,11 @@ impl State<'_> {
                 if plaintext_modulus.evaluate(self.bindings)? <= BigInt::one() {
                     return self.node_error(node.id, "plaintext modulus must be greater than one");
                 }
+                self.decode_targets.push(DecodeTarget {
+                    input: WireId { instantiation_path: self.path.clone(), wire: node.args[0] },
+                    plaintext_modulus: plaintext_modulus.evaluate(self.bindings)?,
+                    length: count,
+                });
                 let ty = if *output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int };
                 for port in 0..count {
                     self.insert_value(node.id, port as u32, Value::Scalar(ty.clone()));
@@ -711,7 +807,14 @@ impl State<'_> {
         }
         match concrete_wire(wire_type, self.bindings)? {
             ConcreteWireType::Matrix(ty) => {
-                let atom = self.source_atom(node.id, 0, ty.clone(), AtomKind::Large, None);
+                let atom = self.source_atom(
+                    node.id,
+                    0,
+                    ty.clone(),
+                    AtomKind::Large,
+                    SourceKind::External { kind: ExternalSourceKind::Matrix },
+                    None,
+                );
                 self.insert_matrix(node.id, 0, ty, TermList::atom(atom), false);
             }
             ConcreteWireType::Preimage(ty) => {
@@ -719,21 +822,33 @@ impl State<'_> {
                     node.id,
                     0,
                     ty.clone(),
-                    AtomKind::Bounded { norm: modulus_half(&ty.modulus)? },
+                    AtomKind::Bounded,
+                    SourceKind::External { kind: ExternalSourceKind::Preimage },
                     None,
                 );
                 self.insert_matrix(node.id, 0, ty, TermList::atom(atom), true);
             }
-            ConcreteWireType::Trapdoor { matrix, sigma } => {
-                let uniform = self.source_atom(node.id, 1, matrix.clone(), AtomKind::Large, None);
-                let sigma_bound = evaluate_bound(&sigma, self.bindings)?;
+            ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count } => {
+                let uniform = self.source_atom(
+                    node.id,
+                    1,
+                    matrix.clone(),
+                    AtomKind::Large,
+                    SourceKind::External { kind: ExternalSourceKind::TrapdoorUniform },
+                    None,
+                );
                 self.insert_value(
                     node.id,
                     0,
                     Value::Trapdoor(TrapdoorValue {
-                        ty: ConcreteWireType::Trapdoor { matrix, sigma: sigma.clone() },
+                        ty: ConcreteWireType::Trapdoor {
+                            matrix,
+                            sigma: sigma.clone(),
+                            gadget_base,
+                            digit_count,
+                        },
                         uniform,
-                        sigma: sigma_bound,
+                        origin: TrapdoorOrigin::Sampled,
                     }),
                 );
             }
@@ -833,7 +948,14 @@ impl State<'_> {
         let ty = concrete_matrix(matrix_type, self.bindings)?;
         match variant {
             HashVariant::Plain => {
-                let id = self.source_atom(node.id, 0, ty.clone(), AtomKind::Large, None);
+                let id = self.source_atom(
+                    node.id,
+                    0,
+                    ty.clone(),
+                    AtomKind::Large,
+                    SourceKind::HashSample { variant, base: None, digit_count: None },
+                    None,
+                );
                 self.insert_matrix(node.id, 0, ty, TermList::atom(id), false);
             }
             HashVariant::Decomposed | HashVariant::SmallDecomposed => {
@@ -869,7 +991,14 @@ impl State<'_> {
                     columns: ty.rows,
                     ..target_ty.clone()
                 };
-                let target = self.source_atom(node.id, 1, target_ty.clone(), AtomKind::Large, None);
+                let target = self.source_atom(
+                    node.id,
+                    1,
+                    target_ty.clone(),
+                    AtomKind::Large,
+                    SourceKind::HashTarget { variant },
+                    None,
+                );
                 let target_wire = WireRef { node: node.id, port: Port(1) };
                 let target_terms = TermList::atom(target);
                 let target_id = WireId { instantiation_path: self.path.clone(), wire: target_wire };
@@ -883,12 +1012,16 @@ impl State<'_> {
                     base,
                     matches!(variant, HashVariant::SmallDecomposed),
                 )?;
-                let norm = UBound::from_ratio(&base_value, &BigInt::from(2))?;
                 let id = self.source_atom(
                     node.id,
                     0,
                     ty.clone(),
-                    AtomKind::Bounded { norm },
+                    AtomKind::Bounded,
+                    SourceKind::HashSample {
+                        variant,
+                        base: Some(base_value),
+                        digit_count: Some(digits),
+                    },
                     Some(PreimageRefs { uniform: gadget, target: TargetRef::Local(target_wire) }),
                 );
                 self.insert_matrix(node.id, 0, ty, TermList::atom(id), true);
@@ -955,40 +1088,26 @@ impl State<'_> {
             )?);
         }
         let definition = match operation {
-            "tensor" => {
-                DefExpr::Tensor { left: input_atoms[0].clone(), right: input_atoms[1].clone() }
-            }
             "concat" => {
                 DefExpr::Concat { inputs: input_atoms.clone(), axis: axis.expect("concat axis") }
             }
             _ => unreachable!(),
         };
-        let kind = if inputs.iter().any(|input| {
-            input.terms.terms.iter().any(|term| {
-                term.factors.iter().any(|factor| {
-                    self.atoms
-                        .get(&factor.atom)
-                        .is_some_and(|atom| matches!(atom.kind, AtomKind::Large))
-                })
-            })
-        }) {
+        let classes = inputs
+            .iter()
+            .map(|input| classify_terms(&input.terms, &self.atoms))
+            .collect::<Result<Vec<_>, _>>()?;
+        if classes.iter().any(|class| matches!(class, TermClass::Mixed)) ||
+            (classes.iter().any(|class| matches!(class, TermClass::Signal)) &&
+                classes.iter().any(|class| matches!(class, TermClass::Noise)))
+        {
+            return self
+                .node_error(node.id, "concat cannot combine signal and noise into one opaque atom");
+        }
+        let kind = if classes.iter().any(|class| matches!(class, TermClass::Signal)) {
             AtomKind::Large
         } else {
-            let norms = inputs
-                .iter()
-                .map(|input| {
-                    sum_norm(&input.terms, &self.atoms, &self.ring_expansion)
-                        .map_err(ElaborationError::from)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let norm = match operation {
-                "tensor" => self.ring_expansion.mul(&norms[0]).mul(&norms[1]),
-                "concat" => {
-                    norms.into_iter().fold(UBound::zero(), |acc, norm| UBound::max(&acc, &norm))
-                }
-                _ => unreachable!(),
-            };
-            AtomKind::Bounded { norm }
+            AtomKind::Bounded
         };
         let id = self.derived_atom(
             node.id,
@@ -1015,7 +1134,16 @@ impl State<'_> {
         {
             return Ok(factor.atom.clone());
         }
-        let kind = derived_kind(&input.terms, &self.atoms, &self.ring_expansion)?;
+        let kind = match classify_terms(&input.terms, &self.atoms)? {
+            TermClass::Signal => AtomKind::Large,
+            TermClass::Zero | TermClass::Noise => AtomKind::Bounded,
+            TermClass::Mixed => {
+                return self.node_error(
+                    node,
+                    "cannot combine signal and noise into one opaque definition atom",
+                );
+            }
+        };
         Ok(self.derived_atom(
             node,
             port,
@@ -1071,10 +1199,14 @@ impl State<'_> {
                     class: AtomClass::Derived {
                         definition: DefExpr::Indicator { index_wire, branch: branch as u64 },
                     },
-                    kind: AtomKind::Bounded { norm: UBound::one() },
+                    kind: AtomKind::Bounded,
                     matrix_type: scalar.clone(),
                     dependencies: BTreeSet::new(),
                     preimage_refs: None,
+                    indicator: Some(IndicatorRole {
+                        domain: SelectionDomainRef::Local(domain.clone()),
+                        branch: branch as u64,
+                    }),
                 });
             }
             for term in &input.terms.terms {
@@ -1240,7 +1372,6 @@ impl State<'_> {
                     .ok_or(ElaborationError::MissingWire { node: call_node.id, wire: *wire })
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let child_gamma = ring_expansion(graph, &bindings)?;
         let mut child = State {
             graph,
             bindings: &bindings,
@@ -1252,7 +1383,7 @@ impl State<'_> {
             atoms: self.atoms.clone(),
             warnings: self.warnings.clone(),
             path,
-            ring_expansion: UBound::max(&self.ring_expansion, &child_gamma),
+            decode_targets: self.decode_targets.clone(),
             assumed_terms: self.assumed_terms.clone(),
             overlay: self.overlay,
             overlay_matches: self.overlay_matches.clone(),
@@ -1280,7 +1411,7 @@ impl State<'_> {
         self.wire_terms = child.wire_terms;
         self.all_wires = child.all_wires;
         self.warnings = child.warnings;
-        self.ring_expansion = child.ring_expansion;
+        self.decode_targets = child.decode_targets;
         self.assumed_terms = child.assumed_terms;
         self.overlay_matches = child.overlay_matches;
         self.used_virtual_atoms = child.used_virtual_atoms;
@@ -1300,7 +1431,6 @@ impl State<'_> {
         let output_ty = ConcreteMatrixType { modulus: target.clone(), ..input.ty.clone() };
         let mut signal = Vec::new();
         let mut bounded = Vec::new();
-        let mut prefix_rounding = UBound::zero();
         for term in &input.terms.terms {
             let large_position = term.factors.iter().position(|factor| {
                 self.atoms
@@ -1308,24 +1438,6 @@ impl State<'_> {
                     .is_some_and(|atom| matches!(atom.kind, AtomKind::Large))
             });
             if let Some(position) = large_position {
-                let prefix = Term {
-                    coefficient: term.coefficient.clone(),
-                    factors: term.factors[..position].to_vec(),
-                };
-                let mut contribution = term_norm(&prefix, &self.atoms, &self.ring_expansion)?
-                    .mul(&self.ring_expansion);
-                if let Some(last) = prefix.factors.last() {
-                    let last_atom = self
-                        .atoms
-                        .get(&last.atom)
-                        .ok_or_else(|| TermError::MissingAtom(last.atom.clone()))?;
-                    if !last_atom.matrix_type.is_scalar() {
-                        contribution = contribution
-                            .mul(&UBound::from_u64(last_atom.matrix_type.columns as u64));
-                    }
-                }
-                prefix_rounding = prefix_rounding
-                    .add(&contribution.mul(&UBound::from_ratio(&BigInt::one(), &BigInt::from(2))?));
                 let mut factors = term.factors.clone();
                 for factor in &mut factors[..position] {
                     factor.view.get_or_insert_with(ViewDescriptor::default).modulus_cast =
@@ -1358,25 +1470,20 @@ impl State<'_> {
             }
         }
         self.warn_viewed_preimages(node.id, &input.terms);
-        let bounded_terms = TermList { terms: bounded };
-        let scaled = sum_norm(&bounded_terms, &self.atoms, &self.ring_expansion)?
-            .mul(&UBound::from_ratio(&target, &input.ty.modulus)?);
-        let error_norm = UBound::from_ratio(&BigInt::one(), &BigInt::from(2))?
-            .add(&prefix_rounding)
-            .add(&scaled);
+        let _bounded_terms = TermList { terms: bounded };
         let signal_terms = TermList { terms: signal.clone() };
         let error = self.derived_atom(
             node.id,
             0,
             output_ty.clone(),
             DefExpr::ModDownError {
-                input: node.args[0],
+                input: input.terms.clone(),
                 signal: signal_terms,
                 source_modulus: input.ty.modulus.clone(),
                 target_modulus: target.clone(),
             },
             dependencies(&input.terms, &self.atoms),
-            AtomKind::Bounded { norm: error_norm },
+            AtomKind::Bounded,
         );
         signal.push(Term {
             coefficient: BigInt::one(),
@@ -1408,7 +1515,7 @@ impl State<'_> {
                     .ok_or_else(|| TermError::MissingAtom(factor.atom.clone()))?
                     .clone();
                 match atom.kind {
-                    AtomKind::Bounded { .. } => {
+                    AtomKind::Bounded => {
                         factor.view.get_or_insert_with(ViewDescriptor::default).modulus_cast =
                             Some(target.clone());
                     }
@@ -1432,23 +1539,18 @@ impl State<'_> {
             }
         }
         self.warn_viewed_preimages(node.id, &input.terms);
-        let integer_norm =
-            int_norm_sum(&input.terms, &self.atoms, &self.ring_expansion, &input.ty.modulus)?;
-        let u_norm = integer_norm
-            .div(&UBound::from_integer(&input.ty.modulus)?)?
-            .add(&UBound::from_ratio(&BigInt::one(), &BigInt::from(2))?);
         let error = self.derived_atom(
             node.id,
             0,
             output_ty.clone(),
             DefExpr::ModUpError {
-                input: node.args[0],
+                input: input.terms.clone(),
                 lifted: lifted.clone(),
                 source_modulus: input.ty.modulus.clone(),
                 target_modulus: target.clone(),
             },
             dependencies(&input.terms, &self.atoms),
-            AtomKind::Bounded { norm: u_norm },
+            AtomKind::Bounded,
         );
         lifted.terms.push(Term {
             coefficient: input.ty.modulus.clone(),
@@ -1550,7 +1652,7 @@ impl State<'_> {
                 term.factors[0].view.is_none() &&
                 self.atoms
                     .get(&term.factors[0].atom)
-                    .is_some_and(|atom| matches!(atom.class, AtomClass::Source))
+                    .is_some_and(|atom| matches!(atom.class, AtomClass::Source { .. }))
         });
         if !single_source && !spec.replace_derived {
             return Err(self.overlay_error(
@@ -1587,17 +1689,6 @@ impl State<'_> {
                 entry,
                 "unfold kind character differs from the current description",
             ));
-        }
-        if !current_large {
-            let old = sum_norm(&current.terms, &self.atoms, &self.ring_expansion)?;
-            let new = sum_norm(&assumed, &self.atoms, &self.ring_expansion)?;
-            if new < old {
-                self.warnings.push(ElaborationWarning {
-                    node: wire.wire.node,
-                    kind: WarningKind::StrengthenedBound,
-                    message: format!("overlay entry {entry} assumes a tighter bound"),
-                });
-            }
         }
         let terms = rewrite_preimages(assumed, &self.atoms, self)?;
         Ok(MatrixValue { ty: current.ty, terms })
@@ -1641,10 +1732,13 @@ impl State<'_> {
             }
             match group {
                 FoldGroup::Keep { .. } => output.extend(members),
-                FoldGroup::Residual { .. } => {
+                FoldGroup::Noise { .. } => {
                     let folded = TermList { terms: members };
-                    if folded.contains_large(&self.atoms)? {
-                        return Err(self.overlay_error(entry, "Residual fold contains a large atom"));
+                    if !matches!(
+                        classify_terms(&folded, &self.atoms)?,
+                        TermClass::Zero | TermClass::Noise
+                    ) {
+                        return Err(self.overlay_error(entry, "Noise fold contains signal"));
                     }
                     let atom = self.create_fold_atom(
                         entry,
@@ -1652,6 +1746,7 @@ impl State<'_> {
                         group_index,
                         current.ty.clone(),
                         folded,
+                        AtomKind::Bounded,
                     )?;
                     output.push(Term {
                         coefficient: BigInt::one(),
@@ -1662,8 +1757,38 @@ impl State<'_> {
                     let suffix_len = usize::try_from(*suffix_len).map_err(|_| {
                         self.overlay_error(entry, "Signal suffix length does not fit usize")
                     })?;
+                    if suffix_len == 0 {
+                        let folded = TermList { terms: members }.canonicalize(&self.atoms)?;
+                        if !matches!(classify_terms(&folded, &self.atoms)?, TermClass::Signal) {
+                            return Err(self.overlay_error(
+                                entry,
+                                "whole-signal fold must contain signal and no standalone noise",
+                            ));
+                        }
+                        let atom = self.create_fold_atom(
+                            entry,
+                            wire,
+                            group_index,
+                            current.ty.clone(),
+                            folded,
+                            AtomKind::Large,
+                        )?;
+                        output.push(Term {
+                            coefficient: BigInt::one(),
+                            factors: vec![Factor { atom, view: None }],
+                        });
+                        continue;
+                    }
                     let first_suffix = signal_suffix(&members[0], suffix_len, &self.atoms)
                         .ok_or_else(|| self.overlay_error(entry, "Signal suffix is too long"))?;
+                    if !first_suffix
+                        .iter()
+                        .any(|factor| self.atoms.get(&factor.atom).is_some_and(Atom::is_large))
+                    {
+                        return Err(
+                            self.overlay_error(entry, "Signal fold suffix contains no signal atom")
+                        );
+                    }
                     let mut prefixes = Vec::new();
                     for member in members {
                         let suffix =
@@ -1703,8 +1828,14 @@ impl State<'_> {
                     } else {
                         self.term_type(entry, &folded.terms[0])?
                     };
-                    let atom =
-                        self.create_fold_atom(entry, wire, group_index, prefix_ty, folded)?;
+                    let atom = self.create_fold_atom(
+                        entry,
+                        wire,
+                        group_index,
+                        prefix_ty,
+                        folded,
+                        AtomKind::Bounded,
+                    )?;
                     let mut factors = vec![Factor { atom, view: None }];
                     factors.extend(first_suffix);
                     output.push(Term { coefficient: BigInt::one(), factors });
@@ -1724,6 +1855,7 @@ impl State<'_> {
         group_index: usize,
         matrix_type: ConcreteMatrixType,
         definition: TermList,
+        kind: AtomKind,
     ) -> Result<AtomId, ElaborationError> {
         if definition.terms.iter().any(|term| {
             term.factors.iter().any(|factor| {
@@ -1736,7 +1868,6 @@ impl State<'_> {
                 message: format!("overlay fold entry {entry} absorbed preimage references"),
             });
         }
-        let norm = sum_norm(&definition, &self.atoms, &self.ring_expansion)?;
         let id = AtomId::Overlay {
             instantiation_path: wire.instantiation_path.clone(),
             node: wire.wire.node,
@@ -1747,10 +1878,11 @@ impl State<'_> {
         let atom = Atom {
             id: id.clone(),
             class: AtomClass::Derived { definition: DefExpr::Fold(definition.clone()) },
-            kind: AtomKind::Bounded { norm },
+            kind,
             matrix_type,
             dependencies: dependencies(&definition, &self.atoms),
             preimage_refs: None,
+            indicator: None,
         };
         if let Some(existing) = self.atoms.insert(atom.clone()) &&
             existing != atom
@@ -1919,14 +2051,14 @@ impl State<'_> {
                             "constant atom matrix type must have positive dimensions and modulus > 1",
                         ));
                     }
-                    let norm = constant_norm(&value, &matrix_type, self.bindings)?;
                     self.atoms.insert(Atom {
                         id: id.clone(),
-                        class: AtomClass::Source,
-                        kind: AtomKind::Bounded { norm },
+                        class: AtomClass::Source { source: SourceKind::ConstantMatrix { value } },
+                        kind: AtomKind::Bounded,
                         matrix_type,
                         dependencies: BTreeSet::new(),
                         preimage_refs: None,
+                        indicator: None,
                     });
                 }
                 Ok(id)
@@ -2016,10 +2148,45 @@ impl State<'_> {
             self.overlay_error(entry, &format!("virtual atom {name} is undeclared"))
         })?;
         let matrix_type = concrete_matrix(&declaration.matrix_type, self.bindings)?;
-        let kind = match declaration.kind {
-            VirtualKind::Large => AtomKind::Large,
-            VirtualKind::Bounded { norm } => {
-                AtomKind::Bounded { norm: evaluate_bound(&norm, self.bindings)? }
+        let (kind, metadata) = match declaration.kind {
+            VirtualKind::Large => (AtomKind::Large, None),
+            VirtualKind::Bounded { norm, is_const_poly, zero_rows, dependencies, clt_ready } => {
+                let zero_rows = zero_rows
+                    .map(|rows| {
+                        let rows = nonnegative_usize(
+                            rows.evaluate(self.bindings)?,
+                            "virtual zero rows",
+                            NodeId(0),
+                        )?;
+                        if rows > matrix_type.rows {
+                            return Err(ElaborationError::Overlay {
+                                entry: Some(entry),
+                                message: "virtual zero_rows exceeds matrix rows".to_owned(),
+                            });
+                        }
+                        Ok(rows)
+                    })
+                    .transpose()?;
+                let dependencies = match dependencies {
+                    crate::overlay::DeclaredDependencyLabels::Known(labels) => {
+                        DeclaredDependencies::Known(
+                            labels.into_iter().map(DeclaredDependencyRef::Local).collect(),
+                        )
+                    }
+                    crate::overlay::DeclaredDependencyLabels::Unknown => {
+                        DeclaredDependencies::Unknown
+                    }
+                };
+                (
+                    AtomKind::Bounded,
+                    Some(AssumedMetadata {
+                        norm: close_real_expr(&norm, self.bindings)?,
+                        is_const_poly,
+                        zero_rows,
+                        dependencies,
+                        clt_ready,
+                    }),
+                )
             }
         };
         let preimage_refs = declaration
@@ -2040,11 +2207,12 @@ impl State<'_> {
             .transpose()?;
         self.atoms.insert(Atom {
             id: id.clone(),
-            class: AtomClass::Assumed,
+            class: AtomClass::Assumed { metadata },
             kind,
             matrix_type: matrix_type.clone(),
             dependencies: BTreeSet::new(),
             preimage_refs: preimage_refs.clone(),
+            indicator: None,
         });
         if let Some(preimage) = &declaration.preimage {
             let uniform_type = self
@@ -2213,16 +2381,18 @@ impl State<'_> {
         port: u32,
         matrix_type: ConcreteMatrixType,
         kind: AtomKind,
+        source: SourceKind,
         preimage_refs: Option<PreimageRefs>,
     ) -> AtomId {
         let id = AtomId::Local { instantiation_path: self.path.clone(), node, port };
         self.atoms.insert(Atom {
             id: id.clone(),
-            class: AtomClass::Source,
+            class: AtomClass::Source { source },
             kind,
             matrix_type,
             dependencies: BTreeSet::new(),
             preimage_refs,
+            indicator: None,
         });
         id
     }
@@ -2244,6 +2414,7 @@ impl State<'_> {
             matrix_type,
             dependencies,
             preimage_refs: None,
+            indicator: None,
         });
         id
     }
@@ -2252,10 +2423,10 @@ impl State<'_> {
         &mut self,
         value: &ConstantMatrix,
         ty: &ConcreteMatrixType,
-        norm: UBound,
     ) -> Result<AtomId, ElaborationError> {
+        let value = close_constant_matrix(value, self.bindings)?;
         let params = vec![
-            serde_json::to_string(value).map_err(|error| ElaborationError::Node {
+            serde_json::to_string(&value).map_err(|error| ElaborationError::Node {
                 node: NodeId(0),
                 message: error.to_string(),
             })?,
@@ -2268,11 +2439,12 @@ impl State<'_> {
         if !self.atoms.contains_key(&id) {
             self.atoms.insert(Atom {
                 id: id.clone(),
-                class: AtomClass::Source,
-                kind: AtomKind::Bounded { norm },
+                class: AtomClass::Source { source: SourceKind::ConstantMatrix { value } },
+                kind: AtomKind::Bounded,
                 matrix_type: ty.clone(),
                 dependencies: BTreeSet::new(),
                 preimage_refs: None,
+                indicator: None,
             });
         }
         Ok(id)
@@ -2285,7 +2457,7 @@ impl State<'_> {
         small: bool,
     ) -> Result<AtomId, ElaborationError> {
         let value = ConstantMatrix::Gadget { base: base.clone(), small };
-        self.constant_atom(&value, ty, modulus_half(&ty.modulus)?)
+        self.constant_atom(&value, ty)
     }
 
     fn require_reduced(&self, node: NodeId, terms: &TermList) -> Result<(), ElaborationError> {
@@ -2464,29 +2636,63 @@ fn concrete_wire(ty: &WireType, env: &ParamEnv) -> Result<ConcreteWireType, Elab
             length: positive_usize(length.evaluate(env)?, "byte-string length", NodeId(0))?,
         },
         WireType::Matrix(matrix) => ConcreteWireType::Matrix(concrete_matrix(matrix, env)?),
-        WireType::Trapdoor { matrix, sigma } => ConcreteWireType::Trapdoor {
-            matrix: concrete_matrix(matrix, env)?,
-            sigma: sigma.clone(),
-        },
+        WireType::Trapdoor { matrix, sigma, gadget_base, digit_count } => {
+            ConcreteWireType::Trapdoor {
+                matrix: concrete_matrix(matrix, env)?,
+                sigma: sigma.clone(),
+                gadget_base: gadget_base.evaluate(env)?.abs(),
+                digit_count: positive_usize(
+                    digit_count.evaluate(env)?,
+                    "trapdoor digit count",
+                    NodeId(0),
+                )?,
+            }
+        }
         WireType::Preimage(matrix) => ConcreteWireType::Preimage(concrete_matrix(matrix, env)?),
     })
 }
 
-fn evaluate_bound(expression: &RealExpr, env: &ParamEnv) -> Result<UBound, ElaborationError> {
+fn close_real_expr(expression: &RealExpr, env: &ParamEnv) -> Result<RealExpr, ElaborationError> {
+    if !contains_sqrt(expression) {
+        return Ok(RealExpr::Rational(expression.evaluate_rational(env)?));
+    }
     Ok(match expression {
-        RealExpr::Rational(value) => UBound::from_ratio(value.numerator(), value.denominator())?,
-        RealExpr::Var(name) => {
-            let value =
-                env.reals.get(name).ok_or_else(|| ExprError::UnboundVariable(name.clone()))?;
-            UBound::from_ratio(value.numerator(), value.denominator())?
+        RealExpr::Rational(value) => RealExpr::Rational(value.clone()),
+        RealExpr::Var(name) => RealExpr::Rational(
+            env.reals.get(name).cloned().ok_or_else(|| ExprError::UnboundVariable(name.clone()))?,
+        ),
+        RealExpr::FromInt(value) => {
+            RealExpr::FromInt(crate::expr::IntExpr::constant(value.evaluate(env)?))
         }
-        RealExpr::FromInt(value) => UBound::from_integer(&value.evaluate(env)?)?,
-        RealExpr::Add(lhs, rhs) => evaluate_bound(lhs, env)?.add(&evaluate_bound(rhs, env)?),
-        RealExpr::Sub(lhs, rhs) => evaluate_bound(lhs, env)?.sub(&evaluate_bound(rhs, env)?)?,
-        RealExpr::Mul(lhs, rhs) => evaluate_bound(lhs, env)?.mul(&evaluate_bound(rhs, env)?),
-        RealExpr::Div(lhs, rhs) => evaluate_bound(lhs, env)?.div(&evaluate_bound(rhs, env)?)?,
-        RealExpr::Sqrt(value) => evaluate_bound(value, env)?.sqrt(),
+        RealExpr::Add(lhs, rhs) => RealExpr::Add(
+            Box::new(close_real_expr(lhs, env)?),
+            Box::new(close_real_expr(rhs, env)?),
+        ),
+        RealExpr::Sub(lhs, rhs) => RealExpr::Sub(
+            Box::new(close_real_expr(lhs, env)?),
+            Box::new(close_real_expr(rhs, env)?),
+        ),
+        RealExpr::Mul(lhs, rhs) => RealExpr::Mul(
+            Box::new(close_real_expr(lhs, env)?),
+            Box::new(close_real_expr(rhs, env)?),
+        ),
+        RealExpr::Div(lhs, rhs) => RealExpr::Div(
+            Box::new(close_real_expr(lhs, env)?),
+            Box::new(close_real_expr(rhs, env)?),
+        ),
+        RealExpr::Sqrt(value) => RealExpr::Sqrt(Box::new(close_real_expr(value, env)?)),
     })
+}
+
+fn contains_sqrt(expression: &RealExpr) -> bool {
+    match expression {
+        RealExpr::Sqrt(_) => true,
+        RealExpr::Add(lhs, rhs) |
+        RealExpr::Sub(lhs, rhs) |
+        RealExpr::Mul(lhs, rhs) |
+        RealExpr::Div(lhs, rhs) => contains_sqrt(lhs) || contains_sqrt(rhs),
+        RealExpr::Rational(_) | RealExpr::Var(_) | RealExpr::FromInt(_) => false,
+    }
 }
 
 fn concrete_matrix(
@@ -2519,6 +2725,13 @@ fn positive_usize(value: BigInt, label: &str, node: NodeId) -> Result<usize, Ela
     })
 }
 
+fn nonnegative_usize(value: BigInt, label: &str, node: NodeId) -> Result<usize, ElaborationError> {
+    value.to_usize().ok_or_else(|| ElaborationError::Node {
+        node,
+        message: format!("{label} must be a nonnegative usize"),
+    })
+}
+
 fn sliced_type(
     input: &ConcreteMatrixType,
     rows: Option<&crate::term::IndexRange>,
@@ -2537,32 +2750,31 @@ fn sliced_type(
     Ok(ConcreteMatrixType { rows: row_count, columns: column_count, ..input.clone() })
 }
 
-fn constant_norm(
+fn close_constant_matrix(
     value: &ConstantMatrix,
-    ty: &ConcreteMatrixType,
     env: &ParamEnv,
-) -> Result<UBound, ElaborationError> {
+) -> Result<ConstantMatrix, ElaborationError> {
     Ok(match value {
-        ConstantMatrix::Zero => UBound::zero(),
-        ConstantMatrix::Identity |
-        ConstantMatrix::UnitRow { .. } |
-        ConstantMatrix::UnitColumn { .. } |
-        ConstantMatrix::Rotation { .. } => UBound::one(),
-        ConstantMatrix::Gadget { .. } => modulus_half(&ty.modulus)?,
-        ConstantMatrix::PowerOfBase { base, exponent } => {
-            let base = base.evaluate(env)?.abs();
-            let exponent =
-                exponent.evaluate(env)?.to_u32().ok_or_else(|| ElaborationError::Node {
-                    node: NodeId(0),
-                    message: "power exponent must be a u32".to_owned(),
-                })?;
-            UBound::from_integer(&base.pow(exponent))?
+        ConstantMatrix::Zero => ConstantMatrix::Zero,
+        ConstantMatrix::Identity => ConstantMatrix::Identity,
+        ConstantMatrix::UnitRow { index } => {
+            ConstantMatrix::UnitRow { index: crate::expr::IntExpr::constant(index.evaluate(env)?) }
         }
+        ConstantMatrix::UnitColumn { index } => ConstantMatrix::UnitColumn {
+            index: crate::expr::IntExpr::constant(index.evaluate(env)?),
+        },
+        ConstantMatrix::Rotation { exponent } => ConstantMatrix::Rotation {
+            exponent: crate::expr::IntExpr::constant(exponent.evaluate(env)?),
+        },
+        ConstantMatrix::Gadget { base, small } => ConstantMatrix::Gadget {
+            base: crate::expr::IntExpr::constant(base.evaluate(env)?),
+            small: *small,
+        },
+        ConstantMatrix::PowerOfBase { base, exponent } => ConstantMatrix::PowerOfBase {
+            base: crate::expr::IntExpr::constant(base.evaluate(env)?),
+            exponent: crate::expr::IntExpr::constant(exponent.evaluate(env)?),
+        },
     })
-}
-
-fn gaussian_norm(sigma: UBound, ty: &ConcreteMatrixType) -> UBound {
-    sigma.mul(&UBound::from_u64(ty.ring_dimension as u64).sqrt()).mul(&UBound::from_u64(8))
 }
 
 fn gadget_digits(modulus: &BigInt, base: &BigInt) -> usize {
@@ -2588,10 +2800,6 @@ fn decomposition_digits(
     }
 }
 
-fn modulus_half(modulus: &BigInt) -> Result<UBound, crate::ubound::UBoundError> {
-    UBound::from_ratio(modulus, &BigInt::from(2))
-}
-
 fn dependencies(terms: &TermList, atoms: &AtomTable) -> BTreeSet<AtomId> {
     terms
         .terms
@@ -2606,67 +2814,36 @@ fn dependencies(terms: &TermList, atoms: &AtomTable) -> BTreeSet<AtomId> {
         .collect()
 }
 
-fn derived_kind(
-    terms: &TermList,
-    atoms: &AtomTable,
-    gamma: &UBound,
-) -> Result<AtomKind, ElaborationError> {
-    if terms.contains_large(atoms)? {
-        Ok(AtomKind::Large)
-    } else {
-        Ok(AtomKind::Bounded { norm: sum_norm(terms, atoms, gamma)? })
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TermClass {
+    Zero,
+    Noise,
+    Signal,
+    Mixed,
 }
 
-fn int_norm_sum(
-    terms: &TermList,
-    atoms: &AtomTable,
-    gamma: &UBound,
-    modulus: &BigInt,
-) -> Result<UBound, ElaborationError> {
-    let half = modulus_half(modulus)?;
-    let mut shadow = atoms.clone();
-    for atom in shadow.values().cloned().collect::<Vec<_>>() {
-        let capped = match atom.kind {
-            AtomKind::Large => half.clone(),
-            AtomKind::Bounded { norm } => UBound::min(&norm, &half),
-        };
-        shadow.get_mut(&atom.id).expect("atom exists").kind = AtomKind::Bounded { norm: capped };
-    }
-    let mut total = UBound::zero();
+fn classify_terms(terms: &TermList, atoms: &AtomTable) -> Result<TermClass, TermError> {
+    let mut signal = false;
+    let mut noise = false;
     for term in &terms.terms {
-        total = total.add(&term_norm(term, &shadow, gamma)?);
+        let term_has_signal = term.factors.iter().try_fold(false, |found, factor| {
+            let atom = atoms
+                .get(&factor.atom)
+                .ok_or_else(|| TermError::MissingAtom(factor.atom.clone()))?;
+            Ok::<_, TermError>(found || atom.is_large())
+        })?;
+        if term_has_signal {
+            signal = true;
+        } else {
+            noise = true;
+        }
     }
-    Ok(total)
-}
-
-fn ring_expansion(graph: &Graph, env: &ParamEnv) -> Result<UBound, ElaborationError> {
-    let maximum = graph
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.kind {
-            NodeKind::Input {
-                wire_type:
-                    WireType::Matrix(matrix) |
-                    WireType::Preimage(matrix) |
-                    WireType::Trapdoor { matrix, .. },
-                ..
-            } => Some(&matrix.ring_dimension),
-            NodeKind::ConstantMatrix { matrix_type, .. } |
-            NodeKind::UniformSample { matrix_type, .. } |
-            NodeKind::GaussianSample { matrix_type, .. } |
-            NodeKind::HashSample { matrix_type, .. } |
-            NodeKind::TrapdoorSample { matrix_type, .. } |
-            NodeKind::PreimageSample { matrix_type } => Some(&matrix_type.ring_dimension),
-            NodeKind::GadgetTrapdoor { matrix_type, .. } => Some(&matrix_type.ring_dimension),
-            _ => None,
-        })
-        .map(|dimension| dimension.evaluate(env))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .unwrap_or_else(BigInt::one);
-    Ok(UBound::from_integer(&maximum)?.sqrt())
+    Ok(match (signal, noise) {
+        (false, false) => TermClass::Zero,
+        (false, true) => TermClass::Noise,
+        (true, false) => TermClass::Signal,
+        (true, true) => TermClass::Mixed,
+    })
 }
 
 #[cfg(test)]
@@ -2715,6 +2892,14 @@ mod tests {
         }
     }
 
+    fn large_sample(id: u64) -> Node {
+        let mut node = bounded_sample(id);
+        let NodeKind::UniformSample { range, .. } = &mut node.kind else { unreachable!() };
+        range.minimum = BigInt::from(-9);
+        range.maximum = BigInt::from(9);
+        node
+    }
+
     fn empty_graph(name: &str, nodes: Vec<Node>, output: WireRef) -> Graph {
         Graph {
             name: name.to_owned(),
@@ -2754,7 +2939,7 @@ mod tests {
     }
 
     #[test]
-    fn tensor_and_concat_retain_exact_defining_expressions_and_norm_rules() {
+    fn concat_and_reshape_retain_exact_defining_expressions_and_tensor_is_rejected() {
         let mut left = bounded_sample(1);
         let mut right = bounded_sample(2);
         for node in [&mut left, &mut right] {
@@ -2762,39 +2947,33 @@ mod tests {
             range.minimum = BigInt::from(-2);
             range.maximum = BigInt::from(2);
         }
-        let tensor =
-            Node { id: NodeId(3), kind: NodeKind::Tensor, args: vec![wire(1, 0), wire(2, 0)] };
         let concat = Node {
-            id: NodeId(4),
+            id: NodeId(3),
             kind: NodeKind::Concat { axis: ConcatAxis::Rows },
             args: vec![wire(1, 0), wire(2, 0)],
         };
         let reshape = Node {
-            id: NodeId(5),
+            id: NodeId(4),
             kind: NodeKind::Reshape { rows: IntExpr::constant(1), columns: IntExpr::constant(8) },
-            args: vec![wire(4, 0)],
+            args: vec![wire(3, 0)],
         };
         let graph = Graph {
             name: "derived-definitions".to_owned(),
             parameters: Vec::new(),
             input_types: BTreeMap::new(),
-            nodes: vec![left, right, tensor, concat, reshape],
+            nodes: vec![left.clone(), right.clone(), concat, reshape],
             outputs: BTreeMap::from([
-                ("tensor".to_owned(), wire(3, 0)),
-                ("concat".to_owned(), wire(4, 0)),
-                ("reshape".to_owned(), wire(5, 0)),
+                ("concat".to_owned(), wire(3, 0)),
+                ("reshape".to_owned(), wire(4, 0)),
             ]),
             subgraphs: BTreeMap::new(),
             real_constants: BTreeMap::new(),
         };
         let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        let tensor_atom = &elaborated_terms(&elaborated, wire(3, 0)).terms[0].factors[0].atom;
-        let concat_atom = &elaborated_terms(&elaborated, wire(4, 0)).terms[0].factors[0].atom;
-        let reshape_atom = &elaborated_terms(&elaborated, wire(5, 0)).terms[0].factors[0].atom;
-        let tensor = elaborated.atoms.get(tensor_atom).expect("tensor atom");
+        let concat_atom = &elaborated_terms(&elaborated, wire(3, 0)).terms[0].factors[0].atom;
+        let reshape_atom = &elaborated_terms(&elaborated, wire(4, 0)).terms[0].factors[0].atom;
         let concat = elaborated.atoms.get(concat_atom).expect("concat atom");
         let reshape = elaborated.atoms.get(reshape_atom).expect("reshape atom");
-        assert!(matches!(tensor.class, AtomClass::Derived { definition: DefExpr::Tensor { .. } }));
         assert!(matches!(
             concat.class,
             AtomClass::Derived { definition: DefExpr::Concat { axis: ConcatAxis::Rows, .. } }
@@ -2803,15 +2982,67 @@ mod tests {
             reshape.class,
             AtomClass::Derived { definition: DefExpr::Reshape { rows: 1, columns: 8, .. } }
         ));
-        let AtomKind::Bounded { norm: tensor_norm } = &tensor.kind else {
-            panic!("bounded tensor")
-        };
-        let AtomKind::Bounded { norm: concat_norm } = &concat.kind else {
-            panic!("bounded concat")
-        };
-        assert_eq!(tensor_norm, &elaborated.ring_expansion.mul(&UBound::from_u64(4)));
-        assert_eq!(concat_norm, &UBound::from_u64(2));
+        assert_eq!(concat.kind, AtomKind::Bounded);
         assert_eq!(reshape.kind, concat.kind);
+
+        let tensor_graph = empty_graph(
+            "unsupported-tensor",
+            vec![
+                left,
+                right,
+                Node { id: NodeId(3), kind: NodeKind::Tensor, args: vec![wire(1, 0), wire(2, 0)] },
+            ],
+            wire(3, 0),
+        );
+        assert!(matches!(
+            elaborate(&tensor_graph, &ParamEnv::default()),
+            Err(ElaborationError::Context { .. })
+        ));
+    }
+
+    #[test]
+    fn opaque_concat_and_reshape_reject_signal_noise_mixtures() {
+        let concat = Graph {
+            name: "mixed-concat".to_owned(),
+            parameters: Vec::new(),
+            input_types: BTreeMap::new(),
+            nodes: vec![
+                large_sample(1),
+                bounded_sample(2),
+                Node {
+                    id: NodeId(3),
+                    kind: NodeKind::Concat { axis: ConcatAxis::Rows },
+                    args: vec![wire(1, 0), wire(2, 0)],
+                },
+            ],
+            outputs: BTreeMap::from([("out".to_owned(), wire(3, 0))]),
+            subgraphs: BTreeMap::new(),
+            real_constants: BTreeMap::new(),
+        };
+        assert!(elaborate(&concat, &ParamEnv::default()).is_err());
+
+        let reshape = empty_graph(
+            "mixed-reshape",
+            vec![
+                large_sample(1),
+                bounded_sample(2),
+                Node {
+                    id: NodeId(3),
+                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Add),
+                    args: vec![wire(1, 0), wire(2, 0)],
+                },
+                Node {
+                    id: NodeId(4),
+                    kind: NodeKind::Reshape {
+                        rows: IntExpr::constant(1),
+                        columns: IntExpr::constant(4),
+                    },
+                    args: vec![wire(3, 0)],
+                },
+            ],
+            wire(4, 0),
+        );
+        assert!(elaborate(&reshape, &ParamEnv::default()).is_err());
     }
 
     #[test]
@@ -2826,7 +3057,12 @@ mod tests {
         for id in [2, 3] {
             nodes.push(Node {
                 id: NodeId(id),
-                kind: NodeKind::TrapdoorSample { matrix_type: matrix_type(), sigma: sigma.clone() },
+                kind: NodeKind::TrapdoorSample {
+                    matrix_type: matrix_type(),
+                    sigma: sigma.clone(),
+                    gadget_base: IntExpr::constant(2),
+                    digit_count: IntExpr::constant(1),
+                },
                 args: Vec::new(),
             });
         }
@@ -2891,7 +3127,12 @@ mod tests {
         for id in [2, 3] {
             nodes.push(Node {
                 id: NodeId(id),
-                kind: NodeKind::TrapdoorSample { matrix_type: matrix_type(), sigma: sigma.clone() },
+                kind: NodeKind::TrapdoorSample {
+                    matrix_type: matrix_type(),
+                    sigma: sigma.clone(),
+                    gadget_base: IntExpr::constant(2),
+                    digit_count: IntExpr::constant(1),
+                },
                 args: Vec::new(),
             });
         }
@@ -2938,7 +3179,12 @@ mod tests {
         for id in [3, 4] {
             nodes.push(Node {
                 id: NodeId(id),
-                kind: NodeKind::TrapdoorSample { matrix_type: matrix_type(), sigma: sigma.clone() },
+                kind: NodeKind::TrapdoorSample {
+                    matrix_type: matrix_type(),
+                    sigma: sigma.clone(),
+                    gadget_base: IntExpr::constant(2),
+                    digit_count: IntExpr::constant(1),
+                },
                 args: Vec::new(),
             });
         }
@@ -3187,11 +3433,7 @@ mod tests {
         );
         let source = elaborated.atoms.get(&cast_factor.atom).expect("source atom");
         assert!(source.preimage_refs.is_some());
-        assert_eq!(
-            crate::bounds::term_norm(cast_term, &elaborated.atoms, &elaborated.ring_expansion)
-                .expect("bounded cast"),
-            UBound::from_ratio(&BigInt::from(17), &BigInt::from(2)).expect("valid cap")
-        );
+        assert_eq!(source.kind, AtomKind::Bounded);
     }
 
     #[test]
@@ -3237,6 +3479,8 @@ mod tests {
                         sigma: RealExpr::Rational(
                             Rational::new(BigInt::from(3), BigInt::one()).expect("rational"),
                         ),
+                        gadget_base: IntExpr::constant(2),
+                        digit_count: IntExpr::constant(1),
                     },
                     args: Vec::new(),
                 },
@@ -3302,7 +3546,7 @@ mod tests {
             error.class,
             AtomClass::Derived { definition: DefExpr::ModDownError { .. } }
         ));
-        assert!(matches!(error.kind, AtomKind::Bounded { .. }));
+        assert_eq!(error.kind, AtomKind::Bounded);
     }
 
     #[test]
@@ -3317,6 +3561,8 @@ mod tests {
                         sigma: RealExpr::Rational(
                             Rational::new(BigInt::from(3), BigInt::one()).expect("rational"),
                         ),
+                        gadget_base: IntExpr::constant(2),
+                        digit_count: IntExpr::constant(1),
                     },
                     args: Vec::new(),
                 },
@@ -3607,6 +3853,16 @@ mod tests {
         FactorRef { atom: AtomRef::Virtual { name: name.to_owned() }, view: None }
     }
 
+    fn bounded_virtual_kind() -> VirtualKind {
+        VirtualKind::Bounded {
+            norm: RealExpr::FromInt(IntExpr::constant(1)),
+            is_const_poly: false,
+            zero_rows: None,
+            dependencies: crate::overlay::DeclaredDependencyLabels::Unknown,
+            clt_ready: false,
+        }
+    }
+
     fn overlay_term(coefficient: i64, factors: Vec<FactorRef>) -> OverlayTerm {
         OverlayTerm { coefficient: IntExpr::constant(coefficient), factors }
     }
@@ -3626,20 +3882,8 @@ mod tests {
         SymbolicOverlay {
             virtual_atoms: BTreeMap::from([
                 ("B".to_owned(), virtual_decl(matrix_type(), VirtualKind::Large)),
-                (
-                    "s".to_owned(),
-                    virtual_decl(
-                        scalar,
-                        VirtualKind::Bounded { norm: RealExpr::FromInt(IntExpr::constant(1)) },
-                    ),
-                ),
-                (
-                    "e".to_owned(),
-                    virtual_decl(
-                        matrix_type(),
-                        VirtualKind::Bounded { norm: RealExpr::FromInt(IntExpr::constant(1)) },
-                    ),
-                ),
+                ("s".to_owned(), virtual_decl(scalar, bounded_virtual_kind())),
+                ("e".to_owned(), virtual_decl(matrix_type(), bounded_virtual_kind())),
             ]),
             term_lists: BTreeMap::from([
                 (
@@ -3726,10 +3970,7 @@ mod tests {
         let overlay = SymbolicOverlay {
             virtual_atoms: BTreeMap::from([(
                 "e".to_owned(),
-                virtual_decl(
-                    matrix_type(),
-                    VirtualKind::Bounded { norm: RealExpr::FromInt(IntExpr::constant(1)) },
-                ),
+                virtual_decl(matrix_type(), bounded_virtual_kind()),
             )]),
             term_lists: BTreeMap::from([(
                 assumed_id("e"),
@@ -3791,10 +4032,7 @@ mod tests {
         let overlay = SymbolicOverlay {
             virtual_atoms: BTreeMap::from([(
                 "k".to_owned(),
-                virtual_decl(
-                    matrix_type(),
-                    VirtualKind::Bounded { norm: RealExpr::FromInt(IntExpr::constant(1)) },
-                ),
+                virtual_decl(matrix_type(), bounded_virtual_kind()),
             )]),
             term_lists: BTreeMap::from([(
                 assumed_id("k"),
@@ -3839,9 +4077,7 @@ mod tests {
                     "K".to_owned(),
                     VirtualAtomDecl {
                         matrix_type: matrix_type(),
-                        kind: VirtualKind::Bounded {
-                            norm: RealExpr::FromInt(IntExpr::constant(1)),
-                        },
+                        kind: bounded_virtual_kind(),
                         preimage: Some(AssumedPreimage {
                             uniform: AtomRef::Virtual { name: "A".to_owned() },
                             target: assumed_id("target"),
@@ -3893,7 +4129,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_fold_retains_an_exact_derived_definition() {
+    fn noise_fold_retains_an_exact_derived_definition() {
         let graph = empty_graph(
             "fold",
             vec![
@@ -3922,7 +4158,7 @@ mod tests {
                 selector(2),
                 Reinterpretation::Fold(FoldSpec {
                     expected: ExpectedTermList { entries: vec![ExpectedEntry::Term(expected)] },
-                    groups: vec![FoldGroup::Residual { terms: BTreeSet::from([0]) }],
+                    groups: vec![FoldGroup::Noise { terms: BTreeSet::from([0]) }],
                 }),
             )],
             ..SymbolicOverlay::default()
@@ -3942,7 +4178,7 @@ mod tests {
             "signal-fold",
             vec![
                 bounded_sample(1),
-                bounded_sample(2),
+                large_sample(2),
                 Node {
                     id: NodeId(3),
                     kind: NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
@@ -3988,6 +4224,52 @@ mod tests {
             output.terms[0].factors[1].atom,
             AtomId::Local { instantiation_path: Vec::new(), node: NodeId(2), port: 0 }
         );
+    }
+
+    #[test]
+    fn zero_suffix_signal_fold_creates_one_large_atom() {
+        let graph = empty_graph(
+            "whole-signal-fold",
+            vec![
+                large_sample(1),
+                Node {
+                    id: NodeId(2),
+                    kind: NodeKind::MatrixScale { scalar: IntExpr::constant(1) },
+                    args: vec![wire(1, 0)],
+                },
+            ],
+            wire(2, 0),
+        );
+        let overlay = SymbolicOverlay {
+            entries: vec![(
+                selector(2),
+                Reinterpretation::Fold(FoldSpec {
+                    expected: ExpectedTermList {
+                        entries: vec![ExpectedEntry::Term(overlay_term(
+                            1,
+                            vec![FactorRef {
+                                atom: AtomRef::Node {
+                                    path: Vec::new(),
+                                    node: NodeId(1),
+                                    port: PortMatcher::Concrete(0),
+                                },
+                                view: None,
+                            }],
+                        ))],
+                    },
+                    groups: vec![FoldGroup::Signal { terms: BTreeSet::from([0]), suffix_len: 0 }],
+                }),
+            )],
+            ..SymbolicOverlay::default()
+        };
+        let elaborated =
+            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay).expect("fold");
+        let output = elaborated_terms(&elaborated, wire(2, 0));
+        assert_eq!(output.terms.len(), 1);
+        assert_eq!(output.terms[0].factors.len(), 1);
+        let atom = elaborated.atoms.get(&output.terms[0].factors[0].atom).expect("fold atom");
+        assert_eq!(atom.kind, AtomKind::Large);
+        assert!(matches!(atom.class, AtomClass::Derived { definition: DefExpr::Fold(_) }));
     }
 
     #[test]
@@ -4056,7 +4338,7 @@ mod tests {
                             ),
                         }],
                     },
-                    groups: vec![FoldGroup::Residual { terms: BTreeSet::from([0]) }],
+                    groups: vec![FoldGroup::Noise { terms: BTreeSet::from([0]) }],
                 }),
             )],
             ..SymbolicOverlay::default()
@@ -4068,7 +4350,7 @@ mod tests {
             .get(&elaborated_terms(&elaborated, wire(7, 0)).terms[0].factors[0].atom)
             .expect("fold atom");
         let AtomClass::Derived { definition: DefExpr::Fold(definition) } = &fold.class else {
-            panic!("residual fold")
+            panic!("noise fold")
         };
         assert_eq!(definition.terms.len(), 2);
         assert!(definition.terms.iter().all(|term| {

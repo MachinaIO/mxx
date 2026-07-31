@@ -86,6 +86,8 @@ pub enum NodeKind {
     TrapdoorSample {
         matrix_type: crate::types::MatrixType,
         sigma: RealExpr,
+        gadget_base: IntExpr,
+        digit_count: IntExpr,
     },
     PreimageSample {
         matrix_type: crate::types::MatrixType,

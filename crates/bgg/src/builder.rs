@@ -25,6 +25,8 @@ pub struct TrapdoorWire {
     pub wire: WireRef,
     pub public: MatrixWire,
     pub sigma: RealExpr,
+    pub gadget_base: mxx_ir_core::IntExpr,
+    pub digit_count: mxx_ir_core::IntExpr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -241,15 +243,28 @@ impl GraphBuilder {
         MatrixWire { wire, matrix_type }
     }
 
-    pub fn trapdoor_sample(&mut self, matrix_type: MatrixType, sigma: RealExpr) -> TrapdoorWire {
+    pub fn trapdoor_sample(
+        &mut self,
+        matrix_type: MatrixType,
+        sigma: RealExpr,
+        gadget_base: mxx_ir_core::IntExpr,
+        digit_count: mxx_ir_core::IntExpr,
+    ) -> TrapdoorWire {
         let public_wire = self.push(
-            NodeKind::TrapdoorSample { matrix_type: matrix_type.clone(), sigma: sigma.clone() },
+            NodeKind::TrapdoorSample {
+                matrix_type: matrix_type.clone(),
+                sigma: sigma.clone(),
+                gadget_base: gadget_base.clone(),
+                digit_count: digit_count.clone(),
+            },
             Vec::new(),
         );
         TrapdoorWire {
             wire: WireRef { node: public_wire.node, port: Port(1) },
             public: MatrixWire { wire: public_wire, matrix_type },
             sigma,
+            gadget_base,
+            digit_count,
         }
     }
 

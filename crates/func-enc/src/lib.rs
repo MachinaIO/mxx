@@ -1,4 +1,5 @@
-// TODO: Re-enable AKY24 after the shared decoder refactor is wired to its raw-mask semantics.
+// AKY24 functional encryption is disabled until its raw-mask semantics are
+// specified separately.
 // pub mod aky24;
 
 pub trait FuncEnc {

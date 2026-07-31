@@ -5,7 +5,6 @@ use mxx_ir_core::{
     types::ConcreteMatrixType,
 };
 use mxx_primitives::{
-    element::PolyElem,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     modulus::{ModulusRaiseError, modulus_raise},
     poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
@@ -57,10 +56,74 @@ pub struct PolyBackend<M, U, H, T>
 where
     M: PolyMatrix,
 {
-    parameters: BTreeMap<RingKey, <M::P as Poly>::Params>,
-    #[cfg(test)]
+    parameters: Vec<BTreeMap<RingKey, <M::P as Poly>::Params>>,
+    active_placement: usize,
     preimage_batch_calls: usize,
     _marker: PhantomData<(M, U, H, T)>,
+}
+
+pub(crate) trait CrtRecomposeMatrix: PolyMatrix {
+    fn crt_recompose_levels(
+        levels: &[Self],
+        plaintext_moduli: &[BigInt],
+        reconstruction_coefficients: &[BigInt],
+    ) -> Result<Self, PolyBackendError>;
+}
+
+pub(crate) fn crt_recompose_cpu<M: PolyMatrix>(
+    levels: &[M],
+    plaintext_moduli: &[BigInt],
+    reconstruction_coefficients: &[BigInt],
+) -> Result<M, PolyBackendError> {
+    let first = levels.first().ok_or(PolyBackendError::InvalidInteger)?;
+    if levels.len() != plaintext_moduli.len() ||
+        levels.len() != reconstruction_coefficients.len() ||
+        levels.iter().any(|level| level.size() != first.size()) ||
+        first.row_size() != 1
+    {
+        return Err(PolyBackendError::InvalidInteger);
+    }
+    let parameters = first.params();
+    let modulus: Arc<BigUint> = parameters.modulus().into();
+    let q = BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone());
+    let mut output = M::zero(parameters, 1, first.col_size());
+    for ((level, plaintext_modulus), reconstruction_coefficient) in
+        levels.iter().zip(plaintext_moduli).zip(reconstruction_coefficients)
+    {
+        let residue = ((reconstruction_coefficient % &q) + &q) % &q;
+        let coefficient = M::P::from_biguint_to_constant(
+            parameters,
+            residue.to_biguint().ok_or(PolyBackendError::InvalidInteger)?,
+        );
+        let rounded = (0..first.col_size())
+            .map(|column| {
+                let coefficients = level
+                    .entry(0, column)
+                    .coeffs_biguints()
+                    .into_iter()
+                    .map(|value| {
+                        let value = BigInt::from_biguint(Sign::Plus, value);
+                        let rounded: BigInt =
+                            ((plaintext_modulus * value + &q / 2) / &q) % plaintext_modulus;
+                        rounded.to_biguint().ok_or(PolyBackendError::InvalidInteger)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(M::P::from_biguints(parameters, &coefficients))
+            })
+            .collect::<Result<Vec<_>, PolyBackendError>>()?;
+        output.add_in_place(&(M::from_poly_vec_row(parameters, rounded) * coefficient));
+    }
+    Ok(output)
+}
+
+impl CrtRecomposeMatrix for DCRTPolyMatrix {
+    fn crt_recompose_levels(
+        levels: &[Self],
+        plaintext_moduli: &[BigInt],
+        reconstruction_coefficients: &[BigInt],
+    ) -> Result<Self, PolyBackendError> {
+        crt_recompose_cpu(levels, plaintext_moduli, reconstruction_coefficients)
+    }
 }
 
 impl<M, U, H, T> Default for PolyBackend<M, U, H, T>
@@ -69,8 +132,8 @@ where
 {
     fn default() -> Self {
         Self {
-            parameters: BTreeMap::new(),
-            #[cfg(test)]
+            parameters: vec![BTreeMap::new()],
+            active_placement: 0,
             preimage_batch_calls: 0,
             _marker: PhantomData,
         }
@@ -89,16 +152,69 @@ where
         backend
     }
 
-    pub fn register(&mut self, parameters: <M::P as Poly>::Params) {
+    /// Constructs the production backend placements represented by the
+    /// concrete parameter set.
+    ///
+    /// CPU parameters expose one logical placement. With the `gpu` feature,
+    /// GPU parameters expose their configured device ids and each runtime
+    /// placement receives an equivalent single-device parameter set. This
+    /// keeps CRT limbs of one matrix together while allowing independent loop
+    /// iterations to be scheduled across devices.
+    pub fn new_for_execution(parameters: impl IntoIterator<Item = <M::P as Poly>::Params>) -> Self {
+        Self::new_for_execution_on(parameters, &[])
+    }
+
+    /// Constructs production placements, preferring an application-selected
+    /// device list over the device ids embedded in the parameter object.
+    pub fn new_for_execution_on(
+        parameters: impl IntoIterator<Item = <M::P as Poly>::Params>,
+        requested_device_ids: &[i32],
+    ) -> Self {
+        let parameters = parameters.into_iter().collect::<Vec<_>>();
+        #[cfg(feature = "gpu")]
+        {
+            super::poly_gpu::new_for_execution_on(parameters, requested_device_ids)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = requested_device_ids;
+            Self::new(parameters)
+        }
+    }
+
+    #[cfg(any(test, feature = "gpu"))]
+    pub(crate) fn new_with_placements(placements: Vec<Vec<<M::P as Poly>::Params>>) -> Self {
+        assert!(!placements.is_empty(), "a backend needs at least one placement");
+        let mut backend = Self {
+            parameters: (0..placements.len()).map(|_| BTreeMap::new()).collect(),
+            active_placement: 0,
+            preimage_batch_calls: 0,
+            _marker: PhantomData,
+        };
+        for (placement, parameters) in placements.into_iter().enumerate() {
+            for parameters in parameters {
+                backend.register_at(placement, parameters);
+            }
+        }
+        backend
+    }
+
+    fn register(&mut self, parameters: <M::P as Poly>::Params) {
+        self.register_at(self.active_placement, parameters);
+    }
+
+    fn register_at(&mut self, placement: usize, parameters: <M::P as Poly>::Params) {
         let modulus: Arc<BigUint> = parameters.modulus().into();
         let key = RingKey {
             modulus: BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone()),
             ring_dimension: parameters.ring_dimension() as usize,
         };
-        self.parameters.insert(key, parameters);
+        self.parameters[placement].insert(key, parameters);
     }
 
-    #[cfg(test)]
+    /// Returns the number of batched preimage requests executed by this
+    /// backend instance. This lightweight diagnostic distinguishes the
+    /// bounded-wave batch path from scalar fallback execution.
     pub fn preimage_batch_calls(&self) -> usize {
         self.preimage_batch_calls
     }
@@ -111,10 +227,12 @@ where
             modulus: matrix_type.modulus.clone(),
             ring_dimension: matrix_type.ring_dimension,
         };
-        self.parameters.get(&key).ok_or(PolyBackendError::MissingParameters(key))
+        self.parameters[self.active_placement]
+            .get(&key)
+            .ok_or(PolyBackendError::MissingParameters(key))
     }
 
-    pub(super) fn validate_gadget_layout(
+    pub(super) fn validate_regular_gadget_layout(
         parameters: &<M::P as Poly>::Params,
         gadget_base: &BigInt,
         digit_count: usize,
@@ -132,24 +250,30 @@ where
         Ok(())
     }
 
+    fn expected_gadget_layout(parameters: &<M::P as Poly>::Params, small: bool) -> (BigInt, usize) {
+        let base = BigInt::one() << parameters.base_bits() as usize;
+        let digits = if small {
+            let (_, crt_bits, _) = parameters.to_crt();
+            crt_bits.div_ceil(parameters.base_bits() as usize)
+        } else {
+            parameters.modulus_digits()
+        };
+        (base, digits)
+    }
+
     fn parameters_for_matrix(
         &self,
         matrix: &M,
     ) -> Result<&<M::P as Poly>::Params, PolyBackendError> {
-        let (rows, columns) = matrix.size();
-        if rows == 0 || columns == 0 {
-            return Err(PolyBackendError::EmptyMatrix);
-        }
-        let polynomial = matrix.entry(0, 0);
-        let coefficient =
-            polynomial.coeffs().into_iter().next().ok_or(PolyBackendError::EmptyMatrix)?;
-        let modulus: Arc<BigUint> = coefficient.modulus().clone().into();
-        let ring_dimension = polynomial.coeffs().len();
+        let parameters = matrix.params();
+        let modulus: Arc<BigUint> = parameters.modulus().into();
         let key = RingKey {
             modulus: BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone()),
-            ring_dimension,
+            ring_dimension: parameters.ring_dimension() as usize,
         };
-        self.parameters.get(&key).ok_or(PolyBackendError::MissingParameters(key))
+        self.parameters[self.active_placement]
+            .get(&key)
+            .ok_or(PolyBackendError::MissingParameters(key))
     }
 
     fn ring_integer(
@@ -166,7 +290,7 @@ where
 
 impl<M, U, H, T> Backend for PolyBackend<M, U, H, T>
 where
-    M: PolyMatrix + 'static,
+    M: CrtRecomposeMatrix + 'static,
     U: PolyUniformSampler<M = M>,
     H: PolyHashSampler<[u8; 32], M = M>,
     T: PolyTrapdoorSampler<M = M>,
@@ -175,6 +299,107 @@ where
     type Matrix = M;
     type Trapdoor = T::Trapdoor;
     type Error = PolyBackendError;
+
+    fn placement_count(&self) -> usize {
+        self.parameters.len()
+    }
+
+    fn active_placement(&self) -> usize {
+        self.active_placement
+    }
+
+    fn set_active_placement(&mut self, placement: usize) -> bool {
+        if placement >= self.parameters.len() {
+            return false;
+        }
+        self.active_placement = placement;
+        true
+    }
+
+    fn matrix_to_active_placement(&mut self, value: &M) -> Result<M, Self::Error> {
+        let target = self.parameters_for_matrix(value)?;
+        if value.params() == target {
+            return Ok(value.clone());
+        }
+        let bytes = value.to_cpu_staging_bytes();
+        Ok(M::from_cpu_staging_bytes(target, &bytes))
+    }
+
+    fn matrix_is_on_active_placement(&self, value: &M) -> bool {
+        self.parameters_for_matrix(value).is_ok_and(|target| value.params() == target)
+    }
+
+    fn matrix_to_placements(&mut self, value: &M) -> Result<Vec<Option<M>>, Self::Error> {
+        let source = value.params();
+        let modulus: Arc<BigUint> = source.modulus().into();
+        let key = RingKey {
+            modulus: BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone()),
+            ring_dimension: source.ring_dimension() as usize,
+        };
+        let targets = self
+            .parameters
+            .iter()
+            .map(|parameters| {
+                parameters.get(&key).ok_or_else(|| PolyBackendError::MissingParameters(key.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let staging =
+            targets.iter().any(|target| source != *target).then(|| value.to_cpu_staging_bytes());
+        Ok(targets
+            .into_iter()
+            .map(|target| {
+                if source == target {
+                    None
+                } else {
+                    Some(M::from_cpu_staging_bytes(
+                        target,
+                        staging.as_deref().expect("cross-placement staging was prepared"),
+                    ))
+                }
+            })
+            .collect())
+    }
+
+    fn trapdoor_to_active_placement(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        value: &T::Trapdoor,
+    ) -> Result<T::Trapdoor, Self::Error> {
+        let parameters = self.parameters(ty)?;
+        T::trapdoor_from_bytes(parameters, &T::trapdoor_to_bytes(value))
+            .ok_or(PolyBackendError::TrapdoorDeserialization)
+    }
+
+    fn trapdoor_to_placements(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        value: &T::Trapdoor,
+        source_placement: usize,
+    ) -> Result<Vec<T::Trapdoor>, Self::Error> {
+        if self.parameters.len() == 1 {
+            return Ok(vec![value.clone()]);
+        }
+        let bytes = T::trapdoor_to_bytes(value);
+        self.parameters
+            .iter()
+            .enumerate()
+            .map(|(placement, parameters)| {
+                if placement == source_placement {
+                    Ok(value.clone())
+                } else {
+                    let key =
+                        RingKey { modulus: ty.modulus.clone(), ring_dimension: ty.ring_dimension };
+                    T::trapdoor_from_bytes(
+                        parameters
+                            .get(&key)
+                            .ok_or_else(|| PolyBackendError::MissingParameters(key.clone()))?,
+                        &bytes,
+                    )
+                    .ok_or(PolyBackendError::TrapdoorDeserialization)
+                }
+            })
+            .collect()
+    }
 
     fn constant_matrix(
         &mut self,
@@ -204,7 +429,13 @@ where
                     .ok_or(PolyBackendError::InvalidInteger)?;
                 M::unit_column_vector(parameters, ty.rows, index)
             }
-            ConstantMatrix::Gadget { small, .. } => {
+            ConstantMatrix::Gadget { base, small } => {
+                if !ty.columns.is_multiple_of(ty.rows) {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
+                let base = base.evaluate(env).map_err(|_| PolyBackendError::InvalidInteger)?;
+                let digit_count = ty.columns / ty.rows;
+                self.validate_gadget_layout(ty, &base, digit_count, *small)?;
                 if *small {
                     M::small_gadget_matrix(parameters, ty.rows)
                 } else {
@@ -285,13 +516,12 @@ where
         Ok(left.tensor(right))
     }
 
-    fn concat(&mut self, inputs: &[M], axis: ConcatAxis) -> Result<M, Self::Error> {
+    fn concat(&mut self, inputs: &[&M], axis: ConcatAxis) -> Result<M, Self::Error> {
         let (first, rest) = inputs.split_first().ok_or(PolyBackendError::InvalidConstantShape)?;
-        let references = rest.iter().collect::<Vec<_>>();
         Ok(match axis {
-            ConcatAxis::Rows => first.concat_rows(&references),
-            ConcatAxis::Columns => first.concat_columns(&references),
-            ConcatAxis::Diagonal => first.concat_diag(&references),
+            ConcatAxis::Rows => first.concat_rows(rest),
+            ConcatAxis::Columns => first.concat_columns(rest),
+            ConcatAxis::Diagonal => first.concat_diag(rest),
         })
     }
 
@@ -334,7 +564,11 @@ where
 
     fn sample_gaussian(&mut self, ty: &ConcreteMatrixType, sigma: f64) -> Result<M, Self::Error> {
         let parameters = self.parameters(ty)?;
-        Ok(U::new().sample_uniform(parameters, ty.rows, ty.columns, DistType::GaussDist { sigma }))
+        Ok(if sigma == 0.0 {
+            M::zero(parameters, ty.rows, ty.columns)
+        } else {
+            U::new().sample_uniform(parameters, ty.rows, ty.columns, DistType::GaussDist { sigma })
+        })
     }
 
     fn sample_hash(
@@ -381,6 +615,26 @@ where
         })
     }
 
+    fn validate_gadget_layout(
+        &self,
+        ty: &ConcreteMatrixType,
+        gadget_base: &BigInt,
+        digit_count: usize,
+        small: bool,
+    ) -> Result<(), Self::Error> {
+        let parameters = self.parameters(ty)?;
+        let (backend_base, backend_digits) = Self::expected_gadget_layout(parameters, small);
+        if gadget_base != &backend_base || digit_count != backend_digits {
+            return Err(PolyBackendError::GadgetLayoutMismatch {
+                declared_base: gadget_base.clone(),
+                declared_digits: digit_count,
+                backend_base,
+                backend_digits,
+            });
+        }
+        Ok(())
+    }
+
     fn sample_trapdoor(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -389,7 +643,7 @@ where
         digit_count: usize,
     ) -> Result<(M, T::Trapdoor), Self::Error> {
         let parameters = self.parameters(ty)?;
-        Self::validate_gadget_layout(parameters, gadget_base, digit_count)?;
+        Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
         let sampler = T::new(parameters, sigma);
         let (trapdoor, public) = sampler.trapdoor(parameters, ty.rows);
         Ok((public, trapdoor))
@@ -406,7 +660,7 @@ where
         target: &M,
     ) -> Result<M, Self::Error> {
         let parameters = self.parameters(ty)?;
-        Self::validate_gadget_layout(parameters, gadget_base, digit_count)?;
+        Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
         let sampler = T::new(parameters, sigma);
         Ok(sampler.preimage(parameters, trapdoor, public, target))
     }
@@ -415,10 +669,7 @@ where
         &mut self,
         requests: Vec<PreimageRequest<M, T::Trapdoor>>,
     ) -> Result<Vec<M>, Self::Error> {
-        #[cfg(test)]
-        {
-            self.preimage_batch_calls += 1;
-        }
+        self.preimage_batch_calls += 1;
         #[cfg(not(feature = "gpu"))]
         {
             requests
@@ -452,8 +703,7 @@ where
             modulus: target_modulus.clone(),
             ring_dimension: source.ring_dimension() as usize,
         };
-        let target = self
-            .parameters
+        let target = self.parameters[self.active_placement]
             .get(&target_key)
             .ok_or(PolyBackendError::MissingParameters(target_key))?;
         Ok(value.modulus_switch(&target.modulus()))
@@ -505,6 +755,15 @@ where
             .collect())
     }
 
+    fn crt_recompose(
+        &mut self,
+        levels: &[M],
+        plaintext_moduli: &[BigInt],
+        reconstruction_coefficients: &[BigInt],
+    ) -> Result<M, Self::Error> {
+        M::crt_recompose_levels(levels, plaintext_moduli, reconstruction_coefficients)
+    }
+
     fn matrix_to_bytes(&self, value: &M) -> Vec<u8> {
         value.to_compact_bytes()
     }
@@ -540,24 +799,125 @@ pub fn cpu_backend(parameters: impl IntoIterator<Item = DCRTPolyParams>) -> CpuD
 
 #[cfg(feature = "gpu")]
 pub mod gpu {
+    pub use crate::backend::poly_gpu::{GpuDcrtBackend, gpu_backend};
+}
+
+#[cfg(test)]
+mod tests {
     use super::*;
-    use mxx_primitives::{
-        matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
-        poly::dcrt::gpu::GpuDCRTPolyParams,
-        sampler::{
-            gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
-            trapdoor::GpuDCRTPolyTrapdoorSampler,
-        },
+    use crate::{
+        RuntimeValue, artifact::MemoryArtifactStore, backend::Backend, execute,
+        transcript::SamplingMode,
     };
+    use mxx_ir_core::{GraphBuilder, IntExpr, ParamEnv, artifact::ArtifactConfidentiality};
+    use mxx_primitives::poly::dcrt::poly::DCRTPoly;
+    use std::collections::BTreeMap;
 
-    pub type GpuDcrtBackend = PolyBackend<
-        GpuDCRTPolyMatrix,
-        GpuDCRTPolyUniformSampler,
-        GpuDCRTPolyHashSampler<keccak_asm::Keccak256>,
-        GpuDCRTPolyTrapdoorSampler,
-    >;
+    #[test]
+    fn crt_recompose_matches_explicit_centered_rounding_relation() {
+        let parameters = DCRTPolyParams::new(4, 2, 10, 5);
+        let (plaintext_moduli, _, depth) = parameters.to_crt();
+        let reconstruction_coefficients = parameters.reconst_coeffs();
+        let modulus = parameters.modulus().as_ref().clone();
+        let expected_levels = (0..depth)
+            .map(|level| {
+                (0..2)
+                    .map(|column| {
+                        (0..parameters.ring_dimension() as usize)
+                            .map(|coefficient| {
+                                BigUint::from(1 + level + 2 * column + coefficient) %
+                                    BigUint::from(plaintext_moduli[level])
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let levels = expected_levels
+            .iter()
+            .enumerate()
+            .map(|(level, columns)| {
+                let scale = &modulus / BigUint::from(plaintext_moduli[level]);
+                DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    columns
+                        .iter()
+                        .map(|coefficients| {
+                            DCRTPoly::from_biguints(
+                                &parameters,
+                                &coefficients
+                                    .iter()
+                                    .map(|value| value * &scale)
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut backend = cpu_backend([parameters.clone()]);
+        let actual = backend
+            .crt_recompose(
+                &levels,
+                &plaintext_moduli.iter().map(|value| BigInt::from(*value)).collect::<Vec<_>>(),
+                &reconstruction_coefficients
+                    .iter()
+                    .map(|value| BigInt::from(value.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .expect("CRT recomposition");
+        for column in 0..2 {
+            let actual_coefficients = actual.entry(0, column).coeffs_biguints();
+            for coefficient in 0..parameters.ring_dimension() as usize {
+                let expected = (0..depth)
+                    .map(|level| {
+                        &expected_levels[level][column][coefficient] *
+                            &reconstruction_coefficients[level]
+                    })
+                    .sum::<BigUint>() %
+                    &modulus;
+                assert_eq!(actual_coefficients[coefficient], expected);
+            }
+        }
 
-    pub fn gpu_backend(parameters: impl IntoIterator<Item = GpuDCRTPolyParams>) -> GpuDcrtBackend {
-        GpuDcrtBackend::new(parameters)
+        let matrix_type = ConcreteMatrixType {
+            modulus: BigInt::from(modulus.clone()),
+            ring_dimension: parameters.ring_dimension() as usize,
+            rows: 1,
+            columns: 2,
+        };
+        let symbolic_type = mxx_ir_core::types::MatrixType {
+            modulus: IntExpr::constant(matrix_type.modulus.clone()),
+            ring_dimension: IntExpr::constant(matrix_type.ring_dimension),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(2),
+        };
+        let mut builder = GraphBuilder::new("crt-runtime-executor", Vec::new());
+        let inputs = (0..depth)
+            .map(|index| builder.input(format!("level_{index}"), symbolic_type.clone()))
+            .collect::<Vec<_>>();
+        let output = builder.crt_recompose(
+            &inputs,
+            plaintext_moduli.iter().map(|value| IntExpr::constant(*value)).collect(),
+            reconstruction_coefficients
+                .iter()
+                .map(|value| IntExpr::constant(value.clone()))
+                .collect(),
+        );
+        builder.output("out", &output, ArtifactConfidentiality::Public);
+        let validated = mxx_ir_core::validate(&builder.finish(), &ParamEnv::default()).unwrap();
+        let runtime_inputs = levels
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (format!("level_{index}"), RuntimeValue::matrix(value.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let mut store = MemoryArtifactStore::default();
+        let executed =
+            execute(&validated, &mut backend, runtime_inputs, &mut store, SamplingMode::Fresh)
+                .expect("validated CRT graph execution");
+        let RuntimeValue::Matrix(executed) = &executed.outputs["out"] else {
+            panic!("CRT output must be a matrix")
+        };
+        assert_eq!(executed.as_ref(), &actual);
     }
 }

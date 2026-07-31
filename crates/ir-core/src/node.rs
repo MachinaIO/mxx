@@ -1,5 +1,5 @@
 use crate::{
-    artifact::ProductionId,
+    artifact::{ArtifactConfidentiality, ProductionId},
     expr::{IntExpr, RealExpr},
     serde_support,
     types::{NodeId, WireRef, WireType},
@@ -24,8 +24,12 @@ pub enum NodeKind {
     },
     Output {
         name: String,
+        artifact_confidentiality: Option<ArtifactConfidentiality>,
     },
     ConstantInt(#[serde(with = "serde_support::bigint")] BigInt),
+    /// Materializes an integer expression after parameter and loop bindings
+    /// have been applied to the current graph instance.
+    EvaluateInt(IntExpr),
     ConstantReal(RealExpr),
     ConstantBool(bool),
     ConstantMatrix {
@@ -36,6 +40,7 @@ pub enum NodeKind {
         matrix_type: crate::types::MatrixType,
         base: IntExpr,
     },
+    TrapdoorPublic,
     IntBinary(IntBinaryOp),
     IntCompare(IntCompareOp),
     BitExtract {
@@ -77,6 +82,15 @@ pub enum NodeKind {
         tag_prefix: Vec<u8>,
         #[serde(default)]
         tag_expressions: Vec<IntExpr>,
+        /// Integer tag components appended as their ASCII decimal spelling.
+        /// This preserves legacy tags built with `format!("...{index}")` in
+        /// bounded loops without unrolling the loop.
+        #[serde(default)]
+        tag_decimal_expressions: Vec<IntExpr>,
+        /// Integer tag components encoded as fixed-width little-endian u64,
+        /// matching legacy slot/output namespaces.
+        #[serde(default)]
+        tag_u64_le_expressions: Vec<IntExpr>,
         base: Option<IntExpr>,
         /// Explicit decomposition width for backend-specific gadget layouts
         /// such as the DCRT small gadget.
@@ -109,13 +123,31 @@ pub enum NodeKind {
     ExtractCoefficient {
         position: IntExpr,
     },
+    /// Keeps one coefficient of a scalar polynomial as its constant term and
+    /// clears every other coefficient.
+    ConstantCoefficient {
+        position: IntExpr,
+    },
     ThresholdDecode {
         plaintext_modulus: IntExpr,
         length: IntExpr,
         output_bool: bool,
     },
+    /// Centered-rounds congruent full-modulus representatives at each CRT
+    /// level and recombines them with explicit reconstruction coefficients.
+    CrtRecompose {
+        plaintext_moduli: Vec<IntExpr>,
+        reconstruction_coefficients: Vec<IntExpr>,
+    },
     SubgraphCall(SubgraphCall),
     ParallelLoop(ParallelLoop),
+    FamilyPack {
+        count: IntExpr,
+    },
+    FamilyGetStatic {
+        index: IntExpr,
+    },
+    FamilyGetDynamic,
     Select {
         count: IntExpr,
     },
@@ -125,7 +157,7 @@ pub enum NodeKind {
 pub struct ArtifactInput {
     pub production_id: ProductionId,
     pub artifact_name: String,
-    pub family_count: Option<IntExpr>,
+    pub confidentiality: ArtifactConfidentiality,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -209,6 +241,16 @@ pub struct SubgraphCall {
 pub struct ParallelLoop {
     pub graph: String,
     pub count: IntExpr,
+    #[serde(default)]
+    pub minimum_count: usize,
     pub index_variable: String,
     pub bindings: Vec<(String, IntExpr)>,
+    pub input_modes: Vec<LoopInputMode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LoopInputMode {
+    Broadcast,
+    Zip,
+    ZipOffset { offset: usize },
 }

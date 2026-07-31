@@ -68,6 +68,10 @@ pub enum WireType {
     Bytes {
         length: IntExpr,
     },
+    TypedBlob {
+        type_name: String,
+        schema_hash: [u8; 32],
+    },
     Matrix(MatrixType),
     Trapdoor {
         matrix: MatrixType,
@@ -76,6 +80,10 @@ pub enum WireType {
         digit_count: IntExpr,
     },
     Preimage(MatrixType),
+    IndexedFamily {
+        element: Box<WireType>,
+        count: IntExpr,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -90,6 +98,10 @@ pub enum ConcreteWireType {
     Bytes {
         length: usize,
     },
+    TypedBlob {
+        type_name: String,
+        schema_hash: [u8; 32],
+    },
     Matrix(ConcreteMatrixType),
     Trapdoor {
         matrix: ConcreteMatrixType,
@@ -99,6 +111,10 @@ pub enum ConcreteWireType {
         digit_count: usize,
     },
     Preimage(ConcreteMatrixType),
+    IndexedFamily {
+        element: Box<ConcreteWireType>,
+        count: usize,
+    },
 }
 
 impl ConcreteWireType {

@@ -702,9 +702,7 @@ namespace
                     return status;
                 }
             }
-        }
-        else
-        {
+            // OpenFHE exposes the evaluation vector in bit-reversed order.
             status = launch_bit_reverse_for_all_limbs(
                 limb_bases_device,
                 limb_stride_bytes_device,
@@ -719,6 +717,11 @@ namespace
                 cleanup();
                 return status;
             }
+        }
+        else
+        {
+            // Input already uses OpenFHE's bit-reversed evaluation order,
+            // which is exactly the ordering consumed by these DIT stages.
             for (uint32_t stage_idx = 0, len = 2; len <= n; len <<= 1, ++stage_idx)
             {
                 const uint64_t *limb_wlens_device =

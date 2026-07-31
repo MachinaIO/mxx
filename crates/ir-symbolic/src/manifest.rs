@@ -8,7 +8,7 @@ use crate::{
     overlay::AssumedTermListId,
     serde_support,
     term::{Factor, Term, TermList, ViewDescriptor},
-    types::{ConcreteMatrixType, WireId, WireRef},
+    types::{ConcreteMatrixType, ConcreteWireType, WireId, WireRef},
 };
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
 use thiserror::Error;
 
-pub const SYMBOLIC_MANIFEST_VERSION: u32 = 3;
+pub const SYMBOLIC_MANIFEST_VERSION: u32 = 5;
 pub type InterpretationDigest = (Option<[u8; 32]>, Option<[u8; 32]>);
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -69,8 +69,8 @@ pub struct ManifestMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManifestArtifact {
-    pub wire_type: ConcreteMatrixType,
-    pub term_list: ManifestTermListRef,
+    pub wire_type: ConcreteWireType,
+    pub term_list: Option<ManifestTermListRef>,
     pub family: Option<Vec<ManifestTermListRef>>,
     #[serde(with = "serde_support::optional_hex32")]
     pub content_hash: Option<[u8; 32]>,
@@ -117,6 +117,15 @@ pub enum ManifestDefExpr {
         input: ManifestAtomRef,
         rows: usize,
         columns: usize,
+    },
+    ConstantCoefficient {
+        input: ManifestAtomRef,
+        position: usize,
+    },
+    CrtRecompose {
+        inputs: Vec<ManifestTermList>,
+        plaintext_moduli: Vec<String>,
+        reconstruction_coefficients: Vec<String>,
     },
     ModDownImage {
         source: ManifestAtomRef,
@@ -167,7 +176,7 @@ pub struct ManifestTermList {
 #[derive(Clone, Debug)]
 pub struct ExportArtifact {
     pub wire: WireId,
-    pub wire_type: ConcreteMatrixType,
+    pub wire_type: ConcreteWireType,
     pub family: Option<Vec<WireId>>,
     pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
@@ -184,11 +193,20 @@ pub struct ImportedManifest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportedArtifact {
-    pub wire_type: ConcreteMatrixType,
-    pub terms: TermList,
+    pub wire_type: ConcreteWireType,
+    pub terms: Option<TermList>,
     pub family: Option<Vec<TermList>>,
     pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
+}
+
+fn artifact_requires_terms(wire_type: &ConcreteWireType) -> bool {
+    matches!(
+        wire_type,
+        ConcreteWireType::Matrix(_) |
+            ConcreteWireType::Preimage(_) |
+            ConcreteWireType::Trapdoor { .. }
+    )
 }
 
 #[derive(Debug, Error)]
@@ -222,6 +240,8 @@ pub enum ManifestError {
     MissingManifestAtom(ManifestAtomRef),
     #[error("manifest term list {0:?} is absent")]
     MissingTermList(ManifestTermListRef),
+    #[error("symbolic manifest artifact {artifact} is invalid: {message}")]
+    InvalidArtifact { artifact: String, message: String },
     #[error("preimage target {0:?} has no exported term-list record")]
     MissingTarget(TargetRef),
     #[error("manifest integer is invalid: {0}")]
@@ -440,9 +460,16 @@ pub fn export_manifest(
     let exported_artifacts = artifacts
         .iter()
         .map(|(name, artifact)| {
-            let term_list = local_wire_ref(&artifact.wire, &mut term_origins)?;
-            target_queue
-                .push_back((TargetRef::Local(artifact.wire.wire), Some(artifact.wire.clone())));
+            let term_list = wire_terms
+                .contains_key(&artifact.wire)
+                .then(|| local_wire_ref(&artifact.wire, &mut term_origins))
+                .transpose()?;
+            if term_list.is_some() {
+                target_queue
+                    .push_back((TargetRef::Local(artifact.wire.wire), Some(artifact.wire.clone())));
+            } else if artifact_requires_terms(&artifact.wire_type) && artifact.family.is_none() {
+                return Err(ManifestError::MissingTarget(TargetRef::Local(artifact.wire.wire)));
+            }
             let family = artifact
                 .family
                 .as_ref()
@@ -716,6 +743,20 @@ fn export_definition(
             rows: *rows,
             columns: *columns,
         },
+        DefExpr::ConstantCoefficient { input, position } => ManifestDefExpr::ConstantCoefficient {
+            input: atom_ref(input, atom_origins)?,
+            position: *position,
+        },
+        DefExpr::CrtRecompose { inputs, plaintext_moduli, reconstruction_coefficients } => {
+            ManifestDefExpr::CrtRecompose {
+                inputs: inputs.iter().map(export_terms).collect::<Result<_, _>>()?,
+                plaintext_moduli: plaintext_moduli.iter().map(ToString::to_string).collect(),
+                reconstruction_coefficients: reconstruction_coefficients
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            }
+        }
         DefExpr::ModDownImage { source, source_modulus, target_modulus } => {
             ManifestDefExpr::ModDownImage {
                 source: atom_ref(source, atom_origins)?,
@@ -759,6 +800,7 @@ fn definition_atoms(definition: &DefExpr) -> Vec<AtomId> {
         DefExpr::Tensor { left, right } => vec![left.clone(), right.clone()],
         DefExpr::Concat { inputs, .. } => inputs.clone(),
         DefExpr::Reshape { input, .. } |
+        DefExpr::ConstantCoefficient { input, .. } |
         DefExpr::ModDownImage { source: input, .. } |
         DefExpr::ModUpLift { source: input, .. } => vec![input.clone()],
         DefExpr::ModDownError { input, signal, .. } => {
@@ -771,6 +813,7 @@ fn definition_atoms(definition: &DefExpr) -> Vec<AtomId> {
             atoms.extend(referenced_atoms(lifted));
             atoms
         }
+        DefExpr::CrtRecompose { inputs, .. } => inputs.iter().flat_map(referenced_atoms).collect(),
         DefExpr::Indicator { .. } => Vec::new(),
     }
 }
@@ -1003,10 +1046,25 @@ pub fn import_manifest(manifest: &Manifest) -> Result<ImportedManifest, Manifest
         .artifacts
         .iter()
         .map(|(name, artifact)| {
-            let terms = imported_terms
-                .get(&target_ref(&artifact.term_list))
-                .cloned()
-                .ok_or_else(|| ManifestError::MissingTermList(artifact.term_list.clone()))?;
+            let terms = artifact
+                .term_list
+                .as_ref()
+                .map(|reference| {
+                    imported_terms
+                        .get(&target_ref(reference))
+                        .cloned()
+                        .ok_or_else(|| ManifestError::MissingTermList(reference.clone()))
+                })
+                .transpose()?;
+            if terms.is_none() &&
+                artifact_requires_terms(&artifact.wire_type) &&
+                artifact.family.is_none()
+            {
+                return Err(ManifestError::InvalidArtifact {
+                    artifact: name.clone(),
+                    message: "matrix-like singular artifact has no symbolic term list".to_owned(),
+                });
+            }
             let family = artifact
                 .family
                 .as_ref()
@@ -1105,6 +1163,25 @@ fn import_definition(
         ManifestDefExpr::Reshape { input, rows, columns } => {
             DefExpr::Reshape { input: resolve(input)?, rows: *rows, columns: *columns }
         }
+        ManifestDefExpr::ConstantCoefficient { input, position } => {
+            DefExpr::ConstantCoefficient { input: resolve(input)?, position: *position }
+        }
+        ManifestDefExpr::CrtRecompose { inputs, plaintext_moduli, reconstruction_coefficients } => {
+            DefExpr::CrtRecompose {
+                inputs: inputs
+                    .iter()
+                    .map(|terms| import_terms(terms, records, atom_id))
+                    .collect::<Result<_, _>>()?,
+                plaintext_moduli: plaintext_moduli
+                    .iter()
+                    .map(|value| parse_integer(value))
+                    .collect::<Result<_, _>>()?,
+                reconstruction_coefficients: reconstruction_coefficients
+                    .iter()
+                    .map(|value| parse_integer(value))
+                    .collect::<Result<_, _>>()?,
+            }
+        }
         ManifestDefExpr::ModDownImage { source, source_modulus, target_modulus } => {
             DefExpr::ModDownImage {
                 source: resolve(source)?,
@@ -1190,8 +1267,8 @@ mod tests {
         interpretation_digests.insert(production.clone(), (None, None));
         let term = ManifestTermListRef::Local(TermListId([3; 32]));
         let artifact = ManifestArtifact {
-            wire_type: matrix_type(),
-            term_list: term.clone(),
+            wire_type: ConcreteWireType::Matrix(matrix_type()),
+            term_list: Some(term.clone()),
             family: None,
             content_hash: None,
             layout: None,
@@ -1234,8 +1311,8 @@ mod tests {
             artifacts: BTreeMap::from([(
                 "x".to_owned(),
                 ManifestArtifact {
-                    wire_type: matrix_type(),
-                    term_list: term_ref.clone(),
+                    wire_type: ConcreteWireType::Matrix(matrix_type()),
+                    term_list: Some(term_ref.clone()),
                     family: None,
                     content_hash: None,
                     layout: None,
@@ -1309,7 +1386,7 @@ mod tests {
                 "x".to_owned(),
                 ExportArtifact {
                     wire: wire.clone(),
-                    wire_type: matrix_type(),
+                    wire_type: ConcreteWireType::Matrix(matrix_type()),
                     family: None,
                     content_hash: None,
                     layout: None,
@@ -1324,6 +1401,79 @@ mod tests {
         assert_eq!(manifest.atoms.len(), 2);
         let imported = import_manifest(&manifest).expect("manifest imports");
         assert_eq!(imported.atoms.len(), 2);
+    }
+
+    #[test]
+    fn constant_coefficient_definition_round_trips_its_reference_and_position() {
+        let production = production_id(SpecHash([31; 32]), [32; 32]);
+        let source = AtomId::Local { instantiation_path: Vec::new(), node: NodeId(1), port: 0 };
+        let derived = AtomId::Local { instantiation_path: Vec::new(), node: NodeId(2), port: 0 };
+        let mut atoms = AtomTable::default();
+        atoms.insert(Atom {
+            id: source.clone(),
+            class: AtomClass::Source { source: source_kind() },
+            kind: AtomKind::Bounded,
+            matrix_type: matrix_type(),
+            dependencies: BTreeSet::new(),
+            preimage_refs: None,
+            indicator: None,
+        });
+        atoms.insert(Atom {
+            id: derived.clone(),
+            class: AtomClass::Derived {
+                definition: DefExpr::ConstantCoefficient { input: source.clone(), position: 5 },
+            },
+            kind: AtomKind::Bounded,
+            matrix_type: matrix_type(),
+            dependencies: BTreeSet::from([source]),
+            preimage_refs: None,
+            indicator: None,
+        });
+        let wire = WireId {
+            instantiation_path: Vec::new(),
+            wire: WireRef { node: NodeId(2), port: Port(0) },
+        };
+        let manifest = export_manifest(
+            production.clone(),
+            &BTreeMap::from([(
+                "x".to_owned(),
+                ExportArtifact {
+                    wire: wire.clone(),
+                    wire_type: ConcreteWireType::Matrix(matrix_type()),
+                    family: None,
+                    content_hash: None,
+                    layout: None,
+                },
+            )]),
+            &BTreeMap::from([(wire, TermList::atom(derived.clone()))]),
+            &BTreeMap::new(),
+            &atoms,
+            &ManifestMetadata::default(),
+        )
+        .expect("export");
+        let imported = import_manifest(&manifest).expect("import");
+        let imported_derived = AtomId::Imported {
+            production_id: production.clone(),
+            manifest_atom_id: manifest_atom_id(&derived).expect("derived manifest id"),
+        };
+        let AtomClass::Derived { definition: DefExpr::ConstantCoefficient { input, position } } =
+            &imported.atoms.get(&imported_derived).expect("imported derived atom").class
+        else {
+            panic!("constant-coefficient definition");
+        };
+        assert_eq!(*position, 5);
+        assert_eq!(
+            input,
+            &AtomId::Imported {
+                production_id: production,
+                manifest_atom_id: manifest_atom_id(&AtomId::Local {
+                    instantiation_path: Vec::new(),
+                    node: NodeId(1),
+                    port: 0,
+                })
+                .expect("source manifest id"),
+            }
+        );
     }
 
     #[test]
@@ -1370,7 +1520,7 @@ mod tests {
                 "x".to_owned(),
                 ExportArtifact {
                     wire: wire.clone(),
-                    wire_type: matrix_type(),
+                    wire_type: ConcreteWireType::Matrix(matrix_type()),
                     family: None,
                     content_hash: None,
                     layout: None,
@@ -1414,8 +1564,8 @@ mod tests {
             artifacts: BTreeMap::from([(
                 "x".to_owned(),
                 ManifestArtifact {
-                    wire_type: matrix_type(),
-                    term_list: term_ref.clone(),
+                    wire_type: ConcreteWireType::Matrix(matrix_type()),
+                    term_list: Some(term_ref.clone()),
                     family: None,
                     content_hash: Some([6; 32]),
                     layout: None,
@@ -1535,7 +1685,7 @@ mod tests {
                 "k".to_owned(),
                 ExportArtifact {
                     wire: wire.clone(),
-                    wire_type: matrix_type(),
+                    wire_type: ConcreteWireType::Matrix(matrix_type()),
                     family: None,
                     content_hash: None,
                     layout: None,
@@ -1596,8 +1746,8 @@ mod tests {
                 artifacts: BTreeMap::from([(
                     name.to_owned(),
                     ManifestArtifact {
-                        wire_type: matrix_type(),
-                        term_list: term.clone(),
+                        wire_type: ConcreteWireType::Matrix(matrix_type()),
+                        term_list: Some(term.clone()),
                         family: None,
                         content_hash: None,
                         layout: None,

@@ -15,7 +15,7 @@ use crate::{
         ImportedManifest, InterpretationDigest, Manifest, import_manifest,
         merge_manifest_projections,
     },
-    node::{ConstantMatrix, HashVariant, MatrixBinaryOp, Node, NodeKind},
+    node::{ConstantMatrix, HashVariant, LoopInputMode, MatrixBinaryOp, Node, NodeKind},
     overlay::{
         AssumedTermListId, AtomRef, ExpectedEntry, FoldGroup, LoopIndexMatcher, OverlayTerm,
         PortMatcher, Reinterpretation, SymbolicOverlay, VirtualKind, overlay_hashes,
@@ -148,6 +148,7 @@ enum Value {
     Matrix(MatrixValue),
     Preimage(MatrixValue),
     Trapdoor(TrapdoorValue),
+    IndexedFamily { element_type: ConcreteWireType, elements: Vec<Value> },
 }
 
 pub fn elaborate(graph: &Graph, bindings: &ParamEnv) -> Result<ElaboratedGraph, ElaborationError> {
@@ -318,9 +319,17 @@ pub fn elaborate_with_overlay(
                     wire_type: ConcreteWireType::Preimage(matrix.ty.clone()),
                     terms: Some(matrix.terms.clone()),
                 },
-                Value::Trapdoor(trapdoor) => {
-                    ElaboratedWire { wire_type: trapdoor.ty.clone(), terms: None }
-                }
+                Value::Trapdoor(trapdoor) => ElaboratedWire {
+                    wire_type: trapdoor.ty.clone(),
+                    terms: Some(TermList::atom(trapdoor.uniform.clone())),
+                },
+                Value::IndexedFamily { element_type, elements } => ElaboratedWire {
+                    wire_type: ConcreteWireType::IndexedFamily {
+                        element: Box::new(element_type.clone()),
+                        count: elements.len(),
+                    },
+                    terms: None,
+                },
             };
             (wire.clone(), elaborated)
         })
@@ -344,6 +353,7 @@ pub fn elaborate_with_overlay(
     })
 }
 
+#[derive(Clone)]
 struct State<'a> {
     graph: &'a Graph,
     bindings: &'a ParamEnv,
@@ -380,20 +390,17 @@ impl State<'_> {
                 self.input(node, name, wire_type, artifact.as_ref())?
             }
             NodeKind::Output { .. } => {
-                if node.args.is_empty() {
-                    return self.node_error(node.id, "output requires at least one value");
+                if node.args.len() != 1 {
+                    return self.node_error(node.id, "output requires exactly one value");
                 }
-                let expected_type = value_type(self.argument(node, 0)?);
-                for port in 0..node.args.len() {
-                    let value = self.argument(node, port)?.clone();
-                    if value_type(&value) != expected_type {
-                        return self
-                            .node_error(node.id, "output family members must have identical types");
-                    }
-                    self.insert_value(node.id, port as u32, value);
-                }
+                let value = self.argument(node, 0)?.clone();
+                self.insert_value(node.id, 0, value);
             }
             NodeKind::ConstantInt(_) => {
+                self.insert_value(node.id, 0, Value::Scalar(ConcreteWireType::ConstantInt));
+            }
+            NodeKind::EvaluateInt(value) => {
+                value.evaluate(self.bindings)?;
                 self.insert_value(node.id, 0, Value::Scalar(ConcreteWireType::ConstantInt));
             }
             NodeKind::ConstantReal(_) => {
@@ -423,7 +430,9 @@ impl State<'_> {
                     Value::Trapdoor(TrapdoorValue {
                         ty: ConcreteWireType::Trapdoor {
                             matrix: ty,
-                            sigma: RealExpr::FromInt(base.clone()),
+                            sigma: RealExpr::FromInt(crate::expr::IntExpr::constant(
+                                gadget_base.clone(),
+                            )),
                             gadget_base: gadget_base.clone(),
                             digit_count,
                         },
@@ -435,6 +444,15 @@ impl State<'_> {
                         },
                     }),
                 );
+            }
+            NodeKind::TrapdoorPublic => {
+                let trapdoor = self.trapdoor_argument(node, 0)?;
+                let matrix = trapdoor
+                    .ty
+                    .matrix_type()
+                    .cloned()
+                    .ok_or_else(|| ElaborationError::ExpectedMatrix(node.id))?;
+                self.insert_matrix(node.id, 0, matrix, TermList::atom(trapdoor.uniform), false);
             }
             NodeKind::IntBinary(_) |
             NodeKind::IntToReal |
@@ -558,11 +576,24 @@ impl State<'_> {
                 variant,
                 tag_prefix: _,
                 tag_expressions,
+                tag_decimal_expressions,
+                tag_u64_le_expressions,
                 base,
                 digit_count,
             } => {
                 for expression in tag_expressions {
                     expression.evaluate(self.bindings)?;
+                }
+                for expression in tag_decimal_expressions {
+                    expression.evaluate(self.bindings)?;
+                }
+                for expression in tag_u64_le_expressions {
+                    if expression.evaluate(self.bindings)?.to_u64().is_none() {
+                        return self.node_error(
+                            node.id,
+                            "little-endian hash tag component must fit in u64",
+                        );
+                    }
                 }
                 self.hash_sample(node, matrix_type, *variant, base.as_ref(), digit_count.as_ref())?
             }
@@ -593,7 +624,7 @@ impl State<'_> {
                     Value::Trapdoor(TrapdoorValue {
                         ty: ConcreteWireType::Trapdoor {
                             matrix: ty,
-                            sigma: sigma.clone(),
+                            sigma: close_real_expr(sigma, self.bindings)?,
                             gadget_base: gadget_base_value,
                             digit_count: digit_count_value,
                         },
@@ -703,6 +734,40 @@ impl State<'_> {
                 }
                 self.insert_value(node.id, 0, Value::Scalar(ConcreteWireType::Int));
             }
+            NodeKind::ConstantCoefficient { position } => {
+                let input = self.matrix_argument(node, 0)?;
+                if !input.ty.is_scalar() {
+                    return self.node_error(node.id, "constant coefficient requires a 1x1 matrix");
+                }
+                let position = position
+                    .evaluate(self.bindings)?
+                    .to_usize()
+                    .filter(|position| *position < input.ty.ring_dimension)
+                    .ok_or_else(|| ElaborationError::Node {
+                        node: node.id,
+                        message: "coefficient position is out of range".to_owned(),
+                    })?;
+                let kind = match classify_terms(&input.terms, &self.atoms)? {
+                    TermClass::Signal => AtomKind::Large,
+                    TermClass::Zero | TermClass::Noise => AtomKind::Bounded,
+                    TermClass::Mixed => {
+                        return self.node_error(
+                            node.id,
+                            "constant coefficient cannot combine signal and noise into one opaque atom",
+                        );
+                    }
+                };
+                let input_atom = self.definition_atom(node.id, 1, &input)?;
+                let id = self.derived_atom(
+                    node.id,
+                    0,
+                    input.ty.clone(),
+                    DefExpr::ConstantCoefficient { input: input_atom.clone(), position },
+                    BTreeSet::from([input_atom]),
+                    kind,
+                );
+                self.insert_matrix(node.id, 0, input.ty, TermList::atom(id), false);
+            }
             NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
                 let input = self.matrix_argument(node, 0)?;
                 self.require_reduced(node.id, &input.terms)?;
@@ -727,7 +792,102 @@ impl State<'_> {
                     self.insert_value(node.id, port as u32, Value::Scalar(ty.clone()));
                 }
             }
+            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => {
+                if node.args.is_empty() ||
+                    node.args.len() != plaintext_moduli.len() ||
+                    node.args.len() != reconstruction_coefficients.len()
+                {
+                    return self.node_error(
+                        node.id,
+                        "CRT recomposition requires one modulus and reconstruction coefficient per input",
+                    );
+                }
+                let inputs = (0..node.args.len())
+                    .map(|index| self.matrix_argument(node, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let ty = inputs[0].ty.clone();
+                if ty.rows != 1 || inputs.iter().any(|input| input.ty != ty) {
+                    return self.node_error(
+                        node.id,
+                        "CRT recomposition inputs must be identical one-row matrices",
+                    );
+                }
+                let plaintext_moduli = plaintext_moduli
+                    .iter()
+                    .map(|value| value.evaluate(self.bindings))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let reconstruction_coefficients = reconstruction_coefficients
+                    .iter()
+                    .map(|value| value.evaluate(self.bindings))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if plaintext_moduli
+                    .iter()
+                    .any(|modulus| modulus <= &BigInt::one() || modulus >= &ty.modulus)
+                {
+                    return self.node_error(
+                        node.id,
+                        "CRT plaintext moduli must be between one and the full modulus",
+                    );
+                }
+                if reconstruction_coefficients.iter().any(|coefficient| {
+                    coefficient.sign() == num_bigint::Sign::Minus || coefficient >= &ty.modulus
+                }) {
+                    return self.node_error(
+                        node.id,
+                        "CRT reconstruction coefficients must be full-modulus residues",
+                    );
+                }
+                for (index, (input, plaintext_modulus)) in
+                    inputs.iter().zip(&plaintext_moduli).enumerate()
+                {
+                    self.require_reduced(node.id, &input.terms)?;
+                    self.decode_targets.push(DecodeTarget {
+                        input: WireId {
+                            instantiation_path: self.path.clone(),
+                            wire: node.args[index],
+                        },
+                        plaintext_modulus: plaintext_modulus.clone(),
+                        length: input.ty.ring_dimension * input.ty.columns,
+                    });
+                }
+                let input_terms =
+                    inputs.iter().map(|input| input.terms.clone()).collect::<Vec<_>>();
+                let input_dependencies =
+                    input_terms.iter().flat_map(|terms| dependencies(terms, &self.atoms)).collect();
+                let id = self.derived_atom(
+                    node.id,
+                    0,
+                    ty.clone(),
+                    DefExpr::CrtRecompose {
+                        inputs: input_terms,
+                        plaintext_moduli,
+                        reconstruction_coefficients,
+                    },
+                    input_dependencies,
+                    AtomKind::Large,
+                );
+                self.insert_matrix(node.id, 0, ty, TermList::atom(id), false);
+            }
             NodeKind::Select { count } => self.select(node, count.evaluate(self.bindings)?)?,
+            NodeKind::FamilyPack { count } => {
+                let count =
+                    positive_usize(count.evaluate(self.bindings)?, "family count", node.id)?;
+                if node.args.len() != count {
+                    return self.node_error(node.id, "family pack argument count mismatch");
+                }
+                let elements = (0..count)
+                    .map(|index| self.argument(node, index).cloned())
+                    .collect::<Result<Vec<_>, _>>()?;
+                let element_type = value_type(&elements[0]);
+                if elements.iter().any(|value| value_type(value) != element_type) {
+                    return self.node_error(node.id, "family members must have identical types");
+                }
+                self.insert_value(node.id, 0, Value::IndexedFamily { element_type, elements });
+            }
+            NodeKind::FamilyGetStatic { index } => {
+                self.family_get_static(node, index.evaluate(self.bindings)?)?
+            }
+            NodeKind::FamilyGetDynamic => self.family_get_dynamic(node)?,
             NodeKind::SubgraphCall(call) => self.subgraph_call(node, call)?,
             NodeKind::ParallelLoop(loop_node) => self.parallel_loop(node, loop_node)?,
         }
@@ -756,53 +916,51 @@ impl State<'_> {
                     artifact: artifact.artifact_name.clone(),
                 }
             })?;
-            let declared_type = concrete_wire(wire_type, self.bindings)?
-                .matrix_type()
-                .cloned()
-                .ok_or_else(|| ElaborationError::Node {
+            let declared = concrete_wire(wire_type, self.bindings)?;
+            if let ConcreteWireType::IndexedFamily { element, count } = &declared {
+                if element.as_ref() != &stored.wire_type {
+                    return self.node_error(
+                        node.id,
+                        "declared artifact family element type does not match the manifest",
+                    );
+                }
+                if !symbolic_artifact_type(element) {
+                    return self.node_error(
+                        node.id,
+                        "symbolic artifact families must contain matrix, preimage, or trapdoor values",
+                    );
+                }
+                let family = stored.family.as_ref().ok_or_else(|| ElaborationError::Node {
                     node: node.id,
-                    message: "manifest artifacts must be declared with a matrix-like type"
+                    message: "artifact family declaration references a singular artifact"
                         .to_owned(),
                 })?;
-            if declared_type != stored.wire_type {
+                if *count != family.len() {
+                    return self.node_error(node.id, "artifact family count mismatch");
+                }
+                let elements = family
+                    .iter()
+                    .map(|terms| imported_artifact_value(element, Some(terms), node.id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.insert_value(
+                    node.id,
+                    0,
+                    Value::IndexedFamily { element_type: element.as_ref().clone(), elements },
+                );
+                return Ok(());
+            }
+            if declared != stored.wire_type {
                 return self
                     .node_error(node.id, "declared artifact type does not match the manifest");
             }
-            if let Some(family) = &stored.family {
-                let expected = artifact
-                    .family_count
-                    .as_ref()
-                    .map(|count| count.evaluate(self.bindings))
-                    .transpose()?
-                    .and_then(|count| count.to_usize())
-                    .unwrap_or(family.len());
-                if expected != family.len() {
-                    return self.node_error(node.id, "artifact family count mismatch");
-                }
-                for (port, terms) in family.iter().enumerate() {
-                    self.insert_matrix(
-                        node.id,
-                        port as u32,
-                        stored.wire_type.clone(),
-                        terms.clone(),
-                        matches!(wire_type, WireType::Preimage(_)),
-                    );
-                }
-            } else {
-                if artifact.family_count.is_some() {
-                    return self.node_error(
-                        node.id,
-                        "artifact declares a family count but the manifest entry is singular",
-                    );
-                }
-                self.insert_matrix(
+            if stored.family.is_some() {
+                return self.node_error(
                     node.id,
-                    0,
-                    stored.wire_type.clone(),
-                    stored.terms.clone(),
-                    matches!(wire_type, WireType::Preimage(_)),
+                    "singular artifact input references an indexed manifest entry",
                 );
             }
+            let value = imported_artifact_value(&declared, stored.terms.as_ref(), node.id)?;
+            self.insert_value(node.id, 0, value);
             return Ok(());
         }
         match concrete_wire(wire_type, self.bindings)? {
@@ -850,6 +1008,12 @@ impl State<'_> {
                         uniform,
                         origin: TrapdoorOrigin::Sampled,
                     }),
+                );
+            }
+            ConcreteWireType::IndexedFamily { .. } => {
+                return self.node_error(
+                    node.id,
+                    "non-artifact indexed-family inputs are not supported yet",
                 );
             }
             scalar => self.insert_value(node.id, 0, Value::Scalar(scalar)),
@@ -1154,6 +1318,38 @@ impl State<'_> {
         ))
     }
 
+    fn family_get_static(&mut self, node: &Node, index: BigInt) -> Result<(), ElaborationError> {
+        let index = nonnegative_usize(index, "family index", node.id)?;
+        let Value::IndexedFamily { elements, .. } = self.argument(node, 0)? else {
+            return self.node_error(node.id, "family access requires an indexed family");
+        };
+        let value = elements.get(index).cloned().ok_or_else(|| ElaborationError::Node {
+            node: node.id,
+            message: "family index is out of range".to_owned(),
+        })?;
+        self.insert_value(node.id, 0, value);
+        Ok(())
+    }
+
+    fn family_get_dynamic(&mut self, node: &Node) -> Result<(), ElaborationError> {
+        self.require_scalar(node, 1, is_integer, "integer family index")?;
+        let Value::IndexedFamily { elements, .. } = self.argument(node, 0)? else {
+            return self.node_error(node.id, "family access requires an indexed family");
+        };
+        let branches = elements
+            .iter()
+            .map(|value| match value {
+                Value::Matrix(matrix) => Ok(matrix.clone()),
+                Value::Preimage(matrix) => Ok(matrix.clone()),
+                _ => self.node_error(
+                    node.id,
+                    "symbolic dynamic family access requires matrix-like elements",
+                ),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.select_matrices(node, node.args[1], branches)
+    }
+
     fn select(&mut self, node: &Node, count: BigInt) -> Result<(), ElaborationError> {
         let count = positive_usize(count, "select count", node.id)?;
         if node.args.len() != count + 1 {
@@ -1163,6 +1359,16 @@ impl State<'_> {
         let branches = (1..=count)
             .map(|index| self.matrix_argument(node, index))
             .collect::<Result<Vec<_>, _>>()?;
+        self.select_matrices(node, node.args[0], branches)
+    }
+
+    fn select_matrices(
+        &mut self,
+        node: &Node,
+        index_wire: WireRef,
+        branches: Vec<MatrixValue>,
+    ) -> Result<(), ElaborationError> {
+        let count = branches.len();
         let ty = branches
             .first()
             .ok_or_else(|| ElaborationError::Node {
@@ -1174,7 +1380,6 @@ impl State<'_> {
         for branch in &branches[1..] {
             check_add_shape(&ty, &branch.ty)?;
         }
-        let index_wire = node.args[0];
         let domain = SelectionDomain {
             index_wire,
             instantiation_path: self.path.clone(),
@@ -1236,6 +1441,11 @@ impl State<'_> {
                 value.sign() != num_bigint::Sign::Minus &&
                     value.to_usize().is_some_and(|value| value < count)
             }
+            NodeKind::EvaluateInt(value) => value
+                .evaluate(self.bindings)
+                .ok()
+                .and_then(|value| value.to_usize())
+                .is_some_and(|value| value < count),
             NodeKind::BoolToInt | NodeKind::BitExtract { .. } => count >= 2,
             NodeKind::IntBinary(crate::node::IntBinaryOp::Remainder) => {
                 let Some(divisor) = node.args.get(1).and_then(|wire| self.graph.node(wire.node))
@@ -1270,6 +1480,7 @@ impl State<'_> {
             env,
             node,
             InstantiationFrame { call: node.id, loop_index: None },
+            None,
         )?;
         for (port, value) in outputs.into_iter().enumerate() {
             self.insert_value(node.id, port as u32, value);
@@ -1288,12 +1499,42 @@ impl State<'_> {
                 message: format!("subgraph {} does not exist", loop_node.graph),
             }
         })?;
-        let count = positive_usize(
+        let count = nonnegative_usize(
             loop_node.count.evaluate(self.bindings)?,
             "parallel-loop count",
             node.id,
         )?;
-        let mut reference_types: Option<Vec<ConcreteWireType>> = None;
+        if count < loop_node.minimum_count {
+            return self.node_error(
+                node.id,
+                &format!(
+                    "parallel-loop count must be at least {}, got {count}",
+                    loop_node.minimum_count
+                ),
+            );
+        }
+        if count == 0 {
+            let env =
+                self.child_bindings(&loop_node.bindings, Some((&loop_node.index_variable, 0)))?;
+            let mut probe = self.clone();
+            let outputs = probe.elaborate_child(
+                &graph,
+                env,
+                node,
+                InstantiationFrame { call: node.id, loop_index: Some(0) },
+                Some((&loop_node.input_modes, 0)),
+            )?;
+            for (port, value) in outputs.into_iter().enumerate() {
+                self.insert_value(
+                    node.id,
+                    port as u32,
+                    Value::IndexedFamily { element_type: value_type(&value), elements: Vec::new() },
+                );
+            }
+            return Ok(());
+        }
+        let mut families =
+            (0..graph.outputs.len()).map(|_| Vec::with_capacity(count)).collect::<Vec<_>>();
         for index in 0..count {
             let mut env =
                 self.child_bindings(&loop_node.bindings, Some((&loop_node.index_variable, index)))?;
@@ -1303,22 +1544,31 @@ impl State<'_> {
                 env,
                 node,
                 InstantiationFrame { call: node.id, loop_index: Some(index as u64) },
+                Some((&loop_node.input_modes, index)),
             )?;
-            let output_types = outputs.iter().map(value_type).collect::<Vec<_>>();
-            if let Some(reference) = &reference_types {
-                if reference != &output_types {
-                    return self.node_error(
-                        node.id,
-                        "parallel-loop output shapes depend on the loop index",
-                    );
+            for (output, value) in outputs.into_iter().enumerate() {
+                if let Some(reference) = families[output].first() {
+                    if value_type(reference) != value_type(&value) {
+                        return self.node_error(
+                            node.id,
+                            "parallel-loop output shapes depend on the loop index",
+                        );
+                    }
                 }
-            } else {
-                reference_types = Some(output_types);
+                families[output].push(value);
             }
-            let width = outputs.len();
-            for (output_index, value) in outputs.into_iter().enumerate() {
-                self.insert_value(node.id, (index * width + output_index) as u32, value);
-            }
+        }
+        for (port, elements) in families.into_iter().enumerate() {
+            let element_type =
+                elements.first().map(value_type).ok_or_else(|| ElaborationError::Node {
+                    node: node.id,
+                    message: "zero-length symbolic loop families are not supported yet".to_owned(),
+                })?;
+            self.insert_value(
+                node.id,
+                port as u32,
+                Value::IndexedFamily { element_type, elements },
+            );
         }
         Ok(())
     }
@@ -1332,8 +1582,9 @@ impl State<'_> {
         if let Some((name, index)) = loop_index {
             env.integers.insert(name.to_owned(), BigInt::from(index));
         }
+        let expression_env = env.clone();
         for (name, expression) in bindings {
-            env.integers.insert(name.clone(), expression.evaluate(&env)?);
+            env.integers.insert(name.clone(), expression.evaluate(&expression_env)?);
         }
         Ok(env)
     }
@@ -1344,6 +1595,7 @@ impl State<'_> {
         bindings: ParamEnv,
         call_node: &Node,
         frame: InstantiationFrame,
+        loop_input: Option<(&[LoopInputMode], usize)>,
     ) -> Result<Vec<Value>, ElaborationError> {
         check_bindings(graph, &bindings)?;
         let mut path = self.path.clone();
@@ -1364,12 +1616,60 @@ impl State<'_> {
         let input_overrides = input_nodes
             .iter()
             .zip(&call_node.args)
-            .map(|((name, _), wire)| {
-                self.values
+            .enumerate()
+            .map(|(position, ((name, _), wire))| {
+                let value = self
+                    .values
                     .get(wire)
                     .cloned()
-                    .map(|value| (name.clone(), value))
-                    .ok_or(ElaborationError::MissingWire { node: call_node.id, wire: *wire })
+                    .ok_or(ElaborationError::MissingWire { node: call_node.id, wire: *wire })?;
+                let value = match loop_input {
+                    Some((modes, index)) => match modes.get(position) {
+                        Some(LoopInputMode::Broadcast) => value,
+                        Some(LoopInputMode::Zip | LoopInputMode::ZipOffset { .. }) => {
+                            let offset = match modes.get(position) {
+                                Some(LoopInputMode::Zip) => 0,
+                                Some(LoopInputMode::ZipOffset { offset }) => *offset,
+                                _ => unreachable!(),
+                            };
+                            let index = index.checked_add(offset).ok_or_else(|| {
+                                ElaborationError::Node {
+                                    node: call_node.id,
+                                    message: "zipped loop input range overflow".to_owned(),
+                                }
+                            })?;
+                            let Value::IndexedFamily { element_type, elements } = value else {
+                                return self.node_error(
+                                    call_node.id,
+                                    "zipped loop input is not an indexed family",
+                                );
+                            };
+                            match elements.get(index) {
+                                Some(element) => element.clone(),
+                                None if elements.is_empty() && index == 0 => self
+                                    .loop_probe_value(
+                                        call_node.id,
+                                        position as u32,
+                                        &element_type,
+                                    )?,
+                                None => {
+                                    return self.node_error(
+                                        call_node.id,
+                                        "zipped loop input count mismatch",
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            return self.node_error(
+                                call_node.id,
+                                "parallel-loop input mode count mismatch",
+                            );
+                        }
+                    },
+                    None => value,
+                };
+                Ok((name.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let mut child = State {
@@ -1419,6 +1719,41 @@ impl State<'_> {
         self.creating_virtual_atoms = child.creating_virtual_atoms;
         self.selection_domains = child.selection_domains;
         Ok(outputs)
+    }
+
+    fn loop_probe_value(
+        &mut self,
+        node: NodeId,
+        port: u32,
+        wire_type: &ConcreteWireType,
+    ) -> Result<Value, ElaborationError> {
+        Ok(match wire_type {
+            ConcreteWireType::Matrix(matrix) => {
+                Value::Matrix(MatrixValue { ty: matrix.clone(), terms: TermList::zero() })
+            }
+            ConcreteWireType::Preimage(matrix) => {
+                Value::Preimage(MatrixValue { ty: matrix.clone(), terms: TermList::zero() })
+            }
+            ConcreteWireType::Trapdoor { matrix, .. } => {
+                let uniform = self.source_atom(
+                    node,
+                    u32::MAX - port,
+                    matrix.clone(),
+                    AtomKind::Large,
+                    SourceKind::External { kind: ExternalSourceKind::TrapdoorUniform },
+                    None,
+                );
+                Value::Trapdoor(TrapdoorValue {
+                    ty: wire_type.clone(),
+                    uniform,
+                    origin: TrapdoorOrigin::Sampled,
+                })
+            }
+            ConcreteWireType::IndexedFamily { .. } => {
+                return self.node_error(node, "nested indexed families are not supported");
+            }
+            scalar => Value::Scalar(scalar.clone()),
+        })
     }
 
     fn mod_down(&mut self, node: &Node, target: BigInt) -> Result<(), ElaborationError> {
@@ -2368,8 +2703,14 @@ impl State<'_> {
     fn insert_value(&mut self, node: NodeId, port: u32, value: Value) {
         let wire = WireRef { node, port: Port(port) };
         let id = WireId { instantiation_path: self.path.clone(), wire };
-        if let Value::Matrix(matrix) | Value::Preimage(matrix) = &value {
-            self.wire_terms.insert(id.clone(), matrix.terms.clone());
+        match &value {
+            Value::Matrix(matrix) | Value::Preimage(matrix) => {
+                self.wire_terms.insert(id.clone(), matrix.terms.clone());
+            }
+            Value::Trapdoor(trapdoor) => {
+                self.wire_terms.insert(id.clone(), TermList::atom(trapdoor.uniform.clone()));
+            }
+            Value::Scalar(_) | Value::IndexedFamily { .. } => {}
         }
         self.all_wires.insert(id, value.clone());
         self.values.insert(wire, value);
@@ -2609,6 +2950,83 @@ fn value_type(value: &Value) -> ConcreteWireType {
         Value::Matrix(matrix) => ConcreteWireType::Matrix(matrix.ty.clone()),
         Value::Preimage(matrix) => ConcreteWireType::Preimage(matrix.ty.clone()),
         Value::Trapdoor(trapdoor) => trapdoor.ty.clone(),
+        Value::IndexedFamily { element_type, elements } => ConcreteWireType::IndexedFamily {
+            element: Box::new(element_type.clone()),
+            count: elements.len(),
+        },
+    }
+}
+
+fn symbolic_artifact_type(wire_type: &ConcreteWireType) -> bool {
+    matches!(
+        wire_type,
+        ConcreteWireType::Matrix(_) |
+            ConcreteWireType::Preimage(_) |
+            ConcreteWireType::Trapdoor { .. }
+    )
+}
+
+fn imported_artifact_value(
+    wire_type: &ConcreteWireType,
+    terms: Option<&TermList>,
+    node: NodeId,
+) -> Result<Value, ElaborationError> {
+    match wire_type {
+        ConcreteWireType::Matrix(matrix) => Ok(Value::Matrix(MatrixValue {
+            ty: matrix.clone(),
+            terms: terms.cloned().ok_or_else(|| ElaborationError::Node {
+                node,
+                message: "matrix artifact has no symbolic term list".to_owned(),
+            })?,
+        })),
+        ConcreteWireType::Preimage(matrix) => Ok(Value::Preimage(MatrixValue {
+            ty: matrix.clone(),
+            terms: terms.cloned().ok_or_else(|| ElaborationError::Node {
+                node,
+                message: "preimage artifact has no symbolic term list".to_owned(),
+            })?,
+        })),
+        ConcreteWireType::Trapdoor { .. } => {
+            let terms = terms.ok_or_else(|| ElaborationError::Node {
+                node,
+                message: "trapdoor artifact has no symbolic public-matrix term list".to_owned(),
+            })?;
+            let [term] = terms.terms.as_slice() else {
+                return Err(ElaborationError::Node {
+                    node,
+                    message: "trapdoor artifact must identify exactly one public-matrix atom"
+                        .to_owned(),
+                });
+            };
+            let [factor] = term.factors.as_slice() else {
+                return Err(ElaborationError::Node {
+                    node,
+                    message: "trapdoor artifact must identify exactly one public-matrix atom"
+                        .to_owned(),
+                });
+            };
+            if term.coefficient != BigInt::one() || factor.view.is_some() {
+                return Err(ElaborationError::Node {
+                    node,
+                    message: "trapdoor artifact public-matrix term must be one unviewed atom"
+                        .to_owned(),
+                });
+            }
+            Ok(Value::Trapdoor(TrapdoorValue {
+                ty: wire_type.clone(),
+                uniform: factor.atom.clone(),
+                origin: TrapdoorOrigin::Sampled,
+            }))
+        }
+        scalar => {
+            if terms.is_some() {
+                return Err(ElaborationError::Node {
+                    node,
+                    message: "non-symbolic artifact unexpectedly carries symbolic terms".to_owned(),
+                });
+            }
+            Ok(Value::Scalar(scalar.clone()))
+        }
     }
 }
 
@@ -2635,11 +3053,14 @@ fn concrete_wire(ty: &WireType, env: &ParamEnv) -> Result<ConcreteWireType, Elab
         WireType::Bytes { length } => ConcreteWireType::Bytes {
             length: positive_usize(length.evaluate(env)?, "byte-string length", NodeId(0))?,
         },
+        WireType::TypedBlob { type_name, schema_hash } => {
+            ConcreteWireType::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash }
+        }
         WireType::Matrix(matrix) => ConcreteWireType::Matrix(concrete_matrix(matrix, env)?),
         WireType::Trapdoor { matrix, sigma, gadget_base, digit_count } => {
             ConcreteWireType::Trapdoor {
                 matrix: concrete_matrix(matrix, env)?,
-                sigma: sigma.clone(),
+                sigma: close_real_expr(sigma, env)?,
                 gadget_base: gadget_base.evaluate(env)?.abs(),
                 digit_count: positive_usize(
                     digit_count.evaluate(env)?,
@@ -2649,50 +3070,22 @@ fn concrete_wire(ty: &WireType, env: &ParamEnv) -> Result<ConcreteWireType, Elab
             }
         }
         WireType::Preimage(matrix) => ConcreteWireType::Preimage(concrete_matrix(matrix, env)?),
+        WireType::IndexedFamily { element, count } => {
+            let count = nonnegative_usize(count.evaluate(env)?, "indexed family count", NodeId(0))?;
+            let element = concrete_wire(element, env)?;
+            if matches!(element, ConcreteWireType::IndexedFamily { .. }) {
+                return Err(ElaborationError::Node {
+                    node: NodeId(0),
+                    message: "nested indexed families are not supported".to_owned(),
+                });
+            }
+            ConcreteWireType::IndexedFamily { element: Box::new(element), count }
+        }
     })
 }
 
 fn close_real_expr(expression: &RealExpr, env: &ParamEnv) -> Result<RealExpr, ElaborationError> {
-    if !contains_sqrt(expression) {
-        return Ok(RealExpr::Rational(expression.evaluate_rational(env)?));
-    }
-    Ok(match expression {
-        RealExpr::Rational(value) => RealExpr::Rational(value.clone()),
-        RealExpr::Var(name) => RealExpr::Rational(
-            env.reals.get(name).cloned().ok_or_else(|| ExprError::UnboundVariable(name.clone()))?,
-        ),
-        RealExpr::FromInt(value) => {
-            RealExpr::FromInt(crate::expr::IntExpr::constant(value.evaluate(env)?))
-        }
-        RealExpr::Add(lhs, rhs) => RealExpr::Add(
-            Box::new(close_real_expr(lhs, env)?),
-            Box::new(close_real_expr(rhs, env)?),
-        ),
-        RealExpr::Sub(lhs, rhs) => RealExpr::Sub(
-            Box::new(close_real_expr(lhs, env)?),
-            Box::new(close_real_expr(rhs, env)?),
-        ),
-        RealExpr::Mul(lhs, rhs) => RealExpr::Mul(
-            Box::new(close_real_expr(lhs, env)?),
-            Box::new(close_real_expr(rhs, env)?),
-        ),
-        RealExpr::Div(lhs, rhs) => RealExpr::Div(
-            Box::new(close_real_expr(lhs, env)?),
-            Box::new(close_real_expr(rhs, env)?),
-        ),
-        RealExpr::Sqrt(value) => RealExpr::Sqrt(Box::new(close_real_expr(value, env)?)),
-    })
-}
-
-fn contains_sqrt(expression: &RealExpr) -> bool {
-    match expression {
-        RealExpr::Sqrt(_) => true,
-        RealExpr::Add(lhs, rhs) |
-        RealExpr::Sub(lhs, rhs) |
-        RealExpr::Mul(lhs, rhs) |
-        RealExpr::Div(lhs, rhs) => contains_sqrt(lhs) || contains_sqrt(rhs),
-        RealExpr::Rational(_) | RealExpr::Var(_) | RealExpr::FromInt(_) => false,
-    }
+    expression.close(env).map_err(ElaborationError::Expression)
 }
 
 fn concrete_matrix(
@@ -2860,6 +3253,7 @@ mod tests {
             UnfoldSpec, VirtualAtomDecl, VirtualKind, WireSelector,
         },
     };
+    use mxx_ir_core::artifact::ArtifactConfidentiality;
 
     fn wire(node: u64, port: u32) -> WireRef {
         WireRef { node: NodeId(node), port: Port(port) }
@@ -2918,6 +3312,71 @@ mod tests {
             .get(&WireId { instantiation_path: Vec::new(), wire })
             .and_then(|wire| wire.terms.as_ref())
             .expect("matrix wire")
+    }
+
+    fn crt_graph(plaintext_moduli: Vec<i64>, coefficients: Vec<i64>) -> Graph {
+        let mut ty = matrix_type();
+        ty.rows = IntExpr::constant(1);
+        let sample = |id| Node {
+            id: NodeId(id),
+            kind: NodeKind::UniformSample {
+                matrix_type: ty.clone(),
+                range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
+            },
+            args: Vec::new(),
+        };
+        empty_graph(
+            "crt-recompose",
+            vec![
+                sample(1),
+                sample(2),
+                Node {
+                    id: NodeId(3),
+                    kind: NodeKind::CrtRecompose {
+                        plaintext_moduli: plaintext_moduli
+                            .into_iter()
+                            .map(IntExpr::constant)
+                            .collect(),
+                        reconstruction_coefficients: coefficients
+                            .into_iter()
+                            .map(IntExpr::constant)
+                            .collect(),
+                    },
+                    args: vec![wire(1, 0), wire(2, 0)],
+                },
+            ],
+            wire(3, 0),
+        )
+    }
+
+    #[test]
+    fn crt_recompose_records_each_decode_target_and_rejects_invalid_parameters() {
+        let elaborated =
+            elaborate(&crt_graph(vec![3, 5], vec![6, 7]), &ParamEnv::default()).unwrap();
+        assert_eq!(elaborated.decode_targets.len(), 2);
+        assert_eq!(
+            elaborated
+                .decode_targets
+                .iter()
+                .map(|target| target.plaintext_modulus.clone())
+                .collect::<Vec<_>>(),
+            vec![BigInt::from(3), BigInt::from(5)]
+        );
+        let output = elaborated_terms(&elaborated, wire(3, 0));
+        let atom = elaborated.atoms.get(&output.terms[0].factors[0].atom).expect("derived atom");
+        assert!(matches!(
+            atom.class,
+            AtomClass::Derived { definition: DefExpr::CrtRecompose { .. } }
+        ));
+
+        for graph in [
+            crt_graph(vec![0, 5], vec![6, 7]),
+            crt_graph(vec![17, 5], vec![6, 7]),
+            crt_graph(vec![3, 5], vec![-1, 7]),
+            crt_graph(vec![3, 5], vec![17, 7]),
+        ] {
+            assert!(elaborate(&graph, &ParamEnv::default()).is_err());
+        }
     }
 
     #[test]
@@ -3043,6 +3502,71 @@ mod tests {
             wire(4, 0),
         );
         assert!(elaborate(&reshape, &ParamEnv::default()).is_err());
+    }
+
+    #[test]
+    fn constant_coefficient_classifies_inputs_and_rejects_a_signal_noise_mixture() {
+        let scalar_type = MatrixType {
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+            ..matrix_type()
+        };
+        let sample = |id, minimum, maximum| Node {
+            id: NodeId(id),
+            kind: NodeKind::UniformSample {
+                matrix_type: scalar_type.clone(),
+                range: SampleRange {
+                    minimum: BigInt::from(minimum),
+                    maximum: BigInt::from(maximum),
+                },
+            },
+            args: Vec::new(),
+        };
+        for (name, input, expected_kind) in [
+            ("bounded", sample(1, -1, 1), AtomKind::Bounded),
+            ("signal", sample(1, -9, 9), AtomKind::Large),
+        ] {
+            let graph = empty_graph(
+                name,
+                vec![
+                    input,
+                    Node {
+                        id: NodeId(2),
+                        kind: NodeKind::ConstantCoefficient { position: IntExpr::constant(3) },
+                        args: vec![wire(1, 0)],
+                    },
+                ],
+                wire(2, 0),
+            );
+            let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
+            let atom_id = &elaborated_terms(&elaborated, wire(2, 0)).terms[0].factors[0].atom;
+            let atom = elaborated.atoms.get(atom_id).expect("derived coefficient atom");
+            assert_eq!(atom.kind, expected_kind);
+            assert!(matches!(
+                atom.class,
+                AtomClass::Derived { definition: DefExpr::ConstantCoefficient { position: 3, .. } }
+            ));
+        }
+
+        let mixed = empty_graph(
+            "mixed-constant-coefficient",
+            vec![
+                sample(1, -9, 9),
+                sample(2, -1, 1),
+                Node {
+                    id: NodeId(3),
+                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Add),
+                    args: vec![wire(1, 0), wire(2, 0)],
+                },
+                Node {
+                    id: NodeId(4),
+                    kind: NodeKind::ConstantCoefficient { position: IntExpr::constant(0) },
+                    args: vec![wire(3, 0)],
+                },
+            ],
+            wire(4, 0),
+        );
+        assert!(elaborate(&mixed, &ParamEnv::default()).is_err());
     }
 
     #[test]
@@ -3818,14 +4342,236 @@ mod tests {
                 },
                 Node {
                     id: NodeId(3),
-                    kind: NodeKind::Output { name: "family".to_owned() },
+                    kind: NodeKind::FamilyPack { count: IntExpr::constant(2) },
                     args: vec![wire(1, 0), wire(2, 0)],
                 },
+                Node {
+                    id: NodeId(4),
+                    kind: NodeKind::Output {
+                        name: "family".to_owned(),
+                        artifact_confidentiality: Some(ArtifactConfidentiality::Public),
+                    },
+                    args: vec![wire(3, 0)],
+                },
             ],
-            wire(3, 0),
+            wire(4, 0),
         );
         let error = elaborate(&graph, &ParamEnv::default()).expect_err("output type mismatch");
         assert!(matches!(root_cause(&error), ElaborationError::Node { node: NodeId(3), .. }));
+    }
+
+    #[test]
+    fn zero_length_parallel_loop_retains_element_type_without_phantom_atoms() {
+        let body = Graph {
+            name: "zero-loop-body".to_owned(),
+            parameters: Vec::new(),
+            input_types: BTreeMap::new(),
+            nodes: vec![Node {
+                id: NodeId(1),
+                kind: NodeKind::GaussianSample {
+                    matrix_type: matrix_type(),
+                    sigma: RealExpr::FromInt(IntExpr::constant(1)),
+                },
+                args: Vec::new(),
+            }],
+            outputs: BTreeMap::from([("out".to_owned(), wire(1, 0))]),
+            subgraphs: BTreeMap::new(),
+            real_constants: BTreeMap::new(),
+        };
+        let mut graph = empty_graph(
+            "zero-loop",
+            vec![Node {
+                id: NodeId(10),
+                kind: NodeKind::ParallelLoop(crate::node::ParallelLoop {
+                    graph: body.name.clone(),
+                    count: IntExpr::constant(0),
+                    minimum_count: 0,
+                    index_variable: "i".to_owned(),
+                    bindings: Vec::new(),
+                    input_modes: Vec::new(),
+                }),
+                args: Vec::new(),
+            }],
+            wire(10, 0),
+        );
+        graph.subgraphs.insert(body.name.clone(), Box::new(body));
+        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("zero loop");
+        assert!(matches!(
+            elaborated.wires[&WireId { instantiation_path: Vec::new(), wire: wire(10, 0) }]
+                .wire_type,
+            ConcreteWireType::IndexedFamily { count: 0, .. }
+        ));
+        assert!(elaborated.atoms.is_empty());
+
+        let NodeKind::ParallelLoop(loop_node) = &mut graph.nodes[0].kind else { unreachable!() };
+        loop_node.minimum_count = 1;
+        let error = elaborate(&graph, &ParamEnv::default())
+            .expect_err("nonempty symbolic loop must reject zero count");
+        assert!(error.to_string().contains("parallel-loop count must be at least 1"));
+    }
+
+    #[test]
+    fn zero_length_zip_loop_uses_only_the_family_element_type() {
+        let producer_body = Graph {
+            name: "zero-family-producer".to_owned(),
+            parameters: Vec::new(),
+            input_types: BTreeMap::new(),
+            nodes: vec![bounded_sample(1)],
+            outputs: BTreeMap::from([("out".to_owned(), wire(1, 0))]),
+            subgraphs: BTreeMap::new(),
+            real_constants: BTreeMap::new(),
+        };
+        let consumer_body = Graph {
+            name: "zero-family-consumer".to_owned(),
+            parameters: Vec::new(),
+            input_types: BTreeMap::from([("value".to_owned(), WireType::Matrix(matrix_type()))]),
+            nodes: vec![Node {
+                id: NodeId(1),
+                kind: NodeKind::Input {
+                    name: "value".to_owned(),
+                    wire_type: WireType::Matrix(matrix_type()),
+                    artifact: None,
+                },
+                args: Vec::new(),
+            }],
+            outputs: BTreeMap::from([("out".to_owned(), wire(1, 0))]),
+            subgraphs: BTreeMap::new(),
+            real_constants: BTreeMap::new(),
+        };
+        let mut graph = empty_graph(
+            "zero-zip",
+            vec![
+                Node {
+                    id: NodeId(10),
+                    kind: NodeKind::ParallelLoop(crate::node::ParallelLoop {
+                        graph: producer_body.name.clone(),
+                        count: IntExpr::constant(0),
+                        minimum_count: 0,
+                        index_variable: "i".to_owned(),
+                        bindings: Vec::new(),
+                        input_modes: Vec::new(),
+                    }),
+                    args: Vec::new(),
+                },
+                Node {
+                    id: NodeId(20),
+                    kind: NodeKind::ParallelLoop(crate::node::ParallelLoop {
+                        graph: consumer_body.name.clone(),
+                        count: IntExpr::constant(0),
+                        minimum_count: 0,
+                        index_variable: "i".to_owned(),
+                        bindings: Vec::new(),
+                        input_modes: vec![LoopInputMode::Zip],
+                    }),
+                    args: vec![wire(10, 0)],
+                },
+            ],
+            wire(20, 0),
+        );
+        graph.subgraphs.insert(producer_body.name.clone(), Box::new(producer_body));
+        graph.subgraphs.insert(consumer_body.name.clone(), Box::new(consumer_body));
+
+        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("zero zip loop");
+        assert!(matches!(
+            elaborated.wires[&WireId { instantiation_path: Vec::new(), wire: wire(20, 0) }]
+                .wire_type,
+            ConcreteWireType::IndexedFamily { count: 0, .. }
+        ));
+        assert!(elaborated.atoms.is_empty());
+    }
+
+    #[test]
+    fn zero_length_zip_loop_accepts_an_imported_empty_family_without_atoms() {
+        let body = Graph {
+            name: "imported-zero-family-consumer".to_owned(),
+            parameters: Vec::new(),
+            input_types: BTreeMap::from([("value".to_owned(), WireType::Matrix(matrix_type()))]),
+            nodes: vec![Node {
+                id: NodeId(1),
+                kind: NodeKind::Input {
+                    name: "value".to_owned(),
+                    wire_type: WireType::Matrix(matrix_type()),
+                    artifact: None,
+                },
+                args: Vec::new(),
+            }],
+            outputs: BTreeMap::from([("out".to_owned(), wire(1, 0))]),
+            subgraphs: BTreeMap::new(),
+            real_constants: BTreeMap::new(),
+        };
+        let production = production_id(crate::atom::SpecHash([41; 32]), [42; 32]);
+        let concrete = ConcreteMatrixType {
+            modulus: BigInt::from(17),
+            ring_dimension: 8,
+            rows: 2,
+            columns: 2,
+        };
+        let manifest = Manifest {
+            format_version: crate::manifest::SYMBOLIC_MANIFEST_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([(
+                "family".to_owned(),
+                crate::manifest::ManifestArtifact {
+                    wire_type: ConcreteWireType::Matrix(concrete),
+                    term_list: None,
+                    family: Some(Vec::new()),
+                    content_hash: None,
+                    layout: None,
+                },
+            )]),
+            atoms: BTreeMap::new(),
+            term_lists: BTreeMap::new(),
+            overlay_hash: None,
+            assumption_hash: None,
+            assumption_digests: BTreeSet::new(),
+            interpretation_digests: BTreeMap::from([(production.clone(), (None, None))]),
+        };
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(matrix_type())),
+            count: IntExpr::constant(0),
+        };
+        let mut graph = empty_graph(
+            "imported-zero-zip",
+            vec![
+                Node {
+                    id: NodeId(1),
+                    kind: NodeKind::Input {
+                        name: "family".to_owned(),
+                        wire_type: family_type.clone(),
+                        artifact: Some(ArtifactInput {
+                            production_id: production,
+                            artifact_name: "family".to_owned(),
+                            confidentiality: ArtifactConfidentiality::Public,
+                        }),
+                    },
+                    args: Vec::new(),
+                },
+                Node {
+                    id: NodeId(2),
+                    kind: NodeKind::ParallelLoop(crate::node::ParallelLoop {
+                        graph: body.name.clone(),
+                        count: IntExpr::constant(0),
+                        minimum_count: 0,
+                        index_variable: "i".to_owned(),
+                        bindings: Vec::new(),
+                        input_modes: vec![LoopInputMode::Zip],
+                    }),
+                    args: vec![wire(1, 0)],
+                },
+            ],
+            wire(2, 0),
+        );
+        graph.input_types.insert("family".to_owned(), family_type);
+        graph.subgraphs.insert(body.name.clone(), Box::new(body));
+
+        let elaborated = elaborate_with_manifests(&graph, &ParamEnv::default(), &[manifest])
+            .expect("imported zero zip loop");
+        assert!(matches!(
+            elaborated.wires[&WireId { instantiation_path: Vec::new(), wire: wire(2, 0) }]
+                .wire_type,
+            ConcreteWireType::IndexedFamily { count: 0, .. }
+        ));
+        assert!(elaborated.atoms.is_empty());
     }
 
     fn matrix_input(id: u64, name: &str, preimage: bool) -> Node {
@@ -4273,7 +5019,7 @@ mod tests {
     }
 
     #[test]
-    fn indicator_sum_expands_affine_ports_as_one_fold_position() {
+    fn indicator_sum_expands_repeated_branches_as_one_fold_position() {
         let graph = empty_graph(
             "indicator-overlay",
             vec![
@@ -4283,16 +5029,10 @@ mod tests {
                     args: Vec::new(),
                 },
                 bounded_sample(2),
-                bounded_sample(3),
-                Node {
-                    id: NodeId(4),
-                    kind: NodeKind::Output { name: "branches".to_owned() },
-                    args: vec![wire(2, 0), wire(3, 0)],
-                },
                 Node {
                     id: NodeId(5),
                     kind: NodeKind::Select { count: IntExpr::constant(2) },
-                    args: vec![wire(1, 0), wire(4, 0), wire(4, 1)],
+                    args: vec![wire(1, 0), wire(2, 0), wire(2, 0)],
                 },
                 bounded_sample(6),
                 Node {
@@ -4317,12 +5057,8 @@ mod tests {
                                     FactorRef {
                                         atom: AtomRef::Node {
                                             path: Vec::new(),
-                                            node: NodeId(4),
-                                            port: PortMatcher::Affine {
-                                                var: "i".to_owned(),
-                                                stride: 1,
-                                                offset: 0,
-                                            },
+                                            node: NodeId(2),
+                                            port: PortMatcher::Concrete(0),
                                         },
                                         view: None,
                                     },
@@ -4360,19 +5096,31 @@ mod tests {
 
     #[test]
     fn overlay_rejects_same_node_references_and_duplicate_targets() {
-        let graph = empty_graph(
+        let child = Graph {
+            name: "two-output-child".to_owned(),
+            parameters: Vec::new(),
+            input_types: BTreeMap::new(),
+            nodes: vec![bounded_sample(1), bounded_sample(2)],
+            outputs: BTreeMap::from([
+                ("left".to_owned(), wire(1, 0)),
+                ("right".to_owned(), wire(2, 0)),
+            ]),
+            subgraphs: BTreeMap::new(),
+            real_constants: BTreeMap::new(),
+        };
+        let mut graph = empty_graph(
             "same-node",
-            vec![
-                bounded_sample(1),
-                bounded_sample(2),
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::Output { name: "family".to_owned() },
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-            ],
+            vec![Node {
+                id: NodeId(3),
+                kind: NodeKind::SubgraphCall(crate::node::SubgraphCall {
+                    graph: child.name.clone(),
+                    bindings: Vec::new(),
+                }),
+                args: Vec::new(),
+            }],
             wire(3, 0),
         );
+        graph.subgraphs.insert(child.name.clone(), Box::new(child));
         let same_node_term = OverlayTerm {
             coefficient: IntExpr::constant(1),
             factors: vec![FactorRef {
@@ -4472,7 +5220,7 @@ mod tests {
                 "c".to_owned(),
                 ExportArtifact {
                     wire: WireId { instantiation_path: Vec::new(), wire: wire(2, 0) },
-                    wire_type: matrix.clone(),
+                    wire_type: ConcreteWireType::Matrix(matrix.clone()),
                     family: None,
                     content_hash: None,
                     layout: None,
@@ -4495,7 +5243,7 @@ mod tests {
                     artifact: Some(ArtifactInput {
                         production_id: producer.clone(),
                         artifact_name: "c".to_owned(),
-                        family_count: None,
+                        confidentiality: ArtifactConfidentiality::Public,
                     }),
                 },
                 args: Vec::new(),
@@ -4520,7 +5268,7 @@ mod tests {
                 "c".to_owned(),
                 ExportArtifact {
                     wire: WireId { instantiation_path: Vec::new(), wire: wire(1, 0) },
-                    wire_type: matrix,
+                    wire_type: ConcreteWireType::Matrix(matrix),
                     family: None,
                     content_hash: None,
                     layout: None,
@@ -4552,5 +5300,137 @@ mod tests {
                 } if production_id == &producer
             )
         }));
+    }
+
+    #[test]
+    fn trapdoor_manifest_closes_producer_bindings_and_preserves_public_atom_identity() {
+        let producer_parameter = crate::graph::CompileParameter {
+            name: "producer_sigma".to_owned(),
+            kind: crate::graph::CompileParameterKind::Real,
+        };
+        let producer_graph = Graph {
+            name: "trapdoor-producer".to_owned(),
+            parameters: vec![producer_parameter],
+            input_types: BTreeMap::new(),
+            nodes: vec![
+                Node {
+                    id: NodeId(1),
+                    kind: NodeKind::TrapdoorSample {
+                        matrix_type: matrix_type(),
+                        sigma: RealExpr::Var("producer_sigma".to_owned()),
+                        gadget_base: IntExpr::constant(2),
+                        digit_count: IntExpr::constant(2),
+                    },
+                    args: Vec::new(),
+                },
+                Node {
+                    id: NodeId(2),
+                    kind: NodeKind::Output {
+                        name: "trapdoor".to_owned(),
+                        artifact_confidentiality: Some(ArtifactConfidentiality::Private),
+                    },
+                    args: vec![wire(1, 1)],
+                },
+            ],
+            outputs: BTreeMap::from([("trapdoor".to_owned(), wire(2, 0))]),
+            subgraphs: BTreeMap::new(),
+            real_constants: BTreeMap::new(),
+        };
+        let sigma = Rational::new(BigInt::from(13), BigInt::from(2)).expect("sigma");
+        let producer_bindings = ParamEnv {
+            reals: BTreeMap::from([("producer_sigma".to_owned(), sigma.clone())]),
+            ..ParamEnv::default()
+        };
+        let producer_elaboration =
+            elaborate(&producer_graph, &producer_bindings).expect("producer elaboration");
+        let producer_wire = WireId { instantiation_path: Vec::new(), wire: wire(2, 0) };
+        let trapdoor_type = producer_elaboration.wires[&producer_wire].wire_type.clone();
+        assert!(matches!(
+            &trapdoor_type,
+            ConcreteWireType::Trapdoor {
+                sigma: RealExpr::Rational(closed),
+                ..
+            } if closed == &sigma
+        ));
+
+        let production = production_id(crate::atom::SpecHash([31; 32]), [32; 32]);
+        let manifest = export_manifest(
+            production.clone(),
+            &BTreeMap::from([(
+                "trapdoor".to_owned(),
+                ExportArtifact {
+                    wire: producer_wire,
+                    wire_type: trapdoor_type,
+                    family: None,
+                    content_hash: None,
+                    layout: None,
+                },
+            )]),
+            &producer_elaboration.wire_terms(),
+            &producer_elaboration.target_terms,
+            &producer_elaboration.atoms,
+            &producer_elaboration.manifest_metadata(),
+        )
+        .expect("trapdoor manifest");
+
+        let consumer_graph = Graph {
+            name: "trapdoor-consumer".to_owned(),
+            parameters: vec![crate::graph::CompileParameter {
+                name: "consumer_sigma".to_owned(),
+                kind: crate::graph::CompileParameterKind::Real,
+            }],
+            input_types: BTreeMap::from([(
+                "trapdoor".to_owned(),
+                WireType::Trapdoor {
+                    matrix: matrix_type(),
+                    sigma: RealExpr::Var("consumer_sigma".to_owned()),
+                    gadget_base: IntExpr::constant(2),
+                    digit_count: IntExpr::constant(2),
+                },
+            )]),
+            nodes: vec![
+                Node {
+                    id: NodeId(1),
+                    kind: NodeKind::Input {
+                        name: "trapdoor".to_owned(),
+                        wire_type: WireType::Trapdoor {
+                            matrix: matrix_type(),
+                            sigma: RealExpr::Var("consumer_sigma".to_owned()),
+                            gadget_base: IntExpr::constant(2),
+                            digit_count: IntExpr::constant(2),
+                        },
+                        artifact: Some(ArtifactInput {
+                            production_id: production.clone(),
+                            artifact_name: "trapdoor".to_owned(),
+                            confidentiality: ArtifactConfidentiality::Private,
+                        }),
+                    },
+                    args: Vec::new(),
+                },
+                Node { id: NodeId(2), kind: NodeKind::TrapdoorPublic, args: vec![wire(1, 0)] },
+            ],
+            outputs: BTreeMap::from([("public".to_owned(), wire(2, 0))]),
+            subgraphs: BTreeMap::new(),
+            real_constants: BTreeMap::new(),
+        };
+        let consumer_bindings = ParamEnv {
+            reals: BTreeMap::from([("consumer_sigma".to_owned(), sigma)]),
+            ..ParamEnv::default()
+        };
+        let consumer = elaborate_with_manifests(
+            &consumer_graph,
+            &consumer_bindings,
+            std::slice::from_ref(&manifest),
+        )
+        .expect("consumer elaboration");
+        let public_terms = elaborated_terms(&consumer, wire(2, 0));
+        assert_eq!(public_terms.terms.len(), 1);
+        assert!(matches!(
+            public_terms.terms[0].factors[0].atom,
+            AtomId::Imported {
+                ref production_id,
+                ..
+            } if production_id == &production
+        ));
     }
 }

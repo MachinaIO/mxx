@@ -1,8 +1,5 @@
 use dashmap::{DashMap, mapref::entry::Entry};
 use num_bigint::BigUint;
-#[cfg(feature = "gpu")]
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
@@ -13,26 +10,17 @@ use std::{
     },
 };
 
-#[cfg(feature = "gpu")]
-use crate::poly::dcrt::gpu::detected_gpu_device_ids;
 use crate::{
     circuit::{
-        Evaluable, GateParamSource, PolyGate, PolyGateKind, PolyGateType, SlotTransferSpec,
+        GateParamSource, PolyGate, PolyGateKind, PolyGateType, PublicLut, SlotTransferSpec,
         SubCircuitParamKind, SubCircuitParamSpec, SubCircuitParamValue, gate::GateId,
     },
-    lookup::{PltEvaluator, PublicLut},
     poly::Poly,
-    slot_transfer::SlotTransferEvaluator,
 };
-use tracing::{debug, info};
 
 mod analysis;
 mod construction;
-mod eval;
 mod subcircuits;
-
-#[cfg(test)]
-mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
 pub struct BatchedWire {
@@ -191,54 +179,6 @@ where
         merged.push(batch);
     }
     merged
-}
-
-pub(crate) fn batched_wire_slice_at(batches: &[BatchedWire], idx: usize) -> GateId {
-    let mut offset = idx;
-    for batch in batches {
-        if offset < batch.len() {
-            return GateId(batch.start().0 + offset);
-        }
-        offset -= batch.len();
-    }
-    panic!(
-        "batched wire index {idx} out of range for flattened len {}",
-        batched_wire_slice_len(batches)
-    );
-}
-
-#[cfg(feature = "gpu")]
-#[derive(Debug)]
-enum LoadedGateInputs<E: Evaluable> {
-    SkipExisting,
-    Unary(E),
-    Binary(E, E),
-    Many(Vec<E>),
-}
-
-#[cfg(feature = "gpu")]
-#[derive(Debug)]
-struct LoadedGateCtx<E: Evaluable> {
-    gate_id: GateId,
-    gate: PolyGate,
-    shard_idx: usize,
-    inputs: LoadedGateInputs<E>,
-}
-
-#[cfg(feature = "gpu")]
-#[derive(Debug)]
-enum ComputedGateValue<E: Evaluable> {
-    SkipExisting,
-    Value(E),
-}
-
-#[cfg(feature = "gpu")]
-#[derive(Debug)]
-struct ComputedGateCtx<E: Evaluable> {
-    gate_id: GateId,
-    gate: PolyGate,
-    shard_idx: usize,
-    value: ComputedGateValue<E>,
 }
 
 #[derive(Debug)]
@@ -404,6 +344,7 @@ pub struct SubCircuitCallInfo {
     pub inputs: Vec<BatchedWire>,
     pub param_bindings: Arc<[SubCircuitParamValue]>,
     pub input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
+    pub scoped_call_id: usize,
     pub output_gate_ids: Vec<GateId>,
 }
 
@@ -424,34 +365,8 @@ pub struct SummedSubCircuitCallInfo {
     pub call_inputs: Vec<Vec<BatchedWire>>,
     pub param_bindings: Vec<Arc<[SubCircuitParamValue]>>,
     pub input_max_plaintext_norm_ranges: Option<Arc<[SubCircuitInputMaxPlaintextNormRange]>>,
+    pub scoped_call_ids: Vec<usize>,
     pub output_gate_ids: Vec<GateId>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct GroupedCallExecutionLayer {
-    pub(crate) regular_gate_ids: Vec<GateId>,
-    pub(crate) sub_circuit_call_ids: Vec<usize>,
-    pub(crate) summed_sub_circuit_call_ids: Vec<usize>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct GroupedExecutionPlan {
-    pub(crate) layers: Vec<GroupedCallExecutionLayer>,
-    pub(crate) reachable_input_gate_ids: Vec<GateId>,
-}
-
-#[derive(Clone)]
-pub(crate) struct PolyCircuitRegistryHandles<P: Poly> {
-    pub(crate) lookup_registry: Arc<LookupRegistry<P>>,
-    pub(crate) binding_registry: Arc<BindingRegistry>,
-    pub(crate) input_set_registry: Arc<InputSetRegistry>,
-    pub(crate) sub_circuit_registry: Arc<SubCircuitRegistry<P>>,
-}
-
-impl<P: Poly> std::fmt::Debug for PolyCircuitRegistryHandles<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PolyCircuitRegistryHandles").finish_non_exhaustive()
-    }
 }
 
 #[derive(Clone)]

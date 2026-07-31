@@ -4,13 +4,12 @@
 
 The repository includes:
 
-- [BGG+ encodings](https://eprint.iacr.org/2014/356.pdf) in `crates/gadgets/src/bgg/`.
-- [WEE25 matrix commitment](https://eprint.iacr.org/2025/509.pdf) in `crates/gadgets/src/commit/`.
-- [Lookup-table evaluation over BGG+ encodings](https://eprint.iacr.org/2025/1870.pdf) in `crates/gadgets/src/lookup/`.
+- [BGG+ encodings](https://eprint.iacr.org/2014/356.pdf) as Graph IR compilers in `crates/bgg/`.
+- [WEE25 matrix commitment](https://eprint.iacr.org/2025/509.pdf) is implemented in the BGG Graph IR layer. Commitment-backed lookup evaluation is unsupported.
+- LWE lookup-table evaluation over BGG+ encodings is implemented as Graph IR in `crates/bgg/`; GGH15 lookup is unsupported and excluded from the new design.
 - Evaluation and decryption of [GSW-FHE](https://eprint.iacr.org/2013/340.pdf) over BGG+ encodings, following [this construction](https://eprint.iacr.org/2015/029.pdf), in `crates/gadgets/src/circuit_gadgets/fhe/`.
-- Diamond witness encryption in `crates/we/`.
-- Benchmark estimation for pseudorandom obfuscation based on [AKY24](https://eprint.iacr.org/2024/1720.pdf) in `crates/io/src/aky24_io/`.
-- Benchmark estimation for [Diamond iO](https://eprint.iacr.org/2025/236.pdf) in `crates/io/src/diamond_io/`.
+- Disabled Diamond witness-encryption reference source in `crates/we/`; it is not exported from the crate root.
+- Disabled [AKY24](https://eprint.iacr.org/2024/1720.pdf) and [Diamond iO](https://eprint.iacr.org/2025/236.pdf) reference sources in `crates/io/`; they are not exported from the crate root.
 
 ## Workspace layout
 
@@ -24,11 +23,11 @@ The repository is a virtual Cargo workspace with no root facade crate:
 | `mxx-runtime` | CPU/GPU execution, reproducible sampling transcripts, liveness, and indexed artifact-family persistence. |
 | `mxx-bench-estimator` | Binding-sensitive measured graph-cost composition, critical paths, parallel waves, and memory peaks. |
 | `mxx-primitives` | Polynomial and matrix representations, samplers, analytical sampling bounds, OpenFHE integration, and all native CUDA kernels and wrappers. |
-| `mxx-gadgets` | BGG encodings, circuits, circuit gadgets, lookup, decoding, noise refresh, input injection, slot transfer, commitments, storage, simulation, and benchmark models. |
-| `mxx-bgg` | Graph compilers for BGG+ wire bundles and `PolyCircuit`, with explicit scheme contexts for lookup and slot-transfer lowering. |
-| `mxx-func-enc` | Functional-encryption interfaces and constructions. AKY24 remains disabled until its shared-decoder migration is complete. |
-| `mxx-we` | Witness-encryption interfaces and Diamond WE. |
-| `mxx-io` | Indistinguishability-obfuscation interfaces, AKY24 iO estimation, and Diamond iO. |
+| `mxx-gadgets` | BGG-independent circuits and circuit gadgets. |
+| `mxx-bgg` | Graph IR samplers and compilers for BGG+ public keys, encodings, polynomial encodings, naive vectors, digit reconstruction, LWE lookup, input injection, slot transfer, standalone commitment, masked decoding, and noise refresh. GGH15 and commitment-backed lookup evaluators are unsupported. |
+| `mxx-func-enc` | Functional-encryption interfaces. AKY24 functional encryption is disabled pending a separate specification of its raw-mask semantics. |
+| `mxx-we` | Witness-encryption interfaces. Diamond WE is disabled pending a separate application cutover. |
+| `mxx-io` | Indistinguishability-obfuscation interfaces. AKY24 iO and Diamond iO are disabled pending separate application cutovers. |
 
 The principal dependency directions are shown with consumers on the left:
 
@@ -37,7 +36,7 @@ mxx-runtime          -> mxx-ir-core, mxx-primitives
 mxx-ir-symbolic    -> mxx-ir-core
 mxx-noise-simulator -> mxx-ir-symbolic, mxx-primitives
 mxx-bench-estimator  -> mxx-ir-core, mxx-runtime
-mxx-gadgets          -> mxx-primitives, mxx-noise-simulator
+mxx-gadgets          -> mxx-ir-core, mxx-primitives
 mxx-bgg              -> mxx-ir-core, mxx-gadgets
 mxx-func-enc/we/io   -> lower layers, never one another
 ```
@@ -53,13 +52,11 @@ The three application crates do not depend on one another. See `docs/architectur
 
 ## Cargo features
 
-Crates with concrete storage or device behavior expose the relevant opt-in
-feature names. Application crates forward them to their lower-level
-dependencies.
+Crates with device-specific behavior expose the relevant opt-in feature name.
+Application crates forward it to their lower-level dependencies.
 
 | Feature | Effect |
 | --- | --- |
-| `disk` | Enables disk-backed primitive matrix storage through `libc` and `memmap2`. |
 | `gpu` | Enables CUDA-backed primitive operations and GPU implementations in dependent crates. Native CUDA compilation is owned by `mxx-primitives`. |
 
 GPU build configuration is handled by `crates/primitives/build.rs` and `crates/primitives/cuda/`.
@@ -71,7 +68,10 @@ GPU build configuration is handled by `crates/primitives/build.rs` and `crates/p
 | `CUDA_LIB_DIR` | CUDA library directory linked by Cargo. |
 | `NVCC` | Explicit CUDA compiler path. |
 
-Runtime parallelism and batching helpers are split between `crates/primitives/src/env.rs` for primitive operations and `crates/gadgets/src/env.rs` for gadget-level workloads.
+Primitive-operation environment configuration lives in
+`crates/primitives/src/env.rs`. Graph scheduling and batching are configured
+through the explicit runtime and estimator APIs rather than gadget-specific
+environment variables.
 
 ## Common commands
 
@@ -79,12 +79,6 @@ Type-check the complete CPU workspace:
 
 ```sh
 cargo check --workspace
-```
-
-Type-check all crates with disk-backed storage:
-
-```sh
-cargo check --workspace --features disk
 ```
 
 Type-check all crates with CUDA support:

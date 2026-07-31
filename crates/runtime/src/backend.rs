@@ -4,7 +4,7 @@ use mxx_ir_core::{
     types::ConcreteMatrixType,
 };
 use num_bigint::BigInt;
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 pub mod poly;
 #[cfg(feature = "gpu")]
@@ -16,15 +16,83 @@ pub struct PreimageRequest<M, T> {
     pub sigma: f64,
     pub gadget_base: BigInt,
     pub digit_count: usize,
-    pub trapdoor: T,
-    pub public: M,
-    pub target: M,
+    pub trapdoor: Arc<T>,
+    pub public: Arc<M>,
+    pub target: Arc<M>,
 }
 
 pub trait Backend {
     type Matrix: Clone + Debug + PartialEq + Send + Sync;
     type Trapdoor: Clone + Debug + Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
+
+    fn placement_count(&self) -> usize {
+        1
+    }
+    fn active_placement(&self) -> usize {
+        0
+    }
+    fn set_active_placement(&mut self, placement: usize) -> bool {
+        placement == 0
+    }
+    fn matrix_to_active_placement(
+        &mut self,
+        value: &Self::Matrix,
+    ) -> Result<Self::Matrix, Self::Error> {
+        Ok(value.clone())
+    }
+    fn matrix_is_on_active_placement(&self, _value: &Self::Matrix) -> bool {
+        true
+    }
+    fn matrix_to_placements(
+        &mut self,
+        value: &Self::Matrix,
+    ) -> Result<Vec<Option<Self::Matrix>>, Self::Error> {
+        let original = self.active_placement();
+        let result = (|| {
+            let mut placed = Vec::with_capacity(self.placement_count());
+            for placement in 0..self.placement_count() {
+                assert!(self.set_active_placement(placement), "backend rejected its own placement");
+                placed.push(if self.matrix_is_on_active_placement(value) {
+                    None
+                } else {
+                    Some(self.matrix_to_active_placement(value)?)
+                });
+            }
+            Ok(placed)
+        })();
+        assert!(self.set_active_placement(original), "backend rejected its active placement");
+        result
+    }
+    fn trapdoor_to_active_placement(
+        &mut self,
+        _ty: &ConcreteMatrixType,
+        value: &Self::Trapdoor,
+    ) -> Result<Self::Trapdoor, Self::Error> {
+        Ok(value.clone())
+    }
+    fn trapdoor_to_placements(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        value: &Self::Trapdoor,
+        source_placement: usize,
+    ) -> Result<Vec<Self::Trapdoor>, Self::Error> {
+        let original = self.active_placement();
+        let result = (|| {
+            let mut placed = Vec::with_capacity(self.placement_count());
+            for placement in 0..self.placement_count() {
+                assert!(self.set_active_placement(placement), "backend rejected its own placement");
+                placed.push(if placement == source_placement {
+                    value.clone()
+                } else {
+                    self.trapdoor_to_active_placement(ty, value)?
+                });
+            }
+            Ok(placed)
+        })();
+        assert!(self.set_active_placement(original), "backend rejected its active placement");
+        result
+    }
 
     fn constant_matrix(
         &mut self,
@@ -67,7 +135,7 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
     fn concat(
         &mut self,
-        inputs: &[Self::Matrix],
+        inputs: &[&Self::Matrix],
         axis: ConcatAxis,
     ) -> Result<Self::Matrix, Self::Error>;
     fn reshape(
@@ -123,12 +191,21 @@ pub trait Backend {
                     request.sigma,
                     &request.gadget_base,
                     request.digit_count,
-                    &request.trapdoor,
-                    &request.public,
-                    &request.target,
+                    request.trapdoor.as_ref(),
+                    request.public.as_ref(),
+                    request.target.as_ref(),
                 )
             })
             .collect()
+    }
+    fn validate_gadget_layout(
+        &self,
+        _ty: &ConcreteMatrixType,
+        _gadget_base: &BigInt,
+        _digit_count: usize,
+        _small: bool,
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
     fn gadget_decompose(
         &mut self,
@@ -156,6 +233,12 @@ pub trait Backend {
         plaintext_modulus: &BigInt,
         length: usize,
     ) -> Result<Vec<BigInt>, Self::Error>;
+    fn crt_recompose(
+        &mut self,
+        levels: &[Self::Matrix],
+        plaintext_moduli: &[BigInt],
+        reconstruction_coefficients: &[BigInt],
+    ) -> Result<Self::Matrix, Self::Error>;
 
     fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8>;
     fn matrix_from_bytes(
@@ -176,10 +259,11 @@ pub enum RuntimeValue<B: Backend> {
     Real(f64),
     Bool(bool),
     Bytes(Vec<u8>),
-    Matrix(B::Matrix),
+    TypedBlob(Vec<u8>),
+    Matrix(Arc<B::Matrix>),
     Trapdoor {
-        secret: Option<B::Trapdoor>,
-        public: B::Matrix,
+        secret: Option<Arc<B::Trapdoor>>,
+        public: Arc<B::Matrix>,
         matrix_type: ConcreteMatrixType,
         sigma: f64,
         gadget_base: BigInt,
@@ -190,8 +274,25 @@ pub enum RuntimeValue<B: Backend> {
         production: mxx_ir_core::artifact::ProductionId,
         name: String,
         index: Option<usize>,
-        matrix_type: ConcreteMatrixType,
+        descriptor: mxx_ir_core::artifact::ManifestArtifact,
     },
+    LazyArtifactFamily {
+        production: mxx_ir_core::artifact::ProductionId,
+        name: String,
+        descriptor: mxx_ir_core::artifact::ManifestArtifact,
+    },
+    StagedArtifact {
+        production: mxx_ir_core::artifact::ProductionId,
+        name: String,
+        index: usize,
+        descriptor: mxx_ir_core::artifact::ManifestArtifact,
+    },
+    StagedArtifactFamily {
+        production: mxx_ir_core::artifact::ProductionId,
+        name: String,
+        descriptor: mxx_ir_core::artifact::ManifestArtifact,
+    },
+    IndexedFamily(Vec<RuntimeValue<B>>),
 }
 
 impl<B: Backend> Clone for RuntimeValue<B> {
@@ -201,6 +302,7 @@ impl<B: Backend> Clone for RuntimeValue<B> {
             Self::Real(value) => Self::Real(*value),
             Self::Bool(value) => Self::Bool(*value),
             Self::Bytes(value) => Self::Bytes(value.clone()),
+            Self::TypedBlob(value) => Self::TypedBlob(value.clone()),
             Self::Matrix(value) => Self::Matrix(value.clone()),
             Self::Trapdoor {
                 secret,
@@ -219,12 +321,37 @@ impl<B: Backend> Clone for RuntimeValue<B> {
                 digit_count: *digit_count,
                 gadget_small: *gadget_small,
             },
-            Self::LazyArtifact { production, name, index, matrix_type } => Self::LazyArtifact {
+            Self::LazyArtifact { production, name, index, descriptor } => Self::LazyArtifact {
                 production: production.clone(),
                 name: name.clone(),
                 index: *index,
-                matrix_type: matrix_type.clone(),
+                descriptor: descriptor.clone(),
             },
+            Self::LazyArtifactFamily { production, name, descriptor } => Self::LazyArtifactFamily {
+                production: production.clone(),
+                name: name.clone(),
+                descriptor: descriptor.clone(),
+            },
+            Self::StagedArtifact { production, name, index, descriptor } => Self::StagedArtifact {
+                production: production.clone(),
+                name: name.clone(),
+                index: *index,
+                descriptor: descriptor.clone(),
+            },
+            Self::StagedArtifactFamily { production, name, descriptor } => {
+                Self::StagedArtifactFamily {
+                    production: production.clone(),
+                    name: name.clone(),
+                    descriptor: descriptor.clone(),
+                }
+            }
+            Self::IndexedFamily(values) => Self::IndexedFamily(values.clone()),
         }
+    }
+}
+
+impl<B: Backend> RuntimeValue<B> {
+    pub fn matrix(value: B::Matrix) -> Self {
+        Self::Matrix(Arc::new(value))
     }
 }

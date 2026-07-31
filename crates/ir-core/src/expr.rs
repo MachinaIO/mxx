@@ -106,6 +106,8 @@ pub enum ExprError {
     InvalidRationalDenominator,
     #[error("a nonnegative real expression evaluated to a negative value")]
     NegativeReal,
+    #[error("a floating-point value is not finite")]
+    NonFiniteReal,
 }
 
 impl IntExpr {
@@ -162,6 +164,21 @@ impl IntExpr {
     pub fn canonicalize(&self) -> Self {
         Polynomial::from_expr(self).into_expr()
     }
+
+    pub fn contains_variable(&self, variable: &str) -> bool {
+        match self {
+            Self::Const(_) => false,
+            Self::Var(name) => name == variable,
+            Self::Add(lhs, rhs) |
+            Self::Sub(lhs, rhs) |
+            Self::Mul(lhs, rhs) |
+            Self::Div(lhs, rhs) |
+            Self::RoundDiv(lhs, rhs) => {
+                lhs.contains_variable(variable) || rhs.contains_variable(variable)
+            }
+            Self::Log2Ceil(value) => value.contains_variable(variable),
+        }
+    }
 }
 
 impl Rational {
@@ -178,6 +195,37 @@ impl Rational {
 
     pub fn from_integer(value: BigInt) -> Self {
         Self { numerator: value, denominator: BigInt::one() }
+    }
+
+    /// Converts one finite IEEE-754 binary64 value to its exact mathematical
+    /// rational value without passing through a decimal or rounded integer.
+    pub fn from_f64_exact(value: f64) -> Result<Self, ExprError> {
+        if !value.is_finite() {
+            return Err(ExprError::NonFiniteReal);
+        }
+        let bits = value.to_bits();
+        let negative = bits >> 63 != 0;
+        let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+        let fraction = bits & ((1u64 << 52) - 1);
+        if exponent_bits == 0 && fraction == 0 {
+            return Ok(Self::from_integer(BigInt::zero()));
+        }
+        let (significand, exponent) = if exponent_bits == 0 {
+            (fraction, -1074)
+        } else {
+            ((1u64 << 52) | fraction, exponent_bits - 1023 - 52)
+        };
+        let mut numerator = BigInt::from(significand);
+        let mut denominator = BigInt::one();
+        if exponent >= 0 {
+            numerator <<= exponent as usize;
+        } else {
+            denominator <<= (-exponent) as usize;
+        }
+        if negative {
+            numerator = -numerator;
+        }
+        Self::new(numerator, denominator)
     }
 
     pub fn numerator(&self) -> &BigInt {
@@ -215,6 +263,25 @@ impl Rational {
 }
 
 impl RealExpr {
+    pub fn from_f64_exact(value: f64) -> Result<Self, ExprError> {
+        Ok(Self::Rational(Rational::from_f64_exact(value)?))
+    }
+
+    pub fn contains_variable(&self, variable: &str) -> bool {
+        match self {
+            Self::Rational(_) => false,
+            Self::Var(name) => name == variable,
+            Self::FromInt(value) => value.contains_variable(variable),
+            Self::Add(lhs, rhs) |
+            Self::Sub(lhs, rhs) |
+            Self::Mul(lhs, rhs) |
+            Self::Div(lhs, rhs) => {
+                lhs.contains_variable(variable) || rhs.contains_variable(variable)
+            }
+            Self::Sqrt(value) => value.contains_variable(variable),
+        }
+    }
+
     pub fn evaluate_f64(&self, env: &ParamEnv) -> Result<f64, ExprError> {
         let value = match self {
             Self::Rational(value) => {
@@ -269,6 +336,41 @@ impl RealExpr {
             }
             Self::Div(lhs, rhs) => lhs.evaluate_rational(env)?.div(&rhs.evaluate_rational(env)?),
             Self::Sqrt(_) => Err(ExprError::InvalidRationalDenominator),
+        }
+    }
+
+    /// Substitutes every compile-time variable while preserving square roots
+    /// as exact symbolic operations. The returned expression is independent
+    /// of `env` and is suitable for persisted type descriptors.
+    pub fn close(&self, env: &ParamEnv) -> Result<Self, ExprError> {
+        if !self.contains_sqrt() {
+            return Ok(Self::Rational(self.evaluate_rational(env)?));
+        }
+        Ok(match self {
+            Self::Rational(value) => Self::Rational(value.clone()),
+            Self::Var(name) => Self::Rational(
+                env.reals
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| ExprError::UnboundVariable(name.clone()))?,
+            ),
+            Self::FromInt(value) => Self::FromInt(IntExpr::constant(value.evaluate(env)?)),
+            Self::Add(lhs, rhs) => Self::Add(Box::new(lhs.close(env)?), Box::new(rhs.close(env)?)),
+            Self::Sub(lhs, rhs) => Self::Sub(Box::new(lhs.close(env)?), Box::new(rhs.close(env)?)),
+            Self::Mul(lhs, rhs) => Self::Mul(Box::new(lhs.close(env)?), Box::new(rhs.close(env)?)),
+            Self::Div(lhs, rhs) => Self::Div(Box::new(lhs.close(env)?), Box::new(rhs.close(env)?)),
+            Self::Sqrt(value) => Self::Sqrt(Box::new(value.close(env)?)),
+        })
+    }
+
+    fn contains_sqrt(&self) -> bool {
+        match self {
+            Self::Sqrt(_) => true,
+            Self::Add(lhs, rhs) |
+            Self::Sub(lhs, rhs) |
+            Self::Mul(lhs, rhs) |
+            Self::Div(lhs, rhs) => lhs.contains_sqrt() || rhs.contains_sqrt(),
+            Self::Rational(_) | Self::Var(_) | Self::FromInt(_) => false,
         }
     }
 }
@@ -434,5 +536,51 @@ mod tests {
             euclidean_div_rem(&BigInt::from(-7), &BigInt::from(3)).expect("nonzero divisor");
         assert_eq!(quotient, BigInt::from(-3));
         assert_eq!(remainder, BigInt::from(2));
+    }
+
+    #[test]
+    fn closed_real_expression_substitutes_variables_inside_square_root_expressions() {
+        let expression = RealExpr::Add(
+            Box::new(RealExpr::Var("sigma".to_owned())),
+            Box::new(RealExpr::Sqrt(Box::new(RealExpr::FromInt(IntExpr::Var(
+                "dimension".to_owned(),
+            ))))),
+        );
+        let env = ParamEnv {
+            integers: BTreeMap::from([("dimension".to_owned(), BigInt::from(9))]),
+            reals: BTreeMap::from([(
+                "sigma".to_owned(),
+                Rational::new(BigInt::from(13), BigInt::from(2)).expect("rational"),
+            )]),
+        };
+        let closed = expression.close(&env).expect("closed expression");
+        assert!(!closed.contains_variable("sigma"));
+        assert!(!closed.contains_variable("dimension"));
+        assert_eq!(closed.evaluate_f64(&ParamEnv::default()).expect("closed value"), 9.5);
+    }
+
+    #[test]
+    fn binary64_conversion_preserves_the_exact_rational_value() {
+        let six_and_a_half = Rational::from_f64_exact(6.5).expect("finite value");
+        assert_eq!(six_and_a_half.numerator(), &BigInt::from(13));
+        assert_eq!(six_and_a_half.denominator(), &BigInt::from(2));
+
+        let sigma = RealExpr::from_f64_exact(4.578).expect("finite sigma");
+        assert_eq!(
+            sigma.evaluate_f64(&ParamEnv::default()).expect("rational sigma").to_bits(),
+            4.578f64.to_bits()
+        );
+
+        let minimum_subnormal =
+            Rational::from_f64_exact(f64::from_bits(1)).expect("finite subnormal");
+        assert_eq!(minimum_subnormal.numerator(), &BigInt::one());
+        assert_eq!(minimum_subnormal.denominator(), &(BigInt::one() << 1074usize));
+    }
+
+    #[test]
+    fn binary64_conversion_rejects_non_finite_values() {
+        for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(matches!(RealExpr::from_f64_exact(value), Err(ExprError::NonFiniteReal)));
+        }
     }
 }

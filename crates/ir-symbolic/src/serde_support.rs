@@ -136,6 +136,23 @@ pub(crate) mod bigint {
     }
 }
 
+pub(crate) mod bigint_vec {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(values: &[BigInt], serializer: S) -> Result<S::Ok, S::Error> {
+        values.iter().map(ToString::to_string).collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<BigInt>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| BigInt::from_str(&value).map_err(D::Error::custom))
+            .collect()
+    }
+}
+
 pub(crate) mod optional_bigint {
     use super::*;
 

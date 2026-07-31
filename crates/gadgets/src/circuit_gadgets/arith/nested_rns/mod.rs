@@ -6,15 +6,14 @@ mod decomposed_mul;
 mod encoding;
 mod poly;
 
-#[cfg(test)]
-mod tests;
-
 use crate::{
-    circuit::{BatchedWire, PolyCircuit, SubCircuitParamSpec, SubCircuitParamValue, gate::GateId},
+    circuit::{
+        BatchedWire, PolyCircuit, PublicLut, SubCircuitParamSpec, SubCircuitParamValue,
+        gate::GateId,
+    },
     circuit_gadgets::conv_mul::{
         negacyclic_conv_mul_right_decomposed_term_many_subcircuit, negacyclic_conv_mul_right_sparse,
     },
-    lookup::PublicLut,
     poly::{Poly, PolyParams},
     utils::{mod_inverse, round_div},
 };

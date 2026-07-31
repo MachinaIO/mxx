@@ -186,7 +186,18 @@ namespace
         {
             throw std::runtime_error("computed root is not a primitive 2N-th root");
         }
-        return root;
+        // OpenFHE canonicalizes a power-of-two root to the smallest primitive
+        // root. Matching that choice keeps the GPU evaluation representation
+        // bit-exact with DCRTPoly rather than merely internally invertible.
+        uint64_t minimum_root = root;
+        uint64_t odd_power = root;
+        const uint64_t root_squared = mul_mod_u64_host(root, root, prime);
+        for (uint64_t exponent = 3; exponent < order; exponent += 2)
+        {
+            odd_power = mul_mod_u64_host(odd_power, root_squared, prime);
+            minimum_root = std::min(minimum_root, odd_power);
+        }
+        return minimum_root;
     }
 
     void validate_gpu_list(const std::vector<int> &gpu_list)

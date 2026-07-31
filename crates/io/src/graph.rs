@@ -6,10 +6,9 @@
 //! per round, and decodes each projected output. Scheme modules own their
 //! public configuration types and map them into this representation.
 
-use mxx_bgg::{GraphBuilder, OutputFamilyError};
 use mxx_ir_core::{
-    Graph, IntExpr,
-    artifact::ProductionId,
+    Graph, GraphBuilder, IntExpr, OutputFamilyError,
+    artifact::{ArtifactConfidentiality, ProductionId},
     expr::RealExpr,
     node::{HashVariant, MatrixBinaryOp},
     types::MatrixType,
@@ -103,7 +102,7 @@ pub(crate) fn build_obfuscation_graph(
     let hash_key = builder.bytes_input("hash_key", 32);
 
     let initial_state = builder.gaussian_sample(config.state_type(), config.sample_sigma.clone());
-    builder.output(names.initial_state.clone(), &initial_state);
+    builder.output(names.initial_state.clone(), &initial_state, ArtifactConfidentiality::Public);
 
     for round in 0..config.round_count {
         let transitions = (0..config.branch_count)
@@ -121,7 +120,11 @@ pub(crate) fn build_obfuscation_graph(
                 )
             })
             .collect::<Vec<_>>();
-        builder.output_family(names.transition(round), &transitions)?;
+        builder.output_family(
+            names.transition(round),
+            &transitions,
+            ArtifactConfidentiality::Public,
+        )?;
     }
 
     let projections = (0..config.output_count)
@@ -139,7 +142,11 @@ pub(crate) fn build_obfuscation_graph(
             )
         })
         .collect::<Vec<_>>();
-    builder.output_family(names.output_projections.clone(), &projections)?;
+    builder.output_family(
+        names.output_projections.clone(),
+        &projections,
+        ArtifactConfidentiality::Public,
+    )?;
     Ok(builder.finish())
 }
 
@@ -156,54 +163,38 @@ pub(crate) fn build_evaluation_graph(
         config.state_type(),
         production_id.clone(),
         names.initial_state.clone(),
+        ArtifactConfidentiality::Public,
     );
 
     for round in 0..config.round_count {
         let branch = builder.integer_input(format!("branch_{round}"));
-        let transitions = if config.branch_count == 1 {
-            vec![builder.artifact_input(
-                format!("transition_artifacts_{round}"),
-                config.transition_type(),
-                production_id.clone(),
-                names.transition(round),
-            )]
-        } else {
-            builder.artifact_family_input(
-                format!("transition_artifacts_{round}"),
-                config.transition_type(),
-                production_id.clone(),
-                names.transition(round),
-                IntExpr::constant(config.branch_count),
-                config.branch_count,
-            )
-        };
-        let selected = builder.select(branch, &transitions);
+        let transitions = builder.artifact_family_input(
+            format!("transition_artifacts_{round}"),
+            config.transition_type(),
+            production_id.clone(),
+            names.transition(round),
+            IntExpr::constant(config.branch_count),
+            ArtifactConfidentiality::Public,
+        );
+        let selected = builder.family_get_dynamic(&transitions, branch);
         state =
             builder.matrix_binary(MatrixBinaryOp::Multiply, &state, &selected, config.state_type());
     }
 
-    let projections = if config.output_count == 1 {
-        vec![builder.artifact_input(
-            "output_projection_artifacts",
-            config.projection_type(),
-            production_id,
-            names.output_projections.clone(),
-        )]
-    } else {
-        builder.artifact_family_input(
-            "output_projection_artifacts",
-            config.projection_type(),
-            production_id,
-            names.output_projections.clone(),
-            IntExpr::constant(config.output_count),
-            config.output_count,
-        )
-    };
-    for (output, projection) in projections.iter().enumerate() {
+    let projection_family = builder.artifact_family_input(
+        "output_projection_artifacts",
+        config.projection_type(),
+        production_id,
+        names.output_projections.clone(),
+        IntExpr::constant(config.output_count),
+        ArtifactConfidentiality::Public,
+    );
+    for output in 0..config.output_count {
+        let projection = builder.family_get_static(&projection_family, IntExpr::constant(output));
         let noisy_plaintext = builder.matrix_binary(
             MatrixBinaryOp::Multiply,
             &state,
-            projection,
+            &projection,
             config.scalar_type(),
         );
         let decoded = builder.threshold_decode(
@@ -212,7 +203,7 @@ pub(crate) fn build_evaluation_graph(
             IntExpr::constant(1),
             true,
         );
-        builder.output_wire(format!("output_{output}"), decoded);
+        builder.value_output_wire(format!("output_{output}"), decoded);
     }
     Ok(builder.finish())
 }
@@ -223,8 +214,8 @@ mod tests {
     use mxx_ir_core::{ParamEnv, artifact::Manifest, validate, validate_with_manifests};
     use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
     use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
+        ExecutionError, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
+        execute, transcript::SamplingMode,
     };
     use num_bigint::{BigInt, Sign};
     use std::{collections::BTreeMap, sync::Arc};
@@ -282,5 +273,61 @@ mod tests {
         )
         .expect("consumer execution");
         assert!(matches!(result.outputs["output_0"], RuntimeValue::Bool(_)));
+    }
+
+    #[test]
+    fn single_branch_evaluation_still_rejects_an_out_of_range_branch() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus: Arc<num_bigint::BigUint> = parameters.modulus().into();
+        let config = IoGraphConfig {
+            modulus: IntExpr::constant(BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone())),
+            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            state_columns: IntExpr::constant(2),
+            round_count: 1,
+            branch_count: 1,
+            output_count: 1,
+            sample_sigma: RealExpr::FromInt(IntExpr::constant(3)),
+            tag: b"io-single-branch".to_vec(),
+        };
+        let names = IoArtifactNames {
+            initial_state: "initial".to_owned(),
+            transition_prefix: "transition".to_owned(),
+            output_projections: "projections".to_owned(),
+        };
+        let producer =
+            build_obfuscation_graph("single-branch-producer", &config, &names).expect("producer");
+        let producer = validate(&producer, &ParamEnv::default()).expect("producer validation");
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let produced = execute(
+            &producer,
+            &mut backend,
+            BTreeMap::from([("hash_key".to_owned(), RuntimeValue::Bytes(vec![29; 32]))]),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .expect("producer execution");
+        let production = produced.production_id.expect("producer manifest");
+        let manifest = store.manifest(&production).expect("manifest").clone();
+        let consumer =
+            build_evaluation_graph("single-branch-consumer", &config, &names, production.clone())
+                .expect("consumer");
+        let consumer = validate_with_manifests(
+            &consumer,
+            &ParamEnv::default(),
+            &BTreeMap::from([(production, manifest)]),
+        )
+        .expect("consumer validation");
+        let error = match execute(
+            &consumer,
+            &mut backend,
+            BTreeMap::from([("branch_0".to_owned(), RuntimeValue::Int(BigInt::from(1)))]),
+            &mut store,
+            SamplingMode::Fresh,
+        ) {
+            Ok(_) => panic!("branch one is out of range for a one-branch family"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ExecutionError::SelectIndexOutOfRange { count: 1, .. }));
     }
 }

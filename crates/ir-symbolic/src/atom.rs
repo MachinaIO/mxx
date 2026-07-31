@@ -184,6 +184,17 @@ pub enum DefExpr {
         rows: usize,
         columns: usize,
     },
+    ConstantCoefficient {
+        input: AtomId,
+        position: usize,
+    },
+    CrtRecompose {
+        inputs: Vec<TermList>,
+        #[serde(with = "serde_support::bigint_vec")]
+        plaintext_moduli: Vec<BigInt>,
+        #[serde(with = "serde_support::bigint_vec")]
+        reconstruction_coefficients: Vec<BigInt>,
+    },
     ModDownImage {
         source: AtomId,
         #[serde(with = "serde_support::bigint")]

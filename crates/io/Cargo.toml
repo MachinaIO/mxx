@@ -4,10 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Indistinguishability obfuscation constructions for mxx"
+# AKY24 and Diamond iO are disabled pending separate application cutovers.
+autotests = false
 
 [features]
 default = []
-disk = ["mxx-primitives/disk", "mxx-gadgets/disk"]
 gpu = ["mxx-primitives/gpu", "mxx-gadgets/gpu"]
 
 [dependencies]
@@ -29,6 +30,6 @@ thiserror.workspace = true
 [dev-dependencies]
 mxx-runtime.workspace = true
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
-mxx-gadgets = { workspace = true, features = ["test-support"] }
+mxx-gadgets.workspace = true
 serial_test.workspace = true
 tracing-subscriber.workspace = true

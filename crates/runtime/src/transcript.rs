@@ -1,15 +1,16 @@
 use mxx_ir_core::types::{ConcreteMatrixType, InstantiationFrame, NodeId, Port};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct DrawSite {
     pub instantiation_path: Vec<InstantiationFrame>,
     pub node: NodeId,
     pub port: Port,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RecordedValue {
     Matrix { matrix_type: ConcreteMatrixType, bytes: Vec<u8> },
     Trapdoor { matrix_type: ConcreteMatrixType, public_bytes: Vec<u8>, trapdoor_bytes: Vec<u8> },

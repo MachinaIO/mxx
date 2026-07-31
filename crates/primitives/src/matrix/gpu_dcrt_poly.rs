@@ -11,7 +11,7 @@ use crate::{
                 GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, GpuP1CovarianceCacheOpaque,
                 GpuRngSeed, check_status, gpu_event_set_destroy, gpu_event_set_wait,
                 gpu_matrix_add, gpu_matrix_add_block, gpu_matrix_copy, gpu_matrix_copy_block,
-                gpu_matrix_create, gpu_matrix_create_p1_covariance_cache,
+                gpu_matrix_create, gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
                 gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal, gpu_matrix_fill_gadget,
                 gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_small_gadget,
@@ -305,6 +305,61 @@ impl GpuDCRTPolyMatrix {
     pub(crate) fn into_coeff_domain(mut self) -> Self {
         self.intt_all_in_place();
         self
+    }
+
+    /// Reconstructs plaintext CRT levels entirely on one active GPU and
+    /// returns the result in evaluation format.
+    ///
+    /// Plaintext moduli and active RNS moduli must fit in `u64`, and the
+    /// current exact-integer kernel supports at most 64 RNS limbs. Each input
+    /// level is converted to coefficient form independently before the single
+    /// recomposition launch. This keeps the initial implementation simple and
+    /// asynchronous, but does not batch those inverse-NTT launches.
+    pub fn crt_recompose_levels(
+        levels: &[Self],
+        plaintext_moduli: &[u64],
+        reconstruction_residues: &[u64],
+    ) -> Self {
+        let first = levels.first().expect("CRT recomposition requires at least one level");
+        assert_eq!(levels.len(), plaintext_moduli.len(), "CRT level count mismatch");
+        let limb_count = first.level + 1;
+        assert_eq!(
+            reconstruction_residues.len(),
+            levels.len() * limb_count,
+            "CRT reconstruction residue count mismatch"
+        );
+        assert!(
+            levels.iter().all(|level| {
+                level.params == first.params &&
+                    level.nrow == 1 &&
+                    level.ncol == first.ncol &&
+                    level.level == first.level
+            }),
+            "CRT levels must have matching parameters and 1 x n shape"
+        );
+        let coefficient_levels =
+            levels.iter().cloned().map(Self::into_coeff_domain).collect::<Vec<_>>();
+        let mut output =
+            Self::new_empty_with_state(&first.params, 1, first.ncol, first.level, false);
+        let raw_levels = coefficient_levels
+            .iter()
+            .map(|level| level.raw as *const GpuMatrixOpaque)
+            .collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_crt_recompose(
+                output.raw,
+                raw_levels.as_ptr(),
+                raw_levels.len(),
+                plaintext_moduli.as_ptr(),
+                reconstruction_residues.as_ptr(),
+                limb_count,
+            )
+        };
+        check_status(status, "gpu_matrix_crt_recompose");
+        let status = unsafe { gpu_matrix_ntt_all(output.raw) };
+        check_status(status, "gpu_matrix_ntt_all after CRT recomposition");
+        output.is_ntt = true;
+        output
     }
 
     fn decompose_from_raw(
@@ -832,7 +887,8 @@ impl GpuDCRTPolyMatrix {
         )
     }
 
-    pub(crate) fn to_cpu_matrix(&self) -> super::dcrt_poly::DCRTPolyMatrix {
+    /// Downloads the complete matrix in one batched RNS transfer.
+    pub fn to_cpu_matrix(&self) -> super::dcrt_poly::DCRTPolyMatrix {
         let cpu_params = self.cpu_params();
         if self.nrow == 0 || self.ncol == 0 {
             return super::dcrt_poly::DCRTPolyMatrix::new_empty(&cpu_params, self.nrow, self.ncol);
@@ -1046,6 +1102,10 @@ impl GpuDCRTPolyMatrix {
 
 impl PolyMatrix for GpuDCRTPolyMatrix {
     type P = GpuDCRTPoly;
+
+    fn params(&self) -> &GpuDCRTPolyParams {
+        &self.params
+    }
 
     fn add_in_place(&mut self, rhs: &Self) {
         GpuDCRTPolyMatrix::add_in_place(self, rhs);
@@ -2053,6 +2113,7 @@ mod tests {
     use super::*;
     use crate::{
         element::{PolyElem, finite_ring::FinRingElem},
+        matrix::dcrt_poly::DCRTPolyMatrix,
         poly::dcrt::gpu::{detected_gpu_device_ids, gpu_device_sync},
     };
     use num_bigint::BigUint;
@@ -2067,6 +2128,33 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let (moduli, _crt_bits, _crt_depth) = params.to_crt();
         GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_ntt_matches_openfhe_evaluation_order() {
+        let cpu_params = DCRTPolyParams::new(8, 2, 16, 8);
+        let gpu_params = gpu_params_from_cpu(&cpu_params);
+        let coefficients = (0..cpu_params.ring_dimension())
+            .map(|index| BigUint::from(index * index + 3 * index + 7))
+            .collect::<Vec<_>>();
+        let cpu = DCRTPolyMatrix::from_poly_vec_row(
+            &cpu_params,
+            vec![DCRTPoly::from_biguints(&cpu_params, &coefficients)],
+        );
+
+        let gpu_from_coefficients = GpuDCRTPolyMatrix::from_poly_vec_row(
+            &gpu_params,
+            vec![GpuDCRTPoly::from_biguints(&gpu_params, &coefficients)],
+        );
+        assert_eq!(gpu_from_coefficients.to_cpu_matrix(), cpu);
+
+        let recovered = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &cpu)
+            .into_coeff_domain()
+            .entry(0, 0)
+            .coeffs_biguints();
+        assert_eq!(recovered, coefficients);
+        gpu_device_sync();
     }
 
     fn gpu_test_seed(base: u64, offset: u64) -> GpuRngSeed {

@@ -1,13 +1,13 @@
-pub mod evaluable;
 pub mod gate;
-pub mod noop;
+pub mod lowering;
 pub mod poly_circuit;
+pub mod public_lut;
 pub mod serde;
 
-pub use evaluable::*;
 pub use gate::{
     GateParamSource, PolyGate, PolyGateKind, PolyGateType, SlotTransferSpec, SubCircuitParamKind,
     SubCircuitParamSpec, SubCircuitParamValue,
 };
-pub use noop::NoCircuitEvaluator;
+pub use lowering::{CircuitLowerError, GateInstance, GraphCircuitLowering, lower_circuit};
 pub use poly_circuit::*;
+pub use public_lut::PublicLut;

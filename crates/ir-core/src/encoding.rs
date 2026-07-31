@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-pub const IR_VERSION: u32 = 1;
+pub const IR_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum EncodingError {
@@ -80,17 +80,18 @@ fn normalize_graph_reals(graph: &mut Graph, bindings: &ParamEnv) -> Result<(), E
 }
 
 fn normalize_wire_type(wire_type: &mut WireType, bindings: &ParamEnv) -> Result<(), ExprError> {
-    if let WireType::Trapdoor { sigma, .. } = wire_type {
-        *sigma = normalize_real(sigma, bindings)?;
+    match wire_type {
+        WireType::Trapdoor { sigma, .. } => {
+            *sigma = normalize_real(sigma, bindings)?;
+        }
+        WireType::IndexedFamily { element, .. } => normalize_wire_type(element, bindings)?,
+        _ => {}
     }
     Ok(())
 }
 
 fn normalize_real(expression: &RealExpr, bindings: &ParamEnv) -> Result<RealExpr, ExprError> {
-    match expression {
-        RealExpr::Sqrt(value) => Ok(RealExpr::Sqrt(Box::new(normalize_real(value, bindings)?))),
-        _ => Ok(RealExpr::Rational(expression.evaluate_rational(bindings)?)),
-    }
+    expression.close(bindings)
 }
 
 fn canonicalize_value(value: Value) -> Value {

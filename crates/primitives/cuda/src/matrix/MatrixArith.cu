@@ -2551,6 +2551,14 @@ namespace
         {
             return set_error(err);
         }
+        // A write to lhs may have been dispatched on a temporary work stream
+        // (for example compact deserialization), so its ordinary limb stream
+        // is not necessarily ordered after the latest write event.
+        status = matrix_wait_limb_stream(lhs, limb_id, lhs_device, stream);
+        if (status != 0)
+        {
+            return status;
+        }
         status = matrix_wait_limb_stream(rhs, limb_id, lhs_device, stream);
         if (status != 0)
         {

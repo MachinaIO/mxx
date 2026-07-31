@@ -7,8 +7,6 @@ use crate::{
 };
 use openfhe::ffi;
 use rayon::prelude::*;
-#[cfg(feature = "disk")]
-use std::ops::Range;
 
 use crate::poly::dcrt::params::DCRTPolyParams;
 
@@ -79,33 +77,13 @@ impl PolyUniformSampler for DCRTPolyUniformSampler {
         // parallel sampling loop.
         ensure_openfhe_warmup(params);
 
-        #[cfg(feature = "disk")]
-        {
-            let mut new_matrix = DCRTPolyMatrix::new_empty(params, nrow, ncol);
-            let f = |row_offsets: Range<usize>, col_offsets: Range<usize>| -> Vec<Vec<DCRTPoly>> {
-                parallel_iter!(row_offsets)
-                    .map(|_| {
-                        parallel_iter!(col_offsets.clone())
-                            .map(|_| self.sample_poly_unchecked(params, &dist))
-                            .collect()
-                    })
-                    .collect()
-            };
-            new_matrix.replace_entries(0..nrow, 0..ncol, f);
-            new_matrix
-        }
-        #[cfg(not(feature = "disk"))]
-        {
-            let c: Vec<Vec<DCRTPoly>> = parallel_iter!(0..nrow)
-                .map(|_| {
-                    parallel_iter!(0..ncol)
-                        .map(|_| self.sample_poly_unchecked(params, &dist))
-                        .collect()
-                })
-                .collect();
+        let c: Vec<Vec<DCRTPoly>> = parallel_iter!(0..nrow)
+            .map(|_| {
+                parallel_iter!(0..ncol).map(|_| self.sample_poly_unchecked(params, &dist)).collect()
+            })
+            .collect();
 
-            DCRTPolyMatrix::from_poly_vec(params, c)
-        }
+        DCRTPolyMatrix::from_poly_vec(params, c)
     }
 }
 

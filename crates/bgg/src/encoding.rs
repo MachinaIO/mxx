@@ -1,5 +1,5 @@
-use crate::{BggPublicKeyCompiler, BggPublicKeyWire, GraphBuilder, MatrixWire};
-use mxx_ir_core::node::MatrixBinaryOp;
+use crate::{BggPublicKeyCompiler, BggPublicKeyWire};
+use mxx_ir_core::{GraphBuilder, MatrixWire, node::MatrixBinaryOp};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16,8 +16,8 @@ pub struct BggEncodingCompiler {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum EncodingCompileError {
-    #[error("BGG+ operands must either both reveal plaintext or both hide it")]
-    PlaintextMismatch,
+    #[error("BGG+ multiplication requires the left operand plaintext")]
+    MissingLeftPlaintext,
 }
 
 impl BggEncodingCompiler {
@@ -35,7 +35,7 @@ impl BggEncodingCompiler {
                 lhs.vector.matrix_type.clone(),
             ),
             pubkey: self.public_key.add(builder, &lhs.pubkey, &rhs.pubkey),
-            plaintext: componentwise_plaintext(builder, lhs, rhs, MatrixBinaryOp::Add)?,
+            plaintext: componentwise_plaintext(builder, lhs, rhs, MatrixBinaryOp::Add),
         })
     }
 
@@ -53,7 +53,7 @@ impl BggEncodingCompiler {
                 lhs.vector.matrix_type.clone(),
             ),
             pubkey: self.public_key.sub(builder, &lhs.pubkey, &rhs.pubkey),
-            plaintext: componentwise_plaintext(builder, lhs, rhs, MatrixBinaryOp::Subtract)?,
+            plaintext: componentwise_plaintext(builder, lhs, rhs, MatrixBinaryOp::Subtract),
         })
     }
 
@@ -83,7 +83,7 @@ impl BggEncodingCompiler {
                 plaintext,
                 rhs.vector.matrix_type.clone(),
             ),
-            None => return Err(EncodingCompileError::PlaintextMismatch),
+            None => return Err(EncodingCompileError::MissingLeftPlaintext),
         };
         let vector = builder.matrix_binary(
             MatrixBinaryOp::Add,
@@ -91,7 +91,7 @@ impl BggEncodingCompiler {
             &second,
             lhs.vector.matrix_type.clone(),
         );
-        let plaintext = componentwise_plaintext(builder, lhs, rhs, MatrixBinaryOp::Multiply)?;
+        let plaintext = componentwise_plaintext(builder, lhs, rhs, MatrixBinaryOp::Multiply);
         Ok(BggEncodingWire {
             vector,
             pubkey: self.public_key.mul(builder, &lhs.pubkey, &rhs.pubkey),
@@ -130,30 +130,7 @@ impl BggEncodingCompiler {
         input: &BggEncodingWire,
         scalar: &MatrixWire,
     ) -> BggEncodingWire {
-        let gadget_type = mxx_ir_core::types::MatrixType {
-            rows: input.pubkey.matrix.matrix_type.rows.clone(),
-            columns: self.public_key.decomposed_type.rows.clone(),
-            ..input.pubkey.matrix.matrix_type.clone()
-        };
-        let gadget = builder.constant_matrix(
-            gadget_type.clone(),
-            mxx_ir_core::node::ConstantMatrix::Gadget {
-                base: self.public_key.base.clone(),
-                small: false,
-            },
-        );
-        let scalar_gadget =
-            builder.matrix_binary(MatrixBinaryOp::Multiply, &gadget, scalar, gadget_type.clone());
-        let scalar_decomposed_type = mxx_ir_core::types::MatrixType {
-            rows: gadget_type.columns.clone(),
-            columns: gadget_type.columns.clone(),
-            ..gadget_type
-        };
-        let decomposed = builder.gadget_decompose(
-            &scalar_gadget,
-            self.public_key.base.clone(),
-            scalar_decomposed_type,
-        );
+        let decomposed = self.public_key.large_scalar_decomposition(builder, &input.pubkey, scalar);
         BggEncodingWire {
             vector: builder.matrix_binary(
                 MatrixBinaryOp::Multiply,
@@ -161,7 +138,11 @@ impl BggEncodingCompiler {
                 &decomposed,
                 input.vector.matrix_type.clone(),
             ),
-            pubkey: self.public_key.large_scalar_mul(builder, &input.pubkey, scalar),
+            pubkey: self.public_key.large_scalar_mul_with_decomposition(
+                builder,
+                &input.pubkey,
+                &decomposed,
+            ),
             plaintext: input.plaintext.as_ref().map(|plaintext| {
                 builder.matrix_binary(
                     MatrixBinaryOp::Multiply,
@@ -172,6 +153,39 @@ impl BggEncodingCompiler {
             }),
         }
     }
+
+    /// Reproduces `BggEncoding::matrix_mul`. The direct implementation drops
+    /// plaintext availability after multiplying by an arbitrary matrix.
+    pub fn matrix_mul(
+        &self,
+        builder: &mut GraphBuilder,
+        input: &BggEncodingWire,
+        target: &MatrixWire,
+    ) -> BggEncodingWire {
+        let decomposed_type = mxx_ir_core::types::MatrixType {
+            modulus: target.matrix_type.modulus.clone(),
+            ring_dimension: target.matrix_type.ring_dimension.clone(),
+            rows: input.vector.matrix_type.columns.clone(),
+            columns: target.matrix_type.columns.clone(),
+        };
+        let decomposed =
+            builder.gadget_decompose(target, self.public_key.base.clone(), decomposed_type.clone());
+        let vector_type = mxx_ir_core::types::MatrixType {
+            rows: input.vector.matrix_type.rows.clone(),
+            columns: target.matrix_type.columns.clone(),
+            ..input.vector.matrix_type.clone()
+        };
+        BggEncodingWire {
+            vector: builder.matrix_binary(
+                MatrixBinaryOp::Multiply,
+                &input.vector,
+                &decomposed,
+                vector_type,
+            ),
+            pubkey: self.public_key.matrix_mul(builder, &input.pubkey, target),
+            plaintext: None,
+        }
+    }
 }
 
 fn componentwise_plaintext(
@@ -179,20 +193,21 @@ fn componentwise_plaintext(
     lhs: &BggEncodingWire,
     rhs: &BggEncodingWire,
     operation: MatrixBinaryOp,
-) -> Result<Option<MatrixWire>, EncodingCompileError> {
+) -> Option<MatrixWire> {
     match (&lhs.plaintext, &rhs.plaintext) {
         (Some(lhs), Some(rhs)) => {
-            Ok(Some(builder.matrix_binary(operation, lhs, rhs, lhs.matrix_type.clone())))
+            Some(builder.matrix_binary(operation, lhs, rhs, lhs.matrix_type.clone()))
         }
-        (None, None) => Ok(None),
-        _ => Err(EncodingCompileError::PlaintextMismatch),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_ir_core::{IntExpr, node::NodeKind, types::MatrixType};
+    use mxx_ir_core::{
+        IntExpr, artifact::ArtifactConfidentiality, node::NodeKind, types::MatrixType,
+    };
 
     fn matrix_type(rows: i64, columns: i64) -> MatrixType {
         MatrixType {
@@ -208,12 +223,18 @@ mod tests {
         let mut builder = GraphBuilder::new("bgg-mul", Vec::new());
         let lhs = BggEncodingWire {
             vector: builder.input("lhs_vector", matrix_type(1, 10)),
-            pubkey: BggPublicKeyWire { matrix: builder.input("lhs_pubkey", matrix_type(2, 10)) },
+            pubkey: BggPublicKeyWire {
+                matrix: builder.input("lhs_pubkey", matrix_type(2, 10)),
+                reveal_plaintext: true,
+            },
             plaintext: Some(builder.input("lhs_plaintext", matrix_type(1, 1))),
         };
         let rhs = BggEncodingWire {
             vector: builder.input("rhs_vector", matrix_type(1, 10)),
-            pubkey: BggPublicKeyWire { matrix: builder.input("rhs_pubkey", matrix_type(2, 10)) },
+            pubkey: BggPublicKeyWire {
+                matrix: builder.input("rhs_pubkey", matrix_type(2, 10)),
+                reveal_plaintext: true,
+            },
             plaintext: Some(builder.input("rhs_plaintext", matrix_type(1, 1))),
         };
         let compiler = BggEncodingCompiler {
@@ -223,12 +244,20 @@ mod tests {
             },
         };
         let output = compiler.mul(&mut builder, &lhs, &rhs).expect("compatible bundles");
-        builder.output("vector", &output.vector);
-        builder.output("pubkey", &output.pubkey.matrix);
-        builder.output("plaintext", output.plaintext.as_ref().expect("plaintext"));
+        builder.output("vector", &output.vector, ArtifactConfidentiality::Public);
+        builder.output("pubkey", &output.pubkey.matrix, ArtifactConfidentiality::Public);
+        builder.output(
+            "plaintext",
+            output.plaintext.as_ref().expect("plaintext"),
+            ArtifactConfidentiality::Public,
+        );
         let graph = builder.finish();
 
-        assert_eq!(graph.nodes.len(), 13);
+        assert_eq!(graph.nodes.len(), 16);
+        assert_eq!(
+            graph.nodes.iter().filter(|node| matches!(node.kind, NodeKind::Output { .. })).count(),
+            3
+        );
         assert!(matches!(graph.nodes[6].kind, NodeKind::GadgetDecompose { small: false, .. }));
         assert_eq!(graph.nodes[6].args, vec![rhs.pubkey.matrix.wire]);
         assert!(matches!(graph.nodes[7].kind, NodeKind::MatrixBinary(MatrixBinaryOp::Multiply)));
@@ -242,6 +271,58 @@ mod tests {
         assert!(matches!(graph.nodes[10].kind, NodeKind::MatrixBinary(MatrixBinaryOp::Multiply)));
         assert!(matches!(graph.nodes[11].kind, NodeKind::GadgetDecompose { small: false, .. }));
         assert!(matches!(graph.nodes[12].kind, NodeKind::MatrixBinary(MatrixBinaryOp::Multiply)));
+    }
+
+    #[test]
+    fn reveal_combinations_match_the_direct_encoding_contract() {
+        let compiler = BggEncodingCompiler {
+            public_key: BggPublicKeyCompiler {
+                base: IntExpr::constant(2),
+                decomposed_type: matrix_type(10, 10),
+            },
+        };
+        for lhs_revealed in [false, true] {
+            for rhs_revealed in [false, true] {
+                let mut builder = GraphBuilder::new("encoding-reveal-contract", Vec::new());
+                let lhs = BggEncodingWire {
+                    vector: builder.input("lhs_vector", matrix_type(1, 10)),
+                    pubkey: BggPublicKeyWire {
+                        matrix: builder.input("lhs_pubkey", matrix_type(2, 10)),
+                        reveal_plaintext: lhs_revealed,
+                    },
+                    plaintext: lhs_revealed
+                        .then(|| builder.input("lhs_plaintext", matrix_type(1, 1))),
+                };
+                let rhs = BggEncodingWire {
+                    vector: builder.input("rhs_vector", matrix_type(1, 10)),
+                    pubkey: BggPublicKeyWire {
+                        matrix: builder.input("rhs_pubkey", matrix_type(2, 10)),
+                        reveal_plaintext: rhs_revealed,
+                    },
+                    plaintext: rhs_revealed
+                        .then(|| builder.input("rhs_plaintext", matrix_type(1, 1))),
+                };
+                let expected_reveal = lhs_revealed && rhs_revealed;
+                for output in [
+                    compiler.add(&mut builder, &lhs, &rhs).expect("addition"),
+                    compiler.sub(&mut builder, &lhs, &rhs).expect("subtraction"),
+                ] {
+                    assert_eq!(output.pubkey.reveal_plaintext, expected_reveal);
+                    assert_eq!(output.plaintext.is_some(), expected_reveal);
+                }
+                match compiler.mul(&mut builder, &lhs, &rhs) {
+                    Ok(output) => {
+                        assert!(lhs_revealed);
+                        assert_eq!(output.pubkey.reveal_plaintext, expected_reveal);
+                        assert_eq!(output.plaintext.is_some(), expected_reveal);
+                    }
+                    Err(error) => {
+                        assert!(!lhs_revealed);
+                        assert_eq!(error, EncodingCompileError::MissingLeftPlaintext);
+                    }
+                }
+            }
+        }
     }
 
     trait NodeWire {

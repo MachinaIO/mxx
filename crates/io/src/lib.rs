@@ -1,22 +1,11 @@
-pub mod aky24_io;
-pub mod diamond_io;
-#[cfg(test)]
-pub(crate) mod env;
-mod graph;
-pub(crate) mod utils;
-
-#[cfg(all(test, feature = "gpu"))]
-pub(crate) use mxx_gadgets::storage;
-pub(crate) use mxx_gadgets::{
-    bench_estimator, bgg, circuit, circuit_gadgets as gadgets, decoder, input_injector, lookup,
-    noise_refresh, simulator, slot_transfer,
-};
-pub(crate) use mxx_primitives::{matrix, poly, sampler};
+// AKY24 iO and Diamond iO are disabled pending separate application cutovers to
+// the current BGG Graph IR and runtime APIs.
+// pub mod aky24_io;
+// pub mod diamond_io;
+// mod graph;
+// pub(crate) mod utils;
 
 use std::path::Path;
-
-pub use aky24_io::{Aky24IO, Aky24IOFuncType};
-pub use diamond_io::{DiamondIO, DiamondIOFuncType, DiamondIOObf};
 
 /// Common interface for indistinguishability obfuscation schemes.
 pub trait Obfuscation {

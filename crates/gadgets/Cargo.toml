@@ -4,18 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Reusable lattice-cryptographic gadgets and protocol components for mxx"
-
 [features]
 default = []
-disk = ["mxx-primitives/disk"]
 gpu = ["mxx-primitives/gpu"]
-# Internal feature enabled by workspace dev-dependencies for cross-crate test helpers.
-test-support = []
 
 [dependencies]
+mxx-ir-core.workspace = true
 mxx-primitives.workspace = true
-mxx-noise-simulator.workspace = true
-tokio.workspace = true
 dashmap.workspace = true
 serde_json.workspace = true
 num-bigint.workspace = true
@@ -28,11 +23,8 @@ serde.workspace = true
 rand.workspace = true
 bincode.workspace = true
 tracing.workspace = true
-memory-stats.workspace = true
 digest.workspace = true
-bitvec.workspace = true
 keccak-asm.workspace = true
-tempfile.workspace = true
 
 [dev-dependencies]
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }

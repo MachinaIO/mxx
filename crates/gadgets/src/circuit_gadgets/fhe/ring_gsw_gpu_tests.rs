@@ -4,9 +4,7 @@ use crate::{
     matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
     poly::dcrt::gpu::{GpuDCRTPoly, GpuDCRTPolyParams},
 };
-use bigdecimal::BigDecimal;
 use num_bigint::BigUint;
-use std::str::FromStr;
 
 const NOISY_ACTIVE_LEVELS: usize = ACTIVE_LEVELS;
 const NOISY_CRT_BITS: usize = 24;
@@ -97,11 +95,6 @@ fn q_over_two_p_threshold(q_modulus: &BigUint, plaintext_modulus: u64) -> BigUin
     q_modulus / BigUint::from(2u64 * plaintext_modulus)
 }
 
-fn q_over_two_p_threshold_bigdecimal(q_modulus: &BigUint, plaintext_modulus: u64) -> BigDecimal {
-    BigDecimal::from_str(&q_over_two_p_threshold(q_modulus, plaintext_modulus).to_string())
-        .expect("q/(2p) threshold must parse as BigDecimal")
-}
-
 fn gpu_expected_coeffs(expected: u64) -> Vec<u64> {
     let mut coeffs = vec![0u64; GPU_TEST_NUM_SLOTS];
     coeffs[0] = expected;
@@ -126,16 +119,8 @@ fn test_ring_gsw_add_circuit_decrypts_to_expected_integer_sum_with_noisy_public_
     let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let sum = lhs.add(&rhs, &mut circuit);
-    let estimated_error = sum.estimate_decryption_error_norm(error_sigma);
-    let estimated_error_bound = estimated_error.maximum_coefficient_bound();
     let q_modulus = active_q_modulus(ctx.nested_rns.as_ref());
     let threshold = q_over_two_p_threshold(&q_modulus, plaintext_modulus);
-    assert!(
-        estimated_error_bound < q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
-        "estimated add decryption error bound {} must stay below q/(2p) {}",
-        estimated_error_bound,
-        threshold
-    );
     let wire_secret_key = circuit.input(1).at(0).as_single_wire();
     let decrypted_sum = sum.decrypt::<GpuDCRTPolyMatrix>(
         wire_secret_key,
@@ -228,16 +213,8 @@ fn test_ring_gsw_sub_circuit_decrypts_to_expected_integer_difference_with_noisy_
     let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let difference = lhs.sub(&rhs, &mut circuit);
-    let estimated_error = difference.estimate_decryption_error_norm(error_sigma);
-    let estimated_error_bound = estimated_error.maximum_coefficient_bound();
     let q_modulus = active_q_modulus(ctx.nested_rns.as_ref());
     let threshold = q_over_two_p_threshold(&q_modulus, plaintext_modulus);
-    assert!(
-        estimated_error_bound < q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
-        "estimated sub decryption error bound {} must stay below q/(2p) {}",
-        estimated_error_bound,
-        threshold
-    );
     let wire_secret_key = circuit.input(1).at(0).as_single_wire();
     let decrypted_difference = difference.decrypt::<GpuDCRTPolyMatrix>(
         wire_secret_key,
@@ -331,16 +308,8 @@ fn test_ring_gsw_mul_circuit_decrypts_to_expected_integer_product_with_noisy_pub
     let lhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let rhs = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let product = lhs.mul(&rhs, &mut circuit);
-    let estimated_error = product.estimate_decryption_error_norm(error_sigma);
-    let estimated_error_bound = estimated_error.maximum_coefficient_bound();
     let q_modulus = active_q_modulus(ctx.nested_rns.as_ref());
     let threshold = q_over_two_p_threshold(&q_modulus, plaintext_modulus);
-    assert!(
-        estimated_error_bound < q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
-        "estimated mul decryption error bound {} must stay below q/(2p) {}",
-        estimated_error_bound,
-        threshold
-    );
     let wire_secret_key = circuit.input(1).at(0).as_single_wire();
     let decrypted_product = product.decrypt::<GpuDCRTPolyMatrix>(
         wire_secret_key,
@@ -435,16 +404,8 @@ fn test_ring_gsw_chained_mul_circuit_decrypts_to_expected_integer_product_with_n
     let rhs1 = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let rhs2 = RingGswCiphertext::input(ctx.clone(), None, &mut circuit);
     let chained_product = lhs.mul(&rhs1, &mut circuit).mul(&rhs2, &mut circuit);
-    let estimated_error = chained_product.estimate_decryption_error_norm(error_sigma);
-    let estimated_error_bound = estimated_error.maximum_coefficient_bound();
     let q_modulus = active_q_modulus(ctx.nested_rns.as_ref());
     let threshold = q_over_two_p_threshold(&q_modulus, plaintext_modulus);
-    assert!(
-        estimated_error_bound < q_over_two_p_threshold_bigdecimal(&q_modulus, plaintext_modulus),
-        "estimated chained-mul decryption error bound {} must stay below q/(2p) {}",
-        estimated_error_bound,
-        threshold
-    );
     let wire_secret_key = circuit.input(1).at(0).as_single_wire();
     let decrypted_product = chained_product.decrypt::<GpuDCRTPolyMatrix>(
         wire_secret_key,

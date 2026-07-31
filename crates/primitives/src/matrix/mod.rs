@@ -62,6 +62,8 @@ pub trait PolyMatrix:
 {
     type P: Poly;
 
+    fn params(&self) -> &<Self::P as Poly>::Params;
+
     fn add_in_place(&mut self, rhs: &Self) {
         *self = self.clone() + rhs;
     }

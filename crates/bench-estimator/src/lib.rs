@@ -9,7 +9,7 @@ use mxx_ir_core::{
 use mxx_runtime::liveness;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -30,6 +30,16 @@ pub trait MeasurementBackend {
     ) -> Result<NodeMeasurement, Self::Error>;
 
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64;
+
+    /// Returns whether measuring `node` is invariant under the named
+    /// loop-varying compile bindings. Implementations must not return `true`
+    /// when they consult one of those bindings to determine cost.
+    fn loop_index_invariant(
+        &self,
+        graph: &str,
+        node: &Node,
+        varying_bindings: &BTreeSet<String>,
+    ) -> bool;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -87,6 +97,8 @@ pub enum EstimateError {
     Encoding(String),
     #[error("peak-memory tolerance factor must be finite and at least one")]
     InvalidPeakMemoryTolerance,
+    #[error("measurement backend reports loop-index-dependent cost for {graph} node {node:?}")]
+    LoopIndexDependentCost { graph: String, node: mxx_ir_core::NodeId },
 }
 
 pub fn estimate<B: MeasurementBackend>(
@@ -334,49 +346,37 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .ok_or_else(|| {
                         EstimateError::Expression("loop count is not usize".to_owned())
                     })?;
+                if count == 0 {
+                    return Ok((NodeMeasurement::default(), 0, 1));
+                }
                 let pool = self.config.device_pool_size.max(1);
                 let occupancy = self.config.per_instance_occupancy.max(1);
                 let concurrent_instances = (pool / occupancy).max(1);
-                let mut reports = Vec::with_capacity(count);
-                for index in 0..count {
-                    let child_bindings = child_bindings(
-                        bindings,
-                        &loop_node.bindings,
-                        Some((&loop_node.index_variable, index)),
-                    )?;
-                    let key = CacheKey::new(child, &child_bindings)?;
-                    *self.invocations.entry(key.clone()).or_default() += 1;
-                    let cached = if let Some(report) = self.cache.get(&key) {
-                        report.clone()
-                    } else {
-                        let mut child_path = path.to_vec();
-                        child_path.push(InstantiationFrame {
-                            call: node.id,
-                            loop_index: Some(index as u64),
-                        });
-                        let report = self.estimate_graph(child, &child_bindings, &child_path)?;
-                        self.cache.insert(key, report.clone());
-                        report
-                    };
-                    reports.push(cached);
-                }
-                let work_seconds = reports.iter().map(|report| report.total_work_seconds).sum();
-                let latency_seconds = reports
-                    .chunks(concurrent_instances)
-                    .map(|wave| {
-                        wave.iter().map(|report| report.critical_path_seconds).fold(0.0, f64::max)
-                    })
-                    .sum();
+                let varying_bindings = loop_varying_bindings(loop_node);
+                self.ensure_loop_cost_invariant(child, &varying_bindings)?;
+                let child_bindings = child_bindings(
+                    bindings,
+                    &loop_node.bindings,
+                    Some((&loop_node.index_variable, 0)),
+                )?;
+                let key = CacheKey::new(child, &child_bindings)?;
+                *self.invocations.entry(key.clone()).or_default() += count;
+                let cached = if let Some(report) = self.cache.get(&key) {
+                    report.clone()
+                } else {
+                    let mut child_path = path.to_vec();
+                    child_path.push(InstantiationFrame { call: node.id, loop_index: Some(0) });
+                    let report = self.estimate_graph(child, &child_bindings, &child_path)?;
+                    self.cache.insert(key, report.clone());
+                    report
+                };
+                let work_seconds = cached.total_work_seconds * count as f64;
+                let latency_seconds =
+                    cached.critical_path_seconds * count.div_ceil(concurrent_instances) as f64;
                 let active_instances = count.min(concurrent_instances);
-                let workspace_bytes = reports
-                    .iter()
-                    .map(|report| report.workspace_high_water_bytes)
-                    .max()
-                    .unwrap_or(0);
-                let peak_per_instance =
-                    reports.iter().map(|report| report.peak_memory_bytes).max().unwrap_or(0);
-                let nested_parallelism =
-                    reports.iter().map(|report| report.maximum_parallelism).max().unwrap_or(1);
+                let workspace_bytes = cached.workspace_high_water_bytes;
+                let peak_per_instance = cached.peak_memory_bytes;
+                let nested_parallelism = cached.maximum_parallelism;
                 Ok((
                     NodeMeasurement { work_seconds, latency_seconds, workspace_bytes },
                     peak_per_instance.saturating_mul(active_instances as u64),
@@ -386,6 +386,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             NodeKind::Input { .. } |
             NodeKind::Output { .. } |
             NodeKind::ConstantInt(_) |
+            NodeKind::EvaluateInt(_) |
             NodeKind::ConstantReal(_) |
             NodeKind::ConstantBool(_) |
             NodeKind::IntBinary(_) |
@@ -395,9 +396,13 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             NodeKind::BoolToInt |
             NodeKind::RealBinary(_) |
             NodeKind::RealSqrt |
+            NodeKind::FamilyPack { .. } |
+            NodeKind::FamilyGetStatic { .. } |
+            NodeKind::FamilyGetDynamic |
             NodeKind::Select { .. } => self.measure(graph, bindings, node),
             NodeKind::ConstantMatrix { .. } |
             NodeKind::GadgetTrapdoor { .. } |
+            NodeKind::TrapdoorPublic |
             NodeKind::MatrixBinary(_) |
             NodeKind::MatrixNegate |
             NodeKind::MatrixScale { .. } |
@@ -415,8 +420,48 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             NodeKind::ModDown { .. } |
             NodeKind::ModUp { .. } |
             NodeKind::ExtractCoefficient { .. } |
-            NodeKind::ThresholdDecode { .. } => self.measure(graph, bindings, node),
+            NodeKind::ConstantCoefficient { .. } |
+            NodeKind::ThresholdDecode { .. } |
+            NodeKind::CrtRecompose { .. } => self.measure(graph, bindings, node),
         }
+    }
+
+    fn ensure_loop_cost_invariant(
+        &self,
+        graph: &Graph,
+        varying_bindings: &BTreeSet<String>,
+    ) -> Result<(), EstimateError> {
+        for node in &graph.nodes {
+            match &node.kind {
+                NodeKind::SubgraphCall(call) => {
+                    let child = graph.subgraphs.get(&call.graph).ok_or_else(|| {
+                        EstimateError::MissingSubgraph { node: node.id, name: call.graph.clone() }
+                    })?;
+                    let child_varying = remap_varying_bindings(varying_bindings, &call.bindings);
+                    self.ensure_loop_cost_invariant(child, &child_varying)?;
+                }
+                NodeKind::ParallelLoop(loop_node) => {
+                    let child = graph.subgraphs.get(&loop_node.graph).ok_or_else(|| {
+                        EstimateError::MissingSubgraph {
+                            node: node.id,
+                            name: loop_node.graph.clone(),
+                        }
+                    })?;
+                    let mut inherited = varying_bindings.clone();
+                    inherited.remove(&loop_node.index_variable);
+                    let child_varying = remap_varying_bindings(&inherited, &loop_node.bindings);
+                    self.ensure_loop_cost_invariant(child, &child_varying)?;
+                }
+                _ if !self.backend.loop_index_invariant(&graph.name, node, varying_bindings) => {
+                    return Err(EstimateError::LoopIndexDependentCost {
+                        graph: graph.name.clone(),
+                        node: node.id,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn measure(
@@ -473,6 +518,9 @@ fn materializes_all_lazy_matrix_arguments(node: &Node) -> bool {
             NodeKind::Output { .. } |
             NodeKind::SubgraphCall(_) |
             NodeKind::ParallelLoop(_) |
+            NodeKind::FamilyPack { .. } |
+            NodeKind::FamilyGetStatic { .. } |
+            NodeKind::FamilyGetDynamic |
             NodeKind::Select { .. }
     )
 }
@@ -486,13 +534,33 @@ fn child_bindings(
     if let Some((name, index)) = loop_index {
         child.integers.insert(name.to_owned(), index.into());
     }
+    let expression_env = child.clone();
     for (name, expression) in bindings {
         let value = expression
-            .evaluate(&child)
+            .evaluate(&expression_env)
             .map_err(|error| EstimateError::Expression(error.to_string()))?;
         child.integers.insert(name.clone(), value);
     }
     Ok(child)
+}
+
+fn loop_varying_bindings(loop_node: &mxx_ir_core::node::ParallelLoop) -> BTreeSet<String> {
+    remap_varying_bindings(&BTreeSet::from([loop_node.index_variable.clone()]), &loop_node.bindings)
+}
+
+fn remap_varying_bindings(
+    inherited: &BTreeSet<String>,
+    bindings: &[(String, mxx_ir_core::IntExpr)],
+) -> BTreeSet<String> {
+    let mut varying = inherited.clone();
+    for (name, expression) in bindings {
+        if inherited.iter().any(|variable| expression.contains_variable(variable)) {
+            varying.insert(name.clone());
+        } else {
+            varying.remove(name);
+        }
+    }
+    varying
 }
 
 #[cfg(test)]
@@ -500,7 +568,7 @@ mod tests {
     use super::*;
     use mxx_ir_core::{
         ParamEnv,
-        artifact::{ProductionId, SpecHash},
+        artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
         graph::{CompileParameter, CompileParameterKind, Graph},
         node::{ArtifactInput, Node, NodeKind, ParallelLoop, SubgraphCall},
         types::{ConcreteMatrixType, MatrixType, NodeId, Port, WireId},
@@ -528,6 +596,15 @@ mod tests {
 
         fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
             8
+        }
+
+        fn loop_index_invariant(
+            &self,
+            _graph: &str,
+            _node: &Node,
+            _varying_bindings: &BTreeSet<String>,
+        ) -> bool {
+            true
         }
     }
 
@@ -606,14 +683,16 @@ mod tests {
                 kind: NodeKind::ParallelLoop(ParallelLoop {
                     graph: "body".to_owned(),
                     count: mxx_ir_core::IntExpr::constant(5),
+                    minimum_count: 0,
                     index_variable: "i".to_owned(),
                     bindings: Vec::new(),
+                    input_modes: Vec::new(),
                 }),
                 args: Vec::new(),
             }],
             outputs: BTreeMap::from([(
                 "out".to_owned(),
-                WireRef { node: NodeId(10), port: Port(4) },
+                WireRef { node: NodeId(10), port: Port(0) },
             )]),
             subgraphs: BTreeMap::new(),
             real_constants: BTreeMap::new(),
@@ -630,10 +709,27 @@ mod tests {
         assert_eq!(backend.measurements, 1);
         assert_eq!(report.total_work_seconds, 5.0);
         assert_eq!(report.critical_path_seconds, 3.0);
+
+        let NodeKind::ParallelLoop(loop_node) = &mut graph.nodes[0].kind else {
+            panic!("expected parallel loop");
+        };
+        loop_node.count = mxx_ir_core::IntExpr::constant(0);
+        let validated =
+            mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("zero-loop validation");
+        let mut backend = CountingBackend::default();
+        let report = estimate(
+            &validated,
+            &mut backend,
+            &EstimateConfig { device_pool_size: 2, per_instance_occupancy: 1 },
+        )
+        .expect("zero-loop estimate");
+        assert_eq!(backend.measurements, 0);
+        assert_eq!(report.total_work_seconds, 0.0);
+        assert_eq!(report.critical_path_seconds, 0.0);
     }
 
     #[test]
-    fn parallel_loop_caches_each_distinct_iteration_binding() {
+    fn parallel_loop_rejects_index_dependent_measurement_cost() {
         #[derive(Default)]
         struct BindingBackend {
             measurements: usize,
@@ -659,6 +755,15 @@ mod tests {
             fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
                 0
             }
+
+            fn loop_index_invariant(
+                &self,
+                _graph: &str,
+                _node: &Node,
+                varying_bindings: &BTreeSet<String>,
+            ) -> bool {
+                !varying_bindings.contains("size")
+            }
         }
 
         let mut child = body();
@@ -675,6 +780,7 @@ mod tests {
                 kind: NodeKind::ParallelLoop(ParallelLoop {
                     graph: "body".to_owned(),
                     count: mxx_ir_core::IntExpr::constant(3),
+                    minimum_count: 0,
                     index_variable: "i".to_owned(),
                     bindings: vec![(
                         "size".to_owned(),
@@ -683,12 +789,13 @@ mod tests {
                             Box::new(mxx_ir_core::IntExpr::constant(1)),
                         ),
                     )],
+                    input_modes: Vec::new(),
                 }),
                 args: Vec::new(),
             }],
             outputs: BTreeMap::from([(
                 "out".to_owned(),
-                WireRef { node: NodeId(10), port: Port(2) },
+                WireRef { node: NodeId(10), port: Port(0) },
             )]),
             subgraphs: BTreeMap::new(),
             real_constants: BTreeMap::new(),
@@ -696,15 +803,78 @@ mod tests {
         graph.subgraphs.insert("body".to_owned(), Box::new(child));
         let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
         let mut backend = BindingBackend::default();
-        let report = estimate(
+        let error = estimate(
             &validated,
             &mut backend,
             &EstimateConfig { device_pool_size: 2, per_instance_occupancy: 1 },
         )
-        .expect("estimate");
-        assert_eq!(backend.measurements, 3);
-        assert_eq!(report.total_work_seconds, 6.0);
-        assert_eq!(report.critical_path_seconds, 5.0);
+        .expect_err("index-dependent measurement must be rejected");
+        assert!(matches!(
+            error,
+            EstimateError::LoopIndexDependentCost {
+                graph,
+                node: NodeId(1)
+            } if graph == "body"
+        ));
+        assert_eq!(backend.measurements, 0);
+
+        let mut leaf = body();
+        leaf.name = "leaf".to_owned();
+        leaf.parameters.push(CompileParameter {
+            name: "size".to_owned(),
+            kind: CompileParameterKind::Integer,
+        });
+        let mut middle = Graph {
+            name: "middle".to_owned(),
+            parameters: Vec::new(),
+            input_types: BTreeMap::new(),
+            nodes: vec![Node {
+                id: NodeId(2),
+                kind: NodeKind::SubgraphCall(SubgraphCall {
+                    graph: leaf.name.clone(),
+                    bindings: vec![("size".to_owned(), mxx_ir_core::IntExpr::Var("i".to_owned()))],
+                }),
+                args: Vec::new(),
+            }],
+            outputs: BTreeMap::from([("out".to_owned(), wire(2))]),
+            subgraphs: BTreeMap::new(),
+            real_constants: BTreeMap::new(),
+        };
+        middle.subgraphs.insert(leaf.name.clone(), Box::new(leaf));
+        let mut nested = Graph {
+            name: "nested-root".to_owned(),
+            parameters: Vec::new(),
+            input_types: BTreeMap::new(),
+            nodes: vec![Node {
+                id: NodeId(20),
+                kind: NodeKind::ParallelLoop(ParallelLoop {
+                    graph: middle.name.clone(),
+                    count: mxx_ir_core::IntExpr::constant(3),
+                    minimum_count: 0,
+                    index_variable: "i".to_owned(),
+                    bindings: Vec::new(),
+                    input_modes: Vec::new(),
+                }),
+                args: Vec::new(),
+            }],
+            outputs: BTreeMap::from([("out".to_owned(), wire(20))]),
+            subgraphs: BTreeMap::new(),
+            real_constants: BTreeMap::new(),
+        };
+        nested.subgraphs.insert(middle.name.clone(), Box::new(middle));
+        let validated =
+            mxx_ir_core::validate(&nested, &ParamEnv::default()).expect("nested validation");
+        let mut backend = BindingBackend::default();
+        let error = estimate(&validated, &mut backend, &EstimateConfig::default())
+            .expect_err("nested index-dependent measurement must be rejected");
+        assert!(matches!(
+            error,
+            EstimateError::LoopIndexDependentCost {
+                graph,
+                node: NodeId(1)
+            } if graph == "leaf"
+        ));
+        assert_eq!(backend.measurements, 0);
     }
 
     #[test]
@@ -727,6 +897,15 @@ mod tests {
             fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
                 if matches!(wire_type, ConcreteWireType::Matrix(_)) { 8 } else { 0 }
             }
+
+            fn loop_index_invariant(
+                &self,
+                _graph: &str,
+                _node: &Node,
+                _varying_bindings: &BTreeSet<String>,
+            ) -> bool {
+                true
+            }
         }
 
         let production = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [9; 32] };
@@ -746,11 +925,14 @@ mod tests {
                     id: NodeId(1),
                     kind: NodeKind::Input {
                         name: "family".to_owned(),
-                        wire_type: mxx_ir_core::WireType::Matrix(matrix_type),
+                        wire_type: mxx_ir_core::WireType::IndexedFamily {
+                            element: Box::new(mxx_ir_core::WireType::Matrix(matrix_type)),
+                            count: mxx_ir_core::IntExpr::constant(3),
+                        },
                         artifact: Some(ArtifactInput {
                             production_id: production,
                             artifact_name: "family".to_owned(),
-                            family_count: Some(mxx_ir_core::IntExpr::constant(3)),
+                            confidentiality: ArtifactConfidentiality::Public,
                         }),
                     },
                     args: Vec::new(),
@@ -762,41 +944,34 @@ mod tests {
                 },
                 Node {
                     id: NodeId(3),
-                    kind: NodeKind::Select { count: mxx_ir_core::IntExpr::constant(3) },
-                    args: vec![
-                        wire(2),
-                        WireRef { node: NodeId(1), port: Port(0) },
-                        WireRef { node: NodeId(1), port: Port(1) },
-                        WireRef { node: NodeId(1), port: Port(2) },
-                    ],
+                    kind: NodeKind::FamilyGetDynamic,
+                    args: vec![wire(1), wire(2)],
                 },
             ],
             outputs: BTreeMap::from([("out".to_owned(), wire(3))]),
             subgraphs: BTreeMap::new(),
             real_constants: BTreeMap::new(),
         };
-        let mut wires = BTreeMap::new();
-        for port in 0..3 {
-            wires.insert(
-                WireId {
-                    instantiation_path: Vec::new(),
-                    wire: WireRef { node: NodeId(1), port: Port(port) },
-                },
-                ConcreteWireType::Matrix(matrix.clone()),
-            );
-        }
+        let mut wires = BTreeMap::from([(
+            WireId { instantiation_path: Vec::new(), wire: wire(1) },
+            ConcreteWireType::IndexedFamily {
+                element: Box::new(ConcreteWireType::Matrix(matrix.clone())),
+                count: 3,
+            },
+        )]);
         wires.insert(
             WireId { instantiation_path: Vec::new(), wire: wire(2) },
             ConcreteWireType::ConstantInt,
         );
         wires.insert(
             WireId { instantiation_path: Vec::new(), wire: wire(3) },
-            ConcreteWireType::Matrix(matrix),
+            ConcreteWireType::Matrix(matrix.clone()),
         );
         let mut validated = ValidatedGraph {
             source,
             bindings: ParamEnv::default(),
             wires,
+            artifact_inputs: BTreeMap::new(),
             outputs: BTreeMap::from([("out".to_owned(), wire(3))]),
             warnings: Vec::new(),
         };
@@ -808,26 +983,27 @@ mod tests {
 
         validated.source.nodes.push(Node {
             id: NodeId(4),
-            kind: NodeKind::MatrixNegate,
-            args: vec![WireRef { node: NodeId(1), port: Port(1) }],
+            kind: NodeKind::FamilyGetStatic { index: mxx_ir_core::IntExpr::constant(1) },
+            args: vec![wire(1)],
         });
-        validated.source.outputs.insert("later".to_owned(), wire(4));
-        validated.outputs.insert("later".to_owned(), wire(4));
+        validated.source.nodes.push(Node {
+            id: NodeId(5),
+            kind: NodeKind::MatrixNegate,
+            args: vec![wire(4)],
+        });
+        validated.source.outputs.insert("later".to_owned(), wire(5));
+        validated.outputs.insert("later".to_owned(), wire(5));
         validated.wires.insert(
             WireId { instantiation_path: Vec::new(), wire: wire(4) },
-            ConcreteWireType::Matrix(
-                validated.wires[&WireId {
-                    instantiation_path: Vec::new(),
-                    wire: WireRef { node: NodeId(1), port: Port(1) },
-                }]
-                    .matrix_type()
-                    .expect("matrix type")
-                    .clone(),
-            ),
+            ConcreteWireType::Matrix(matrix.clone()),
+        );
+        validated.wires.insert(
+            WireId { instantiation_path: Vec::new(), wire: wire(5) },
+            ConcreteWireType::Matrix(matrix),
         );
         let report = estimate(&validated, &mut MemoryBackend, &EstimateConfig::default())
             .expect("estimate with retained selected input");
-        assert_eq!(report.persistent_bytes_over_time, vec![0, 0, 16, 24]);
+        assert_eq!(report.persistent_bytes_over_time, vec![0, 0, 8, 16, 24]);
         assert_eq!(report.peak_memory_bytes, 24);
     }
 
@@ -850,6 +1026,15 @@ mod tests {
 
             fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
                 if matches!(wire_type, ConcreteWireType::Matrix(_)) { 8 } else { 0 }
+            }
+
+            fn loop_index_invariant(
+                &self,
+                _graph: &str,
+                _node: &Node,
+                _varying_bindings: &BTreeSet<String>,
+            ) -> bool {
+                true
             }
         }
 
@@ -874,7 +1059,7 @@ mod tests {
                         artifact: Some(ArtifactInput {
                             production_id: production,
                             artifact_name: "artifact".to_owned(),
-                            family_count: None,
+                            confidentiality: ArtifactConfidentiality::Public,
                         }),
                     },
                     args: Vec::new(),
@@ -899,6 +1084,7 @@ mod tests {
             source,
             bindings: ParamEnv::default(),
             wires,
+            artifact_inputs: BTreeMap::new(),
             outputs: BTreeMap::from([("out".to_owned(), wire(2))]),
             warnings: Vec::new(),
         };
@@ -931,6 +1117,15 @@ mod tests {
                         .saturating_mul(u64::try_from(matrix.columns).expect("columns"))
                         .saturating_mul(8)
                 })
+            }
+
+            fn loop_index_invariant(
+                &self,
+                _graph: &str,
+                _node: &Node,
+                _varying_bindings: &BTreeSet<String>,
+            ) -> bool {
+                true
             }
         }
 

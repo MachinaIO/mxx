@@ -1,13 +1,20 @@
 use crate::{
-    BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire, GraphBuilder,
+    BggEncodingCompiler, BggEncodingWire, BggPolyEncodingCompiler, BggPolyEncodingWire,
+    BggPublicKeyCompiler, BggPublicKeyWire, NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire,
+    NaiveBggVecCompiler,
 };
 use mxx_gadgets::{
     Poly,
-    circuit::{GateParamSource, PolyCircuit, PolyGateType, SubCircuitParamValue, gate::GateId},
+    circuit::{
+        CircuitLowerError, GateInstance, GraphCircuitLowering, PolyCircuit, PolyGateKind,
+        lower_circuit,
+    },
 };
-use mxx_ir_core::node::MatrixBinaryOp;
+use mxx_ir_core::{
+    GraphBuilder, MatrixWire, SubgraphBuildError, artifact::ArtifactConfidentiality,
+    node::MatrixBinaryOp,
+};
 use num_bigint::BigInt;
-use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -18,6 +25,12 @@ pub enum CircuitCompileError {
     InvalidArity { gate: usize },
     #[error("gate {gate} requires lowering context for {kind}")]
     MissingGateContext { gate: usize, kind: &'static str },
+    #[error("the circuit contains advanced gates and requires an advanced lowering context")]
+    AdvancedGateContextRequired,
+    #[error("gate {gate} has an invalid slot-transfer or slot-reduction specification")]
+    InvalidSlotTransfer { gate: usize },
+    #[error("slot-transfer artifact {name} is unavailable")]
+    MissingSlotTransferArtifact { name: String },
     #[error("the circuit compiler received more input bundles than the circuit consumes")]
     ExtraInputs,
     #[error("gate {gate}: {source}")]
@@ -26,13 +39,607 @@ pub enum CircuitCompileError {
         #[source]
         source: crate::encoding::EncodingCompileError,
     },
+    #[error("gate {gate}: {source}")]
+    PolyEncoding {
+        gate: usize,
+        #[source]
+        source: crate::poly_encoding::PolyEncodingCompileError,
+    },
+    #[error("gate {gate}: {source}")]
+    NaiveVec {
+        gate: usize,
+        #[source]
+        source: crate::naive_vec::NaiveVecCompileError,
+    },
+    #[error("gate {gate}: {source}")]
+    LweLookup {
+        gate: usize,
+        #[source]
+        source: crate::lwe_lookup::LweLookupCompileError,
+    },
     #[error(transparent)]
-    Subgraph(#[from] crate::SubgraphBuildError),
+    Subgraph(#[from] SubgraphBuildError),
 }
 
 #[derive(Clone, Debug)]
 pub struct PolyCircuitCompiler {
     pub public_key: BggPublicKeyCompiler,
+}
+
+struct PublicKeyLowering<'a, P: Poly> {
+    compiler: &'a BggPublicKeyCompiler,
+    advanced: Option<&'a mut (dyn AdvancedGateLowering<P, BggPublicKeyWire> + 'a)>,
+}
+
+struct EncodingLowering<'a, P: Poly> {
+    compiler: &'a BggEncodingCompiler,
+    advanced: Option<&'a mut (dyn AdvancedGateLowering<P, BggEncodingWire> + 'a)>,
+}
+
+struct PolyEncodingLowering<'a, P: Poly> {
+    compiler: &'a BggPolyEncodingCompiler,
+    advanced: Option<&'a mut (dyn AdvancedGateLowering<P, BggPolyEncodingWire> + 'a)>,
+}
+
+struct NaivePublicKeyLowering<'a, P: Poly> {
+    compiler: &'a NaiveBggVecCompiler,
+    advanced: Option<&'a mut (dyn AdvancedGateLowering<P, NaiveBggPublicKeyVecWire> + 'a)>,
+}
+
+struct NaiveEncodingLowering<'a, P: Poly> {
+    compiler: &'a NaiveBggVecCompiler,
+    advanced: Option<&'a mut (dyn AdvancedGateLowering<P, NaiveBggEncodingVecWire> + 'a)>,
+}
+
+impl<P: Poly> GraphCircuitLowering<P> for PublicKeyLowering<'_, P> {
+    type Wire = BggPublicKeyWire;
+    type Error = CircuitCompileError;
+
+    fn binary(
+        &mut self,
+        builder: &mut GraphBuilder,
+        operation: PolyGateKind,
+        lhs: &Self::Wire,
+        rhs: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let operation = match operation {
+            PolyGateKind::Add => MatrixBinaryOp::Add,
+            PolyGateKind::Sub => MatrixBinaryOp::Subtract,
+            PolyGateKind::Mul => MatrixBinaryOp::Multiply,
+            _ => {
+                return Err(CircuitCompileError::InvalidArity { gate: gate.local_gate().index() });
+            }
+        };
+        compile_public_key_binary_template(builder, self.compiler, operation, lhs, rhs)
+    }
+
+    fn small_scalar_mul(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        scalar: &[u32],
+        _gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let scalar = builder.constant_polynomial(
+            scalar_type(&input.matrix.matrix_type),
+            scalar.iter().map(|value| BigInt::from(*value)),
+        );
+        compile_public_key_scalar_template(builder, self.compiler, input, &scalar, false)
+    }
+
+    fn large_scalar_mul(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        scalar: &[num_bigint::BigUint],
+        _gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let scalar = builder.constant_polynomial(
+            scalar_type(&input.matrix.matrix_type),
+            scalar.iter().map(|value| BigInt::from(value.clone())),
+        );
+        compile_public_key_scalar_template(builder, self.compiler, input, &scalar, true)
+    }
+
+    fn slot_transfer(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        source_slots: &[(u32, Option<u32>)],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.slot_transfer(builder, input, source_slots, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot transfer",
+            }),
+        }
+    }
+
+    fn slot_reduce(
+        &mut self,
+        builder: &mut GraphBuilder,
+        inputs: &[Self::Wire],
+        slot_count: usize,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.slot_reduce(builder, inputs, slot_count, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot reduction",
+            }),
+        }
+    }
+
+    fn public_lookup(
+        &mut self,
+        builder: &mut GraphBuilder,
+        circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        input: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.public_lookup(builder, circuit, lookup_id, input, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "public lookup",
+            }),
+        }
+    }
+}
+
+impl<P: Poly> GraphCircuitLowering<P> for EncodingLowering<'_, P> {
+    type Wire = BggEncodingWire;
+    type Error = CircuitCompileError;
+
+    fn binary(
+        &mut self,
+        builder: &mut GraphBuilder,
+        operation: PolyGateKind,
+        lhs: &Self::Wire,
+        rhs: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let operation = match operation {
+            PolyGateKind::Add => MatrixBinaryOp::Add,
+            PolyGateKind::Sub => MatrixBinaryOp::Subtract,
+            PolyGateKind::Mul => MatrixBinaryOp::Multiply,
+            _ => {
+                return Err(CircuitCompileError::InvalidArity { gate: gate.local_gate().index() });
+            }
+        };
+        compile_encoding_binary_template(
+            builder,
+            self.compiler,
+            operation,
+            lhs,
+            rhs,
+            gate.local_gate().index(),
+        )
+    }
+
+    fn small_scalar_mul(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        scalar: &[u32],
+        _gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let scalar = builder.constant_polynomial(
+            scalar_type(&input.pubkey.matrix.matrix_type),
+            scalar.iter().map(|value| BigInt::from(*value)),
+        );
+        compile_encoding_scalar_template(builder, self.compiler, input, &scalar, false)
+    }
+
+    fn large_scalar_mul(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        scalar: &[num_bigint::BigUint],
+        _gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let scalar = builder.constant_polynomial(
+            scalar_type(&input.pubkey.matrix.matrix_type),
+            scalar.iter().map(|value| BigInt::from(value.clone())),
+        );
+        compile_encoding_scalar_template(builder, self.compiler, input, &scalar, true)
+    }
+
+    fn slot_transfer(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        source_slots: &[(u32, Option<u32>)],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.slot_transfer(builder, input, source_slots, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot transfer",
+            }),
+        }
+    }
+
+    fn slot_reduce(
+        &mut self,
+        builder: &mut GraphBuilder,
+        inputs: &[Self::Wire],
+        slot_count: usize,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.slot_reduce(builder, inputs, slot_count, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot reduction",
+            }),
+        }
+    }
+
+    fn public_lookup(
+        &mut self,
+        builder: &mut GraphBuilder,
+        circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        input: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.public_lookup(builder, circuit, lookup_id, input, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "public lookup",
+            }),
+        }
+    }
+}
+
+impl<P: Poly> GraphCircuitLowering<P> for PolyEncodingLowering<'_, P> {
+    type Wire = BggPolyEncodingWire;
+    type Error = CircuitCompileError;
+
+    fn binary(
+        &mut self,
+        builder: &mut GraphBuilder,
+        operation: PolyGateKind,
+        lhs: &Self::Wire,
+        rhs: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let output = match operation {
+            PolyGateKind::Add => self.compiler.add(builder, lhs, rhs),
+            PolyGateKind::Sub => self.compiler.sub(builder, lhs, rhs),
+            PolyGateKind::Mul => self.compiler.mul(builder, lhs, rhs),
+            _ => {
+                return Err(CircuitCompileError::InvalidArity { gate: gate.local_gate().index() });
+            }
+        };
+        output.map_err(|source| CircuitCompileError::PolyEncoding {
+            gate: gate.local_gate().index(),
+            source,
+        })
+    }
+
+    fn small_scalar_mul(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        scalar: &[u32],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let scalar = builder.constant_polynomial(
+            scalar_type(&input.pubkey.matrix.matrix_type),
+            scalar.iter().map(|value| BigInt::from(*value)),
+        );
+        self.compiler.small_scalar_mul(builder, input, &scalar).map_err(|source| {
+            CircuitCompileError::PolyEncoding { gate: gate.local_gate().index(), source }
+        })
+    }
+
+    fn large_scalar_mul(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        scalar: &[num_bigint::BigUint],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let scalar = builder.constant_polynomial(
+            scalar_type(&input.pubkey.matrix.matrix_type),
+            scalar.iter().map(|value| BigInt::from(value.clone())),
+        );
+        self.compiler.large_scalar_mul(builder, input, &scalar).map_err(|source| {
+            CircuitCompileError::PolyEncoding { gate: gate.local_gate().index(), source }
+        })
+    }
+
+    fn slot_transfer(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        source_slots: &[(u32, Option<u32>)],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.slot_transfer(builder, input, source_slots, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot transfer",
+            }),
+        }
+    }
+
+    fn slot_reduce(
+        &mut self,
+        builder: &mut GraphBuilder,
+        inputs: &[Self::Wire],
+        slot_count: usize,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.slot_reduce(builder, inputs, slot_count, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot reduction",
+            }),
+        }
+    }
+
+    fn public_lookup(
+        &mut self,
+        builder: &mut GraphBuilder,
+        circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        input: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.public_lookup(builder, circuit, lookup_id, input, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "public lookup",
+            }),
+        }
+    }
+}
+
+impl<P: Poly> GraphCircuitLowering<P> for NaivePublicKeyLowering<'_, P> {
+    type Wire = NaiveBggPublicKeyVecWire;
+    type Error = CircuitCompileError;
+
+    fn binary(
+        &mut self,
+        builder: &mut GraphBuilder,
+        operation: PolyGateKind,
+        lhs: &Self::Wire,
+        rhs: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let output = match operation {
+            PolyGateKind::Add => self.compiler.add_public_keys(builder, lhs, rhs),
+            PolyGateKind::Sub => self.compiler.sub_public_keys(builder, lhs, rhs),
+            PolyGateKind::Mul => self.compiler.mul_public_keys(builder, lhs, rhs),
+            _ => {
+                return Err(CircuitCompileError::InvalidArity { gate: gate.local_gate().index() });
+            }
+        };
+        output.map_err(|source| CircuitCompileError::NaiveVec {
+            gate: gate.local_gate().index(),
+            source,
+        })
+    }
+
+    fn small_scalar_mul(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        scalar: &[u32],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let scalar = builder.constant_polynomial(
+            scalar_type(&input.matrices.matrix_type),
+            scalar.iter().map(|value| BigInt::from(*value)),
+        );
+        self.compiler.small_scalar_mul_public_keys(builder, input, &scalar).map_err(|source| {
+            CircuitCompileError::NaiveVec { gate: gate.local_gate().index(), source }
+        })
+    }
+
+    fn large_scalar_mul(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        scalar: &[num_bigint::BigUint],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let scalar = builder.constant_polynomial(
+            scalar_type(&input.matrices.matrix_type),
+            scalar.iter().map(|value| BigInt::from(value.clone())),
+        );
+        self.compiler.large_scalar_mul_public_keys(builder, input, &scalar).map_err(|source| {
+            CircuitCompileError::NaiveVec { gate: gate.local_gate().index(), source }
+        })
+    }
+
+    fn slot_transfer(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        source_slots: &[(u32, Option<u32>)],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.slot_transfer(builder, input, source_slots, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot transfer",
+            }),
+        }
+    }
+
+    fn slot_reduce(
+        &mut self,
+        builder: &mut GraphBuilder,
+        inputs: &[Self::Wire],
+        slot_count: usize,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.slot_reduce(builder, inputs, slot_count, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot reduction",
+            }),
+        }
+    }
+
+    fn public_lookup(
+        &mut self,
+        builder: &mut GraphBuilder,
+        circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        input: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.public_lookup(builder, circuit, lookup_id, input, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "public lookup",
+            }),
+        }
+    }
+}
+
+impl<P: Poly> GraphCircuitLowering<P> for NaiveEncodingLowering<'_, P> {
+    type Wire = NaiveBggEncodingVecWire;
+    type Error = CircuitCompileError;
+
+    fn binary(
+        &mut self,
+        builder: &mut GraphBuilder,
+        operation: PolyGateKind,
+        lhs: &Self::Wire,
+        rhs: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let output = match operation {
+            PolyGateKind::Add => self.compiler.add_encodings(builder, lhs, rhs),
+            PolyGateKind::Sub => self.compiler.sub_encodings(builder, lhs, rhs),
+            PolyGateKind::Mul => self.compiler.mul_encodings(builder, lhs, rhs),
+            _ => {
+                return Err(CircuitCompileError::InvalidArity { gate: gate.local_gate().index() });
+            }
+        };
+        output.map_err(|source| CircuitCompileError::NaiveVec {
+            gate: gate.local_gate().index(),
+            source,
+        })
+    }
+
+    fn small_scalar_mul(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        scalar: &[u32],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let scalar = builder.constant_polynomial(
+            scalar_type(&input.pubkeys.matrix_type),
+            scalar.iter().map(|value| BigInt::from(*value)),
+        );
+        self.compiler.small_scalar_mul_encodings(builder, input, &scalar).map_err(|source| {
+            CircuitCompileError::NaiveVec { gate: gate.local_gate().index(), source }
+        })
+    }
+
+    fn large_scalar_mul(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        scalar: &[num_bigint::BigUint],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let scalar = builder.constant_polynomial(
+            scalar_type(&input.pubkeys.matrix_type),
+            scalar.iter().map(|value| BigInt::from(value.clone())),
+        );
+        self.compiler.large_scalar_mul_encodings(builder, input, &scalar).map_err(|source| {
+            CircuitCompileError::NaiveVec { gate: gate.local_gate().index(), source }
+        })
+    }
+
+    fn slot_transfer(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &Self::Wire,
+        source_slots: &[(u32, Option<u32>)],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.slot_transfer(builder, input, source_slots, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot transfer",
+            }),
+        }
+    }
+
+    fn slot_reduce(
+        &mut self,
+        builder: &mut GraphBuilder,
+        inputs: &[Self::Wire],
+        slot_count: usize,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.slot_reduce(builder, inputs, slot_count, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot reduction",
+            }),
+        }
+    }
+
+    fn public_lookup(
+        &mut self,
+        builder: &mut GraphBuilder,
+        circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        input: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        match self.advanced.as_deref_mut() {
+            Some(advanced) => advanced.public_lookup(builder, circuit, lookup_id, input, gate),
+            None => Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "public lookup",
+            }),
+        }
+    }
+}
+
+fn map_lower_error(error: CircuitLowerError<CircuitCompileError>) -> CircuitCompileError {
+    match error {
+        CircuitLowerError::MissingInput { gate, input } => {
+            CircuitCompileError::MissingInput { gate, input }
+        }
+        CircuitLowerError::InvalidArity { gate } => CircuitCompileError::InvalidArity { gate },
+        CircuitLowerError::ExtraInputs => CircuitCompileError::ExtraInputs,
+        CircuitLowerError::ParameterizedPublicLookup { gate, .. } => {
+            CircuitCompileError::MissingGateContext { gate, kind: "parameterized public lookup" }
+        }
+        CircuitLowerError::MissingParameter { gate, .. } |
+        CircuitLowerError::ParameterKind { gate, .. } => {
+            CircuitCompileError::MissingGateContext { gate, kind: "sub-circuit parameter binding" }
+        }
+        CircuitLowerError::Operation { source, .. } => source,
+    }
 }
 
 /// Scheme-specific lowering for gates whose concrete construction depends on
@@ -44,7 +651,7 @@ pub trait AdvancedGateLowering<P: Poly, W> {
         builder: &mut GraphBuilder,
         input: &W,
         source_slots: &[(u32, Option<u32>)],
-        gate: GateId,
+        gate: GateInstance<'_>,
     ) -> Result<W, CircuitCompileError>;
 
     fn slot_reduce(
@@ -52,7 +659,7 @@ pub trait AdvancedGateLowering<P: Poly, W> {
         builder: &mut GraphBuilder,
         inputs: &[W],
         slot_count: usize,
-        gate: GateId,
+        gate: GateInstance<'_>,
     ) -> Result<W, CircuitCompileError>;
 
     fn public_lookup(
@@ -61,8 +668,66 @@ pub trait AdvancedGateLowering<P: Poly, W> {
         circuit: &PolyCircuit<P>,
         lookup_id: usize,
         input: &W,
-        gate: GateId,
+        gate: GateInstance<'_>,
     ) -> Result<W, CircuitCompileError>;
+}
+
+/// Combines one public-lookup lowering with one slot-transfer lowering.
+///
+/// The two constructions have independent preprocessing artifacts. Keeping
+/// them as delegates avoids a product enum over lookup schemes and slot
+/// schemes while still allowing one circuit to contain both gate families.
+#[derive(Clone, Debug)]
+pub struct CompositeAdvancedGateLowering<L, S> {
+    pub lookup: L,
+    pub slots: S,
+}
+
+impl<L, S> CompositeAdvancedGateLowering<L, S> {
+    pub fn new(lookup: L, slots: S) -> Self {
+        Self { lookup, slots }
+    }
+
+    pub fn into_parts(self) -> (L, S) {
+        (self.lookup, self.slots)
+    }
+}
+
+impl<P: Poly, W, L, S> AdvancedGateLowering<P, W> for CompositeAdvancedGateLowering<L, S>
+where
+    L: AdvancedGateLowering<P, W>,
+    S: AdvancedGateLowering<P, W>,
+{
+    fn slot_transfer(
+        &mut self,
+        builder: &mut GraphBuilder,
+        input: &W,
+        source_slots: &[(u32, Option<u32>)],
+        gate: GateInstance<'_>,
+    ) -> Result<W, CircuitCompileError> {
+        self.slots.slot_transfer(builder, input, source_slots, gate)
+    }
+
+    fn slot_reduce(
+        &mut self,
+        builder: &mut GraphBuilder,
+        inputs: &[W],
+        slot_count: usize,
+        gate: GateInstance<'_>,
+    ) -> Result<W, CircuitCompileError> {
+        self.slots.slot_reduce(builder, inputs, slot_count, gate)
+    }
+
+    fn public_lookup(
+        &mut self,
+        builder: &mut GraphBuilder,
+        circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        input: &W,
+        gate: GateInstance<'_>,
+    ) -> Result<W, CircuitCompileError> {
+        self.lookup.public_lookup(builder, circuit, lookup_id, input, gate)
+    }
 }
 
 impl PolyCircuitCompiler {
@@ -73,78 +738,17 @@ impl PolyCircuitCompiler {
         one: BggPublicKeyWire,
         inputs: impl IntoIterator<Item = BggPublicKeyWire>,
     ) -> Result<Vec<BggPublicKeyWire>, CircuitCompileError> {
-        let mut values = BTreeMap::new();
-        let mut supplied = inputs.into_iter();
-        for (_, gate) in circuit.gates_in_id_order() {
-            let gate_id = gate.gate_id.index();
-            let value = match &gate.gate_type {
-                PolyGateType::Input if gate_id == 0 => one.clone(),
-                PolyGateType::Input => supplied
-                    .next()
-                    .ok_or(CircuitCompileError::MissingInput { gate: gate_id, input: gate_id })?,
-                PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => {
-                    let [lhs, rhs] = lookup_binary(&values, gate)?;
-                    match gate.gate_type {
-                        PolyGateType::Add => compile_public_key_binary_template(
-                            builder,
-                            &self.public_key,
-                            MatrixBinaryOp::Add,
-                            lhs,
-                            rhs,
-                        )?,
-                        PolyGateType::Sub => compile_public_key_binary_template(
-                            builder,
-                            &self.public_key,
-                            MatrixBinaryOp::Subtract,
-                            lhs,
-                            rhs,
-                        )?,
-                        PolyGateType::Mul => compile_public_key_binary_template(
-                            builder,
-                            &self.public_key,
-                            MatrixBinaryOp::Multiply,
-                            lhs,
-                            rhs,
-                        )?,
-                        _ => unreachable!(),
-                    }
-                }
-                PolyGateType::SmallScalarMul { scalar } => {
-                    let input = lookup_unary(&values, gate)?;
-                    let scalar = scalar_u32(builder, gate_id, scalar, &input.matrix.matrix_type)?;
-                    compile_public_key_scalar_template(
-                        builder,
-                        &self.public_key,
-                        input,
-                        &scalar,
-                        false,
-                    )?
-                }
-                PolyGateType::LargeScalarMul { scalar } => {
-                    let input = lookup_unary(&values, gate)?;
-                    let scalar =
-                        scalar_biguint(builder, gate_id, scalar, &input.matrix.matrix_type)?;
-                    compile_public_key_scalar_template(
-                        builder,
-                        &self.public_key,
-                        input,
-                        &scalar,
-                        true,
-                    )?
-                }
-                other => {
-                    return Err(CircuitCompileError::MissingGateContext {
-                        gate: gate_id,
-                        kind: gate_kind_name(other),
-                    });
-                }
-            };
-            values.insert(gate_id, value);
+        if circuit.requires_advanced_lowering() {
+            return Err(CircuitCompileError::AdvancedGateContextRequired);
         }
-        if supplied.next().is_some() {
-            return Err(CircuitCompileError::ExtraInputs);
-        }
-        collect_outputs(circuit, &values)
+        lower_circuit(
+            builder,
+            circuit,
+            one,
+            inputs,
+            &mut PublicKeyLowering::<P> { compiler: &self.public_key, advanced: None },
+        )
+        .map_err(map_lower_error)
     }
 
     pub fn compile_encodings<P: Poly>(
@@ -154,71 +758,39 @@ impl PolyCircuitCompiler {
         one: BggEncodingWire,
         inputs: impl IntoIterator<Item = BggEncodingWire>,
     ) -> Result<Vec<BggEncodingWire>, CircuitCompileError> {
+        if circuit.requires_advanced_lowering() {
+            return Err(CircuitCompileError::AdvancedGateContextRequired);
+        }
         let compiler = BggEncodingCompiler { public_key: self.public_key.clone() };
-        let mut values = BTreeMap::new();
-        let mut supplied = inputs.into_iter();
-        for (_, gate) in circuit.gates_in_id_order() {
-            let gate_id = gate.gate_id.index();
-            let value = match &gate.gate_type {
-                PolyGateType::Input if gate_id == 0 => one.clone(),
-                PolyGateType::Input => supplied
-                    .next()
-                    .ok_or(CircuitCompileError::MissingInput { gate: gate_id, input: gate_id })?,
-                PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => {
-                    let [lhs, rhs] = lookup_binary(&values, gate)?;
-                    match gate.gate_type {
-                        PolyGateType::Add => compile_encoding_binary_template(
-                            builder,
-                            &compiler,
-                            MatrixBinaryOp::Add,
-                            lhs,
-                            rhs,
-                            gate_id,
-                        ),
-                        PolyGateType::Sub => compile_encoding_binary_template(
-                            builder,
-                            &compiler,
-                            MatrixBinaryOp::Subtract,
-                            lhs,
-                            rhs,
-                            gate_id,
-                        ),
-                        PolyGateType::Mul => compile_encoding_binary_template(
-                            builder,
-                            &compiler,
-                            MatrixBinaryOp::Multiply,
-                            lhs,
-                            rhs,
-                            gate_id,
-                        ),
-                        _ => unreachable!(),
-                    }?
-                }
-                PolyGateType::SmallScalarMul { scalar } => {
-                    let input = lookup_unary(&values, gate)?;
-                    let scalar =
-                        scalar_u32(builder, gate_id, scalar, &input.pubkey.matrix.matrix_type)?;
-                    compile_encoding_scalar_template(builder, &compiler, input, &scalar, false)?
-                }
-                PolyGateType::LargeScalarMul { scalar } => {
-                    let input = lookup_unary(&values, gate)?;
-                    let scalar =
-                        scalar_biguint(builder, gate_id, scalar, &input.pubkey.matrix.matrix_type)?;
-                    compile_encoding_scalar_template(builder, &compiler, input, &scalar, true)?
-                }
-                other => {
-                    return Err(CircuitCompileError::MissingGateContext {
-                        gate: gate_id,
-                        kind: gate_kind_name(other),
-                    });
-                }
-            };
-            values.insert(gate_id, value);
+        lower_circuit(
+            builder,
+            circuit,
+            one,
+            inputs,
+            &mut EncodingLowering::<P> { compiler: &compiler, advanced: None },
+        )
+        .map_err(map_lower_error)
+    }
+
+    pub fn compile_poly_encodings<P: Poly>(
+        &self,
+        builder: &mut GraphBuilder,
+        circuit: &PolyCircuit<P>,
+        one: BggPolyEncodingWire,
+        inputs: impl IntoIterator<Item = BggPolyEncodingWire>,
+    ) -> Result<Vec<BggPolyEncodingWire>, CircuitCompileError> {
+        if circuit.requires_advanced_lowering() {
+            return Err(CircuitCompileError::AdvancedGateContextRequired);
         }
-        if supplied.next().is_some() {
-            return Err(CircuitCompileError::ExtraInputs);
-        }
-        collect_outputs(circuit, &values)
+        let compiler = BggPolyEncodingCompiler { public_key: self.public_key.clone() };
+        lower_circuit(
+            builder,
+            circuit,
+            one,
+            inputs,
+            &mut PolyEncodingLowering::<P> { compiler: &compiler, advanced: None },
+        )
+        .map_err(map_lower_error)
     }
 
     pub fn compile_public_keys_with_lowering<P: Poly, L>(
@@ -232,167 +804,14 @@ impl PolyCircuitCompiler {
     where
         L: AdvancedGateLowering<P, BggPublicKeyWire>,
     {
-        self.compile_public_keys_scoped(
+        lower_circuit(
             builder,
             circuit,
             one,
-            inputs.into_iter().collect(),
-            &[],
-            lowering,
+            inputs,
+            &mut PublicKeyLowering::<P> { compiler: &self.public_key, advanced: Some(lowering) },
         )
-    }
-
-    fn compile_public_keys_scoped<P: Poly, L>(
-        &self,
-        builder: &mut GraphBuilder,
-        circuit: &PolyCircuit<P>,
-        one: BggPublicKeyWire,
-        inputs: Vec<BggPublicKeyWire>,
-        bindings: &[SubCircuitParamValue],
-        lowering: &mut L,
-    ) -> Result<Vec<BggPublicKeyWire>, CircuitCompileError>
-    where
-        L: AdvancedGateLowering<P, BggPublicKeyWire>,
-    {
-        let mut values = BTreeMap::new();
-        let mut supplied = inputs.into_iter();
-        for (_, gate) in circuit.gates_in_id_order() {
-            let gate_id = gate.gate_id.index();
-            if values.contains_key(&gate_id) {
-                continue;
-            }
-            let value = match &gate.gate_type {
-                PolyGateType::Input if gate_id == 0 => one.clone(),
-                PolyGateType::Input => supplied
-                    .next()
-                    .ok_or(CircuitCompileError::MissingInput { gate: gate_id, input: gate_id })?,
-                PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => {
-                    let [lhs, rhs] = lookup_binary(&values, gate)?;
-                    match gate.gate_type {
-                        PolyGateType::Add => compile_public_key_binary_template(
-                            builder,
-                            &self.public_key,
-                            MatrixBinaryOp::Add,
-                            lhs,
-                            rhs,
-                        )?,
-                        PolyGateType::Sub => compile_public_key_binary_template(
-                            builder,
-                            &self.public_key,
-                            MatrixBinaryOp::Subtract,
-                            lhs,
-                            rhs,
-                        )?,
-                        PolyGateType::Mul => compile_public_key_binary_template(
-                            builder,
-                            &self.public_key,
-                            MatrixBinaryOp::Multiply,
-                            lhs,
-                            rhs,
-                        )?,
-                        _ => unreachable!(),
-                    }
-                }
-                PolyGateType::SmallScalarMul { scalar } => {
-                    let input = lookup_unary(&values, gate)?;
-                    let scalar =
-                        scalar_u32_bound(builder, scalar, bindings, &input.matrix.matrix_type);
-                    compile_public_key_scalar_template(
-                        builder,
-                        &self.public_key,
-                        input,
-                        &scalar,
-                        false,
-                    )?
-                }
-                PolyGateType::LargeScalarMul { scalar } => {
-                    let input = lookup_unary(&values, gate)?;
-                    let scalar =
-                        scalar_biguint_bound(builder, scalar, bindings, &input.matrix.matrix_type);
-                    compile_public_key_scalar_template(
-                        builder,
-                        &self.public_key,
-                        input,
-                        &scalar,
-                        true,
-                    )?
-                }
-                PolyGateType::SlotTransfer { src_slots } => {
-                    let input = lookup_unary(&values, gate)?;
-                    let source_slots = src_slots.resolve_slot_transfer(bindings);
-                    lowering.slot_transfer(builder, input, source_slots.as_ref(), gate.gate_id)?
-                }
-                PolyGateType::SlotReduce { num_slots, .. } => {
-                    let inputs = lookup_many(&values, gate)?;
-                    lowering.slot_reduce(builder, &inputs, *num_slots, gate.gate_id)?
-                }
-                PolyGateType::PubLut { lut_id } => {
-                    let input = lookup_unary(&values, gate)?;
-                    lowering.public_lookup(
-                        builder,
-                        circuit,
-                        lut_id.resolve_public_lookup(bindings),
-                        input,
-                        gate.gate_id,
-                    )?
-                }
-                PolyGateType::SubCircuitOutput { call_id, .. } => {
-                    let info = circuit.sub_circuit_call_info(*call_id);
-                    let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
-                    let child_inputs = flatten_inputs(&values, &info.inputs, gate_id)?;
-                    let outputs = self.compile_public_keys_scoped(
-                        builder,
-                        child.as_ref(),
-                        one.clone(),
-                        child_inputs,
-                        info.param_bindings.as_ref(),
-                        lowering,
-                    )?;
-                    insert_call_outputs(&mut values, &info.output_gate_ids, outputs, gate_id)?;
-                    continue;
-                }
-                PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
-                    let info = circuit.summed_sub_circuit_call_info(*summed_call_id);
-                    let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
-                    let mut accumulated: Option<Vec<BggPublicKeyWire>> = None;
-                    for (call_inputs, call_bindings) in
-                        info.call_inputs.iter().zip(info.param_bindings.iter())
-                    {
-                        let child_inputs = flatten_inputs(&values, call_inputs, gate_id)?;
-                        let outputs = self.compile_public_keys_scoped(
-                            builder,
-                            child.as_ref(),
-                            one.clone(),
-                            child_inputs,
-                            call_bindings.as_ref(),
-                            lowering,
-                        )?;
-                        if let Some(current) = accumulated.as_mut() {
-                            for (sum, output) in current.iter_mut().zip(outputs) {
-                                *sum = compile_public_key_binary_template(
-                                    builder,
-                                    &self.public_key,
-                                    MatrixBinaryOp::Add,
-                                    sum,
-                                    &output,
-                                )?;
-                            }
-                        } else {
-                            accumulated = Some(outputs);
-                        }
-                    }
-                    let outputs =
-                        accumulated.ok_or(CircuitCompileError::InvalidArity { gate: gate_id })?;
-                    insert_call_outputs(&mut values, &info.output_gate_ids, outputs, gate_id)?;
-                    continue;
-                }
-            };
-            values.insert(gate_id, value);
-        }
-        if supplied.next().is_some() {
-            return Err(CircuitCompileError::ExtraInputs);
-        }
-        collect_outputs(circuit, &values)
+        .map_err(map_lower_error)
     }
 
     pub fn compile_encodings_with_lowering<P: Poly, L>(
@@ -406,168 +825,81 @@ impl PolyCircuitCompiler {
     where
         L: AdvancedGateLowering<P, BggEncodingWire>,
     {
-        self.compile_encodings_scoped(
+        let compiler = BggEncodingCompiler { public_key: self.public_key.clone() };
+        lower_circuit(
             builder,
             circuit,
             one,
-            inputs.into_iter().collect(),
-            &[],
-            lowering,
+            inputs,
+            &mut EncodingLowering::<P> { compiler: &compiler, advanced: Some(lowering) },
         )
+        .map_err(map_lower_error)
     }
 
-    fn compile_encodings_scoped<P: Poly, L>(
+    pub fn compile_poly_encodings_with_lowering<P: Poly, L>(
         &self,
         builder: &mut GraphBuilder,
         circuit: &PolyCircuit<P>,
-        one: BggEncodingWire,
-        inputs: Vec<BggEncodingWire>,
-        bindings: &[SubCircuitParamValue],
+        one: BggPolyEncodingWire,
+        inputs: impl IntoIterator<Item = BggPolyEncodingWire>,
         lowering: &mut L,
-    ) -> Result<Vec<BggEncodingWire>, CircuitCompileError>
+    ) -> Result<Vec<BggPolyEncodingWire>, CircuitCompileError>
     where
-        L: AdvancedGateLowering<P, BggEncodingWire>,
+        L: AdvancedGateLowering<P, BggPolyEncodingWire>,
     {
-        let compiler = BggEncodingCompiler { public_key: self.public_key.clone() };
-        let mut values = BTreeMap::new();
-        let mut supplied = inputs.into_iter();
-        for (_, gate) in circuit.gates_in_id_order() {
-            let gate_id = gate.gate_id.index();
-            if values.contains_key(&gate_id) {
-                continue;
-            }
-            let value = match &gate.gate_type {
-                PolyGateType::Input if gate_id == 0 => one.clone(),
-                PolyGateType::Input => supplied
-                    .next()
-                    .ok_or(CircuitCompileError::MissingInput { gate: gate_id, input: gate_id })?,
-                PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => {
-                    let [lhs, rhs] = lookup_binary(&values, gate)?;
-                    match gate.gate_type {
-                        PolyGateType::Add => compile_encoding_binary_template(
-                            builder,
-                            &compiler,
-                            MatrixBinaryOp::Add,
-                            lhs,
-                            rhs,
-                            gate_id,
-                        ),
-                        PolyGateType::Sub => compile_encoding_binary_template(
-                            builder,
-                            &compiler,
-                            MatrixBinaryOp::Subtract,
-                            lhs,
-                            rhs,
-                            gate_id,
-                        ),
-                        PolyGateType::Mul => compile_encoding_binary_template(
-                            builder,
-                            &compiler,
-                            MatrixBinaryOp::Multiply,
-                            lhs,
-                            rhs,
-                            gate_id,
-                        ),
-                        _ => unreachable!(),
-                    }?
-                }
-                PolyGateType::SmallScalarMul { scalar } => {
-                    let input = lookup_unary(&values, gate)?;
-                    let scalar = scalar_u32_bound(
-                        builder,
-                        scalar,
-                        bindings,
-                        &input.pubkey.matrix.matrix_type,
-                    );
-                    compile_encoding_scalar_template(builder, &compiler, input, &scalar, false)?
-                }
-                PolyGateType::LargeScalarMul { scalar } => {
-                    let input = lookup_unary(&values, gate)?;
-                    let scalar = scalar_biguint_bound(
-                        builder,
-                        scalar,
-                        bindings,
-                        &input.pubkey.matrix.matrix_type,
-                    );
-                    compile_encoding_scalar_template(builder, &compiler, input, &scalar, true)?
-                }
-                PolyGateType::SlotTransfer { src_slots } => {
-                    let input = lookup_unary(&values, gate)?;
-                    let source_slots = src_slots.resolve_slot_transfer(bindings);
-                    lowering.slot_transfer(builder, input, source_slots.as_ref(), gate.gate_id)?
-                }
-                PolyGateType::SlotReduce { num_slots, .. } => {
-                    let inputs = lookup_many(&values, gate)?;
-                    lowering.slot_reduce(builder, &inputs, *num_slots, gate.gate_id)?
-                }
-                PolyGateType::PubLut { lut_id } => {
-                    let input = lookup_unary(&values, gate)?;
-                    lowering.public_lookup(
-                        builder,
-                        circuit,
-                        lut_id.resolve_public_lookup(bindings),
-                        input,
-                        gate.gate_id,
-                    )?
-                }
-                PolyGateType::SubCircuitOutput { call_id, .. } => {
-                    let info = circuit.sub_circuit_call_info(*call_id);
-                    let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
-                    let child_inputs = flatten_inputs(&values, &info.inputs, gate_id)?;
-                    let outputs = self.compile_encodings_scoped(
-                        builder,
-                        child.as_ref(),
-                        one.clone(),
-                        child_inputs,
-                        info.param_bindings.as_ref(),
-                        lowering,
-                    )?;
-                    insert_call_outputs(&mut values, &info.output_gate_ids, outputs, gate_id)?;
-                    continue;
-                }
-                PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
-                    let info = circuit.summed_sub_circuit_call_info(*summed_call_id);
-                    let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
-                    let mut accumulated: Option<Vec<BggEncodingWire>> = None;
-                    for (call_inputs, call_bindings) in
-                        info.call_inputs.iter().zip(info.param_bindings.iter())
-                    {
-                        let child_inputs = flatten_inputs(&values, call_inputs, gate_id)?;
-                        let outputs = self.compile_encodings_scoped(
-                            builder,
-                            child.as_ref(),
-                            one.clone(),
-                            child_inputs,
-                            call_bindings.as_ref(),
-                            lowering,
-                        )?;
-                        if let Some(current) = accumulated.as_mut() {
-                            for (sum, output) in current.iter_mut().zip(outputs) {
-                                *sum = compile_encoding_binary_template(
-                                    builder,
-                                    &compiler,
-                                    MatrixBinaryOp::Add,
-                                    sum,
-                                    &output,
-                                    gate_id,
-                                )?;
-                            }
-                        } else {
-                            accumulated = Some(outputs);
-                        }
-                    }
-                    let outputs =
-                        accumulated.ok_or(CircuitCompileError::InvalidArity { gate: gate_id })?;
-                    insert_call_outputs(&mut values, &info.output_gate_ids, outputs, gate_id)?;
-                    continue;
-                }
-            };
-            values.insert(gate_id, value);
-        }
-        if supplied.next().is_some() {
-            return Err(CircuitCompileError::ExtraInputs);
-        }
-        collect_outputs(circuit, &values)
+        let compiler = BggPolyEncodingCompiler { public_key: self.public_key.clone() };
+        lower_circuit(
+            builder,
+            circuit,
+            one,
+            inputs,
+            &mut PolyEncodingLowering::<P> { compiler: &compiler, advanced: Some(lowering) },
+        )
+        .map_err(map_lower_error)
+    }
+
+    pub fn compile_naive_public_keys_with_lowering<P: Poly, L>(
+        &self,
+        builder: &mut GraphBuilder,
+        circuit: &PolyCircuit<P>,
+        one: NaiveBggPublicKeyVecWire,
+        inputs: impl IntoIterator<Item = NaiveBggPublicKeyVecWire>,
+        lowering: &mut L,
+    ) -> Result<Vec<NaiveBggPublicKeyVecWire>, CircuitCompileError>
+    where
+        L: AdvancedGateLowering<P, NaiveBggPublicKeyVecWire>,
+    {
+        let compiler = NaiveBggVecCompiler { public_key: self.public_key.clone() };
+        lower_circuit(
+            builder,
+            circuit,
+            one,
+            inputs,
+            &mut NaivePublicKeyLowering::<P> { compiler: &compiler, advanced: Some(lowering) },
+        )
+        .map_err(map_lower_error)
+    }
+
+    pub fn compile_naive_encodings_with_lowering<P: Poly, L>(
+        &self,
+        builder: &mut GraphBuilder,
+        circuit: &PolyCircuit<P>,
+        one: NaiveBggEncodingVecWire,
+        inputs: impl IntoIterator<Item = NaiveBggEncodingVecWire>,
+        lowering: &mut L,
+    ) -> Result<Vec<NaiveBggEncodingVecWire>, CircuitCompileError>
+    where
+        L: AdvancedGateLowering<P, NaiveBggEncodingVecWire>,
+    {
+        let compiler = NaiveBggVecCompiler { public_key: self.public_key.clone() };
+        lower_circuit(
+            builder,
+            circuit,
+            one,
+            inputs,
+            &mut NaiveEncodingLowering::<P> { compiler: &compiler, advanced: Some(lowering) },
+        )
+        .map_err(map_lower_error)
     }
 }
 
@@ -584,22 +916,26 @@ fn compile_public_key_binary_template(
         MatrixBinaryOp::Multiply => "bgg-public-key-mul",
     };
     let mut template = GraphBuilder::new(name, Vec::new());
-    let template_lhs =
-        BggPublicKeyWire { matrix: template.input("lhs", lhs.matrix.matrix_type.clone()) };
-    let template_rhs =
-        BggPublicKeyWire { matrix: template.input("rhs", rhs.matrix.matrix_type.clone()) };
+    let template_lhs = BggPublicKeyWire {
+        matrix: template.input("lhs", lhs.matrix.matrix_type.clone()),
+        reveal_plaintext: lhs.reveal_plaintext,
+    };
+    let template_rhs = BggPublicKeyWire {
+        matrix: template.input("rhs", rhs.matrix.matrix_type.clone()),
+        reveal_plaintext: rhs.reveal_plaintext,
+    };
     let output = match operation {
         MatrixBinaryOp::Add => compiler.add(&mut template, &template_lhs, &template_rhs),
         MatrixBinaryOp::Subtract => compiler.sub(&mut template, &template_lhs, &template_rhs),
         MatrixBinaryOp::Multiply => compiler.mul(&mut template, &template_lhs, &template_rhs),
     };
-    template.output("0_matrix", &output.matrix);
+    template.output("0_matrix", &output.matrix, ArtifactConfidentiality::Public);
     let mut outputs = builder.subgraph_call(
         template.finish(),
         vec![lhs.matrix.wire, rhs.matrix.wire],
         &[output.matrix.matrix_type],
     )?;
-    Ok(BggPublicKeyWire { matrix: outputs.remove(0) })
+    Ok(BggPublicKeyWire { matrix: outputs.remove(0), reveal_plaintext: output.reveal_plaintext })
 }
 
 fn compile_encoding_binary_template(
@@ -611,14 +947,10 @@ fn compile_encoding_binary_template(
     gate: usize,
 ) -> Result<BggEncodingWire, CircuitCompileError> {
     let plaintext_kind = match (&lhs.plaintext, &rhs.plaintext) {
-        (Some(_), Some(_)) => "revealed",
-        (None, None) => "hidden",
-        _ => {
-            return Err(CircuitCompileError::Encoding {
-                gate,
-                source: crate::encoding::EncodingCompileError::PlaintextMismatch,
-            });
-        }
+        (Some(_), Some(_)) => "revealed-revealed",
+        (Some(_), None) => "revealed-hidden",
+        (None, Some(_)) => "hidden-revealed",
+        (None, None) => "hidden-hidden",
     };
     let operation_name = match operation {
         MatrixBinaryOp::Add => "add",
@@ -631,6 +963,7 @@ fn compile_encoding_binary_template(
         vector: template.input("0_lhs_vector", lhs.vector.matrix_type.clone()),
         pubkey: BggPublicKeyWire {
             matrix: template.input("1_lhs_pubkey", lhs.pubkey.matrix.matrix_type.clone()),
+            reveal_plaintext: lhs.pubkey.reveal_plaintext,
         },
         plaintext: lhs
             .plaintext
@@ -641,6 +974,7 @@ fn compile_encoding_binary_template(
         vector: template.input("3_rhs_vector", rhs.vector.matrix_type.clone()),
         pubkey: BggPublicKeyWire {
             matrix: template.input("4_rhs_pubkey", rhs.pubkey.matrix.matrix_type.clone()),
+            reveal_plaintext: rhs.pubkey.reveal_plaintext,
         },
         plaintext: rhs
             .plaintext
@@ -653,10 +987,10 @@ fn compile_encoding_binary_template(
         MatrixBinaryOp::Multiply => compiler.mul(&mut template, &template_lhs, &template_rhs),
     }
     .map_err(|source| CircuitCompileError::Encoding { gate, source })?;
-    template.output("0_vector", &output.vector);
-    template.output("1_pubkey", &output.pubkey.matrix);
+    template.output("0_vector", &output.vector, ArtifactConfidentiality::Public);
+    template.output("1_pubkey", &output.pubkey.matrix, ArtifactConfidentiality::Public);
     if let Some(plaintext) = &output.plaintext {
-        template.output("2_plaintext", plaintext);
+        template.output("2_plaintext", plaintext, ArtifactConfidentiality::Public);
     }
     let mut args = vec![lhs.vector.wire, lhs.pubkey.matrix.wire];
     if let Some(plaintext) = &lhs.plaintext {
@@ -673,7 +1007,10 @@ fn compile_encoding_binary_template(
     }
     let mut outputs = builder.subgraph_call(template.finish(), args, &output_types)?;
     let vector = outputs.remove(0);
-    let pubkey = BggPublicKeyWire { matrix: outputs.remove(0) };
+    let pubkey = BggPublicKeyWire {
+        matrix: outputs.remove(0),
+        reveal_plaintext: output.pubkey.reveal_plaintext,
+    };
     let plaintext = (!outputs.is_empty()).then(|| outputs.remove(0));
     Ok(BggEncodingWire { vector, pubkey, plaintext })
 }
@@ -682,33 +1019,35 @@ fn compile_public_key_scalar_template(
     builder: &mut GraphBuilder,
     compiler: &BggPublicKeyCompiler,
     input: &BggPublicKeyWire,
-    scalar: &crate::MatrixWire,
+    scalar: &MatrixWire,
     large: bool,
 ) -> Result<BggPublicKeyWire, CircuitCompileError> {
     let name = if large { "bgg-public-key-large-scalar" } else { "bgg-public-key-small-scalar" };
     let mut template = GraphBuilder::new(name, Vec::new());
-    let template_input =
-        BggPublicKeyWire { matrix: template.input("input", input.matrix.matrix_type.clone()) };
+    let template_input = BggPublicKeyWire {
+        matrix: template.input("input", input.matrix.matrix_type.clone()),
+        reveal_plaintext: input.reveal_plaintext,
+    };
     let template_scalar = template.input("scalar", scalar.matrix_type.clone());
     let output = if large {
         compiler.large_scalar_mul(&mut template, &template_input, &template_scalar)
     } else {
         compiler.small_scalar_mul(&mut template, &template_input, &template_scalar)
     };
-    template.output("0_matrix", &output.matrix);
+    template.output("0_matrix", &output.matrix, ArtifactConfidentiality::Public);
     let mut outputs = builder.subgraph_call(
         template.finish(),
         vec![input.matrix.wire, scalar.wire],
         &[output.matrix.matrix_type],
     )?;
-    Ok(BggPublicKeyWire { matrix: outputs.remove(0) })
+    Ok(BggPublicKeyWire { matrix: outputs.remove(0), reveal_plaintext: output.reveal_plaintext })
 }
 
 fn compile_encoding_scalar_template(
     builder: &mut GraphBuilder,
     compiler: &BggEncodingCompiler,
     input: &BggEncodingWire,
-    scalar: &crate::MatrixWire,
+    scalar: &MatrixWire,
     large: bool,
 ) -> Result<BggEncodingWire, CircuitCompileError> {
     let plaintext_kind = if input.plaintext.is_some() { "revealed" } else { "hidden" };
@@ -719,6 +1058,7 @@ fn compile_encoding_scalar_template(
         vector: template.input("0_vector", input.vector.matrix_type.clone()),
         pubkey: BggPublicKeyWire {
             matrix: template.input("1_pubkey", input.pubkey.matrix.matrix_type.clone()),
+            reveal_plaintext: input.pubkey.reveal_plaintext,
         },
         plaintext: input
             .plaintext
@@ -731,10 +1071,10 @@ fn compile_encoding_scalar_template(
     } else {
         compiler.small_scalar_mul(&mut template, &template_input, &template_scalar)
     };
-    template.output("0_vector", &output.vector);
-    template.output("1_pubkey", &output.pubkey.matrix);
+    template.output("0_vector", &output.vector, ArtifactConfidentiality::Public);
+    template.output("1_pubkey", &output.pubkey.matrix, ArtifactConfidentiality::Public);
     if let Some(plaintext) = &output.plaintext {
-        template.output("2_plaintext", plaintext);
+        template.output("2_plaintext", plaintext, ArtifactConfidentiality::Public);
     }
     let mut args = vec![input.vector.wire, input.pubkey.matrix.wire];
     if let Some(plaintext) = &input.plaintext {
@@ -748,127 +1088,12 @@ fn compile_encoding_scalar_template(
     }
     let mut outputs = builder.subgraph_call(template.finish(), args, &output_types)?;
     let vector = outputs.remove(0);
-    let pubkey = BggPublicKeyWire { matrix: outputs.remove(0) };
+    let pubkey = BggPublicKeyWire {
+        matrix: outputs.remove(0),
+        reveal_plaintext: output.pubkey.reveal_plaintext,
+    };
     let plaintext = (!outputs.is_empty()).then(|| outputs.remove(0));
     Ok(BggEncodingWire { vector, pubkey, plaintext })
-}
-
-fn scalar_u32_bound(
-    builder: &mut GraphBuilder,
-    source: &GateParamSource<Vec<u32>>,
-    bindings: &[SubCircuitParamValue],
-    ambient: &mxx_ir_core::types::MatrixType,
-) -> crate::MatrixWire {
-    builder.constant_polynomial(
-        scalar_type(ambient),
-        source.resolve_small_scalar(bindings).iter().map(|value| BigInt::from(*value)),
-    )
-}
-
-fn scalar_biguint_bound(
-    builder: &mut GraphBuilder,
-    source: &GateParamSource<Vec<num_bigint::BigUint>>,
-    bindings: &[SubCircuitParamValue],
-    ambient: &mxx_ir_core::types::MatrixType,
-) -> crate::MatrixWire {
-    builder.constant_polynomial(
-        scalar_type(ambient),
-        source.resolve_large_scalar(bindings).iter().map(|value| BigInt::from(value.clone())),
-    )
-}
-
-fn lookup_many<T: Clone>(
-    values: &BTreeMap<usize, T>,
-    gate: &mxx_gadgets::circuit::PolyGate,
-) -> Result<Vec<T>, CircuitCompileError> {
-    gate.input_gates
-        .iter()
-        .map(|input| {
-            values.get(&input.index()).cloned().ok_or(CircuitCompileError::MissingInput {
-                gate: gate.gate_id.index(),
-                input: input.index(),
-            })
-        })
-        .collect()
-}
-
-fn flatten_inputs<T: Clone>(
-    values: &BTreeMap<usize, T>,
-    batches: &[mxx_gadgets::circuit::BatchedWire],
-    gate: usize,
-) -> Result<Vec<T>, CircuitCompileError> {
-    batches
-        .iter()
-        .flat_map(|batch| batch.gate_ids())
-        .map(|input| {
-            values
-                .get(&input.index())
-                .cloned()
-                .ok_or(CircuitCompileError::MissingInput { gate, input: input.index() })
-        })
-        .collect()
-}
-
-fn insert_call_outputs<T>(
-    values: &mut BTreeMap<usize, T>,
-    output_ids: &[GateId],
-    outputs: Vec<T>,
-    gate: usize,
-) -> Result<(), CircuitCompileError> {
-    if output_ids.len() != outputs.len() {
-        return Err(CircuitCompileError::InvalidArity { gate });
-    }
-    values.extend(output_ids.iter().map(|id| id.index()).zip(outputs));
-    Ok(())
-}
-
-fn lookup_unary<'a, T>(
-    values: &'a BTreeMap<usize, T>,
-    gate: &mxx_gadgets::circuit::PolyGate,
-) -> Result<&'a T, CircuitCompileError> {
-    let [input] = gate.input_gates.as_slice() else {
-        return Err(CircuitCompileError::InvalidArity { gate: gate.gate_id.index() });
-    };
-    values.get(&input.index()).ok_or(CircuitCompileError::MissingInput {
-        gate: gate.gate_id.index(),
-        input: input.index(),
-    })
-}
-
-fn scalar_u32(
-    builder: &mut GraphBuilder,
-    gate: usize,
-    source: &GateParamSource<Vec<u32>>,
-    ambient: &mxx_ir_core::types::MatrixType,
-) -> Result<crate::MatrixWire, CircuitCompileError> {
-    let GateParamSource::Const(coefficients) = source else {
-        return Err(CircuitCompileError::MissingGateContext {
-            gate,
-            kind: "parameterized small scalar multiplication",
-        });
-    };
-    Ok(builder.constant_polynomial(
-        scalar_type(ambient),
-        coefficients.iter().map(|value| BigInt::from(*value)),
-    ))
-}
-
-fn scalar_biguint(
-    builder: &mut GraphBuilder,
-    gate: usize,
-    source: &GateParamSource<Vec<num_bigint::BigUint>>,
-    ambient: &mxx_ir_core::types::MatrixType,
-) -> Result<crate::MatrixWire, CircuitCompileError> {
-    let GateParamSource::Const(coefficients) = source else {
-        return Err(CircuitCompileError::MissingGateContext {
-            gate,
-            kind: "parameterized large scalar multiplication",
-        });
-    };
-    Ok(builder.constant_polynomial(
-        scalar_type(ambient),
-        coefficients.iter().map(|value| BigInt::from(value.clone())),
-    ))
 }
 
 fn scalar_type(ambient: &mxx_ir_core::types::MatrixType) -> mxx_ir_core::types::MatrixType {
@@ -880,74 +1105,15 @@ fn scalar_type(ambient: &mxx_ir_core::types::MatrixType) -> mxx_ir_core::types::
     }
 }
 
-fn lookup_binary<'a, T>(
-    values: &'a BTreeMap<usize, T>,
-    gate: &mxx_gadgets::circuit::PolyGate,
-) -> Result<[&'a T; 2], CircuitCompileError> {
-    let [lhs, rhs] = gate.input_gates.as_slice() else {
-        return Err(CircuitCompileError::InvalidArity { gate: gate.gate_id.index() });
-    };
-    Ok([
-        values.get(&lhs.index()).ok_or(CircuitCompileError::MissingInput {
-            gate: gate.gate_id.index(),
-            input: lhs.index(),
-        })?,
-        values.get(&rhs.index()).ok_or(CircuitCompileError::MissingInput {
-            gate: gate.gate_id.index(),
-            input: rhs.index(),
-        })?,
-    ])
-}
-
-fn collect_outputs<P: Poly, T: Clone>(
-    circuit: &PolyCircuit<P>,
-    values: &BTreeMap<usize, T>,
-) -> Result<Vec<T>, CircuitCompileError> {
-    circuit
-        .output_gate_ids()
-        .iter()
-        .map(|id| {
-            values
-                .get(&id.index())
-                .cloned()
-                .ok_or(CircuitCompileError::MissingInput { gate: id.index(), input: id.index() })
-        })
-        .collect()
-}
-
-fn gate_kind_name(kind: &PolyGateType) -> &'static str {
-    match kind {
-        PolyGateType::Input => "input",
-        PolyGateType::Add => "add",
-        PolyGateType::Sub => "sub",
-        PolyGateType::Mul => "mul",
-        PolyGateType::SmallScalarMul { .. } => "small scalar multiplication",
-        PolyGateType::LargeScalarMul { .. } => "large scalar multiplication",
-        PolyGateType::SlotTransfer { .. } => "slot transfer",
-        PolyGateType::SlotReduce { .. } => "slot reduction",
-        PolyGateType::PubLut { .. } => "public lookup",
-        PolyGateType::SubCircuitOutput { .. } => "sub-circuit call",
-        PolyGateType::SummedSubCircuitOutput { .. } => "summed sub-circuit call",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_gadgets::bgg::{encoding::BggEncoding, public_key::BggPublicKey};
-    use mxx_ir_core::{IntExpr, ParamEnv, types::MatrixType};
-    use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{
-            Poly, PolyParams,
-            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        },
+    use mxx_gadgets::{PolyElem, circuit::PublicLut};
+    use mxx_ir_core::{IntExpr, types::MatrixType};
+    use mxx_primitives::poly::{
+        PolyParams,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
-    use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
-    };
-    use num_bigint::Sign;
 
     struct NoAdvancedGates;
 
@@ -957,10 +1123,10 @@ mod tests {
             _builder: &mut GraphBuilder,
             _input: &W,
             _source_slots: &[(u32, Option<u32>)],
-            gate: GateId,
+            gate: GateInstance<'_>,
         ) -> Result<W, CircuitCompileError> {
             Err(CircuitCompileError::MissingGateContext {
-                gate: gate.index(),
+                gate: gate.local_gate().index(),
                 kind: "slot transfer",
             })
         }
@@ -970,10 +1136,10 @@ mod tests {
             _builder: &mut GraphBuilder,
             _inputs: &[W],
             _slot_count: usize,
-            gate: GateId,
+            gate: GateInstance<'_>,
         ) -> Result<W, CircuitCompileError> {
             Err(CircuitCompileError::MissingGateContext {
-                gate: gate.index(),
+                gate: gate.local_gate().index(),
                 kind: "slot reduction",
             })
         }
@@ -984,12 +1150,64 @@ mod tests {
             _circuit: &PolyCircuit<DCRTPoly>,
             _lookup_id: usize,
             _input: &W,
-            gate: GateId,
+            gate: GateInstance<'_>,
         ) -> Result<W, CircuitCompileError> {
             Err(CircuitCompileError::MissingGateContext {
-                gate: gate.index(),
+                gate: gate.local_gate().index(),
                 kind: "public lookup",
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAdvancedGates {
+        slot_instances: Vec<(Vec<usize>, usize, usize)>,
+        lookup_instances: Vec<(Vec<usize>, usize, usize)>,
+    }
+
+    impl AdvancedGateLowering<DCRTPoly, BggPublicKeyWire> for RecordingAdvancedGates {
+        fn slot_transfer(
+            &mut self,
+            _builder: &mut GraphBuilder,
+            input: &BggPublicKeyWire,
+            _source_slots: &[(u32, Option<u32>)],
+            gate: GateInstance<'_>,
+        ) -> Result<BggPublicKeyWire, CircuitCompileError> {
+            self.slot_instances.push((
+                gate.call_path().to_vec(),
+                gate.local_gate().index(),
+                gate.operation_occurrence(),
+            ));
+            Ok(input.clone())
+        }
+
+        fn slot_reduce(
+            &mut self,
+            _builder: &mut GraphBuilder,
+            _inputs: &[BggPublicKeyWire],
+            _slot_count: usize,
+            gate: GateInstance<'_>,
+        ) -> Result<BggPublicKeyWire, CircuitCompileError> {
+            Err(CircuitCompileError::MissingGateContext {
+                gate: gate.local_gate().index(),
+                kind: "slot reduction",
+            })
+        }
+
+        fn public_lookup(
+            &mut self,
+            _builder: &mut GraphBuilder,
+            _circuit: &PolyCircuit<DCRTPoly>,
+            _lookup_id: usize,
+            input: &BggPublicKeyWire,
+            gate: GateInstance<'_>,
+        ) -> Result<BggPublicKeyWire, CircuitCompileError> {
+            self.lookup_instances.push((
+                gate.call_path().to_vec(),
+                gate.local_gate().index(),
+                gate.operation_occurrence(),
+            ));
+            Ok(input.clone())
         }
     }
 
@@ -1000,31 +1218,6 @@ mod tests {
             rows: IntExpr::constant(rows),
             columns: IntExpr::constant(columns),
         }
-    }
-
-    fn dcrt_matrix_type(parameters: &DCRTPolyParams, rows: usize, columns: usize) -> MatrixType {
-        let modulus: std::sync::Arc<num_bigint::BigUint> = parameters.modulus().into();
-        MatrixType {
-            modulus: IntExpr::constant(BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
-            rows: IntExpr::constant(rows),
-            columns: IntExpr::constant(columns),
-        }
-    }
-
-    fn polynomial_row(
-        parameters: &DCRTPolyParams,
-        columns: usize,
-        offset: usize,
-    ) -> DCRTPolyMatrix {
-        DCRTPolyMatrix::from_poly_vec(
-            parameters,
-            vec![
-                (0..columns)
-                    .map(|index| DCRTPoly::const_rotate_poly(parameters, index + offset))
-                    .collect(),
-            ],
-        )
     }
 
     #[test]
@@ -1041,10 +1234,19 @@ mod tests {
         parent.output(outputs);
 
         let mut builder = GraphBuilder::new("subcircuit", Vec::new());
-        let one = BggPublicKeyWire { matrix: builder.input("one", matrix_type(2, 10)) };
+        let one = BggPublicKeyWire {
+            matrix: builder.input("one", matrix_type(2, 10)),
+            reveal_plaintext: true,
+        };
         let inputs = [
-            BggPublicKeyWire { matrix: builder.input("left", matrix_type(2, 10)) },
-            BggPublicKeyWire { matrix: builder.input("right", matrix_type(2, 10)) },
+            BggPublicKeyWire {
+                matrix: builder.input("left", matrix_type(2, 10)),
+                reveal_plaintext: true,
+            },
+            BggPublicKeyWire {
+                matrix: builder.input("right", matrix_type(2, 10)),
+                reveal_plaintext: true,
+            },
         ];
         let compiler = PolyCircuitCompiler {
             public_key: BggPublicKeyCompiler {
@@ -1062,17 +1264,209 @@ mod tests {
             )
             .expect("sub-circuit should lower");
         assert_eq!(output.len(), 1);
-        builder.output("result", &output[0].matrix);
+        builder.output("result", &output[0].matrix, ArtifactConfidentiality::Public);
         let graph = builder.finish();
         assert!(matches!(
-            graph.nodes.last().expect("add node").kind,
+            graph.nodes[graph.nodes.len() - 2].kind,
             mxx_ir_core::node::NodeKind::SubgraphCall(_)
+        ));
+        assert!(matches!(
+            graph.nodes.last().expect("output node").kind,
+            mxx_ir_core::node::NodeKind::Output { .. }
         ));
         let add_template = graph.subgraphs.get("bgg-public-key-add").expect("shared add template");
         assert!(add_template.nodes.iter().any(|node| matches!(
             node.kind,
             mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Add)
         )));
+    }
+
+    #[test]
+    fn advanced_lowering_receives_distinct_scoped_gate_instances() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let child_input = child.input(1).as_single_wire();
+        let transferred = child.slot_transfer_gate(child_input, &[(0, None)]);
+        child.output([transferred]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let child_id = circuit.register_sub_circuit(child);
+        let first = circuit.call_sub_circuit(child_id, [input]);
+        let second = circuit.call_sub_circuit(child_id, [input]);
+        circuit.output([first[0], second[0]]);
+
+        let mut builder = GraphBuilder::new("scoped-advanced-lowering", Vec::new());
+        let one = BggPublicKeyWire {
+            matrix: builder.input("one", matrix_type(2, 10)),
+            reveal_plaintext: true,
+        };
+        let input = BggPublicKeyWire {
+            matrix: builder.input("input", matrix_type(2, 10)),
+            reveal_plaintext: true,
+        };
+        let compiler = PolyCircuitCompiler {
+            public_key: BggPublicKeyCompiler {
+                base: IntExpr::constant(2),
+                decomposed_type: matrix_type(10, 10),
+            },
+        };
+        let mut lowering = RecordingAdvancedGates::default();
+        let outputs = compiler
+            .compile_public_keys_with_lowering(&mut builder, &circuit, one, [input], &mut lowering)
+            .expect("advanced circuit should lower");
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(lowering.slot_instances.len(), 2);
+        assert_ne!(lowering.slot_instances[0].0, lowering.slot_instances[1].0);
+        assert!(lowering.slot_instances.iter().all(|(_, _, occurrence)| *occurrence == 0));
+    }
+
+    #[test]
+    fn composite_advanced_lowering_routes_lookup_and_slot_gates_to_separate_delegates() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let transferred = circuit.slot_transfer_gate(input, &[(0, None)]);
+        let lookup_id = circuit.register_public_lookup(PublicLut::new(
+            &parameters,
+            2,
+            |parameters: &DCRTPolyParams, input| {
+                Some((input, <DCRTPoly as Poly>::Elem::constant(&parameters.modulus(), input)))
+            },
+            None,
+        ));
+        let looked_up = circuit.public_lookup_gate(transferred, lookup_id);
+        circuit.output([looked_up]);
+
+        let mut builder = GraphBuilder::new("composite-advanced-lowering", Vec::new());
+        let one = BggPublicKeyWire {
+            matrix: builder.input("one", matrix_type(2, 10)),
+            reveal_plaintext: true,
+        };
+        let input = BggPublicKeyWire {
+            matrix: builder.input("input", matrix_type(2, 10)),
+            reveal_plaintext: true,
+        };
+        let compiler = PolyCircuitCompiler {
+            public_key: BggPublicKeyCompiler {
+                base: IntExpr::constant(2),
+                decomposed_type: matrix_type(10, 10),
+            },
+        };
+        let mut lowering = CompositeAdvancedGateLowering::new(
+            RecordingAdvancedGates::default(),
+            RecordingAdvancedGates::default(),
+        );
+        let outputs = compiler
+            .compile_public_keys_with_lowering(&mut builder, &circuit, one, [input], &mut lowering)
+            .expect("mixed advanced circuit should lower");
+        assert_eq!(outputs.len(), 1);
+
+        let (lookup, slots) = lowering.into_parts();
+        assert_eq!(lookup.lookup_instances.len(), 1);
+        assert!(lookup.slot_instances.is_empty());
+        assert_eq!(slots.slot_instances.len(), 1);
+        assert!(slots.lookup_instances.is_empty());
+    }
+
+    #[test]
+    fn context_free_compilers_reject_advanced_gates_before_lowering() {
+        let mut slot_transfer = PolyCircuit::<DCRTPoly>::new();
+        let input = slot_transfer.input(1).as_single_wire();
+        let output = slot_transfer.slot_transfer_gate(input, &[(0, None)]);
+        slot_transfer.output([output]);
+
+        let mut slot_reduce = PolyCircuit::<DCRTPoly>::new();
+        let input = slot_reduce.input(1).as_single_wire();
+        let output = slot_reduce.slot_reduce_gate(&[input], 1);
+        slot_reduce.output([output]);
+
+        let mut public_lookup = PolyCircuit::<DCRTPoly>::new();
+        let input = public_lookup.input(1).as_single_wire();
+        let output = public_lookup.public_lookup_gate(input, 0);
+        public_lookup.output([output]);
+
+        let mut nested_child = PolyCircuit::<DCRTPoly>::new();
+        let input = nested_child.input(1).as_single_wire();
+        let output = nested_child.slot_transfer_gate(input, &[(0, None)]);
+        nested_child.output([output]);
+        let mut nested = PolyCircuit::<DCRTPoly>::new();
+        let input = nested.input(1).as_single_wire();
+        let child = nested.register_sub_circuit(nested_child);
+        let output = nested.call_sub_circuit(child, [input]);
+        nested.output(output);
+
+        let compiler = PolyCircuitCompiler {
+            public_key: BggPublicKeyCompiler {
+                base: IntExpr::constant(2),
+                decomposed_type: matrix_type(10, 10),
+            },
+        };
+        for circuit in [slot_transfer, slot_reduce, public_lookup, nested] {
+            assert!(circuit.requires_advanced_lowering());
+
+            let mut builder = GraphBuilder::new("context-free-public-key", Vec::new());
+            let one = BggPublicKeyWire {
+                matrix: builder.input("one", matrix_type(2, 10)),
+                reveal_plaintext: true,
+            };
+            let input = BggPublicKeyWire {
+                matrix: builder.input("input", matrix_type(2, 10)),
+                reveal_plaintext: true,
+            };
+            assert!(matches!(
+                compiler.compile_public_keys(&mut builder, &circuit, one, [input]),
+                Err(CircuitCompileError::AdvancedGateContextRequired)
+            ));
+            assert_eq!(builder.finish().nodes.len(), 2);
+
+            let mut builder = GraphBuilder::new("context-free-encoding", Vec::new());
+            let one = BggEncodingWire {
+                vector: builder.input("one_vector", matrix_type(1, 10)),
+                pubkey: BggPublicKeyWire {
+                    matrix: builder.input("one_pubkey", matrix_type(2, 10)),
+                    reveal_plaintext: false,
+                },
+                plaintext: None,
+            };
+            let input = BggEncodingWire {
+                vector: builder.input("input_vector", matrix_type(1, 10)),
+                pubkey: BggPublicKeyWire {
+                    matrix: builder.input("input_pubkey", matrix_type(2, 10)),
+                    reveal_plaintext: false,
+                },
+                plaintext: None,
+            };
+            assert!(matches!(
+                compiler.compile_encodings(&mut builder, &circuit, one, [input]),
+                Err(CircuitCompileError::AdvancedGateContextRequired)
+            ));
+            assert_eq!(builder.finish().nodes.len(), 4);
+
+            let mut builder = GraphBuilder::new("context-free-poly-encoding", Vec::new());
+            let one_vector = builder.input("one_vector", matrix_type(1, 10));
+            let one = BggPolyEncodingWire {
+                vectors: builder.family_pack(&[one_vector]).expect("one vector family"),
+                pubkey: BggPublicKeyWire {
+                    matrix: builder.input("one_pubkey", matrix_type(2, 10)),
+                    reveal_plaintext: false,
+                },
+                plaintexts: None,
+            };
+            let input_vector = builder.input("input_vector", matrix_type(1, 10));
+            let input = BggPolyEncodingWire {
+                vectors: builder.family_pack(&[input_vector]).expect("input vector family"),
+                pubkey: BggPublicKeyWire {
+                    matrix: builder.input("input_pubkey", matrix_type(2, 10)),
+                    reveal_plaintext: false,
+                },
+                plaintexts: None,
+            };
+            assert!(matches!(
+                compiler.compile_poly_encodings(&mut builder, &circuit, one, [input]),
+                Err(CircuitCompileError::AdvancedGateContextRequired)
+            ));
+            assert_eq!(builder.finish().nodes.len(), 6);
+        }
     }
 
     #[test]
@@ -1084,10 +1478,19 @@ mod tests {
         circuit.output([second]);
 
         let mut builder = GraphBuilder::new("template-reuse", Vec::new());
-        let one = BggPublicKeyWire { matrix: builder.input("one", matrix_type(2, 10)) };
+        let one = BggPublicKeyWire {
+            matrix: builder.input("one", matrix_type(2, 10)),
+            reveal_plaintext: true,
+        };
         let supplied = [
-            BggPublicKeyWire { matrix: builder.input("left", matrix_type(2, 10)) },
-            BggPublicKeyWire { matrix: builder.input("right", matrix_type(2, 10)) },
+            BggPublicKeyWire {
+                matrix: builder.input("left", matrix_type(2, 10)),
+                reveal_plaintext: true,
+            },
+            BggPublicKeyWire {
+                matrix: builder.input("right", matrix_type(2, 10)),
+                reveal_plaintext: true,
+            },
         ];
         let compiler = PolyCircuitCompiler {
             public_key: BggPublicKeyCompiler {
@@ -1097,7 +1500,7 @@ mod tests {
         };
         let output =
             compiler.compile_public_keys(&mut builder, &circuit, one, supplied).expect("circuit");
-        builder.output("result", &output[0].matrix);
+        builder.output("result", &output[0].matrix, ArtifactConfidentiality::Public);
         let graph = builder.finish();
         assert_eq!(graph.subgraphs.len(), 1);
         assert!(graph.subgraphs.contains_key("bgg-public-key-add"));
@@ -1109,103 +1512,5 @@ mod tests {
                 .count(),
             2
         );
-    }
-
-    #[test]
-    fn encoding_multiplication_template_matches_the_concrete_evaluable_operation() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let columns = parameters.modulus_digits();
-        let row_type = dcrt_matrix_type(&parameters, 1, columns);
-        let scalar_type = dcrt_matrix_type(&parameters, 1, 1);
-        let decomposed_type = dcrt_matrix_type(&parameters, columns, columns);
-        let mut builder = GraphBuilder::new("encoding-template-conformance", Vec::new());
-        let lhs = BggEncodingWire {
-            vector: builder.input("lhs_vector", row_type.clone()),
-            pubkey: BggPublicKeyWire { matrix: builder.input("lhs_pubkey", row_type.clone()) },
-            plaintext: Some(builder.input("lhs_plaintext", scalar_type.clone())),
-        };
-        let rhs = BggEncodingWire {
-            vector: builder.input("rhs_vector", row_type.clone()),
-            pubkey: BggPublicKeyWire { matrix: builder.input("rhs_pubkey", row_type.clone()) },
-            plaintext: Some(builder.input("rhs_plaintext", scalar_type)),
-        };
-        let compiler = BggEncodingCompiler {
-            public_key: BggPublicKeyCompiler {
-                base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
-                decomposed_type,
-            },
-        };
-        let output = compile_encoding_binary_template(
-            &mut builder,
-            &compiler,
-            MatrixBinaryOp::Multiply,
-            &lhs,
-            &rhs,
-            0,
-        )
-        .expect("multiplication template");
-        builder.output("vector", &output.vector);
-        builder.output("pubkey", &output.pubkey.matrix);
-        builder.output("plaintext", output.plaintext.as_ref().expect("revealed plaintext"));
-        let graph = builder.finish();
-        assert_eq!(graph.subgraphs.len(), 1);
-        let elaborated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
-
-        let lhs_vector = polynomial_row(&parameters, columns, 0);
-        let lhs_pubkey = polynomial_row(&parameters, columns, 1);
-        let rhs_vector = polynomial_row(&parameters, columns, 2);
-        let rhs_pubkey = polynomial_row(&parameters, columns, 3);
-        let lhs_plaintext = DCRTPoly::const_rotate_poly(&parameters, 1);
-        let rhs_plaintext = DCRTPoly::const_rotate_poly(&parameters, 2);
-        let expected = BggEncoding::new(
-            lhs_vector.clone(),
-            BggPublicKey::new(lhs_pubkey.clone(), true),
-            Some(lhs_plaintext.clone()),
-        ) * &BggEncoding::new(
-            rhs_vector.clone(),
-            BggPublicKey::new(rhs_pubkey.clone(), true),
-            Some(rhs_plaintext.clone()),
-        );
-        let mut backend = cpu_backend([parameters.clone()]);
-        let mut store = MemoryArtifactStore::default();
-        let result = execute(
-            &elaborated,
-            &mut backend,
-            BTreeMap::from([
-                ("lhs_vector".to_owned(), RuntimeValue::Matrix(lhs_vector)),
-                ("lhs_pubkey".to_owned(), RuntimeValue::Matrix(lhs_pubkey)),
-                (
-                    "lhs_plaintext".to_owned(),
-                    RuntimeValue::Matrix(DCRTPolyMatrix::from_poly_vec(
-                        &parameters,
-                        vec![vec![lhs_plaintext]],
-                    )),
-                ),
-                ("rhs_vector".to_owned(), RuntimeValue::Matrix(rhs_vector)),
-                ("rhs_pubkey".to_owned(), RuntimeValue::Matrix(rhs_pubkey)),
-                (
-                    "rhs_plaintext".to_owned(),
-                    RuntimeValue::Matrix(DCRTPolyMatrix::from_poly_vec(
-                        &parameters,
-                        vec![vec![rhs_plaintext]],
-                    )),
-                ),
-            ]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .expect("execution");
-        let RuntimeValue::Matrix(vector) = &result.outputs["vector"] else {
-            panic!("vector output")
-        };
-        let RuntimeValue::Matrix(pubkey) = &result.outputs["pubkey"] else {
-            panic!("pubkey output")
-        };
-        let RuntimeValue::Matrix(plaintext) = &result.outputs["plaintext"] else {
-            panic!("plaintext output")
-        };
-        assert_eq!(vector, &expected.vector);
-        assert_eq!(pubkey, &expected.pubkey.matrix);
-        assert_eq!(plaintext.entry(0, 0), expected.plaintext.expect("plaintext"));
     }
 }

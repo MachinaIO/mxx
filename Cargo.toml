@@ -41,7 +41,6 @@ itertools = "0.14.0"
 keccak-asm = "0.1.4"
 libc = "0.2"
 memory-stats = "1.2.0"
-memmap2 = "0.9.5"
 num-bigint = { version = "0.4.6", features = ["serde", "rand"] }
 num-integer = "0.1"
 num-traits = "0.2.19"

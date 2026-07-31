@@ -162,6 +162,14 @@ unsafe extern "C" {
         lhs: *const GpuMatrixOpaque,
         scalar: *const GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_crt_recompose(
+        out: *mut GpuMatrixOpaque,
+        levels: *const *const GpuMatrixOpaque,
+        level_count: usize,
+        plaintext_moduli: *const u64,
+        reconstruction_residues: *const u64,
+        reconstruction_stride: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_copy_block(
         out: *mut GpuMatrixOpaque,
         src: *const GpuMatrixOpaque,

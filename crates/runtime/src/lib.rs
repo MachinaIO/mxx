@@ -3,8 +3,17 @@
 pub mod artifact;
 pub mod backend;
 pub mod executor;
+pub mod filesystem_store;
 pub mod liveness;
+pub mod session;
 pub mod transcript;
 
 pub use backend::{Backend, RuntimeValue};
-pub use executor::{ExecutionError, ExecutionResult, ExecutionTrace, execute, execute_with_trace};
+pub use executor::{
+    ExecutionConfig, ExecutionError, ExecutionResult, ExecutionTrace, StagedFamilyLease, execute,
+    execute_in_session, execute_in_session_with_config, execute_with_config, execute_with_trace,
+};
+pub use filesystem_store::{FilesystemArtifactStore, FilesystemStoreError};
+pub use session::{
+    ArtifactHandle, SessionAliasDescriptor, SessionDescriptor, SessionStatus, SessionStore,
+};

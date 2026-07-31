@@ -17,3 +17,4 @@
 #include "MatrixSampling.cu"
 #include "MatrixTrapdoor.cu"
 #include "MatrixSerde.cu"
+#include "MatrixCrt.cu"

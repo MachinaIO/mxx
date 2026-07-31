@@ -1,13 +1,9 @@
-pub mod diamond_we;
+// Diamond WE is disabled pending a separate application cutover to the current
+// BGG Graph IR and runtime APIs.
+// pub mod diamond_we;
 
-pub(crate) use mxx_gadgets::{
-    bench_estimator, bgg, circuit, env, input_injector, lookup, simulator, slot_transfer, utils,
-};
-pub(crate) use mxx_primitives::{matrix, poly, sampler};
-
-use crate::{circuit::PolyCircuit, poly::Poly};
-
-pub use diamond_we::{DiamondWE, DiamondWECiphertext};
+use mxx_gadgets::circuit::PolyCircuit;
+use mxx_primitives::poly::Poly;
 
 /// Common interface for witness encryption schemes.
 pub trait WitnessEnc<P: Poly> {

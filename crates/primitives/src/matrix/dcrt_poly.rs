@@ -17,9 +17,6 @@ use std::{io::Read, ops::Range, path::Path};
 
 use super::base::BaseMatrix;
 
-#[cfg(feature = "disk")]
-use super::base::disk::map_file_mut;
-
 impl MatrixParams for DCRTPolyParams {
     fn entry_size(&self) -> usize {
         let log_q_bytes = self.modulus_bits().div_ceil(8);
@@ -50,6 +47,10 @@ pub type DCRTPolyMatrix = BaseMatrix<DCRTPoly>;
 
 impl PolyMatrix for DCRTPolyMatrix {
     type P = DCRTPoly;
+
+    fn params(&self) -> &DCRTPolyParams {
+        &self.params
+    }
 
     fn from_poly_vec(params: &DCRTPolyParams, vec: Vec<Vec<DCRTPoly>>) -> Self {
         let nrow = vec.len();
@@ -333,20 +334,7 @@ impl PolyMatrix for DCRTPolyMatrix {
         matrix
     }
     fn set_entry(&mut self, i: usize, j: usize, elem: Self::P) {
-        #[cfg(not(feature = "disk"))]
-        {
-            self.inner[i][j] = elem;
-        }
-        #[cfg(feature = "disk")]
-        {
-            let entry_size = self.params.entry_size();
-            let offset = (i * self.ncol + j) * entry_size;
-            let bytes = elem.as_elem_to_bytes();
-            unsafe {
-                let mut mmap = map_file_mut(&self.file, offset, entry_size);
-                mmap.copy_from_slice(&bytes);
-            }
-        }
+        self.inner[i][j] = elem;
     }
 
     fn into_compact_bytes(self) -> Vec<u8> {

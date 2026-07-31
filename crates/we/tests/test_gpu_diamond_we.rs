@@ -4,6 +4,10 @@ mod support;
 use support as workspace_deps;
 
 use keccak_asm::Keccak256;
+use mxx_runtime::{
+    FilesystemArtifactStore,
+    artifact::{ArtifactKey, ArtifactStore},
+};
 use num_bigint::BigUint;
 use std::{
     env, fs,
@@ -387,7 +391,7 @@ fn gpu_params_for_crt_depth(
         cpu_params.ring_dimension(),
         moduli,
         cpu_params.base_bits(),
-        gpu_ids,
+        vec![gpu_ids[0]],
         Some(1),
     );
     assert_eq!(gpu_params.modulus(), cpu_params.modulus());
@@ -746,6 +750,15 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
     init_storage_system(final_dir.clone());
     let diamond =
         build_gpu_diamond_we(&cfg, gpu_params.clone(), gpu_ids.clone(), final_dir.clone());
+    assert_eq!(
+        diamond.injector.params.device_ids().len(),
+        1,
+        "the base parameter object intentionally covers one device for this regression"
+    );
+    assert_eq!(
+        diamond.injector.gpu_device_ids, gpu_ids,
+        "the production backend must honor the injector device override"
+    );
     let gpu_circuit = build_circuit::<GpuDCRTPoly>(cfg.circuit_height);
 
     info!("starting DiamondWE GPU public-key bench estimator construction");
@@ -787,37 +800,52 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
     info!(msg, "starting DiamondWE GPU enc");
     let ct = diamond.enc(&msg, gpu_circuit.clone(), &instance);
     gpu_device_sync();
-    let one_preimage_path = fs::read_dir(&final_dir)
-        .expect("DiamondWE artifact directory should be readable")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-                name.starts_with("diamond_we_session_") &&
-                    name.contains("_we_one_preimage") &&
-                    name.ends_with(".matrixbin")
-            })
-        })
-        .expect("session-qualified one-preimage artifact should exist");
-    fs::remove_file(&one_preimage_path)
-        .expect("test should remove one saved preimage to simulate interruption");
-    fs::remove_file(final_dir.join("diamond_we_enc_complete"))
-        .expect("test should remove the encryption completion marker");
+    let graph_store_dir = final_dir.join("graph-runtime");
+    let mut graph_store = FilesystemArtifactStore::open(&graph_store_dir)
+        .expect("DiamondWE runtime store should open");
+    let first_manifest = graph_store
+        .load_manifest(&ct.production_id)
+        .expect("DiamondWE production manifest should exist");
+    assert_eq!(
+        first_manifest.artifacts["we_witness_preimages_chunk_0"].family_count,
+        Some(cfg.witness_size),
+        "witness preimages must be a typed runtime family"
+    );
+    assert_eq!(
+        first_manifest.artifacts["diamond_transition_level_1_state_0_chunk_0"].family_count,
+        Some(cfg.input_base()),
+        "transition preimages must be a typed runtime family"
+    );
+    let damaged_key = ArtifactKey {
+        production: ct.production_id.clone(),
+        name: "diamond_transition_level_1_state_0_chunk_0".to_owned(),
+        index: Some(0),
+    };
+    let damaged_descriptor = first_manifest.artifacts[&damaged_key.name].clone();
+    graph_store
+        .remove_staged(&damaged_key)
+        .expect("fault injection should remove one committed family member");
+    assert!(
+        graph_store.load(&damaged_key, &damaged_descriptor).is_err(),
+        "fault injection must leave the committed session incomplete"
+    );
+    drop(graph_store);
     let resumed_ct = diamond.enc(&msg, gpu_circuit, &instance);
     gpu_device_sync();
     assert_eq!(resumed_ct.hash_key, ct.hash_key);
-    assert!(one_preimage_path.exists());
+    assert_eq!(resumed_ct.production_id, ct.production_id);
     assert_eq!(
-        fs::read_dir(&final_dir)
-            .expect("DiamondWE artifact directory should be readable")
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry.file_name().to_string_lossy().ends_with("_storage_accounting.json")
-            })
-            .count(),
-        1,
-        "the resumed session must publish one actual-byte accounting artifact"
+        FilesystemArtifactStore::open(&graph_store_dir)
+            .expect("reopen DiamondWE runtime store")
+            .load_manifest(&resumed_ct.production_id)
+            .expect("replayed production manifest should exist"),
+        first_manifest,
+        "the public retry must replay one immutable runtime production"
     );
+    FilesystemArtifactStore::open(&graph_store_dir)
+        .expect("reopen repaired DiamondWE runtime store")
+        .load(&damaged_key, &damaged_descriptor)
+        .expect("the retry must repair the missing committed family member");
     info!("starting DiamondWE GPU dec");
     let _expected_msg_guard =
         EnvVarGuard::set("DIAMOND_WE_GPU_BENCH_EXPECTED_MSG", if msg { "true" } else { "false" });

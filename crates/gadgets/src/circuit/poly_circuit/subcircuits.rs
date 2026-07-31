@@ -1,5 +1,4 @@
 use super::*;
-use std::path::Path;
 
 impl<P: Poly> PolyCircuit<P> {
     pub(crate) fn inherit_shared_registries(
@@ -78,24 +77,6 @@ impl<P: Poly> PolyCircuit<P> {
             self.sub_circuit_registry = Arc::clone(&sub_circuit_registry);
         }
         self.allow_register_lookup = false;
-    }
-
-    pub(crate) fn registry_handles(&self) -> PolyCircuitRegistryHandles<P> {
-        PolyCircuitRegistryHandles {
-            lookup_registry: Arc::clone(&self.lookup_registry),
-            binding_registry: Arc::clone(&self.binding_registry),
-            input_set_registry: Arc::clone(&self.input_set_registry),
-            sub_circuit_registry: Arc::clone(&self.sub_circuit_registry),
-        }
-    }
-
-    pub(crate) fn inherit_registry_handles(&mut self, handles: &PolyCircuitRegistryHandles<P>) {
-        self.inherit_shared_registries(
-            Arc::clone(&handles.lookup_registry),
-            Arc::clone(&handles.binding_registry),
-            Arc::clone(&handles.input_set_registry),
-            Arc::clone(&handles.sub_circuit_registry),
-        );
     }
 
     fn import_sub_circuit_to_registry(
@@ -199,56 +180,6 @@ impl<P: Poly> PolyCircuit<P> {
         }
     }
 
-    pub(crate) fn with_sub_circuit_call_inputs_by_id<T>(
-        &self,
-        call_id: usize,
-        f: impl FnOnce(&[BatchedWire], &[BatchedWire]) -> T,
-    ) -> T {
-        let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
-        self.with_sub_circuit_call_inputs(call, f)
-    }
-
-    pub(crate) fn with_sub_circuit_call_by_id<T>(
-        &self,
-        call_id: usize,
-        f: impl FnOnce(
-            usize,
-            Arc<[SubCircuitParamValue]>,
-            &[BatchedWire],
-            &[BatchedWire],
-            &[GateId],
-        ) -> T,
-    ) -> T {
-        let call = self.sub_circuit_calls.get(&call_id).expect("sub-circuit call missing");
-        let param_bindings = self.binding_set(call.binding_set_id);
-        self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
-            f(call.sub_circuit_id, param_bindings, shared_prefix, suffix, &call.output_gate_ids)
-        })
-    }
-
-    pub(crate) fn sub_circuit_call_shared_prefix_set_id(&self, call_id: usize) -> Option<usize> {
-        self.sub_circuit_calls
-            .get(&call_id)
-            .expect("sub-circuit call missing")
-            .shared_input_prefix_set_id
-    }
-
-    pub(crate) fn for_each_summed_sub_circuit_call_input(
-        &self,
-        summed_call_id: usize,
-        mut f: impl FnMut(GateId),
-    ) {
-        let call = self
-            .summed_sub_circuit_calls
-            .get(&summed_call_id)
-            .expect("summed sub-circuit call missing");
-        for input_set_id in &call.call_input_set_ids {
-            for input_id in iter_batched_wire_gates(self.input_set(*input_set_id).as_ref()) {
-                f(input_id);
-            }
-        }
-    }
-
     fn collect_sub_circuit_call_inputs(&self, call: &SubCircuitCall) -> Vec<BatchedWire> {
         self.with_sub_circuit_call_inputs(call, |shared_prefix, suffix| {
             let mut inputs = Vec::with_capacity(shared_prefix.len() + suffix.len());
@@ -266,6 +197,7 @@ impl<P: Poly> PolyCircuit<P> {
             inputs: self.collect_sub_circuit_call_inputs(call),
             param_bindings: self.binding_set(call.binding_set_id),
             input_max_plaintext_norm_ranges: call.input_max_plaintext_norm_ranges.clone(),
+            scoped_call_id: call.scoped_call_id,
             output_gate_ids: call.output_gate_ids.clone(),
         }
     }
@@ -295,25 +227,9 @@ impl<P: Poly> PolyCircuit<P> {
             call_inputs,
             param_bindings,
             input_max_plaintext_norm_ranges: call.input_max_plaintext_norm_ranges.clone(),
+            scoped_call_ids: call.scoped_call_ids.clone(),
             output_gate_ids: call.output_gate_ids.clone(),
         }
-    }
-
-    pub(crate) fn with_summed_sub_circuit_call_by_id<T>(
-        &self,
-        summed_call_id: usize,
-        f: impl FnOnce(usize, &[usize], &[usize], &[GateId]) -> T,
-    ) -> T {
-        let call = self
-            .summed_sub_circuit_calls
-            .get(&summed_call_id)
-            .expect("summed sub-circuit call missing");
-        f(
-            call.sub_circuit_id,
-            &call.call_input_set_ids,
-            &call.call_binding_set_ids,
-            &call.output_gate_ids,
-        )
     }
 
     pub fn register_sub_circuit_param(&mut self, spec: SubCircuitParamSpec) -> usize {
@@ -337,43 +253,6 @@ impl<P: Poly> PolyCircuit<P> {
             "sub-circuit parameter kind mismatch for param {param_id}: expected {:?}, got {:?}",
             expected, actual
         );
-    }
-
-    pub(crate) fn simulator_param_bindings(&self) -> Arc<[SubCircuitParamValue]> {
-        Arc::from(
-            self.sub_circuit_params
-                .iter()
-                .map(SubCircuitParamSpec::simulator_binding)
-                .collect::<Vec<_>>(),
-        )
-    }
-
-    pub(crate) fn sub_circuit_input_max_plaintext_norm_ranges(
-        &self,
-    ) -> Option<&[SubCircuitInputMaxPlaintextNormRange]> {
-        self.sub_circuit_input_max_plaintext_norm_ranges.as_deref()
-    }
-
-    pub(crate) fn sub_circuit_call_input_max_plaintext_norm_ranges(
-        &self,
-        call_id: usize,
-    ) -> Option<&[SubCircuitInputMaxPlaintextNormRange]> {
-        self.sub_circuit_calls
-            .get(&call_id)
-            .expect("sub-circuit call missing")
-            .input_max_plaintext_norm_ranges
-            .as_deref()
-    }
-
-    pub(crate) fn summed_sub_circuit_call_input_max_plaintext_norm_ranges(
-        &self,
-        summed_call_id: usize,
-    ) -> Option<&[SubCircuitInputMaxPlaintextNormRange]> {
-        self.summed_sub_circuit_calls
-            .get(&summed_call_id)
-            .expect("summed sub-circuit call missing")
-            .input_max_plaintext_norm_ranges
-            .as_deref()
     }
 
     fn validate_sub_circuit_input_max_plaintext_norm_ranges(
@@ -498,13 +377,6 @@ impl<P: Poly> PolyCircuit<P> {
         }
         total
     }
-
-    /// Compatibility no-op.
-    ///
-    /// Older callers can still opt into "disk" storage, but sub-circuits are now stored only as
-    /// shared in-memory `Arc<PolyCircuit<_>>` values. Keeping this method avoids a broader API
-    /// churn outside the current refactor scope.
-    pub fn enable_subcircuits_in_disk(&mut self, _dir_path: impl AsRef<Path>) {}
 
     pub fn register_sub_circuit<T>(&mut self, sub_circuit: T) -> usize
     where

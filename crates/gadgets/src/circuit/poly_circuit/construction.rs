@@ -30,12 +30,6 @@ impl<P: Poly> PolyCircuit<P> {
         }
     }
 
-    pub(crate) fn new_with_registry_handles(handles: &PolyCircuitRegistryHandles<P>) -> Self {
-        let mut circuit = Self::new();
-        circuit.inherit_registry_handles(handles);
-        circuit
-    }
-
     /// Get number of inputs
     pub fn num_input(&self) -> usize {
         self.num_input

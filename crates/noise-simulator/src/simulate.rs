@@ -506,6 +506,20 @@ impl Evaluator<'_> {
                     false,
                 ))
             }
+            DefExpr::ConstantCoefficient { input, .. } => {
+                let value = self.eval_atom(input)?;
+                let zero_rows = (value.poly_norm.norm.is_zero() &&
+                    value.zero_rows == Some(value.nrow))
+                .then_some(atom.matrix_type.rows);
+                Ok(PolyMatrixNorm::from_parts(
+                    atom.matrix_type.rows,
+                    atom.matrix_type.columns,
+                    value.poly_norm.into_constant_poly(),
+                    zero_rows,
+                    value.deps,
+                    false,
+                ))
+            }
             DefExpr::Indicator { .. } => Ok(PolyMatrixNorm::from_parts(
                 1,
                 1,
@@ -527,9 +541,9 @@ impl Evaluator<'_> {
                 atom: atom.id.clone(),
                 reason: "tensor is unsupported in the initial simulator".to_owned(),
             }),
-            DefExpr::ModDownImage { .. } | DefExpr::ModUpLift { .. } => {
-                Err(SimulationError::MixedBoundedAtom(atom.id.clone()))
-            }
+            DefExpr::ModDownImage { .. } |
+            DefExpr::ModUpLift { .. } |
+            DefExpr::CrtRecompose { .. } => Err(SimulationError::MixedBoundedAtom(atom.id.clone())),
         }
     }
 
@@ -1000,6 +1014,43 @@ mod tests {
             report.outputs["out"].noise.as_ref().expect("noise").bound,
             BigDecimal::from(26u64)
         );
+    }
+
+    #[test]
+    fn constant_coefficient_preserves_bound_and_dependency_as_constant_polynomial() {
+        let graph = graph(
+            "constant-coefficient",
+            vec![
+                Node {
+                    id: NodeId(1),
+                    kind: NodeKind::GaussianSample {
+                        matrix_type: matrix_type(1, 1),
+                        sigma: rational(4),
+                    },
+                    args: Vec::new(),
+                },
+                Node {
+                    id: NodeId(2),
+                    kind: NodeKind::ConstantCoefficient { position: IntExpr::constant(2) },
+                    args: vec![wire(1, 0)],
+                },
+            ],
+            wire(2, 0),
+        );
+        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
+        let report = simulate(&elaborated).expect("simulation");
+        let noise = report.outputs["out"].noise.as_ref().expect("noise");
+        assert_eq!(noise.bound, BigDecimal::from(26u64));
+        assert!(noise.is_const_poly);
+        assert_eq!(
+            noise.dependencies,
+            DependencySet::singleton(stable_source_id(&AtomId::Local {
+                instantiation_path: Vec::new(),
+                node: NodeId(1),
+                port: 0,
+            }))
+        );
+        assert!(!noise.clt_ready);
     }
 
     #[test]

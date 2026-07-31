@@ -70,6 +70,7 @@ struct GpuMatrix
 #endif
 
 #include "matrix/MatrixArith.cuh"
+#include "matrix/MatrixCrt.cuh"
 #include "matrix/MatrixData.cuh"
 #include "matrix/MatrixDecompose.cuh"
 #include "matrix/MatrixNTT.cuh"

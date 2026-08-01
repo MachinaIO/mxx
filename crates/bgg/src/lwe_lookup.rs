@@ -1066,6 +1066,10 @@ mod tests {
             1
         );
         let producer_symbolic = producer.elaborate(&ParamEnv::default()).expect("producer IR");
+        let producer_noise =
+            mxx_noise_simulator::simulate(&producer_symbolic).expect("producer noise simulation");
+        assert!(producer_noise.outputs.contains_key(&names.low_matrices));
+        assert!(producer_noise.outputs.contains_key(&names.high_matrices));
         let producer = producer.validate(&ParamEnv::default()).expect("validated producer");
         let mut store = MemoryArtifactStore::default();
         let mut producer_backend = cpu_backend([parameters.clone()]);
@@ -1196,6 +1200,9 @@ mod tests {
                 &[symbolic_manifest],
             )
             .expect("consumer symbolic IR");
+        let consumer_noise =
+            mxx_noise_simulator::simulate(&consumer_symbolic).expect("consumer noise simulation");
+        assert!(consumer_noise.outputs.contains_key("vector"));
         let output_expression = consumer_symbolic
             .wire(&consumer_symbolic.outputs["vector"])
             .and_then(|wire| wire.expression)

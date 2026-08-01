@@ -1846,3 +1846,169 @@ fn atom_belongs_to_scope(atom: &AtomId, scope: &FrozenGraphScopeId) -> bool {
         AtomId::Local(reference) | AtomId::TrapdoorPublic(reference) if &reference.scope == scope
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mxx_ir_core::{
+        GraphOutput, IntExpr, NodeHandle, ValueHandle, WireType,
+        graph::Graph,
+        node::{ConcatAxis, NodeKind},
+        types::MatrixType,
+    };
+    use std::collections::BTreeMap;
+
+    fn matrix_type(rows: i64, columns: i64) -> MatrixType {
+        MatrixType {
+            modulus: IntExpr::constant(257),
+            ring_dimension: IntExpr::constant(8),
+            rows: IntExpr::constant(rows),
+            columns: IntExpr::constant(columns),
+        }
+    }
+
+    fn input(name: &str, rows: i64, columns: i64) -> ValueHandle {
+        let wire_type = WireType::Matrix(matrix_type(rows, columns));
+        NodeHandle::new(
+            NodeKind::Input { name: name.to_owned(), wire_type: wire_type.clone(), artifact: None },
+            Vec::new(),
+            vec![wire_type],
+        )
+        .output(0)
+        .expect("matrix input")
+    }
+
+    fn value(
+        kind: NodeKind,
+        arguments: Vec<ValueHandle>,
+        output_types: Vec<WireType>,
+    ) -> ValueHandle {
+        NodeHandle::new(kind, arguments, output_types).output(0).expect("node output")
+    }
+
+    fn graph(name: &str, outputs: impl IntoIterator<Item = (&'static str, ValueHandle)>) -> Graph {
+        Graph::freeze(
+            name,
+            Vec::new(),
+            outputs
+                .into_iter()
+                .map(|(name, value)| {
+                    (name.to_owned(), GraphOutput { value, confidentiality: None })
+                })
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze graph")
+        .0
+    }
+
+    fn output_node<'a>(graph: &'a ElaboratedGraph, name: &str) -> &'a SymbolicExprNode {
+        let expression = graph
+            .wire(&graph.outputs[name])
+            .and_then(|wire| wire.expression)
+            .expect("matrix output expression");
+        &graph.expressions.get(expression).expect("expression record").node
+    }
+
+    #[test]
+    fn active_structural_nodes_elaborate_to_typed_symbolic_nodes() {
+        let rectangular = input("rectangular", 2, 3);
+        let transposed = value(
+            NodeKind::Transpose,
+            vec![rectangular.clone()],
+            vec![WireType::Matrix(matrix_type(3, 2))],
+        );
+        let reshaped = value(
+            NodeKind::Reshape { rows: IntExpr::constant(1), columns: IntExpr::constant(6) },
+            vec![rectangular],
+            vec![WireType::Matrix(matrix_type(1, 6))],
+        );
+        let coefficient = value(
+            NodeKind::ConstantCoefficient { position: IntExpr::constant(3) },
+            vec![input("polynomial", 1, 1)],
+            vec![WireType::Matrix(matrix_type(1, 1))],
+        );
+        let concatenated = value(
+            NodeKind::Concat { axis: ConcatAxis::Rows },
+            vec![input("top", 1, 2), input("bottom", 2, 2)],
+            vec![WireType::Matrix(matrix_type(3, 2))],
+        );
+        let elaborated = elaborate(
+            &graph(
+                "active-structural-nodes",
+                [
+                    ("transpose", transposed),
+                    ("reshape", reshaped),
+                    ("coefficient", coefficient),
+                    ("concat", concatenated),
+                ],
+            ),
+            &ParamEnv::default(),
+        )
+        .expect("elaboration");
+
+        assert!(matches!(output_node(&elaborated, "transpose"), SymbolicExprNode::Transpose(_)));
+        assert!(matches!(
+            output_node(&elaborated, "reshape"),
+            SymbolicExprNode::Reshape { rows: 1, columns: 6, .. }
+        ));
+        assert!(matches!(
+            output_node(&elaborated, "coefficient"),
+            SymbolicExprNode::ConstantCoefficient { position: 3, .. }
+        ));
+        assert!(matches!(
+            output_node(&elaborated, "concat"),
+            SymbolicExprNode::Concat { axis: ConcatAxis::Rows, inputs } if inputs.len() == 2
+        ));
+    }
+
+    #[test]
+    fn crt_and_threshold_decode_elaboration_preserve_normative_metadata() {
+        let crt = value(
+            NodeKind::CrtRecompose {
+                plaintext_moduli: vec![IntExpr::constant(3), IntExpr::constant(5)],
+                reconstruction_coefficients: vec![IntExpr::constant(7), IntExpr::constant(11)],
+            },
+            vec![input("level-0", 1, 2), input("level-1", 1, 2)],
+            vec![WireType::Matrix(matrix_type(1, 2))],
+        );
+        let decode_handle = NodeHandle::new(
+            NodeKind::ThresholdDecode {
+                plaintext_modulus: IntExpr::constant(3),
+                length: IntExpr::constant(2),
+                output_bool: false,
+            },
+            vec![input("encoded", 1, 1)],
+            vec![WireType::Int, WireType::Int],
+        );
+        let decoded = decode_handle.output(0).expect("first decoded coefficient");
+        let elaborated = elaborate(
+            &graph("crt-and-decode", [("crt", crt), ("decoded", decoded)]),
+            &ParamEnv::default(),
+        )
+        .expect("elaboration");
+
+        assert!(matches!(
+            output_node(&elaborated, "crt"),
+            SymbolicExprNode::CrtRecompose {
+                plaintext_moduli,
+                reconstruction_coefficients,
+                inputs,
+            } if plaintext_moduli == &vec![BigInt::from(3), BigInt::from(5)] &&
+                reconstruction_coefficients == &vec![BigInt::from(7), BigInt::from(11)] &&
+                inputs.len() == 2
+        ));
+        assert_eq!(elaborated.decode_targets.len(), 3);
+        let decode_metadata = elaborated
+            .decode_targets
+            .iter()
+            .map(|target| (target.plaintext_modulus.clone(), target.length))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_metadata,
+            vec![(BigInt::from(3), 16), (BigInt::from(5), 16), (BigInt::from(3), 2)]
+        );
+    }
+}

@@ -574,6 +574,15 @@ mod tests {
         let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
         assert_eq!(elaborated.outputs.len(), 2);
         assert!(!elaborated.atoms.is_empty());
+        let report = mxx_noise_simulator::simulate(&elaborated).expect("noise simulation");
+        for name in ["constant", "message"] {
+            let estimate = &report.outputs[name];
+            assert!(estimate.has_signal, "{name} retains the BGG signal term");
+            assert!(
+                estimate.noise.as_ref().is_some_and(|noise| noise.bound > 0),
+                "{name} retains sampled error in the noise estimate"
+            );
+        }
     }
 
     #[test]

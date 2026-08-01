@@ -626,7 +626,11 @@ mod tests {
             .build()
             .expect("online graph");
         online_graph.validate(&ParamEnv::default()).expect("valid online graph");
-        online_graph.elaborate(&ParamEnv::default()).expect("symbolic online graph");
+        let elaborated =
+            online_graph.elaborate(&ParamEnv::default()).expect("symbolic online graph");
+        let report = mxx_noise_simulator::simulate(&elaborated).expect("noise simulation");
+        assert!(report.outputs.contains_key("vectors"));
+        assert!(report.outputs.contains_key("public-keys"));
     }
 
     #[test]

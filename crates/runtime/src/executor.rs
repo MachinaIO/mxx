@@ -2881,7 +2881,17 @@ mod tests {
     use super::*;
     use crate::{artifact::MemoryArtifactStore, backend::poly::cpu_backend};
     use mxx_dsl::{DslContext, Family, MatType, Parallel, Ring, Subgraph};
-    use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
+    use mxx_ir_core::{
+        Graph, GraphOutput, NodeHandle, RealExpr, ValueHandle, WireType,
+        node::{IntBinaryOp, IntCompareOp, NodeKind, RealBinaryOp},
+    };
+    use mxx_primitives::{
+        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        poly::{
+            Poly, PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+    };
     use num_bigint::{BigInt, Sign};
 
     #[test]
@@ -2917,6 +2927,50 @@ mod tests {
             _ => panic!("range output is not a family"),
         }
         result.cleanup_staged(&mut store).expect("staged cleanup");
+    }
+
+    #[test]
+    fn empty_range_loop_elaborates_and_executes_without_phantom_members() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let family = Parallel::range(0)
+            .map(|index| ring.polynomial([index.expression()]))
+            .expect("empty range loop");
+        let built = DslContext::new("runtime-empty-range")
+            .family_output("values", family)
+            .expect("output")
+            .build()
+            .expect("build");
+        let symbolic = built.elaborate(&ParamEnv::default()).expect("elaboration");
+        let output = symbolic.wire(&symbolic.outputs["values"]).expect("symbolic output");
+        assert!(output.family.is_some());
+        let validated = built.validate(&ParamEnv::default()).expect("validation");
+        let result = execute(
+            &validated,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        match &result.outputs["values"] {
+            RuntimeValue::IndexedFamily(values) => assert!(values.is_empty()),
+            RuntimeValue::StagedArtifactFamily { descriptor, .. } |
+            RuntimeValue::LazyArtifactFamily { descriptor, .. } => {
+                assert_eq!(descriptor.family_count, Some(0));
+            }
+            RuntimeValue::Int(_) => panic!("empty range output became an integer"),
+            RuntimeValue::Real(_) => panic!("empty range output became a real"),
+            RuntimeValue::Bool(_) => panic!("empty range output became a bool"),
+            RuntimeValue::Bytes(_) => panic!("empty range output became bytes"),
+            RuntimeValue::TypedBlob(_) => panic!("empty range output became a blob"),
+            RuntimeValue::Matrix(_) => panic!("empty range output became a matrix"),
+            RuntimeValue::Trapdoor { .. } => panic!("empty range output became a trapdoor"),
+            RuntimeValue::LazyArtifact { .. } | RuntimeValue::StagedArtifact { .. } => {
+                panic!("empty range output became a scalar artifact")
+            }
+        }
     }
 
     #[test]
@@ -2977,5 +3031,291 @@ mod tests {
             bytes(&result.outputs["actual-family-one"]),
             bytes(&result.outputs["expected-family-one"]),
         );
+    }
+
+    fn matrix_output<'a>(
+        result: &'a ExecutionResult<crate::backend::poly::CpuDcrtBackend>,
+        name: &str,
+    ) -> &'a DCRTPolyMatrix {
+        let RuntimeValue::Matrix(value) = &result.outputs[name] else {
+            panic!("{name} is not a matrix")
+        };
+        value
+    }
+
+    #[test]
+    fn transcript_replay_and_trace_preserve_sampled_execution_exactly() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let sample = ring.gaussian((1, 1), 3);
+        let built = DslContext::new("runtime-transcript-and-trace")
+            .output("sample", sample.clone())
+            .expect("sample output")
+            .output("double", sample.clone() + sample)
+            .expect("double output")
+            .build()
+            .expect("build");
+        let validated = built.validate(&ParamEnv::default()).expect("validation");
+
+        let mut recorder = crate::transcript::TranscriptRecorder::default();
+        let mut backend = cpu_backend([parameters.clone()]);
+        let mut store = MemoryArtifactStore::default();
+        let (recorded, trace) = execute_with_trace(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Record(&mut recorder),
+        )
+        .expect("recorded execution");
+        assert_eq!(recorder.iter().count(), 1);
+        assert!(trace.len() >= 2, "trace must retain the sample and dependent sum");
+
+        let replayer = recorder.into_replayer();
+        let replayed = execute(
+            &validated,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Replay(&replayer),
+        )
+        .expect("replayed execution");
+        assert_eq!(matrix_output(&recorded, "sample"), matrix_output(&replayed, "sample"));
+        assert_eq!(matrix_output(&recorded, "double"), matrix_output(&replayed, "double"));
+    }
+
+    #[test]
+    fn resumable_session_reuses_draws_and_rejects_changed_inputs() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let sampled = DslContext::new("runtime-resumable-sample")
+            .private_output("sample", ring.gaussian((1, 1), 3))
+            .expect("private sample")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let nonce = [47u8; 32];
+        let mut store = MemoryArtifactStore::default();
+        let first = execute_in_session(
+            &sampled,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut store,
+            nonce,
+        )
+        .expect("first session execution");
+        let second = execute_in_session(
+            &sampled,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut store,
+            nonce,
+        )
+        .expect("resumed session execution");
+        assert_eq!(first.production_id, second.production_id);
+        assert_eq!(matrix_output(&first, "sample"), matrix_output(&second, "sample"));
+
+        let input = ring.input("input", (1, 1));
+        let input_graph = DslContext::new("runtime-session-input-identity")
+            .private_output("output", input)
+            .expect("private output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut input_store = MemoryArtifactStore::default();
+        let zero = DCRTPolyMatrix::zero(&parameters, 1, 1);
+        execute_in_session(
+            &input_graph,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::from([("input".to_owned(), RuntimeValue::matrix(zero))]),
+            &mut input_store,
+            [53u8; 32],
+        )
+        .expect("initial input session");
+        let one = DCRTPolyMatrix::identity(&parameters, 1, None);
+        assert!(matches!(
+            execute_in_session(
+                &input_graph,
+                &mut cpu_backend([parameters.clone()]),
+                BTreeMap::from([("input".to_owned(), RuntimeValue::matrix(one))]),
+                &mut input_store,
+                [53u8; 32],
+            ),
+            Err(ExecutionError::Artifact(_))
+        ));
+    }
+
+    fn scalar_value(
+        kind: NodeKind,
+        arguments: Vec<ValueHandle>,
+        output_type: WireType,
+    ) -> ValueHandle {
+        NodeHandle::new(kind, arguments, vec![output_type]).output(0).expect("scalar output")
+    }
+
+    #[test]
+    fn scalar_nodes_follow_euclidean_and_real_arithmetic_contracts() {
+        let minus_seven = scalar_value(
+            NodeKind::ConstantInt(BigInt::from(-7)),
+            Vec::new(),
+            WireType::ConstantInt,
+        );
+        let three =
+            scalar_value(NodeKind::ConstantInt(BigInt::from(3)), Vec::new(), WireType::ConstantInt);
+        let quotient = scalar_value(
+            NodeKind::IntBinary(IntBinaryOp::Divide),
+            vec![minus_seven.clone(), three.clone()],
+            WireType::Int,
+        );
+        let remainder = scalar_value(
+            NodeKind::IntBinary(IntBinaryOp::Remainder),
+            vec![minus_seven.clone(), three.clone()],
+            WireType::Int,
+        );
+        let less = scalar_value(
+            NodeKind::IntCompare(IntCompareOp::Less),
+            vec![minus_seven, three],
+            WireType::Bool,
+        );
+        let nine = scalar_value(
+            NodeKind::ConstantReal(RealExpr::from_integer(9)),
+            Vec::new(),
+            WireType::ConstantReal,
+        );
+        let square_root = scalar_value(NodeKind::RealSqrt, vec![nine], WireType::Real);
+        let two = scalar_value(
+            NodeKind::ConstantReal(RealExpr::from_integer(2)),
+            Vec::new(),
+            WireType::ConstantReal,
+        );
+        let real_product = scalar_value(
+            NodeKind::RealBinary(RealBinaryOp::Multiply),
+            vec![square_root.clone(), two],
+            WireType::Real,
+        );
+        let graph = Graph::freeze(
+            "runtime-scalar-contracts",
+            Vec::new(),
+            BTreeMap::from([
+                ("quotient".to_owned(), GraphOutput { value: quotient, confidentiality: None }),
+                ("remainder".to_owned(), GraphOutput { value: remainder, confidentiality: None }),
+                ("less".to_owned(), GraphOutput { value: less, confidentiality: None }),
+                ("sqrt".to_owned(), GraphOutput { value: square_root, confidentiality: None }),
+                ("product".to_owned(), GraphOutput { value: real_product, confidentiality: None }),
+            ]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze")
+        .0;
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let result = execute(
+            &validated,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        assert!(
+            matches!(&result.outputs["quotient"], RuntimeValue::Int(value) if value == &BigInt::from(-3))
+        );
+        assert!(
+            matches!(&result.outputs["remainder"], RuntimeValue::Int(value) if value == &BigInt::from(2))
+        );
+        assert!(matches!(&result.outputs["less"], RuntimeValue::Bool(true)));
+        assert!(
+            matches!(&result.outputs["sqrt"], RuntimeValue::Real(value) if (*value - 3.0).abs() < 1e-12)
+        );
+        assert!(
+            matches!(&result.outputs["product"], RuntimeValue::Real(value) if (*value - 6.0).abs() < 1e-12)
+        );
+    }
+
+    #[test]
+    fn integer_division_by_zero_is_a_runtime_error() {
+        let one =
+            scalar_value(NodeKind::ConstantInt(BigInt::from(1)), Vec::new(), WireType::ConstantInt);
+        let zero =
+            scalar_value(NodeKind::ConstantInt(BigInt::from(0)), Vec::new(), WireType::ConstantInt);
+        let quotient =
+            scalar_value(NodeKind::IntBinary(IntBinaryOp::Divide), vec![one, zero], WireType::Int);
+        let graph = Graph::freeze(
+            "runtime-division-by-zero",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: quotient, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze")
+        .0;
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
+        assert!(matches!(
+            execute(
+                &validated,
+                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+            ),
+            Err(ExecutionError::DivisionByZero(_))
+        ));
+    }
+
+    #[test]
+    fn dynamic_family_access_selects_the_runtime_index_and_rejects_out_of_range() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let family = Family::pack(vec![ring.polynomial([10.into()]), ring.polynomial([20.into()])])
+            .expect("family");
+        let selected = family.get(ring.input("index", (1, 1)).extract_coefficient(0));
+        let validated = DslContext::new("runtime-dynamic-family")
+            .output("selected", selected)
+            .expect("output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let index_value = |index| {
+            DCRTPolyMatrix::from_poly_vec(
+                &parameters,
+                vec![vec![DCRTPoly::from_usize_to_constant(&parameters, index)]],
+            )
+        };
+        let selected = execute(
+            &validated,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::from([("index".to_owned(), RuntimeValue::matrix(index_value(1)))]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("selected execution");
+        let expected = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            vec![vec![DCRTPoly::from_usize_to_constant(&parameters, 20)]],
+        );
+        assert_eq!(matrix_output(&selected, "selected"), &expected);
+
+        assert!(matches!(
+            execute(
+                &validated,
+                &mut cpu_backend([parameters.clone()]),
+                BTreeMap::from([("index".to_owned(), RuntimeValue::matrix(index_value(2)))]),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+            ),
+            Err(ExecutionError::SelectIndexOutOfRange { index, count: 2, .. }) if index == BigInt::from(2)
+        ));
     }
 }

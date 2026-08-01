@@ -3124,6 +3124,29 @@ mod tests {
     }
 
     #[test]
+    fn assume_rejects_type_mismatches_and_duplicate_targets() {
+        let ring = Ring::new(17, 8);
+        let target = ring.input("target", (1, 1));
+        let wrong_shape = VirtualMat::large("wrong", matrix_type(1, 2));
+        assert!(matches!(target.clone().assume(wrong_shape), Err(DslError::AssumptionType)));
+
+        let first = target
+            .clone()
+            .assume(VirtualMat::large("first", matrix_type(1, 1)))
+            .expect("first assumption");
+        let second = target
+            .assume(VirtualMat::large("second", matrix_type(1, 1)))
+            .expect("second assumption handle");
+        let result = DslContext::new("duplicate-assumption")
+            .output("first", first)
+            .expect("first output")
+            .output("second", second)
+            .expect("second output")
+            .build();
+        assert!(matches!(result, Err(DslError::DuplicateAssumption)));
+    }
+
+    #[test]
     fn executable_zero_roots_and_products_elaborate_to_typed_zero() {
         let ring = Ring::new(17, 8);
         let root = ring.zero((2, 3));

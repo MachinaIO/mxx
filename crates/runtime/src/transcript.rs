@@ -38,10 +38,14 @@ pub enum TranscriptError {
 
 impl TranscriptRecorder {
     pub fn record(&mut self, site: DrawSite, value: RecordedValue) -> Result<(), TranscriptError> {
-        if self.entries.insert(site.clone(), value).is_some() {
-            Err(TranscriptError::Duplicate(site))
-        } else {
-            Ok(())
+        match self.entries.entry(site.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(value);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(TranscriptError::Duplicate(site))
+            }
         }
     }
 
@@ -68,4 +72,51 @@ pub enum SamplingMode<'a> {
     Fresh,
     Record(&'a mut TranscriptRecorder),
     Replay(&'a TranscriptReplayer),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn site(node: u64) -> DrawSite {
+        DrawSite { instantiation_path: Vec::new(), node: NodeId(node), port: Port(0) }
+    }
+
+    fn value() -> RecordedValue {
+        RecordedValue::Matrix {
+            matrix_type: ConcreteMatrixType {
+                modulus: 17.into(),
+                ring_dimension: 8,
+                rows: 1,
+                columns: 1,
+            },
+            bytes: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn recorder_rejects_duplicate_draw_sites_without_replacing_the_original() {
+        let mut recorder = TranscriptRecorder::default();
+        recorder.record(site(1), value()).expect("first record");
+        let replacement = RecordedValue::Matrix {
+            matrix_type: ConcreteMatrixType {
+                modulus: 17.into(),
+                ring_dimension: 8,
+                rows: 1,
+                columns: 1,
+            },
+            bytes: vec![9],
+        };
+        assert_eq!(recorder.record(site(1), replacement), Err(TranscriptError::Duplicate(site(1))));
+        assert_eq!(recorder.into_replayer().get(&site(1)).cloned(), Ok(value()));
+    }
+
+    #[test]
+    fn replayer_reports_the_exact_missing_draw_site() {
+        let missing = site(7);
+        assert_eq!(
+            TranscriptReplayer::default().get(&missing),
+            Err(TranscriptError::Missing(missing))
+        );
+    }
 }

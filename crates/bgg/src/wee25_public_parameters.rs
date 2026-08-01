@@ -334,6 +334,9 @@ mod tests {
             .build()
             .expect("build");
         built.validate(&ParamEnv::default()).expect("validate");
-        built.elaborate(&ParamEnv::default()).expect("elaborate");
+        let symbolic = built.elaborate(&ParamEnv::default()).expect("elaborate");
+        let report = mxx_noise_simulator::simulate(&symbolic).expect("simulate");
+        assert!(!report.outputs.is_empty());
+        assert!(!report.outputs.contains_key(WEE25_PUBLIC_B_TRAPDOOR));
     }
 }

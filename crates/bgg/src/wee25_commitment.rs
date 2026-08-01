@@ -283,7 +283,9 @@ mod tests {
             .build()
             .expect("build");
         built.validate(&ParamEnv::default()).expect("validate");
-        built.elaborate(&ParamEnv::default()).expect("elaborate");
+        let symbolic = built.elaborate(&ParamEnv::default()).expect("elaborate");
+        let report = mxx_noise_simulator::simulate(&symbolic).expect("simulate");
+        assert!(!report.outputs.is_empty());
     }
 
     #[test]

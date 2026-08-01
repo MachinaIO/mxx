@@ -1284,6 +1284,219 @@ fn node_error<T>(
     Err(ValidationError::Node { scope: scope.clone(), node, message: message.to_owned() })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        graph::{GraphOutput, ValueHandle},
+        node::SampleRange,
+    };
+
+    fn matrix_type(modulus: i64, rows: i64, columns: i64) -> MatrixType {
+        MatrixType {
+            modulus: IntExpr::constant(modulus),
+            ring_dimension: IntExpr::constant(8),
+            rows: IntExpr::constant(rows),
+            columns: IntExpr::constant(columns),
+        }
+    }
+
+    fn input(name: &str, matrix_type: MatrixType) -> ValueHandle {
+        let wire_type = WireType::Matrix(matrix_type);
+        NodeHandle::new(
+            NodeKind::Input { name: name.to_owned(), wire_type: wire_type.clone(), artifact: None },
+            Vec::new(),
+            vec![wire_type],
+        )
+        .output(0)
+        .expect("matrix input")
+    }
+
+    fn value(
+        kind: NodeKind,
+        arguments: Vec<ValueHandle>,
+        output_types: Vec<WireType>,
+    ) -> ValueHandle {
+        NodeHandle::new(kind, arguments, output_types).output(0).expect("node has an output")
+    }
+
+    fn graph(name: &str, output: ValueHandle) -> Graph {
+        Graph::freeze(
+            name,
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze graph")
+        .0
+    }
+
+    fn node_message(error: ValidationError) -> String {
+        match error {
+            ValidationError::Node { message, .. } => message,
+            other => panic!("expected node validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matrix_arithmetic_rejects_shape_and_ring_mismatches() {
+        let left = input("left", matrix_type(17, 1, 2));
+        let right = input("right", matrix_type(17, 2, 1));
+        let sum = value(
+            NodeKind::MatrixBinary(MatrixBinaryOp::Add),
+            vec![left, right],
+            vec![WireType::Matrix(matrix_type(17, 1, 2))],
+        );
+        assert!(matches!(
+            validate(&graph("shape-mismatch", sum), &ParamEnv::default()),
+            Err(ValidationError::Check(CheckError::ShapeMismatch { .. }))
+        ));
+
+        let left = input("left", matrix_type(17, 1, 1));
+        let right = input("right", matrix_type(19, 1, 1));
+        let product = value(
+            NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
+            vec![left, right],
+            vec![WireType::Matrix(matrix_type(17, 1, 1))],
+        );
+        assert!(matches!(
+            validate(&graph("ring-mismatch", product), &ParamEnv::default()),
+            Err(ValidationError::Check(CheckError::RingMismatch))
+        ));
+    }
+
+    #[test]
+    fn samplers_and_structural_views_reject_invalid_parameters() {
+        let gaussian_type = matrix_type(17, 1, 1);
+        let gaussian = value(
+            NodeKind::GaussianSample {
+                matrix_type: gaussian_type.clone(),
+                sigma: crate::RealExpr::from_integer(-1),
+            },
+            Vec::new(),
+            vec![WireType::Matrix(gaussian_type)],
+        );
+        assert!(
+            node_message(
+                validate(&graph("negative-gaussian", gaussian), &ParamEnv::default()).unwrap_err()
+            )
+            .contains("Gaussian sigma")
+        );
+
+        let uniform_type = matrix_type(17, 1, 1);
+        let uniform = value(
+            NodeKind::UniformSample {
+                matrix_type: uniform_type.clone(),
+                range: SampleRange { minimum: IntExpr::constant(2), maximum: IntExpr::constant(1) },
+            },
+            Vec::new(),
+            vec![WireType::Matrix(uniform_type)],
+        );
+        assert_eq!(
+            node_message(
+                validate(&graph("empty-uniform", uniform), &ParamEnv::default()).unwrap_err()
+            ),
+            "uniform sample range is empty"
+        );
+
+        let source = input("source", matrix_type(17, 2, 2));
+        let reshape = value(
+            NodeKind::Reshape { rows: IntExpr::constant(3), columns: IntExpr::constant(1) },
+            vec![source],
+            vec![WireType::Matrix(matrix_type(17, 3, 1))],
+        );
+        assert_eq!(
+            node_message(
+                validate(&graph("invalid-reshape", reshape), &ParamEnv::default()).unwrap_err()
+            ),
+            "reshape changes the element count"
+        );
+    }
+
+    #[test]
+    fn crt_and_decode_validate_all_metadata_against_the_input_type() {
+        let level = input("level", matrix_type(257, 1, 2));
+        let crt = value(
+            NodeKind::CrtRecompose {
+                plaintext_moduli: vec![IntExpr::constant(3), IntExpr::constant(5)],
+                reconstruction_coefficients: vec![IntExpr::constant(1)],
+            },
+            vec![level.clone()],
+            vec![WireType::Matrix(matrix_type(257, 1, 2))],
+        );
+        assert_eq!(
+            node_message(validate(&graph("invalid-crt", crt), &ParamEnv::default()).unwrap_err()),
+            "CRT metadata count does not match inputs"
+        );
+
+        let decode = NodeHandle::new(
+            NodeKind::ThresholdDecode {
+                plaintext_modulus: IntExpr::constant(1),
+                length: IntExpr::constant(9),
+                output_bool: false,
+            },
+            vec![level],
+            vec![WireType::Int; 9],
+        )
+        .output(0)
+        .expect("decode output");
+        assert_eq!(
+            node_message(
+                validate(&graph("invalid-decode", decode), &ParamEnv::default()).unwrap_err()
+            ),
+            "invalid threshold decoding parameters"
+        );
+    }
+
+    #[test]
+    fn family_validation_rejects_heterogeneous_members_and_warns_for_dynamic_indices() {
+        let left = input("left", matrix_type(17, 1, 1));
+        let right = input("right", matrix_type(17, 2, 1));
+        let heterogeneous = value(
+            NodeKind::FamilyPack { count: IntExpr::constant(2) },
+            vec![left, right],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Matrix(matrix_type(17, 1, 1))),
+                count: IntExpr::constant(2),
+            }],
+        );
+        assert_eq!(
+            node_message(
+                validate(&graph("heterogeneous-family", heterogeneous), &ParamEnv::default())
+                    .unwrap_err()
+            ),
+            "family members must have one non-family type"
+        );
+
+        let first = input("first", matrix_type(17, 1, 1));
+        let second = input("second", matrix_type(17, 1, 1));
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(matrix_type(17, 1, 1))),
+            count: IntExpr::constant(2),
+        };
+        let family = value(
+            NodeKind::FamilyPack { count: IntExpr::constant(2) },
+            vec![first, second],
+            vec![family_type],
+        );
+        let index =
+            value(NodeKind::ConstantInt(BigInt::from(1)), Vec::new(), vec![WireType::ConstantInt]);
+        let selected = value(
+            NodeKind::FamilyGetDynamic,
+            vec![family, index],
+            vec![WireType::Matrix(matrix_type(17, 1, 1))],
+        );
+        let validated = validate(&graph("dynamic-family", selected), &ParamEnv::default()).unwrap();
+        assert_eq!(validated.warnings.len(), 1);
+        assert_eq!(validated.warnings[0].kind, WarningKind::RuntimeSelectBoundsCheck);
+    }
+}
+
 fn runtime_bounds_warning(node: NodeId, message: &str) -> ElaborationWarning {
     ElaborationWarning {
         node,

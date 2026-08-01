@@ -7,7 +7,7 @@ use mxx_ir_core::{
     ScopedWireRef,
     expr::{IntExpr, ParamEnv, RealExpr},
     node::ConstantMatrix,
-    types::ConcreteMatrixType,
+    types::{ConcreteMatrixType, ConcreteWireType},
 };
 use mxx_ir_symbolic::{
     atom::{
@@ -120,6 +120,9 @@ pub fn simulate(graph: &ElaboratedGraph) -> Result<NoiseReport, SimulationError>
     for (name, wire) in &graph.outputs {
         let symbolic =
             evaluator.graph.wire(wire).ok_or_else(|| SimulationError::MissingWire(wire.clone()))?;
+        if matches!(symbolic.wire_type, ConcreteWireType::Trapdoor { .. }) {
+            continue;
+        }
         let estimate = match (symbolic.expression, symbolic.family.as_ref()) {
             (Some(expression), _) => evaluator.eval(expression, &Assignment::new())?,
             (None, Some(SymbolicFamily::ExactMembers(members))) => {

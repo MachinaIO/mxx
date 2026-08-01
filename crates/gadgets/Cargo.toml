@@ -6,7 +6,7 @@ license.workspace = true
 description = "Reusable lattice-cryptographic gadgets and protocol components for mxx"
 [features]
 default = []
-gpu = ["mxx-primitives/gpu"]
+gpu = ["mxx-primitives/gpu", "mxx-runtime/gpu"]
 
 [dependencies]
 mxx-ir-core.workspace = true

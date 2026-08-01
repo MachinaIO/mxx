@@ -14,7 +14,7 @@ use crate::{
     },
 };
 use mxx_dsl::{ConcatAxis, DslContext, GraphValue, Mat, Ring, Subgraph};
-use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange};
+use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange, validate::ValidatedGraph};
 use mxx_primitives::{
     element::PolyElem,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -278,38 +278,8 @@ pub fn execute_circuit_with_shape(
     inputs: &[DCRTPolyMatrix],
     shape: (usize, usize),
 ) -> Vec<DCRTPolyMatrix> {
-    assert_eq!(
-        circuit.sorted_input_gate_ids().len(),
-        inputs.len(),
-        "each concrete input must correspond to one circuit input wire"
-    );
-    assert_eq!(shape.0, shape.1, "runtime test wires use square matrices");
     assert!(inputs.iter().all(|input| input.size() == shape), "runtime input shape mismatch");
-    let ring = Ring::new(
-        BigInt::from(parameters.modulus().as_ref().clone()),
-        parameters.ring_dimension() as usize,
-    );
-    let input_wires = (0..inputs.len())
-        .map(|index| ring.input(format!("input-{index}"), shape))
-        .collect::<Vec<_>>();
-    let outputs = lower_circuit_structured(
-        circuit,
-        ring.identity(shape.0),
-        input_wires,
-        &mut RuntimeLowering { ring, parameters: parameters.clone(), wire_size: shape.0 },
-    )
-    .expect("runtime unit-test lowering is infallible");
-    let mut context = DslContext::new(name);
-    for (index, output) in outputs.into_iter().enumerate() {
-        context = context
-            .public_output(format!("output-{index}"), output)
-            .expect("output names are unique");
-    }
-    let graph = context
-        .build()
-        .expect("build runtime unit-test graph")
-        .validate(&ParamEnv::default())
-        .expect("validate runtime unit-test graph");
+    let graph = build_circuit_graph(name, parameters, circuit, inputs.len(), shape);
     let result = execute(
         &graph,
         &mut cpu_backend([parameters.clone()]),
@@ -330,6 +300,46 @@ pub fn execute_circuit_with_shape(
             value.as_ref().clone()
         })
         .collect()
+}
+
+pub(crate) fn build_circuit_graph(
+    name: &str,
+    parameters: &DCRTPolyParams,
+    circuit: &PolyCircuit<DCRTPoly>,
+    input_count: usize,
+    shape: (usize, usize),
+) -> ValidatedGraph {
+    assert_eq!(
+        circuit.sorted_input_gate_ids().len(),
+        input_count,
+        "each concrete input must correspond to one circuit input wire"
+    );
+    assert_eq!(shape.0, shape.1, "runtime test wires use square matrices");
+    let ring = Ring::new(
+        BigInt::from(parameters.modulus().as_ref().clone()),
+        parameters.ring_dimension() as usize,
+    );
+    let input_wires = (0..input_count)
+        .map(|index| ring.input(format!("input-{index}"), shape))
+        .collect::<Vec<_>>();
+    let outputs = lower_circuit_structured(
+        circuit,
+        ring.identity(shape.0),
+        input_wires,
+        &mut RuntimeLowering { ring, parameters: parameters.clone(), wire_size: shape.0 },
+    )
+    .expect("runtime unit-test lowering is infallible");
+    let mut context = DslContext::new(name);
+    for (index, output) in outputs.into_iter().enumerate() {
+        context = context
+            .public_output(format!("output-{index}"), output)
+            .expect("output names are unique");
+    }
+    context
+        .build()
+        .expect("build runtime unit-test graph")
+        .validate(&ParamEnv::default())
+        .expect("validate runtime unit-test graph")
 }
 
 #[derive(Clone, Debug)]

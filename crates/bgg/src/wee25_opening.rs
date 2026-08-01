@@ -816,7 +816,9 @@ mod tests {
             .build()
             .unwrap();
         built.validate(&ParamEnv::default()).unwrap();
-        built.elaborate(&ParamEnv::default()).unwrap();
+        let symbolic = built.elaborate(&ParamEnv::default()).unwrap();
+        let report = mxx_noise_simulator::simulate(&symbolic).unwrap();
+        assert!(report.outputs.contains_key("residual"));
     }
 
     #[test]

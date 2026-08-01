@@ -14,6 +14,8 @@ pub mod utils;
 
 #[cfg(test)]
 mod test_utils;
+#[cfg(all(test, feature = "gpu"))]
+mod test_utils_gpu;
 
 // BGG-specific lookup evaluation lives in `mxx-bgg`. The WEE25
 // commitment-backed lookup evaluator is not currently implemented.

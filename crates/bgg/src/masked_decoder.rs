@@ -235,7 +235,10 @@ mod tests {
             .build()
             .expect("build preprocessing");
         preprocessing.validate(&ParamEnv::default()).expect("validate preprocessing");
-        preprocessing.elaborate(&ParamEnv::default()).expect("elaborate preprocessing");
+        let symbolic =
+            preprocessing.elaborate(&ParamEnv::default()).expect("elaborate preprocessing");
+        let report = mxx_noise_simulator::simulate(&symbolic).expect("simulate preprocessing");
+        assert!(report.outputs.contains_key(MASKED_DECODER_PREIMAGES));
 
         let state = ring.input("state", (1, compiler.decoder_columns()));
         let preimages = ring.input_family("preimages", 3, (compiler.decoder_columns(), 1));

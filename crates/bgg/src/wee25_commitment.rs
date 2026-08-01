@@ -1,19 +1,15 @@
+//! Standalone WEE25 commitment trees expressed with the declarative DSL.
+
+use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Ring};
 use mxx_ir_core::{
-    GraphBuilder, IntExpr, MatrixFamilyWire, MatrixWire, OutputFamilyError, SubgraphBuildError,
-    WireRef,
-    artifact::ArtifactConfidentiality,
-    node::{ConcatAxis, ConstantMatrix, HashVariant, IndexRange, MatrixBinaryOp},
-    types::MatrixType,
+    IntExpr,
+    node::{ConcatAxis, IndexRange},
 };
+use rayon::prelude::*;
 use thiserror::Error;
 
 const HASH_TAG_PREFIX: &[u8] = b"wee25_w_block_";
 
-/// Graph-IR compiler for the standalone WEE25 commitment tree.
-///
-/// This compiler deliberately does not implement the excluded WEE25-backed
-/// lookup evaluator. Message blocks and every internal commitment have shape
-/// `secret_size × public_columns`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Wee25CommitmentCompiler {
     pub modulus: IntExpr,
@@ -24,30 +20,28 @@ pub struct Wee25CommitmentCompiler {
     pub gadget_base: IntExpr,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Error)]
+#[derive(Debug, Error)]
 pub enum Wee25CommitmentError {
-    #[error(
-        "WEE25 dimensions, digit count, and tree base must be nonzero, with tree base at least two"
-    )]
+    #[error("WEE25 dimensions and digit count must be nonzero and tree base must be at least two")]
     InvalidLayout,
-    #[error(
-        "WEE25 message block count must be a positive power of tree_base and at least tree_base"
-    )]
+    #[error("WEE25 block count must be a positive power of tree base and at least tree base")]
     InvalidBlockCount,
     #[error(transparent)]
-    Subgraph(#[from] SubgraphBuildError),
-    #[error(transparent)]
-    OutputFamily(#[from] OutputFamilyError),
+    Dsl(#[from] DslError),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct Wee25CommitmentTreeWire {
-    pub root: MatrixWire,
-    /// Breadth-first tree order, identical to the legacy `CommitCache::node_index`.
-    pub cached_nodes: MatrixFamilyWire,
+    pub root: Mat,
+    /// Breadth-first order, matching the historical cache index.
+    pub cached_nodes: Family<Mat>,
 }
 
 impl Wee25CommitmentCompiler {
+    pub fn ring(&self) -> Ring {
+        Ring::new(self.modulus.clone(), self.ring_dimension.clone())
+    }
+
     pub fn public_columns(&self) -> usize {
         self.secret_size * (2 + self.digit_count)
     }
@@ -56,16 +50,11 @@ impl Wee25CommitmentCompiler {
         self.secret_size * self.digit_count
     }
 
-    pub fn matrix_type(&self, rows: usize, columns: usize) -> MatrixType {
-        MatrixType {
-            modulus: self.modulus.clone(),
-            ring_dimension: self.ring_dimension.clone(),
-            rows: IntExpr::constant(rows),
-            columns: IntExpr::constant(columns),
-        }
+    pub fn matrix_type(&self, rows: usize, columns: usize) -> mxx_ir_core::types::MatrixType {
+        self.ring().matrix_type((rows, columns))
     }
 
-    pub fn block_type(&self) -> MatrixType {
+    pub fn block_type(&self) -> mxx_ir_core::types::MatrixType {
         self.matrix_type(self.secret_size, self.public_columns())
     }
 
@@ -91,95 +80,108 @@ impl Wee25CommitmentCompiler {
         (remaining == self.tree_base).then_some(()).ok_or(Wee25CommitmentError::InvalidBlockCount)
     }
 
-    /// Builds the WEE25 commitment root while preserving the legacy tree order.
     pub fn commitment(
         &self,
-        builder: &mut GraphBuilder,
-        hash_key: WireRef,
-        message_blocks: &[MatrixWire],
-    ) -> Result<MatrixWire, Wee25CommitmentError> {
-        Ok(self.commitment_tree(builder, hash_key, message_blocks)?.root)
+        hash_key: Bytes,
+        message_blocks: &[Mat],
+    ) -> Result<Mat, Wee25CommitmentError> {
+        Ok(self.commitment_tree(hash_key, message_blocks)?.root)
     }
 
     pub fn commitment_tree(
         &self,
-        builder: &mut GraphBuilder,
-        hash_key: WireRef,
-        message_blocks: &[MatrixWire],
+        hash_key: Bytes,
+        message_blocks: &[Mat],
     ) -> Result<Wee25CommitmentTreeWire, Wee25CommitmentError> {
         self.validate_block_count(message_blocks.len())?;
-        if message_blocks.iter().any(|block| block.matrix_type != self.block_type()) {
+        if message_blocks.par_iter().any(|block| block.matrix_type() != &self.block_type()) {
             return Err(Wee25CommitmentError::InvalidLayout);
         }
-        let mut nodes = Vec::with_capacity(self.cache_node_count(message_blocks.len()));
-        let root = self.commit_level(
-            builder,
-            hash_key,
-            message_blocks,
-            0,
-            message_blocks.len(),
-            &mut nodes,
-        )?;
-        nodes.sort_by_key(|(index, _)| *index);
-        let cached_nodes =
-            builder.family_pack(&nodes.into_iter().map(|(_, node)| node).collect::<Vec<_>>())?;
+        let (root, mut nodes) =
+            self.commit_level(hash_key, message_blocks, 0, message_blocks.len())?;
+        nodes.par_sort_unstable_by_key(|(index, _)| *index);
+        let cached_nodes = Family::pack(nodes.into_iter().map(|(_, node)| node).collect())?;
         Ok(Wee25CommitmentTreeWire { root, cached_nodes })
     }
 
     pub fn export_commitment_tree(
         &self,
-        builder: &mut GraphBuilder,
-        tree: &Wee25CommitmentTreeWire,
-    ) {
-        builder.output("wee25_commitment", &tree.root, ArtifactConfidentiality::Public);
-        builder.output_family_wire(
-            "wee25_commitment_nodes",
-            &tree.cached_nodes,
-            ArtifactConfidentiality::Public,
-        );
+        context: DslContext,
+        tree: Wee25CommitmentTreeWire,
+    ) -> Result<DslContext, DslError> {
+        context
+            .public_output("wee25_commitment", tree.root)?
+            .public_family_output("wee25_commitment_nodes", tree.cached_nodes)
     }
 
     fn commit_level(
         &self,
-        builder: &mut GraphBuilder,
-        hash_key: WireRef,
-        blocks: &[MatrixWire],
+        hash_key: Bytes,
+        blocks: &[Mat],
         offset: usize,
         total_count: usize,
-        nodes: &mut Vec<(usize, MatrixWire)>,
-    ) -> Result<MatrixWire, Wee25CommitmentError> {
+    ) -> Result<(Mat, Vec<(usize, Mat)>), Wee25CommitmentError> {
         if blocks.len() == self.tree_base {
-            let commitment = self.call_base(builder, hash_key, blocks)?;
-            nodes.push((
-                self.cache_node_index(total_count, offset, blocks.len()),
+            let commitment = self.base_commitment(hash_key, blocks)?;
+            return Ok((
                 commitment.clone(),
+                vec![(self.cache_node_index(total_count, offset, blocks.len()), commitment)],
             ));
-            return Ok(commitment);
         }
         let child_len = blocks.len() / self.tree_base;
-        let children = blocks
+        let subtrees = blocks
             .chunks(child_len)
             .enumerate()
-            .map(|(child_index, child)| {
-                self.commit_level(
-                    builder,
-                    hash_key,
-                    child,
-                    offset + child_index * child_len,
-                    total_count,
-                    nodes,
-                )
+            .map(|(child, blocks)| {
+                self.commit_level(hash_key.clone(), blocks, offset + child * child_len, total_count)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let commitment = self.call_base(builder, hash_key, &children)?;
+        let children = subtrees.iter().map(|(root, _)| root.clone()).collect::<Vec<_>>();
+        let commitment = self.base_commitment(hash_key, &children)?;
+        let mut nodes = subtrees.into_iter().flat_map(|(_, nodes)| nodes).collect::<Vec<_>>();
         nodes.push((self.cache_node_index(total_count, offset, blocks.len()), commitment.clone()));
-        Ok(commitment)
+        Ok((commitment, nodes))
+    }
+
+    fn base_commitment(
+        &self,
+        hash_key: Bytes,
+        blocks: &[Mat],
+    ) -> Result<Mat, Wee25CommitmentError> {
+        if blocks.len() != self.tree_base {
+            return Err(Wee25CommitmentError::InvalidBlockCount);
+        }
+        let columns = self.tree_base * self.public_columns();
+        let message = Mat::concat(ConcatAxis::Columns, blocks.to_vec());
+        let decomposition = message.decompose(self.gadget_base.clone(), self.digit_count).as_mat();
+        let terms = (0..columns * self.gadget_rows())
+            .map(|index| {
+                let column = index / self.gadget_rows();
+                let digit_row = index % self.gadget_rows();
+                let mut tag = HashTag::from(HASH_TAG_PREFIX);
+                tag.push(IntExpr::constant(index));
+                let w = self.ring().hash_matrix(
+                    hash_key.clone(),
+                    tag,
+                    (self.secret_size, self.public_columns()),
+                );
+                let digit = decomposition.clone().slice(
+                    Some(IndexRange { start: digit_row.into(), end: (digit_row + 1).into() }),
+                    Some(IndexRange { start: column.into(), end: (column + 1).into() }),
+                );
+                w * digit
+            })
+            .collect::<Vec<_>>();
+        Ok(terms
+            .into_iter()
+            .reduce(|sum, term| sum + term)
+            .unwrap_or_else(|| self.ring().zero((self.secret_size, self.public_columns()))))
     }
 
     pub fn cache_node_count(&self, block_count: usize) -> usize {
-        let mut level_nodes = 1usize;
+        let mut level_nodes = 1;
         let mut level_length = block_count;
-        let mut total = 0usize;
+        let mut total = 0;
         while level_length >= self.tree_base {
             total += level_nodes;
             if level_length == self.tree_base {
@@ -193,105 +195,23 @@ impl Wee25CommitmentCompiler {
 
     pub fn cache_node_index(&self, total_count: usize, offset: usize, length: usize) -> usize {
         let mut level_length = total_count;
-        let mut level_nodes = 1usize;
-        let mut nodes_before_level = 0usize;
+        let mut level_nodes = 1;
+        let mut before = 0;
         while level_length > length {
-            nodes_before_level += level_nodes;
+            before += level_nodes;
             level_nodes *= self.tree_base;
             level_length /= self.tree_base;
         }
-        nodes_before_level + offset / length
-    }
-
-    fn call_base(
-        &self,
-        builder: &mut GraphBuilder,
-        hash_key: WireRef,
-        blocks: &[MatrixWire],
-    ) -> Result<MatrixWire, Wee25CommitmentError> {
-        debug_assert_eq!(blocks.len(), self.tree_base);
-        let mut body = GraphBuilder::new(
-            format!(
-                "wee25-commit-base-d{}-b{}-k{}",
-                self.secret_size, self.tree_base, self.digit_count
-            ),
-            Vec::new(),
-        );
-        let body_hash_key = body.bytes_input("0_hash_key", 32);
-        let body_message = body.input(
-            "1_message",
-            self.matrix_type(self.secret_size, self.tree_base * self.public_columns()),
-        );
-        let output = self.base_commitment(&mut body, body_hash_key, &body_message);
-        body.value_output_wire("0_commitment", output.wire);
-
-        let message = builder.concat(
-            ConcatAxis::Columns,
-            blocks,
-            self.matrix_type(self.secret_size, self.tree_base * self.public_columns()),
-        );
-        Ok(builder
-            .subgraph_call(body.finish(), vec![hash_key, message.wire], &[self.block_type()])?
-            .remove(0))
-    }
-
-    fn base_commitment(
-        &self,
-        builder: &mut GraphBuilder,
-        hash_key: WireRef,
-        message: &MatrixWire,
-    ) -> MatrixWire {
-        let base_columns = self.tree_base * self.public_columns();
-        let decomposition = builder.gadget_decompose_with_layout(
-            message,
-            self.gadget_base.clone(),
-            false,
-            Some(IntExpr::constant(self.digit_count)),
-            self.matrix_type(self.gadget_rows(), base_columns),
-        );
-        let mut commitment = builder.constant_matrix(self.block_type(), ConstantMatrix::Zero);
-        for column in 0..base_columns {
-            for digit_row in 0..self.gadget_rows() {
-                let block_index = column * self.gadget_rows() + digit_row;
-                let w_block = builder.hash_sample_with_encoded_tags(
-                    hash_key,
-                    self.block_type(),
-                    HashVariant::Plain,
-                    HASH_TAG_PREFIX.to_vec(),
-                    Vec::new(),
-                    Vec::new(),
-                    vec![IntExpr::constant(block_index)],
-                    None,
-                    None,
-                );
-                let digit = builder.slice(
-                    &decomposition,
-                    Some(IndexRange { start: digit_row, end: digit_row + 1 }),
-                    Some(IndexRange { start: column, end: column + 1 }),
-                    self.matrix_type(1, 1),
-                );
-                let term = builder.matrix_binary(
-                    MatrixBinaryOp::Multiply,
-                    &w_block,
-                    &digit,
-                    self.block_type(),
-                );
-                commitment = builder.matrix_binary(
-                    MatrixBinaryOp::Add,
-                    &commitment,
-                    &term,
-                    self.block_type(),
-                );
-            }
-        }
-        commitment
+        before + offset / length
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_ir_core::{ParamEnv, artifact::ArtifactConfidentiality, validate};
+    use keccak_asm::Keccak256;
+    use mxx_dsl::Parallel;
+    use mxx_ir_core::ParamEnv;
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -310,28 +230,26 @@ mod tests {
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
-    type HashSampler = DCRTPolyHashSampler<keccak_asm::Keccak256>;
-
     fn direct_base(
         compiler: &Wee25CommitmentCompiler,
         parameters: &DCRTPolyParams,
-        hash_key: [u8; 32],
+        key: [u8; 32],
         blocks: &[DCRTPolyMatrix],
     ) -> DCRTPolyMatrix {
         let refs = blocks.iter().collect::<Vec<_>>();
         let message = blocks[0].concat_columns(&refs[1..]);
-        let sampler = HashSampler::new();
+        let sampler = DCRTPolyHashSampler::<Keccak256>::new();
         let mut result =
             DCRTPolyMatrix::zero(parameters, compiler.secret_size, compiler.public_columns());
         for column in 0..message.col_size() {
             let decomposed = message.get_column_matrix_decompose(column);
             for digit_row in 0..compiler.gadget_rows() {
-                let block_index = column * compiler.gadget_rows() + digit_row;
+                let index = column * compiler.gadget_rows() + digit_row;
                 let mut tag = HASH_TAG_PREFIX.to_vec();
-                tag.extend_from_slice(&block_index.to_le_bytes());
+                tag.extend_from_slice(&index.to_le_bytes());
                 let w = sampler.sample_hash(
                     parameters,
-                    hash_key,
+                    key,
                     tag,
                     compiler.secret_size,
                     compiler.public_columns(),
@@ -344,8 +262,81 @@ mod tests {
     }
 
     #[test]
+    fn commitment_tree_builds_and_elaborates() {
+        let compiler = Wee25CommitmentCompiler {
+            modulus: 257.into(),
+            ring_dimension: 8.into(),
+            secret_size: 1,
+            tree_base: 2,
+            digit_count: 4,
+            gadget_base: 4.into(),
+        };
+        let ring = compiler.ring();
+        let blocks = (0..4)
+            .map(|index| ring.input(format!("block-{index}"), (1, compiler.public_columns())))
+            .collect::<Vec<_>>();
+        let tree =
+            compiler.commitment_tree(ring.bytes_input("hash-key", 32), &blocks).expect("tree");
+        let built = compiler
+            .export_commitment_tree(DslContext::new("wee25-commitment"), tree)
+            .expect("outputs")
+            .build()
+            .expect("build");
+        built.validate(&ParamEnv::default()).expect("validate");
+        built.elaborate(&ParamEnv::default()).expect("elaborate");
+    }
+
+    #[test]
+    fn commitment_tree_is_composable_inside_parallel_body() {
+        let compiler = Wee25CommitmentCompiler {
+            modulus: 257.into(),
+            ring_dimension: 8.into(),
+            secret_size: 1,
+            tree_base: 2,
+            digit_count: 2,
+            gadget_base: 4.into(),
+        };
+        let ring = compiler.ring();
+        let hash_key = ring.bytes_input("hash-key", 32);
+        let blocks = (0..2)
+            .map(|index| ring.input(format!("block-{index}"), (1, compiler.public_columns())))
+            .collect::<Vec<_>>();
+        let roots = Parallel::range(2)
+            .map(move |_| {
+                compiler
+                    .commitment_tree(hash_key.clone(), &blocks)
+                    .expect("commitment in parallel body")
+                    .root
+            })
+            .expect("parallel family");
+        let built = DslContext::new("wee25-parallel-composition")
+            .family_output("roots", roots)
+            .expect("family output")
+            .build()
+            .expect("build");
+        built.validate(&ParamEnv::default()).expect("validate");
+        built.elaborate(&ParamEnv::default()).expect("elaborate");
+    }
+
+    #[test]
+    fn rejects_non_power_block_count() {
+        let compiler = Wee25CommitmentCompiler {
+            modulus: 17.into(),
+            ring_dimension: 4.into(),
+            secret_size: 1,
+            tree_base: 2,
+            digit_count: 3,
+            gadget_base: 2.into(),
+        };
+        assert!(matches!(
+            compiler.validate_block_count(3),
+            Err(Wee25CommitmentError::InvalidBlockCount)
+        ));
+    }
+
+    #[test]
     #[serial_test::serial]
-    fn commitment_tree_matches_legacy_formula_exactly() {
+    fn commitment_root_and_cache_order_match_the_concrete_formula() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let compiler = Wee25CommitmentCompiler {
             modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
@@ -355,12 +346,11 @@ mod tests {
             digit_count: parameters.modulus_digits(),
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
         };
-        let hash_key = [0x37; 32];
-        let mut builder = GraphBuilder::new("wee25-commitment-tree-test", Vec::new());
-        let hash_key_wire = builder.bytes_input("hash_key", 32);
+        let key = [0x37; 32];
+        let ring = compiler.ring();
         let mut inputs = BTreeMap::from([(
-            "hash_key".to_owned(),
-            RuntimeValue::<CpuDcrtBackend>::Bytes(hash_key.to_vec()),
+            "hash-key".to_owned(),
+            RuntimeValue::<CpuDcrtBackend>::Bytes(key.to_vec()),
         )]);
         let blocks = (0..4)
             .map(|index| {
@@ -377,43 +367,42 @@ mod tests {
                             .collect(),
                     ],
                 );
-                let name = format!("message_{index}");
+                let name = format!("block-{index}");
                 inputs.insert(name.clone(), RuntimeValue::matrix(value.clone()));
-                (builder.input(name, compiler.block_type()), value)
+                (ring.input(name, (1, compiler.public_columns())), value)
             })
             .collect::<Vec<_>>();
-        let block_wires = blocks.iter().map(|(wire, _)| wire.clone()).collect::<Vec<_>>();
-        let commitment = compiler
-            .commitment(&mut builder, hash_key_wire, &block_wires)
-            .expect("valid commitment tree");
-        builder.output("commitment", &commitment, ArtifactConfidentiality::Public);
-        let graph = validate(&builder.finish(), &ParamEnv::default()).expect("valid graph");
-        let mut backend = cpu_backend([parameters.clone()]);
-        let mut store = MemoryArtifactStore::default();
-        let result = execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-            .expect("runtime execution");
-
+        let tree = compiler
+            .commitment_tree(
+                ring.bytes_input("hash-key", 32),
+                &blocks.iter().map(|(wire, _)| wire.clone()).collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let mut context = DslContext::new("wee25-parity").output("root", tree.root).unwrap();
+        for index in 0..compiler.cache_node_count(4) {
+            context = context
+                .output(format!("cache-{index}"), tree.cached_nodes.get_static(index))
+                .unwrap();
+        }
+        let built = context.build().unwrap();
+        let validated = built.validate(&ParamEnv::default()).unwrap();
+        let result = execute(
+            &validated,
+            &mut cpu_backend([parameters.clone()]),
+            inputs,
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
         let values = blocks.into_iter().map(|(_, value)| value).collect::<Vec<_>>();
-        let left = direct_base(&compiler, &parameters, hash_key, &values[..2]);
-        let right = direct_base(&compiler, &parameters, hash_key, &values[2..]);
-        let expected = direct_base(&compiler, &parameters, hash_key, &[left, right]);
-        let RuntimeValue::Matrix(actual) = &result.outputs["commitment"] else {
-            panic!("matrix commitment output");
-        };
-        assert_eq!(actual.as_ref(), &expected);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn rejects_non_power_block_count() {
-        let compiler = Wee25CommitmentCompiler {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(4),
-            secret_size: 1,
-            tree_base: 2,
-            digit_count: 3,
-            gadget_base: IntExpr::constant(2),
-        };
-        assert_eq!(compiler.validate_block_count(3), Err(Wee25CommitmentError::InvalidBlockCount));
+        let left = direct_base(&compiler, &parameters, key, &values[..2]);
+        let right = direct_base(&compiler, &parameters, key, &values[2..]);
+        let root = direct_base(&compiler, &parameters, key, &[left.clone(), right.clone()]);
+        for (name, expected) in
+            [("root", &root), ("cache-0", &root), ("cache-1", &left), ("cache-2", &right)]
+        {
+            let RuntimeValue::Matrix(actual) = &result.outputs[name] else { panic!("matrix") };
+            assert_eq!(actual.as_ref(), expected, "{name}");
+        }
     }
 }

@@ -7,13 +7,17 @@ description = "BGG+ graph templates and PolyCircuit lowering for mxx"
 
 [dependencies]
 mxx-ir-core.workspace = true
+mxx-dsl.workspace = true
 mxx-gadgets.workspace = true
 num-bigint.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 mxx-primitives.workspace = true
 mxx-runtime.workspace = true
+mxx-noise-simulator.workspace = true
+mxx-ir-symbolic.workspace = true
 keccak-asm.workspace = true
 serial_test.workspace = true

@@ -4,12 +4,9 @@
 
 The repository includes:
 
-- [BGG+ encodings](https://eprint.iacr.org/2014/356.pdf) as Graph IR compilers in `crates/bgg/`.
-- [WEE25 matrix commitment](https://eprint.iacr.org/2025/509.pdf) is implemented in the BGG Graph IR layer. Commitment-backed lookup evaluation is unsupported.
-- LWE lookup-table evaluation over BGG+ encodings is implemented as Graph IR in `crates/bgg/`; GGH15 lookup is unsupported and excluded from the new design.
+- [BGG+ encodings](https://eprint.iacr.org/2014/356.pdf) as declarative DSL programs in `crates/bgg/`.
 - Evaluation and decryption of [GSW-FHE](https://eprint.iacr.org/2013/340.pdf) over BGG+ encodings, following [this construction](https://eprint.iacr.org/2015/029.pdf), in `crates/gadgets/src/circuit_gadgets/fhe/`.
-- Disabled Diamond witness-encryption reference source in `crates/we/`; it is not exported from the crate root.
-- Disabled [AKY24](https://eprint.iacr.org/2024/1720.pdf) and [Diamond iO](https://eprint.iacr.org/2025/236.pdf) reference sources in `crates/io/`; they are not exported from the crate root.
+- Application interfaces for witness encryption and indistinguishability obfuscation. Diamond WE and Diamond iO implementations are currently absent; the retained [AKY24 iO](https://eprint.iacr.org/2024/1720.pdf) source is excluded from the crate root pending its DSL cutover.
 
 ## Workspace layout
 
@@ -18,13 +15,14 @@ The repository is a virtual Cargo workspace with no root facade crate:
 | Crate | Responsibility |
 | --- | --- |
 | `mxx-ir-core` | Executable typed graph IR, exact compile expressions, concrete validation, and artifact manifests. |
-| `mxx-ir-symbolic` | Optional symbolic-term elaboration, rewrite, and cross-graph identity operations over Graph IR. |
+| `mxx-dsl` | Typed declarative construction API over immutable core DAG nodes. |
+| `mxx-ir-symbolic` | Typed symbolic-expression elaboration, targeted rewrite, and cross-graph identity operations over Graph IR. |
 | `mxx-noise-simulator` | Numerical noise analysis over elaborated symbolic IR using the existing polynomial and matrix norm rules. |
-| `mxx-runtime` | CPU/GPU execution, reproducible sampling transcripts, liveness, and indexed artifact-family persistence. |
+| `mxx-runtime` | CPU/GPU execution, reproducible sampling transcripts, sessions, and in-memory artifacts. |
 | `mxx-bench-estimator` | Binding-sensitive measured graph-cost composition, critical paths, parallel waves, and memory peaks. |
 | `mxx-primitives` | Polynomial and matrix representations, samplers, analytical sampling bounds, OpenFHE integration, and all native CUDA kernels and wrappers. |
 | `mxx-gadgets` | BGG-independent circuits and circuit gadgets. |
-| `mxx-bgg` | Graph IR samplers and compilers for BGG+ public keys, encodings, polynomial encodings, naive vectors, digit reconstruction, LWE lookup, input injection, slot transfer, standalone commitment, masked decoding, and noise refresh. GGH15 and commitment-backed lookup evaluators are unsupported. |
+| `mxx-bgg` | Declarative BGG+ public keys, encodings, samplers, polynomial/naive families, circuit evaluation, masked decoding, slot transfer, artifacts, and noise refresh. |
 | `mxx-func-enc` | Functional-encryption interfaces. AKY24 functional encryption is disabled pending a separate specification of its raw-mask semantics. |
 | `mxx-we` | Witness-encryption interfaces. Diamond WE is disabled pending a separate application cutover. |
 | `mxx-io` | Indistinguishability-obfuscation interfaces. AKY24 iO and Diamond iO are disabled pending separate application cutovers. |
@@ -33,11 +31,12 @@ The principal dependency directions are shown with consumers on the left:
 
 ```text
 mxx-runtime          -> mxx-ir-core, mxx-primitives
-mxx-ir-symbolic    -> mxx-ir-core
-mxx-noise-simulator -> mxx-ir-symbolic, mxx-primitives
+mxx-ir-symbolic      -> mxx-ir-core
+mxx-dsl              -> mxx-ir-core, mxx-ir-symbolic
+mxx-noise-simulator -> mxx-ir-core, mxx-ir-symbolic, mxx-primitives
 mxx-bench-estimator  -> mxx-ir-core, mxx-runtime
-mxx-gadgets          -> mxx-ir-core, mxx-primitives
-mxx-bgg              -> mxx-ir-core, mxx-gadgets
+mxx-gadgets          -> mxx-dsl, mxx-ir-core, mxx-primitives
+mxx-bgg              -> mxx-dsl, mxx-gadgets, mxx-ir-core
 mxx-func-enc/we/io   -> lower layers, never one another
 ```
 

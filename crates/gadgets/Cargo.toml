@@ -27,6 +27,8 @@ digest.workspace = true
 keccak-asm.workspace = true
 
 [dev-dependencies]
+mxx-dsl.workspace = true
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
+mxx-runtime.workspace = true
 serial_test.workspace = true
 tracing-subscriber.workspace = true

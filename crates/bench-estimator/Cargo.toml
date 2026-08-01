@@ -13,4 +13,5 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+mxx-dsl.workspace = true
 num-bigint.workspace = true

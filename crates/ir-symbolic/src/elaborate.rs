@@ -1,158 +1,104 @@
 use crate::{
     atom::{
-        AssumedMetadata, Atom, AtomClass, AtomId, AtomKind, AtomTable, ConcatAxis,
-        DeclaredDependencies, DeclaredDependencyRef, DefExpr, ExternalSourceKind, IndicatorRole,
-        InstantiationFrame, PreimageRefs, SelectionDomain, SelectionDomainRef, SourceKind,
-        TargetRef,
+        AssumedMetadata, Atom, AtomClass, AtomId, AtomKind, AtomTable, DeclaredDependencies,
+        DeclaredDependencyRef, ExternalSourceKind, ParallelIndex, PreimageRelation,
+        SelectionDomain, SelectionDomainRef, SourceKind, SymbolicInstantiationFrame,
     },
-    checks::{
-        CheckError, ElaborationWarning, WarningKind, check_add_shape, check_mod_down_normal_form,
-        check_topological, is_reduced, multiplication_type,
+    checks::ElaborationWarning,
+    expression::{
+        ExpressionError, IndexRange, SymbolicExprArena, SymbolicExprId, SymbolicExprNode,
     },
-    expr::{ExprError, ParamEnv, RealExpr},
-    graph::Graph,
-    manifest::{
-        ImportedManifest, InterpretationDigest, Manifest, import_manifest,
-        merge_manifest_projections,
-    },
-    node::{ConstantMatrix, HashVariant, LoopInputMode, MatrixBinaryOp, Node, NodeKind},
+    manifest::{Manifest, ManifestArtifact},
     overlay::{
-        AssumedTermListId, AtomRef, ExpectedEntry, FoldGroup, LoopIndexMatcher, OverlayTerm,
-        PortMatcher, Reinterpretation, SymbolicOverlay, VirtualKind, overlay_hashes,
-        selector_matches, validate_overlay,
+        DeclaredDependencyLabels, ExactAtomRef, PendingSymbolicExpr, PendingSymbolicExprNode,
+        SymbolicOverlay, SymbolicValueRef, VirtualKind,
     },
-    rewrite::{RewriteError, TargetTermLists, rewrite_preimages},
-    term::{Factor, Term, TermError, TermList, ViewDescriptor},
-    types::{
-        ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port, WireId, WireRef, WireType,
-    },
+    rewrite::{RewriteError, rewrite_expression},
+};
+use mxx_ir_core::{
+    FrozenGraphScopeId, Graph, ScopedWireRef,
+    expr::{ExprError, ParamEnv},
+    node::{HashVariant, LoopInputMode, MatrixBinaryOp, NodeKind},
+    types::{ConcreteMatrixType, ConcreteWireType, NodeId, Port, WireRef},
+    validate::{ValidatedGraph, ValidatedScope, ValidationError},
 };
 use num_bigint::BigInt;
-use num_traits::{One, Signed, ToPrimitive, Zero};
+use num_traits::{Signed, ToPrimitive};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ElaboratedWire {
-    pub wire_type: ConcreteWireType,
-    pub terms: Option<TermList>,
+pub enum SymbolicFamily {
+    ExactMembers(Vec<SymbolicExprId>),
+    StructuralTemplate { count: usize, template: SymbolicExprId, index_slot: u32 },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ElaboratedWire {
+    pub wire_type: ConcreteWireType,
+    pub expression: Option<SymbolicExprId>,
+    pub family: Option<SymbolicFamily>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ElaboratedScope {
+    pub wires: BTreeMap<WireRef, ElaboratedWire>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ElaboratedGraph {
     pub name: String,
     pub source: Graph,
     pub bindings: ParamEnv,
-    pub wires: BTreeMap<WireId, ElaboratedWire>,
-    pub outputs: BTreeMap<String, WireRef>,
+    pub scopes: BTreeMap<FrozenGraphScopeId, ElaboratedScope>,
+    pub outputs: BTreeMap<String, ScopedWireRef>,
     pub atoms: AtomTable,
+    pub expressions: SymbolicExprArena,
+    pub preimage_relations: Vec<PreimageRelation>,
     pub warnings: Vec<ElaborationWarning>,
     pub decode_targets: Vec<DecodeTarget>,
-    pub target_terms: BTreeMap<TargetRef, TermList>,
-    #[serde(with = "crate::serde_support::optional_hex32")]
-    pub overlay_hash: Option<[u8; 32]>,
-    #[serde(with = "crate::serde_support::optional_hex32")]
-    pub assumption_hash: Option<[u8; 32]>,
-    #[serde(with = "crate::serde_support::hex32_set")]
-    pub assumption_digests: BTreeSet<[u8; 32]>,
-    #[serde(with = "crate::manifest::interpretation_digest_map")]
-    pub interpretation_digests: BTreeMap<crate::atom::ProductionId, InterpretationDigest>,
+    pub assumption_digest: Option<[u8; 32]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodeTarget {
-    pub input: WireId,
-    #[serde(with = "crate::serde_support::bigint")]
+    pub input: ScopedWireRef,
     pub plaintext_modulus: BigInt,
     pub length: usize,
 }
 
 impl ElaboratedGraph {
-    pub fn wire_terms(&self) -> BTreeMap<WireId, TermList> {
-        self.wires
-            .iter()
-            .filter_map(|(wire, elaborated)| {
-                elaborated.terms.clone().map(|terms| (wire.clone(), terms))
-            })
-            .collect()
+    pub fn scope(&self, id: &FrozenGraphScopeId) -> Option<&ElaboratedScope> {
+        self.scopes.get(id)
     }
 
-    pub fn manifest_metadata(&self) -> crate::manifest::ManifestMetadata {
-        crate::manifest::ManifestMetadata {
-            overlay_hash: self.overlay_hash,
-            assumption_hash: self.assumption_hash,
-            assumption_digests: self.assumption_digests.clone(),
-            interpretation_digests: self.interpretation_digests.clone(),
-        }
+    pub fn wire(&self, reference: &ScopedWireRef) -> Option<&ElaboratedWire> {
+        self.scope(&reference.scope)?.wires.get(&reference.wire)
     }
 }
 
 #[derive(Debug, Error)]
 pub enum ElaborationError {
-    #[error("node {node:?} at instantiation path {instantiation_path:?}: {source}")]
-    Context {
-        node: NodeId,
-        instantiation_path: Vec<InstantiationFrame>,
-        #[source]
-        source: Box<ElaborationError>,
-    },
     #[error(transparent)]
-    Expression(#[from] ExprError),
+    ParameterExpression(#[from] ExprError),
     #[error(transparent)]
-    Check(#[from] CheckError),
+    Validation(#[from] ValidationError),
     #[error(transparent)]
-    Terms(#[from] TermError),
+    SymbolicExpression(#[from] ExpressionError),
     #[error(transparent)]
     Rewrite(#[from] RewriteError),
-    #[error("node {node:?}: {message}")]
-    Node { node: NodeId, message: String },
-    #[error("wire {wire:?} is unavailable while elaborating node {node:?}")]
-    MissingWire { node: NodeId, wire: WireRef },
-    #[error("node {0:?} does not produce a matrix wire")]
-    ExpectedMatrix(NodeId),
-    #[error("compile parameter {0} is not bound with the declared kind")]
-    MissingBinding(String),
-    #[error("manifest {0:?} was not supplied")]
-    MissingManifest(crate::atom::ProductionId),
-    #[error("manifest artifact {artifact} does not exist in {production:?}")]
-    MissingArtifact { production: crate::atom::ProductionId, artifact: String },
-    #[error("structural node {0:?} is not valid in this graph position")]
-    InvalidStructuralNode(NodeId),
-    #[error("symbolic overlay entry {entry:?}: {message}")]
-    Overlay { entry: Option<usize>, message: String },
-}
-
-#[derive(Clone)]
-struct MatrixValue {
-    ty: ConcreteMatrixType,
-    terms: TermList,
-}
-
-#[derive(Clone)]
-struct TrapdoorValue {
-    ty: ConcreteWireType,
-    uniform: AtomId,
-    origin: TrapdoorOrigin,
-}
-
-#[derive(Clone)]
-enum TrapdoorOrigin {
-    Sampled,
-    Gadget { base: BigInt, digit_count: usize, small: bool },
-}
-
-#[derive(Clone)]
-enum Value {
-    Scalar(ConcreteWireType),
-    Matrix(MatrixValue),
-    Preimage(MatrixValue),
-    Trapdoor(TrapdoorValue),
-    IndexedFamily { element_type: ConcreteWireType, elements: Vec<Value> },
+    #[error("scope {scope:?}, node {node:?}: {message}")]
+    Node { scope: FrozenGraphScopeId, node: NodeId, message: String },
+    #[error("symbolic overlay: {0}")]
+    Overlay(String),
+    #[error("symbolic manifests are not self-consistent: {0}")]
+    Manifest(String),
 }
 
 pub fn elaborate(graph: &Graph, bindings: &ParamEnv) -> Result<ElaboratedGraph, ElaborationError> {
-    elaborate_with_overlay(graph, bindings, &[], &SymbolicOverlay::default())
+    let validated = mxx_ir_core::validate(graph, bindings)?;
+    elaborate_validated(&validated, &[], &SymbolicOverlay::default())
 }
 
 pub fn elaborate_with_manifests(
@@ -160,7 +106,8 @@ pub fn elaborate_with_manifests(
     bindings: &ParamEnv,
     manifests: &[Manifest],
 ) -> Result<ElaboratedGraph, ElaborationError> {
-    elaborate_with_overlay(graph, bindings, manifests, &SymbolicOverlay::default())
+    let validated = mxx_ir_core::validate(graph, bindings)?;
+    elaborate_validated(&validated, manifests, &SymbolicOverlay::default())
 }
 
 pub fn elaborate_with_overlay(
@@ -169,5268 +116,1733 @@ pub fn elaborate_with_overlay(
     manifests: &[Manifest],
     overlay: &SymbolicOverlay,
 ) -> Result<ElaboratedGraph, ElaborationError> {
-    validate_overlay(overlay)
-        .map_err(|message| ElaborationError::Overlay { entry: None, message })?;
-    let (overlay_hash, assumption_hash) = overlay_hashes(overlay)
-        .map_err(|message| ElaborationError::Overlay { entry: None, message })?;
-    check_bindings(graph, bindings)?;
-    for (name, declaration) in &overlay.virtual_atoms {
-        concrete_matrix(&declaration.matrix_type, bindings).map_err(|error| {
-            ElaborationError::Overlay {
-                entry: None,
-                message: format!("virtual atom {name} has an invalid matrix type: {error}"),
-            }
-        })?;
-        if let VirtualKind::Bounded { norm, zero_rows, .. } = &declaration.kind {
-            close_real_expr(norm, bindings).map_err(|error| ElaborationError::Overlay {
-                entry: None,
-                message: format!("virtual atom {name} has an invalid bound: {error}"),
-            })?;
-            if let Some(zero_rows) = zero_rows {
-                zero_rows.evaluate(bindings).map_err(|error| ElaborationError::Overlay {
-                    entry: None,
-                    message: format!("virtual atom {name} has invalid zero_rows: {error}"),
-                })?;
-            }
-        }
-    }
-    check_topological(graph).map_err(|error| contextualize_check(error, &[]))?;
-    let merged = merge_manifest_projections(manifests)
-        .map_err(|error| ElaborationError::Node { node: NodeId(0), message: error.to_string() })?;
-    let imported = merged
-        .iter()
-        .map(|(id, manifest)| {
-            import_manifest(manifest).map(|imported| (id.clone(), imported)).map_err(|error| {
-                ElaborationError::Node { node: NodeId(0), message: error.to_string() }
-            })
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let mut assumption_digests = BTreeSet::new();
-    let mut interpretation_digests = BTreeMap::new();
-    let mut target_terms = BTreeMap::new();
-    for manifest in imported.values() {
-        assumption_digests.extend(manifest.assumption_digests.iter().copied());
-        for (target, terms) in &manifest.term_lists {
-            if let Some(existing) = target_terms.insert(target.clone(), terms.clone()) &&
-                existing != *terms
-            {
-                return Err(ElaborationError::Node {
-                    node: NodeId(0),
-                    message: format!("embedded manifest term list {target:?} disagrees"),
-                });
-            }
-        }
-        for (production, digest) in &manifest.interpretation_digests {
-            interpretation_digests.insert(production.clone(), *digest);
-        }
-    }
-    if let Some(hash) = assumption_hash {
-        assumption_digests.insert(hash);
-    }
+    let validated = mxx_ir_core::validate(graph, bindings)?;
+    elaborate_validated(&validated, manifests, overlay)
+}
+
+pub fn elaborate_validated(
+    validated: &ValidatedGraph,
+    manifests: &[Manifest],
+    overlay: &SymbolicOverlay,
+) -> Result<ElaboratedGraph, ElaborationError> {
+    overlay.validate().map_err(ElaborationError::Overlay)?;
     let mut state = State {
-        bindings,
-        manifests: &imported,
-        graph,
-        input_overrides: BTreeMap::new(),
-        values: BTreeMap::new(),
-        all_wires: BTreeMap::new(),
-        wire_terms: BTreeMap::new(),
-        atoms: AtomTable::default(),
-        warnings: Vec::new(),
-        path: Vec::new(),
-        decode_targets: Vec::new(),
-        assumed_terms: BTreeMap::new(),
+        graph: validated,
         overlay,
-        overlay_matches: vec![0; overlay.entries.len()],
-        used_virtual_atoms: BTreeSet::new(),
-        used_assumed_terms: BTreeSet::new(),
-        creating_virtual_atoms: BTreeSet::new(),
-        active_overlay_wire: None,
-        selection_domains: BTreeMap::new(),
+        atoms: AtomTable::default(),
+        expressions: SymbolicExprArena::default(),
+        relations: Vec::new(),
+        scopes: BTreeMap::new(),
+        warnings: Vec::new(),
+        decode_targets: Vec::new(),
+        imported_artifacts: BTreeMap::new(),
     };
-    for imported in imported.values() {
-        for atom in imported.atoms.values() {
-            if let Some(existing) = state.atoms.insert(atom.clone()) &&
-                existing != *atom
-            {
-                return Err(ElaborationError::Node {
-                    node: NodeId(0),
-                    message: format!("embedded manifest atom {:?} disagrees", atom.id),
-                });
-            }
-        }
-    }
-    for node in &graph.nodes {
-        state.elaborate_node_with_context(node)?;
-    }
-    for (index, count) in state.overlay_matches.iter().enumerate() {
-        if *count == 0 {
-            state.warnings.push(ElaborationWarning {
-                node: overlay.entries[index].0.node,
-                kind: WarningKind::UnusedOverlaySelector,
-                message: format!("symbolic overlay selector {index} matched no wire"),
-            });
-        }
-    }
-    for name in overlay.virtual_atoms.keys() {
-        if !state.used_virtual_atoms.contains(name) {
-            state.warnings.push(ElaborationWarning {
-                node: NodeId(0),
-                kind: WarningKind::UnusedVirtualAtom,
-                message: format!("virtual atom {name} is unused"),
-            });
-        }
-    }
-    for id in overlay.term_lists.keys() {
-        if !state.used_assumed_terms.contains(id) {
-            state.warnings.push(ElaborationWarning {
-                node: NodeId(0),
-                kind: WarningKind::UnusedAssumedTermList,
-                message: format!("assumed term list {} is unused", id.0),
-            });
-        }
-    }
-    for (name, wire) in &graph.outputs {
-        if !state.values.contains_key(wire) {
-            return Err(contextualize(
-                wire.node,
-                &[],
-                ElaborationError::Node {
-                    node: wire.node,
-                    message: format!(
-                        "graph output {name} refers to unavailable port {}",
-                        wire.port.0
-                    ),
-                },
-            ));
-        }
-    }
-    let wires = state
-        .all_wires
+    state.import_manifests(manifests)?;
+    state.insert_virtual_atoms()?;
+    state.elaborate_scope(&FrozenGraphScopeId::Root, validated.root_scope())?;
+    state.apply_declared_preimages()?;
+    state.rewrite_all_roots()?;
+    let outputs = validated
+        .source
+        .outputs()
         .iter()
-        .map(|(wire, value)| {
-            let elaborated = match value {
-                Value::Scalar(ty) => ElaboratedWire { wire_type: ty.clone(), terms: None },
-                Value::Matrix(matrix) => ElaboratedWire {
-                    wire_type: ConcreteWireType::Matrix(matrix.ty.clone()),
-                    terms: Some(matrix.terms.clone()),
-                },
-                Value::Preimage(matrix) => ElaboratedWire {
-                    wire_type: ConcreteWireType::Preimage(matrix.ty.clone()),
-                    terms: Some(matrix.terms.clone()),
-                },
-                Value::Trapdoor(trapdoor) => ElaboratedWire {
-                    wire_type: trapdoor.ty.clone(),
-                    terms: Some(TermList::atom(trapdoor.uniform.clone())),
-                },
-                Value::IndexedFamily { element_type, elements } => ElaboratedWire {
-                    wire_type: ConcreteWireType::IndexedFamily {
-                        element: Box::new(element_type.clone()),
-                        count: elements.len(),
-                    },
-                    terms: None,
-                },
-            };
-            (wire.clone(), elaborated)
+        .map(|(name, output)| {
+            (name.clone(), ScopedWireRef { scope: FrozenGraphScopeId::Root, wire: output.value })
         })
         .collect();
-    target_terms.extend(state.assumed_terms.clone());
-
     Ok(ElaboratedGraph {
-        name: graph.name.clone(),
-        source: graph.clone(),
-        bindings: bindings.clone(),
-        wires,
-        outputs: graph.outputs.clone(),
+        name: validated.source.name().to_owned(),
+        source: validated.source.clone(),
+        bindings: validated.bindings.clone(),
+        scopes: state.scopes,
+        outputs,
         atoms: state.atoms,
+        expressions: state.expressions,
+        preimage_relations: state.relations,
         warnings: state.warnings,
         decode_targets: state.decode_targets,
-        target_terms,
-        overlay_hash,
-        assumption_hash,
-        assumption_digests,
-        interpretation_digests,
+        assumption_digest: overlay.digest().map_err(ElaborationError::Overlay)?,
     })
 }
 
-#[derive(Clone)]
 struct State<'a> {
-    graph: &'a Graph,
-    bindings: &'a ParamEnv,
-    manifests: &'a BTreeMap<crate::atom::ProductionId, ImportedManifest>,
-    input_overrides: BTreeMap<String, Value>,
-    values: BTreeMap<WireRef, Value>,
-    all_wires: BTreeMap<WireId, Value>,
-    wire_terms: BTreeMap<WireId, TermList>,
-    atoms: AtomTable,
-    warnings: Vec<ElaborationWarning>,
-    path: Vec<InstantiationFrame>,
-    decode_targets: Vec<DecodeTarget>,
-    assumed_terms: BTreeMap<TargetRef, TermList>,
+    graph: &'a ValidatedGraph,
     overlay: &'a SymbolicOverlay,
-    overlay_matches: Vec<usize>,
-    used_virtual_atoms: BTreeSet<String>,
-    used_assumed_terms: BTreeSet<AssumedTermListId>,
-    creating_virtual_atoms: BTreeSet<String>,
-    active_overlay_wire: Option<WireId>,
-    selection_domains: BTreeMap<WireId, SelectionDomain>,
+    atoms: AtomTable,
+    expressions: SymbolicExprArena,
+    relations: Vec<PreimageRelation>,
+    scopes: BTreeMap<FrozenGraphScopeId, ElaboratedScope>,
+    warnings: Vec<ElaborationWarning>,
+    decode_targets: Vec<DecodeTarget>,
+    imported_artifacts: BTreeMap<(mxx_ir_core::artifact::ProductionId, String), ManifestArtifact>,
+}
+
+#[derive(Clone, Default)]
+struct SymbolicOutput {
+    expression: Option<SymbolicExprId>,
+    family: Option<SymbolicFamily>,
 }
 
 impl State<'_> {
-    fn elaborate_node_with_context(&mut self, node: &Node) -> Result<(), ElaborationError> {
-        let path = self.path.clone();
-        self.elaborate_node(node)
-            .and_then(|()| self.apply_overlay_to_node(node.id))
-            .map_err(|error| contextualize_unless_present(node.id, &path, error))
+    fn import_manifests(&mut self, manifests: &[Manifest]) -> Result<(), ElaborationError> {
+        for manifest in manifests {
+            let imported =
+                crate::manifest::import_manifest(manifest, &mut self.expressions, &mut self.atoms)
+                    .map_err(|error| ElaborationError::Manifest(error.to_string()))?;
+            self.relations.extend(imported.preimage_relations);
+            for (name, artifact) in imported.artifacts {
+                let key = (manifest.production_id.clone(), name);
+                if let Some(existing) = self.imported_artifacts.insert(key, artifact.clone()) &&
+                    existing != artifact
+                {
+                    return Err(ElaborationError::Manifest(
+                        "conflicting imported symbolic artifact".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
-    fn elaborate_node(&mut self, node: &Node) -> Result<(), ElaborationError> {
-        match &node.kind {
-            NodeKind::Input { name, wire_type, artifact } => {
-                self.input(node, name, wire_type, artifact.as_ref())?
-            }
-            NodeKind::Output { .. } => {
-                if node.args.len() != 1 {
-                    return self.node_error(node.id, "output requires exactly one value");
-                }
-                let value = self.argument(node, 0)?.clone();
-                self.insert_value(node.id, 0, value);
-            }
-            NodeKind::ConstantInt(_) => {
-                self.insert_value(node.id, 0, Value::Scalar(ConcreteWireType::ConstantInt));
-            }
-            NodeKind::EvaluateInt(value) => {
-                value.evaluate(self.bindings)?;
-                self.insert_value(node.id, 0, Value::Scalar(ConcreteWireType::ConstantInt));
-            }
-            NodeKind::ConstantReal(_) => {
-                self.insert_value(node.id, 0, Value::Scalar(ConcreteWireType::ConstantReal));
-            }
-            NodeKind::ConstantBool(_) => {
-                self.insert_value(node.id, 0, Value::Scalar(ConcreteWireType::ConstantBool));
-            }
-            NodeKind::ConstantMatrix { matrix_type, value } => {
-                let ty = concrete_matrix(matrix_type, self.bindings)?;
-                let terms = if matches!(value, ConstantMatrix::Zero) {
-                    TermList::zero()
-                } else {
-                    let id = self.constant_atom(value, &ty)?;
-                    TermList::atom(id)
-                };
-                self.insert_matrix(node.id, 0, ty, terms, false);
-            }
-            NodeKind::GadgetTrapdoor { matrix_type, base } => {
-                let ty = concrete_matrix(matrix_type, self.bindings)?;
-                let gadget = self.gadget_atom(&ty, base, false)?;
-                let gadget_base = base.evaluate(self.bindings)?.abs();
-                let digit_count = ty.columns / ty.rows;
-                self.insert_value(
-                    node.id,
-                    0,
-                    Value::Trapdoor(TrapdoorValue {
-                        ty: ConcreteWireType::Trapdoor {
-                            matrix: ty,
-                            sigma: RealExpr::FromInt(crate::expr::IntExpr::constant(
-                                gadget_base.clone(),
-                            )),
-                            gadget_base: gadget_base.clone(),
-                            digit_count,
-                        },
-                        uniform: gadget,
-                        origin: TrapdoorOrigin::Gadget {
-                            base: gadget_base,
-                            digit_count,
-                            small: false,
-                        },
-                    }),
-                );
-            }
-            NodeKind::TrapdoorPublic => {
-                let trapdoor = self.trapdoor_argument(node, 0)?;
-                let matrix = trapdoor
-                    .ty
-                    .matrix_type()
-                    .cloned()
-                    .ok_or_else(|| ElaborationError::ExpectedMatrix(node.id))?;
-                self.insert_matrix(node.id, 0, matrix, TermList::atom(trapdoor.uniform), false);
-            }
-            NodeKind::IntBinary(_) |
-            NodeKind::IntToReal |
-            NodeKind::BoolToInt |
-            NodeKind::RealBinary(_) |
-            NodeKind::RealSqrt => self.scalar_operation(node)?,
-            NodeKind::IntCompare(_) => {
-                self.require_scalar(node, 0, is_integer, "integer")?;
-                self.require_scalar(node, 1, is_integer, "integer")?;
-                self.insert_value(node.id, 0, Value::Scalar(ConcreteWireType::Bool));
-            }
-            NodeKind::BitExtract { bit } => {
-                self.require_scalar(node, 0, is_integer, "integer")?;
-                if bit.evaluate(self.bindings)?.sign() == num_bigint::Sign::Minus {
-                    return self.node_error(node.id, "bit position must be nonnegative");
-                }
-                self.insert_value(node.id, 0, Value::Scalar(ConcreteWireType::Bool));
-            }
-            NodeKind::MatrixBinary(operation) => self.matrix_binary(node, *operation)?,
-            NodeKind::MatrixNegate => {
-                let input = self.matrix_argument(node, 0)?;
-                self.insert_matrix(node.id, 0, input.ty, input.terms.negate(), false);
-            }
-            NodeKind::MatrixScale { scalar } => {
-                let input = self.matrix_argument(node, 0)?;
-                let scalar = scalar.evaluate(self.bindings)?;
-                let terms = input.terms.scale(&scalar, &self.atoms)?;
-                self.insert_matrix(node.id, 0, input.ty, terms, false);
-            }
-            NodeKind::Transpose => {
-                let input = self.matrix_argument(node, 0)?;
-                self.warn_viewed_preimages(node.id, &input.terms);
-                let ty = ConcreteMatrixType {
-                    rows: input.ty.columns,
-                    columns: input.ty.rows,
-                    ..input.ty
-                };
-                let terms = input.terms.transpose(&self.atoms)?;
-                self.insert_matrix(node.id, 0, ty, terms, false);
-            }
-            NodeKind::Slice { rows, columns } => {
-                let input = self.matrix_argument(node, 0)?;
-                self.warn_viewed_preimages(node.id, &input.terms);
-                let ty = sliced_type(&input.ty, rows.as_ref(), columns.as_ref())?;
-                let terms = input.terms.slice(*rows, *columns, &self.atoms)?;
-                self.insert_matrix(node.id, 0, ty, terms, false);
-            }
-            NodeKind::Tensor => {
-                return self.node_error(node.id, "tensor is unsupported by symbolic elaboration");
-            }
-            NodeKind::Concat { axis } => self.derived_matrix(node, "concat", Some(*axis))?,
-            NodeKind::Reshape { rows, columns } => {
-                let input = self.matrix_argument(node, 0)?;
-                self.require_reduced(node.id, &input.terms)?;
-                let rows = positive_usize(rows.evaluate(self.bindings)?, "reshape rows", node.id)?;
-                let columns =
-                    positive_usize(columns.evaluate(self.bindings)?, "reshape columns", node.id)?;
-                if rows.saturating_mul(columns) != input.ty.rows.saturating_mul(input.ty.columns) {
-                    return self.node_error(node.id, "reshape changes the element count");
-                }
-                let input_atom = self.definition_atom(node.id, 1, &input)?;
-                let kind = match classify_terms(&input.terms, &self.atoms)? {
-                    TermClass::Signal => AtomKind::Large,
-                    TermClass::Zero | TermClass::Noise => AtomKind::Bounded,
-                    TermClass::Mixed => {
-                        return self.node_error(
-                            node.id,
-                            "reshape cannot combine signal and noise into one opaque atom",
-                        );
+    fn insert_virtual_atoms(&mut self) -> Result<(), ElaborationError> {
+        for (id, declaration) in &self.overlay.virtual_atoms {
+            let matrix_type = concrete_matrix(&declaration.matrix_type, &self.graph.bindings)?;
+            let (kind, metadata) = match &declaration.kind {
+                VirtualKind::Large => (AtomKind::Large, None),
+                VirtualKind::Bounded {
+                    norm,
+                    is_const_poly,
+                    zero_rows,
+                    dependencies,
+                    clt_ready,
+                } => {
+                    let zero_rows = zero_rows
+                        .as_ref()
+                        .map(|rows| rows.evaluate(&self.graph.bindings))
+                        .transpose()?
+                        .map(|rows| {
+                            rows.to_usize().ok_or_else(|| {
+                                ElaborationError::Overlay(
+                                    "virtual zero_rows must be a nonnegative usize".to_owned(),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    if zero_rows.is_some_and(|rows| rows > matrix_type.rows) {
+                        return Err(ElaborationError::Overlay(
+                            "virtual zero_rows exceeds matrix rows".to_owned(),
+                        ));
                     }
-                };
-                let ty = ConcreteMatrixType { rows, columns, ..input.ty };
-                let id = self.derived_atom(
-                    node.id,
-                    0,
-                    ty.clone(),
-                    DefExpr::Reshape { input: input_atom.clone(), rows, columns },
-                    BTreeSet::from([input_atom]),
-                    kind,
-                );
-                self.insert_matrix(node.id, 0, ty, TermList::atom(id), false);
-            }
-            NodeKind::UniformSample { matrix_type, range } => {
-                let ty = concrete_matrix(matrix_type, self.bindings)?;
-                if range.minimum > range.maximum {
-                    return self.node_error(node.id, "uniform sample range is empty");
+                    let dependencies = match dependencies {
+                        DeclaredDependencyLabels::Known(labels) => DeclaredDependencies::Known(
+                            labels.iter().cloned().map(DeclaredDependencyRef::Local).collect(),
+                        ),
+                        DeclaredDependencyLabels::Unknown => DeclaredDependencies::Unknown,
+                    };
+                    (
+                        AtomKind::Bounded,
+                        Some(AssumedMetadata {
+                            norm: norm.close(&self.graph.bindings)?,
+                            is_const_poly: *is_const_poly,
+                            zero_rows,
+                            dependencies,
+                            clt_ready: *clt_ready,
+                        }),
+                    )
                 }
-                let maximum = range.minimum.abs().max(range.maximum.abs());
-                let kind = if &maximum * BigInt::from(2) >= ty.modulus {
+            };
+            self.insert_atom(Atom {
+                id: AtomId::Virtual(*id),
+                class: AtomClass::Assumed { metadata },
+                kind,
+                matrix_type,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn elaborate_scope(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        validated: &ValidatedScope,
+    ) -> Result<(), ElaborationError> {
+        if self.scopes.contains_key(scope_id) {
+            return Ok(());
+        }
+        let source_scope = self.graph.source.scope(scope_id).expect("validated source scope");
+        let mut wires = BTreeMap::new();
+        self.scopes.insert(scope_id.clone(), ElaboratedScope { wires: BTreeMap::new() });
+        for (position, handle) in validated.execution_order.iter().enumerate() {
+            let node = NodeId(position as u64);
+            let args = source_scope.arguments(handle).expect("frozen arguments");
+            let outputs = handle
+                .output_types()
+                .iter()
+                .enumerate()
+                .map(|(port, _)| WireRef { node, port: Port(port as u32) })
+                .collect::<Vec<_>>();
+            let values = self.elaborate_node(
+                scope_id,
+                node,
+                handle.kind(),
+                &args,
+                &outputs,
+                validated,
+                &wires,
+            )?;
+            for (port, output) in outputs.iter().enumerate() {
+                let symbolic = values.get(port).cloned().unwrap_or_default();
+                wires.insert(
+                    *output,
+                    ElaboratedWire {
+                        wire_type: validated.wire_types[output].clone(),
+                        expression: symbolic.expression,
+                        family: symbolic.family,
+                    },
+                );
+            }
+            self.scopes.insert(scope_id.clone(), ElaboratedScope { wires: wires.clone() });
+            for output in outputs {
+                let target = ScopedWireRef { scope: scope_id.clone(), wire: output };
+                if self.overlay.assumptions.contains_key(&target) {
+                    self.apply_assumption(&target)?;
+                }
+            }
+            wires = self.scopes.get(scope_id).expect("current scope exists").wires.clone();
+        }
+        self.scopes.insert(scope_id.clone(), ElaboratedScope { wires });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn elaborate_node(
+        &mut self,
+        scope: &FrozenGraphScopeId,
+        node: NodeId,
+        kind: &NodeKind,
+        args: &[WireRef],
+        outputs: &[WireRef],
+        validated: &ValidatedScope,
+        wires: &BTreeMap<WireRef, ElaboratedWire>,
+    ) -> Result<Vec<SymbolicOutput>, ElaborationError> {
+        let output_type = |port: usize| validated.wire_types[&outputs[port]].clone();
+        let local = |port: usize| {
+            AtomId::Local(ScopedWireRef { scope: scope.clone(), wire: outputs[port] })
+        };
+
+        let result = match kind {
+            NodeKind::Input { artifact, .. } => {
+                let ty = output_type(0);
+                let imported = artifact.as_ref().and_then(|artifact| {
+                    self.imported_artifacts
+                        .get(&(artifact.production_id.clone(), artifact.artifact_name.clone()))
+                        .cloned()
+                });
+                if let Some(imported) = imported {
+                    if imported.wire_type != ty {
+                        return Err(self.node_error(
+                            scope,
+                            node,
+                            "symbolic artifact type does not match executable input type",
+                        ));
+                    }
+                    vec![SymbolicOutput {
+                        expression: imported.expression,
+                        family: imported.family,
+                    }]
+                } else if let Some(matrix_type) = matrix_type(&ty).cloned() {
+                    let id = local(0);
+                    let (atom_kind, source) = match ty {
+                        ConcreteWireType::Preimage(_) => (
+                            AtomKind::Bounded,
+                            SourceKind::External { kind: ExternalSourceKind::Preimage },
+                        ),
+                        ConcreteWireType::Trapdoor { .. } => (
+                            AtomKind::Bounded,
+                            SourceKind::External { kind: ExternalSourceKind::TrapdoorUniform },
+                        ),
+                        _ => (
+                            AtomKind::Large,
+                            SourceKind::External { kind: ExternalSourceKind::Matrix },
+                        ),
+                    };
+                    self.insert_source_atom(id.clone(), atom_kind, matrix_type.clone(), source)?;
+                    if matches!(ty, ConcreteWireType::Trapdoor { .. }) {
+                        self.insert_source_atom(
+                            AtomId::TrapdoorPublic(ScopedWireRef {
+                                scope: scope.clone(),
+                                wire: outputs[0],
+                            }),
+                            AtomKind::Large,
+                            matrix_type,
+                            SourceKind::External { kind: ExternalSourceKind::Matrix },
+                        )?;
+                    }
+                    let expression = self.expressions.atom(id, &self.atoms)?;
+                    let family = match ty {
+                        ConcreteWireType::IndexedFamily { count, .. } => {
+                            Some(SymbolicFamily::StructuralTemplate {
+                                count,
+                                template: expression,
+                                index_slot: u32::MAX,
+                            })
+                        }
+                        _ => None,
+                    };
+                    vec![SymbolicOutput { expression: Some(expression), family }]
+                } else {
+                    vec![SymbolicOutput::default()]
+                }
+            }
+            NodeKind::ConstantMatrix { value, .. } => {
+                let ty = matrix_type(&output_type(0)).expect("validated matrix").clone();
+                let expression = if matches!(value, mxx_ir_core::node::ConstantMatrix::Zero) {
+                    self.expressions.zero(ty)?
+                } else {
+                    let id = local(0);
+                    self.insert_source_atom(
+                        id.clone(),
+                        AtomKind::Bounded,
+                        ty,
+                        SourceKind::ConstantMatrix { value: value.clone() },
+                    )?;
+                    self.expressions.atom(id, &self.atoms)?
+                };
+                vec![matrix_output(expression)]
+            }
+            NodeKind::UniformSample { range, .. } => {
+                let minimum = range.minimum.evaluate(&self.graph.bindings)?;
+                let maximum = range.maximum.evaluate(&self.graph.bindings)?;
+                let ty = matrix_type(&output_type(0)).expect("validated matrix").clone();
+                let maximum_absolute = minimum.abs().max(maximum.abs());
+                let atom_kind = if &maximum_absolute * BigInt::from(2u8) >= ty.modulus {
                     AtomKind::Large
                 } else {
                     AtomKind::Bounded
                 };
-                let id = self.source_atom(
-                    node.id,
-                    0,
-                    ty.clone(),
-                    kind,
-                    SourceKind::UniformSample {
-                        minimum: range.minimum.clone(),
-                        maximum: range.maximum.clone(),
-                    },
-                    None,
-                );
-                self.insert_matrix(node.id, 0, ty, TermList::atom(id), false);
-            }
-            NodeKind::GaussianSample { matrix_type, sigma } => {
-                let ty = concrete_matrix(matrix_type, self.bindings)?;
-                let id = self.source_atom(
-                    node.id,
-                    0,
-                    ty.clone(),
-                    AtomKind::Bounded,
-                    SourceKind::GaussianSample { sigma: close_real_expr(sigma, self.bindings)? },
-                    None,
-                );
-                self.insert_matrix(node.id, 0, ty, TermList::atom(id), false);
-            }
-            NodeKind::HashSample {
-                matrix_type,
-                variant,
-                tag_prefix: _,
-                tag_expressions,
-                tag_decimal_expressions,
-                tag_u64_le_expressions,
-                base,
-                digit_count,
-            } => {
-                for expression in tag_expressions {
-                    expression.evaluate(self.bindings)?;
-                }
-                for expression in tag_decimal_expressions {
-                    expression.evaluate(self.bindings)?;
-                }
-                for expression in tag_u64_le_expressions {
-                    if expression.evaluate(self.bindings)?.to_u64().is_none() {
-                        return self.node_error(
-                            node.id,
-                            "little-endian hash tag component must fit in u64",
-                        );
-                    }
-                }
-                self.hash_sample(node, matrix_type, *variant, base.as_ref(), digit_count.as_ref())?
-            }
-            NodeKind::TrapdoorSample { matrix_type, sigma, gadget_base, digit_count } => {
-                let ty = concrete_matrix(matrix_type, self.bindings)?;
-                let gadget_base_value = gadget_base.evaluate(self.bindings)?.abs();
-                let digit_count_value = positive_usize(
-                    digit_count.evaluate(self.bindings)?,
-                    "trapdoor digit count",
-                    node.id,
+                let id = local(0);
+                self.insert_source_atom(
+                    id.clone(),
+                    atom_kind,
+                    ty,
+                    SourceKind::UniformSample { minimum, maximum },
                 )?;
-                let uniform = self.source_atom(
-                    node.id,
-                    0,
-                    ty.clone(),
-                    AtomKind::Large,
-                    SourceKind::TrapdoorUniform {
-                        sigma: close_real_expr(sigma, self.bindings)?,
-                        gadget_base: gadget_base_value.clone(),
-                        digit_count: digit_count_value,
-                    },
-                    None,
-                );
-                self.insert_matrix(node.id, 0, ty.clone(), TermList::atom(uniform.clone()), false);
-                self.insert_value(
-                    node.id,
-                    1,
-                    Value::Trapdoor(TrapdoorValue {
-                        ty: ConcreteWireType::Trapdoor {
-                            matrix: ty,
-                            sigma: close_real_expr(sigma, self.bindings)?,
-                            gadget_base: gadget_base_value,
-                            digit_count: digit_count_value,
-                        },
-                        uniform,
-                        origin: TrapdoorOrigin::Sampled,
-                    }),
-                );
+                let expression = self.expressions.atom(id, &self.atoms)?;
+                vec![matrix_output(expression)]
             }
-            NodeKind::PreimageSample { matrix_type } => {
-                let ty = concrete_matrix(matrix_type, self.bindings)?;
-                let trapdoor = self.trapdoor_argument(node, 0)?;
-                let target = *node.args.get(1).ok_or(ElaborationError::MissingWire {
-                    node: node.id,
-                    wire: WireRef { node: node.id, port: Port(1) },
+            NodeKind::GaussianSample { sigma, .. } => {
+                let id = local(0);
+                self.insert_source_atom(
+                    id.clone(),
+                    AtomKind::Bounded,
+                    matrix_type(&output_type(0)).expect("validated matrix").clone(),
+                    SourceKind::GaussianSample { sigma: sigma.close(&self.graph.bindings)? },
+                )?;
+                let expression = self.expressions.atom(id, &self.atoms)?;
+                vec![matrix_output(expression)]
+            }
+            NodeKind::HashSample { variant, base, digit_count, .. } => {
+                let id = local(0);
+                let base =
+                    base.as_ref().map(|value| value.evaluate(&self.graph.bindings)).transpose()?;
+                let digit_count = digit_count
+                    .as_ref()
+                    .map(|value| value.evaluate(&self.graph.bindings))
+                    .transpose()?
+                    .map(|value| value.to_usize().expect("validated digit count"));
+                self.insert_source_atom(
+                    id.clone(),
+                    if matches!(variant, HashVariant::Plain) {
+                        AtomKind::Large
+                    } else {
+                        AtomKind::Bounded
+                    },
+                    matrix_type(&output_type(0)).expect("validated matrix").clone(),
+                    SourceKind::HashSample { variant: *variant, base, digit_count },
+                )?;
+                let expression = self.expressions.atom(id, &self.atoms)?;
+                vec![matrix_output(expression)]
+            }
+            NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, .. } => {
+                let public = local(0);
+                let trapdoor = local(1);
+                let ty = matrix_type(&output_type(0)).expect("validated public matrix").clone();
+                let sigma = sigma.close(&self.graph.bindings)?;
+                let base = gadget_base.evaluate(&self.graph.bindings)?.abs();
+                let digits = digit_count
+                    .evaluate(&self.graph.bindings)?
+                    .to_usize()
+                    .expect("validated digit count");
+                self.insert_source_atom(
+                    public.clone(),
+                    AtomKind::Large,
+                    ty.clone(),
+                    SourceKind::TrapdoorUniform {
+                        sigma: sigma.clone(),
+                        gadget_base: base.clone(),
+                        digit_count: digits,
+                    },
+                )?;
+                self.insert_source_atom(
+                    trapdoor.clone(),
+                    AtomKind::Bounded,
+                    ty,
+                    SourceKind::TrapdoorUniform { sigma, gadget_base: base, digit_count: digits },
+                )?;
+                vec![
+                    matrix_output(self.expressions.atom(public, &self.atoms)?),
+                    matrix_output(self.expressions.atom(trapdoor, &self.atoms)?),
+                ]
+            }
+            NodeKind::GadgetTrapdoor { base, .. } => {
+                let id = local(0);
+                let ty = matrix_type(&output_type(0)).expect("validated trapdoor").clone();
+                let digit_count = ty.columns / ty.rows;
+                self.insert_source_atom(
+                    id.clone(),
+                    AtomKind::Bounded,
+                    ty,
+                    SourceKind::GadgetDecomposition {
+                        base: base.evaluate(&self.graph.bindings)?.abs(),
+                        digit_count,
+                        small: false,
+                    },
+                )?;
+                let expression = self.expressions.atom(id, &self.atoms)?;
+                vec![matrix_output(expression)]
+            }
+            NodeKind::TrapdoorPublic => {
+                let expression = self.trapdoor_public_expression(scope, args[0], wires)?;
+                vec![matrix_output(expression)]
+            }
+            NodeKind::PreimageSample { .. } => {
+                let left_expression = self.matrix_expression(scope, node, args[0], wires)?;
+                let left_matrix = self.exact_atom_expression(left_expression).ok_or_else(|| {
+                    self.node_error(
+                        scope,
+                        node,
+                        "preimage public input does not identify one exact atom",
+                    )
                 })?;
-                let target_value = self.matrix_argument(node, 1)?;
-                let uniform_type =
-                    trapdoor.ty.matrix_type().expect("trapdoor always has a matrix type");
-                let product = multiplication_type(uniform_type, &ty)?;
-                check_add_shape(&product, &target_value.ty)?;
-                let refs =
-                    PreimageRefs { uniform: trapdoor.uniform, target: TargetRef::Local(target) };
-                let ConcreteWireType::Trapdoor { sigma, gadget_base, digit_count, .. } =
-                    &trapdoor.ty
-                else {
-                    unreachable!("trapdoor value has trapdoor type")
+                let target = self.matrix_expression(scope, node, args[2], wires)?;
+                let id = local(0);
+                let output = matrix_type(&output_type(0)).expect("validated preimage").clone();
+                let (sigma, base, digits, public_rows) = match &validated.wire_types[&args[1]] {
+                    ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count } => {
+                        (sigma.clone(), gadget_base.clone(), *digit_count, matrix.rows)
+                    }
+                    _ => return Err(self.node_error(scope, node, "preimage input is not trapdoor")),
                 };
-                let source = match &trapdoor.origin {
-                    TrapdoorOrigin::Sampled => SourceKind::PreimageSample {
-                        trapdoor_sigma: close_real_expr(sigma, self.bindings)?,
-                        gadget_base: gadget_base.clone(),
-                        digit_count: *digit_count,
-                        public_matrix_rows: uniform_type.rows,
-                        target_block_rows: target_value.ty.rows / uniform_type.rows,
+                self.insert_source_atom(
+                    id.clone(),
+                    AtomKind::Bounded,
+                    output.clone(),
+                    SourceKind::PreimageSample {
+                        trapdoor_sigma: sigma,
+                        gadget_base: base,
+                        digit_count: digits,
+                        public_matrix_rows: public_rows,
+                        target_block_rows: output.rows,
                         zero_rows: None,
                     },
-                    TrapdoorOrigin::Gadget { base, digit_count, small } => {
-                        SourceKind::GadgetDecomposition {
-                            base: base.clone(),
-                            digit_count: *digit_count,
-                            small: *small,
-                        }
-                    }
-                };
-                let id =
-                    self.source_atom(node.id, 0, ty.clone(), AtomKind::Bounded, source, Some(refs));
-                self.insert_matrix(node.id, 0, ty, TermList::atom(id), true);
+                )?;
+                let expression = self.expressions.atom(id.clone(), &self.atoms)?;
+                self.insert_relation(PreimageRelation {
+                    left_matrix,
+                    preimage: id,
+                    product: target,
+                })?;
+                vec![matrix_output(expression)]
             }
             NodeKind::GadgetDecompose { base, small, digit_count } => {
-                let target = *node.args.first().ok_or(ElaborationError::MissingWire {
-                    node: node.id,
-                    wire: WireRef { node: node.id, port: Port(0) },
-                })?;
-                let input = self.matrix_argument(node, 0)?;
-                let base_value = base.evaluate(self.bindings)?;
-                if base_value <= BigInt::one() {
-                    return self.node_error(node.id, "gadget base must be greater than one");
-                }
-                let digits = decomposition_digits(
-                    digit_count.as_ref(),
-                    &input.ty.modulus,
-                    &base_value,
-                    self.bindings,
-                    node.id,
-                )?;
-                let gadget_ty = ConcreteMatrixType {
-                    columns: input.ty.rows.saturating_mul(digits),
-                    ..input.ty.clone()
-                };
-                let output_ty = ConcreteMatrixType {
-                    rows: gadget_ty.columns,
-                    columns: input.ty.columns,
-                    ..input.ty.clone()
-                };
-                let gadget = self.gadget_atom(&gadget_ty, base, *small)?;
-                let id = self.source_atom(
-                    node.id,
-                    0,
-                    output_ty.clone(),
+                let id = local(0);
+                let ty = matrix_type(&output_type(0)).expect("validated decomposition").clone();
+                let input_ty = matrix_type(&validated.wire_types[&args[0]])
+                    .expect("validated decomposition input");
+                let digits = digit_count
+                    .as_ref()
+                    .map(|value| value.evaluate(&self.graph.bindings))
+                    .transpose()?
+                    .and_then(|value| value.to_usize())
+                    .unwrap_or_else(|| ty.rows / input_ty.rows);
+                self.insert_source_atom(
+                    id.clone(),
                     AtomKind::Bounded,
+                    ty,
                     SourceKind::GadgetDecomposition {
-                        base: base_value,
+                        base: base.evaluate(&self.graph.bindings)?.abs(),
                         digit_count: digits,
                         small: *small,
                     },
-                    Some(PreimageRefs { uniform: gadget, target: TargetRef::Local(target) }),
-                );
-                self.insert_matrix(node.id, 0, output_ty, TermList::atom(id), true);
+                )?;
+                let expression = self.expressions.atom(id, &self.atoms)?;
+                vec![matrix_output(expression)]
             }
-            NodeKind::ModDown { target_modulus } => {
-                self.mod_down(node, target_modulus.evaluate(self.bindings)?)?
+            NodeKind::MatrixBinary(operation) => {
+                let left = self.matrix_expression(scope, node, args[0], wires)?;
+                let right = self.matrix_expression(scope, node, args[1], wires)?;
+                let ty = matrix_type(&output_type(0)).expect("validated matrix result").clone();
+                let expression = match operation {
+                    MatrixBinaryOp::Add => self.expressions.add(ty, [left, right])?,
+                    MatrixBinaryOp::Subtract => self.expressions.subtract(ty, left, right)?,
+                    MatrixBinaryOp::Multiply => {
+                        self.expressions.multiply(ty, [left, right], &self.atoms)?
+                    }
+                };
+                vec![matrix_output(expression)]
             }
-            NodeKind::ModUp { target_modulus } => {
-                self.mod_up(node, target_modulus.evaluate(self.bindings)?)?
+            NodeKind::MatrixNegate => {
+                let value = self.matrix_expression(scope, node, args[0], wires)?;
+                vec![matrix_output(self.expressions.scale(-BigInt::from(1u8), value)?)]
             }
-            NodeKind::ExtractCoefficient { position } => {
-                let input = self.matrix_argument(node, 0)?;
-                self.require_reduced(node.id, &input.terms)?;
-                if !input.ty.is_scalar() {
-                    return self.node_error(node.id, "extract coefficient requires a 1x1 matrix");
-                }
-                let position = position.evaluate(self.bindings)?;
-                if position.sign() == num_bigint::Sign::Minus ||
-                    position >= BigInt::from(input.ty.ring_dimension)
-                {
-                    return self.node_error(node.id, "coefficient position is out of range");
-                }
-                self.insert_value(node.id, 0, Value::Scalar(ConcreteWireType::Int));
+            NodeKind::MatrixScale { scalar } => {
+                let value = self.matrix_expression(scope, node, args[0], wires)?;
+                let scalar = scalar.evaluate(&self.graph.bindings)?;
+                vec![matrix_output(self.expressions.scale(scalar, value)?)]
+            }
+            NodeKind::Transpose => {
+                let value = self.matrix_expression(scope, node, args[0], wires)?;
+                let ty = matrix_type(&output_type(0)).expect("validated transpose").clone();
+                vec![matrix_output(self.expressions.transpose(ty, value)?)]
+            }
+            NodeKind::Slice { rows, columns } => {
+                let range = |range: &mxx_ir_core::node::IndexRange| -> Result<IndexRange, ElaborationError> {
+                    Ok(IndexRange {
+                        start: range.start.evaluate(&self.graph.bindings)?.to_usize().expect("validated"),
+                        end: range.end.evaluate(&self.graph.bindings)?.to_usize().expect("validated"),
+                    })
+                };
+                let value = self.matrix_expression(scope, node, args[0], wires)?;
+                let ty = matrix_type(&output_type(0)).expect("validated slice").clone();
+                let expression = self.expressions.slice(
+                    ty,
+                    value,
+                    rows.as_ref().map(range).transpose()?,
+                    columns.as_ref().map(range).transpose()?,
+                )?;
+                vec![matrix_output(expression)]
+            }
+            NodeKind::Tensor => {
+                let left = self.matrix_expression(scope, node, args[0], wires)?;
+                let right = self.matrix_expression(scope, node, args[1], wires)?;
+                let ty = matrix_type(&output_type(0)).expect("validated tensor").clone();
+                vec![matrix_output(self.expressions.tensor(ty, left, right)?)]
+            }
+            NodeKind::Concat { axis } => {
+                let inputs = args
+                    .iter()
+                    .map(|argument| self.matrix_expression(scope, node, *argument, wires))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let ty = matrix_type(&output_type(0)).expect("validated concat").clone();
+                vec![matrix_output(self.expressions.concat(ty, *axis, inputs)?)]
+            }
+            NodeKind::Reshape { .. } => {
+                let value = self.matrix_expression(scope, node, args[0], wires)?;
+                let ty = matrix_type(&output_type(0)).expect("validated reshape").clone();
+                vec![matrix_output(self.expressions.reshape(ty, value)?)]
             }
             NodeKind::ConstantCoefficient { position } => {
-                let input = self.matrix_argument(node, 0)?;
-                if !input.ty.is_scalar() {
-                    return self.node_error(node.id, "constant coefficient requires a 1x1 matrix");
-                }
+                let value = self.matrix_expression(scope, node, args[0], wires)?;
                 let position = position
-                    .evaluate(self.bindings)?
+                    .evaluate(&self.graph.bindings)?
                     .to_usize()
-                    .filter(|position| *position < input.ty.ring_dimension)
-                    .ok_or_else(|| ElaborationError::Node {
-                        node: node.id,
-                        message: "coefficient position is out of range".to_owned(),
-                    })?;
-                let kind = match classify_terms(&input.terms, &self.atoms)? {
-                    TermClass::Signal => AtomKind::Large,
-                    TermClass::Zero | TermClass::Noise => AtomKind::Bounded,
-                    TermClass::Mixed => {
-                        return self.node_error(
-                            node.id,
-                            "constant coefficient cannot combine signal and noise into one opaque atom",
-                        );
-                    }
-                };
-                let input_atom = self.definition_atom(node.id, 1, &input)?;
-                let id = self.derived_atom(
-                    node.id,
-                    0,
-                    input.ty.clone(),
-                    DefExpr::ConstantCoefficient { input: input_atom.clone(), position },
-                    BTreeSet::from([input_atom]),
-                    kind,
-                );
-                self.insert_matrix(node.id, 0, input.ty, TermList::atom(id), false);
-            }
-            NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
-                let input = self.matrix_argument(node, 0)?;
-                self.require_reduced(node.id, &input.terms)?;
-                if !input.ty.is_scalar() {
-                    return self.node_error(node.id, "threshold decode requires a 1x1 matrix");
-                }
-                let count =
-                    positive_usize(length.evaluate(self.bindings)?, "decode length", node.id)?;
-                if count > input.ty.ring_dimension {
-                    return self.node_error(node.id, "decode length exceeds ring dimension");
-                }
-                if plaintext_modulus.evaluate(self.bindings)? <= BigInt::one() {
-                    return self.node_error(node.id, "plaintext modulus must be greater than one");
-                }
-                self.decode_targets.push(DecodeTarget {
-                    input: WireId { instantiation_path: self.path.clone(), wire: node.args[0] },
-                    plaintext_modulus: plaintext_modulus.evaluate(self.bindings)?,
-                    length: count,
-                });
-                let ty = if *output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int };
-                for port in 0..count {
-                    self.insert_value(node.id, port as u32, Value::Scalar(ty.clone()));
-                }
+                    .expect("validated coefficient position");
+                let ty = matrix_type(&output_type(0)).expect("validated coefficient").clone();
+                vec![matrix_output(self.expressions.constant_coefficient(ty, value, position)?)]
             }
             NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => {
-                if node.args.is_empty() ||
-                    node.args.len() != plaintext_moduli.len() ||
-                    node.args.len() != reconstruction_coefficients.len()
-                {
-                    return self.node_error(
-                        node.id,
-                        "CRT recomposition requires one modulus and reconstruction coefficient per input",
-                    );
-                }
-                let inputs = (0..node.args.len())
-                    .map(|index| self.matrix_argument(node, index))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let ty = inputs[0].ty.clone();
-                if ty.rows != 1 || inputs.iter().any(|input| input.ty != ty) {
-                    return self.node_error(
-                        node.id,
-                        "CRT recomposition inputs must be identical one-row matrices",
-                    );
-                }
-                let plaintext_moduli = plaintext_moduli
+                let inputs = args
                     .iter()
-                    .map(|value| value.evaluate(self.bindings))
+                    .map(|argument| self.matrix_expression(scope, node, *argument, wires))
                     .collect::<Result<Vec<_>, _>>()?;
-                let reconstruction_coefficients = reconstruction_coefficients
+                let moduli = plaintext_moduli
                     .iter()
-                    .map(|value| value.evaluate(self.bindings))
+                    .map(|value| value.evaluate(&self.graph.bindings))
                     .collect::<Result<Vec<_>, _>>()?;
-                if plaintext_moduli
+                let coefficients = reconstruction_coefficients
                     .iter()
-                    .any(|modulus| modulus <= &BigInt::one() || modulus >= &ty.modulus)
-                {
-                    return self.node_error(
-                        node.id,
-                        "CRT plaintext moduli must be between one and the full modulus",
-                    );
-                }
-                if reconstruction_coefficients.iter().any(|coefficient| {
-                    coefficient.sign() == num_bigint::Sign::Minus || coefficient >= &ty.modulus
-                }) {
-                    return self.node_error(
-                        node.id,
-                        "CRT reconstruction coefficients must be full-modulus residues",
-                    );
-                }
-                for (index, (input, plaintext_modulus)) in
-                    inputs.iter().zip(&plaintext_moduli).enumerate()
-                {
-                    self.require_reduced(node.id, &input.terms)?;
+                    .map(|value| value.evaluate(&self.graph.bindings))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (argument, plaintext_modulus) in args.iter().zip(&moduli) {
+                    let input_type =
+                        matrix_type(&validated.wire_types[argument]).expect("validated CRT input");
                     self.decode_targets.push(DecodeTarget {
-                        input: WireId {
-                            instantiation_path: self.path.clone(),
-                            wire: node.args[index],
-                        },
+                        input: ScopedWireRef { scope: scope.clone(), wire: *argument },
                         plaintext_modulus: plaintext_modulus.clone(),
-                        length: input.ty.ring_dimension * input.ty.columns,
+                        length: input_type.ring_dimension * input_type.columns,
                     });
                 }
-                let input_terms =
-                    inputs.iter().map(|input| input.terms.clone()).collect::<Vec<_>>();
-                let input_dependencies =
-                    input_terms.iter().flat_map(|terms| dependencies(terms, &self.atoms)).collect();
-                let id = self.derived_atom(
-                    node.id,
-                    0,
-                    ty.clone(),
-                    DefExpr::CrtRecompose {
-                        inputs: input_terms,
-                        plaintext_moduli,
-                        reconstruction_coefficients,
-                    },
-                    input_dependencies,
-                    AtomKind::Large,
-                );
-                self.insert_matrix(node.id, 0, ty, TermList::atom(id), false);
+                let ty = matrix_type(&output_type(0)).expect("validated CRT output").clone();
+                let expression =
+                    self.expressions.crt_recompose(ty, inputs, moduli, coefficients)?;
+                vec![matrix_output(expression)]
             }
-            NodeKind::Select { count } => self.select(node, count.evaluate(self.bindings)?)?,
-            NodeKind::FamilyPack { count } => {
-                let count =
-                    positive_usize(count.evaluate(self.bindings)?, "family count", node.id)?;
-                if node.args.len() != count {
-                    return self.node_error(node.id, "family pack argument count mismatch");
-                }
-                let elements = (0..count)
-                    .map(|index| self.argument(node, index).cloned())
+            NodeKind::ThresholdDecode { plaintext_modulus, length, .. } => {
+                self.decode_targets.push(DecodeTarget {
+                    input: ScopedWireRef { scope: scope.clone(), wire: args[0] },
+                    plaintext_modulus: plaintext_modulus.evaluate(&self.graph.bindings)?,
+                    length: length.evaluate(&self.graph.bindings)?.to_usize().expect("validated"),
+                });
+                outputs.iter().map(|_| SymbolicOutput::default()).collect()
+            }
+            NodeKind::FamilyPack { .. } => {
+                let members = args
+                    .iter()
+                    .map(|argument| self.matrix_expression(scope, node, *argument, wires))
                     .collect::<Result<Vec<_>, _>>()?;
-                let element_type = value_type(&elements[0]);
-                if elements.iter().any(|value| value_type(value) != element_type) {
-                    return self.node_error(node.id, "family members must have identical types");
-                }
-                self.insert_value(node.id, 0, Value::IndexedFamily { element_type, elements });
+                let matrix =
+                    matrix_type(&output_type(0)).expect("validated family element").clone();
+                let domain = SelectionDomainRef::Local(SelectionDomain {
+                    index_wire: ScopedWireRef { scope: scope.clone(), wire: outputs[0] },
+                    instantiation_path: Vec::new(),
+                    count: members.len() as u64,
+                    modulus: matrix.modulus.clone(),
+                    ring_dimension: matrix.ring_dimension,
+                });
+                let expression = self.expressions.select(matrix, domain, members.clone())?;
+                vec![SymbolicOutput {
+                    expression: Some(expression),
+                    family: Some(SymbolicFamily::ExactMembers(members)),
+                }]
             }
             NodeKind::FamilyGetStatic { index } => {
-                self.family_get_static(node, index.evaluate(self.bindings)?)?
-            }
-            NodeKind::FamilyGetDynamic => self.family_get_dynamic(node)?,
-            NodeKind::SubgraphCall(call) => self.subgraph_call(node, call)?,
-            NodeKind::ParallelLoop(loop_node) => self.parallel_loop(node, loop_node)?,
-        }
-        Ok(())
-    }
-
-    fn input(
-        &mut self,
-        node: &Node,
-        name: &str,
-        wire_type: &WireType,
-        artifact: Option<&crate::node::ArtifactInput>,
-    ) -> Result<(), ElaborationError> {
-        if let Some(value) = self.input_overrides.get(name).cloned() {
-            self.insert_value(node.id, 0, value);
-            return Ok(());
-        }
-        if let Some(artifact) = artifact {
-            let imported = self
-                .manifests
-                .get(&artifact.production_id)
-                .ok_or_else(|| ElaborationError::MissingManifest(artifact.production_id.clone()))?;
-            let stored = imported.artifacts.get(&artifact.artifact_name).ok_or_else(|| {
-                ElaborationError::MissingArtifact {
-                    production: artifact.production_id.clone(),
-                    artifact: artifact.artifact_name.clone(),
-                }
-            })?;
-            let declared = concrete_wire(wire_type, self.bindings)?;
-            if let ConcreteWireType::IndexedFamily { element, count } = &declared {
-                if element.as_ref() != &stored.wire_type {
-                    return self.node_error(
-                        node.id,
-                        "declared artifact family element type does not match the manifest",
-                    );
-                }
-                if !symbolic_artifact_type(element) {
-                    return self.node_error(
-                        node.id,
-                        "symbolic artifact families must contain matrix, preimage, or trapdoor values",
-                    );
-                }
-                let family = stored.family.as_ref().ok_or_else(|| ElaborationError::Node {
-                    node: node.id,
-                    message: "artifact family declaration references a singular artifact"
-                        .to_owned(),
-                })?;
-                if *count != family.len() {
-                    return self.node_error(node.id, "artifact family count mismatch");
-                }
-                let elements = family
-                    .iter()
-                    .map(|terms| imported_artifact_value(element, Some(terms), node.id))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.insert_value(
-                    node.id,
-                    0,
-                    Value::IndexedFamily { element_type: element.as_ref().clone(), elements },
-                );
-                return Ok(());
-            }
-            if declared != stored.wire_type {
-                return self
-                    .node_error(node.id, "declared artifact type does not match the manifest");
-            }
-            if stored.family.is_some() {
-                return self.node_error(
-                    node.id,
-                    "singular artifact input references an indexed manifest entry",
-                );
-            }
-            let value = imported_artifact_value(&declared, stored.terms.as_ref(), node.id)?;
-            self.insert_value(node.id, 0, value);
-            return Ok(());
-        }
-        match concrete_wire(wire_type, self.bindings)? {
-            ConcreteWireType::Matrix(ty) => {
-                let atom = self.source_atom(
-                    node.id,
-                    0,
-                    ty.clone(),
-                    AtomKind::Large,
-                    SourceKind::External { kind: ExternalSourceKind::Matrix },
-                    None,
-                );
-                self.insert_matrix(node.id, 0, ty, TermList::atom(atom), false);
-            }
-            ConcreteWireType::Preimage(ty) => {
-                let atom = self.source_atom(
-                    node.id,
-                    0,
-                    ty.clone(),
-                    AtomKind::Bounded,
-                    SourceKind::External { kind: ExternalSourceKind::Preimage },
-                    None,
-                );
-                self.insert_matrix(node.id, 0, ty, TermList::atom(atom), true);
-            }
-            ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count } => {
-                let uniform = self.source_atom(
-                    node.id,
-                    1,
-                    matrix.clone(),
-                    AtomKind::Large,
-                    SourceKind::External { kind: ExternalSourceKind::TrapdoorUniform },
-                    None,
-                );
-                self.insert_value(
-                    node.id,
-                    0,
-                    Value::Trapdoor(TrapdoorValue {
-                        ty: ConcreteWireType::Trapdoor {
-                            matrix,
-                            sigma: sigma.clone(),
-                            gadget_base,
-                            digit_count,
-                        },
-                        uniform,
-                        origin: TrapdoorOrigin::Sampled,
-                    }),
-                );
-            }
-            ConcreteWireType::IndexedFamily { .. } => {
-                return self.node_error(
-                    node.id,
-                    "non-artifact indexed-family inputs are not supported yet",
-                );
-            }
-            scalar => self.insert_value(node.id, 0, Value::Scalar(scalar)),
-        }
-        Ok(())
-    }
-
-    fn scalar_operation(&mut self, node: &Node) -> Result<(), ElaborationError> {
-        let ty = match node.kind {
-            NodeKind::IntBinary(_) => {
-                self.require_scalar(node, 0, is_integer, "integer")?;
-                self.require_scalar(node, 1, is_integer, "integer")?;
-                ConcreteWireType::Int
-            }
-            NodeKind::BoolToInt => {
-                self.require_scalar(node, 0, is_boolean, "boolean")?;
-                ConcreteWireType::Int
-            }
-            NodeKind::IntToReal => {
-                self.require_scalar(node, 0, is_integer, "integer")?;
-                ConcreteWireType::Real
-            }
-            NodeKind::RealBinary(_) => {
-                self.require_scalar(node, 0, is_real, "real")?;
-                self.require_scalar(node, 1, is_real, "real")?;
-                ConcreteWireType::Real
-            }
-            NodeKind::RealSqrt => {
-                self.require_scalar(node, 0, is_real, "real")?;
-                ConcreteWireType::Real
-            }
-            _ => return self.node_error(node.id, "invalid scalar operation"),
-        };
-        self.insert_value(node.id, 0, Value::Scalar(ty));
-        Ok(())
-    }
-
-    fn require_scalar(
-        &self,
-        node: &Node,
-        index: usize,
-        predicate: fn(&ConcreteWireType) -> bool,
-        expected: &str,
-    ) -> Result<(), ElaborationError> {
-        let Value::Scalar(ty) = self.argument(node, index)? else {
-            return self.node_error(node.id, &format!("expected {expected} scalar argument"));
-        };
-        if predicate(ty) {
-            Ok(())
-        } else {
-            self.node_error(node.id, &format!("expected {expected} scalar argument"))
-        }
-    }
-
-    fn matrix_binary(
-        &mut self,
-        node: &Node,
-        operation: MatrixBinaryOp,
-    ) -> Result<(), ElaborationError> {
-        let left = self.matrix_argument(node, 0)?;
-        let right = self.matrix_argument(node, 1)?;
-        let (ty, terms) = match operation {
-            MatrixBinaryOp::Add => {
-                check_add_shape(&left.ty, &right.ty)?;
-                (left.ty.clone(), left.terms.add(&right.terms, &self.atoms)?)
-            }
-            MatrixBinaryOp::Subtract => {
-                check_add_shape(&left.ty, &right.ty)?;
-                (left.ty.clone(), left.terms.sub(&right.terms, &self.atoms)?)
-            }
-            MatrixBinaryOp::Multiply => {
-                let ty = multiplication_type(&left.ty, &right.ty)?;
-                let expanded = left.terms.multiply(&right.terms, &self.atoms)?;
-                let terms = rewrite_preimages(expanded, &self.atoms, self)?;
-                (ty, terms)
-            }
-        };
-        self.insert_matrix(node.id, 0, ty, terms, false);
-        Ok(())
-    }
-
-    fn hash_sample(
-        &mut self,
-        node: &Node,
-        matrix_type: &MatrixType,
-        variant: HashVariant,
-        base: Option<&crate::expr::IntExpr>,
-        digit_count: Option<&crate::expr::IntExpr>,
-    ) -> Result<(), ElaborationError> {
-        let Value::Scalar(ConcreteWireType::Bytes { length: 32 }) = self.argument(node, 0)? else {
-            return self.node_error(node.id, "hash sampling requires a 32-byte key");
-        };
-        for index in 1..node.args.len() {
-            self.require_scalar(node, index, is_integer, "integer hash-tag component")?;
-        }
-        let ty = concrete_matrix(matrix_type, self.bindings)?;
-        match variant {
-            HashVariant::Plain => {
-                let id = self.source_atom(
-                    node.id,
-                    0,
-                    ty.clone(),
-                    AtomKind::Large,
-                    SourceKind::HashSample { variant, base: None, digit_count: None },
-                    None,
-                );
-                self.insert_matrix(node.id, 0, ty, TermList::atom(id), false);
-            }
-            HashVariant::Decomposed | HashVariant::SmallDecomposed => {
-                let base = base.ok_or_else(|| ElaborationError::Node {
-                    node: node.id,
-                    message: "decomposed hash requires a base".to_owned(),
-                })?;
-                let base_value = base.evaluate(self.bindings)?.abs();
-                if base_value <= BigInt::one() {
-                    return self
-                        .node_error(node.id, "decomposed hash base must be greater than one");
-                }
-                let digits = decomposition_digits(
-                    digit_count,
-                    &ty.modulus,
-                    &base_value,
-                    self.bindings,
-                    node.id,
-                )?;
-                if ty.rows % digits != 0 {
-                    return self.node_error(
-                        node.id,
-                        "decomposed hash output rows must be divisible by gadget digits",
-                    );
-                }
-                let target_ty = ConcreteMatrixType {
-                    rows: ty.rows / digits,
-                    columns: ty.columns,
-                    ..ty.clone()
+                let index = index
+                    .evaluate(&self.graph.bindings)?
+                    .to_usize()
+                    .expect("validated family index");
+                let expression = match wires.get(&args[0]).and_then(|wire| wire.family.as_ref()) {
+                    Some(SymbolicFamily::ExactMembers(members)) => members[index],
+                    Some(SymbolicFamily::StructuralTemplate { template, .. }) => self
+                        .specialize_expression(
+                            *template,
+                            ParallelIndex::Static(index as u64),
+                            0,
+                            &mut BTreeMap::new(),
+                        )?,
+                    None => {
+                        return Err(self.node_error(scope, node, "family has no symbolic state"))
+                    }
                 };
-                let gadget_ty = ConcreteMatrixType {
-                    rows: target_ty.rows,
-                    columns: ty.rows,
-                    ..target_ty.clone()
-                };
-                let target = self.source_atom(
-                    node.id,
-                    1,
-                    target_ty.clone(),
-                    AtomKind::Large,
-                    SourceKind::HashTarget { variant },
-                    None,
-                );
-                let target_wire = WireRef { node: node.id, port: Port(1) };
-                let target_terms = TermList::atom(target);
-                let target_id = WireId { instantiation_path: self.path.clone(), wire: target_wire };
-                self.wire_terms.insert(target_id.clone(), target_terms.clone());
-                self.all_wires.insert(
-                    target_id,
-                    Value::Matrix(MatrixValue { ty: target_ty, terms: target_terms }),
-                );
-                let gadget = self.gadget_atom(
-                    &gadget_ty,
-                    base,
-                    matches!(variant, HashVariant::SmallDecomposed),
-                )?;
-                let id = self.source_atom(
-                    node.id,
-                    0,
-                    ty.clone(),
-                    AtomKind::Bounded,
-                    SourceKind::HashSample {
-                        variant,
-                        base: Some(base_value),
-                        digit_count: Some(digits),
-                    },
-                    Some(PreimageRefs { uniform: gadget, target: TargetRef::Local(target_wire) }),
-                );
-                self.insert_matrix(node.id, 0, ty, TermList::atom(id), true);
+                vec![matrix_output(expression)]
             }
-        }
-        Ok(())
-    }
-
-    fn derived_matrix(
-        &mut self,
-        node: &Node,
-        operation: &str,
-        axis: Option<ConcatAxis>,
-    ) -> Result<(), ElaborationError> {
-        let inputs = (0..node.args.len())
-            .map(|index| self.matrix_argument(node, index))
-            .collect::<Result<Vec<_>, _>>()?;
-        for input in &inputs {
-            self.require_reduced(node.id, &input.terms)?;
-        }
-        let first = inputs.first().ok_or_else(|| ElaborationError::Node {
-            node: node.id,
-            message: format!("{operation} requires at least one input"),
-        })?;
-        let mut ty = first.ty.clone();
-        match operation {
-            "tensor" => {
-                if inputs.len() != 2 {
-                    return self.node_error(node.id, "tensor requires two inputs");
-                }
-                crate::checks::check_same_ring(&inputs[0].ty, &inputs[1].ty)?;
-                ty.rows = ty.rows.saturating_mul(inputs[1].ty.rows);
-                ty.columns = ty.columns.saturating_mul(inputs[1].ty.columns);
-            }
-            "concat" => {
-                for input in &inputs[1..] {
-                    crate::checks::check_same_ring(&ty, &input.ty)?;
-                    match axis.expect("concat axis") {
-                        ConcatAxis::Rows if ty.columns == input.ty.columns => {
-                            ty.rows += input.ty.rows;
-                        }
-                        ConcatAxis::Columns if ty.rows == input.ty.rows => {
-                            ty.columns += input.ty.columns;
-                        }
-                        ConcatAxis::Diagonal => {
-                            ty.rows += input.ty.rows;
-                            ty.columns += input.ty.columns;
-                        }
-                        _ => return self.node_error(node.id, "concat shape mismatch"),
-                    }
-                }
-            }
-            _ => unreachable!(),
-        }
-        let mut input_atoms = Vec::with_capacity(inputs.len());
-        for (index, input) in inputs.iter().enumerate() {
-            input_atoms.push(self.definition_atom(
-                node.id,
-                u32::try_from(index + 1).map_err(|_| ElaborationError::Node {
-                    node: node.id,
-                    message: "derived input count exceeds the atom port range".to_owned(),
-                })?,
-                input,
-            )?);
-        }
-        let definition = match operation {
-            "concat" => {
-                DefExpr::Concat { inputs: input_atoms.clone(), axis: axis.expect("concat axis") }
-            }
-            _ => unreachable!(),
-        };
-        let classes = inputs
-            .iter()
-            .map(|input| classify_terms(&input.terms, &self.atoms))
-            .collect::<Result<Vec<_>, _>>()?;
-        if classes.iter().any(|class| matches!(class, TermClass::Mixed)) ||
-            (classes.iter().any(|class| matches!(class, TermClass::Signal)) &&
-                classes.iter().any(|class| matches!(class, TermClass::Noise)))
-        {
-            return self
-                .node_error(node.id, "concat cannot combine signal and noise into one opaque atom");
-        }
-        let kind = if classes.iter().any(|class| matches!(class, TermClass::Signal)) {
-            AtomKind::Large
-        } else {
-            AtomKind::Bounded
-        };
-        let id = self.derived_atom(
-            node.id,
-            0,
-            ty.clone(),
-            definition,
-            input_atoms.into_iter().collect(),
-            kind,
-        );
-        self.insert_matrix(node.id, 0, ty, TermList::atom(id), false);
-        Ok(())
-    }
-
-    fn definition_atom(
-        &mut self,
-        node: NodeId,
-        port: u32,
-        input: &MatrixValue,
-    ) -> Result<AtomId, ElaborationError> {
-        if let [term] = input.terms.terms.as_slice() &&
-            term.coefficient == BigInt::one() &&
-            let [factor] = term.factors.as_slice() &&
-            factor.view.is_none()
-        {
-            return Ok(factor.atom.clone());
-        }
-        let kind = match classify_terms(&input.terms, &self.atoms)? {
-            TermClass::Signal => AtomKind::Large,
-            TermClass::Zero | TermClass::Noise => AtomKind::Bounded,
-            TermClass::Mixed => {
-                return self.node_error(
-                    node,
-                    "cannot combine signal and noise into one opaque definition atom",
-                );
-            }
-        };
-        Ok(self.derived_atom(
-            node,
-            port,
-            input.ty.clone(),
-            DefExpr::TermList(input.terms.clone()),
-            dependencies(&input.terms, &self.atoms),
-            kind,
-        ))
-    }
-
-    fn family_get_static(&mut self, node: &Node, index: BigInt) -> Result<(), ElaborationError> {
-        let index = nonnegative_usize(index, "family index", node.id)?;
-        let Value::IndexedFamily { elements, .. } = self.argument(node, 0)? else {
-            return self.node_error(node.id, "family access requires an indexed family");
-        };
-        let value = elements.get(index).cloned().ok_or_else(|| ElaborationError::Node {
-            node: node.id,
-            message: "family index is out of range".to_owned(),
-        })?;
-        self.insert_value(node.id, 0, value);
-        Ok(())
-    }
-
-    fn family_get_dynamic(&mut self, node: &Node) -> Result<(), ElaborationError> {
-        self.require_scalar(node, 1, is_integer, "integer family index")?;
-        let Value::IndexedFamily { elements, .. } = self.argument(node, 0)? else {
-            return self.node_error(node.id, "family access requires an indexed family");
-        };
-        let branches = elements
-            .iter()
-            .map(|value| match value {
-                Value::Matrix(matrix) => Ok(matrix.clone()),
-                Value::Preimage(matrix) => Ok(matrix.clone()),
-                _ => self.node_error(
-                    node.id,
-                    "symbolic dynamic family access requires matrix-like elements",
-                ),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.select_matrices(node, node.args[1], branches)
-    }
-
-    fn select(&mut self, node: &Node, count: BigInt) -> Result<(), ElaborationError> {
-        let count = positive_usize(count, "select count", node.id)?;
-        if node.args.len() != count + 1 {
-            return self.node_error(node.id, "select argument count mismatch");
-        }
-        self.require_scalar(node, 0, is_integer, "integer select index")?;
-        let branches = (1..=count)
-            .map(|index| self.matrix_argument(node, index))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.select_matrices(node, node.args[0], branches)
-    }
-
-    fn select_matrices(
-        &mut self,
-        node: &Node,
-        index_wire: WireRef,
-        branches: Vec<MatrixValue>,
-    ) -> Result<(), ElaborationError> {
-        let count = branches.len();
-        let ty = branches
-            .first()
-            .ok_or_else(|| ElaborationError::Node {
-                node: node.id,
-                message: "select has no branches".to_owned(),
-            })?
-            .ty
-            .clone();
-        for branch in &branches[1..] {
-            check_add_shape(&ty, &branch.ty)?;
-        }
-        let domain = SelectionDomain {
-            index_wire,
-            instantiation_path: self.path.clone(),
-            count: count as u64,
-            modulus: ty.modulus.clone(),
-            ring_dimension: ty.ring_dimension,
-        };
-        self.selection_domains.insert(
-            WireId {
-                instantiation_path: self.path.clone(),
-                wire: WireRef { node: node.id, port: Port(0) },
-            },
-            domain.clone(),
-        );
-        let scalar = ConcreteMatrixType::scalar(ty.modulus.clone(), ty.ring_dimension);
-        let mut terms = Vec::new();
-        for (branch, input) in branches.iter().enumerate() {
-            let indicator = AtomId::Indicator { domain: domain.clone(), branch: branch as u64 };
-            if !self.atoms.contains_key(&indicator) {
-                self.atoms.insert(Atom {
-                    id: indicator.clone(),
-                    class: AtomClass::Derived {
-                        definition: DefExpr::Indicator { index_wire, branch: branch as u64 },
-                    },
-                    kind: AtomKind::Bounded,
-                    matrix_type: scalar.clone(),
-                    dependencies: BTreeSet::new(),
-                    preimage_refs: None,
-                    indicator: Some(IndicatorRole {
-                        domain: SelectionDomainRef::Local(domain.clone()),
-                        branch: branch as u64,
-                    }),
-                });
-            }
-            for term in &input.terms.terms {
-                let mut factors = vec![Factor { atom: indicator.clone(), view: None }];
-                factors.extend(term.factors.iter().cloned());
-                terms.push(Term { coefficient: term.coefficient.clone(), factors });
-            }
-        }
-        let terms = TermList { terms }.canonicalize(&self.atoms)?;
-        if !self.index_proven_in_range(index_wire, count) {
-            self.warnings.push(ElaborationWarning {
-                node: node.id,
-                kind: WarningKind::RuntimeSelectBoundsCheck,
-                message: "select index requires a runtime bounds check".to_owned(),
-            });
-        }
-        self.insert_matrix(node.id, 0, ty, terms, false);
-        Ok(())
-    }
-
-    fn index_proven_in_range(&self, wire: WireRef, count: usize) -> bool {
-        let Some(node) = self.graph.node(wire.node) else {
-            return false;
-        };
-        match &node.kind {
-            NodeKind::ConstantInt(value) => {
-                value.sign() != num_bigint::Sign::Minus &&
-                    value.to_usize().is_some_and(|value| value < count)
-            }
-            NodeKind::EvaluateInt(value) => value
-                .evaluate(self.bindings)
-                .ok()
-                .and_then(|value| value.to_usize())
-                .is_some_and(|value| value < count),
-            NodeKind::BoolToInt | NodeKind::BitExtract { .. } => count >= 2,
-            NodeKind::IntBinary(crate::node::IntBinaryOp::Remainder) => {
-                let Some(divisor) = node.args.get(1).and_then(|wire| self.graph.node(wire.node))
-                else {
-                    return false;
-                };
-                matches!(
-                    &divisor.kind,
-                    NodeKind::ConstantInt(value)
-                        if value > &BigInt::zero() &&
-                            value.to_usize().is_some_and(|value| value <= count)
-                )
-            }
-            _ => false,
-        }
-    }
-
-    fn subgraph_call(
-        &mut self,
-        node: &Node,
-        call: &crate::node::SubgraphCall,
-    ) -> Result<(), ElaborationError> {
-        let graph = self.graph.subgraphs.get(&call.graph).cloned().ok_or_else(|| {
-            ElaborationError::Node {
-                node: node.id,
-                message: format!("subgraph {} does not exist", call.graph),
-            }
-        })?;
-        let env = self.child_bindings(&call.bindings, None)?;
-        let outputs = self.elaborate_child(
-            &graph,
-            env,
-            node,
-            InstantiationFrame { call: node.id, loop_index: None },
-            None,
-        )?;
-        for (port, value) in outputs.into_iter().enumerate() {
-            self.insert_value(node.id, port as u32, value);
-        }
-        Ok(())
-    }
-
-    fn parallel_loop(
-        &mut self,
-        node: &Node,
-        loop_node: &crate::node::ParallelLoop,
-    ) -> Result<(), ElaborationError> {
-        let graph = self.graph.subgraphs.get(&loop_node.graph).cloned().ok_or_else(|| {
-            ElaborationError::Node {
-                node: node.id,
-                message: format!("subgraph {} does not exist", loop_node.graph),
-            }
-        })?;
-        let count = nonnegative_usize(
-            loop_node.count.evaluate(self.bindings)?,
-            "parallel-loop count",
-            node.id,
-        )?;
-        if count < loop_node.minimum_count {
-            return self.node_error(
-                node.id,
-                &format!(
-                    "parallel-loop count must be at least {}, got {count}",
-                    loop_node.minimum_count
-                ),
-            );
-        }
-        if count == 0 {
-            let env =
-                self.child_bindings(&loop_node.bindings, Some((&loop_node.index_variable, 0)))?;
-            let mut probe = self.clone();
-            let outputs = probe.elaborate_child(
-                &graph,
-                env,
-                node,
-                InstantiationFrame { call: node.id, loop_index: Some(0) },
-                Some((&loop_node.input_modes, 0)),
-            )?;
-            for (port, value) in outputs.into_iter().enumerate() {
-                self.insert_value(
-                    node.id,
-                    port as u32,
-                    Value::IndexedFamily { element_type: value_type(&value), elements: Vec::new() },
-                );
-            }
-            return Ok(());
-        }
-        let mut families =
-            (0..graph.outputs.len()).map(|_| Vec::with_capacity(count)).collect::<Vec<_>>();
-        for index in 0..count {
-            let mut env =
-                self.child_bindings(&loop_node.bindings, Some((&loop_node.index_variable, index)))?;
-            env.integers.insert(loop_node.index_variable.clone(), BigInt::from(index));
-            let outputs = self.elaborate_child(
-                &graph,
-                env,
-                node,
-                InstantiationFrame { call: node.id, loop_index: Some(index as u64) },
-                Some((&loop_node.input_modes, index)),
-            )?;
-            for (output, value) in outputs.into_iter().enumerate() {
-                if let Some(reference) = families[output].first() {
-                    if value_type(reference) != value_type(&value) {
-                        return self.node_error(
-                            node.id,
-                            "parallel-loop output shapes depend on the loop index",
-                        );
-                    }
-                }
-                families[output].push(value);
-            }
-        }
-        for (port, elements) in families.into_iter().enumerate() {
-            let element_type =
-                elements.first().map(value_type).ok_or_else(|| ElaborationError::Node {
-                    node: node.id,
-                    message: "zero-length symbolic loop families are not supported yet".to_owned(),
-                })?;
-            self.insert_value(
-                node.id,
-                port as u32,
-                Value::IndexedFamily { element_type, elements },
-            );
-        }
-        Ok(())
-    }
-
-    fn child_bindings(
-        &self,
-        bindings: &[(String, crate::expr::IntExpr)],
-        loop_index: Option<(&str, usize)>,
-    ) -> Result<ParamEnv, ElaborationError> {
-        let mut env = self.bindings.clone();
-        if let Some((name, index)) = loop_index {
-            env.integers.insert(name.to_owned(), BigInt::from(index));
-        }
-        let expression_env = env.clone();
-        for (name, expression) in bindings {
-            env.integers.insert(name.clone(), expression.evaluate(&expression_env)?);
-        }
-        Ok(env)
-    }
-
-    fn elaborate_child(
-        &mut self,
-        graph: &Graph,
-        bindings: ParamEnv,
-        call_node: &Node,
-        frame: InstantiationFrame,
-        loop_input: Option<(&[LoopInputMode], usize)>,
-    ) -> Result<Vec<Value>, ElaborationError> {
-        check_bindings(graph, &bindings)?;
-        let mut path = self.path.clone();
-        path.push(frame);
-        check_topological(graph).map_err(|error| contextualize_check(error, &path))?;
-        let input_nodes = graph
-            .nodes
-            .iter()
-            .filter_map(|node| match &node.kind {
-                NodeKind::Input { name, .. } => Some((name.clone(), node)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if input_nodes.len() != call_node.args.len() {
-            return self
-                .node_error(call_node.id, "subgraph input count does not match call arguments");
-        }
-        let input_overrides = input_nodes
-            .iter()
-            .zip(&call_node.args)
-            .enumerate()
-            .map(|(position, ((name, _), wire))| {
-                let value = self
-                    .values
-                    .get(wire)
-                    .cloned()
-                    .ok_or(ElaborationError::MissingWire { node: call_node.id, wire: *wire })?;
-                let value = match loop_input {
-                    Some((modes, index)) => match modes.get(position) {
-                        Some(LoopInputMode::Broadcast) => value,
-                        Some(LoopInputMode::Zip | LoopInputMode::ZipOffset { .. }) => {
-                            let offset = match modes.get(position) {
-                                Some(LoopInputMode::Zip) => 0,
-                                Some(LoopInputMode::ZipOffset { offset }) => *offset,
-                                _ => unreachable!(),
-                            };
-                            let index = index.checked_add(offset).ok_or_else(|| {
-                                ElaborationError::Node {
-                                    node: call_node.id,
-                                    message: "zipped loop input range overflow".to_owned(),
-                                }
-                            })?;
-                            let Value::IndexedFamily { element_type, elements } = value else {
-                                return self.node_error(
-                                    call_node.id,
-                                    "zipped loop input is not an indexed family",
-                                );
-                            };
-                            match elements.get(index) {
-                                Some(element) => element.clone(),
-                                None if elements.is_empty() && index == 0 => self
-                                    .loop_probe_value(
-                                        call_node.id,
-                                        position as u32,
-                                        &element_type,
-                                    )?,
-                                None => {
-                                    return self.node_error(
-                                        call_node.id,
-                                        "zipped loop input count mismatch",
-                                    );
-                                }
-                            }
-                        }
-                        None => {
-                            return self.node_error(
-                                call_node.id,
-                                "parallel-loop input mode count mismatch",
-                            );
-                        }
-                    },
-                    None => value,
-                };
-                Ok((name.clone(), value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let mut child = State {
-            graph,
-            bindings: &bindings,
-            manifests: self.manifests,
-            input_overrides,
-            values: BTreeMap::new(),
-            all_wires: self.all_wires.clone(),
-            wire_terms: self.wire_terms.clone(),
-            atoms: self.atoms.clone(),
-            warnings: self.warnings.clone(),
-            path,
-            decode_targets: self.decode_targets.clone(),
-            assumed_terms: self.assumed_terms.clone(),
-            overlay: self.overlay,
-            overlay_matches: self.overlay_matches.clone(),
-            used_virtual_atoms: self.used_virtual_atoms.clone(),
-            used_assumed_terms: self.used_assumed_terms.clone(),
-            creating_virtual_atoms: self.creating_virtual_atoms.clone(),
-            active_overlay_wire: None,
-            selection_domains: self.selection_domains.clone(),
-        };
-        for child_node in &graph.nodes {
-            child.elaborate_node_with_context(child_node)?;
-        }
-        let outputs = graph
-            .outputs
-            .values()
-            .map(|wire| {
-                child
-                    .values
-                    .get(wire)
-                    .cloned()
-                    .ok_or(ElaborationError::MissingWire { node: call_node.id, wire: *wire })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.atoms = child.atoms;
-        self.wire_terms = child.wire_terms;
-        self.all_wires = child.all_wires;
-        self.warnings = child.warnings;
-        self.decode_targets = child.decode_targets;
-        self.assumed_terms = child.assumed_terms;
-        self.overlay_matches = child.overlay_matches;
-        self.used_virtual_atoms = child.used_virtual_atoms;
-        self.used_assumed_terms = child.used_assumed_terms;
-        self.creating_virtual_atoms = child.creating_virtual_atoms;
-        self.selection_domains = child.selection_domains;
-        Ok(outputs)
-    }
-
-    fn loop_probe_value(
-        &mut self,
-        node: NodeId,
-        port: u32,
-        wire_type: &ConcreteWireType,
-    ) -> Result<Value, ElaborationError> {
-        Ok(match wire_type {
-            ConcreteWireType::Matrix(matrix) => {
-                Value::Matrix(MatrixValue { ty: matrix.clone(), terms: TermList::zero() })
-            }
-            ConcreteWireType::Preimage(matrix) => {
-                Value::Preimage(MatrixValue { ty: matrix.clone(), terms: TermList::zero() })
-            }
-            ConcreteWireType::Trapdoor { matrix, .. } => {
-                let uniform = self.source_atom(
-                    node,
-                    u32::MAX - port,
-                    matrix.clone(),
-                    AtomKind::Large,
-                    SourceKind::External { kind: ExternalSourceKind::TrapdoorUniform },
-                    None,
-                );
-                Value::Trapdoor(TrapdoorValue {
-                    ty: wire_type.clone(),
-                    uniform,
-                    origin: TrapdoorOrigin::Sampled,
-                })
-            }
-            ConcreteWireType::IndexedFamily { .. } => {
-                return self.node_error(node, "nested indexed families are not supported");
-            }
-            scalar => Value::Scalar(scalar.clone()),
-        })
-    }
-
-    fn mod_down(&mut self, node: &Node, target: BigInt) -> Result<(), ElaborationError> {
-        let input = self.matrix_argument(node, 0)?;
-        if target <= BigInt::one() || target >= input.ty.modulus {
-            return self.node_error(node.id, "mod-down target must satisfy 1 < p < q");
-        }
-        self.require_reduced(node.id, &input.terms)?;
-        check_mod_down_normal_form(&input.terms, &self.atoms)?;
-        let output_ty = ConcreteMatrixType { modulus: target.clone(), ..input.ty.clone() };
-        let mut signal = Vec::new();
-        let mut bounded = Vec::new();
-        for term in &input.terms.terms {
-            let large_position = term.factors.iter().position(|factor| {
-                self.atoms
-                    .get(&factor.atom)
-                    .is_some_and(|atom| matches!(atom.kind, AtomKind::Large))
-            });
-            if let Some(position) = large_position {
-                let mut factors = term.factors.clone();
-                for factor in &mut factors[..position] {
-                    factor.view.get_or_insert_with(ViewDescriptor::default).modulus_cast =
-                        Some(target.clone());
-                }
-                let source = factors[position].atom.clone();
-                let source_atom = self
-                    .atoms
-                    .get(&source)
-                    .ok_or_else(|| TermError::MissingAtom(source.clone()))?;
-                let image = self.derived_atom(
-                    node.id,
-                    (signal.len() + 1) as u32,
-                    ConcreteMatrixType {
-                        modulus: target.clone(),
-                        ..source_atom.matrix_type.clone()
-                    },
-                    DefExpr::ModDownImage {
-                        source: source.clone(),
-                        source_modulus: input.ty.modulus.clone(),
-                        target_modulus: target.clone(),
-                    },
-                    BTreeSet::from([source]),
-                    AtomKind::Large,
-                );
-                factors[position] = Factor { atom: image, view: None };
-                signal.push(Term { coefficient: term.coefficient.clone(), factors });
-            } else {
-                bounded.push(term.clone());
-            }
-        }
-        self.warn_viewed_preimages(node.id, &input.terms);
-        let _bounded_terms = TermList { terms: bounded };
-        let signal_terms = TermList { terms: signal.clone() };
-        let error = self.derived_atom(
-            node.id,
-            0,
-            output_ty.clone(),
-            DefExpr::ModDownError {
-                input: input.terms.clone(),
-                signal: signal_terms,
-                source_modulus: input.ty.modulus.clone(),
-                target_modulus: target.clone(),
-            },
-            dependencies(&input.terms, &self.atoms),
-            AtomKind::Bounded,
-        );
-        signal.push(Term {
-            coefficient: BigInt::one(),
-            factors: vec![Factor { atom: error, view: None }],
-        });
-        self.insert_matrix(
-            node.id,
-            0,
-            output_ty,
-            TermList { terms: signal }.canonicalize(&self.atoms)?,
-            false,
-        );
-        Ok(())
-    }
-
-    fn mod_up(&mut self, node: &Node, target: BigInt) -> Result<(), ElaborationError> {
-        let input = self.matrix_argument(node, 0)?;
-        if target <= input.ty.modulus {
-            return self.node_error(node.id, "mod-up target must be greater than q");
-        }
-        self.require_reduced(node.id, &input.terms)?;
-        let output_ty = ConcreteMatrixType { modulus: target.clone(), ..input.ty.clone() };
-        let mut lifted = input.terms.clone();
-        for term in &mut lifted.terms {
-            for factor in &mut term.factors {
-                let atom = self
-                    .atoms
-                    .get(&factor.atom)
-                    .ok_or_else(|| TermError::MissingAtom(factor.atom.clone()))?
-                    .clone();
-                match atom.kind {
-                    AtomKind::Bounded => {
-                        factor.view.get_or_insert_with(ViewDescriptor::default).modulus_cast =
-                            Some(target.clone());
-                    }
-                    AtomKind::Large => {
-                        let source = factor.atom.clone();
-                        factor.atom = self.derived_atom(
-                            node.id,
-                            (self.atoms.len() + 1) as u32,
-                            ConcreteMatrixType { modulus: target.clone(), ..atom.matrix_type },
-                            DefExpr::ModUpLift {
-                                source: source.clone(),
-                                source_modulus: input.ty.modulus.clone(),
-                                target_modulus: target.clone(),
-                            },
-                            BTreeSet::from([source]),
-                            AtomKind::Large,
-                        );
-                        factor.view = None;
-                    }
-                }
-            }
-        }
-        self.warn_viewed_preimages(node.id, &input.terms);
-        let error = self.derived_atom(
-            node.id,
-            0,
-            output_ty.clone(),
-            DefExpr::ModUpError {
-                input: input.terms.clone(),
-                lifted: lifted.clone(),
-                source_modulus: input.ty.modulus.clone(),
-                target_modulus: target.clone(),
-            },
-            dependencies(&input.terms, &self.atoms),
-            AtomKind::Bounded,
-        );
-        lifted.terms.push(Term {
-            coefficient: input.ty.modulus.clone(),
-            factors: vec![Factor { atom: error, view: None }],
-        });
-        self.insert_matrix(node.id, 0, output_ty, lifted.canonicalize(&self.atoms)?, false);
-        Ok(())
-    }
-
-    fn apply_overlay_to_node(&mut self, node: NodeId) -> Result<(), ElaborationError> {
-        if self.overlay.entries.is_empty() {
-            return Ok(());
-        }
-        let wires = self
-            .all_wires
-            .keys()
-            .filter(|wire| wire.instantiation_path == self.path && wire.wire.node == node)
-            .cloned()
-            .collect::<Vec<_>>();
-        for wire_id in wires {
-            let matches = self
-                .overlay
-                .entries
-                .iter()
-                .enumerate()
-                .filter_map(|(index, (selector, reinterpretation))| {
-                    selector_matches(
-                        selector,
-                        &wire_id.instantiation_path,
-                        wire_id.wire.node,
-                        wire_id.wire.port.0,
-                    )
-                    .map(|bindings| (index, bindings, reinterpretation.clone()))
-                })
-                .collect::<Vec<_>>();
-            if matches.len() > 1 {
-                return Err(ElaborationError::Overlay {
-                    entry: None,
-                    message: format!(
-                        "multiple overlay selectors resolve to concrete wire {wire_id:?}"
-                    ),
-                });
-            }
-            let Some((entry_index, bindings, reinterpretation)) = matches.into_iter().next() else {
-                continue;
-            };
-            self.overlay_matches[entry_index] += 1;
-            let value = self
-                .all_wires
-                .get(&wire_id)
-                .cloned()
-                .ok_or(ElaborationError::MissingWire { node, wire: wire_id.wire })?;
-            let (matrix, preimage) = match value {
-                Value::Matrix(matrix) => (matrix, false),
-                Value::Preimage(matrix) => (matrix, true),
-                _ => {
-                    return Err(ElaborationError::Overlay {
-                        entry: Some(entry_index),
-                        message: format!("selected wire {wire_id:?} is not matrix-like"),
-                    });
-                }
-            };
-            self.active_overlay_wire = Some(wire_id.clone());
-            let result = match reinterpretation {
-                Reinterpretation::Unfold(spec) => {
-                    self.apply_unfold(entry_index, &wire_id, matrix, preimage, &bindings, &spec)?
-                }
-                Reinterpretation::Fold(spec) => {
-                    self.apply_fold(entry_index, &wire_id, matrix, &bindings, &spec)?
-                }
-            };
-            self.active_overlay_wire = None;
-            let matrix = result;
-            let value = if preimage {
-                Value::Preimage(matrix.clone())
-            } else {
-                Value::Matrix(matrix.clone())
-            };
-            self.wire_terms.insert(wire_id.clone(), matrix.terms);
-            self.all_wires.insert(wire_id.clone(), value.clone());
-            self.values.insert(wire_id.wire, value);
-        }
-        Ok(())
-    }
-
-    fn apply_unfold(
-        &mut self,
-        entry: usize,
-        wire: &WireId,
-        current: MatrixValue,
-        preimage_wire: bool,
-        bindings: &BTreeMap<String, u64>,
-        spec: &crate::overlay::UnfoldSpec,
-    ) -> Result<MatrixValue, ElaborationError> {
-        let single_source = current.terms.terms.as_slice().first().is_some_and(|term| {
-            current.terms.terms.len() == 1 &&
-                term.coefficient == BigInt::one() &&
-                term.factors.len() == 1 &&
-                term.factors[0].view.is_none() &&
-                self.atoms
-                    .get(&term.factors[0].atom)
-                    .is_some_and(|atom| matches!(atom.class, AtomClass::Source { .. }))
-        });
-        if !single_source && !spec.replace_derived {
-            return Err(self.overlay_error(
-                entry,
-                "unfolding a derived description requires replace_derived: true",
-            ));
-        }
-        if !single_source {
-            self.warnings.push(ElaborationWarning {
-                node: wire.wire.node,
-                kind: WarningKind::ReplacedDerivedDescription,
-                message: format!("overlay entry {entry} replaced a derived description"),
-            });
-        }
-        if preimage_wire ||
-            current.terms.terms.iter().any(|term| {
-                term.factors.iter().any(|factor| {
-                    self.atoms.get(&factor.atom).is_some_and(|atom| atom.preimage_refs.is_some())
-                })
-            })
-        {
-            self.warnings.push(ElaborationWarning {
-                node: wire.wire.node,
-                kind: WarningKind::DroppedPreimageReferences,
-                message: format!("overlay entry {entry} discarded preimage references"),
-            });
-        }
-        let assumed = self.resolve_assumed_terms(&spec.new_terms, bindings)?;
-        self.check_term_list_type(entry, &assumed, &current.ty)?;
-        let current_large = current.terms.contains_large(&self.atoms)?;
-        let assumed_large = assumed.contains_large(&self.atoms)?;
-        if current_large != assumed_large {
-            return Err(self.overlay_error(
-                entry,
-                "unfold kind character differs from the current description",
-            ));
-        }
-        let terms = rewrite_preimages(assumed, &self.atoms, self)?;
-        Ok(MatrixValue { ty: current.ty, terms })
-    }
-
-    fn apply_fold(
-        &mut self,
-        entry: usize,
-        wire: &WireId,
-        current: MatrixValue,
-        bindings: &BTreeMap<String, u64>,
-        spec: &crate::overlay::FoldSpec,
-    ) -> Result<MatrixValue, ElaborationError> {
-        let positions = spec
-            .expected
-            .entries
-            .iter()
-            .map(|expected| self.resolve_expected_entry(entry, expected, bindings))
-            .collect::<Result<Vec<_>, _>>()?;
-        let expected = TermList { terms: positions.iter().flatten().cloned().collect() }
-            .canonicalize(&self.atoms)?;
-        if expected != current.terms {
-            return Err(self.overlay_error(
-                entry,
-                &format!(
-                    "fold intent mismatch: expected {:?}, actual {:?}",
-                    expected, current.terms
-                ),
-            ));
-        }
-        self.check_fold_partition(entry, positions.len(), &spec.groups)?;
-        let mut output = Vec::new();
-        for (group_index, group) in spec.groups.iter().enumerate() {
-            let members = group
-                .terms()
-                .iter()
-                .flat_map(|position| positions[*position].iter().cloned())
-                .collect::<Vec<_>>();
-            if members.is_empty() {
-                continue;
-            }
-            match group {
-                FoldGroup::Keep { .. } => output.extend(members),
-                FoldGroup::Noise { .. } => {
-                    let folded = TermList { terms: members };
-                    if !matches!(
-                        classify_terms(&folded, &self.atoms)?,
-                        TermClass::Zero | TermClass::Noise
-                    ) {
-                        return Err(self.overlay_error(entry, "Noise fold contains signal"));
-                    }
-                    let atom = self.create_fold_atom(
-                        entry,
-                        wire,
-                        group_index,
-                        current.ty.clone(),
-                        folded,
-                        AtomKind::Bounded,
-                    )?;
-                    output.push(Term {
-                        coefficient: BigInt::one(),
-                        factors: vec![Factor { atom, view: None }],
-                    });
-                }
-                FoldGroup::Signal { suffix_len, .. } => {
-                    let suffix_len = usize::try_from(*suffix_len).map_err(|_| {
-                        self.overlay_error(entry, "Signal suffix length does not fit usize")
-                    })?;
-                    if suffix_len == 0 {
-                        let folded = TermList { terms: members }.canonicalize(&self.atoms)?;
-                        if !matches!(classify_terms(&folded, &self.atoms)?, TermClass::Signal) {
-                            return Err(self.overlay_error(
-                                entry,
-                                "whole-signal fold must contain signal and no standalone noise",
-                            ));
-                        }
-                        let atom = self.create_fold_atom(
-                            entry,
-                            wire,
-                            group_index,
-                            current.ty.clone(),
-                            folded,
-                            AtomKind::Large,
-                        )?;
-                        output.push(Term {
-                            coefficient: BigInt::one(),
-                            factors: vec![Factor { atom, view: None }],
+            NodeKind::FamilyGetDynamic => {
+                let expression = match wires.get(&args[0]).and_then(|wire| wire.family.as_ref()) {
+                    Some(SymbolicFamily::ExactMembers(members)) => {
+                        let matrix =
+                            matrix_type(&output_type(0)).expect("validated family element").clone();
+                        let domain = SelectionDomainRef::Local(SelectionDomain {
+                            index_wire: ScopedWireRef { scope: scope.clone(), wire: args[1] },
+                            instantiation_path: Vec::new(),
+                            count: members.len() as u64,
+                            modulus: matrix.modulus.clone(),
+                            ring_dimension: matrix.ring_dimension,
                         });
-                        continue;
+                        self.expressions.select(matrix, domain, members.clone())?
                     }
-                    let first_suffix = signal_suffix(&members[0], suffix_len, &self.atoms)
-                        .ok_or_else(|| self.overlay_error(entry, "Signal suffix is too long"))?;
-                    if !first_suffix
-                        .iter()
-                        .any(|factor| self.atoms.get(&factor.atom).is_some_and(Atom::is_large))
-                    {
-                        return Err(
-                            self.overlay_error(entry, "Signal fold suffix contains no signal atom")
-                        );
+                    Some(SymbolicFamily::StructuralTemplate { template, .. }) => self
+                        .specialize_expression(
+                            *template,
+                            ParallelIndex::Dynamic(ScopedWireRef {
+                                scope: scope.clone(),
+                                wire: args[1],
+                            }),
+                            0,
+                            &mut BTreeMap::new(),
+                        )?,
+                    None => {
+                        return Err(self.node_error(scope, node, "family has no symbolic state"))
                     }
-                    let mut prefixes = Vec::new();
-                    for member in members {
-                        let suffix =
-                            signal_suffix(&member, suffix_len, &self.atoms).ok_or_else(|| {
-                                self.overlay_error(entry, "Signal suffix is too long")
-                            })?;
-                        if suffix != first_suffix {
-                            return Err(self.overlay_error(
-                                entry,
-                                "Signal fold members do not share an identical suffix",
-                            ));
-                        }
-                        let prefix_len = member.factors.len() - suffix.len();
-                        let prefix = Term {
-                            coefficient: member.coefficient,
-                            factors: member.factors[..prefix_len].to_vec(),
+                };
+                vec![matrix_output(expression)]
+            }
+            NodeKind::Select { count } => {
+                let branches = args[1..]
+                    .iter()
+                    .map(|branch| self.matrix_expression(scope, node, *branch, wires))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let matrix = matrix_type(&output_type(0)).expect("validated select").clone();
+                let domain = SelectionDomainRef::Local(SelectionDomain {
+                    index_wire: ScopedWireRef { scope: scope.clone(), wire: args[0] },
+                    instantiation_path: Vec::new(),
+                    count: count.evaluate(&self.graph.bindings)?.to_u64().expect("validated"),
+                    modulus: matrix.modulus.clone(),
+                    ring_dimension: matrix.ring_dimension,
+                });
+                vec![matrix_output(self.expressions.select(matrix, domain, branches)?)]
+            }
+            NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) => {
+                self.elaborate_structural(scope, node, kind, args, outputs, wires)?
+            }
+            NodeKind::ConstantInt(_) |
+            NodeKind::EvaluateInt(_) |
+            NodeKind::ConstantReal(_) |
+            NodeKind::ConstantBool(_) |
+            NodeKind::IntBinary(_) |
+            NodeKind::IntCompare(_) |
+            NodeKind::BitExtract { .. } |
+            NodeKind::IntToReal |
+            NodeKind::BoolToInt |
+            NodeKind::RealBinary(_) |
+            NodeKind::RealSqrt |
+            NodeKind::ExtractCoefficient { .. } => {
+                outputs.iter().map(|_| SymbolicOutput::default()).collect()
+            }
+        };
+        Ok(result)
+    }
+
+    fn elaborate_structural(
+        &mut self,
+        scope: &FrozenGraphScopeId,
+        node: NodeId,
+        kind: &NodeKind,
+        args: &[WireRef],
+        outputs: &[WireRef],
+        wires: &BTreeMap<WireRef, ElaboratedWire>,
+    ) -> Result<Vec<SymbolicOutput>, ElaborationError> {
+        let child_id = self
+            .graph
+            .source
+            .child_scope_id(scope, node)
+            .ok_or_else(|| self.node_error(scope, node, "missing structural child scope"))?;
+        let child_validated = self
+            .graph
+            .scope(&child_id)
+            .cloned()
+            .ok_or_else(|| self.node_error(scope, node, "missing validated child scope"))?;
+        self.elaborate_scope(&child_id, &child_validated)?;
+        let child_source = self.graph.source.scope(&child_id).expect("validated child scope");
+        let modes = match kind {
+            NodeKind::ParallelLoop(spec) => spec.input_modes.clone(),
+            NodeKind::SubgraphCall(_) => vec![LoopInputMode::Broadcast; args.len()],
+            _ => unreachable!(),
+        };
+        let call_site =
+            ScopedWireRef { scope: scope.clone(), wire: WireRef { node, port: Port(0) } };
+        let frame = match kind {
+            NodeKind::ParallelLoop(spec) => SymbolicInstantiationFrame::ParallelIteration {
+                call_site: call_site.clone(),
+                index_slot: spec.index_slot,
+                index: ParallelIndex::Template,
+                index_offset: 0,
+            },
+            NodeKind::SubgraphCall(_) => SymbolicInstantiationFrame::Call(call_site.clone()),
+            _ => unreachable!(),
+        };
+        let loop_count = match kind {
+            NodeKind::ParallelLoop(spec) => Some(
+                spec.count
+                    .evaluate(&self.graph.bindings)?
+                    .to_usize()
+                    .expect("validated parallel count"),
+            ),
+            _ => None,
+        };
+        let mut substitutions = BTreeMap::new();
+        let mut wire_substitutions = BTreeMap::new();
+        for (((child_input, parent_argument), mode), input_index) in
+            child_source.inputs().iter().zip(args).zip(modes).zip(0usize..)
+        {
+            let child_reference = ScopedWireRef { scope: child_id.clone(), wire: *child_input };
+            let parent_reference = ScopedWireRef { scope: scope.clone(), wire: *parent_argument };
+            wire_substitutions.insert(child_reference.clone(), parent_reference);
+            let child_atom = AtomId::Local(child_reference);
+            let parent = wires.get(parent_argument).cloned().ok_or_else(|| {
+                self.node_error(scope, node, "structural argument is unavailable")
+            })?;
+            let replacement = match &mode {
+                LoopInputMode::Broadcast => parent.expression,
+                LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => match parent.family {
+                    Some(SymbolicFamily::ExactMembers(members)) => {
+                        let offset = match mode {
+                            LoopInputMode::Zip => 0,
+                            LoopInputMode::ZipOffset { offset } => offset,
+                            LoopInputMode::Broadcast => unreachable!(),
                         };
-                        if prefix.factors.iter().any(|factor| {
-                            self.atoms
-                                .get(&factor.atom)
-                                .is_some_and(|atom| matches!(atom.kind, AtomKind::Large))
-                        }) {
-                            return Err(self
-                                .overlay_error(entry, "Signal fold prefix contains a large atom"));
-                        }
-                        prefixes.push(prefix);
+                        let count = loop_count.expect("parallel zip input");
+                        let branches = members
+                            .get(offset..offset + count)
+                            .ok_or_else(|| {
+                                self.node_error(scope, node, "parallel zip family range is invalid")
+                            })?
+                            .to_vec();
+                        let matrix = matrix_type(&child_validated.wire_types[child_input])
+                            .expect("validated matrix family argument")
+                            .clone();
+                        let domain = SelectionDomainRef::Local(SelectionDomain {
+                            index_wire: call_site.clone(),
+                            instantiation_path: vec![frame.clone()],
+                            count: count as u64,
+                            modulus: matrix.modulus.clone(),
+                            ring_dimension: matrix.ring_dimension,
+                        });
+                        Some(self.expressions.select(matrix, domain, branches)?)
                     }
-                    let folded = TermList { terms: prefixes }.canonicalize(&self.atoms)?;
-                    if folded.terms.is_empty() {
-                        continue;
+                    Some(SymbolicFamily::StructuralTemplate { template, .. }) => {
+                        let offset = match mode {
+                            LoopInputMode::Zip => 0,
+                            LoopInputMode::ZipOffset { offset } => offset as u64,
+                            LoopInputMode::Broadcast => unreachable!(),
+                        };
+                        Some(self.specialize_expression(
+                            template,
+                            ParallelIndex::Template,
+                            offset,
+                            &mut BTreeMap::new(),
+                        )?)
                     }
-                    let prefix_ty = if folded.terms[0].factors.is_empty() {
-                        ConcreteMatrixType::scalar(
-                            current.ty.modulus.clone(),
-                            current.ty.ring_dimension,
-                        )
-                    } else {
-                        self.term_type(entry, &folded.terms[0])?
-                    };
-                    let atom = self.create_fold_atom(
-                        entry,
-                        wire,
-                        group_index,
-                        prefix_ty,
-                        folded,
-                        AtomKind::Bounded,
-                    )?;
-                    let mut factors = vec![Factor { atom, view: None }];
-                    factors.extend(first_suffix);
-                    output.push(Term { coefficient: BigInt::one(), factors });
-                }
+                    None => parent.expression,
+                },
+            };
+            if let Some(replacement) = replacement {
+                substitutions.insert(child_atom, replacement);
+            } else if matrix_type(&child_validated.wire_types[child_input]).is_some() {
+                return Err(self.node_error(
+                    scope,
+                    node,
+                    &format!("matrix structural argument {input_index} has no expression"),
+                ));
             }
         }
-        Ok(MatrixValue {
-            ty: current.ty,
-            terms: TermList { terms: output }.canonicalize(&self.atoms)?,
+        let child_outputs = self.scopes[&child_id].wires.clone();
+        let mut memo = BTreeMap::new();
+        let mut result = Vec::with_capacity(outputs.len());
+        for (port, child_output) in child_source.outputs().iter().enumerate() {
+            let output = &child_outputs[child_output];
+            let expression = output
+                .expression
+                .map(|expression| {
+                    self.instantiate_expression(
+                        expression,
+                        &child_id,
+                        &frame,
+                        &substitutions,
+                        &wire_substitutions,
+                        &mut memo,
+                    )
+                })
+                .transpose()?;
+            let family = match kind {
+                NodeKind::ParallelLoop(spec) => {
+                    let count = loop_count.expect("parallel loop count");
+                    expression.map(|template| SymbolicFamily::StructuralTemplate {
+                        count,
+                        template,
+                        index_slot: spec.index_slot,
+                    })
+                }
+                NodeKind::SubgraphCall(_) => output
+                    .family
+                    .as_ref()
+                    .map(|family| {
+                        self.instantiate_family(
+                            family,
+                            &child_id,
+                            &frame,
+                            &substitutions,
+                            &wire_substitutions,
+                            &mut memo,
+                        )
+                    })
+                    .transpose()?,
+                _ => unreachable!(),
+            };
+            let _ = port;
+            result.push(SymbolicOutput { expression, family });
+        }
+        self.instantiate_relations(
+            &child_id,
+            &frame,
+            &substitutions,
+            &wire_substitutions,
+            &mut memo,
+        )?;
+        Ok(result)
+    }
+
+    fn instantiate_family(
+        &mut self,
+        family: &SymbolicFamily,
+        child_scope: &FrozenGraphScopeId,
+        frame: &SymbolicInstantiationFrame,
+        substitutions: &BTreeMap<AtomId, SymbolicExprId>,
+        wire_substitutions: &BTreeMap<ScopedWireRef, ScopedWireRef>,
+        memo: &mut BTreeMap<SymbolicExprId, SymbolicExprId>,
+    ) -> Result<SymbolicFamily, ElaborationError> {
+        Ok(match family {
+            SymbolicFamily::ExactMembers(members) => SymbolicFamily::ExactMembers(
+                members
+                    .iter()
+                    .map(|member| {
+                        self.instantiate_expression(
+                            *member,
+                            child_scope,
+                            frame,
+                            substitutions,
+                            wire_substitutions,
+                            memo,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            SymbolicFamily::StructuralTemplate { count, template, index_slot } => {
+                SymbolicFamily::StructuralTemplate {
+                    count: *count,
+                    template: self.instantiate_expression(
+                        *template,
+                        child_scope,
+                        frame,
+                        substitutions,
+                        wire_substitutions,
+                        memo,
+                    )?,
+                    index_slot: *index_slot,
+                }
+            }
         })
     }
 
-    fn create_fold_atom(
+    #[allow(clippy::too_many_arguments)]
+    fn instantiate_expression(
         &mut self,
-        entry: usize,
-        wire: &WireId,
-        group_index: usize,
-        matrix_type: ConcreteMatrixType,
-        definition: TermList,
-        kind: AtomKind,
-    ) -> Result<AtomId, ElaborationError> {
-        if definition.terms.iter().any(|term| {
-            term.factors.iter().any(|factor| {
-                self.atoms.get(&factor.atom).is_some_and(|atom| atom.preimage_refs.is_some())
-            })
-        }) {
-            self.warnings.push(ElaborationWarning {
-                node: wire.wire.node,
-                kind: WarningKind::DroppedPreimageReferences,
-                message: format!("overlay fold entry {entry} absorbed preimage references"),
-            });
+        source: SymbolicExprId,
+        child_scope: &FrozenGraphScopeId,
+        frame: &SymbolicInstantiationFrame,
+        substitutions: &BTreeMap<AtomId, SymbolicExprId>,
+        wire_substitutions: &BTreeMap<ScopedWireRef, ScopedWireRef>,
+        memo: &mut BTreeMap<SymbolicExprId, SymbolicExprId>,
+    ) -> Result<SymbolicExprId, ElaborationError> {
+        if let Some(value) = memo.get(&source) {
+            return Ok(*value);
         }
-        let id = AtomId::Overlay {
-            instantiation_path: wire.instantiation_path.clone(),
-            node: wire.wire.node,
-            port: wire.wire.port.0,
-            group_index: u32::try_from(group_index)
-                .map_err(|_| self.overlay_error(entry, "fold group index exceeds u32"))?,
+        let record = self
+            .expressions
+            .get(source)
+            .cloned()
+            .ok_or(ExpressionError::MissingExpression(source))?;
+        let result = match record.node {
+            SymbolicExprNode::Zero => self.expressions.zero(record.matrix_type)?,
+            SymbolicExprNode::Atom(atom) => {
+                if let Some(replacement) = substitutions.get(&atom) {
+                    *replacement
+                } else {
+                    let atom = self.instantiate_atom(&atom, child_scope, frame)?;
+                    self.expressions.atom(atom, &self.atoms)?
+                }
+            }
+            SymbolicExprNode::Add(children) => {
+                let children = self.instantiate_children(
+                    children,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                self.expressions.add(record.matrix_type, children)?
+            }
+            SymbolicExprNode::Scale { coefficient, value } => {
+                let value = self.instantiate_expression(
+                    value,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                self.expressions.scale(coefficient, value)?
+            }
+            SymbolicExprNode::Mul(children) => {
+                let children = self.instantiate_children(
+                    children,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                self.expressions.multiply(record.matrix_type, children, &self.atoms)?
+            }
+            SymbolicExprNode::Tensor { left, right } => {
+                let [left, right] = self.instantiate_pair(
+                    [left, right],
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                self.expressions.tensor(record.matrix_type, left, right)?
+            }
+            SymbolicExprNode::Concat { axis, inputs } => {
+                let inputs = self.instantiate_children(
+                    inputs,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                self.expressions.concat(record.matrix_type, axis, inputs)?
+            }
+            SymbolicExprNode::Select { domain, branches } => {
+                let branches = self.instantiate_children(
+                    branches,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                let domain = instantiate_domain(domain, child_scope, frame, wire_substitutions);
+                self.expressions.select(record.matrix_type, domain, branches)?
+            }
+            SymbolicExprNode::Transpose(value) => {
+                let value = self.instantiate_expression(
+                    value,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                self.expressions.transpose(record.matrix_type, value)?
+            }
+            SymbolicExprNode::Slice { value, rows, columns } => {
+                let value = self.instantiate_expression(
+                    value,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                self.expressions.slice(record.matrix_type, value, rows, columns)?
+            }
+            SymbolicExprNode::Reshape { value, .. } => {
+                let value = self.instantiate_expression(
+                    value,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                self.expressions.reshape(record.matrix_type, value)?
+            }
+            SymbolicExprNode::ConstantCoefficient { value, position } => {
+                let value = self.instantiate_expression(
+                    value,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                self.expressions.constant_coefficient(record.matrix_type, value, position)?
+            }
+            SymbolicExprNode::CrtRecompose {
+                inputs,
+                plaintext_moduli,
+                reconstruction_coefficients,
+            } => {
+                let inputs = self.instantiate_children(
+                    inputs,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
+                )?;
+                self.expressions.crt_recompose(
+                    record.matrix_type,
+                    inputs,
+                    plaintext_moduli,
+                    reconstruction_coefficients,
+                )?
+            }
         };
-        let atom = Atom {
-            id: id.clone(),
-            class: AtomClass::Derived { definition: DefExpr::Fold(definition.clone()) },
-            kind,
-            matrix_type,
-            dependencies: dependencies(&definition, &self.atoms),
-            preimage_refs: None,
-            indicator: None,
-        };
-        if let Some(existing) = self.atoms.insert(atom.clone()) &&
-            existing != atom
-        {
-            return Err(self.overlay_error(entry, "fold atom identity has conflicting definitions"));
-        }
-        Ok(id)
+        memo.insert(source, result);
+        Ok(result)
     }
 
-    fn resolve_expected_entry(
+    #[allow(clippy::too_many_arguments)]
+    fn instantiate_children(
         &mut self,
-        entry: usize,
-        expected: &ExpectedEntry,
-        bindings: &BTreeMap<String, u64>,
-    ) -> Result<Vec<Term>, ElaborationError> {
-        match expected {
-            ExpectedEntry::Term(term) => {
-                let term = self.resolve_overlay_term(entry, term, bindings, true)?;
-                Ok((!term.coefficient.is_zero()).then_some(term).into_iter().collect())
-            }
-            ExpectedEntry::IndicatorSum { select, index_var, body } => {
-                let path = self.resolve_reference_path(entry, &select.path, bindings)?;
-                let select_wire = WireId {
-                    instantiation_path: path.clone(),
-                    wire: WireRef { node: select.node, port: Port(0) },
-                };
-                if self.active_overlay_wire.as_ref().is_some_and(|target| {
-                    target.instantiation_path == select_wire.instantiation_path &&
-                        target.wire.node == select_wire.wire.node
-                }) {
-                    return Err(self
-                        .overlay_error(entry, "IndicatorSum select must precede the target wire"));
-                }
-                let domain =
-                    self.selection_domains.get(&select_wire).cloned().ok_or_else(|| {
-                        self.overlay_error(
-                            entry,
-                            "IndicatorSum selector does not address an elaborated Select",
-                        )
-                    })?;
-                if domain.count == 0 {
-                    return Err(self.overlay_error(entry, "IndicatorSum domain is empty"));
-                }
-                let mut result = Vec::new();
-                for branch in 0..domain.count {
-                    let mut branch_bindings = bindings.clone();
-                    branch_bindings.insert(index_var.clone(), branch);
-                    let mut term =
-                        self.resolve_overlay_term(entry, body, &branch_bindings, true)?;
-                    if term.coefficient.is_zero() {
-                        continue;
-                    }
-                    term.factors.insert(
-                        0,
-                        Factor {
-                            atom: AtomId::Indicator { domain: domain.clone(), branch },
-                            view: None,
-                        },
-                    );
-                    result.push(term);
-                }
-                Ok(result)
-            }
-        }
-    }
-
-    fn resolve_assumed_terms(
-        &mut self,
-        id: &AssumedTermListId,
-        bindings: &BTreeMap<String, u64>,
-    ) -> Result<TermList, ElaborationError> {
-        self.used_assumed_terms.insert(id.clone());
-        let target = TargetRef::Assumed(id.clone());
-        if let Some(terms) = self.assumed_terms.get(&target) {
-            return Ok(terms.clone());
-        }
-        let declaration = self.overlay.term_lists.get(id).cloned().ok_or_else(|| {
-            self.overlay_error_without_entry(&format!("assumed term list {} is undeclared", id.0))
-        })?;
-        let terms = TermList {
-            terms: declaration
-                .terms
-                .iter()
-                .map(|term| self.resolve_overlay_term(0, term, bindings, false))
-                .collect::<Result<_, _>>()?,
-        }
-        .canonicalize(&self.atoms)?;
-        self.assumed_terms.insert(target, terms.clone());
-        Ok(terms)
-    }
-
-    fn resolve_overlay_term(
-        &mut self,
-        entry: usize,
-        term: &OverlayTerm,
-        bindings: &BTreeMap<String, u64>,
-        allow_node: bool,
-    ) -> Result<Term, ElaborationError> {
-        let coefficient = term.coefficient.evaluate(self.bindings)?;
-        let factors = term
-            .factors
-            .iter()
-            .map(|factor| {
-                Ok(Factor {
-                    atom: self.resolve_atom_ref(entry, &factor.atom, bindings, allow_node)?,
-                    view: factor.view.clone(),
-                })
-            })
-            .collect::<Result<_, ElaborationError>>()?;
-        Ok(Term { coefficient, factors })
-    }
-
-    fn resolve_atom_ref(
-        &mut self,
-        entry: usize,
-        reference: &AtomRef,
-        bindings: &BTreeMap<String, u64>,
-        allow_node: bool,
-    ) -> Result<AtomId, ElaborationError> {
-        match reference {
-            AtomRef::Constant { kind, params } => {
-                let id = AtomId::Constant { kind: kind.clone(), params: params.clone() };
-                if !self.atoms.contains_key(&id) {
-                    if kind != "matrix" || params.len() != 5 {
-                        return Err(self.overlay_error(
-                            entry,
-                            &format!("constant atom {id:?} has an unsupported identity"),
-                        ));
-                    }
-                    let value =
-                        serde_json::from_str::<ConstantMatrix>(&params[0]).map_err(|error| {
-                            self.overlay_error(
-                                entry,
-                                &format!("constant atom value is invalid: {error}"),
-                            )
-                        })?;
-                    let parse_integer = |value: &str, label: &str| {
-                        value.parse::<BigInt>().map_err(|error| {
-                            self.overlay_error(
-                                entry,
-                                &format!("constant atom {label} is invalid: {error}"),
-                            )
-                        })
-                    };
-                    let parse_usize = |value: &str, label: &str| {
-                        value.parse::<usize>().map_err(|error| {
-                            self.overlay_error(
-                                entry,
-                                &format!("constant atom {label} is invalid: {error}"),
-                            )
-                        })
-                    };
-                    let matrix_type = ConcreteMatrixType {
-                        modulus: parse_integer(&params[1], "modulus")?,
-                        ring_dimension: parse_usize(&params[2], "ring dimension")?,
-                        rows: parse_usize(&params[3], "rows")?,
-                        columns: parse_usize(&params[4], "columns")?,
-                    };
-                    if matrix_type.modulus <= BigInt::one() ||
-                        matrix_type.ring_dimension == 0 ||
-                        matrix_type.rows == 0 ||
-                        matrix_type.columns == 0
-                    {
-                        return Err(self.overlay_error(
-                            entry,
-                            "constant atom matrix type must have positive dimensions and modulus > 1",
-                        ));
-                    }
-                    self.atoms.insert(Atom {
-                        id: id.clone(),
-                        class: AtomClass::Source { source: SourceKind::ConstantMatrix { value } },
-                        kind: AtomKind::Bounded,
-                        matrix_type,
-                        dependencies: BTreeSet::new(),
-                        preimage_refs: None,
-                        indicator: None,
-                    });
-                }
-                Ok(id)
-            }
-            AtomRef::Imported { production_id, manifest_atom_id } => {
-                let id = AtomId::Imported {
-                    production_id: production_id.clone(),
-                    manifest_atom_id: *manifest_atom_id,
-                };
-                self.atoms.contains_key(&id).then_some(id.clone()).ok_or_else(|| {
-                    self.overlay_error(entry, &format!("imported atom {id:?} is absent"))
-                })
-            }
-            AtomRef::Virtual { name } => self.ensure_virtual_atom(entry, name, bindings),
-            AtomRef::Node { path, node, port } => {
-                if !allow_node {
-                    return Err(self.overlay_error(
-                        entry,
-                        "Node references are forbidden in global declarations",
-                    ));
-                }
-                let path = self.resolve_reference_path(entry, path, bindings)?;
-                let port = match port {
-                    PortMatcher::Concrete(port) => *port,
-                    PortMatcher::Affine { var, stride, offset } => {
-                        let value = bindings.get(var).ok_or_else(|| {
-                            self.overlay_error(entry, &format!("port variable {var} is unbound"))
-                        })?;
-                        let port = u64::from(*stride)
-                            .checked_mul(*value)
-                            .and_then(|port| port.checked_add(u64::from(*offset)))
-                            .ok_or_else(|| {
-                                self.overlay_error(entry, "resolved port arithmetic overflow")
-                            })?;
-                        u32::try_from(port)
-                            .map_err(|_| self.overlay_error(entry, "resolved port exceeds u32"))?
-                    }
-                };
-                let wire = WireId {
-                    instantiation_path: path,
-                    wire: WireRef { node: *node, port: Port(port) },
-                };
-                if self.active_overlay_wire.as_ref().is_some_and(|target| {
-                    target.instantiation_path == wire.instantiation_path &&
-                        target.wire.node == wire.wire.node
-                }) {
-                    return Err(self.overlay_error(
-                        entry,
-                        "a wire never precedes another port of its own node",
-                    ));
-                }
-                let terms = self.wire_terms.get(&wire).ok_or_else(|| {
-                    self.overlay_error(entry, &format!("referenced wire {wire:?} is unavailable"))
-                })?;
-                let [term] = terms.terms.as_slice() else {
-                    return Err(self.overlay_error(entry, "Node reference is not a single term"));
-                };
-                let [factor] = term.factors.as_slice() else {
-                    return Err(self.overlay_error(entry, "Node reference is not a single factor"));
-                };
-                if term.coefficient != BigInt::one() || factor.view.is_some() {
-                    return Err(self.overlay_error(
-                        entry,
-                        "Node reference must have coefficient one and no view",
-                    ));
-                }
-                Ok(factor.atom.clone())
-            }
-        }
-    }
-
-    fn ensure_virtual_atom(
-        &mut self,
-        entry: usize,
-        name: &str,
-        bindings: &BTreeMap<String, u64>,
-    ) -> Result<AtomId, ElaborationError> {
-        let id = AtomId::Virtual { name: name.to_owned() };
-        self.used_virtual_atoms.insert(name.to_owned());
-        if self.atoms.contains_key(&id) {
-            return Ok(id);
-        }
-        if !self.creating_virtual_atoms.insert(name.to_owned()) {
-            return Err(self.overlay_error(entry, "virtual preimage declarations are cyclic"));
-        }
-        let declaration = self.overlay.virtual_atoms.get(name).cloned().ok_or_else(|| {
-            self.overlay_error(entry, &format!("virtual atom {name} is undeclared"))
-        })?;
-        let matrix_type = concrete_matrix(&declaration.matrix_type, self.bindings)?;
-        let (kind, metadata) = match declaration.kind {
-            VirtualKind::Large => (AtomKind::Large, None),
-            VirtualKind::Bounded { norm, is_const_poly, zero_rows, dependencies, clt_ready } => {
-                let zero_rows = zero_rows
-                    .map(|rows| {
-                        let rows = nonnegative_usize(
-                            rows.evaluate(self.bindings)?,
-                            "virtual zero rows",
-                            NodeId(0),
-                        )?;
-                        if rows > matrix_type.rows {
-                            return Err(ElaborationError::Overlay {
-                                entry: Some(entry),
-                                message: "virtual zero_rows exceeds matrix rows".to_owned(),
-                            });
-                        }
-                        Ok(rows)
-                    })
-                    .transpose()?;
-                let dependencies = match dependencies {
-                    crate::overlay::DeclaredDependencyLabels::Known(labels) => {
-                        DeclaredDependencies::Known(
-                            labels.into_iter().map(DeclaredDependencyRef::Local).collect(),
-                        )
-                    }
-                    crate::overlay::DeclaredDependencyLabels::Unknown => {
-                        DeclaredDependencies::Unknown
-                    }
-                };
-                (
-                    AtomKind::Bounded,
-                    Some(AssumedMetadata {
-                        norm: close_real_expr(&norm, self.bindings)?,
-                        is_const_poly,
-                        zero_rows,
-                        dependencies,
-                        clt_ready,
-                    }),
+        children: Vec<SymbolicExprId>,
+        child_scope: &FrozenGraphScopeId,
+        frame: &SymbolicInstantiationFrame,
+        substitutions: &BTreeMap<AtomId, SymbolicExprId>,
+        wire_substitutions: &BTreeMap<ScopedWireRef, ScopedWireRef>,
+        memo: &mut BTreeMap<SymbolicExprId, SymbolicExprId>,
+    ) -> Result<Vec<SymbolicExprId>, ElaborationError> {
+        children
+            .into_iter()
+            .map(|child| {
+                self.instantiate_expression(
+                    child,
+                    child_scope,
+                    frame,
+                    substitutions,
+                    wire_substitutions,
+                    memo,
                 )
-            }
-        };
-        let preimage_refs = declaration
-            .preimage
-            .as_ref()
-            .map(|preimage| {
-                if !self.overlay.term_lists.contains_key(&preimage.target) {
-                    return Err(self.overlay_error(
-                        entry,
-                        &format!("assumed target {} is undeclared", preimage.target.0),
-                    ));
-                }
-                Ok(PreimageRefs {
-                    uniform: self.resolve_atom_ref(entry, &preimage.uniform, bindings, false)?,
-                    target: TargetRef::Assumed(preimage.target.clone()),
-                })
-            })
-            .transpose()?;
-        self.atoms.insert(Atom {
-            id: id.clone(),
-            class: AtomClass::Assumed { metadata },
-            kind,
-            matrix_type: matrix_type.clone(),
-            dependencies: BTreeSet::new(),
-            preimage_refs: preimage_refs.clone(),
-            indicator: None,
-        });
-        if let Some(preimage) = &declaration.preimage {
-            let uniform_type = self
-                .atoms
-                .get(&preimage_refs.as_ref().expect("preimage refs exist").uniform)
-                .expect("resolved uniform atom exists")
-                .matrix_type
-                .clone();
-            let target_type = multiplication_type(&uniform_type, &matrix_type)?;
-            let target_terms = self.resolve_assumed_terms(&preimage.target, bindings)?;
-            if let Err(error) = self.check_term_list_type(entry, &target_terms, &target_type) {
-                self.atoms.remove(&id);
-                self.creating_virtual_atoms.remove(name);
-                return Err(error);
-            }
-        }
-        self.creating_virtual_atoms.remove(name);
-        Ok(id)
-    }
-
-    fn resolve_reference_path(
-        &self,
-        entry: usize,
-        path: &[crate::overlay::FrameMatcher],
-        bindings: &BTreeMap<String, u64>,
-    ) -> Result<Vec<InstantiationFrame>, ElaborationError> {
-        path.iter()
-            .map(|frame| {
-                let loop_index = match &frame.loop_index {
-                    LoopIndexMatcher::Concrete(index) => Some(*index),
-                    LoopIndexMatcher::Var(name) => Some(*bindings.get(name).ok_or_else(|| {
-                        self.overlay_error(entry, &format!("path variable {name} is unbound"))
-                    })?),
-                    LoopIndexMatcher::Any => {
-                        return Err(
-                            self.overlay_error(entry, "Any is ambiguous in an atom reference path")
-                        );
-                    }
-                };
-                Ok(InstantiationFrame { call: frame.call, loop_index })
             })
             .collect()
     }
 
-    fn check_fold_partition(
-        &self,
-        entry: usize,
-        positions: usize,
-        groups: &[FoldGroup],
-    ) -> Result<(), ElaborationError> {
-        let mut seen = BTreeSet::new();
-        for group in groups {
-            for position in group.terms() {
-                if *position >= positions {
-                    return Err(self.overlay_error(entry, "fold group position is out of range"));
-                }
-                if !seen.insert(*position) {
-                    return Err(self.overlay_error(entry, "fold groups overlap"));
+    #[allow(clippy::too_many_arguments)]
+    fn instantiate_pair(
+        &mut self,
+        children: [SymbolicExprId; 2],
+        child_scope: &FrozenGraphScopeId,
+        frame: &SymbolicInstantiationFrame,
+        substitutions: &BTreeMap<AtomId, SymbolicExprId>,
+        wire_substitutions: &BTreeMap<ScopedWireRef, ScopedWireRef>,
+        memo: &mut BTreeMap<SymbolicExprId, SymbolicExprId>,
+    ) -> Result<[SymbolicExprId; 2], ElaborationError> {
+        let [left, right] = children;
+        Ok([
+            self.instantiate_expression(
+                left,
+                child_scope,
+                frame,
+                substitutions,
+                wire_substitutions,
+                memo,
+            )?,
+            self.instantiate_expression(
+                right,
+                child_scope,
+                frame,
+                substitutions,
+                wire_substitutions,
+                memo,
+            )?,
+        ])
+    }
+
+    fn instantiate_atom(
+        &mut self,
+        id: &AtomId,
+        child_scope: &FrozenGraphScopeId,
+        frame: &SymbolicInstantiationFrame,
+    ) -> Result<AtomId, ElaborationError> {
+        let instantiated = match id {
+            AtomId::Local(template) | AtomId::TrapdoorPublic(template)
+                if &template.scope == child_scope =>
+            {
+                AtomId::Instantiated {
+                    template: template.clone(),
+                    instantiation_path: vec![frame.clone()],
                 }
             }
-        }
-        if seen.len() != positions {
-            return Err(self.overlay_error(entry, "fold groups do not partition expected positions"));
-        }
-        Ok(())
-    }
-
-    fn check_term_list_type(
-        &self,
-        entry: usize,
-        terms: &TermList,
-        expected: &ConcreteMatrixType,
-    ) -> Result<(), ElaborationError> {
-        for term in &terms.terms {
-            if &self.term_type(entry, term)? != expected {
-                return Err(self.overlay_error(entry, "assumed term has the wrong matrix type"));
+            AtomId::Instantiated { template, instantiation_path } => {
+                let mut path = instantiation_path.clone();
+                path.push(frame.clone());
+                AtomId::Instantiated { template: template.clone(), instantiation_path: path }
             }
+            _ => return Ok(id.clone()),
+        };
+        if self.atoms.contains_key(&instantiated) {
+            return Ok(instantiated);
         }
-        Ok(())
-    }
-
-    fn term_type(&self, entry: usize, term: &Term) -> Result<ConcreteMatrixType, ElaborationError> {
-        let mut result: Option<ConcreteMatrixType> = None;
-        for factor in &term.factors {
-            let atom = self
-                .atoms
-                .get(&factor.atom)
-                .ok_or_else(|| self.overlay_error(entry, "term references an absent atom"))?;
-            let ty = viewed_type(atom.matrix_type.clone(), factor.view.as_ref());
-            result = Some(match result {
-                None => ty,
-                Some(current) => multiplication_type(&current, &ty)?,
-            });
-        }
-        result
-            .ok_or_else(|| self.overlay_error(entry, "empty-factor overlay terms are unsupported"))
-    }
-
-    fn overlay_error(&self, entry: usize, message: &str) -> ElaborationError {
-        ElaborationError::Overlay { entry: Some(entry), message: message.to_owned() }
-    }
-
-    fn overlay_error_without_entry(&self, message: &str) -> ElaborationError {
-        ElaborationError::Overlay { entry: None, message: message.to_owned() }
-    }
-
-    fn argument(&self, node: &Node, index: usize) -> Result<&Value, ElaborationError> {
-        let wire = *node.args.get(index).ok_or(ElaborationError::MissingWire {
-            node: node.id,
-            wire: WireRef { node: node.id, port: Port(index as u32) },
+        let source = self.atoms.get(id).cloned().ok_or_else(|| {
+            ElaborationError::Overlay(format!("missing atom during instantiation: {id:?}"))
         })?;
-        self.values.get(&wire).ok_or(ElaborationError::MissingWire { node: node.id, wire })
+        self.insert_atom(Atom { id: instantiated.clone(), ..source })?;
+        Ok(instantiated)
     }
 
-    fn matrix_argument(&self, node: &Node, index: usize) -> Result<MatrixValue, ElaborationError> {
-        match self.argument(node, index)? {
-            Value::Matrix(value) | Value::Preimage(value) => Ok(value.clone()),
-            _ => Err(ElaborationError::ExpectedMatrix(node.id)),
-        }
-    }
-
-    fn trapdoor_argument(
-        &self,
-        node: &Node,
-        index: usize,
-    ) -> Result<TrapdoorValue, ElaborationError> {
-        match self.argument(node, index)? {
-            Value::Trapdoor(value) => Ok(value.clone()),
-            _ => self.node_error(node.id, "expected a trapdoor argument"),
-        }
-    }
-
-    fn insert_matrix(
+    #[allow(clippy::too_many_arguments)]
+    fn instantiate_relations(
         &mut self,
-        node: NodeId,
-        port: u32,
-        ty: ConcreteMatrixType,
-        terms: TermList,
-        preimage: bool,
-    ) {
-        let wire = WireRef { node, port: Port(port) };
-        let value = if preimage {
-            Value::Preimage(MatrixValue { ty, terms: terms.clone() })
-        } else {
-            Value::Matrix(MatrixValue { ty, terms: terms.clone() })
-        };
-        let id = WireId { instantiation_path: self.path.clone(), wire };
-        self.wire_terms.insert(id.clone(), terms);
-        self.all_wires.insert(id, value.clone());
-        self.values.insert(wire, value);
-    }
-
-    fn insert_value(&mut self, node: NodeId, port: u32, value: Value) {
-        let wire = WireRef { node, port: Port(port) };
-        let id = WireId { instantiation_path: self.path.clone(), wire };
-        match &value {
-            Value::Matrix(matrix) | Value::Preimage(matrix) => {
-                self.wire_terms.insert(id.clone(), matrix.terms.clone());
+        child_scope: &FrozenGraphScopeId,
+        frame: &SymbolicInstantiationFrame,
+        substitutions: &BTreeMap<AtomId, SymbolicExprId>,
+        wire_substitutions: &BTreeMap<ScopedWireRef, ScopedWireRef>,
+        memo: &mut BTreeMap<SymbolicExprId, SymbolicExprId>,
+    ) -> Result<(), ElaborationError> {
+        let source_relations = self.relations.clone();
+        for relation in source_relations {
+            if !atom_belongs_to_scope(&relation.preimage, child_scope) {
+                continue;
             }
-            Value::Trapdoor(trapdoor) => {
-                self.wire_terms.insert(id.clone(), TermList::atom(trapdoor.uniform.clone()));
-            }
-            Value::Scalar(_) | Value::IndexedFamily { .. } => {}
+            let left_matrix = self.instantiate_exact_atom(
+                &relation.left_matrix,
+                child_scope,
+                frame,
+                substitutions,
+            )?;
+            let preimage =
+                self.instantiate_exact_atom(&relation.preimage, child_scope, frame, substitutions)?;
+            let product = self.instantiate_expression(
+                relation.product,
+                child_scope,
+                frame,
+                substitutions,
+                wire_substitutions,
+                memo,
+            )?;
+            self.insert_relation(PreimageRelation { left_matrix, preimage, product })?;
         }
-        self.all_wires.insert(id, value.clone());
-        self.values.insert(wire, value);
+        Ok(())
     }
 
-    fn source_atom(
+    fn instantiate_exact_atom(
         &mut self,
-        node: NodeId,
-        port: u32,
-        matrix_type: ConcreteMatrixType,
-        kind: AtomKind,
-        source: SourceKind,
-        preimage_refs: Option<PreimageRefs>,
-    ) -> AtomId {
-        let id = AtomId::Local { instantiation_path: self.path.clone(), node, port };
-        self.atoms.insert(Atom {
-            id: id.clone(),
-            class: AtomClass::Source { source },
-            kind,
-            matrix_type,
-            dependencies: BTreeSet::new(),
-            preimage_refs,
-            indicator: None,
-        });
-        id
-    }
-
-    fn derived_atom(
-        &mut self,
-        node: NodeId,
-        port: u32,
-        matrix_type: ConcreteMatrixType,
-        definition: DefExpr,
-        dependencies: BTreeSet<AtomId>,
-        kind: AtomKind,
-    ) -> AtomId {
-        let id = AtomId::Local { instantiation_path: self.path.clone(), node, port };
-        self.atoms.insert(Atom {
-            id: id.clone(),
-            class: AtomClass::Derived { definition },
-            kind,
-            matrix_type,
-            dependencies,
-            preimage_refs: None,
-            indicator: None,
-        });
-        id
-    }
-
-    fn constant_atom(
-        &mut self,
-        value: &ConstantMatrix,
-        ty: &ConcreteMatrixType,
+        atom: &AtomId,
+        child_scope: &FrozenGraphScopeId,
+        frame: &SymbolicInstantiationFrame,
+        substitutions: &BTreeMap<AtomId, SymbolicExprId>,
     ) -> Result<AtomId, ElaborationError> {
-        let value = close_constant_matrix(value, self.bindings)?;
-        let params = vec![
-            serde_json::to_string(&value).map_err(|error| ElaborationError::Node {
-                node: NodeId(0),
-                message: error.to_string(),
-            })?,
-            ty.modulus.to_string(),
-            ty.ring_dimension.to_string(),
-            ty.rows.to_string(),
-            ty.columns.to_string(),
-        ];
-        let id = AtomId::Constant { kind: "matrix".to_owned(), params };
-        if !self.atoms.contains_key(&id) {
-            self.atoms.insert(Atom {
-                id: id.clone(),
-                class: AtomClass::Source { source: SourceKind::ConstantMatrix { value } },
-                kind: AtomKind::Bounded,
-                matrix_type: ty.clone(),
-                dependencies: BTreeSet::new(),
-                preimage_refs: None,
-                indicator: None,
+        if let Some(expression) = substitutions.get(atom) {
+            return self.exact_atom_expression(*expression).ok_or_else(|| {
+                ElaborationError::Overlay(
+                    "preimage relation input was bound to a non-atomic expression".to_owned(),
+                )
             });
         }
-        Ok(id)
+        self.instantiate_atom(atom, child_scope, frame)
     }
 
-    fn gadget_atom(
+    fn specialize_expression(
         &mut self,
-        ty: &ConcreteMatrixType,
-        base: &crate::expr::IntExpr,
-        small: bool,
-    ) -> Result<AtomId, ElaborationError> {
-        let value = ConstantMatrix::Gadget { base: base.clone(), small };
-        self.constant_atom(&value, ty)
-    }
-
-    fn require_reduced(&self, node: NodeId, terms: &TermList) -> Result<(), ElaborationError> {
-        if is_reduced(terms, &self.atoms)? {
-            Ok(())
-        } else {
-            Err(ElaborationError::Node {
-                node,
-                message: CheckError::RequiresReducedInput.to_string(),
-            })
+        source: SymbolicExprId,
+        index: ParallelIndex,
+        index_offset: u64,
+        memo: &mut BTreeMap<SymbolicExprId, SymbolicExprId>,
+    ) -> Result<SymbolicExprId, ElaborationError> {
+        if let Some(value) = memo.get(&source) {
+            return Ok(*value);
         }
-    }
-
-    fn warn_viewed_preimages(&mut self, node: NodeId, terms: &TermList) {
-        if terms.terms.iter().any(|term| {
-            term.factors.iter().any(|factor| {
-                self.atoms.get(&factor.atom).is_some_and(|atom| atom.preimage_refs.is_some())
-            })
-        }) {
-            self.warnings.push(ElaborationWarning {
-                node,
-                kind: WarningKind::DroppedPreimageReferences,
-                message: "a viewed or modulus-converted preimage occurrence does not retain its rewrite identity".to_owned(),
-            });
-        }
-    }
-
-    fn node_error<T>(&self, node: NodeId, message: &str) -> Result<T, ElaborationError> {
-        Err(ElaborationError::Node { node, message: message.to_owned() })
-    }
-}
-
-impl TargetTermLists for State<'_> {
-    fn resolve(&self, preimage: &AtomId, target: &TargetRef) -> Option<&TermList> {
-        match target {
-            TargetRef::Local(wire) => {
-                let instantiation_path = match preimage {
-                    AtomId::Local { instantiation_path, .. } => instantiation_path.clone(),
-                    _ => Vec::new(),
-                };
-                self.wire_terms.get(&WireId { instantiation_path, wire: *wire })
+        let record = self
+            .expressions
+            .get(source)
+            .cloned()
+            .ok_or(ExpressionError::MissingExpression(source))?;
+        let result = match record.node {
+            SymbolicExprNode::Zero => self.expressions.zero(record.matrix_type)?,
+            SymbolicExprNode::Atom(atom) => {
+                let atom = self.specialize_atom(&atom, &index, index_offset)?;
+                self.expressions.atom(atom, &self.atoms)?
             }
-            TargetRef::Imported { production_id, .. } => self
-                .manifests
-                .get(production_id)
-                .and_then(|manifest| manifest.term_lists.get(target)),
-            TargetRef::Assumed(_) => self.assumed_terms.get(target),
-        }
-    }
-}
-
-fn signal_suffix(term: &Term, suffix_len: usize, atoms: &AtomTable) -> Option<Vec<Factor>> {
-    let non_scalar_positions = term
-        .factors
-        .iter()
-        .enumerate()
-        .filter_map(|(index, factor)| {
-            atoms
-                .get(&factor.atom)
-                .is_some_and(|atom| !atom.matrix_type.is_scalar())
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    if suffix_len > non_scalar_positions.len() {
-        return None;
-    }
-    let start = if suffix_len == 0 {
-        term.factors.len()
-    } else {
-        non_scalar_positions[non_scalar_positions.len() - suffix_len]
-    };
-    Some(term.factors[start..].to_vec())
-}
-
-fn viewed_type(mut ty: ConcreteMatrixType, view: Option<&ViewDescriptor>) -> ConcreteMatrixType {
-    let Some(view) = view else {
-        return ty;
-    };
-    if view.transpose {
-        std::mem::swap(&mut ty.rows, &mut ty.columns);
-    }
-    if let Some(rows) = &view.row_range {
-        ty.rows = rows.end.saturating_sub(rows.start);
-    }
-    if let Some(columns) = &view.column_range {
-        ty.columns = columns.end.saturating_sub(columns.start);
-    }
-    if let Some(modulus) = &view.modulus_cast {
-        ty.modulus = modulus.clone();
-    }
-    ty
-}
-
-fn contextualize(
-    node: NodeId,
-    instantiation_path: &[InstantiationFrame],
-    source: ElaborationError,
-) -> ElaborationError {
-    ElaborationError::Context {
-        node,
-        instantiation_path: instantiation_path.to_vec(),
-        source: Box::new(source),
-    }
-}
-
-fn contextualize_unless_present(
-    node: NodeId,
-    instantiation_path: &[InstantiationFrame],
-    error: ElaborationError,
-) -> ElaborationError {
-    if matches!(&error, ElaborationError::Context { .. }) {
-        error
-    } else {
-        contextualize(node, instantiation_path, error)
-    }
-}
-
-fn contextualize_check(
-    error: CheckError,
-    instantiation_path: &[InstantiationFrame],
-) -> ElaborationError {
-    let node = match &error {
-        CheckError::Core(mxx_ir_core::checks::CheckError::DuplicateNode(node)) |
-        CheckError::Core(mxx_ir_core::checks::CheckError::NotTopological { node, .. }) |
-        CheckError::Core(mxx_ir_core::checks::CheckError::InvalidOutput { node, .. }) => *node,
-        _ => NodeId(0),
-    };
-    contextualize(node, instantiation_path, ElaborationError::Check(error))
-}
-
-fn check_bindings(graph: &Graph, env: &ParamEnv) -> Result<(), ElaborationError> {
-    for parameter in &graph.parameters {
-        let present = match parameter.kind {
-            crate::graph::CompileParameterKind::Integer => {
-                env.integers.contains_key(&parameter.name)
+            SymbolicExprNode::Add(children) => {
+                let children = self.specialize_children(children, &index, index_offset, memo)?;
+                self.expressions.add(record.matrix_type, children)?
             }
-            crate::graph::CompileParameterKind::Real => env.reals.contains_key(&parameter.name),
+            SymbolicExprNode::Scale { coefficient, value } => {
+                let value = self.specialize_expression(value, index.clone(), index_offset, memo)?;
+                self.expressions.scale(coefficient, value)?
+            }
+            SymbolicExprNode::Mul(children) => {
+                let children = self.specialize_children(children, &index, index_offset, memo)?;
+                self.expressions.multiply(record.matrix_type, children, &self.atoms)?
+            }
+            SymbolicExprNode::Tensor { left, right } => {
+                let left = self.specialize_expression(left, index.clone(), index_offset, memo)?;
+                let right = self.specialize_expression(right, index.clone(), index_offset, memo)?;
+                self.expressions.tensor(record.matrix_type, left, right)?
+            }
+            SymbolicExprNode::Concat { axis, inputs } => {
+                let inputs = self.specialize_children(inputs, &index, index_offset, memo)?;
+                self.expressions.concat(record.matrix_type, axis, inputs)?
+            }
+            SymbolicExprNode::Select { domain, branches } => {
+                if let Some(branch) = parallel_family_branch(&domain, &index, index_offset) {
+                    let selected = *branches.get(branch).ok_or_else(|| {
+                        ElaborationError::Overlay(
+                            "parallel family specialization is out of range".to_owned(),
+                        )
+                    })?;
+                    let result =
+                        self.specialize_expression(selected, index.clone(), index_offset, memo)?;
+                    memo.insert(source, result);
+                    return Ok(result);
+                }
+                let branches = self.specialize_children(branches, &index, index_offset, memo)?;
+                let domain = specialize_domain(domain, &index, index_offset);
+                self.expressions.select(record.matrix_type, domain, branches)?
+            }
+            SymbolicExprNode::Transpose(value) => {
+                let value = self.specialize_expression(value, index.clone(), index_offset, memo)?;
+                self.expressions.transpose(record.matrix_type, value)?
+            }
+            SymbolicExprNode::Slice { value, rows, columns } => {
+                let value = self.specialize_expression(value, index.clone(), index_offset, memo)?;
+                self.expressions.slice(record.matrix_type, value, rows, columns)?
+            }
+            SymbolicExprNode::Reshape { value, .. } => {
+                let value = self.specialize_expression(value, index.clone(), index_offset, memo)?;
+                self.expressions.reshape(record.matrix_type, value)?
+            }
+            SymbolicExprNode::ConstantCoefficient { value, position } => {
+                let value = self.specialize_expression(value, index.clone(), index_offset, memo)?;
+                self.expressions.constant_coefficient(record.matrix_type, value, position)?
+            }
+            SymbolicExprNode::CrtRecompose {
+                inputs,
+                plaintext_moduli,
+                reconstruction_coefficients,
+            } => {
+                let inputs = self.specialize_children(inputs, &index, index_offset, memo)?;
+                self.expressions.crt_recompose(
+                    record.matrix_type,
+                    inputs,
+                    plaintext_moduli,
+                    reconstruction_coefficients,
+                )?
+            }
         };
-        if !present {
-            return Err(ElaborationError::MissingBinding(parameter.name.clone()));
+        memo.insert(source, result);
+        Ok(result)
+    }
+
+    fn specialize_children(
+        &mut self,
+        children: Vec<SymbolicExprId>,
+        index: &ParallelIndex,
+        index_offset: u64,
+        memo: &mut BTreeMap<SymbolicExprId, SymbolicExprId>,
+    ) -> Result<Vec<SymbolicExprId>, ElaborationError> {
+        children
+            .into_iter()
+            .map(|child| self.specialize_expression(child, index.clone(), index_offset, memo))
+            .collect()
+    }
+
+    fn specialize_atom(
+        &mut self,
+        id: &AtomId,
+        index: &ParallelIndex,
+        index_offset: u64,
+    ) -> Result<AtomId, ElaborationError> {
+        let AtomId::Instantiated { template, instantiation_path } = id else {
+            return Ok(id.clone());
+        };
+        let mut path = instantiation_path.clone();
+        if !specialize_path(&mut path, index, index_offset) {
+            return Ok(id.clone());
         }
-    }
-    Ok(())
-}
-
-fn value_type(value: &Value) -> ConcreteWireType {
-    match value {
-        Value::Scalar(ty) => ty.clone(),
-        Value::Matrix(matrix) => ConcreteWireType::Matrix(matrix.ty.clone()),
-        Value::Preimage(matrix) => ConcreteWireType::Preimage(matrix.ty.clone()),
-        Value::Trapdoor(trapdoor) => trapdoor.ty.clone(),
-        Value::IndexedFamily { element_type, elements } => ConcreteWireType::IndexedFamily {
-            element: Box::new(element_type.clone()),
-            count: elements.len(),
-        },
-    }
-}
-
-fn symbolic_artifact_type(wire_type: &ConcreteWireType) -> bool {
-    matches!(
-        wire_type,
-        ConcreteWireType::Matrix(_) |
-            ConcreteWireType::Preimage(_) |
-            ConcreteWireType::Trapdoor { .. }
-    )
-}
-
-fn imported_artifact_value(
-    wire_type: &ConcreteWireType,
-    terms: Option<&TermList>,
-    node: NodeId,
-) -> Result<Value, ElaborationError> {
-    match wire_type {
-        ConcreteWireType::Matrix(matrix) => Ok(Value::Matrix(MatrixValue {
-            ty: matrix.clone(),
-            terms: terms.cloned().ok_or_else(|| ElaborationError::Node {
-                node,
-                message: "matrix artifact has no symbolic term list".to_owned(),
-            })?,
-        })),
-        ConcreteWireType::Preimage(matrix) => Ok(Value::Preimage(MatrixValue {
-            ty: matrix.clone(),
-            terms: terms.cloned().ok_or_else(|| ElaborationError::Node {
-                node,
-                message: "preimage artifact has no symbolic term list".to_owned(),
-            })?,
-        })),
-        ConcreteWireType::Trapdoor { .. } => {
-            let terms = terms.ok_or_else(|| ElaborationError::Node {
-                node,
-                message: "trapdoor artifact has no symbolic public-matrix term list".to_owned(),
+        let specialized =
+            AtomId::Instantiated { template: template.clone(), instantiation_path: path };
+        if !self.atoms.contains_key(&specialized) {
+            let source = self.atoms.get(id).cloned().ok_or_else(|| {
+                ElaborationError::Overlay(format!("missing template atom: {id:?}"))
             })?;
-            let [term] = terms.terms.as_slice() else {
-                return Err(ElaborationError::Node {
-                    node,
-                    message: "trapdoor artifact must identify exactly one public-matrix atom"
-                        .to_owned(),
-                });
-            };
-            let [factor] = term.factors.as_slice() else {
-                return Err(ElaborationError::Node {
-                    node,
-                    message: "trapdoor artifact must identify exactly one public-matrix atom"
-                        .to_owned(),
-                });
-            };
-            if term.coefficient != BigInt::one() || factor.view.is_some() {
-                return Err(ElaborationError::Node {
-                    node,
-                    message: "trapdoor artifact public-matrix term must be one unviewed atom"
-                        .to_owned(),
-                });
-            }
-            Ok(Value::Trapdoor(TrapdoorValue {
-                ty: wire_type.clone(),
-                uniform: factor.atom.clone(),
-                origin: TrapdoorOrigin::Sampled,
-            }))
+            self.insert_atom(Atom { id: specialized.clone(), ..source })?;
+            self.specialize_relations_for(id, &specialized, index, index_offset)?;
         }
-        scalar => {
-            if terms.is_some() {
-                return Err(ElaborationError::Node {
-                    node,
-                    message: "non-symbolic artifact unexpectedly carries symbolic terms".to_owned(),
-                });
-            }
-            Ok(Value::Scalar(scalar.clone()))
+        Ok(specialized)
+    }
+
+    fn specialize_relations_for(
+        &mut self,
+        source_atom: &AtomId,
+        specialized_atom: &AtomId,
+        index: &ParallelIndex,
+        index_offset: u64,
+    ) -> Result<(), ElaborationError> {
+        let relations = self.relations.clone();
+        for relation in relations.into_iter().filter(|relation| &relation.preimage == source_atom) {
+            let left_matrix = self.specialize_atom(&relation.left_matrix, index, index_offset)?;
+            let mut memo = BTreeMap::new();
+            let product = self.specialize_expression(
+                relation.product,
+                index.clone(),
+                index_offset,
+                &mut memo,
+            )?;
+            self.insert_relation(PreimageRelation {
+                left_matrix,
+                preimage: specialized_atom.clone(),
+                product,
+            })?;
         }
+        Ok(())
+    }
+
+    fn apply_assumption(&mut self, target: &ScopedWireRef) -> Result<(), ElaborationError> {
+        let pending = self.overlay.assumptions.get(target).expect("caller checked assumption");
+        let expression = self.convert_pending_expression(pending)?;
+        let wire = self
+            .scopes
+            .get_mut(&target.scope)
+            .and_then(|scope| scope.wires.get_mut(&target.wire))
+            .ok_or_else(|| {
+                ElaborationError::Overlay("assumption target is unavailable".to_owned())
+            })?;
+        let expected = matrix_type(&wire.wire_type).ok_or_else(|| {
+            ElaborationError::Overlay("assumption target is not a matrix".to_owned())
+        })?;
+        if self.expressions.matrix_type(expression)? != expected {
+            return Err(ElaborationError::Overlay(
+                "assumption expression type does not match target".to_owned(),
+            ));
+        }
+        wire.expression = Some(expression);
+        wire.family = None;
+        Ok(())
+    }
+
+    fn convert_pending_expression(
+        &mut self,
+        pending: &PendingSymbolicExpr,
+    ) -> Result<SymbolicExprId, ElaborationError> {
+        let matrix_type = concrete_matrix(&pending.matrix_type, &self.graph.bindings)?;
+        Ok(match &pending.node {
+            PendingSymbolicExprNode::Zero => self.expressions.zero(matrix_type)?,
+            PendingSymbolicExprNode::Value(value) => match value {
+                SymbolicValueRef::Local(reference) => self
+                    .scopes
+                    .get(&reference.scope)
+                    .and_then(|scope| scope.wires.get(&reference.wire))
+                    .and_then(|wire| wire.expression)
+                    .ok_or_else(|| {
+                        ElaborationError::Overlay(format!(
+                            "assumption value is unavailable: {reference:?}"
+                        ))
+                    })?,
+                SymbolicValueRef::Virtual(id) => {
+                    self.expressions.atom(AtomId::Virtual(*id), &self.atoms)?
+                }
+                SymbolicValueRef::ImportedAtom { production_id, manifest_atom_id } => {
+                    self.expressions.atom(
+                        AtomId::Imported {
+                            production_id: production_id.clone(),
+                            manifest_atom_id: *manifest_atom_id,
+                        },
+                        &self.atoms,
+                    )?
+                }
+            },
+            PendingSymbolicExprNode::Add(children) => {
+                let children = children
+                    .iter()
+                    .map(|child| self.convert_pending_expression(child))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.expressions.add(matrix_type, children)?
+            }
+            PendingSymbolicExprNode::Scale { coefficient, value } => {
+                let value = self.convert_pending_expression(value)?;
+                let result =
+                    self.expressions.scale(coefficient.evaluate(&self.graph.bindings)?, value)?;
+                if self.expressions.matrix_type(result)? != &matrix_type {
+                    return Err(ElaborationError::Overlay(
+                        "assumption scale type mismatch".to_owned(),
+                    ));
+                }
+                result
+            }
+            PendingSymbolicExprNode::Mul(children) => {
+                let children = children
+                    .iter()
+                    .map(|child| self.convert_pending_expression(child))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.expressions.multiply(matrix_type, children, &self.atoms)?
+            }
+        })
+    }
+
+    fn apply_declared_preimages(&mut self) -> Result<(), ElaborationError> {
+        for relation in &self.overlay.preimage_relations {
+            let left_matrix = self.exact_atom(&relation.left_matrix)?;
+            let preimage = self.exact_atom(&relation.preimage)?;
+            let product = self.convert_pending_expression(&relation.product)?;
+            self.insert_relation(PreimageRelation { left_matrix, preimage, product })?;
+        }
+        Ok(())
+    }
+
+    fn exact_atom(&self, reference: &ExactAtomRef) -> Result<AtomId, ElaborationError> {
+        match reference {
+            ExactAtomRef::Virtual(id) => Ok(AtomId::Virtual(*id)),
+            ExactAtomRef::Imported { production_id, manifest_atom_id } => Ok(AtomId::Imported {
+                production_id: production_id.clone(),
+                manifest_atom_id: *manifest_atom_id,
+            }),
+            ExactAtomRef::Local(reference) => {
+                let expression = self
+                    .scopes
+                    .get(&reference.scope)
+                    .and_then(|scope| scope.wires.get(&reference.wire))
+                    .and_then(|wire| wire.expression)
+                    .ok_or_else(|| {
+                        ElaborationError::Overlay("exact local atom is unavailable".to_owned())
+                    })?;
+                self.exact_atom_expression(expression).ok_or_else(|| {
+                    ElaborationError::Overlay(
+                        "exact local reference is not one unviewed atom".to_owned(),
+                    )
+                })
+            }
+        }
+    }
+
+    fn rewrite_all_roots(&mut self) -> Result<(), ElaborationError> {
+        let relation_snapshot = self.relations.clone();
+        for relation in &mut self.relations {
+            relation.product = rewrite_expression(
+                relation.product,
+                &mut self.expressions,
+                &self.atoms,
+                &relation_snapshot,
+            )?;
+        }
+        let relations = self.relations.clone();
+        for scope in self.scopes.values_mut() {
+            for wire in scope.wires.values_mut() {
+                if let Some(expression) = wire.expression {
+                    wire.expression = Some(rewrite_expression(
+                        expression,
+                        &mut self.expressions,
+                        &self.atoms,
+                        &relations,
+                    )?);
+                }
+                if let Some(family) = &mut wire.family {
+                    match family {
+                        SymbolicFamily::ExactMembers(members) => {
+                            for member in members {
+                                *member = rewrite_expression(
+                                    *member,
+                                    &mut self.expressions,
+                                    &self.atoms,
+                                    &relations,
+                                )?;
+                            }
+                        }
+                        SymbolicFamily::StructuralTemplate { template, .. } => {
+                            *template = rewrite_expression(
+                                *template,
+                                &mut self.expressions,
+                                &self.atoms,
+                                &relations,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn trapdoor_public_expression(
+        &mut self,
+        scope: &FrozenGraphScopeId,
+        trapdoor: WireRef,
+        wires: &BTreeMap<WireRef, ElaboratedWire>,
+    ) -> Result<SymbolicExprId, ElaborationError> {
+        if trapdoor.port != Port(0) {
+            let public = WireRef { node: trapdoor.node, port: Port(0) };
+            if let Some(expression) = wires.get(&public).and_then(|wire| wire.expression) {
+                return Ok(expression);
+            }
+        }
+        let id = AtomId::TrapdoorPublic(ScopedWireRef { scope: scope.clone(), wire: trapdoor });
+        if self.atoms.contains_key(&id) {
+            return Ok(self.expressions.atom(id, &self.atoms)?);
+        }
+        wires
+            .get(&trapdoor)
+            .and_then(|wire| wire.expression)
+            .ok_or_else(|| self.node_error(scope, trapdoor.node, "trapdoor public is unavailable"))
+    }
+
+    fn matrix_expression(
+        &self,
+        scope: &FrozenGraphScopeId,
+        node: NodeId,
+        wire: WireRef,
+        wires: &BTreeMap<WireRef, ElaboratedWire>,
+    ) -> Result<SymbolicExprId, ElaborationError> {
+        wires.get(&wire).and_then(|wire| wire.expression).ok_or_else(|| {
+            self.node_error(scope, node, "matrix argument has no symbolic expression")
+        })
+    }
+
+    fn exact_atom_expression(&self, expression: SymbolicExprId) -> Option<AtomId> {
+        match &self.expressions.get(expression)?.node {
+            SymbolicExprNode::Atom(atom) => Some(atom.clone()),
+            _ => None,
+        }
+    }
+
+    fn insert_source_atom(
+        &mut self,
+        id: AtomId,
+        kind: AtomKind,
+        matrix_type: ConcreteMatrixType,
+        source: SourceKind,
+    ) -> Result<(), ElaborationError> {
+        self.insert_atom(Atom { id, class: AtomClass::Source { source }, kind, matrix_type })
+    }
+
+    fn insert_atom(&mut self, atom: Atom) -> Result<(), ElaborationError> {
+        if let Some(existing) = self.atoms.insert(atom.clone()) &&
+            existing != atom
+        {
+            return Err(ElaborationError::Overlay("symbolic atom identity collision".to_owned()));
+        }
+        Ok(())
+    }
+
+    fn insert_relation(&mut self, relation: PreimageRelation) -> Result<(), ElaborationError> {
+        if let Some(existing) = self.relations.iter().find(|existing| {
+            existing.left_matrix == relation.left_matrix && existing.preimage == relation.preimage
+        }) {
+            if existing != &relation {
+                return Err(ElaborationError::Overlay(
+                    "preimage relation is declared more than once".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        self.relations.push(relation);
+        Ok(())
+    }
+
+    fn node_error(
+        &self,
+        scope: &FrozenGraphScopeId,
+        node: NodeId,
+        message: &str,
+    ) -> ElaborationError {
+        ElaborationError::Node { scope: scope.clone(), node, message: message.to_owned() }
     }
 }
 
-fn is_integer(ty: &ConcreteWireType) -> bool {
-    matches!(ty, ConcreteWireType::Int | ConcreteWireType::ConstantInt)
+fn matrix_output(expression: SymbolicExprId) -> SymbolicOutput {
+    SymbolicOutput { expression: Some(expression), family: None }
 }
 
-fn is_real(ty: &ConcreteWireType) -> bool {
-    matches!(ty, ConcreteWireType::Real | ConcreteWireType::ConstantReal)
-}
-
-fn is_boolean(ty: &ConcreteWireType) -> bool {
-    matches!(ty, ConcreteWireType::Bool | ConcreteWireType::ConstantBool)
-}
-
-fn concrete_wire(ty: &WireType, env: &ParamEnv) -> Result<ConcreteWireType, ElaborationError> {
-    Ok(match ty {
-        WireType::ConstantInt => ConcreteWireType::ConstantInt,
-        WireType::ConstantReal => ConcreteWireType::ConstantReal,
-        WireType::ConstantBool => ConcreteWireType::ConstantBool,
-        WireType::Int => ConcreteWireType::Int,
-        WireType::Real => ConcreteWireType::Real,
-        WireType::Bool => ConcreteWireType::Bool,
-        WireType::Bytes { length } => ConcreteWireType::Bytes {
-            length: positive_usize(length.evaluate(env)?, "byte-string length", NodeId(0))?,
-        },
-        WireType::TypedBlob { type_name, schema_hash } => {
-            ConcreteWireType::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash }
-        }
-        WireType::Matrix(matrix) => ConcreteWireType::Matrix(concrete_matrix(matrix, env)?),
-        WireType::Trapdoor { matrix, sigma, gadget_base, digit_count } => {
-            ConcreteWireType::Trapdoor {
-                matrix: concrete_matrix(matrix, env)?,
-                sigma: close_real_expr(sigma, env)?,
-                gadget_base: gadget_base.evaluate(env)?.abs(),
-                digit_count: positive_usize(
-                    digit_count.evaluate(env)?,
-                    "trapdoor digit count",
-                    NodeId(0),
-                )?,
-            }
-        }
-        WireType::Preimage(matrix) => ConcreteWireType::Preimage(concrete_matrix(matrix, env)?),
-        WireType::IndexedFamily { element, count } => {
-            let count = nonnegative_usize(count.evaluate(env)?, "indexed family count", NodeId(0))?;
-            let element = concrete_wire(element, env)?;
-            if matches!(element, ConcreteWireType::IndexedFamily { .. }) {
-                return Err(ElaborationError::Node {
-                    node: NodeId(0),
-                    message: "nested indexed families are not supported".to_owned(),
-                });
-            }
-            ConcreteWireType::IndexedFamily { element: Box::new(element), count }
-        }
-    })
-}
-
-fn close_real_expr(expression: &RealExpr, env: &ParamEnv) -> Result<RealExpr, ElaborationError> {
-    expression.close(env).map_err(ElaborationError::Expression)
+fn matrix_type(ty: &ConcreteWireType) -> Option<&ConcreteMatrixType> {
+    match ty {
+        ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => Some(matrix),
+        ConcreteWireType::Trapdoor { matrix, .. } => Some(matrix),
+        ConcreteWireType::IndexedFamily { element, .. } => matrix_type(element),
+        _ => None,
+    }
 }
 
 fn concrete_matrix(
-    ty: &MatrixType,
-    env: &ParamEnv,
+    matrix_type: &mxx_ir_core::types::MatrixType,
+    bindings: &ParamEnv,
 ) -> Result<ConcreteMatrixType, ElaborationError> {
-    let modulus = ty.modulus.evaluate(env)?;
-    if modulus <= BigInt::one() {
-        return Err(ElaborationError::Node {
-            node: NodeId(0),
-            message: "matrix modulus must be greater than one".to_owned(),
-        });
-    }
     Ok(ConcreteMatrixType {
-        modulus,
-        ring_dimension: positive_usize(
-            ty.ring_dimension.evaluate(env)?,
-            "ring dimension",
-            NodeId(0),
-        )?,
-        rows: positive_usize(ty.rows.evaluate(env)?, "matrix rows", NodeId(0))?,
-        columns: positive_usize(ty.columns.evaluate(env)?, "matrix columns", NodeId(0))?,
+        modulus: matrix_type.modulus.evaluate(bindings)?,
+        ring_dimension: matrix_type
+            .ring_dimension
+            .evaluate(bindings)?
+            .to_usize()
+            .ok_or_else(|| ElaborationError::Overlay("ring dimension is not a usize".to_owned()))?,
+        rows: matrix_type
+            .rows
+            .evaluate(bindings)?
+            .to_usize()
+            .ok_or_else(|| ElaborationError::Overlay("matrix rows are not a usize".to_owned()))?,
+        columns: matrix_type.columns.evaluate(bindings)?.to_usize().ok_or_else(|| {
+            ElaborationError::Overlay("matrix columns are not a usize".to_owned())
+        })?,
     })
 }
 
-fn positive_usize(value: BigInt, label: &str, node: NodeId) -> Result<usize, ElaborationError> {
-    value.to_usize().filter(|value| *value > 0).ok_or_else(|| ElaborationError::Node {
-        node,
-        message: format!("{label} must be a positive usize"),
-    })
-}
-
-fn nonnegative_usize(value: BigInt, label: &str, node: NodeId) -> Result<usize, ElaborationError> {
-    value.to_usize().ok_or_else(|| ElaborationError::Node {
-        node,
-        message: format!("{label} must be a nonnegative usize"),
-    })
-}
-
-fn sliced_type(
-    input: &ConcreteMatrixType,
-    rows: Option<&crate::term::IndexRange>,
-    columns: Option<&crate::term::IndexRange>,
-) -> Result<ConcreteMatrixType, ElaborationError> {
-    let row_count = rows.map_or(input.rows, |range| range.end.saturating_sub(range.start));
-    let column_count = columns.map_or(input.columns, |range| range.end.saturating_sub(range.start));
-    if rows.is_some_and(|range| range.start >= range.end || range.end > input.rows) ||
-        columns.is_some_and(|range| range.start >= range.end || range.end > input.columns)
-    {
-        return Err(ElaborationError::Node {
-            node: NodeId(0),
-            message: "slice range is invalid".to_owned(),
-        });
-    }
-    Ok(ConcreteMatrixType { rows: row_count, columns: column_count, ..input.clone() })
-}
-
-fn close_constant_matrix(
-    value: &ConstantMatrix,
-    env: &ParamEnv,
-) -> Result<ConstantMatrix, ElaborationError> {
-    Ok(match value {
-        ConstantMatrix::Zero => ConstantMatrix::Zero,
-        ConstantMatrix::Identity => ConstantMatrix::Identity,
-        ConstantMatrix::UnitRow { index } => {
-            ConstantMatrix::UnitRow { index: crate::expr::IntExpr::constant(index.evaluate(env)?) }
-        }
-        ConstantMatrix::UnitColumn { index } => ConstantMatrix::UnitColumn {
-            index: crate::expr::IntExpr::constant(index.evaluate(env)?),
-        },
-        ConstantMatrix::Rotation { exponent } => ConstantMatrix::Rotation {
-            exponent: crate::expr::IntExpr::constant(exponent.evaluate(env)?),
-        },
-        ConstantMatrix::Gadget { base, small } => ConstantMatrix::Gadget {
-            base: crate::expr::IntExpr::constant(base.evaluate(env)?),
-            small: *small,
-        },
-        ConstantMatrix::PowerOfBase { base, exponent } => ConstantMatrix::PowerOfBase {
-            base: crate::expr::IntExpr::constant(base.evaluate(env)?),
-            exponent: crate::expr::IntExpr::constant(exponent.evaluate(env)?),
-        },
-    })
-}
-
-fn gadget_digits(modulus: &BigInt, base: &BigInt) -> usize {
-    let mut power = BigInt::one();
-    let mut digits = 0usize;
-    while power < *modulus {
-        power *= base;
-        digits = digits.saturating_add(1);
-    }
-    digits.max(1)
-}
-
-fn decomposition_digits(
-    explicit: Option<&crate::expr::IntExpr>,
-    modulus: &BigInt,
-    base: &BigInt,
-    env: &ParamEnv,
-    node: NodeId,
-) -> Result<usize, ElaborationError> {
-    match explicit {
-        Some(value) => positive_usize(value.evaluate(env)?, "decomposition digit count", node),
-        None => Ok(gadget_digits(modulus, base)),
-    }
-}
-
-fn dependencies(terms: &TermList, atoms: &AtomTable) -> BTreeSet<AtomId> {
-    terms
-        .terms
-        .iter()
-        .flat_map(|term| term.factors.iter().map(|factor| factor.atom.clone()))
-        .flat_map(|id| {
-            let mut dependencies =
-                atoms.get(&id).map_or_else(BTreeSet::new, |atom| atom.dependencies.clone());
-            dependencies.insert(id);
-            dependencies
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TermClass {
-    Zero,
-    Noise,
-    Signal,
-    Mixed,
-}
-
-fn classify_terms(terms: &TermList, atoms: &AtomTable) -> Result<TermClass, TermError> {
-    let mut signal = false;
-    let mut noise = false;
-    for term in &terms.terms {
-        let term_has_signal = term.factors.iter().try_fold(false, |found, factor| {
-            let atom = atoms
-                .get(&factor.atom)
-                .ok_or_else(|| TermError::MissingAtom(factor.atom.clone()))?;
-            Ok::<_, TermError>(found || atom.is_large())
-        })?;
-        if term_has_signal {
-            signal = true;
-        } else {
-            noise = true;
-        }
-    }
-    Ok(match (signal, noise) {
-        (false, false) => TermClass::Zero,
-        (false, true) => TermClass::Noise,
-        (true, false) => TermClass::Signal,
-        (true, true) => TermClass::Mixed,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        expr::{IntExpr, Rational, RealExpr},
-        graph::Graph,
-        manifest::{ExportArtifact, export_manifest, import_manifest, production_id},
-        node::{ArtifactInput, MatrixBinaryOp, Node, NodeKind, SampleRange},
-        overlay::{
-            AssumedPreimage, AssumedTermList, AtomRef, ExpectedEntry, ExpectedTermList, FactorRef,
-            FoldGroup, FoldSpec, OverlayTerm, PortMatcher, Reinterpretation, SelectNodeSelector,
-            UnfoldSpec, VirtualAtomDecl, VirtualKind, WireSelector,
-        },
-    };
-    use mxx_ir_core::artifact::ArtifactConfidentiality;
-
-    fn wire(node: u64, port: u32) -> WireRef {
-        WireRef { node: NodeId(node), port: Port(port) }
-    }
-
-    fn root_cause(error: &ElaborationError) -> &ElaborationError {
-        match error {
-            ElaborationError::Context { source, .. } => root_cause(source),
-            _ => error,
-        }
-    }
-
-    fn matrix_type() -> MatrixType {
-        MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(8),
-            rows: IntExpr::constant(2),
-            columns: IntExpr::constant(2),
-        }
-    }
-
-    fn bounded_sample(id: u64) -> Node {
-        Node {
-            id: NodeId(id),
-            kind: NodeKind::UniformSample {
-                matrix_type: matrix_type(),
-                range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-            },
-            args: Vec::new(),
-        }
-    }
-
-    fn large_sample(id: u64) -> Node {
-        let mut node = bounded_sample(id);
-        let NodeKind::UniformSample { range, .. } = &mut node.kind else { unreachable!() };
-        range.minimum = BigInt::from(-9);
-        range.maximum = BigInt::from(9);
-        node
-    }
-
-    fn empty_graph(name: &str, nodes: Vec<Node>, output: WireRef) -> Graph {
-        Graph {
-            name: name.to_owned(),
-            parameters: Vec::new(),
-            input_types: BTreeMap::new(),
-            nodes,
-            outputs: BTreeMap::from([("out".to_owned(), output)]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        }
-    }
-
-    fn elaborated_terms(graph: &ElaboratedGraph, wire: WireRef) -> &TermList {
-        graph
-            .wires
-            .get(&WireId { instantiation_path: Vec::new(), wire })
-            .and_then(|wire| wire.terms.as_ref())
-            .expect("matrix wire")
-    }
-
-    fn crt_graph(plaintext_moduli: Vec<i64>, coefficients: Vec<i64>) -> Graph {
-        let mut ty = matrix_type();
-        ty.rows = IntExpr::constant(1);
-        let sample = |id| Node {
-            id: NodeId(id),
-            kind: NodeKind::UniformSample {
-                matrix_type: ty.clone(),
-                range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-            },
-            args: Vec::new(),
-        };
-        empty_graph(
-            "crt-recompose",
-            vec![
-                sample(1),
-                sample(2),
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::CrtRecompose {
-                        plaintext_moduli: plaintext_moduli
-                            .into_iter()
-                            .map(IntExpr::constant)
-                            .collect(),
-                        reconstruction_coefficients: coefficients
-                            .into_iter()
-                            .map(IntExpr::constant)
-                            .collect(),
-                    },
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-            ],
-            wire(3, 0),
-        )
-    }
-
-    #[test]
-    fn crt_recompose_records_each_decode_target_and_rejects_invalid_parameters() {
-        let elaborated =
-            elaborate(&crt_graph(vec![3, 5], vec![6, 7]), &ParamEnv::default()).unwrap();
-        assert_eq!(elaborated.decode_targets.len(), 2);
-        assert_eq!(
-            elaborated
-                .decode_targets
-                .iter()
-                .map(|target| target.plaintext_modulus.clone())
-                .collect::<Vec<_>>(),
-            vec![BigInt::from(3), BigInt::from(5)]
-        );
-        let output = elaborated_terms(&elaborated, wire(3, 0));
-        let atom = elaborated.atoms.get(&output.terms[0].factors[0].atom).expect("derived atom");
-        assert!(matches!(
-            atom.class,
-            AtomClass::Derived { definition: DefExpr::CrtRecompose { .. } }
-        ));
-
-        for graph in [
-            crt_graph(vec![0, 5], vec![6, 7]),
-            crt_graph(vec![17, 5], vec![6, 7]),
-            crt_graph(vec![3, 5], vec![-1, 7]),
-            crt_graph(vec![3, 5], vec![17, 7]),
-        ] {
-            assert!(elaborate(&graph, &ParamEnv::default()).is_err());
-        }
-    }
-
-    #[test]
-    fn transpose_twice_restores_view_free_identity() {
-        let graph = empty_graph(
-            "transpose",
-            vec![
-                bounded_sample(1),
-                Node { id: NodeId(2), kind: NodeKind::Transpose, args: vec![wire(1, 0)] },
-                Node { id: NodeId(3), kind: NodeKind::Transpose, args: vec![wire(2, 0)] },
-            ],
-            wire(3, 0),
-        );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        assert_eq!(
-            elaborated_terms(&elaborated, wire(1, 0)),
-            elaborated_terms(&elaborated, wire(3, 0))
-        );
-    }
-
-    #[test]
-    fn concat_and_reshape_retain_exact_defining_expressions_and_tensor_is_rejected() {
-        let mut left = bounded_sample(1);
-        let mut right = bounded_sample(2);
-        for node in [&mut left, &mut right] {
-            let NodeKind::UniformSample { range, .. } = &mut node.kind else { unreachable!() };
-            range.minimum = BigInt::from(-2);
-            range.maximum = BigInt::from(2);
-        }
-        let concat = Node {
-            id: NodeId(3),
-            kind: NodeKind::Concat { axis: ConcatAxis::Rows },
-            args: vec![wire(1, 0), wire(2, 0)],
-        };
-        let reshape = Node {
-            id: NodeId(4),
-            kind: NodeKind::Reshape { rows: IntExpr::constant(1), columns: IntExpr::constant(8) },
-            args: vec![wire(3, 0)],
-        };
-        let graph = Graph {
-            name: "derived-definitions".to_owned(),
-            parameters: Vec::new(),
-            input_types: BTreeMap::new(),
-            nodes: vec![left.clone(), right.clone(), concat, reshape],
-            outputs: BTreeMap::from([
-                ("concat".to_owned(), wire(3, 0)),
-                ("reshape".to_owned(), wire(4, 0)),
-            ]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        };
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        let concat_atom = &elaborated_terms(&elaborated, wire(3, 0)).terms[0].factors[0].atom;
-        let reshape_atom = &elaborated_terms(&elaborated, wire(4, 0)).terms[0].factors[0].atom;
-        let concat = elaborated.atoms.get(concat_atom).expect("concat atom");
-        let reshape = elaborated.atoms.get(reshape_atom).expect("reshape atom");
-        assert!(matches!(
-            concat.class,
-            AtomClass::Derived { definition: DefExpr::Concat { axis: ConcatAxis::Rows, .. } }
-        ));
-        assert!(matches!(
-            reshape.class,
-            AtomClass::Derived { definition: DefExpr::Reshape { rows: 1, columns: 8, .. } }
-        ));
-        assert_eq!(concat.kind, AtomKind::Bounded);
-        assert_eq!(reshape.kind, concat.kind);
-
-        let tensor_graph = empty_graph(
-            "unsupported-tensor",
-            vec![
-                left,
-                right,
-                Node { id: NodeId(3), kind: NodeKind::Tensor, args: vec![wire(1, 0), wire(2, 0)] },
-            ],
-            wire(3, 0),
-        );
-        assert!(matches!(
-            elaborate(&tensor_graph, &ParamEnv::default()),
-            Err(ElaborationError::Context { .. })
-        ));
-    }
-
-    #[test]
-    fn opaque_concat_and_reshape_reject_signal_noise_mixtures() {
-        let concat = Graph {
-            name: "mixed-concat".to_owned(),
-            parameters: Vec::new(),
-            input_types: BTreeMap::new(),
-            nodes: vec![
-                large_sample(1),
-                bounded_sample(2),
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::Concat { axis: ConcatAxis::Rows },
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-            ],
-            outputs: BTreeMap::from([("out".to_owned(), wire(3, 0))]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        };
-        assert!(elaborate(&concat, &ParamEnv::default()).is_err());
-
-        let reshape = empty_graph(
-            "mixed-reshape",
-            vec![
-                large_sample(1),
-                bounded_sample(2),
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Add),
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-                Node {
-                    id: NodeId(4),
-                    kind: NodeKind::Reshape {
-                        rows: IntExpr::constant(1),
-                        columns: IntExpr::constant(4),
-                    },
-                    args: vec![wire(3, 0)],
-                },
-            ],
-            wire(4, 0),
-        );
-        assert!(elaborate(&reshape, &ParamEnv::default()).is_err());
-    }
-
-    #[test]
-    fn constant_coefficient_classifies_inputs_and_rejects_a_signal_noise_mixture() {
-        let scalar_type = MatrixType {
-            rows: IntExpr::constant(1),
-            columns: IntExpr::constant(1),
-            ..matrix_type()
-        };
-        let sample = |id, minimum, maximum| Node {
-            id: NodeId(id),
-            kind: NodeKind::UniformSample {
-                matrix_type: scalar_type.clone(),
-                range: SampleRange {
-                    minimum: BigInt::from(minimum),
-                    maximum: BigInt::from(maximum),
-                },
-            },
-            args: Vec::new(),
-        };
-        for (name, input, expected_kind) in [
-            ("bounded", sample(1, -1, 1), AtomKind::Bounded),
-            ("signal", sample(1, -9, 9), AtomKind::Large),
-        ] {
-            let graph = empty_graph(
-                name,
-                vec![
-                    input,
-                    Node {
-                        id: NodeId(2),
-                        kind: NodeKind::ConstantCoefficient { position: IntExpr::constant(3) },
-                        args: vec![wire(1, 0)],
-                    },
-                ],
-                wire(2, 0),
-            );
-            let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-            let atom_id = &elaborated_terms(&elaborated, wire(2, 0)).terms[0].factors[0].atom;
-            let atom = elaborated.atoms.get(atom_id).expect("derived coefficient atom");
-            assert_eq!(atom.kind, expected_kind);
-            assert!(matches!(
-                atom.class,
-                AtomClass::Derived { definition: DefExpr::ConstantCoefficient { position: 3, .. } }
-            ));
-        }
-
-        let mixed = empty_graph(
-            "mixed-constant-coefficient",
-            vec![
-                sample(1, -9, 9),
-                sample(2, -1, 1),
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Add),
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-                Node {
-                    id: NodeId(4),
-                    kind: NodeKind::ConstantCoefficient { position: IntExpr::constant(0) },
-                    args: vec![wire(3, 0)],
-                },
-            ],
-            wire(4, 0),
-        );
-        assert!(elaborate(&mixed, &ParamEnv::default()).is_err());
-    }
-
-    #[test]
-    fn correlated_selects_eliminate_cross_terms_and_rewrite_diagonal() {
-        let sigma =
-            RealExpr::Rational(Rational::new(BigInt::from(3), BigInt::from(1)).expect("rational"));
-        let mut nodes = vec![Node {
-            id: NodeId(1),
-            kind: NodeKind::ConstantInt(BigInt::from(0)),
-            args: Vec::new(),
-        }];
-        for id in [2, 3] {
-            nodes.push(Node {
-                id: NodeId(id),
-                kind: NodeKind::TrapdoorSample {
-                    matrix_type: matrix_type(),
-                    sigma: sigma.clone(),
-                    gadget_base: IntExpr::constant(2),
-                    digit_count: IntExpr::constant(1),
-                },
-                args: Vec::new(),
-            });
-        }
-        nodes.extend([bounded_sample(4), bounded_sample(5)]);
-        for (id, trapdoor, target) in [(6, 2, 4), (7, 3, 5)] {
-            nodes.push(Node {
-                id: NodeId(id),
-                kind: NodeKind::PreimageSample { matrix_type: matrix_type() },
-                args: vec![wire(trapdoor, 1), wire(target, 0)],
-            });
-        }
-        nodes.push(Node {
-            id: NodeId(8),
-            kind: NodeKind::Select { count: IntExpr::constant(2) },
-            args: vec![wire(1, 0), wire(2, 0), wire(3, 0)],
-        });
-        nodes.push(Node {
-            id: NodeId(9),
-            kind: NodeKind::Select { count: IntExpr::constant(2) },
-            args: vec![wire(1, 0), wire(6, 0), wire(7, 0)],
-        });
-        nodes.push(Node {
-            id: NodeId(10),
-            kind: NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-            args: vec![wire(8, 0), wire(9, 0)],
-        });
-        let graph = empty_graph("correlated", nodes, wire(10, 0));
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        let output = elaborated_terms(&elaborated, wire(10, 0));
-        assert_eq!(output.terms.len(), 2);
-        for term in &output.terms {
-            assert_eq!(term.factors.len(), 2);
-            assert!(matches!(term.factors[0].atom, AtomId::Indicator { .. }));
-            assert!(matches!(term.factors[1].atom, AtomId::Local { node: NodeId(4 | 5), .. }));
-        }
-    }
-
-    fn large_term_count(elaborated: &ElaboratedGraph, output: WireRef) -> usize {
-        elaborated_terms(elaborated, output)
-            .terms
-            .iter()
-            .filter(|term| {
-                term.factors.iter().any(|factor| {
-                    elaborated
-                        .atoms
-                        .get(&factor.atom)
-                        .is_some_and(|atom| matches!(atom.kind, AtomKind::Large))
-                })
-            })
-            .count()
-    }
-
-    #[test]
-    fn correlated_select_with_mismatched_preimage_branch_leaves_large_term() {
-        let sigma =
-            RealExpr::Rational(Rational::new(BigInt::from(3), BigInt::one()).expect("rational"));
-        let mut nodes = vec![Node {
-            id: NodeId(1),
-            kind: NodeKind::ConstantInt(BigInt::from(0)),
-            args: Vec::new(),
-        }];
-        for id in [2, 3] {
-            nodes.push(Node {
-                id: NodeId(id),
-                kind: NodeKind::TrapdoorSample {
-                    matrix_type: matrix_type(),
-                    sigma: sigma.clone(),
-                    gadget_base: IntExpr::constant(2),
-                    digit_count: IntExpr::constant(1),
-                },
-                args: Vec::new(),
-            });
-        }
-        nodes.extend([bounded_sample(4), bounded_sample(5)]);
-        nodes.push(Node {
-            id: NodeId(6),
-            kind: NodeKind::PreimageSample { matrix_type: matrix_type() },
-            args: vec![wire(2, 1), wire(4, 0)],
-        });
-        // This branch deliberately references A_0 while it is paired with A_1.
-        nodes.push(Node {
-            id: NodeId(7),
-            kind: NodeKind::PreimageSample { matrix_type: matrix_type() },
-            args: vec![wire(2, 1), wire(5, 0)],
-        });
-        nodes.push(Node {
-            id: NodeId(8),
-            kind: NodeKind::Select { count: IntExpr::constant(2) },
-            args: vec![wire(1, 0), wire(2, 0), wire(3, 0)],
-        });
-        nodes.push(Node {
-            id: NodeId(9),
-            kind: NodeKind::Select { count: IntExpr::constant(2) },
-            args: vec![wire(1, 0), wire(6, 0), wire(7, 0)],
-        });
-        nodes.push(Node {
-            id: NodeId(10),
-            kind: NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-            args: vec![wire(8, 0), wire(9, 0)],
-        });
-        let graph = empty_graph("mismatched-selected-preimage", nodes, wire(10, 0));
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        assert_eq!(large_term_count(&elaborated, wire(10, 0)), 1);
-    }
-
-    #[test]
-    fn independently_selected_uniform_and_preimage_leave_cross_branch_large_terms() {
-        let sigma =
-            RealExpr::Rational(Rational::new(BigInt::from(3), BigInt::one()).expect("rational"));
-        let mut nodes = vec![
-            Node { id: NodeId(1), kind: NodeKind::ConstantInt(BigInt::from(0)), args: Vec::new() },
-            Node { id: NodeId(2), kind: NodeKind::ConstantInt(BigInt::from(1)), args: Vec::new() },
-        ];
-        for id in [3, 4] {
-            nodes.push(Node {
-                id: NodeId(id),
-                kind: NodeKind::TrapdoorSample {
-                    matrix_type: matrix_type(),
-                    sigma: sigma.clone(),
-                    gadget_base: IntExpr::constant(2),
-                    digit_count: IntExpr::constant(1),
-                },
-                args: Vec::new(),
-            });
-        }
-        nodes.extend([bounded_sample(5), bounded_sample(6)]);
-        for (id, trapdoor, target) in [(7, 3, 5), (8, 4, 6)] {
-            nodes.push(Node {
-                id: NodeId(id),
-                kind: NodeKind::PreimageSample { matrix_type: matrix_type() },
-                args: vec![wire(trapdoor, 1), wire(target, 0)],
-            });
-        }
-        nodes.push(Node {
-            id: NodeId(9),
-            kind: NodeKind::Select { count: IntExpr::constant(2) },
-            args: vec![wire(1, 0), wire(3, 0), wire(4, 0)],
-        });
-        nodes.push(Node {
-            id: NodeId(10),
-            kind: NodeKind::Select { count: IntExpr::constant(2) },
-            args: vec![wire(2, 0), wire(7, 0), wire(8, 0)],
-        });
-        nodes.push(Node {
-            id: NodeId(11),
-            kind: NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-            args: vec![wire(9, 0), wire(10, 0)],
-        });
-        let graph = empty_graph("independent-selected-preimages", nodes, wire(11, 0));
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        assert_eq!(large_term_count(&elaborated, wire(11, 0)), 2);
-    }
-
-    #[test]
-    fn same_index_selects_over_different_rings_use_distinct_indicator_families() {
-        let mut other_ring = matrix_type();
-        other_ring.modulus = IntExpr::constant(19);
-        let mut graph = empty_graph(
-            "ring-scoped-selects",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::ConstantInt(BigInt::from(0)),
-                    args: Vec::new(),
-                },
-                bounded_sample(2),
-                bounded_sample(3),
-                Node {
-                    id: NodeId(4),
-                    kind: NodeKind::UniformSample {
-                        matrix_type: other_ring.clone(),
-                        range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(5),
-                    kind: NodeKind::UniformSample {
-                        matrix_type: other_ring,
-                        range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(6),
-                    kind: NodeKind::Select { count: IntExpr::constant(2) },
-                    args: vec![wire(1, 0), wire(2, 0), wire(3, 0)],
-                },
-                Node {
-                    id: NodeId(7),
-                    kind: NodeKind::Select { count: IntExpr::constant(2) },
-                    args: vec![wire(1, 0), wire(4, 0), wire(5, 0)],
-                },
-            ],
-            wire(6, 0),
-        );
-        graph.outputs.insert("other".to_owned(), wire(7, 0));
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        let first = &elaborated_terms(&elaborated, wire(6, 0)).terms[0].factors[0].atom;
-        let second = &elaborated_terms(&elaborated, wire(7, 0)).terms[0].factors[0].atom;
-        assert_ne!(first, second);
-        assert!(matches!(
-            (first, second),
-            (
-                AtomId::Indicator {
-                    domain: first_domain,
-                    ..
-                },
-                AtomId::Indicator {
-                    domain: second_domain,
-                    ..
+fn instantiate_domain(
+    domain: SelectionDomainRef,
+    child_scope: &FrozenGraphScopeId,
+    frame: &SymbolicInstantiationFrame,
+    substitutions: &BTreeMap<ScopedWireRef, ScopedWireRef>,
+) -> SelectionDomainRef {
+    match domain {
+        SelectionDomainRef::Local(mut domain) => {
+            if domain.index_wire.scope == *child_scope {
+                if let Some(replacement) = substitutions.get(&domain.index_wire) {
+                    domain.index_wire = replacement.clone();
                 }
-            ) if first_domain.index_wire == second_domain.index_wire
-                && first_domain.modulus != second_domain.modulus
-        ));
-    }
-
-    #[test]
-    fn repeated_subgraph_calls_stamp_distinct_atom_paths() {
-        let body = empty_graph("body", vec![bounded_sample(1)], wire(1, 0));
-        let mut graph = empty_graph(
-            "parent",
-            vec![
-                Node {
-                    id: NodeId(10),
-                    kind: NodeKind::SubgraphCall(crate::node::SubgraphCall {
-                        graph: "body".to_owned(),
-                        bindings: Vec::new(),
-                    }),
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(11),
-                    kind: NodeKind::SubgraphCall(crate::node::SubgraphCall {
-                        graph: "body".to_owned(),
-                        bindings: Vec::new(),
-                    }),
-                    args: Vec::new(),
-                },
-            ],
-            wire(11, 0),
-        );
-        graph.subgraphs.insert("body".to_owned(), Box::new(body));
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        let first = elaborated_terms(&elaborated, wire(10, 0)).terms[0].factors[0].atom.clone();
-        let second = elaborated_terms(&elaborated, wire(11, 0)).terms[0].factors[0].atom.clone();
-        assert_ne!(first, second);
-        assert!(matches!(
-            first,
-            AtomId::Local {
-                instantiation_path,
-                ..
-            } if instantiation_path == vec![InstantiationFrame {
-                call: NodeId(10),
-                loop_index: None,
-            }]
-        ));
-    }
-
-    #[test]
-    fn child_failure_reports_the_child_node_and_instantiation_path() {
-        let mut narrow = matrix_type();
-        narrow.columns = IntExpr::constant(1);
-        let child = empty_graph(
-            "invalid-child",
-            vec![
-                bounded_sample(1),
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::UniformSample {
-                        matrix_type: narrow,
-                        range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Add),
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-            ],
-            wire(3, 0),
-        );
-        let mut graph = empty_graph(
-            "root",
-            vec![Node {
-                id: NodeId(10),
-                kind: NodeKind::SubgraphCall(crate::node::SubgraphCall {
-                    graph: "invalid-child".to_owned(),
-                    bindings: Vec::new(),
-                }),
-                args: Vec::new(),
-            }],
-            wire(10, 0),
-        );
-        graph.subgraphs.insert("invalid-child".to_owned(), Box::new(child));
-
-        let error = elaborate(&graph, &ParamEnv::default()).expect_err("child shape mismatch");
-        let ElaborationError::Context { node, instantiation_path, source } = &error else {
-            panic!("contextual error: {error}")
-        };
-        assert_eq!(*node, NodeId(3));
-        assert_eq!(
-            instantiation_path,
-            &[InstantiationFrame { call: NodeId(10), loop_index: None }]
-        );
-        assert!(matches!(
-            root_cause(source),
-            ElaborationError::Check(CheckError::Core(
-                mxx_ir_core::checks::CheckError::ShapeMismatch { .. }
-            ))
-        ));
-    }
-
-    #[test]
-    fn mod_up_caps_a_large_bounded_preimage_and_drops_its_references() {
-        let target_type = MatrixType {
-            rows: IntExpr::constant(2),
-            columns: IntExpr::constant(1),
-            ..matrix_type()
-        };
-        let graph = empty_graph(
-            "mod-up-cap",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::UniformSample {
-                        matrix_type: target_type,
-                        range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::GadgetDecompose {
-                        base: IntExpr::constant(20),
-                        small: false,
-                        digit_count: None,
-                    },
-                    args: vec![wire(1, 0)],
-                },
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::ModUp { target_modulus: IntExpr::constant(257) },
-                    args: vec![wire(2, 0)],
-                },
-            ],
-            wire(3, 0),
-        );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        assert!(elaborated.warnings.iter().any(|warning| {
-            warning.node == NodeId(3) && warning.kind == WarningKind::DroppedPreimageReferences
-        }));
-
-        let output = elaborated_terms(&elaborated, wire(3, 0));
-        let cast_term = output
-            .terms
-            .iter()
-            .find(|term| {
-                term.coefficient == BigInt::one() &&
-                    term.factors.iter().any(|factor| factor.view.is_some())
-            })
-            .expect("cast preimage term");
-        let cast_factor = &cast_term.factors[0];
-        assert_eq!(
-            cast_factor.view.as_ref().and_then(|view| view.modulus_cast.as_ref()),
-            Some(&BigInt::from(257))
-        );
-        let source = elaborated.atoms.get(&cast_factor.atom).expect("source atom");
-        assert!(source.preimage_refs.is_some());
-        assert_eq!(source.kind, AtomKind::Bounded);
-    }
-
-    #[test]
-    fn mod_down_casts_indicator_and_bounded_prefix_into_target_ring() {
-        let scalar_type = MatrixType {
-            rows: IntExpr::constant(1),
-            columns: IntExpr::constant(1),
-            ..matrix_type()
-        };
-        let graph = empty_graph(
-            "mod-down-indicator-prefix",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::ConstantInt(BigInt::from(0)),
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::UniformSample {
-                        matrix_type: scalar_type.clone(),
-                        range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::UniformSample {
-                        matrix_type: scalar_type,
-                        range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(4),
-                    kind: NodeKind::Select { count: IntExpr::constant(2) },
-                    args: vec![wire(1, 0), wire(2, 0), wire(3, 0)],
-                },
-                Node {
-                    id: NodeId(5),
-                    kind: NodeKind::TrapdoorSample {
-                        matrix_type: matrix_type(),
-                        sigma: RealExpr::Rational(
-                            Rational::new(BigInt::from(3), BigInt::one()).expect("rational"),
-                        ),
-                        gadget_base: IntExpr::constant(2),
-                        digit_count: IntExpr::constant(1),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(6),
-                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-                    args: vec![wire(4, 0), wire(5, 0)],
-                },
-                Node {
-                    id: NodeId(7),
-                    kind: NodeKind::ModDown { target_modulus: IntExpr::constant(7) },
-                    args: vec![wire(6, 0)],
-                },
-            ],
-            wire(7, 0),
-        );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        let output = elaborated_terms(&elaborated, wire(7, 0));
-        assert!(output.terms.iter().all(|term| !term.coefficient.is_zero()));
-        let signal_terms = output
-            .terms
-            .iter()
-            .filter(|term| {
-                term.factors.iter().any(|factor| {
-                    elaborated
-                        .atoms
-                        .get(&factor.atom)
-                        .is_some_and(|atom| matches!(atom.kind, AtomKind::Large))
-                })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(signal_terms.len(), 2);
-        for term in signal_terms {
-            assert_eq!(term.factors.len(), 3);
-            assert!(
-                term.factors[..2]
-                    .iter()
-                    .any(|factor| matches!(factor.atom, AtomId::Indicator { .. }))
-            );
-            for factor in &term.factors[..2] {
-                assert_eq!(
-                    factor.view.as_ref().and_then(|view| view.modulus_cast.as_ref()),
-                    Some(&BigInt::from(7))
-                );
+                domain.instantiation_path.push(frame.clone());
             }
-            let tail = elaborated.atoms.get(&term.factors[2].atom).expect("mod-down image");
-            assert_eq!(tail.matrix_type.modulus, BigInt::from(7));
-            assert!(matches!(
-                tail.class,
-                AtomClass::Derived { definition: DefExpr::ModDownImage { .. } }
-            ));
+            SelectionDomainRef::Local(domain)
         }
-        let error = output
-            .terms
-            .iter()
-            .find_map(|term| {
-                (term.factors.len() == 1)
-                    .then(|| elaborated.atoms.get(&term.factors[0].atom))
-                    .flatten()
-            })
-            .expect("mod-down error");
-        assert!(matches!(
-            error.class,
-            AtomClass::Derived { definition: DefExpr::ModDownError { .. } }
-        ));
-        assert_eq!(error.kind, AtomKind::Bounded);
+        imported => imported,
     }
+}
 
-    #[test]
-    fn mod_down_rejects_large_factor_before_bounded_matrix_tail() {
-        let graph = empty_graph(
-            "invalid-mod-down-tail",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::TrapdoorSample {
-                        matrix_type: matrix_type(),
-                        sigma: RealExpr::Rational(
-                            Rational::new(BigInt::from(3), BigInt::one()).expect("rational"),
-                        ),
-                        gadget_base: IntExpr::constant(2),
-                        digit_count: IntExpr::constant(1),
-                    },
-                    args: Vec::new(),
-                },
-                bounded_sample(2),
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-                Node {
-                    id: NodeId(4),
-                    kind: NodeKind::ModDown { target_modulus: IntExpr::constant(7) },
-                    args: vec![wire(3, 0)],
-                },
-            ],
-            wire(4, 0),
-        );
-        let error = elaborate(&graph, &ParamEnv::default()).expect_err("invalid normal form");
-        assert!(matches!(
-            root_cause(&error),
-            ElaborationError::Check(CheckError::InvalidModDownNormalForm)
-        ));
+fn specialize_domain(
+    mut domain: SelectionDomainRef,
+    index: &ParallelIndex,
+    index_offset: u64,
+) -> SelectionDomainRef {
+    if let SelectionDomainRef::Local(domain) = &mut domain {
+        specialize_path(&mut domain.instantiation_path, index, index_offset);
     }
+    domain
+}
 
-    #[test]
-    fn select_rejects_mismatched_family_shapes() {
-        let mut narrow = matrix_type();
-        narrow.columns = IntExpr::constant(1);
-        let graph = empty_graph(
-            "invalid-select",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::ConstantInt(BigInt::from(0)),
-                    args: Vec::new(),
-                },
-                bounded_sample(2),
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::UniformSample {
-                        matrix_type: narrow,
-                        range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(4),
-                    kind: NodeKind::Select { count: IntExpr::constant(2) },
-                    args: vec![wire(1, 0), wire(2, 0), wire(3, 0)],
-                },
-            ],
-            wire(4, 0),
-        );
-        let error = elaborate(&graph, &ParamEnv::default()).expect_err("shape mismatch");
-        assert!(matches!(
-            root_cause(&error),
-            ElaborationError::Check(CheckError::Core(
-                mxx_ir_core::checks::CheckError::ShapeMismatch { .. }
-            ))
-        ));
+fn parallel_family_branch(
+    domain: &SelectionDomainRef,
+    index: &ParallelIndex,
+    index_offset: u64,
+) -> Option<usize> {
+    let SelectionDomainRef::Local(domain) = domain else { return None };
+    let SymbolicInstantiationFrame::ParallelIteration {
+        call_site,
+        index: ParallelIndex::Template,
+        index_offset: stored_offset,
+        ..
+    } = domain.instantiation_path.last()?
+    else {
+        return None;
+    };
+    if &domain.index_wire != call_site {
+        return None;
     }
-
-    #[test]
-    fn select_marks_only_indices_that_are_not_statically_proven_in_range() {
-        let graph_for_index = |name: &str, index: Node| {
-            empty_graph(
-                name,
-                vec![
-                    index,
-                    bounded_sample(2),
-                    bounded_sample(3),
-                    Node {
-                        id: NodeId(4),
-                        kind: NodeKind::Select { count: IntExpr::constant(2) },
-                        args: vec![wire(1, 0), wire(2, 0), wire(3, 0)],
-                    },
-                ],
-                wire(4, 0),
-            )
-        };
-        let in_range = graph_for_index(
-            "constant-in-range-select",
-            Node { id: NodeId(1), kind: NodeKind::ConstantInt(BigInt::one()), args: Vec::new() },
-        );
-        let elaborated = elaborate(&in_range, &ParamEnv::default()).expect("in-range select");
-        assert!(elaborated.warnings.is_empty());
-
-        let out_of_range = graph_for_index(
-            "constant-out-of-range-select",
-            Node { id: NodeId(1), kind: NodeKind::ConstantInt(BigInt::from(2)), args: Vec::new() },
-        );
-        let elaborated =
-            elaborate(&out_of_range, &ParamEnv::default()).expect("runtime-checked select");
-        assert!(elaborated.warnings.iter().any(|warning| {
-            warning.node == NodeId(4) && warning.kind == WarningKind::RuntimeSelectBoundsCheck
-        }));
+    match index {
+        ParallelIndex::Static(index) => {
+            usize::try_from(index.checked_add(*stored_offset)?.checked_add(index_offset)?).ok()
+        }
+        ParallelIndex::Template | ParallelIndex::Dynamic(_) => None,
     }
+}
 
-    #[test]
-    fn select_range_proof_understands_boolean_and_euclidean_remainder_indices() {
-        let mut remainder_graph = empty_graph(
-            "remainder-select",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::Input {
-                        name: "index".to_owned(),
-                        wire_type: WireType::Int,
-                        artifact: None,
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::ConstantInt(BigInt::from(2)),
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::IntBinary(crate::node::IntBinaryOp::Remainder),
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-                bounded_sample(4),
-                bounded_sample(5),
-                Node {
-                    id: NodeId(6),
-                    kind: NodeKind::Select { count: IntExpr::constant(2) },
-                    args: vec![wire(3, 0), wire(4, 0), wire(5, 0)],
-                },
-            ],
-            wire(6, 0),
-        );
-        remainder_graph.input_types.insert("index".to_owned(), WireType::Int);
-        let elaborated =
-            elaborate(&remainder_graph, &ParamEnv::default()).expect("remainder select");
-        assert!(elaborated.warnings.is_empty());
-
-        let bool_graph = empty_graph(
-            "boolean-select",
-            vec![
-                Node { id: NodeId(1), kind: NodeKind::ConstantBool(true), args: Vec::new() },
-                Node { id: NodeId(2), kind: NodeKind::BoolToInt, args: vec![wire(1, 0)] },
-                bounded_sample(3),
-                bounded_sample(4),
-                Node {
-                    id: NodeId(5),
-                    kind: NodeKind::Select { count: IntExpr::constant(2) },
-                    args: vec![wire(2, 0), wire(3, 0), wire(4, 0)],
-                },
-            ],
-            wire(5, 0),
-        );
-        let elaborated = elaborate(&bool_graph, &ParamEnv::default()).expect("boolean select");
-        assert!(elaborated.warnings.is_empty());
-    }
-
-    #[test]
-    fn child_select_bounds_warning_is_propagated() {
-        let mut child = empty_graph(
-            "dynamic-select-child",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::Input {
-                        name: "index".to_owned(),
-                        wire_type: WireType::Int,
-                        artifact: None,
-                    },
-                    args: Vec::new(),
-                },
-                bounded_sample(2),
-                bounded_sample(3),
-                Node {
-                    id: NodeId(4),
-                    kind: NodeKind::Select { count: IntExpr::constant(2) },
-                    args: vec![wire(1, 0), wire(2, 0), wire(3, 0)],
-                },
-            ],
-            wire(4, 0),
-        );
-        child.input_types.insert("index".to_owned(), WireType::Int);
-        let mut graph = empty_graph(
-            "select-parent",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::ConstantInt(BigInt::zero()),
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(10),
-                    kind: NodeKind::SubgraphCall(crate::node::SubgraphCall {
-                        graph: "dynamic-select-child".to_owned(),
-                        bindings: Vec::new(),
-                    }),
-                    args: vec![wire(1, 0)],
-                },
-            ],
-            wire(10, 0),
-        );
-        graph.subgraphs.insert("dynamic-select-child".to_owned(), Box::new(child));
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("child select");
-        assert!(elaborated.warnings.iter().any(|warning| {
-            warning.node == NodeId(4) && warning.kind == WarningKind::RuntimeSelectBoundsCheck
-        }));
-    }
-
-    #[test]
-    fn graph_json_round_trip_preserves_elaboration() {
-        let graph = empty_graph(
-            "json-round-trip",
-            vec![
-                bounded_sample(1),
-                bounded_sample(2),
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Add),
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-            ],
-            wire(3, 0),
-        );
-        let json = serde_json::to_vec(&graph).expect("serialize graph");
-        let decoded: Graph = serde_json::from_slice(&json).expect("deserialize graph");
-        let original = elaborate(&graph, &ParamEnv::default()).expect("original");
-        let round_trip = elaborate(&decoded, &ParamEnv::default()).expect("round trip");
-        assert_eq!(original, round_trip);
-    }
-
-    #[test]
-    fn graph_output_rejects_an_unavailable_port() {
-        let graph = empty_graph("bad-output-port", vec![bounded_sample(1)], wire(1, 1));
-        let error = elaborate(&graph, &ParamEnv::default()).expect_err("invalid output port");
-        assert!(matches!(root_cause(&error), ElaborationError::Node { node: NodeId(1), .. }));
-    }
-
-    #[test]
-    fn output_family_requires_identical_member_types() {
-        let mut scalar_type = matrix_type();
-        scalar_type.rows = IntExpr::constant(1);
-        scalar_type.columns = IntExpr::constant(1);
-        let graph = empty_graph(
-            "bad-output-family",
-            vec![
-                bounded_sample(1),
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::UniformSample {
-                        matrix_type: scalar_type,
-                        range: SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::FamilyPack { count: IntExpr::constant(2) },
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-                Node {
-                    id: NodeId(4),
-                    kind: NodeKind::Output {
-                        name: "family".to_owned(),
-                        artifact_confidentiality: Some(ArtifactConfidentiality::Public),
-                    },
-                    args: vec![wire(3, 0)],
-                },
-            ],
-            wire(4, 0),
-        );
-        let error = elaborate(&graph, &ParamEnv::default()).expect_err("output type mismatch");
-        assert!(matches!(root_cause(&error), ElaborationError::Node { node: NodeId(3), .. }));
-    }
-
-    #[test]
-    fn zero_length_parallel_loop_retains_element_type_without_phantom_atoms() {
-        let body = Graph {
-            name: "zero-loop-body".to_owned(),
-            parameters: Vec::new(),
-            input_types: BTreeMap::new(),
-            nodes: vec![Node {
-                id: NodeId(1),
-                kind: NodeKind::GaussianSample {
-                    matrix_type: matrix_type(),
-                    sigma: RealExpr::FromInt(IntExpr::constant(1)),
-                },
-                args: Vec::new(),
-            }],
-            outputs: BTreeMap::from([("out".to_owned(), wire(1, 0))]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        };
-        let mut graph = empty_graph(
-            "zero-loop",
-            vec![Node {
-                id: NodeId(10),
-                kind: NodeKind::ParallelLoop(crate::node::ParallelLoop {
-                    graph: body.name.clone(),
-                    count: IntExpr::constant(0),
-                    minimum_count: 0,
-                    index_variable: "i".to_owned(),
-                    bindings: Vec::new(),
-                    input_modes: Vec::new(),
-                }),
-                args: Vec::new(),
-            }],
-            wire(10, 0),
-        );
-        graph.subgraphs.insert(body.name.clone(), Box::new(body));
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("zero loop");
-        assert!(matches!(
-            elaborated.wires[&WireId { instantiation_path: Vec::new(), wire: wire(10, 0) }]
-                .wire_type,
-            ConcreteWireType::IndexedFamily { count: 0, .. }
-        ));
-        assert!(elaborated.atoms.is_empty());
-
-        let NodeKind::ParallelLoop(loop_node) = &mut graph.nodes[0].kind else { unreachable!() };
-        loop_node.minimum_count = 1;
-        let error = elaborate(&graph, &ParamEnv::default())
-            .expect_err("nonempty symbolic loop must reject zero count");
-        assert!(error.to_string().contains("parallel-loop count must be at least 1"));
-    }
-
-    #[test]
-    fn zero_length_zip_loop_uses_only_the_family_element_type() {
-        let producer_body = Graph {
-            name: "zero-family-producer".to_owned(),
-            parameters: Vec::new(),
-            input_types: BTreeMap::new(),
-            nodes: vec![bounded_sample(1)],
-            outputs: BTreeMap::from([("out".to_owned(), wire(1, 0))]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        };
-        let consumer_body = Graph {
-            name: "zero-family-consumer".to_owned(),
-            parameters: Vec::new(),
-            input_types: BTreeMap::from([("value".to_owned(), WireType::Matrix(matrix_type()))]),
-            nodes: vec![Node {
-                id: NodeId(1),
-                kind: NodeKind::Input {
-                    name: "value".to_owned(),
-                    wire_type: WireType::Matrix(matrix_type()),
-                    artifact: None,
-                },
-                args: Vec::new(),
-            }],
-            outputs: BTreeMap::from([("out".to_owned(), wire(1, 0))]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        };
-        let mut graph = empty_graph(
-            "zero-zip",
-            vec![
-                Node {
-                    id: NodeId(10),
-                    kind: NodeKind::ParallelLoop(crate::node::ParallelLoop {
-                        graph: producer_body.name.clone(),
-                        count: IntExpr::constant(0),
-                        minimum_count: 0,
-                        index_variable: "i".to_owned(),
-                        bindings: Vec::new(),
-                        input_modes: Vec::new(),
-                    }),
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(20),
-                    kind: NodeKind::ParallelLoop(crate::node::ParallelLoop {
-                        graph: consumer_body.name.clone(),
-                        count: IntExpr::constant(0),
-                        minimum_count: 0,
-                        index_variable: "i".to_owned(),
-                        bindings: Vec::new(),
-                        input_modes: vec![LoopInputMode::Zip],
-                    }),
-                    args: vec![wire(10, 0)],
-                },
-            ],
-            wire(20, 0),
-        );
-        graph.subgraphs.insert(producer_body.name.clone(), Box::new(producer_body));
-        graph.subgraphs.insert(consumer_body.name.clone(), Box::new(consumer_body));
-
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("zero zip loop");
-        assert!(matches!(
-            elaborated.wires[&WireId { instantiation_path: Vec::new(), wire: wire(20, 0) }]
-                .wire_type,
-            ConcreteWireType::IndexedFamily { count: 0, .. }
-        ));
-        assert!(elaborated.atoms.is_empty());
-    }
-
-    #[test]
-    fn zero_length_zip_loop_accepts_an_imported_empty_family_without_atoms() {
-        let body = Graph {
-            name: "imported-zero-family-consumer".to_owned(),
-            parameters: Vec::new(),
-            input_types: BTreeMap::from([("value".to_owned(), WireType::Matrix(matrix_type()))]),
-            nodes: vec![Node {
-                id: NodeId(1),
-                kind: NodeKind::Input {
-                    name: "value".to_owned(),
-                    wire_type: WireType::Matrix(matrix_type()),
-                    artifact: None,
-                },
-                args: Vec::new(),
-            }],
-            outputs: BTreeMap::from([("out".to_owned(), wire(1, 0))]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        };
-        let production = production_id(crate::atom::SpecHash([41; 32]), [42; 32]);
-        let concrete = ConcreteMatrixType {
-            modulus: BigInt::from(17),
-            ring_dimension: 8,
-            rows: 2,
-            columns: 2,
-        };
-        let manifest = Manifest {
-            format_version: crate::manifest::SYMBOLIC_MANIFEST_VERSION,
-            production_id: production.clone(),
-            artifacts: BTreeMap::from([(
-                "family".to_owned(),
-                crate::manifest::ManifestArtifact {
-                    wire_type: ConcreteWireType::Matrix(concrete),
-                    term_list: None,
-                    family: Some(Vec::new()),
-                    content_hash: None,
-                    layout: None,
-                },
-            )]),
-            atoms: BTreeMap::new(),
-            term_lists: BTreeMap::new(),
-            overlay_hash: None,
-            assumption_hash: None,
-            assumption_digests: BTreeSet::new(),
-            interpretation_digests: BTreeMap::from([(production.clone(), (None, None))]),
-        };
-        let family_type = WireType::IndexedFamily {
-            element: Box::new(WireType::Matrix(matrix_type())),
-            count: IntExpr::constant(0),
-        };
-        let mut graph = empty_graph(
-            "imported-zero-zip",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::Input {
-                        name: "family".to_owned(),
-                        wire_type: family_type.clone(),
-                        artifact: Some(ArtifactInput {
-                            production_id: production,
-                            artifact_name: "family".to_owned(),
-                            confidentiality: ArtifactConfidentiality::Public,
-                        }),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::ParallelLoop(crate::node::ParallelLoop {
-                        graph: body.name.clone(),
-                        count: IntExpr::constant(0),
-                        minimum_count: 0,
-                        index_variable: "i".to_owned(),
-                        bindings: Vec::new(),
-                        input_modes: vec![LoopInputMode::Zip],
-                    }),
-                    args: vec![wire(1, 0)],
-                },
-            ],
-            wire(2, 0),
-        );
-        graph.input_types.insert("family".to_owned(), family_type);
-        graph.subgraphs.insert(body.name.clone(), Box::new(body));
-
-        let elaborated = elaborate_with_manifests(&graph, &ParamEnv::default(), &[manifest])
-            .expect("imported zero zip loop");
-        assert!(matches!(
-            elaborated.wires[&WireId { instantiation_path: Vec::new(), wire: wire(2, 0) }]
-                .wire_type,
-            ConcreteWireType::IndexedFamily { count: 0, .. }
-        ));
-        assert!(elaborated.atoms.is_empty());
-    }
-
-    fn matrix_input(id: u64, name: &str, preimage: bool) -> Node {
-        let matrix = matrix_type();
-        Node {
-            id: NodeId(id),
-            kind: NodeKind::Input {
-                name: name.to_owned(),
-                wire_type: if preimage {
-                    WireType::Preimage(matrix)
-                } else {
-                    WireType::Matrix(matrix)
-                },
-                artifact: None,
-            },
-            args: Vec::new(),
+fn specialize_path(
+    path: &mut [SymbolicInstantiationFrame],
+    index: &ParallelIndex,
+    index_offset: u64,
+) -> bool {
+    for frame in path.iter_mut().rev() {
+        if let SymbolicInstantiationFrame::ParallelIteration {
+            index: selected,
+            index_offset: stored_offset,
+            ..
+        } = frame &&
+            matches!(selected, ParallelIndex::Template)
+        {
+            let combined_offset = stored_offset
+                .checked_add(index_offset)
+                .expect("validated parallel offset must fit u64");
+            match index {
+                ParallelIndex::Static(index) => {
+                    *selected = ParallelIndex::Static(
+                        index
+                            .checked_add(combined_offset)
+                            .expect("validated parallel index must fit u64"),
+                    );
+                    *stored_offset = 0;
+                }
+                ParallelIndex::Template | ParallelIndex::Dynamic(_) => {
+                    *selected = index.clone();
+                    *stored_offset = combined_offset;
+                }
+            }
+            return true;
         }
     }
+    false
+}
 
-    fn virtual_decl(matrix_type: MatrixType, kind: VirtualKind) -> VirtualAtomDecl {
-        VirtualAtomDecl { matrix_type, kind, preimage: None }
-    }
-
-    fn virtual_factor(name: &str) -> FactorRef {
-        FactorRef { atom: AtomRef::Virtual { name: name.to_owned() }, view: None }
-    }
-
-    fn bounded_virtual_kind() -> VirtualKind {
-        VirtualKind::Bounded {
-            norm: RealExpr::FromInt(IntExpr::constant(1)),
-            is_const_poly: false,
-            zero_rows: None,
-            dependencies: crate::overlay::DeclaredDependencyLabels::Unknown,
-            clt_ready: false,
-        }
-    }
-
-    fn overlay_term(coefficient: i64, factors: Vec<FactorRef>) -> OverlayTerm {
-        OverlayTerm { coefficient: IntExpr::constant(coefficient), factors }
-    }
-
-    fn assumed_id(name: &str) -> AssumedTermListId {
-        AssumedTermListId(name.to_owned())
-    }
-
-    fn selector(node: u64) -> WireSelector {
-        WireSelector { path: Vec::new(), node: NodeId(node), port: 0 }
-    }
-
-    fn unfold_overlay() -> SymbolicOverlay {
-        let mut scalar = matrix_type();
-        scalar.rows = IntExpr::constant(1);
-        scalar.columns = IntExpr::constant(1);
-        SymbolicOverlay {
-            virtual_atoms: BTreeMap::from([
-                ("B".to_owned(), virtual_decl(matrix_type(), VirtualKind::Large)),
-                ("s".to_owned(), virtual_decl(scalar, bounded_virtual_kind())),
-                ("e".to_owned(), virtual_decl(matrix_type(), bounded_virtual_kind())),
-            ]),
-            term_lists: BTreeMap::from([
-                (
-                    assumed_id("B"),
-                    AssumedTermList { terms: vec![overlay_term(1, vec![virtual_factor("B")])] },
-                ),
-                (
-                    assumed_id("c"),
-                    AssumedTermList {
-                        terms: vec![
-                            overlay_term(1, vec![virtual_factor("s"), virtual_factor("B")]),
-                            overlay_term(1, vec![virtual_factor("e")]),
-                        ],
-                    },
-                ),
-            ]),
-            entries: vec![
-                (
-                    selector(1),
-                    Reinterpretation::Unfold(UnfoldSpec {
-                        new_terms: assumed_id("B"),
-                        replace_derived: false,
-                    }),
-                ),
-                (
-                    selector(2),
-                    Reinterpretation::Unfold(UnfoldSpec {
-                        new_terms: assumed_id("c"),
-                        replace_derived: false,
-                    }),
-                ),
-            ],
-        }
-    }
-
-    fn two_input_graph() -> Graph {
-        let mut graph = empty_graph(
-            "overlay-unfold",
-            vec![matrix_input(1, "B", false), matrix_input(2, "c", false)],
-            wire(2, 0),
-        );
-        graph.input_types.insert("B".to_owned(), WireType::Matrix(matrix_type()));
-        graph.input_types.insert("c".to_owned(), WireType::Matrix(matrix_type()));
-        graph
-    }
-
-    #[test]
-    fn unfold_replaces_sources_with_shared_virtual_atoms_and_hashes_ignore_entry_order() {
-        let graph = two_input_graph();
-        let overlay = unfold_overlay();
-        let elaborated =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay).expect("unfold");
-        let b_terms = elaborated_terms(&elaborated, wire(1, 0));
-        let c_terms = elaborated_terms(&elaborated, wire(2, 0));
-        assert_eq!(b_terms.terms[0].factors[0].atom, AtomId::Virtual { name: "B".to_owned() });
-        assert_eq!(c_terms.terms.len(), 2);
-        assert!(elaborated.assumption_hash.is_some());
-        assert!(elaborated.assumption_digests.contains(&elaborated.assumption_hash.unwrap()));
-
-        let mut reordered = overlay.clone();
-        reordered.entries.reverse();
-        let reordered =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &reordered).expect("reorder");
-        assert_eq!(elaborated.overlay_hash, reordered.overlay_hash);
-        assert_eq!(elaborated.assumption_hash, reordered.assumption_hash);
-        assert_eq!(elaborated.wires, reordered.wires);
-    }
-
-    #[test]
-    fn unfold_enforces_kind_character_and_replace_derived_discipline() {
-        let graph = empty_graph(
-            "replace-derived",
-            vec![
-                bounded_sample(1),
-                bounded_sample(2),
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Add),
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-            ],
-            wire(3, 0),
-        );
-        let overlay = SymbolicOverlay {
-            virtual_atoms: BTreeMap::from([(
-                "e".to_owned(),
-                virtual_decl(matrix_type(), bounded_virtual_kind()),
-            )]),
-            term_lists: BTreeMap::from([(
-                assumed_id("e"),
-                AssumedTermList { terms: vec![overlay_term(1, vec![virtual_factor("e")])] },
-            )]),
-            entries: vec![(
-                selector(3),
-                Reinterpretation::Unfold(UnfoldSpec {
-                    new_terms: assumed_id("e"),
-                    replace_derived: false,
-                }),
-            )],
-        };
-        let error = elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay)
-            .expect_err("derived replacement requires opt-in");
-        assert!(error.to_string().contains("replace_derived"));
-
-        let mut accepted = overlay;
-        let Reinterpretation::Unfold(spec) = &mut accepted.entries[0].1 else { unreachable!() };
-        spec.replace_derived = true;
-        let elaborated =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &accepted).expect("opt-in");
-        assert!(
-            elaborated
-                .warnings
-                .iter()
-                .any(|warning| { warning.kind == WarningKind::ReplacedDerivedDescription })
-        );
-
-        let bounded_graph = empty_graph("bounded", vec![bounded_sample(1)], wire(1, 0));
-        let large_overlay = SymbolicOverlay {
-            virtual_atoms: BTreeMap::from([(
-                "large".to_owned(),
-                virtual_decl(matrix_type(), VirtualKind::Large),
-            )]),
-            term_lists: BTreeMap::from([(
-                assumed_id("large"),
-                AssumedTermList { terms: vec![overlay_term(1, vec![virtual_factor("large")])] },
-            )]),
-            entries: vec![(
-                selector(1),
-                Reinterpretation::Unfold(UnfoldSpec {
-                    new_terms: assumed_id("large"),
-                    replace_derived: false,
-                }),
-            )],
-        };
-        let error =
-            elaborate_with_overlay(&bounded_graph, &ParamEnv::default(), &[], &large_overlay)
-                .expect_err("bounded cannot become large");
-        assert!(error.to_string().contains("kind character"));
-    }
-
-    #[test]
-    fn unfold_of_preimage_wire_is_auditable_and_cycles_fail_structurally() {
-        let mut graph =
-            empty_graph("preimage-unfold", vec![matrix_input(1, "k", true)], wire(1, 0));
-        graph.input_types.insert("k".to_owned(), WireType::Preimage(matrix_type()));
-        let overlay = SymbolicOverlay {
-            virtual_atoms: BTreeMap::from([(
-                "k".to_owned(),
-                virtual_decl(matrix_type(), bounded_virtual_kind()),
-            )]),
-            term_lists: BTreeMap::from([(
-                assumed_id("k"),
-                AssumedTermList { terms: vec![overlay_term(1, vec![virtual_factor("k")])] },
-            )]),
-            entries: vec![(
-                selector(1),
-                Reinterpretation::Unfold(UnfoldSpec {
-                    new_terms: assumed_id("k"),
-                    replace_derived: false,
-                }),
-            )],
-        };
-        let elaborated =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay).expect("unfold");
-        assert!(
-            elaborated
-                .warnings
-                .iter()
-                .any(|warning| { warning.kind == WarningKind::DroppedPreimageReferences })
-        );
-
-        let mut cyclic = overlay;
-        cyclic.virtual_atoms.get_mut("k").unwrap().preimage = Some(AssumedPreimage {
-            uniform: AtomRef::Virtual { name: "k".to_owned() },
-            target: assumed_id("k"),
-        });
-        let error =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &cyclic).expect_err("cycle");
-        assert!(error.to_string().contains("cycle"));
-    }
-
-    #[test]
-    fn assumed_preimage_types_are_checked_and_virtual_uniforms_rewrite() {
-        let mut graph =
-            empty_graph("assumed-preimage", vec![matrix_input(1, "c", false)], wire(1, 0));
-        graph.input_types.insert("c".to_owned(), WireType::Matrix(matrix_type()));
-        let overlay = SymbolicOverlay {
-            virtual_atoms: BTreeMap::from([
-                ("A".to_owned(), virtual_decl(matrix_type(), VirtualKind::Large)),
-                (
-                    "K".to_owned(),
-                    VirtualAtomDecl {
-                        matrix_type: matrix_type(),
-                        kind: bounded_virtual_kind(),
-                        preimage: Some(AssumedPreimage {
-                            uniform: AtomRef::Virtual { name: "A".to_owned() },
-                            target: assumed_id("target"),
-                        }),
-                    },
-                ),
-                ("target".to_owned(), virtual_decl(matrix_type(), VirtualKind::Large)),
-            ]),
-            term_lists: BTreeMap::from([
-                (
-                    assumed_id("target"),
-                    AssumedTermList {
-                        terms: vec![overlay_term(1, vec![virtual_factor("target")])],
-                    },
-                ),
-                (
-                    assumed_id("c"),
-                    AssumedTermList {
-                        terms: vec![overlay_term(
-                            1,
-                            vec![virtual_factor("A"), virtual_factor("K")],
-                        )],
-                    },
-                ),
-            ]),
-            entries: vec![(
-                selector(1),
-                Reinterpretation::Unfold(UnfoldSpec {
-                    new_terms: assumed_id("c"),
-                    replace_derived: false,
-                }),
-            )],
-        };
-        let elaborated =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay).expect("rewrite");
-        assert_eq!(
-            elaborated_terms(&elaborated, wire(1, 0)),
-            &TermList::atom(AtomId::Virtual { name: "target".to_owned() })
-        );
-
-        let mut invalid = overlay;
-        let mut scalar = matrix_type();
-        scalar.rows = IntExpr::constant(1);
-        scalar.columns = IntExpr::constant(1);
-        invalid.virtual_atoms.get_mut("target").unwrap().matrix_type = scalar;
-        let error = elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &invalid)
-            .expect_err("target type mismatch");
-        assert!(error.to_string().contains("wrong matrix type"));
-    }
-
-    #[test]
-    fn noise_fold_retains_an_exact_derived_definition() {
-        let graph = empty_graph(
-            "fold",
-            vec![
-                bounded_sample(1),
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Add),
-                    args: vec![wire(1, 0), wire(1, 0)],
-                },
-            ],
-            wire(2, 0),
-        );
-        let expected = OverlayTerm {
-            coefficient: IntExpr::constant(2),
-            factors: vec![FactorRef {
-                atom: AtomRef::Node {
-                    path: Vec::new(),
-                    node: NodeId(1),
-                    port: PortMatcher::Concrete(0),
-                },
-                view: None,
-            }],
-        };
-        let overlay = SymbolicOverlay {
-            entries: vec![(
-                selector(2),
-                Reinterpretation::Fold(FoldSpec {
-                    expected: ExpectedTermList { entries: vec![ExpectedEntry::Term(expected)] },
-                    groups: vec![FoldGroup::Noise { terms: BTreeSet::from([0]) }],
-                }),
-            )],
-            ..SymbolicOverlay::default()
-        };
-        let elaborated =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay).expect("fold");
-        let atom_id = &elaborated_terms(&elaborated, wire(2, 0)).terms[0].factors[0].atom;
-        let atom = elaborated.atoms.get(atom_id).expect("fold atom");
-        assert!(matches!(atom.class, AtomClass::Derived { definition: DefExpr::Fold(_) }));
-        assert!(elaborated.assumption_hash.is_none());
-        assert!(elaborated.overlay_hash.is_some());
-    }
-
-    #[test]
-    fn signal_fold_keeps_the_common_suffix_and_folds_only_the_prefix() {
-        let graph = empty_graph(
-            "signal-fold",
-            vec![
-                bounded_sample(1),
-                large_sample(2),
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-            ],
-            wire(3, 0),
-        );
-        let node_factor = |node| FactorRef {
-            atom: AtomRef::Node {
-                path: Vec::new(),
-                node: NodeId(node),
-                port: PortMatcher::Concrete(0),
-            },
-            view: None,
-        };
-        let overlay = SymbolicOverlay {
-            entries: vec![(
-                selector(3),
-                Reinterpretation::Fold(FoldSpec {
-                    expected: ExpectedTermList {
-                        entries: vec![ExpectedEntry::Term(overlay_term(
-                            1,
-                            vec![node_factor(1), node_factor(2)],
-                        ))],
-                    },
-                    groups: vec![FoldGroup::Signal { terms: BTreeSet::from([0]), suffix_len: 1 }],
-                }),
-            )],
-            ..SymbolicOverlay::default()
-        };
-        let elaborated =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay).expect("fold");
-        let output = elaborated_terms(&elaborated, wire(3, 0));
-        assert_eq!(output.terms.len(), 1);
-        assert_eq!(output.terms[0].factors.len(), 2);
-        let fold = elaborated.atoms.get(&output.terms[0].factors[0].atom).expect("fold atom");
-        let AtomClass::Derived { definition: DefExpr::Fold(definition) } = &fold.class else {
-            panic!("signal prefix must be retained as a fold definition")
-        };
-        assert_eq!(definition.terms[0].factors.len(), 1);
-        assert_eq!(
-            output.terms[0].factors[1].atom,
-            AtomId::Local { instantiation_path: Vec::new(), node: NodeId(2), port: 0 }
-        );
-    }
-
-    #[test]
-    fn zero_suffix_signal_fold_creates_one_large_atom() {
-        let graph = empty_graph(
-            "whole-signal-fold",
-            vec![
-                large_sample(1),
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::MatrixScale { scalar: IntExpr::constant(1) },
-                    args: vec![wire(1, 0)],
-                },
-            ],
-            wire(2, 0),
-        );
-        let overlay = SymbolicOverlay {
-            entries: vec![(
-                selector(2),
-                Reinterpretation::Fold(FoldSpec {
-                    expected: ExpectedTermList {
-                        entries: vec![ExpectedEntry::Term(overlay_term(
-                            1,
-                            vec![FactorRef {
-                                atom: AtomRef::Node {
-                                    path: Vec::new(),
-                                    node: NodeId(1),
-                                    port: PortMatcher::Concrete(0),
-                                },
-                                view: None,
-                            }],
-                        ))],
-                    },
-                    groups: vec![FoldGroup::Signal { terms: BTreeSet::from([0]), suffix_len: 0 }],
-                }),
-            )],
-            ..SymbolicOverlay::default()
-        };
-        let elaborated =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay).expect("fold");
-        let output = elaborated_terms(&elaborated, wire(2, 0));
-        assert_eq!(output.terms.len(), 1);
-        assert_eq!(output.terms[0].factors.len(), 1);
-        let atom = elaborated.atoms.get(&output.terms[0].factors[0].atom).expect("fold atom");
-        assert_eq!(atom.kind, AtomKind::Large);
-        assert!(matches!(atom.class, AtomClass::Derived { definition: DefExpr::Fold(_) }));
-    }
-
-    #[test]
-    fn indicator_sum_expands_repeated_branches_as_one_fold_position() {
-        let graph = empty_graph(
-            "indicator-overlay",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::ConstantInt(BigInt::zero()),
-                    args: Vec::new(),
-                },
-                bounded_sample(2),
-                Node {
-                    id: NodeId(5),
-                    kind: NodeKind::Select { count: IntExpr::constant(2) },
-                    args: vec![wire(1, 0), wire(2, 0), wire(2, 0)],
-                },
-                bounded_sample(6),
-                Node {
-                    id: NodeId(7),
-                    kind: NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-                    args: vec![wire(5, 0), wire(6, 0)],
-                },
-            ],
-            wire(7, 0),
-        );
-        let overlay = SymbolicOverlay {
-            entries: vec![(
-                selector(7),
-                Reinterpretation::Fold(FoldSpec {
-                    expected: ExpectedTermList {
-                        entries: vec![ExpectedEntry::IndicatorSum {
-                            select: SelectNodeSelector { path: Vec::new(), node: NodeId(5) },
-                            index_var: "i".to_owned(),
-                            body: overlay_term(
-                                1,
-                                vec![
-                                    FactorRef {
-                                        atom: AtomRef::Node {
-                                            path: Vec::new(),
-                                            node: NodeId(2),
-                                            port: PortMatcher::Concrete(0),
-                                        },
-                                        view: None,
-                                    },
-                                    FactorRef {
-                                        atom: AtomRef::Node {
-                                            path: Vec::new(),
-                                            node: NodeId(6),
-                                            port: PortMatcher::Concrete(0),
-                                        },
-                                        view: None,
-                                    },
-                                ],
-                            ),
-                        }],
-                    },
-                    groups: vec![FoldGroup::Noise { terms: BTreeSet::from([0]) }],
-                }),
-            )],
-            ..SymbolicOverlay::default()
-        };
-        let elaborated =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay).expect("fold");
-        let fold = elaborated
-            .atoms
-            .get(&elaborated_terms(&elaborated, wire(7, 0)).terms[0].factors[0].atom)
-            .expect("fold atom");
-        let AtomClass::Derived { definition: DefExpr::Fold(definition) } = &fold.class else {
-            panic!("noise fold")
-        };
-        assert_eq!(definition.terms.len(), 2);
-        assert!(definition.terms.iter().all(|term| {
-            term.factors.iter().any(|factor| matches!(factor.atom, AtomId::Indicator { .. }))
-        }));
-    }
-
-    #[test]
-    fn overlay_rejects_same_node_references_and_duplicate_targets() {
-        let child = Graph {
-            name: "two-output-child".to_owned(),
-            parameters: Vec::new(),
-            input_types: BTreeMap::new(),
-            nodes: vec![bounded_sample(1), bounded_sample(2)],
-            outputs: BTreeMap::from([
-                ("left".to_owned(), wire(1, 0)),
-                ("right".to_owned(), wire(2, 0)),
-            ]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        };
-        let mut graph = empty_graph(
-            "same-node",
-            vec![Node {
-                id: NodeId(3),
-                kind: NodeKind::SubgraphCall(crate::node::SubgraphCall {
-                    graph: child.name.clone(),
-                    bindings: Vec::new(),
-                }),
-                args: Vec::new(),
-            }],
-            wire(3, 0),
-        );
-        graph.subgraphs.insert(child.name.clone(), Box::new(child));
-        let same_node_term = OverlayTerm {
-            coefficient: IntExpr::constant(1),
-            factors: vec![FactorRef {
-                atom: AtomRef::Node {
-                    path: Vec::new(),
-                    node: NodeId(3),
-                    port: PortMatcher::Concrete(1),
-                },
-                view: None,
-            }],
-        };
-        let overlay = SymbolicOverlay {
-            entries: vec![(
-                selector(3),
-                Reinterpretation::Fold(FoldSpec {
-                    expected: ExpectedTermList {
-                        entries: vec![ExpectedEntry::Term(same_node_term)],
-                    },
-                    groups: vec![FoldGroup::Keep { terms: BTreeSet::from([0]) }],
-                }),
-            )],
-            ..SymbolicOverlay::default()
-        };
-        let error = elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay)
-            .expect_err("same-node reference");
-        assert!(error.to_string().contains("own node"));
-
-        let graph = empty_graph("duplicate", vec![bounded_sample(1)], wire(1, 0));
-        let fold = Reinterpretation::Fold(FoldSpec {
-            expected: ExpectedTermList::default(),
-            groups: Vec::new(),
-        });
-        let duplicate = SymbolicOverlay {
-            entries: vec![(selector(1), fold.clone()), (selector(1), fold)],
-            ..SymbolicOverlay::default()
-        };
-        let error = elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &duplicate)
-            .expect_err("duplicate");
-        assert!(error.to_string().contains("multiple overlay selectors"));
-    }
-
-    #[test]
-    fn unused_overlay_declarations_and_selectors_are_reported() {
-        let graph = empty_graph("unused", vec![bounded_sample(1)], wire(1, 0));
-        let overlay = SymbolicOverlay {
-            virtual_atoms: BTreeMap::from([(
-                "unused".to_owned(),
-                virtual_decl(matrix_type(), VirtualKind::Large),
-            )]),
-            term_lists: BTreeMap::from([(assumed_id("unused"), AssumedTermList::default())]),
-            entries: vec![(
-                selector(99),
-                Reinterpretation::Fold(FoldSpec {
-                    expected: ExpectedTermList::default(),
-                    groups: Vec::new(),
-                }),
-            )],
-        };
-        let elaborated =
-            elaborate_with_overlay(&graph, &ParamEnv::default(), &[], &overlay).expect("warnings");
-        assert!(
-            elaborated
-                .warnings
-                .iter()
-                .any(|warning| { warning.kind == WarningKind::UnusedOverlaySelector })
-        );
-        assert!(
-            elaborated
-                .warnings
-                .iter()
-                .any(|warning| { warning.kind == WarningKind::UnusedVirtualAtom })
-        );
-        assert!(
-            elaborated
-                .warnings
-                .iter()
-                .any(|warning| { warning.kind == WarningKind::UnusedAssumedTermList })
-        );
-    }
-
-    #[test]
-    fn manifest_reexport_preserves_assumption_provenance_and_atom_origin() {
-        let producer_graph = two_input_graph();
-        let producer_elaboration =
-            elaborate_with_overlay(&producer_graph, &ParamEnv::default(), &[], &unfold_overlay())
-                .expect("producer");
-        let producer = production_id(crate::atom::SpecHash([21; 32]), [22; 32]);
-        let matrix = ConcreteMatrixType {
-            modulus: BigInt::from(17),
-            ring_dimension: 8,
-            rows: 2,
-            columns: 2,
-        };
-        let producer_manifest = export_manifest(
-            producer.clone(),
-            &BTreeMap::from([(
-                "c".to_owned(),
-                ExportArtifact {
-                    wire: WireId { instantiation_path: Vec::new(), wire: wire(2, 0) },
-                    wire_type: ConcreteWireType::Matrix(matrix.clone()),
-                    family: None,
-                    content_hash: None,
-                    layout: None,
-                },
-            )]),
-            &producer_elaboration.wire_terms(),
-            &producer_elaboration.target_terms,
-            &producer_elaboration.atoms,
-            &producer_elaboration.manifest_metadata(),
-        )
-        .expect("producer manifest");
-
-        let mut consumer_graph = empty_graph(
-            "consumer",
-            vec![Node {
-                id: NodeId(1),
-                kind: NodeKind::Input {
-                    name: "c".to_owned(),
-                    wire_type: WireType::Matrix(matrix_type()),
-                    artifact: Some(ArtifactInput {
-                        production_id: producer.clone(),
-                        artifact_name: "c".to_owned(),
-                        confidentiality: ArtifactConfidentiality::Public,
-                    }),
-                },
-                args: Vec::new(),
-            }],
-            wire(1, 0),
-        );
-        consumer_graph.input_types.insert("c".to_owned(), WireType::Matrix(matrix_type()));
-        let consumer = elaborate_with_manifests(
-            &consumer_graph,
-            &ParamEnv::default(),
-            std::slice::from_ref(&producer_manifest),
-        )
-        .expect("consumer");
-        let producer_assumption = producer_manifest.assumption_hash.expect("assumption");
-        assert!(consumer.assumption_digests.contains(&producer_assumption));
-        assert!(consumer.assumption_hash.is_none());
-
-        let intermediary = production_id(crate::atom::SpecHash([23; 32]), [24; 32]);
-        let intermediary_manifest = export_manifest(
-            intermediary,
-            &BTreeMap::from([(
-                "c".to_owned(),
-                ExportArtifact {
-                    wire: WireId { instantiation_path: Vec::new(), wire: wire(1, 0) },
-                    wire_type: ConcreteWireType::Matrix(matrix),
-                    family: None,
-                    content_hash: None,
-                    layout: None,
-                },
-            )]),
-            &consumer.wire_terms(),
-            &consumer.target_terms,
-            &consumer.atoms,
-            &consumer.manifest_metadata(),
-        )
-        .expect("intermediary manifest");
-        assert!(intermediary_manifest.assumption_digests.contains(&producer_assumption));
-        assert!(intermediary_manifest.atoms.keys().any(|reference| {
-            matches!(
-                reference,
-                crate::manifest::ManifestAtomRef::Imported {
-                    production_id,
-                    ..
-                } if production_id == &producer
-            )
-        }));
-        let imported = import_manifest(&intermediary_manifest).expect("standalone intermediary");
-        assert!(imported.atoms.iter().any(|(id, _)| {
-            matches!(
-                id,
-                AtomId::Imported {
-                    production_id,
-                    ..
-                } if production_id == &producer
-            )
-        }));
-    }
-
-    #[test]
-    fn trapdoor_manifest_closes_producer_bindings_and_preserves_public_atom_identity() {
-        let producer_parameter = crate::graph::CompileParameter {
-            name: "producer_sigma".to_owned(),
-            kind: crate::graph::CompileParameterKind::Real,
-        };
-        let producer_graph = Graph {
-            name: "trapdoor-producer".to_owned(),
-            parameters: vec![producer_parameter],
-            input_types: BTreeMap::new(),
-            nodes: vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::TrapdoorSample {
-                        matrix_type: matrix_type(),
-                        sigma: RealExpr::Var("producer_sigma".to_owned()),
-                        gadget_base: IntExpr::constant(2),
-                        digit_count: IntExpr::constant(2),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::Output {
-                        name: "trapdoor".to_owned(),
-                        artifact_confidentiality: Some(ArtifactConfidentiality::Private),
-                    },
-                    args: vec![wire(1, 1)],
-                },
-            ],
-            outputs: BTreeMap::from([("trapdoor".to_owned(), wire(2, 0))]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        };
-        let sigma = Rational::new(BigInt::from(13), BigInt::from(2)).expect("sigma");
-        let producer_bindings = ParamEnv {
-            reals: BTreeMap::from([("producer_sigma".to_owned(), sigma.clone())]),
-            ..ParamEnv::default()
-        };
-        let producer_elaboration =
-            elaborate(&producer_graph, &producer_bindings).expect("producer elaboration");
-        let producer_wire = WireId { instantiation_path: Vec::new(), wire: wire(2, 0) };
-        let trapdoor_type = producer_elaboration.wires[&producer_wire].wire_type.clone();
-        assert!(matches!(
-            &trapdoor_type,
-            ConcreteWireType::Trapdoor {
-                sigma: RealExpr::Rational(closed),
-                ..
-            } if closed == &sigma
-        ));
-
-        let production = production_id(crate::atom::SpecHash([31; 32]), [32; 32]);
-        let manifest = export_manifest(
-            production.clone(),
-            &BTreeMap::from([(
-                "trapdoor".to_owned(),
-                ExportArtifact {
-                    wire: producer_wire,
-                    wire_type: trapdoor_type,
-                    family: None,
-                    content_hash: None,
-                    layout: None,
-                },
-            )]),
-            &producer_elaboration.wire_terms(),
-            &producer_elaboration.target_terms,
-            &producer_elaboration.atoms,
-            &producer_elaboration.manifest_metadata(),
-        )
-        .expect("trapdoor manifest");
-
-        let consumer_graph = Graph {
-            name: "trapdoor-consumer".to_owned(),
-            parameters: vec![crate::graph::CompileParameter {
-                name: "consumer_sigma".to_owned(),
-                kind: crate::graph::CompileParameterKind::Real,
-            }],
-            input_types: BTreeMap::from([(
-                "trapdoor".to_owned(),
-                WireType::Trapdoor {
-                    matrix: matrix_type(),
-                    sigma: RealExpr::Var("consumer_sigma".to_owned()),
-                    gadget_base: IntExpr::constant(2),
-                    digit_count: IntExpr::constant(2),
-                },
-            )]),
-            nodes: vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::Input {
-                        name: "trapdoor".to_owned(),
-                        wire_type: WireType::Trapdoor {
-                            matrix: matrix_type(),
-                            sigma: RealExpr::Var("consumer_sigma".to_owned()),
-                            gadget_base: IntExpr::constant(2),
-                            digit_count: IntExpr::constant(2),
-                        },
-                        artifact: Some(ArtifactInput {
-                            production_id: production.clone(),
-                            artifact_name: "trapdoor".to_owned(),
-                            confidentiality: ArtifactConfidentiality::Private,
-                        }),
-                    },
-                    args: Vec::new(),
-                },
-                Node { id: NodeId(2), kind: NodeKind::TrapdoorPublic, args: vec![wire(1, 0)] },
-            ],
-            outputs: BTreeMap::from([("public".to_owned(), wire(2, 0))]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        };
-        let consumer_bindings = ParamEnv {
-            reals: BTreeMap::from([("consumer_sigma".to_owned(), sigma)]),
-            ..ParamEnv::default()
-        };
-        let consumer = elaborate_with_manifests(
-            &consumer_graph,
-            &consumer_bindings,
-            std::slice::from_ref(&manifest),
-        )
-        .expect("consumer elaboration");
-        let public_terms = elaborated_terms(&consumer, wire(2, 0));
-        assert_eq!(public_terms.terms.len(), 1);
-        assert!(matches!(
-            public_terms.terms[0].factors[0].atom,
-            AtomId::Imported {
-                ref production_id,
-                ..
-            } if production_id == &production
-        ));
-    }
+fn atom_belongs_to_scope(atom: &AtomId, scope: &FrozenGraphScopeId) -> bool {
+    matches!(
+        atom,
+        AtomId::Local(reference) | AtomId::TrapdoorPublic(reference) if &reference.scope == scope
+    )
 }

@@ -515,3 +515,360 @@ where
     );
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        circuit::PolyGateKind,
+        circuit_gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext},
+        test_utils::{
+            ScalarArithmeticContext, ScalarArithmeticEntry, diagonal_matrix,
+            execute_circuit_with_shape,
+        },
+        utils::gen_biguint_for_modulus,
+    };
+    use mxx_primitives::{
+        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        poly::{
+            Poly, PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+    };
+    use num_traits::One;
+
+    const P_MODULI_BITS: usize = 5;
+    const SCALE: u64 = 1 << 8;
+
+    fn nested_context(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+        parameters: &DCRTPolyParams,
+        q_level: Option<usize>,
+    ) -> Arc<NestedRnsPolyContext> {
+        Arc::new(NestedRnsPolyContext::setup(
+            circuit,
+            parameters,
+            P_MODULI_BITS,
+            crate::circuit_gadgets::arith::DEFAULT_MAX_UNREDUCED_MULS,
+            SCALE,
+            false,
+            q_level,
+        ))
+    }
+
+    fn active_modulus(
+        parameters: &DCRTPolyParams,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+    ) -> BigUint {
+        let (q_moduli, _, _) = parameters.to_crt();
+        let levels = enable_levels.unwrap_or(q_moduli.len() - level_offset);
+        q_moduli[level_offset..level_offset + levels]
+            .par_iter()
+            .copied()
+            .map(BigUint::from)
+            .reduce(BigUint::one, |left, right| left * right)
+    }
+
+    fn random_coefficients(modulus: &BigUint, count: usize) -> Vec<BigUint> {
+        (0..count)
+            .into_par_iter()
+            .map_init(rand::rng, |rng, _| gen_biguint_for_modulus(rng, modulus))
+            .collect()
+    }
+
+    fn encode_slot_inputs(
+        parameters: &DCRTPolyParams,
+        context: &NestedRnsPolyContext,
+        coefficients: &[BigUint],
+        enable_levels: Option<usize>,
+        level_offset: usize,
+    ) -> Vec<DCRTPolyMatrix> {
+        let encodings = coefficients
+            .par_iter()
+            .map(|coefficient| {
+                crate::circuit_gadgets::arith::encode_nested_rns_poly_with_offset::<DCRTPoly>(
+                    context.p_moduli_bits,
+                    context.max_unreduced_muls,
+                    parameters,
+                    coefficient,
+                    level_offset,
+                    enable_levels,
+                )
+            })
+            .collect::<Vec<_>>();
+        (0..encodings[0].len())
+            .into_par_iter()
+            .map(|gate_index| {
+                diagonal_matrix(
+                    parameters,
+                    encodings.iter().map(|encoding| encoding[gate_index].clone()),
+                )
+            })
+            .collect()
+    }
+
+    fn execute_slot_output(
+        name: &str,
+        parameters: &DCRTPolyParams,
+        circuit: &PolyCircuit<DCRTPoly>,
+        inputs: &[DCRTPolyMatrix],
+        num_slots: usize,
+    ) -> Vec<BigUint> {
+        let outputs =
+            execute_circuit_with_shape(name, parameters, circuit, inputs, (num_slots, num_slots));
+        assert_eq!(outputs.len(), 1);
+        (0..num_slots)
+            .into_par_iter()
+            .map(|slot| outputs[0].entry(slot, slot).coeffs_biguints()[0].clone())
+            .collect()
+    }
+
+    #[test]
+    fn two_slot_negacyclic_convolution_matches_the_coefficient_oracle_at_runtime() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let q_modulus = parameters.to_crt().0[0];
+        let context = Arc::new(ScalarArithmeticContext { q_modulus });
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let left = ScalarArithmeticEntry::input(context.clone(), Some(1), Some(0), &mut circuit);
+        let right = ScalarArithmeticEntry::input(context, Some(1), Some(0), &mut circuit);
+        let output = negacyclic_conv_mul(&parameters, &mut circuit, &left, &right, 2);
+        circuit.output([output.wire]);
+
+        let zero = DCRTPoly::const_zero(&parameters);
+        let left_value = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            vec![
+                vec![DCRTPoly::from_usize_to_constant(&parameters, 3), zero.clone()],
+                vec![zero.clone(), DCRTPoly::from_usize_to_constant(&parameters, 2)],
+            ],
+        );
+        let right_value = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            vec![
+                vec![DCRTPoly::from_usize_to_constant(&parameters, 5), zero.clone()],
+                vec![zero.clone(), DCRTPoly::from_usize_to_constant(&parameters, 7)],
+            ],
+        );
+        let actual = execute_circuit_with_shape(
+            "two-slot-negacyclic-convolution-runtime",
+            &parameters,
+            &circuit,
+            &[left_value, right_value],
+            (2, 2),
+        );
+
+        // (3 + 2X)(5 + 7X) mod (X^2 + 1) = 1 + 31X.
+        let expected = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            vec![
+                vec![DCRTPoly::from_usize_to_constant(&parameters, 1), zero.clone()],
+                vec![zero, DCRTPoly::from_usize_to_constant(&parameters, 31)],
+            ],
+        );
+        assert_eq!(actual[0], expected);
+    }
+
+    #[test]
+    fn nested_rns_negacyclic_diagonal_matches_the_signed_matrix_diagonal_at_runtime() {
+        let num_slots = 4;
+        let parameters = DCRTPolyParams::new(4, 2, 10, 5);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context = nested_context(&mut circuit, &parameters, None);
+        let input = NestedRnsPoly::input(context.clone(), None, None, &mut circuit);
+        let diagonal = negacyclic_diagonal(&mut circuit, &input, 2, num_slots);
+        let output = diagonal.reconstruct(&mut circuit);
+        circuit.output([output]);
+
+        let coefficients = [3u8, 5, 7, 11].into_iter().map(BigUint::from).collect::<Vec<_>>();
+        let inputs = encode_slot_inputs(&parameters, &context, &coefficients, None, 0);
+        let actual = execute_slot_output(
+            "nested-rns-negacyclic-diagonal-runtime",
+            &parameters,
+            &circuit,
+            &inputs,
+            num_slots,
+        );
+        let modulus = active_modulus(&parameters, None, 0);
+        assert_eq!(
+            actual,
+            vec![
+                (&modulus - &coefficients[2]) % &modulus,
+                (&modulus - &coefficients[2]) % &modulus,
+                coefficients[2].clone(),
+                coefficients[2].clone(),
+            ]
+        );
+    }
+
+    fn test_nested_rns_convolution_window(
+        parameters: DCRTPolyParams,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+    ) {
+        let num_slots = parameters.ring_dimension() as usize;
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context = nested_context(&mut circuit, &parameters, None);
+        let left =
+            NestedRnsPoly::input(context.clone(), enable_levels, Some(level_offset), &mut circuit);
+        let right =
+            NestedRnsPoly::input(context.clone(), enable_levels, Some(level_offset), &mut circuit);
+        let product = negacyclic_conv_mul(&parameters, &mut circuit, &left, &right, num_slots);
+        let output = product.reconstruct(&mut circuit);
+        circuit.output([output]);
+
+        let modulus = active_modulus(&parameters, enable_levels, level_offset);
+        let left_coefficients = random_coefficients(&modulus, num_slots);
+        let right_coefficients = random_coefficients(&modulus, num_slots);
+        let expected = (&DCRTPoly::from_biguints(&parameters, &left_coefficients) *
+            &DCRTPoly::from_biguints(&parameters, &right_coefficients))
+            .coeffs_biguints();
+        let mut inputs = encode_slot_inputs(
+            &parameters,
+            &context,
+            &left_coefficients,
+            enable_levels,
+            level_offset,
+        );
+        inputs.extend(encode_slot_inputs(
+            &parameters,
+            &context,
+            &right_coefficients,
+            enable_levels,
+            level_offset,
+        ));
+        let actual = execute_slot_output(
+            "nested-rns-negacyclic-convolution-runtime",
+            &parameters,
+            &circuit,
+            &inputs,
+            num_slots,
+        );
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual % &modulus == expected % &modulus)
+        );
+        assert!(
+            circuit
+                .count_gates_by_type_vec()
+                .get(&PolyGateKind::SlotTransfer)
+                .copied()
+                .unwrap_or_default() >
+                0
+        );
+    }
+
+    #[test]
+    fn nested_rns_convolution_matches_primitive_polynomial_multiplication_at_runtime() {
+        test_nested_rns_convolution_window(DCRTPolyParams::new(4, 2, 10, 5), None, 0);
+    }
+
+    #[test]
+    fn nested_rns_convolution_respects_a_nonzero_partial_level_window_at_runtime() {
+        test_nested_rns_convolution_window(DCRTPolyParams::new(2, 3, 10, 5), Some(2), 1);
+    }
+
+    fn build_manual_sparse_convolution(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+        left: &NestedRnsPoly<DCRTPoly>,
+        right: &NestedRnsPoly<DCRTPoly>,
+        target_q_index: usize,
+        num_slots: usize,
+    ) -> NestedRnsPoly<DCRTPoly> {
+        let terms = (0..num_slots)
+            .map(|diagonal| {
+                let left_diagonal = negacyclic_diagonal(circuit, left, diagonal, num_slots);
+                let right_rotated =
+                    right.slot_transfer(&rhs_rotation_plan(num_slots, diagonal), circuit);
+                left_diagonal.mul_right_sparse(&right_rotated, target_q_index, circuit)
+            })
+            .collect();
+        reduce_terms_pairwise(terms, circuit)
+    }
+
+    fn build_sparse_convolution(
+        automatic: bool,
+        parameters: &DCRTPolyParams,
+        target_q_index: usize,
+        num_slots: usize,
+    ) -> (Arc<NestedRnsPolyContext>, PolyCircuit<DCRTPoly>) {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context = nested_context(&mut circuit, parameters, None);
+        let left = NestedRnsPoly::input(context.clone(), None, None, &mut circuit);
+        let right = NestedRnsPoly::input(context.clone(), None, None, &mut circuit);
+        let chunk_width = context.p_moduli.len() + 1;
+        let sparse_index = target_q_index * chunk_width + context.p_moduli.len();
+        let sparse_right = right.gadget_decompose(&mut circuit).remove(sparse_index);
+        let product = if automatic {
+            negacyclic_conv_mul_right_sparse(
+                parameters,
+                &mut circuit,
+                &left,
+                &sparse_right,
+                target_q_index,
+                num_slots,
+            )
+        } else {
+            build_manual_sparse_convolution(
+                &mut circuit,
+                &left,
+                &sparse_right,
+                target_q_index,
+                num_slots,
+            )
+        };
+        let output = product.reconstruct(&mut circuit);
+        circuit.output([output]);
+        (context, circuit)
+    }
+
+    #[test]
+    fn sparse_nested_rns_convolution_matches_the_manual_pipeline_without_depth_regression() {
+        let num_slots = 2;
+        let target_q_index = 1;
+        let parameters = DCRTPolyParams::new(2, 2, 10, 5);
+        let (automatic_context, automatic) =
+            build_sparse_convolution(true, &parameters, target_q_index, num_slots);
+        let (manual_context, manual) =
+            build_sparse_convolution(false, &parameters, target_q_index, num_slots);
+        let modulus = active_modulus(&parameters, None, 0);
+        let left_coefficients = random_coefficients(&modulus, num_slots);
+        let right_coefficients = random_coefficients(&modulus, num_slots);
+        let mut automatic_inputs =
+            encode_slot_inputs(&parameters, &automatic_context, &left_coefficients, None, 0);
+        automatic_inputs.extend(encode_slot_inputs(
+            &parameters,
+            &automatic_context,
+            &right_coefficients,
+            None,
+            0,
+        ));
+        let mut manual_inputs =
+            encode_slot_inputs(&parameters, &manual_context, &left_coefficients, None, 0);
+        manual_inputs.extend(encode_slot_inputs(
+            &parameters,
+            &manual_context,
+            &right_coefficients,
+            None,
+            0,
+        ));
+        let automatic_output = execute_slot_output(
+            "nested-rns-sparse-convolution-runtime",
+            &parameters,
+            &automatic,
+            &automatic_inputs,
+            num_slots,
+        );
+        let manual_output = execute_slot_output(
+            "nested-rns-manual-sparse-convolution-runtime",
+            &parameters,
+            &manual,
+            &manual_inputs,
+            num_slots,
+        );
+        assert_eq!(automatic_output, manual_output);
+        assert!(automatic.non_free_depth() <= manual.non_free_depth());
+    }
+}

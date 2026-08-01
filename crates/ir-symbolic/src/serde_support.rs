@@ -1,5 +1,5 @@
 use num_bigint::BigInt;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+use serde::{Deserialize, Deserializer, Serializer, de::Error};
 use std::str::FromStr;
 
 pub(crate) mod hex32 {
@@ -41,88 +41,6 @@ pub(crate) mod hex32 {
     }
 }
 
-pub(crate) mod optional_hex32 {
-    use super::*;
-
-    pub fn serialize<S: Serializer>(
-        value: &Option<[u8; 32]>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(value) => serializer.serialize_some(&HexDigest(value)),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<[u8; 32]>, D::Error> {
-        Option::<HexDigestOwned>::deserialize(deserializer).map(|value| value.map(|value| value.0))
-    }
-
-    struct HexDigest<'a>(&'a [u8; 32]);
-
-    impl Serialize for HexDigest<'_> {
-        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            super::hex32::serialize(self.0, serializer)
-        }
-    }
-
-    struct HexDigestOwned([u8; 32]);
-
-    impl<'de> Deserialize<'de> for HexDigestOwned {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            super::hex32::deserialize(deserializer).map(Self)
-        }
-    }
-}
-
-pub(crate) mod hex32_set {
-    use super::*;
-    use serde::ser::SerializeSeq;
-    use std::collections::BTreeSet;
-
-    pub fn serialize<S: Serializer>(
-        value: &BTreeSet<[u8; 32]>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        let mut sequence = serializer.serialize_seq(Some(value.len()))?;
-        for digest in value {
-            sequence.serialize_element(&HexDigest(digest))?;
-        }
-        sequence.end()
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<BTreeSet<[u8; 32]>, D::Error> {
-        let values = Vec::<HexDigestOwned>::deserialize(deserializer)?;
-        let input_len = values.len();
-        let result = values.into_iter().map(|value| value.0).collect::<BTreeSet<_>>();
-        if result.len() == input_len {
-            Ok(result)
-        } else {
-            Err(D::Error::custom("duplicate digest"))
-        }
-    }
-
-    struct HexDigest<'a>(&'a [u8; 32]);
-
-    impl Serialize for HexDigest<'_> {
-        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            super::hex32::serialize(self.0, serializer)
-        }
-    }
-
-    struct HexDigestOwned([u8; 32]);
-
-    impl<'de> Deserialize<'de> for HexDigestOwned {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            super::hex32::deserialize(deserializer).map(Self)
-        }
-    }
-}
-
 pub(crate) mod bigint {
     use super::*;
 
@@ -133,23 +51,6 @@ pub(crate) mod bigint {
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BigInt, D::Error> {
         let value = String::deserialize(deserializer)?;
         BigInt::from_str(&value).map_err(D::Error::custom)
-    }
-}
-
-pub(crate) mod bigint_vec {
-    use super::*;
-
-    pub fn serialize<S: Serializer>(values: &[BigInt], serializer: S) -> Result<S::Ok, S::Error> {
-        values.iter().map(ToString::to_string).collect::<Vec<_>>().serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<BigInt>, D::Error> {
-        Vec::<String>::deserialize(deserializer)?
-            .into_iter()
-            .map(|value| BigInt::from_str(&value).map_err(D::Error::custom))
-            .collect()
     }
 }
 
@@ -172,5 +73,23 @@ pub(crate) mod optional_bigint {
         Option::<String>::deserialize(deserializer)?
             .map(|value| BigInt::from_str(&value).map_err(D::Error::custom))
             .transpose()
+    }
+}
+
+pub(crate) mod bigint_vec {
+    use super::*;
+    use serde::Serialize;
+
+    pub fn serialize<S: Serializer>(values: &[BigInt], serializer: S) -> Result<S::Ok, S::Error> {
+        values.iter().map(ToString::to_string).collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<BigInt>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| BigInt::from_str(&value).map_err(D::Error::custom))
+            .collect()
     }
 }

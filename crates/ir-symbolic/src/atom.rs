@@ -1,37 +1,48 @@
-use crate::{
-    overlay::AssumedTermListId,
-    serde_support,
-    term::TermList,
-    types::{ConcreteMatrixType, NodeId, WireRef},
-};
+use crate::{expression::SymbolicExprId, overlay::StableVirtualAtomId, serde_support};
 use mxx_ir_core::{
+    ScopedWireRef,
     expr::RealExpr,
     node::{ConstantMatrix, HashVariant},
+    types::ConcreteMatrixType,
 };
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use mxx_ir_core::{
-    artifact::{ProductionId, SpecHash},
-    node::ConcatAxis,
-    types::InstantiationFrame,
-};
+pub use mxx_ir_core::artifact::{ProductionId, SpecHash};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ManifestAtomId(#[serde(with = "serde_support::hex32")] pub [u8; 32]);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct TermListId(#[serde(with = "serde_support::hex32")] pub [u8; 32]);
-
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct SelectionDomain {
-    pub index_wire: WireRef,
-    pub instantiation_path: Vec<InstantiationFrame>,
+    pub index_wire: ScopedWireRef,
+    pub instantiation_path: Vec<SymbolicInstantiationFrame>,
     pub count: u64,
     #[serde(with = "serde_support::bigint")]
     pub modulus: BigInt,
     pub ring_dimension: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub enum SymbolicInstantiationFrame {
+    Call(ScopedWireRef),
+    ParallelIteration {
+        call_site: ScopedWireRef,
+        index_slot: u32,
+        index: ParallelIndex,
+        /// Added to the selected iteration for a structural `ZipOffset` input.
+        index_offset: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub enum ParallelIndex {
+    Template,
+    Static(u64),
+    Dynamic(ScopedWireRef),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -42,28 +53,17 @@ pub enum AtomId {
         /// Canonically encoded compile parameters, including matrix parameters.
         params: Vec<String>,
     },
-    Local {
-        instantiation_path: Vec<InstantiationFrame>,
-        node: NodeId,
-        port: u32,
+    Local(ScopedWireRef),
+    TrapdoorPublic(ScopedWireRef),
+    Instantiated {
+        template: ScopedWireRef,
+        instantiation_path: Vec<SymbolicInstantiationFrame>,
     },
     Imported {
         production_id: ProductionId,
         manifest_atom_id: ManifestAtomId,
     },
-    Virtual {
-        name: String,
-    },
-    Overlay {
-        instantiation_path: Vec<InstantiationFrame>,
-        node: NodeId,
-        port: u32,
-        group_index: u32,
-    },
-    Indicator {
-        domain: SelectionDomain,
-        branch: u64,
-    },
+    Virtual(StableVirtualAtomId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -162,97 +162,17 @@ pub enum SelectionDomainRef {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IndicatorRole {
-    pub domain: SelectionDomainRef,
-    pub branch: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tag", content = "value")]
-pub enum DefExpr {
-    TermList(TermList),
-    Tensor {
-        left: AtomId,
-        right: AtomId,
-    },
-    Concat {
-        inputs: Vec<AtomId>,
-        axis: ConcatAxis,
-    },
-    Reshape {
-        input: AtomId,
-        rows: usize,
-        columns: usize,
-    },
-    ConstantCoefficient {
-        input: AtomId,
-        position: usize,
-    },
-    CrtRecompose {
-        inputs: Vec<TermList>,
-        #[serde(with = "serde_support::bigint_vec")]
-        plaintext_moduli: Vec<BigInt>,
-        #[serde(with = "serde_support::bigint_vec")]
-        reconstruction_coefficients: Vec<BigInt>,
-    },
-    ModDownImage {
-        source: AtomId,
-        #[serde(with = "serde_support::bigint")]
-        source_modulus: BigInt,
-        #[serde(with = "serde_support::bigint")]
-        target_modulus: BigInt,
-    },
-    ModUpLift {
-        source: AtomId,
-        #[serde(with = "serde_support::bigint")]
-        source_modulus: BigInt,
-        #[serde(with = "serde_support::bigint")]
-        target_modulus: BigInt,
-    },
-    Indicator {
-        index_wire: WireRef,
-        branch: u64,
-    },
-    ModDownError {
-        input: TermList,
-        signal: TermList,
-        #[serde(with = "serde_support::bigint")]
-        source_modulus: BigInt,
-        #[serde(with = "serde_support::bigint")]
-        target_modulus: BigInt,
-    },
-    ModUpError {
-        input: TermList,
-        lifted: TermList,
-        #[serde(with = "serde_support::bigint")]
-        source_modulus: BigInt,
-        #[serde(with = "serde_support::bigint")]
-        target_modulus: BigInt,
-    },
-    Fold(TermList),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "tag", content = "value")]
-#[allow(clippy::large_enum_variant)]
 pub enum AtomClass {
     Source { source: SourceKind },
-    Derived { definition: DefExpr },
     Assumed { metadata: Option<AssumedMetadata> },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-#[serde(tag = "tag", content = "value")]
-pub enum TargetRef {
-    Local(WireRef),
-    Imported { production_id: ProductionId, term_list_id: TermListId },
-    Assumed(AssumedTermListId),
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PreimageRefs {
-    pub uniform: AtomId,
-    pub target: TargetRef,
+pub struct PreimageRelation {
+    pub left_matrix: AtomId,
+    pub preimage: AtomId,
+    pub product: SymbolicExprId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -261,9 +181,6 @@ pub struct Atom {
     pub class: AtomClass,
     pub kind: AtomKind,
     pub matrix_type: ConcreteMatrixType,
-    pub dependencies: BTreeSet<AtomId>,
-    pub preimage_refs: Option<PreimageRefs>,
-    pub indicator: Option<IndicatorRole>,
 }
 
 impl Atom {
@@ -308,9 +225,5 @@ impl AtomTable {
 
     pub fn contains_key(&self, id: &AtomId) -> bool {
         self.atoms.contains_key(id)
-    }
-
-    pub fn remove(&mut self, id: &AtomId) -> Option<Atom> {
-        self.atoms.remove(id)
     }
 }

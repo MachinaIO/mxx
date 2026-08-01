@@ -1,684 +1,560 @@
-use crate::{
-    BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire,
-    encoding::EncodingCompileError,
-};
-use mxx_ir_core::{
-    GraphBuilder, MatrixFamilyWire, MatrixWire, SubgraphBuildError,
-    node::{LoopInputMode, MatrixBinaryOp},
-};
+//! Per-slot BGG+ vectors represented by indexed DSL families.
+
+use crate::{BggPublicKeyCompiler, BggPublicKeyWire};
+use mxx_dsl::{DslError, Family, Mat};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct NaiveBggPublicKeyVecWire {
-    pub matrices: MatrixFamilyWire,
+    pub matrices: Family<Mat>,
     pub reveal_plaintext: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct NaiveBggEncodingVecWire {
-    pub vectors: MatrixFamilyWire,
-    pub pubkeys: MatrixFamilyWire,
+    pub vectors: Family<Mat>,
+    pub pubkeys: Family<Mat>,
     pub pubkey_reveal_plaintext: bool,
-    pub plaintexts: Option<MatrixFamilyWire>,
+    pub plaintexts: Option<Family<Mat>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NaiveBggVecCompiler {
     pub public_key: BggPublicKeyCompiler,
 }
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum NaiveVecCompileError {
     #[error("naive BGG+ vector families must have matching slot counts")]
     SlotCountMismatch,
+    #[error("naive BGG+ multiplication requires the left plaintext family")]
+    MissingLeftPlaintext,
     #[error(transparent)]
-    Encoding(#[from] EncodingCompileError),
-    #[error(transparent)]
-    Subgraph(#[from] SubgraphBuildError),
+    Dsl(#[from] DslError),
 }
 
 impl NaiveBggVecCompiler {
+    pub fn matrix_mul_public_keys(
+        &self,
+        input: &NaiveBggPublicKeyVecWire,
+        target: &Mat,
+    ) -> Result<NaiveBggPublicKeyVecWire, NaiveVecCompileError> {
+        let compiler = self.public_key.clone();
+        let target = target.clone();
+        let reveal = input.reveal_plaintext;
+        let matrices = input.matrices.clone().parallel_map(move |_, matrix| {
+            compiler
+                .matrix_mul(&BggPublicKeyWire { matrix, reveal_plaintext: reveal }, &target)
+                .matrix
+        })?;
+        Ok(NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: reveal })
+    }
+
     pub fn add_public_keys(
         &self,
-        builder: &mut GraphBuilder,
         lhs: &NaiveBggPublicKeyVecWire,
         rhs: &NaiveBggPublicKeyVecWire,
     ) -> Result<NaiveBggPublicKeyVecWire, NaiveVecCompileError> {
-        self.public_key_binary(builder, lhs, rhs, MatrixBinaryOp::Add)
+        self.public_key_binary(lhs, rhs, |compiler, left, right| compiler.add(left, right))
     }
 
     pub fn sub_public_keys(
         &self,
-        builder: &mut GraphBuilder,
         lhs: &NaiveBggPublicKeyVecWire,
         rhs: &NaiveBggPublicKeyVecWire,
     ) -> Result<NaiveBggPublicKeyVecWire, NaiveVecCompileError> {
-        self.public_key_binary(builder, lhs, rhs, MatrixBinaryOp::Subtract)
+        self.public_key_binary(lhs, rhs, |compiler, left, right| compiler.sub(left, right))
     }
 
     pub fn mul_public_keys(
         &self,
-        builder: &mut GraphBuilder,
         lhs: &NaiveBggPublicKeyVecWire,
         rhs: &NaiveBggPublicKeyVecWire,
     ) -> Result<NaiveBggPublicKeyVecWire, NaiveVecCompileError> {
-        self.public_key_binary(builder, lhs, rhs, MatrixBinaryOp::Multiply)
-    }
-
-    pub fn small_scalar_mul_public_keys(
-        &self,
-        builder: &mut GraphBuilder,
-        input: &NaiveBggPublicKeyVecWire,
-        scalar: &MatrixWire,
-    ) -> Result<NaiveBggPublicKeyVecWire, NaiveVecCompileError> {
-        self.public_key_scalar(builder, input, scalar, false)
-    }
-
-    pub fn large_scalar_mul_public_keys(
-        &self,
-        builder: &mut GraphBuilder,
-        input: &NaiveBggPublicKeyVecWire,
-        scalar: &MatrixWire,
-    ) -> Result<NaiveBggPublicKeyVecWire, NaiveVecCompileError> {
-        self.public_key_scalar(builder, input, scalar, true)
-    }
-
-    pub fn matrix_mul_public_keys(
-        &self,
-        builder: &mut GraphBuilder,
-        input: &NaiveBggPublicKeyVecWire,
-        target: &MatrixWire,
-    ) -> Result<NaiveBggPublicKeyVecWire, NaiveVecCompileError> {
-        let mut body = GraphBuilder::new("naive-bgg-public-key-matrix-mul", Vec::new());
-        let body_input = BggPublicKeyWire {
-            matrix: body.input("0_input", input.matrices.matrix_type.clone()),
-            reveal_plaintext: input.reveal_plaintext,
-        };
-        let body_target = body.input("1_target", target.matrix_type.clone());
-        let output = self.public_key.matrix_mul(&mut body, &body_input, &body_target);
-        body.value_output_wire("0_matrix", output.matrix.wire);
-        let mut outputs = builder.parallel_loop(
-            body.finish(),
-            input.matrices.count.clone(),
-            "slot",
-            Vec::new(),
-            vec![input.matrices.wire, target.wire],
-            vec![LoopInputMode::Zip, LoopInputMode::Broadcast],
-            std::slice::from_ref(&output.matrix.matrix_type),
-        )?;
-        Ok(NaiveBggPublicKeyVecWire {
-            matrices: outputs.remove(0),
-            reveal_plaintext: output.reveal_plaintext,
-        })
+        self.public_key_binary(lhs, rhs, |compiler, left, right| compiler.mul(left, right))
     }
 
     pub fn add_encodings(
         &self,
-        builder: &mut GraphBuilder,
         lhs: &NaiveBggEncodingVecWire,
         rhs: &NaiveBggEncodingVecWire,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
-        self.encoding_binary(builder, lhs, rhs, MatrixBinaryOp::Add)
+        self.encoding_binary(
+            lhs,
+            rhs,
+            |left, right| left + right,
+            |compiler, left, right| compiler.add(left, right),
+        )
     }
 
     pub fn sub_encodings(
         &self,
-        builder: &mut GraphBuilder,
         lhs: &NaiveBggEncodingVecWire,
         rhs: &NaiveBggEncodingVecWire,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
-        self.encoding_binary(builder, lhs, rhs, MatrixBinaryOp::Subtract)
+        self.encoding_binary(
+            lhs,
+            rhs,
+            |left, right| left - right,
+            |compiler, left, right| compiler.sub(left, right),
+        )
     }
 
     pub fn mul_encodings(
         &self,
-        builder: &mut GraphBuilder,
         lhs: &NaiveBggEncodingVecWire,
         rhs: &NaiveBggEncodingVecWire,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
-        self.encoding_binary(builder, lhs, rhs, MatrixBinaryOp::Multiply)
+        validate_encoding_pair(lhs, rhs)?;
+        let lhs_plaintexts =
+            lhs.plaintexts.clone().ok_or(NaiveVecCompileError::MissingLeftPlaintext)?;
+        let base = self.public_key.base.clone();
+        let digits = self.public_key.digit_count.clone();
+        let decomposed_rhs = rhs.pubkeys.clone().parallel_map(move |_, matrix| {
+            matrix.decompose(base.clone(), digits.clone()).as_mat()
+        })?;
+        let first =
+            lhs.vectors.clone().parallel_zip(decomposed_rhs, |_, left, right| left * right)?;
+        let second = rhs
+            .vectors
+            .clone()
+            .parallel_zip(lhs_plaintexts, |_, right, plaintext| right * plaintext)?;
+        let vectors = first.parallel_zip(second, |_, left, right| left + right)?;
+        let pubkeys =
+            self.key_family_binary(lhs, rhs, |compiler, left, right| compiler.mul(left, right))?;
+        let plaintexts = lhs
+            .plaintexts
+            .clone()
+            .zip(rhs.plaintexts.clone())
+            .map(|(left, right)| left.parallel_zip(right, |_, left, right| left * right))
+            .transpose()?;
+        Ok(NaiveBggEncodingVecWire {
+            vectors,
+            pubkeys,
+            pubkey_reveal_plaintext: lhs.pubkey_reveal_plaintext && rhs.pubkey_reveal_plaintext,
+            plaintexts,
+        })
     }
 
     pub fn small_scalar_mul_encodings(
         &self,
-        builder: &mut GraphBuilder,
         input: &NaiveBggEncodingVecWire,
-        scalar: &MatrixWire,
+        scalar: &Mat,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
-        self.encoding_scalar(builder, input, scalar, false)
+        self.encoding_scalar(input, scalar, false)
     }
 
     pub fn large_scalar_mul_encodings(
         &self,
-        builder: &mut GraphBuilder,
         input: &NaiveBggEncodingVecWire,
-        scalar: &MatrixWire,
+        scalar: &Mat,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
-        self.encoding_scalar(builder, input, scalar, true)
+        self.encoding_scalar(input, scalar, true)
     }
 
     pub fn matrix_mul_encodings(
         &self,
-        builder: &mut GraphBuilder,
         input: &NaiveBggEncodingVecWire,
-        target: &MatrixWire,
+        target: &Mat,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
         validate_encoding(input)?;
-        let compiler = BggEncodingCompiler { public_key: self.public_key.clone() };
-        let mut body = GraphBuilder::new("naive-bgg-encoding-matrix-mul", Vec::new());
-        let body_input = encoding_body_input(&mut body, "input", input);
-        let body_target = body.input("3_target", target.matrix_type.clone());
-        let output = compiler.matrix_mul(&mut body, &body_input, &body_target);
-        body.value_output_wire("0_vector", output.vector.wire);
-        body.value_output_wire("1_pubkey", output.pubkey.matrix.wire);
-        let mut args = vec![input.vectors.wire, input.pubkeys.wire];
-        let mut modes = vec![LoopInputMode::Zip, LoopInputMode::Zip];
-        if let Some(plaintexts) = &input.plaintexts {
-            args.push(plaintexts.wire);
-            modes.push(LoopInputMode::Zip);
-        }
-        args.push(target.wire);
-        modes.push(LoopInputMode::Broadcast);
-        let mut outputs = builder.parallel_loop(
-            body.finish(),
-            input.vectors.count.clone(),
-            "slot",
-            Vec::new(),
-            args,
-            modes,
-            &[output.vector.matrix_type.clone(), output.pubkey.matrix.matrix_type.clone()],
-        )?;
+        let base = self.public_key.base.clone();
+        let digits = self.public_key.digit_count.clone();
+        let decomposed = target.clone().decompose(base, digits).as_mat();
+        let vectors =
+            input.vectors.clone().parallel_map(move |_, value| value * decomposed.clone())?;
+        let key_compiler = self.public_key.clone();
+        let target_for_keys = target.clone();
+        let pubkeys = input.pubkeys.clone().parallel_map(move |_, matrix| {
+            key_compiler
+                .matrix_mul(
+                    &BggPublicKeyWire { matrix, reveal_plaintext: input.pubkey_reveal_plaintext },
+                    &target_for_keys,
+                )
+                .matrix
+        })?;
         Ok(NaiveBggEncodingVecWire {
-            vectors: outputs.remove(0),
-            pubkeys: outputs.remove(0),
-            pubkey_reveal_plaintext: output.pubkey.reveal_plaintext,
+            vectors,
+            pubkeys,
+            pubkey_reveal_plaintext: input.pubkey_reveal_plaintext,
             plaintexts: None,
         })
     }
 
     fn public_key_binary(
         &self,
-        builder: &mut GraphBuilder,
         lhs: &NaiveBggPublicKeyVecWire,
         rhs: &NaiveBggPublicKeyVecWire,
-        operation: MatrixBinaryOp,
+        operation: impl Fn(
+            &BggPublicKeyCompiler,
+            &BggPublicKeyWire,
+            &BggPublicKeyWire,
+        ) -> BggPublicKeyWire
+        + Send
+        + Sync
+        + 'static,
     ) -> Result<NaiveBggPublicKeyVecWire, NaiveVecCompileError> {
-        validate_family_pair(&lhs.matrices, &rhs.matrices)?;
-        let operation_name = operation_name(operation);
-        let mut body = GraphBuilder::new(
-            format!(
-                "naive-bgg-public-key-{operation_name}-{}-{}",
-                reveal_name(lhs.reveal_plaintext),
-                reveal_name(rhs.reveal_plaintext)
-            ),
-            Vec::new(),
-        );
-        let lhs_input = BggPublicKeyWire {
-            matrix: body.input("0_lhs", lhs.matrices.matrix_type.clone()),
-            reveal_plaintext: lhs.reveal_plaintext,
-        };
-        let rhs_input = BggPublicKeyWire {
-            matrix: body.input("1_rhs", rhs.matrices.matrix_type.clone()),
-            reveal_plaintext: rhs.reveal_plaintext,
-        };
-        let output = match operation {
-            MatrixBinaryOp::Add => self.public_key.add(&mut body, &lhs_input, &rhs_input),
-            MatrixBinaryOp::Subtract => self.public_key.sub(&mut body, &lhs_input, &rhs_input),
-            MatrixBinaryOp::Multiply => self.public_key.mul(&mut body, &lhs_input, &rhs_input),
-        };
-        body.value_output_wire("0_matrix", output.matrix.wire);
-        let mut outputs = builder.parallel_loop(
-            body.finish(),
-            lhs.matrices.count.clone(),
-            "slot",
-            Vec::new(),
-            vec![lhs.matrices.wire, rhs.matrices.wire],
-            vec![LoopInputMode::Zip, LoopInputMode::Zip],
-            std::slice::from_ref(&output.matrix.matrix_type),
-        )?;
-        Ok(NaiveBggPublicKeyVecWire {
-            matrices: outputs.remove(0),
-            reveal_plaintext: output.reveal_plaintext,
-        })
-    }
-
-    fn public_key_scalar(
-        &self,
-        builder: &mut GraphBuilder,
-        input: &NaiveBggPublicKeyVecWire,
-        scalar: &MatrixWire,
-        large: bool,
-    ) -> Result<NaiveBggPublicKeyVecWire, NaiveVecCompileError> {
-        let mut body = GraphBuilder::new(
-            format!(
-                "naive-bgg-public-key-{}-scalar-{}",
-                if large { "large" } else { "small" },
-                reveal_name(input.reveal_plaintext)
-            ),
-            Vec::new(),
-        );
-        let body_input = BggPublicKeyWire {
-            matrix: body.input("0_input", input.matrices.matrix_type.clone()),
-            reveal_plaintext: input.reveal_plaintext,
-        };
-        let body_scalar = body.input("1_scalar", scalar.matrix_type.clone());
-        let output = if large {
-            self.public_key.large_scalar_mul(&mut body, &body_input, &body_scalar)
-        } else {
-            self.public_key.small_scalar_mul(&mut body, &body_input, &body_scalar)
-        };
-        body.value_output_wire("0_matrix", output.matrix.wire);
-        let mut outputs = builder.parallel_loop(
-            body.finish(),
-            input.matrices.count.clone(),
-            "slot",
-            Vec::new(),
-            vec![input.matrices.wire, scalar.wire],
-            vec![LoopInputMode::Zip, LoopInputMode::Broadcast],
-            std::slice::from_ref(&output.matrix.matrix_type),
-        )?;
-        Ok(NaiveBggPublicKeyVecWire {
-            matrices: outputs.remove(0),
-            reveal_plaintext: output.reveal_plaintext,
-        })
+        if lhs.matrices.count() != rhs.matrices.count() {
+            return Err(NaiveVecCompileError::SlotCountMismatch);
+        }
+        let compiler = self.public_key.clone();
+        let reveal = lhs.reveal_plaintext && rhs.reveal_plaintext;
+        let left_reveal = lhs.reveal_plaintext;
+        let right_reveal = rhs.reveal_plaintext;
+        let matrices =
+            lhs.matrices.clone().parallel_zip(rhs.matrices.clone(), move |_, left, right| {
+                operation(
+                    &compiler,
+                    &BggPublicKeyWire { matrix: left, reveal_plaintext: left_reveal },
+                    &BggPublicKeyWire { matrix: right, reveal_plaintext: right_reveal },
+                )
+                .matrix
+            })?;
+        Ok(NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: reveal })
     }
 
     fn encoding_binary(
         &self,
-        builder: &mut GraphBuilder,
         lhs: &NaiveBggEncodingVecWire,
         rhs: &NaiveBggEncodingVecWire,
-        operation: MatrixBinaryOp,
+        vector_op: impl Fn(Mat, Mat) -> Mat + Copy,
+        key_op: impl Fn(&BggPublicKeyCompiler, &BggPublicKeyWire, &BggPublicKeyWire) -> BggPublicKeyWire
+        + 'static,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
-        validate_encoding(lhs)?;
-        validate_encoding(rhs)?;
-        validate_family_pair(&lhs.vectors, &rhs.vectors)?;
-        let compiler = BggEncodingCompiler { public_key: self.public_key.clone() };
-        let mut body = GraphBuilder::new(
-            format!(
-                "naive-bgg-encoding-{}-{}-{}",
-                operation_name(operation),
-                reveal_name(lhs.plaintexts.is_some()),
-                reveal_name(rhs.plaintexts.is_some())
-            ),
-            Vec::new(),
-        );
-        let lhs_input = encoding_body_input(&mut body, "lhs", lhs);
-        let rhs_input = encoding_body_input(&mut body, "rhs", rhs);
-        let output = match operation {
-            MatrixBinaryOp::Add => compiler.add(&mut body, &lhs_input, &rhs_input),
-            MatrixBinaryOp::Subtract => compiler.sub(&mut body, &lhs_input, &rhs_input),
-            MatrixBinaryOp::Multiply => compiler.mul(&mut body, &lhs_input, &rhs_input),
-        }?;
-        body.value_output_wire("0_vector", output.vector.wire);
-        body.value_output_wire("1_pubkey", output.pubkey.matrix.wire);
-        if let Some(plaintext) = &output.plaintext {
-            body.value_output_wire("2_plaintext", plaintext.wire);
-        }
-        let mut args = vec![lhs.vectors.wire, lhs.pubkeys.wire];
-        let mut modes = vec![LoopInputMode::Zip, LoopInputMode::Zip];
-        if let Some(plaintexts) = &lhs.plaintexts {
-            args.push(plaintexts.wire);
-            modes.push(LoopInputMode::Zip);
-        }
-        args.extend([rhs.vectors.wire, rhs.pubkeys.wire]);
-        modes.extend([LoopInputMode::Zip, LoopInputMode::Zip]);
-        if let Some(plaintexts) = &rhs.plaintexts {
-            args.push(plaintexts.wire);
-            modes.push(LoopInputMode::Zip);
-        }
-        let mut output_types =
-            vec![output.vector.matrix_type.clone(), output.pubkey.matrix.matrix_type.clone()];
-        if let Some(plaintext) = &output.plaintext {
-            output_types.push(plaintext.matrix_type.clone());
-        }
-        let mut outputs = builder.parallel_loop(
-            body.finish(),
-            lhs.vectors.count.clone(),
-            "slot",
-            Vec::new(),
-            args,
-            modes,
-            &output_types,
-        )?;
-        let vectors = outputs.remove(0);
-        let pubkeys = outputs.remove(0);
-        let plaintexts = (!outputs.is_empty()).then(|| outputs.remove(0));
+        validate_encoding_pair(lhs, rhs)?;
+        let vectors = lhs
+            .vectors
+            .clone()
+            .parallel_zip(rhs.vectors.clone(), move |_, left, right| vector_op(left, right))?;
+        let pubkeys = self.key_family_binary(lhs, rhs, key_op)?;
+        let plaintexts = lhs
+            .plaintexts
+            .clone()
+            .zip(rhs.plaintexts.clone())
+            .map(|(left, right)| {
+                left.parallel_zip(right, move |_, left, right| vector_op(left, right))
+            })
+            .transpose()?;
         Ok(NaiveBggEncodingVecWire {
             vectors,
             pubkeys,
-            pubkey_reveal_plaintext: output.pubkey.reveal_plaintext,
+            pubkey_reveal_plaintext: lhs.pubkey_reveal_plaintext && rhs.pubkey_reveal_plaintext,
             plaintexts,
+        })
+    }
+
+    fn key_family_binary(
+        &self,
+        lhs: &NaiveBggEncodingVecWire,
+        rhs: &NaiveBggEncodingVecWire,
+        operation: impl Fn(
+            &BggPublicKeyCompiler,
+            &BggPublicKeyWire,
+            &BggPublicKeyWire,
+        ) -> BggPublicKeyWire
+        + 'static,
+    ) -> Result<Family<Mat>, DslError> {
+        let compiler = self.public_key.clone();
+        let left_reveal = lhs.pubkey_reveal_plaintext;
+        let right_reveal = rhs.pubkey_reveal_plaintext;
+        lhs.pubkeys.clone().parallel_zip(rhs.pubkeys.clone(), move |_, left, right| {
+            operation(
+                &compiler,
+                &BggPublicKeyWire { matrix: left, reveal_plaintext: left_reveal },
+                &BggPublicKeyWire { matrix: right, reveal_plaintext: right_reveal },
+            )
+            .matrix
         })
     }
 
     fn encoding_scalar(
         &self,
-        builder: &mut GraphBuilder,
         input: &NaiveBggEncodingVecWire,
-        scalar: &MatrixWire,
+        scalar: &Mat,
         large: bool,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
         validate_encoding(input)?;
-        let compiler = BggEncodingCompiler { public_key: self.public_key.clone() };
-        let mut body = GraphBuilder::new(
-            format!(
-                "naive-bgg-encoding-{}-scalar-{}",
-                if large { "large" } else { "small" },
-                reveal_name(input.plaintexts.is_some())
-            ),
-            Vec::new(),
-        );
-        let body_input = encoding_body_input(&mut body, "input", input);
-        let body_scalar = body.input("3_scalar", scalar.matrix_type.clone());
-        let output = if large {
-            compiler.large_scalar_mul(&mut body, &body_input, &body_scalar)
+        let vector_factor = if large {
+            let rows = input.pubkeys.clone().parallel_map({
+                let compiler = self.public_key.clone();
+                let scalar = scalar.clone();
+                move |_, matrix| {
+                    compiler.large_scalar_decomposition(
+                        &BggPublicKeyWire {
+                            matrix,
+                            reveal_plaintext: input.pubkey_reveal_plaintext,
+                        },
+                        &scalar,
+                    )
+                }
+            })?;
+            Some(rows)
         } else {
-            compiler.small_scalar_mul(&mut body, &body_input, &body_scalar)
+            None
         };
-        body.value_output_wire("0_vector", output.vector.wire);
-        body.value_output_wire("1_pubkey", output.pubkey.matrix.wire);
-        if let Some(plaintext) = &output.plaintext {
-            body.value_output_wire("2_plaintext", plaintext.wire);
-        }
-        let mut args = vec![input.vectors.wire, input.pubkeys.wire];
-        let mut modes = vec![LoopInputMode::Zip, LoopInputMode::Zip];
-        if let Some(plaintexts) = &input.plaintexts {
-            args.push(plaintexts.wire);
-            modes.push(LoopInputMode::Zip);
-        }
-        args.push(scalar.wire);
-        modes.push(LoopInputMode::Broadcast);
-        let mut output_types =
-            vec![output.vector.matrix_type.clone(), output.pubkey.matrix.matrix_type.clone()];
-        if let Some(plaintext) = &output.plaintext {
-            output_types.push(plaintext.matrix_type.clone());
-        }
-        let mut outputs = builder.parallel_loop(
-            body.finish(),
-            input.vectors.count.clone(),
-            "slot",
-            Vec::new(),
-            args,
-            modes,
-            &output_types,
-        )?;
-        let vectors = outputs.remove(0);
-        let pubkeys = outputs.remove(0);
-        let plaintexts = (!outputs.is_empty()).then(|| outputs.remove(0));
+        let vectors = match vector_factor {
+            Some(factors) => {
+                input.vectors.clone().parallel_zip(factors, |_, value, factor| value * factor)?
+            }
+            None => {
+                let scalar = scalar.clone();
+                input.vectors.clone().parallel_map(move |_, value| value * scalar.clone())?
+            }
+        };
+        let compiler = self.public_key.clone();
+        let scalar_for_keys = scalar.clone();
+        let reveal = input.pubkey_reveal_plaintext;
+        let pubkeys = input.pubkeys.clone().parallel_map(move |_, matrix| {
+            let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
+            if large {
+                compiler.large_scalar_mul(&key, &scalar_for_keys).matrix
+            } else {
+                compiler.small_scalar_mul(&key, &scalar_for_keys).matrix
+            }
+        })?;
+        let plaintexts = input
+            .plaintexts
+            .clone()
+            .map(|values| {
+                let scalar = scalar.clone();
+                values.parallel_map(move |_, value| value * scalar.clone())
+            })
+            .transpose()?;
         Ok(NaiveBggEncodingVecWire {
             vectors,
             pubkeys,
-            pubkey_reveal_plaintext: output.pubkey.reveal_plaintext,
+            pubkey_reveal_plaintext: reveal,
             plaintexts,
         })
     }
 }
 
-fn encoding_body_input(
-    body: &mut GraphBuilder,
-    prefix: &str,
-    input: &NaiveBggEncodingVecWire,
-) -> BggEncodingWire {
-    BggEncodingWire {
-        vector: body.input(format!("{prefix}_0_vector"), input.vectors.matrix_type.clone()),
-        pubkey: BggPublicKeyWire {
-            matrix: body.input(format!("{prefix}_1_pubkey"), input.pubkeys.matrix_type.clone()),
-            reveal_plaintext: input.pubkey_reveal_plaintext,
-        },
-        plaintext: input.plaintexts.as_ref().map(|plaintexts| {
-            body.input(format!("{prefix}_2_plaintext"), plaintexts.matrix_type.clone())
-        }),
-    }
-}
-
-fn validate_encoding(input: &NaiveBggEncodingVecWire) -> Result<(), NaiveVecCompileError> {
-    validate_family_pair(&input.vectors, &input.pubkeys)?;
-    if let Some(plaintexts) = &input.plaintexts {
-        validate_family_pair(&input.vectors, plaintexts)?;
-    }
-    Ok(())
-}
-
-fn validate_family_pair(
-    lhs: &MatrixFamilyWire,
-    rhs: &MatrixFamilyWire,
-) -> Result<(), NaiveVecCompileError> {
-    if lhs.count != rhs.count {
+fn validate_encoding(value: &NaiveBggEncodingVecWire) -> Result<(), NaiveVecCompileError> {
+    if value.vectors.count() != value.pubkeys.count() ||
+        value
+            .plaintexts
+            .as_ref()
+            .is_some_and(|plaintexts| plaintexts.count() != value.vectors.count())
+    {
         return Err(NaiveVecCompileError::SlotCountMismatch);
     }
     Ok(())
 }
 
-fn operation_name(operation: MatrixBinaryOp) -> &'static str {
-    match operation {
-        MatrixBinaryOp::Add => "add",
-        MatrixBinaryOp::Subtract => "sub",
-        MatrixBinaryOp::Multiply => "mul",
+fn validate_encoding_pair(
+    lhs: &NaiveBggEncodingVecWire,
+    rhs: &NaiveBggEncodingVecWire,
+) -> Result<(), NaiveVecCompileError> {
+    validate_encoding(lhs)?;
+    validate_encoding(rhs)?;
+    if lhs.vectors.count() != rhs.vectors.count() {
+        return Err(NaiveVecCompileError::SlotCountMismatch);
     }
-}
-
-fn reveal_name(revealed: bool) -> &'static str {
-    if revealed { "revealed" } else { "hidden" }
+    Ok(())
 }
 
 #[cfg(test)]
-mod graph_tests {
+mod tests {
     use super::*;
-    use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactConfidentiality, types::MatrixType};
+    use crate::test_utils::{execute_graph, matrix_output, row};
+    use mxx_dsl::{DslContext, Ring};
+    use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{
-            Poly, PolyParams,
-            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        },
+        poly::{PolyParams, dcrt::params::DCRTPolyParams},
     };
-    use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
-    };
+    use mxx_runtime::RuntimeValue;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
-    fn matrix_type(parameters: &DCRTPolyParams, rows: usize, columns: usize) -> MatrixType {
-        MatrixType {
-            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
-            rows: IntExpr::constant(rows),
-            columns: IntExpr::constant(columns),
-        }
-    }
+    #[test]
+    fn naive_encoding_multiplication_elaborates_all_indexed_families() {
+        let ring = Ring::new(257, 8);
+        let compiler = NaiveBggVecCompiler {
+            public_key: BggPublicKeyCompiler {
+                ring: ring.clone(),
+                base: 4.into(),
+                digit_count: 4.into(),
+            },
+        };
+        let encoding = |prefix: &str| NaiveBggEncodingVecWire {
+            vectors: ring.input_family(format!("{prefix}-vectors"), 2, (1, 8)),
+            pubkeys: ring.input_family(format!("{prefix}-pubkeys"), 2, (2, 8)),
+            pubkey_reveal_plaintext: true,
+            plaintexts: Some(ring.input_family(format!("{prefix}-plaintexts"), 2, (1, 1))),
+        };
+        let product =
+            compiler.mul_encodings(&encoding("left"), &encoding("right")).expect("product");
+        let built = DslContext::new("naive-bgg-encoding-mul")
+            .family_output("vectors", product.vectors)
+            .expect("vector family")
+            .family_output("pubkeys", product.pubkeys)
+            .expect("public-key family")
+            .build()
+            .expect("build");
+        let kinds = built
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
+        assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::ParallelLoop(_))));
+        assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::GadgetDecompose { .. })));
+        assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixBinary(_))));
 
-    fn row(parameters: &DCRTPolyParams, columns: usize, offset: usize) -> DCRTPolyMatrix {
-        DCRTPolyMatrix::from_poly_vec_row(
-            parameters,
-            (0..columns)
-                .map(|index| {
-                    DCRTPoly::const_rotate_poly(
-                        parameters,
-                        (index + offset) % parameters.ring_dimension() as usize,
-                    )
-                })
-                .collect(),
-        )
+        let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
+        for output in ["vectors", "pubkeys"] {
+            let wire = elaborated.wire(&elaborated.outputs[output]).expect("family output");
+            assert!(wire.family.is_some());
+        }
     }
 
     #[test]
-    fn encoding_add_zips_every_component_and_matches_primitive_addition() {
+    fn runtime_addition_zips_every_component_and_matches_primitives() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let columns = parameters.modulus_digits();
-        let vector_type = matrix_type(&parameters, 1, columns);
-        let public_key_type = matrix_type(&parameters, 2, columns);
-        let plaintext_type = matrix_type(&parameters, 1, 1);
-        let mut builder = GraphBuilder::new("naive-add-runtime", Vec::new());
-
-        let mut family = |prefix: &str, matrix_type: &MatrixType| {
-            let values = (0..2)
-                .map(|slot| builder.input(format!("{prefix}_{slot}"), matrix_type.clone()))
-                .collect::<Vec<_>>();
-            builder.family_pack(&values).expect("homogeneous family")
-        };
-        let lhs = NaiveBggEncodingVecWire {
-            vectors: family("lhs_vector", &vector_type),
-            pubkeys: family("lhs_pubkey", &public_key_type),
-            pubkey_reveal_plaintext: true,
-            plaintexts: Some(family("lhs_plaintext", &plaintext_type)),
-        };
-        let rhs = NaiveBggEncodingVecWire {
-            vectors: family("rhs_vector", &vector_type),
-            pubkeys: family("rhs_pubkey", &public_key_type),
-            pubkey_reveal_plaintext: true,
-            plaintexts: Some(family("rhs_plaintext", &plaintext_type)),
-        };
+        let digit_count = parameters.modulus_digits();
+        let columns = 2 * digit_count;
+        let ring = Ring::new(
+            BigInt::from(parameters.modulus().as_ref().clone()),
+            parameters.ring_dimension() as usize,
+        );
         let compiler = NaiveBggVecCompiler {
             public_key: BggPublicKeyCompiler {
-                base: IntExpr::constant(1u64 << parameters.base_bits()),
-                decomposed_type: matrix_type(&parameters, columns, columns),
+                ring: ring.clone(),
+                base: BigInt::from(1u64 << parameters.base_bits()).into(),
+                digit_count: digit_count.into(),
             },
         };
-        let output = compiler.add_encodings(&mut builder, &lhs, &rhs).expect("compatible families");
+        let encoding = |prefix: &str| NaiveBggEncodingVecWire {
+            vectors: Family::pack(
+                (0..2)
+                    .map(|slot| ring.input(format!("{prefix}-vector-{slot}"), (1, columns)))
+                    .collect(),
+            )
+            .unwrap(),
+            pubkeys: Family::pack(
+                (0..2)
+                    .map(|slot| ring.input(format!("{prefix}-public-{slot}"), (2, columns)))
+                    .collect(),
+            )
+            .unwrap(),
+            pubkey_reveal_plaintext: true,
+            plaintexts: Some(
+                Family::pack(
+                    (0..2)
+                        .map(|slot| ring.input(format!("{prefix}-plaintext-{slot}"), (1, 1)))
+                        .collect(),
+                )
+                .unwrap(),
+            ),
+        };
+        let output = compiler.add_encodings(&encoding("lhs"), &encoding("rhs")).unwrap();
+        let plaintexts = output.plaintexts.unwrap();
+        let mut context = DslContext::new("naive-bgg-add-runtime");
         for slot in 0..2 {
-            for (name, output_family) in [
-                ("vector", &output.vectors),
-                ("pubkey", &output.pubkeys),
-                ("plaintext", output.plaintexts.as_ref().expect("revealed plaintexts")),
-            ] {
-                let value = builder.family_get_static(output_family, IntExpr::constant(slot));
-                builder.output(format!("{name}_{slot}"), &value, ArtifactConfidentiality::Public);
-            }
+            context = context
+                .output(format!("vector-{slot}"), output.vectors.get_static(slot))
+                .unwrap()
+                .output(format!("public-{slot}"), output.pubkeys.get_static(slot))
+                .unwrap()
+                .output(format!("plaintext-{slot}"), plaintexts.get_static(slot))
+                .unwrap();
         }
-        let validated = mxx_ir_core::validate(&builder.finish(), &ParamEnv::default())
-            .expect("valid naive-vector graph");
+        let graph = context.build().unwrap();
 
         let mut inputs = BTreeMap::new();
         let mut expected = BTreeMap::new();
         for slot in 0..2 {
-            for (component, matrix_type_columns, offset) in [
-                ("vector", columns, 0),
-                ("pubkey_row_0", columns, 2),
-                ("pubkey_row_1", columns, 4),
-                ("plaintext", 1, 6),
+            let lhs_vector = row(&parameters, columns, slot);
+            let rhs_vector = row(&parameters, columns, slot + 1);
+            let lhs_public = DCRTPolyMatrix::from_poly_vec(
+                &parameters,
+                vec![
+                    row(&parameters, columns, slot + 2).get_row(0),
+                    row(&parameters, columns, slot + 4).get_row(0),
+                ],
+            );
+            let rhs_public = DCRTPolyMatrix::from_poly_vec(
+                &parameters,
+                vec![
+                    row(&parameters, columns, slot + 3).get_row(0),
+                    row(&parameters, columns, slot + 5).get_row(0),
+                ],
+            );
+            let lhs_plaintext = row(&parameters, 1, slot + 6);
+            let rhs_plaintext = row(&parameters, 1, slot + 7);
+            for (name, value) in [
+                (format!("lhs-vector-{slot}"), lhs_vector.clone()),
+                (format!("rhs-vector-{slot}"), rhs_vector.clone()),
+                (format!("lhs-public-{slot}"), lhs_public.clone()),
+                (format!("rhs-public-{slot}"), rhs_public.clone()),
+                (format!("lhs-plaintext-{slot}"), lhs_plaintext.clone()),
+                (format!("rhs-plaintext-{slot}"), rhs_plaintext.clone()),
             ] {
-                let lhs_value = row(&parameters, matrix_type_columns, offset + slot);
-                let rhs_value = row(&parameters, matrix_type_columns, offset + slot + 1);
-                if component.starts_with("pubkey") {
-                    continue;
-                }
-                inputs.insert(
-                    format!("lhs_{component}_{slot}"),
-                    RuntimeValue::matrix(lhs_value.clone()),
-                );
-                inputs.insert(
-                    format!("rhs_{component}_{slot}"),
-                    RuntimeValue::matrix(rhs_value.clone()),
-                );
-                expected.insert(format!("{component}_{slot}"), lhs_value + rhs_value);
+                inputs.insert(name, RuntimeValue::matrix(value));
             }
-            let lhs_pubkey = DCRTPolyMatrix::from_poly_vec(
-                &parameters,
-                vec![
-                    row(&parameters, columns, 2 + slot).get_row(0),
-                    row(&parameters, columns, 4 + slot).get_row(0),
-                ],
-            );
-            let rhs_pubkey = DCRTPolyMatrix::from_poly_vec(
-                &parameters,
-                vec![
-                    row(&parameters, columns, 3 + slot).get_row(0),
-                    row(&parameters, columns, 5 + slot).get_row(0),
-                ],
-            );
-            inputs.insert(format!("lhs_pubkey_{slot}"), RuntimeValue::matrix(lhs_pubkey.clone()));
-            inputs.insert(format!("rhs_pubkey_{slot}"), RuntimeValue::matrix(rhs_pubkey.clone()));
-            expected.insert(format!("pubkey_{slot}"), lhs_pubkey + rhs_pubkey);
+            expected.insert(format!("vector-{slot}"), lhs_vector + rhs_vector);
+            expected.insert(format!("public-{slot}"), lhs_public + rhs_public);
+            expected.insert(format!("plaintext-{slot}"), lhs_plaintext + rhs_plaintext);
         }
-        let mut backend = cpu_backend([parameters]);
-        let mut store = MemoryArtifactStore::default();
-        let result = execute(&validated, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-            .expect("naive-vector graph execution");
+        let result = execute_graph(graph, parameters, inputs);
         for (name, expected) in expected {
-            let RuntimeValue::Matrix(actual) = &result.outputs[&name] else {
-                panic!("{name} output must be a matrix");
-            };
-            assert_eq!(actual.as_ref(), &expected);
+            assert_eq!(matrix_output(&result, &name), &expected, "{name}");
         }
-        assert!(output.pubkey_reveal_plaintext);
-        assert!(output.plaintexts.is_some());
     }
 
     #[test]
-    fn arbitrary_matrix_multiplication_matches_primitive_decomposition() {
+    fn runtime_matrix_multiplication_matches_primitive_decomposition() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let columns = 2 * parameters.modulus_digits();
-        let vector_type = matrix_type(&parameters, 1, columns);
-        let public_key_type = matrix_type(&parameters, 2, columns);
-        let plaintext_type = matrix_type(&parameters, 1, 1);
-        let target_type = matrix_type(&parameters, 2, 1);
-        let mut builder = GraphBuilder::new("naive-matrix-mul-runtime", Vec::new());
-        let vector_input = builder.input("vector", vector_type);
-        let public_key_input = builder.input("public_key", public_key_type);
-        let plaintext_input = builder.input("plaintext", plaintext_type);
-        let target_input = builder.input("target", target_type);
-        let vectors = builder.family_pack(&[vector_input]).expect("vector family");
-        let public_keys = builder.family_pack(&[public_key_input]).expect("public-key family");
-        let plaintexts = builder.family_pack(&[plaintext_input]).expect("plaintext family");
+        let digit_count = parameters.modulus_digits();
+        let columns = 2 * digit_count;
+        let ring = Ring::new(
+            BigInt::from(parameters.modulus().as_ref().clone()),
+            parameters.ring_dimension() as usize,
+        );
         let compiler = NaiveBggVecCompiler {
             public_key: BggPublicKeyCompiler {
-                base: IntExpr::constant(1u64 << parameters.base_bits()),
-                decomposed_type: matrix_type(&parameters, columns, columns),
+                ring: ring.clone(),
+                base: BigInt::from(1u64 << parameters.base_bits()).into(),
+                digit_count: digit_count.into(),
             },
         };
-        let output = compiler
-            .matrix_mul_encodings(
-                &mut builder,
-                &NaiveBggEncodingVecWire {
-                    vectors,
-                    pubkeys: public_keys,
-                    pubkey_reveal_plaintext: true,
-                    plaintexts: Some(plaintexts),
-                },
-                &target_input,
-            )
-            .expect("compatible matrix multiplication");
-        let output_vector = builder.family_get_static(&output.vectors, IntExpr::constant(0));
-        let output_public_key = builder.family_get_static(&output.pubkeys, IntExpr::constant(0));
-        builder.output("vector", &output_vector, ArtifactConfidentiality::Public);
-        builder.output("public_key", &output_public_key, ArtifactConfidentiality::Public);
-        let validated = mxx_ir_core::validate(&builder.finish(), &ParamEnv::default())
-            .expect("valid matrix-multiplication graph");
+        let input = NaiveBggEncodingVecWire {
+            vectors: Family::pack(vec![ring.input("vector", (1, columns))]).unwrap(),
+            pubkeys: Family::pack(vec![ring.input("public", (2, columns))]).unwrap(),
+            pubkey_reveal_plaintext: true,
+            plaintexts: Some(Family::pack(vec![ring.input("plaintext", (1, 1))]).unwrap()),
+        };
+        let target = ring.input("target", (2, 1));
+        let output = compiler.matrix_mul_encodings(&input, &target).unwrap();
+        let graph = DslContext::new("naive-bgg-matrix-mul-runtime")
+            .output("vector", output.vectors.get_static(0))
+            .unwrap()
+            .output("public", output.pubkeys.get_static(0))
+            .unwrap()
+            .build()
+            .unwrap();
 
         let vector = row(&parameters, columns, 0);
-        let public_key = DCRTPolyMatrix::from_poly_vec(
+        let public = DCRTPolyMatrix::from_poly_vec(
             &parameters,
             vec![row(&parameters, columns, 2).get_row(0), row(&parameters, columns, 4).get_row(0)],
         );
         let plaintext = row(&parameters, 1, 6);
         let target = DCRTPolyMatrix::unit_column_vector(&parameters, 2, 1);
-        let expected_vector = vector.mul_decompose(&target);
-        let expected_public_key = public_key.mul_decompose(&target);
-        let mut backend = cpu_backend([parameters]);
-        let mut store = MemoryArtifactStore::default();
-        let result = execute(
-            &validated,
-            &mut backend,
+        let result = execute_graph(
+            graph,
+            parameters,
             BTreeMap::from([
-                ("vector".to_owned(), RuntimeValue::matrix(vector)),
-                ("public_key".to_owned(), RuntimeValue::matrix(public_key)),
+                ("vector".to_owned(), RuntimeValue::matrix(vector.clone())),
+                ("public".to_owned(), RuntimeValue::matrix(public.clone())),
                 ("plaintext".to_owned(), RuntimeValue::matrix(plaintext)),
-                ("target".to_owned(), RuntimeValue::matrix(target)),
+                ("target".to_owned(), RuntimeValue::matrix(target.clone())),
             ]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .expect("matrix-multiplication execution");
-        let RuntimeValue::Matrix(actual_vector) = &result.outputs["vector"] else {
-            panic!("vector output must be a matrix");
-        };
-        let RuntimeValue::Matrix(actual_public_key) = &result.outputs["public_key"] else {
-            panic!("public-key output must be a matrix");
-        };
-        assert_eq!(actual_vector.as_ref(), &expected_vector);
-        assert_eq!(actual_public_key.as_ref(), &expected_public_key);
+        );
+        assert_eq!(matrix_output(&result, "vector"), &vector.mul_decompose(&target));
+        assert_eq!(matrix_output(&result, "public"), &public.mul_decompose(&target));
         assert!(output.plaintexts.is_none());
     }
 }

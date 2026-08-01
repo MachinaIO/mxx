@@ -1,22 +1,17 @@
+//! Declarative BGG+ public-key and encoding samplers.
+
 use crate::{
     BggEncodingWire, BggPolyEncodingWire, BggPublicKeyWire, NaiveBggEncodingVecWire,
     NaiveBggPublicKeyVecWire,
 };
+use mxx_dsl::{Bytes, Family, HashTag, Mat, Parallel, Ring, parallel_zip};
 use mxx_ir_core::{
-    GraphBuilder, IntExpr, MatrixFamilyWire, MatrixWire, RealExpr, SubgraphBuildError, WireRef,
-    node::{
-        ConcatAxis, ConstantMatrix, HashVariant, IndexRange, LoopInputMode, MatrixBinaryOp,
-        SampleRange,
-    },
-    types::MatrixType,
+    IntExpr, RealExpr,
+    node::{ConcatAxis, IndexRange},
 };
-use num_bigint::BigInt;
+use rayon::prelude::*;
 use thiserror::Error;
 
-/// Explicit BGG+ matrix layout used by the Graph IR samplers.
-///
-/// `digit_count` is deliberately explicit: the sampler graph must not infer a
-/// backend gadget layout from the modulus.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BggSamplerLayout {
     pub modulus: IntExpr,
@@ -27,24 +22,8 @@ pub struct BggSamplerLayout {
 }
 
 impl BggSamplerLayout {
-    pub fn scalar_type(&self) -> MatrixType {
-        self.matrix_type(1, 1)
-    }
-
-    pub fn secret_type(&self) -> MatrixType {
-        self.matrix_type(1, self.secret_dimension)
-    }
-
-    pub fn public_key_type(&self) -> MatrixType {
-        self.matrix_type(self.secret_dimension, self.public_key_columns())
-    }
-
-    pub fn vector_type(&self) -> MatrixType {
-        self.matrix_type(1, self.public_key_columns())
-    }
-
-    pub fn slot_secret_type(&self) -> MatrixType {
-        self.matrix_type(self.secret_dimension, self.secret_dimension)
+    pub fn ring(&self) -> Ring {
+        Ring::new(self.modulus.clone(), self.ring_dimension.clone())
     }
 
     pub fn public_key_columns(&self) -> usize {
@@ -52,120 +31,353 @@ impl BggSamplerLayout {
             .checked_mul(self.digit_count)
             .expect("BGG+ public-key column count overflow")
     }
-
-    fn matrix_type(&self, rows: usize, columns: usize) -> MatrixType {
-        MatrixType {
-            modulus: self.modulus.clone(),
-            ring_dimension: self.ring_dimension.clone(),
-            rows: IntExpr::constant(rows),
-            columns: IntExpr::constant(columns),
-        }
-    }
-
-    fn packed_public_key_type(&self, count: usize) -> MatrixType {
-        self.matrix_type(
-            self.secret_dimension,
-            self.public_key_columns()
-                .checked_mul(count)
-                .expect("packed BGG+ public-key column count overflow"),
-        )
-    }
-
-    fn packed_vector_type(&self, count: usize) -> MatrixType {
-        self.matrix_type(
-            1,
-            self.public_key_columns()
-                .checked_mul(count)
-                .expect("packed BGG+ vector column count overflow"),
-        )
-    }
-
-    fn plaintext_row_type(&self, count: usize) -> MatrixType {
-        self.matrix_type(1, count)
-    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BggPublicKeySampler {
     pub layout: BggSamplerLayout,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BggEncodingSampler {
     pub layout: BggSamplerLayout,
     pub gaussian_sigma: Option<RealExpr>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BggPolyEncodingSampler {
     pub layout: BggSamplerLayout,
     pub gaussian_sigma: Option<RealExpr>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NaiveBggPublicKeyVecSampler {
     pub layout: BggSamplerLayout,
     pub slot_count: IntExpr,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NaiveBggEncodingVecSampler {
     pub scalar: BggEncodingSampler,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct BggPolyEncodingSample {
     pub encodings: Vec<BggPolyEncodingWire>,
-    pub slot_secret_matrices: MatrixFamilyWire,
+    pub slot_secret_matrices: Family<Mat>,
 }
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum BggSampleError {
     #[error("BGG+ sampling requires public_keys.len() == plaintexts.len() + 1")]
     InputCountMismatch,
-    #[error("BGG+ sampler received a secret vector with the wrong matrix type")]
-    SecretTypeMismatch,
-    #[error("BGG+ sampler received a public key with the wrong matrix type")]
-    PublicKeyTypeMismatch,
-    #[error("BGG+ sampler received a plaintext with the wrong matrix type")]
-    PlaintextTypeMismatch,
+    #[error("BGG+ sampler received an incompatible matrix type")]
+    MatrixTypeMismatch,
     #[error("BGG+ polynomial sampler families must have matching slot counts")]
     SlotCountMismatch,
-    #[error("BGG+ polynomial sampler received a slot-secret family with the wrong matrix type")]
-    SlotSecretTypeMismatch,
     #[error(transparent)]
-    Subgraph(#[from] SubgraphBuildError),
+    Dsl(#[from] mxx_dsl::DslError),
+}
+
+impl BggPolyEncodingSampler {
+    pub fn sample(
+        &self,
+        secret: Mat,
+        public_keys: &[BggPublicKeyWire],
+        plaintexts: &[Family<Mat>],
+        slot_count: IntExpr,
+        supplied_slot_secrets: Option<Family<Mat>>,
+    ) -> Result<BggPolyEncodingSample, BggSampleError> {
+        if public_keys.len() != plaintexts.len() + 1 {
+            return Err(BggSampleError::InputCountMismatch);
+        }
+        let ring = self.layout.ring();
+        let secret_size = self.layout.secret_dimension;
+        if !same_matrix_type(secret.matrix_type(), &ring.matrix_type((1, secret_size))) ||
+            public_keys.par_iter().any(|key| {
+                !same_matrix_type(
+                    key.matrix.matrix_type(),
+                    &ring.matrix_type((secret_size, self.layout.public_key_columns())),
+                )
+            }) ||
+            plaintexts.par_iter().any(|family| {
+                family.count() != &slot_count ||
+                    !same_matrix_type(family.element_type(), &ring.matrix_type((1, 1)))
+            })
+        {
+            return Err(BggSampleError::MatrixTypeMismatch);
+        }
+        let (slot_secrets, transformed_secrets) = if let Some(slot_secrets) = supplied_slot_secrets
+        {
+            if slot_secrets.count() != &slot_count ||
+                !same_matrix_type(
+                    slot_secrets.element_type(),
+                    &ring.matrix_type((secret_size, secret_size)),
+                )
+            {
+                return Err(BggSampleError::SlotCountMismatch);
+            }
+            let transformed = slot_secrets.clone().parallel_map({
+                let secret = secret.clone();
+                move |_, slot_secret| secret.clone() * slot_secret
+            })?;
+            (slot_secrets, transformed)
+        } else {
+            let (transformed, sampled) = Parallel::range(slot_count.clone()).map_values({
+                let ring = ring.clone();
+                let secret = secret.clone();
+                move |_| {
+                    let slot_secret = ring.uniform_in((secret_size, secret_size), -1, 1);
+                    (secret.clone() * slot_secret.clone(), slot_secret)
+                }
+            })?;
+            (sampled, transformed)
+        };
+        let ones = transformed_secrets.clone().parallel_map({
+            let ring = ring.clone();
+            move |_, _| ring.identity(1)
+        })?;
+        let plaintext_rows = plaintexts.iter().cloned().reduce(|left, right| {
+            left.parallel_zip(right, |_, left, right| {
+                Mat::concat(ConcatAxis::Columns, vec![left, right])
+            })
+            .expect("validated family counts")
+        });
+        let encoded_plaintexts = match plaintext_rows {
+            Some(rows) => ones.clone().parallel_zip(rows, |_, one, row| {
+                Mat::concat(ConcatAxis::Columns, vec![one, row])
+            })?,
+            None => ones.clone(),
+        };
+        let packed_public = Mat::concat(
+            ConcatAxis::Columns,
+            public_keys.iter().map(|key| key.matrix.clone()).collect(),
+        );
+        let count = public_keys.len();
+        let columns = self.layout.public_key_columns();
+        let gadget =
+            ring.gadget(secret_size, self.layout.gadget_base.clone(), self.layout.digit_count);
+        let sigma = self.gaussian_sigma.clone();
+        let vector_families = parallel_zip(
+            (transformed_secrets, encoded_plaintexts),
+            move |_, (secret, encoded_plaintexts)| {
+                let packed = secret.clone() * packed_public.clone() -
+                    encoded_plaintexts.tensor(secret * gadget.clone()) +
+                    match &sigma {
+                        Some(sigma) => ring.gaussian((1, columns * count), sigma.clone()),
+                        None => ring.zero((1, columns * count)),
+                    };
+                (0..count)
+                    .map(|index| {
+                        packed.clone().slice(
+                            None,
+                            Some(IndexRange {
+                                start: (columns * index).into(),
+                                end: (columns * (index + 1)).into(),
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )?;
+        let encodings = vector_families
+            .into_iter()
+            .enumerate()
+            .map(|(index, vectors)| BggPolyEncodingWire {
+                vectors,
+                pubkey: public_keys[index].clone(),
+                plaintexts: public_keys[index]
+                    .reveal_plaintext
+                    .then(|| if index == 0 { ones.clone() } else { plaintexts[index - 1].clone() }),
+            })
+            .collect();
+        Ok(BggPolyEncodingSample { encodings, slot_secret_matrices: slot_secrets })
+    }
+}
+
+impl NaiveBggPublicKeyVecSampler {
+    pub fn sample(
+        &self,
+        hash_key: Bytes,
+        tag: &[u8],
+        reveal_plaintexts: &[bool],
+    ) -> Result<Vec<NaiveBggPublicKeyVecWire>, BggSampleError> {
+        let outputs = (0..=reveal_plaintexts.len())
+            .map(|output| {
+                let reveal = output == 0 || reveal_plaintexts[output - 1];
+                let packed_count = if output == 0 { 1 } else { 2 };
+                let mut prefix = tag.to_vec();
+                prefix.extend_from_slice(&(output as u64).to_le_bytes());
+                let family = Parallel::range(self.slot_count.clone()).map({
+                    let ring = self.layout.ring();
+                    let key = hash_key.clone();
+                    move |slot| {
+                        let mut tag = HashTag::from(prefix.clone());
+                        tag.push(slot);
+                        let packed = ring.hash_matrix(
+                            key.clone(),
+                            tag,
+                            (
+                                self.layout.secret_dimension,
+                                self.layout.public_key_columns() * packed_count,
+                            ),
+                        );
+                        if output == 0 {
+                            packed
+                        } else {
+                            packed.slice(
+                                None,
+                                Some(IndexRange {
+                                    start: self.layout.public_key_columns().into(),
+                                    end: (self.layout.public_key_columns() * 2).into(),
+                                }),
+                            )
+                        }
+                    }
+                })?;
+                Ok(NaiveBggPublicKeyVecWire { matrices: family, reveal_plaintext: reveal })
+            })
+            .collect::<Result<Vec<_>, BggSampleError>>()?;
+        Ok(outputs)
+    }
+}
+
+impl NaiveBggEncodingVecSampler {
+    pub fn sample(
+        &self,
+        secret: Mat,
+        public_keys: &[NaiveBggPublicKeyVecWire],
+        plaintexts: &[Family<Mat>],
+    ) -> Result<Vec<NaiveBggEncodingVecWire>, BggSampleError> {
+        if public_keys.len() != plaintexts.len() + 1 {
+            return Err(BggSampleError::InputCountMismatch);
+        }
+        let slot_count = public_keys[0].matrices.count().clone();
+        if public_keys.par_iter().any(|key| key.matrices.count() != &slot_count) ||
+            plaintexts.par_iter().any(|value| value.count() != &slot_count)
+        {
+            return Err(BggSampleError::SlotCountMismatch);
+        }
+        let layout = &self.scalar.layout;
+        let ring = layout.ring();
+        if !same_matrix_type(secret.matrix_type(), &ring.matrix_type((1, layout.secret_dimension))) ||
+            public_keys.par_iter().any(|key| {
+                !same_matrix_type(
+                    key.matrices.element_type(),
+                    &ring.matrix_type((layout.secret_dimension, layout.public_key_columns())),
+                )
+            }) ||
+            plaintexts
+                .par_iter()
+                .any(|value| !same_matrix_type(value.element_type(), &ring.matrix_type((1, 1))))
+        {
+            return Err(BggSampleError::MatrixTypeMismatch);
+        }
+        let outputs = (0..public_keys.len())
+            .map(|output| {
+                let vectors = if output == 0 {
+                    public_keys[0].matrices.clone().parallel_map({
+                        let sampler = self.scalar.clone();
+                        let secret = secret.clone();
+                        let reveal = public_keys[0].reveal_plaintext;
+                        move |_, one_key| {
+                            sampler
+                                .sample(
+                                    secret.clone(),
+                                    &[BggPublicKeyWire {
+                                        matrix: one_key,
+                                        reveal_plaintext: reveal,
+                                    }],
+                                    &[],
+                                )
+                                .expect("validated scalar sampler")
+                                .remove(0)
+                                .vector
+                        }
+                    })?
+                } else {
+                    parallel_zip(
+                        (
+                            public_keys[0].matrices.clone(),
+                            public_keys[output].matrices.clone(),
+                            plaintexts[output - 1].clone(),
+                        ),
+                        {
+                            let sampler = self.scalar.clone();
+                            let secret = secret.clone();
+                            let one_reveal = public_keys[0].reveal_plaintext;
+                            let reveal = public_keys[output].reveal_plaintext;
+                            move |_, (one_key, key, plaintext)| {
+                                sampler
+                                    .sample(
+                                        secret.clone(),
+                                        &[
+                                            BggPublicKeyWire {
+                                                matrix: one_key,
+                                                reveal_plaintext: one_reveal,
+                                            },
+                                            BggPublicKeyWire {
+                                                matrix: key,
+                                                reveal_plaintext: reveal,
+                                            },
+                                        ],
+                                        &[plaintext],
+                                    )
+                                    .expect("validated scalar sampler")
+                                    .remove(1)
+                                    .vector
+                            }
+                        },
+                    )?
+                };
+                Ok(NaiveBggEncodingVecWire {
+                    vectors,
+                    pubkeys: public_keys[output].matrices.clone(),
+                    pubkey_reveal_plaintext: public_keys[output].reveal_plaintext,
+                    plaintexts: public_keys[output].reveal_plaintext.then(|| {
+                        if output == 0 {
+                            public_keys[0]
+                                .matrices
+                                .clone()
+                                .parallel_map({
+                                    let ring = self.scalar.layout.ring();
+                                    move |_, _| ring.identity(1)
+                                })
+                                .expect("family")
+                        } else {
+                            plaintexts[output - 1].clone()
+                        }
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>, BggSampleError>>()?;
+        Ok(outputs)
+    }
 }
 
 impl BggPublicKeySampler {
-    /// Reproduces the legacy public-key sampler as one hash-sampled packed
-    /// matrix followed by column slices. The first key always reveals the
-    /// constant-one plaintext.
+    /// Samples the packed public matrices once and exposes deterministic slices.
     pub fn sample(
         &self,
-        builder: &mut GraphBuilder,
-        hash_key: WireRef,
-        tag: &[u8],
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
         reveal_plaintexts: &[bool],
     ) -> Vec<BggPublicKeyWire> {
         let count = reveal_plaintexts.len() + 1;
-        let all = builder.hash_sample(
-            hash_key,
-            self.layout.packed_public_key_type(count),
-            HashVariant::Plain,
-            tag.to_vec(),
-            Vec::new(),
-            None,
-            None,
-        );
         let columns = self.layout.public_key_columns();
+        let packed = self.layout.ring().hash_matrix(
+            hash_key,
+            tag,
+            (self.layout.secret_dimension, columns * count),
+        );
         (0..count)
             .map(|index| BggPublicKeyWire {
-                matrix: builder.slice(
-                    &all,
+                matrix: packed.clone().slice(
                     None,
-                    Some(IndexRange { start: columns * index, end: columns * (index + 1) }),
-                    self.layout.public_key_type(),
+                    Some(IndexRange {
+                        start: (columns * index).into(),
+                        end: (columns * (index + 1)).into(),
+                    }),
                 ),
                 reveal_plaintext: index == 0 || reveal_plaintexts[index - 1],
             })
@@ -174,479 +386,89 @@ impl BggPublicKeySampler {
 }
 
 impl BggEncodingSampler {
-    /// Emits the exact BGG+ relation used by the former concrete sampler:
-    ///
-    /// `s * [A_0 | ... | A_t] - [1 | x_1 | ... | x_t] tensor (s * G) + e`.
+    /// Builds the packed relation `sA - ([1|x_1|...|x_t] tensor sG) + e`, then
+    /// exposes its column slices. This preserves the executable dataflow of the
+    /// original sampler; the symbolic layer represents Concat and Tensor
+    /// directly without changing the runtime formula.
     pub fn sample(
         &self,
-        builder: &mut GraphBuilder,
-        secret: &MatrixWire,
+        secret: Mat,
         public_keys: &[BggPublicKeyWire],
-        plaintexts: &[MatrixWire],
+        plaintexts: &[Mat],
     ) -> Result<Vec<BggEncodingWire>, BggSampleError> {
-        validate_inputs(&self.layout, secret, public_keys, plaintexts)?;
-        let count = public_keys.len();
-        let all_public_keys = builder.concat(
-            ConcatAxis::Columns,
-            &public_keys.iter().map(|key| key.matrix.clone()).collect::<Vec<_>>(),
-            self.layout.packed_public_key_type(count),
-        );
-        let one = builder.constant_matrix(self.layout.scalar_type(), ConstantMatrix::Identity);
-        let mut extended_plaintexts = Vec::with_capacity(count);
-        extended_plaintexts.push(one);
-        extended_plaintexts.extend_from_slice(plaintexts);
-        let encoded_plaintexts = builder.concat(
-            ConcatAxis::Columns,
-            &extended_plaintexts,
-            self.layout.plaintext_row_type(count),
-        );
-        let all_vector = sample_packed_encoding(
-            builder,
-            &self.layout,
-            self.gaussian_sigma.as_ref(),
-            secret,
-            &all_public_keys,
-            &encoded_plaintexts,
-            count,
-        );
-        Ok(slice_encodings(
-            builder,
-            &self.layout,
-            &all_vector,
-            public_keys,
-            extended_plaintexts.into_iter(),
-        ))
-    }
-}
-
-impl BggPolyEncodingSampler {
-    /// Samples all slot-local BGG+ vectors in one bounded parallel-loop graph.
-    ///
-    /// A supplied slot-secret family is consumed with `Zip`. Otherwise each
-    /// loop instance samples one ternary secret matrix and returns the family
-    /// so callers can persist or reuse it.
-    pub fn sample(
-        &self,
-        builder: &mut GraphBuilder,
-        secret: &MatrixWire,
-        public_keys: &[BggPublicKeyWire],
-        plaintexts: &[MatrixFamilyWire],
-        slot_count: IntExpr,
-        slot_secret_matrices: Option<&MatrixFamilyWire>,
-    ) -> Result<BggPolyEncodingSample, BggSampleError> {
-        validate_poly_inputs(
-            &self.layout,
-            secret,
-            public_keys,
-            plaintexts,
-            &slot_count,
-            slot_secret_matrices,
-        )?;
-        let count = public_keys.len();
-        let all_public_keys = builder.concat(
-            ConcatAxis::Columns,
-            &public_keys.iter().map(|key| key.matrix.clone()).collect::<Vec<_>>(),
-            self.layout.packed_public_key_type(count),
-        );
-
-        let mut body = GraphBuilder::new(
-            format!(
-                "bgg-poly-sample-{}-{}",
-                count,
-                if slot_secret_matrices.is_some() { "supplied-secret" } else { "fresh-secret" }
-            ),
-            Vec::new(),
-        );
-        let body_secret = body.input("00000000000000000000_secret", self.layout.secret_type());
-        let body_public_keys = body
-            .input("00000000000000000001_public_keys", self.layout.packed_public_key_type(count));
-        let mut args = vec![secret.wire, all_public_keys.wire];
-        let mut input_modes = vec![LoopInputMode::Broadcast, LoopInputMode::Broadcast];
-
-        let body_slot_secret = if let Some(slot_secrets) = slot_secret_matrices {
-            args.push(slot_secrets.wire);
-            input_modes.push(LoopInputMode::Zip);
-            body.input("00000000000000000002_slot_secret", self.layout.slot_secret_type())
-        } else {
-            body.uniform_sample(
-                self.layout.slot_secret_type(),
-                SampleRange { minimum: BigInt::from(-1), maximum: BigInt::from(1) },
-            )
-        };
-        let transformed_secret = body.matrix_binary(
-            MatrixBinaryOp::Multiply,
-            &body_secret,
-            &body_slot_secret,
-            self.layout.secret_type(),
-        );
-
-        let one = body.constant_matrix(self.layout.scalar_type(), ConstantMatrix::Identity);
-        let mut extended_plaintexts = Vec::with_capacity(count);
-        extended_plaintexts.push(one.clone());
-        for (index, plaintexts) in plaintexts.iter().enumerate() {
-            args.push(plaintexts.wire);
-            input_modes.push(LoopInputMode::Zip);
-            extended_plaintexts.push(
-                body.input(format!("{:020}_plaintext", index + 3), self.layout.scalar_type()),
-            );
-        }
-        let encoded_plaintexts = body.concat(
-            ConcatAxis::Columns,
-            &extended_plaintexts,
-            self.layout.plaintext_row_type(count),
-        );
-        let all_vector = sample_packed_encoding(
-            &mut body,
-            &self.layout,
-            self.gaussian_sigma.as_ref(),
-            &transformed_secret,
-            &body_public_keys,
-            &encoded_plaintexts,
-            count,
-        );
-
-        let columns = self.layout.public_key_columns();
-        let mut output_types = Vec::with_capacity(count + 2);
-        for index in 0..count {
-            let vector = body.slice(
-                &all_vector,
-                None,
-                Some(IndexRange { start: columns * index, end: columns * (index + 1) }),
-                self.layout.vector_type(),
-            );
-            body.value_output_wire(format!("{index:020}_vector"), vector.wire);
-            output_types.push(self.layout.vector_type());
-        }
-        let fresh_secret_output = slot_secret_matrices.is_none();
-        if fresh_secret_output {
-            body.value_output_wire(format!("{count:020}_slot_secret"), body_slot_secret.wire);
-            output_types.push(self.layout.slot_secret_type());
-        }
-        let constant_plaintext_output = public_keys[0].reveal_plaintext;
-        if constant_plaintext_output {
-            let output_index = count + usize::from(fresh_secret_output);
-            body.value_output_wire(format!("{output_index:020}_constant_plaintext"), one.wire);
-            output_types.push(self.layout.scalar_type());
-        }
-
-        let mut outputs = builder.parallel_loop(
-            body.finish(),
-            slot_count,
-            "slot",
-            Vec::new(),
-            args,
-            input_modes,
-            &output_types,
-        )?;
-        let vector_families = outputs.drain(..count).collect::<Vec<_>>();
-        let slot_secret_matrices = if fresh_secret_output {
-            outputs.remove(0)
-        } else {
-            slot_secret_matrices.expect("validated supplied slot-secret family").clone()
-        };
-        let constant_plaintexts = constant_plaintext_output.then(|| outputs.remove(0));
-
-        let encodings = vector_families
-            .into_iter()
-            .enumerate()
-            .map(|(index, vectors)| BggPolyEncodingWire {
-                vectors,
-                pubkey: public_keys[index].clone(),
-                plaintexts: if !public_keys[index].reveal_plaintext {
-                    None
-                } else if index == 0 {
-                    constant_plaintexts.clone()
-                } else {
-                    Some(plaintexts[index - 1].clone())
-                },
-            })
-            .collect();
-        Ok(BggPolyEncodingSample { encodings, slot_secret_matrices })
-    }
-}
-
-impl NaiveBggPublicKeyVecSampler {
-    /// Reproduces the legacy per-output, per-slot hash namespace without
-    /// unrolling the slot family into the parent graph.
-    pub fn sample(
-        &self,
-        builder: &mut GraphBuilder,
-        hash_key: WireRef,
-        tag: &[u8],
-        reveal_plaintexts: &[bool],
-    ) -> Result<Vec<NaiveBggPublicKeyVecWire>, BggSampleError> {
-        let mut outputs = Vec::with_capacity(reveal_plaintexts.len() + 1);
-        for output_index in 0..=reveal_plaintexts.len() {
-            let reveal_plaintext = output_index == 0 || reveal_plaintexts[output_index - 1];
-            let packed_count = if output_index == 0 { 1 } else { 2 };
-            let mut body = GraphBuilder::new(
-                format!("naive-bgg-public-key-sample-{output_index}"),
-                Vec::new(),
-            );
-            let body_key = body.bytes_input("0_hash_key", 32);
-            let mut tag_prefix = tag.to_vec();
-            tag_prefix.extend_from_slice(&(output_index as u64).to_le_bytes());
-            let all = body.hash_sample_with_encoded_tags(
-                body_key,
-                self.layout.packed_public_key_type(packed_count),
-                HashVariant::Plain,
-                tag_prefix,
-                Vec::new(),
-                Vec::new(),
-                vec![IntExpr::Var("slot".to_owned())],
-                None,
-                None,
-            );
-            let matrix = if output_index == 0 {
-                all
-            } else {
-                let columns = self.layout.public_key_columns();
-                body.slice(
-                    &all,
-                    None,
-                    Some(IndexRange { start: columns, end: columns * 2 }),
-                    self.layout.public_key_type(),
-                )
-            };
-            body.value_output_wire("0_matrix", matrix.wire);
-            let mut families = builder.nonempty_parallel_loop(
-                body.finish(),
-                self.slot_count.clone(),
-                "slot",
-                Vec::new(),
-                vec![hash_key],
-                vec![LoopInputMode::Broadcast],
-                &[self.layout.public_key_type()],
-            )?;
-            outputs
-                .push(NaiveBggPublicKeyVecWire { matrices: families.remove(0), reveal_plaintext });
-        }
-        Ok(outputs)
-    }
-}
-
-impl NaiveBggEncodingVecSampler {
-    /// Samples each logical output in its own slot loop, preserving the
-    /// legacy sampler's independent packed Gaussian draw per output and slot.
-    pub fn sample(
-        &self,
-        builder: &mut GraphBuilder,
-        secret: &MatrixWire,
-        public_keys: &[NaiveBggPublicKeyVecWire],
-        plaintexts: &[MatrixFamilyWire],
-    ) -> Result<Vec<NaiveBggEncodingVecWire>, BggSampleError> {
         if public_keys.len() != plaintexts.len() + 1 {
             return Err(BggSampleError::InputCountMismatch);
         }
-        if secret.matrix_type != self.scalar.layout.secret_type() {
-            return Err(BggSampleError::SecretTypeMismatch);
+        let count = public_keys.len();
+        let columns = self.layout.public_key_columns();
+        let ring = self.layout.ring();
+        let secret_type = ring.matrix_type((1, self.layout.secret_dimension));
+        let public_key_type = ring.matrix_type((self.layout.secret_dimension, columns));
+        let plaintext_type = ring.matrix_type((1, 1));
+        if !same_matrix_type(secret.matrix_type(), &secret_type) ||
+            public_keys
+                .par_iter()
+                .any(|key| !same_matrix_type(key.matrix.matrix_type(), &public_key_type)) ||
+            plaintexts
+                .par_iter()
+                .any(|plaintext| !same_matrix_type(plaintext.matrix_type(), &plaintext_type))
+        {
+            return Err(BggSampleError::MatrixTypeMismatch);
         }
-        let slot_count = public_keys[0].matrices.count.clone();
-        for public_key in public_keys {
-            if public_key.matrices.count != slot_count {
-                return Err(BggSampleError::SlotCountMismatch);
-            }
-            if public_key.matrices.matrix_type != self.scalar.layout.public_key_type() {
-                return Err(BggSampleError::PublicKeyTypeMismatch);
-            }
-        }
-        for plaintext in plaintexts {
-            if plaintext.count != slot_count {
-                return Err(BggSampleError::SlotCountMismatch);
-            }
-            if plaintext.matrix_type != self.scalar.layout.scalar_type() {
-                return Err(BggSampleError::PlaintextTypeMismatch);
-            }
-        }
-
-        let mut outputs = Vec::with_capacity(public_keys.len());
-        for output_index in 0..public_keys.len() {
-            let mut body = GraphBuilder::new(
-                format!(
-                    "naive-bgg-encoding-sample-{output_index}-{}",
-                    if public_keys[output_index].reveal_plaintext { "revealed" } else { "hidden" }
+        let all_public_keys = Mat::concat(
+            ConcatAxis::Columns,
+            public_keys.iter().map(|key| key.matrix.clone()).collect(),
+        );
+        let one = ring.identity(1);
+        let mut extended_plaintexts = Vec::with_capacity(count);
+        extended_plaintexts.push(one);
+        extended_plaintexts.extend(plaintexts.iter().cloned());
+        let encoded_plaintexts = Mat::concat(ConcatAxis::Columns, extended_plaintexts.clone());
+        let gadget = ring.gadget(
+            self.layout.secret_dimension,
+            self.layout.gadget_base.clone(),
+            self.layout.digit_count,
+        );
+        let packed_vector = secret.clone() * all_public_keys -
+            encoded_plaintexts.tensor(secret.clone() * gadget) +
+            match &self.gaussian_sigma {
+                Some(sigma) => ring.gaussian((1, columns * count), sigma.clone()),
+                None => ring.zero((1, columns * count)),
+            };
+        Ok((0..count)
+            .map(|index| BggEncodingWire {
+                vector: packed_vector.clone().slice(
+                    None,
+                    Some(IndexRange {
+                        start: (columns * index).into(),
+                        end: (columns * (index + 1)).into(),
+                    }),
                 ),
-                Vec::new(),
-            );
-            let body_secret = body.input("0_secret", self.scalar.layout.secret_type());
-            let one_public_key = BggPublicKeyWire {
-                matrix: body.input("1_one_public_key", self.scalar.layout.public_key_type()),
-                reveal_plaintext: public_keys[0].reveal_plaintext,
-            };
-            let mut args = vec![secret.wire, public_keys[0].matrices.wire];
-            let mut modes = vec![LoopInputMode::Broadcast, LoopInputMode::Zip];
-            let selected = if output_index == 0 {
-                self.scalar.sample(&mut body, &body_secret, &[one_public_key], &[])?.remove(0)
-            } else {
-                let public_key = BggPublicKeyWire {
-                    matrix: body.input("2_public_key", self.scalar.layout.public_key_type()),
-                    reveal_plaintext: public_keys[output_index].reveal_plaintext,
-                };
-                let plaintext = body.input("3_plaintext", self.scalar.layout.scalar_type());
-                args.extend([
-                    public_keys[output_index].matrices.wire,
-                    plaintexts[output_index - 1].wire,
-                ]);
-                modes.extend([LoopInputMode::Zip, LoopInputMode::Zip]);
-                self.scalar
-                    .sample(&mut body, &body_secret, &[one_public_key, public_key], &[plaintext])?
-                    .remove(1)
-            };
-            body.value_output_wire("0_vector", selected.vector.wire);
-            let mut output_types = vec![self.scalar.layout.vector_type()];
-            let constant_plaintext_output = output_index == 0 && selected.plaintext.is_some();
-            if constant_plaintext_output {
-                body.value_output_wire(
-                    "1_constant_plaintext",
-                    selected.plaintext.as_ref().expect("checked constant plaintext").wire,
-                );
-                output_types.push(self.scalar.layout.scalar_type());
-            }
-            let mut families = builder.nonempty_parallel_loop(
-                body.finish(),
-                slot_count.clone(),
-                "slot",
-                Vec::new(),
-                args,
-                modes,
-                &output_types,
-            )?;
-            let vectors = families.remove(0);
-            let plaintexts = if constant_plaintext_output {
-                Some(families.remove(0))
-            } else if output_index > 0 && public_keys[output_index].reveal_plaintext {
-                Some(plaintexts[output_index - 1].clone())
-            } else {
-                None
-            };
-            outputs.push(NaiveBggEncodingVecWire {
-                vectors,
-                pubkeys: public_keys[output_index].matrices.clone(),
-                pubkey_reveal_plaintext: public_keys[output_index].reveal_plaintext,
-                plaintexts,
-            });
-        }
-        Ok(outputs)
+                pubkey: public_keys[index].clone(),
+                plaintext: public_keys[index]
+                    .reveal_plaintext
+                    .then(|| extended_plaintexts[index].clone()),
+            })
+            .collect())
     }
 }
 
-fn sample_packed_encoding(
-    builder: &mut GraphBuilder,
-    layout: &BggSamplerLayout,
-    gaussian_sigma: Option<&RealExpr>,
-    secret: &MatrixWire,
-    all_public_keys: &MatrixWire,
-    encoded_plaintexts: &MatrixWire,
-    count: usize,
-) -> MatrixWire {
-    let packed_type = layout.packed_vector_type(count);
-    let first = builder.matrix_binary(
-        MatrixBinaryOp::Multiply,
-        secret,
-        all_public_keys,
-        packed_type.clone(),
-    );
-    let gadget = builder.constant_matrix(
-        layout.public_key_type(),
-        ConstantMatrix::Gadget { base: layout.gadget_base.clone(), small: false },
-    );
-    let secret_gadget =
-        builder.matrix_binary(MatrixBinaryOp::Multiply, secret, &gadget, layout.vector_type());
-    let second = builder.tensor(encoded_plaintexts, &secret_gadget, packed_type.clone());
-    let difference =
-        builder.matrix_binary(MatrixBinaryOp::Subtract, &first, &second, packed_type.clone());
-    let error = match gaussian_sigma {
-        Some(sigma) => builder.gaussian_sample(packed_type.clone(), sigma.clone()),
-        None => builder.constant_matrix(packed_type.clone(), ConstantMatrix::Zero),
-    };
-    builder.matrix_binary(MatrixBinaryOp::Add, &difference, &error, packed_type)
-}
-
-fn slice_encodings(
-    builder: &mut GraphBuilder,
-    layout: &BggSamplerLayout,
-    all_vector: &MatrixWire,
-    public_keys: &[BggPublicKeyWire],
-    plaintexts: impl Iterator<Item = MatrixWire>,
-) -> Vec<BggEncodingWire> {
-    let columns = layout.public_key_columns();
-    public_keys
-        .iter()
-        .zip(plaintexts)
-        .enumerate()
-        .map(|(index, (pubkey, plaintext))| BggEncodingWire {
-            vector: builder.slice(
-                all_vector,
-                None,
-                Some(IndexRange { start: columns * index, end: columns * (index + 1) }),
-                layout.vector_type(),
-            ),
-            pubkey: pubkey.clone(),
-            plaintext: pubkey.reveal_plaintext.then_some(plaintext),
-        })
-        .collect()
-}
-
-fn validate_inputs(
-    layout: &BggSamplerLayout,
-    secret: &MatrixWire,
-    public_keys: &[BggPublicKeyWire],
-    plaintexts: &[MatrixWire],
-) -> Result<(), BggSampleError> {
-    if public_keys.len() != plaintexts.len() + 1 {
-        return Err(BggSampleError::InputCountMismatch);
-    }
-    if secret.matrix_type != layout.secret_type() {
-        return Err(BggSampleError::SecretTypeMismatch);
-    }
-    if public_keys.iter().any(|key| key.matrix.matrix_type != layout.public_key_type()) {
-        return Err(BggSampleError::PublicKeyTypeMismatch);
-    }
-    if plaintexts.iter().any(|plaintext| plaintext.matrix_type != layout.scalar_type()) {
-        return Err(BggSampleError::PlaintextTypeMismatch);
-    }
-    Ok(())
-}
-
-fn validate_poly_inputs(
-    layout: &BggSamplerLayout,
-    secret: &MatrixWire,
-    public_keys: &[BggPublicKeyWire],
-    plaintexts: &[MatrixFamilyWire],
-    slot_count: &IntExpr,
-    slot_secret_matrices: Option<&MatrixFamilyWire>,
-) -> Result<(), BggSampleError> {
-    if public_keys.len() != plaintexts.len() + 1 {
-        return Err(BggSampleError::InputCountMismatch);
-    }
-    if secret.matrix_type != layout.secret_type() {
-        return Err(BggSampleError::SecretTypeMismatch);
-    }
-    if public_keys.iter().any(|key| key.matrix.matrix_type != layout.public_key_type()) {
-        return Err(BggSampleError::PublicKeyTypeMismatch);
-    }
-    if plaintexts.iter().any(|plaintext| plaintext.matrix_type != layout.scalar_type()) {
-        return Err(BggSampleError::PlaintextTypeMismatch);
-    }
-    if plaintexts.iter().any(|plaintext| &plaintext.count != slot_count) {
-        return Err(BggSampleError::SlotCountMismatch);
-    }
-    if let Some(slot_secrets) = slot_secret_matrices {
-        if slot_secrets.count != *slot_count {
-            return Err(BggSampleError::SlotCountMismatch);
-        }
-        if slot_secrets.matrix_type != layout.slot_secret_type() {
-            return Err(BggSampleError::SlotSecretTypeMismatch);
-        }
-    }
-    Ok(())
+fn same_matrix_type(
+    lhs: &mxx_ir_core::types::MatrixType,
+    rhs: &mxx_ir_core::types::MatrixType,
+) -> bool {
+    lhs.modulus.canonicalize() == rhs.modulus.canonicalize() &&
+        lhs.ring_dimension.canonicalize() == rhs.ring_dimension.canonicalize() &&
+        lhs.rows.canonicalize() == rhs.rows.canonicalize() &&
+        lhs.columns.canonicalize() == rhs.columns.canonicalize()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keccak_asm::Keccak256;
-    use mxx_ir_core::{ParamEnv, artifact::ArtifactConfidentiality, validate};
+    use crate::test_utils::{execute_graph, matrix_output};
+    use mxx_dsl::DslContext;
+    use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -662,13 +484,12 @@ mod tests {
         execute,
         transcript::{SamplingMode, TranscriptRecorder},
     };
-    use num_bigint::{BigInt, Sign};
+    use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
-    fn layout(parameters: &DCRTPolyParams, secret_dimension: usize) -> BggSamplerLayout {
-        let modulus: std::sync::Arc<num_bigint::BigUint> = parameters.modulus().into();
+    fn concrete_layout(parameters: &DCRTPolyParams, secret_dimension: usize) -> BggSamplerLayout {
         BggSamplerLayout {
-            modulus: IntExpr::constant(BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone())),
+            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
             ring_dimension: IntExpr::constant(parameters.ring_dimension()),
             secret_dimension,
             digit_count: parameters.modulus_digits(),
@@ -698,61 +519,157 @@ mod tests {
     }
 
     #[test]
-    fn public_key_and_encoding_graphs_match_the_legacy_matrix_formulas() {
+    fn bgg_sampling_elaborates_without_aggregate_atoms() {
+        let layout = BggSamplerLayout {
+            modulus: 257.into(),
+            ring_dimension: 8.into(),
+            secret_dimension: 2,
+            digit_count: 4,
+            gadget_base: 4.into(),
+        };
+        let ring = layout.ring();
+        let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
+            ring.bytes_input("hash-key", 32),
+            b"bgg-test".to_vec(),
+            &[true],
+        );
+        let encodings = BggEncodingSampler { layout, gaussian_sigma: Some(3.into()) }
+            .sample(ring.input("secret", (1, 2)), &public_keys, &[ring.input("plaintext", (1, 1))])
+            .expect("compatible sampler inputs");
+        let built = DslContext::new("bgg-sampling")
+            .private_output("constant", encodings[0].vector.clone())
+            .expect("constant output")
+            .private_output("message", encodings[1].vector.clone())
+            .expect("message output")
+            .build()
+            .expect("build");
+        let concat_count = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind(), NodeKind::Concat { axis: ConcatAxis::Columns }))
+            .count();
+        let tensor_count = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind(), NodeKind::Tensor))
+            .count();
+        let gaussian_types = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                NodeKind::GaussianSample { matrix_type, .. } => Some(matrix_type),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(concat_count, 2, "packed public keys and packed plaintext row");
+        assert_eq!(tensor_count, 1, "one packed plaintext/secret-gadget tensor");
+        assert_eq!(gaussian_types.len(), 1, "one packed error sample");
+        assert_eq!(gaussian_types[0].columns.canonicalize(), IntExpr::constant(16));
+        let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
+        assert_eq!(elaborated.outputs.len(), 2);
+        assert!(!elaborated.atoms.is_empty());
+    }
+
+    #[test]
+    fn polynomial_and_naive_sampler_entrypoints_build_and_elaborate() {
+        let layout = BggSamplerLayout {
+            modulus: 257.into(),
+            ring_dimension: 8.into(),
+            secret_dimension: 1,
+            digit_count: 2,
+            gadget_base: 4.into(),
+        };
+        let ring = layout.ring();
+        let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
+            ring.bytes_input("packed-key", 32),
+            b"packed".to_vec(),
+            &[true],
+        );
+        let plaintexts = Family::pack(
+            (0..2).map(|slot| ring.input(format!("plaintext-{slot}"), (1, 1))).collect(),
+        )
+        .unwrap();
+        let poly =
+            BggPolyEncodingSampler { layout: layout.clone(), gaussian_sigma: Some(3.into()) }
+                .sample(
+                    ring.input("poly-secret", (1, 1)),
+                    &public_keys,
+                    std::slice::from_ref(&plaintexts),
+                    2.into(),
+                    None,
+                )
+                .unwrap();
+        let naive_keys =
+            NaiveBggPublicKeyVecSampler { layout: layout.clone(), slot_count: 2.into() }
+                .sample(ring.bytes_input("naive-key", 32), b"naive", &[true])
+                .unwrap();
+        let naive = NaiveBggEncodingVecSampler {
+            scalar: BggEncodingSampler { layout, gaussian_sigma: Some(3.into()) },
+        }
+        .sample(ring.input("naive-secret", (1, 1)), &naive_keys, std::slice::from_ref(&plaintexts))
+        .unwrap();
+        let built = DslContext::new("bgg-family-samplers")
+            .family_output("poly", poly.encodings[1].vectors.clone())
+            .unwrap()
+            .family_output("poly-secrets", poly.slot_secret_matrices)
+            .unwrap()
+            .family_output("naive", naive[1].vectors.clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        built.elaborate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn runtime_public_keys_and_encodings_match_the_bgg_sampling_formula() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let layout = layout(&parameters, 2);
+        let layout = concrete_layout(&parameters, 2);
         let key = [23u8; 32];
         let tag = b"bgg-ir-sampler";
-        let mut builder = GraphBuilder::new("bgg-sampler-relation", Vec::new());
-        let key_wire = builder.bytes_input("key", 32);
-        let secret_wire = builder.input("secret", layout.secret_type());
-        let plaintext_wires = [
-            builder.input("plaintext_0", layout.scalar_type()),
-            builder.input("plaintext_1", layout.scalar_type()),
-        ];
+        let ring = layout.ring();
         let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
-            &mut builder,
-            key_wire,
-            tag,
+            ring.bytes_input("key", key.len()),
+            tag.to_vec(),
             &[false, true],
         );
         let encodings = BggEncodingSampler { layout: layout.clone(), gaussian_sigma: None }
-            .sample(&mut builder, &secret_wire, &public_keys, &plaintext_wires)
-            .expect("compatible sampler inputs");
-        for (index, public_key) in public_keys.iter().enumerate() {
-            builder.output(
-                format!("public_key_{index}"),
-                &public_key.matrix,
-                ArtifactConfidentiality::Public,
-            );
-            builder.output(
-                format!("vector_{index}"),
-                &encodings[index].vector,
-                ArtifactConfidentiality::Public,
-            );
+            .sample(
+                ring.input("secret", (1, layout.secret_dimension)),
+                &public_keys,
+                &[ring.input("plaintext-0", (1, 1)), ring.input("plaintext-1", (1, 1))],
+            )
+            .unwrap();
+        let mut context = DslContext::new("bgg-sampler-runtime");
+        for index in 0..public_keys.len() {
+            context = context
+                .output(format!("public-{index}"), public_keys[index].matrix.clone())
+                .unwrap()
+                .output(format!("vector-{index}"), encodings[index].vector.clone())
+                .unwrap();
         }
-        let validated =
-            validate(&builder.finish(), &ParamEnv::default()).expect("valid BGG+ sampler graph");
+        let graph = context.build().unwrap();
 
         let secret_value = secret(&parameters, layout.secret_dimension);
         let plaintext_values = [scalar(&parameters, 2), scalar(&parameters, 3)];
-        let mut backend = cpu_backend([parameters.clone()]);
-        let mut store = MemoryArtifactStore::default();
-        let result = execute(
-            &validated,
-            &mut backend,
+        let result = execute_graph(
+            graph,
+            parameters.clone(),
             BTreeMap::from([
                 ("key".to_owned(), RuntimeValue::Bytes(key.to_vec())),
                 ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
-                ("plaintext_0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
-                ("plaintext_1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
+                ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
+                ("plaintext-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
             ]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .expect("BGG+ sampler execution");
+        );
 
-        let packed = DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+        let packed = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
             &parameters,
             key,
             tag,
@@ -769,188 +686,82 @@ mod tests {
                 plaintext_values[1].entry(0, 0),
             ],
         );
-        let all_vectors = secret_value.clone() * packed.clone() -
-            encoded_plaintexts.tensor(&(secret_value.clone() * gadget));
+        let vectors = secret_value.clone() * packed.clone() -
+            encoded_plaintexts.tensor(&(secret_value * gadget));
         for index in 0..public_keys.len() {
-            let expected_public_key = packed.slice_columns(
-                layout.public_key_columns() * index,
-                layout.public_key_columns() * (index + 1),
+            let start = layout.public_key_columns() * index;
+            let end = layout.public_key_columns() * (index + 1);
+            assert_eq!(
+                matrix_output(&result, &format!("public-{index}")),
+                &packed.slice_columns(start, end)
             );
-            let RuntimeValue::Matrix(actual_public_key) =
-                &result.outputs[&format!("public_key_{index}")]
-            else {
-                panic!("public-key output must be a matrix");
-            };
-            assert_eq!(actual_public_key.as_ref(), &expected_public_key);
-
-            let expected_vector = all_vectors.slice_columns(
-                layout.public_key_columns() * index,
-                layout.public_key_columns() * (index + 1),
+            assert_eq!(
+                matrix_output(&result, &format!("vector-{index}")),
+                &vectors.slice_columns(start, end)
             );
-            let RuntimeValue::Matrix(actual_vector) = &result.outputs[&format!("vector_{index}")]
-            else {
-                panic!("encoding output must be a matrix");
-            };
-            assert_eq!(actual_vector.as_ref(), &expected_vector);
         }
         assert!(encodings[0].plaintext.is_some());
         assert!(encodings[1].plaintext.is_none());
         assert!(encodings[2].plaintext.is_some());
     }
 
-    #[test]
-    fn polynomial_sampler_uses_one_fresh_ternary_secret_per_slot() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let layout = layout(&parameters, 2);
-        let slot_count = 3usize;
-        let mut builder = GraphBuilder::new("bgg-poly-sampler-relation", Vec::new());
-        let secret_wire = builder.input("secret", layout.secret_type());
-        let public_key_wires = [
-            BggPublicKeyWire {
-                matrix: builder.input("public_key_0", layout.public_key_type()),
-                reveal_plaintext: true,
-            },
-            BggPublicKeyWire {
-                matrix: builder.input("public_key_1", layout.public_key_type()),
-                reveal_plaintext: true,
-            },
-        ];
-        let plaintext_slots = (0..slot_count)
-            .map(|slot| builder.input(format!("plaintext_{slot}"), layout.scalar_type()))
-            .collect::<Vec<_>>();
-        let plaintext_family =
-            builder.family_pack(&plaintext_slots).expect("homogeneous plaintext family");
-        let sample = BggPolyEncodingSampler { layout: layout.clone(), gaussian_sigma: None }
-            .sample(
-                &mut builder,
-                &secret_wire,
-                &public_key_wires,
-                std::slice::from_ref(&plaintext_family),
-                IntExpr::constant(slot_count),
-                None,
-            )
-            .expect("compatible polynomial sampler inputs");
-        for slot in 0..slot_count {
-            let vector =
-                builder.family_get_static(&sample.encodings[1].vectors, IntExpr::constant(slot));
-            let slot_secret =
-                builder.family_get_static(&sample.slot_secret_matrices, IntExpr::constant(slot));
-            builder.output(format!("vector_{slot}"), &vector, ArtifactConfidentiality::Public);
-            builder.output(
-                format!("slot_secret_{slot}"),
-                &slot_secret,
-                ArtifactConfidentiality::Private,
-            );
-        }
-        let validated = validate(&builder.finish(), &ParamEnv::default())
-            .expect("valid polynomial BGG+ sampler graph");
-
-        let secret_value = secret(&parameters, layout.secret_dimension);
-        let public_key_values = [
-            DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
-                &parameters,
-                [31u8; 32],
-                b"poly-public-key-0",
-                layout.secret_dimension,
-                layout.public_key_columns(),
-                DistType::FinRingDist,
-            ),
-            DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
-                &parameters,
-                [31u8; 32],
-                b"poly-public-key-1",
-                layout.secret_dimension,
-                layout.public_key_columns(),
-                DistType::FinRingDist,
-            ),
-        ];
-        let plaintext_values =
-            (0..slot_count).map(|slot| scalar(&parameters, slot + 1)).collect::<Vec<_>>();
-        let mut inputs = BTreeMap::from([
-            ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
-            ("public_key_0".to_owned(), RuntimeValue::matrix(public_key_values[0].clone())),
-            ("public_key_1".to_owned(), RuntimeValue::matrix(public_key_values[1].clone())),
-        ]);
-        for (slot, plaintext) in plaintext_values.iter().enumerate() {
-            inputs.insert(format!("plaintext_{slot}"), RuntimeValue::matrix(plaintext.clone()));
-        }
-        let mut backend = cpu_backend([parameters.clone()]);
-        let mut store = MemoryArtifactStore::default();
-        let result = execute(&validated, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-            .expect("polynomial BGG+ sampler execution");
-        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
-        for slot in 0..slot_count {
-            let RuntimeValue::Matrix(slot_secret) = &result.outputs[&format!("slot_secret_{slot}")]
-            else {
-                panic!("slot secret must be a matrix");
-            };
-            let RuntimeValue::Matrix(vector) = &result.outputs[&format!("vector_{slot}")] else {
-                panic!("slot vector must be a matrix");
-            };
-            let transformed_secret = secret_value.clone() * slot_secret.as_ref();
-            let expected = transformed_secret.clone() * public_key_values[1].clone() -
-                plaintext_values[slot].clone().tensor(&(transformed_secret * gadget.clone()));
-            assert_eq!(vector.as_ref(), &expected);
-        }
-    }
-
-    fn supplied_secret_graph(
+    fn supplied_slot_secret_graph(
         layout: &BggSamplerLayout,
         sigma: Option<RealExpr>,
-    ) -> mxx_ir_core::ValidatedGraph {
-        let slot_count = 2usize;
-        let mut builder = GraphBuilder::new("bgg-poly-supplied-secret", Vec::new());
-        let secret_wire = builder.input("secret", layout.secret_type());
+    ) -> mxx_dsl::BuiltGraph {
+        let ring = layout.ring();
         let public_keys = [
             BggPublicKeyWire {
-                matrix: builder.input("public_key_0", layout.public_key_type()),
+                matrix: ring
+                    .input("public-0", (layout.secret_dimension, layout.public_key_columns())),
                 reveal_plaintext: true,
             },
             BggPublicKeyWire {
-                matrix: builder.input("public_key_1", layout.public_key_type()),
+                matrix: ring
+                    .input("public-1", (layout.secret_dimension, layout.public_key_columns())),
                 reveal_plaintext: false,
             },
         ];
-        let plaintexts = (0..slot_count)
-            .map(|slot| builder.input(format!("plaintext_{slot}"), layout.scalar_type()))
-            .collect::<Vec<_>>();
-        let plaintexts = builder.family_pack(&plaintexts).expect("plaintext family");
-        let slot_secrets = (0..slot_count)
-            .map(|slot| builder.input(format!("slot_secret_{slot}"), layout.slot_secret_type()))
-            .collect::<Vec<_>>();
-        let slot_secrets = builder.family_pack(&slot_secrets).expect("slot-secret family");
+        let plaintexts = Family::pack(
+            (0..2).map(|slot| ring.input(format!("plaintext-{slot}"), (1, 1))).collect(),
+        )
+        .unwrap();
+        let slot_secrets = Family::pack(
+            (0..2)
+                .map(|slot| {
+                    ring.input(
+                        format!("slot-secret-{slot}"),
+                        (layout.secret_dimension, layout.secret_dimension),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
         let sample = BggPolyEncodingSampler { layout: layout.clone(), gaussian_sigma: sigma }
             .sample(
-                &mut builder,
-                &secret_wire,
+                ring.input("secret", (1, layout.secret_dimension)),
                 &public_keys,
                 &[plaintexts],
-                IntExpr::constant(slot_count),
-                Some(&slot_secrets),
+                2.into(),
+                Some(slot_secrets.clone()),
             )
-            .expect("compatible supplied-secret graph");
-        assert!(
-            sample.encodings[1].plaintexts.is_none(),
-            "hidden public-key metadata must suppress plaintext metadata"
-        );
-        assert_eq!(sample.slot_secret_matrices, slot_secrets);
-        for slot in 0..slot_count {
-            let vector =
-                builder.family_get_static(&sample.encodings[1].vectors, IntExpr::constant(slot));
-            builder.output(format!("vector_{slot}"), &vector, ArtifactConfidentiality::Public);
+            .unwrap();
+        assert!(sample.encodings[1].plaintexts.is_none());
+        let mut context = DslContext::new("bgg-poly-supplied-secret-runtime");
+        for slot in 0..2 {
+            context = context
+                .output(format!("vector-{slot}"), sample.encodings[1].vectors.get_static(slot))
+                .unwrap();
         }
-        validate(&builder.finish(), &ParamEnv::default()).expect("valid supplied-secret graph")
+        context.build().unwrap()
     }
 
     #[test]
-    fn supplied_slot_secret_preserves_zip_order_and_zero_sigma_matches_no_error() {
+    fn supplied_slot_secrets_preserve_order_and_zero_sigma_matches_no_error() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let layout = layout(&parameters, 2);
-        let no_error = supplied_secret_graph(&layout, None);
-        let zero_error = supplied_secret_graph(
-            &layout,
-            Some(RealExpr::from_f64_exact(0.0).expect("finite zero")),
-        );
+        let layout = concrete_layout(&parameters, 2);
+        let no_error = supplied_slot_secret_graph(&layout, None);
+        let zero_error = supplied_slot_secret_graph(&layout, Some(RealExpr::from_integer(0)));
         let secret_value = secret(&parameters, layout.secret_dimension);
         let slot_secret_values = [
             DCRTPolyMatrix::identity(&parameters, layout.secret_dimension, None),
@@ -968,19 +779,19 @@ mod tests {
                 ],
             ),
         ];
-        let public_key_values = [
-            DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+        let public_values = [
+            DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
                 &parameters,
                 [41u8; 32],
-                b"supplied-public-key-0",
+                b"supplied-public-0",
                 layout.secret_dimension,
                 layout.public_key_columns(),
                 DistType::FinRingDist,
             ),
-            DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
+            DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
                 &parameters,
                 [41u8; 32],
-                b"supplied-public-key-1",
+                b"supplied-public-1",
                 layout.secret_dimension,
                 layout.public_key_columns(),
                 DistType::FinRingDist,
@@ -989,107 +800,161 @@ mod tests {
         let plaintexts = [scalar(&parameters, 3), scalar(&parameters, 5)];
         let inputs = BTreeMap::from([
             ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
-            ("public_key_0".to_owned(), RuntimeValue::matrix(public_key_values[0].clone())),
-            ("public_key_1".to_owned(), RuntimeValue::matrix(public_key_values[1].clone())),
-            ("plaintext_0".to_owned(), RuntimeValue::matrix(plaintexts[0].clone())),
-            ("plaintext_1".to_owned(), RuntimeValue::matrix(plaintexts[1].clone())),
-            ("slot_secret_0".to_owned(), RuntimeValue::matrix(slot_secret_values[0].clone())),
-            ("slot_secret_1".to_owned(), RuntimeValue::matrix(slot_secret_values[1].clone())),
+            ("public-0".to_owned(), RuntimeValue::matrix(public_values[0].clone())),
+            ("public-1".to_owned(), RuntimeValue::matrix(public_values[1].clone())),
+            ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintexts[0].clone())),
+            ("plaintext-1".to_owned(), RuntimeValue::matrix(plaintexts[1].clone())),
+            ("slot-secret-0".to_owned(), RuntimeValue::matrix(slot_secret_values[0].clone())),
+            ("slot-secret-1".to_owned(), RuntimeValue::matrix(slot_secret_values[1].clone())),
         ]);
-        let execute_graph = |graph: &mxx_ir_core::ValidatedGraph| {
-            let mut backend = cpu_backend([parameters.clone()]);
-            let mut store = MemoryArtifactStore::default();
-            execute(graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
-                .expect("supplied-secret execution")
-        };
-        let none_result = execute_graph(&no_error);
-        let zero_result = execute_graph(&zero_error);
+        let no_error_result = execute_graph(no_error, parameters.clone(), inputs.clone());
+        let zero_error_result = execute_graph(zero_error, parameters.clone(), inputs);
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
         for slot in 0..2 {
-            let RuntimeValue::Matrix(none_vector) = &none_result.outputs[&format!("vector_{slot}")]
-            else {
-                panic!("none vector output");
-            };
-            let RuntimeValue::Matrix(zero_vector) = &zero_result.outputs[&format!("vector_{slot}")]
-            else {
-                panic!("zero vector output");
-            };
-            assert_eq!(none_vector, zero_vector);
-            let transformed_secret = secret_value.clone() * slot_secret_values[slot].clone();
-            let expected = transformed_secret.clone() * public_key_values[1].clone() -
-                plaintexts[slot].clone().tensor(&(transformed_secret * gadget.clone()));
-            assert_eq!(none_vector.as_ref(), &expected);
+            let actual = matrix_output(&no_error_result, &format!("vector-{slot}"));
+            assert_eq!(actual, matrix_output(&zero_error_result, &format!("vector-{slot}")));
+            let transformed = secret_value.clone() * slot_secret_values[slot].clone();
+            let expected = transformed.clone() * public_values[1].clone() -
+                plaintexts[slot].clone().tensor(&(transformed * gadget.clone()));
+            assert_eq!(actual, &expected);
         }
     }
 
     #[test]
-    fn naive_vector_samplers_preserve_nonempty_slots_tags_and_encoding_formula() {
+    fn polynomial_sampler_runtime_uses_slot_secrets_in_the_bgg_formula() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let layout = layout(&parameters, 2);
+        let layout = concrete_layout(&parameters, 2);
+        let ring = layout.ring();
+        let public_keys = [
+            BggPublicKeyWire {
+                matrix: ring
+                    .input("public-0", (layout.secret_dimension, layout.public_key_columns())),
+                reveal_plaintext: true,
+            },
+            BggPublicKeyWire {
+                matrix: ring
+                    .input("public-1", (layout.secret_dimension, layout.public_key_columns())),
+                reveal_plaintext: true,
+            },
+        ];
+        let plaintext_family = Family::pack(
+            (0..3).map(|slot| ring.input(format!("plaintext-{slot}"), (1, 1))).collect(),
+        )
+        .unwrap();
+        let sample = BggPolyEncodingSampler { layout: layout.clone(), gaussian_sigma: None }
+            .sample(
+                ring.input("secret", (1, layout.secret_dimension)),
+                &public_keys,
+                &[plaintext_family],
+                3.into(),
+                None,
+            )
+            .unwrap();
+        let mut context = DslContext::new("bgg-poly-sampler-runtime");
+        for slot in 0..3 {
+            context = context
+                .output(format!("vector-{slot}"), sample.encodings[1].vectors.get_static(slot))
+                .unwrap()
+                .private_output(
+                    format!("slot-secret-{slot}"),
+                    sample.slot_secret_matrices.get_static(slot),
+                )
+                .unwrap();
+        }
+        let graph = context.build().unwrap();
+
+        let secret_value = secret(&parameters, layout.secret_dimension);
+        let public_values = [
+            DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
+                &parameters,
+                [31u8; 32],
+                b"poly-public-0",
+                layout.secret_dimension,
+                layout.public_key_columns(),
+                DistType::FinRingDist,
+            ),
+            DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
+                &parameters,
+                [31u8; 32],
+                b"poly-public-1",
+                layout.secret_dimension,
+                layout.public_key_columns(),
+                DistType::FinRingDist,
+            ),
+        ];
+        let plaintexts = (0..3).map(|slot| scalar(&parameters, slot + 1)).collect::<Vec<_>>();
+        let mut inputs = BTreeMap::from([
+            ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+            ("public-0".to_owned(), RuntimeValue::matrix(public_values[0].clone())),
+            ("public-1".to_owned(), RuntimeValue::matrix(public_values[1].clone())),
+        ]);
+        for (slot, plaintext) in plaintexts.iter().enumerate() {
+            inputs.insert(format!("plaintext-{slot}"), RuntimeValue::matrix(plaintext.clone()));
+        }
+        let result = execute_graph(graph, parameters.clone(), inputs);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
+        for slot in 0..3 {
+            let slot_secret = matrix_output(&result, &format!("slot-secret-{slot}"));
+            let transformed = secret_value.clone() * slot_secret.clone();
+            let expected = transformed.clone() * public_values[1].clone() -
+                plaintexts[slot].clone().tensor(&(transformed * gadget.clone()));
+            assert_eq!(matrix_output(&result, &format!("vector-{slot}")), &expected);
+        }
+    }
+
+    #[test]
+    fn naive_sampler_runtime_preserves_tags_and_encoding_formulas() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let layout = concrete_layout(&parameters, 2);
         let key = [47u8; 32];
         let tag = b"naive-bgg-ir";
-        let slot_count = 2usize;
-        let mut builder = GraphBuilder::new("naive-bgg-samplers", Vec::new());
-        let key_wire = builder.bytes_input("key", key.len());
-        let secret_wire = builder.input("secret", layout.secret_type());
-        let public_keys = NaiveBggPublicKeyVecSampler {
-            layout: layout.clone(),
-            slot_count: IntExpr::constant(slot_count),
-        }
-        .sample(&mut builder, key_wire, tag, &[true])
-        .expect("nonempty public-key families");
-        let plaintext_wires = (0..slot_count)
-            .map(|slot| builder.input(format!("plaintext_{slot}"), layout.scalar_type()))
-            .collect::<Vec<_>>();
-        let plaintexts = builder.family_pack(&plaintext_wires).expect("plaintext family");
+        let ring = layout.ring();
+        let public_keys =
+            NaiveBggPublicKeyVecSampler { layout: layout.clone(), slot_count: 2.into() }
+                .sample(ring.bytes_input("key", key.len()), tag, &[true])
+                .unwrap();
+        let plaintexts = Family::pack(
+            (0..2).map(|slot| ring.input(format!("plaintext-{slot}"), (1, 1))).collect(),
+        )
+        .unwrap();
         let encodings = NaiveBggEncodingVecSampler {
             scalar: BggEncodingSampler { layout: layout.clone(), gaussian_sigma: None },
         }
-        .sample(&mut builder, &secret_wire, &public_keys, std::slice::from_ref(&plaintexts))
-        .expect("compatible naive sampler inputs");
+        .sample(ring.input("secret", (1, layout.secret_dimension)), &public_keys, &[plaintexts])
+        .unwrap();
+        let mut context = DslContext::new("naive-bgg-sampler-runtime");
         for output in 0..public_keys.len() {
-            for slot in 0..slot_count {
-                let public_key = builder
-                    .family_get_static(&public_keys[output].matrices, IntExpr::constant(slot));
-                let vector =
-                    builder.family_get_static(&encodings[output].vectors, IntExpr::constant(slot));
-                builder.output(
-                    format!("public_key_{output}_{slot}"),
-                    &public_key,
-                    ArtifactConfidentiality::Public,
-                );
-                builder.output(
-                    format!("vector_{output}_{slot}"),
-                    &vector,
-                    ArtifactConfidentiality::Public,
-                );
+            for slot in 0..2 {
+                context = context
+                    .output(
+                        format!("public-{output}-{slot}"),
+                        public_keys[output].matrices.get_static(slot),
+                    )
+                    .unwrap()
+                    .output(
+                        format!("vector-{output}-{slot}"),
+                        encodings[output].vectors.get_static(slot),
+                    )
+                    .unwrap();
             }
         }
-        let validated =
-            validate(&builder.finish(), &ParamEnv::default()).expect("valid naive sampler graph");
-
+        let graph = context.build().unwrap();
         let secret_value = secret(&parameters, layout.secret_dimension);
         let plaintext_values = [scalar(&parameters, 2), scalar(&parameters, 5)];
-        let mut backend = cpu_backend([parameters.clone()]);
-        let mut store = MemoryArtifactStore::default();
-        let result = execute(
-            &validated,
-            &mut backend,
+        let result = execute_graph(
+            graph,
+            parameters.clone(),
             BTreeMap::from([
                 ("key".to_owned(), RuntimeValue::Bytes(key.to_vec())),
                 ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
-                ("plaintext_0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
-                ("plaintext_1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
+                ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
+                ("plaintext-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
             ]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .expect("naive sampler execution");
-
-        let hash_sampler = DCRTPolyHashSampler::<Keccak256>::new();
+        );
+        let hash_sampler = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new();
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
         for output in 0..public_keys.len() {
-            for slot in 0..slot_count {
+            for slot in 0..2 {
                 let mut slot_tag = tag.to_vec();
                 slot_tag.extend_from_slice(&(output as u64).to_le_bytes());
                 slot_tag.extend_from_slice(&(slot as u64).to_le_bytes());
@@ -1102,207 +967,146 @@ mod tests {
                     layout.public_key_columns() * packed_count,
                     DistType::FinRingDist,
                 );
-                let expected_public_key = if output == 0 {
+                let expected_public = if output == 0 {
                     packed
                 } else {
                     packed
-                        .slice_columns(layout.public_key_columns(), layout.public_key_columns() * 2)
+                        .slice_columns(layout.public_key_columns(), 2 * layout.public_key_columns())
                 };
-                let RuntimeValue::Matrix(actual_public_key) =
-                    &result.outputs[&format!("public_key_{output}_{slot}")]
-                else {
-                    panic!("naive public-key output")
-                };
-                assert_eq!(actual_public_key.as_ref(), &expected_public_key);
-
+                assert_eq!(
+                    matrix_output(&result, &format!("public-{output}-{slot}")),
+                    &expected_public
+                );
                 let plaintext = if output == 0 {
                     DCRTPolyMatrix::identity(&parameters, 1, None)
                 } else {
                     plaintext_values[slot].clone()
                 };
-                let expected_vector = secret_value.clone() * expected_public_key -
+                let expected_vector = secret_value.clone() * expected_public -
                     plaintext.tensor(&(secret_value.clone() * gadget.clone()));
-                let RuntimeValue::Matrix(actual_vector) =
-                    &result.outputs[&format!("vector_{output}_{slot}")]
-                else {
-                    panic!("naive encoding output")
-                };
-                assert_eq!(actual_vector.as_ref(), &expected_vector);
+                assert_eq!(
+                    matrix_output(&result, &format!("vector-{output}-{slot}")),
+                    &expected_vector
+                );
             }
         }
-        assert!(public_keys.iter().all(|public_key| public_key.reveal_plaintext));
+        assert!(public_keys.iter().all(|key| key.reveal_plaintext));
         assert!(encodings.iter().all(|encoding| encoding.plaintexts.is_some()));
-
-        let mut parameterized = GraphBuilder::new(
-            "naive-bgg-nonempty",
-            vec![mxx_ir_core::graph::CompileParameter {
-                name: "slots".to_owned(),
-                kind: mxx_ir_core::graph::CompileParameterKind::Integer,
-            }],
-        );
-        let key_wire = parameterized.bytes_input("key", key.len());
-        NaiveBggPublicKeyVecSampler {
-            layout: layout.clone(),
-            slot_count: IntExpr::Var("slots".to_owned()),
-        }
-        .sample(&mut parameterized, key_wire, tag, &[])
-        .expect("parameterized sampler graph");
-        let graph = parameterized.finish();
-        let zero_env = ParamEnv {
-            integers: BTreeMap::from([("slots".to_owned(), BigInt::from(0))]),
-            ..Default::default()
-        };
-        assert!(
-            validate(&graph, &zero_env)
-                .expect_err("zero-slot naive sampler must be rejected")
-                .to_string()
-                .contains("loop count must be at least 1")
-        );
-        let two_env = ParamEnv {
-            integers: BTreeMap::from([("slots".to_owned(), BigInt::from(2))]),
-            ..Default::default()
-        };
-        validate(&graph, &two_env).expect("positive parameterized slot count");
-
-        let mut external = GraphBuilder::new(
-            "naive-bgg-external-nonempty",
-            vec![mxx_ir_core::graph::CompileParameter {
-                name: "slots".to_owned(),
-                kind: mxx_ir_core::graph::CompileParameterKind::Integer,
-            }],
-        );
-        let count = IntExpr::Var("slots".to_owned());
-        let secret = external.input("secret", layout.secret_type());
-        let public_key = NaiveBggPublicKeyVecWire {
-            matrices: external.family_input("public_keys", layout.public_key_type(), count.clone()),
-            reveal_plaintext: true,
-        };
-        NaiveBggEncodingVecSampler { scalar: BggEncodingSampler { layout, gaussian_sigma: None } }
-            .sample(&mut external, &secret, &[public_key], &[])
-            .expect("external parameterized families");
-        assert!(
-            validate(&external.finish(), &zero_env)
-                .expect_err("zero-slot external encoding family must be rejected")
-                .to_string()
-                .contains("loop count must be at least 1")
-        );
     }
 
     #[test]
-    fn fresh_slot_secret_draws_replay_at_the_same_loop_sites() {
+    fn fresh_slot_secret_draws_replay_at_the_same_parallel_sites() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let layout = layout(&parameters, 2);
-        let slot_count = 2usize;
-        let mut builder = GraphBuilder::new("bgg-poly-replay", Vec::new());
-        let secret_wire = builder.input("secret", layout.secret_type());
-        let public_keys = [BggPublicKeyWire {
-            matrix: builder.input("public_key", layout.public_key_type()),
-            reveal_plaintext: true,
-        }];
+        let layout = concrete_layout(&parameters, 2);
+        let ring = layout.ring();
         let sample = BggPolyEncodingSampler { layout: layout.clone(), gaussian_sigma: None }
             .sample(
-                &mut builder,
-                &secret_wire,
-                &public_keys,
+                ring.input("secret", (1, layout.secret_dimension)),
+                &[BggPublicKeyWire {
+                    matrix: ring
+                        .input("public", (layout.secret_dimension, layout.public_key_columns())),
+                    reveal_plaintext: true,
+                }],
                 &[],
-                IntExpr::constant(slot_count),
+                2.into(),
                 None,
             )
-            .expect("fresh-secret graph");
-        for slot in 0..slot_count {
-            let vector =
-                builder.family_get_static(&sample.encodings[0].vectors, IntExpr::constant(slot));
-            let slot_secret =
-                builder.family_get_static(&sample.slot_secret_matrices, IntExpr::constant(slot));
-            builder.output(format!("vector_{slot}"), &vector, ArtifactConfidentiality::Public);
-            builder.output(
-                format!("slot_secret_{slot}"),
-                &slot_secret,
-                ArtifactConfidentiality::Private,
-            );
+            .unwrap();
+        let mut context = DslContext::new("bgg-poly-replay");
+        for slot in 0..2 {
+            context = context
+                .output(format!("vector-{slot}"), sample.encodings[0].vectors.get_static(slot))
+                .unwrap()
+                .private_output(
+                    format!("slot-secret-{slot}"),
+                    sample.slot_secret_matrices.get_static(slot),
+                )
+                .unwrap();
         }
-        let validated =
-            validate(&builder.finish(), &ParamEnv::default()).expect("valid replay graph");
+        let validated = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
         let inputs = BTreeMap::from([
             (
                 "secret".to_owned(),
                 RuntimeValue::matrix(secret(&parameters, layout.secret_dimension)),
             ),
             (
-                "public_key".to_owned(),
-                RuntimeValue::matrix(DCRTPolyHashSampler::<Keccak256>::new().sample_hash(
-                    &parameters,
-                    [43u8; 32],
-                    b"replay-public-key",
-                    layout.secret_dimension,
-                    layout.public_key_columns(),
-                    DistType::FinRingDist,
-                )),
+                "public".to_owned(),
+                RuntimeValue::matrix(
+                    DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
+                        &parameters,
+                        [43u8; 32],
+                        b"replay-public",
+                        layout.secret_dimension,
+                        layout.public_key_columns(),
+                        DistType::FinRingDist,
+                    ),
+                ),
             ),
         ]);
         let mut recorder = TranscriptRecorder::default();
-        let mut record_backend = cpu_backend([parameters.clone()]);
-        let mut record_store = MemoryArtifactStore::default();
         let recorded = execute(
             &validated,
-            &mut record_backend,
+            &mut cpu_backend([parameters.clone()]),
             inputs.clone(),
-            &mut record_store,
+            &mut MemoryArtifactStore::default(),
             SamplingMode::Record(&mut recorder),
         )
-        .expect("record execution");
-        assert_eq!(recorder.iter().count(), slot_count);
+        .unwrap();
+        assert_eq!(recorder.iter().count(), 2);
         let replayer = recorder.into_replayer();
-        let mut replay_backend = cpu_backend([parameters]);
-        let mut replay_store = MemoryArtifactStore::default();
         let replayed = execute(
             &validated,
-            &mut replay_backend,
+            &mut cpu_backend([parameters]),
             inputs,
-            &mut replay_store,
+            &mut MemoryArtifactStore::default(),
             SamplingMode::Replay(&replayer),
         )
-        .expect("replay execution");
+        .unwrap();
         for name in recorded.outputs.keys() {
             let RuntimeValue::Matrix(recorded_value) = &recorded.outputs[name] else {
-                panic!("{name} recorded output");
+                panic!("{name} recorded output must be a matrix")
             };
             let RuntimeValue::Matrix(replayed_value) = &replayed.outputs[name] else {
-                panic!("{name} replayed output");
+                panic!("{name} replayed output must be a matrix")
             };
-            assert_eq!(recorded_value, replayed_value);
+            assert_eq!(recorded_value, replayed_value, "{name}");
         }
     }
 
     #[test]
-    fn runtime_rejects_a_sampler_gadget_layout_that_the_backend_cannot_honor() {
+    fn runtime_rejects_a_sampler_gadget_layout_the_backend_cannot_honor() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let mut layout = layout(&parameters, 2);
-        layout.gadget_base = IntExpr::constant(1u64 << (parameters.base_bits() + 1));
-        let mut builder = GraphBuilder::new("bgg-invalid-gadget-layout", Vec::new());
-        let secret_wire = builder.input("secret", layout.secret_type());
-        let public_key = BggPublicKeyWire {
-            matrix: builder.input("public_key", layout.public_key_type()),
-            reveal_plaintext: true,
-        };
+        let mut layout = concrete_layout(&parameters, 2);
+        layout.gadget_base = IntExpr::constant(BigInt::from(1u64 << (parameters.base_bits() + 1)));
+        let ring = layout.ring();
         let encodings = BggEncodingSampler { layout: layout.clone(), gaussian_sigma: None }
-            .sample(&mut builder, &secret_wire, &[public_key], &[])
-            .expect("statically shaped graph");
-        builder.output("vector", &encodings[0].vector, ArtifactConfidentiality::Public);
-        let validated = validate(&builder.finish(), &ParamEnv::default())
-            .expect("backend layout is checked at execution");
-        let mut backend = cpu_backend([parameters.clone()]);
-        let mut store = MemoryArtifactStore::default();
+            .sample(
+                ring.input("secret", (1, layout.secret_dimension)),
+                &[BggPublicKeyWire {
+                    matrix: ring
+                        .input("public", (layout.secret_dimension, layout.public_key_columns())),
+                    reveal_plaintext: true,
+                }],
+                &[],
+            )
+            .unwrap();
+        let validated = DslContext::new("bgg-invalid-gadget-layout")
+            .output("vector", encodings[0].vector.clone())
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
         let error = match execute(
             &validated,
-            &mut backend,
+            &mut cpu_backend([parameters.clone()]),
             BTreeMap::from([
                 (
                     "secret".to_owned(),
                     RuntimeValue::matrix(secret(&parameters, layout.secret_dimension)),
                 ),
                 (
-                    "public_key".to_owned(),
+                    "public".to_owned(),
                     RuntimeValue::matrix(DCRTPolyMatrix::zero(
                         &parameters,
                         layout.secret_dimension,
@@ -1310,7 +1114,7 @@ mod tests {
                     )),
                 ),
             ]),
-            &mut store,
+            &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
         ) {
             Ok(_) => panic!("mismatched backend gadget layout must be rejected"),

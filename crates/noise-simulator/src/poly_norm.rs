@@ -122,3 +122,28 @@ impl Mul<PolyNorm> for BigDecimal {
         PolyNorm::from_norm(rhs.ctx, rhs.norm * self, rhs.is_const_poly)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gaussian_envelope_remains_six_point_five_sigma() {
+        let sigma = BigDecimal::from(4u32);
+        assert_eq!(high_probability_envelope_from_sigma(&sigma), BigDecimal::from(26u32));
+    }
+
+    #[test]
+    fn two_nonconstant_factors_pay_the_ring_sqrt_factor() {
+        let ctx = Arc::new(SimulatorContext::new(
+            BigDecimal::from(4u32),
+            BigDecimal::from(2u32),
+            1,
+            1,
+            1,
+        ));
+        let product = PolyNorm::new(ctx.clone(), BigDecimal::from(2u32)) *
+            PolyNorm::new(ctx, BigDecimal::from(3u32));
+        assert_eq!(product.norm, BigDecimal::from(24u32));
+    }
+}

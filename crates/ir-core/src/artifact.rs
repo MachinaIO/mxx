@@ -1,6 +1,5 @@
 use crate::{
     encoding::IR_VERSION,
-    node::NodeKind,
     serde_support,
     types::{ConcreteMatrixType, ConcreteWireType, WireId},
     validate::ValidatedGraph,
@@ -158,28 +157,23 @@ pub fn export_manifest(
 ///
 /// Indexed-family outputs become artifact families; compatible scalar wires
 /// become singular artifacts. Every persisted output must be backed by an
-/// `Output` node carrying an explicit confidentiality declaration.
+/// graph output carrying an explicit confidentiality declaration.
 pub fn export_validated_manifest(
     production_id: ProductionId,
     graph: &ValidatedGraph,
 ) -> Result<Manifest, ManifestExportError> {
     let artifacts = graph
-        .outputs
+        .source
+        .outputs()
         .iter()
-        .filter_map(|(name, wire)| {
-            let confidentiality =
-                graph.source.node(wire.node).and_then(|node| match &node.kind {
-                    NodeKind::Output {
-                        name: output_name,
-                        artifact_confidentiality: Some(confidentiality),
-                    } if output_name == name => Some(*confidentiality),
-                    _ => None,
-                })?;
+        .filter_map(|(name, output)| {
+            let confidentiality = output.confidentiality?;
             Some((|| {
-                let id = WireId { instantiation_path: Vec::new(), wire: *wire };
+                let id = WireId { instantiation_path: Vec::new(), wire: output.value };
                 let wire_type = graph
-                    .wires
-                    .get(&id)
+                    .root_scope()
+                    .wire_types
+                    .get(&output.value)
                     .ok_or_else(|| ManifestExportError::MissingOutput { name: name.clone() })?;
                 let (element_type, first_class_family_count) = match wire_type {
                     ConcreteWireType::IndexedFamily { element, count } => {

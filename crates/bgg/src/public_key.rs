@@ -1,227 +1,251 @@
-use mxx_ir_core::{GraphBuilder, IntExpr, MatrixWire, node::MatrixBinaryOp, types::MatrixType};
+//! Declarative BGG+ public-key graph values.
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending, Ring};
+use mxx_ir_core::{IntExpr, ValueHandle};
+
+#[derive(Clone)]
 pub struct BggPublicKeyWire {
-    pub matrix: MatrixWire,
+    pub matrix: Mat,
     pub reveal_plaintext: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
+pub struct BggPublicKeyType {
+    pub matrix: MatType,
+    pub reveal_plaintext: bool,
+}
+
+impl GraphValue for BggPublicKeyWire {
+    type Schema = BggPublicKeyType;
+
+    fn flatten(&self) -> Vec<ValueHandle> {
+        self.matrix.flatten()
+    }
+
+    fn pending(&self) -> Pending {
+        self.matrix.pending()
+    }
+
+    fn schema(&self) -> Self::Schema {
+        BggPublicKeyType { matrix: self.matrix.schema(), reveal_plaintext: self.reveal_plaintext }
+    }
+
+    fn from_values(
+        schema: &Self::Schema,
+        values: &[ValueHandle],
+        pending: Pending,
+    ) -> Result<Self, DslError> {
+        Ok(Self {
+            matrix: Mat::from_values(&schema.matrix, values, pending)?,
+            reveal_plaintext: schema.reveal_plaintext,
+        })
+    }
+}
+
+impl GraphValueSchema for BggPublicKeyType {
+    type Value = BggPublicKeyWire;
+
+    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
+        BggPublicKeyWire {
+            matrix: self.matrix.placeholders_from(next),
+            reveal_plaintext: self.reveal_plaintext,
+        }
+    }
+
+    fn wire_types(&self) -> Vec<mxx_ir_core::types::WireType> {
+        self.matrix.wire_types()
+    }
+}
+
+#[derive(Clone)]
 pub struct BggPublicKeyCompiler {
+    pub ring: Ring,
     pub base: IntExpr,
-    pub decomposed_type: MatrixType,
+    pub digit_count: IntExpr,
 }
 
 impl BggPublicKeyCompiler {
-    pub fn add(
-        &self,
-        builder: &mut GraphBuilder,
-        lhs: &BggPublicKeyWire,
-        rhs: &BggPublicKeyWire,
-    ) -> BggPublicKeyWire {
+    pub fn add(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: builder.matrix_binary(
-                MatrixBinaryOp::Add,
-                &lhs.matrix,
-                &rhs.matrix,
-                lhs.matrix.matrix_type.clone(),
-            ),
+            matrix: lhs.matrix.clone() + rhs.matrix.clone(),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }
 
-    pub fn sub(
-        &self,
-        builder: &mut GraphBuilder,
-        lhs: &BggPublicKeyWire,
-        rhs: &BggPublicKeyWire,
-    ) -> BggPublicKeyWire {
+    pub fn sub(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: builder.matrix_binary(
-                MatrixBinaryOp::Subtract,
-                &lhs.matrix,
-                &rhs.matrix,
-                lhs.matrix.matrix_type.clone(),
-            ),
+            matrix: lhs.matrix.clone() - rhs.matrix.clone(),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }
 
-    /// Reproduces `BggPublicKey::mul`: `lhs.mul_decompose(rhs)`.
-    pub fn mul(
-        &self,
-        builder: &mut GraphBuilder,
-        lhs: &BggPublicKeyWire,
-        rhs: &BggPublicKeyWire,
-    ) -> BggPublicKeyWire {
+    /// Builds `lhs * G^-1(rhs)` directly in the executable core DAG.
+    pub fn mul(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
         let decomposed =
-            builder.gadget_decompose(&rhs.matrix, self.base.clone(), self.decomposed_type.clone());
+            rhs.matrix.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat();
         BggPublicKeyWire {
-            matrix: builder.matrix_binary(
-                MatrixBinaryOp::Multiply,
-                &lhs.matrix,
-                &decomposed,
-                lhs.matrix.matrix_type.clone(),
-            ),
+            matrix: lhs.matrix.clone() * decomposed,
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }
 
-    pub fn small_scalar_mul(
-        &self,
-        builder: &mut GraphBuilder,
-        input: &BggPublicKeyWire,
-        scalar: &MatrixWire,
-    ) -> BggPublicKeyWire {
+    pub fn small_scalar_mul(&self, input: &BggPublicKeyWire, scalar: &Mat) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: builder.matrix_binary(
-                MatrixBinaryOp::Multiply,
-                &input.matrix,
-                scalar,
-                input.matrix.matrix_type.clone(),
-            ),
+            matrix: input.matrix.clone() * scalar.clone(),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
 
-    /// Reproduces `BggPublicKey::large_scalar_mul`, including its explicit
-    /// gadget construction and decomposition.
-    pub fn large_scalar_mul(
-        &self,
-        builder: &mut GraphBuilder,
-        input: &BggPublicKeyWire,
-        scalar: &MatrixWire,
-    ) -> BggPublicKeyWire {
-        let decomposed = self.large_scalar_decomposition(builder, input, scalar);
-        self.large_scalar_mul_with_decomposition(builder, input, &decomposed)
+    pub fn large_scalar_mul(&self, input: &BggPublicKeyWire, scalar: &Mat) -> BggPublicKeyWire {
+        let decomposed = self.large_scalar_decomposition(input, scalar);
+        self.large_scalar_mul_with_decomposition(input, decomposed)
     }
 
-    /// Reproduces `BggPublicKey::matrix_mul`: `A * G^-1(target)`.
-    pub fn matrix_mul(
-        &self,
-        builder: &mut GraphBuilder,
-        input: &BggPublicKeyWire,
-        target: &MatrixWire,
-    ) -> BggPublicKeyWire {
-        let decomposed_type = MatrixType {
-            modulus: target.matrix_type.modulus.clone(),
-            ring_dimension: target.matrix_type.ring_dimension.clone(),
-            rows: input.matrix.matrix_type.columns.clone(),
-            columns: target.matrix_type.columns.clone(),
-        };
+    pub fn matrix_mul(&self, input: &BggPublicKeyWire, target: &Mat) -> BggPublicKeyWire {
         let decomposed =
-            builder.gadget_decompose(target, self.base.clone(), decomposed_type.clone());
-        let output_type = MatrixType {
-            rows: input.matrix.matrix_type.rows.clone(),
-            columns: target.matrix_type.columns.clone(),
-            ..input.matrix.matrix_type.clone()
-        };
+            target.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat();
         BggPublicKeyWire {
-            matrix: builder.matrix_binary(
-                MatrixBinaryOp::Multiply,
-                &input.matrix,
-                &decomposed,
-                output_type,
-            ),
+            matrix: input.matrix.clone() * decomposed,
             reveal_plaintext: input.reveal_plaintext,
         }
     }
 
     pub(crate) fn large_scalar_mul_with_decomposition(
         &self,
-        builder: &mut GraphBuilder,
         input: &BggPublicKeyWire,
-        decomposed: &MatrixWire,
+        decomposed: Mat,
     ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: builder.matrix_binary(
-                MatrixBinaryOp::Multiply,
-                &input.matrix,
-                decomposed,
-                input.matrix.matrix_type.clone(),
-            ),
+            matrix: input.matrix.clone() * decomposed,
             reveal_plaintext: input.reveal_plaintext,
         }
     }
 
-    pub(crate) fn large_scalar_decomposition(
-        &self,
-        builder: &mut GraphBuilder,
-        input: &BggPublicKeyWire,
-        scalar: &MatrixWire,
-    ) -> MatrixWire {
-        let gadget_type = MatrixType {
-            rows: input.matrix.matrix_type.rows.clone(),
-            columns: self.decomposed_type.rows.clone(),
-            ..input.matrix.matrix_type.clone()
-        };
-        let gadget = builder.constant_matrix(
-            gadget_type.clone(),
-            mxx_ir_core::node::ConstantMatrix::Gadget { base: self.base.clone(), small: false },
-        );
-        let scalar_gadget =
-            builder.matrix_binary(MatrixBinaryOp::Multiply, &gadget, scalar, gadget_type.clone());
-        let scalar_decomposed_type = MatrixType {
-            rows: gadget_type.columns.clone(),
-            columns: gadget_type.columns.clone(),
-            ..gadget_type
-        };
-        builder.gadget_decompose(&scalar_gadget, self.base.clone(), scalar_decomposed_type)
+    pub(crate) fn large_scalar_decomposition(&self, input: &BggPublicKeyWire, scalar: &Mat) -> Mat {
+        let rows = input.matrix.matrix_type().rows.clone();
+        let gadget = self.ring.gadget(rows, self.base.clone(), self.digit_count.clone());
+        (gadget * scalar.clone()).decompose(self.base.clone(), self.digit_count.clone()).as_mat()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{execute_graph, matrix_output, row};
+    use mxx_dsl::DslContext;
+    use mxx_ir_core::ParamEnv;
+    use mxx_primitives::{
+        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        poly::{PolyParams, dcrt::params::DCRTPolyParams},
+    };
+    use mxx_runtime::RuntimeValue;
+    use num_bigint::BigInt;
+    use std::collections::BTreeMap;
 
-    fn matrix_type(rows: i64, columns: i64) -> MatrixType {
-        MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(8),
-            rows: IntExpr::constant(rows),
-            columns: IntExpr::constant(columns),
+    #[test]
+    fn multiplication_is_decompose_then_multiply() {
+        let ring = Ring::new(17, 8);
+        let lhs = BggPublicKeyWire { matrix: ring.input("lhs", (2, 4)), reveal_plaintext: true };
+        let rhs = BggPublicKeyWire { matrix: ring.input("rhs", (2, 4)), reveal_plaintext: true };
+        let compiler = BggPublicKeyCompiler { ring, base: 2.into(), digit_count: 2.into() };
+        let output = compiler.mul(&lhs, &rhs);
+        let built = DslContext::new("bgg-public-key-mul")
+            .public_output("output", output.matrix)
+            .expect("output")
+            .build()
+            .expect("build");
+        mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid graph");
+    }
+
+    #[test]
+    fn reveal_metadata_matches_the_public_key_contract() {
+        let ring = Ring::new(17, 8);
+        let compiler =
+            BggPublicKeyCompiler { ring: ring.clone(), base: 2.into(), digit_count: 2.into() };
+        for left_revealed in [false, true] {
+            for right_revealed in [false, true] {
+                let left = BggPublicKeyWire {
+                    matrix: ring.input("left", (2, 4)),
+                    reveal_plaintext: left_revealed,
+                };
+                let right = BggPublicKeyWire {
+                    matrix: ring.input("right", (2, 4)),
+                    reveal_plaintext: right_revealed,
+                };
+                let expected = left_revealed && right_revealed;
+                assert_eq!(compiler.add(&left, &right).reveal_plaintext, expected);
+                assert_eq!(compiler.sub(&left, &right).reveal_plaintext, expected);
+                assert_eq!(compiler.mul(&left, &right).reveal_plaintext, expected);
+            }
+        }
+        for revealed in [false, true] {
+            let input = BggPublicKeyWire {
+                matrix: ring.input("input", (2, 4)),
+                reveal_plaintext: revealed,
+            };
+            let scalar = ring.input("scalar", (1, 1));
+            assert_eq!(compiler.small_scalar_mul(&input, &scalar).reveal_plaintext, revealed);
+            assert_eq!(compiler.large_scalar_mul(&input, &scalar).reveal_plaintext, revealed);
         }
     }
 
     #[test]
-    fn reveal_metadata_matches_direct_public_key_operations() {
+    fn runtime_operations_match_primitive_matrix_formulas() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let digit_count = parameters.modulus_digits();
+        let columns = 2 * digit_count;
+        let ring = Ring::new(
+            BigInt::from(parameters.modulus().as_ref().clone()),
+            parameters.ring_dimension() as usize,
+        );
         let compiler = BggPublicKeyCompiler {
-            base: IntExpr::constant(2),
-            decomposed_type: matrix_type(10, 10),
+            ring: ring.clone(),
+            base: BigInt::from(1u64 << parameters.base_bits()).into(),
+            digit_count: digit_count.into(),
         };
-        for lhs_revealed in [false, true] {
-            for rhs_revealed in [false, true] {
-                let mut builder = GraphBuilder::new("public-key-reveal", Vec::new());
-                let lhs = BggPublicKeyWire {
-                    matrix: builder.input("lhs", matrix_type(2, 10)),
-                    reveal_plaintext: lhs_revealed,
-                };
-                let rhs = BggPublicKeyWire {
-                    matrix: builder.input("rhs", matrix_type(2, 10)),
-                    reveal_plaintext: rhs_revealed,
-                };
-                let expected = lhs_revealed && rhs_revealed;
-                assert_eq!(compiler.add(&mut builder, &lhs, &rhs).reveal_plaintext, expected);
-                assert_eq!(compiler.sub(&mut builder, &lhs, &rhs).reveal_plaintext, expected);
-                assert_eq!(compiler.mul(&mut builder, &lhs, &rhs).reveal_plaintext, expected);
-            }
-        }
+        let lhs =
+            BggPublicKeyWire { matrix: ring.input("lhs", (2, columns)), reveal_plaintext: true };
+        let rhs =
+            BggPublicKeyWire { matrix: ring.input("rhs", (2, columns)), reveal_plaintext: true };
+        let target = ring.input("target", (2, 1));
+        let add = compiler.add(&lhs, &rhs);
+        let sub = compiler.sub(&lhs, &rhs);
+        let mul = compiler.mul(&lhs, &rhs);
+        let matrix_mul = compiler.matrix_mul(&lhs, &target);
+        let graph = DslContext::new("bgg-public-key-runtime")
+            .output("add", add.matrix)
+            .unwrap()
+            .output("sub", sub.matrix)
+            .unwrap()
+            .output("mul", mul.matrix)
+            .unwrap()
+            .output("matrix-mul", matrix_mul.matrix)
+            .unwrap()
+            .build()
+            .unwrap();
 
-        for revealed in [false, true] {
-            let mut builder = GraphBuilder::new("public-key-scalar-reveal", Vec::new());
-            let input = BggPublicKeyWire {
-                matrix: builder.input("input", matrix_type(2, 10)),
-                reveal_plaintext: revealed,
-            };
-            let scalar = builder.input("scalar", matrix_type(1, 1));
-            assert_eq!(
-                compiler.small_scalar_mul(&mut builder, &input, &scalar).reveal_plaintext,
-                revealed
-            );
-            assert_eq!(
-                compiler.large_scalar_mul(&mut builder, &input, &scalar).reveal_plaintext,
-                revealed
-            );
-        }
+        let lhs_value = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            vec![row(&parameters, columns, 0).get_row(0), row(&parameters, columns, 2).get_row(0)],
+        );
+        let rhs_value = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            vec![row(&parameters, columns, 1).get_row(0), row(&parameters, columns, 3).get_row(0)],
+        );
+        let target_value = DCRTPolyMatrix::unit_column_vector(&parameters, 2, 1);
+        let result = execute_graph(
+            graph,
+            parameters,
+            BTreeMap::from([
+                ("lhs".to_owned(), RuntimeValue::matrix(lhs_value.clone())),
+                ("rhs".to_owned(), RuntimeValue::matrix(rhs_value.clone())),
+                ("target".to_owned(), RuntimeValue::matrix(target_value.clone())),
+            ]),
+        );
+
+        assert_eq!(matrix_output(&result, "add"), &(lhs_value.clone() + rhs_value.clone()));
+        assert_eq!(matrix_output(&result, "sub"), &(lhs_value.clone() - rhs_value.clone()));
+        assert_eq!(matrix_output(&result, "mul"), &lhs_value.mul_decompose(&rhs_value));
+        assert_eq!(matrix_output(&result, "matrix-mul"), &lhs_value.mul_decompose(&target_value));
     }
 }

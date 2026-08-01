@@ -685,3 +685,170 @@ pub fn encode_carry_arith_poly<P: Poly>(
         .map(|constant| P::from_biguint_to_constant(params, constant))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        test_utils::execute_circuit,
+        utils::gen_biguint_for_modulus,
+    };
+    use mxx_primitives::poly::{
+        PolyParams,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    };
+    use num_traits::Zero;
+    use std::sync::Arc;
+
+    fn test_parameters() -> DCRTPolyParams {
+        DCRTPolyParams::new(4, 2, 15, 8)
+    }
+
+    fn execute_polys(
+        name: &str,
+        parameters: &DCRTPolyParams,
+        circuit: &PolyCircuit<DCRTPoly>,
+        inputs: Vec<DCRTPoly>,
+    ) -> Vec<DCRTPoly> {
+        let inputs = inputs
+            .into_iter()
+            .map(|poly| DCRTPolyMatrix::from_poly_vec_row(parameters, vec![poly]))
+            .collect::<Vec<_>>();
+        execute_circuit(name, parameters, circuit, &inputs)
+            .into_iter()
+            .map(|matrix| matrix.entry(0, 0).clone())
+            .collect()
+    }
+
+    fn limb_len(parameters: &DCRTPolyParams, limb_bit_size: usize) -> usize {
+        parameters.modulus_bits().div_ceil(limb_bit_size)
+    }
+
+    fn random_value(parameters: &DCRTPolyParams) -> BigUint {
+        let mut rng = rand::rng();
+        gen_biguint_for_modulus(&mut rng, parameters.modulus().as_ref())
+    }
+
+    fn test_add_case(limb_bit_size: usize, left_value: BigUint, right_value: BigUint) {
+        let parameters = test_parameters();
+        let limb_len = limb_len(&parameters, limb_bit_size);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context =
+            Arc::new(CarryArithPolyContext::setup(&mut circuit, &parameters, limb_bit_size, false));
+        let input_bits = limb_len * limb_bit_size;
+        let left = CarryArithPoly::input(context.clone(), &mut circuit, input_bits);
+        let right = CarryArithPoly::input(context, &mut circuit, input_bits);
+        let sum = left.add(&right, &mut circuit);
+        circuit.output(sum.limbs);
+
+        let mut inputs = encode_carry_arith_poly(limb_bit_size, limb_len, &parameters, &left_value);
+        inputs.extend(encode_carry_arith_poly(limb_bit_size, limb_len, &parameters, &right_value));
+        let actual = execute_polys("carry-add-runtime", &parameters, &circuit, inputs);
+        let expected = encode_carry_arith_poly(
+            limb_bit_size,
+            limb_len + 1,
+            &parameters,
+            &(left_value + right_value),
+        );
+        assert_eq!(actual, expected);
+    }
+
+    fn test_less_than_case(limb_bit_size: usize, left_value: BigUint, right_value: BigUint) {
+        let parameters = test_parameters();
+        let limb_len = limb_len(&parameters, limb_bit_size);
+        let input_bits = limb_len * limb_bit_size;
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context =
+            Arc::new(CarryArithPolyContext::setup(&mut circuit, &parameters, limb_bit_size, false));
+        let left = CarryArithPoly::input(context.clone(), &mut circuit, input_bits);
+        let right = CarryArithPoly::input(context, &mut circuit, input_bits);
+        let (is_less, difference) = left.less_than(&right, &mut circuit);
+        circuit.output(std::iter::once(is_less).chain(difference.limbs));
+
+        let mut inputs = encode_carry_arith_poly(limb_bit_size, limb_len, &parameters, &left_value);
+        inputs.extend(encode_carry_arith_poly(limb_bit_size, limb_len, &parameters, &right_value));
+        let actual = execute_polys("carry-less-than-runtime", &parameters, &circuit, inputs);
+        let (expected_flag, expected_difference) = if left_value < right_value {
+            (BigUint::from(1u8), (BigUint::from(1u8) << input_bits) + left_value - right_value)
+        } else {
+            (BigUint::zero(), left_value - right_value)
+        };
+        let mut expected = encode_carry_arith_poly(limb_bit_size, 1, &parameters, &expected_flag);
+        expected.extend(encode_carry_arith_poly(
+            limb_bit_size,
+            limb_len,
+            &parameters,
+            &expected_difference,
+        ));
+        assert_eq!(actual, expected);
+    }
+
+    fn test_mul_case(limb_bit_size: usize, left_value: BigUint, right_value: BigUint) {
+        let parameters = test_parameters();
+        let limb_len = limb_len(&parameters, limb_bit_size);
+        let input_bits = limb_len * limb_bit_size;
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context =
+            Arc::new(CarryArithPolyContext::setup(&mut circuit, &parameters, limb_bit_size, false));
+        let left = CarryArithPoly::input(context.clone(), &mut circuit, input_bits);
+        let right = CarryArithPoly::input(context, &mut circuit, input_bits);
+        let product = left.mul(&right, &mut circuit, None);
+        circuit.output(product.limbs);
+
+        let mut inputs = encode_carry_arith_poly(limb_bit_size, limb_len, &parameters, &left_value);
+        inputs.extend(encode_carry_arith_poly(limb_bit_size, limb_len, &parameters, &right_value));
+        let actual = execute_polys("carry-mul-runtime", &parameters, &circuit, inputs);
+        let expected = encode_carry_arith_poly(
+            limb_bit_size,
+            2 * limb_len,
+            &parameters,
+            &(left_value * right_value),
+        );
+        assert_eq!(actual, expected);
+    }
+
+    fn boundary_values(parameters: &DCRTPolyParams) -> (BigUint, BigUint) {
+        (BigUint::zero(), parameters.modulus().as_ref() - BigUint::from(1u8))
+    }
+
+    fn test_random_cases(limb_bit_size: usize) {
+        let parameters = test_parameters();
+        let left = random_value(&parameters);
+        let right = random_value(&parameters);
+        test_add_case(limb_bit_size, left.clone(), right.clone());
+        test_less_than_case(limb_bit_size, left.clone(), right.clone());
+        test_mul_case(limb_bit_size, left, right);
+    }
+
+    fn test_boundary_cases(limb_bit_size: usize) {
+        let parameters = test_parameters();
+        let (minimum, maximum) = boundary_values(&parameters);
+        test_add_case(limb_bit_size, minimum.clone(), maximum.clone());
+        test_add_case(limb_bit_size, maximum.clone(), maximum.clone());
+        test_less_than_case(limb_bit_size, minimum.clone(), maximum.clone());
+        test_less_than_case(limb_bit_size, maximum.clone(), minimum.clone());
+        test_mul_case(limb_bit_size, minimum, maximum.clone());
+        test_mul_case(limb_bit_size, maximum.clone(), maximum);
+    }
+
+    #[test]
+    fn lookup_backed_limbs_match_random_integer_arithmetic_at_runtime() {
+        test_random_cases(3);
+    }
+
+    #[test]
+    fn lookup_backed_limbs_match_boundary_integer_arithmetic_at_runtime() {
+        test_boundary_cases(3);
+    }
+
+    #[test]
+    fn bit_limbs_match_random_integer_arithmetic_at_runtime() {
+        test_random_cases(1);
+    }
+
+    #[test]
+    fn bit_limbs_match_boundary_integer_arithmetic_at_runtime() {
+        test_boundary_cases(1);
+    }
+}

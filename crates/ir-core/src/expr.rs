@@ -11,6 +11,7 @@ use thiserror::Error;
 pub enum IntExpr {
     Const(#[serde(with = "serde_support::bigint")] BigInt),
     Var(String),
+    LoopIndex(u32),
     Add(Box<Self>, Box<Self>),
     Sub(Box<Self>, Box<Self>),
     Mul(Box<Self>, Box<Self>),
@@ -30,6 +31,7 @@ impl Serialize for IntExpr {
 enum IntExprRepr {
     Const(String),
     Var(String),
+    LoopIndex(u32),
     Add(Box<Self>, Box<Self>),
     Sub(Box<Self>, Box<Self>),
     Mul(Box<Self>, Box<Self>),
@@ -43,6 +45,7 @@ impl From<IntExpr> for IntExprRepr {
         match value {
             IntExpr::Const(value) => Self::Const(value.to_string()),
             IntExpr::Var(name) => Self::Var(name),
+            IntExpr::LoopIndex(slot) => Self::LoopIndex(slot),
             IntExpr::Add(lhs, rhs) => {
                 Self::Add(Box::new(Self::from(*lhs)), Box::new(Self::from(*rhs)))
             }
@@ -88,6 +91,8 @@ pub enum RealExpr {
 pub struct ParamEnv {
     pub integers: BTreeMap<String, BigInt>,
     pub reals: BTreeMap<String, Rational>,
+    #[serde(default)]
+    pub loop_indices: BTreeMap<u32, BigInt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -123,6 +128,11 @@ impl IntExpr {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| ExprError::UnboundVariable(name.clone())),
+            Self::LoopIndex(slot) => env
+                .loop_indices
+                .get(slot)
+                .cloned()
+                .ok_or_else(|| ExprError::UnboundVariable(format!("loop-index[{slot}]"))),
             Self::Add(lhs, rhs) => Ok(lhs.evaluate(env)? + rhs.evaluate(env)?),
             Self::Sub(lhs, rhs) => Ok(lhs.evaluate(env)? - rhs.evaluate(env)?),
             Self::Mul(lhs, rhs) => Ok(lhs.evaluate(env)? * rhs.evaluate(env)?),
@@ -169,6 +179,7 @@ impl IntExpr {
         match self {
             Self::Const(_) => false,
             Self::Var(name) => name == variable,
+            Self::LoopIndex(_) => false,
             Self::Add(lhs, rhs) |
             Self::Sub(lhs, rhs) |
             Self::Mul(lhs, rhs) |
@@ -178,6 +189,30 @@ impl IntExpr {
             }
             Self::Log2Ceil(value) => value.contains_variable(variable),
         }
+    }
+}
+
+impl From<i32> for IntExpr {
+    fn from(value: i32) -> Self {
+        Self::constant(value)
+    }
+}
+
+impl From<i64> for IntExpr {
+    fn from(value: i64) -> Self {
+        Self::constant(value)
+    }
+}
+
+impl From<usize> for IntExpr {
+    fn from(value: usize) -> Self {
+        Self::constant(value)
+    }
+}
+
+impl From<BigInt> for IntExpr {
+    fn from(value: BigInt) -> Self {
+        Self::Const(value)
     }
 }
 
@@ -263,6 +298,9 @@ impl Rational {
 }
 
 impl RealExpr {
+    pub fn from_integer(value: impl Into<BigInt>) -> Self {
+        Self::Rational(Rational::from_integer(value.into()))
+    }
     pub fn from_f64_exact(value: f64) -> Result<Self, ExprError> {
         Ok(Self::Rational(Rational::from_f64_exact(value)?))
     }
@@ -375,9 +413,16 @@ impl RealExpr {
     }
 }
 
+impl From<i32> for RealExpr {
+    fn from(value: i32) -> Self {
+        Self::from_integer(value)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Generator {
     Var(String),
+    LoopIndex(u32),
     Div(IntExpr, IntExpr),
     RoundDiv(IntExpr, IntExpr),
     Log2Ceil(IntExpr),
@@ -393,6 +438,7 @@ impl Polynomial {
         match expr {
             IntExpr::Const(value) => Self::constant(value.clone()),
             IntExpr::Var(name) => Self::generator(Generator::Var(name.clone())),
+            IntExpr::LoopIndex(slot) => Self::generator(Generator::LoopIndex(*slot)),
             IntExpr::Add(lhs, rhs) => Self::from_expr(lhs).add(Self::from_expr(rhs)),
             IntExpr::Sub(lhs, rhs) => Self::from_expr(lhs).sub(Self::from_expr(rhs)),
             IntExpr::Mul(lhs, rhs) => Self::from_expr(lhs).mul(Self::from_expr(rhs)),
@@ -475,6 +521,7 @@ impl Generator {
     fn into_expr(self) -> IntExpr {
         match self {
             Self::Var(name) => IntExpr::Var(name),
+            Self::LoopIndex(slot) => IntExpr::LoopIndex(slot),
             Self::Div(lhs, rhs) => IntExpr::Div(Box::new(lhs), Box::new(rhs)),
             Self::RoundDiv(lhs, rhs) => IntExpr::RoundDiv(Box::new(lhs), Box::new(rhs)),
             Self::Log2Ceil(value) => IntExpr::Log2Ceil(Box::new(value)),
@@ -552,6 +599,7 @@ mod tests {
                 "sigma".to_owned(),
                 Rational::new(BigInt::from(13), BigInt::from(2)).expect("rational"),
             )]),
+            loop_indices: BTreeMap::new(),
         };
         let closed = expression.close(&env).expect("closed expression");
         assert!(!closed.contains_variable("sigma"));

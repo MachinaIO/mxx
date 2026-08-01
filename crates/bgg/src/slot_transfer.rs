@@ -1,17 +1,12 @@
-use crate::{
-    AdvancedGateLowering, CircuitCompileError, NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire,
-};
-use mxx_gadgets::{
-    Poly,
-    circuit::{GateInstance, PolyCircuit},
-};
-use mxx_ir_core::{
-    GraphBuilder, IntExpr, MatrixFamilyWire, OutputFamilyError, node::MatrixBinaryOp,
-};
-use num_bigint::BigInt;
+//! Slot transfer and reduction over declarative indexed families.
+
+use crate::{NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire};
+use mxx_dsl::{DslError, Family, Mat, Ring};
+use mxx_ir_core::IntExpr;
+use rayon::prelude::*;
 use thiserror::Error;
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum SlotFamilyCompileError {
     #[error("slot transfer requires at least one destination slot")]
     EmptyTransfer,
@@ -19,12 +14,12 @@ pub enum SlotFamilyCompileError {
     EmptyReduction,
     #[error("slot reduction input count exceeds its source-slot count")]
     TooManyReductionInputs,
-    #[error("naive Graph IR slot reduction requires homogeneous public-key reveal metadata")]
+    #[error("slot reduction requires homogeneous public-key reveal metadata")]
     RevealMetadataMismatch,
-    #[error("naive Graph IR slot reduction requires homogeneous plaintext availability")]
+    #[error("slot reduction requires homogeneous plaintext availability")]
     PlaintextAvailabilityMismatch,
     #[error(transparent)]
-    OutputFamily(#[from] OutputFamilyError),
+    Dsl(#[from] DslError),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -33,37 +28,29 @@ pub struct NaiveBggSlotTransferCompiler;
 impl NaiveBggSlotTransferCompiler {
     pub fn transfer_public_keys(
         &self,
-        builder: &mut GraphBuilder,
         input: &NaiveBggPublicKeyVecWire,
         source_slots: &[(u32, Option<u32>)],
     ) -> Result<NaiveBggPublicKeyVecWire, SlotFamilyCompileError> {
         Ok(NaiveBggPublicKeyVecWire {
-            matrices: transfer_matrix_family(builder, &input.matrices, source_slots)?,
+            matrices: transfer_matrix_family(&input.matrices, source_slots)?,
             reveal_plaintext: input.reveal_plaintext,
         })
     }
 
     pub fn reduce_public_keys(
         &self,
-        builder: &mut GraphBuilder,
         inputs: &[NaiveBggPublicKeyVecWire],
         source_slot_count: usize,
     ) -> Result<NaiveBggPublicKeyVecWire, SlotFamilyCompileError> {
-        // Graph IR indexed families have one bundle-level metadata value. The
-        // old concrete container could carry different reveal flags in
-        // different output members; this compiler deliberately supports the
-        // homogeneous family invariant used by the Graph IR samplers and
-        // rejects a reduction that would create heterogeneous metadata.
         let Some(first) = inputs.first() else {
             return Err(SlotFamilyCompileError::EmptyReduction);
         };
-        if inputs.iter().any(|input| input.reveal_plaintext != first.reveal_plaintext) {
+        if inputs.par_iter().any(|input| input.reveal_plaintext != first.reveal_plaintext) {
             return Err(SlotFamilyCompileError::RevealMetadataMismatch);
         }
         Ok(NaiveBggPublicKeyVecWire {
             matrices: reduce_matrix_families(
-                builder,
-                &inputs.iter().map(|input| input.matrices.clone()).collect::<Vec<_>>(),
+                &inputs.par_iter().map(|input| input.matrices.clone()).collect::<Vec<_>>(),
                 source_slot_count,
             )?,
             reveal_plaintext: first.reveal_plaintext,
@@ -72,191 +59,88 @@ impl NaiveBggSlotTransferCompiler {
 
     pub fn transfer_encodings(
         &self,
-        builder: &mut GraphBuilder,
         input: &NaiveBggEncodingVecWire,
         source_slots: &[(u32, Option<u32>)],
     ) -> Result<NaiveBggEncodingVecWire, SlotFamilyCompileError> {
         Ok(NaiveBggEncodingVecWire {
-            vectors: transfer_matrix_family(builder, &input.vectors, source_slots)?,
-            pubkeys: transfer_matrix_family(builder, &input.pubkeys, source_slots)?,
+            vectors: transfer_matrix_family(&input.vectors, source_slots)?,
+            pubkeys: transfer_matrix_family(&input.pubkeys, source_slots)?,
             pubkey_reveal_plaintext: input.pubkey_reveal_plaintext,
             plaintexts: input
                 .plaintexts
                 .as_ref()
-                .map(|plaintexts| transfer_matrix_family(builder, plaintexts, source_slots))
+                .map(|plaintexts| transfer_matrix_family(plaintexts, source_slots))
                 .transpose()?,
         })
     }
 
     pub fn reduce_encodings(
         &self,
-        builder: &mut GraphBuilder,
         inputs: &[NaiveBggEncodingVecWire],
         source_slot_count: usize,
     ) -> Result<NaiveBggEncodingVecWire, SlotFamilyCompileError> {
-        // As above, optional plaintext presence is homogeneous for one Graph
-        // IR family. Reject mixed inputs instead of manufacturing placeholder
-        // plaintext matrices or silently losing availability metadata.
         let Some(first) = inputs.first() else {
             return Err(SlotFamilyCompileError::EmptyReduction);
         };
-        if inputs.iter().any(|input| input.pubkey_reveal_plaintext != first.pubkey_reveal_plaintext)
+        if inputs
+            .par_iter()
+            .any(|input| input.pubkey_reveal_plaintext != first.pubkey_reveal_plaintext)
         {
             return Err(SlotFamilyCompileError::RevealMetadataMismatch);
         }
         let has_plaintexts = first.plaintexts.is_some();
-        if inputs.iter().any(|input| input.plaintexts.is_some() != has_plaintexts) {
+        if inputs.par_iter().any(|input| input.plaintexts.is_some() != has_plaintexts) {
             return Err(SlotFamilyCompileError::PlaintextAvailabilityMismatch);
         }
-        let vectors = inputs.iter().map(|input| input.vectors.clone()).collect::<Vec<_>>();
-        let pubkeys = inputs.iter().map(|input| input.pubkeys.clone()).collect::<Vec<_>>();
+        let vectors = inputs.par_iter().map(|input| input.vectors.clone()).collect::<Vec<_>>();
+        let pubkeys = inputs.par_iter().map(|input| input.pubkeys.clone()).collect::<Vec<_>>();
         let plaintexts = has_plaintexts
             .then(|| {
                 inputs
-                    .iter()
-                    .map(|input| input.plaintexts.as_ref().expect("checked availability").clone())
+                    .par_iter()
+                    .map(|input| input.plaintexts.as_ref().expect("checked").clone())
                     .collect::<Vec<_>>()
             })
-            .map(|plaintexts| reduce_matrix_families(builder, &plaintexts, source_slot_count))
+            .map(|families| reduce_matrix_families(&families, source_slot_count))
             .transpose()?;
         Ok(NaiveBggEncodingVecWire {
-            vectors: reduce_matrix_families(builder, &vectors, source_slot_count)?,
-            pubkeys: reduce_matrix_families(builder, &pubkeys, source_slot_count)?,
+            vectors: reduce_matrix_families(&vectors, source_slot_count)?,
+            pubkeys: reduce_matrix_families(&pubkeys, source_slot_count)?,
             pubkey_reveal_plaintext: first.pubkey_reveal_plaintext,
             plaintexts,
         })
     }
 }
 
-impl<P: Poly> AdvancedGateLowering<P, NaiveBggPublicKeyVecWire> for NaiveBggSlotTransferCompiler {
-    fn slot_transfer(
-        &mut self,
-        builder: &mut GraphBuilder,
-        input: &NaiveBggPublicKeyVecWire,
-        source_slots: &[(u32, Option<u32>)],
-        gate: GateInstance<'_>,
-    ) -> Result<NaiveBggPublicKeyVecWire, CircuitCompileError> {
-        self.transfer_public_keys(builder, input, source_slots).map_err(|_| {
-            CircuitCompileError::InvalidSlotTransfer { gate: gate.local_gate().index() }
-        })
-    }
-
-    fn slot_reduce(
-        &mut self,
-        builder: &mut GraphBuilder,
-        inputs: &[NaiveBggPublicKeyVecWire],
-        slot_count: usize,
-        gate: GateInstance<'_>,
-    ) -> Result<NaiveBggPublicKeyVecWire, CircuitCompileError> {
-        self.reduce_public_keys(builder, inputs, slot_count).map_err(|_| {
-            CircuitCompileError::InvalidSlotTransfer { gate: gate.local_gate().index() }
-        })
-    }
-
-    fn public_lookup(
-        &mut self,
-        _builder: &mut GraphBuilder,
-        _circuit: &PolyCircuit<P>,
-        _lookup_id: usize,
-        _input: &NaiveBggPublicKeyVecWire,
-        gate: GateInstance<'_>,
-    ) -> Result<NaiveBggPublicKeyVecWire, CircuitCompileError> {
-        Err(CircuitCompileError::MissingGateContext {
-            gate: gate.local_gate().index(),
-            kind: "public lookup",
-        })
-    }
-}
-
-impl<P: Poly> AdvancedGateLowering<P, NaiveBggEncodingVecWire> for NaiveBggSlotTransferCompiler {
-    fn slot_transfer(
-        &mut self,
-        builder: &mut GraphBuilder,
-        input: &NaiveBggEncodingVecWire,
-        source_slots: &[(u32, Option<u32>)],
-        gate: GateInstance<'_>,
-    ) -> Result<NaiveBggEncodingVecWire, CircuitCompileError> {
-        self.transfer_encodings(builder, input, source_slots).map_err(|_| {
-            CircuitCompileError::InvalidSlotTransfer { gate: gate.local_gate().index() }
-        })
-    }
-
-    fn slot_reduce(
-        &mut self,
-        builder: &mut GraphBuilder,
-        inputs: &[NaiveBggEncodingVecWire],
-        slot_count: usize,
-        gate: GateInstance<'_>,
-    ) -> Result<NaiveBggEncodingVecWire, CircuitCompileError> {
-        self.reduce_encodings(builder, inputs, slot_count).map_err(|_| {
-            CircuitCompileError::InvalidSlotTransfer { gate: gate.local_gate().index() }
-        })
-    }
-
-    fn public_lookup(
-        &mut self,
-        _builder: &mut GraphBuilder,
-        _circuit: &PolyCircuit<P>,
-        _lookup_id: usize,
-        _input: &NaiveBggEncodingVecWire,
-        gate: GateInstance<'_>,
-    ) -> Result<NaiveBggEncodingVecWire, CircuitCompileError> {
-        Err(CircuitCompileError::MissingGateContext {
-            gate: gate.local_gate().index(),
-            kind: "public lookup",
-        })
-    }
-}
-
-/// Selects and optionally scales members of one BGG matrix family.
-///
-/// Each `(source, scalar)` pair creates one destination member. Scalars use
-/// the same constant-polynomial convention as `PolyCircuit` small scalar
-/// multiplication.
-pub(crate) fn transfer_matrix_family(
-    builder: &mut GraphBuilder,
-    input: &MatrixFamilyWire,
+fn transfer_matrix_family(
+    input: &Family<Mat>,
     source_slots: &[(u32, Option<u32>)],
-) -> Result<MatrixFamilyWire, SlotFamilyCompileError> {
+) -> Result<Family<Mat>, SlotFamilyCompileError> {
     if source_slots.is_empty() {
         return Err(SlotFamilyCompileError::EmptyTransfer);
     }
-    let outputs = source_slots
-        .iter()
-        .map(|(source, scalar)| {
-            let selected = builder.family_get_static(input, IntExpr::constant(*source));
-            match scalar {
-                Some(scalar) => {
-                    let scalar =
-                        builder.constant_polynomial(scalar_type(input), [BigInt::from(*scalar)]);
-                    builder.matrix_binary(
-                        MatrixBinaryOp::Multiply,
-                        &selected,
-                        &scalar,
-                        input.matrix_type.clone(),
-                    )
-                }
-                None => selected,
-            }
-        })
+    let descriptors = source_slots
+        .par_iter()
+        .map(|(source, scalar)| (usize::try_from(*source).expect("u32 fits usize"), *scalar))
         .collect::<Vec<_>>();
-    Ok(builder.family_pack(&outputs)?)
+    let ty = input.element_type();
+    let ring = Ring::new(ty.modulus.clone(), ty.ring_dimension.clone());
+    let outputs = descriptors
+        .into_iter()
+        .map(|(source, scalar)| {
+            let selected = input.get_static(source);
+            scalar.map_or(selected.clone(), |scalar| {
+                selected * ring.polynomial([IntExpr::constant(scalar)])
+            })
+        })
+        .collect();
+    Ok(Family::pack(outputs)?)
 }
 
-/// Reduces the first `source_slot_count` members of each input family into one
-/// output member, using the basis polynomials `1, X, X^2, ...`.
-///
-/// Output member `i` is derived only from input family `i`, matching the
-/// historical BGG slot-reduction layout.
-///
-/// Validation of the generated rotation constants also enforces
-/// `source_slot_count <= ring_dimension`, so an oversized reduction is
-/// rejected before execution instead of reaching a backend coefficient index.
-pub(crate) fn reduce_matrix_families(
-    builder: &mut GraphBuilder,
-    inputs: &[MatrixFamilyWire],
+fn reduce_matrix_families(
+    inputs: &[Family<Mat>],
     source_slot_count: usize,
-) -> Result<MatrixFamilyWire, SlotFamilyCompileError> {
+) -> Result<Family<Mat>, SlotFamilyCompileError> {
     if inputs.is_empty() || source_slot_count == 0 {
         return Err(SlotFamilyCompileError::EmptyReduction);
     }
@@ -265,118 +149,86 @@ pub(crate) fn reduce_matrix_families(
     }
     let mut outputs = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let mut terms = Vec::with_capacity(source_slot_count);
-        for source in 0..source_slot_count {
-            let selected = builder.family_get_static(input, IntExpr::constant(source));
-            let mut coefficients = vec![BigInt::from(0); source + 1];
-            coefficients[source] = BigInt::from(1);
-            let scalar = builder.constant_polynomial(scalar_type(input), coefficients);
-            terms.push(builder.matrix_binary(
-                MatrixBinaryOp::Multiply,
-                &selected,
-                &scalar,
-                input.matrix_type.clone(),
-            ));
-        }
-        let mut terms = terms.into_iter();
-        let mut output = terms.next().expect("source_slot_count was checked nonzero");
-        for term in terms {
-            output = builder.matrix_binary(
-                MatrixBinaryOp::Add,
-                &output,
-                &term,
-                input.matrix_type.clone(),
-            );
-        }
-        outputs.push(output);
+        let ty = input.element_type();
+        let ring = Ring::new(ty.modulus.clone(), ty.ring_dimension.clone());
+        let mut terms = (0..source_slot_count).map(|source| {
+            input.get_static(source) *
+                ring.polynomial(
+                    (0..=source).map(|index| IntExpr::constant(usize::from(index == source))),
+                )
+        });
+        let first = terms.next().expect("nonzero source slot count");
+        outputs.push(terms.fold(first, |sum, term| sum + term));
     }
-    Ok(builder.family_pack(&outputs)?)
-}
-
-fn scalar_type(input: &MatrixFamilyWire) -> mxx_ir_core::types::MatrixType {
-    mxx_ir_core::types::MatrixType {
-        modulus: input.matrix_type.modulus.clone(),
-        ring_dimension: input.matrix_type.ring_dimension.clone(),
-        rows: IntExpr::constant(1),
-        columns: IntExpr::constant(1),
-    }
+    Ok(Family::pack(outputs)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_ir_core::{ParamEnv, artifact::ArtifactConfidentiality, types::MatrixType, validate};
+    use crate::test_utils::{execute_graph, matrix_output, row};
+    use mxx_dsl::{DslContext, Family};
+    use mxx_ir_core::ParamEnv;
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::dcrt_poly::DCRTPolyMatrix,
         poly::{
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
     };
-    use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
-    };
+    use mxx_runtime::RuntimeValue;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
-    fn matrix_type(parameters: &DCRTPolyParams, rows: usize, columns: usize) -> MatrixType {
-        MatrixType {
-            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
-            rows: IntExpr::constant(rows),
-            columns: IntExpr::constant(columns),
-        }
-    }
-
-    fn row(parameters: &DCRTPolyParams, columns: usize, offset: usize) -> DCRTPolyMatrix {
-        DCRTPolyMatrix::from_poly_vec_row(
-            parameters,
-            (0..columns)
-                .map(|column| {
-                    DCRTPoly::const_rotate_poly(
-                        parameters,
-                        (offset + column) % parameters.ring_dimension() as usize,
-                    )
-                })
-                .collect(),
-        )
-    }
-
     #[test]
-    fn naive_transfer_and_reduce_match_the_legacy_slotwise_formulas() {
+    fn runtime_transfer_and_reduce_match_the_slotwise_primitive_formulas() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let columns = parameters.modulus_digits();
-        let row_type = matrix_type(&parameters, 1, columns);
-        let scalar_type = matrix_type(&parameters, 1, 1);
-        let mut builder = GraphBuilder::new("naive-slot-transfer", Vec::new());
+        let ring = Ring::new(
+            BigInt::from(parameters.modulus().as_ref().clone()),
+            parameters.ring_dimension() as usize,
+        );
+        let mut inputs = BTreeMap::new();
+        let mut source_values = BTreeMap::<String, Vec<DCRTPolyMatrix>>::new();
         let mut make_encoding = |prefix: &str| {
-            let vectors = (0..3)
-                .map(|slot| builder.input(format!("{prefix}_vector_{slot}"), row_type.clone()))
-                .collect::<Vec<_>>();
-            let pubkeys = (0..3)
-                .map(|slot| builder.input(format!("{prefix}_pubkey_{slot}"), row_type.clone()))
-                .collect::<Vec<_>>();
-            let plaintexts = (0..3)
-                .map(|slot| {
-                    builder.input(format!("{prefix}_plaintext_{slot}"), scalar_type.clone())
-                })
-                .collect::<Vec<_>>();
+            let mut make_family = |component: &str, width: usize, component_index: usize| {
+                let values = (0..3)
+                    .map(|slot| {
+                        row(
+                            &parameters,
+                            width,
+                            usize::from(prefix == "second") * 9 + component_index * 3 + slot,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let wires = values
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, value)| {
+                        let name = format!("{prefix}_{component}_{slot}");
+                        inputs.insert(name.clone(), RuntimeValue::matrix(value.clone()));
+                        ring.input(name, (1, width))
+                    })
+                    .collect();
+                source_values.insert(format!("{prefix}_{component}"), values);
+                Family::pack(wires).expect("three-member input family")
+            };
             NaiveBggEncodingVecWire {
-                vectors: builder.family_pack(&vectors).expect("vector family"),
-                pubkeys: builder.family_pack(&pubkeys).expect("public-key family"),
+                vectors: make_family("vector", columns, 0),
+                pubkeys: make_family("pubkey", columns, 1),
                 pubkey_reveal_plaintext: true,
-                plaintexts: Some(builder.family_pack(&plaintexts).expect("plaintext family")),
+                plaintexts: Some(make_family("plaintext", 1, 2)),
             }
         };
         let first = make_encoding("first");
         let second = make_encoding("second");
         let compiler = NaiveBggSlotTransferCompiler;
         let transferred = compiler
-            .transfer_encodings(&mut builder, &first, &[(2, Some(3)), (0, None)])
+            .transfer_encodings(&first, &[(2, Some(3)), (0, None)])
             .expect("valid transfer");
-        let reduced =
-            compiler.reduce_encodings(&mut builder, &[first, second], 3).expect("valid reduction");
+        let reduced = compiler.reduce_encodings(&[first, second], 3).expect("valid reduction");
+
+        let mut context = DslContext::new("naive-slot-transfer-runtime");
         for (prefix, output, count) in
             [("transferred", &transferred, 2usize), ("reduced", &reduced, 2usize)]
         {
@@ -384,56 +236,26 @@ mod tests {
                 for (component, family) in [
                     ("vector", &output.vectors),
                     ("pubkey", &output.pubkeys),
-                    ("plaintext", output.plaintexts.as_ref().expect("revealed plaintext family")),
+                    ("plaintext", output.plaintexts.as_ref().expect("plaintext family")),
                 ] {
-                    let value = builder.family_get_static(family, IntExpr::constant(slot));
-                    builder.output(
-                        format!("{prefix}_{component}_{slot}"),
-                        &value,
-                        ArtifactConfidentiality::Public,
-                    );
+                    context = context
+                        .output(format!("{prefix}_{component}_{slot}"), family.get_static(slot))
+                        .expect("matrix output");
                 }
             }
         }
-        let validated =
-            validate(&builder.finish(), &ParamEnv::default()).expect("valid slot graph");
-
-        let mut inputs = BTreeMap::new();
-        let mut source_values = BTreeMap::<String, Vec<DCRTPolyMatrix>>::new();
-        for (input_index, prefix) in ["first", "second"].into_iter().enumerate() {
-            for (component_index, (component, width)) in
-                [("vector", columns), ("pubkey", columns), ("plaintext", 1)].into_iter().enumerate()
-            {
-                let values = (0..3)
-                    .map(|slot| {
-                        row(&parameters, width, input_index * 9 + component_index * 3 + slot)
-                    })
-                    .collect::<Vec<_>>();
-                for (slot, value) in values.iter().enumerate() {
-                    inputs.insert(
-                        format!("{prefix}_{component}_{slot}"),
-                        RuntimeValue::matrix(value.clone()),
-                    );
-                }
-                source_values.insert(format!("{prefix}_{component}"), values);
-            }
-        }
-        let mut backend = cpu_backend([parameters.clone()]);
-        let mut store = MemoryArtifactStore::default();
-        let result = execute(&validated, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-            .expect("slot graph execution");
+        let result =
+            execute_graph(context.build().expect("runtime graph"), parameters.clone(), inputs);
 
         let transfer_scalar = DCRTPoly::from_u32s(&parameters, &[3]);
         for component in ["vector", "pubkey", "plaintext"] {
             let source = &source_values[&format!("first_{component}")];
             let expected = [source[2].clone() * transfer_scalar.clone(), source[0].clone()];
             for (slot, expected) in expected.into_iter().enumerate() {
-                let RuntimeValue::Matrix(actual) =
-                    &result.outputs[&format!("transferred_{component}_{slot}")]
-                else {
-                    panic!("transferred output")
-                };
-                assert_eq!(actual.as_ref(), &expected);
+                assert_eq!(
+                    matrix_output(&result, &format!("transferred_{component}_{slot}")),
+                    &expected
+                );
             }
         }
         for (output_slot, prefix) in ["first", "second"].into_iter().enumerate() {
@@ -447,83 +269,96 @@ mod tests {
                         coefficients[slot] = 1;
                         value.clone() * DCRTPoly::from_u32s(&parameters, &coefficients)
                     })
-                    .reduce(|lhs, rhs| lhs + rhs)
+                    .reduce(|left, right| left + right)
                     .expect("three source slots");
-                let RuntimeValue::Matrix(actual) =
-                    &result.outputs[&format!("reduced_{component}_{output_slot}")]
-                else {
-                    panic!("reduced output")
-                };
-                assert_eq!(actual.as_ref(), &expected);
+                assert_eq!(
+                    matrix_output(&result, &format!("reduced_{component}_{output_slot}")),
+                    &expected
+                );
             }
         }
     }
 
     #[test]
-    fn naive_reduction_rejects_oversized_rotations_during_graph_validation() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let row_type = matrix_type(&parameters, 1, parameters.modulus_digits());
-        let mut builder = GraphBuilder::new("oversized-naive-reduction", Vec::new());
-        let members = (0..9)
-            .map(|slot| builder.input(format!("slot_{slot}"), row_type.clone()))
-            .collect::<Vec<_>>();
-        let input = NaiveBggPublicKeyVecWire {
-            matrices: builder.family_pack(&members).expect("input family"),
-            reveal_plaintext: true,
-        };
-        let output = NaiveBggSlotTransferCompiler
-            .reduce_public_keys(&mut builder, &[input], 9)
-            .expect("graph construction leaves parameter validation to ir-core");
-        let first = builder.family_get_static(&output.matrices, IntExpr::constant(0));
-        builder.output("output", &first, ArtifactConfidentiality::Public);
-
-        let error = validate(&builder.finish(), &ParamEnv::default())
-            .expect_err("source slot count exceeds ring dimension");
-        assert!(error.to_string().contains("rotation exponent is out of range"));
+    fn slot_transfer_and_reduction_preserve_heterogeneous_member_terms() {
+        let ring = Ring::new(257, 8);
+        let matrices =
+            Family::pack(vec![ring.gaussian((1, 1), 2), ring.gaussian((1, 1), 3)]).expect("family");
+        let input = NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: true };
+        let compiler = NaiveBggSlotTransferCompiler;
+        let transferred =
+            compiler.transfer_public_keys(&input, &[(1, None), (0, None)]).expect("transfer");
+        let reduced = compiler.reduce_public_keys(&[input], 2).expect("reduction");
+        let built = DslContext::new("slot-symbolics")
+            .output("transferred", transferred.matrices.get_static(0))
+            .expect("transfer output")
+            .output("reduced", reduced.matrices.get_static(0))
+            .expect("reduction output")
+            .build()
+            .expect("build");
+        let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
+        let report = mxx_noise_simulator::simulate(&elaborated).expect("simulation");
+        let transferred_bound =
+            report.outputs["transferred"].noise.as_ref().expect("noise").bound.clone();
+        let reduced_bound = report.outputs["reduced"].noise.as_ref().expect("noise").bound.clone();
+        assert_eq!(transferred_bound.to_string(), "19.5");
+        assert!(reduced_bound > transferred_bound);
     }
 
     #[test]
-    fn naive_reduction_rejects_heterogeneous_bundle_metadata() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let row_type = matrix_type(&parameters, 1, parameters.modulus_digits());
-        let scalar_type = matrix_type(&parameters, 1, 1);
-        let mut builder = GraphBuilder::new("heterogeneous-naive-reduction", Vec::new());
-        let rows = (0..2)
-            .map(|slot| builder.input(format!("row_{slot}"), row_type.clone()))
-            .collect::<Vec<_>>();
-        let scalars = (0..2)
-            .map(|slot| builder.input(format!("scalar_{slot}"), scalar_type.clone()))
-            .collect::<Vec<_>>();
-        let row_family = builder.family_pack(&rows).expect("row family");
-        let scalar_family = builder.family_pack(&scalars).expect("scalar family");
-        let public =
-            NaiveBggPublicKeyVecWire { matrices: row_family.clone(), reveal_plaintext: true };
-        let hidden =
-            NaiveBggPublicKeyVecWire { matrices: row_family.clone(), reveal_plaintext: false };
-        assert_eq!(
-            NaiveBggSlotTransferCompiler.reduce_public_keys(&mut builder, &[public, hidden], 2),
+    fn reduction_rejects_oversized_rotations_during_validation() {
+        let ring = Ring::new(17, 8);
+        let input = NaiveBggPublicKeyVecWire {
+            matrices: Family::pack(
+                (0..9).map(|slot| ring.input(format!("slot-{slot}"), (1, 2))).collect(),
+            )
+            .unwrap(),
+            reveal_plaintext: true,
+        };
+        let output = NaiveBggSlotTransferCompiler
+            .reduce_public_keys(&[input], 9)
+            .expect("construction leaves rotation validation to ir-core");
+        let graph = DslContext::new("oversized-slot-reduction")
+            .output("output", output.matrices.get_static(0))
+            .unwrap()
+            .build()
+            .unwrap();
+        let error = graph
+            .validate(&ParamEnv::default())
+            .expect_err("rotation exponent exceeds ring dimension");
+        assert!(error.to_string().contains("constant polynomial exceeds the ring dimension"));
+    }
+
+    #[test]
+    fn reduction_rejects_heterogeneous_family_metadata() {
+        let ring = Ring::new(17, 8);
+        let rows =
+            Family::pack(vec![ring.input("row-0", (1, 2)), ring.input("row-1", (1, 2))]).unwrap();
+        let scalars =
+            Family::pack(vec![ring.input("scalar-0", (1, 1)), ring.input("scalar-1", (1, 1))])
+                .unwrap();
+        let public = NaiveBggPublicKeyVecWire { matrices: rows.clone(), reveal_plaintext: true };
+        let hidden = NaiveBggPublicKeyVecWire { matrices: rows.clone(), reveal_plaintext: false };
+        assert!(matches!(
+            NaiveBggSlotTransferCompiler.reduce_public_keys(&[public, hidden], 2),
             Err(SlotFamilyCompileError::RevealMetadataMismatch)
-        );
+        ));
 
         let revealed = NaiveBggEncodingVecWire {
-            vectors: row_family.clone(),
-            pubkeys: row_family.clone(),
+            vectors: rows.clone(),
+            pubkeys: rows.clone(),
             pubkey_reveal_plaintext: true,
-            plaintexts: Some(scalar_family),
+            plaintexts: Some(scalars),
         };
         let unavailable = NaiveBggEncodingVecWire {
-            vectors: row_family.clone(),
-            pubkeys: row_family,
+            vectors: rows.clone(),
+            pubkeys: rows,
             pubkey_reveal_plaintext: true,
             plaintexts: None,
         };
-        assert_eq!(
-            NaiveBggSlotTransferCompiler.reduce_encodings(
-                &mut builder,
-                &[revealed, unavailable],
-                2
-            ),
+        assert!(matches!(
+            NaiveBggSlotTransferCompiler.reduce_encodings(&[revealed, unavailable], 2),
             Err(SlotFamilyCompileError::PlaintextAvailabilityMismatch)
-        );
+        ));
     }
 }

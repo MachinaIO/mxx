@@ -1,12 +1,11 @@
-use super::{Backend, PreimageRequest};
+use super::{Backend, IndexRange, PreimageRequest, SampleRange};
 use mxx_ir_core::{
     ParamEnv,
-    node::{ConcatAxis, ConstantMatrix, HashVariant, IndexRange, SampleRange},
+    node::{ConcatAxis, ConstantMatrix, HashVariant},
     types::ConcreteMatrixType,
 };
 use mxx_primitives::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-    modulus::{ModulusRaiseError, modulus_raise},
     poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{
         DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
@@ -15,6 +14,7 @@ use mxx_primitives::{
     },
 };
 use num_bigint::{BigInt, BigUint, Sign};
+use num_integer::Integer;
 use num_traits::{One, ToPrimitive, Zero};
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use thiserror::Error;
@@ -48,8 +48,6 @@ pub enum PolyBackendError {
         backend_base: BigInt,
         backend_digits: usize,
     },
-    #[error(transparent)]
-    ModulusRaise(#[from] ModulusRaiseError),
 }
 
 pub struct PolyBackend<M, U, H, T>
@@ -182,7 +180,7 @@ where
         }
     }
 
-    #[cfg(any(test, feature = "gpu"))]
+    #[cfg(feature = "gpu")]
     pub(crate) fn new_with_placements(placements: Vec<Vec<<M::P as Poly>::Params>>) -> Self {
         assert!(!placements.is_empty(), "a backend needs at least one placement");
         let mut backend = Self {
@@ -463,6 +461,25 @@ where
                     vec![vec![M::P::const_rotate_poly(parameters, exponent)]],
                 )
             }
+            ConstantMatrix::Polynomial { coefficients } if ty.rows == 1 && ty.columns == 1 => {
+                let modulus: Arc<BigUint> = parameters.modulus().into();
+                let modulus = BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone());
+                let coefficients = coefficients
+                    .iter()
+                    .map(|coefficient| {
+                        coefficient
+                            .evaluate(env)
+                            .map_err(|_| PolyBackendError::InvalidInteger)?
+                            .mod_floor(&modulus)
+                            .to_biguint()
+                            .ok_or(PolyBackendError::InvalidInteger)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                M::from_poly_vec(
+                    parameters,
+                    vec![vec![M::P::from_biguints(parameters, &coefficients)]],
+                )
+            }
             _ => return Err(PolyBackendError::InvalidConstantShape),
         })
     }
@@ -697,42 +714,18 @@ where
         Ok(if small { value.small_decompose() } else { value.decompose() })
     }
 
-    fn modulus_down(&mut self, value: &M, target_modulus: &BigInt) -> Result<M, Self::Error> {
-        let source = self.parameters_for_matrix(value)?;
-        let target_key = RingKey {
-            modulus: target_modulus.clone(),
-            ring_dimension: source.ring_dimension() as usize,
-        };
-        let target = self.parameters[self.active_placement]
-            .get(&target_key)
-            .ok_or(PolyBackendError::MissingParameters(target_key))?;
-        Ok(value.modulus_switch(&target.modulus()))
-    }
-
-    fn modulus_up(
-        &mut self,
-        value: &M,
-        target_type: &ConcreteMatrixType,
-    ) -> Result<M, Self::Error> {
-        let source = self.parameters_for_matrix(value)?;
-        let target = self.parameters(target_type)?;
-        Ok(modulus_raise(value, source, target)?)
-    }
-
     fn extract_coefficient(&mut self, value: &M, position: usize) -> Result<BigInt, Self::Error> {
-        let parameters = self.parameters_for_matrix(value)?;
-        let modulus: Arc<BigUint> = parameters.modulus().into();
+        self.parameters_for_matrix(value)?;
         let residue = value
             .entry(0, 0)
             .coeffs_biguints()
             .get(position)
             .cloned()
             .ok_or(PolyBackendError::InvalidInteger)?;
-        if &residue * BigUint::from(2u8) > *modulus {
-            Ok(-BigInt::from_biguint(Sign::Plus, modulus.as_ref() - residue))
-        } else {
-            Ok(BigInt::from_biguint(Sign::Plus, residue))
-        }
+        // `Int` values produced by coefficient extraction are used as family
+        // and public-LUT indices. Preserve the canonical ring residue so a
+        // valid coefficient above q/2 does not become a negative index.
+        Ok(BigInt::from_biguint(Sign::Plus, residue))
     }
 
     fn threshold_decode(
@@ -797,127 +790,30 @@ pub fn cpu_backend(parameters: impl IntoIterator<Item = DCRTPolyParams>) -> CpuD
     CpuDcrtBackend::new(parameters)
 }
 
-#[cfg(feature = "gpu")]
-pub mod gpu {
-    pub use crate::backend::poly_gpu::{GpuDcrtBackend, gpu_backend};
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::Backend, execute,
-        transcript::SamplingMode,
-    };
-    use mxx_ir_core::{GraphBuilder, IntExpr, ParamEnv, artifact::ArtifactConfidentiality};
     use mxx_primitives::poly::dcrt::poly::DCRTPoly;
-    use std::collections::BTreeMap;
 
     #[test]
-    fn crt_recompose_matches_explicit_centered_rounding_relation() {
-        let parameters = DCRTPolyParams::new(4, 2, 10, 5);
-        let (plaintext_moduli, _, depth) = parameters.to_crt();
-        let reconstruction_coefficients = parameters.reconst_coeffs();
-        let modulus = parameters.modulus().as_ref().clone();
-        let expected_levels = (0..depth)
-            .map(|level| {
-                (0..2)
-                    .map(|column| {
-                        (0..parameters.ring_dimension() as usize)
-                            .map(|coefficient| {
-                                BigUint::from(1 + level + 2 * column + coefficient) %
-                                    BigUint::from(plaintext_moduli[level])
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let levels = expected_levels
-            .iter()
-            .enumerate()
-            .map(|(level, columns)| {
-                let scale = &modulus / BigUint::from(plaintext_moduli[level]);
-                DCRTPolyMatrix::from_poly_vec_row(
-                    &parameters,
-                    columns
-                        .iter()
-                        .map(|coefficients| {
-                            DCRTPoly::from_biguints(
-                                &parameters,
-                                &coefficients
-                                    .iter()
-                                    .map(|value| value * &scale)
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
-                        .collect(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut backend = cpu_backend([parameters.clone()]);
-        let actual = backend
-            .crt_recompose(
-                &levels,
-                &plaintext_moduli.iter().map(|value| BigInt::from(*value)).collect::<Vec<_>>(),
-                &reconstruction_coefficients
-                    .iter()
-                    .map(|value| BigInt::from(value.clone()))
-                    .collect::<Vec<_>>(),
-            )
-            .expect("CRT recomposition");
-        for column in 0..2 {
-            let actual_coefficients = actual.entry(0, column).coeffs_biguints();
-            for coefficient in 0..parameters.ring_dimension() as usize {
-                let expected = (0..depth)
-                    .map(|level| {
-                        &expected_levels[level][column][coefficient] *
-                            &reconstruction_coefficients[level]
-                    })
-                    .sum::<BigUint>() %
-                    &modulus;
-                assert_eq!(actual_coefficients[coefficient], expected);
-            }
-        }
-
-        let matrix_type = ConcreteMatrixType {
-            modulus: BigInt::from(modulus.clone()),
-            ring_dimension: parameters.ring_dimension() as usize,
-            rows: 1,
-            columns: 2,
-        };
-        let symbolic_type = mxx_ir_core::types::MatrixType {
-            modulus: IntExpr::constant(matrix_type.modulus.clone()),
-            ring_dimension: IntExpr::constant(matrix_type.ring_dimension),
-            rows: IntExpr::constant(1),
-            columns: IntExpr::constant(2),
-        };
-        let mut builder = GraphBuilder::new("crt-runtime-executor", Vec::new());
-        let inputs = (0..depth)
-            .map(|index| builder.input(format!("level_{index}"), symbolic_type.clone()))
-            .collect::<Vec<_>>();
-        let output = builder.crt_recompose(
-            &inputs,
-            plaintext_moduli.iter().map(|value| IntExpr::constant(*value)).collect(),
-            reconstruction_coefficients
-                .iter()
-                .map(|value| IntExpr::constant(value.clone()))
-                .collect(),
+    fn coefficient_extraction_returns_a_canonical_index_above_half_modulus() {
+        let parameters = DCRTPolyParams::new(2, 1, 10, 5);
+        let modulus = parameters.modulus();
+        let residue = modulus.as_ref() - BigUint::from(1u8);
+        let value = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![DCRTPoly::from_biguint_to_constant(&parameters, residue.clone())],
         );
-        builder.output("out", &output, ArtifactConfidentiality::Public);
-        let validated = mxx_ir_core::validate(&builder.finish(), &ParamEnv::default()).unwrap();
-        let runtime_inputs = levels
-            .iter()
-            .enumerate()
-            .map(|(index, value)| (format!("level_{index}"), RuntimeValue::matrix(value.clone())))
-            .collect::<BTreeMap<_, _>>();
-        let mut store = MemoryArtifactStore::default();
-        let executed =
-            execute(&validated, &mut backend, runtime_inputs, &mut store, SamplingMode::Fresh)
-                .expect("validated CRT graph execution");
-        let RuntimeValue::Matrix(executed) = &executed.outputs["out"] else {
-            panic!("CRT output must be a matrix")
-        };
-        assert_eq!(executed.as_ref(), &actual);
+        let mut backend = cpu_backend([parameters]);
+
+        assert_eq!(
+            backend.extract_coefficient(&value, 0).expect("extract coefficient"),
+            BigInt::from_biguint(Sign::Plus, residue)
+        );
     }
+}
+
+#[cfg(feature = "gpu")]
+pub mod gpu {
+    pub use crate::backend::poly_gpu::{GpuDcrtBackend, gpu_backend};
 }

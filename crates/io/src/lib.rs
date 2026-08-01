@@ -1,11 +1,9 @@
 // AKY24 iO and Diamond iO are disabled pending separate application cutovers to
-// the current BGG Graph IR and runtime APIs.
+// the declarative DSL and current IR/runtime APIs.
 // pub mod aky24_io;
 // pub mod diamond_io;
 // mod graph;
 // pub(crate) mod utils;
-
-use std::path::Path;
 
 /// Common interface for indistinguishability obfuscation schemes.
 pub trait Obfuscation {
@@ -18,9 +16,9 @@ pub trait Obfuscation {
     /// Plain output type returned by online evaluation.
     type Output;
 
-    /// Obfuscate `func`, storing any large preprocessing artifacts under `dir_path`.
-    fn obfuscation(&self, dir_path: &Path, func: Self::FuncType) -> Self::Obf;
+    /// Obfuscate `func` into an in-memory application value.
+    fn obfuscation(&self, func: Self::FuncType) -> Self::Obf;
 
-    /// Evaluate `obf` on `input`, reading persisted artifacts from `dir_path`.
-    fn eval(&self, dir_path: &Path, obf: &Self::Obf, input: Self::Input) -> Self::Output;
+    /// Evaluate `obf` on `input`.
+    fn eval(&self, obf: &Self::Obf, input: Self::Input) -> Self::Output;
 }

@@ -12,7 +12,11 @@ pub mod decoder;
 pub mod noise_refresh;
 pub mod utils;
 
-// GGH15 lookup and the WEE25 commitment-backed lookup evaluator are unsupported.
+#[cfg(test)]
+mod test_utils;
+
+// BGG-specific lookup evaluation lives in `mxx-bgg`. The WEE25
+// commitment-backed lookup evaluator is not currently implemented.
 
 #[cfg(test)]
 #[allow(unused_imports)]

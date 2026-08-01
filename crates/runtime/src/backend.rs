@@ -1,6 +1,6 @@
 use mxx_ir_core::{
     ParamEnv,
-    node::{ConcatAxis, ConstantMatrix, HashVariant, IndexRange, SampleRange},
+    node::{ConcatAxis, ConstantMatrix, HashVariant},
     types::ConcreteMatrixType,
 };
 use num_bigint::BigInt;
@@ -19,6 +19,18 @@ pub struct PreimageRequest<M, T> {
     pub trapdoor: Arc<T>,
     pub public: Arc<M>,
     pub target: Arc<M>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampleRange {
+    pub minimum: BigInt,
+    pub maximum: BigInt,
 }
 
 pub trait Backend {
@@ -211,16 +223,6 @@ pub trait Backend {
         &mut self,
         value: &Self::Matrix,
         small: bool,
-    ) -> Result<Self::Matrix, Self::Error>;
-    fn modulus_down(
-        &mut self,
-        value: &Self::Matrix,
-        target_modulus: &BigInt,
-    ) -> Result<Self::Matrix, Self::Error>;
-    fn modulus_up(
-        &mut self,
-        value: &Self::Matrix,
-        target_type: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error>;
     fn extract_coefficient(
         &mut self,

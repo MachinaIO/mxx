@@ -3,9 +3,13 @@ use super::{
     SlotTransferSpec, SubCircuitParamValue, gate::GateId,
 };
 use crate::Poly;
-use mxx_ir_core::GraphBuilder;
 use num_bigint::BigUint;
-use std::{borrow::Cow, collections::BTreeMap, error::Error};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    error::Error,
+    sync::Arc,
+};
 use thiserror::Error;
 
 /// Stable structural identity of one circuit-operation invocation.
@@ -51,13 +55,43 @@ impl<'a> GateInstance<'a> {
 /// sub-circuit expansion. Scheme crates implement only the operation-specific
 /// wire formulas. This keeps `mxx-gadgets` independent of BGG value types and
 /// keeps concrete execution in `mxx-runtime`.
-pub trait GraphCircuitLowering<P: Poly> {
+pub trait CircuitLoweringTypes {
     type Wire: Clone;
     type Error: Error + Send + Sync + 'static;
+}
 
+/// Scheme-specific lowering for public lookup gates.
+pub trait PublicLookupLowering<P: Poly>: CircuitLoweringTypes {
+    fn public_lookup(
+        &mut self,
+        circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        input: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error>;
+}
+
+/// Scheme-specific lowering for slot transfer and reduction gates.
+pub trait SlotOperationLowering<P: Poly>: CircuitLoweringTypes {
+    fn slot_transfer(
+        &mut self,
+        input: &Self::Wire,
+        source_slots: &[(u32, Option<u32>)],
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error>;
+
+    fn slot_reduce(
+        &mut self,
+        inputs: &[Self::Wire],
+        slot_count: usize,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error>;
+}
+
+/// Scheme-specific lowering for ordinary arithmetic gates.
+pub trait ArithmeticCircuitLowering<P: Poly>: CircuitLoweringTypes {
     fn binary(
         &mut self,
-        builder: &mut GraphBuilder,
         operation: PolyGateKind,
         lhs: &Self::Wire,
         rhs: &Self::Wire,
@@ -66,7 +100,6 @@ pub trait GraphCircuitLowering<P: Poly> {
 
     fn small_scalar_mul(
         &mut self,
-        builder: &mut GraphBuilder,
         input: &Self::Wire,
         scalar: &[u32],
         gate: GateInstance<'_>,
@@ -74,36 +107,55 @@ pub trait GraphCircuitLowering<P: Poly> {
 
     fn large_scalar_mul(
         &mut self,
-        builder: &mut GraphBuilder,
         input: &Self::Wire,
         scalar: &[BigUint],
         gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error>;
+}
 
-    fn slot_transfer(
-        &mut self,
-        builder: &mut GraphBuilder,
-        input: &Self::Wire,
-        source_slots: &[(u32, Option<u32>)],
-        gate: GateInstance<'_>,
-    ) -> Result<Self::Wire, Self::Error>;
+/// Complete lowering used by circuit traversal.
+pub trait GraphCircuitLowering<P: Poly>:
+    ArithmeticCircuitLowering<P> + PublicLookupLowering<P> + SlotOperationLowering<P>
+{
+}
 
-    fn slot_reduce(
-        &mut self,
-        builder: &mut GraphBuilder,
-        inputs: &[Self::Wire],
-        slot_count: usize,
-        gate: GateInstance<'_>,
-    ) -> Result<Self::Wire, Self::Error>;
+impl<P, L> GraphCircuitLowering<P> for L
+where
+    P: Poly,
+    L: ArithmeticCircuitLowering<P> + PublicLookupLowering<P> + SlotOperationLowering<P>,
+{
+}
 
-    fn public_lookup(
+/// Graph lowering that can preserve reusable [`PolyCircuit`] sub-circuits as
+/// structural subgraphs instead of expanding every call into its parent.
+pub trait StructuredCircuitLowering<P: Poly>: GraphCircuitLowering<P> {
+    type Subgraph: Clone;
+
+    /// Whether lookup/slot gate identities affect values or artifact names
+    /// emitted by this lowerer. Such definitions are kept per invocation;
+    /// pure executable lowerers can share them because the core subgraph call
+    /// already supplies distinct runtime and symbolic instantiation paths.
+    fn call_site_identity_is_semantic(&self) -> bool {
+        true
+    }
+
+    fn define_subgraph<F>(
         &mut self,
-        builder: &mut GraphBuilder,
-        circuit: &PolyCircuit<P>,
-        lookup_id: usize,
-        input: &Self::Wire,
-        gate: GateInstance<'_>,
-    ) -> Result<Self::Wire, Self::Error>;
+        name: &str,
+        input_examples: &[Self::Wire],
+        body: F,
+    ) -> Result<Self::Subgraph, CircuitLowerError<Self::Error>>
+    where
+        F: FnOnce(
+            &mut Self,
+            Vec<Self::Wire>,
+        ) -> Result<Vec<Self::Wire>, CircuitLowerError<Self::Error>>;
+
+    fn call_subgraph(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Self::Wire>,
+    ) -> Result<Vec<Self::Wire>, CircuitLowerError<Self::Error>>;
 }
 
 #[derive(Debug, Error)]
@@ -123,6 +175,8 @@ where
     ParameterizedPublicLookup { gate: usize, parameter: usize },
     #[error("the circuit lowerer received more input bundles than the circuit consumes")]
     ExtraInputs,
+    #[error("graph structure error: {0}")]
+    GraphStructure(String),
     #[error("gate {gate}: {source}")]
     Operation {
         gate: usize,
@@ -134,7 +188,6 @@ where
 /// Lowers one complete circuit, including recursively registered and summed
 /// sub-circuits, into canonical Graph IR through `lowering`.
 pub fn lower_circuit<P, L>(
-    builder: &mut GraphBuilder,
     circuit: &PolyCircuit<P>,
     one: L::Wire,
     inputs: impl IntoIterator<Item = L::Wire>,
@@ -144,19 +197,313 @@ where
     P: Poly,
     L: GraphCircuitLowering<P>,
 {
-    lower_scoped(
-        builder,
+    lower_scoped(circuit, one, inputs.into_iter().collect(), &[], &mut Vec::new(), lowering)
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SubgraphCacheKey {
+    circuit_identity: usize,
+    bindings: Vec<SubCircuitParamValue>,
+    call_path: Option<Vec<usize>>,
+}
+
+struct StructuredLoweringState<S> {
+    definitions: HashMap<SubgraphCacheKey, S>,
+    call_site_identity: HashMap<usize, bool>,
+    next_definition: usize,
+}
+
+impl<S> Default for StructuredLoweringState<S> {
+    fn default() -> Self {
+        Self { definitions: HashMap::new(), call_site_identity: HashMap::new(), next_definition: 0 }
+    }
+}
+
+fn requires_call_site_identity<P: Poly>(
+    circuit: &PolyCircuit<P>,
+    memo: &mut HashMap<usize, bool>,
+) -> bool {
+    let circuit_identity = circuit as *const PolyCircuit<P> as usize;
+    if let Some(&required) = memo.get(&circuit_identity) {
+        return required;
+    }
+    // Registered sub-circuits form a DAG. Insert a provisional value so an
+    // invalid recursive registration cannot make this structural query recurse
+    // forever before normal circuit validation reports it.
+    memo.insert(circuit_identity, false);
+    let required = circuit.gates_in_id_order().any(|(_, gate)| match &gate.gate_type {
+        PolyGateType::SlotTransfer { .. } |
+        PolyGateType::SlotReduce { .. } |
+        PolyGateType::PubLut { .. } => true,
+        PolyGateType::SubCircuitOutput { call_id, .. } => {
+            let info = circuit.sub_circuit_call_info(*call_id);
+            let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
+            requires_call_site_identity(child.as_ref(), memo)
+        }
+        PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
+            let info = circuit.summed_sub_circuit_call_info(*summed_call_id);
+            let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
+            requires_call_site_identity(child.as_ref(), memo)
+        }
+        _ => false,
+    });
+    memo.insert(circuit_identity, required);
+    required
+}
+
+/// Lowers a complete circuit while retaining registered sub-circuits as
+/// reusable structural subgraphs. The implicit constant-one wire is an
+/// explicit subgraph argument so no executable value is captured across a
+/// structural boundary.
+pub fn lower_circuit_structured<P, L>(
+    circuit: &PolyCircuit<P>,
+    one: L::Wire,
+    inputs: impl IntoIterator<Item = L::Wire>,
+    lowering: &mut L,
+) -> Result<Vec<L::Wire>, CircuitLowerError<L::Error>>
+where
+    P: Poly,
+    L: StructuredCircuitLowering<P>,
+{
+    lower_scoped_structured(
         circuit,
         one,
         inputs.into_iter().collect(),
         &[],
         &mut Vec::new(),
         lowering,
+        &mut StructuredLoweringState::default(),
     )
 }
 
+fn structured_definition<P, L>(
+    child: Arc<PolyCircuit<P>>,
+    one: &L::Wire,
+    child_inputs: &[L::Wire],
+    bindings: &[SubCircuitParamValue],
+    call_path: &[usize],
+    lowering: &mut L,
+    state: &mut StructuredLoweringState<L::Subgraph>,
+) -> Result<L::Subgraph, CircuitLowerError<L::Error>>
+where
+    P: Poly,
+    L: StructuredCircuitLowering<P>,
+{
+    let call_site_identity = lowering.call_site_identity_is_semantic() &&
+        requires_call_site_identity(child.as_ref(), &mut state.call_site_identity);
+    let key = SubgraphCacheKey {
+        circuit_identity: Arc::as_ptr(&child) as usize,
+        bindings: bindings.to_vec(),
+        call_path: call_site_identity.then(|| call_path.to_vec()),
+    };
+    if let Some(definition) = state.definitions.get(&key) {
+        return Ok(definition.clone());
+    }
+    let definition_id = state.next_definition;
+    state.next_definition += 1;
+    let name = format!("poly-circuit-{definition_id}");
+    let definition_inputs =
+        std::iter::once(one.clone()).chain(child_inputs.iter().cloned()).collect::<Vec<_>>();
+    let bindings = bindings.to_vec();
+    let mut definition_path = call_path.to_vec();
+    let definition =
+        lowering.define_subgraph(&name, &definition_inputs, |lowering, mut placeholders| {
+            if placeholders.is_empty() {
+                return Err(CircuitLowerError::InvalidArity { gate: 0 });
+            }
+            let child_one = placeholders.remove(0);
+            lower_scoped_structured(
+                child.as_ref(),
+                child_one,
+                placeholders,
+                &bindings,
+                &mut definition_path,
+                lowering,
+                state,
+            )
+        })?;
+    state.definitions.insert(key, definition.clone());
+    Ok(definition)
+}
+
+fn call_structured_child<P, L>(
+    child: Arc<PolyCircuit<P>>,
+    one: &L::Wire,
+    child_inputs: Vec<L::Wire>,
+    bindings: &[SubCircuitParamValue],
+    call_path: &[usize],
+    lowering: &mut L,
+    state: &mut StructuredLoweringState<L::Subgraph>,
+) -> Result<Vec<L::Wire>, CircuitLowerError<L::Error>>
+where
+    P: Poly,
+    L: StructuredCircuitLowering<P>,
+{
+    let definition =
+        structured_definition(child, one, &child_inputs, bindings, call_path, lowering, state)?;
+    lowering.call_subgraph(&definition, std::iter::once(one.clone()).chain(child_inputs).collect())
+}
+
+fn lower_scoped_structured<P, L>(
+    circuit: &PolyCircuit<P>,
+    one: L::Wire,
+    inputs: Vec<L::Wire>,
+    bindings: &[SubCircuitParamValue],
+    call_path: &mut Vec<usize>,
+    lowering: &mut L,
+    state: &mut StructuredLoweringState<L::Subgraph>,
+) -> Result<Vec<L::Wire>, CircuitLowerError<L::Error>>
+where
+    P: Poly,
+    L: StructuredCircuitLowering<P>,
+{
+    let mut values = BTreeMap::new();
+    let mut supplied = inputs.into_iter();
+    for (_, gate) in circuit.gates_in_id_order() {
+        let gate_id = gate.gate_id.index();
+        if values.contains_key(&gate_id) {
+            continue;
+        }
+        let gate_instance = GateInstance::ordinary(call_path, gate.gate_id);
+        let value = match &gate.gate_type {
+            PolyGateType::Input if gate_id == 0 => one.clone(),
+            PolyGateType::Input => supplied
+                .next()
+                .ok_or(CircuitLowerError::MissingInput { gate: gate_id, input: gate_id })?,
+            PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => {
+                let [lhs, rhs] = lookup_binary(&values, gate)?;
+                lowering
+                    .binary(gate.gate_type.kind(), lhs, rhs, gate_instance)
+                    .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
+            }
+            PolyGateType::SmallScalarMul { scalar } => {
+                let input = lookup_unary(&values, gate)?;
+                let scalar = resolve_small_scalar(scalar, bindings, gate_id)?;
+                lowering
+                    .small_scalar_mul(input, scalar, gate_instance)
+                    .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
+            }
+            PolyGateType::LargeScalarMul { scalar } => {
+                let input = lookup_unary(&values, gate)?;
+                let scalar = resolve_large_scalar(scalar, bindings, gate_id)?;
+                lowering
+                    .large_scalar_mul(input, scalar, gate_instance)
+                    .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
+            }
+            PolyGateType::SlotTransfer { src_slots } => {
+                let input = lookup_unary(&values, gate)?;
+                let source_slots = resolve_slot_transfer(src_slots, bindings, gate_id)?;
+                lowering
+                    .slot_transfer(input, &source_slots, gate_instance)
+                    .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
+            }
+            PolyGateType::SlotReduce { num_slots, .. } => {
+                let inputs = lookup_many(&values, gate)?;
+                lowering
+                    .slot_reduce(&inputs, *num_slots, gate_instance)
+                    .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
+            }
+            PolyGateType::PubLut { lut_id } => {
+                let input = lookup_unary(&values, gate)?;
+                let lookup_id = match lut_id {
+                    GateParamSource::Const(lookup_id) => *lookup_id,
+                    GateParamSource::Param(parameter) => {
+                        return Err(CircuitLowerError::ParameterizedPublicLookup {
+                            gate: gate_id,
+                            parameter: *parameter,
+                        });
+                    }
+                };
+                lowering
+                    .public_lookup(circuit, lookup_id, input, gate_instance)
+                    .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
+            }
+            PolyGateType::SubCircuitOutput { call_id, .. } => {
+                let info = circuit.sub_circuit_call_info(*call_id);
+                let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
+                let child_inputs = flatten_inputs(&values, &info.inputs, gate_id)?;
+                call_path.push(info.scoped_call_id);
+                let outputs = call_structured_child(
+                    child,
+                    &one,
+                    child_inputs,
+                    info.param_bindings.as_ref(),
+                    call_path,
+                    lowering,
+                    state,
+                );
+                call_path.pop();
+                let outputs = outputs?;
+                insert_call_outputs(&mut values, &info.output_gate_ids, outputs, gate_id)?;
+                continue;
+            }
+            PolyGateType::SummedSubCircuitOutput { summed_call_id, .. } => {
+                let info = circuit.summed_sub_circuit_call_info(*summed_call_id);
+                let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
+                if info.call_inputs.len() != info.scoped_call_ids.len() ||
+                    info.param_bindings.len() != info.scoped_call_ids.len()
+                {
+                    return Err(CircuitLowerError::InvalidArity { gate: gate_id });
+                }
+                let mut accumulated: Option<Vec<L::Wire>> = None;
+                for (inner_call, ((call_inputs, call_bindings), scoped_call_id)) in info
+                    .call_inputs
+                    .iter()
+                    .zip(info.param_bindings.iter())
+                    .zip(info.scoped_call_ids.iter())
+                    .enumerate()
+                {
+                    let child_inputs = flatten_inputs(&values, call_inputs, gate_id)?;
+                    call_path.push(*scoped_call_id);
+                    let outputs = call_structured_child(
+                        child.clone(),
+                        &one,
+                        child_inputs,
+                        call_bindings.as_ref(),
+                        call_path,
+                        lowering,
+                        state,
+                    );
+                    call_path.pop();
+                    let outputs = outputs?;
+                    if let Some(current) = accumulated.as_mut() {
+                        if current.len() != outputs.len() {
+                            return Err(CircuitLowerError::InvalidArity { gate: gate_id });
+                        }
+                        for ((sum, output), output_gate) in
+                            current.iter_mut().zip(outputs).zip(info.output_gate_ids.iter())
+                        {
+                            *sum = lowering
+                                .binary(
+                                    PolyGateKind::Add,
+                                    sum,
+                                    &output,
+                                    GateInstance::occurrence(call_path, *output_gate, inner_call),
+                                )
+                                .map_err(|source| CircuitLowerError::Operation {
+                                    gate: gate_id,
+                                    source,
+                                })?;
+                        }
+                    } else {
+                        accumulated = Some(outputs);
+                    }
+                }
+                let outputs =
+                    accumulated.ok_or(CircuitLowerError::InvalidArity { gate: gate_id })?;
+                insert_call_outputs(&mut values, &info.output_gate_ids, outputs, gate_id)?;
+                continue;
+            }
+        };
+        values.insert(gate_id, value);
+    }
+    if supplied.next().is_some() {
+        return Err(CircuitLowerError::ExtraInputs);
+    }
+    collect_outputs(circuit, &values)
+}
+
 fn lower_scoped<P, L>(
-    builder: &mut GraphBuilder,
     circuit: &PolyCircuit<P>,
     one: L::Wire,
     inputs: Vec<L::Wire>,
@@ -184,34 +531,34 @@ where
             PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => {
                 let [lhs, rhs] = lookup_binary(&values, gate)?;
                 lowering
-                    .binary(builder, gate.gate_type.kind(), lhs, rhs, gate_instance)
+                    .binary(gate.gate_type.kind(), lhs, rhs, gate_instance)
                     .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
             }
             PolyGateType::SmallScalarMul { scalar } => {
                 let input = lookup_unary(&values, gate)?;
                 let scalar = resolve_small_scalar(scalar, bindings, gate_id)?;
                 lowering
-                    .small_scalar_mul(builder, input, scalar, gate_instance)
+                    .small_scalar_mul(input, scalar, gate_instance)
                     .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
             }
             PolyGateType::LargeScalarMul { scalar } => {
                 let input = lookup_unary(&values, gate)?;
                 let scalar = resolve_large_scalar(scalar, bindings, gate_id)?;
                 lowering
-                    .large_scalar_mul(builder, input, scalar, gate_instance)
+                    .large_scalar_mul(input, scalar, gate_instance)
                     .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
             }
             PolyGateType::SlotTransfer { src_slots } => {
                 let input = lookup_unary(&values, gate)?;
                 let source_slots = resolve_slot_transfer(src_slots, bindings, gate_id)?;
                 lowering
-                    .slot_transfer(builder, input, &source_slots, gate_instance)
+                    .slot_transfer(input, &source_slots, gate_instance)
                     .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
             }
             PolyGateType::SlotReduce { num_slots, .. } => {
                 let inputs = lookup_many(&values, gate)?;
                 lowering
-                    .slot_reduce(builder, &inputs, *num_slots, gate_instance)
+                    .slot_reduce(&inputs, *num_slots, gate_instance)
                     .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
             }
             PolyGateType::PubLut { lut_id } => {
@@ -226,7 +573,7 @@ where
                     }
                 };
                 lowering
-                    .public_lookup(builder, circuit, lookup_id, input, gate_instance)
+                    .public_lookup(circuit, lookup_id, input, gate_instance)
                     .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
             }
             PolyGateType::SubCircuitOutput { call_id, .. } => {
@@ -235,7 +582,6 @@ where
                 let child_inputs = flatten_inputs(&values, &info.inputs, gate_id)?;
                 call_path.push(info.scoped_call_id);
                 let outputs = lower_scoped(
-                    builder,
                     child.as_ref(),
                     one.clone(),
                     child_inputs,
@@ -267,7 +613,6 @@ where
                     let child_inputs = flatten_inputs(&values, call_inputs, gate_id)?;
                     call_path.push(*scoped_call_id);
                     let outputs = lower_scoped(
-                        builder,
                         child.as_ref(),
                         one.clone(),
                         child_inputs,
@@ -286,7 +631,6 @@ where
                         {
                             *sum = lowering
                                 .binary(
-                                    builder,
                                     PolyGateKind::Add,
                                     sum,
                                     &output,
@@ -538,13 +882,14 @@ mod tests {
         }
     }
 
-    impl GraphCircuitLowering<DCRTPoly> for RecordingLowering {
+    impl CircuitLoweringTypes for RecordingLowering {
         type Wire = usize;
         type Error = Infallible;
+    }
 
+    impl ArithmeticCircuitLowering<DCRTPoly> for RecordingLowering {
         fn binary(
             &mut self,
-            _builder: &mut GraphBuilder,
             operation: PolyGateKind,
             lhs: &Self::Wire,
             rhs: &Self::Wire,
@@ -556,7 +901,6 @@ mod tests {
 
         fn small_scalar_mul(
             &mut self,
-            _builder: &mut GraphBuilder,
             input: &Self::Wire,
             scalar: &[u32],
             gate: GateInstance<'_>,
@@ -568,7 +912,6 @@ mod tests {
 
         fn large_scalar_mul(
             &mut self,
-            _builder: &mut GraphBuilder,
             input: &Self::Wire,
             scalar: &[BigUint],
             gate: GateInstance<'_>,
@@ -577,10 +920,11 @@ mod tests {
             self.large_scalars.push(scalar.to_vec());
             Ok(*input)
         }
+    }
 
+    impl SlotOperationLowering<DCRTPoly> for RecordingLowering {
         fn slot_transfer(
             &mut self,
-            _builder: &mut GraphBuilder,
             input: &Self::Wire,
             source_slots: &[(u32, Option<u32>)],
             gate: GateInstance<'_>,
@@ -592,7 +936,6 @@ mod tests {
 
         fn slot_reduce(
             &mut self,
-            _builder: &mut GraphBuilder,
             inputs: &[Self::Wire],
             _slot_count: usize,
             gate: GateInstance<'_>,
@@ -600,10 +943,11 @@ mod tests {
             self.record(PolyGateKind::SlotReduce, gate);
             Ok(inputs.iter().sum())
         }
+    }
 
+    impl PublicLookupLowering<DCRTPoly> for RecordingLowering {
         fn public_lookup(
             &mut self,
-            _builder: &mut GraphBuilder,
             _circuit: &PolyCircuit<DCRTPoly>,
             _lookup_id: usize,
             input: &Self::Wire,
@@ -611,6 +955,33 @@ mod tests {
         ) -> Result<Self::Wire, Self::Error> {
             self.record(PolyGateKind::PubLut, gate);
             Ok(*input)
+        }
+    }
+
+    impl StructuredCircuitLowering<DCRTPoly> for RecordingLowering {
+        type Subgraph = Vec<usize>;
+
+        fn define_subgraph<F>(
+            &mut self,
+            _name: &str,
+            input_examples: &[Self::Wire],
+            body: F,
+        ) -> Result<Self::Subgraph, CircuitLowerError<Self::Error>>
+        where
+            F: FnOnce(
+                &mut Self,
+                Vec<Self::Wire>,
+            ) -> Result<Vec<Self::Wire>, CircuitLowerError<Self::Error>>,
+        {
+            body(self, input_examples.to_vec())
+        }
+
+        fn call_subgraph(
+            &mut self,
+            definition: &Self::Subgraph,
+            _inputs: Vec<Self::Wire>,
+        ) -> Result<Vec<Self::Wire>, CircuitLowerError<Self::Error>> {
+            Ok(definition.clone())
         }
     }
 
@@ -637,9 +1008,16 @@ mod tests {
     }
 
     fn recorded_lowering(circuit: &PolyCircuit<DCRTPoly>) -> RecordingLowering {
-        let mut builder = GraphBuilder::new("recording-lowering", Vec::new());
         let mut lowering = RecordingLowering::default();
-        let outputs = lower_circuit(&mut builder, circuit, 1, [7], &mut lowering)
+        let outputs =
+            lower_circuit(circuit, 1, [7], &mut lowering).expect("recording lowerer is infallible");
+        assert_eq!(outputs, vec![7, 7, 7, 7, 14, 14]);
+        lowering
+    }
+
+    fn recorded_structured_lowering(circuit: &PolyCircuit<DCRTPoly>) -> RecordingLowering {
+        let mut lowering = RecordingLowering::default();
+        let outputs = lower_circuit_structured(circuit, 1, [7], &mut lowering)
             .expect("recording lowerer is infallible");
         assert_eq!(outputs, vec![7, 7, 7, 7, 14, 14]);
         lowering
@@ -691,6 +1069,31 @@ mod tests {
     }
 
     #[test]
+    fn structured_sensitive_subcircuits_preserve_each_invocation_identity() {
+        let (circuit, _) = repeated_child_circuit();
+        let first = recorded_structured_lowering(&circuit);
+        let second = recorded_structured_lowering(&circuit);
+        assert_eq!(first.operations, second.operations);
+
+        let slot_instances = first
+            .operations
+            .iter()
+            .filter(|(kind, ..)| *kind == PolyGateKind::SlotTransfer)
+            .collect::<Vec<_>>();
+        assert_eq!(slot_instances.len(), 4);
+        let distinct_paths = slot_instances
+            .iter()
+            .map(|(_, path, ..)| path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct_paths.len(), 4);
+        assert_eq!(
+            first.operations,
+            recorded_lowering(&circuit).operations,
+            "structured lowering must preserve the flat lowering identities for artifact-sensitive gates"
+        );
+    }
+
+    #[test]
     fn direct_and_summed_subcircuits_resolve_each_scalar_binding() {
         let mut child = PolyCircuit::<DCRTPoly>::new();
         let input = child.input(1).as_single_wire();
@@ -726,9 +1129,8 @@ mod tests {
         );
         circuit.output([direct[0], summed[0]]);
 
-        let mut builder = GraphBuilder::new("bound-summed-lowering", Vec::new());
         let mut lowering = RecordingLowering::default();
-        let outputs = lower_circuit(&mut builder, &circuit, 1usize, [13, 17, 19], &mut lowering)
+        let outputs = lower_circuit(&circuit, 1usize, [13, 17, 19], &mut lowering)
             .expect("recording lowerer is infallible");
         assert_eq!(outputs, vec![13, 36]);
         assert_eq!(lowering.small_scalars, vec![vec![2, 3], vec![2, 3], vec![7]]);

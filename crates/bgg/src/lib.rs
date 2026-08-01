@@ -1,9 +1,7 @@
-//! Graph-IR compilers for BGG+ wire bundles and polynomial circuits.
+//! BGG+ constructions expressed directly with the declarative graph DSL.
 
 pub mod circuit;
-pub mod digits_to_int;
 pub mod encoding;
-pub mod input_injection;
 pub mod lwe_lookup;
 pub mod masked_decoder;
 pub mod naive_vec;
@@ -19,20 +17,15 @@ pub mod wee25_commitment;
 pub mod wee25_opening;
 pub mod wee25_public_parameters;
 
-pub use circuit::{
-    AdvancedGateLowering, CircuitCompileError, CompositeAdvancedGateLowering, PolyCircuitCompiler,
-};
-pub use digits_to_int::{BggDigitsToIntCompiler, DigitsToIntCompileError};
-pub use encoding::{BggEncodingCompiler, BggEncodingWire};
-pub use input_injection::{
-    DIAMOND_FINAL_PUBLIC, DIAMOND_FINAL_TRAPDOORS, DIAMOND_INITIAL_STATE,
-    DiamondInputInjectionArtifacts, DiamondInputInjectionCompiler, DiamondInputInjectionError,
-    DiamondInputInjectionPreprocessingWires, DiamondInputInjectionWires,
-};
+#[cfg(test)]
+mod test_utils;
+
+pub use circuit::{CircuitCompileError, NoPublicLookup, NoSlotOperations, PolyCircuitCompiler};
+pub use encoding::{BggEncodingCompiler, BggEncodingType, BggEncodingWire, EncodingCompileError};
 pub use lwe_lookup::{
     LweLookupArtifactNames, LweLookupArtifactWires, LweLookupArtifacts, LweLookupCompileError,
     LweLookupCompiler, LweLookupEncodingLowering, LweLookupIdentity, LweLookupInvocation,
-    LweLookupPolyEncodingLowering, LweLookupPreprocessingWire, LweLookupPublicKeyLowering,
+    LweLookupPolyEncodingLowering, LweLookupPreprocessingWires, LweLookupPublicKeyLowering,
     LweLookupTable, NaiveLweLookupEncodingLowering, NaiveLweLookupInvocation,
     NaiveLweLookupPublicKeyLowering,
 };
@@ -49,16 +42,16 @@ pub use noise_refresh::{
     NaiveBggNoiseRefreshPreprocessingWires,
 };
 pub use poly_encoding::{BggPolyEncodingCompiler, BggPolyEncodingWire, PolyEncodingCompileError};
-pub use public_key::{BggPublicKeyCompiler, BggPublicKeyWire};
+pub use public_key::{BggPublicKeyCompiler, BggPublicKeyType, BggPublicKeyWire};
 pub use sampler::{
     BggEncodingSampler, BggPolyEncodingSample, BggPolyEncodingSampler, BggPublicKeySampler,
     BggSampleError, BggSamplerLayout, NaiveBggEncodingVecSampler, NaiveBggPublicKeyVecSampler,
 };
 pub use slot_transfer::{NaiveBggSlotTransferCompiler, SlotFamilyCompileError};
 pub use slot_transfer_artifact::{
-    BggSlotTransferArtifactCompiler, BggSlotTransferBaseArtifacts, BggSlotTransferBaseWires,
-    BggSlotTransferGateArtifacts, BggSlotTransferGateWires, BggSlotTransferPublicSlotWires,
-    BggSlotTransferSlotArtifacts, BggSlotTransferSlotWires, SlotTransferArtifactError,
+    BggSlotTransferArtifactCompiler, BggSlotTransferArtifactError, BggSlotTransferBaseArtifacts,
+    BggSlotTransferBaseWires, BggSlotTransferGateArtifacts, BggSlotTransferGateWires,
+    BggSlotTransferPublicSlotWires, BggSlotTransferSlotArtifacts, BggSlotTransferSlotWires,
 };
 pub use slot_transfer_poly_encoding::BggPolySlotTransferLowering;
 pub use slot_transfer_public_key::{BggSlotTransferGateRequest, BggSlotTransferPublicKeyLowering};
@@ -73,3 +66,5 @@ pub use wee25_opening::{
 pub use wee25_public_parameters::{
     WEE25_PUBLIC_B_TRAPDOOR, Wee25PublicParameterCompiler, Wee25PublicParameterPreprocessingWires,
 };
+
+// The WEE25 commitment-backed lookup evaluator remains intentionally absent.

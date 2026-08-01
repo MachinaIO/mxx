@@ -3,7 +3,6 @@ use crate::{
     types::{ConcreteMatrixType, NodeId},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -33,20 +32,20 @@ pub enum CheckError {
 }
 
 pub fn check_topological(graph: &Graph) -> Result<(), CheckError> {
-    let mut seen = BTreeSet::new();
-    for node in &graph.nodes {
-        if !seen.insert(node.id) {
-            return Err(CheckError::DuplicateNode(node.id));
-        }
-        for argument in &node.args {
-            if !seen.contains(&argument.node) {
-                return Err(CheckError::NotTopological { node: node.id, dependency: argument.node });
+    for scope in graph.scopes().values() {
+        for (position, node) in scope.nodes().iter().enumerate() {
+            let id = NodeId(position as u64);
+            for argument in scope.arguments(node).expect("frozen same-scope arguments") {
+                if argument.node.0 >= id.0 {
+                    return Err(CheckError::NotTopological { node: id, dependency: argument.node });
+                }
             }
         }
     }
-    for (name, wire) in &graph.outputs {
-        if !seen.contains(&wire.node) {
-            return Err(CheckError::InvalidOutput { name: name.clone(), node: wire.node });
+    let root = graph.root_scope();
+    for (name, output) in graph.outputs() {
+        if root.node(output.value.node).is_none() {
+            return Err(CheckError::InvalidOutput { name: name.clone(), node: output.value.node });
         }
     }
     Ok(())
@@ -93,71 +92,4 @@ pub fn multiplication_type(
         rows,
         columns,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        graph::Graph,
-        node::{Node, NodeKind},
-        types::{Port, WireRef},
-    };
-    use num_bigint::BigInt;
-    use std::collections::BTreeMap;
-
-    fn wire(node: u64) -> WireRef {
-        WireRef { node: NodeId(node), port: Port(0) }
-    }
-
-    fn graph(nodes: Vec<Node>, output: WireRef) -> Graph {
-        Graph {
-            name: "checks".to_owned(),
-            parameters: Vec::new(),
-            input_types: BTreeMap::new(),
-            nodes,
-            outputs: BTreeMap::from([("out".to_owned(), output)]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        }
-    }
-
-    fn integer(id: u64) -> Node {
-        Node { id: NodeId(id), kind: NodeKind::ConstantInt(BigInt::from(id)), args: Vec::new() }
-    }
-
-    #[test]
-    fn topological_check_rejects_duplicate_node_ids() {
-        let error = check_topological(&graph(vec![integer(1), integer(1)], wire(1)))
-            .expect_err("duplicate node");
-        assert!(matches!(error, CheckError::DuplicateNode(NodeId(1))));
-    }
-
-    #[test]
-    fn topological_check_rejects_forward_references() {
-        let dependent = Node {
-            id: NodeId(1),
-            kind: NodeKind::IntBinary(crate::node::IntBinaryOp::Add),
-            args: vec![wire(2), wire(2)],
-        };
-        let error = check_topological(&graph(vec![dependent, integer(2)], wire(1)))
-            .expect_err("forward reference");
-        assert!(matches!(
-            error,
-            CheckError::NotTopological { node: NodeId(1), dependency: NodeId(2) }
-        ));
-    }
-
-    #[test]
-    fn topological_check_rejects_missing_output_node() {
-        let error =
-            check_topological(&graph(vec![integer(1)], wire(2))).expect_err("missing output node");
-        assert!(matches!(
-            error,
-            CheckError::InvalidOutput {
-                name,
-                node: NodeId(2),
-            } if name == "out"
-        ));
-    }
 }

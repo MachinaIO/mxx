@@ -1174,3 +1174,324 @@ pub fn encode_montgomery_poly_with_window<P: Poly>(
         .flatten()
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        circuit_gadgets::arith::{DecomposeArithmeticGadget, ModularArithmeticGadget},
+        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        test_utils::execute_circuit,
+        utils::gen_biguint_for_modulus,
+    };
+    use mxx_primitives::poly::{
+        Poly as ConcretePoly, PolyParams,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    };
+    use num_traits::Zero;
+
+    const LIMB_BIT_SIZE: usize = 3;
+
+    fn test_parameters() -> DCRTPolyParams {
+        DCRTPolyParams::new(4, 3, 12, 6)
+    }
+
+    fn execute_polys(
+        name: &str,
+        parameters: &DCRTPolyParams,
+        circuit: &PolyCircuit<DCRTPoly>,
+        inputs: Vec<DCRTPoly>,
+    ) -> Vec<DCRTPoly> {
+        let inputs = inputs
+            .into_iter()
+            .map(|poly| DCRTPolyMatrix::from_poly_vec_row(parameters, vec![poly]))
+            .collect::<Vec<_>>();
+        execute_circuit(name, parameters, circuit, &inputs)
+            .into_iter()
+            .map(|matrix| matrix.entry(0, 0).clone())
+            .collect()
+    }
+
+    fn active_modulus(
+        parameters: &DCRTPolyParams,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+    ) -> BigUint {
+        let (q_moduli, _, _) = parameters.to_crt();
+        let levels = enable_levels.unwrap_or(q_moduli.len() - level_offset);
+        q_moduli[level_offset..level_offset + levels]
+            .par_iter()
+            .copied()
+            .map(BigUint::from)
+            .reduce(BigUint::one, |left, right| left * right)
+    }
+
+    fn random_value(modulus: &BigUint) -> BigUint {
+        let mut rng = rand::rng();
+        gen_biguint_for_modulus(&mut rng, modulus)
+    }
+
+    fn build_input(
+        context: Arc<MontgomeryPolyContext<DCRTPoly>>,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+        circuit: &mut PolyCircuit<DCRTPoly>,
+    ) -> MontgomeryPoly<DCRTPoly> {
+        <MontgomeryPoly<DCRTPoly> as ModularArithmeticGadget<DCRTPoly>>::input(
+            context,
+            enable_levels,
+            Some(level_offset),
+            circuit,
+        )
+    }
+
+    fn execute_constant_output(
+        name: &str,
+        parameters: &DCRTPolyParams,
+        circuit: &PolyCircuit<DCRTPoly>,
+        inputs: Vec<DCRTPoly>,
+    ) -> BigUint {
+        let outputs = execute_polys(name, parameters, circuit, inputs);
+        assert_eq!(outputs.len(), 1);
+        outputs[0].coeffs_biguints()[0].clone()
+    }
+
+    fn test_roundtrip_case(
+        limb_bit_size: usize,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+        value: BigUint,
+    ) {
+        let parameters = test_parameters();
+        let modulus = active_modulus(&parameters, enable_levels, level_offset);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context =
+            Arc::new(MontgomeryPolyContext::setup(&mut circuit, &parameters, limb_bit_size, false));
+        let input = build_input(context, enable_levels, level_offset, &mut circuit);
+        let output = input.finalize(&mut circuit);
+        circuit.output([output]);
+        let inputs = encode_montgomery_poly_with_window(
+            limb_bit_size,
+            &parameters,
+            &value,
+            enable_levels,
+            level_offset,
+        );
+        let actual =
+            execute_constant_output("montgomery-roundtrip-runtime", &parameters, &circuit, inputs);
+        assert_eq!(actual % &modulus, value % modulus);
+    }
+
+    #[derive(Clone, Copy)]
+    enum BinaryOperation {
+        Add,
+        Sub,
+        Mul,
+    }
+
+    fn test_binary_case(
+        operation: BinaryOperation,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+        left_value: BigUint,
+        right_value: BigUint,
+    ) {
+        let parameters = test_parameters();
+        let modulus = active_modulus(&parameters, enable_levels, level_offset);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context =
+            Arc::new(MontgomeryPolyContext::setup(&mut circuit, &parameters, LIMB_BIT_SIZE, false));
+        let left = build_input(context.clone(), enable_levels, level_offset, &mut circuit);
+        let right = build_input(context, enable_levels, level_offset, &mut circuit);
+        let result = match operation {
+            BinaryOperation::Add => left.add(&right, &mut circuit),
+            BinaryOperation::Sub => left.sub(&right, &mut circuit),
+            BinaryOperation::Mul => left.mul(&right, &mut circuit),
+        };
+        let output = result.finalize(&mut circuit);
+        circuit.output([output]);
+        let mut inputs = encode_montgomery_poly_with_window(
+            LIMB_BIT_SIZE,
+            &parameters,
+            &left_value,
+            enable_levels,
+            level_offset,
+        );
+        inputs.extend(encode_montgomery_poly_with_window(
+            LIMB_BIT_SIZE,
+            &parameters,
+            &right_value,
+            enable_levels,
+            level_offset,
+        ));
+        let actual =
+            execute_constant_output("montgomery-binary-runtime", &parameters, &circuit, inputs);
+        let expected = match operation {
+            BinaryOperation::Add => left_value + right_value,
+            BinaryOperation::Sub => left_value + &modulus - right_value,
+            BinaryOperation::Mul => left_value * right_value,
+        };
+        assert_eq!(actual % &modulus, expected % modulus);
+    }
+
+    fn run_roundtrip_cases(
+        limb_bit_size: usize,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+    ) {
+        let parameters = test_parameters();
+        let modulus = active_modulus(&parameters, enable_levels, level_offset);
+        [BigUint::zero(), &modulus - BigUint::from(1u8), random_value(&modulus)]
+            .into_par_iter()
+            .for_each(|value| {
+                test_roundtrip_case(limb_bit_size, enable_levels, level_offset, value);
+            });
+    }
+
+    fn run_binary_cases(
+        operation: BinaryOperation,
+        enable_levels: Option<usize>,
+        level_offset: usize,
+    ) {
+        let parameters = test_parameters();
+        let modulus = active_modulus(&parameters, enable_levels, level_offset);
+        let cases = match operation {
+            BinaryOperation::Add => vec![
+                (BigUint::zero(), &modulus - BigUint::from(1u8)),
+                (&modulus - BigUint::from(1u8), &modulus - BigUint::from(1u8)),
+                (random_value(&modulus), random_value(&modulus)),
+            ],
+            BinaryOperation::Sub => vec![
+                (BigUint::zero(), &modulus - BigUint::from(1u8)),
+                (&modulus - BigUint::from(1u8), BigUint::zero()),
+                (random_value(&modulus), random_value(&modulus)),
+            ],
+            BinaryOperation::Mul => vec![
+                (BigUint::zero(), &modulus - BigUint::from(1u8)),
+                (&modulus - BigUint::from(1u8), &modulus - BigUint::from(1u8)),
+                (random_value(&modulus), random_value(&modulus)),
+            ],
+        };
+        cases.into_par_iter().for_each(|(left, right)| {
+            test_binary_case(operation, enable_levels, level_offset, left, right);
+        });
+    }
+
+    fn test_decomposition_case(enable_levels: Option<usize>, level_offset: usize) {
+        let parameters = test_parameters();
+        let modulus = active_modulus(&parameters, enable_levels, level_offset);
+        let value = random_value(&modulus);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context =
+            Arc::new(MontgomeryPolyContext::setup(&mut circuit, &parameters, LIMB_BIT_SIZE, false));
+        let input = build_input(context.clone(), enable_levels, level_offset, &mut circuit);
+        let gadget = MontgomeryPoly::gadget_vector(
+            context.clone(),
+            enable_levels,
+            Some(level_offset),
+            &mut circuit,
+        );
+        let decomposition = input.gadget_decompose(&mut circuit);
+        assert_eq!(gadget.len(), decomposition.len());
+        let mut terms = gadget.iter().zip(&decomposition);
+        let (first_gadget, first_digit) =
+            terms.next().expect("Montgomery gadget decomposition is non-empty");
+        let mut recomposed = first_gadget.mul(first_digit, &mut circuit);
+        for (gadget, digit) in terms {
+            let product = gadget.mul(digit, &mut circuit);
+            recomposed = recomposed.add(&product, &mut circuit);
+        }
+        let output = recomposed.finalize(&mut circuit);
+        circuit.output([output]);
+        let inputs = encode_montgomery_poly_with_window(
+            LIMB_BIT_SIZE,
+            &parameters,
+            &value,
+            enable_levels,
+            level_offset,
+        );
+        let actual = execute_constant_output(
+            "montgomery-decomposition-runtime",
+            &parameters,
+            &circuit,
+            inputs,
+        );
+        assert_eq!(actual % &modulus, value.clone() % &modulus);
+
+        let target = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![DCRTPoly::from_biguint_to_constant(&parameters, value)],
+        );
+        let native_gadget = MontgomeryPoly::<DCRTPoly>::gadget_matrix::<DCRTPolyMatrix>(
+            &parameters,
+            &context,
+            enable_levels,
+            Some(level_offset),
+        );
+        let native_decomposition = MontgomeryPoly::<DCRTPoly>::gadget_decomposed::<DCRTPolyMatrix>(
+            &parameters,
+            &context,
+            &target,
+            enable_levels,
+            Some(level_offset),
+        );
+        assert_eq!(native_gadget.col_size(), native_decomposition.row_size());
+    }
+
+    #[test]
+    fn roundtrip_reconstructs_full_depth_values_at_runtime() {
+        run_roundtrip_cases(LIMB_BIT_SIZE, None, 0);
+    }
+
+    #[test]
+    fn roundtrip_reconstructs_partial_window_values_at_runtime() {
+        run_roundtrip_cases(LIMB_BIT_SIZE, Some(2), 1);
+    }
+
+    #[test]
+    fn one_bit_limbs_roundtrip_at_runtime() {
+        let parameters = test_parameters();
+        let modulus = active_modulus(&parameters, None, 0);
+        test_roundtrip_case(1, None, 0, random_value(&modulus));
+    }
+
+    #[test]
+    fn addition_reconstructs_full_depth_values_at_runtime() {
+        run_binary_cases(BinaryOperation::Add, None, 0);
+    }
+
+    #[test]
+    fn addition_reconstructs_partial_window_values_at_runtime() {
+        run_binary_cases(BinaryOperation::Add, Some(2), 1);
+    }
+
+    #[test]
+    fn subtraction_reconstructs_full_depth_values_at_runtime() {
+        run_binary_cases(BinaryOperation::Sub, None, 0);
+    }
+
+    #[test]
+    fn subtraction_reconstructs_partial_window_values_at_runtime() {
+        run_binary_cases(BinaryOperation::Sub, Some(2), 1);
+    }
+
+    #[test]
+    fn multiplication_reconstructs_full_depth_values_at_runtime() {
+        run_binary_cases(BinaryOperation::Mul, None, 0);
+    }
+
+    #[test]
+    fn multiplication_reconstructs_partial_window_values_at_runtime() {
+        run_binary_cases(BinaryOperation::Mul, Some(2), 1);
+    }
+
+    #[test]
+    fn gadget_decomposition_recomposes_full_depth_value_at_runtime() {
+        test_decomposition_case(None, 0);
+    }
+
+    #[test]
+    fn gadget_decomposition_recomposes_partial_window_value_at_runtime() {
+        test_decomposition_case(Some(2), 1);
+    }
+}

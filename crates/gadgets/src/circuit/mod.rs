@@ -8,6 +8,10 @@ pub use gate::{
     GateParamSource, PolyGate, PolyGateKind, PolyGateType, SlotTransferSpec, SubCircuitParamKind,
     SubCircuitParamSpec, SubCircuitParamValue,
 };
-pub use lowering::{CircuitLowerError, GateInstance, GraphCircuitLowering, lower_circuit};
+pub use lowering::{
+    ArithmeticCircuitLowering, CircuitLowerError, CircuitLoweringTypes, GateInstance,
+    GraphCircuitLowering, PublicLookupLowering, SlotOperationLowering, StructuredCircuitLowering,
+    lower_circuit, lower_circuit_structured,
+};
 pub use poly_circuit::*;
 pub use public_lut::PublicLut;

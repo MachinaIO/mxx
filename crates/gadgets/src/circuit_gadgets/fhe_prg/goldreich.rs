@@ -1360,9 +1360,89 @@ impl GraphSeedStream {
 #[cfg(test)]
 mod graph_tests {
     use super::*;
+    use crate::{
+        circuit_gadgets::{
+            arith::NestedRnsPolyContext,
+            fhe::{
+                ring_gsw::RingGswCiphertext,
+                ring_gsw_nested_rns::{
+                    NestedRnsRingGswContext, active_q_modulus, ciphertext_from_outputs,
+                    ciphertext_inputs_from_native, decrypt_ciphertext, encrypt_plaintext_bit,
+                    sample_public_key, sample_secret_key,
+                },
+            },
+        },
+        test_utils::{constant_matrix, execute_circuit, execute_circuit_with_shape},
+    };
+    use mxx_primitives::{
+        matrix::dcrt_poly::DCRTPolyMatrix,
+        poly::{
+            Poly,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+    };
+    use num_traits::ToPrimitive;
+    use rand::Rng;
     use std::collections::HashSet;
 
     const SEED: [u8; 32] = [0x5a; 32];
+
+    #[derive(Clone)]
+    struct RuntimeBooleanWire {
+        context: Arc<()>,
+        wire: GateId,
+    }
+
+    impl BooleanCiphertext<DCRTPoly> for RuntimeBooleanWire {
+        type Context = ();
+
+        fn context(&self) -> &Arc<Self::Context> {
+            &self.context
+        }
+
+        fn add(&self, other: &Self, circuit: &mut PolyCircuit<DCRTPoly>) -> Self {
+            Self {
+                context: self.context.clone(),
+                wire: circuit.add_gate(self.wire, other.wire).as_single_wire(),
+            }
+        }
+
+        fn sub(&self, other: &Self, circuit: &mut PolyCircuit<DCRTPoly>) -> Self {
+            Self {
+                context: self.context.clone(),
+                wire: circuit.sub_gate(self.wire, other.wire).as_single_wire(),
+            }
+        }
+
+        fn and(&self, other: &Self, circuit: &mut PolyCircuit<DCRTPoly>) -> Self {
+            Self {
+                context: self.context.clone(),
+                wire: circuit.and_gate(self.wire, other.wire).as_single_wire(),
+            }
+        }
+
+        fn xor(&self, other: &Self, circuit: &mut PolyCircuit<DCRTPoly>) -> Self {
+            Self {
+                context: self.context.clone(),
+                wire: circuit.xor_gate(self.wire, other.wire).as_single_wire(),
+            }
+        }
+
+        fn sub_circuit_input(
+            context: Arc<Self::Context>,
+            circuit: &mut PolyCircuit<DCRTPoly>,
+        ) -> Self {
+            Self { context, wire: circuit.input(1).as_single_wire() }
+        }
+
+        fn sub_circuit_wires(&self) -> Vec<BatchedWire> {
+            vec![self.wire.into()]
+        }
+
+        fn from_sub_circuit_outputs(template: &Self, outputs: &[BatchedWire]) -> Self {
+            Self { context: template.context.clone(), wire: outputs[0].as_single_wire() }
+        }
+    }
 
     #[test]
     fn output_bound_uses_strict_seven_over_five() {
@@ -1425,6 +1505,145 @@ mod graph_tests {
             GoldreichGraphGeneration::default(),
         );
         assert_eq!(evaluate_plaintext_goldreich(&graph, &[1, 0, 1, 1, 1]), vec![1, 1]);
+    }
+
+    #[test]
+    fn encrypted_predicate_circuit_matches_plaintext_evaluation_at_runtime() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let graph = GoldreichGraph::from_edges(
+            5,
+            vec![GoldreichEdge::new([0, 1, 2], [3, 4]), GoldreichEdge::new([0, 2, 4], [1, 3])],
+            GoldreichGraphGeneration::default(),
+        );
+        let plaintext = [1u64, 0, 1, 1, 1];
+        let expected = evaluate_plaintext_goldreich(&graph, &plaintext);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context = Arc::new(());
+        let inputs = (0..plaintext.len())
+            .map(|_| RuntimeBooleanWire::sub_circuit_input(context.clone(), &mut circuit))
+            .collect::<Vec<_>>();
+        let prg = GoldreichFhePrg::from_public_graph(&mut circuit, context, graph);
+        let outputs = prg.evaluate_uniform(&inputs, &mut circuit);
+        circuit.output(outputs.iter().map(|output| output.wire));
+        let input_values =
+            plaintext.map(|value| constant_matrix(&parameters, usize::try_from(value).unwrap()));
+        let actual =
+            execute_circuit("goldreich-predicate-runtime", &parameters, &circuit, &input_values);
+
+        assert_eq!(
+            actual,
+            expected
+                .into_iter()
+                .map(|value| constant_matrix(&parameters, usize::try_from(value).unwrap()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ring_gsw_predicate_executes_through_ir_and_decrypts_to_plaintext() {
+        const RING_DIMENSION: u32 = 2;
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let parameters = DCRTPolyParams::new(RING_DIMENSION, 1, 10, 5);
+        let nested_rns = Arc::new(NestedRnsPolyContext::setup(
+            &mut circuit,
+            &parameters,
+            5,
+            2,
+            16,
+            false,
+            Some(1),
+        ));
+        let context = Arc::new(NestedRnsRingGswContext::from_arith_context(
+            &mut circuit,
+            &parameters,
+            RING_DIMENSION as usize,
+            nested_rns,
+            Some(1),
+            Some(0),
+        ));
+        let graph = GoldreichGraph::from_edges(
+            5,
+            vec![GoldreichEdge::new([0, 1, 2], [3, 4])],
+            GoldreichGraphGeneration::default(),
+        );
+        let encrypted_inputs = (0..graph.input_size)
+            .map(|_| RingGswCiphertext::input(context.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let prg = GoldreichFhePrg::from_public_graph(&mut circuit, context.clone(), graph.clone());
+        let encrypted_outputs = prg.evaluate_uniform(&encrypted_inputs, &mut circuit);
+        let mut output_wires = Vec::with_capacity(2 * context.width());
+        for ciphertext in &encrypted_outputs {
+            output_wires.extend(ciphertext.reconstruct(&mut circuit));
+        }
+        circuit.output(output_wires);
+
+        let secret_key = sample_secret_key(&parameters);
+        let mut public_key_hash = [0u8; 32];
+        rand::rng().fill(&mut public_key_hash);
+        let public_key = sample_public_key(
+            &parameters,
+            context.width(),
+            &secret_key,
+            public_key_hash,
+            b"goldreich-runtime-test-public-key",
+            None,
+        );
+        let plaintext =
+            (0..graph.input_size).map(|_| u64::from(rand::random::<bool>())).collect::<Vec<_>>();
+        let expected = evaluate_plaintext_goldreich(&graph, &plaintext);
+        let native_inputs = plaintext
+            .par_iter()
+            .map(|&bit| {
+                encrypt_plaintext_bit(
+                    &parameters,
+                    context.nested_rns.as_ref(),
+                    &public_key,
+                    bit != 0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let runtime_inputs = native_inputs
+            .iter()
+            .flat_map(|ciphertext| {
+                ciphertext_inputs_from_native(
+                    &parameters,
+                    context.nested_rns.as_ref(),
+                    ciphertext,
+                    context.level_offset,
+                    Some(context.active_levels),
+                )
+            })
+            .collect::<Vec<_>>();
+        let runtime_outputs = execute_circuit_with_shape(
+            "goldreich-ring-gsw-runtime",
+            &parameters,
+            &circuit,
+            &runtime_inputs,
+            (RING_DIMENSION as usize, RING_DIMENSION as usize),
+        );
+        let output = ciphertext_from_outputs(&parameters, &runtime_outputs, context.width());
+        let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
+            &parameters,
+            context.nested_rns.as_ref(),
+            &output,
+            &secret_key,
+            2,
+        );
+        let q_modulus = active_q_modulus(context.nested_rns.as_ref());
+        let half_q = &q_modulus / BigUint::from(2u64);
+        let actual = decrypted
+            .coeffs_biguints()
+            .into_par_iter()
+            .map(|coefficient| {
+                ((BigUint::from(2u64) * coefficient + &half_q) / &q_modulus)
+                    .to_u64()
+                    .expect("Goldreich plaintext coefficient must fit in u64") %
+                    2
+            })
+            .collect::<Vec<_>>();
+        let mut expected_coefficients = vec![0; RING_DIMENSION as usize];
+        expected_coefficients[0] = expected[0];
+        assert_eq!(actual, expected_coefficients);
     }
 
     #[test]

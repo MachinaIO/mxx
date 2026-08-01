@@ -1,19 +1,15 @@
 use crate::{
     artifact::{ArtifactConfidentiality, ProductionId},
     expr::{IntExpr, RealExpr},
-    serde_support,
-    types::{NodeId, WireRef, WireType},
+    types::WireType,
 };
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Node {
-    pub id: NodeId,
-    pub kind: NodeKind,
-    pub args: Vec<WireRef>,
-}
-
+/// Executable operation represented by a declarative graph node.
+///
+/// Node identity, arguments, output types, and structural child definitions
+/// live on `GraphNode`; this enum contains operation semantics only.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tag", content = "value")]
 pub enum NodeKind {
@@ -22,13 +18,7 @@ pub enum NodeKind {
         wire_type: WireType,
         artifact: Option<ArtifactInput>,
     },
-    Output {
-        name: String,
-        artifact_confidentiality: Option<ArtifactConfidentiality>,
-    },
-    ConstantInt(#[serde(with = "serde_support::bigint")] BigInt),
-    /// Materializes an integer expression after parameter and loop bindings
-    /// have been applied to the current graph instance.
+    ConstantInt(#[serde(with = "crate::serde_support::bigint")] BigInt),
     EvaluateInt(IntExpr),
     ConstantReal(RealExpr),
     ConstantBool(bool),
@@ -82,18 +72,11 @@ pub enum NodeKind {
         tag_prefix: Vec<u8>,
         #[serde(default)]
         tag_expressions: Vec<IntExpr>,
-        /// Integer tag components appended as their ASCII decimal spelling.
-        /// This preserves legacy tags built with `format!("...{index}")` in
-        /// bounded loops without unrolling the loop.
         #[serde(default)]
         tag_decimal_expressions: Vec<IntExpr>,
-        /// Integer tag components encoded as fixed-width little-endian u64,
-        /// matching legacy slot/output namespaces.
         #[serde(default)]
         tag_u64_le_expressions: Vec<IntExpr>,
         base: Option<IntExpr>,
-        /// Explicit decomposition width for backend-specific gadget layouts
-        /// such as the DCRT small gadget.
         #[serde(default)]
         digit_count: Option<IntExpr>,
     },
@@ -109,22 +92,12 @@ pub enum NodeKind {
     GadgetDecompose {
         base: IntExpr,
         small: bool,
-        /// Explicit decomposition width when it cannot be derived from the
-        /// aggregate modulus and base alone.
         #[serde(default)]
         digit_count: Option<IntExpr>,
-    },
-    ModDown {
-        target_modulus: IntExpr,
-    },
-    ModUp {
-        target_modulus: IntExpr,
     },
     ExtractCoefficient {
         position: IntExpr,
     },
-    /// Keeps one coefficient of a scalar polynomial as its constant term and
-    /// clears every other coefficient.
     ConstantCoefficient {
         position: IntExpr,
     },
@@ -133,8 +106,6 @@ pub enum NodeKind {
         length: IntExpr,
         output_bool: bool,
     },
-    /// Centered-rounds congruent full-modulus representatives at each CRT
-    /// level and recombines them with explicit reconstruction coefficients.
     CrtRecompose {
         plaintext_moduli: Vec<IntExpr>,
         reconstruction_coefficients: Vec<IntExpr>,
@@ -170,6 +141,7 @@ pub enum ConstantMatrix {
     Gadget { base: IntExpr, small: bool },
     PowerOfBase { base: IntExpr, exponent: IntExpr },
     Rotation { exponent: IntExpr },
+    Polynomial { coefficients: Vec<IntExpr> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -205,16 +177,14 @@ pub enum MatrixBinaryOp {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SampleRange {
-    #[serde(with = "serde_support::bigint")]
-    pub minimum: BigInt,
-    #[serde(with = "serde_support::bigint")]
-    pub maximum: BigInt,
+    pub minimum: IntExpr,
+    pub maximum: IntExpr,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct IndexRange {
-    pub start: usize,
-    pub end: usize,
+    pub start: IntExpr,
+    pub end: IntExpr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -233,17 +203,16 @@ pub enum HashVariant {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SubgraphCall {
-    pub graph: String,
+    pub definition: String,
     pub bindings: Vec<(String, IntExpr)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParallelLoop {
-    pub graph: String,
     pub count: IntExpr,
     #[serde(default)]
     pub minimum_count: usize,
-    pub index_variable: String,
+    pub index_slot: u32,
     pub bindings: Vec<(String, IntExpr)>,
     pub input_modes: Vec<LoopInputMode>,
 }

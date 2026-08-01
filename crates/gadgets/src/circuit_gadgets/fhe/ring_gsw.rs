@@ -895,6 +895,76 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{
+        ScalarArithmeticContext, ScalarArithmeticEntry, constant_matrix, execute_circuit,
+    };
+    use mxx_primitives::poly::{
+        PolyParams,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    };
+
+    #[test]
+    fn ciphertext_arithmetic_matches_primitive_matrix_operations_at_runtime() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let arithmetic = Arc::new(ScalarArithmeticContext { q_modulus: parameters.to_crt().0[0] });
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context = Arc::new(RingGswContext::from_arith_context(
+            &mut circuit,
+            &parameters,
+            1,
+            arithmetic,
+            Some(1),
+            Some(0),
+        ));
+        let left = RingGswCiphertext::<DCRTPoly, ScalarArithmeticEntry>::input(
+            context.clone(),
+            None,
+            &mut circuit,
+        );
+        let right = RingGswCiphertext::<DCRTPoly, ScalarArithmeticEntry>::input(
+            context,
+            None,
+            &mut circuit,
+        );
+        let sum = left.add(&right, &mut circuit);
+        let difference = left.sub(&right, &mut circuit);
+        let product = left.mul(&right, &mut circuit);
+        circuit.output(
+            sum.rows
+                .iter()
+                .chain(difference.rows.iter())
+                .chain(product.rows.iter())
+                .flat_map(|row| row.iter().map(|entry| entry.wire)),
+        );
+
+        let inputs = (1..=8).map(|value| constant_matrix(&parameters, value)).collect::<Vec<_>>();
+        let actual = execute_circuit("ring-gsw-add-sub-runtime", &parameters, &circuit, &inputs);
+        for index in 0..4 {
+            assert_eq!(actual[index], inputs[index].clone() + &inputs[4 + index]);
+            assert_eq!(actual[4 + index], inputs[index].clone() - &inputs[4 + index]);
+        }
+        assert_eq!(
+            actual[8],
+            inputs[0].clone() * inputs[4].entry(0, 0) + &inputs[1].clone() * inputs[6].entry(0, 0)
+        );
+        assert_eq!(
+            actual[9],
+            inputs[0].clone() * inputs[5].entry(0, 0) + &inputs[1].clone() * inputs[7].entry(0, 0)
+        );
+        assert_eq!(
+            actual[10],
+            inputs[2].clone() * inputs[4].entry(0, 0) + &inputs[3].clone() * inputs[6].entry(0, 0)
+        );
+        assert_eq!(
+            actual[11],
+            inputs[2].clone() * inputs[5].entry(0, 0) + &inputs[3].clone() * inputs[7].entry(0, 0)
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RingGswCiphertext<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>>
 {

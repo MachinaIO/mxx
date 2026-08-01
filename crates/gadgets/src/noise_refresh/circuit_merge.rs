@@ -48,88 +48,97 @@ where
 #[cfg(test)]
 mod graph_tests {
     use super::*;
-    use crate::circuit::{GateInstance, GraphCircuitLowering, PolyGateKind, lower_circuit};
-    use mxx_ir_core::{
-        GraphBuilder, IntExpr, MatrixWire, ParamEnv,
-        node::{ConstantMatrix, MatrixBinaryOp},
-        types::MatrixType,
-        validate,
+    use crate::circuit::{
+        ArithmeticCircuitLowering, CircuitLoweringTypes, GateInstance, PolyGateKind,
+        PublicLookupLowering, SlotOperationLowering, lower_circuit,
     };
-    use mxx_primitives::poly::dcrt::poly::DCRTPoly;
-    use num_bigint::BigUint;
-    use std::convert::Infallible;
+    use mxx_dsl::{DslContext, Mat, Ring};
+    use mxx_ir_core::{IntExpr, ParamEnv};
+    use mxx_primitives::{
+        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        poly::{
+            Poly, PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+    };
+    use mxx_runtime::{
+        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
+        transcript::SamplingMode,
+    };
+    use num_bigint::{BigInt, BigUint};
+    use std::{collections::BTreeMap, convert::Infallible};
 
     struct MatrixLowering;
 
-    impl GraphCircuitLowering<DCRTPoly> for MatrixLowering {
-        type Wire = MatrixWire;
+    impl CircuitLoweringTypes for MatrixLowering {
+        type Wire = Mat;
         type Error = Infallible;
+    }
 
+    impl ArithmeticCircuitLowering<DCRTPoly> for MatrixLowering {
         fn binary(
             &mut self,
-            builder: &mut GraphBuilder,
             operation: PolyGateKind,
-            lhs: &MatrixWire,
-            rhs: &MatrixWire,
+            lhs: &Mat,
+            rhs: &Mat,
             _gate: GateInstance<'_>,
-        ) -> Result<MatrixWire, Infallible> {
-            let operation = match operation {
-                PolyGateKind::Add => MatrixBinaryOp::Add,
-                PolyGateKind::Sub => MatrixBinaryOp::Subtract,
-                PolyGateKind::Mul => MatrixBinaryOp::Multiply,
+        ) -> Result<Mat, Infallible> {
+            let output = match operation {
+                PolyGateKind::Add => lhs.clone() + rhs.clone(),
+                PolyGateKind::Sub => lhs.clone() - rhs.clone(),
+                PolyGateKind::Mul => lhs.clone() * rhs.clone(),
                 _ => unreachable!("merge circuit contains only addition"),
             };
-            Ok(builder.matrix_binary(operation, lhs, rhs, lhs.matrix_type.clone()))
+            Ok(output)
         }
 
         fn small_scalar_mul(
             &mut self,
-            _builder: &mut GraphBuilder,
-            input: &MatrixWire,
+            input: &Mat,
             _scalar: &[u32],
             _gate: GateInstance<'_>,
-        ) -> Result<MatrixWire, Infallible> {
+        ) -> Result<Mat, Infallible> {
             Ok(input.clone())
         }
 
         fn large_scalar_mul(
             &mut self,
-            _builder: &mut GraphBuilder,
-            input: &MatrixWire,
+            input: &Mat,
             _scalar: &[BigUint],
             _gate: GateInstance<'_>,
-        ) -> Result<MatrixWire, Infallible> {
+        ) -> Result<Mat, Infallible> {
             Ok(input.clone())
         }
+    }
 
+    impl SlotOperationLowering<DCRTPoly> for MatrixLowering {
         fn slot_transfer(
             &mut self,
-            _builder: &mut GraphBuilder,
-            input: &MatrixWire,
+            input: &Mat,
             _source_slots: &[(u32, Option<u32>)],
             _gate: GateInstance<'_>,
-        ) -> Result<MatrixWire, Infallible> {
+        ) -> Result<Mat, Infallible> {
             Ok(input.clone())
         }
 
         fn slot_reduce(
             &mut self,
-            _builder: &mut GraphBuilder,
-            inputs: &[MatrixWire],
+            inputs: &[Mat],
             _slot_count: usize,
             _gate: GateInstance<'_>,
-        ) -> Result<MatrixWire, Infallible> {
+        ) -> Result<Mat, Infallible> {
             Ok(inputs[0].clone())
         }
+    }
 
+    impl PublicLookupLowering<DCRTPoly> for MatrixLowering {
         fn public_lookup(
             &mut self,
-            _builder: &mut GraphBuilder,
             _circuit: &PolyCircuit<DCRTPoly>,
             _lookup_id: usize,
-            input: &MatrixWire,
+            input: &Mat,
             _gate: GateInstance<'_>,
-        ) -> Result<MatrixWire, Infallible> {
+        ) -> Result<Mat, Infallible> {
             Ok(input.clone())
         }
     }
@@ -145,23 +154,52 @@ mod graph_tests {
             assert_eq!(gate.gate_type, crate::circuit::PolyGateType::Add);
             assert_eq!(gate.input_gates, vec![input_gates[index], input_gates[3 + index]]);
         }
-        let matrix_type = MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(8),
-            rows: IntExpr::constant(1),
-            columns: IntExpr::constant(1),
-        };
-        let mut builder = GraphBuilder::new("noise-refresh-merge-template", Vec::new());
-        let one = builder.constant_matrix(matrix_type.clone(), ConstantMatrix::Identity);
-        let inputs = (0..6)
-            .map(|index| builder.input(format!("input_{index}"), matrix_type.clone()))
-            .collect::<Vec<_>>();
-        let outputs = lower_circuit(&mut builder, &circuit, one, inputs, &mut MatrixLowering)
-            .expect("merge lowering");
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let ring = Ring::new(
+            IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
+            IntExpr::constant(parameters.ring_dimension()),
+        );
+        let shape = (1, 1);
+        let one = ring.identity(1);
+        let inputs =
+            (0..6).map(|index| ring.input(format!("input_{index}"), shape)).collect::<Vec<_>>();
+        let outputs =
+            lower_circuit(&circuit, one, inputs, &mut MatrixLowering).expect("merge lowering");
         assert_eq!(outputs.len(), 3);
-        for (index, output) in outputs.iter().enumerate() {
-            builder.value_output_wire(format!("output_{index}"), output.wire);
+        let mut context = DslContext::new("noise-refresh-merge-template");
+        for (index, output) in outputs.into_iter().enumerate() {
+            context =
+                context.public_output(format!("output_{index}"), output).expect("unique output");
         }
-        validate(&builder.finish(), &ParamEnv::default()).expect("valid merge Graph IR");
+        let built = context.build().expect("build merge Graph IR");
+        let validated = built.validate(&ParamEnv::default()).expect("valid merge Graph IR");
+        let input_values = (0..6)
+            .map(|index| {
+                DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_usize_to_constant(&parameters, index + 1)],
+                )
+            })
+            .collect::<Vec<_>>();
+        let result = execute(
+            &validated,
+            &mut cpu_backend([parameters]),
+            input_values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    (format!("input_{index}"), RuntimeValue::matrix(value.clone()))
+                })
+                .collect::<BTreeMap<_, _>>(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execute merge Graph IR");
+        for index in 0..3 {
+            let RuntimeValue::Matrix(actual) = &result.outputs[&format!("output_{index}")] else {
+                panic!("merge output must be a matrix")
+            };
+            assert_eq!(actual.as_ref(), &(input_values[index].clone() + &input_values[3 + index]));
+        }
     }
 }

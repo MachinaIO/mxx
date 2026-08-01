@@ -1,8 +1,10 @@
+//! Masked high-bit decoding expressed with declarative matrix families.
+
+use mxx_dsl::{Bool, DslContext, DslError, Family, Int, Mat, Ring, Trapdoor};
 use mxx_ir_core::{
-    GraphBuilder, IntExpr, MatrixFamilyWire, MatrixWire, RealExpr, SubgraphBuildError,
-    TrapdoorWire, ValueFamilyWire,
+    IntExpr, RealExpr,
     artifact::{ArtifactConfidentiality, ProductionId},
-    node::{ConcatAxis, ConstantMatrix, IndexRange, LoopInputMode, MatrixBinaryOp},
+    node::{ConcatAxis, IndexRange},
     types::MatrixType,
 };
 use thiserror::Error;
@@ -20,31 +22,30 @@ pub struct MaskedHighBitDecoderCompiler {
     pub coefficient_count: usize,
 }
 
+#[derive(Clone)]
+pub struct MaskedHighBitDecoderPreprocessingWires {
+    pub preimages: Family<Mat>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaskedHighBitDecoderArtifacts {
     pub production_id: ProductionId,
     pub slot_count: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaskedHighBitDecoderPreprocessingWires {
-    pub preimages: MatrixFamilyWire,
+pub enum MaskedHighBitDecoderOutputs {
+    Integers(Vec<Family<Int>>),
+    Booleans(Vec<Family<Bool>>),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaskedHighBitDecoderOutputs {
-    /// One family per decoded coefficient. Each family is indexed by decoder slot.
-    pub coefficients: Vec<ValueFamilyWire>,
-}
-
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum MaskedHighBitDecoderError {
     #[error("masked decoder dimensions and coefficient count must be nonzero")]
     EmptyLayout,
-    #[error("masked decoder input families must have the artifact slot count")]
+    #[error("masked decoder input families must have the configured slot count")]
     FamilyCountMismatch,
     #[error(transparent)]
-    Subgraph(#[from] SubgraphBuildError),
+    Dsl(#[from] DslError),
 }
 
 impl MaskedHighBitDecoderCompiler {
@@ -54,124 +55,67 @@ impl MaskedHighBitDecoderCompiler {
         }
         Ok(())
     }
-
     pub fn public_key_type(&self) -> MatrixType {
         self.matrix_type(self.secret_size, self.public_key_columns())
     }
-
     pub fn decoder_public_type(&self) -> MatrixType {
         self.matrix_type(self.decoder_rows(), self.decoder_columns())
     }
-
     pub fn decoder_state_type(&self) -> MatrixType {
         self.matrix_type(1, self.decoder_columns())
     }
-
     pub fn encoding_vector_type(&self) -> MatrixType {
         self.matrix_type(1, self.public_key_columns())
     }
-
     pub fn scalar_type(&self) -> MatrixType {
         self.matrix_type(1, 1)
     }
 
     pub fn build_preprocessing(
         &self,
-        builder: &mut GraphBuilder,
-        decoder_trapdoor: &TrapdoorWire,
-        public_keys: &MatrixFamilyWire,
+        decoder_trapdoor: Trapdoor,
+        public_keys: Family<Mat>,
         slot_count: usize,
     ) -> Result<MaskedHighBitDecoderPreprocessingWires, MaskedHighBitDecoderError> {
         self.validate_layout()?;
-        if public_keys.count != IntExpr::constant(slot_count) {
+        if public_keys.count() != &IntExpr::constant(slot_count) ||
+            public_keys.element_type() != &self.public_key_type()
+        {
             return Err(MaskedHighBitDecoderError::FamilyCountMismatch);
         }
-
-        let mut body = GraphBuilder::new(
-            format!("bgg-masked-decoder-preprocess-d{}-k{}", self.secret_size, self.digit_count),
-            Vec::new(),
-        );
-        let body_public_key = body.input("0_public_key", self.public_key_type());
-        let body_trapdoor = body.trapdoor_input(
-            "1_decoder_trapdoor",
-            self.decoder_public_type(),
-            self.trapdoor_sigma.clone(),
-            self.gadget_base.clone(),
-            IntExpr::constant(self.digit_count),
-        );
-        let identity = body.constant_matrix(
-            self.matrix_type(self.secret_size, self.secret_size),
-            ConstantMatrix::Identity,
-        );
-        let selector = body.slice(
-            &identity,
-            None,
-            Some(IndexRange { start: 0, end: 1 }),
-            self.matrix_type(self.secret_size, 1),
-        );
-        let decomposed_selector = body.gadget_decompose_with_layout(
-            &selector,
-            self.gadget_base.clone(),
-            false,
-            Some(IntExpr::constant(self.digit_count)),
-            self.matrix_type(self.public_key_columns(), 1),
-        );
-        let top = body.matrix_binary(
-            MatrixBinaryOp::Multiply,
-            &body_public_key,
-            &decomposed_selector,
-            self.matrix_type(self.secret_size, 1),
-        );
-        let bottom =
-            body.constant_matrix(self.matrix_type(self.secret_size, 1), ConstantMatrix::Zero);
-        let target =
-            body.concat(ConcatAxis::Rows, &[top, bottom], self.matrix_type(self.decoder_rows(), 1));
-        let preimage = body.preimage_sample(
-            &body_trapdoor,
-            &target,
-            self.matrix_type(self.decoder_columns(), 1),
-        );
-        body.value_output_wire("0_preimage", preimage.wire);
-
-        let [preimages] = builder
-            .parallel_loop(
-                body.finish(),
-                IntExpr::constant(slot_count),
-                "slot",
-                Vec::new(),
-                vec![public_keys.wire, decoder_trapdoor.wire],
-                vec![LoopInputMode::Zip, LoopInputMode::Broadcast],
-                &[self.matrix_type(self.decoder_columns(), 1)],
-            )?
-            .try_into()
-            .expect("one preprocessing output was declared");
+        let ring = Ring::new(self.modulus.clone(), self.ring_dimension.clone());
+        let (secret_size, digit_count, decoder_columns) =
+            (self.secret_size, self.digit_count, self.decoder_columns());
+        let gadget_base = self.gadget_base.clone();
+        let preimages = public_keys.parallel_map(move |_, public_key| {
+            let selector = ring
+                .identity(secret_size)
+                .slice(None, Some(IndexRange { start: 0.into(), end: 1.into() }));
+            let top = public_key * selector.decompose(gadget_base.clone(), digit_count).as_mat();
+            let target = Mat::concat(ConcatAxis::Rows, vec![top, ring.zero((secret_size, 1))]);
+            decoder_trapdoor.sample_preimage(target, (decoder_columns, 1)).as_mat()
+        })?;
         Ok(MaskedHighBitDecoderPreprocessingWires { preimages })
     }
 
     pub fn export_preprocessing(
         &self,
-        builder: &mut GraphBuilder,
-        wires: &MaskedHighBitDecoderPreprocessingWires,
-    ) {
-        builder.output_family_wire(
-            MASKED_DECODER_PREIMAGES,
-            &wires.preimages,
-            ArtifactConfidentiality::Public,
-        );
+        context: DslContext,
+        wires: MaskedHighBitDecoderPreprocessingWires,
+    ) -> Result<DslContext, MaskedHighBitDecoderError> {
+        Ok(context.public_family_output(MASKED_DECODER_PREIMAGES, wires.preimages)?)
     }
 
     pub fn import_preimages(
         &self,
-        builder: &mut GraphBuilder,
         artifacts: &MaskedHighBitDecoderArtifacts,
-    ) -> Result<MatrixFamilyWire, MaskedHighBitDecoderError> {
+    ) -> Result<Family<Mat>, MaskedHighBitDecoderError> {
         self.validate_layout()?;
-        Ok(builder.artifact_family_input(
-            "masked_decoder_preimages_input",
-            self.matrix_type(self.decoder_columns(), 1),
+        Ok(Ring::new(self.modulus.clone(), self.ring_dimension.clone()).family_artifact_input(
             artifacts.production_id.clone(),
             MASKED_DECODER_PREIMAGES,
-            IntExpr::constant(artifacts.slot_count),
+            artifacts.slot_count,
+            (self.decoder_columns(), 1),
             ArtifactConfidentiality::Public,
         ))
     }
@@ -179,132 +123,63 @@ impl MaskedHighBitDecoderCompiler {
     #[allow(clippy::too_many_arguments)]
     pub fn build_online(
         &self,
-        builder: &mut GraphBuilder,
-        decoder_state: &MatrixWire,
-        preimages: &MatrixFamilyWire,
-        secret_dependent_vectors: &MatrixFamilyWire,
-        public_bottom_plaintexts: &MatrixFamilyWire,
+        decoder_state: Mat,
+        preimages: Family<Mat>,
+        vectors: Family<Mat>,
+        bottoms: Family<Mat>,
         plaintext_modulus: IntExpr,
         output_bool: bool,
         slot_count: usize,
     ) -> Result<MaskedHighBitDecoderOutputs, MaskedHighBitDecoderError> {
         self.validate_layout()?;
-        let expected_count = IntExpr::constant(slot_count);
-        if preimages.count != expected_count ||
-            secret_dependent_vectors.count != expected_count ||
-            public_bottom_plaintexts.count != expected_count
+        let expected = IntExpr::constant(slot_count);
+        if preimages.count() != &expected ||
+            vectors.count() != &expected ||
+            bottoms.count() != &expected
         {
             return Err(MaskedHighBitDecoderError::FamilyCountMismatch);
         }
-
-        let mut body = GraphBuilder::new(
-            format!(
-                "bgg-masked-decoder-online-d{}-k{}-coeff{}-bool{}",
-                self.secret_size, self.digit_count, self.coefficient_count, output_bool
-            ),
-            Vec::new(),
-        );
-        let body_preimage = body.input("0_preimage", self.matrix_type(self.decoder_columns(), 1));
-        let body_vector = body.input("1_secret_dependent", self.encoding_vector_type());
-        let body_public_bottom = body.input("2_public_bottom", self.scalar_type());
-        let body_decoder_state = body.input("3_decoder_state", self.decoder_state_type());
-
-        let identity = body.constant_matrix(
-            self.matrix_type(self.secret_size, self.secret_size),
-            ConstantMatrix::Identity,
-        );
-        let selector = body.slice(
-            &identity,
-            None,
-            Some(IndexRange { start: 0, end: 1 }),
-            self.matrix_type(self.secret_size, 1),
-        );
-        let decomposed_selector = body.gadget_decompose_with_layout(
-            &selector,
-            self.gadget_base.clone(),
-            false,
-            Some(IntExpr::constant(self.digit_count)),
-            self.matrix_type(self.public_key_columns(), 1),
-        );
-        let projected_decoder = body.matrix_binary(
-            MatrixBinaryOp::Multiply,
-            &body_decoder_state,
-            &body_preimage,
-            self.scalar_type(),
-        );
-        let projected_encoding = body.matrix_binary(
-            MatrixBinaryOp::Multiply,
-            &body_vector,
-            &decomposed_selector,
-            self.scalar_type(),
-        );
-        let difference = body.matrix_binary(
-            MatrixBinaryOp::Subtract,
-            &projected_decoder,
-            &projected_encoding,
-            self.scalar_type(),
-        );
-        let noisy_plaintext = body.matrix_binary(
-            MatrixBinaryOp::Add,
-            &difference,
-            &body_public_bottom,
-            self.scalar_type(),
-        );
-        let first = body.threshold_decode(
-            &noisy_plaintext,
-            plaintext_modulus,
-            IntExpr::constant(self.coefficient_count),
-            output_bool,
-        );
-        for coefficient in 0..self.coefficient_count {
-            body.value_output_wire(
-                format!("{coefficient:08}_coefficient"),
-                mxx_ir_core::WireRef {
-                    node: first.node,
-                    port: mxx_ir_core::Port(coefficient as u32),
-                },
-            );
-        }
-        let coefficients = builder.parallel_value_loop(
-            body.finish(),
-            expected_count,
-            "slot",
-            Vec::new(),
-            vec![
-                preimages.wire,
-                secret_dependent_vectors.wire,
-                public_bottom_plaintexts.wire,
-                decoder_state.wire,
-            ],
-            vec![
-                LoopInputMode::Zip,
-                LoopInputMode::Zip,
-                LoopInputMode::Zip,
-                LoopInputMode::Broadcast,
-            ],
-            self.coefficient_count,
+        let ring = Ring::new(self.modulus.clone(), self.ring_dimension.clone());
+        let (secret_size, digit_count) = (self.secret_size, self.digit_count);
+        let gadget_base = self.gadget_base.clone();
+        let noisy = preimages.parallel_zip3_values(
+            vectors,
+            bottoms,
+            move |_, preimage, vector, bottom| {
+                let selector = ring
+                    .identity(secret_size)
+                    .slice(None, Some(IndexRange { start: 0.into(), end: 1.into() }));
+                decoder_state.clone() * preimage -
+                    vector * selector.decompose(gadget_base.clone(), digit_count).as_mat() +
+                    bottom
+            },
         )?;
-        Ok(MaskedHighBitDecoderOutputs { coefficients })
+        if output_bool {
+            Ok(MaskedHighBitDecoderOutputs::Booleans(
+                noisy.parallel_threshold_decode_bools(plaintext_modulus, self.coefficient_count)?,
+            ))
+        } else {
+            Ok(MaskedHighBitDecoderOutputs::Integers(
+                noisy.parallel_threshold_decode_ints(plaintext_modulus, self.coefficient_count)?,
+            ))
+        }
     }
 
     fn public_key_columns(&self) -> usize {
         self.secret_size * self.digit_count
     }
-
     fn decoder_rows(&self) -> usize {
         self.secret_size * 2
     }
-
     fn decoder_columns(&self) -> usize {
         self.decoder_rows() * (self.digit_count + 2)
     }
-
     fn matrix_type(&self, rows: usize, columns: usize) -> MatrixType {
         MatrixType {
             modulus: self.modulus.clone(),
             ring_dimension: self.ring_dimension.clone(),
-            rows: IntExpr::constant(rows),
-            columns: IntExpr::constant(columns),
+            rows: rows.into(),
+            columns: columns.into(),
         }
     }
 }
@@ -312,7 +187,8 @@ impl MaskedHighBitDecoderCompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_ir_core::{ParamEnv, validate};
+    use crate::test_utils::execute_graph;
+    use mxx_ir_core::ParamEnv;
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -320,77 +196,70 @@ mod tests {
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
     };
-    use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
-    };
+    use mxx_runtime::{RuntimeValue, backend::poly::CpuDcrtBackend};
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeMap;
 
     fn compiler() -> MaskedHighBitDecoderCompiler {
         MaskedHighBitDecoderCompiler {
-            modulus: IntExpr::constant(BigInt::from(65537)),
-            ring_dimension: IntExpr::constant(8),
+            modulus: 65_537.into(),
+            ring_dimension: 8.into(),
             secret_size: 2,
             digit_count: 4,
-            gadget_base: IntExpr::constant(4),
-            trapdoor_sigma: RealExpr::from_f64_exact(5.0).expect("finite sigma"),
-            coefficient_count: 8,
+            gadget_base: 4.into(),
+            trapdoor_sigma: RealExpr::from_integer(5),
+            coefficient_count: 4,
         }
     }
 
     #[test]
     fn preprocessing_and_online_graphs_validate() {
         let compiler = compiler();
-        let mut preprocessing = GraphBuilder::new("decoder-preprocessing", Vec::new());
-        let trapdoor = preprocessing.trapdoor_sample(
-            compiler.decoder_public_type(),
+        let ring = Ring::new(compiler.modulus.clone(), compiler.ring_dimension.clone());
+        let trapdoor = ring.sample_trapdoor(
+            compiler.decoder_rows(),
             compiler.trapdoor_sigma.clone(),
             compiler.gadget_base.clone(),
-            IntExpr::constant(compiler.digit_count),
+            compiler.digit_count,
         );
-        let public_keys = preprocessing.family_input(
-            "public_keys",
-            compiler.public_key_type(),
-            IntExpr::constant(3),
+        let public_keys = ring.input_family(
+            "public-keys",
+            3,
+            (compiler.secret_size, compiler.public_key_columns()),
         );
-        let wires =
-            compiler.build_preprocessing(&mut preprocessing, &trapdoor, &public_keys, 3).unwrap();
-        compiler.export_preprocessing(&mut preprocessing, &wires);
-        validate(&preprocessing.finish(), &ParamEnv::default()).unwrap();
+        let preprocessing =
+            compiler.build_preprocessing(trapdoor, public_keys, 3).expect("preprocessing");
+        let preprocessing = compiler
+            .export_preprocessing(DslContext::new("decoder-preprocessing"), preprocessing)
+            .expect("export")
+            .build()
+            .expect("build preprocessing");
+        preprocessing.validate(&ParamEnv::default()).expect("validate preprocessing");
+        preprocessing.elaborate(&ParamEnv::default()).expect("elaborate preprocessing");
 
-        let mut online = GraphBuilder::new("decoder-online", Vec::new());
-        let decoder_state = online.input("decoder_state", compiler.decoder_state_type());
-        let preimages = online.family_input(
-            "preimages",
-            compiler.matrix_type(compiler.decoder_columns(), 1),
-            IntExpr::constant(3),
-        );
-        let vectors =
-            online.family_input("vectors", compiler.encoding_vector_type(), IntExpr::constant(3));
-        let public_bottom =
-            online.family_input("public_bottom", compiler.scalar_type(), IntExpr::constant(3));
-        let outputs = compiler
-            .build_online(
-                &mut online,
-                &decoder_state,
-                &preimages,
-                &vectors,
-                &public_bottom,
-                IntExpr::constant(2),
-                true,
-                3,
-            )
-            .unwrap();
-        assert_eq!(outputs.coefficients.len(), 8);
-        for (index, family) in outputs.coefficients.iter().enumerate() {
-            online.value_output_wire(format!("decoded_{index}"), family.wire);
-        }
-        validate(&online.finish(), &ParamEnv::default()).unwrap();
+        let state = ring.input("state", (1, compiler.decoder_columns()));
+        let preimages = ring.input_family("preimages", 3, (compiler.decoder_columns(), 1));
+        let vectors = ring.input_family("vectors", 3, (1, compiler.public_key_columns()));
+        let bottoms = ring.input_family("bottoms", 3, (1, 1));
+        let MaskedHighBitDecoderOutputs::Integers(outputs) = compiler
+            .build_online(state, preimages, vectors, bottoms, 2.into(), false, 3)
+            .expect("online")
+        else {
+            panic!("integer outputs")
+        };
+        let context = outputs
+            .into_iter()
+            .enumerate()
+            .try_fold(DslContext::new("decoder-online"), |context, (index, output)| {
+                context.int_family_output(format!("coefficient-{index}"), output)
+            })
+            .expect("outputs");
+        let online = context.build().expect("build online");
+        online.validate(&ParamEnv::default()).expect("validate online");
     }
 
     #[test]
-    fn online_execution_matches_explicit_threshold_decode_oracle() {
+    fn online_runtime_matches_explicit_threshold_decode_oracle() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let q = parameters.modulus().as_ref().clone();
         let digit_count = parameters.modulus_digits();
@@ -399,60 +268,62 @@ mod tests {
             ring_dimension: IntExpr::constant(parameters.ring_dimension()),
             secret_size: 1,
             digit_count,
-            gadget_base: IntExpr::constant(1u64 << parameters.base_bits()),
-            trapdoor_sigma: RealExpr::from_f64_exact(5.0).unwrap(),
+            gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
+            trapdoor_sigma: RealExpr::from_integer(5),
             coefficient_count: parameters.ring_dimension() as usize,
         };
         let slot_count = 3usize;
         let plaintext_modulus = BigUint::from(5u8);
-        let mut builder = GraphBuilder::new("decoder-online-runtime", Vec::new());
-        let decoder_state = builder.input("decoder_state", compiler.decoder_state_type());
-        let preimages = builder.family_input(
-            "preimages",
-            compiler.matrix_type(compiler.decoder_columns(), 1),
-            IntExpr::constant(slot_count),
-        );
-        let vectors = builder.family_input(
-            "vectors",
-            compiler.encoding_vector_type(),
-            IntExpr::constant(slot_count),
-        );
-        let public_bottom = builder.family_input(
-            "public_bottom",
-            compiler.scalar_type(),
-            IntExpr::constant(slot_count),
-        );
-        let outputs = compiler
+        let ring = Ring::new(compiler.modulus.clone(), compiler.ring_dimension.clone());
+        let preimages = Family::pack(
+            (0..slot_count)
+                .map(|slot| ring.input(format!("preimage-{slot}"), (compiler.decoder_columns(), 1)))
+                .collect(),
+        )
+        .unwrap();
+        let vectors = Family::pack(
+            (0..slot_count)
+                .map(|slot| {
+                    ring.input(format!("vector-{slot}"), (1, compiler.public_key_columns()))
+                })
+                .collect(),
+        )
+        .unwrap();
+        let bottoms = Family::pack(
+            (0..slot_count).map(|slot| ring.input(format!("bottom-{slot}"), (1, 1))).collect(),
+        )
+        .unwrap();
+        let MaskedHighBitDecoderOutputs::Integers(outputs) = compiler
             .build_online(
-                &mut builder,
-                &decoder_state,
-                &preimages,
-                &vectors,
-                &public_bottom,
+                ring.input("decoder-state", (1, compiler.decoder_columns())),
+                preimages,
+                vectors,
+                bottoms,
                 IntExpr::constant(BigInt::from(plaintext_modulus.clone())),
                 false,
                 slot_count,
             )
-            .unwrap();
-        for (coefficient, family) in outputs.coefficients.iter().enumerate() {
-            for slot in 0..slot_count {
-                let value = builder.value_family_get_static(family, IntExpr::constant(slot));
-                builder.value_output_wire(format!("slot_{slot}_coefficient_{coefficient}"), value);
-            }
+            .unwrap()
+        else {
+            panic!("integer outputs")
+        };
+        let mut context = DslContext::new("decoder-online-runtime");
+        for (coefficient, output) in outputs.into_iter().enumerate() {
+            context =
+                context.int_family_output(format!("coefficient-{coefficient}"), output).unwrap();
         }
-        let validated = validate(&builder.finish(), &ParamEnv::default()).unwrap();
+        let graph = context.build().unwrap();
 
         let decoder_coefficients = (0..compiler.coefficient_count)
             .map(|coefficient| BigUint::from(coefficient + 7))
             .collect::<Vec<_>>();
-        let decoder_polynomial = DCRTPoly::from_biguints(&parameters, &decoder_coefficients);
-        let decoder_state_value = DCRTPolyMatrix::from_poly_vec_row(
+        let decoder_state = DCRTPolyMatrix::from_poly_vec_row(
             &parameters,
-            std::iter::once(decoder_polynomial)
+            std::iter::once(DCRTPoly::from_biguints(&parameters, &decoder_coefficients))
                 .chain((1..compiler.decoder_columns()).map(|_| DCRTPoly::const_zero(&parameters)))
                 .collect(),
         );
-        let preimage_value = DCRTPolyMatrix::from_poly_vec(
+        let preimage = DCRTPolyMatrix::from_poly_vec(
             &parameters,
             std::iter::once(vec![DCRTPoly::const_one(&parameters)])
                 .chain(
@@ -461,82 +332,61 @@ mod tests {
                 )
                 .collect(),
         );
-        let mut vector_values = Vec::with_capacity(slot_count);
-        let mut public_bottom_values = Vec::with_capacity(slot_count);
-        let mut expected_values = Vec::with_capacity(slot_count);
+        let mut inputs =
+            BTreeMap::from([("decoder-state".to_owned(), RuntimeValue::matrix(decoder_state))]);
+        let mut expected = vec![Vec::with_capacity(compiler.coefficient_count); slot_count];
         for slot in 0..slot_count {
             let secret_coefficients = (0..compiler.coefficient_count)
                 .map(|coefficient| BigUint::from(coefficient + slot + 3))
                 .collect::<Vec<_>>();
-            let secret_polynomial = DCRTPoly::from_biguints(&parameters, &secret_coefficients);
-            vector_values.push(DCRTPolyMatrix::from_poly_vec_row(
+            let vector = DCRTPolyMatrix::from_poly_vec_row(
                 &parameters,
-                std::iter::once(secret_polynomial)
+                std::iter::once(DCRTPoly::from_biguints(&parameters, &secret_coefficients))
                     .chain(
                         (1..compiler.public_key_columns())
                             .map(|_| DCRTPoly::const_zero(&parameters)),
                     )
                     .collect(),
-            ));
-
-            let mut public_bottom_coefficients = Vec::with_capacity(compiler.coefficient_count);
-            let mut slot_expected = Vec::with_capacity(compiler.coefficient_count);
+            );
+            let mut bottom_coefficients = Vec::with_capacity(compiler.coefficient_count);
             for coefficient in 0..compiler.coefficient_count {
                 let target_plaintext = BigUint::from((slot + coefficient) % 5);
                 let target = (&q * target_plaintext + &plaintext_modulus / BigUint::from(2u8)) /
                     &plaintext_modulus;
                 let residual =
                     &decoder_coefficients[coefficient] - &secret_coefficients[coefficient];
-                let public_bottom = (&target + &q - &residual) % &q;
+                let bottom = (&target + &q - &residual) % &q;
                 let noisy = (&decoder_coefficients[coefficient] + &q -
                     &secret_coefficients[coefficient] +
-                    &public_bottom) %
+                    &bottom) %
                     &q;
                 let decoded = (&plaintext_modulus * noisy + &q / BigUint::from(2u8)) / &q %
                     &plaintext_modulus;
-                public_bottom_coefficients.push(public_bottom);
-                slot_expected.push(BigInt::from(decoded));
+                bottom_coefficients.push(bottom);
+                expected[slot].push(BigInt::from(decoded));
             }
-            public_bottom_values.push(DCRTPolyMatrix::from_poly_vec_row(
-                &parameters,
-                vec![DCRTPoly::from_biguints(&parameters, &public_bottom_coefficients)],
-            ));
-            expected_values.push(slot_expected);
+            inputs.insert(format!("preimage-{slot}"), RuntimeValue::matrix(preimage.clone()));
+            inputs.insert(format!("vector-{slot}"), RuntimeValue::matrix(vector));
+            inputs.insert(
+                format!("bottom-{slot}"),
+                RuntimeValue::matrix(DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_biguints(&parameters, &bottom_coefficients)],
+                )),
+            );
         }
-        let repeated_family = |value: &DCRTPolyMatrix| {
-            RuntimeValue::IndexedFamily(
-                (0..slot_count).map(|_| RuntimeValue::matrix(value.clone())).collect(),
-            )
-        };
-        let inputs = BTreeMap::from([
-            ("decoder_state".to_owned(), RuntimeValue::matrix(decoder_state_value)),
-            ("preimages".to_owned(), repeated_family(&preimage_value)),
-            (
-                "vectors".to_owned(),
-                RuntimeValue::IndexedFamily(
-                    vector_values.into_iter().map(RuntimeValue::matrix).collect(),
-                ),
-            ),
-            (
-                "public_bottom".to_owned(),
-                RuntimeValue::IndexedFamily(
-                    public_bottom_values.into_iter().map(RuntimeValue::matrix).collect(),
-                ),
-            ),
-        ]);
-        let mut backend = cpu_backend([parameters]);
-        let mut store = MemoryArtifactStore::default();
-        let result =
-            execute(&validated, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
-        for slot in 0..slot_count {
-            for coefficient in 0..compiler.coefficient_count {
-                let expected = &expected_values[slot][coefficient];
-                let RuntimeValue::Int(actual) =
-                    &result.outputs[&format!("slot_{slot}_coefficient_{coefficient}")]
-                else {
-                    panic!("decoded output must be an integer")
+        let result = execute_graph(graph, parameters, inputs);
+        for coefficient in 0..compiler.coefficient_count {
+            let RuntimeValue::<CpuDcrtBackend>::IndexedFamily(values) =
+                &result.outputs[&format!("coefficient-{coefficient}")]
+            else {
+                panic!("decoded coefficient must be an integer family")
+            };
+            for slot in 0..slot_count {
+                let RuntimeValue::Int(actual) = &values[slot] else {
+                    panic!("decoded family member must be an integer")
                 };
-                assert_eq!(actual, expected);
+                assert_eq!(actual, &expected[slot][coefficient]);
             }
         }
     }

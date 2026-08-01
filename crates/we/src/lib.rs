@@ -1,5 +1,5 @@
-// Diamond WE is disabled pending a separate application cutover to the current
-// BGG Graph IR and runtime APIs.
+// Diamond WE is disabled pending a separate application cutover to the
+// declarative DSL and current IR/runtime APIs.
 // pub mod diamond_we;
 
 use mxx_gadgets::circuit::PolyCircuit;

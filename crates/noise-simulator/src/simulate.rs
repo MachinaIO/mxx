@@ -3,16 +3,19 @@ use crate::{
     poly_norm::high_probability_envelope_from_sigma,
 };
 use bigdecimal::BigDecimal;
+use mxx_ir_core::{
+    ScopedWireRef,
+    expr::{IntExpr, ParamEnv, RealExpr},
+    node::ConstantMatrix,
+    types::ConcreteMatrixType,
+};
 use mxx_ir_symbolic::{
     atom::{
         AssumedMetadata, Atom, AtomClass, AtomId, AtomKind, DeclaredDependencies,
-        DeclaredDependencyRef, DefExpr, ExternalSourceKind, SelectionDomainRef, SourceKind,
+        DeclaredDependencyRef, ExternalSourceKind, SelectionDomainRef, SourceKind,
     },
-    elaborate::{DecodeTarget, ElaboratedGraph},
-    expr::{IntExpr, ParamEnv, RealExpr},
-    node::ConstantMatrix,
-    term::{Term, TermList, ViewDescriptor},
-    types::{ConcreteMatrixType, WireId},
+    elaborate::{DecodeTarget, ElaboratedGraph, SymbolicFamily},
+    expression::{IndexRange, SymbolicExprId, SymbolicExprNode},
 };
 use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -59,20 +62,22 @@ pub struct NoiseReport {
 
 #[derive(Debug, Error)]
 pub enum SimulationError {
-    #[error("wire {0:?} has no symbolic matrix term list")]
-    MissingWire(WireId),
+    #[error("wire {0:?} has no symbolic matrix expression")]
+    MissingWire(ScopedWireRef),
+    #[error("symbolic expression is missing: {0:?}")]
+    MissingExpression(SymbolicExprId),
     #[error("atom is missing from the symbolic atom table: {0:?}")]
     MissingAtom(AtomId),
-    #[error("bounded external source {kind:?} at {atom:?} has no manifest or unfold metadata")]
+    #[error("bounded external source {kind:?} at {atom:?} has no manifest or assume metadata")]
     UnsupportedExternal { atom: AtomId, kind: ExternalSourceKind },
-    #[error("unsupported symbolic definition at atom {atom:?}: {reason}")]
-    UnsupportedDefinition { atom: AtomId, reason: String },
+    #[error("invalid selection: {0}")]
+    InvalidSelection(String),
     #[error("invalid numerical metadata at atom {atom:?}: {reason}")]
     InvalidMetadata { atom: AtomId, reason: String },
-    #[error("matrix shape mismatch while evaluating atom {0:?}")]
-    ShapeMismatch(AtomId),
-    #[error("signal and noise were combined inside bounded atom {0:?}")]
-    MixedBoundedAtom(AtomId),
+    #[error("matrix shape mismatch while evaluating symbolic expression")]
+    ShapeMismatch,
+    #[error("a bounded alternative unexpectedly contains a signal factor")]
+    MixedBoundedAlternative,
 }
 
 #[derive(Clone)]
@@ -81,11 +86,27 @@ struct Estimate {
     noise: Option<PolyMatrixNorm>,
 }
 
+#[derive(Clone)]
+enum AnalysisFactor {
+    Signal(ConcreteMatrixType),
+    Bounded(PolyMatrixNorm),
+    Identity(ConcreteMatrixType),
+}
+
+#[derive(Clone)]
+struct Alternative {
+    coefficient: BigInt,
+    factors: Vec<AnalysisFactor>,
+}
+
+type Assignment = BTreeMap<SelectionDomainRef, u64>;
+type CanonicalAssignment = Vec<(SelectionDomainRef, u64)>;
+
 struct Evaluator<'a> {
     graph: &'a ElaboratedGraph,
     contexts: BTreeMap<usize, Arc<SimulatorContext>>,
     atoms: BTreeMap<AtomId, PolyMatrixNorm>,
-    active: BTreeSet<AtomId>,
+    memo: BTreeMap<(SymbolicExprId, CanonicalAssignment), Estimate>,
 }
 
 pub fn simulate(graph: &ElaboratedGraph) -> Result<NoiseReport, SimulationError> {
@@ -93,27 +114,46 @@ pub fn simulate(graph: &ElaboratedGraph) -> Result<NoiseReport, SimulationError>
         graph,
         contexts: BTreeMap::new(),
         atoms: BTreeMap::new(),
-        active: BTreeSet::new(),
+        memo: BTreeMap::new(),
     };
     let mut outputs = BTreeMap::new();
     for (name, wire) in &graph.outputs {
-        let wire = WireId { instantiation_path: Vec::new(), wire: *wire };
-        if evaluator.graph.wires.get(&wire).and_then(|wire| wire.terms.as_ref()).is_some() {
-            outputs.insert(name.clone(), evaluator.eval_wire(&wire)?.into_report());
-        }
+        let symbolic =
+            evaluator.graph.wire(wire).ok_or_else(|| SimulationError::MissingWire(wire.clone()))?;
+        let estimate = match (symbolic.expression, symbolic.family.as_ref()) {
+            (Some(expression), _) => evaluator.eval(expression, &Assignment::new())?,
+            (None, Some(SymbolicFamily::ExactMembers(members))) => {
+                let mut branches = Vec::with_capacity(members.len());
+                for member in members {
+                    branches.push(evaluator.eval(*member, &Assignment::new())?);
+                }
+                join_selection(branches)
+            }
+            (None, Some(SymbolicFamily::StructuralTemplate { template, .. })) => {
+                evaluator.eval(*template, &Assignment::new())?
+            }
+            (None, None) => continue,
+        };
+        outputs.insert(name.clone(), estimate.into_report());
     }
+
     let mut decode_targets = Vec::with_capacity(graph.decode_targets.len());
     for target in &graph.decode_targets {
-        let estimate = evaluator.eval_wire(&target.input)?;
+        let symbolic = evaluator
+            .graph
+            .wire(&target.input)
+            .ok_or_else(|| SimulationError::MissingWire(target.input.clone()))?;
+        let expression = symbolic
+            .expression
+            .ok_or_else(|| SimulationError::MissingWire(target.input.clone()))?;
+        let estimate = evaluator.eval(expression, &Assignment::new())?;
         let noise_bound = estimate
             .noise
             .as_ref()
             .map_or_else(BigDecimal::zero, PolyMatrixNorm::maximum_coefficient_bound);
-        let modulus = evaluator
-            .graph
-            .wires
-            .get(&target.input)
-            .and_then(|wire| wire.wire_type.matrix_type())
+        let modulus = symbolic
+            .wire_type
+            .matrix_type()
             .ok_or_else(|| SimulationError::MissingWire(target.input.clone()))?
             .modulus
             .clone();
@@ -164,149 +204,343 @@ impl Evaluator<'_> {
             .clone()
     }
 
-    fn eval_wire(&mut self, wire: &WireId) -> Result<Estimate, SimulationError> {
-        let symbolic_wire =
-            self.graph.wires.get(wire).ok_or_else(|| SimulationError::MissingWire(wire.clone()))?;
-        let terms = symbolic_wire
-            .terms
-            .clone()
-            .ok_or_else(|| SimulationError::MissingWire(wire.clone()))?;
-        if terms.terms.is_empty() {
-            let ty = symbolic_wire
-                .wire_type
-                .matrix_type()
-                .ok_or_else(|| SimulationError::MissingWire(wire.clone()))?
-                .clone();
-            let ctx = self.context(ty.ring_dimension);
-            return Ok(Estimate {
-                signal: false,
-                noise: Some(exact_zero(ty.rows, ty.columns, ctx)),
-            });
+    fn eval(
+        &mut self,
+        expression: SymbolicExprId,
+        assignment: &Assignment,
+    ) -> Result<Estimate, SimulationError> {
+        let key = (expression, self.canonical_assignment(expression, assignment)?);
+        if let Some(estimate) = self.memo.get(&key) {
+            return Ok(estimate.clone());
         }
-        self.eval_terms(&terms)
-    }
-
-    fn eval_terms(&mut self, terms: &TermList) -> Result<Estimate, SimulationError> {
-        let Some(domain) = self.first_indicator_domain(terms)? else {
-            return self.eval_terms_without_select(terms);
+        let estimate = if let Some(domain) = self.first_unassigned_domain(expression, assignment)? {
+            let mut branches = Vec::with_capacity(domain.count());
+            for branch in 0..domain.count() {
+                let mut assigned = assignment.clone();
+                assigned.insert(domain.clone(), branch as u64);
+                branches.push(self.eval(expression, &assigned)?);
+            }
+            join_selection(branches)
+        } else {
+            self.eval_assigned(expression, assignment)?
         };
-        let mut branches = BTreeMap::<u64, Vec<Term>>::new();
-        let mut rest = Vec::new();
-        for term in &terms.terms {
-            let mut branch = None;
-            let mut factors = Vec::with_capacity(term.factors.len());
-            for factor in &term.factors {
-                let atom = self.atom(&factor.atom)?;
-                if atom.indicator.as_ref().is_some_and(|role| role.domain == domain) {
-                    branch = Some(atom.indicator.as_ref().expect("checked").branch);
-                } else {
-                    factors.push(factor.clone());
-                }
-            }
-            let stripped = Term { coefficient: term.coefficient.clone(), factors };
-            if let Some(branch) = branch {
-                branches.entry(branch).or_default().push(stripped);
-            } else {
-                rest.push(stripped);
-            }
-        }
-        let mut branch_estimates = Vec::new();
-        for branch in 0..selection_domain_count(&domain) {
-            let branch_terms = branches.remove(&branch).unwrap_or_default();
-            branch_estimates.push(self.eval_terms(&TermList { terms: branch_terms })?);
-        }
-        let selected = join_selection(branch_estimates);
-        add_estimates(selected, self.eval_terms(&TermList { terms: rest })?)
+        self.memo.insert(key, estimate.clone());
+        Ok(estimate)
     }
 
-    fn first_indicator_domain(
-        &self,
-        terms: &TermList,
-    ) -> Result<Option<SelectionDomainRef>, SimulationError> {
-        for term in &terms.terms {
-            for factor in &term.factors {
-                if let Some(role) = &self.atom(&factor.atom)?.indicator {
-                    return Ok(Some(role.domain.clone()));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn eval_terms_without_select(&mut self, terms: &TermList) -> Result<Estimate, SimulationError> {
+    fn eval_assigned(
+        &mut self,
+        expression: SymbolicExprId,
+        assignment: &Assignment,
+    ) -> Result<Estimate, SimulationError> {
         let mut signal = false;
         let mut noise = None;
-        for term in &terms.terms {
-            if self.term_has_signal(term)? {
+        self.for_each_alternative(expression, assignment, &mut |evaluator, alternative| {
+            if alternative.factors.iter().any(|factor| matches!(factor, AnalysisFactor::Signal(_)))
+            {
                 signal = true;
-                continue;
+                return Ok(());
             }
-            let term_noise = self.eval_bounded_term(term, None)?;
-            noise = Some(match noise {
-                Some(current) => current + term_noise,
-                None => term_noise,
+            let value = evaluator.eval_bounded_alternative(alternative)?;
+            noise = Some(match noise.take() {
+                Some(current) => normalize_exact_zero(current + value),
+                None => value,
             });
-        }
+            Ok(())
+        })?;
         Ok(Estimate { signal, noise: noise.map(normalize_exact_zero) })
     }
 
-    fn term_has_signal(&self, term: &Term) -> Result<bool, SimulationError> {
-        for factor in &term.factors {
-            if matches!(self.atom(&factor.atom)?.kind, AtomKind::Large) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn eval_bounded_term(
+    fn for_each_alternative(
         &mut self,
-        term: &Term,
-        cap: Option<&BigInt>,
-    ) -> Result<PolyMatrixNorm, SimulationError> {
-        let mut value = None;
-        for factor in &term.factors {
-            let atom = self.atom(&factor.atom)?.clone();
-            let mut factor_value = if matches!(atom.kind, AtomKind::Large) {
-                let modulus =
-                    cap.ok_or_else(|| SimulationError::MixedBoundedAtom(atom.id.clone()))?;
-                self.capped_large(&atom, modulus)
-            } else {
-                let mut value = self.eval_atom(&atom.id)?;
-                if let Some(modulus) = cap {
-                    let half = BigDecimal::from(modulus.clone()) / BigDecimal::from(2u64);
-                    if value.poly_norm.norm > half {
-                        value.poly_norm.norm = half.clone();
-                        value.poly_norm.sigma = half;
-                    }
-                }
-                value
-            };
-            if let Some(view) = &factor.view {
-                apply_view(&mut factor_value, view, &atom.matrix_type.modulus);
-            }
-            value = Some(match value {
-                None => factor_value,
-                Some(lhs) => multiply_factors(lhs, factor_value, &atom.id)?,
-            });
-        }
-        let coefficient = BigDecimal::from(term.coefficient.abs());
-        let value = match value {
-            Some(value) if coefficient == BigDecimal::one() => value,
-            Some(value) => value * coefficient,
-            None => {
-                let ctx = self.context(1);
-                PolyMatrixNorm::from_parts(
-                    1,
-                    1,
-                    PolyNorm::constant(ctx, coefficient),
-                    None,
-                    DependencySet::empty(),
-                    false,
+        expression: SymbolicExprId,
+        assignment: &Assignment,
+        callback: &mut dyn FnMut(&mut Self, Alternative) -> Result<(), SimulationError>,
+    ) -> Result<(), SimulationError> {
+        let record = self.record(expression)?.clone();
+        match record.node {
+            SymbolicExprNode::Zero => {
+                let context = self.context(record.matrix_type.ring_dimension);
+                callback(
+                    self,
+                    Alternative {
+                        coefficient: BigInt::one(),
+                        factors: vec![AnalysisFactor::Bounded(exact_zero(
+                            record.matrix_type.rows,
+                            record.matrix_type.columns,
+                            context,
+                        ))],
+                    },
                 )
             }
-        };
-        Ok(normalize_exact_zero(value))
+            SymbolicExprNode::Atom(id) => {
+                let atom = self.atom(&id)?.clone();
+                let factor = if matches!(atom.kind, AtomKind::Large) {
+                    AnalysisFactor::Signal(atom.matrix_type)
+                } else if is_identity_atom(&atom) {
+                    AnalysisFactor::Identity(atom.matrix_type)
+                } else {
+                    AnalysisFactor::Bounded(self.eval_atom(&id)?)
+                };
+                callback(self, Alternative { coefficient: BigInt::one(), factors: vec![factor] })
+            }
+            SymbolicExprNode::Add(children) => {
+                for child in children {
+                    self.for_each_alternative(child, assignment, callback)?;
+                }
+                Ok(())
+            }
+            SymbolicExprNode::Scale { coefficient, value } => {
+                self.for_each_alternative(value, assignment, &mut |evaluator, mut alternative| {
+                    alternative.coefficient *= &coefficient;
+                    callback(evaluator, alternative)
+                })
+            }
+            SymbolicExprNode::Mul(children) => self.for_each_product_alternative(
+                &children,
+                0,
+                assignment,
+                Alternative { coefficient: BigInt::one(), factors: Vec::new() },
+                callback,
+            ),
+            SymbolicExprNode::Tensor { left, right } => {
+                self.for_each_alternative(left, assignment, &mut |evaluator, left_alt| {
+                    evaluator.for_each_alternative(
+                        right,
+                        assignment,
+                        &mut |evaluator, right_alt| {
+                            let coefficient = &left_alt.coefficient * &right_alt.coefficient;
+                            let left_signal = left_alt
+                                .factors
+                                .iter()
+                                .any(|factor| matches!(factor, AnalysisFactor::Signal(_)));
+                            let right_signal = right_alt
+                                .factors
+                                .iter()
+                                .any(|factor| matches!(factor, AnalysisFactor::Signal(_)));
+                            let factor = if left_signal || right_signal {
+                                AnalysisFactor::Signal(record.matrix_type.clone())
+                            } else {
+                                let mut left_alt = left_alt.clone();
+                                let mut right_alt = right_alt;
+                                left_alt.coefficient = BigInt::one();
+                                right_alt.coefficient = BigInt::one();
+                                let left = evaluator.eval_bounded_alternative(left_alt)?;
+                                let right = evaluator.eval_bounded_alternative(right_alt)?;
+                                AnalysisFactor::Bounded(tensor_norm(
+                                    left,
+                                    right,
+                                    &record.matrix_type,
+                                ))
+                            };
+                            callback(evaluator, Alternative { coefficient, factors: vec![factor] })
+                        },
+                    )
+                })
+            }
+            SymbolicExprNode::Concat { inputs, .. } => {
+                let mut child_values = Vec::with_capacity(inputs.len());
+                let mut has_signal = false;
+                for input in inputs {
+                    let input_ty = self.record(input)?.matrix_type.clone();
+                    let estimate = self.eval_assigned(input, assignment)?;
+                    has_signal |= estimate.signal;
+                    child_values.push(estimate.noise.unwrap_or_else(|| {
+                        exact_zero(
+                            input_ty.rows,
+                            input_ty.columns,
+                            self.context(input_ty.ring_dimension),
+                        )
+                    }));
+                }
+                if has_signal {
+                    callback(
+                        self,
+                        Alternative {
+                            coefficient: BigInt::one(),
+                            factors: vec![AnalysisFactor::Signal(record.matrix_type.clone())],
+                        },
+                    )?;
+                }
+                let context = self.context(record.matrix_type.ring_dimension);
+                callback(
+                    self,
+                    Alternative {
+                        coefficient: BigInt::one(),
+                        factors: vec![AnalysisFactor::Bounded(join_opaque(
+                            child_values,
+                            &record.matrix_type,
+                            context,
+                        ))],
+                    },
+                )
+            }
+            SymbolicExprNode::Select { domain, branches } => {
+                let branch = assignment.get(&domain).copied().ok_or_else(|| {
+                    SimulationError::InvalidSelection("unassigned selection domain".to_owned())
+                })?;
+                let selected = branches.get(branch as usize).copied().ok_or_else(|| {
+                    SimulationError::InvalidSelection("selection branch is out of range".to_owned())
+                })?;
+                self.for_each_alternative(selected, assignment, callback)
+            }
+            SymbolicExprNode::Transpose(value) => {
+                self.for_each_alternative(value, assignment, &mut |evaluator, mut alternative| {
+                    alternative.factors.reverse();
+                    for factor in &mut alternative.factors {
+                        transpose_factor(factor);
+                    }
+                    callback(evaluator, alternative)
+                })
+            }
+            SymbolicExprNode::Slice { value, rows, columns } => {
+                self.for_each_alternative(value, assignment, &mut |evaluator, mut alternative| {
+                    slice_alternative(&mut alternative, rows, columns);
+                    callback(evaluator, alternative)
+                })
+            }
+            SymbolicExprNode::Reshape { value, .. } => {
+                let estimate = self.eval_assigned(value, assignment)?;
+                self.emit_structural_transform(
+                    estimate,
+                    &record.matrix_type,
+                    callback,
+                    reshape_norm,
+                )
+            }
+            SymbolicExprNode::ConstantCoefficient { value, .. } => {
+                let estimate = self.eval_assigned(value, assignment)?;
+                self.emit_structural_transform(
+                    estimate,
+                    &record.matrix_type,
+                    callback,
+                    constant_coefficient_norm,
+                )
+            }
+            SymbolicExprNode::CrtRecompose { .. } => callback(
+                self,
+                Alternative {
+                    coefficient: BigInt::one(),
+                    factors: vec![AnalysisFactor::Signal(record.matrix_type)],
+                },
+            ),
+        }
+    }
+
+    fn for_each_product_alternative(
+        &mut self,
+        children: &[SymbolicExprId],
+        index: usize,
+        assignment: &Assignment,
+        prefix: Alternative,
+        callback: &mut dyn FnMut(&mut Self, Alternative) -> Result<(), SimulationError>,
+    ) -> Result<(), SimulationError> {
+        if index == children.len() {
+            return callback(self, prefix);
+        }
+        self.for_each_alternative(children[index], assignment, &mut |evaluator, child| {
+            let mut combined = prefix.clone();
+            combined.coefficient *= child.coefficient;
+            combined.factors.extend(child.factors);
+            evaluator.for_each_product_alternative(
+                children,
+                index + 1,
+                assignment,
+                combined,
+                callback,
+            )
+        })
+    }
+
+    fn emit_structural_transform(
+        &mut self,
+        estimate: Estimate,
+        ty: &ConcreteMatrixType,
+        callback: &mut dyn FnMut(&mut Self, Alternative) -> Result<(), SimulationError>,
+        transform: impl FnOnce(PolyMatrixNorm, &ConcreteMatrixType) -> PolyMatrixNorm,
+    ) -> Result<(), SimulationError> {
+        if estimate.signal {
+            callback(
+                self,
+                Alternative {
+                    coefficient: BigInt::one(),
+                    factors: vec![AnalysisFactor::Signal(ty.clone())],
+                },
+            )?;
+        }
+        if let Some(noise) = estimate.noise {
+            callback(
+                self,
+                Alternative {
+                    coefficient: BigInt::one(),
+                    factors: vec![AnalysisFactor::Bounded(transform(noise, ty))],
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn eval_bounded_alternative(
+        &mut self,
+        alternative: Alternative,
+    ) -> Result<PolyMatrixNorm, SimulationError> {
+        if alternative.factors.iter().any(|factor| matches!(factor, AnalysisFactor::Signal(_))) {
+            return Err(SimulationError::MixedBoundedAlternative);
+        }
+        let mut product_shape = None;
+        let mut identity_ring_dimension = None;
+        for factor in &alternative.factors {
+            let shape = factor_shape(factor);
+            product_shape = Some(match product_shape {
+                Some(current) => multiplication_shape(current, shape)?,
+                None => shape,
+            });
+            if let AnalysisFactor::Identity(ty) = factor {
+                identity_ring_dimension = Some(ty.ring_dimension);
+            }
+        }
+        let mut bounded = Vec::new();
+        for factor in alternative.factors {
+            match factor {
+                AnalysisFactor::Bounded(value) => bounded.push(value),
+                AnalysisFactor::Identity(_) => {}
+                AnalysisFactor::Signal(_) => unreachable!("signal checked above"),
+            }
+        }
+        let coefficient = BigDecimal::from(alternative.coefficient.abs());
+        if bounded.is_empty() {
+            let (rows, columns) = product_shape.unwrap_or((1, 1));
+            let ring_dimension = identity_ring_dimension.unwrap_or(1);
+            return Ok(PolyMatrixNorm::from_parts(
+                rows,
+                columns,
+                PolyNorm::constant(self.context(ring_dimension), coefficient),
+                None,
+                DependencySet::empty(),
+                false,
+            ));
+        }
+        let mut value = bounded.remove(0);
+        for rhs in bounded {
+            value = multiply_factors(value, rhs)?;
+        }
+        if coefficient != BigDecimal::one() {
+            value = value * coefficient;
+        }
+        let mut value = normalize_exact_zero(value);
+        if let Some((rows, columns)) = product_shape &&
+            (value.nrow != rows || value.ncol != columns)
+        {
+            if value.poly_norm.norm.is_zero() {
+                return Ok(exact_zero(rows, columns, value.clone_ctx()));
+            }
+            value.nrow = rows;
+            value.ncol = columns;
+            value.ncol_sqrt =
+                BigDecimal::from(columns as u64).sqrt().expect("positive column count");
+            value.zero_rows = None;
+        }
+        Ok(value)
     }
 
     fn eval_atom(&mut self, id: &AtomId) -> Result<PolyMatrixNorm, SimulationError> {
@@ -315,28 +549,19 @@ impl Evaluator<'_> {
         }
         let atom = self.atom(id)?.clone();
         if matches!(atom.kind, AtomKind::Large) {
-            return Err(SimulationError::MixedBoundedAtom(id.clone()));
+            return Err(SimulationError::MixedBoundedAlternative);
         }
-        if !self.active.insert(id.clone()) {
-            return Err(SimulationError::UnsupportedDefinition {
-                atom: id.clone(),
-                reason: "cyclic atom definition".to_owned(),
-            });
-        }
-        let result = match &atom.class {
-            AtomClass::Source { source } => self.eval_source(&atom, source),
+        let value = normalize_exact_zero(match &atom.class {
+            AtomClass::Source { source } => self.eval_source(&atom, source)?,
             AtomClass::Assumed { metadata } => {
                 let metadata =
                     metadata.as_ref().ok_or_else(|| SimulationError::InvalidMetadata {
                         atom: id.clone(),
                         reason: "bounded assumed atom has no declared metadata".to_owned(),
                     })?;
-                self.eval_assumed(&atom, metadata)
+                self.eval_assumed(&atom, metadata)?
             }
-            AtomClass::Derived { definition } => self.eval_derived(&atom, definition),
-        };
-        self.active.remove(id);
-        let value = normalize_exact_zero(result?);
+        });
         self.atoms.insert(id.clone(), value.clone());
         Ok(value)
     }
@@ -349,29 +574,23 @@ impl Evaluator<'_> {
         let ty = &atom.matrix_type;
         let ctx = self.context(ty.ring_dimension);
         let stable = DependencySet::singleton(stable_source_id(&atom.id));
-        let value = match source {
-            SourceKind::ConstantMatrix { value } => {
-                let norm = constant_norm(value, ty, &atom.id)?;
-                PolyMatrixNorm::from_parts(
-                    ty.rows,
-                    ty.columns,
-                    PolyNorm::constant(ctx, norm),
-                    None,
-                    DependencySet::empty(),
-                    false,
-                )
-            }
-            SourceKind::UniformSample { minimum, maximum } => {
-                let norm = BigDecimal::from(minimum.abs().max(maximum.abs()));
-                PolyMatrixNorm::from_parts(
-                    ty.rows,
-                    ty.columns,
-                    PolyNorm::new(ctx, norm),
-                    None,
-                    stable,
-                    true,
-                )
-            }
+        Ok(match source {
+            SourceKind::ConstantMatrix { value } => PolyMatrixNorm::from_parts(
+                ty.rows,
+                ty.columns,
+                PolyNorm::constant(ctx, constant_norm(value, ty, &atom.id)?),
+                matches!(value, ConstantMatrix::Zero).then_some(ty.rows),
+                DependencySet::empty(),
+                false,
+            ),
+            SourceKind::UniformSample { minimum, maximum } => PolyMatrixNorm::from_parts(
+                ty.rows,
+                ty.columns,
+                PolyNorm::new(ctx, BigDecimal::from(minimum.abs().max(maximum.abs()))),
+                None,
+                stable,
+                true,
+            ),
             SourceKind::GaussianSample { sigma } => PolyMatrixNorm::from_parts(
                 ty.rows,
                 ty.columns,
@@ -394,7 +613,7 @@ impl Evaluator<'_> {
                 let term = sqrt_usize(*target_block_rows) * ring_sqrt * sqrt_usize(m_g) +
                     BigDecimal::from(2u64).sqrt().expect("sqrt(2)") * ring_sqrt +
                     decimal_ratio(47, 10);
-                let derived_sigma = decimal_ratio(18, 10) *
+                let sigma = decimal_ratio(18, 10) *
                     &tau *
                     (BigDecimal::from(gadget_base.clone()) + BigDecimal::one()) *
                     &tau *
@@ -402,7 +621,7 @@ impl Evaluator<'_> {
                 PolyMatrixNorm::from_parts(
                     ty.rows,
                     ty.columns,
-                    PolyNorm::new(ctx, high_probability_envelope_from_sigma(&derived_sigma)),
+                    PolyNorm::new(ctx, high_probability_envelope_from_sigma(&sigma)),
                     *zero_rows,
                     stable,
                     true,
@@ -438,10 +657,9 @@ impl Evaluator<'_> {
             SourceKind::TrapdoorUniform { .. } |
             SourceKind::HashSample { base: None, .. } |
             SourceKind::HashTarget { .. } => {
-                return Err(SimulationError::MixedBoundedAtom(atom.id.clone()));
+                return Err(SimulationError::MixedBoundedAlternative);
             }
-        };
-        Ok(value)
+        })
     }
 
     fn eval_assumed(
@@ -456,13 +674,14 @@ impl Evaluator<'_> {
                 DependencySet::known(labels.iter().map(stable_declared_id).collect())
             }
         };
+        let norm = eval_real(&metadata.norm, &atom.id)?;
         Ok(PolyMatrixNorm::from_parts(
             atom.matrix_type.rows,
             atom.matrix_type.columns,
             if metadata.is_const_poly {
-                PolyNorm::constant(ctx, eval_real(&metadata.norm, &atom.id)?)
+                PolyNorm::constant(ctx, norm)
             } else {
-                PolyNorm::new(ctx, eval_real(&metadata.norm, &atom.id)?)
+                PolyNorm::new(ctx, norm)
             },
             metadata.zero_rows,
             dependencies,
@@ -470,196 +689,138 @@ impl Evaluator<'_> {
         ))
     }
 
-    fn eval_derived(
-        &mut self,
-        atom: &Atom,
-        definition: &DefExpr,
-    ) -> Result<PolyMatrixNorm, SimulationError> {
-        match definition {
-            DefExpr::TermList(terms) | DefExpr::Fold(terms) => {
-                let estimate = self.eval_terms(terms)?;
-                self.require_noise(atom, estimate)
-            }
-            DefExpr::Concat { inputs, .. } => {
-                let values = inputs
-                    .iter()
-                    .map(|input| self.eval_atom(input))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(join_opaque(
-                    values,
-                    &atom.matrix_type,
-                    self.context(atom.matrix_type.ring_dimension),
-                ))
-            }
-            DefExpr::Reshape { input, .. } => {
-                let value = self.eval_atom(input)?;
-                let zero_rows = (value.poly_norm.is_const_poly &&
-                    value.poly_norm.norm.is_zero() &&
-                    value.zero_rows == Some(value.nrow))
-                .then_some(atom.matrix_type.rows);
-                Ok(PolyMatrixNorm::from_parts(
-                    atom.matrix_type.rows,
-                    atom.matrix_type.columns,
-                    value.poly_norm,
-                    zero_rows,
-                    value.deps,
-                    false,
-                ))
-            }
-            DefExpr::ConstantCoefficient { input, .. } => {
-                let value = self.eval_atom(input)?;
-                let zero_rows = (value.poly_norm.norm.is_zero() &&
-                    value.zero_rows == Some(value.nrow))
-                .then_some(atom.matrix_type.rows);
-                Ok(PolyMatrixNorm::from_parts(
-                    atom.matrix_type.rows,
-                    atom.matrix_type.columns,
-                    value.poly_norm.into_constant_poly(),
-                    zero_rows,
-                    value.deps,
-                    false,
-                ))
-            }
-            DefExpr::Indicator { .. } => Ok(PolyMatrixNorm::from_parts(
-                1,
-                1,
-                PolyNorm::constant(
-                    self.context(atom.matrix_type.ring_dimension),
-                    BigDecimal::one(),
-                ),
-                None,
-                DependencySet::empty(),
-                false,
-            )),
-            DefExpr::ModDownError { input, source_modulus, target_modulus, .. } => {
-                self.eval_mod_down_error(atom, input, source_modulus, target_modulus)
-            }
-            DefExpr::ModUpError { input, source_modulus, .. } => {
-                self.eval_mod_up_error(atom, input, source_modulus)
-            }
-            DefExpr::Tensor { .. } => Err(SimulationError::UnsupportedDefinition {
-                atom: atom.id.clone(),
-                reason: "tensor is unsupported in the initial simulator".to_owned(),
-            }),
-            DefExpr::ModDownImage { .. } |
-            DefExpr::ModUpLift { .. } |
-            DefExpr::CrtRecompose { .. } => Err(SimulationError::MixedBoundedAtom(atom.id.clone())),
-        }
+    fn first_unassigned_domain(
+        &self,
+        expression: SymbolicExprId,
+        assignment: &Assignment,
+    ) -> Result<Option<SelectionDomainRef>, SimulationError> {
+        let mut domains = Vec::new();
+        self.collect_domains(expression, assignment, &mut domains, &mut BTreeSet::new())?;
+        domains.sort();
+        domains.dedup();
+        Ok(domains.into_iter().next())
     }
 
-    fn require_noise(
-        &mut self,
-        atom: &Atom,
-        estimate: Estimate,
-    ) -> Result<PolyMatrixNorm, SimulationError> {
-        if estimate.signal {
-            return Err(SimulationError::MixedBoundedAtom(atom.id.clone()));
-        }
-        let ctx = self.context(atom.matrix_type.ring_dimension);
-        Ok(estimate.noise.unwrap_or_else(|| zero_matrix(atom, ctx)))
+    fn canonical_assignment(
+        &self,
+        expression: SymbolicExprId,
+        assignment: &Assignment,
+    ) -> Result<CanonicalAssignment, SimulationError> {
+        let mut domains = Vec::new();
+        self.collect_relevant_domains(expression, assignment, &mut domains, &mut BTreeSet::new())?;
+        domains.sort();
+        domains.dedup();
+        Ok(domains
+            .into_iter()
+            .filter_map(|domain| assignment.get(&domain).map(|branch| (domain, *branch)))
+            .collect())
     }
 
-    fn eval_mod_down_error(
-        &mut self,
-        atom: &Atom,
-        input: &TermList,
-        source_modulus: &BigInt,
-        target_modulus: &BigInt,
-    ) -> Result<PolyMatrixNorm, SimulationError> {
-        let mut prefix_rounding = BigDecimal::zero();
-        let mut dependencies = DependencySet::empty();
-        let mut bounded = Vec::new();
-        for term in &input.terms {
-            let position = term.factors.iter().position(|factor| {
-                self.atom(&factor.atom)
-                    .is_ok_and(|factor_atom| matches!(factor_atom.kind, AtomKind::Large))
-            });
-            if let Some(position) = position {
-                let prefix = Term {
-                    coefficient: term.coefficient.clone(),
-                    factors: term.factors[..position].to_vec(),
-                };
-                let prefix_norm = self.eval_bounded_term(&prefix, None)?;
-                dependencies = dependencies.union(&prefix_norm.deps);
-                let mut contribution = prefix_norm.maximum_coefficient_bound() *
-                    self.context(atom.matrix_type.ring_dimension).ring_dim_sqrt.clone();
-                if let Some(last) = prefix.factors.last() {
-                    let last = self.atom(&last.atom)?;
-                    if !last.matrix_type.is_scalar() {
-                        contribution *= BigDecimal::from(last.matrix_type.columns as u64);
-                    }
+    fn collect_relevant_domains(
+        &self,
+        expression: SymbolicExprId,
+        assignment: &Assignment,
+        domains: &mut Vec<SelectionDomainRef>,
+        visited: &mut BTreeSet<SymbolicExprId>,
+    ) -> Result<(), SimulationError> {
+        if !visited.insert(expression) {
+            return Ok(());
+        }
+        let node = &self.record(expression)?.node;
+        match node {
+            SymbolicExprNode::Select { domain, branches } => {
+                domains.push(domain.clone());
+                if let Some(branch) = assignment.get(domain).copied() {
+                    let selected = branches.get(branch as usize).ok_or_else(|| {
+                        SimulationError::InvalidSelection(
+                            "selection branch is out of range".to_owned(),
+                        )
+                    })?;
+                    self.collect_relevant_domains(*selected, assignment, domains, visited)?;
                 }
-                prefix_rounding += contribution / BigDecimal::from(2u64);
-            } else {
-                bounded.push(term.clone());
             }
+            SymbolicExprNode::Add(children) |
+            SymbolicExprNode::Mul(children) |
+            SymbolicExprNode::Concat { inputs: children, .. } |
+            SymbolicExprNode::CrtRecompose { inputs: children, .. } => {
+                for child in children {
+                    self.collect_relevant_domains(*child, assignment, domains, visited)?;
+                }
+            }
+            SymbolicExprNode::Scale { value, .. } |
+            SymbolicExprNode::Transpose(value) |
+            SymbolicExprNode::Slice { value, .. } |
+            SymbolicExprNode::Reshape { value, .. } |
+            SymbolicExprNode::ConstantCoefficient { value, .. } => {
+                self.collect_relevant_domains(*value, assignment, domains, visited)?;
+            }
+            SymbolicExprNode::Tensor { left, right } => {
+                self.collect_relevant_domains(*left, assignment, domains, visited)?;
+                self.collect_relevant_domains(*right, assignment, domains, visited)?;
+            }
+            SymbolicExprNode::Zero | SymbolicExprNode::Atom(_) => {}
         }
-        let bounded = self.eval_terms(&TermList { terms: bounded })?;
-        let bounded = bounded.noise.map_or_else(BigDecimal::zero, |value| {
-            dependencies = dependencies.union(&value.deps);
-            value.maximum_coefficient_bound()
-        });
-        let norm = BigDecimal::from(1u64) / BigDecimal::from(2u64) +
-            prefix_rounding +
-            bounded * BigDecimal::from(target_modulus.clone()) /
-                BigDecimal::from(source_modulus.clone());
-        Ok(plain_bound_with_deps(
-            atom,
-            self.context(atom.matrix_type.ring_dimension),
-            norm,
-            dependencies,
-        ))
+        Ok(())
     }
 
-    fn eval_mod_up_error(
-        &mut self,
-        atom: &Atom,
-        input: &TermList,
-        source_modulus: &BigInt,
-    ) -> Result<PolyMatrixNorm, SimulationError> {
-        let mut integer_norm = BigDecimal::zero();
-        let mut dependencies = DependencySet::empty();
-        for term in &input.terms {
-            let term = self.eval_bounded_term(term, Some(source_modulus))?;
-            integer_norm += term.maximum_coefficient_bound();
-            dependencies = dependencies.union(&term.deps);
+    fn collect_domains(
+        &self,
+        expression: SymbolicExprId,
+        assignment: &Assignment,
+        domains: &mut Vec<SelectionDomainRef>,
+        visited: &mut BTreeSet<SymbolicExprId>,
+    ) -> Result<(), SimulationError> {
+        if !visited.insert(expression) {
+            return Ok(());
         }
-        let norm = integer_norm / BigDecimal::from(source_modulus.clone()) +
-            BigDecimal::from(1u64) / BigDecimal::from(2u64);
-        Ok(plain_bound_with_deps(
-            atom,
-            self.context(atom.matrix_type.ring_dimension),
-            norm,
-            dependencies,
-        ))
+        let node = &self.record(expression)?.node;
+        match node {
+            SymbolicExprNode::Select { domain, branches } => {
+                if let Some(branch) = assignment.get(domain).copied() {
+                    let selected = branches.get(branch as usize).ok_or_else(|| {
+                        SimulationError::InvalidSelection(
+                            "selection branch is out of range".to_owned(),
+                        )
+                    })?;
+                    self.collect_domains(*selected, assignment, domains, visited)?;
+                } else {
+                    domains.push(domain.clone());
+                }
+            }
+            SymbolicExprNode::Add(children) |
+            SymbolicExprNode::Mul(children) |
+            SymbolicExprNode::Concat { inputs: children, .. } |
+            SymbolicExprNode::CrtRecompose { inputs: children, .. } => {
+                for child in children {
+                    self.collect_domains(*child, assignment, domains, visited)?;
+                }
+            }
+            SymbolicExprNode::Scale { value, .. } |
+            SymbolicExprNode::Transpose(value) |
+            SymbolicExprNode::Slice { value, .. } |
+            SymbolicExprNode::Reshape { value, .. } |
+            SymbolicExprNode::ConstantCoefficient { value, .. } => {
+                self.collect_domains(*value, assignment, domains, visited)?;
+            }
+            SymbolicExprNode::Tensor { left, right } => {
+                self.collect_domains(*left, assignment, domains, visited)?;
+                self.collect_domains(*right, assignment, domains, visited)?;
+            }
+            SymbolicExprNode::Zero | SymbolicExprNode::Atom(_) => {}
+        }
+        Ok(())
     }
 
-    fn capped_large(&mut self, atom: &Atom, modulus: &BigInt) -> PolyMatrixNorm {
-        PolyMatrixNorm::from_parts(
-            atom.matrix_type.rows,
-            atom.matrix_type.columns,
-            PolyNorm::new(
-                self.context(atom.matrix_type.ring_dimension),
-                BigDecimal::from(modulus.clone()) / BigDecimal::from(2u64),
-            ),
-            None,
-            DependencySet::Unknown,
-            false,
-        )
+    fn record(
+        &self,
+        expression: SymbolicExprId,
+    ) -> Result<&mxx_ir_symbolic::expression::SymbolicExprRecord, SimulationError> {
+        self.graph.expressions.get(expression).ok_or(SimulationError::MissingExpression(expression))
     }
 
     fn atom(&self, id: &AtomId) -> Result<&Atom, SimulationError> {
         self.graph.atoms.get(id).ok_or_else(|| SimulationError::MissingAtom(id.clone()))
     }
-}
-
-fn add_estimates(lhs: Estimate, rhs: Estimate) -> Result<Estimate, SimulationError> {
-    let noise = match (lhs.noise, rhs.noise) {
-        (Some(lhs), Some(rhs)) => Some(normalize_exact_zero(lhs + rhs)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    };
-    Ok(Estimate { signal: lhs.signal || rhs.signal, noise })
 }
 
 fn join_selection(branches: Vec<Estimate>) -> Estimate {
@@ -678,14 +839,6 @@ fn join_selection(branches: Vec<Estimate>) -> Estimate {
     Estimate { signal, noise: join_selection_noise(noises) }
 }
 
-fn selection_domain_count(domain: &SelectionDomainRef) -> u64 {
-    match domain {
-        SelectionDomainRef::Local(domain) | SelectionDomainRef::Imported { domain, .. } => {
-            domain.count
-        }
-    }
-}
-
 fn join_selection_noise(values: Vec<PolyMatrixNorm>) -> Option<PolyMatrixNorm> {
     let first = values.first()?.clone();
     let norm = values
@@ -699,7 +852,7 @@ fn join_selection_noise(values: Vec<PolyMatrixNorm>) -> Option<PolyMatrixNorm> {
     let dependencies =
         values.iter().fold(DependencySet::empty(), |deps, value| deps.union(&value.deps));
     let is_const_poly = values.iter().all(|value| value.poly_norm.is_const_poly);
-    let zero_rows = values.iter().map(|value| value.zero_rows).all_equal().unwrap_or(None);
+    let zero_rows = all_equal(values.iter().map(|value| value.zero_rows)).unwrap_or(None);
     Some(PolyMatrixNorm::from_parts(
         first.nrow,
         first.ncol,
@@ -714,43 +867,9 @@ fn join_selection_noise(values: Vec<PolyMatrixNorm>) -> Option<PolyMatrixNorm> {
     ))
 }
 
-trait AllEqualOption: Iterator {
-    fn all_equal(mut self) -> Option<Self::Item>
-    where
-        Self: Sized,
-        Self::Item: Clone + PartialEq,
-    {
-        let first = self.next()?;
-        if self.all(|value| value == first) { Some(first) } else { None }
-    }
-}
-impl<I: Iterator> AllEqualOption for I {}
-
-fn multiply_factors(
-    lhs: PolyMatrixNorm,
-    rhs: PolyMatrixNorm,
-    atom: &AtomId,
-) -> Result<PolyMatrixNorm, SimulationError> {
-    if lhs.nrow == 1 && lhs.ncol == 1 && !(rhs.nrow == 1 && rhs.ncol == 1) {
-        return Ok(scale_matrix(rhs, lhs));
-    }
-    if rhs.nrow == 1 && rhs.ncol == 1 && !(lhs.nrow == 1 && lhs.ncol == 1) {
-        return Ok(scale_matrix(lhs, rhs));
-    }
-    if lhs.ncol != rhs.nrow {
-        return Err(SimulationError::ShapeMismatch(atom.clone()));
-    }
-    Ok(lhs * rhs)
-}
-
-fn scale_matrix(matrix: PolyMatrixNorm, scalar: PolyMatrixNorm) -> PolyMatrixNorm {
-    let disjoint = matrix.deps.is_disjoint(&scalar.deps);
-    let clt_ready = disjoint && matrix.clt_ready && scalar.clt_ready;
-    let dependencies = matrix.deps.union(&scalar.deps);
-    let mut output = matrix * &scalar.poly_norm;
-    output.deps = dependencies;
-    output.clt_ready = clt_ready;
-    output
+fn all_equal<T: Clone + PartialEq>(mut values: impl Iterator<Item = T>) -> Option<T> {
+    let first = values.next()?;
+    values.all(|value| value == first).then_some(first)
 }
 
 fn join_opaque(
@@ -778,34 +897,164 @@ fn join_opaque(
     )
 }
 
-fn apply_view(value: &mut PolyMatrixNorm, view: &ViewDescriptor, source_modulus: &BigInt) {
-    if let Some(target_modulus) = &view.modulus_cast {
-        let cap_modulus = source_modulus.min(target_modulus);
-        let cap = BigDecimal::from(cap_modulus.clone()) / BigDecimal::from(2u64);
-        if value.poly_norm.norm > cap {
-            value.poly_norm.norm = cap.clone();
-            value.poly_norm.sigma = cap;
+fn reshape_norm(value: PolyMatrixNorm, ty: &ConcreteMatrixType) -> PolyMatrixNorm {
+    let zero_rows = (value.poly_norm.is_const_poly &&
+        value.poly_norm.norm.is_zero() &&
+        value.zero_rows == Some(value.nrow))
+    .then_some(ty.rows);
+    PolyMatrixNorm::from_parts(ty.rows, ty.columns, value.poly_norm, zero_rows, value.deps, false)
+}
+
+fn constant_coefficient_norm(value: PolyMatrixNorm, ty: &ConcreteMatrixType) -> PolyMatrixNorm {
+    let zero_rows =
+        (value.poly_norm.norm.is_zero() && value.zero_rows == Some(value.nrow)).then_some(ty.rows);
+    PolyMatrixNorm::from_parts(
+        ty.rows,
+        ty.columns,
+        value.poly_norm.into_constant_poly(),
+        zero_rows,
+        value.deps,
+        false,
+    )
+}
+
+fn tensor_norm(
+    left: PolyMatrixNorm,
+    right: PolyMatrixNorm,
+    ty: &ConcreteMatrixType,
+) -> PolyMatrixNorm {
+    let disjoint = left.deps.is_disjoint(&right.deps);
+    let use_clt = disjoint && (left.clt_ready || right.clt_ready);
+    let contraction = if left.poly_norm.is_const_poly || right.poly_norm.is_const_poly {
+        BigDecimal::one()
+    } else {
+        BigDecimal::from(ty.ring_dimension as u64)
+    };
+    let scale = if use_clt {
+        contraction.sqrt().expect("positive tensor contraction")
+    } else {
+        contraction
+    };
+    let norm = scale * &left.poly_norm.norm * &right.poly_norm.norm;
+    PolyMatrixNorm::from_parts(
+        ty.rows,
+        ty.columns,
+        if left.poly_norm.is_const_poly && right.poly_norm.is_const_poly {
+            PolyNorm::constant(left.clone_ctx(), norm)
+        } else {
+            PolyNorm::new(left.clone_ctx(), norm)
+        },
+        None,
+        left.deps.union(&right.deps),
+        disjoint && left.clt_ready && right.clt_ready,
+    )
+}
+
+fn multiply_factors(
+    lhs: PolyMatrixNorm,
+    rhs: PolyMatrixNorm,
+) -> Result<PolyMatrixNorm, SimulationError> {
+    if lhs.nrow == 1 && lhs.ncol == 1 && !(rhs.nrow == 1 && rhs.ncol == 1) {
+        return Ok(scale_matrix(rhs, lhs));
+    }
+    if rhs.nrow == 1 && rhs.ncol == 1 && !(lhs.nrow == 1 && lhs.ncol == 1) {
+        return Ok(scale_matrix(lhs, rhs));
+    }
+    if lhs.ncol != rhs.nrow {
+        return Err(SimulationError::ShapeMismatch);
+    }
+    Ok(lhs * rhs)
+}
+
+fn scale_matrix(matrix: PolyMatrixNorm, scalar: PolyMatrixNorm) -> PolyMatrixNorm {
+    let disjoint = matrix.deps.is_disjoint(&scalar.deps);
+    let clt_ready = disjoint && matrix.clt_ready && scalar.clt_ready;
+    let dependencies = matrix.deps.union(&scalar.deps);
+    let mut output = matrix * &scalar.poly_norm;
+    output.deps = dependencies;
+    output.clt_ready = clt_ready;
+    output
+}
+
+fn transpose_factor(factor: &mut AnalysisFactor) {
+    match factor {
+        AnalysisFactor::Signal(ty) | AnalysisFactor::Identity(ty) => {
+            std::mem::swap(&mut ty.rows, &mut ty.columns);
         }
-    }
-    if view.transpose {
-        std::mem::swap(&mut value.nrow, &mut value.ncol);
-        value.ncol_sqrt =
-            BigDecimal::from(value.ncol as u64).sqrt().expect("positive column count");
-        value.zero_rows = None;
-    }
-    if let Some(rows) = view.row_range {
-        value.nrow = rows.end.saturating_sub(rows.start);
-        value.zero_rows = None;
-    }
-    if let Some(columns) = view.column_range {
-        value.ncol = columns.end.saturating_sub(columns.start);
-        value.ncol_sqrt =
-            BigDecimal::from(value.ncol as u64).sqrt().expect("positive column count");
+        AnalysisFactor::Bounded(value) => {
+            std::mem::swap(&mut value.nrow, &mut value.ncol);
+            value.ncol_sqrt =
+                BigDecimal::from(value.ncol as u64).sqrt().expect("positive column count");
+            value.zero_rows = None;
+        }
     }
 }
 
-fn zero_matrix(atom: &Atom, ctx: Arc<SimulatorContext>) -> PolyMatrixNorm {
-    exact_zero(atom.matrix_type.rows, atom.matrix_type.columns, ctx)
+fn slice_alternative(
+    alternative: &mut Alternative,
+    rows: Option<IndexRange>,
+    columns: Option<IndexRange>,
+) {
+    if let Some(index) = alternative.factors.iter().position(|factor| !factor_is_scalar(factor)) {
+        if let Some(rows) = rows {
+            set_factor_rows(&mut alternative.factors[index], rows.end - rows.start);
+        }
+    }
+    if let Some(index) = alternative.factors.iter().rposition(|factor| !factor_is_scalar(factor)) {
+        if let Some(columns) = columns {
+            set_factor_columns(&mut alternative.factors[index], columns.end - columns.start);
+        }
+    }
+}
+
+fn set_factor_rows(factor: &mut AnalysisFactor, rows: usize) {
+    match factor {
+        AnalysisFactor::Signal(ty) | AnalysisFactor::Identity(ty) => ty.rows = rows,
+        AnalysisFactor::Bounded(value) => {
+            value.nrow = rows;
+            value.zero_rows = None;
+        }
+    }
+}
+
+fn set_factor_columns(factor: &mut AnalysisFactor, columns: usize) {
+    match factor {
+        AnalysisFactor::Signal(ty) | AnalysisFactor::Identity(ty) => ty.columns = columns,
+        AnalysisFactor::Bounded(value) => {
+            value.ncol = columns;
+            value.ncol_sqrt =
+                BigDecimal::from(columns as u64).sqrt().expect("positive column count");
+        }
+    }
+}
+
+fn factor_is_scalar(factor: &AnalysisFactor) -> bool {
+    match factor {
+        AnalysisFactor::Signal(ty) | AnalysisFactor::Identity(ty) => ty.is_scalar(),
+        AnalysisFactor::Bounded(value) => value.nrow == 1 && value.ncol == 1,
+    }
+}
+
+fn factor_shape(factor: &AnalysisFactor) -> (usize, usize) {
+    match factor {
+        AnalysisFactor::Signal(ty) | AnalysisFactor::Identity(ty) => (ty.rows, ty.columns),
+        AnalysisFactor::Bounded(value) => (value.nrow, value.ncol),
+    }
+}
+
+fn multiplication_shape(
+    left: (usize, usize),
+    right: (usize, usize),
+) -> Result<(usize, usize), SimulationError> {
+    if left == (1, 1) {
+        Ok(right)
+    } else if right == (1, 1) {
+        Ok(left)
+    } else if left.1 == right.0 {
+        Ok((left.0, right.1))
+    } else {
+        Err(SimulationError::ShapeMismatch)
+    }
 }
 
 fn exact_zero(nrow: usize, ncol: usize, ctx: Arc<SimulatorContext>) -> PolyMatrixNorm {
@@ -827,19 +1076,12 @@ fn normalize_exact_zero(value: PolyMatrixNorm) -> PolyMatrixNorm {
     }
 }
 
-fn plain_bound_with_deps(
-    atom: &Atom,
-    ctx: Arc<SimulatorContext>,
-    norm: BigDecimal,
-    dependencies: DependencySet,
-) -> PolyMatrixNorm {
-    PolyMatrixNorm::from_parts(
-        atom.matrix_type.rows,
-        atom.matrix_type.columns,
-        PolyNorm::new(ctx, norm),
-        None,
-        dependencies,
-        false,
+fn is_identity_atom(atom: &Atom) -> bool {
+    matches!(
+        atom.class,
+        AtomClass::Source {
+            source: SourceKind::ConstantMatrix { value: ConstantMatrix::Identity }
+        }
     )
 }
 
@@ -867,6 +1109,14 @@ fn constant_norm(
             })?;
             BigDecimal::from(base.pow(exponent))
         }
+        ConstantMatrix::Polynomial { coefficients } => coefficients
+            .iter()
+            .map(|coefficient| eval_int(coefficient, atom).map(|value| value.abs()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .map(BigDecimal::from)
+            .unwrap_or_else(BigDecimal::zero),
     })
 }
 
@@ -882,7 +1132,7 @@ fn eval_real(expression: &RealExpr, atom: &AtomId) -> Result<BigDecimal, Simulat
 }
 
 fn eval_real_raw(expression: &RealExpr, atom: &AtomId) -> Result<BigDecimal, SimulationError> {
-    let value = match expression {
+    Ok(match expression {
         RealExpr::Rational(value) => {
             BigDecimal::from(value.numerator().clone()) /
                 BigDecimal::from(value.denominator().clone())
@@ -920,8 +1170,7 @@ fn eval_real_raw(expression: &RealExpr, atom: &AtomId) -> Result<BigDecimal, Sim
                 reason: format!("unclosed real variable {name}"),
             });
         }
-    };
-    Ok(value)
+    })
 }
 
 fn eval_int(expression: &IntExpr, atom: &AtomId) -> Result<BigInt, SimulationError> {
@@ -957,15 +1206,43 @@ fn decimal_ratio(numerator: i64, denominator: i64) -> BigDecimal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_ir_symbolic::{
-        elaborate::elaborate,
-        expr::{IntExpr, Rational},
-        graph::Graph,
-        node::{MatrixBinaryOp, Node, NodeKind},
-        types::{MatrixType, NodeId, Port, WireRef},
+    use mxx_dsl::{BoundedMetadata, DslContext, Family, Ring, VirtualMat};
+    use mxx_ir_core::{
+        Graph, GraphOutput, NodeHandle, ValueHandle,
+        node::NodeKind,
+        types::{MatrixType, WireType},
     };
+    use mxx_ir_symbolic::overlay::DeclaredDependencyLabels;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    fn matrix_type(rows: i64, columns: i64) -> MatrixType {
+    fn output_report(output: mxx_dsl::Mat) -> WireNoiseReport {
+        let built = DslContext::new("noise-test")
+            .output("output", output)
+            .expect("output")
+            .build()
+            .expect("build");
+        let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
+        simulate(&elaborated).expect("simulation").outputs.remove("output").expect("report")
+    }
+
+    fn bounded_metadata(
+        norm: i64,
+        labels: &[&str],
+        zero_rows: Option<usize>,
+        clt_ready: bool,
+    ) -> BoundedMetadata {
+        BoundedMetadata {
+            norm: RealExpr::from_integer(norm),
+            is_const_poly: false,
+            zero_rows: zero_rows.map(IntExpr::constant),
+            dependencies: DeclaredDependencyLabels::Known(
+                labels.iter().map(|label| (*label).to_owned()).collect::<BTreeSet<_>>(),
+            ),
+            clt_ready,
+        }
+    }
+
+    fn core_matrix_type(rows: usize, columns: usize) -> MatrixType {
         MatrixType {
             modulus: IntExpr::constant(97),
             ring_dimension: IntExpr::constant(8),
@@ -974,443 +1251,116 @@ mod tests {
         }
     }
 
-    fn wire(node: u64, port: u32) -> WireRef {
-        WireRef { node: NodeId(node), port: Port(port) }
-    }
-
-    fn rational(value: i64) -> RealExpr {
-        RealExpr::Rational(Rational::new(BigInt::from(value), BigInt::one()).expect("rational"))
-    }
-
-    fn graph(name: &str, nodes: Vec<Node>, output: WireRef) -> Graph {
-        Graph {
-            name: name.to_owned(),
-            parameters: Vec::new(),
-            input_types: BTreeMap::new(),
-            nodes,
-            outputs: BTreeMap::from([("out".to_owned(), output)]),
-            subgraphs: BTreeMap::new(),
-            real_constants: BTreeMap::new(),
-        }
+    fn freeze_graph(
+        name: &str,
+        outputs: impl IntoIterator<Item = (&'static str, ValueHandle)>,
+        effects: Vec<ValueHandle>,
+    ) -> Graph {
+        Graph::freeze(
+            name,
+            Vec::new(),
+            outputs
+                .into_iter()
+                .map(|(name, value)| {
+                    (name.to_owned(), GraphOutput { value, confidentiality: None })
+                })
+                .collect(),
+            Vec::new(),
+            effects,
+            BTreeMap::new(),
+        )
+        .expect("freeze graph")
+        .0
     }
 
     #[test]
-    fn gaussian_source_uses_the_existing_six_point_five_sigma_envelope() {
-        let graph = graph(
-            "gaussian",
-            vec![Node {
-                id: NodeId(1),
-                kind: NodeKind::GaussianSample {
-                    matrix_type: matrix_type(2, 3),
-                    sigma: rational(4),
-                },
-                args: Vec::new(),
-            }],
-            wire(1, 0),
-        );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
+    fn selection_uses_the_largest_branch_bound_instead_of_the_sum() {
+        let ring = Ring::new(257, 8);
+        let index = ring.input("index", (1, 1)).extract_coefficient(0);
+        let selected = index
+            .select(vec![ring.gaussian((1, 1), 2), ring.gaussian((1, 1), 3)])
+            .expect("compatible branches");
+        let built = DslContext::new("selection-bound")
+            .output("selected", selected)
+            .expect("output")
+            .build()
+            .expect("build");
+        let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
         let report = simulate(&elaborated).expect("simulation");
         assert_eq!(
-            report.outputs["out"].noise.as_ref().expect("noise").bound,
-            BigDecimal::from(26u64)
+            report.outputs["selected"].noise.as_ref().expect("bounded output").bound,
+            BigDecimal::from(195u64) / BigDecimal::from(10u64),
         );
     }
 
     #[test]
-    fn constant_coefficient_preserves_bound_and_dependency_as_constant_polynomial() {
-        let graph = graph(
-            "constant-coefficient",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::GaussianSample {
-                        matrix_type: matrix_type(1, 1),
-                        sigma: rational(4),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::ConstantCoefficient { position: IntExpr::constant(2) },
-                    args: vec![wire(1, 0)],
-                },
-            ],
-            wire(2, 0),
-        );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
+    fn static_family_access_uses_the_selected_member_expression() {
+        let ring = Ring::new(257, 8);
+        let family =
+            Family::pack(vec![ring.gaussian((1, 1), 2), ring.gaussian((1, 1), 3)]).expect("family");
+        let selected = family.get_static(1);
+        let built = DslContext::new("family-member-bound")
+            .output("selected", selected)
+            .expect("output")
+            .family_output("family", family)
+            .expect("family output")
+            .build()
+            .expect("build");
+        let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
         let report = simulate(&elaborated).expect("simulation");
-        let noise = report.outputs["out"].noise.as_ref().expect("noise");
-        assert_eq!(noise.bound, BigDecimal::from(26u64));
-        assert!(noise.is_const_poly);
         assert_eq!(
-            noise.dependencies,
-            DependencySet::singleton(stable_source_id(&AtomId::Local {
-                instantiation_path: Vec::new(),
-                node: NodeId(1),
-                port: 0,
-            }))
+            report.outputs["selected"].noise.as_ref().expect("bounded output").bound,
+            BigDecimal::from(195u64) / BigDecimal::from(10u64),
         );
-        assert!(!noise.clt_ready);
-    }
-
-    #[test]
-    fn selection_uses_branch_max_and_joins_metadata_instead_of_summing_branches() {
-        let graph = graph(
-            "selection",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::ConstantInt(BigInt::zero()),
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::GaussianSample {
-                        matrix_type: matrix_type(1, 1),
-                        sigma: rational(2),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::GaussianSample {
-                        matrix_type: matrix_type(1, 1),
-                        sigma: rational(5),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(4),
-                    kind: NodeKind::Select { count: IntExpr::constant(2) },
-                    args: vec![wire(1, 0), wire(2, 0), wire(3, 0)],
-                },
-            ],
-            wire(4, 0),
-        );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        let report = simulate(&elaborated).expect("simulation");
-        let noise = report.outputs["out"].noise.as_ref().expect("noise");
-        assert_eq!(noise.bound, decimal_ratio(65, 2));
-        assert!(!noise.clt_ready);
         assert_eq!(
-            noise.dependencies,
-            DependencySet::singleton(stable_source_id(&AtomId::Local {
-                instantiation_path: Vec::new(),
-                node: NodeId(2),
-                port: 0,
-            }))
-            .union(&DependencySet::singleton(stable_source_id(&AtomId::Local {
-                instantiation_path: Vec::new(),
-                node: NodeId(3),
-                port: 0,
-            })))
+            report.outputs["family"].noise.as_ref().expect("bounded family").bound,
+            BigDecimal::from(195u64) / BigDecimal::from(10u64),
         );
     }
 
     #[test]
-    fn preimage_uses_explicit_layout_and_the_existing_derived_sigma_formula() {
-        let graph = graph(
-            "preimage",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::TrapdoorSample {
-                        matrix_type: matrix_type(1, 3),
-                        sigma: rational(3),
-                        gadget_base: IntExpr::constant(2),
-                        digit_count: IntExpr::constant(1),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::GaussianSample {
-                        matrix_type: matrix_type(1, 1),
-                        sigma: rational(1),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::PreimageSample { matrix_type: matrix_type(3, 1) },
-                    args: vec![wire(1, 1), wire(2, 0)],
-                },
-            ],
-            wire(3, 0),
-        );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        let report = simulate(&elaborated).expect("simulation");
-        let ring_sqrt = BigDecimal::from(8u64).sqrt().expect("sqrt(8)");
+    fn exact_identity_does_not_change_a_gaussian_bound() {
+        let ring = Ring::new(257, 8);
+        let report = output_report(ring.identity(2) * ring.gaussian((2, 1), 2));
+        assert_eq!(report.noise.expect("bounded output").bound, BigDecimal::from(13u8));
+    }
+
+    #[test]
+    fn direct_preimage_preserves_the_existing_derived_sigma_formula() {
+        let ring = Ring::new(97, 8);
+        let trapdoor = ring.sample_trapdoor(1, 3, 2, 1);
+        let preimage = trapdoor.sample_preimage(ring.gaussian((1, 1), 1), (3, 1));
+        let report = output_report(preimage.as_mat()).noise.expect("preimage noise");
+        let ring_sqrt = BigDecimal::from(8u8).sqrt().expect("sqrt(8)");
         let derived_sigma = decimal_ratio(18, 10) *
-            BigDecimal::from(3u64) *
-            BigDecimal::from(3u64) *
-            BigDecimal::from(3u64) *
-            (ring_sqrt.clone() +
-                BigDecimal::from(2u64).sqrt().expect("sqrt(2)") * ring_sqrt +
+            BigDecimal::from(3u8) *
+            BigDecimal::from(3u8) *
+            BigDecimal::from(3u8) *
+            (BigDecimal::from(3u8).sqrt().expect("sqrt(3)") * ring_sqrt.clone() +
+                BigDecimal::from(2u8).sqrt().expect("sqrt(2)") * ring_sqrt +
                 decimal_ratio(47, 10));
-        assert_eq!(
-            report.outputs["out"].noise.as_ref().expect("noise").bound,
-            high_probability_envelope_from_sigma(&derived_sigma)
-        );
+        assert_eq!(report.bound, high_probability_envelope_from_sigma(&derived_sigma));
     }
 
     #[test]
-    fn gadget_trapdoor_preimage_uses_balanced_digit_rule() {
-        let graph = graph(
-            "gadget-preimage",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::GadgetTrapdoor {
-                        matrix_type: matrix_type(1, 7),
-                        base: IntExpr::constant(2),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::GaussianSample {
-                        matrix_type: matrix_type(1, 1),
-                        sigma: rational(1),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(3),
-                    kind: NodeKind::PreimageSample { matrix_type: matrix_type(7, 1) },
-                    args: vec![wire(1, 0), wire(2, 0)],
-                },
-            ],
-            wire(3, 0),
-        );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        let report = simulate(&elaborated).expect("simulation");
-        let digit_sigma =
-            (BigDecimal::from(6u64) / BigDecimal::from(12u64)).sqrt().expect("digit sigma");
-        assert_eq!(
-            report.outputs["out"].noise.as_ref().expect("noise").bound,
-            high_probability_envelope_from_sigma(&digit_sigma)
-        );
-    }
-
-    #[test]
-    fn real_expression_allows_negative_intermediate_when_final_norm_is_nonnegative() {
-        let atom = AtomId::Virtual { name: "norm".to_owned() };
-        let expression = RealExpr::Add(
-            Box::new(RealExpr::Sub(
-                Box::new(rational(1)),
-                Box::new(RealExpr::Sqrt(Box::new(rational(4)))),
-            )),
-            Box::new(rational(2)),
-        );
-        assert_eq!(eval_real(&expression, &atom).expect("valid final norm"), BigDecimal::one());
-    }
-
-    #[test]
-    fn exact_zero_derived_atom_has_constant_empty_dependency_metadata() {
-        let graph = graph(
-            "zero-reshape",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::ConstantMatrix {
-                        matrix_type: matrix_type(1, 1),
-                        value: ConstantMatrix::Zero,
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::Reshape {
-                        rows: IntExpr::constant(1),
-                        columns: IntExpr::constant(1),
-                    },
-                    args: vec![wire(1, 0)],
-                },
-            ],
-            wire(2, 0),
-        );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        let report = simulate(&elaborated).expect("simulation");
-        let noise = report.outputs["out"].noise.as_ref().expect("explicit zero");
-        assert_eq!(noise.bound, BigDecimal::zero());
-        assert!(noise.is_const_poly);
-        assert_eq!(noise.zero_rows, Some(1));
-        assert_eq!(noise.dependencies, DependencySet::empty());
-        assert!(!noise.clt_ready);
-    }
-
-    #[test]
-    fn direct_zero_and_zero_arithmetic_use_canonical_metadata() {
-        for (name, nodes, output) in [
-            (
-                "direct-zero",
-                vec![Node {
-                    id: NodeId(1),
-                    kind: NodeKind::ConstantMatrix {
-                        matrix_type: matrix_type(2, 2),
-                        value: ConstantMatrix::Zero,
-                    },
-                    args: Vec::new(),
-                }],
-                wire(1, 0),
-            ),
-            (
-                "zero-add",
-                vec![
-                    Node {
-                        id: NodeId(1),
-                        kind: NodeKind::ConstantMatrix {
-                            matrix_type: matrix_type(2, 2),
-                            value: ConstantMatrix::Zero,
-                        },
-                        args: Vec::new(),
-                    },
-                    Node {
-                        id: NodeId(2),
-                        kind: NodeKind::MatrixBinary(MatrixBinaryOp::Add),
-                        args: vec![wire(1, 0), wire(1, 0)],
-                    },
-                ],
-                wire(2, 0),
-            ),
-            (
-                "zero-multiply",
-                vec![
-                    Node {
-                        id: NodeId(1),
-                        kind: NodeKind::ConstantMatrix {
-                            matrix_type: matrix_type(2, 2),
-                            value: ConstantMatrix::Zero,
-                        },
-                        args: Vec::new(),
-                    },
-                    Node {
-                        id: NodeId(2),
-                        kind: NodeKind::GaussianSample {
-                            matrix_type: matrix_type(2, 2),
-                            sigma: rational(3),
-                        },
-                        args: Vec::new(),
-                    },
-                    Node {
-                        id: NodeId(3),
-                        kind: NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-                        args: vec![wire(1, 0), wire(2, 0)],
-                    },
-                ],
-                wire(3, 0),
-            ),
-        ] {
-            let elaborated =
-                elaborate(&graph(name, nodes, output), &ParamEnv::default()).expect("elaboration");
-            let report = simulate(&elaborated).expect("simulation");
-            let noise = report.outputs["out"].noise.as_ref().expect("explicit zero");
-            assert_eq!(noise.bound, BigDecimal::zero(), "{name}");
-            assert!(noise.is_const_poly, "{name}");
-            assert_eq!(noise.zero_rows, Some(2), "{name}");
-            assert_eq!(noise.dependencies, DependencySet::empty(), "{name}");
-            assert!(!noise.clt_ready, "{name}");
-        }
-    }
-
-    #[test]
-    fn modulus_cast_caps_a_factor_at_half_the_smaller_modulus() {
-        let ctx = Arc::new(SimulatorContext::new(
-            BigDecimal::from(8u64).sqrt().expect("sqrt(8)"),
-            BigDecimal::from(2u64),
-            8,
-            7,
-            1,
-        ));
-        let mut value = PolyMatrixNorm::from_parts(
-            1,
-            1,
-            PolyNorm::new(ctx, BigDecimal::from(80u64)),
-            None,
-            DependencySet::Unknown,
-            false,
-        );
-        let view = ViewDescriptor {
-            modulus_cast: Some(BigInt::from(101u64)),
-            ..ViewDescriptor::default()
-        };
-        apply_view(&mut value, &view, &BigInt::from(97u64));
-        assert_eq!(value.maximum_coefficient_bound(), decimal_ratio(97, 2));
-    }
-
-    #[test]
-    fn all_zero_opaque_join_uses_canonical_zero_metadata() {
-        let ctx = Arc::new(SimulatorContext::new(
-            BigDecimal::from(8u64).sqrt().expect("sqrt(8)"),
-            BigDecimal::from(2u64),
-            8,
-            7,
-            1,
-        ));
-        let value = exact_zero(1, 1, ctx.clone());
-        let joined = join_opaque(
-            vec![value.clone(), value],
-            &ConcreteMatrixType {
-                modulus: BigInt::from(97u64),
-                ring_dimension: 8,
-                rows: 2,
-                columns: 1,
+    fn bounded_external_preimage_without_manifest_or_assumption_is_unsupported() {
+        let ty = core_matrix_type(1, 1);
+        let input = NodeHandle::new(
+            NodeKind::Input {
+                name: "external".to_owned(),
+                wire_type: WireType::Preimage(ty.clone()),
+                artifact: None,
             },
-            ctx,
+            Vec::new(),
+            vec![WireType::Preimage(ty)],
         );
-        assert_eq!(joined.maximum_coefficient_bound(), BigDecimal::zero());
-        assert!(joined.poly_norm.is_const_poly);
-        assert_eq!(joined.zero_rows, Some(2));
-        assert_eq!(joined.deps, DependencySet::empty());
-        assert!(!joined.clt_ready);
-    }
-
-    #[test]
-    fn selection_metadata_includes_an_absent_branch_as_exact_zero() {
-        let ctx = Arc::new(SimulatorContext::new(
-            BigDecimal::from(8u64).sqrt().expect("sqrt(8)"),
-            BigDecimal::from(2u64),
-            8,
-            7,
-            1,
-        ));
-        let nonzero = PolyMatrixNorm::from_parts(
-            2,
-            1,
-            PolyNorm::new(ctx, BigDecimal::one()),
-            Some(1),
-            DependencySet::Unknown,
-            true,
+        let graph = freeze_graph(
+            "external-preimage",
+            [("external", input.output(0).expect("input"))],
+            Vec::new(),
         );
-        let joined = join_selection(vec![
-            Estimate { signal: false, noise: Some(nonzero) },
-            Estimate { signal: false, noise: None },
-        ]);
-        let noise = joined.noise.expect("one branch has noise");
-        assert_eq!(noise.zero_rows, None);
-        assert!(!noise.clt_ready);
-    }
-
-    #[test]
-    fn bounded_external_input_without_manifest_or_unfold_is_unsupported() {
-        let mut graph = graph(
-            "external",
-            vec![Node {
-                id: NodeId(1),
-                kind: NodeKind::Input {
-                    name: "x".to_owned(),
-                    wire_type: mxx_ir_symbolic::types::WireType::Preimage(matrix_type(1, 1)),
-                    artifact: None,
-                },
-                args: Vec::new(),
-            }],
-            wire(1, 0),
-        );
-        graph
-            .input_types
-            .insert("x".to_owned(), mxx_ir_symbolic::types::WireType::Preimage(matrix_type(1, 1)));
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
+        let elaborated =
+            mxx_ir_symbolic::elaborate(&graph, &ParamEnv::default()).expect("symbolic elaboration");
         assert!(matches!(
             simulate(&elaborated),
             Err(SimulationError::UnsupportedExternal { kind: ExternalSourceKind::Preimage, .. })
@@ -1418,31 +1368,29 @@ mod tests {
     }
 
     #[test]
-    fn simulation_visits_decode_inputs_even_when_graph_outputs_are_scalar() {
-        let graph = graph(
-            "decode",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::GaussianSample {
-                        matrix_type: matrix_type(1, 1),
-                        sigma: rational(1),
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::ThresholdDecode {
-                        plaintext_modulus: IntExpr::constant(2),
-                        length: IntExpr::constant(1),
-                        output_bool: false,
-                    },
-                    args: vec![wire(1, 0)],
-                },
-            ],
-            wire(2, 0),
+    fn decode_effect_is_simulated_without_a_matrix_output() {
+        let ty = core_matrix_type(1, 1);
+        let gaussian = NodeHandle::new(
+            NodeKind::GaussianSample { matrix_type: ty.clone(), sigma: RealExpr::from_integer(1) },
+            Vec::new(),
+            vec![WireType::Matrix(ty)],
         );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
+        let decode = NodeHandle::new(
+            NodeKind::ThresholdDecode {
+                plaintext_modulus: IntExpr::constant(2),
+                length: IntExpr::constant(1),
+                output_bool: false,
+            },
+            vec![gaussian.output(0).expect("gaussian")],
+            vec![WireType::Int],
+        );
+        let graph = freeze_graph(
+            "decode-effect",
+            std::iter::empty(),
+            vec![decode.output(0).expect("decode effect")],
+        );
+        let elaborated =
+            mxx_ir_symbolic::elaborate(&graph, &ParamEnv::default()).expect("symbolic elaboration");
         let report = simulate(&elaborated).expect("simulation");
         assert!(report.outputs.is_empty());
         assert_eq!(report.decode_targets.len(), 1);
@@ -1450,40 +1398,312 @@ mod tests {
             report.decode_targets[0].estimate.noise.as_ref().expect("decode noise").bound,
             decimal_ratio(13, 2)
         );
-        assert_eq!(report.decode_targets[0].threshold, decimal_ratio(97, 4));
-        assert!(report.decode_targets[0].within_threshold);
     }
 
     #[test]
-    fn simulation_does_not_visit_unreachable_bounded_inputs() {
-        let mut graph = graph(
-            "target-only",
-            vec![
-                Node {
-                    id: NodeId(1),
-                    kind: NodeKind::Input {
-                        name: "unused".to_owned(),
-                        wire_type: mxx_ir_symbolic::types::WireType::Preimage(matrix_type(1, 1)),
-                        artifact: None,
-                    },
-                    args: Vec::new(),
-                },
-                Node {
-                    id: NodeId(2),
-                    kind: NodeKind::GaussianSample {
-                        matrix_type: matrix_type(1, 1),
-                        sigma: rational(1),
-                    },
-                    args: Vec::new(),
-                },
+    fn simulation_does_not_visit_a_non_output_external_preimage() {
+        let ty = core_matrix_type(1, 1);
+        let external = NodeHandle::new(
+            NodeKind::Input {
+                name: "unused".to_owned(),
+                wire_type: WireType::Preimage(ty.clone()),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![WireType::Preimage(ty.clone())],
+        );
+        let gaussian = NodeHandle::new(
+            NodeKind::GaussianSample { matrix_type: ty.clone(), sigma: RealExpr::from_integer(1) },
+            Vec::new(),
+            vec![WireType::Matrix(ty)],
+        );
+        let graph = freeze_graph(
+            "reachable-output-only",
+            [
+                ("unused", external.output(0).expect("external")),
+                ("output", gaussian.output(0).expect("gaussian")),
             ],
-            wire(2, 0),
+            Vec::new(),
         );
-        graph.input_types.insert(
-            "unused".to_owned(),
-            mxx_ir_symbolic::types::WireType::Preimage(matrix_type(1, 1)),
-        );
-        let elaborated = elaborate(&graph, &ParamEnv::default()).expect("elaboration");
-        assert!(simulate(&elaborated).is_ok());
+        let mut elaborated =
+            mxx_ir_symbolic::elaborate(&graph, &ParamEnv::default()).expect("symbolic elaboration");
+        elaborated.outputs.remove("unused");
+        let report = simulate(&elaborated).expect("unreferenced external is not evaluated");
+        assert_eq!(report.outputs.len(), 1);
+    }
+
+    #[test]
+    fn exact_zero_structural_transform_keeps_canonical_metadata() {
+        let ring = Ring::new(257, 8);
+        let report = output_report(ring.zero((1, 4)).reshape(2, 2));
+        let noise = report.noise.expect("typed zero");
+        assert_eq!(noise.bound, BigDecimal::zero());
+        assert_eq!((noise.rows, noise.columns), (2, 2));
+        assert!(noise.is_const_poly);
+        assert_eq!(noise.zero_rows, Some(2));
+        assert_eq!(noise.dependencies, DependencySet::empty());
+        assert!(!noise.clt_ready);
+    }
+
+    #[test]
+    fn identity_preserves_all_bounded_metadata_on_both_sides() {
+        let ring = Ring::new(257, 8);
+        let ty = ring.matrix_type((2, 2));
+        let virtual_value =
+            VirtualMat::bounded("bounded", ty, bounded_metadata(7, &["source"], Some(1), true));
+        let assumed =
+            ring.input("assumed", (2, 2)).assume(virtual_value).expect("well-typed assumption");
+        let direct = output_report(assumed.clone()).noise.expect("direct bounded output");
+        let left =
+            output_report(ring.identity(2) * assumed.clone()).noise.expect("left identity output");
+        let right = output_report(assumed * ring.identity(2)).noise.expect("right identity output");
+        assert_eq!(left, direct);
+        assert_eq!(right, direct);
+    }
+
+    #[test]
+    fn identity_times_bounded_scalar_preserves_matrix_shape() {
+        let ring = Ring::new(257, 8);
+        let scalar = ring
+            .input("scalar", (1, 1))
+            .assume(VirtualMat::bounded(
+                "scalar",
+                ring.matrix_type((1, 1)),
+                bounded_metadata(7, &["source"], None, true),
+            ))
+            .expect("well-typed scalar assumption");
+        let report = output_report(ring.identity(2) * scalar).noise.expect("bounded output");
+        assert_eq!((report.rows, report.columns), (2, 2));
+        assert_eq!(report.bound, BigDecimal::from(7u8));
+    }
+
+    #[test]
+    fn simulator_skips_identity_factors_before_norm_multiplication() {
+        let ring = Ring::new(257, 8);
+        let output = ring
+            .input("assumed", (2, 2))
+            .assume(VirtualMat::bounded(
+                "bounded",
+                ring.matrix_type((2, 2)),
+                bounded_metadata(7, &["source"], Some(1), true),
+            ))
+            .expect("well-typed assumption");
+        let built = DslContext::new("identity-factor")
+            .output("output", output)
+            .expect("output")
+            .build()
+            .expect("build");
+        let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
+        let expression = elaborated.outputs["output"].clone();
+        let symbolic = elaborated.wire(&expression).expect("symbolic output");
+        let atom = match &elaborated
+            .expressions
+            .get(symbolic.expression.expect("expression"))
+            .expect("record")
+            .node
+        {
+            SymbolicExprNode::Atom(atom) => atom.clone(),
+            node => panic!("expected assumed atom, got {node:?}"),
+        };
+        let mut evaluator = Evaluator {
+            graph: &elaborated,
+            contexts: BTreeMap::new(),
+            atoms: BTreeMap::new(),
+            memo: BTreeMap::new(),
+        };
+        let bounded = evaluator.eval_atom(&atom).expect("bounded atom");
+        let identity_type = ConcreteMatrixType {
+            modulus: BigInt::from(257u16),
+            ring_dimension: 8,
+            rows: 2,
+            columns: 2,
+        };
+        let evaluated = evaluator
+            .eval_bounded_alternative(Alternative {
+                coefficient: BigInt::one(),
+                factors: vec![
+                    AnalysisFactor::Identity(identity_type.clone()),
+                    AnalysisFactor::Bounded(bounded.clone()),
+                    AnalysisFactor::Identity(identity_type),
+                ],
+            })
+            .expect("identity factors");
+        assert_eq!(evaluated, bounded);
+    }
+
+    #[test]
+    fn product_of_sum_keeps_dependency_aware_rules_termwise() {
+        let ring = Ring::new(257, 8);
+        let ty = ring.matrix_type((2, 2));
+        let a = VirtualMat::bounded("a", ty.clone(), bounded_metadata(2, &["x"], None, true));
+        let b = VirtualMat::bounded("b", ty.clone(), bounded_metadata(3, &["y"], None, true));
+        let c = VirtualMat::bounded("c", ty, bounded_metadata(5, &["x"], None, true));
+        let output =
+            ring.input("output", (2, 2)).assume((a + b) * c).expect("well-typed assumption");
+        let report = output_report(output).noise.expect("bounded output");
+
+        let ring_sqrt = BigDecimal::from(8u8).sqrt().expect("sqrt(8)");
+        let contraction = BigDecimal::from(2u8) * &ring_sqrt * &ring_sqrt;
+        let ac = &contraction * BigDecimal::from(2u8) * BigDecimal::from(5u8);
+        let bc = contraction.sqrt().expect("sqrt contraction") *
+            BigDecimal::from(3u8) *
+            BigDecimal::from(5u8);
+        assert_eq!(report.bound, ac + bc);
+        assert!(!report.clt_ready);
+        assert!(matches!(report.dependencies, DependencySet::Known(ref ids) if ids.len() == 2));
+    }
+
+    #[test]
+    fn mul_and_tensor_alternatives_are_yielded_one_at_a_time() {
+        let ring = Ring::new(257, 8);
+        let bounded = (0..4)
+            .map(|index| {
+                ring.input(format!("bounded-{index}"), (1, 1))
+                    .assume(VirtualMat::bounded(
+                        format!("bounded-{index}"),
+                        ring.matrix_type((1, 1)),
+                        bounded_metadata(index as i64 + 1, &["stream"], None, false),
+                    ))
+                    .expect("bounded assumption")
+            })
+            .collect::<Vec<_>>();
+        let sum = bounded.iter().cloned().reduce(|left, right| left + right).expect("sum");
+        let built = DslContext::new("alternative-streaming")
+            .output("mul", sum.clone() * sum.clone())
+            .expect("mul")
+            .output("tensor", sum.clone().tensor(sum))
+            .expect("tensor")
+            .build()
+            .expect("build");
+        let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
+        let arena_len = elaborated.expressions.len();
+        let mut evaluator = Evaluator {
+            graph: &elaborated,
+            contexts: BTreeMap::new(),
+            atoms: BTreeMap::new(),
+            memo: BTreeMap::new(),
+        };
+        for (output, expected) in [("mul", 16), ("tensor", 16)] {
+            let wire = elaborated.wire(&elaborated.outputs[output]).expect("output");
+            let mut yielded = 0;
+            let mut active = 0;
+            let mut high_water = 0;
+            evaluator
+                .for_each_alternative(
+                    wire.expression.expect("expression"),
+                    &Assignment::new(),
+                    &mut |_, _| {
+                        active += 1;
+                        high_water = high_water.max(active);
+                        yielded += 1;
+                        active -= 1;
+                        Ok(())
+                    },
+                )
+                .expect("stream alternatives");
+            assert_eq!(yielded, expected, "{output}");
+            assert_eq!(high_water, 1, "{output}");
+            assert_eq!(elaborated.expressions.len(), arena_len, "{output}");
+        }
+    }
+
+    #[test]
+    fn tensor_uses_polynomial_contraction_without_matrix_inner_dimension() {
+        let ring = Ring::new(257, 8);
+        let report = output_report(ring.gaussian((2, 1), 2).tensor(ring.gaussian((3, 2), 3)));
+        let expected = BigDecimal::from(8u8).sqrt().expect("sqrt(8)") *
+            BigDecimal::from(13u8) *
+            (BigDecimal::from(39u8) / BigDecimal::from(2u8));
+        let noise = report.noise.expect("bounded tensor");
+        assert_eq!(noise.bound, expected);
+        assert_eq!((noise.rows, noise.columns), (6, 2));
+        assert_eq!(noise.zero_rows, None);
+        assert!(noise.clt_ready);
+        assert!(matches!(noise.dependencies, DependencySet::Known(ref ids) if ids.len() == 2));
+    }
+
+    #[test]
+    fn tensor_applies_each_additive_coefficient_once() {
+        let ring = Ring::new(257, 8);
+        let ty = ring.matrix_type((1, 1));
+        let left = VirtualMat::bounded("left", ty.clone(), bounded_metadata(3, &["x"], None, true));
+        let right = VirtualMat::bounded("right", ty, bounded_metadata(5, &["x"], None, true));
+        let left = ring.input("left", (1, 1)).assume(left).expect("well-typed assumption");
+        let right = ring.input("right", (1, 1)).assume(right).expect("well-typed assumption");
+        let report =
+            output_report((left.clone() + left).tensor(right)).noise.expect("bounded tensor");
+        assert_eq!(report.bound, BigDecimal::from(240u16));
+        assert!(!report.clt_ready);
+        assert!(matches!(report.dependencies, DependencySet::Known(ref ids) if ids.len() == 1));
+    }
+
+    #[test]
+    fn tensor_preserves_constant_and_one_ready_clt_rules() {
+        let ring = Ring::new(257, 8);
+        let scalar_type = ring.matrix_type((1, 1));
+        let bounded = ring
+            .input("bounded", (1, 1))
+            .assume(VirtualMat::bounded(
+                "bounded",
+                scalar_type.clone(),
+                bounded_metadata(5, &["bounded"], None, true),
+            ))
+            .unwrap();
+        let constant =
+            output_report(ring.identity(1).tensor(bounded)).noise.expect("constant tensor");
+        assert_eq!(constant.bound, BigDecimal::from(5u8));
+        assert!(!constant.clt_ready);
+
+        let left = ring
+            .input("left", (1, 1))
+            .assume(VirtualMat::bounded(
+                "left",
+                scalar_type.clone(),
+                bounded_metadata(2, &["x"], None, false),
+            ))
+            .unwrap();
+        let right = ring
+            .input("right", (1, 1))
+            .assume(VirtualMat::bounded(
+                "right",
+                scalar_type,
+                bounded_metadata(3, &["y"], None, true),
+            ))
+            .unwrap();
+        let one_ready = output_report(left.tensor(right)).noise.expect("one-ready tensor");
+        let expected = BigDecimal::from(8u8).sqrt().expect("sqrt(8)") * BigDecimal::from(6u8);
+        assert_eq!(one_ready.bound, expected);
+        assert!(!one_ready.clt_ready);
+    }
+
+    #[test]
+    fn mixed_tensor_keeps_signal_and_bounded_contributions_separate() {
+        let ring = Ring::new(257, 8);
+        let left = ring.input("left-signal", (1, 1)) + ring.gaussian((1, 1), 2);
+        let right = ring.input("right-signal", (1, 1)) + ring.gaussian((1, 1), 3);
+        let report = output_report(left.tensor(right));
+        assert!(report.has_signal);
+        let expected = BigDecimal::from(8u8).sqrt().expect("sqrt(8)") *
+            BigDecimal::from(13u8) *
+            (BigDecimal::from(39u8) / BigDecimal::from(2u8));
+        assert_eq!(report.noise.expect("bounded tensor alternative").bound, expected);
+    }
+
+    #[test]
+    fn correlated_selections_are_joined_after_the_surrounding_product() {
+        let ring = Ring::new(257, 8);
+        let index = ring.input("index", (1, 1)).extract_coefficient(0);
+        let left = index
+            .clone()
+            .select(vec![ring.gaussian((1, 1), 1), ring.gaussian((1, 1), 10)])
+            .expect("left selection");
+        let right = index
+            .select(vec![ring.gaussian((1, 1), 10), ring.gaussian((1, 1), 1)])
+            .expect("right selection");
+        let report = output_report(left * right);
+        let expected = BigDecimal::from(8u8).sqrt().expect("sqrt(8)") *
+            (BigDecimal::from(13u8) / BigDecimal::from(2u8)) *
+            BigDecimal::from(65u8);
+        assert_eq!(report.noise.expect("bounded product").bound, expected);
     }
 }

@@ -539,6 +539,9 @@ impl PolyParams for GpuDCRTPolyParams {
     }
 
     fn params_for_device(&self, device_id: i32) -> Self {
+        if self.gpu_ids.as_slice() == [device_id] && self.dnum == 1 {
+            return self.clone();
+        }
         let ctx = self.single_device_context(device_id);
         Self {
             ring_dimension: self.ring_dimension,

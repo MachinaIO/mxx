@@ -117,22 +117,52 @@ pub trait Backend {
         left: &Self::Matrix,
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error>;
+    fn add_batch(
+        &mut self,
+        inputs: Vec<(Self::Matrix, Self::Matrix)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        inputs.into_iter().map(|(left, right)| self.add(&left, &right)).collect()
+    }
     fn sub(
         &mut self,
         left: &Self::Matrix,
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error>;
+    fn sub_batch(
+        &mut self,
+        inputs: Vec<(Self::Matrix, Self::Matrix)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        inputs.into_iter().map(|(left, right)| self.sub(&left, &right)).collect()
+    }
     fn multiply(
         &mut self,
         left: &Self::Matrix,
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error>;
+    fn multiply_batch(
+        &mut self,
+        inputs: Vec<(Self::Matrix, Self::Matrix)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        inputs.into_iter().map(|(left, right)| self.multiply(&left, &right)).collect()
+    }
     fn negate(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error>;
+    fn negate_batch(
+        &mut self,
+        inputs: Vec<Self::Matrix>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        inputs.into_iter().map(|value| self.negate(&value)).collect()
+    }
     fn scale_integer(
         &mut self,
         value: &Self::Matrix,
         scalar: &BigInt,
     ) -> Result<Self::Matrix, Self::Error>;
+    fn scale_integer_batch(
+        &mut self,
+        inputs: Vec<(Self::Matrix, BigInt)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        inputs.into_iter().map(|(value, scalar)| self.scale_integer(&value, &scalar)).collect()
+    }
     fn transpose(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error>;
     fn slice(
         &mut self,

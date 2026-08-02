@@ -16,6 +16,7 @@ use mxx_primitives::{
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, ToPrimitive, Zero};
+use rayon::prelude::*;
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use thiserror::Error;
 
@@ -488,8 +489,16 @@ where
         Ok(left.clone() + right)
     }
 
+    fn add_batch(&mut self, inputs: Vec<(M, M)>) -> Result<Vec<M>, Self::Error> {
+        Ok(inputs.into_par_iter().map(|(left, right)| left + &right).collect())
+    }
+
     fn sub(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
         Ok(left.clone() - right)
+    }
+
+    fn sub_batch(&mut self, inputs: Vec<(M, M)>) -> Result<Vec<M>, Self::Error> {
+        Ok(inputs.into_par_iter().map(|(left, right)| left - &right).collect())
     }
 
     fn multiply(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
@@ -504,13 +513,45 @@ where
         })
     }
 
+    fn multiply_batch(&mut self, inputs: Vec<(M, M)>) -> Result<Vec<M>, Self::Error> {
+        Ok(inputs
+            .into_par_iter()
+            .map(|(left, right)| {
+                let left_size = left.size();
+                let right_size = right.size();
+                if left_size == (1, 1) {
+                    right * left.entry(0, 0)
+                } else if right_size == (1, 1) {
+                    left * right.entry(0, 0)
+                } else {
+                    left * &right
+                }
+            })
+            .collect())
+    }
+
     fn negate(&mut self, value: &M) -> Result<M, Self::Error> {
         Ok(-value.clone())
+    }
+
+    fn negate_batch(&mut self, inputs: Vec<M>) -> Result<Vec<M>, Self::Error> {
+        Ok(inputs.into_par_iter().map(|value| -value).collect())
     }
 
     fn scale_integer(&mut self, value: &M, scalar: &BigInt) -> Result<M, Self::Error> {
         let parameters = self.parameters_for_matrix(value)?;
         Ok(value.clone() * Self::ring_integer(parameters, scalar)?)
+    }
+
+    fn scale_integer_batch(&mut self, inputs: Vec<(M, BigInt)>) -> Result<Vec<M>, Self::Error> {
+        let prepared = inputs
+            .into_iter()
+            .map(|(value, scalar)| {
+                let parameters = self.parameters_for_matrix(&value)?;
+                Ok((value, Self::ring_integer(parameters, &scalar)?))
+            })
+            .collect::<Result<Vec<_>, PolyBackendError>>()?;
+        Ok(prepared.into_par_iter().map(|(value, scalar)| value * scalar).collect())
     }
 
     fn transpose(&mut self, value: &M) -> Result<M, Self::Error> {

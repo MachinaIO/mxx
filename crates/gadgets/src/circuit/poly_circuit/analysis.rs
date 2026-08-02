@@ -500,3 +500,76 @@ impl<P: Poly> PolyCircuit<P> {
         if levels.is_empty() { 0 } else { levels.len() - 1 }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mxx_primitives::poly::dcrt::poly::DCRTPoly;
+
+    #[test]
+    fn depth_and_non_free_depth_follow_the_documented_gate_rules() {
+        let mut direct = PolyCircuit::<DCRTPoly>::new();
+        let input = direct.input(1).as_single_wire();
+        direct.output([input]);
+        assert_eq!(direct.depth(), 0);
+        assert_eq!(direct.non_free_depth(), 0);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(4).to_vec();
+        let first_sum = circuit.add_gate(inputs[0], inputs[1]);
+        let second_sum = circuit.add_gate(first_sum, inputs[2]);
+        let product = circuit.mul_gate(second_sum, inputs[3]);
+        circuit.output([product]);
+        assert_eq!(circuit.depth(), 3);
+        assert_eq!(circuit.non_free_depth(), 1);
+        assert_eq!(circuit.non_free_depth_contributions().get(&PolyGateKind::Mul), Some(&1));
+    }
+
+    #[test]
+    fn non_free_depth_tracks_multi_output_and_repeated_subcircuit_calls() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let inputs = child.input(2).to_vec();
+        let product = child.mul_gate(inputs[0], inputs[1]);
+        child.output([inputs[0].into(), product]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(3).to_vec();
+        let precomputed = circuit.mul_gate(inputs[0], inputs[1]);
+        let child_id = circuit.register_sub_circuit(child);
+        let shallow = circuit.call_sub_circuit(child_id, [inputs[0], inputs[2]]);
+        let deep = circuit.call_sub_circuit(child_id, [precomputed, inputs[2].into()]);
+        let output = circuit.add_gate(shallow[1], deep[1]);
+        circuit.output([shallow[0], output]);
+
+        assert_eq!(circuit.non_free_depth(), 2);
+        assert_eq!(circuit.non_free_depth_contributions().get(&PolyGateKind::Mul), Some(&2));
+    }
+
+    #[test]
+    fn summed_subcircuits_use_maximum_inner_depth_and_slot_transfer_is_non_free() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let inputs = child.input(2).to_vec();
+        let product = child.mul_gate(inputs[0], inputs[1]);
+        child.output([product]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(4).to_vec();
+        let child_id = circuit.register_sub_circuit(child);
+        let first = circuit.intern_input_set([inputs[0], inputs[1]]);
+        let second = circuit.intern_input_set([inputs[2], inputs[3]]);
+        let bindings = circuit.intern_binding_set(&[]);
+        let summed = circuit.call_sub_circuit_sum_many_with_binding_set_ids(
+            child_id,
+            vec![first, second],
+            vec![bindings, bindings],
+        );
+        let transferred = circuit.slot_transfer_gate(summed[0], &[(0, None)]);
+        circuit.output([transferred]);
+
+        assert_eq!(circuit.non_free_depth(), 2);
+        let contributions = circuit.non_free_depth_contributions();
+        assert_eq!(contributions.get(&PolyGateKind::Mul), Some(&1));
+        assert_eq!(contributions.get(&PolyGateKind::SlotTransfer), Some(&1));
+        assert!(!contributions.contains_key(&PolyGateKind::Add));
+    }
+}

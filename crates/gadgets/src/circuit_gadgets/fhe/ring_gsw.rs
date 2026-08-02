@@ -963,6 +963,64 @@ mod tests {
             inputs[2].clone() * inputs[5].entry(0, 0) + &inputs[3].clone() * inputs[7].entry(0, 0)
         );
     }
+
+    fn scalar_test_context(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+    ) -> Arc<RingGswContext<DCRTPoly, ScalarArithmeticEntry>> {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let arithmetic = Arc::new(ScalarArithmeticContext { q_modulus: parameters.to_crt().0[0] });
+        Arc::new(RingGswContext::from_arith_context(
+            circuit,
+            &parameters,
+            1,
+            arithmetic,
+            Some(1),
+            Some(0),
+        ))
+    }
+
+    #[test]
+    fn plaintext_bounds_propagate_through_ring_gsw_arithmetic() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context = scalar_test_context(&mut circuit);
+        let left =
+            RingGswCiphertext::input(context.clone(), Some(BigUint::from(3u8)), &mut circuit);
+        let right = RingGswCiphertext::input(context, Some(BigUint::from(5u8)), &mut circuit);
+        assert_eq!(left.max_plaintext, BigUint::from(3u8));
+        assert_eq!(left.add(&right, &mut circuit).max_plaintext, BigUint::from(8u8));
+        assert_eq!(left.sub(&right, &mut circuit).max_plaintext, BigUint::from(8u8));
+        assert_eq!(left.mul(&right, &mut circuit).max_plaintext, BigUint::from(15u8));
+    }
+
+    #[test]
+    fn xor_preserves_the_boolean_plaintext_bound() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context = scalar_test_context(&mut circuit);
+        let left = RingGswCiphertext::input(context.clone(), None, &mut circuit);
+        let right = RingGswCiphertext::input(context, None, &mut circuit);
+        assert_eq!(left.xor(&right, &mut circuit).max_plaintext, BigUint::from(1u8));
+    }
+
+    #[test]
+    #[should_panic(expected = "RingGswCiphertext::and requires lhs.max_plaintext == 1")]
+    fn and_rejects_a_non_boolean_plaintext_bound() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context = scalar_test_context(&mut circuit);
+        let left =
+            RingGswCiphertext::input(context.clone(), Some(BigUint::from(2u8)), &mut circuit);
+        let right = RingGswCiphertext::input(context, None, &mut circuit);
+        let _ = left.and(&right, &mut circuit);
+    }
+
+    #[test]
+    #[should_panic(expected = "RingGswCiphertext::xor requires rhs.max_plaintext == 1")]
+    fn xor_rejects_a_non_boolean_plaintext_bound() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let context = scalar_test_context(&mut circuit);
+        let left = RingGswCiphertext::input(context.clone(), None, &mut circuit);
+        let right = RingGswCiphertext::input(context, Some(BigUint::from(2u8)), &mut circuit);
+        let _ = left.xor(&right, &mut circuit);
+    }
 }
 
 #[derive(Debug, Clone)]

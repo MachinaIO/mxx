@@ -156,6 +156,14 @@ pub trait StructuredCircuitLowering<P: Poly>: GraphCircuitLowering<P> {
         definition: &Self::Subgraph,
         inputs: Vec<Self::Wire>,
     ) -> Result<Vec<Self::Wire>, CircuitLowerError<Self::Error>>;
+
+    fn call_subgraph_parallel(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Vec<Self::Wire>>,
+    ) -> Result<Vec<Vec<Self::Wire>>, CircuitLowerError<Self::Error>> {
+        inputs.into_iter().map(|inputs| self.call_subgraph(definition, inputs)).collect()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -344,6 +352,29 @@ where
     lowering.call_subgraph(&definition, std::iter::once(one.clone()).chain(child_inputs).collect())
 }
 
+fn call_structured_children_parallel<P, L>(
+    child: Arc<PolyCircuit<P>>,
+    one: &L::Wire,
+    child_inputs: Vec<Vec<L::Wire>>,
+    bindings: &[SubCircuitParamValue],
+    call_path: &[usize],
+    lowering: &mut L,
+    state: &mut StructuredLoweringState<L::Subgraph>,
+) -> Result<Vec<Vec<L::Wire>>, CircuitLowerError<L::Error>>
+where
+    P: Poly,
+    L: StructuredCircuitLowering<P>,
+{
+    let first = child_inputs.first().ok_or(CircuitLowerError::InvalidArity { gate: 0 })?;
+    let definition =
+        structured_definition(child, one, first, bindings, call_path, lowering, state)?;
+    let inputs = child_inputs
+        .into_iter()
+        .map(|inputs| std::iter::once(one.clone()).chain(inputs).collect())
+        .collect();
+    lowering.call_subgraph_parallel(&definition, inputs)
+}
+
 fn lower_scoped_structured<P, L>(
     circuit: &PolyCircuit<P>,
     one: L::Wire,
@@ -419,6 +450,74 @@ where
                     .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
             }
             PolyGateType::SubCircuitOutput { call_id, .. } => {
+                if !lowering.call_site_identity_is_semantic() {
+                    let first_call = circuit
+                        .sub_circuit_calls
+                        .get(call_id)
+                        .expect("sub-circuit call missing")
+                        .clone();
+                    if first_call.shared_input_prefix_set_id.is_some() {
+                        let mut child_inputs = Vec::new();
+                        let mut call_infos = Vec::new();
+                        for (&candidate_id, candidate) in
+                            circuit.sub_circuit_calls.range(*call_id..)
+                        {
+                            if candidate_id != *call_id + call_infos.len() ||
+                                candidate.sub_circuit_id != first_call.sub_circuit_id ||
+                                candidate.shared_input_prefix_set_id !=
+                                    first_call.shared_input_prefix_set_id ||
+                                candidate.binding_set_id != first_call.binding_set_id ||
+                                candidate.input_suffix.len() != first_call.input_suffix.len() ||
+                                candidate.input_max_plaintext_norm_ranges !=
+                                    first_call.input_max_plaintext_norm_ranges ||
+                                candidate.num_outputs != first_call.num_outputs
+                            {
+                                break;
+                            }
+
+                            let info = circuit.sub_circuit_call_info(candidate_id);
+                            if info
+                                .inputs
+                                .iter()
+                                .flat_map(BatchedWire::iter)
+                                .any(|input| !values.contains_key(&input.index()))
+                            {
+                                break;
+                            }
+                            child_inputs.push(flatten_inputs(&values, &info.inputs, gate_id)?);
+                            call_infos.push(info);
+                        }
+                        if call_infos.len() > 1 {
+                            let child =
+                                circuit.registered_sub_circuit_ref(first_call.sub_circuit_id);
+                            let bindings = circuit.binding_set(first_call.binding_set_id);
+                            call_path.push(first_call.scoped_call_id);
+                            let outputs = call_structured_children_parallel(
+                                child,
+                                &one,
+                                child_inputs,
+                                bindings.as_ref(),
+                                call_path,
+                                lowering,
+                                state,
+                            );
+                            call_path.pop();
+                            let outputs = outputs?;
+                            if outputs.len() != call_infos.len() {
+                                return Err(CircuitLowerError::InvalidArity { gate: gate_id });
+                            }
+                            for (info, outputs) in call_infos.iter().zip(outputs) {
+                                insert_call_outputs(
+                                    &mut values,
+                                    &info.output_gate_ids,
+                                    outputs,
+                                    gate_id,
+                                )?;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let info = circuit.sub_circuit_call_info(*call_id);
                 let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
                 let child_inputs = flatten_inputs(&values, &info.inputs, gate_id)?;
@@ -863,12 +962,28 @@ mod tests {
     };
     use std::convert::Infallible;
 
-    #[derive(Default)]
     struct RecordingLowering {
         operations: Vec<(PolyGateKind, Vec<usize>, usize, usize)>,
         slot_mapping_pointers: Vec<usize>,
         small_scalars: Vec<Vec<u32>>,
         large_scalars: Vec<Vec<BigUint>>,
+        call_site_identity_is_semantic: bool,
+        sequential_subgraph_calls: usize,
+        parallel_subgraph_batch_sizes: Vec<usize>,
+    }
+
+    impl Default for RecordingLowering {
+        fn default() -> Self {
+            Self {
+                operations: Vec::new(),
+                slot_mapping_pointers: Vec::new(),
+                small_scalars: Vec::new(),
+                large_scalars: Vec::new(),
+                call_site_identity_is_semantic: true,
+                sequential_subgraph_calls: 0,
+                parallel_subgraph_batch_sizes: Vec::new(),
+            }
+        }
     }
 
     impl RecordingLowering {
@@ -961,6 +1076,10 @@ mod tests {
     impl StructuredCircuitLowering<DCRTPoly> for RecordingLowering {
         type Subgraph = Vec<usize>;
 
+        fn call_site_identity_is_semantic(&self) -> bool {
+            self.call_site_identity_is_semantic
+        }
+
         fn define_subgraph<F>(
             &mut self,
             _name: &str,
@@ -981,7 +1100,17 @@ mod tests {
             definition: &Self::Subgraph,
             _inputs: Vec<Self::Wire>,
         ) -> Result<Vec<Self::Wire>, CircuitLowerError<Self::Error>> {
+            self.sequential_subgraph_calls += 1;
             Ok(definition.clone())
+        }
+
+        fn call_subgraph_parallel(
+            &mut self,
+            definition: &Self::Subgraph,
+            inputs: Vec<Vec<Self::Wire>>,
+        ) -> Result<Vec<Vec<Self::Wire>>, CircuitLowerError<Self::Error>> {
+            self.parallel_subgraph_batch_sizes.push(inputs.len());
+            Ok(inputs.into_iter().map(|_| definition.clone()).collect())
         }
     }
 
@@ -1039,7 +1168,7 @@ mod tests {
         let distinct_paths = slot_instances
             .iter()
             .map(|(_, path, ..)| path.clone())
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<std::collections::HashSet<_>>();
         assert_eq!(distinct_paths.len(), 4);
         let distinct_operation_identities = first
             .operations
@@ -1094,6 +1223,76 @@ mod tests {
     }
 
     #[test]
+    fn structured_parallel_calls_stop_before_a_data_dependency() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let child_inputs = child.input(2).to_vec();
+        let output = child.add_gate(child_inputs[0], child_inputs[1]);
+        child.output([output]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(2).to_vec();
+        let child_id = circuit.register_sub_circuit(child);
+        let shared_prefix = circuit.intern_input_set([inputs[0]]);
+        let first = circuit.call_sub_circuit_with_shared_input_prefix_and_bindings(
+            child_id,
+            shared_prefix,
+            [inputs[1]],
+            &[],
+        );
+        let second = circuit.call_sub_circuit_with_shared_input_prefix_and_bindings(
+            child_id,
+            shared_prefix,
+            [first[0]],
+            &[],
+        );
+        circuit.output(second);
+
+        let mut lowering = RecordingLowering {
+            call_site_identity_is_semantic: false,
+            ..RecordingLowering::default()
+        };
+        lower_circuit_structured(&circuit, 1usize, [3, 5], &mut lowering)
+            .expect("dependent sub-circuit calls must remain sequentially lowerable");
+        assert_eq!(lowering.sequential_subgraph_calls, 2);
+        assert!(lowering.parallel_subgraph_batch_sizes.is_empty());
+    }
+
+    #[test]
+    fn structured_independent_calls_share_one_parallel_batch() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let child_inputs = child.input(2).to_vec();
+        let output = child.add_gate(child_inputs[0], child_inputs[1]);
+        child.output([output]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(3).to_vec();
+        let child_id = circuit.register_sub_circuit(child);
+        let shared_prefix = circuit.intern_input_set([inputs[0]]);
+        let first = circuit.call_sub_circuit_with_shared_input_prefix_and_bindings(
+            child_id,
+            shared_prefix,
+            [inputs[1]],
+            &[],
+        );
+        let second = circuit.call_sub_circuit_with_shared_input_prefix_and_bindings(
+            child_id,
+            shared_prefix,
+            [inputs[2]],
+            &[],
+        );
+        circuit.output([first[0], second[0]]);
+
+        let mut lowering = RecordingLowering {
+            call_site_identity_is_semantic: false,
+            ..RecordingLowering::default()
+        };
+        lower_circuit_structured(&circuit, 1usize, [3, 5, 7], &mut lowering)
+            .expect("independent sub-circuit calls must lower as one parallel batch");
+        assert_eq!(lowering.sequential_subgraph_calls, 0);
+        assert_eq!(lowering.parallel_subgraph_batch_sizes, vec![2]);
+    }
+
+    #[test]
     fn direct_and_summed_subcircuits_resolve_each_scalar_binding() {
         let mut child = PolyCircuit::<DCRTPoly>::new();
         let input = child.input(1).as_single_wire();
@@ -1142,5 +1341,133 @@ mod tests {
                 vec![BigUint::from(11u8), BigUint::from(1u8)],
             ]
         );
+    }
+
+    #[test]
+    fn every_gate_category_reaches_its_lowering_trait_operation() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(2).to_vec();
+        let add = circuit.add_gate(inputs[0], inputs[1]);
+        let sub = circuit.sub_gate(inputs[0], inputs[1]);
+        let mul = circuit.mul_gate(inputs[0], inputs[1]);
+        let small = circuit.small_scalar_mul(add, &[2, 1]);
+        let large = circuit.large_scalar_mul(sub, &[BigUint::from(9u8)]);
+        let transferred = circuit.slot_transfer_gate(mul, &[(0, None)]);
+        let reduced = circuit.slot_reduce_gate(&[small, large, transferred], 3);
+        let lookup = circuit.slot_transfer_gate(reduced, &[(0, None)]).as_single_wire();
+        circuit.gates.get_mut(&lookup).expect("lookup placeholder gate").gate_type =
+            PolyGateType::PubLut { lut_id: GateParamSource::Const(0) };
+        circuit.output([lookup]);
+
+        let mut lowering = RecordingLowering::default();
+        let outputs = lower_circuit(&circuit, 1usize, [3, 5], &mut lowering)
+            .expect("recording lowerer is infallible");
+        assert_eq!(outputs.len(), 1);
+        let kinds = lowering
+            .operations
+            .iter()
+            .map(|(kind, ..)| *kind)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            kinds,
+            [
+                PolyGateKind::Add,
+                PolyGateKind::Sub,
+                PolyGateKind::Mul,
+                PolyGateKind::SmallScalarMul,
+                PolyGateKind::LargeScalarMul,
+                PolyGateKind::SlotTransfer,
+                PolyGateKind::SlotReduce,
+                PolyGateKind::PubLut,
+            ]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn lowering_reports_extra_inputs_missing_inputs_and_invalid_arity() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        circuit.output([input]);
+        let mut lowering = RecordingLowering::default();
+        assert!(matches!(
+            lower_circuit(&circuit, 1usize, [7, 11], &mut lowering),
+            Err(CircuitLowerError::ExtraInputs)
+        ));
+
+        let mut missing = PolyCircuit::<DCRTPoly>::new();
+        let inputs = missing.input(2).to_vec();
+        let add = missing.add_gate(inputs[0], inputs[1]).as_single_wire();
+        missing.gates.get_mut(&add).expect("add gate").input_gates[1] = GateId(999);
+        missing.output([add]);
+        let mut lowering = RecordingLowering::default();
+        assert!(matches!(
+            lower_circuit(&missing, 1usize, [7, 11], &mut lowering),
+            Err(CircuitLowerError::MissingInput { input: 999, .. })
+        ));
+
+        let mut invalid = PolyCircuit::<DCRTPoly>::new();
+        let inputs = invalid.input(2).to_vec();
+        let add = invalid.add_gate(inputs[0], inputs[1]).as_single_wire();
+        invalid.gates.get_mut(&add).expect("add gate").input_gates.pop();
+        invalid.output([add]);
+        let mut lowering = RecordingLowering::default();
+        assert!(matches!(
+            lower_circuit(&invalid, 1usize, [7, 11], &mut lowering),
+            Err(CircuitLowerError::InvalidArity { gate }) if gate == add.index()
+        ));
+    }
+
+    #[test]
+    fn lowering_reports_missing_wrong_kind_and_unsupported_lookup_parameters() {
+        let mut missing = PolyCircuit::<DCRTPoly>::new();
+        let parameter = missing
+            .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 7 });
+        let input = missing.input(1).as_single_wire();
+        let output = missing.small_scalar_mul_param(input, parameter);
+        missing.output([output]);
+        let mut lowering = RecordingLowering::default();
+        assert!(matches!(
+            lower_circuit(&missing, 1usize, [5], &mut lowering),
+            Err(CircuitLowerError::MissingParameter { parameter: 0, .. })
+        ));
+
+        let build_parent = |gate_type: PolyGateType| {
+            let mut child = PolyCircuit::<DCRTPoly>::new();
+            let parameter = child
+                .register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 7 });
+            let input = child.input(1).as_single_wire();
+            let output = child.small_scalar_mul_param(input, parameter).as_single_wire();
+            child.gates.get_mut(&output).expect("parameterized gate").gate_type = gate_type;
+            child.output([output]);
+
+            let mut parent = PolyCircuit::<DCRTPoly>::new();
+            let input = parent.input(1).as_single_wire();
+            let child_id = parent.register_sub_circuit(child);
+            let outputs = parent.call_sub_circuit_with_bindings(
+                child_id,
+                [input],
+                &[SubCircuitParamValue::SmallScalarMul(vec![3])],
+            );
+            parent.output(outputs);
+            parent
+        };
+
+        let wrong_kind =
+            build_parent(PolyGateType::LargeScalarMul { scalar: GateParamSource::Param(0) });
+        let mut lowering = RecordingLowering::default();
+        assert!(matches!(
+            lower_circuit(&wrong_kind, 1usize, [5], &mut lowering),
+            Err(CircuitLowerError::ParameterKind { parameter: 0, .. })
+        ));
+
+        let parameterized_lookup =
+            build_parent(PolyGateType::PubLut { lut_id: GateParamSource::Param(0) });
+        let mut lowering = RecordingLowering::default();
+        assert!(matches!(
+            lower_circuit(&parameterized_lookup, 1usize, [5], &mut lowering),
+            Err(CircuitLowerError::ParameterizedPublicLookup { parameter: 0, .. })
+        ));
     }
 }

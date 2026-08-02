@@ -132,6 +132,8 @@ pub enum ExecutionError {
     Expression { node: NodeId, message: String },
     #[error("backend placement {placement} is outside [0, {count})")]
     BackendPlacement { placement: usize, count: usize },
+    #[error("backend returned an invalid parallel batch length at node {0:?}")]
+    InvalidBatch(NodeId),
     #[error("manifest operation failed: {0}")]
     Manifest(String),
     #[error("scratch cleanup failed: {message}")]
@@ -445,6 +447,10 @@ where
             };
             if matches!(node.kind, NodeKind::PreimageSample { .. }) && envs.len() > 1 {
                 self.execute_preimage_batch(scope_id, &paths, &placements, &node, &mut values)?;
+            } else if envs.len() > 1 &&
+                placements.iter().all(|placement| *placement == placements[0]) &&
+                self.execute_parallel_matrix_node(placements[0], &envs, &node, &mut values)?
+            {
             } else if matches!(node.kind, NodeKind::Select { .. }) {
                 for index in 0..envs.len() {
                     self.set_placement(placements[index])?;
@@ -500,6 +506,58 @@ where
             instances.push(InstanceResult { outputs });
         }
         Ok(instances)
+    }
+
+    fn execute_parallel_matrix_node(
+        &mut self,
+        placement: usize,
+        envs: &[ParamEnv],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+    ) -> Result<bool, ExecutionError> {
+        self.set_placement(placement)?;
+        let outputs = match node.kind {
+            NodeKind::MatrixBinary(operation) => {
+                let mut inputs = Vec::with_capacity(values.len());
+                for instance in values.iter_mut() {
+                    let left = self.matrix(instance, node.args[0])?;
+                    let right = self.matrix(instance, node.args[1])?;
+                    inputs.push((left.as_ref().clone(), right.as_ref().clone()));
+                }
+                match operation {
+                    MatrixBinaryOp::Add => self.backend.add_batch(inputs),
+                    MatrixBinaryOp::Subtract => self.backend.sub_batch(inputs),
+                    MatrixBinaryOp::Multiply => self.backend.multiply_batch(inputs),
+                }
+                .map_err(Self::backend_error)?
+            }
+            NodeKind::MatrixNegate => {
+                let mut inputs = Vec::with_capacity(values.len());
+                for instance in values.iter_mut() {
+                    inputs.push(self.matrix(instance, node.args[0])?.as_ref().clone());
+                }
+                self.backend.negate_batch(inputs).map_err(Self::backend_error)?
+            }
+            NodeKind::MatrixScale { scalar } => {
+                let mut inputs = Vec::with_capacity(values.len());
+                for (env, instance) in envs.iter().zip(values.iter_mut()) {
+                    let value = self.matrix(instance, node.args[0])?;
+                    let scalar = scalar
+                        .evaluate(env)
+                        .map_err(|error| self.expression_error(node.id, error))?;
+                    inputs.push((value.as_ref().clone(), scalar));
+                }
+                self.backend.scale_integer_batch(inputs).map_err(Self::backend_error)?
+            }
+            _ => return Ok(false),
+        };
+        if outputs.len() != values.len() {
+            return Err(ExecutionError::InvalidBatch(node.id));
+        }
+        for (instance, output) in values.iter_mut().zip(outputs) {
+            self.put(instance, node.id, 0, RuntimeValue::matrix(output));
+        }
+        Ok(true)
     }
 
     fn persist_outputs(
@@ -2927,6 +2985,53 @@ mod tests {
             _ => panic!("range output is not a family"),
         }
         result.cleanup_staged(&mut store).expect("staged cleanup");
+    }
+
+    #[test]
+    fn parallel_zip_many_executes_matrix_batches_in_bounded_waves() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let families = (0..4)
+            .map(|_| {
+                Family::pack(vec![ring.identity(1), ring.zero((1, 1))]).expect("matrix family")
+            })
+            .collect::<Vec<_>>();
+        let sums = Family::parallel_zip_many_values(families, |_, inputs| {
+            inputs.into_iter().reduce(|left, right| left + right).expect("non-empty batch")
+        })
+        .expect("parallel zip many");
+        let first_sum = sums.get_static(0);
+        let second_sum = sums.get_static(1);
+        let built = DslContext::new("runtime-parallel-zip-many")
+            .output("first-sum", first_sum)
+            .expect("first output")
+            .output("second-sum", second_sum)
+            .expect("second output")
+            .build()
+            .expect("build");
+        let validated = built.validate(&ParamEnv::default()).expect("validation");
+        let result = execute_with_config(
+            &validated,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+            ExecutionConfig { max_parallel_instances: NonZeroUsize::new(2).expect("nonzero") },
+        )
+        .expect("execution");
+        let four = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![DCRTPoly::from_usize_to_constant(&parameters, 4)],
+        );
+        let RuntimeValue::Matrix(first) = &result.outputs["first-sum"] else {
+            panic!("first parallel output must be a matrix")
+        };
+        let RuntimeValue::Matrix(second) = &result.outputs["second-sum"] else {
+            panic!("second parallel output must be a matrix")
+        };
+        assert_eq!(first.as_ref(), &four);
+        assert_eq!(second.as_ref(), &DCRTPolyMatrix::zero(&parameters, 1, 1));
     }
 
     #[test]

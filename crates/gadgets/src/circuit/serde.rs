@@ -524,3 +524,82 @@ impl SerializablePolyCircuit {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mxx_primitives::poly::dcrt::poly::DCRTPoly;
+
+    fn assert_json_roundtrip(circuit: PolyCircuit<DCRTPoly>) {
+        let serialized = SerializablePolyCircuit::from_circuit(circuit.clone());
+        let json = serialized.to_json_str();
+        let roundtrip = SerializablePolyCircuit::from_json_str(&json).to_circuit::<DCRTPoly>();
+        assert_eq!(roundtrip, circuit);
+    }
+
+    #[test]
+    fn serialization_roundtrip_preserves_arithmetic_and_nonconsecutive_inputs() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(4).to_vec();
+        let sum = circuit.add_gate(inputs[0], inputs[2]);
+        let product = circuit.mul_gate(sum, inputs[3]);
+        circuit.output([product, inputs[1].into()]);
+        assert_json_roundtrip(circuit);
+    }
+
+    #[test]
+    fn serialization_roundtrip_preserves_slot_operations() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let inputs = circuit.input(2).to_vec();
+        let transferred =
+            circuit.slot_transfer_gate(inputs[0], &[(1, None), (0, Some(3)), (1, None)]);
+        let reduced = circuit.slot_reduce_gate(&[transferred, inputs[1].into()], 3);
+        circuit.output([reduced]);
+        assert_json_roundtrip(circuit);
+    }
+
+    #[test]
+    fn serialization_roundtrip_preserves_parameterized_subcircuits() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let scalar =
+            child.register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 7 });
+        let input = child.input(1).as_single_wire();
+        let output = child.small_scalar_mul_param(input, scalar);
+        child.output([output]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let child_id = circuit.register_sub_circuit(child);
+        let outputs = circuit.call_sub_circuit_with_bindings(
+            child_id,
+            [input],
+            &[SubCircuitParamValue::SmallScalarMul(vec![5])],
+        );
+        circuit.output(outputs);
+        assert_json_roundtrip(circuit);
+    }
+
+    #[test]
+    fn serialization_roundtrip_preserves_summed_subcircuits() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let scalar =
+            child.register_sub_circuit_param(SubCircuitParamSpec::SmallScalarMul { max_scalar: 3 });
+        let input = child.input(1).as_single_wire();
+        let output = child.small_scalar_mul_param(input, scalar);
+        child.output([output]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let child_id = circuit.register_sub_circuit(child);
+        let input_set = circuit.intern_input_set([input]);
+        let two = circuit.intern_binding_set(&[SubCircuitParamValue::SmallScalarMul(vec![2])]);
+        let three = circuit.intern_binding_set(&[SubCircuitParamValue::SmallScalarMul(vec![3])]);
+        let outputs = circuit.call_sub_circuit_sum_many_with_binding_set_ids(
+            child_id,
+            vec![input_set, input_set],
+            vec![two, three],
+        );
+        circuit.output(outputs);
+        assert_json_roundtrip(circuit);
+    }
+}

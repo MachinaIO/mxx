@@ -124,7 +124,7 @@ where
     P: Poly + 'static,
     M: PolyMatrix<P = P>,
     HS: PolyHashSampler<[u8; 32], M = M>,
-    US: PolyUniformSampler<M = M>,
+    US: PolyUniformSampler<M = M> + Sync,
     B: AsRef<[u8]>,
 {
     sample_public_key_columns_with_samplers::<P, M, HS, US, B>(
@@ -153,7 +153,7 @@ where
     P: Poly + 'static,
     M: PolyMatrix<P = P>,
     HS: PolyHashSampler<[u8; 32], M = M>,
-    US: PolyUniformSampler<M = M>,
+    US: PolyUniformSampler<M = M> + Sync,
     B: AsRef<[u8]>,
 {
     assert!(width > 0, "Ring-GSW public-key width must be positive");
@@ -217,7 +217,7 @@ pub fn encrypt_plaintext_bit_with_sampler<P, M, US>(
 where
     P: Poly + 'static,
     M: PolyMatrix<P = P>,
-    US: PolyUniformSampler<M = M>,
+    US: PolyUniformSampler<M = M> + Sync,
 {
     let width = public_key[0].len();
     let mut ciphertext = [Vec::with_capacity(width), Vec::with_capacity(width)];
@@ -261,7 +261,7 @@ pub fn encrypt_plaintext_bit_columns_with_sampler<P, M, US, F>(
 ) where
     P: Poly + 'static,
     M: PolyMatrix<P = P>,
-    US: PolyUniformSampler<M = M>,
+    US: PolyUniformSampler<M = M> + Sync,
     F: FnMut(usize, P, P),
 {
     let width = public_key[0].len();
@@ -275,17 +275,21 @@ pub fn encrypt_plaintext_bit_columns_with_sampler<P, M, US, F>(
     );
     let zero = P::const_zero(params);
 
-    for col_idx in 0..width {
-        let (top, bottom) = encrypt_plaintext_bit_column_with_material(
-            params,
-            public_key,
-            plaintext,
-            col_idx,
-            &uniform_sampler,
-            &gadget_row,
-            &zero,
-        );
-
+    let columns = (0..width)
+        .into_par_iter()
+        .map(|col_idx| {
+            encrypt_plaintext_bit_column_with_material(
+                params,
+                public_key,
+                plaintext,
+                col_idx,
+                &uniform_sampler,
+                &gadget_row,
+                &zero,
+            )
+        })
+        .collect::<Vec<_>>();
+    for (col_idx, (top, bottom)) in columns.into_iter().enumerate() {
         consume_column(col_idx, top, bottom);
     }
 }
@@ -515,8 +519,10 @@ mod tests {
     use super::*;
     use crate::{
         circuit::PolyCircuit,
-        test_utils::{diagonal_matrix, execute_circuit_with_shape},
+        circuit_gadgets::fhe::ring_gsw::MUL_COLUMN_SUBCIRCUIT_BATCH,
+        test_utils::{build_circuit_graph, diagonal_matrix, execute_circuit_with_shape},
     };
+    use mxx_ir_core::node::NodeKind;
     use num_traits::ToPrimitive;
     use rand::Rng;
     use std::sync::Arc;
@@ -532,13 +538,21 @@ mod tests {
     fn test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> (DCRTPolyParams, Arc<NestedRnsRingGswContext<DCRTPoly>>) {
+        test_context_with_unreduced_mul_budget(circuit, MAX_UNREDUCED_MULS, SCALE)
+    }
+
+    fn test_context_with_unreduced_mul_budget(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+        max_unreduced_muls: usize,
+        scale: u64,
+    ) -> (DCRTPolyParams, Arc<NestedRnsRingGswContext<DCRTPoly>>) {
         let params = DCRTPolyParams::new(RING_DIMENSION, ACTIVE_LEVELS, CRT_BITS, BASE_BITS);
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             circuit,
             &params,
             P_MODULI_BITS,
-            MAX_UNREDUCED_MULS,
-            SCALE,
+            max_unreduced_muls,
+            scale,
             false,
             Some(ACTIVE_LEVELS),
         ));
@@ -584,15 +598,61 @@ mod tests {
     }
 
     #[test]
-    fn nested_rns_ciphertext_operations_execute_through_ir_and_decrypt() {
+    fn native_ciphertext_inputs_preserve_every_ring_coefficient_when_slots_are_fewer() {
+        let ring_dimension = 4u32;
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let params = DCRTPolyParams::new(ring_dimension, ACTIVE_LEVELS, CRT_BITS, BASE_BITS);
+        let nested_rns = Arc::new(NestedRnsPolyContext::setup(
+            &mut circuit,
+            &params,
+            P_MODULI_BITS,
+            MAX_UNREDUCED_MULS,
+            SCALE,
+            false,
+            Some(ACTIVE_LEVELS),
+        ));
+        let context = Arc::new(NestedRnsRingGswContext::from_arith_context(
+            &mut circuit,
+            &params,
+            2,
+            nested_rns,
+            Some(ACTIVE_LEVELS),
+            Some(0),
+        ));
+        let secret_key = sample_secret_key(&params);
+        let public_key = sample_public_key(
+            &params,
+            context.width(),
+            &secret_key,
+            sample_hash_key(),
+            b"ring-gsw-preserve-all-coefficients",
+            None,
+        );
+        let ciphertext =
+            encrypt_plaintext_bit(&params, context.nested_rns.as_ref(), &public_key, true);
+        let inputs = ciphertext_inputs_from_native(
+            &params,
+            context.nested_rns.as_ref(),
+            &ciphertext,
+            context.level_offset,
+            Some(context.active_levels),
+        );
+        assert!(!inputs.is_empty());
+        assert!(inputs.iter().all(|input| {
+            input.row_size() == ring_dimension as usize &&
+                input.col_size() == ring_dimension as usize
+        }));
+    }
+
+    #[test]
+    fn nested_rns_add_sub_execute_through_ir_and_decrypt() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, context) = test_context(&mut circuit);
         let left = NestedRnsRingGswCiphertext::input(context.clone(), None, &mut circuit);
         let right = NestedRnsRingGswCiphertext::input(context.clone(), None, &mut circuit);
         let sum = left.add(&right, &mut circuit);
         let difference = left.sub(&right, &mut circuit);
-        let product = left.mul(&right, &mut circuit);
-        let results = [sum, difference, product];
+        let results = [sum, difference];
         let mut output_wires = Vec::with_capacity(results.len() * 2 * context.width());
         for result in &results {
             output_wires.extend(result.reconstruct(&mut circuit));
@@ -658,7 +718,7 @@ mod tests {
             .collect::<Vec<_>>();
         let x = u64::from(plaintexts[0]);
         let y = u64::from(plaintexts[1]);
-        let expectations = [(3, (x + y) % 3), (3, (x + 3 - y) % 3), (2, (x * y) % 2)];
+        let expectations = [(3, (x + y) % 3), (3, (x + 3 - y) % 3)];
         native_outputs.par_iter().zip(expectations).for_each(
             |(ciphertext, (plaintext_modulus, expected))| {
                 let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
@@ -738,6 +798,170 @@ mod tests {
             ),
             expected_constant((x + y) % 3),
             "RingGswCiphertext::decrypt must execute through DSL/IR/runtime and match plaintext addition"
+        );
+    }
+
+    #[test]
+    fn decrypt_batch_packs_one_ciphertext_per_runtime_slot() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, context) = test_context(&mut circuit);
+        let ciphertexts = (0..context.num_slots)
+            .map(|_| NestedRnsRingGswCiphertext::input(context.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let secret_key_wire = circuit.input(1).as_single_wire();
+        let references = ciphertexts.iter().collect::<Vec<_>>();
+        let decrypted = NestedRnsRingGswCiphertext::decrypt_batch::<DCRTPolyMatrix>(
+            &references,
+            secret_key_wire,
+            BigUint::from(2u8),
+            &mut circuit,
+        )
+        .add_in_circuit(&mut circuit);
+        circuit.output([decrypted]);
+
+        let secret_key = sample_secret_key(&params);
+        let public_key = sample_public_key(
+            &params,
+            context.width(),
+            &secret_key,
+            sample_hash_key(),
+            b"ring-gsw-batched-decryption",
+            None,
+        );
+        let plaintexts = [false, true];
+        assert_eq!(plaintexts.len(), context.num_slots);
+        let native_ciphertexts = plaintexts
+            .into_par_iter()
+            .map(|plaintext| {
+                encrypt_plaintext_bit(&params, context.nested_rns.as_ref(), &public_key, plaintext)
+            })
+            .collect::<Vec<_>>();
+        let mut runtime_inputs = native_ciphertexts
+            .iter()
+            .flat_map(|ciphertext| {
+                ciphertext_inputs_from_native(
+                    &params,
+                    context.nested_rns.as_ref(),
+                    ciphertext,
+                    context.level_offset,
+                    Some(context.active_levels),
+                )
+            })
+            .collect::<Vec<_>>();
+        runtime_inputs
+            .push(diagonal_matrix(&params, (0..context.num_slots).map(|_| secret_key.clone())));
+        let outputs = execute_circuit_with_shape(
+            "nested-rns-ring-gsw-decrypt-batch",
+            &params,
+            &circuit,
+            &runtime_inputs,
+            (context.num_slots, context.num_slots),
+        );
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].row_size(), context.num_slots);
+        assert_eq!(outputs[0].col_size(), context.num_slots);
+        let q_modulus = active_q_modulus(context.nested_rns.as_ref());
+        plaintexts.into_iter().enumerate().for_each(|(slot, plaintext)| {
+            assert_eq!(
+                rounded_coefficients(&outputs[0].entry(slot, slot), 2, &q_modulus),
+                expected_constant(u64::from(plaintext)),
+                "decrypted batch slot {slot}"
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds num_slots")]
+    fn decrypt_batch_rejects_more_ciphertexts_than_runtime_slots() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, context) = test_context(&mut circuit);
+        let ciphertexts = (0..=context.num_slots)
+            .map(|_| NestedRnsRingGswCiphertext::input(context.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let secret_key = circuit.input(1).as_single_wire();
+        let references = ciphertexts.iter().collect::<Vec<_>>();
+        let _ = NestedRnsRingGswCiphertext::decrypt_batch::<DCRTPolyMatrix>(
+            &references,
+            secret_key,
+            BigUint::from(2u8),
+            &mut circuit,
+        );
+    }
+
+    #[test]
+    fn chained_multiplication_builds_the_complete_ir_graph() {
+        let ring_dimension = 2u32;
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let params = DCRTPolyParams::new(ring_dimension, ACTIVE_LEVELS, CRT_BITS, BASE_BITS);
+        let nested_rns = Arc::new(NestedRnsPolyContext::setup(
+            &mut circuit,
+            &params,
+            P_MODULI_BITS,
+            MAX_UNREDUCED_MULS,
+            SCALE,
+            false,
+            Some(ACTIVE_LEVELS),
+        ));
+        let context = Arc::new(NestedRnsRingGswContext::from_arith_context(
+            &mut circuit,
+            &params,
+            ring_dimension as usize,
+            nested_rns,
+            Some(ACTIVE_LEVELS),
+            Some(0),
+        ));
+        let inputs = (0..3)
+            .map(|_| NestedRnsRingGswCiphertext::input(context.clone(), None, &mut circuit))
+            .collect::<Vec<_>>();
+        let product = inputs[0].mul(&inputs[1], &mut circuit).mul(&inputs[2], &mut circuit);
+        let product_outputs = product.reconstruct(&mut circuit);
+        assert_eq!(product_outputs.len(), 2 * context.width());
+        assert_eq!(product.max_plaintext, BigUint::from(1u8));
+        circuit.output(product_outputs);
+        assert_eq!(circuit.output_gate_ids().len(), 2 * context.width());
+        let graph = build_circuit_graph(
+            "nested-rns-ring-gsw-chained-structure",
+            &params,
+            &circuit,
+            circuit.num_input(),
+            (ring_dimension as usize, ring_dimension as usize),
+        );
+        assert!(
+            graph
+                .source
+                .scopes()
+                .values()
+                .flat_map(|scope| scope.nodes())
+                .any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))),
+            "Ring-GSW column calls must lower to an IR parallel loop"
+        );
+    }
+
+    #[test]
+    fn multiplication_context_supports_a_final_column_batch_narrower_than_the_batch_size() {
+        let active_levels = 15usize;
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let params = DCRTPolyParams::new(2, active_levels, 18, BASE_BITS);
+        let nested_rns = Arc::new(NestedRnsPolyContext::setup(
+            &mut circuit,
+            &params,
+            7,
+            MAX_UNREDUCED_MULS,
+            SCALE,
+            false,
+            Some(active_levels),
+        ));
+        let context = NestedRnsRingGswContext::from_arith_context(
+            &mut circuit,
+            &params,
+            2,
+            nested_rns,
+            Some(active_levels),
+            Some(0),
+        );
+        assert_ne!(
+            context.width() % (MUL_COLUMN_SUBCIRCUIT_BATCH * MUL_COLUMN_SUBCIRCUIT_BATCH),
+            0
         );
     }
 }

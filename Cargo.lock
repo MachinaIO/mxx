@@ -614,6 +614,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "rand 0.9.2",
+ "rayon",
  "serde",
  "serial_test",
  "sha2",

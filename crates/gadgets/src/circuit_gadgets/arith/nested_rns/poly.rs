@@ -1857,7 +1857,7 @@ mod tests {
         circuit::PolyGateKind,
         circuit_gadgets::arith::DecomposeArithmeticGadget,
         test_utils::{diagonal_matrix, execute_circuit_with_shape, execute_polynomial_circuit},
-        utils::gen_biguint_for_modulus,
+        utils::{ceil_biguint_nth_root, gen_biguint_for_modulus, pow_biguint_usize},
     };
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -1866,7 +1866,7 @@ mod tests {
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
     };
-    use num_traits::{One, Zero};
+    use num_traits::{One, ToPrimitive, Zero};
 
     const P_MODULI_BITS: usize = 5;
     const SCALE: u64 = 1 << 8;
@@ -1885,6 +1885,25 @@ mod tests {
             &parameters,
             P_MODULI_BITS,
             DEFAULT_MAX_UNREDUCED_MULS,
+            SCALE,
+            false,
+            q_level,
+        ));
+        (parameters, context)
+    }
+
+    fn create_context_with_config(
+        circuit: &mut PolyCircuit<DCRTPoly>,
+        q_level: Option<usize>,
+        p_moduli_bits: usize,
+        max_unreduced_muls: usize,
+    ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
+        let parameters = DCRTPolyParams::new(2, 3, 18, 6);
+        let context = Arc::new(NestedRnsPolyContext::setup(
+            circuit,
+            &parameters,
+            p_moduli_bits,
+            max_unreduced_muls,
             SCALE,
             false,
             q_level,
@@ -2258,6 +2277,64 @@ mod tests {
     }
 
     #[test]
+    fn gadget_decomposed_preserves_random_matrix_entry_layout() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (parameters, context) = create_context(&mut circuit, Some(1));
+        let modulus = parameters.modulus();
+        let entries = (0..6)
+            .into_par_iter()
+            .map(|_| {
+                let mut rng = rand::rng();
+                DCRTPoly::from_biguint_to_constant(
+                    &parameters,
+                    gen_biguint_for_modulus(&mut rng, modulus.as_ref()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let target = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            entries.chunks(3).map(|row| row.to_vec()).collect(),
+        );
+        let decomposed = NestedRnsPoly::<DCRTPoly>::gadget_decomposed::<DCRTPolyMatrix>(
+            &parameters,
+            &context,
+            &target,
+            Some(1),
+            None,
+        );
+        let gadget_len = decomposed.row_size() / target.row_size();
+        assert_eq!(decomposed.col_size(), target.col_size());
+        assert!(gadget_len > 0);
+
+        (0..target.row_size() * target.col_size()).into_par_iter().for_each(|entry_index| {
+            let row = entry_index / target.col_size();
+            let column = entry_index % target.col_size();
+            let single =
+                DCRTPolyMatrix::from_poly_vec(&parameters, vec![vec![target.entry(row, column)]]);
+            let expected = NestedRnsPoly::<DCRTPoly>::gadget_decomposed::<DCRTPolyMatrix>(
+                &parameters,
+                &context,
+                &single,
+                Some(1),
+                None,
+            );
+            assert_eq!(expected.size(), (gadget_len, 1));
+            for digit in 0..gadget_len {
+                // This test isolates matrix row/column placement. Preservation of every ring
+                // coefficient is covered by
+                // `gadget_decomposition_recomposes_runtime_and_native_values`.
+                let actual_constant =
+                    decomposed.entry(row * gadget_len + digit, column).coeffs_biguints()[0].clone();
+                let expected_constant = expected.entry(digit, 0).coeffs_biguints()[0].clone();
+                assert_eq!(
+                    actual_constant, expected_constant,
+                    "decomposed matrix entry ({row}, {column}), digit {digit}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn unreduced_decomposition_matches_explicit_lazy_reduction_at_runtime() {
         fn build(
             explicit_reduce: bool,
@@ -2458,5 +2535,157 @@ mod tests {
         let left = NestedRnsPoly::input(context.clone(), Some(1), None, &mut circuit);
         let right = NestedRnsPoly::input(context, Some(2), None, &mut circuit);
         let _ = left.add(&right, &mut circuit);
+    }
+
+    #[test]
+    fn sample_crt_primes_satisfies_the_configured_unreduced_multiplication_budget() {
+        let q_max = 43u64;
+        let p_moduli_bits = 7usize;
+        let max_unreduced_muls = 4usize;
+        let p_moduli =
+            super::super::encoding::sample_crt_primes(p_moduli_bits, q_max, max_unreduced_muls);
+        let product =
+            p_moduli.par_iter().copied().map(BigUint::from).reduce(BigUint::one, |a, b| a * b);
+        let sum = p_moduli.par_iter().copied().sum::<u64>();
+        let bound =
+            super::super::encoding::sample_crt_primes_mul_budget_bound(sum, p_moduli.len(), q_max);
+        assert!(pow_biguint_usize(&bound, max_unreduced_muls) < product);
+
+        let default_product = super::super::encoding::sample_crt_primes(
+            p_moduli_bits,
+            q_max,
+            DEFAULT_MAX_UNREDUCED_MULS,
+        )
+        .par_iter()
+        .copied()
+        .map(BigUint::from)
+        .reduce(BigUint::one, |a, b| a * b);
+        assert!(default_product < product);
+    }
+
+    #[test]
+    fn sequential_add_inserts_only_the_required_full_reduction() {
+        let q_level = Some(1usize);
+        let mut setup = PolyCircuit::<DCRTPoly>::new();
+        let (_, context) = create_context(&mut setup, q_level);
+        let reduced_bound = context.full_reduce_max_plaintexts[0].clone();
+        let (operand_count, operand_bound) = (2usize..=8)
+            .find_map(|count| {
+                let count = BigUint::from(count);
+                let bound = (&context.p_full + &count - BigUint::one()) / &count;
+                let pre_last = &bound * (&count - BigUint::one());
+                if pre_last < context.p_full &&
+                    &bound * &count >= context.p_full &&
+                    &reduced_bound + &bound < context.p_full
+                {
+                    Some((count.to_usize().expect("small operand count"), bound))
+                } else {
+                    None
+                }
+            })
+            .expect("a short addition chain must trigger exactly one reduction");
+
+        let build = |manual: bool| {
+            let mut circuit = PolyCircuit::<DCRTPoly>::new();
+            let (_, context) = create_context(&mut circuit, q_level);
+            let inputs = (0..operand_count)
+                .map(|_| {
+                    let input = NestedRnsPoly::input(context.clone(), q_level, None, &mut circuit);
+                    NestedRnsPoly::new(
+                        input.ctx.clone(),
+                        input.inner.clone(),
+                        None,
+                        input.enable_levels,
+                        vec![operand_bound.clone()],
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut sum = inputs[0].clone();
+            if manual {
+                for input in inputs.iter().skip(1).take(operand_count - 2) {
+                    sum = sum.add(input, &mut circuit);
+                }
+                sum = sum.full_reduce(&mut circuit);
+                sum = sum.add(
+                    &inputs.last().expect("last input").full_reduce(&mut circuit),
+                    &mut circuit,
+                );
+            } else {
+                for input in inputs.iter().skip(1) {
+                    sum = sum.add(input, &mut circuit);
+                }
+            }
+            let result = sum.clone();
+            let output = result.reconstruct(&mut circuit);
+            circuit.output([output]);
+            (result, circuit)
+        };
+        let (automatic_result, automatic) = build(false);
+        let (manual_result, manual) = build(true);
+        assert_eq!(automatic_result.max_plaintexts, manual_result.max_plaintexts);
+        assert_eq!(automatic_result.p_max_traces, manual_result.p_max_traces);
+        assert_eq!(automatic.count_gates_by_type_vec(), manual.count_gates_by_type_vec());
+        assert_eq!(automatic.non_free_depth_contributions(), manual.non_free_depth_contributions());
+    }
+
+    #[test]
+    fn sequential_mul_uses_the_extended_unreduced_multiplication_budget() {
+        let q_level = Some(1usize);
+        let p_moduli_bits = 10usize;
+        let max_unreduced_muls = 4usize;
+        let mut setup = PolyCircuit::<DCRTPoly>::new();
+        let (_, context) =
+            create_context_with_config(&mut setup, q_level, p_moduli_bits, max_unreduced_muls);
+        let operand_count = max_unreduced_muls + 1;
+        let operand_bound = ceil_biguint_nth_root(&context.p_full, operand_count);
+        assert!(pow_biguint_usize(&operand_bound, operand_count - 1) < context.p_full);
+        assert!(pow_biguint_usize(&operand_bound, operand_count) >= context.p_full);
+
+        let build = |manual: bool| {
+            let mut circuit = PolyCircuit::<DCRTPoly>::new();
+            let (_, context) = create_context_with_config(
+                &mut circuit,
+                q_level,
+                p_moduli_bits,
+                max_unreduced_muls,
+            );
+            let inputs = (0..operand_count)
+                .map(|_| {
+                    let input = NestedRnsPoly::input(context.clone(), q_level, None, &mut circuit);
+                    NestedRnsPoly::new(
+                        input.ctx.clone(),
+                        input.inner.clone(),
+                        None,
+                        input.enable_levels,
+                        vec![operand_bound.clone()],
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut product = inputs[0].clone();
+            if manual {
+                for input in inputs.iter().skip(1).take(operand_count - 2) {
+                    product = product.mul(input, &mut circuit);
+                }
+                product = product.full_reduce(&mut circuit);
+                product = product.mul(
+                    &inputs.last().expect("last input").full_reduce(&mut circuit),
+                    &mut circuit,
+                );
+            } else {
+                for input in inputs.iter().skip(1) {
+                    product = product.mul(input, &mut circuit);
+                }
+            }
+            let result = product.clone();
+            let output = result.reconstruct(&mut circuit);
+            circuit.output([output]);
+            (result, circuit)
+        };
+        let (automatic_result, automatic) = build(false);
+        let (manual_result, manual) = build(true);
+        assert_eq!(automatic_result.max_plaintexts, manual_result.max_plaintexts);
+        assert_eq!(automatic_result.p_max_traces, manual_result.p_max_traces);
+        assert_eq!(automatic.count_gates_by_type_vec(), manual.count_gates_by_type_vec());
+        assert_eq!(automatic.non_free_depth_contributions(), manual.non_free_depth_contributions());
     }
 }

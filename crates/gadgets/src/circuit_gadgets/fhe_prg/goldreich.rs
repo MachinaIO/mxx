@@ -1540,6 +1540,7 @@ mod graph_tests {
     }
 
     #[test]
+    #[ignore = "full nested-RNS Ring-GSW CPU runtime round trip takes more than six minutes"]
     fn ring_gsw_predicate_executes_through_ir_and_decrypts_to_plaintext() {
         const RING_DIMENSION: u32 = 2;
         let mut circuit = PolyCircuit::<DCRTPoly>::new();

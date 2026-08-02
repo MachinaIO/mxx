@@ -13,7 +13,7 @@ use crate::{
         conv_mul::{NegacyclicConvolutionContext, RingGswConvolution},
     },
 };
-use mxx_dsl::{ConcatAxis, DslContext, GraphValue, Mat, Ring, Subgraph};
+use mxx_dsl::{ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph};
 use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange, validate::ValidatedGraph};
 use mxx_primitives::{
     element::PolyElem,
@@ -216,6 +216,52 @@ impl StructuredCircuitLowering<DCRTPoly> for RuntimeLowering {
         definition
             .call(inputs)
             .map_err(|error| crate::circuit::CircuitLowerError::GraphStructure(error.to_string()))
+    }
+
+    fn call_subgraph_parallel(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Vec<Mat>>,
+    ) -> Result<Vec<Vec<Mat>>, crate::circuit::CircuitLowerError<Self::Error>> {
+        let Some(first) = inputs.first() else {
+            return Ok(Vec::new());
+        };
+        let input_count = first.len();
+        if input_count == 0 || inputs.iter().any(|instance| instance.len() != input_count) {
+            return Err(crate::circuit::CircuitLowerError::GraphStructure(
+                "parallel subgraph calls require a non-empty rectangular input set".to_owned(),
+            ));
+        }
+        let count = inputs.len();
+        let mut inputs_by_position =
+            (0..input_count).map(|_| Vec::with_capacity(count)).collect::<Vec<_>>();
+        for instance in inputs {
+            for (position, input) in instance.into_iter().enumerate() {
+                inputs_by_position[position].push(input);
+            }
+        }
+        let families = inputs_by_position
+            .into_iter()
+            .map(Family::pack)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                crate::circuit::CircuitLowerError::GraphStructure(error.to_string())
+            })?;
+        let definition = definition.clone();
+        let output_families = Family::parallel_zip_many_values(families, move |_, child_inputs| {
+            definition
+                .call(child_inputs)
+                .expect("parallel subgraph inputs preserve the validated definition schema")
+        })
+        .map_err(|error| crate::circuit::CircuitLowerError::GraphStructure(error.to_string()))?;
+        let output_count = output_families.len();
+        let mut outputs = (0..count).map(|_| Vec::with_capacity(output_count)).collect::<Vec<_>>();
+        for family in output_families {
+            for (index, instance) in outputs.iter_mut().enumerate() {
+                instance.push(family.get_static(index));
+            }
+        }
+        Ok(outputs)
     }
 }
 

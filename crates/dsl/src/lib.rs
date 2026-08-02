@@ -1035,6 +1035,68 @@ impl Family<Mat> {
         self.parallel_map_values(body)
     }
 
+    pub fn parallel_zip_many_values<R: ParallelOutput>(
+        families: Vec<Self>,
+        body: impl FnOnce(LoopIndex, Vec<Mat>) -> R,
+    ) -> Result<R::Families, DslError> {
+        let Some(first) = families.first() else {
+            return Err(DslError::Schema);
+        };
+        let count = first.count.clone();
+        if families.iter().any(|family| family.count != count) {
+            return Err(DslError::FamilyCountMismatch);
+        }
+        let element_types = families
+            .iter()
+            .map(|family| family.element_schema.matrix_type.clone())
+            .collect::<Vec<_>>();
+        let (body_value, explicit_inputs, scope) = with_new_construction_scope(|scope| {
+            let inputs = element_types
+                .into_iter()
+                .enumerate()
+                .map(|(index, matrix_type)| {
+                    Mat::source_input(format!("item-{index}"), matrix_type, None)
+                })
+                .collect::<Vec<_>>();
+            let explicit_inputs = inputs.iter().map(|input| input.value.clone()).collect();
+            let output = body(LoopIndex { expression: IntExpr::LoopIndex(0) }, inputs);
+            (output, explicit_inputs, scope)
+        });
+        let body_outputs = body_value.flatten();
+        let sealed = SubgraphHandle::seal(
+            "parallel-zip-many-body",
+            scope,
+            explicit_inputs,
+            body_outputs,
+            CapturePolicy::BroadcastScalarsAndArtifactFamilies,
+        )?;
+        let mut arguments = families.iter().map(|family| family.value.clone()).collect::<Vec<_>>();
+        let mut modes = vec![LoopInputMode::Zip; families.len()];
+        arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
+        modes.extend((0..sealed.captures.len()).map(|_| LoopInputMode::Broadcast));
+        let family_outputs = body_value.parallel_family_types(&count)?;
+        let node = NodeHandle::parallel_loop(
+            sealed.handle,
+            arguments,
+            family_outputs,
+            ParallelLoop {
+                count: count.clone(),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: Vec::new(),
+                input_modes: modes,
+            },
+        );
+        let pending = Pending::merge(
+            families
+                .into_iter()
+                .map(|family| family.pending)
+                .chain(std::iter::once(body_value.pending().remap(&sealed.remap))),
+        );
+        let mut next_port = 0;
+        body_value.parallel_families(&node, &mut next_port, &count, pending)
+    }
+
     pub fn parallel_map_values<R: ParallelOutput>(
         self,
         body: impl FnOnce(LoopIndex, Mat) -> R,
@@ -3274,6 +3336,39 @@ mod tests {
             .find(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
             .expect("parallel loop");
         assert_eq!(loop_node.output_types().len(), 2);
+    }
+
+    #[test]
+    fn parallel_zip_many_keeps_each_matrix_as_a_separate_zipped_family() {
+        let ring = Ring::new(17, 8);
+        let families = (0..4)
+            .map(|_| {
+                Family::pack(vec![ring.identity(1), ring.zero((1, 1))]).expect("matrix family")
+            })
+            .collect::<Vec<_>>();
+        let outputs = Family::parallel_zip_many_values(families, |_, inputs| {
+            inputs.into_iter().reduce(|left, right| left + right).expect("non-empty zipped inputs")
+        })
+        .expect("parallel zip many");
+        let built = DslContext::new("parallel-zip-many")
+            .output("first", outputs.get_static(0))
+            .expect("first")
+            .output("second", outputs.get_static(1))
+            .expect("second")
+            .build()
+            .expect("build");
+        built.validate(&ParamEnv::default()).expect("validation");
+        let loop_spec = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find_map(|node| match node.kind() {
+                NodeKind::ParallelLoop(spec) => Some(spec),
+                _ => None,
+            })
+            .expect("parallel loop");
+        assert_eq!(loop_spec.input_modes, vec![LoopInputMode::Zip; 4]);
     }
 
     #[test]

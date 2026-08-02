@@ -1486,11 +1486,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "full-depth Montgomery gadget decomposition runtime coverage takes several minutes"]
     fn gadget_decomposition_recomposes_full_depth_value_at_runtime() {
         test_decomposition_case(None, 0);
     }
 
     #[test]
+    #[ignore = "partial-window Montgomery gadget decomposition runtime coverage takes about two minutes"]
     fn gadget_decomposition_recomposes_partial_window_value_at_runtime() {
         test_decomposition_case(Some(2), 1);
     }

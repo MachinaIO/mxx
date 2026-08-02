@@ -779,6 +779,13 @@ async fn test_gpu_diamond_we_error_search_bench_estimate_and_round_trip() {
     assert!(estimate.enc.total_time > BigUint::from(0u32));
     assert!(estimate.dec.total_time > BigUint::from(0u32));
     assert!(estimate.ciphertext_bytes > BigUint::from(0u32));
+    if env::var("DIAMOND_WE_GPU_BENCH_ESTIMATE_ONLY")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        info!("DiamondWE GPU estimate-only mode finished before round trip");
+        return;
+    }
 
     let witness = { vec![true; cfg.witness_size] };
     let instance = vec![true; cfg.instance_size()];

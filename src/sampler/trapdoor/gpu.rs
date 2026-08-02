@@ -280,47 +280,17 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             p1_rows + p2_rows,
             "public matrix columns must match perturbation rows",
         );
-        let mut perturbed_syndrome = target.clone();
-        {
-            let public_right = public_matrix.slice(0, d, p1_rows, p1_rows + p2_rows);
-            let right_image = &public_right * &p2;
-            let right_image = if right_image.col_size() == target_cols {
-                right_image
-            } else {
-                right_image.slice_columns(0, target_cols)
-            };
-            perturbed_syndrome.sub_in_place(&right_image);
-        }
-        {
-            let public_left = public_matrix.slice(0, d, 0, p1_rows);
-            let left_image = &public_left * &p1;
-            let left_image = if left_image.col_size() == target_cols {
-                left_image
-            } else {
-                left_image.slice_columns(0, target_cols)
-            };
-            perturbed_syndrome.sub_in_place(&left_image);
-        }
+        let perturbed_syndrome =
+            GpuDCRTPolyMatrix::preimage_residual(target, public_matrix, &p1, &p2);
         tracing::debug!(
             elapsed_ms = perturb_start.elapsed().as_secs_f64() * 1_000.0,
             "gpu preimage: computed perturbed_syndrome"
         );
 
+        // Materialize the final layout before sampling z so p1/p2 can be released before the
+        // largest correction buffers are live. The correction itself remains one fused kernel.
+        let mut out = GpuDCRTPolyMatrix::preimage_output_from_perturbation(p1, p2, target_cols);
         let assemble_start = Instant::now();
-        let p1_level = p1.level();
-        let p1_is_ntt = p1.is_ntt();
-        let mut out = GpuDCRTPolyMatrix::new_empty_with_state(
-            params,
-            p1_rows + p2_rows,
-            target_cols,
-            p1_level,
-            p1_is_ntt,
-        );
-        out.copy_block_from(&p1, 0, 0, 0, 0, p1_rows, target_cols);
-        out.copy_block_from(&p2, p1_rows, 0, 0, 0, p2_rows, target_cols);
-        drop(p1);
-        drop(p2);
-
         let gauss_start = Instant::now();
         let z_hat_mat =
             perturbed_syndrome.gauss_samp_gq_arb_base(self.c, self.sigma, random_gpu_rng_seed());
@@ -329,49 +299,10 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             "gpu preimage: sampled z_hat_mat with gauss_samp_gq_arb_base"
         );
 
-        let r_mul_start = Instant::now();
-        let r_z_hat = &trapdoor.r * &z_hat_mat;
-        tracing::debug!(
-            elapsed_ms = r_mul_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: computed r * z_hat"
-        );
-        out.add_block_from(&r_z_hat, 0, 0, 0, 0, r_z_hat.row_size(), target_cols);
+        out.preimage_add_correction(&trapdoor.r, &trapdoor.e, &z_hat_mat);
         tracing::debug!(
             elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
-            row_start = 0usize,
-            rows = r_z_hat.row_size(),
-            step = "r_z_hat",
-            "gpu preimage: merged correction block"
-        );
-        drop(r_z_hat);
-
-        let e_mul_start = Instant::now();
-        let e_z_hat = &trapdoor.e * &z_hat_mat;
-        tracing::debug!(
-            elapsed_ms = e_mul_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: computed e * z_hat"
-        );
-        out.add_block_from(&e_z_hat, d, 0, 0, 0, e_z_hat.row_size(), target_cols);
-        tracing::debug!(
-            elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
-            row_start = d,
-            rows = e_z_hat.row_size(),
-            step = "e_z_hat",
-            "gpu preimage: merged correction block"
-        );
-        drop(e_z_hat);
-
-        out.add_block_from(&z_hat_mat, 2 * d, 0, 0, 0, z_hat_mat.row_size(), target_cols);
-        tracing::debug!(
-            elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
-            row_start = 2 * d,
-            rows = z_hat_mat.row_size(),
-            step = "z_hat_mat",
-            "gpu preimage: merged correction block"
-        );
-        tracing::debug!(
-            elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: assembled output matrix"
+            "gpu preimage: assembled output matrix with fused correction"
         );
         tracing::debug!(
             elapsed_ms = preimage_start.elapsed().as_secs_f64() * 1_000.0,
@@ -464,7 +395,7 @@ fn sample_pert_square_mat_gpu_native_parts(
         DistType::GaussDist { sigma: sigma_large },
     );
     tracing::debug!("gpu preimage sample_pert: sampled p2");
-    let tp2 = trapdoor.r.concat_rows(&[&trapdoor.e]) * &p2;
+    let tp2 = GpuDCRTPolyMatrix::mul_vertical_pair(&trapdoor.r, &trapdoor.e, &p2);
     tracing::debug!("gpu preimage sample_pert: computed tp2");
 
     // Keep perturbation generation on device: this sampler uses the full
@@ -620,6 +551,30 @@ mod tests {
         let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
         let product = &public_matrix * &preimage;
         assert_eq!(product, target);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_generation_variable_chunk_widths() {
+        gpu_device_sync();
+        let size = 3usize;
+        let cpu_params = gpu_test_params();
+        let params = gpu_params_from_cpu(&cpu_params);
+        let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
+
+        for chunk_width in [1usize, 2, 3, 5, 8] {
+            let target =
+                uniform_sampler.sample_uniform(&params, size, chunk_width, DistType::FinRingDist);
+            let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+            assert_eq!(preimage.col_size(), chunk_width);
+            assert_eq!(
+                &public_matrix * &preimage,
+                target,
+                "fused preimage relation failed for runtime chunk width {chunk_width}"
+            );
+        }
     }
 
     #[test]

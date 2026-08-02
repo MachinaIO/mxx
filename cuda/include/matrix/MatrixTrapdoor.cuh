@@ -99,6 +99,25 @@ extern "C"
         gpu_chacha::GpuRngSeed seed,
         GpuMatrix *out);
 
+    int gpu_matrix_mul_vertical_pair(
+        GpuMatrix *out,
+        const GpuMatrix *top,
+        const GpuMatrix *bottom,
+        const GpuMatrix *rhs);
+
+    int gpu_matrix_preimage_residual(
+        GpuMatrix *out,
+        const GpuMatrix *target,
+        const GpuMatrix *public_matrix,
+        const GpuMatrix *p1,
+        const GpuMatrix *p2);
+
+    int gpu_matrix_preimage_add_correction(
+        GpuMatrix *out,
+        const GpuMatrix *r,
+        const GpuMatrix *e,
+        const GpuMatrix *z);
+
 #ifdef __cplusplus
 }
 #endif

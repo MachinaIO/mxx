@@ -355,6 +355,30 @@ impl<P: Poly> PolyCircuit<P> {
         self.small_scalar_mul(input, &scalar)
     }
 
+    /// Cyclically rotates logical slots while preserving the slot structure for
+    /// scheme-specific lowering.
+    ///
+    /// This differs from [`Self::rotate_gate`], which multiplies a polynomial by
+    /// a ring monomial. The default slot lowering materializes this operation as
+    /// an ordinary slot transfer, while specialized schemes may lower the
+    /// rotation directly.
+    pub fn slot_rotation_gate<I: Into<BatchedWire>>(
+        &mut self,
+        input: I,
+        offset: usize,
+        num_slots: usize,
+    ) -> BatchedWire {
+        assert!(num_slots > 0, "slot_rotation_gate requires num_slots > 0");
+        let input = input.into();
+        debug_assert!(input.is_single_wire());
+        BatchedWire::single(self.new_gate_generic(
+            vec![input.as_single_wire()],
+            PolyGateType::SlotTransfer {
+                src_slots: GateParamSource::Const(SlotTransferSpec::rotation(offset, num_slots)),
+            },
+        ))
+    }
+
     pub fn public_lookup_gate<I: Into<BatchedWire>>(
         &mut self,
         input: I,

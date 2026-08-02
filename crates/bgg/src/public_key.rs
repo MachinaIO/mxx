@@ -1,7 +1,10 @@
 //! Declarative BGG+ public-key graph values.
 
-use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending, Ring};
-use mxx_ir_core::{IntExpr, ValueHandle};
+use crate::encoding::BggSamplerLayout;
+use mxx_dsl::{
+    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Pending, Ring,
+};
+use mxx_ir_core::{IntExpr, ValueHandle, node::IndexRange};
 
 #[derive(Clone)]
 pub struct BggPublicKeyWire {
@@ -125,6 +128,41 @@ impl BggPublicKeyCompiler {
         let rows = input.matrix.matrix_type().rows.clone();
         let gadget = self.ring.gadget(rows, self.base.clone(), self.digit_count.clone());
         (gadget * scalar.clone()).decompose(self.base.clone(), self.digit_count.clone()).as_mat()
+    }
+}
+
+#[derive(Clone)]
+pub struct BggPublicKeySampler {
+    pub layout: BggSamplerLayout,
+}
+
+impl BggPublicKeySampler {
+    /// Samples the packed public matrices once and exposes deterministic slices.
+    pub fn sample(
+        &self,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        reveal_plaintexts: &[bool],
+    ) -> Vec<BggPublicKeyWire> {
+        let count = reveal_plaintexts.len() + 1;
+        let columns = self.layout.public_key_columns();
+        let packed = self.layout.ring().hash_matrix(
+            hash_key,
+            tag,
+            (self.layout.secret_dimension, columns * count),
+        );
+        (0..count)
+            .map(|index| BggPublicKeyWire {
+                matrix: packed.clone().slice(
+                    None,
+                    Some(IndexRange {
+                        start: (columns * index).into(),
+                        end: (columns * (index + 1)).into(),
+                    }),
+                ),
+                reveal_plaintext: index == 0 || reveal_plaintexts[index - 1],
+            })
+            .collect()
     }
 }
 

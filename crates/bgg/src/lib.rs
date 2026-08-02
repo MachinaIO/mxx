@@ -6,13 +6,10 @@ pub mod lwe_lookup;
 pub mod masked_decoder;
 pub mod naive_vec;
 pub mod noise_refresh;
-pub mod poly_encoding;
 pub mod public_key;
-pub mod sampler;
-pub mod slot_transfer;
-pub mod slot_transfer_artifact;
-pub mod slot_transfer_poly_encoding;
-pub mod slot_transfer_public_key;
+pub mod slot_operation;
+pub mod tall_encoding;
+pub mod tall_rotation_encoding;
 pub mod wee25_commitment;
 pub mod wee25_opening;
 pub mod wee25_public_parameters;
@@ -21,12 +18,15 @@ pub mod wee25_public_parameters;
 mod test_utils;
 
 pub use circuit::{CircuitCompileError, NoPublicLookup, NoSlotOperations, PolyCircuitCompiler};
-pub use encoding::{BggEncodingCompiler, BggEncodingType, BggEncodingWire, EncodingCompileError};
+pub use encoding::{
+    BggEncodingCompiler, BggEncodingSampler, BggEncodingType, BggEncodingWire, BggSampleError,
+    BggSamplerLayout, EncodingCompileError,
+};
 pub use lwe_lookup::{
     LweLookupArtifactNames, LweLookupArtifactWires, LweLookupArtifacts, LweLookupCompileError,
     LweLookupCompiler, LweLookupEncodingLowering, LweLookupIdentity, LweLookupInvocation,
-    LweLookupPolyEncodingLowering, LweLookupPreprocessingWires, LweLookupPublicKeyLowering,
-    LweLookupTable, NaiveLweLookupEncodingLowering, NaiveLweLookupInvocation,
+    LweLookupPreprocessingWires, LweLookupPublicKeyLowering, LweLookupTable,
+    LweLookupTallEncodingLowering, NaiveLweLookupEncodingLowering, NaiveLweLookupInvocation,
     NaiveLweLookupPublicKeyLowering,
 };
 pub use masked_decoder::{
@@ -34,27 +34,33 @@ pub use masked_decoder::{
     MaskedHighBitDecoderError, MaskedHighBitDecoderOutputs, MaskedHighBitDecoderPreprocessingWires,
 };
 pub use naive_vec::{
-    NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire, NaiveBggVecCompiler, NaiveVecCompileError,
+    NaiveBggEncodingVecSampler, NaiveBggEncodingVecWire, NaiveBggPublicKeyVecSampler,
+    NaiveBggPublicKeyVecWire, NaiveBggVecCompiler, NaiveVecCompileError,
 };
 pub use noise_refresh::{
     NOISE_REFRESH_A_PRIME, NOISE_REFRESH_DECODER_PREIMAGES, NaiveBggNoiseRefreshArtifactWires,
     NaiveBggNoiseRefreshArtifacts, NaiveBggNoiseRefreshCompiler, NaiveBggNoiseRefreshError,
     NaiveBggNoiseRefreshPreprocessingWires,
 };
-pub use poly_encoding::{BggPolyEncodingCompiler, BggPolyEncodingWire, PolyEncodingCompileError};
-pub use public_key::{BggPublicKeyCompiler, BggPublicKeyType, BggPublicKeyWire};
-pub use sampler::{
-    BggEncodingSampler, BggPolyEncodingSample, BggPolyEncodingSampler, BggPublicKeySampler,
-    BggSampleError, BggSamplerLayout, NaiveBggEncodingVecSampler, NaiveBggPublicKeyVecSampler,
+pub use public_key::{
+    BggPublicKeyCompiler, BggPublicKeySampler, BggPublicKeyType, BggPublicKeyWire,
 };
-pub use slot_transfer::{NaiveBggSlotTransferCompiler, SlotFamilyCompileError};
-pub use slot_transfer_artifact::{
+pub use slot_operation::{
     BggSlotTransferArtifactCompiler, BggSlotTransferArtifactError, BggSlotTransferBaseArtifacts,
-    BggSlotTransferBaseWires, BggSlotTransferGateArtifacts, BggSlotTransferGateWires,
-    BggSlotTransferPublicSlotWires, BggSlotTransferSlotArtifacts, BggSlotTransferSlotWires,
+    BggSlotTransferBaseWires, BggSlotTransferGateArtifacts, BggSlotTransferGateRequest,
+    BggSlotTransferGateWires, BggSlotTransferPublicKeyLowering, BggSlotTransferPublicSlotWires,
+    BggSlotTransferSlotArtifacts, BggSlotTransferSlotWires, BggTallSlotLowering,
+    BggTallSlotPublicKeyLowering, NaiveBggSlotTransferCompiler, SlotFamilyCompileError,
 };
-pub use slot_transfer_poly_encoding::BggPolySlotTransferLowering;
-pub use slot_transfer_public_key::{BggSlotTransferGateRequest, BggSlotTransferPublicKeyLowering};
+pub use tall_encoding::{
+    BggTallEncodingCompiler, BggTallEncodingSample, BggTallEncodingSampler, BggTallEncodingWire,
+    BggTallPlaintext, TallCompileError,
+};
+pub use tall_rotation_encoding::{
+    TallRotationDirection, TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts,
+    TallRotationEncodingCompiler, TallRotationEncodingKey, TallRotationEncodingPreprocessingWires,
+    TallRotationEncodingWires, required_tall_rotation_encodings,
+};
 pub use wee25_commitment::{
     Wee25CommitmentCompiler, Wee25CommitmentError, Wee25CommitmentTreeWire,
 };

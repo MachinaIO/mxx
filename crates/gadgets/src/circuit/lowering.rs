@@ -80,6 +80,26 @@ pub trait SlotOperationLowering<P: Poly>: CircuitLoweringTypes {
         gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error>;
 
+    /// Lowers a cyclic slot rotation.
+    ///
+    /// Implementors may override this to preserve and exploit the rotation
+    /// structure. The default retains the existing behavior by materializing an
+    /// explicit slot-transfer mapping.
+    fn slot_rotation(
+        &mut self,
+        input: &Self::Wire,
+        offset: u32,
+        num_slots: u32,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let materialized = SlotTransferSpec::rotation(
+            usize::try_from(offset).expect("rotation offset must fit in usize"),
+            usize::try_from(num_slots).expect("rotation slot count must fit in usize"),
+        )
+        .materialize();
+        self.slot_transfer(input, &materialized, gate)
+    }
+
     fn slot_reduce(
         &mut self,
         inputs: &[Self::Wire],
@@ -423,10 +443,17 @@ where
             }
             PolyGateType::SlotTransfer { src_slots } => {
                 let input = lookup_unary(&values, gate)?;
-                let source_slots = resolve_slot_transfer(src_slots, bindings, gate_id)?;
-                lowering
-                    .slot_transfer(input, &source_slots, gate_instance)
-                    .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
+                match resolve_slot_transfer_spec(src_slots, bindings, gate_id)? {
+                    SlotTransferSpec::Rotation { diagonal, num_slots } => lowering
+                        .slot_rotation(input, *diagonal, *num_slots, gate_instance)
+                        .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?,
+                    spec => {
+                        let source_slots = materialize_slot_transfer(spec);
+                        lowering.slot_transfer(input, &source_slots, gate_instance).map_err(
+                            |source| CircuitLowerError::Operation { gate: gate_id, source },
+                        )?
+                    }
+                }
             }
             PolyGateType::SlotReduce { num_slots, .. } => {
                 let inputs = lookup_many(&values, gate)?;
@@ -649,10 +676,17 @@ where
             }
             PolyGateType::SlotTransfer { src_slots } => {
                 let input = lookup_unary(&values, gate)?;
-                let source_slots = resolve_slot_transfer(src_slots, bindings, gate_id)?;
-                lowering
-                    .slot_transfer(input, &source_slots, gate_instance)
-                    .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?
+                match resolve_slot_transfer_spec(src_slots, bindings, gate_id)? {
+                    SlotTransferSpec::Rotation { diagonal, num_slots } => lowering
+                        .slot_rotation(input, *diagonal, *num_slots, gate_instance)
+                        .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?,
+                    spec => {
+                        let source_slots = materialize_slot_transfer(spec);
+                        lowering.slot_transfer(input, &source_slots, gate_instance).map_err(
+                            |source| CircuitLowerError::Operation { gate: gate_id, source },
+                        )?
+                    }
+                }
             }
             PolyGateType::SlotReduce { num_slots, .. } => {
                 let inputs = lookup_many(&values, gate)?;
@@ -804,24 +838,18 @@ where
     }
 }
 
-fn resolve_slot_transfer<'a, E>(
+fn resolve_slot_transfer_spec<'a, E>(
     source: &'a GateParamSource<SlotTransferSpec>,
     bindings: &'a [SubCircuitParamValue],
     gate: usize,
-) -> Result<Cow<'a, [(u32, Option<u32>)]>, CircuitLowerError<E>>
+) -> Result<&'a SlotTransferSpec, CircuitLowerError<E>>
 where
     E: Error + Send + Sync + 'static,
 {
     match source {
-        GateParamSource::Const(SlotTransferSpec::Explicit(value)) => {
-            Ok(Cow::Borrowed(value.as_slice()))
-        }
-        GateParamSource::Const(value) => Ok(Cow::Owned(value.materialize())),
+        GateParamSource::Const(value) => Ok(value),
         GateParamSource::Param(parameter) => match bindings.get(*parameter) {
-            Some(SubCircuitParamValue::SlotTransfer(SlotTransferSpec::Explicit(value))) => {
-                Ok(Cow::Borrowed(value.as_slice()))
-            }
-            Some(SubCircuitParamValue::SlotTransfer(value)) => Ok(Cow::Owned(value.materialize())),
+            Some(SubCircuitParamValue::SlotTransfer(value)) => Ok(value),
             Some(actual) => Err(CircuitLowerError::ParameterKind {
                 gate,
                 parameter: *parameter,
@@ -830,6 +858,13 @@ where
             }),
             None => Err(CircuitLowerError::MissingParameter { gate, parameter: *parameter }),
         },
+    }
+}
+
+fn materialize_slot_transfer(spec: &SlotTransferSpec) -> Cow<'_, [(u32, Option<u32>)]> {
+    match spec {
+        SlotTransferSpec::Explicit(value) => Cow::Borrowed(value.as_slice()),
+        value => Cow::Owned(value.materialize()),
     }
 }
 
@@ -965,6 +1000,7 @@ mod tests {
     struct RecordingLowering {
         operations: Vec<(PolyGateKind, Vec<usize>, usize, usize)>,
         slot_mapping_pointers: Vec<usize>,
+        slot_rotations: Vec<(u32, u32)>,
         small_scalars: Vec<Vec<u32>>,
         large_scalars: Vec<Vec<BigUint>>,
         call_site_identity_is_semantic: bool,
@@ -977,6 +1013,7 @@ mod tests {
             Self {
                 operations: Vec::new(),
                 slot_mapping_pointers: Vec::new(),
+                slot_rotations: Vec::new(),
                 small_scalars: Vec::new(),
                 large_scalars: Vec::new(),
                 call_site_identity_is_semantic: true,
@@ -1049,6 +1086,18 @@ mod tests {
             Ok(*input)
         }
 
+        fn slot_rotation(
+            &mut self,
+            input: &Self::Wire,
+            offset: u32,
+            num_slots: u32,
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            self.record(PolyGateKind::SlotTransfer, gate);
+            self.slot_rotations.push((offset, num_slots));
+            Ok(*input)
+        }
+
         fn slot_reduce(
             &mut self,
             inputs: &[Self::Wire],
@@ -1056,6 +1105,37 @@ mod tests {
             gate: GateInstance<'_>,
         ) -> Result<Self::Wire, Self::Error> {
             self.record(PolyGateKind::SlotReduce, gate);
+            Ok(inputs.iter().sum())
+        }
+    }
+
+    #[derive(Default)]
+    struct DefaultRotationLowering {
+        mappings: Vec<Vec<(u32, Option<u32>)>>,
+    }
+
+    impl CircuitLoweringTypes for DefaultRotationLowering {
+        type Wire = usize;
+        type Error = Infallible;
+    }
+
+    impl SlotOperationLowering<DCRTPoly> for DefaultRotationLowering {
+        fn slot_transfer(
+            &mut self,
+            input: &Self::Wire,
+            source_slots: &[(u32, Option<u32>)],
+            _gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            self.mappings.push(source_slots.to_vec());
+            Ok(*input)
+        }
+
+        fn slot_reduce(
+            &mut self,
+            inputs: &[Self::Wire],
+            _slot_count: usize,
+            _gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
             Ok(inputs.iter().sum())
         }
     }
@@ -1195,6 +1275,58 @@ mod tests {
             first.slot_mapping_pointers.iter().all(|pointer| *pointer == stored_mapping_pointer),
             "explicit slot mappings must be borrowed rather than cloned"
         );
+    }
+
+    #[test]
+    fn rotation_specs_preserve_specialized_dispatch_in_both_traversals() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let rotation =
+            child.register_sub_circuit_param(SubCircuitParamSpec::SlotTransfer { max_scalar: 1 });
+        let input = child.input(1).as_single_wire();
+        let rotated = child.slot_transfer_gate_param(input, rotation);
+        child.output([rotated]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let constant = circuit.slot_rotation_gate(input, 5, 4);
+        let child_id = circuit.register_sub_circuit(child);
+        let parameterized = circuit.call_sub_circuit_with_bindings(
+            child_id,
+            [constant],
+            &[SubCircuitParamValue::SlotTransfer(SlotTransferSpec::rotation(7, 6))],
+        );
+        circuit.output(parameterized);
+
+        for structured in [false, true] {
+            let mut lowering = RecordingLowering::default();
+            let outputs = if structured {
+                lower_circuit_structured(&circuit, 1usize, [11], &mut lowering)
+            } else {
+                lower_circuit(&circuit, 1usize, [11], &mut lowering)
+            }
+            .expect("rotation lowering must be infallible");
+            assert_eq!(outputs, vec![11]);
+            assert_eq!(lowering.slot_rotations, vec![(5, 4), (7, 6)]);
+            assert!(
+                lowering.slot_mapping_pointers.is_empty(),
+                "rotation specs must not be materialized before specialized dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn default_rotation_lowering_matches_an_explicit_slot_transfer() {
+        let expected = SlotTransferSpec::rotation(5, 4).materialize();
+        let mut lowering = DefaultRotationLowering::default();
+        let input = 17usize;
+        let rotated = lowering
+            .slot_rotation(&input, 5, 4, GateInstance::ordinary(&[], GateId(1)))
+            .expect("default rotation lowering must be infallible");
+        let transferred = lowering
+            .slot_transfer(&input, &expected, GateInstance::ordinary(&[], GateId(2)))
+            .expect("explicit transfer lowering must be infallible");
+        assert_eq!(rotated, transferred);
+        assert_eq!(lowering.mappings, vec![expected.clone(), expected]);
     }
 
     #[test]

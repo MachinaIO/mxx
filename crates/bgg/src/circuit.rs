@@ -1,10 +1,11 @@
 //! PolyCircuit evaluation into declarative BGG+ DAG values.
 
 use crate::{
-    BggEncodingCompiler, BggEncodingWire, BggPolyEncodingCompiler, BggPolyEncodingWire,
-    BggPublicKeyCompiler, BggPublicKeyWire, EncodingCompileError, NaiveBggEncodingVecWire,
-    NaiveBggPublicKeyVecWire, NaiveBggSlotTransferCompiler, NaiveBggVecCompiler,
-    NaiveVecCompileError, PolyEncodingCompileError, SlotFamilyCompileError,
+    BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire,
+    EncodingCompileError, NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire,
+    NaiveBggSlotTransferCompiler, NaiveBggVecCompiler, NaiveVecCompileError,
+    SlotFamilyCompileError,
+    tall_encoding::{BggTallEncodingCompiler, BggTallEncodingWire, TallCompileError},
 };
 use mxx_dsl::{GraphValue, Subgraph};
 use mxx_gadgets::{
@@ -98,6 +99,16 @@ where
     ) -> Result<Self::Wire, Self::Error> {
         self.slots.slot_reduce(inputs, slot_count, gate)
     }
+
+    fn slot_rotation(
+        &mut self,
+        input: &Self::Wire,
+        offset: u32,
+        num_slots: u32,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        self.slots.slot_rotation(input, offset, num_slots, gate)
+    }
 }
 
 impl<P, A, L, S> PublicLookupLowering<P> for ConfiguredCircuitLowering<'_, A, L, S>
@@ -172,7 +183,7 @@ pub enum CircuitCompileError {
     #[error(transparent)]
     NaiveVector(#[from] NaiveVecCompileError),
     #[error(transparent)]
-    PolyEncoding(#[from] PolyEncodingCompileError),
+    TallEncoding(#[from] TallCompileError),
     #[error(transparent)]
     SlotFamily(#[from] SlotFamilyCompileError),
     #[error(transparent)]
@@ -187,6 +198,8 @@ pub enum CircuitCompileError {
     InvalidSlotTransfer { gate: usize },
     #[error("slot-transfer artifact is missing: {name}")]
     MissingSlotTransferArtifact { name: String },
+    #[error("tall rotation encoding ({num_slots}, {offset}) is unavailable")]
+    MissingTallRotationEncoding { num_slots: u32, offset: u32 },
     #[error("gate {gate}: {source}")]
     LweLookup {
         gate: usize,
@@ -274,21 +287,21 @@ impl PolyCircuitCompiler {
         lower_circuit_structured(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
     }
 
-    pub fn compile_poly_encodings_with_lowerings<P, L, S>(
+    pub fn compile_tall_encodings_with_lowerings<P, L, S>(
         &self,
         circuit: &PolyCircuit<P>,
-        one: BggPolyEncodingWire,
-        inputs: impl IntoIterator<Item = BggPolyEncodingWire>,
+        one: BggTallEncodingWire,
+        inputs: impl IntoIterator<Item = BggTallEncodingWire>,
         lookup: &mut L,
         slots: &mut S,
-    ) -> Result<Vec<BggPolyEncodingWire>, CircuitCompileError>
+    ) -> Result<Vec<BggTallEncodingWire>, CircuitCompileError>
     where
         P: Poly,
-        L: PublicLookupLowering<P, Wire = BggPolyEncodingWire, Error = CircuitCompileError>,
-        S: SlotOperationLowering<P, Wire = BggPolyEncodingWire, Error = CircuitCompileError>,
+        L: PublicLookupLowering<P, Wire = BggTallEncodingWire, Error = CircuitCompileError>,
+        S: SlotOperationLowering<P, Wire = BggTallEncodingWire, Error = CircuitCompileError>,
     {
-        let compiler = BggPolyEncodingCompiler { public_key: self.public_key.clone() };
-        let arithmetic = PolyEncodingLowering::<P> { compiler: &compiler, marker: PhantomData };
+        let compiler = BggTallEncodingCompiler { public_key: self.public_key.clone() };
+        let arithmetic = TallEncodingLowering::<P> { compiler: &compiler, marker: PhantomData };
         let mut lowering = ConfiguredCircuitLowering { arithmetic, lookup, slots };
         lower_circuit(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
     }
@@ -387,15 +400,15 @@ impl PolyCircuitCompiler {
         self.compile_naive_public_keys_with_lowerings(circuit, one, inputs, &mut lookup, &mut slots)
     }
 
-    pub fn compile_poly_encodings<P: Poly>(
+    pub fn compile_tall_encodings<P: Poly>(
         &self,
         circuit: &PolyCircuit<P>,
-        one: BggPolyEncodingWire,
-        inputs: impl IntoIterator<Item = BggPolyEncodingWire>,
-    ) -> Result<Vec<BggPolyEncodingWire>, CircuitCompileError> {
+        one: BggTallEncodingWire,
+        inputs: impl IntoIterator<Item = BggTallEncodingWire>,
+    ) -> Result<Vec<BggTallEncodingWire>, CircuitCompileError> {
         let mut lookup = NoPublicLookup::default();
         let mut slots = NoSlotOperations::default();
-        self.compile_poly_encodings_with_lowerings(circuit, one, inputs, &mut lookup, &mut slots)
+        self.compile_tall_encodings_with_lowerings(circuit, one, inputs, &mut lookup, &mut slots)
     }
 
     pub fn compile_naive_encodings<P: Poly>(
@@ -415,17 +428,17 @@ struct NaivePublicKeyLowering<P> {
     marker: PhantomData<P>,
 }
 
-struct PolyEncodingLowering<'a, P> {
-    compiler: &'a BggPolyEncodingCompiler,
+struct TallEncodingLowering<'a, P> {
+    compiler: &'a BggTallEncodingCompiler,
     marker: PhantomData<P>,
 }
 
-impl<P> CircuitLoweringTypes for PolyEncodingLowering<'_, P> {
-    type Wire = BggPolyEncodingWire;
+impl<P> CircuitLoweringTypes for TallEncodingLowering<'_, P> {
+    type Wire = BggTallEncodingWire;
     type Error = CircuitCompileError;
 }
 
-impl<P: Poly> ArithmeticCircuitLowering<P> for PolyEncodingLowering<'_, P> {
+impl<P: Poly> ArithmeticCircuitLowering<P> for TallEncodingLowering<'_, P> {
     fn binary(
         &mut self,
         operation: PolyGateKind,
@@ -436,7 +449,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PolyEncodingLowering<'_, P> {
         match operation {
             PolyGateKind::Add => Ok(self.compiler.add(lhs, rhs)?),
             PolyGateKind::Sub => Ok(self.compiler.sub(lhs, rhs)?),
-            PolyGateKind::Mul => Ok(self.compiler.mul(lhs, rhs)?),
+            PolyGateKind::Mul => Ok(self.compiler.simd_mul(lhs, rhs)?),
             _ => unsupported(gate, "non-binary operation"),
         }
     }

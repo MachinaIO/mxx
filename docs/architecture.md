@@ -147,19 +147,25 @@ encoding preimages.
 
 ### `mxx-bgg`
 
-`crates/bgg/` owns BGG+ public keys, encodings, samplers, indexed encoding
-families, circuit evaluation, masked decoding, naive and cryptographic slot
-transfer, preprocessing artifacts, and noise refresh. All active BGG graph
-code uses `mxx-dsl`.
+`crates/bgg/` owns BGG+ public keys, scalar, naive-vector, and tall encodings,
+their component-local samplers, circuit evaluation, masked decoding,
+cryptographic slot operations, preprocessing artifacts, and noise refresh. Tall
+encodings share one public matrix across row-wise slot secrets and support
+direct cyclic tall-rotation encoding pairs without constructing dense permutation
+matrices. All active BGG graph code uses `mxx-dsl`.
 
 The LWE-based public LUT evaluator, including its preprocessing artifacts and
-scalar, polynomial-slot, and naive per-slot circuit lowerings, is implemented
+scalar, shared-helper tall, and naive per-slot circuit lowerings, is implemented
 in `mxx-bgg` with the declarative DSL. Public lookup implementations provide
 only `PublicLookupLowering`; slot-transfer implementations provide only
 `SlotOperationLowering`. `GraphCircuitLowering` is the complete traversal
 interface and inherits those traits together with ordinary arithmetic
 lowering. `PolyCircuitCompiler::compile_*_with_lowerings` accepts lookup and
 slot providers separately when a circuit uses either or both gate families.
+Within `mxx-bgg`, each sampler lives beside the component it constructs.
+`slot_operation.rs` contains slot transfer, reduction, and rotation lowering for
+the supported BGG+ component families, while `tall_rotation_encoding.rs` owns the
+cryptographic tall rotation encoding preprocessing and artifact definitions.
 The WEE25 commitment-backed lookup evaluator is deliberately outside the
 current implementation. Decoder and noise-refresh circuit templates remain in
 `mxx-gadgets` because they are fundamentally `PolyCircuit` components.

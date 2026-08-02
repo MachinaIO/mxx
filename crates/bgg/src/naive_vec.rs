@@ -1,7 +1,12 @@
 //! Per-slot BGG+ vectors represented by indexed DSL families.
 
-use crate::{BggPublicKeyCompiler, BggPublicKeyWire};
-use mxx_dsl::{DslError, Family, Mat};
+use crate::{
+    BggEncodingSampler, BggPublicKeyCompiler, BggPublicKeyWire, BggSampleError, BggSamplerLayout,
+    encoding::same_matrix_type,
+};
+use mxx_dsl::{Bytes, DslError, Family, HashTag, Mat, Parallel, parallel_zip};
+use mxx_ir_core::{IntExpr, node::IndexRange};
+use rayon::prelude::*;
 use thiserror::Error;
 
 #[derive(Clone)]
@@ -353,6 +358,177 @@ fn validate_encoding_pair(
     Ok(())
 }
 
+#[derive(Clone)]
+pub struct NaiveBggPublicKeyVecSampler {
+    pub layout: BggSamplerLayout,
+    pub slot_count: IntExpr,
+}
+
+#[derive(Clone)]
+pub struct NaiveBggEncodingVecSampler {
+    pub scalar: BggEncodingSampler,
+}
+
+impl NaiveBggPublicKeyVecSampler {
+    pub fn sample(
+        &self,
+        hash_key: Bytes,
+        tag: &[u8],
+        reveal_plaintexts: &[bool],
+    ) -> Result<Vec<NaiveBggPublicKeyVecWire>, BggSampleError> {
+        let outputs = (0..=reveal_plaintexts.len())
+            .map(|output| {
+                let reveal = output == 0 || reveal_plaintexts[output - 1];
+                let packed_count = if output == 0 { 1 } else { 2 };
+                let mut prefix = tag.to_vec();
+                prefix.extend_from_slice(&(output as u64).to_le_bytes());
+                let family = Parallel::range(self.slot_count.clone()).map({
+                    let ring = self.layout.ring();
+                    let key = hash_key.clone();
+                    move |slot| {
+                        let mut tag = HashTag::from(prefix.clone());
+                        tag.push(slot);
+                        let packed = ring.hash_matrix(
+                            key.clone(),
+                            tag,
+                            (
+                                self.layout.secret_dimension,
+                                self.layout.public_key_columns() * packed_count,
+                            ),
+                        );
+                        if output == 0 {
+                            packed
+                        } else {
+                            packed.slice(
+                                None,
+                                Some(IndexRange {
+                                    start: self.layout.public_key_columns().into(),
+                                    end: (self.layout.public_key_columns() * 2).into(),
+                                }),
+                            )
+                        }
+                    }
+                })?;
+                Ok(NaiveBggPublicKeyVecWire { matrices: family, reveal_plaintext: reveal })
+            })
+            .collect::<Result<Vec<_>, BggSampleError>>()?;
+        Ok(outputs)
+    }
+}
+
+impl NaiveBggEncodingVecSampler {
+    pub fn sample(
+        &self,
+        secret: Mat,
+        public_keys: &[NaiveBggPublicKeyVecWire],
+        plaintexts: &[Family<Mat>],
+    ) -> Result<Vec<NaiveBggEncodingVecWire>, BggSampleError> {
+        if public_keys.len() != plaintexts.len() + 1 {
+            return Err(BggSampleError::InputCountMismatch);
+        }
+        let slot_count = public_keys[0].matrices.count().clone();
+        if public_keys.par_iter().any(|key| key.matrices.count() != &slot_count) ||
+            plaintexts.par_iter().any(|value| value.count() != &slot_count)
+        {
+            return Err(BggSampleError::SlotCountMismatch);
+        }
+        let layout = &self.scalar.layout;
+        let ring = layout.ring();
+        if !same_matrix_type(secret.matrix_type(), &ring.matrix_type((1, layout.secret_dimension))) ||
+            public_keys.par_iter().any(|key| {
+                !same_matrix_type(
+                    key.matrices.element_type(),
+                    &ring.matrix_type((layout.secret_dimension, layout.public_key_columns())),
+                )
+            }) ||
+            plaintexts
+                .par_iter()
+                .any(|value| !same_matrix_type(value.element_type(), &ring.matrix_type((1, 1))))
+        {
+            return Err(BggSampleError::MatrixTypeMismatch);
+        }
+        let outputs = (0..public_keys.len())
+            .map(|output| {
+                let vectors = if output == 0 {
+                    public_keys[0].matrices.clone().parallel_map({
+                        let sampler = self.scalar.clone();
+                        let secret = secret.clone();
+                        let reveal = public_keys[0].reveal_plaintext;
+                        move |_, one_key| {
+                            sampler
+                                .sample(
+                                    secret.clone(),
+                                    &[BggPublicKeyWire {
+                                        matrix: one_key,
+                                        reveal_plaintext: reveal,
+                                    }],
+                                    &[],
+                                )
+                                .expect("validated scalar sampler")
+                                .remove(0)
+                                .vector
+                        }
+                    })?
+                } else {
+                    parallel_zip(
+                        (
+                            public_keys[0].matrices.clone(),
+                            public_keys[output].matrices.clone(),
+                            plaintexts[output - 1].clone(),
+                        ),
+                        {
+                            let sampler = self.scalar.clone();
+                            let secret = secret.clone();
+                            let one_reveal = public_keys[0].reveal_plaintext;
+                            let reveal = public_keys[output].reveal_plaintext;
+                            move |_, (one_key, key, plaintext)| {
+                                sampler
+                                    .sample(
+                                        secret.clone(),
+                                        &[
+                                            BggPublicKeyWire {
+                                                matrix: one_key,
+                                                reveal_plaintext: one_reveal,
+                                            },
+                                            BggPublicKeyWire {
+                                                matrix: key,
+                                                reveal_plaintext: reveal,
+                                            },
+                                        ],
+                                        &[plaintext],
+                                    )
+                                    .expect("validated scalar sampler")
+                                    .remove(1)
+                                    .vector
+                            }
+                        },
+                    )?
+                };
+                Ok(NaiveBggEncodingVecWire {
+                    vectors,
+                    pubkeys: public_keys[output].matrices.clone(),
+                    pubkey_reveal_plaintext: public_keys[output].reveal_plaintext,
+                    plaintexts: public_keys[output].reveal_plaintext.then(|| {
+                        if output == 0 {
+                            public_keys[0]
+                                .matrices
+                                .clone()
+                                .parallel_map({
+                                    let ring = self.scalar.layout.ring();
+                                    move |_, _| ring.identity(1)
+                                })
+                                .expect("family")
+                        } else {
+                            plaintexts[output - 1].clone()
+                        }
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>, BggSampleError>>()?;
+        Ok(outputs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,11 +537,44 @@ mod tests {
     use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{PolyParams, dcrt::params::DCRTPolyParams},
+        poly::{
+            Poly, PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+        sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
     use mxx_runtime::RuntimeValue;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
+
+    fn concrete_layout(parameters: &DCRTPolyParams, secret_dimension: usize) -> BggSamplerLayout {
+        BggSamplerLayout {
+            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
+            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            secret_dimension,
+            digit_count: parameters.modulus_digits(),
+            gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
+        }
+    }
+    fn scalar(parameters: &DCRTPolyParams, rotation: usize) -> DCRTPolyMatrix {
+        DCRTPolyMatrix::from_poly_vec(
+            parameters,
+            vec![vec![DCRTPoly::const_rotate_poly(parameters, rotation)]],
+        )
+    }
+    fn secret(parameters: &DCRTPolyParams, dimension: usize) -> DCRTPolyMatrix {
+        DCRTPolyMatrix::from_poly_vec_row(
+            parameters,
+            (0..dimension)
+                .map(|index| {
+                    DCRTPoly::const_rotate_poly(
+                        parameters,
+                        index % parameters.ring_dimension() as usize,
+                    )
+                })
+                .collect(),
+        )
+    }
 
     #[test]
     fn naive_encoding_multiplication_elaborates_all_indexed_families() {
@@ -556,5 +765,96 @@ mod tests {
         assert_eq!(matrix_output(&result, "vector"), &vector.mul_decompose(&target));
         assert_eq!(matrix_output(&result, "public"), &public.mul_decompose(&target));
         assert!(output.plaintexts.is_none());
+    }
+    #[test]
+    fn naive_sampler_runtime_preserves_tags_and_encoding_formulas() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let layout = concrete_layout(&parameters, 2);
+        let key = [47u8; 32];
+        let tag = b"naive-bgg-ir";
+        let ring = layout.ring();
+        let public_keys =
+            NaiveBggPublicKeyVecSampler { layout: layout.clone(), slot_count: 2.into() }
+                .sample(ring.bytes_input("key", key.len()), tag, &[true])
+                .unwrap();
+        let plaintexts = Family::pack(
+            (0..2).map(|slot| ring.input(format!("plaintext-{slot}"), (1, 1))).collect(),
+        )
+        .unwrap();
+        let encodings = NaiveBggEncodingVecSampler {
+            scalar: BggEncodingSampler { layout: layout.clone(), gaussian_sigma: None },
+        }
+        .sample(ring.input("secret", (1, layout.secret_dimension)), &public_keys, &[plaintexts])
+        .unwrap();
+        let mut context = DslContext::new("naive-bgg-sampler-runtime");
+        for output in 0..public_keys.len() {
+            for slot in 0..2 {
+                context = context
+                    .output(
+                        format!("public-{output}-{slot}"),
+                        public_keys[output].matrices.get_static(slot),
+                    )
+                    .unwrap()
+                    .output(
+                        format!("vector-{output}-{slot}"),
+                        encodings[output].vectors.get_static(slot),
+                    )
+                    .unwrap();
+            }
+        }
+        let graph = context.build().unwrap();
+        let secret_value = secret(&parameters, layout.secret_dimension);
+        let plaintext_values = [scalar(&parameters, 2), scalar(&parameters, 5)];
+        let result = execute_graph(
+            graph,
+            parameters.clone(),
+            BTreeMap::from([
+                ("key".to_owned(), RuntimeValue::Bytes(key.to_vec())),
+                ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+                ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
+                ("plaintext-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
+            ]),
+        );
+        let hash_sampler = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new();
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
+        for output in 0..public_keys.len() {
+            for slot in 0..2 {
+                let mut slot_tag = tag.to_vec();
+                slot_tag.extend_from_slice(&(output as u64).to_le_bytes());
+                slot_tag.extend_from_slice(&(slot as u64).to_le_bytes());
+                let packed_count = if output == 0 { 1 } else { 2 };
+                let packed = hash_sampler.sample_hash(
+                    &parameters,
+                    key,
+                    &slot_tag,
+                    layout.secret_dimension,
+                    layout.public_key_columns() * packed_count,
+                    DistType::FinRingDist,
+                );
+                let expected_public = if output == 0 {
+                    packed
+                } else {
+                    packed
+                        .slice_columns(layout.public_key_columns(), 2 * layout.public_key_columns())
+                };
+                assert_eq!(
+                    matrix_output(&result, &format!("public-{output}-{slot}")),
+                    &expected_public
+                );
+                let plaintext = if output == 0 {
+                    DCRTPolyMatrix::identity(&parameters, 1, None)
+                } else {
+                    plaintext_values[slot].clone()
+                };
+                let expected_vector = secret_value.clone() * expected_public -
+                    plaintext.tensor(&(secret_value.clone() * gadget.clone()));
+                assert_eq!(
+                    matrix_output(&result, &format!("vector-{output}-{slot}")),
+                    &expected_vector
+                );
+            }
+        }
+        assert!(public_keys.iter().all(|key| key.reveal_plaintext));
+        assert!(encodings.iter().all(|encoding| encoding.plaintexts.is_some()));
     }
 }

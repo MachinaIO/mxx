@@ -22,7 +22,7 @@ The repository is a virtual Cargo workspace with no root facade crate:
 | `mxx-bench-estimator` | Binding-sensitive measured graph-cost composition, critical paths, parallel waves, and memory peaks. |
 | `mxx-primitives` | Polynomial and matrix representations, samplers, analytical sampling bounds, OpenFHE integration, and all native CUDA kernels and wrappers. |
 | `mxx-gadgets` | BGG-independent circuits and circuit gadgets. |
-| `mxx-bgg` | Declarative BGG+ public keys, encodings, samplers, polynomial/naive families, circuit evaluation, masked decoding, slot transfer, artifacts, and noise refresh. |
+| `mxx-bgg` | Declarative BGG+ public keys, scalar, naive-vector, and tall encodings, component-local samplers, shared-helper public LUTs, circuit evaluation, masked decoding, slot operations, tall rotation encodings, and noise refresh. |
 | `mxx-func-enc` | Functional-encryption interfaces. AKY24 functional encryption is disabled pending a separate specification of its raw-mask semantics. |
 | `mxx-we` | Diamond witness encryption: declarative preprocessing, encryption and decryption graphs, symbolic noise simulation, parameter search, cost estimation, and CPU/GPU runtime integration. |
 | `mxx-io` | Indistinguishability-obfuscation interfaces. AKY24 iO and Diamond iO are disabled pending separate application cutovers. |

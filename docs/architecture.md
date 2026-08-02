@@ -6,7 +6,8 @@ Consumers depend directly on the crate that owns the abstraction they use.
 Detailed guides are available for the [typed DSL](dsl.md),
 [core IR](ir-core.md), [symbolic IR](ir-symbolic.md),
 [noise simulator](noise-simulator.md), and
-[runtime](runtime.md).
+[runtime](runtime.md). The active Diamond witness-encryption application is
+described in [diamond-we.md](diamond-we.md).
 
 ## Dependency layers
 
@@ -23,8 +24,9 @@ mxx-bgg              -> mxx-dsl, mxx-gadgets, mxx-ir-core
 mxx-func-enc/we/io   -> lower layers, never one another
 ```
 
-Application crates currently expose interfaces only. Their protocol graphs
-will be implemented separately with the declarative DSL.
+`mxx-we` contains the active Diamond witness-encryption protocol graphs.
+Functional encryption and indistinguishability obfuscation remain disabled
+until their separate declarative-DSL migrations.
 
 ## Crate responsibilities
 
@@ -138,6 +140,10 @@ must not be replaced by unbounded host parallelism.
 `crates/gadgets/` owns BGG-independent `PolyCircuit` structure and reusable
 circuit gadgets. `circuit_gadgets` contains arithmetic, convolution, FHE,
 Ring-GSW, PRG, NTT, decoder templates, and noise-refresh circuit templates.
+The Diamond input-injection gadget builds the initial `p` vector and transition
+preprocessing shared by Diamond WE and Diamond iO. It returns the final
+trapdoors for application-specific projections but does not construct BGG+
+encoding preimages.
 
 ### `mxx-bgg`
 
@@ -157,6 +163,18 @@ slot providers separately when a circuit uses either or both gate families.
 The WEE25 commitment-backed lookup evaluator is deliberately outside the
 current implementation. Decoder and noise-refresh circuit templates remain in
 `mxx-gadgets` because they are fundamentally `PolyCircuit` components.
+
+### `mxx-we`
+
+`crates/we/` owns Diamond witness encryption. Its preprocessing, encryption,
+and decryption computations are declarative DSL graphs over `mxx-bgg`; runtime
+execution is provided for CPU and GPU backends without a separate protocol
+implementation. Public preprocessing values are passed through runtime
+sessions and artifact manifests rather than a protocol-specific disk feature.
+
+The crate also owns Diamond-specific symbolic noise simulation, automatic
+ring-dimension and modulus search, and graph cost estimation. See
+`docs/diamond-we.md` for the protocol graph and validation details.
 
 ## Parallelism
 

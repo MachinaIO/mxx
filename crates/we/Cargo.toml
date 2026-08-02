@@ -4,8 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Witness encryption constructions for mxx"
-# Diamond WE is disabled pending a separate application cutover to the current IR APIs.
-autotests = false
 
 [features]
 default = []
@@ -15,22 +13,19 @@ gpu = ["mxx-primitives/gpu", "mxx-gadgets/gpu", "mxx-runtime/gpu"]
 mxx-primitives.workspace = true
 mxx-gadgets.workspace = true
 mxx-bgg.workspace = true
+mxx-bench-estimator.workspace = true
+mxx-dsl.workspace = true
 mxx-ir-core.workspace = true
+mxx-ir-symbolic.workspace = true
+mxx-noise-simulator.workspace = true
 mxx-runtime.workspace = true
 bigdecimal.workspace = true
-digest.workspace = true
-keccak-asm.workspace = true
 num-bigint.workspace = true
-num-traits.workspace = true
 rand.workspace = true
-rayon.workspace = true
-serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+keccak-asm.workspace = true
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
 mxx-gadgets.workspace = true
-tokio.workspace = true
-serial_test.workspace = true
-tracing-subscriber.workspace = true

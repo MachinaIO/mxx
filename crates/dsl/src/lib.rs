@@ -899,12 +899,58 @@ pub struct Bool {
 }
 
 impl Int {
+    pub fn constant(value: impl Into<num_bigint::BigInt>) -> Self {
+        let node = NodeHandle::new(
+            NodeKind::ConstantInt(value.into()),
+            Vec::new(),
+            vec![WireType::ConstantInt],
+        );
+        Self { value: node.output(0).expect("constant integer"), pending: Pending::default() }
+    }
+
     pub fn value_handle(&self) -> &ValueHandle {
         &self.value
     }
 
     pub fn pending_assumptions(&self) -> bool {
         self.pending.0.is_some()
+    }
+
+    pub fn add(self, rhs: Self) -> Self {
+        let pending = Pending::merge([self.pending, rhs.pending]);
+        let node = NodeHandle::new(
+            NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add),
+            vec![self.value, rhs.value],
+            vec![WireType::Int],
+        );
+        Self { value: node.output(0).expect("integer sum"), pending }
+    }
+
+    pub fn equal(self, rhs: Self) -> Bool {
+        self.compare(rhs, mxx_ir_core::node::IntCompareOp::Equal)
+    }
+
+    pub fn less_equal(self, rhs: Self) -> Bool {
+        self.compare(rhs, mxx_ir_core::node::IntCompareOp::LessEqual)
+    }
+
+    pub fn bit(self, position: impl Into<IntExpr>) -> Bool {
+        let node = NodeHandle::new(
+            NodeKind::BitExtract { bit: position.into() },
+            vec![self.value],
+            vec![WireType::Bool],
+        );
+        Bool { value: node.output(0).expect("integer bit"), pending: self.pending }
+    }
+
+    fn compare(self, rhs: Self, operation: mxx_ir_core::node::IntCompareOp) -> Bool {
+        let pending = Pending::merge([self.pending, rhs.pending]);
+        let node = NodeHandle::new(
+            NodeKind::IntCompare(operation),
+            vec![self.value, rhs.value],
+            vec![WireType::Bool],
+        );
+        Bool { value: node.output(0).expect("integer comparison"), pending }
     }
 
     pub fn select(self, branches: Vec<Mat>) -> Result<Mat, DslError> {
@@ -927,6 +973,13 @@ impl Int {
             vec![WireType::Matrix(output_type.clone())],
         );
         Ok(Mat { value: node.output(0).expect("select output"), matrix_type: output_type, pending })
+    }
+}
+
+impl Bool {
+    pub fn to_int(self) -> Int {
+        let node = NodeHandle::new(NodeKind::BoolToInt, vec![self.value], vec![WireType::Int]);
+        Int { value: node.output(0).expect("boolean integer"), pending: self.pending }
     }
 }
 
@@ -1882,6 +1935,16 @@ impl DslContext {
 
     pub fn output(mut self, name: impl Into<String>, mat: Mat) -> Result<Self, DslError> {
         self.insert_output(name.into(), mat, None)?;
+        Ok(self)
+    }
+
+    pub fn bool_output(mut self, name: impl Into<String>, value: Bool) -> Result<Self, DslError> {
+        self.insert_pending_output(name.into(), value.value, value.pending, None)?;
+        Ok(self)
+    }
+
+    pub fn int_output(mut self, name: impl Into<String>, value: Int) -> Result<Self, DslError> {
+        self.insert_pending_output(name.into(), value.value, value.pending, None)?;
         Ok(self)
     }
 

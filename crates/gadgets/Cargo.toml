@@ -9,6 +9,7 @@ default = []
 gpu = ["mxx-primitives/gpu", "mxx-runtime/gpu"]
 
 [dependencies]
+mxx-dsl.workspace = true
 mxx-ir-core.workspace = true
 mxx-primitives.workspace = true
 dashmap.workspace = true
@@ -27,7 +28,6 @@ digest.workspace = true
 keccak-asm.workspace = true
 
 [dev-dependencies]
-mxx-dsl.workspace = true
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
 mxx-runtime.workspace = true
 serial_test.workspace = true

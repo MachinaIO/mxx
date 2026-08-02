@@ -6,7 +6,7 @@ The repository includes:
 
 - [BGG+ encodings](https://eprint.iacr.org/2014/356.pdf) as declarative DSL programs in `crates/bgg/`.
 - Evaluation and decryption of [GSW-FHE](https://eprint.iacr.org/2013/340.pdf) over BGG+ encodings, following [this construction](https://eprint.iacr.org/2015/029.pdf), in `crates/gadgets/src/circuit_gadgets/fhe/`.
-- Application interfaces for witness encryption and indistinguishability obfuscation. Diamond WE and Diamond iO implementations are currently absent; the retained [AKY24 iO](https://eprint.iacr.org/2024/1720.pdf) source is excluded from the crate root pending its DSL cutover.
+- [Diamond witness encryption](https://eprint.iacr.org/2025/375) as declarative encryption and decryption graphs, with symbolic noise simulation, automatic parameter search, and CPU/GPU execution, in `crates/we/`. Indistinguishability-obfuscation implementations remain disabled pending their DSL cutover.
 
 ## Workspace layout
 
@@ -24,7 +24,7 @@ The repository is a virtual Cargo workspace with no root facade crate:
 | `mxx-gadgets` | BGG-independent circuits and circuit gadgets. |
 | `mxx-bgg` | Declarative BGG+ public keys, encodings, samplers, polynomial/naive families, circuit evaluation, masked decoding, slot transfer, artifacts, and noise refresh. |
 | `mxx-func-enc` | Functional-encryption interfaces. AKY24 functional encryption is disabled pending a separate specification of its raw-mask semantics. |
-| `mxx-we` | Witness-encryption interfaces. Diamond WE is disabled pending a separate application cutover. |
+| `mxx-we` | Diamond witness encryption: declarative preprocessing, encryption and decryption graphs, symbolic noise simulation, parameter search, cost estimation, and CPU/GPU runtime integration. |
 | `mxx-io` | Indistinguishability-obfuscation interfaces. AKY24 iO and Diamond iO are disabled pending separate application cutovers. |
 
 The principal dependency directions are shown with consumers on the left:

@@ -110,6 +110,15 @@ struct Evaluator<'a> {
 }
 
 pub fn simulate(graph: &ElaboratedGraph) -> Result<NoiseReport, SimulationError> {
+    simulate_with_selection_values(graph, &BTreeMap::new())
+}
+
+/// Simulates a graph while fixing selected runtime control wires to known values.
+/// Unspecified selection domains retain the usual max-over-branches behavior.
+pub fn simulate_with_selection_values(
+    graph: &ElaboratedGraph,
+    selection_values: &BTreeMap<ScopedWireRef, u64>,
+) -> Result<NoiseReport, SimulationError> {
     let mut evaluator = Evaluator {
         graph,
         contexts: BTreeMap::new(),
@@ -124,16 +133,21 @@ pub fn simulate(graph: &ElaboratedGraph) -> Result<NoiseReport, SimulationError>
             continue;
         }
         let estimate = match (symbolic.expression, symbolic.family.as_ref()) {
-            (Some(expression), _) => evaluator.eval(expression, &Assignment::new())?,
+            (Some(expression), _) => {
+                let assignment = evaluator.selection_assignment(expression, selection_values)?;
+                evaluator.eval(expression, &assignment)?
+            }
             (None, Some(SymbolicFamily::ExactMembers(members))) => {
                 let mut branches = Vec::with_capacity(members.len());
                 for member in members {
-                    branches.push(evaluator.eval(*member, &Assignment::new())?);
+                    let assignment = evaluator.selection_assignment(*member, selection_values)?;
+                    branches.push(evaluator.eval(*member, &assignment)?);
                 }
                 join_selection(branches)
             }
             (None, Some(SymbolicFamily::StructuralTemplate { template, .. })) => {
-                evaluator.eval(*template, &Assignment::new())?
+                let assignment = evaluator.selection_assignment(*template, selection_values)?;
+                evaluator.eval(*template, &assignment)?
             }
             (None, None) => continue,
         };
@@ -149,7 +163,8 @@ pub fn simulate(graph: &ElaboratedGraph) -> Result<NoiseReport, SimulationError>
         let expression = symbolic
             .expression
             .ok_or_else(|| SimulationError::MissingWire(target.input.clone()))?;
-        let estimate = evaluator.eval(expression, &Assignment::new())?;
+        let assignment = evaluator.selection_assignment(expression, selection_values)?;
+        let estimate = evaluator.eval(expression, &assignment)?;
         let noise_bound = estimate
             .noise
             .as_ref()
@@ -190,6 +205,70 @@ impl Estimate {
 }
 
 impl Evaluator<'_> {
+    fn selection_assignment(
+        &self,
+        expression: SymbolicExprId,
+        values: &BTreeMap<ScopedWireRef, u64>,
+    ) -> Result<Assignment, SimulationError> {
+        let mut domains = Vec::new();
+        self.collect_all_domains(expression, &mut domains, &mut BTreeSet::new())?;
+        domains.sort();
+        domains.dedup();
+        let mut assignment = Assignment::new();
+        for domain in domains {
+            let SelectionDomainRef::Local(local) = &domain else { continue };
+            let Some(value) = values.get(&local.index_wire).copied() else { continue };
+            if value >= local.count {
+                return Err(SimulationError::InvalidSelection(format!(
+                    "selection value {value} is outside domain size {}",
+                    local.count
+                )));
+            }
+            assignment.insert(domain, value);
+        }
+        Ok(assignment)
+    }
+
+    fn collect_all_domains(
+        &self,
+        expression: SymbolicExprId,
+        domains: &mut Vec<SelectionDomainRef>,
+        visited: &mut BTreeSet<SymbolicExprId>,
+    ) -> Result<(), SimulationError> {
+        if !visited.insert(expression) {
+            return Ok(());
+        }
+        match &self.record(expression)?.node {
+            SymbolicExprNode::Select { domain, branches } => {
+                domains.push(domain.clone());
+                for branch in branches {
+                    self.collect_all_domains(*branch, domains, visited)?;
+                }
+            }
+            SymbolicExprNode::Add(children) |
+            SymbolicExprNode::Mul(children) |
+            SymbolicExprNode::Concat { inputs: children, .. } |
+            SymbolicExprNode::CrtRecompose { inputs: children, .. } => {
+                for child in children {
+                    self.collect_all_domains(*child, domains, visited)?;
+                }
+            }
+            SymbolicExprNode::Scale { value, .. } |
+            SymbolicExprNode::Transpose(value) |
+            SymbolicExprNode::Slice { value, .. } |
+            SymbolicExprNode::Reshape { value, .. } |
+            SymbolicExprNode::ConstantCoefficient { value, .. } => {
+                self.collect_all_domains(*value, domains, visited)?;
+            }
+            SymbolicExprNode::Tensor { left, right } => {
+                self.collect_all_domains(*left, domains, visited)?;
+                self.collect_all_domains(*right, domains, visited)?;
+            }
+            SymbolicExprNode::Zero | SymbolicExprNode::Atom(_) => {}
+        }
+        Ok(())
+    }
+
     fn context(&mut self, ring_dimension: usize) -> Arc<SimulatorContext> {
         self.contexts
             .entry(ring_dimension)
@@ -1293,6 +1372,22 @@ mod tests {
         assert_eq!(
             report.outputs["selected"].noise.as_ref().expect("bounded output").bound,
             BigDecimal::from(195u64) / BigDecimal::from(10u64),
+        );
+        let output = elaborated.outputs.get("selected").expect("selected output");
+        let expression = elaborated.wire(output).and_then(|wire| wire.expression).unwrap();
+        let SymbolicExprNode::Select { domain: SelectionDomainRef::Local(domain), .. } =
+            &elaborated.expressions.get(expression).unwrap().node
+        else {
+            panic!("selected output must retain its local domain")
+        };
+        let fixed = simulate_with_selection_values(
+            &elaborated,
+            &BTreeMap::from([(domain.index_wire.clone(), 0)]),
+        )
+        .expect("fixed selection simulation");
+        assert_eq!(
+            fixed.outputs["selected"].noise.as_ref().expect("bounded output").bound,
+            BigDecimal::from(13u64),
         );
     }
 

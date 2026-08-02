@@ -9,6 +9,7 @@
 pub mod circuit;
 pub mod circuit_gadgets;
 pub mod decoder;
+pub mod input_injector;
 pub mod noise_refresh;
 pub mod utils;
 

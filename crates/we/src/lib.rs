@@ -1,6 +1,6 @@
-// Diamond WE is disabled pending a separate application cutover to the
-// declarative DSL and current IR/runtime APIs.
-// pub mod diamond_we;
+//! Witness-encryption applications built from the declarative graph DSL.
+
+pub mod diamond;
 
 use mxx_gadgets::circuit::PolyCircuit;
 use mxx_primitives::poly::Poly;
@@ -11,13 +11,18 @@ pub trait WitnessEnc<P: Poly> {
     type Inst;
     type Wtns;
     type Ciphertext;
+    type Error;
 
     fn enc(
-        &self,
+        &mut self,
         msg: &Self::Msg,
         circuit: PolyCircuit<P>,
         instance: &Self::Inst,
-    ) -> Self::Ciphertext;
+    ) -> Result<Self::Ciphertext, Self::Error>;
 
-    fn dec(&self, ct: &Self::Ciphertext, witness: &Self::Wtns) -> Self::Msg;
+    fn dec(
+        &mut self,
+        ct: &Self::Ciphertext,
+        witness: &Self::Wtns,
+    ) -> Result<Self::Msg, Self::Error>;
 }

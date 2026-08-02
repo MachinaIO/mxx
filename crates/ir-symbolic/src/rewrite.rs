@@ -60,11 +60,21 @@ impl Rewriter<'_> {
                         .into_iter()
                         .map(|child| self.rewrite(child))
                         .collect::<Result<Vec<_>, _>>()?;
-                    self.arena.add(record.matrix_type, children)?
+                    self.rewrite_sum(record.matrix_type, children)?
                 }
                 SymbolicExprNode::Scale { coefficient, value } => {
                     let value = self.rewrite(value)?;
-                    self.arena.scale(coefficient, value)?
+                    if let SymbolicExprNode::Select { domain, branches } =
+                        self.arena.get(value).expect("expression").node.clone()
+                    {
+                        let branches = branches
+                            .into_iter()
+                            .map(|branch| self.arena.scale(coefficient.clone(), branch))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        self.arena.select(record.matrix_type, domain, branches)?
+                    } else {
+                        self.arena.scale(coefficient, value)?
+                    }
                 }
                 SymbolicExprNode::Mul(children) => {
                     let children = children
@@ -149,7 +159,7 @@ impl Rewriter<'_> {
             };
         let mut forced_distribution = None;
         loop {
-            if let Some((position, replacement)) = self.preimage_pair(&children) {
+            if let Some((position, replacement)) = self.rewrite_adjacent_pair(&children)? {
                 let replacement = self.rewrite(replacement)?;
                 children.splice(position..position + 2, [replacement]);
                 forced_distribution = Some(position);
@@ -191,6 +201,30 @@ impl Rewriter<'_> {
                 };
                 return self.rewrite(result);
             }
+            if let Some((position, domain, branches)) =
+                children.iter().enumerate().find_map(|(position, child)| {
+                    let SymbolicExprNode::Select { domain, branches } =
+                        self.arena.get(*child)?.node.clone()
+                    else {
+                        return None;
+                    };
+                    Some((position, domain, branches))
+                })
+            {
+                let mut expanded = Vec::with_capacity(branches.len());
+                for branch in branches {
+                    let mut product = children.clone();
+                    product[position] = branch;
+                    let branch_type = product_type(self.arena, &product)?;
+                    expanded.push(self.rewrite_product(branch_type, product)?);
+                }
+                let result = self.arena.select(matrix_type.clone(), domain, expanded)?;
+                return Ok(if let Some(coefficient) = coefficient {
+                    self.arena.scale(coefficient, result)?
+                } else {
+                    result
+                });
+            }
             let result = self.arena.multiply(matrix_type, children, self.atoms)?;
             return Ok(if let Some(coefficient) = coefficient {
                 self.arena.scale(coefficient, result)?
@@ -200,12 +234,96 @@ impl Rewriter<'_> {
         }
     }
 
-    fn preimage_pair(&self, children: &[SymbolicExprId]) -> Option<(usize, SymbolicExprId)> {
-        children.windows(2).enumerate().find_map(|(position, pair)| {
-            let left = atom_id(self.arena, pair[0])?;
-            let right = atom_id(self.arena, pair[1])?;
-            self.relations.get(&(left, right)).copied().map(|product| (position, product))
-        })
+    fn rewrite_sum(
+        &mut self,
+        matrix_type: mxx_ir_core::types::ConcreteMatrixType,
+        children: Vec<SymbolicExprId>,
+    ) -> Result<SymbolicExprId, RewriteError> {
+        let Some((domain, branch_count)) = children.iter().find_map(|child| {
+            let SymbolicExprNode::Select { domain, branches } = &self.arena.get(*child)?.node
+            else {
+                return None;
+            };
+            Some((domain.clone(), branches.len()))
+        }) else {
+            return Ok(self.arena.add(matrix_type, children)?);
+        };
+        let mut sums = Vec::with_capacity(branch_count);
+        for branch_index in 0..branch_count {
+            let mut terms = Vec::with_capacity(children.len());
+            for child in &children {
+                match &self.arena.get(*child).expect("expression").node {
+                    SymbolicExprNode::Select { domain: child_domain, branches }
+                        if child_domain == &domain =>
+                    {
+                        terms.push(branches[branch_index]);
+                    }
+                    _ => terms.push(*child),
+                }
+            }
+            let sum = self.arena.add(matrix_type.clone(), terms)?;
+            sums.push(self.rewrite(sum)?);
+        }
+        Ok(self.arena.select(matrix_type, domain, sums)?)
+    }
+
+    fn rewrite_adjacent_pair(
+        &mut self,
+        children: &[SymbolicExprId],
+    ) -> Result<Option<(usize, SymbolicExprId)>, RewriteError> {
+        for (position, pair) in children.windows(2).enumerate() {
+            if let Some(product) = self.relation_product(pair[0], pair[1])? {
+                return Ok(Some((position, product)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Applies exact preimage relations without erasing a runtime selection.
+    ///
+    /// `B * select(K_i)` becomes `select(B * K_i)` when every selected
+    /// preimage has an exact relation for `B`. Likewise, `select(X_i) * K`
+    /// pushes the common right factor into each branch. Keeping the `Select`
+    /// node avoids enumerating combinations across independent loop levels.
+    fn relation_product(
+        &mut self,
+        left: SymbolicExprId,
+        right: SymbolicExprId,
+    ) -> Result<Option<SymbolicExprId>, RewriteError> {
+        if let (Some(left_atom), Some(right_atom)) =
+            (atom_id(self.arena, left), atom_id(self.arena, right))
+        {
+            return Ok(self.relations.get(&(left_atom, right_atom)).copied());
+        }
+        if let (Some(left_atom), SymbolicExprNode::Select { domain, branches }) =
+            (atom_id(self.arena, left), self.arena.get(right).expect("expression").node.clone())
+        {
+            let mut products = Vec::with_capacity(branches.len());
+            for branch in branches {
+                let Some(right_atom) = product_edge_atom(self.arena, branch, true) else {
+                    return Ok(None);
+                };
+                if !self.relations.contains_key(&(left_atom.clone(), right_atom)) {
+                    return Ok(None);
+                }
+                let branch_type = product_type(self.arena, &[left, branch])?;
+                products.push(self.rewrite_product(branch_type, vec![left, branch])?);
+            }
+            let matrix_type = product_type(self.arena, &[left, right])?;
+            return Ok(Some(self.arena.select(matrix_type, domain, products)?));
+        }
+        if let SymbolicExprNode::Select { domain, branches } =
+            self.arena.get(left).expect("expression").node.clone()
+        {
+            let matrix_type = product_type(self.arena, &[left, right])?;
+            let mut products = Vec::with_capacity(branches.len());
+            for branch in branches {
+                let branch_type = product_type(self.arena, &[branch, right])?;
+                products.push(self.rewrite_product(branch_type, vec![branch, right])?);
+            }
+            return Ok(Some(self.arena.select(matrix_type, domain, products)?));
+        }
+        Ok(None)
     }
 
     fn block_pair(
@@ -213,19 +331,31 @@ impl Rewriter<'_> {
         children: &[SymbolicExprId],
     ) -> Result<Option<(usize, SymbolicExprId)>, RewriteError> {
         for (position, pair) in children.windows(2).enumerate() {
-            let Some((left, right)) = aligned_blocks(self.arena, pair[0], pair[1]) else {
-                continue;
-            };
-            let mut terms = Vec::with_capacity(left.len());
-            for (left, right) in left.into_iter().zip(right) {
-                let ty = product_type(self.arena, &[left, right])?;
-                terms.push(self.rewrite_product(ty, vec![left, right])?);
+            if let Some((left, right)) = aligned_blocks(self.arena, pair[0], pair[1]) {
+                let mut terms = Vec::with_capacity(left.len());
+                for (left, right) in left.into_iter().zip(right) {
+                    let ty = product_type(self.arena, &[left, right])?;
+                    terms.push(self.rewrite_product(ty, vec![left, right])?);
+                }
+                let ty = self.arena.matrix_type(pair[0])?.clone();
+                let output_ty =
+                    mxx_ir_core::checks::multiplication_type(&ty, self.arena.matrix_type(pair[1])?)
+                        .map_err(|_| ExpressionError::TypeMismatch)?;
+                return Ok(Some((position, self.arena.add(output_ty, terms)?)));
             }
-            let ty = self.arena.matrix_type(pair[0])?.clone();
-            let output_ty =
-                mxx_ir_core::checks::multiplication_type(&ty, self.arena.matrix_type(pair[1])?)
-                    .map_err(|_| ExpressionError::TypeMismatch)?;
-            return Ok(Some((position, self.arena.add(output_ty, terms)?)));
+            if let Some((axis, left, right)) = aligned_concat_blocks(self.arena, pair[0], pair[1]) {
+                let mut terms = Vec::with_capacity(left.len());
+                for (left, right) in left.into_iter().zip(right) {
+                    let ty = product_type(self.arena, &[left, right])?;
+                    terms.push(self.rewrite_product(ty, vec![left, right])?);
+                }
+                let output_ty = mxx_ir_core::checks::multiplication_type(
+                    self.arena.matrix_type(pair[0])?,
+                    self.arena.matrix_type(pair[1])?,
+                )
+                .map_err(|_| ExpressionError::TypeMismatch)?;
+                return Ok(Some((position, self.arena.concat(output_ty, axis, terms)?)));
+            }
         }
         Ok(None)
     }
@@ -249,24 +379,48 @@ impl Rewriter<'_> {
         branch: SymbolicExprId,
     ) -> bool {
         if position > 0 {
-            let left = product_edge_atom(self.arena, children[position - 1], false);
-            let right = product_edge_atom(self.arena, branch, true);
-            if left.zip(right).is_some_and(|pair| self.relations.contains_key(&pair)) ||
-                aligned_blocks(self.arena, children[position - 1], branch).is_some()
+            let edge = product_edge_expression(self.arena, branch, true);
+            if self.has_relation_redex(children[position - 1], branch) ||
+                edge.is_some_and(|edge| {
+                    aligned_blocks(self.arena, children[position - 1], edge).is_some() ||
+                        aligned_concat_blocks(self.arena, children[position - 1], edge).is_some()
+                })
             {
                 return true;
             }
         }
         if position + 1 < children.len() {
-            let left = product_edge_atom(self.arena, branch, false);
-            let right = product_edge_atom(self.arena, children[position + 1], true);
-            if left.zip(right).is_some_and(|pair| self.relations.contains_key(&pair)) ||
-                aligned_blocks(self.arena, branch, children[position + 1]).is_some()
+            let edge = product_edge_expression(self.arena, branch, false);
+            if self.has_relation_redex(branch, children[position + 1]) ||
+                edge.is_some_and(|edge| {
+                    aligned_blocks(self.arena, edge, children[position + 1]).is_some() ||
+                        aligned_concat_blocks(self.arena, edge, children[position + 1]).is_some()
+                })
             {
                 return true;
             }
         }
         false
+    }
+
+    fn has_relation_redex(&self, left: SymbolicExprId, right: SymbolicExprId) -> bool {
+        let Some(left_atom) = product_edge_atom(self.arena, left, false) else {
+            return false;
+        };
+        if let Some(right_atom) = product_edge_atom(self.arena, right, true) {
+            return self.relations.contains_key(&(left_atom, right_atom));
+        }
+        let Some(SymbolicExprNode::Select { branches, .. }) =
+            self.arena.get(right).map(|record| &record.node)
+        else {
+            return false;
+        };
+        !branches.is_empty() &&
+            branches.iter().all(|branch| {
+                product_edge_atom(self.arena, *branch, true).is_some_and(|right_atom| {
+                    self.relations.contains_key(&(left_atom.clone(), right_atom))
+                })
+            })
     }
 }
 
@@ -291,6 +445,20 @@ fn product_edge_atom(
             first,
         ),
         _ => None,
+    }
+}
+
+fn product_edge_expression(
+    arena: &SymbolicExprArena,
+    value: SymbolicExprId,
+    first: bool,
+) -> Option<SymbolicExprId> {
+    match &arena.get(value)?.node {
+        SymbolicExprNode::Scale { value, .. } => product_edge_expression(arena, *value, first),
+        SymbolicExprNode::Mul(children) => {
+            Some(*if first { children.first()? } else { children.last()? })
+        }
+        _ => Some(value),
     }
 }
 
@@ -325,6 +493,40 @@ fn aligned_blocks(
     Some((left.clone(), right.clone()))
 }
 
+fn aligned_concat_blocks(
+    arena: &SymbolicExprArena,
+    left: SymbolicExprId,
+    right: SymbolicExprId,
+) -> Option<(ConcatAxis, Vec<SymbolicExprId>, Vec<SymbolicExprId>)> {
+    let SymbolicExprNode::Concat { axis: left_axis, inputs: left } = &arena.get(left)?.node else {
+        return None;
+    };
+    let SymbolicExprNode::Concat { axis: right_axis, inputs: right } = &arena.get(right)?.node
+    else {
+        return None;
+    };
+    let output_axis = match (left_axis, right_axis) {
+        (ConcatAxis::Columns, ConcatAxis::Diagonal) => ConcatAxis::Columns,
+        (ConcatAxis::Diagonal, ConcatAxis::Rows) => ConcatAxis::Rows,
+        (ConcatAxis::Diagonal, ConcatAxis::Diagonal) => ConcatAxis::Diagonal,
+        _ => return None,
+    };
+    if left.len() != right.len() || left.is_empty() {
+        return None;
+    }
+    for (left, right) in left.iter().zip(right) {
+        if mxx_ir_core::checks::multiplication_type(
+            arena.matrix_type(*left).ok()?,
+            arena.matrix_type(*right).ok()?,
+        )
+        .is_err()
+        {
+            return None;
+        }
+    }
+    Some((output_axis, left.clone(), right.clone()))
+}
+
 fn product_type(
     arena: &SymbolicExprArena,
     values: &[SymbolicExprId],
@@ -340,7 +542,7 @@ fn product_type(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atom::{Atom, AtomClass, AtomKind, SourceKind};
+    use crate::atom::{Atom, AtomClass, AtomKind, SelectionDomain, SelectionDomainRef, SourceKind};
     use mxx_ir_core::{
         FrozenGraphScopeId, ScopedWireRef,
         node::ConstantMatrix,
@@ -674,5 +876,81 @@ mod tests {
                     if children.len() == 2 && children[0] == left && children[1] == error_expr
             )
         }));
+    }
+
+    #[test]
+    fn selected_preimages_rewrite_branchwise_without_erasing_the_domain() {
+        let b = id(70);
+        let k0 = id(71);
+        let k1 = id(72);
+        let p0 = id(73);
+        let p1 = id(74);
+        let mut atoms = AtomTable::default();
+        for atom in [&b, &k0, &k1, &p0, &p1] {
+            insert(&mut atoms, atom.clone(), AtomKind::Bounded);
+        }
+        let mut arena = SymbolicExprArena::default();
+        let b_expr = arena.atom(b.clone(), &atoms).unwrap();
+        let k0_expr = arena.atom(k0.clone(), &atoms).unwrap();
+        let k1_expr = arena.atom(k1.clone(), &atoms).unwrap();
+        let p0_expr = arena.atom(p0, &atoms).unwrap();
+        let p1_expr = arena.atom(p1, &atoms).unwrap();
+        let domain = SelectionDomainRef::Local(SelectionDomain {
+            index_wire: match id(75) {
+                AtomId::Local(reference) => reference,
+                _ => unreachable!(),
+            },
+            instantiation_path: Vec::new(),
+            count: 2,
+            modulus: BigInt::from(257),
+            ring_dimension: 8,
+        });
+        let selected = arena.select(ty(), domain.clone(), vec![k0_expr, k1_expr]).unwrap();
+        let root = arena.multiply(ty(), [b_expr, selected], &atoms).unwrap();
+        let rewritten = rewrite_expression(
+            root,
+            &mut arena,
+            &atoms,
+            &[
+                PreimageRelation { left_matrix: b.clone(), preimage: k0, product: p0_expr },
+                PreimageRelation { left_matrix: b, preimage: k1, product: p1_expr },
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            &arena.get(rewritten).unwrap().node,
+            SymbolicExprNode::Select { domain: actual, branches }
+                if actual == &domain && branches == &vec![p0_expr, p1_expr]
+        ));
+    }
+
+    #[test]
+    fn diagonal_block_products_reduce_to_the_two_aligned_terms() {
+        let ids = (80..86).map(id).collect::<Vec<_>>();
+        let mut atoms = AtomTable::default();
+        for atom in &ids {
+            insert(&mut atoms, atom.clone(), AtomKind::Bounded);
+        }
+        let mut arena = SymbolicExprArena::default();
+        let expressions =
+            ids.iter().map(|atom| arena.atom(atom.clone(), &atoms).unwrap()).collect::<Vec<_>>();
+        let row = ConcreteMatrixType { columns: 2, ..ty() };
+        let diagonal = ConcreteMatrixType { rows: 2, columns: 2, ..ty() };
+        let column = ConcreteMatrixType { rows: 2, ..ty() };
+        let left =
+            arena.concat(row, ConcatAxis::Columns, vec![expressions[0], expressions[1]]).unwrap();
+        let middle = arena
+            .concat(diagonal, ConcatAxis::Diagonal, vec![expressions[2], expressions[3]])
+            .unwrap();
+        let right =
+            arena.concat(column, ConcatAxis::Rows, vec![expressions[4], expressions[5]]).unwrap();
+        let root = arena.multiply(ty(), [left, middle, right], &atoms).unwrap();
+        let rewritten = rewrite_expression(root, &mut arena, &atoms, &[]).unwrap();
+        let SymbolicExprNode::Add(terms) = &arena.get(rewritten).unwrap().node else {
+            panic!("aligned diagonal product must be an additive expression")
+        };
+        let products = terms.iter().map(|term| factors(&arena, *term)).collect::<Vec<_>>();
+        assert!(products.contains(&vec![ids[0].clone(), ids[2].clone(), ids[4].clone()]));
+        assert!(products.contains(&vec![ids[1].clone(), ids[3].clone(), ids[5].clone()]));
     }
 }

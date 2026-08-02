@@ -19,6 +19,7 @@ pub use poly_matrix_norm::PolyMatrixNorm;
 pub use poly_norm::PolyNorm;
 pub use simulate::{
     DecodeNoiseReport, MatrixNoiseReport, NoiseReport, SimulationError, WireNoiseReport, simulate,
+    simulate_with_selection_values,
 };
 
 #[derive(Debug, Clone)]

@@ -400,9 +400,19 @@ impl State<'_> {
                     self.expressions.zero(ty)?
                 } else {
                     let id = local(0);
+                    let kind = if matches!(
+                        value,
+                        mxx_ir_core::node::ConstantMatrix::Gadget { small: false, .. }
+                    ) {
+                        // A full gadget row reaches the modulus scale and is
+                        // part of the encoded signal, not a bounded error.
+                        AtomKind::Large
+                    } else {
+                        AtomKind::Bounded
+                    };
                     self.insert_source_atom(
                         id.clone(),
-                        AtomKind::Bounded,
+                        kind,
                         ty,
                         SourceKind::ConstantMatrix { value: value.clone() },
                     )?;

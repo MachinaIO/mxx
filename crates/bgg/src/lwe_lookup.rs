@@ -1207,14 +1207,19 @@ mod tests {
             .wire(&consumer_symbolic.outputs["vector"])
             .and_then(|wire| wire.expression)
             .expect("lookup output expression");
-        assert!(matches!(
-            consumer_symbolic
-                .expressions
-                .get(output_expression)
-                .expect("lookup output expression")
-                .node,
+        let mxx_ir_symbolic::SymbolicExprNode::Select { branches, .. } = &consumer_symbolic
+            .expressions
+            .get(output_expression)
+            .expect("lookup output expression")
+            .node
+        else {
+            panic!("lookup output must preserve its runtime selection")
+        };
+        assert_eq!(branches.len(), lookup.table.len());
+        assert!(branches.iter().all(|branch| matches!(
+            consumer_symbolic.expressions.get(*branch).expect("lookup branch expression").node,
             mxx_ir_symbolic::SymbolicExprNode::Add(_)
-        ));
+        )));
         let consumer = consumer
             .validate_with_manifests(
                 &ParamEnv::default(),

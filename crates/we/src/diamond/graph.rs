@@ -222,44 +222,39 @@ impl DiamondWeCompiler {
         let ring = self.config.ring();
         let state_columns = self.config.state_columns()?;
         let public_columns = self.config.public_key_columns()?;
-        let mut states = vec![ring.artifact_input(
+        let initial_state = ring.artifact_input(
             encryption.clone(),
             DiamondArtifactNames::INITIAL_STATE,
             (1, state_columns),
             ArtifactConfidentiality::Public,
-        )];
+        );
         let witness_digits = (0..self.config.input_count)
             .map(|digit| {
                 ring.input(format!("witness-digit-{digit}"), (1, 1)).extract_coefficient(0)
             })
             .collect::<Vec<_>>();
-        for level in 1..=self.config.input_count {
-            let first_new_state = 1 + (level - 1) * self.config.batch_bits;
-            let state_count = self.config.state_count_at_level(level)?;
-            let mut source_states = Vec::with_capacity(state_count);
-            let mut selected_transitions = Vec::with_capacity(state_count);
-            for state in 0..state_count {
-                let branches = (0..self.config.digit_base)
+        let transitions = (1..=self.config.input_count)
+            .map(|level| {
+                let state_count = self.config.state_count_at_level(level)?;
+                Ok((0..self.config.digit_base)
                     .map(|digit| {
-                        ring.artifact_input(
-                            encryption.clone(),
-                            DiamondArtifactNames::transition(level, digit, state),
-                            (state_columns, state_columns),
-                            ArtifactConfidentiality::Public,
-                        )
+                        (0..state_count)
+                            .map(|state| {
+                                ring.artifact_input(
+                                    encryption.clone(),
+                                    DiamondArtifactNames::transition(level, digit, state),
+                                    (state_columns, state_columns),
+                                    ArtifactConfidentiality::Public,
+                                )
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .collect();
-                let transition = witness_digits[level - 1].clone().select(branches)?;
-                let source = if state >= first_new_state { 0 } else { state };
-                source_states.push(states[source].clone());
-                selected_transitions.push(transition);
-            }
-            let next_states = Family::pack(source_states)?
-                .parallel_zip(Family::pack(selected_transitions)?, |_, state, transition| {
-                    state * transition
-                })?;
-            states = (0..state_count).map(|state| next_states.get_static(state)).collect();
-        }
+                    .collect::<Vec<_>>())
+            })
+            .collect::<Result<Vec<_>, DiamondCompileError>>()?;
+        let states = DiamondInputInjector::new(self.config.input_config())?
+            .evaluate(initial_state, &witness_digits, &transitions)?
+            .states;
 
         let public_key_compiler = self.public_key_compiler();
         let encoding_compiler = BggEncodingCompiler { public_key: public_key_compiler.clone() };

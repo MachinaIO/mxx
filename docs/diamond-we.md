@@ -33,10 +33,9 @@ transition matrix per witness digit, advances the encoded state, evaluates the
 same public circuit over BGG+ encodings, applies the one, witness, `k`, and
 decoder projections, and threshold-decodes the resulting polynomial. Artifact
 identity and manifest validation bind decryption to the corresponding
-encryption production without a protocol-specific disk format. The BGG hash
-key is also the production nonce, matching the protocol's deterministic
-sampling session; decryption verifies both that nonce and the encryption graph
-hash before consuming artifacts.
+encryption production. The BGG hash key is also the production nonce, matching
+the protocol's deterministic sampling session; decryption verifies both that
+nonce and the encryption graph hash before consuming artifacts.
 
 ## Circuit lowerings
 

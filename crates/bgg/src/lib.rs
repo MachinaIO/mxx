@@ -1,5 +1,6 @@
 //! BGG+ constructions expressed directly with the declarative graph DSL.
 
+pub mod attribute_encoding;
 pub mod circuit;
 pub mod encoding;
 pub mod lwe_lookup;
@@ -17,7 +18,14 @@ pub mod wee25_public_parameters;
 #[cfg(test)]
 mod test_utils;
 
-pub use circuit::{CircuitCompileError, NoPublicLookup, NoSlotOperations, PolyCircuitCompiler};
+pub use attribute_encoding::{
+    AttributeEncodingCompiler, AttributeEncodingWire, AttributeEvaluationError,
+    AttributeMatrixEvaluation,
+};
+pub use circuit::{
+    CircuitCompileError, NaiveEncodingSlotOperations, NaivePublicKeySlotOperations, NoPublicLookup,
+    NoSlotOperations, PolyCircuitCompiler,
+};
 pub use encoding::{
     BggEncodingCompiler, BggEncodingSampler, BggEncodingType, BggEncodingWire, BggSampleError,
     BggSamplerLayout, EncodingCompileError,
@@ -27,7 +35,9 @@ pub use lwe_lookup::{
     LweLookupCompiler, LweLookupEncodingLowering, LweLookupIdentity, LweLookupInvocation,
     LweLookupPreprocessingWires, LweLookupPublicKeyLowering, LweLookupTable,
     LweLookupTallEncodingLowering, NaiveLweLookupEncodingLowering, NaiveLweLookupInvocation,
-    NaiveLweLookupPublicKeyLowering,
+    NaiveLweLookupPreprocessingEntry, NaiveLweLookupPreprocessingLowering,
+    NaiveLweLookupPublicKeyLowering, bind_naive_lwe_lookup_invocations,
+    collect_lwe_lookup_identities, collect_lwe_lookup_identities_with_prefix,
 };
 pub use masked_decoder::{
     MASKED_DECODER_PREIMAGES, MaskedHighBitDecoderArtifacts, MaskedHighBitDecoderCompiler,

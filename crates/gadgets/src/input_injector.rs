@@ -1,6 +1,6 @@
 //! BGG-independent input-injection preprocessing shared by Diamond applications.
 
-use mxx_dsl::{DslError, Mat, Parallel, Ring, Trapdoor};
+use mxx_dsl::{DslError, Family, Int, Mat, Parallel, Ring, Trapdoor};
 use mxx_ir_core::{IntExpr, RealExpr, node::ConcatAxis};
 use num_bigint::BigInt;
 use thiserror::Error;
@@ -37,6 +37,8 @@ pub enum DiamondInputConfigError {
     InvalidGadgetBase,
     #[error("a Diamond input-injection layout calculation overflowed")]
     LayoutOverflow,
+    #[error("Diamond input-injection transition artifacts do not match the configured layout")]
+    InvalidTransitionLayout,
 }
 
 #[derive(Debug, Error)]
@@ -54,6 +56,15 @@ pub struct DiamondInputPreprocessing {
     pub transitions: Vec<Vec<Vec<Mat>>>,
     /// Trapdoors for the final state bases, returned for application-specific projections.
     pub final_trapdoors: Vec<Trapdoor>,
+}
+
+/// Online result of applying the input-selected transition matrices.
+///
+/// `states[0]` is the default `(s, k)` state.  The remaining entries are the
+/// bit-specific states in the same order returned by
+/// [`DiamondInputConfig::bit_state_index`].
+pub struct DiamondInputEvaluation {
+    pub states: Vec<Mat>,
 }
 
 #[derive(Clone)]
@@ -232,6 +243,63 @@ impl DiamondInputInjector {
             bases.pop().expect("Diamond input preprocessing always has a final level");
         Ok(DiamondInputPreprocessing { p, transitions, final_trapdoors })
     }
+
+    /// Applies the preprocessed transition matrices to one packed input.
+    ///
+    /// The transition layout is exactly the one returned by [`Self::preprocess`]:
+    /// `[level][digit][state]`.  Selection is represented by the DSL `Select`
+    /// node and all independent state transitions at a level are represented by
+    /// one IR parallel loop.
+    pub fn evaluate(
+        &self,
+        initial_state: Mat,
+        input_digits: &[Int],
+        transitions: &[Vec<Vec<Mat>>],
+    ) -> Result<DiamondInputEvaluation, DiamondInputPreprocessError> {
+        self.config.validate()?;
+        if input_digits.len() != self.config.input_count ||
+            transitions.len() != self.config.input_count
+        {
+            return Err(DiamondInputConfigError::InvalidTransitionLayout.into());
+        }
+
+        let mut states = vec![initial_state];
+        for level in 1..=self.config.input_count {
+            let state_count = self.config.state_count_at_level(level)?;
+            let level_transitions = &transitions[level - 1];
+            if level_transitions.len() != self.config.digit_base ||
+                level_transitions.iter().any(|branch| branch.len() != state_count)
+            {
+                return Err(DiamondInputConfigError::InvalidTransitionLayout.into());
+            }
+            let first_new_state = 1 + (level - 1) * self.config.batch_bits;
+            let source_states = Family::pack(
+                (0..state_count)
+                    .map(|state| {
+                        let source = if state >= first_new_state { 0 } else { state };
+                        states[source].clone()
+                    })
+                    .collect(),
+            )?;
+            let selected_transitions = Family::pack(
+                (0..state_count)
+                    .map(|state| {
+                        input_digits[level - 1].clone().select(
+                            (0..self.config.digit_base)
+                                .map(|digit| level_transitions[digit][state].clone())
+                                .collect(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            let next = source_states
+                .parallel_zip(selected_transitions, move |_, state, transition| {
+                    state * transition
+                })?;
+            states = (0..state_count).map(|state| next.get_static(state)).collect();
+        }
+        Ok(DiamondInputEvaluation { states })
+    }
 }
 
 fn ternary_secret(ring: &Ring) -> Mat {
@@ -302,5 +370,43 @@ mod tests {
         );
         let elaborated = built.elaborate(&ParamEnv::default()).unwrap();
         assert!(!elaborated.preimage_relations.is_empty());
+    }
+
+    #[test]
+    fn online_evaluation_selects_transitions_and_uses_parallel_state_updates() {
+        let injector = DiamondInputInjector::new(config()).unwrap();
+        let ring = injector.config.ring();
+        let preprocessing =
+            injector.preprocess(ring.input("message", (1, 1))).expect("preprocessing");
+        let digits = (0..injector.config.input_count)
+            .map(|digit| ring.input(format!("digit-{digit}"), (1, 1)).extract_coefficient(0))
+            .collect::<Vec<_>>();
+        let evaluation = injector
+            .evaluate(preprocessing.p, &digits, &preprocessing.transitions)
+            .expect("online evaluation");
+        let graph = DslContext::new("diamond-input-online")
+            .output("default-state", evaluation.states[0].clone())
+            .unwrap()
+            .output("last-state", evaluation.states.last().unwrap().clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let validated = graph.validate(&ParamEnv::default()).unwrap();
+        assert!(
+            validated
+                .source
+                .scopes()
+                .values()
+                .flat_map(|scope| scope.nodes())
+                .any(|node| matches!(node.kind(), NodeKind::ParallelLoop { .. }))
+        );
+        assert!(
+            validated
+                .source
+                .scopes()
+                .values()
+                .flat_map(|scope| scope.nodes())
+                .any(|node| matches!(node.kind(), NodeKind::Select { .. }))
+        );
     }
 }

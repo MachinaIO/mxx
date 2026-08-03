@@ -8,7 +8,10 @@ use crate::{
 use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Ring, Trapdoor, parallel_zip};
 use mxx_gadgets::{
     Poly, PolyElem,
-    circuit::{CircuitLoweringTypes, GateInstance, PolyCircuit, PublicLookupLowering},
+    circuit::{
+        ArithmeticCircuitLowering, CircuitLowerError, CircuitLoweringTypes, GateInstance,
+        PolyCircuit, PolyGateKind, PublicLookupLowering, SlotOperationLowering, lower_circuit,
+    },
 };
 use mxx_ir_core::{
     IntExpr,
@@ -20,6 +23,110 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
+
+struct LweLookupIdentityCollector {
+    identities: Vec<LweLookupIdentity>,
+}
+
+impl CircuitLoweringTypes for LweLookupIdentityCollector {
+    type Wire = ();
+    type Error = CircuitCompileError;
+}
+
+impl<P: Poly> ArithmeticCircuitLowering<P> for LweLookupIdentityCollector {
+    fn binary(
+        &mut self,
+        _operation: PolyGateKind,
+        _lhs: &Self::Wire,
+        _rhs: &Self::Wire,
+        _gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        Ok(())
+    }
+
+    fn small_scalar_mul(
+        &mut self,
+        _input: &Self::Wire,
+        _scalar: &[u32],
+        _gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        Ok(())
+    }
+
+    fn large_scalar_mul(
+        &mut self,
+        _input: &Self::Wire,
+        _scalar: &[num_bigint::BigUint],
+        _gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        Ok(())
+    }
+}
+
+impl<P: Poly> PublicLookupLowering<P> for LweLookupIdentityCollector {
+    fn public_lookup(
+        &mut self,
+        _circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        _input: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        self.identities.push(identity_for_gate(gate, lookup_id));
+        Ok(())
+    }
+}
+
+impl<P: Poly> SlotOperationLowering<P> for LweLookupIdentityCollector {
+    fn slot_transfer(
+        &mut self,
+        _input: &Self::Wire,
+        _source_slots: &[(u32, Option<u32>)],
+        _gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        Ok(())
+    }
+
+    fn slot_reduce(
+        &mut self,
+        _inputs: &[Self::Wire],
+        _slot_count: usize,
+        _gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        Ok(())
+    }
+}
+
+/// Enumerates every concrete public-lookup invocation after recursively
+/// expanding direct, summed, and repeated sub-circuit calls. The identities
+/// are exactly those consumed by the LWE lookup lowerings, including call
+/// paths and operation occurrences.
+pub fn collect_lwe_lookup_identities<P: Poly>(
+    circuit: &PolyCircuit<P>,
+) -> Result<Vec<LweLookupIdentity>, CircuitCompileError> {
+    collect_lwe_lookup_identities_with_prefix(circuit, &[])
+}
+
+pub fn collect_lwe_lookup_identities_with_prefix<P: Poly>(
+    circuit: &PolyCircuit<P>,
+    call_path_prefix: &[usize],
+) -> Result<Vec<LweLookupIdentity>, CircuitCompileError> {
+    let mut collector = LweLookupIdentityCollector { identities: Vec::new() };
+    lower_circuit(circuit, (), std::iter::repeat_n((), circuit.num_input()), &mut collector)
+        .map_err(|error| match error {
+            CircuitLowerError::Operation { source, .. } => source,
+            other => CircuitCompileError::Structure(other.to_string()),
+        })?;
+    Ok(collector
+        .identities
+        .into_iter()
+        .map(|mut identity| {
+            let mut call_path = call_path_prefix.to_vec();
+            call_path.extend(identity.call_path);
+            identity.call_path = call_path;
+            identity
+        })
+        .collect())
+}
 
 /// Stable structural identity of one public-lookup invocation.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -226,6 +333,36 @@ pub struct LweLookupArtifactWires {
     pub high_matrices: Family<Mat>,
 }
 
+#[derive(Clone)]
+pub struct NaiveLweLookupPreprocessingEntry {
+    pub compilers: Vec<LweLookupCompiler>,
+    pub wires: Vec<LweLookupPreprocessingWires>,
+}
+
+impl NaiveLweLookupPreprocessingEntry {
+    pub fn export(&self, mut context: DslContext) -> Result<DslContext, LweLookupCompileError> {
+        for (compiler, wires) in self.compilers.iter().zip(&self.wires) {
+            context = compiler.export_preprocessing(
+                context,
+                wires.clone(),
+                &LweLookupArtifactNames::for_compiler(compiler),
+            )?;
+        }
+        Ok(context)
+    }
+}
+
+pub struct NaiveLweLookupPreprocessingLowering<P: Poly> {
+    parameters: P::Params,
+    hash_key: Bytes,
+    trapdoors: Vec<Trapdoor>,
+    gadget_base: IntExpr,
+    digit_count: IntExpr,
+    slot_count: usize,
+    call_path_prefix: Vec<usize>,
+    entries: Vec<NaiveLweLookupPreprocessingEntry>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LweLookupInvocation {
     compiler: LweLookupCompiler,
@@ -291,6 +428,8 @@ pub enum LweLookupCompileError {
     EmptySlotInvocations,
     #[error("naive LWE lookup slot {slot} has an inconsistent structural identity")]
     SlotIdentity { slot: usize },
+    #[error("LWE lookup circuit traversal failed: {0}")]
+    CircuitStructure(String),
     #[error(transparent)]
     Dsl(#[from] DslError),
 }
@@ -622,6 +761,177 @@ fn same_matrix_type(lhs: &MatrixType, rhs: &MatrixType) -> bool {
         lhs.ring_dimension.canonicalize() == rhs.ring_dimension.canonicalize() &&
         lhs.rows.canonicalize() == rhs.rows.canonicalize() &&
         lhs.columns.canonicalize() == rhs.columns.canonicalize()
+}
+
+fn lookup_compiler_for_circuit<P: Poly>(
+    parameters: &P::Params,
+    circuit: &PolyCircuit<P>,
+    identity: LweLookupIdentity,
+    public_key_type: MatrixType,
+    gadget_base: IntExpr,
+    digit_count: IntExpr,
+) -> Result<LweLookupCompiler, LweLookupCompileError> {
+    let table = LweLookupTable::from_public_lut(
+        parameters,
+        circuit.lookup_table(identity.lookup).as_ref(),
+    )?;
+    let public_columns = public_key_type.columns.clone();
+    let high_rows = IntExpr::Mul(
+        Box::new(public_key_type.rows.clone()),
+        Box::new(IntExpr::Add(Box::new(digit_count.clone()), Box::new(IntExpr::constant(2)))),
+    )
+    .canonicalize();
+    let low_matrix_type = MatrixType {
+        rows: public_columns.clone(),
+        columns: public_columns.clone(),
+        ..public_key_type.clone()
+    };
+    let high_matrix_type =
+        MatrixType { rows: high_rows, columns: public_columns, ..public_key_type.clone() };
+    Ok(LweLookupCompiler {
+        identity,
+        table,
+        public_key_type,
+        low_matrix_type,
+        high_matrix_type,
+        gadget_base,
+        digit_count,
+    })
+}
+
+impl<P: Poly> NaiveLweLookupPreprocessingLowering<P> {
+    pub fn new(
+        parameters: P::Params,
+        hash_key: Bytes,
+        trapdoors: Vec<Trapdoor>,
+        gadget_base: IntExpr,
+        digit_count: IntExpr,
+        call_path_prefix: Vec<usize>,
+    ) -> Result<Self, LweLookupCompileError> {
+        let slot_count = trapdoors.len();
+        if slot_count == 0 {
+            return Err(LweLookupCompileError::EmptySlotInvocations);
+        }
+        Ok(Self {
+            parameters,
+            hash_key,
+            trapdoors,
+            gadget_base,
+            digit_count,
+            slot_count,
+            call_path_prefix,
+            entries: Vec::new(),
+        })
+    }
+
+    pub fn into_entries(self) -> Vec<NaiveLweLookupPreprocessingEntry> {
+        self.entries
+    }
+}
+
+impl<P: Poly> CircuitLoweringTypes for NaiveLweLookupPreprocessingLowering<P> {
+    type Wire = NaiveBggPublicKeyVecWire;
+    type Error = CircuitCompileError;
+}
+
+impl<P: Poly> PublicLookupLowering<P> for NaiveLweLookupPreprocessingLowering<P> {
+    fn public_lookup(
+        &mut self,
+        circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        input: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        if input.matrices.count() != &IntExpr::constant(self.slot_count) {
+            return Err(CircuitCompileError::LweLookup {
+                gate: gate.local_gate().index(),
+                source: LweLookupCompileError::SlotCountMismatch,
+            });
+        }
+        let mut base_identity = identity_for_gate(gate, lookup_id);
+        let mut call_path = self.call_path_prefix.clone();
+        call_path.extend(base_identity.call_path);
+        base_identity.call_path = call_path;
+        let mut compilers = Vec::with_capacity(self.slot_count);
+        let mut wires = Vec::with_capacity(self.slot_count);
+        let mut outputs = Vec::with_capacity(self.slot_count);
+        for slot in 0..self.slot_count {
+            let compiler = lookup_compiler_for_circuit(
+                &self.parameters,
+                circuit,
+                LweLookupIdentity { slot: Some(slot), ..base_identity.clone() },
+                input.matrices.element_type().clone(),
+                self.gadget_base.clone(),
+                self.digit_count.clone(),
+            )
+            .map_err(|source| CircuitCompileError::LweLookup {
+                gate: gate.local_gate().index(),
+                source,
+            })?;
+            let preprocessing = compiler
+                .preprocess(
+                    self.hash_key.clone(),
+                    &BggPublicKeyWire {
+                        matrix: input.matrices.get_static(slot),
+                        reveal_plaintext: input.reveal_plaintext,
+                    },
+                    &self.trapdoors[slot],
+                )
+                .map_err(|source| CircuitCompileError::LweLookup {
+                    gate: gate.local_gate().index(),
+                    source,
+                })?;
+            outputs.push(preprocessing.output_public_key.clone());
+            compilers.push(compiler);
+            wires.push(preprocessing);
+        }
+        let matrices = Family::pack(outputs).map_err(|source| CircuitCompileError::LweLookup {
+            gate: gate.local_gate().index(),
+            source: source.into(),
+        })?;
+        self.entries.push(NaiveLweLookupPreprocessingEntry { compilers, wires });
+        Ok(NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: true })
+    }
+}
+
+pub fn bind_naive_lwe_lookup_invocations<P: Poly>(
+    parameters: &P::Params,
+    circuit: &PolyCircuit<P>,
+    production: ProductionId,
+    public_key_type: MatrixType,
+    gadget_base: IntExpr,
+    digit_count: IntExpr,
+    slot_count: usize,
+    call_path_prefix: &[usize],
+) -> Result<Vec<NaiveLweLookupInvocation>, LweLookupCompileError> {
+    if slot_count == 0 {
+        return Err(LweLookupCompileError::EmptySlotInvocations);
+    }
+    collect_lwe_lookup_identities_with_prefix(circuit, call_path_prefix)
+        .map_err(|error| LweLookupCompileError::CircuitStructure(error.to_string()))?
+        .into_iter()
+        .map(|identity| {
+            let slots = (0..slot_count)
+                .map(|slot| {
+                    let compiler = lookup_compiler_for_circuit(
+                        parameters,
+                        circuit,
+                        LweLookupIdentity { slot: Some(slot), ..identity.clone() },
+                        public_key_type.clone(),
+                        gadget_base.clone(),
+                        digit_count.clone(),
+                    )?;
+                    LweLookupInvocation::bind(
+                        compiler.clone(),
+                        LweLookupArtifacts::for_compiler(production.clone(), &compiler),
+                        parameters,
+                        circuit,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            NaiveLweLookupInvocation::new(slots)
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -1265,6 +1575,103 @@ mod tests {
             ),
             Err(LweLookupCompileError::MatrixTypeMismatch)
         ));
+    }
+
+    #[test]
+    fn lookup_identity_collection_matches_the_lowering_identity() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let lookup_id = circuit.register_public_lookup(PublicLut::new(
+            &parameters,
+            2,
+            |parameters: &DCRTPolyParams, input| {
+                Some((
+                    input,
+                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
+                ))
+            },
+            None,
+        ));
+        let output = circuit.public_lookup_gate(input, lookup_id).as_single_wire();
+        circuit.output([output]);
+        assert_eq!(
+            collect_lwe_lookup_identities(&circuit).unwrap(),
+            vec![LweLookupIdentity {
+                call_path: Vec::new(),
+                gate: output.index(),
+                occurrence: 0,
+                lookup: lookup_id,
+                slot: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn naive_preprocessing_lowering_reuses_shared_trapdoors_and_namespaces_artifacts() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let digit_count = parameters.modulus_digits();
+        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let lookup_id = circuit.register_public_lookup(PublicLut::new(
+            &parameters,
+            2,
+            |parameters: &DCRTPolyParams, input| {
+                Some((
+                    input,
+                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
+                ))
+            },
+            None,
+        ));
+        let output = circuit.public_lookup_gate(input, lookup_id);
+        circuit.output([output]);
+        let public_key = |name: &str| NaiveBggPublicKeyVecWire {
+            matrices: ring.input_family(name, 2, (1, digit_count)),
+            reveal_plaintext: true,
+        };
+        let trapdoor =
+            ring.sample_trapdoor(1, 5, BigInt::from(1u64 << parameters.base_bits()), digit_count);
+        let mut lookup = NaiveLweLookupPreprocessingLowering::new(
+            parameters.clone(),
+            ring.bytes_input("hash-key", 32),
+            vec![trapdoor.clone(), trapdoor],
+            BigInt::from(1u64 << parameters.base_bits()).into(),
+            digit_count.into(),
+            vec![17],
+        )
+        .unwrap();
+        let mut slots = crate::NoSlotOperations::default();
+        let outputs = crate::PolyCircuitCompiler {
+            public_key: BggPublicKeyCompiler {
+                ring: ring.clone(),
+                base: BigInt::from(1u64 << parameters.base_bits()).into(),
+                digit_count: digit_count.into(),
+            },
+        }
+        .compile_naive_public_keys_with_lowerings(
+            &circuit,
+            public_key("one"),
+            [public_key("input")],
+            &mut lookup,
+            &mut slots,
+        )
+        .unwrap();
+        let entries = lookup.into_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].compilers.len(), 2);
+        assert!(
+            entries[0].compilers.iter().all(|compiler| compiler.identity.call_path == vec![17])
+        );
+        let mut context = DslContext::new("naive-lookup-preprocessing")
+            .family_output("output", outputs[0].matrices.clone())
+            .unwrap();
+        for entry in entries {
+            context = entry.export(context).unwrap();
+        }
+        context.build().unwrap().validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

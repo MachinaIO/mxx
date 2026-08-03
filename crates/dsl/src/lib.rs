@@ -324,6 +324,24 @@ impl Ring {
         )
     }
 
+    /// Reconstructs one polynomial from canonical coefficient bits.
+    ///
+    /// Bits are coefficient-major and little-endian within each coefficient.
+    #[track_caller]
+    pub fn pack_polynomial_coefficients(&self, bits: Family<Bool>, coefficient_bits: usize) -> Mat {
+        let matrix_type = self.matrix_type((1, 1));
+        let pending = bits.pending;
+        let node = NodeHandle::new(
+            NodeKind::PackPolynomialCoefficients {
+                matrix_type: matrix_type.clone(),
+                coefficient_bits: IntExpr::constant(coefficient_bits),
+            },
+            vec![bits.value],
+            vec![WireType::Matrix(matrix_type.clone())],
+        );
+        Mat { value: node.output(0).expect("packed polynomial"), matrix_type, pending }
+    }
+
     #[track_caller]
     pub fn uniform(&self, shape: impl IntoShape) -> Mat {
         self.uniform_in(
@@ -472,6 +490,28 @@ impl Ring {
             vec![ty],
         );
         Bytes { value: node.output(0).expect("bytes input"), pending: Pending::default() }
+    }
+
+    #[track_caller]
+    pub fn bytes_artifact_input(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        length: impl Into<IntExpr>,
+        confidentiality: ArtifactConfidentiality,
+    ) -> Bytes {
+        let artifact_name = artifact_name.into();
+        let ty = WireType::Bytes { length: length.into() };
+        let node = NodeHandle::new(
+            NodeKind::Input {
+                name: artifact_name.clone(),
+                wire_type: ty.clone(),
+                artifact: Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            },
+            Vec::new(),
+            vec![ty],
+        );
+        Bytes { value: node.output(0).expect("bytes artifact input"), pending: Pending::default() }
     }
 }
 
@@ -672,6 +712,25 @@ impl Mat {
             vec![WireType::Int],
         );
         Int { value: node.output(0).expect("coefficient"), pending }
+    }
+
+    /// Serializes one polynomial into canonical coefficient bits.
+    ///
+    /// Bits are coefficient-major and little-endian within each coefficient.
+    /// Validation ensures that this matrix is scalar and every requested
+    /// coefficient position is in range.
+    #[track_caller]
+    pub fn canonical_coefficient_bits(
+        self,
+        ring_dimension: usize,
+        coefficient_bits: usize,
+    ) -> Result<Family<Bool>, DslError> {
+        let mut bits = Vec::with_capacity(ring_dimension.saturating_mul(coefficient_bits));
+        for coefficient in 0..ring_dimension {
+            let value = self.clone().extract_coefficient(coefficient);
+            bits.extend((0..coefficient_bits).map(|bit| value.clone().bit(bit)));
+        }
+        Family::<Bool>::pack_bools(bits)
     }
 
     #[track_caller]
@@ -917,13 +976,38 @@ impl Int {
     }
 
     pub fn add(self, rhs: Self) -> Self {
+        self.binary(rhs, mxx_ir_core::node::IntBinaryOp::Add, "integer sum")
+    }
+
+    pub fn sub(self, rhs: Self) -> Self {
+        self.binary(rhs, mxx_ir_core::node::IntBinaryOp::Subtract, "integer difference")
+    }
+
+    pub fn mul(self, rhs: Self) -> Self {
+        self.binary(rhs, mxx_ir_core::node::IntBinaryOp::Multiply, "integer product")
+    }
+
+    pub fn div(self, rhs: Self) -> Self {
+        self.binary(rhs, mxx_ir_core::node::IntBinaryOp::Divide, "integer quotient")
+    }
+
+    pub fn rem(self, rhs: Self) -> Self {
+        self.binary(rhs, mxx_ir_core::node::IntBinaryOp::Remainder, "integer remainder")
+    }
+
+    fn binary(
+        self,
+        rhs: Self,
+        operation: mxx_ir_core::node::IntBinaryOp,
+        output_name: &'static str,
+    ) -> Self {
         let pending = Pending::merge([self.pending, rhs.pending]);
         let node = NodeHandle::new(
-            NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add),
+            NodeKind::IntBinary(operation),
             vec![self.value, rhs.value],
             vec![WireType::Int],
         );
-        Self { value: node.output(0).expect("integer sum"), pending }
+        Self { value: node.output(0).expect(output_name), pending }
     }
 
     pub fn equal(self, rhs: Self) -> Bool {
@@ -980,6 +1064,42 @@ impl Bool {
     pub fn to_int(self) -> Int {
         let node = NodeHandle::new(NodeKind::BoolToInt, vec![self.value], vec![WireType::Int]);
         Int { value: node.output(0).expect("boolean integer"), pending: self.pending }
+    }
+}
+
+impl Family<Bool> {
+    pub fn pack_bools(values: Vec<Bool>) -> Result<Self, DslError> {
+        let Some(element_schema) = values.first().cloned() else {
+            return Err(DslError::Schema);
+        };
+        let count = IntExpr::constant(values.len());
+        let pending = Pending::merge(values.iter().map(|value| value.pending.clone()));
+        let node = NodeHandle::new(
+            NodeKind::FamilyPack { count: count.clone() },
+            values.into_iter().map(|value| value.value).collect(),
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Bool),
+                count: count.clone(),
+            }],
+        );
+        Ok(Self {
+            value: node.output(0).expect("packed boolean family"),
+            element_schema,
+            count,
+            pending,
+        })
+    }
+
+    pub fn get_static(&self, index: impl Into<IntExpr>) -> Bool {
+        let node = NodeHandle::new(
+            NodeKind::FamilyGetStatic { index: index.into() },
+            vec![self.value.clone()],
+            vec![WireType::Bool],
+        );
+        Bool {
+            value: node.output(0).expect("boolean family element"),
+            pending: self.pending.clone(),
+        }
     }
 }
 
@@ -1948,8 +2068,27 @@ impl DslContext {
         Ok(self)
     }
 
+    pub fn bytes_output(mut self, name: impl Into<String>, value: Bytes) -> Result<Self, DslError> {
+        self.insert_pending_output(name.into(), value.value, value.pending, None)?;
+        Ok(self)
+    }
+
     pub fn public_output(mut self, name: impl Into<String>, mat: Mat) -> Result<Self, DslError> {
         self.insert_output(name.into(), mat, Some(ArtifactConfidentiality::Public))?;
+        Ok(self)
+    }
+
+    pub fn public_bytes_output(
+        mut self,
+        name: impl Into<String>,
+        value: Bytes,
+    ) -> Result<Self, DslError> {
+        self.insert_pending_output(
+            name.into(),
+            value.value,
+            value.pending,
+            Some(ArtifactConfidentiality::Public),
+        )?;
         Ok(self)
     }
 
@@ -3511,6 +3650,28 @@ mod tests {
             report.outputs["second"].noise.as_ref().unwrap().bound,
             bigdecimal::BigDecimal::from(39u8) / bigdecimal::BigDecimal::from(2u8),
         );
+    }
+
+    #[test]
+    fn packed_polynomial_is_an_exact_symbolic_signal() {
+        let ring = Ring::new(257, 8);
+        let coefficient_bits = 9;
+        let bits = (0..8 * coefficient_bits)
+            .map(|index| Int::constant(index % 2).bit(0))
+            .collect::<Vec<_>>();
+        let packed = ring.pack_polynomial_coefficients(
+            Family::<Bool>::pack_bools(bits).expect("boolean family"),
+            coefficient_bits,
+        );
+        let built = DslContext::new("packed-polynomial-symbolic-signal")
+            .output("packed", packed)
+            .unwrap()
+            .build()
+            .unwrap();
+        let elaborated = built.elaborate(&ParamEnv::default()).unwrap();
+        let report = mxx_noise_simulator::simulate(&elaborated).unwrap();
+        assert!(report.outputs["packed"].has_signal);
+        assert!(report.outputs["packed"].noise.is_none());
     }
 
     #[test]

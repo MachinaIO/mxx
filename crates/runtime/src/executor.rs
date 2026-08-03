@@ -1480,6 +1480,33 @@ where
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
+            NodeKind::PackPolynomialCoefficients { coefficient_bits, .. } => {
+                let coefficient_bits = self.eval_usize(node.id, coefficient_bits, env)?;
+                let count = self.family_count(values, node.args[0])?;
+                let mut bits = Vec::with_capacity(count);
+                for index in 0..count {
+                    let member = self.family_member(values, node.args[0], index, node.id)?;
+                    let RuntimeValue::Bool(bit) = member else {
+                        return Err(ExecutionError::ValueKind(node.args[0]));
+                    };
+                    bits.push(bit);
+                }
+                let ty = self
+                    .validated_wire_type(scope_id, WireRef { node: node.id, port: Port(0) })
+                    .and_then(ConcreteWireType::matrix_type)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ExecutionError::MissingMetadata(WireId {
+                            instantiation_path: path.to_vec(),
+                            wire: WireRef { node: node.id, port: Port(0) },
+                        })
+                    })?;
+                let output = self
+                    .backend
+                    .pack_polynomial_coefficients(&ty, &bits, coefficient_bits)
+                    .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
             NodeKind::SubgraphCall(call) => {
                 let child_id =
                     self.validated.source.child_scope_id(scope_id, node.id).ok_or_else(|| {
@@ -2951,6 +2978,50 @@ mod tests {
         },
     };
     use num_bigint::{BigInt, Sign};
+    use num_traits::ToPrimitive;
+    use rand::Rng;
+
+    #[test]
+    fn canonical_polynomial_coefficient_bits_roundtrip_on_cpu() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = parameters.modulus();
+        let coefficient_bits = parameters.modulus_bits();
+        let ring_dimension = parameters.ring_dimension() as usize;
+        let upper = modulus.to_u64().expect("test modulus fits u64");
+        let mut rng = rand::rng();
+        let mut coefficients = (0..ring_dimension)
+            .map(|_| num_bigint::BigUint::from(rng.random_range(0..upper)))
+            .collect::<Vec<_>>();
+        coefficients[0] = num_bigint::BigUint::from(0u8);
+        coefficients[1] = modulus.as_ref() - num_bigint::BigUint::from(1u8);
+        let polynomial = DCRTPoly::from_biguints(&parameters, &coefficients);
+        let input_matrix = DCRTPolyMatrix::from_poly_vec_row(&parameters, vec![polynomial]);
+
+        let modulus = BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone());
+        let ring = Ring::new(modulus, ring_dimension);
+        let input = ring.input("input", (1, 1));
+        let bits = input
+            .canonical_coefficient_bits(ring_dimension, coefficient_bits)
+            .expect("coefficient bits");
+        let reconstructed = ring.pack_polynomial_coefficients(bits, coefficient_bits);
+        let graph = DslContext::new("canonical-polynomial-coefficient-bits")
+            .output("reconstructed", reconstructed)
+            .expect("output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+
+        let result = execute(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::from([("input".to_owned(), RuntimeValue::matrix(input_matrix.clone()))]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        assert_eq!(matrix_output(&result, "reconstructed"), &input_matrix);
+    }
 
     #[test]
     fn range_loop_executes_in_bounded_waves_with_concrete_loop_indices() {

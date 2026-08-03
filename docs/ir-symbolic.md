@@ -91,8 +91,7 @@ replays every expression through the canonical constructors and preserves the
 originating production identity. The current format version is checked
 exactly, and import validates expression topology, artifact root types, and
 relation atom references before publishing the imported state. Only the
-current representation is accepted; there is no legacy reader or compatibility
-alias.
+current representation is accepted.
 
 ## Noise analysis boundary
 

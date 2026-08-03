@@ -1,24 +1,28 @@
-// AKY24 iO and Diamond iO are disabled pending separate application cutovers to
-// the declarative DSL and current IR/runtime APIs.
-// pub mod aky24_io;
-// pub mod diamond_io;
-// mod graph;
-// pub(crate) mod utils;
+// AKY24 iO is temporarily disabled until its full cascade receives end-to-end validation.
+// pub mod aky24;
+pub mod diamond;
+mod linked_noise;
 
 /// Common interface for indistinguishability obfuscation schemes.
 pub trait Obfuscation {
     /// User-facing function descriptor accepted by the obfuscator.
-    type FuncType;
+    type Function;
     /// Persistable obfuscation object produced by preprocessing the function.
-    type Obf;
+    type Obfuscation;
     /// Plain input type accepted by online evaluation.
     type Input;
     /// Plain output type returned by online evaluation.
     type Output;
+    /// Scheme-specific preprocessing or evaluation error.
+    type Error;
 
     /// Obfuscate `func` into an in-memory application value.
-    fn obfuscation(&self, func: Self::FuncType) -> Self::Obf;
+    fn obfuscate(&mut self, function: &Self::Function) -> Result<Self::Obfuscation, Self::Error>;
 
-    /// Evaluate `obf` on `input`.
-    fn eval(&self, obf: &Self::Obf, input: Self::Input) -> Self::Output;
+    /// Evaluate `obfuscation` on `input`.
+    fn evaluate(
+        &mut self,
+        obfuscation: &Self::Obfuscation,
+        input: &Self::Input,
+    ) -> Result<Self::Output, Self::Error>;
 }

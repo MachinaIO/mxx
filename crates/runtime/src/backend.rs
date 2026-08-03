@@ -265,6 +265,12 @@ pub trait Backend {
         plaintext_modulus: &BigInt,
         length: usize,
     ) -> Result<Vec<BigInt>, Self::Error>;
+    fn pack_polynomial_coefficients(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        bits: &[bool],
+        coefficient_bits: usize,
+    ) -> Result<Self::Matrix, Self::Error>;
     fn crt_recompose(
         &mut self,
         levels: &[Self::Matrix],

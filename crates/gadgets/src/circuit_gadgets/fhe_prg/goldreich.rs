@@ -1284,8 +1284,12 @@ fn derive_distinct_goldreich_graph_ranges(
     graphs
 }
 
-#[cfg(test)]
-fn evaluate_plaintext_goldreich(graph: &GoldreichGraph, input_bits: &[u64]) -> Vec<u64> {
+/// Evaluates the public Goldreich graph directly on Boolean plaintexts.
+///
+/// Runtime correctness tests use this as the trusted plaintext counterpart of
+/// the Ring-GSW circuit evaluator. Independent output edges are evaluated in
+/// parallel.
+pub fn evaluate_goldreich_bits(graph: &GoldreichGraph, input_bits: &[bool]) -> Vec<bool> {
     assert_eq!(
         input_bits.len(),
         graph.input_size,
@@ -1293,11 +1297,6 @@ fn evaluate_plaintext_goldreich(graph: &GoldreichGraph, input_bits: &[u64]) -> V
         graph.input_size,
         input_bits.len()
     );
-    assert!(
-        input_bits.iter().all(|bit| *bit <= 1),
-        "Goldreich plaintext evaluation expects only Boolean input bits"
-    );
-
     graph
         .edges
         .par_iter()
@@ -1308,6 +1307,19 @@ fn evaluate_plaintext_goldreich(graph: &GoldreichGraph, input_bits: &[u64]) -> V
                 (input_bits[edge.and_inputs[0]] & input_bits[edge.and_inputs[1]])
         })
         .collect()
+}
+
+#[cfg(test)]
+fn evaluate_plaintext_goldreich(graph: &GoldreichGraph, input_bits: &[u64]) -> Vec<u64> {
+    let input = input_bits
+        .iter()
+        .map(|bit| match bit {
+            0 => false,
+            1 => true,
+            _ => panic!("Goldreich plaintext evaluation expects only Boolean input bits"),
+        })
+        .collect::<Vec<_>>();
+    evaluate_goldreich_bits(graph, &input).into_iter().map(u64::from).collect()
 }
 
 #[derive(Debug, Clone)]

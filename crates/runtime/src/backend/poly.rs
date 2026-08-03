@@ -9,8 +9,8 @@ use mxx_primitives::{
     poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{
         DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
-        hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
-        uniform::DCRTPolyUniformSampler,
+        bounds::matrix_within_coefficient_bound, hash::DCRTPolyHashSampler,
+        trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
 };
 use num_bigint::{BigInt, BigUint, Sign};
@@ -59,6 +59,27 @@ where
     active_placement: usize,
     preimage_batch_calls: usize,
     _marker: PhantomData<(M, U, H, T)>,
+}
+
+fn rejection_resample_candidate<T>(
+    mut sample: impl FnMut() -> T,
+    mut accepts: impl FnMut(&T) -> bool,
+) -> T {
+    loop {
+        let candidate = sample();
+        if accepts(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn sample_bounded_candidate<M: PolyMatrix>(
+    max_coefficient_bound: &BigUint,
+    sample: impl FnMut() -> M,
+) -> M {
+    rejection_resample_candidate(sample, |candidate| {
+        matrix_within_coefficient_bound(candidate, max_coefficient_bound)
+    })
 }
 
 pub(crate) trait CrtRecomposeMatrix: PolyMatrix {
@@ -620,12 +641,24 @@ where
         Ok(U::new().sample_uniform(parameters, ty.rows, ty.columns, distribution))
     }
 
-    fn sample_gaussian(&mut self, ty: &ConcreteMatrixType, sigma: f64) -> Result<M, Self::Error> {
+    fn sample_gaussian(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        sigma: f64,
+        max_coefficient_bound: &BigInt,
+    ) -> Result<M, Self::Error> {
         let parameters = self.parameters(ty)?;
+        let max_coefficient_bound =
+            max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
         Ok(if sigma == 0.0 {
             M::zero(parameters, ty.rows, ty.columns)
         } else {
-            U::new().sample_uniform(parameters, ty.rows, ty.columns, DistType::GaussDist { sigma })
+            U::new().sample_uniform(
+                parameters,
+                ty.rows,
+                ty.columns,
+                DistType::GaussDist { sigma, max_coefficient_bound: Some(max_coefficient_bound) },
+            )
         })
     }
 
@@ -713,14 +746,19 @@ where
         sigma: f64,
         gadget_base: &BigInt,
         digit_count: usize,
+        max_coefficient_bound: &BigInt,
         trapdoor: &T::Trapdoor,
         public: &M,
         target: &M,
     ) -> Result<M, Self::Error> {
         let parameters = self.parameters(ty)?;
         Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
+        let max_coefficient_bound =
+            max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
         let sampler = T::new(parameters, sigma);
-        Ok(sampler.preimage(parameters, trapdoor, public, target))
+        Ok(sample_bounded_candidate(&max_coefficient_bound, || {
+            sampler.preimage(parameters, trapdoor, public, target)
+        }))
     }
 
     fn sample_preimage_batch(
@@ -738,6 +776,7 @@ where
                         request.sigma,
                         &request.gadget_base,
                         request.digit_count,
+                        &request.max_coefficient_bound,
                         &request.trapdoor,
                         &request.public,
                         &request.target,
@@ -882,6 +921,26 @@ mod tests {
             backend.extract_coefficient(&value, 0).expect("extract coefficient"),
             BigInt::from_biguint(Sign::Plus, residue)
         );
+    }
+
+    #[test]
+    fn bounded_candidate_sampling_retries_without_clipping() {
+        let parameters = DCRTPolyParams::new(2, 1, 10, 5);
+        let candidate = |value: u8| {
+            DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguint_to_constant(&parameters, BigUint::from(value))],
+            )
+        };
+        let rejected = candidate(7);
+        let accepted = candidate(2);
+        let mut draws = 0;
+        let sampled = sample_bounded_candidate(&BigUint::from(2u8), || {
+            draws += 1;
+            if draws == 1 { rejected.clone() } else { accepted.clone() }
+        });
+        assert_eq!(draws, 2);
+        assert_eq!(sampled, accepted);
     }
 }
 

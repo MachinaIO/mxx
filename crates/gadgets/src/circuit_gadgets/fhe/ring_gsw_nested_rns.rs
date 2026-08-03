@@ -17,7 +17,7 @@ use crate::{
     },
 };
 use keccak_asm::Keccak256;
-use mxx_dsl::{BoundedMetadata, Family, Mat, Ring, VirtualMat};
+use mxx_dsl::{Family, Mat, Ring};
 use mxx_ir_core::RealExpr;
 use num_bigint::BigUint;
 use rayon::prelude::*;
@@ -42,46 +42,26 @@ pub struct NativeRingGswDslInputs {
 }
 
 /// Declares the executable inputs used by [`native_ring_gsw_scalar_bindings`]
-/// and separates modulus-scale signal from native encryption error.
+/// for native Ring-GSW ciphertext entries.
 ///
 /// The values are not sampled by the graph: obfuscation samples the private
 /// seed ciphertext natively and binds the resulting nested-RNS values at
-/// execution. Top-row entries are pure Large signal. Bottom-row entries are
-/// reinterpreted as Large signal plus the bounded `eR` term from the noisy
-/// public key and binary ciphertext randomizer. Unknown dependencies keep the
-/// simulator on conservative addition rather than assuming CLT independence.
+/// execution. Correctness proofs reason about the native encryption error in
+/// the application-specific proof rather than attaching symbolic annotations
+/// to executable wires.
 pub fn declare_native_ring_gsw_dsl_inputs(
     ring: &Ring,
     prefix: &str,
     wire_count: usize,
     slot_count: usize,
-    ciphertext_error_norm: RealExpr,
+    _ciphertext_error_norm: RealExpr,
 ) -> Result<NativeRingGswDslInputs, mxx_dsl::DslError> {
     assert!(wire_count.is_multiple_of(2), "Ring-GSW ciphertext must have two equally sized rows");
-    let bottom_row_start = wire_count / 2;
     let mut scalar_families = Vec::with_capacity(wire_count);
     let mut input_names = Vec::with_capacity(wire_count);
     for wire in 0..wire_count {
         let name = format!("{prefix}-{wire}");
-        let scalar_type = ring.matrix_type((1, 1));
-        let error_norm = ciphertext_error_norm.clone();
-        let family = ring.input_family(name.clone(), slot_count, (1, 1)).parallel_map(
-            move |_, scalar| {
-                let signal =
-                    VirtualMat::large(format!("{name}:nested-rns-signal"), scalar_type.clone());
-                if wire < bottom_row_start {
-                    scalar.assume(signal)
-                } else {
-                    let error = VirtualMat::bounded(
-                        format!("{name}:native-encryption-error"),
-                        scalar_type.clone(),
-                        BoundedMetadata::conservative(error_norm.clone()),
-                    );
-                    scalar.assume(signal + error)
-                }
-                .expect("native Ring-GSW scalar assumption is shape preserving")
-            },
-        )?;
+        let family = ring.input_family(name.clone(), slot_count, (1, 1));
         scalar_families.push(family);
         input_names.push(format!("{prefix}-{wire}"));
     }
@@ -244,7 +224,14 @@ where
         .get_row(0);
     let error = error_sigma.filter(|sigma| *sigma != 0.0).map(|sigma| {
         let uniform_sampler = US::new();
-        uniform_sampler.sample_uniform(params, 1, col_len, DistType::GaussDist { sigma }).get_row(0)
+        uniform_sampler
+            .sample_uniform(
+                params,
+                1,
+                col_len,
+                DistType::GaussDist { sigma, max_coefficient_bound: None },
+            )
+            .get_row(0)
     });
     let b = a
         .par_iter()
@@ -815,9 +802,6 @@ mod tests {
             .build()
             .unwrap();
         graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
-        let elaborated = graph.elaborate(&mxx_ir_core::ParamEnv::default()).unwrap();
-        let bounded_atoms = elaborated.atoms.values().filter(|atom| !atom.is_large()).count();
-        assert_eq!(bounded_atoms, scalar_inputs.len() / 2);
     }
 
     #[test]

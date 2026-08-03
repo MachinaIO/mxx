@@ -2,10 +2,10 @@
 //!
 //! This crate owns executable graph structure, compile expressions, concrete
 //! type validation, canonical identities, and runtime artifact metadata.
-//! Optional symbolic-term operations live in `mxx-ir-symbolic`.
 
 pub mod artifact;
 pub mod checks;
+pub mod constraints;
 pub mod encoding;
 pub mod expr;
 pub mod graph;
@@ -14,6 +14,7 @@ mod serde_support;
 pub mod types;
 pub mod validate;
 
+pub use constraints::{ParamConstraint, derive_param_constraints};
 pub use expr::{IntExpr, ParamEnv, Rational, RealExpr};
 pub use graph::{
     CapturePolicy, CapturedValue, CompileParameter, CompileParameterKind, ConstructionScopeId,

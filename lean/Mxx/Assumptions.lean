@@ -1,0 +1,174 @@
+import Mathlib.Data.ENNReal.Basic
+
+namespace Mxx
+
+structure Matrix where
+  coefficients : List Int
+  modulus : Int := 0
+  ringDimension : Nat := 0
+  rows : Nat := 0
+  columns : Nat := 0
+  deriving DecidableEq
+
+def Matrix.coefficient (matrix : Matrix) (row column coefficient : Nat) : Int :=
+  matrix.coefficients.getD (((row * matrix.columns + column) * matrix.ringDimension) + coefficient) 0
+
+def reduceCoefficient (modulus value : Int) : Int :=
+  if modulus ≤ 0 then value else value % modulus
+
+def centeredCoefficient (modulus value : Int) : Int :=
+  if modulus ≤ 0 then value
+  else
+    let residue := reduceCoefficient modulus value
+    if 2 * residue > modulus then residue - modulus else residue
+
+def negacyclicCoefficient (ringDimension : Nat)
+    (left right : Nat → Int) (coefficient : Nat) : Int :=
+  (List.range ringDimension).foldl (fun total leftCoefficient =>
+    if leftCoefficient ≤ coefficient then
+      total + left leftCoefficient * right (coefficient - leftCoefficient)
+    else
+      total - left leftCoefficient * right (ringDimension + coefficient - leftCoefficient)) 0
+
+def matrixMul (left right : Matrix) : Matrix :=
+  if left.modulus = right.modulus ∧ left.ringDimension = right.ringDimension ∧
+      left.columns = right.rows then
+    { coefficients :=
+        (List.range left.rows).flatMap fun row =>
+          (List.range right.columns).flatMap fun column =>
+            (List.range left.ringDimension).map fun coefficient =>
+              reduceCoefficient left.modulus <|
+              (List.range left.columns).foldl (fun total inner =>
+                total + negacyclicCoefficient left.ringDimension
+                  (left.coefficient row inner)
+                  (right.coefficient inner column)
+                  coefficient) 0
+      modulus := left.modulus
+      ringDimension := left.ringDimension
+      rows := left.rows
+      columns := right.columns }
+  else
+    { coefficients := [] }
+
+def matrixConcatRows : List Matrix → Matrix
+  | [] => { coefficients := [] }
+  | first :: rest =>
+      let matrices := first :: rest
+      { coefficients := matrices.flatMap Matrix.coefficients
+        modulus := first.modulus
+        ringDimension := first.ringDimension
+        rows := (matrices.map Matrix.rows).sum
+        columns := first.columns }
+
+def matrixConcatColumns : List Matrix → Matrix
+  | [] => { coefficients := [] }
+  | first :: rest =>
+      let matrices := first :: rest
+      { coefficients :=
+          (List.range first.rows).flatMap fun row =>
+            matrices.flatMap fun matrix =>
+              (List.range matrix.columns).flatMap fun column =>
+                (List.range first.ringDimension).map fun coefficient =>
+                  matrix.coefficient row column coefficient
+        modulus := first.modulus
+        ringDimension := first.ringDimension
+        rows := first.rows
+        columns := (matrices.map Matrix.columns).sum }
+
+def diagonalCoefficient (matrices : List Matrix)
+    (row column coefficient rowOffset columnOffset : Nat) : Int :=
+  match matrices with
+  | [] => 0
+  | matrix :: tail =>
+      if rowOffset ≤ row ∧ row < rowOffset + matrix.rows ∧
+          columnOffset ≤ column ∧ column < columnOffset + matrix.columns then
+        matrix.coefficient (row - rowOffset) (column - columnOffset) coefficient
+      else
+        diagonalCoefficient tail row column coefficient
+          (rowOffset + matrix.rows) (columnOffset + matrix.columns)
+
+def matrixConcatDiagonal : List Matrix → Matrix
+  | [] => { coefficients := [] }
+  | first :: rest =>
+      let matrices := first :: rest
+      let rows := (matrices.map Matrix.rows).sum
+      let columns := (matrices.map Matrix.columns).sum
+      { coefficients :=
+          (List.range rows).flatMap fun row =>
+            (List.range columns).flatMap fun column =>
+              (List.range first.ringDimension).map fun coefficient =>
+                diagonalCoefficient matrices row column coefficient 0 0
+        modulus := first.modulus
+        ringDimension := first.ringDimension
+        rows
+        columns }
+
+def coefficientNorm : List Int → Nat
+  | [] => 0
+  | coefficient :: coefficients => max coefficient.natAbs (coefficientNorm coefficients)
+
+def maxCenteredCoefficientNorm (matrix : Matrix) : Nat :=
+  coefficientNorm (matrix.coefficients.map (centeredCoefficient matrix.modulus))
+
+theorem coefficient_natAbs_le_norm
+    {coefficients : List Int} {coefficient : Int}
+    (member : coefficient ∈ coefficients) :
+    coefficient.natAbs ≤ coefficientNorm coefficients := by
+  induction coefficients with
+  | nil => simp at member
+  | cons head tail induction =>
+      simp only [List.mem_cons] at member
+      rcases member with rfl | member
+      · simp [coefficientNorm]
+      · exact le_trans (induction member) (le_max_right _ _)
+
+theorem headD_natAbs_le_norm (matrix : Matrix) :
+    (centeredCoefficient matrix.modulus (matrix.coefficients.headD 0)).natAbs ≤
+      maxCenteredCoefficientNorm matrix := by
+  rcases matrix with ⟨coefficients, modulus, ringDimension, rows, columns⟩
+  cases coefficients with
+  | nil =>
+      have zeroCentered : centeredCoefficient modulus 0 = 0 := by
+        by_cases nonpositive : modulus ≤ 0
+        · simp [centeredCoefficient, nonpositive]
+        · have positive : 0 < modulus := lt_of_not_ge nonpositive
+          simp [centeredCoefficient, reduceCoefficient, nonpositive, positive.ne', positive.le]
+      simp [maxCenteredCoefficientNorm, zeroCentered]
+  | cons head tail =>
+      exact coefficient_natAbs_le_norm
+        (coefficients := (head :: tail).map (centeredCoefficient modulus))
+        (coefficient := centeredCoefficient modulus head) (by simp)
+
+structure SamplerParams where
+  maxCoefficientBound : Nat
+  modulus : Int := 0
+  ringDimension : Nat := 0
+  rows : Nat := 0
+  columns : Nat := 0
+
+def Matrix.withSamplerParams (matrix : Matrix) (params : SamplerParams) : Matrix :=
+  let count := params.rows * params.columns * params.ringDimension
+  let coefficients := matrix.coefficients.take count ++
+    List.replicate (count - matrix.coefficients.length) 0
+  { matrix with
+    coefficients
+    modulus := params.modulus
+    ringDimension := params.ringDimension
+    rows := params.rows
+    columns := params.columns }
+
+structure MxxSamplerFamily where
+  gaussianSample : SamplerParams → List Matrix
+  trapdoorSample : SamplerParams → List Matrix
+  samplePreimage : SamplerParams → Matrix → Matrix → List Matrix
+
+structure MxxBoundedSamplerContract (samplers : MxxSamplerFamily) : Prop where
+  gaussianHardSupport :
+    ∀ params sample, sample ∈ samplers.gaussianSample params →
+      maxCenteredCoefficientNorm (sample.withSamplerParams params) ≤ params.maxCoefficientBound
+  preimageContract :
+    ∀ params b p k, k ∈ samplers.samplePreimage params b p →
+      matrixMul b (k.withSamplerParams params) = p ∧
+      maxCenteredCoefficientNorm (k.withSamplerParams params) ≤ params.maxCoefficientBound
+
+end Mxx

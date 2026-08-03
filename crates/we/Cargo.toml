@@ -7,25 +7,8 @@ description = "Witness encryption constructions for mxx"
 
 [features]
 default = []
-gpu = ["mxx-primitives/gpu", "mxx-gadgets/gpu", "mxx-runtime/gpu"]
+gpu = []
 
 [dependencies]
 mxx-primitives.workspace = true
-mxx-gadgets.workspace = true
-mxx-bgg.workspace = true
-mxx-bench-estimator.workspace = true
-mxx-dsl.workspace = true
-mxx-ir-core.workspace = true
-mxx-ir-symbolic.workspace = true
-mxx-noise-simulator.workspace = true
-mxx-runtime.workspace = true
-bigdecimal.workspace = true
-num-bigint.workspace = true
-rand.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-
-[dev-dependencies]
-keccak-asm.workspace = true
-mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
 mxx-gadgets.workspace = true

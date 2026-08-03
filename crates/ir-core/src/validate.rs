@@ -76,6 +76,8 @@ pub enum ValidationError {
     IllegalLoopIndex { scope: FrozenGraphScopeId, slot: u32 },
     #[error("loop-index binder {slot} occurs in a structural type in scope {scope:?}")]
     StructuralLoopIndex { scope: FrozenGraphScopeId, slot: u32 },
+    #[error("parameter constraint failed: {0}")]
+    ParameterConstraint(String),
 }
 
 pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
@@ -204,6 +206,10 @@ pub fn validate_with_manifests(
     check_manifests(manifests)?;
     check_bindings(graph, bindings)?;
     check_topological(graph)?;
+    // This is the single source for parameter-only validity and is also emitted as Lean
+    // `ParamsValid`. The remaining validation derives concrete types, checks wire flow and
+    // shapes, and constructs execution/liveness data.
+    crate::constraints::evaluate_param_constraints(graph, bindings)?;
 
     let mut warnings = Vec::new();
     let mut scopes = BTreeMap::new();
@@ -398,6 +404,7 @@ fn validate_node(
                 sigma: crate::RealExpr::FromInt(IntExpr::constant(gadget_base.clone())),
                 gadget_base,
                 digit_count,
+                preimage_max_coefficient_bound: BigInt::zero(),
             }]
         }
         NodeKind::TrapdoorPublic => {
@@ -528,9 +535,13 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
         }
-        NodeKind::GaussianSample { matrix_type, sigma } => {
+        NodeKind::GaussianSample { matrix_type, sigma, max_coefficient_bound } => {
             require_arity(scope, node, 0)?;
             require_nonnegative_real(sigma.evaluate_f64(env)?, scope, node.id, "Gaussian sigma")?;
+            let max_coefficient_bound = max_coefficient_bound.evaluate(env)?;
+            if max_coefficient_bound.is_negative() {
+                return node_error(scope, node.id, "Gaussian coefficient bound must be nonnegative");
+            }
             vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
         }
         NodeKind::HashSample {
@@ -567,7 +578,13 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
         }
-        NodeKind::TrapdoorSample { matrix_type, sigma, gadget_base, digit_count } => {
+        NodeKind::TrapdoorSample {
+            matrix_type,
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+        } => {
             require_arity(scope, node, 0)?;
             let sigma = sigma.close(env)?;
             require_positive_real(
@@ -582,6 +599,10 @@ fn validate_node(
             }
             let digit_count =
                 positive_usize(digit_count.evaluate(env)?, "trapdoor digit count", scope, node.id)?;
+            let preimage_max_coefficient_bound = preimage_max_coefficient_bound.evaluate(env)?;
+            if preimage_max_coefficient_bound.is_negative() {
+                return node_error(scope, node.id, "preimage coefficient bound must be nonnegative");
+            }
             let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
             let expected_columns = matrix
                 .rows
@@ -600,11 +621,20 @@ fn validate_node(
             }
             vec![
                 ConcreteWireType::Matrix(matrix.clone()),
-                ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count },
+                ConcreteWireType::Trapdoor {
+                    matrix,
+                    sigma,
+                    gadget_base,
+                    digit_count,
+                    preimage_max_coefficient_bound,
+                },
             ]
         }
-        NodeKind::PreimageSample { matrix_type } => {
+        NodeKind::PreimageSample { matrix_type, max_coefficient_bound } => {
             require_arity(scope, node, 3)?;
+            if max_coefficient_bound.evaluate(env)?.is_negative() {
+                return node_error(scope, node.id, "preimage coefficient bound must be nonnegative");
+            }
             let public = matrix_argument(scope, values, node, 0)?;
             let trapdoor = trapdoor_argument(scope, values, node, 1)?;
             if public != trapdoor {
@@ -1060,19 +1090,19 @@ fn concrete_wire(
         WireType::Preimage(matrix) => {
             ConcreteWireType::Preimage(concrete_matrix(matrix, env, scope, node)?)
         }
-        WireType::Trapdoor { matrix, sigma, gadget_base, digit_count } => {
-            ConcreteWireType::Trapdoor {
-                matrix: concrete_matrix(matrix, env, scope, node)?,
-                sigma: sigma.close(env)?,
-                gadget_base: gadget_base.evaluate(env)?,
-                digit_count: positive_usize(
-                    digit_count.evaluate(env)?,
-                    "digit count",
-                    scope,
-                    node,
-                )?,
-            }
-        }
+        WireType::Trapdoor {
+            matrix,
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+        } => ConcreteWireType::Trapdoor {
+            matrix: concrete_matrix(matrix, env, scope, node)?,
+            sigma: sigma.close(env)?,
+            gadget_base: gadget_base.evaluate(env)?,
+            digit_count: positive_usize(digit_count.evaluate(env)?, "digit count", scope, node)?,
+            preimage_max_coefficient_bound: preimage_max_coefficient_bound.evaluate(env)?,
+        },
         WireType::IndexedFamily { element, count } => {
             let element = concrete_wire(element, env, scope, node)?;
             if matches!(element, ConcreteWireType::IndexedFamily { .. }) {
@@ -1379,6 +1409,7 @@ mod tests {
     fn node_message(error: ValidationError) -> String {
         match error {
             ValidationError::Node { message, .. } => message,
+            ValidationError::ParameterConstraint(message) => message,
             other => panic!("expected node validation error, got {other:?}"),
         }
     }
@@ -1417,6 +1448,7 @@ mod tests {
             NodeKind::GaussianSample {
                 matrix_type: gaussian_type.clone(),
                 sigma: crate::RealExpr::from_integer(-1),
+                max_coefficient_bound: IntExpr::constant(0),
             },
             Vec::new(),
             vec![WireType::Matrix(gaussian_type)],
@@ -1437,11 +1469,11 @@ mod tests {
             Vec::new(),
             vec![WireType::Matrix(uniform_type)],
         );
-        assert_eq!(
+        assert!(
             node_message(
                 validate(&graph("empty-uniform", uniform), &ParamEnv::default()).unwrap_err()
-            ),
-            "uniform sample range is empty"
+            )
+            .contains("uniform range")
         );
 
         let source = input("source", matrix_type(17, 2, 2));
@@ -1485,11 +1517,11 @@ mod tests {
         )
         .output(0)
         .expect("decode output");
-        assert_eq!(
+        assert!(
             node_message(
                 validate(&graph("invalid-decode", decode), &ParamEnv::default()).unwrap_err()
-            ),
-            "invalid threshold decoding parameters"
+            )
+            .contains("plaintext modulus")
         );
     }
 

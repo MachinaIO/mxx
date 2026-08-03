@@ -280,32 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn slot_transfer_and_reduction_preserve_heterogeneous_member_terms() {
-        let ring = Ring::new(257, 8);
-        let matrices =
-            Family::pack(vec![ring.gaussian((1, 1), 2), ring.gaussian((1, 1), 3)]).expect("family");
-        let input = NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: true };
-        let compiler = NaiveBggSlotTransferCompiler;
-        let transferred =
-            compiler.transfer_public_keys(&input, &[(1, None), (0, None)]).expect("transfer");
-        let reduced = compiler.reduce_public_keys(&[input], 2).expect("reduction");
-        let built = DslContext::new("slot-symbolics")
-            .output("transferred", transferred.matrices.get_static(0))
-            .expect("transfer output")
-            .output("reduced", reduced.matrices.get_static(0))
-            .expect("reduction output")
-            .build()
-            .expect("build");
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
-        let report = mxx_noise_simulator::simulate(&elaborated).expect("simulation");
-        let transferred_bound =
-            report.outputs["transferred"].noise.as_ref().expect("noise").bound.clone();
-        let reduced_bound = report.outputs["reduced"].noise.as_ref().expect("noise").bound.clone();
-        assert_eq!(transferred_bound.to_string(), "19.5");
-        assert!(reduced_bound > transferred_bound);
-    }
-
-    #[test]
     fn reduction_rejects_oversized_rotations_during_validation() {
         let ring = Ring::new(17, 8);
         let input = NaiveBggPublicKeyVecWire {

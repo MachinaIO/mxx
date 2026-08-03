@@ -79,7 +79,68 @@ jobs:
 
       - name: Run test
         run: RUST_TEST_NOCAPTURE=1 cargo test -r --workspace --lib -- --test-threads=1
-  
+
+  lean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-25
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgmp-dev libgomp1
+
+      - name: Checkout OpenFHE
+        uses: actions/checkout@v4
+        with:
+          repository: MachinaIO/openfhe-development
+          ref: main
+          path: openfhe
+
+      - name: Build OpenFHE
+        run: |
+          cd openfhe
+          mkdir -p build && cd build
+          cmake .. -DWITH_OPENMP=OFF
+          make -j"$(nproc)"
+          sudo make install
+          echo "/usr/local/lib" | sudo tee /etc/ld.so.conf.d/openfhe.conf
+          sudo ldconfig
+
+      - name: Install Lean through elan
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Lean dependencies
+        working-directory: lean
+        run: |
+          lake update
+          git -C .lake/packages/VCVio submodule update --init --recursive
+          lake exe cache get
+
+      - name: Regenerate checked-in protocol definitions
+        run: |
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "${scratch}"' EXIT
+          MXX_CORRECTNESS_OUT_DIR="${scratch}/correctness" cargo run -p mxx-correctness --example emit_correctness
+          MXX_CORRECTNESS_OUT_DIR="${scratch}/gadgets" cargo run -p mxx-gadgets --example emit_correctness
+          diff -ru crates/correctness/lean/MxxCorrectness/Generated "${scratch}/correctness"
+          diff -ru crates/gadgets/lean/MxxGadgets/Generated "${scratch}/gadgets"
+
+      - name: Build Lean libraries
+        working-directory: lean
+        run: lake build Mxx MxxCorrectness MxxGadgets
+
+      - name: Verify committed protocol theorems
+        run: |
+          cargo run -p mxx-correctness --example verify_correctness
+          cargo run -p mxx-gadgets --example verify_correctness
+
   ci-success:
     name: ci success
     runs-on: ubuntu-latest
@@ -87,6 +148,7 @@ jobs:
     needs:
       - run
       - fmt
+      - lean
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@release/v1

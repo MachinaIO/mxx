@@ -65,6 +65,7 @@ pub enum NodeKind {
     GaussianSample {
         matrix_type: crate::types::MatrixType,
         sigma: RealExpr,
+        max_coefficient_bound: IntExpr,
     },
     HashSample {
         matrix_type: crate::types::MatrixType,
@@ -85,9 +86,11 @@ pub enum NodeKind {
         sigma: RealExpr,
         gadget_base: IntExpr,
         digit_count: IntExpr,
+        preimage_max_coefficient_bound: IntExpr,
     },
     PreimageSample {
         matrix_type: crate::types::MatrixType,
+        max_coefficient_bound: IntExpr,
     },
     GadgetDecompose {
         base: IntExpr,

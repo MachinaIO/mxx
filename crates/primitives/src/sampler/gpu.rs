@@ -28,7 +28,7 @@ impl PolyUniformSampler for GpuDCRTPolyUniformSampler {
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         dist: &DistType,
     ) -> <Self::M as PolyMatrix>::P {
-        let sampled = self.sample_uniform(params, 1, 1, *dist);
+        let sampled = self.sample_uniform(params, 1, 1, dist.clone());
         sampled.entry(0, 0)
     }
 
@@ -169,7 +169,7 @@ fn sample_gpu_matrix_with_seed(
             0.0,
             seed,
         ),
-        DistType::GaussDist { sigma } => GpuDCRTPolyMatrix::sample_distribution(
+        DistType::GaussDist { sigma, .. } => GpuDCRTPolyMatrix::sample_distribution(
             params,
             nrow,
             ncol,
@@ -219,7 +219,7 @@ fn sample_gpu_matrix_with_seed_columns(
             0.0,
             seed,
         ),
-        DistType::GaussDist { sigma } => GpuDCRTPolyMatrix::sample_distribution_columns(
+        DistType::GaussDist { sigma, .. } => GpuDCRTPolyMatrix::sample_distribution_columns(
             params,
             nrow,
             total_ncol,
@@ -370,7 +370,7 @@ mod tests {
             &params,
             4,
             5,
-            DistType::GaussDist { sigma },
+            DistType::GaussDist { sigma, max_coefficient_bound: None },
             GpuRngSeed::from_bytes([0x5au8; 32]),
         );
 

@@ -1,6 +1,7 @@
 //! Witness-encryption applications built from the declarative graph DSL.
 
-pub mod diamond;
+// Application modules are disabled until their protocol-specific hard-bound
+// recurrences or certified correctness checkers are available.
 
 use mxx_gadgets::circuit::PolyCircuit;
 use mxx_primitives::poly::Poly;

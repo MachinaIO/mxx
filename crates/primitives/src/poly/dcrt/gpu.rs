@@ -1440,7 +1440,8 @@ mod tests {
             "Reconstructed polynomial does not match original (FinRingDist)"
         );
 
-        let original_cpu_poly = sampler.sample_poly(&params, &DistType::GaussDist { sigma: 3.2 });
+        let original_cpu_poly = sampler
+            .sample_poly(&params, &DistType::GaussDist { sigma: 3.2, max_coefficient_bound: None });
         let original_poly = gpu_poly_from_cpu(&original_cpu_poly, &gpu_params);
         let bytes = original_poly.to_compact_bytes();
         let reconstructed_poly = GpuDCRTPoly::from_compact_bytes(&gpu_params, &bytes);

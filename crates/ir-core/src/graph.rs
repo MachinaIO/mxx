@@ -345,8 +345,8 @@ pub enum CapturePolicy {
     /// Broadcast scalar values and read-only artifact families into a
     /// structural child scope.
     ///
-    /// Arbitrary executable families remain rejected because their symbolic
-    /// member identity cannot be reconstructed from an opaque family input.
+    /// Arbitrary executable families remain rejected because their member
+    /// dataflow cannot be reconstructed from an opaque family input.
     BroadcastScalarsAndArtifactFamilies,
 }
 

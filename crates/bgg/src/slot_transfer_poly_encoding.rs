@@ -261,13 +261,12 @@ impl<P: Poly> SlotOperationLowering<P> for BggPolySlotTransferLowering {
 mod tests {
     use super::*;
     use crate::{
-        BggPublicKeyCompiler, BggSlotTransferBaseWires, BggSlotTransferPublicKeyLowering,
-        NoPublicLookup, PolyCircuitCompiler,
+        BggPublicKeyCompiler, NoPublicLookup, PolyCircuitCompiler,
         test_utils::{execute_graph, matrix_output},
     };
     use mxx_dsl::{DslContext, Ring};
     use mxx_gadgets::circuit::PolyCircuit;
-    use mxx_ir_core::{ParamEnv, RealExpr};
+    use mxx_ir_core::RealExpr;
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -357,6 +356,8 @@ mod tests {
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
             trapdoor_sigma: RealExpr::from_f64_exact(4.578).expect("finite sigma"),
             error_sigma: RealExpr::from_f64_exact(0.0).expect("finite sigma"),
+            error_max_coefficient_bound: 0.into(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
         };
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let first_gate = circuit.input(1).as_single_wire();
@@ -695,101 +696,5 @@ mod tests {
                 &expected_plaintext
             );
         }
-    }
-
-    #[test]
-    fn polynomial_slot_transfer_lowering_builds_and_symbolically_elaborates() {
-        let artifact = BggSlotTransferArtifactCompiler {
-            modulus: 257.into(),
-            ring_dimension: 8.into(),
-            secret_size: 1,
-            slot_count: 2,
-            digit_count: 2,
-            chunk_columns: 2,
-            gadget_base: 4.into(),
-            trapdoor_sigma: RealExpr::from_integer(5),
-            error_sigma: RealExpr::from_integer(3),
-        };
-        let ring = Ring::new(257, 8);
-        let hash_key = ring.bytes_input("hash-key", 32);
-        let base: BggSlotTransferBaseWires = artifact.build_base().expect("base artifacts");
-        let slots = artifact.build_slots(hash_key.clone(), &base).expect("slot artifacts");
-
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let input_gate = circuit.input(1).as_single_wire();
-        let transferred = circuit.slot_transfer_gate(input_gate, &[(1, None), (0, Some(2))]);
-        circuit.output([transferred]);
-
-        let public_key_type = ring.matrix_type((1, 2));
-        let one_public =
-            BggPublicKeyWire { matrix: ring.input("one-public", (1, 2)), reveal_plaintext: true };
-        let input_public =
-            BggPublicKeyWire { matrix: ring.input("input-public", (1, 2)), reveal_plaintext: true };
-        let public_compiler =
-            BggPublicKeyCompiler { ring: ring.clone(), base: 4.into(), digit_count: 2.into() };
-        let mut public_lowering = BggSlotTransferPublicKeyLowering {
-            compiler: public_compiler.clone(),
-            hash_key: hash_key.clone(),
-            public_key_type,
-            configured_slot_count: 2,
-            requests: Vec::new(),
-        };
-        let circuit_compiler = PolyCircuitCompiler { public_key: public_compiler.clone() };
-        let mut public_lookup = NoPublicLookup::default();
-        circuit_compiler
-            .compile_public_keys_with_lowerings(
-                &circuit,
-                one_public.clone(),
-                [input_public.clone()],
-                &mut public_lookup,
-                &mut public_lowering,
-            )
-            .expect("public-key pass");
-        let gates = artifact
-            .build_gate_preimages(&base, &slots, &public_lowering.requests)
-            .expect("gate artifacts");
-
-        let encoding = BggPolyEncodingWire {
-            vectors: ring.input_family("vectors", 2, (1, 2)),
-            pubkey: input_public,
-            plaintexts: Some(ring.input_family("plaintexts", 2, (1, 1))),
-        };
-        let one_encoding = BggPolyEncodingWire {
-            vectors: ring.input_family("one-vectors", 2, (1, 2)),
-            pubkey: one_public,
-            plaintexts: Some(ring.input_family("one-plaintexts", 2, (1, 1))),
-        };
-        let mut lowering = BggPolySlotTransferLowering {
-            compiler: BggPolyEncodingCompiler { public_key: public_compiler },
-            artifact,
-            hash_key,
-            c_b0: ring.input("c-b0", (1, 4)),
-            slots: BggSlotTransferPublicSlotWires {
-                public_keys: slots.public_keys,
-                b0_preimage_chunks: slots.b0_preimage_chunks,
-                b1_preimage_chunks: slots.b1_preimage_chunks,
-            },
-            gates,
-        };
-        let mut encoding_lookup = NoPublicLookup::default();
-        let outputs = circuit_compiler
-            .compile_poly_encodings_with_lowerings(
-                &circuit,
-                one_encoding,
-                [encoding],
-                &mut encoding_lookup,
-                &mut lowering,
-            )
-            .expect("encoding pass");
-        let built = DslContext::new("slot-transfer-poly-encoding")
-            .family_output("vectors", outputs[0].vectors.clone())
-            .expect("vectors")
-            .output("public", outputs[0].pubkey.matrix.clone())
-            .expect("public")
-            .build()
-            .expect("build");
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
-        assert!(elaborated.wire(&elaborated.outputs["vectors"]).unwrap().family.is_some());
-        assert!(elaborated.wire(&elaborated.outputs["public"]).unwrap().expression.is_some());
     }
 }

@@ -1,4 +1,5 @@
 use crate::{matrix::PolyMatrix, poly::Poly};
+use num_bigint::BigUint;
 
 pub mod bounds;
 #[cfg(feature = "gpu")]
@@ -7,7 +8,7 @@ pub mod hash;
 pub mod trapdoor;
 pub mod uniform;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 /// Enum representing different types of distributions for random sampling.
 pub enum DistType {
     /// Distribution over a finite ring, typically samples elements from a ring in a uniform or
@@ -18,7 +19,13 @@ pub enum DistType {
     /// Each sample is drawn proportionally to exp(-π‖x‖² / σ²), restricted to x ∈ Λ.
     ///
     /// * `sigma` - The Gaussian parameter (standard deviation).
-    GaussDist { sigma: f64 },
+    GaussDist {
+        sigma: f64,
+        /// When present, the CPU sampler independently rejection-resamples coefficients until
+        /// their centered magnitude is at most this authoritative hard cutoff. GPU enforcement is
+        /// a tracked follow-up and GPU execution is excluded from correctness correspondence.
+        max_coefficient_bound: Option<BigUint>,
+    },
     /// Distribution that produces random bits (0 or 1).
     BitDist,
     /// Distribution that produces random bits (-1,0,1).

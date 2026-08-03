@@ -20,8 +20,7 @@ use mxx_bgg::{
     PolyCircuitCompiler, bind_naive_lwe_lookup_invocations,
 };
 use mxx_dsl::{
-    BoundedMetadata, BuiltGraph, Bytes, DslContext, DslError, Family, HashTag, Int, Mat, Parallel,
-    Ring, Trapdoor, VirtualMat,
+    BuiltGraph, Bytes, DslContext, DslError, Family, HashTag, Int, Mat, Parallel, Ring, Trapdoor,
 };
 use mxx_gadgets::{
     Poly,
@@ -197,11 +196,6 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
         let hash_key = ring.bytes_input(HASH_KEY_INPUT, 32);
         let noise_refresh_hash_key = ring.bytes_input(NOISE_REFRESH_HASH_KEY_INPUT, 32);
         let private_k = ring.input(PRIVATE_K_INPUT, (1, 1));
-        let private_k = private_k.clone().assume(VirtualMat::bounded(
-            "diamond-io/private-k",
-            private_k.matrix_type().clone(),
-            BoundedMetadata::conservative(1),
-        ))?;
         let injector = DiamondInputInjector::new(self.config.input_config())?;
         let injection = injector.preprocess(private_k)?;
         let lookup_trapdoor = ring.sample_trapdoor(
@@ -1852,38 +1846,6 @@ mod tests {
         }
     }
 
-    fn symbolic_manifest(
-        production: ProductionId,
-        elaborated: &mxx_ir_symbolic::ElaboratedGraph,
-    ) -> mxx_ir_symbolic::manifest::Manifest {
-        let artifacts = elaborated
-            .outputs
-            .iter()
-            .map(|(name, reference)| {
-                let wire = elaborated.wire(reference).unwrap();
-                (
-                    name.clone(),
-                    mxx_ir_symbolic::manifest::ExportArtifact {
-                        wire_type: wire.wire_type.clone(),
-                        expression: wire.expression,
-                        family: wire.family.clone(),
-                        content_hash: None,
-                        layout: None,
-                    },
-                )
-            })
-            .collect();
-        mxx_ir_symbolic::manifest::export_manifest(
-            production,
-            &artifacts,
-            &elaborated.atoms,
-            &elaborated.expressions,
-            &elaborated.preimage_relations,
-            elaborated.assumption_digest,
-        )
-        .unwrap()
-    }
-
     #[test]
     #[ignore = "expands the full nested-RNS Diamond iO graph"]
     fn top_level_producer_and_consumer_are_manifest_linked() {
@@ -1910,15 +1872,9 @@ mod tests {
         let production = ProductionId { spec_hash: SpecHash([4; 32]), execution_nonce: [5; 32] };
         let artifact_manifest =
             export_validated_manifest(production.clone(), &validated_producer).unwrap();
-        let elaborated_producer = producer.graph.elaborate(&bindings).unwrap();
-        let symbolic_manifest = symbolic_manifest(production.clone(), &elaborated_producer);
         let consumer = compiler.build_evaluation(&function, production.clone()).unwrap();
         let manifests = BTreeMap::from([(production, artifact_manifest)]);
         consumer.graph.validate_with_manifests(&bindings, &manifests).unwrap();
-        consumer
-            .graph
-            .elaborate_with_manifests(&bindings, &manifests, &[symbolic_manifest])
-            .unwrap();
     }
 
     fn config() -> DiamondIoConfig {
@@ -1952,7 +1908,7 @@ mod tests {
     }
 
     #[test]
-    fn one_full_branch_rebase_and_refresh_round_validates_and_elaborates() {
+    fn one_full_branch_rebase_and_refresh_round_validates() {
         let config = config();
         config.validate(&DiamondIoFunction::GoldreichPrf { output_bits: 1 }).unwrap();
         let compiler = DiamondIoRoundCompiler { config: config.clone() };
@@ -2041,7 +1997,6 @@ mod tests {
             .build()
             .unwrap();
         graph.validate(&ParamEnv::default()).unwrap();
-        graph.elaborate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

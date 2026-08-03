@@ -19,6 +19,7 @@ pub struct BggSamplerLayout {
     pub secret_dimension: usize,
     pub digit_count: usize,
     pub gadget_base: IntExpr,
+    pub gaussian_max_coefficient_bound: IntExpr,
 }
 
 impl BggSamplerLayout {
@@ -164,7 +165,11 @@ impl BggPolyEncodingSampler {
                 let packed = secret.clone() * packed_public.clone() -
                     encoded_plaintexts.tensor(secret * gadget.clone()) +
                     match &sigma {
-                        Some(sigma) => ring.gaussian((1, columns * count), sigma.clone()),
+                        Some(sigma) => ring.gaussian(
+                            (1, columns * count),
+                            sigma.clone(),
+                            self.layout.gaussian_max_coefficient_bound.clone(),
+                        ),
                         None => ring.zero((1, columns * count)),
                     };
                 (0..count)
@@ -388,8 +393,7 @@ impl BggPublicKeySampler {
 impl BggEncodingSampler {
     /// Builds the packed relation `sA - ([1|x_1|...|x_t] tensor sG) + e`, then
     /// exposes its column slices. This preserves the executable dataflow of the
-    /// original sampler; the symbolic layer represents Concat and Tensor
-    /// directly without changing the runtime formula.
+    /// original sampler. Concat and Tensor remain ordinary executable nodes.
     pub fn sample(
         &self,
         secret: Mat,
@@ -432,7 +436,11 @@ impl BggEncodingSampler {
         let packed_vector = secret.clone() * all_public_keys -
             encoded_plaintexts.tensor(secret.clone() * gadget) +
             match &self.gaussian_sigma {
-                Some(sigma) => ring.gaussian((1, columns * count), sigma.clone()),
+                Some(sigma) => ring.gaussian(
+                    (1, columns * count),
+                    sigma.clone(),
+                    self.layout.gaussian_max_coefficient_bound.clone(),
+                ),
                 None => ring.zero((1, columns * count)),
             };
         Ok((0..count)
@@ -468,7 +476,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output};
     use mxx_dsl::DslContext;
-    use mxx_ir_core::{ParamEnv, node::NodeKind};
+    use mxx_ir_core::ParamEnv;
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -494,6 +502,7 @@ mod tests {
             secret_dimension,
             digit_count: parameters.modulus_digits(),
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
+            gaussian_max_coefficient_bound: 30.into(),
         }
     }
 
@@ -519,73 +528,6 @@ mod tests {
     }
 
     #[test]
-    fn bgg_sampling_elaborates_without_aggregate_atoms() {
-        let layout = BggSamplerLayout {
-            modulus: 257.into(),
-            ring_dimension: 8.into(),
-            secret_dimension: 2,
-            digit_count: 4,
-            gadget_base: 4.into(),
-        };
-        let ring = layout.ring();
-        let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
-            ring.bytes_input("hash-key", 32),
-            b"bgg-test".to_vec(),
-            &[true],
-        );
-        let encodings = BggEncodingSampler { layout, gaussian_sigma: Some(3.into()) }
-            .sample(ring.input("secret", (1, 2)), &public_keys, &[ring.input("plaintext", (1, 1))])
-            .expect("compatible sampler inputs");
-        let built = DslContext::new("bgg-sampling")
-            .private_output("constant", encodings[0].vector.clone())
-            .expect("constant output")
-            .private_output("message", encodings[1].vector.clone())
-            .expect("message output")
-            .build()
-            .expect("build");
-        let concat_count = built
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .filter(|node| matches!(node.kind(), NodeKind::Concat { axis: ConcatAxis::Columns }))
-            .count();
-        let tensor_count = built
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .filter(|node| matches!(node.kind(), NodeKind::Tensor))
-            .count();
-        let gaussian_types = built
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .filter_map(|node| match node.kind() {
-                NodeKind::GaussianSample { matrix_type, .. } => Some(matrix_type),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(concat_count, 2, "packed public keys and packed plaintext row");
-        assert_eq!(tensor_count, 1, "one packed plaintext/secret-gadget tensor");
-        assert_eq!(gaussian_types.len(), 1, "one packed error sample");
-        assert_eq!(gaussian_types[0].columns.canonicalize(), IntExpr::constant(16));
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
-        assert_eq!(elaborated.outputs.len(), 2);
-        assert!(!elaborated.atoms.is_empty());
-        let report = mxx_noise_simulator::simulate(&elaborated).expect("noise simulation");
-        for name in ["constant", "message"] {
-            let estimate = &report.outputs[name];
-            assert!(estimate.has_signal, "{name} retains the BGG signal term");
-            assert!(
-                estimate.noise.as_ref().is_some_and(|noise| noise.bound > 0),
-                "{name} retains sampled error in the noise estimate"
-            );
-        }
-    }
-
-    #[test]
     fn polynomial_and_naive_sampler_entrypoints_build_and_elaborate() {
         let layout = BggSamplerLayout {
             modulus: 257.into(),
@@ -593,6 +535,7 @@ mod tests {
             secret_dimension: 1,
             digit_count: 2,
             gadget_base: 4.into(),
+            gaussian_max_coefficient_bound: 30.into(),
         };
         let ring = layout.ring();
         let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
@@ -633,7 +576,7 @@ mod tests {
             .build()
             .unwrap();
         built.validate(&ParamEnv::default()).unwrap();
-        built.elaborate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

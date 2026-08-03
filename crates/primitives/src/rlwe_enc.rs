@@ -26,7 +26,12 @@ where
     assert!(a.col_size() == 1);
 
     // Sample error from Gaussian distribution
-    let e = sampler_uniform.sample_uniform(params, 1, 1, DistType::GaussDist { sigma });
+    let e = sampler_uniform.sample_uniform(
+        params,
+        1,
+        1,
+        DistType::GaussDist { sigma, max_coefficient_bound: None },
+    );
 
     // Use provided scale or calculate half of q
     let scale =

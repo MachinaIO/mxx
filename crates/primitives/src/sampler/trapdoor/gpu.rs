@@ -69,8 +69,8 @@ impl GpuDCRTTrapdoor {
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
-        let dist = DistType::GaussDist { sigma };
-        let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
+        let dist = DistType::GaussDist { sigma, max_coefficient_bound: None };
+        let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist.clone());
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
         let a_mat_coeff = coeff_cached_matrix(&(&r * &r.transpose()));
         let b_mat_coeff = coeff_cached_matrix(&(&r * &e.transpose()));
@@ -354,7 +354,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let k = params.modulus_digits();
         let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
 
-        let dist = DistType::GaussDist { sigma: s };
+        let dist = DistType::GaussDist { sigma: s, max_coefficient_bound: None };
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let preimage_right = uniform_sampler.sample_uniform(params, ext_ncol, target_ncol, dist);
         let t = target - &(ext_matrix * &preimage_right);
@@ -392,7 +392,7 @@ fn sample_pert_square_mat_gpu_native_parts(
         params,
         dk,
         padded_ncol,
-        DistType::GaussDist { sigma: sigma_large },
+        DistType::GaussDist { sigma: sigma_large, max_coefficient_bound: None },
     );
     tracing::debug!("gpu preimage sample_pert: sampled p2");
     let tp2 = GpuDCRTPolyMatrix::mul_vertical_pair(&trapdoor.r, &trapdoor.e, &p2);
@@ -429,10 +429,10 @@ mod tests {
                 params::DCRTPolyParams,
             },
         },
-        sampler::bounds::{compute_preimage_sigma, maximum_coefficient_bound_from_sigma},
+        sampler::bounds::{compute_preimage_sigma, hard_cutoff_from_sigma_bound},
     };
     use bigdecimal::{BigDecimal, FromPrimitive};
-    use num_bigint::{BigInt, BigUint};
+    use num_bigint::BigUint;
     use serial_test::serial as sequential;
 
     const SIGMA: f64 = 4.578;
@@ -672,7 +672,7 @@ mod tests {
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
         let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, bound_sigma);
-        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
+        let preimage_bound = hard_cutoff_from_sigma_bound(&preimage_sigma);
         let modulus = params.modulus();
 
         for sample_idx in 0..4usize {
@@ -687,9 +687,8 @@ mod tests {
                         let value = coeff.value().clone();
                         let neg = modulus.as_ref() - &value;
                         let centered_abs = if value < neg { value } else { neg };
-                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_bound,
+                            centered_abs <= preimage_bound,
                             "preimage coeff exceeds preimage maximum coefficient bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
                             sample_idx,
                             i,
@@ -734,7 +733,7 @@ mod tests {
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
         let m_g = (size * params.modulus_digits()) as u64;
         let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, None);
-        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
+        let preimage_bound = hard_cutoff_from_sigma_bound(&preimage_sigma);
         let modulus = params.modulus();
         let n = params.ring_dimension() as usize;
         let k = params.modulus_digits();
@@ -760,9 +759,8 @@ mod tests {
                         let value = coeff.value().clone();
                         let neg = modulus.as_ref() - &value;
                         let centered_abs = if value < neg { value } else { neg };
-                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_bound,
+                            centered_abs <= preimage_bound,
                             "p_hat coeff exceeds preimage maximum coefficient bound at sample={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={}",
                             sample_idx,
                             i,
@@ -799,7 +797,7 @@ mod tests {
         let base = BigDecimal::from_biguint(BigUint::from(1u32) << base_params.base_bits(), 0);
         let m_g = (size * base_params.modulus_digits()) as u64;
         let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, None);
-        let preimage_bound = maximum_coefficient_bound_from_sigma(&preimage_sigma);
+        let preimage_bound = hard_cutoff_from_sigma_bound(&preimage_sigma);
         let modulus = base_params.modulus();
 
         struct DeviceCase {
@@ -859,9 +857,8 @@ mod tests {
                         let value = coeff.value().clone();
                         let neg = modulus.as_ref() - &value;
                         let centered_abs = if value < neg { value } else { neg };
-                        let centered_bd = BigDecimal::from(BigInt::from(centered_abs.clone()));
                         assert!(
-                            centered_bd < preimage_bound,
+                            centered_abs <= preimage_bound,
                             "restored preimage coeff exceeds preimage maximum coefficient bound (src_device={}, dst_device={}, row={}, col={}, coeff_idx={}, centered_abs={}, bound={})",
                             case.src_device,
                             case.dst_device,

@@ -427,7 +427,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output, row};
     use mxx_dsl::{DslContext, Ring};
-    use mxx_ir_core::{ParamEnv, node::NodeKind};
+    use mxx_ir_core::ParamEnv;
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
@@ -473,50 +473,7 @@ mod tests {
             .build()
             .unwrap();
         graph.validate(&ParamEnv::default()).unwrap();
-        graph.elaborate(&ParamEnv::default()).unwrap();
-    }
-
-    #[test]
-    fn naive_encoding_multiplication_elaborates_all_indexed_families() {
-        let ring = Ring::new(257, 8);
-        let compiler = NaiveBggVecCompiler {
-            public_key: BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 4.into(),
-                digit_count: 4.into(),
-            },
-        };
-        let encoding = |prefix: &str| NaiveBggEncodingVecWire {
-            vectors: ring.input_family(format!("{prefix}-vectors"), 2, (1, 8)),
-            pubkeys: ring.input_family(format!("{prefix}-pubkeys"), 2, (2, 8)),
-            pubkey_reveal_plaintext: true,
-            plaintexts: Some(ring.input_family(format!("{prefix}-plaintexts"), 2, (1, 1))),
-        };
-        let product =
-            compiler.mul_encodings(&encoding("left"), &encoding("right")).expect("product");
-        let built = DslContext::new("naive-bgg-encoding-mul")
-            .family_output("vectors", product.vectors)
-            .expect("vector family")
-            .family_output("pubkeys", product.pubkeys)
-            .expect("public-key family")
-            .build()
-            .expect("build");
-        let kinds = built
-            .graph
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .map(|node| node.kind())
-            .collect::<Vec<_>>();
-        assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::ParallelLoop(_))));
-        assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::GadgetDecompose { .. })));
-        assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixBinary(_))));
-
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
-        for output in ["vectors", "pubkeys"] {
-            let wire = elaborated.wire(&elaborated.outputs[output]).expect("family output");
-            assert!(wire.family.is_some());
-        }
+        graph.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

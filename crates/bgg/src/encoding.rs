@@ -194,7 +194,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output, row};
     use mxx_dsl::{DslContext, Ring, Subgraph};
-    use mxx_ir_core::{ParamEnv, node::NodeKind};
+
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
@@ -262,52 +262,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn encoding_multiplication_keeps_executable_decompose_multiply_add_and_elaborates() {
-        let ring = Ring::new(257, 8);
-        let compiler = BggEncodingCompiler {
-            public_key: BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 4.into(),
-                digit_count: 4.into(),
-            },
-        };
-        let encoding = |prefix: &str| BggEncodingWire {
-            vector: ring.input(format!("{prefix}-vector"), (1, 8)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{prefix}-public"), (2, 8)),
-                reveal_plaintext: true,
-            },
-            plaintext: Some(ring.input(format!("{prefix}-plaintext"), (1, 1))),
-        };
-        let product = compiler.mul(&encoding("left"), &encoding("right")).expect("product");
-        let built = DslContext::new("bgg-encoding-mul")
-            .output("vector", product.vector)
-            .expect("vector output")
-            .output("public", product.pubkey.matrix)
-            .expect("public output")
-            .build()
-            .expect("build");
-        let kinds = built
-            .graph
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .map(|node| node.kind())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kinds.iter().filter(|kind| matches!(kind, NodeKind::GadgetDecompose { .. })).count(),
-            2
-        );
-        assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixBinary(_))));
-
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
-        let vector = elaborated.wire(&elaborated.outputs["vector"]).expect("vector output");
-        assert!(
-            elaborated.expressions.get(vector.expression.expect("vector expression")).is_some()
-        );
     }
 
     #[test]

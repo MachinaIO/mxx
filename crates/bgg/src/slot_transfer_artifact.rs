@@ -30,6 +30,8 @@ pub struct BggSlotTransferArtifactCompiler {
     pub gadget_base: IntExpr,
     pub trapdoor_sigma: RealExpr,
     pub error_sigma: RealExpr,
+    pub error_max_coefficient_bound: IntExpr,
+    pub preimage_max_coefficient_bound: IntExpr,
 }
 
 #[derive(Debug, Error)]
@@ -110,12 +112,14 @@ impl BggSlotTransferArtifactCompiler {
                 self.trapdoor_sigma.clone(),
                 self.gadget_base.clone(),
                 self.digit_count,
+                self.preimage_max_coefficient_bound.clone(),
             ),
             b1: ring.sample_trapdoor(
                 self.secret_size * 2,
                 self.trapdoor_sigma.clone(),
                 self.gadget_base.clone(),
                 self.digit_count,
+                self.preimage_max_coefficient_bound.clone(),
             ),
         })
     }
@@ -147,6 +151,7 @@ impl BggSlotTransferArtifactCompiler {
                 self.trapdoor_sigma.clone(),
                 self.gadget_base.clone(),
                 self.digit_count,
+                self.preimage_max_coefficient_bound.clone(),
             ),
             b1: ring.trapdoor_artifact_input(
                 artifacts.production_id.clone(),
@@ -156,6 +161,7 @@ impl BggSlotTransferArtifactCompiler {
                 self.trapdoor_sigma.clone(),
                 self.gadget_base.clone(),
                 self.digit_count,
+                self.preimage_max_coefficient_bound.clone(),
             ),
         })
     }
@@ -200,7 +206,12 @@ impl BggSlotTransferArtifactCompiler {
                         b1_public.clone().slice(None, Some(target_columns.clone()));
                     let columns = target.matrix_type().columns.clone();
                     b0.sample_preimage(
-                        target + ring.gaussian((secret_size, columns.clone()), error_sigma.clone()),
+                        target +
+                            ring.gaussian(
+                                (secret_size, columns.clone()),
+                                error_sigma.clone(),
+                                self.error_max_coefficient_bound.clone(),
+                            ),
                         (b0.public_matrix().matrix_type().columns.clone(), columns),
                     )
                     .as_mat()
@@ -229,6 +240,7 @@ impl BggSlotTransferArtifactCompiler {
                             ring.gaussian(
                                 (secret_size * 2, columns.clone()),
                                 error_sigma.clone(),
+                                self.error_max_coefficient_bound.clone(),
                             ),
                         (b1.public_matrix().matrix_type().columns.clone(), columns),
                     )
@@ -445,6 +457,7 @@ impl BggSlotTransferArtifactCompiler {
                     ring.gaussian(
                         (self.secret_size, range_len(&columns)),
                         self.error_sigma.clone(),
+                        self.error_max_coefficient_bound.clone(),
                     );
                 base.b0
                     .sample_preimage(target, (self.b0_public_columns(), range_len(&columns)))
@@ -493,6 +506,7 @@ impl BggSlotTransferArtifactCompiler {
                     ring.gaussian(
                         (self.secret_size, range_len(&columns)),
                         self.error_sigma.clone(),
+                        self.error_max_coefficient_bound.clone(),
                     );
                 base.b0
                     .sample_preimage(target, (self.b0_public_columns(), range_len(&columns)))
@@ -638,6 +652,8 @@ mod tests {
             gadget_base: 4.into(),
             trapdoor_sigma: RealExpr::from_integer(5),
             error_sigma: RealExpr::from_integer(3),
+            error_max_coefficient_bound: 19.into(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
         }
     }
 
@@ -664,6 +680,8 @@ mod tests {
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
             trapdoor_sigma: RealExpr::from_f64_exact(4.578).expect("finite sigma"),
             error_sigma: RealExpr::from_integer(0),
+            error_max_coefficient_bound: 0.into(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
         };
         let ring = compiler.ring();
         let base = compiler.build_base().expect("base");
@@ -828,6 +846,8 @@ mod tests {
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
             trapdoor_sigma: RealExpr::from_f64_exact(4.578).expect("finite sigma"),
             error_sigma: RealExpr::from_integer(0),
+            error_max_coefficient_bound: 0.into(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
         };
         let mut backend = cpu_backend([parameters.clone()]);
         let mut store = MemoryArtifactStore::default();
@@ -1145,7 +1165,6 @@ mod tests {
             .build()
             .expect("slot graph");
         slot_graph.validate(&ParamEnv::default()).expect("valid slot graph");
-        slot_graph.elaborate(&ParamEnv::default()).expect("symbolic slot graph");
 
         let key = compiler.ring().bytes_input("gate-hash-key", 32);
         let input = compiler.ring().hash_matrix(
@@ -1184,6 +1203,5 @@ mod tests {
             .build()
             .expect("gate graph");
         gate_graph.validate(&ParamEnv::default()).expect("valid gate graph");
-        gate_graph.elaborate(&ParamEnv::default()).expect("symbolic gate graph");
     }
 }

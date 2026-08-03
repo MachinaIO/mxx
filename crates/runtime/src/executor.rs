@@ -446,7 +446,14 @@ where
                 args: scope.arguments(handle).expect("validated node belongs to its scope"),
             };
             if matches!(node.kind, NodeKind::PreimageSample { .. }) && envs.len() > 1 {
-                self.execute_preimage_batch(scope_id, &paths, &placements, &node, &mut values)?;
+                self.execute_preimage_batch(
+                    scope_id,
+                    &envs,
+                    &paths,
+                    &placements,
+                    &node,
+                    &mut values,
+                )?;
             } else if envs.len() > 1 &&
                 placements.iter().all(|placement| *placement == placements[0]) &&
                 self.execute_parallel_matrix_node(placements[0], &envs, &node, &mut values)?
@@ -1261,14 +1268,17 @@ where
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
-            NodeKind::GaussianSample { sigma, .. } => {
+            NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
                 let sigma = sigma
                     .evaluate_f64(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
+                let max_coefficient_bound = max_coefficient_bound
+                    .evaluate(env)
+                    .map_err(|error| self.expression_error(node.id, error))?;
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
-                    backend.sample_gaussian(&ty, sigma)
+                    backend.sample_gaussian(&ty, sigma, &max_coefficient_bound)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
@@ -1355,13 +1365,16 @@ where
                     },
                 );
             }
-            NodeKind::PreimageSample { .. } => {
+            NodeKind::PreimageSample { max_coefficient_bound, .. } => {
                 let public = self.matrix(values, node.args[0])?;
                 let (secret, _, _, sigma, gadget_base, digit_count, gadget_small) =
                     self.trapdoor(values, node.args[1])?;
                 let target = self.matrix(values, node.args[2])?;
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
+                let max_coefficient_bound = max_coefficient_bound
+                    .evaluate(env)
+                    .map_err(|error| self.expression_error(node.id, error))?;
                 let value = if let Some(small) = gadget_small {
                     self.backend.gadget_decompose(&target, small).map_err(Self::backend_error)?
                 } else {
@@ -1373,6 +1386,7 @@ where
                             sigma,
                             &gadget_base,
                             digit_count,
+                            &max_coefficient_bound,
                             secret,
                             &public,
                             &target,
@@ -1779,6 +1793,7 @@ where
     fn execute_preimage_batch(
         &mut self,
         scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
         paths: &[Vec<InstantiationFrame>],
         placements: &[usize],
         node: &ExecutableNode<'_>,
@@ -1807,6 +1822,12 @@ where
                 continue;
             }
             let matrix_type = self.matrix_type(scope_id, &paths[instance], wire)?;
+            let NodeKind::PreimageSample { max_coefficient_bound, .. } = node.kind else {
+                unreachable!("preimage batch only handles preimage nodes")
+            };
+            let max_coefficient_bound = max_coefficient_bound
+                .evaluate(&envs[instance])
+                .map_err(|error| self.expression_error(node.id, error))?;
             pending.push(Pending {
                 instance,
                 placement: placements[instance],
@@ -1817,6 +1838,7 @@ where
                     sigma,
                     gadget_base,
                     digit_count,
+                    max_coefficient_bound,
                     trapdoor: secret.expect("sampled trapdoor must carry secret material"),
                     public,
                     target,
@@ -2292,7 +2314,7 @@ where
                 Ok(RuntimeValue::TypedBlob(bytes))
             }
             (
-                ArtifactType::Trapdoor { matrix, sigma, gadget_base, digit_count },
+                ArtifactType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. },
                 ArtifactPayload::Trapdoor { public_bytes, secret_bytes },
             ) => {
                 let public = self
@@ -3118,9 +3140,6 @@ mod tests {
             .expect("output")
             .build()
             .expect("build");
-        let symbolic = built.elaborate(&ParamEnv::default()).expect("elaboration");
-        let output = symbolic.wire(&symbolic.outputs["values"]).expect("symbolic output");
-        assert!(output.family.is_some());
         let validated = built.validate(&ParamEnv::default()).expect("validation");
         let result = execute(
             &validated,
@@ -3224,7 +3243,7 @@ mod tests {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
-        let sample = ring.gaussian((1, 1), 3);
+        let sample = ring.gaussian((1, 1), 3, 19);
         let built = DslContext::new("runtime-transcript-and-trace")
             .output("sample", sample.clone())
             .expect("sample output")
@@ -3267,7 +3286,7 @@ mod tests {
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let sampled = DslContext::new("runtime-resumable-sample")
-            .private_output("sample", ring.gaussian((1, 1), 3))
+            .private_output("sample", ring.gaussian((1, 1), 3, 19))
             .expect("private sample")
             .build()
             .expect("build")

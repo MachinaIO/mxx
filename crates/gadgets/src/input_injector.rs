@@ -1,5 +1,7 @@
 //! BGG-independent input-injection preprocessing shared by Diamond applications.
 
+pub mod correctness;
+
 use mxx_dsl::{DslError, Family, Int, Mat, Parallel, Ring, Trapdoor};
 use mxx_ir_core::{IntExpr, RealExpr, node::ConcatAxis};
 use num_bigint::BigInt;
@@ -19,6 +21,8 @@ pub struct DiamondInputConfig {
     pub digit_count: usize,
     pub trapdoor_sigma: RealExpr,
     pub error_sigma: RealExpr,
+    pub error_max_coefficient_bound: BigInt,
+    pub preimage_max_coefficient_bound: BigInt,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -35,6 +39,8 @@ pub enum DiamondInputConfigError {
     InvalidDigitBase,
     #[error("the gadget base must be at least two")]
     InvalidGadgetBase,
+    #[error("sampler coefficient bounds must be nonnegative")]
+    InvalidSamplerBound,
     #[error("a Diamond input-injection layout calculation overflowed")]
     LayoutOverflow,
     #[error("Diamond input-injection transition artifacts do not match the configured layout")]
@@ -91,6 +97,11 @@ impl DiamondInputConfig {
         }
         if self.gadget_base < BigInt::from(2) {
             return Err(DiamondInputConfigError::InvalidGadgetBase);
+        }
+        if self.error_max_coefficient_bound < BigInt::from(0) ||
+            self.preimage_max_coefficient_bound < BigInt::from(0)
+        {
+            return Err(DiamondInputConfigError::InvalidSamplerBound);
         }
         self.witness_size()?;
         self.state_columns()?;
@@ -169,6 +180,7 @@ impl DiamondInputInjector {
                             self.config.trapdoor_sigma.clone(),
                             self.config.gadget_base_expr(),
                             self.config.digit_count_expr(),
+                            self.config.preimage_max_coefficient_bound.clone(),
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -178,7 +190,11 @@ impl DiamondInputInjector {
         let secret_epsilon = ternary_secret(&ring);
         let selector = Mat::concat(ConcatAxis::Columns, vec![secret_epsilon, message]);
         let p = selector * bases[0][0].public_matrix() +
-            ring.gaussian((1, state_columns), self.config.error_sigma.clone());
+            ring.gaussian(
+                (1, state_columns),
+                self.config.error_sigma.clone(),
+                self.config.error_max_coefficient_bound.clone(),
+            );
 
         let mut transitions = Vec::with_capacity(self.config.input_count);
         for level in 1..=self.config.input_count {
@@ -193,6 +209,7 @@ impl DiamondInputInjector {
                 let public = bases[level][state].public_matrix();
                 let ring = ring.clone();
                 let sigma = self.config.error_sigma.clone();
+                let error_bound = self.config.error_max_coefficient_bound.clone();
                 let new_bit = (state >= first_new_state).then(|| state - first_new_state);
                 let build_transition = move |secret_mask: Mat, bit: Option<Mat>| {
                     let selector = if let Some(bit) = bit {
@@ -203,7 +220,11 @@ impl DiamondInputInjector {
                         regular_selector(secret_mask)
                     };
                     let target = selector * public.clone() +
-                        ring.gaussian((state_rows, state_columns), sigma.clone());
+                        ring.gaussian(
+                            (state_rows, state_columns),
+                            sigma.clone(),
+                            error_bound.clone(),
+                        );
                     source.sample_preimage(target, (state_columns, state_columns)).as_mat()
                 };
                 let family = if let Some(bit_index) = new_bit {
@@ -337,6 +358,8 @@ mod tests {
             digit_count: 2,
             trapdoor_sigma: RealExpr::from_integer(4),
             error_sigma: RealExpr::from_integer(3),
+            error_max_coefficient_bound: BigInt::from(19),
+            preimage_max_coefficient_bound: BigInt::from(64),
         }
     }
 
@@ -368,8 +391,6 @@ mod tests {
                 .flat_map(|scope| scope.nodes())
                 .any(|node| matches!(node.kind(), NodeKind::PreimageSample { .. }))
         );
-        let elaborated = built.elaborate(&ParamEnv::default()).unwrap();
-        assert!(!elaborated.preimage_relations.is_empty());
     }
 
     #[test]

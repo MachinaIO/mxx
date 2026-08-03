@@ -17,7 +17,5 @@ rayon.workspace = true
 [dev-dependencies]
 mxx-primitives.workspace = true
 mxx-runtime.workspace = true
-mxx-noise-simulator.workspace = true
-mxx-ir-symbolic.workspace = true
 keccak-asm.workspace = true
 serial_test.workspace = true

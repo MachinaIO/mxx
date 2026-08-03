@@ -122,7 +122,8 @@ where
         request.matrix_type != first.matrix_type ||
             request.sigma != first.sigma ||
             request.gadget_base != first.gadget_base ||
-            request.digit_count != first.digit_count
+            request.digit_count != first.digit_count ||
+            request.max_coefficient_bound != first.max_coefficient_bound
     }) {
         return requests
             .into_iter()
@@ -132,6 +133,7 @@ where
                     request.sigma,
                     &request.gadget_base,
                     request.digit_count,
+                    &request.max_coefficient_bound,
                     request.trapdoor.as_ref(),
                     request.public.as_ref(),
                     request.target.as_ref(),
@@ -140,6 +142,25 @@ where
             .collect();
     }
     let parameters = backend.parameters(&first.matrix_type)?;
+    if parameters.device_ids().is_empty() {
+        return requests
+            .into_iter()
+            .map(|request| {
+                backend.sample_preimage(
+                    &request.matrix_type,
+                    request.sigma,
+                    &request.gadget_base,
+                    request.digit_count,
+                    &request.max_coefficient_bound,
+                    request.trapdoor.as_ref(),
+                    request.public.as_ref(),
+                    request.target.as_ref(),
+                )
+            })
+            .collect();
+    }
+    // Device-side cutoff enforcement is intentionally deferred. GPU execution is excluded from
+    // concrete-runtime correspondence until bounded GPU preimage sampling lands.
     PolyBackend::<M, U, H, T>::validate_regular_gadget_layout(
         parameters,
         &first.gadget_base,

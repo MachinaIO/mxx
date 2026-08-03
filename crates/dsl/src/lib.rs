@@ -1,13 +1,10 @@
 //! Declarative typed construction API for mxx graphs.
 //!
 //! Executable operations create immutable `mxx-ir-core` nodes immediately.
-//! The only non-executable expression wrapper is [`SymbolicExpr`], used by
-//! [`Mat::assume`] to attach an axiom-like symbolic annotation.
 
 use mxx_ir_core::{
-    CapturePolicy, CompileParameter, CompileParameterKind, FreezeError, FreezeMap, Graph,
-    GraphOutput, IntExpr, NodeHandle, ParamEnv, RealExpr, SealMap, SealedSubgraph, SubgraphHandle,
-    ValueHandle,
+    CapturePolicy, CompileParameter, CompileParameterKind, FreezeError, Graph, GraphOutput,
+    IntExpr, NodeHandle, ParamEnv, RealExpr, SealMap, SealedSubgraph, SubgraphHandle, ValueHandle,
     artifact::{ArtifactConfidentiality, ProductionId},
     graph::with_new_construction_scope,
     node::{
@@ -16,19 +13,13 @@ use mxx_ir_core::{
     },
     types::{MatrixType, WireType},
 };
-use mxx_ir_symbolic::overlay::{
-    DeclaredDependencyLabels, PendingSymbolicExpr, PendingSymbolicExprNode, StableVirtualAtomId,
-    SymbolicOverlay, SymbolicValueRef, VirtualAtomDecl, VirtualKind,
-};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::BTreeMap,
     ops::{Add, Mul, Neg, Sub},
-    sync::Arc,
 };
 use thiserror::Error;
 
 pub use mxx_ir_core::{Rational, artifact::ArtifactConfidentiality as Confidentiality};
-pub use mxx_ir_symbolic::atom::AssumedMetadata;
 
 #[derive(Debug, Error)]
 pub enum DslError {
@@ -36,12 +27,6 @@ pub enum DslError {
     Freeze(#[from] FreezeError),
     #[error("duplicate output name: {0}")]
     DuplicateOutput(String),
-    #[error("assume target already has an assumption")]
-    DuplicateAssumption,
-    #[error("assume expression type does not match its target")]
-    AssumptionType,
-    #[error("assume references an executable value that is unreachable or in another scope")]
-    UnreachableSymbolicFactor,
     #[error("subgraph body captures an executable value")]
     SubgraphCapture,
     #[error("graph value schema does not match its flattened values")]
@@ -50,6 +35,10 @@ pub enum DslError {
     FamilyCountMismatch,
     #[error(transparent)]
     StructuralValidation(#[from] mxx_ir_core::ValidationError),
+    #[error("ideal and predicate specifications must be sampler-free")]
+    NonPureSpecification,
+    #[error("a pure predicate must have exactly one boolean output")]
+    PredicateOutput,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -103,6 +92,7 @@ pub struct TrapdoorType {
     pub sigma: RealExpr,
     pub gadget_base: IntExpr,
     pub digit_count: IntExpr,
+    pub preimage_max_coefficient_bound: IntExpr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -128,6 +118,20 @@ pub struct Ring {
 }
 
 impl Ring {
+    /// Creates a protocol boolean input.
+    ///
+    /// This is placed on `Ring` for consistency with the other typed input builders; the value
+    /// itself is ring-independent.
+    #[track_caller]
+    pub fn bool_input(&self, name: impl Into<String>) -> Bool {
+        let node = NodeHandle::new(
+            NodeKind::Input { name: name.into(), wire_type: WireType::Bool, artifact: None },
+            Vec::new(),
+            vec![WireType::Bool],
+        );
+        Bool { value: node.output(0).expect("boolean input"), pending: Pending::default() }
+    }
+
     pub fn new(modulus: impl Into<IntExpr>, ring_dimension: impl Into<IntExpr>) -> Self {
         Self { modulus: modulus.into(), ring_dimension: ring_dimension.into() }
     }
@@ -201,11 +205,13 @@ impl Ring {
         sigma: impl Into<RealExpr>,
         gadget_base: impl Into<IntExpr>,
         digit_count: impl Into<IntExpr>,
+        preimage_max_coefficient_bound: impl Into<IntExpr>,
     ) -> Trapdoor {
         let rows = rows.into();
         let sigma = sigma.into();
         let gadget_base = gadget_base.into();
         let digit_count = digit_count.into();
+        let preimage_max_coefficient_bound = preimage_max_coefficient_bound.into();
         let matrix_type = self.matrix_type(Shape {
             rows: rows.clone(),
             columns: IntExpr::Mul(
@@ -228,8 +234,13 @@ impl Ring {
             }),
         );
         let trapdoor_artifact_name = trapdoor_artifact_name.into();
-        let wire_type =
-            WireType::Trapdoor { matrix: matrix_type.clone(), sigma, gadget_base, digit_count };
+        let wire_type = WireType::Trapdoor {
+            matrix: matrix_type.clone(),
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+        };
         let node = NodeHandle::new(
             NodeKind::Input {
                 name: trapdoor_artifact_name.clone(),
@@ -247,6 +258,7 @@ impl Ring {
             public,
             value: node.output(0).expect("trapdoor artifact input"),
             matrix_type,
+            preimage_max_coefficient_bound,
             pending: Pending::default(),
         }
     }
@@ -370,10 +382,19 @@ impl Ring {
     }
 
     #[track_caller]
-    pub fn gaussian(&self, shape: impl IntoShape, sigma: impl Into<RealExpr>) -> Mat {
+    pub fn gaussian(
+        &self,
+        shape: impl IntoShape,
+        sigma: impl Into<RealExpr>,
+        max_coefficient_bound: impl Into<IntExpr>,
+    ) -> Mat {
         let ty = self.matrix_type(shape);
         Mat::from_node(
-            NodeKind::GaussianSample { matrix_type: ty.clone(), sigma: sigma.into() },
+            NodeKind::GaussianSample {
+                matrix_type: ty.clone(),
+                sigma: sigma.into(),
+                max_coefficient_bound: max_coefficient_bound.into(),
+            },
             Vec::new(),
             ty,
         )
@@ -440,11 +461,13 @@ impl Ring {
         sigma: impl Into<RealExpr>,
         gadget_base: impl Into<IntExpr>,
         digit_count: impl Into<IntExpr>,
+        preimage_max_coefficient_bound: impl Into<IntExpr>,
     ) -> Trapdoor {
         let rows = rows.into();
         let sigma = sigma.into();
         let gadget_base = gadget_base.into();
         let digit_count = digit_count.into();
+        let preimage_max_coefficient_bound = preimage_max_coefficient_bound.into();
         let matrix_type = self.matrix_type(Shape {
             rows: rows.clone(),
             columns: IntExpr::Mul(
@@ -462,11 +485,18 @@ impl Ring {
                 sigma: sigma.clone(),
                 gadget_base: gadget_base.clone(),
                 digit_count: digit_count.clone(),
+                preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
             },
             Vec::new(),
             vec![
                 WireType::Matrix(matrix_type.clone()),
-                WireType::Trapdoor { matrix: matrix_type.clone(), sigma, gadget_base, digit_count },
+                WireType::Trapdoor {
+                    matrix: matrix_type.clone(),
+                    sigma,
+                    gadget_base,
+                    digit_count,
+                    preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+                },
             ],
         );
         Trapdoor {
@@ -477,6 +507,7 @@ impl Ring {
             },
             value: node.output(1).expect("trapdoor output"),
             matrix_type,
+            preimage_max_coefficient_bound,
             pending: Pending::default(),
         }
     }
@@ -787,16 +818,6 @@ impl Mat {
             .collect()
     }
 
-    pub fn assume(self, expression: impl IntoSymbolicExpr) -> Result<Self, DslError> {
-        let expression = expression.into_symbolic_expr();
-        if !expression.well_typed || self.matrix_type != expression.matrix_type {
-            return Err(DslError::AssumptionType);
-        }
-        let pending = Pending::merge([self.pending.clone(), expression.pending.clone()]);
-        let annotation = PendingAssumption { target: self.value.clone(), expression };
-        Ok(Self { pending: Pending::annotation(pending, annotation), ..self })
-    }
-
     pub fn concat(axis: ConcatAxis, values: Vec<Mat>) -> Mat {
         let first = values.first().expect("concat requires at least one input").matrix_type.clone();
         let rows = match axis {
@@ -869,32 +890,6 @@ impl Neg for Mat {
     }
 }
 
-macro_rules! mat_symbolic_rhs {
-    ($rhs:ty) => {
-        impl Add<$rhs> for Mat {
-            type Output = SymbolicExpr;
-            fn add(self, rhs: $rhs) -> Self::Output {
-                self.into_symbolic_expr() + rhs
-            }
-        }
-        impl Sub<$rhs> for Mat {
-            type Output = SymbolicExpr;
-            fn sub(self, rhs: $rhs) -> Self::Output {
-                self.into_symbolic_expr() - rhs
-            }
-        }
-        impl Mul<$rhs> for Mat {
-            type Output = SymbolicExpr;
-            fn mul(self, rhs: $rhs) -> Self::Output {
-                self.into_symbolic_expr() * rhs
-            }
-        }
-    };
-}
-
-mat_symbolic_rhs!(VirtualMat);
-mat_symbolic_rhs!(SymbolicExpr);
-
 #[derive(Clone)]
 pub struct Preimage {
     value: ValueHandle,
@@ -922,6 +917,7 @@ pub struct Trapdoor {
     public: Mat,
     value: ValueHandle,
     matrix_type: MatrixType,
+    preimage_max_coefficient_bound: IntExpr,
     pending: Pending,
 }
 
@@ -937,7 +933,10 @@ impl Trapdoor {
             MatrixType { rows: shape.rows, columns: shape.columns, ..self.matrix_type.clone() };
         let pending = Pending::merge([self.pending.clone(), target.pending.clone()]);
         let node = NodeHandle::new(
-            NodeKind::PreimageSample { matrix_type: ty.clone() },
+            NodeKind::PreimageSample {
+                matrix_type: ty.clone(),
+                max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+            },
             vec![self.public.value.clone(), self.value.clone(), target.value],
             vec![WireType::Preimage(ty.clone())],
         );
@@ -972,7 +971,7 @@ impl Int {
     }
 
     pub fn pending_assumptions(&self) -> bool {
-        self.pending.0.is_some()
+        false
     }
 
     pub fn add(self, rhs: Self) -> Self {
@@ -1738,286 +1737,20 @@ impl LoopIndex {
     }
 }
 
-#[derive(Clone)]
-pub struct VirtualMat(Arc<VirtualMatInner>);
-
-#[derive(Clone)]
-struct VirtualMatInner {
-    diagnostic_name: String,
-    matrix_type: MatrixType,
-    kind: VirtualKind,
-}
-
-impl VirtualMat {
-    pub fn large(name: impl Into<String>, matrix_type: MatrixType) -> Self {
-        Self(Arc::new(VirtualMatInner {
-            diagnostic_name: name.into(),
-            matrix_type,
-            kind: VirtualKind::Large,
-        }))
-    }
-
-    pub fn bounded(
-        name: impl Into<String>,
-        matrix_type: MatrixType,
-        metadata: BoundedMetadata,
-    ) -> Self {
-        Self(Arc::new(VirtualMatInner {
-            diagnostic_name: name.into(),
-            matrix_type,
-            kind: VirtualKind::Bounded {
-                norm: metadata.norm,
-                is_const_poly: metadata.is_const_poly,
-                zero_rows: metadata.zero_rows,
-                dependencies: metadata.dependencies,
-                clt_ready: metadata.clt_ready,
-            },
-        }))
-    }
-
-    fn identity(&self) -> usize {
-        Arc::as_ptr(&self.0) as usize
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct BoundedMetadata {
-    pub norm: RealExpr,
-    pub is_const_poly: bool,
-    pub zero_rows: Option<IntExpr>,
-    pub dependencies: DeclaredDependencyLabels,
-    pub clt_ready: bool,
-}
-
-impl BoundedMetadata {
-    pub fn conservative(norm: impl Into<RealExpr>) -> Self {
-        Self {
-            norm: norm.into(),
-            is_const_poly: false,
-            zero_rows: None,
-            dependencies: DeclaredDependencyLabels::Unknown,
-            clt_ready: false,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct SymbolicExpr {
-    matrix_type: MatrixType,
-    node: PendingSymbolicNode,
-    pending: Pending,
-    well_typed: bool,
-}
-
-#[derive(Clone)]
-enum PendingSymbolicNode {
-    Value(PendingSymbolicValue),
-    Add(Vec<SymbolicExpr>),
-    Scale { coefficient: IntExpr, value: Box<SymbolicExpr> },
-    Mul(Vec<SymbolicExpr>),
-}
-
-#[derive(Clone)]
-enum PendingSymbolicValue {
-    Concrete(ValueHandle),
-    Virtual(VirtualMat),
-}
-
-pub trait IntoSymbolicExpr {
-    fn into_symbolic_expr(self) -> SymbolicExpr;
-}
-
-impl IntoSymbolicExpr for SymbolicExpr {
-    fn into_symbolic_expr(self) -> SymbolicExpr {
-        self
-    }
-}
-
-impl IntoSymbolicExpr for VirtualMat {
-    fn into_symbolic_expr(self) -> SymbolicExpr {
-        SymbolicExpr {
-            matrix_type: self.0.matrix_type.clone(),
-            node: PendingSymbolicNode::Value(PendingSymbolicValue::Virtual(self)),
-            pending: Pending::default(),
-            well_typed: true,
-        }
-    }
-}
-
-impl IntoSymbolicExpr for Mat {
-    fn into_symbolic_expr(self) -> SymbolicExpr {
-        SymbolicExpr {
-            matrix_type: self.matrix_type,
-            node: PendingSymbolicNode::Value(PendingSymbolicValue::Concrete(self.value)),
-            pending: self.pending,
-            well_typed: true,
-        }
-    }
-}
-
-impl<T: IntoSymbolicExpr> Add<T> for SymbolicExpr {
-    type Output = SymbolicExpr;
-    fn add(self, rhs: T) -> Self::Output {
-        let rhs = rhs.into_symbolic_expr();
-        let well_typed = self.well_typed && rhs.well_typed && self.matrix_type == rhs.matrix_type;
-        SymbolicExpr {
-            matrix_type: self.matrix_type.clone(),
-            node: PendingSymbolicNode::Add(vec![self.clone(), rhs.clone()]),
-            pending: Pending::merge([self.pending, rhs.pending]),
-            well_typed,
-        }
-    }
-}
-
-impl<T: IntoSymbolicExpr> Sub<T> for SymbolicExpr {
-    type Output = SymbolicExpr;
-    fn sub(self, rhs: T) -> Self::Output {
-        self + (-rhs.into_symbolic_expr())
-    }
-}
-
-impl<T: IntoSymbolicExpr> Mul<T> for SymbolicExpr {
-    type Output = SymbolicExpr;
-    fn mul(self, rhs: T) -> Self::Output {
-        let rhs = rhs.into_symbolic_expr();
-        let matrix_type = product_type(&self.matrix_type, &rhs.matrix_type);
-        let well_typed = self.well_typed &&
-            rhs.well_typed &&
-            self.matrix_type.modulus == rhs.matrix_type.modulus &&
-            self.matrix_type.ring_dimension == rhs.matrix_type.ring_dimension &&
-            (self.matrix_type.columns == rhs.matrix_type.rows ||
-                is_scalar_type(&self.matrix_type) ||
-                is_scalar_type(&rhs.matrix_type));
-        SymbolicExpr {
-            matrix_type,
-            node: PendingSymbolicNode::Mul(vec![self.clone(), rhs.clone()]),
-            pending: Pending::merge([self.pending, rhs.pending]),
-            well_typed,
-        }
-    }
-}
-
-impl Neg for SymbolicExpr {
-    type Output = SymbolicExpr;
-
-    fn neg(self) -> Self::Output {
-        SymbolicExpr {
-            matrix_type: self.matrix_type.clone(),
-            node: PendingSymbolicNode::Scale {
-                coefficient: IntExpr::constant(-1),
-                value: Box::new(self.clone()),
-            },
-            pending: self.pending,
-            well_typed: self.well_typed,
-        }
-    }
-}
-
-impl Neg for VirtualMat {
-    type Output = SymbolicExpr;
-
-    fn neg(self) -> Self::Output {
-        -self.into_symbolic_expr()
-    }
-}
-
-macro_rules! symbolic_binary_lhs {
-    ($lhs:ty) => {
-        impl<T: IntoSymbolicExpr> Add<T> for $lhs {
-            type Output = SymbolicExpr;
-            fn add(self, rhs: T) -> Self::Output {
-                self.into_symbolic_expr() + rhs
-            }
-        }
-        impl<T: IntoSymbolicExpr> Sub<T> for $lhs {
-            type Output = SymbolicExpr;
-            fn sub(self, rhs: T) -> Self::Output {
-                self.into_symbolic_expr() - rhs
-            }
-        }
-        impl<T: IntoSymbolicExpr> Mul<T> for $lhs {
-            type Output = SymbolicExpr;
-            fn mul(self, rhs: T) -> Self::Output {
-                self.into_symbolic_expr() * rhs
-            }
-        }
-    };
-}
-
-symbolic_binary_lhs!(VirtualMat);
-
 #[derive(Clone, Default)]
 #[doc(hidden)]
-pub struct Pending(Option<Arc<PendingNode>>);
-
-struct PendingNode {
-    parents: Vec<Pending>,
-    assumption: Option<PendingAssumption>,
-}
-
-#[derive(Clone)]
-struct PendingAssumption {
-    target: ValueHandle,
-    expression: SymbolicExpr,
-}
+pub struct Pending;
 
 impl Pending {
     #[doc(hidden)]
-    pub fn merge(values: impl IntoIterator<Item = Pending>) -> Self {
-        let parents = values.into_iter().filter(|value| value.0.is_some()).collect::<Vec<_>>();
-        match parents.len() {
-            0 => Self::default(),
-            1 => parents.into_iter().next().expect("one parent"),
-            _ => Self(Some(Arc::new(PendingNode { parents, assumption: None }))),
-        }
+    pub fn merge(_values: impl IntoIterator<Item = Pending>) -> Self {
+        Self
     }
 
-    fn annotation(parent: Pending, assumption: PendingAssumption) -> Self {
-        Self(Some(Arc::new(PendingNode { parents: vec![parent], assumption: Some(assumption) })))
-    }
-
-    fn remap(&self, map: &SealMap) -> Self {
-        let Some(node) = &self.0 else { return Self::default() };
-        let parents = node.parents.iter().map(|parent| parent.remap(map)).collect();
-        let assumption = node.assumption.as_ref().map(|assumption| PendingAssumption {
-            target: map
-                .resolve(&assumption.target)
-                .cloned()
-                .unwrap_or_else(|| assumption.target.clone()),
-            expression: assumption.expression.remap(map),
-        });
-        Self(Some(Arc::new(PendingNode { parents, assumption })))
+    fn remap(&self, _map: &SealMap) -> Self {
+        Self
     }
 }
-
-impl SymbolicExpr {
-    fn remap(&self, map: &SealMap) -> Self {
-        let mut result = self.clone();
-        result.node = match &self.node {
-            PendingSymbolicNode::Value(PendingSymbolicValue::Concrete(value)) => {
-                PendingSymbolicNode::Value(PendingSymbolicValue::Concrete(
-                    map.resolve(value).cloned().unwrap_or_else(|| value.clone()),
-                ))
-            }
-            PendingSymbolicNode::Value(PendingSymbolicValue::Virtual(value)) => {
-                PendingSymbolicNode::Value(PendingSymbolicValue::Virtual(value.clone()))
-            }
-            PendingSymbolicNode::Add(children) => {
-                PendingSymbolicNode::Add(children.iter().map(|child| child.remap(map)).collect())
-            }
-            PendingSymbolicNode::Scale { coefficient, value } => PendingSymbolicNode::Scale {
-                coefficient: coefficient.clone(),
-                value: Box::new(value.remap(map)),
-            },
-            PendingSymbolicNode::Mul(children) => {
-                PendingSymbolicNode::Mul(children.iter().map(|child| child.remap(map)).collect())
-            }
-        };
-        result.pending = result.pending.remap(map);
-        result
-    }
-}
-
 pub struct DslContext {
     name: String,
     parameters: Vec<CompileParameter>,
@@ -2027,7 +1760,6 @@ pub struct DslContext {
 
 struct PendingOutput {
     value: ValueHandle,
-    pending: Pending,
     confidentiality: Option<ArtifactConfidentiality>,
 }
 
@@ -2119,10 +1851,7 @@ impl DslContext {
     ) -> Result<(), DslError> {
         if self
             .outputs
-            .insert(
-                name.clone(),
-                PendingOutput { value: mat.value, pending: mat.pending, confidentiality },
-            )
+            .insert(name.clone(), PendingOutput { value: mat.value, confidentiality })
             .is_some()
         {
             return Err(DslError::DuplicateOutput(name));
@@ -2188,25 +1917,16 @@ impl DslContext {
         &mut self,
         name: String,
         value: ValueHandle,
-        pending: Pending,
+        _pending: Pending,
         confidentiality: Option<ArtifactConfidentiality>,
     ) -> Result<(), DslError> {
-        if self
-            .outputs
-            .insert(name.clone(), PendingOutput { value, pending, confidentiality })
-            .is_some()
-        {
+        if self.outputs.insert(name.clone(), PendingOutput { value, confidentiality }).is_some() {
             return Err(DslError::DuplicateOutput(name));
         }
         Ok(())
     }
 
     pub fn build(self) -> Result<BuiltGraph, DslError> {
-        let pending = Pending::merge(self.outputs.values().map(|output| output.pending.clone()));
-        let retained_roots = pending_assumptions(&pending)
-            .iter()
-            .flat_map(|assumption| concrete_symbolic_values(&assumption.expression))
-            .collect();
         let outputs = self
             .outputs
             .into_iter()
@@ -2214,23 +1934,76 @@ impl DslContext {
                 (name, GraphOutput { value: output.value, confidentiality: output.confidentiality })
             })
             .collect();
-        let (graph, map) = Graph::freeze(
+        let (graph, _) = Graph::freeze(
             self.name,
             self.parameters,
             outputs,
-            retained_roots,
+            Vec::new(),
             Vec::new(),
             self.real_constants,
         )?;
-        let symbolic_overlay = freeze_pending(pending, &map)?;
         mxx_ir_core::validate_structure(&graph)?;
-        Ok(BuiltGraph { graph, symbolic_overlay })
+        Ok(BuiltGraph { graph })
     }
 }
 
 pub struct BuiltGraph {
     pub graph: Graph,
-    pub symbolic_overlay: SymbolicOverlay,
+}
+
+#[derive(Clone)]
+pub struct IdealSpec {
+    pub graph: Graph,
+}
+
+#[derive(Clone)]
+pub struct PurePredicateSpec {
+    pub graph: Graph,
+}
+
+fn require_sampler_free(graph: &Graph) -> Result<(), DslError> {
+    let contains_sampler = graph.scopes().values().any(|scope| {
+        scope.nodes().iter().any(|node| {
+            matches!(
+                node.kind(),
+                NodeKind::UniformSample { .. } |
+                    NodeKind::GaussianSample { .. } |
+                    NodeKind::HashSample { .. } |
+                    NodeKind::TrapdoorSample { .. } |
+                    NodeKind::PreimageSample { .. }
+            )
+        })
+    });
+    if contains_sampler {
+        return Err(DslError::NonPureSpecification);
+    }
+    Ok(())
+}
+
+impl IdealSpec {
+    pub fn new(graph: BuiltGraph) -> Result<Self, DslError> {
+        require_sampler_free(&graph.graph)?;
+        Ok(Self { graph: graph.graph })
+    }
+}
+
+impl PurePredicateSpec {
+    pub fn new(graph: BuiltGraph) -> Result<Self, DslError> {
+        require_sampler_free(&graph.graph)?;
+        if graph.graph.outputs().len() != 1 {
+            return Err(DslError::PredicateOutput);
+        }
+        let output = graph.graph.outputs().values().next().expect("one predicate output").value;
+        let output_type = graph
+            .graph
+            .root_scope()
+            .node(output.node)
+            .and_then(|node| node.output_types().get(output.port.0 as usize));
+        if output_type != Some(&WireType::Bool) && output_type != Some(&WireType::ConstantBool) {
+            return Err(DslError::PredicateOutput);
+        }
+        Ok(Self { graph: graph.graph })
+    }
 }
 
 impl BuiltGraph {
@@ -2248,160 +2021,12 @@ impl BuiltGraph {
     ) -> Result<mxx_ir_core::validate::ValidatedGraph, ValidationBuildError> {
         Ok(mxx_ir_core::validate_with_manifests(&self.graph, bindings, manifests)?)
     }
-
-    pub fn elaborate(
-        &self,
-        bindings: &ParamEnv,
-    ) -> Result<mxx_ir_symbolic::ElaboratedGraph, mxx_ir_symbolic::ElaborationError> {
-        mxx_ir_symbolic::elaborate_with_overlay(&self.graph, bindings, &[], &self.symbolic_overlay)
-    }
-
-    pub fn elaborate_with_manifests(
-        &self,
-        bindings: &ParamEnv,
-        artifact_manifests: &BTreeMap<ProductionId, mxx_ir_core::artifact::Manifest>,
-        symbolic_manifests: &[mxx_ir_symbolic::manifest::Manifest],
-    ) -> Result<mxx_ir_symbolic::ElaboratedGraph, mxx_ir_symbolic::ElaborationError> {
-        let validated =
-            mxx_ir_core::validate_with_manifests(&self.graph, bindings, artifact_manifests)?;
-        mxx_ir_symbolic::elaborate_validated(&validated, symbolic_manifests, &self.symbolic_overlay)
-    }
 }
 
 #[derive(Debug, Error)]
 pub enum ValidationBuildError {
     #[error(transparent)]
     Core(#[from] mxx_ir_core::ValidationError),
-}
-
-fn freeze_pending(pending: Pending, map: &FreezeMap) -> Result<SymbolicOverlay, DslError> {
-    let mut assumptions = pending_assumptions(&pending);
-    assumptions.sort_by_key(|assumption| map.resolve(&assumption.target).cloned());
-
-    let mut overlay = SymbolicOverlay::default();
-    let mut virtual_ids = HashMap::<usize, StableVirtualAtomId>::new();
-    for assumption in assumptions {
-        let target =
-            map.resolve(&assumption.target).cloned().ok_or(DslError::UnreachableSymbolicFactor)?;
-        if overlay.assumptions.contains_key(&target) {
-            return Err(DslError::DuplicateAssumption);
-        }
-        let expression = freeze_symbolic_expression(
-            assumption.expression,
-            &assumption.target,
-            map,
-            &mut overlay.virtual_atoms,
-            &mut virtual_ids,
-        )?;
-        overlay.assumptions.insert(target, expression);
-    }
-    Ok(overlay)
-}
-
-fn pending_assumptions(pending: &Pending) -> Vec<PendingAssumption> {
-    let mut assumptions = Vec::new();
-    let mut seen = HashSet::new();
-    fn visit(
-        pending: &Pending,
-        seen: &mut HashSet<usize>,
-        assumptions: &mut Vec<PendingAssumption>,
-    ) {
-        let Some(node) = &pending.0 else { return };
-        let identity = Arc::as_ptr(node) as usize;
-        if !seen.insert(identity) {
-            return;
-        }
-        for parent in &node.parents {
-            visit(parent, seen, assumptions);
-        }
-        if let Some(assumption) = &node.assumption {
-            assumptions.push(assumption.clone());
-        }
-    }
-    visit(&pending, &mut seen, &mut assumptions);
-    assumptions
-}
-
-fn concrete_symbolic_values(expression: &SymbolicExpr) -> Vec<ValueHandle> {
-    fn visit(expression: &SymbolicExpr, values: &mut Vec<ValueHandle>) {
-        match &expression.node {
-            PendingSymbolicNode::Value(PendingSymbolicValue::Concrete(value)) => {
-                values.push(value.clone());
-            }
-            PendingSymbolicNode::Value(PendingSymbolicValue::Virtual(_)) => {}
-            PendingSymbolicNode::Add(children) | PendingSymbolicNode::Mul(children) => {
-                for child in children {
-                    visit(child, values);
-                }
-            }
-            PendingSymbolicNode::Scale { value, .. } => visit(value, values),
-        }
-    }
-    let mut values = Vec::new();
-    visit(expression, &mut values);
-    values
-}
-
-fn freeze_symbolic_expression(
-    expression: SymbolicExpr,
-    target: &ValueHandle,
-    map: &FreezeMap,
-    virtual_atoms: &mut BTreeMap<StableVirtualAtomId, VirtualAtomDecl>,
-    virtual_ids: &mut HashMap<usize, StableVirtualAtomId>,
-) -> Result<PendingSymbolicExpr, DslError> {
-    let node = match expression.node {
-        PendingSymbolicNode::Value(PendingSymbolicValue::Concrete(value)) => {
-            if value.construction_scope() != target.construction_scope() {
-                return Err(DslError::UnreachableSymbolicFactor);
-            }
-            PendingSymbolicExprNode::Value(SymbolicValueRef::Local(
-                map.resolve(&value).cloned().ok_or(DslError::UnreachableSymbolicFactor)?,
-            ))
-        }
-        PendingSymbolicNode::Value(PendingSymbolicValue::Virtual(value)) => {
-            let identity = value.identity();
-            let next = StableVirtualAtomId(virtual_ids.len() as u64);
-            let id = *virtual_ids.entry(identity).or_insert_with(|| {
-                virtual_atoms.insert(
-                    next,
-                    VirtualAtomDecl {
-                        diagnostic_name: value.0.diagnostic_name.clone(),
-                        matrix_type: value.0.matrix_type.clone(),
-                        kind: value.0.kind.clone(),
-                    },
-                );
-                next
-            });
-            PendingSymbolicExprNode::Value(SymbolicValueRef::Virtual(id))
-        }
-        PendingSymbolicNode::Add(children) => PendingSymbolicExprNode::Add(
-            children
-                .into_iter()
-                .map(|child| {
-                    freeze_symbolic_expression(child, target, map, virtual_atoms, virtual_ids)
-                })
-                .collect::<Result<_, _>>()?,
-        ),
-        PendingSymbolicNode::Scale { coefficient, value } => PendingSymbolicExprNode::Scale {
-            coefficient,
-            value: Box::new(freeze_symbolic_expression(
-                *value,
-                target,
-                map,
-                virtual_atoms,
-                virtual_ids,
-            )?),
-        },
-        PendingSymbolicNode::Mul(children) => PendingSymbolicExprNode::Mul(
-            children
-                .into_iter()
-                .map(|child| {
-                    freeze_symbolic_expression(child, target, map, virtual_atoms, virtual_ids)
-                })
-                .collect::<Result<_, _>>()?,
-        ),
-    };
-    Ok(PendingSymbolicExpr { matrix_type: expression.matrix_type, node })
 }
 
 pub trait GraphValue: Clone {
@@ -2813,7 +2438,13 @@ impl GraphValue for Trapdoor {
     }
 
     fn schema(&self) -> Self::Schema {
-        let WireType::Trapdoor { sigma, gadget_base, digit_count, .. } = self.value.wire_type()
+        let WireType::Trapdoor {
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+            ..
+        } = self.value.wire_type()
         else {
             unreachable!("Trapdoor always wraps a trapdoor wire")
         };
@@ -2822,6 +2453,7 @@ impl GraphValue for Trapdoor {
             sigma: sigma.clone(),
             gadget_base: gadget_base.clone(),
             digit_count: digit_count.clone(),
+            preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
         }
     }
 
@@ -2839,6 +2471,7 @@ impl GraphValue for Trapdoor {
             },
             value: value.clone(),
             matrix_type: schema.matrix.clone(),
+            preimage_max_coefficient_bound: schema.preimage_max_coefficient_bound.clone(),
             pending,
         })
     }
@@ -2855,6 +2488,7 @@ impl GraphValueSchema for TrapdoorType {
             sigma: self.sigma.clone(),
             gadget_base: self.gadget_base.clone(),
             digit_count: self.digit_count.clone(),
+            preimage_max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
         };
         let node = NodeHandle::new(
             NodeKind::Input {
@@ -2869,6 +2503,7 @@ impl GraphValueSchema for TrapdoorType {
             public,
             value: node.output(0).expect("trapdoor argument"),
             matrix_type: self.matrix.clone(),
+            preimage_max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
             pending: Pending::default(),
         }
     }
@@ -2881,6 +2516,7 @@ impl GraphValueSchema for TrapdoorType {
                 sigma: self.sigma.clone(),
                 gadget_base: self.gadget_base.clone(),
                 digit_count: self.digit_count.clone(),
+                preimage_max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
             },
         ]
     }
@@ -3285,834 +2921,48 @@ pub use mxx_ir_core::node::ConcatAxis;
 mod tests {
     use super::*;
 
-    fn matrix_type(rows: i64, columns: i64) -> MatrixType {
-        MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(8),
-            rows: IntExpr::constant(rows),
-            columns: IntExpr::constant(columns),
-        }
-    }
-
     #[test]
-    fn executable_arithmetic_is_an_immutable_shared_dag() {
+    fn executable_arithmetic_builds_and_validates() {
         let ring = Ring::new(17, 8);
         let input = ring.input("input", (2, 2));
-        let sum = input.clone() + input;
-        let built = DslContext::new("sum").public_output("sum", sum).unwrap().build().unwrap();
-        assert_eq!(built.graph.root_scope().nodes().len(), 2);
+        let output = input.clone() + input;
+        let built = DslContext::new("sum").output("sum", output).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
-    fn build_rejects_undeclared_compile_variables() {
-        let ring = Ring::new(IntExpr::Var("missing".to_owned()), 8);
-        let result = DslContext::new("undeclared")
-            .output("value", ring.input("value", (1, 1)))
-            .expect("output")
-            .build();
-        assert!(matches!(
-            result,
-            Err(DslError::StructuralValidation(
-                mxx_ir_core::ValidationError::UndeclaredCompileVariable(name)
-            )) if name == "missing"
-        ));
-    }
+    fn sampler_cutoff_is_serialized_and_validated() {
+        let ring = Ring::new(257, 8);
+        let sample = ring.gaussian((1, 1), 3, 19);
+        let built =
+            DslContext::new("bounded-gaussian").output("sample", sample).unwrap().build().unwrap();
+        let serialized = serde_json::to_string(&built.graph).unwrap();
+        assert!(serialized.contains("max_coefficient_bound"));
+        built.validate(&ParamEnv::default()).unwrap();
 
-    #[test]
-    fn build_rejects_loop_indices_in_structural_types() {
-        let ring = Ring::new(17, 8);
-        let family = Parallel::range(2)
-            .map(|index| {
-                ring.gaussian(
-                    (IntExpr::Add(Box::new(index.expression()), Box::new(IntExpr::constant(1))), 1),
-                    2,
-                )
-            })
-            .expect("parallel body construction");
-        let result = DslContext::new("structural-loop-index")
-            .family_output("family", family)
-            .expect("output")
-            .build();
-        assert!(matches!(
-            result,
-            Err(DslError::StructuralValidation(
-                mxx_ir_core::ValidationError::StructuralLoopIndex { slot: 0, .. }
-            ))
-        ));
-    }
-
-    #[test]
-    fn assume_uses_arithmetic_and_preserves_virtual_handle_identity() {
-        let ring = Ring::new(17, 8);
-        let a = ring.input("a", (2, 2));
-        let c = ring.input("c", (2, 2));
-        let s = VirtualMat::bounded(
-            "s",
-            matrix_type(2, 2),
-            BoundedMetadata::conservative(RealExpr::from_integer(2)),
-        );
-        let e = VirtualMat::bounded(
-            "e",
-            matrix_type(2, 2),
-            BoundedMetadata::conservative(RealExpr::from_integer(3)),
-        );
-        let c = c.assume(s * a.clone() + e).unwrap();
-        let built = DslContext::new("assume").output("c", c).unwrap().build().unwrap();
-        assert_eq!(built.graph.root_scope().nodes().len(), 2);
-        assert_eq!(built.symbolic_overlay.virtual_atoms.len(), 2);
-        assert_eq!(built.symbolic_overlay.assumptions.len(), 1);
-        let assumption = built.symbolic_overlay.assumptions.values().next().expect("assumption");
-        assert!(matches!(
-            &assumption.node,
-            PendingSymbolicExprNode::Add(children)
-                if children.len() == 2 &&
-                    children.iter().any(|child| matches!(child.node, PendingSymbolicExprNode::Mul(_)))
-        ));
-    }
-
-    #[test]
-    fn virtual_clone_reuses_identity_but_same_named_construction_does_not() {
-        let ring = Ring::new(17, 8);
-        let metadata = BoundedMetadata::conservative(1);
-        let first = VirtualMat::bounded("v", matrix_type(1, 1), metadata.clone());
-        let distinct = VirtualMat::bounded("v", matrix_type(1, 1), metadata);
-        let target = ring.input("target", (1, 1));
-        let assumed = target.assume(first.clone() + first + distinct).expect("typed assumption");
-        let built = DslContext::new("virtual-identities")
-            .output("output", assumed)
-            .expect("output")
-            .build()
-            .expect("build");
-        assert_eq!(built.symbolic_overlay.virtual_atoms.len(), 2);
-    }
-
-    #[test]
-    fn assume_rejects_type_mismatches_and_duplicate_targets() {
-        let ring = Ring::new(17, 8);
-        let target = ring.input("target", (1, 1));
-        let wrong_shape = VirtualMat::large("wrong", matrix_type(1, 2));
-        assert!(matches!(target.clone().assume(wrong_shape), Err(DslError::AssumptionType)));
-
-        let first = target
-            .clone()
-            .assume(VirtualMat::large("first", matrix_type(1, 1)))
-            .expect("first assumption");
-        let second = target
-            .assume(VirtualMat::large("second", matrix_type(1, 1)))
-            .expect("second assumption handle");
-        let result = DslContext::new("duplicate-assumption")
-            .output("first", first)
-            .expect("first output")
-            .output("second", second)
-            .expect("second output")
-            .build();
-        assert!(matches!(result, Err(DslError::DuplicateAssumption)));
-    }
-
-    #[test]
-    fn executable_zero_roots_and_products_elaborate_to_typed_zero() {
-        let ring = Ring::new(17, 8);
-        let root = ring.zero((2, 3));
-        let product = ring.zero((2, 2)) * ring.gaussian((2, 3), 2);
-        let built = DslContext::new("typed-zero-elaboration")
-            .output("root", root)
-            .unwrap()
-            .output("product", product)
+        let parameterized = DslContext::new("parameterized-bounded-gaussian")
+            .int_parameter("cutoff")
+            .output("sample", ring.gaussian((1, 1), 3, IntExpr::Var("cutoff".to_owned())))
             .unwrap()
             .build()
             .unwrap();
-        let elaborated = built.elaborate(&ParamEnv::default()).unwrap();
-        for name in ["root", "product"] {
-            let expression = elaborated
-                .wire(&elaborated.outputs[name])
-                .and_then(|wire| wire.expression)
-                .expect("matrix expression");
-            assert!(matches!(
-                elaborated.expressions.get(expression).unwrap().node,
-                mxx_ir_symbolic::SymbolicExprNode::Zero
-            ));
-        }
-    }
-
-    #[test]
-    fn subgraph_rejects_implicit_runtime_capture() {
-        let ring = Ring::new(17, 8);
-        let key = ring.input("key", (2, 2));
-        let result =
-            Subgraph::<Mat, Mat>::define("capturing", MatType(matrix_type(2, 2)), |input| {
-                input * key
-            });
-        assert!(matches!(result, Err(DslError::SubgraphCapture)));
-    }
-
-    #[test]
-    fn subgraph_assumption_rejects_symbolic_only_outer_capture() {
-        let ring = Ring::new(17, 8);
-        let outer = ring.input("outer", (1, 1));
-        let virtual_value =
-            VirtualMat::bounded("virtual", matrix_type(1, 1), BoundedMetadata::conservative(1));
-        let assumed = Subgraph::<Mat, Mat>::define(
-            "symbolic-capture",
-            MatType(matrix_type(1, 1)),
-            move |input: Mat| {
-                input.clone().assume(virtual_value * outer).expect("typed assumption")
-            },
-        )
-        .expect("symbolic-only capture is detected after stable scope assignment");
-        let output = assumed.call(ring.input("input", (1, 1))).expect("subgraph call");
-        let result =
-            DslContext::new("symbolic-capture").output("output", output).expect("output").build();
-        assert!(matches!(result, Err(DslError::UnreachableSymbolicFactor)));
-    }
-
-    #[test]
-    fn repeated_matrix_schema_uses_distinct_argument_names() {
-        let ty = MatType(matrix_type(1, 1));
-        let reversed = Subgraph::define("reverse", (ty.clone(), ty), |(left, right)| (right, left))
-            .expect("two matrix arguments");
-        let ring = Ring::new(17, 8);
-        let (right, left) = reversed
-            .call((ring.input("left", (1, 1)), ring.input("right", (1, 1))))
-            .expect("subgraph call");
-        DslContext::new("two-matrix-subgraph")
-            .output("left", left)
-            .expect("left output")
-            .output("right", right)
-            .expect("right output")
-            .build()
-            .expect("distinct placeholder names");
-    }
-
-    #[test]
-    fn range_zip_and_offset_build_structural_parallel_loops() {
-        let ring = Ring::new(17, 8);
-        let key = ring.bytes_input("hash-key", 32);
-        let generated = Parallel::range(3)
-            .map(|index| ring.hash_matrix(key.clone(), tag!["public-key", index], (1, 1)))
-            .expect("range loop");
-        let left = ring.input_family("left", 2, (1, 1));
-        let right = ring.input_family("right", 3, (1, 1));
-        let offset =
-            left.parallel_zip_offset(right, 1, |_, left, right| left + right).expect("offset loop");
-        let built = DslContext::new("parallel-forms")
-            .public_family_output("generated", generated)
-            .expect("generated output")
-            .public_family_output("offset", offset)
-            .expect("offset output")
-            .build()
-            .expect("build");
-        built.validate(&ParamEnv::default()).expect("valid loops");
-        built.elaborate(&ParamEnv::default()).expect("symbolically elaborated loops");
-        assert_eq!(
-            built
-                .graph
-                .root_scope()
-                .nodes()
-                .iter()
-                .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn parallel_range_can_return_multiple_homogeneous_families() {
-        let ring = Ring::new(17, 8);
-        let (left, right) = Parallel::range(3)
-            .map_values(|_| (ring.gaussian((1, 1), 2), ring.gaussian((2, 1), 3)))
-            .expect("two family outputs");
-        let built = DslContext::new("parallel-multi-output")
-            .family_output("left", left)
-            .expect("left")
-            .family_output("right", right)
-            .expect("right")
-            .build()
-            .expect("build");
-        built.validate(&ParamEnv::default()).expect("validation");
-        let loop_node = built
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .find(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
-            .expect("parallel loop");
-        assert_eq!(loop_node.output_types().len(), 2);
-    }
-
-    #[test]
-    fn parallel_zip_many_keeps_each_matrix_as_a_separate_zipped_family() {
-        let ring = Ring::new(17, 8);
-        let families = (0..4)
-            .map(|_| {
-                Family::pack(vec![ring.identity(1), ring.zero((1, 1))]).expect("matrix family")
-            })
-            .collect::<Vec<_>>();
-        let outputs = Family::parallel_zip_many_values(families, |_, inputs| {
-            inputs.into_iter().reduce(|left, right| left + right).expect("non-empty zipped inputs")
-        })
-        .expect("parallel zip many");
-        let built = DslContext::new("parallel-zip-many")
-            .output("first", outputs.get_static(0))
-            .expect("first")
-            .output("second", outputs.get_static(1))
-            .expect("second")
-            .build()
-            .expect("build");
-        built.validate(&ParamEnv::default()).expect("validation");
-        let loop_spec = built
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .find_map(|node| match node.kind() {
-                NodeKind::ParallelLoop(spec) => Some(spec),
-                _ => None,
-            })
-            .expect("parallel loop");
-        assert_eq!(loop_spec.input_modes, vec![LoopInputMode::Zip; 4]);
-    }
-
-    #[test]
-    fn static_parallel_members_have_distinct_symbolic_iteration_identities() {
-        let ring = Ring::new(17, 8);
-        let family = Parallel::range(2).map(|_| ring.gaussian((1, 1), 2)).expect("parallel family");
-        let built = DslContext::new("parallel-identities")
-            .output("first", family.get_static(0))
-            .expect("first")
-            .output("second", family.get_static(1))
-            .expect("second")
-            .build()
-            .expect("build");
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
-        let atom = |name: &str| {
-            let expression = elaborated
-                .wire(&elaborated.outputs[name])
-                .and_then(|wire| wire.expression)
-                .expect("one Gaussian expression");
-            let mxx_ir_symbolic::SymbolicExprNode::Atom(atom) =
-                &elaborated.expressions.get(expression).expect("expression").node
-            else {
-                panic!("one Gaussian atom")
-            };
-            atom.clone()
+        let negative = ParamEnv {
+            integers: BTreeMap::from([("cutoff".to_owned(), (-1).into())]),
+            ..ParamEnv::default()
         };
-        let first = atom("first");
-        let second = atom("second");
-        assert_ne!(first, second);
-        assert!(matches!(
-            first,
-            mxx_ir_symbolic::atom::AtomId::Instantiated {
-                instantiation_path,
-                ..
-            } if matches!(
-                instantiation_path.last(),
-                Some(mxx_ir_symbolic::atom::SymbolicInstantiationFrame::ParallelIteration {
-                    index: mxx_ir_symbolic::atom::ParallelIndex::Static(0),
-                    ..
-                })
-            )
-        ));
-        assert!(matches!(
-            second,
-            mxx_ir_symbolic::atom::AtomId::Instantiated {
-                instantiation_path,
-                ..
-            } if matches!(
-                instantiation_path.last(),
-                Some(mxx_ir_symbolic::atom::SymbolicInstantiationFrame::ParallelIteration {
-                    index: mxx_ir_symbolic::atom::ParallelIndex::Static(1),
-                    ..
-                })
-            )
-        ));
+        let constraints = mxx_ir_core::derive_param_constraints(&parameterized.graph).unwrap();
+        assert!(constraints.iter().any(|constraint| !constraint.evaluate(&negative).unwrap()));
+        assert!(parameterized.validate(&negative).is_err());
     }
 
     #[test]
-    fn zipped_exact_family_specializes_to_the_matching_static_member() {
+    fn pure_specs_reject_sampling() {
         let ring = Ring::new(257, 8);
-        let input = Family::pack(vec![ring.gaussian((1, 1), 2), ring.gaussian((1, 1), 3)]).unwrap();
-        let mapped = input.parallel_map(|_, value| value).expect("parallel identity");
-        let built = DslContext::new("zipped-family-specialization")
-            .output("first", mapped.get_static(0))
-            .unwrap()
-            .output("second", mapped.get_static(1))
+        let sampled = DslContext::new("not-pure")
+            .output("sample", ring.gaussian((1, 1), 3, 19))
             .unwrap()
             .build()
             .unwrap();
-        let elaborated = built.elaborate(&ParamEnv::default()).unwrap();
-        let report = mxx_noise_simulator::simulate(&elaborated).unwrap();
-        assert_eq!(
-            report.outputs["first"].noise.as_ref().unwrap().bound,
-            bigdecimal::BigDecimal::from(13u8),
-        );
-        assert_eq!(
-            report.outputs["second"].noise.as_ref().unwrap().bound,
-            bigdecimal::BigDecimal::from(39u8) / bigdecimal::BigDecimal::from(2u8),
-        );
-    }
-
-    #[test]
-    fn packed_polynomial_is_an_exact_symbolic_signal() {
-        let ring = Ring::new(257, 8);
-        let coefficient_bits = 9;
-        let bits = (0..8 * coefficient_bits)
-            .map(|index| Int::constant(index % 2).bit(0))
-            .collect::<Vec<_>>();
-        let packed = ring.pack_polynomial_coefficients(
-            Family::<Bool>::pack_bools(bits).expect("boolean family"),
-            coefficient_bits,
-        );
-        let built = DslContext::new("packed-polynomial-symbolic-signal")
-            .output("packed", packed)
-            .unwrap()
-            .build()
-            .unwrap();
-        let elaborated = built.elaborate(&ParamEnv::default()).unwrap();
-        let report = mxx_noise_simulator::simulate(&elaborated).unwrap();
-        assert!(report.outputs["packed"].has_signal);
-        assert!(report.outputs["packed"].noise.is_none());
-    }
-
-    #[test]
-    fn zipped_structural_family_offset_specializes_to_shifted_source_members() {
-        let ring = Ring::new(257, 8);
-        let left = Parallel::range(2).map(|_| ring.zero((1, 1))).expect("left family");
-        let right = Parallel::range(3).map(|_| ring.gaussian((1, 1), 2)).expect("right family");
-        let shifted =
-            left.parallel_zip_offset(right, 1, |_, _, right| right).expect("offset family");
-        let dynamic_index = ring.input("index", (1, 1)).extract_coefficient(0);
-        let built = DslContext::new("structural-offset-specialization")
-            .output("first", shifted.get_static(0))
-            .unwrap()
-            .output("second", shifted.get_static(1))
-            .unwrap()
-            .output("dynamic", shifted.get(dynamic_index))
-            .unwrap()
-            .build()
-            .unwrap();
-        let elaborated = built.elaborate(&ParamEnv::default()).unwrap();
-        let iteration = |name: &str| {
-            let expression = elaborated
-                .wire(&elaborated.outputs[name])
-                .and_then(|wire| wire.expression)
-                .expect("one Gaussian expression");
-            let mxx_ir_symbolic::SymbolicExprNode::Atom(atom) =
-                &elaborated.expressions.get(expression).expect("expression").node
-            else {
-                panic!("one Gaussian atom")
-            };
-            let mxx_ir_symbolic::atom::AtomId::Instantiated { instantiation_path, .. } = atom
-            else {
-                panic!("instantiated Gaussian atom")
-            };
-            let Some(mxx_ir_symbolic::atom::SymbolicInstantiationFrame::ParallelIteration {
-                index,
-                index_offset,
-                ..
-            }) = instantiation_path.last()
-            else {
-                panic!("parallel iteration frame")
-            };
-            (index.clone(), *index_offset)
-        };
-        assert_eq!(iteration("first"), (mxx_ir_symbolic::atom::ParallelIndex::Static(1), 0),);
-        assert_eq!(iteration("second"), (mxx_ir_symbolic::atom::ParallelIndex::Static(2), 0),);
-        assert!(matches!(
-            iteration("dynamic"),
-            (mxx_ir_symbolic::atom::ParallelIndex::Dynamic(_), 1)
-        ));
-    }
-
-    #[test]
-    fn structural_parallel_template_arena_size_is_independent_of_iteration_count() {
-        let arena_size = |count| {
-            let ring = Ring::new(257, 8);
-            let family =
-                Parallel::range(count).map(|_| ring.gaussian((1, 1), 2)).expect("parallel family");
-            let built = DslContext::new("compact-parallel")
-                .family_output("family", family)
-                .unwrap()
-                .build()
-                .unwrap();
-            built.elaborate(&ParamEnv::default()).unwrap().expressions.len()
-        };
-        assert_eq!(arena_size(2), arena_size(200));
-    }
-
-    #[test]
-    fn template_dynamic_and_subgraph_calls_have_distinct_instantiation_identities() {
-        let ring = Ring::new(257, 8);
-        let family = Parallel::range(2).map(|_| ring.gaussian((1, 1), 2)).unwrap();
-        let dynamic_index = ring.input("index", (1, 1)).extract_coefficient(0);
-        let dynamic = family.get(dynamic_index);
-        let sampled_ring = ring.clone();
-        let sampled =
-            Subgraph::<Mat, Mat>::define("sampled", MatType(ring.matrix_type((1, 1))), move |_| {
-                sampled_ring.gaussian((1, 1), 2)
-            })
-            .unwrap();
-        let first_call = sampled.call(ring.zero((1, 1))).unwrap();
-        let second_call = sampled.call(ring.zero((1, 1))).unwrap();
-        let built = DslContext::new("instantiation-identities")
-            .family_output("family", family)
-            .unwrap()
-            .output("dynamic", dynamic)
-            .unwrap()
-            .output("first-call", first_call)
-            .unwrap()
-            .output("second-call", second_call)
-            .unwrap()
-            .build()
-            .unwrap();
-        let elaborated = built.elaborate(&ParamEnv::default()).unwrap();
-        let atom = |expression| {
-            let mxx_ir_symbolic::SymbolicExprNode::Atom(atom) =
-                &elaborated.expressions.get(expression).unwrap().node
-            else {
-                panic!("single sampled atom")
-            };
-            atom.clone()
-        };
-        let family_wire = elaborated.wire(&elaborated.outputs["family"]).unwrap();
-        let mxx_ir_symbolic::elaborate::SymbolicFamily::StructuralTemplate { template, .. } =
-            family_wire.family.as_ref().expect("family state")
-        else {
-            panic!("structural template")
-        };
-        let template_atom = atom(*template);
-        let dynamic_atom = atom(
-            elaborated
-                .wire(&elaborated.outputs["dynamic"])
-                .and_then(|wire| wire.expression)
-                .unwrap(),
-        );
-        let call_atom = |name: &str| {
-            atom(
-                elaborated
-                    .wire(&elaborated.outputs[name])
-                    .and_then(|wire| wire.expression)
-                    .unwrap(),
-            )
-        };
-        let first_call = call_atom("first-call");
-        let second_call = call_atom("second-call");
-        assert!(matches!(
-            template_atom,
-            mxx_ir_symbolic::atom::AtomId::Instantiated { ref instantiation_path, .. }
-                if matches!(
-                    instantiation_path.last(),
-                    Some(mxx_ir_symbolic::atom::SymbolicInstantiationFrame::ParallelIteration {
-                        index: mxx_ir_symbolic::atom::ParallelIndex::Template,
-                        ..
-                    })
-                )
-        ));
-        assert!(matches!(
-            dynamic_atom,
-            mxx_ir_symbolic::atom::AtomId::Instantiated { ref instantiation_path, .. }
-                if matches!(
-                    instantiation_path.last(),
-                    Some(mxx_ir_symbolic::atom::SymbolicInstantiationFrame::ParallelIteration {
-                        index: mxx_ir_symbolic::atom::ParallelIndex::Dynamic(_),
-                        ..
-                    })
-                )
-        ));
-        assert_ne!(first_call, second_call);
-        assert!(matches!(
-            first_call,
-            mxx_ir_symbolic::atom::AtomId::Instantiated { ref instantiation_path, .. }
-                if matches!(
-                    instantiation_path.last(),
-                    Some(mxx_ir_symbolic::atom::SymbolicInstantiationFrame::Call(_))
-                )
-        ));
-    }
-
-    #[test]
-    fn select_elaboration_preserves_the_selection_domain() {
-        let ring = Ring::new(17, 8);
-        let index = ring.input("index", (1, 1)).extract_coefficient(0);
-        let selected =
-            index.select(vec![ring.gaussian((1, 1), 2), ring.gaussian((1, 1), 3)]).expect("select");
-        let built = DslContext::new("select")
-            .output("selected", selected)
-            .expect("output")
-            .build()
-            .expect("build");
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
-        let expression = elaborated
-            .wire(&elaborated.outputs["selected"])
-            .and_then(|wire| wire.expression)
-            .expect("selected expression");
-        assert!(matches!(
-            elaborated.expressions.get(expression).expect("expression").node,
-            mxx_ir_symbolic::SymbolicExprNode::Select { .. }
-        ));
-    }
-
-    #[test]
-    fn concat_is_preserved_as_a_typed_symbolic_node() {
-        let ring = Ring::new(17, 8);
-        let left = ring.input("left", (1, 3));
-        let right = ring.input("right", (2, 3)) + ring.gaussian((2, 3), 2);
-        let rows = Mat::concat(ConcatAxis::Rows, vec![left, right]);
-        let columns = Mat::concat(
-            ConcatAxis::Columns,
-            vec![ring.gaussian((2, 1), 2), ring.input("column-right", (2, 2))],
-        );
-        let built = DslContext::new("structural-concat")
-            .output("rows", rows)
-            .expect("output")
-            .output("columns", columns)
-            .expect("columns")
-            .build()
-            .expect("build");
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("typed concat");
-        for (name, expected) in [("rows", ConcatAxis::Rows), ("columns", ConcatAxis::Columns)] {
-            let expression = elaborated
-                .wire(&elaborated.outputs[name])
-                .and_then(|wire| wire.expression)
-                .expect("output expression");
-            assert!(matches!(
-                elaborated.expressions.get(expression).expect("expression").node,
-                mxx_ir_symbolic::SymbolicExprNode::Concat { axis, .. } if axis == expected
-            ));
-        }
-    }
-
-    #[test]
-    fn diagonal_concat_accepts_mixed_symbolic_inputs() {
-        let ring = Ring::new(17, 8);
-        let mixed = ring.input("signal", (1, 1)) + ring.gaussian((1, 1), 2);
-        let output = Mat::concat(ConcatAxis::Diagonal, vec![mixed, ring.gaussian((2, 2), 3)]);
-        let built = DslContext::new("diagonal-concat")
-            .output("output", output)
-            .expect("output")
-            .build()
-            .expect("build");
-        built.elaborate(&ParamEnv::default()).expect("diagonal concat is unrestricted");
-    }
-
-    #[test]
-    fn all_builtin_graph_values_cross_a_subgraph_boundary() {
-        let ring = Ring::new(257, 8);
-        let trapdoor = ring.sample_trapdoor(1, 3, 4, 2);
-        let preimage = trapdoor.sample_preimage(ring.input("target", (1, 1)), (4, 1));
-        let bytes = ring.bytes_input("bytes", 32);
-        let family = ring.input_family("family", 2, (1, 1));
-        let schema = (
-            BytesType { length: 32.into() },
-            (
-                MatFamilyType { element: ring.matrix_type((1, 1)), count: 2.into() },
-                (trapdoor.schema(), preimage.schema()),
-            ),
-        );
-        let identity = Subgraph::define("typed-identity", schema, |value| value)
-            .expect("typed subgraph definition");
-        let (_, (family, (trapdoor, preimage))) =
-            identity.call((bytes, (family, (trapdoor, preimage)))).expect("typed subgraph call");
-        let built = DslContext::new("typed-values")
-            .family_output("family", family)
-            .expect("family output")
-            .output("trapdoor-public", trapdoor.public_matrix())
-            .expect("trapdoor output")
-            .output("preimage", preimage.as_mat())
-            .expect("preimage output")
-            .build()
-            .expect("build");
-        built.validate(&ParamEnv::default()).expect("validation");
-    }
-
-    #[test]
-    fn trapdoor_subgraph_placeholder_preserves_public_preimage_relation() {
-        let ring = Ring::new(257, 8);
-        let trapdoor = ring.sample_trapdoor(1, 3, 4, 2);
-        let schema = (trapdoor.schema(), MatType(ring.matrix_type((1, 1))));
-        let relation =
-            Subgraph::define("trapdoor-relation", schema, |(trapdoor, target): (Trapdoor, Mat)| {
-                let public = trapdoor.public_matrix();
-                let preimage = trapdoor.sample_preimage(target, (4, 1));
-                public * preimage.as_mat()
-            })
-            .expect("trapdoor relation subgraph");
-        let target = ring.input("target", (1, 1));
-        let product = relation.call((trapdoor, target)).expect("subgraph call");
-        let built = DslContext::new("trapdoor-relation")
-            .output("product", product)
-            .expect("output")
-            .build()
-            .expect("build");
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
-        let product = elaborated
-            .wire(&elaborated.outputs["product"])
-            .and_then(|wire| wire.expression)
-            .expect("product expression");
-        assert!(matches!(
-            elaborated.expressions.get(product).expect("expression").node,
-            mxx_ir_symbolic::SymbolicExprNode::Atom(_)
-        ));
-    }
-
-    #[test]
-    fn symbolic_artifact_import_preserves_preimage_identity() {
-        let ring = Ring::new(257, 8);
-        let trapdoor = ring.sample_trapdoor(1, 3, 4, 2);
-        let public = trapdoor.public_matrix();
-        let target = ring.input("target", (1, 1));
-        let preimage = trapdoor.sample_preimage(target, (4, 1));
-        let producer = DslContext::new("producer")
-            .public_output("public", public)
-            .expect("public output")
-            .public_output("preimage", preimage.as_mat())
-            .expect("preimage output")
-            .build()
-            .expect("producer build");
-        let bindings = ParamEnv::default();
-        let validated = producer.validate(&bindings).expect("producer validation");
-        let elaborated = producer.elaborate(&bindings).expect("producer elaboration");
-        let production = ProductionId {
-            spec_hash: mxx_ir_core::artifact::SpecHash([7; 32]),
-            execution_nonce: [9; 32],
-        };
-        let artifact_manifest =
-            mxx_ir_core::artifact::export_validated_manifest(production.clone(), &validated)
-                .expect("artifact manifest");
-        let symbolic_exports = elaborated
-            .outputs
-            .iter()
-            .map(|(name, reference)| {
-                let wire = elaborated.wire(reference).expect("elaborated output");
-                (
-                    name.clone(),
-                    mxx_ir_symbolic::manifest::ExportArtifact {
-                        wire_type: wire.wire_type.clone(),
-                        expression: wire.expression,
-                        family: wire.family.clone(),
-                        content_hash: None,
-                        layout: None,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let symbolic_manifest = mxx_ir_symbolic::manifest::export_manifest(
-            production.clone(),
-            &symbolic_exports,
-            &elaborated.atoms,
-            &elaborated.expressions,
-            &elaborated.preimage_relations,
-            elaborated.assumption_digest,
-        )
-        .expect("symbolic manifest");
-
-        let imported_public = ring.artifact_input(
-            production.clone(),
-            "public",
-            (1, 4),
-            ArtifactConfidentiality::Public,
-        );
-        let imported_preimage = ring.artifact_input(
-            production.clone(),
-            "preimage",
-            (4, 1),
-            ArtifactConfidentiality::Public,
-        );
-        let consumer = DslContext::new("consumer")
-            .output("product", imported_public * imported_preimage)
-            .expect("consumer output")
-            .build()
-            .expect("consumer build");
-        let imported = consumer
-            .elaborate_with_manifests(
-                &bindings,
-                &BTreeMap::from([(production, artifact_manifest)]),
-                &[symbolic_manifest],
-            )
-            .expect("consumer elaboration");
-        let product = imported
-            .wire(&imported.outputs["product"])
-            .and_then(|wire| wire.expression)
-            .expect("product expression");
-        let mxx_ir_symbolic::SymbolicExprNode::Atom(atom) =
-            &imported.expressions.get(product).expect("expression").node
-        else {
-            panic!("B*K rewrites to the imported target")
-        };
-        assert!(matches!(atom, mxx_ir_symbolic::atom::AtomId::Imported { .. }));
-    }
-
-    #[test]
-    fn parallel_loop_can_broadcast_and_select_an_artifact_family() {
-        let ring = Ring::new(257, 8);
-        let lookup = Family::pack(vec![ring.gaussian((1, 1), 2), ring.gaussian((1, 1), 3)])
-            .expect("lookup family");
-        let producer = DslContext::new("artifact-family-producer")
-            .public_family_output("lookup", lookup)
-            .expect("lookup output")
-            .build()
-            .expect("producer build");
-        let bindings = ParamEnv::default();
-        let validated = producer.validate(&bindings).expect("producer validation");
-        let elaborated = producer.elaborate(&bindings).expect("producer elaboration");
-        let production = ProductionId {
-            spec_hash: mxx_ir_core::artifact::SpecHash([11; 32]),
-            execution_nonce: [12; 32],
-        };
-        let artifact_manifest =
-            mxx_ir_core::artifact::export_validated_manifest(production.clone(), &validated)
-                .expect("artifact manifest");
-        let output = &elaborated.outputs["lookup"];
-        let wire = elaborated.wire(output).expect("lookup output wire");
-        let symbolic_manifest = mxx_ir_symbolic::manifest::export_manifest(
-            production.clone(),
-            &BTreeMap::from([(
-                "lookup".to_owned(),
-                mxx_ir_symbolic::manifest::ExportArtifact {
-                    wire_type: wire.wire_type.clone(),
-                    expression: wire.expression,
-                    family: wire.family.clone(),
-                    content_hash: None,
-                    layout: None,
-                },
-            )]),
-            &elaborated.atoms,
-            &elaborated.expressions,
-            &elaborated.preimage_relations,
-            elaborated.assumption_digest,
-        )
-        .expect("symbolic manifest");
-
-        let imported = ring.family_artifact_input(
-            production.clone(),
-            "lookup",
-            2,
-            (1, 1),
-            ArtifactConfidentiality::Public,
-        );
-        let indices = ring.input_family("indices", 2, (1, 1));
-        let selected = indices
-            .parallel_map(move |_, index| imported.get(index.extract_coefficient(0)))
-            .expect("parallel artifact selection");
-        let consumer = DslContext::new("artifact-family-consumer")
-            .family_output("selected", selected)
-            .expect("selected output")
-            .build()
-            .expect("consumer build");
-        let imported = consumer
-            .elaborate_with_manifests(
-                &bindings,
-                &BTreeMap::from([(production, artifact_manifest)]),
-                &[symbolic_manifest],
-            )
-            .expect("consumer elaboration");
-        let selected = imported
-            .wire(&imported.outputs["selected"])
-            .and_then(|wire| wire.family.as_ref())
-            .expect("selected symbolic family");
-        assert!(matches!(
-            selected,
-            mxx_ir_symbolic::elaborate::SymbolicFamily::StructuralTemplate { .. }
-        ));
+        assert!(matches!(IdealSpec::new(sampled), Err(DslError::NonPureSpecification)));
     }
 }

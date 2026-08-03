@@ -177,7 +177,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output, row};
     use mxx_dsl::{DslContext, Ring};
-    use mxx_ir_core::{ParamEnv, node::NodeKind};
+
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
@@ -185,54 +185,6 @@ mod tests {
     use mxx_runtime::RuntimeValue;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
-
-    #[test]
-    fn poly_encoding_multiplication_elaborates_structural_family_operations() {
-        let ring = Ring::new(257, 8);
-        let compiler = BggPolyEncodingCompiler {
-            public_key: BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 4.into(),
-                digit_count: 4.into(),
-            },
-        };
-        let encoding = |prefix: &str| BggPolyEncodingWire {
-            vectors: ring.input_family(format!("{prefix}-vectors"), 3, (1, 8)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{prefix}-public"), (2, 8)),
-                reveal_plaintext: true,
-            },
-            plaintexts: Some(ring.input_family(format!("{prefix}-plaintexts"), 3, (1, 1))),
-        };
-        let product = compiler.mul(&encoding("left"), &encoding("right")).expect("product");
-        let built = DslContext::new("bgg-poly-encoding-mul")
-            .family_output("vectors", product.vectors)
-            .expect("vector family")
-            .output("public", product.pubkey.matrix)
-            .expect("public output")
-            .build()
-            .expect("build");
-        assert!(
-            built
-                .graph
-                .root_scope()
-                .nodes()
-                .iter()
-                .any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
-        );
-        assert!(
-            built
-                .graph
-                .scopes()
-                .values()
-                .flat_map(|scope| scope.nodes())
-                .any(|node| { matches!(node.kind(), NodeKind::GadgetDecompose { .. }) })
-        );
-
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
-        let vectors = elaborated.wire(&elaborated.outputs["vectors"]).expect("vectors output");
-        assert!(vectors.family.is_some());
-    }
 
     #[test]
     fn reveal_combinations_match_the_poly_encoding_contract() {

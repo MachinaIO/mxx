@@ -380,53 +380,40 @@ pub fn ciphertext_inputs_from_native(
         .map(|row| {
             row.par_iter()
                 .map(|poly| {
-                    let coeff_encodings = poly
-                        .coeffs_biguints()
-                        .into_par_iter()
-                        .map(|coeff| {
-                            encode_nested_rns_poly_with_offset::<DCRTPoly>(
-                                ctx.p_moduli_bits,
-                                ctx.max_unreduced_muls,
-                                params,
-                                &coeff,
-                                level_offset,
-                                enable_levels,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let encoded_len = coeff_encodings.first().map(|encoded| encoded.len()).expect(
-                        "native Ring-GSW ciphertext polynomials must have at least one slot",
-                    );
-                    assert!(
-                        coeff_encodings.iter().all(|encoded| encoded.len() == encoded_len),
-                        "all nested-RNS coefficient encodings must have the same gate length"
-                    );
-                    (0..encoded_len)
-                        .into_par_iter()
-                        .map(|gate_idx| {
-                            let diagonal = coeff_encodings
-                                .iter()
-                                .map(|encoded| encoded[gate_idx].clone())
-                                .collect::<Vec<_>>();
-                            let zero = DCRTPoly::const_zero(params);
-                            DCRTPolyMatrix::from_poly_vec(
-                                params,
-                                (0..diagonal.len())
-                                    .map(|row_idx| {
-                                        (0..diagonal.len())
-                                            .map(|col_idx| {
-                                                if row_idx == col_idx {
-                                                    diagonal[row_idx].clone()
-                                                } else {
-                                                    zero.clone()
-                                                }
-                                            })
-                                            .collect()
-                                    })
-                                    .collect(),
-                            )
-                        })
-                        .collect::<Vec<_>>()
+                    let coefficients = poly.coeffs_biguints();
+                    encode_nested_rns_poly_with_offset::<DCRTPoly>(
+                        ctx.p_moduli_bits,
+                        ctx.max_unreduced_muls,
+                        params,
+                        &coefficients,
+                        level_offset,
+                        enable_levels,
+                    )
+                    .into_par_iter()
+                    .map(|diagonal| {
+                        let diagonal = diagonal
+                            .into_iter()
+                            .map(|value| DCRTPoly::from_biguint_to_constant(params, value))
+                            .collect::<Vec<_>>();
+                        let zero = DCRTPoly::const_zero(params);
+                        DCRTPolyMatrix::from_poly_vec(
+                            params,
+                            (0..diagonal.len())
+                                .map(|row_idx| {
+                                    (0..diagonal.len())
+                                        .map(|col_idx| {
+                                            if row_idx == col_idx {
+                                                diagonal[row_idx].clone()
+                                            } else {
+                                                zero.clone()
+                                            }
+                                        })
+                                        .collect()
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
         })

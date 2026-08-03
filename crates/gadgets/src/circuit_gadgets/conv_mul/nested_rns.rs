@@ -29,17 +29,21 @@ impl<P: Poly + 'static> NegacyclicConvolutionContext<P> for NestedRnsPolyContext
         diagonal: usize,
         num_slots: usize,
     ) -> Vec<SubCircuitParamValue> {
-        let rhs_binding =
-            SubCircuitParamValue::SlotTransfer(SlotTransferSpec::rotation(diagonal, num_slots));
+        let lanes = self.q_moduli_depth;
+        let rhs_binding = SubCircuitParamValue::SlotTransfer(SlotTransferSpec::rotation(
+            diagonal * lanes,
+            num_slots * lanes,
+        ));
         let lhs_bindings = self
             .p_moduli
             .par_iter()
             .map(|&p_i| {
                 let negative_scalar =
                     u32::try_from(p_i - 1).expect("signed slot-transfer scalar must fit in u32");
-                SubCircuitParamValue::SlotTransfer(SlotTransferSpec::repeated(
+                SubCircuitParamValue::SlotTransfer(SlotTransferSpec::repeated_lanes(
                     diagonal,
                     num_slots,
+                    lanes,
                     diagonal,
                     Some(negative_scalar),
                 ))
@@ -66,15 +70,21 @@ impl<P: Poly + 'static> NegacyclicConvolutionContext<P> for NestedRnsPolyContext
 }
 
 impl<P: Poly + 'static> RingGswConvolution<P> for NestedRnsPoly<P> {
+    fn physical_q_row_count(&self) -> usize {
+        1
+    }
+
     fn from_diagonal_q_level_outputs(
         template: &Self,
         q_level_outputs: Vec<Vec<BatchedWire>>,
         max_plaintexts: Vec<BigUint>,
         p_max_traces: Vec<BigUint>,
     ) -> Self {
+        assert_eq!(q_level_outputs.len(), 1, "packed nested-RNS has one physical q row");
         NestedRnsPoly::new(
             template.ctx.clone(),
-            q_level_outputs.into_iter().map(BatchedWire::from_batches).collect::<Vec<_>>(),
+            BatchedWire::from_batches(q_level_outputs.into_iter().next().unwrap()),
+            template.num_coefficient_slots,
             Some(template.level_offset),
             template.enable_levels,
             max_plaintexts,
@@ -91,12 +101,11 @@ impl<P: Poly + 'static> RingGswConvolution<P> for NestedRnsPoly<P> {
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
         let active_levels = template.active_q_moduli().len();
-        let mut inner =
-            (0..active_levels).map(|_| template.ctx.zero_level_batch(circuit)).collect::<Vec<_>>();
-        inner[target_q_idx] = BatchedWire::from_batches(q_level_output);
+        let _ = circuit;
         NestedRnsPoly::new(
             template.ctx.clone(),
-            inner,
+            BatchedWire::from_batches(q_level_output),
+            template.num_coefficient_slots,
             Some(template.level_offset),
             template.enable_levels,
             (0..active_levels)

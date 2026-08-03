@@ -581,6 +581,33 @@ mod tests {
     }
 
     #[test]
+    fn serialization_roundtrip_preserves_repeated_lanes() {
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let transfer =
+            child.register_sub_circuit_param(SubCircuitParamSpec::SlotTransfer { max_scalar: 5 });
+        let input = child.input(1).as_single_wire();
+        let output = child.slot_transfer_gate_param(input, transfer);
+        child.output([output]);
+
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input = circuit.input(1).as_single_wire();
+        let child_id = circuit.register_sub_circuit(child);
+        let output = circuit.call_sub_circuit_with_bindings(
+            child_id,
+            [input],
+            &[SubCircuitParamValue::SlotTransfer(SlotTransferSpec::repeated_lanes(
+                1,
+                4,
+                3,
+                2,
+                Some(5),
+            ))],
+        );
+        circuit.output(output);
+        assert_json_roundtrip(circuit);
+    }
+
+    #[test]
     fn serialization_roundtrip_preserves_parameterized_subcircuits() {
         let mut child = PolyCircuit::<DCRTPoly>::new();
         let scalar =

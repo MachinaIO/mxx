@@ -13,7 +13,7 @@ use mxx_gadgets::{
     circuit::{
         ArithmeticCircuitLowering, CircuitLowerError, CircuitLoweringTypes, GateInstance,
         PolyCircuit, PolyGateKind, PublicLookupLowering, SlotOperationLowering,
-        StructuredCircuitLowering, lower_circuit, lower_circuit_structured,
+        StructuredCircuitLowering, lower_circuit,
     },
 };
 use num_bigint::BigUint;
@@ -284,7 +284,7 @@ impl PolyCircuitCompiler {
     {
         let arithmetic = PublicKeyLowering::<P> { compiler: &self.public_key, marker: PhantomData };
         let mut lowering = ConfiguredCircuitLowering { arithmetic, lookup, slots };
-        lower_circuit_structured(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
+        lower_circuit(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
     }
 
     pub fn compile_tall_encodings_with_lowerings<P, L, S>(
@@ -322,7 +322,7 @@ impl PolyCircuitCompiler {
         let compiler = BggEncodingCompiler { public_key: self.public_key.clone() };
         let arithmetic = EncodingLowering::<P> { compiler: &compiler, marker: PhantomData };
         let mut lowering = ConfiguredCircuitLowering { arithmetic, lookup, slots };
-        lower_circuit_structured(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
+        lower_circuit(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
     }
 
     pub fn compile_naive_public_keys_with_lowerings<P, L, S>(

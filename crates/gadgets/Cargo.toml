@@ -7,11 +7,13 @@ description = "Reusable lattice-cryptographic gadgets and protocol components fo
 [features]
 default = []
 gpu = ["mxx-primitives/gpu", "mxx-runtime/gpu"]
+test-support = ["dep:mxx-runtime"]
 
 [dependencies]
 mxx-dsl.workspace = true
 mxx-ir-core.workspace = true
 mxx-primitives.workspace = true
+mxx-runtime = { workspace = true, optional = true }
 dashmap.workspace = true
 serde_json.workspace = true
 num-bigint.workspace = true

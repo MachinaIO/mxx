@@ -139,7 +139,13 @@ must not be replaced by unbounded host parallelism.
 
 `crates/gadgets/` owns BGG-independent `PolyCircuit` structure and reusable
 circuit gadgets. `circuit_gadgets` contains arithmetic, convolution, FHE,
-Ring-GSW, PRG, NTT, decoder templates, and noise-refresh circuit templates.
+Ring-GSW, PRG, decoder templates, and noise-refresh circuit templates. Nested-RNS
+values use one p-residue wire batch with coefficient-major physical slots
+`slot(coefficient, level) = coefficient * q_moduli_depth + level`; inactive
+q-level lanes are literal zero. Ordinary arithmetic preserves lanes, while
+reconstruction and modulus-basis conversion perform explicit cross-lane moves.
+The older NTT and CKKS gadgets remain disabled until their per-level wire
+marshaling is rewritten for this packed layout.
 The Diamond input-injection gadget builds the initial `p` vector and transition
 preprocessing shared by Diamond WE and Diamond iO. It returns the final
 trapdoors for application-specific projections but does not construct BGG+

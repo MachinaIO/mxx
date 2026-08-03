@@ -1,3 +1,15 @@
+//! Lane-packed nested-RNS arithmetic.
+//!
+//! Every p-residue wire uses coefficient-major physical slots
+//! `slot(coefficient, q_level) = coefficient * q_moduli_depth + q_level`. Arithmetic and LUT
+//! helpers preserve q-level lanes; only reconstruction and modulus-basis conversion aggregate or
+//! move lanes. Inactive lanes are exact zero.
+//!
+//! Per-lane constants, masks, full reduction, and non-rotation slot transfers are represented as
+//! identity slot-transfer gates. Under BGG lowering these require slot-transfer preprocessing
+//! artifacts. Reconstruction adds one explicit transfer per active q-level, and convolution adds
+//! compact `RepeatedLanes` transfers; coefficient rotations remain artifact-free rotations.
+
 #[cfg(feature = "gpu")]
 mod gpu;
 
@@ -56,8 +68,6 @@ pub struct NestedRnsPolyContext {
     lazy_reduce_id: usize,
     decomposition_terms_id: usize,
     gadget_decompose_id: usize,
-    full_reduce_id: usize,
-    full_reduce_bindings: Vec<Vec<SubCircuitParamValue>>,
     mul_lazy_reduce_id: usize,
     mul_right_sparse_id: usize,
 }
@@ -73,7 +83,6 @@ struct NestedRnsRegisteredSubcircuitIds {
     lazy_reduce_id: usize,
     decomposition_terms_id: usize,
     gadget_decompose_id: usize,
-    full_reduce_id: usize,
     mul_lazy_reduce_id: usize,
     mul_right_sparse_id: usize,
 }
@@ -81,12 +90,13 @@ struct NestedRnsRegisteredSubcircuitIds {
 #[derive(Debug, Clone)]
 /// Circuit-level nested-RNS polynomial representation.
 ///
-/// `inner` stores one batched p-residue vector per active q-level. `max_plaintexts` and
-/// `p_max_traces` are conservative metadata carried alongside the wires so later helpers know when
-/// a lazy reduce or full reduce is required without changing the arithmetic semantics.
+/// `inner` stores the p-residue wires once. Each wire uses coefficient-major slots
+/// `slot(c, level) = c * q_moduli_depth + level`; inactive q-level lanes are exact zero.
+/// `max_plaintexts` and `p_max_traces` remain active-window-local metadata.
 pub struct NestedRnsPoly<P: Poly> {
     pub ctx: Arc<NestedRnsPolyContext>,
-    pub inner: Vec<BatchedWire>,
+    pub inner: BatchedWire,
+    pub num_coefficient_slots: usize,
     pub level_offset: usize,
     pub enable_levels: Option<usize>,
     pub max_plaintexts: Vec<BigUint>,

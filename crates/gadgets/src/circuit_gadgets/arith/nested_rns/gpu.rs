@@ -77,29 +77,32 @@ mod tests {
         let q_level = Some(2);
 
         for input in [12345u64, 23456u64, 34567u64] {
-            let input = BigUint::from(input);
+            let values = [BigUint::from(input), BigUint::from(input + 7)];
             let expected = encode_nested_rns_poly::<DCRTPoly>(
                 P_MODULI_BITS,
                 MAX_UNREDUCED_MULS,
                 &cpu_params,
-                &input,
+                &values,
                 q_level,
             );
             let actual_bytes = encode_nested_rns_poly_compact_bytes::<GpuDCRTPoly>(
                 P_MODULI_BITS,
                 MAX_UNREDUCED_MULS,
                 &gpu_params,
-                &input,
+                &values,
                 q_level,
             );
 
             assert_eq!(actual_bytes.len(), expected.len());
-            for (idx, (actual_bytes, expected_poly)) in
+            for (p_idx, (actual_slots, expected_slots)) in
                 actual_bytes.into_iter().zip(expected.into_iter()).enumerate()
             {
-                let local_params = gpu_params.params_for_device(gpu_ids[idx % gpu_ids.len()]);
-                let actual_poly = GpuDCRTPoly::from_compact_bytes(&local_params, &actual_bytes);
-                assert_eq!(actual_poly.coeffs_biguints(), expected_poly.coeffs_biguints());
+                let local_params = gpu_params.params_for_device(gpu_ids[p_idx % gpu_ids.len()]);
+                assert_eq!(actual_slots.len(), expected_slots.len());
+                for (actual_bytes, expected_value) in actual_slots.into_iter().zip(expected_slots) {
+                    let actual_poly = GpuDCRTPoly::from_compact_bytes(&local_params, &actual_bytes);
+                    assert_eq!(actual_poly.coeffs_biguints()[0], expected_value);
+                }
             }
 
             gpu_device_sync();

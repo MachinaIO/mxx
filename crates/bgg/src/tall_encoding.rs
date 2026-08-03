@@ -519,21 +519,31 @@ mod tests {
     use crate::{
         BggSlotTransferArtifactCompiler, BggSlotTransferPublicKeyLowering,
         BggSlotTransferPublicSlotWires, BggTallSlotLowering, BggTallSlotPublicKeyLowering,
-        CircuitCompileError, TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts,
+        CircuitCompileError, LweLookupArtifactNames, LweLookupArtifacts, LweLookupCompiler,
+        LweLookupIdentity, LweLookupInvocation, LweLookupPreprocessingWires,
+        LweLookupPublicKeyLowering, LweLookupTable, LweLookupTallEncodingLowering,
+        PolyCircuitCompiler, TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts,
         TallRotationEncodingCompiler, TallRotationEncodingKey, required_tall_rotation_encodings,
         tall_rotation_encoding::tall_rotation_public_key_tag,
         test_utils::{execute_graph, matrix_output, row},
     };
     use mxx_dsl::{DslContext, Ring};
-    use mxx_gadgets::circuit::{
-        CircuitLoweringTypes, GateInstance, PolyCircuit, SlotOperationLowering, SlotTransferSpec,
-        SubCircuitParamSpec, SubCircuitParamValue,
+    use mxx_gadgets::{
+        circuit::{
+            CircuitLoweringTypes, GateInstance, PolyCircuit, PublicLookupLowering,
+            SlotOperationLowering, SlotTransferSpec, SubCircuitParamSpec, SubCircuitParamValue,
+        },
+        circuit_gadgets::{
+            arith::{NestedRnsPoly, NestedRnsPolyContext},
+            conv_mul::negacyclic_conv_mul,
+        },
+        test_utils::{PolyVec, execute_polyvec_circuit},
     };
     use mxx_ir_core::ParamEnv;
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
-            PolyParams,
+            Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
@@ -543,7 +553,10 @@ mod tests {
         transcript::SamplingMode,
     };
     use num_bigint::BigInt;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
 
     fn concrete_ring(parameters: &DCRTPolyParams) -> Ring {
         Ring::new(
@@ -1332,5 +1345,390 @@ mod tests {
                 TallRotationEncodingKey { num_slots: 8, offset: 3 },
             ])
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingPublicLookups {
+        identities: Vec<(LweLookupIdentity, usize)>,
+    }
+
+    impl CircuitLoweringTypes for RecordingPublicLookups {
+        type Wire = BggPublicKeyWire;
+        type Error = CircuitCompileError;
+    }
+
+    impl<P: mxx_gadgets::Poly> PublicLookupLowering<P> for RecordingPublicLookups {
+        fn public_lookup(
+            &mut self,
+            _circuit: &PolyCircuit<P>,
+            lookup_id: usize,
+            input: &Self::Wire,
+            gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            self.identities.push((
+                LweLookupIdentity {
+                    call_path: gate.call_path().to_vec(),
+                    gate: gate.local_gate().index(),
+                    occurrence: gate.operation_occurrence(),
+                    lookup: lookup_id,
+                    slot: None,
+                },
+                lookup_id,
+            ));
+            Ok(input.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct PassthroughPublicSlots;
+
+    impl CircuitLoweringTypes for PassthroughPublicSlots {
+        type Wire = BggPublicKeyWire;
+        type Error = CircuitCompileError;
+    }
+
+    impl<P: mxx_gadgets::Poly> SlotOperationLowering<P> for PassthroughPublicSlots {
+        fn slot_transfer(
+            &mut self,
+            input: &Self::Wire,
+            _source_slots: &[(u32, Option<u32>)],
+            _gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            Ok(input.clone())
+        }
+
+        fn slot_reduce(
+            &mut self,
+            inputs: &[Self::Wire],
+            _slot_count: usize,
+            _gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            Ok(inputs.first().expect("slot reduction input").clone())
+        }
+
+        fn slot_rotation(
+            &mut self,
+            input: &Self::Wire,
+            _offset: u32,
+            _num_slots: u32,
+            _gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            Ok(input.clone())
+        }
+    }
+
+    fn assert_production_tall_artifacts_cover_circuit(
+        circuit: &PolyCircuit<DCRTPoly>,
+        parameters: &DCRTPolyParams,
+        physical_slots: usize,
+    ) -> Vec<Vec<DCRTPolyMatrix>> {
+        let ring = concrete_ring(parameters);
+        let digits = parameters.modulus_digits();
+        let public_key_compiler = BggPublicKeyCompiler {
+            ring: ring.clone(),
+            base: BigInt::from(1u64 << parameters.base_bits()).into(),
+            digit_count: digits.into(),
+        };
+        let circuit_compiler = PolyCircuitCompiler { public_key: public_key_compiler.clone() };
+        let public_key =
+            || BggPublicKeyWire { matrix: ring.zero((1, digits)), reveal_plaintext: true };
+
+        let mut recording_lookups = RecordingPublicLookups::default();
+        let mut passthrough_slots = PassthroughPublicSlots;
+        circuit_compiler
+            .compile_public_keys_with_lowerings(
+                circuit,
+                public_key(),
+                (0..circuit.num_input()).map(|_| public_key()),
+                &mut recording_lookups,
+                &mut passthrough_slots,
+            )
+            .expect("lookup identity discovery");
+        assert!(!recording_lookups.identities.is_empty());
+
+        let lookup_compilers = recording_lookups
+            .identities
+            .into_iter()
+            .map(|(identity, lookup_id)| {
+                let table = LweLookupTable::from_public_lut(
+                    parameters,
+                    circuit.lookup_table(lookup_id).as_ref(),
+                )
+                .expect("nested-RNS lookup table");
+                LweLookupCompiler {
+                    identity,
+                    table,
+                    public_key_type: ring.matrix_type((1, digits)),
+                    low_matrix_type: ring.matrix_type((digits, digits)),
+                    high_matrix_type: ring.matrix_type((digits + 2, digits)),
+                    gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
+                    digit_count: digits.into(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut artifact_context = DslContext::new("packed-nested-rns-lookup-artifacts");
+        for lookup in &lookup_compilers {
+            let wires = LweLookupPreprocessingWires {
+                output_public_key: ring.zero((1, digits)),
+                low_matrices: Family::pack(
+                    (0..lookup.table.len()).map(|_| ring.zero((digits, digits))).collect(),
+                )
+                .expect("lookup low artifact family"),
+                high_matrices: Family::pack(
+                    (0..lookup.table.len()).map(|_| ring.zero((digits + 2, digits))).collect(),
+                )
+                .expect("lookup high artifact family"),
+            };
+            artifact_context = lookup
+                .export_preprocessing(
+                    artifact_context,
+                    wires,
+                    &LweLookupArtifactNames::for_compiler(lookup),
+                )
+                .expect("lookup artifact outputs");
+        }
+        let artifact_graph = artifact_context
+            .build()
+            .expect("lookup artifact graph")
+            .validate(&ParamEnv::default())
+            .expect("lookup artifact validation");
+        let mut store = MemoryArtifactStore::default();
+        let mut backend = cpu_backend([parameters.clone()]);
+        let artifact_result = execute(
+            &artifact_graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .expect("lookup artifact production");
+        let production_id = artifact_result.production_id.expect("lookup production id");
+        let manifest = store.manifest(&production_id).expect("lookup manifest").clone();
+        let invocations = lookup_compilers
+            .into_iter()
+            .map(|lookup| {
+                LweLookupInvocation::bind(
+                    lookup.clone(),
+                    LweLookupArtifacts::for_compiler(production_id.clone(), &lookup),
+                    parameters,
+                    circuit,
+                )
+                .expect("nested-RNS lookup invocation")
+            })
+            .collect::<Vec<_>>();
+
+        let hash_key = ring.bytes_input("packed-artifact-hash-key", 32);
+        let mut public_lookup =
+            LweLookupPublicKeyLowering::new(invocations.clone()).expect("public lookup lowering");
+        let mut public_slots = BggTallSlotPublicKeyLowering {
+            inner: BggSlotTransferPublicKeyLowering {
+                compiler: public_key_compiler.clone(),
+                hash_key: hash_key.clone(),
+                public_key_type: ring.matrix_type((1, digits)),
+                configured_slot_count: physical_slots,
+                requests: Vec::new(),
+            },
+        };
+        circuit_compiler
+            .compile_public_keys_with_lowerings(
+                circuit,
+                public_key(),
+                (0..circuit.num_input()).map(|_| public_key()),
+                &mut public_lookup,
+                &mut public_slots,
+            )
+            .expect("production public-key lowering");
+        assert!(!public_slots.inner.requests.is_empty());
+
+        let artifact = BggSlotTransferArtifactCompiler {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
+            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            secret_size: 1,
+            slot_count: physical_slots,
+            digit_count: digits,
+            chunk_columns: digits.max(1),
+            gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
+            trapdoor_sigma: RealExpr::from_integer(5),
+            error_sigma: RealExpr::from_integer(0),
+        };
+        let base = artifact.build_base().expect("slot base artifacts");
+        let slot_wires =
+            artifact.build_slots(hash_key.clone(), &base).expect("slot preprocessing artifacts");
+        let gate_wires = artifact
+            .build_gate_preimages(&base, &slot_wires, &public_slots.inner.requests)
+            .expect("per-gate slot artifacts");
+        let slots = BggSlotTransferPublicSlotWires {
+            public_keys: slot_wires.public_keys,
+            b0_preimage_chunks: slot_wires.b0_preimage_chunks,
+            b1_preimage_chunks: slot_wires.b1_preimage_chunks,
+        };
+        let rotations = required_tall_rotation_encodings(circuit)
+            .expect("required tall rotations")
+            .into_iter()
+            .map(|key| {
+                let wire = TallRotationEncodingWires {
+                    key,
+                    a_forward: ring.hash_matrix(
+                        hash_key.clone(),
+                        tall_rotation_public_key_tag(key, false),
+                        (1, digits),
+                    ),
+                    a_backward: ring.hash_matrix(
+                        hash_key.clone(),
+                        tall_rotation_public_key_tag(key, true),
+                        (1, digits),
+                    ),
+                    c_forward: Family::pack(
+                        (0..physical_slots).map(|_| ring.zero((1, digits))).collect(),
+                    )
+                    .expect("forward rotation rows"),
+                    c_backward: Family::pack(
+                        (0..physical_slots).map(|_| ring.zero((1, digits))).collect(),
+                    )
+                    .expect("backward rotation rows"),
+                };
+                (key, wire)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let zero_tall = || BggTallEncodingWire {
+            rows: Family::pack((0..physical_slots).map(|_| ring.zero((1, digits))).collect())
+                .expect("packed rows"),
+            pubkey: public_key(),
+            plaintext: BggTallPlaintext::Diagonal(
+                Family::pack((0..physical_slots).map(|_| ring.zero((1, 1))).collect())
+                    .expect("packed plaintexts"),
+            ),
+        };
+        let one = BggTallEncodingWire {
+            plaintext: BggTallPlaintext::Diagonal(
+                Family::pack((0..physical_slots).map(|_| ring.identity(1)).collect())
+                    .expect("packed ones"),
+            ),
+            ..zero_tall()
+        };
+        let mut lookup = LweLookupTallEncodingLowering::new(
+            invocations,
+            Family::pack((0..physical_slots).map(|_| ring.zero((1, digits + 2))).collect())
+                .expect("lookup helper rows"),
+        )
+        .expect("tall lookup lowering");
+        let mut slots = BggTallSlotLowering {
+            compiler: BggTallEncodingCompiler { public_key: public_key_compiler },
+            artifact: artifact.clone(),
+            hash_key,
+            c_b0: ring.zero((1, artifact.b0_public_columns())),
+            slots,
+            gates: gate_wires,
+            rotations,
+        };
+        let outputs = circuit_compiler
+            .compile_tall_encodings_with_lowerings(
+                circuit,
+                one,
+                (0..circuit.num_input()).map(|_| zero_tall()),
+                &mut lookup,
+                &mut slots,
+            )
+            .expect("generated production artifacts must cover every packed gate");
+        assert_eq!(outputs.len(), circuit.output_gate_ids().len());
+
+        let mut output_context = DslContext::new("packed-nested-rns-production-tall-runtime");
+        for (output_index, output) in outputs.into_iter().enumerate() {
+            let BggTallPlaintext::Diagonal(plaintexts) = output.plaintext else {
+                panic!("zero nested-RNS inputs keep revealed tall plaintexts")
+            };
+            for slot in 0..physical_slots {
+                output_context = output_context
+                    .output(
+                        format!("output-{output_index}-slot-{slot}"),
+                        plaintexts.get_static(slot),
+                    )
+                    .expect("unique production tall plaintext output");
+            }
+        }
+        let graph = output_context
+            .build()
+            .expect("production tall graph")
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production_id, manifest)]),
+            )
+            .expect("production tall manifest validation");
+        let result = execute(
+            &graph,
+            &mut backend,
+            BTreeMap::from([(
+                "packed-artifact-hash-key".to_owned(),
+                RuntimeValue::Bytes(vec![0x93; 32]),
+            )]),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .expect("production tall runtime");
+        (0..circuit.output_gate_ids().len())
+            .map(|output_index| {
+                (0..physical_slots)
+                    .map(|slot| {
+                        matrix_output(&result, &format!("output-{output_index}-slot-{slot}"))
+                            .clone()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn packed_nested_rns_compiles_through_tall_arithmetic_lookup_and_slot_lowerings() {
+        let parameters = DCRTPolyParams::new(2, 2, 12, 6);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let nested =
+            Arc::new(NestedRnsPolyContext::setup(&mut circuit, &parameters, 6, 2, 16, false, None));
+        let coefficient_slots = 2;
+        let left =
+            NestedRnsPoly::input(nested.clone(), coefficient_slots, Some(2), None, &mut circuit);
+        let right =
+            NestedRnsPoly::input(nested.clone(), coefficient_slots, Some(2), None, &mut circuit);
+        let ordinary = left.mul(&right, &mut circuit).full_reduce(&mut circuit);
+        let convolution =
+            negacyclic_conv_mul(&parameters, &mut circuit, &left, &right, coefficient_slots)
+                .full_reduce(&mut circuit);
+        let ordinary = ordinary.reconstruct(&mut circuit);
+        let convolution = convolution.reconstruct(&mut circuit);
+        circuit.output([ordinary, convolution]);
+
+        let physical_slots = coefficient_slots * nested.q_moduli_depth;
+        let rotations = required_tall_rotation_encodings(&circuit).expect("rotation discovery");
+        assert!(rotations.contains(&TallRotationEncodingKey {
+            num_slots: physical_slots as u32,
+            offset: nested.q_moduli_depth as u32,
+        }));
+        let outputs =
+            assert_production_tall_artifacts_cover_circuit(&circuit, &parameters, physical_slots);
+
+        let zero_polyvec =
+            PolyVec((0..physical_slots).map(|_| DCRTPoly::const_zero(&parameters)).collect());
+        let plaintext_outputs = execute_polyvec_circuit(
+            "packed-nested-rns-plaintext-oracle",
+            &parameters,
+            &circuit,
+            (0..circuit.num_input()).map(|_| zero_polyvec.clone()).collect(),
+            physical_slots,
+        );
+        assert_eq!(plaintext_outputs.len(), outputs.len());
+        for (output_index, plaintext_output) in plaintext_outputs.iter().enumerate() {
+            for slot in 0..physical_slots {
+                assert_eq!(
+                    outputs[output_index][slot],
+                    DCRTPolyMatrix::from_poly_vec(
+                        &parameters,
+                        vec![vec![plaintext_output.0[slot].clone()]],
+                    ),
+                    "tall decoded lane must match the PolyVec plaintext execution"
+                );
+            }
+        }
     }
 }

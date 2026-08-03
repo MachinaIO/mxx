@@ -1330,6 +1330,15 @@ mod tests {
     }
 
     #[test]
+    fn repeated_lanes_materializes_lane_preserving_broadcast() {
+        let spec = SlotTransferSpec::repeated_lanes(1, 3, 2, 2, Some(7));
+        assert_eq!(
+            spec.materialize(),
+            vec![(2, Some(7)), (3, Some(7)), (2, Some(7)), (3, Some(7)), (2, None), (3, None),]
+        );
+    }
+
+    #[test]
     fn structured_sensitive_subcircuits_preserve_each_invocation_identity() {
         let (circuit, _) = repeated_child_circuit();
         let first = recorded_structured_lowering(&circuit);

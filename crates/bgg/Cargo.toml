@@ -15,6 +15,7 @@ thiserror.workspace = true
 rayon.workspace = true
 
 [dev-dependencies]
+mxx-gadgets = { workspace = true, features = ["test-support"] }
 mxx-primitives.workspace = true
 mxx-runtime.workspace = true
 mxx-noise-simulator.workspace = true

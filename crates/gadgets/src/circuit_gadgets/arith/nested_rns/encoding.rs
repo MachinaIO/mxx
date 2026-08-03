@@ -341,14 +341,14 @@ pub fn encode_nested_rns_poly_compact_bytes<P: Poly>(
     p_moduli_bits: usize,
     max_unreduced_muls: usize,
     params: &P::Params,
-    input: &BigUint,
+    values: &[BigUint],
     q_level: Option<usize>,
-) -> Vec<Vec<u8>> {
+) -> Vec<Vec<Vec<u8>>> {
     encode_nested_rns_poly_compact_bytes_with_offset::<P>(
         p_moduli_bits,
         max_unreduced_muls,
         params,
-        input,
+        values,
         0,
         q_level,
     )
@@ -358,26 +358,38 @@ pub fn encode_nested_rns_poly_compact_bytes_with_offset<P: Poly>(
     p_moduli_bits: usize,
     max_unreduced_muls: usize,
     params: &P::Params,
-    input: &BigUint,
+    values: &[BigUint],
     q_level_offset: usize,
     q_level: Option<usize>,
-) -> Vec<Vec<u8>> {
-    let (q_moduli, active_q_level, p_moduli) =
+) -> Vec<Vec<Vec<u8>>> {
+    let (q_moduli, _, p_moduli) =
         resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, max_unreduced_muls, params, q_level);
-    let input_mod_q = q_moduli
-        .iter()
-        .skip(q_level_offset)
-        .take(active_q_level)
-        .map(|&q_i| input % BigUint::from(q_i))
-        .collect::<Vec<_>>();
+    let active_q_level = q_level.unwrap_or_else(|| {
+        q_moduli
+            .len()
+            .checked_sub(q_level_offset)
+            .expect("q_level_offset must not exceed q modulus depth")
+    });
+    assert!(q_level_offset + active_q_level <= q_moduli.len());
+    assert!(!values.is_empty(), "nested-RNS encoding requires coefficient values");
     let p_moduli_depth = p_moduli.len();
-    let output_count = active_q_level * p_moduli_depth;
-
-    map_nested_rns_outputs_with_params::<P, _, _>(params, output_count, |idx, local_params| {
-        let q_idx = idx / p_moduli_depth;
-        let p_idx = idx % p_moduli_depth;
-        let residue = &input_mod_q[q_idx] % p_moduli[p_idx];
-        P::from_biguint_to_constant(local_params, residue).to_compact_bytes()
+    let lanes = q_moduli.len();
+    map_nested_rns_outputs_with_params::<P, _, _>(params, p_moduli_depth, |p_idx, local_params| {
+        values
+            .iter()
+            .flat_map(|value| {
+                let q_moduli = &q_moduli;
+                let p_i = p_moduli[p_idx];
+                (0..lanes).map(move |g| {
+                    let residue = if g < q_level_offset || g >= q_level_offset + active_q_level {
+                        BigUint::ZERO
+                    } else {
+                        (value % BigUint::from(q_moduli[g])) % p_i
+                    };
+                    P::from_biguint_to_constant(local_params, residue).to_compact_bytes()
+                })
+            })
+            .collect()
     })
 }
 
@@ -385,14 +397,14 @@ pub fn encode_nested_rns_poly<P: Poly>(
     p_moduli_bits: usize,
     max_unreduced_muls: usize,
     params: &P::Params,
-    input: &BigUint,
+    values: &[BigUint],
     q_level: Option<usize>,
-) -> Vec<P> {
+) -> Vec<Vec<BigUint>> {
     encode_nested_rns_poly_with_offset::<P>(
         p_moduli_bits,
         max_unreduced_muls,
         params,
-        input,
+        values,
         0,
         q_level,
     )
@@ -402,19 +414,37 @@ pub fn encode_nested_rns_poly_with_offset<P: Poly>(
     p_moduli_bits: usize,
     max_unreduced_muls: usize,
     params: &P::Params,
-    input: &BigUint,
+    values: &[BigUint],
     q_level_offset: usize,
     q_level: Option<usize>,
-) -> Vec<P> {
-    let (q_moduli, active_q_level, p_moduli) =
+) -> Vec<Vec<BigUint>> {
+    let (q_moduli, _, p_moduli) =
         resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, max_unreduced_muls, params, q_level);
-    let p_moduli_depth = p_moduli.len();
-    let mut polys = vec![Vec::with_capacity(p_moduli_depth); active_q_level];
-    for (q_idx, &q_i) in q_moduli.iter().skip(q_level_offset).take(active_q_level).enumerate() {
-        let input_qi = input % BigUint::from(q_i);
-        for &p_i in &p_moduli {
-            polys[q_idx].push(P::from_biguint_to_constant(params, &input_qi % p_i));
-        }
-    }
-    polys.into_iter().flatten().collect::<Vec<_>>()
+    let active_q_level = q_level.unwrap_or_else(|| {
+        q_moduli
+            .len()
+            .checked_sub(q_level_offset)
+            .expect("q_level_offset must not exceed q modulus depth")
+    });
+    assert!(q_level_offset + active_q_level <= q_moduli.len());
+    assert!(!values.is_empty(), "nested-RNS encoding requires coefficient values");
+    let lanes = q_moduli.len();
+    p_moduli
+        .into_par_iter()
+        .map(|p_i| {
+            values
+                .iter()
+                .flat_map(|value| {
+                    let q_moduli = &q_moduli;
+                    (0..lanes).map(move |g| {
+                        if g < q_level_offset || g >= q_level_offset + active_q_level {
+                            BigUint::ZERO
+                        } else {
+                            (value % BigUint::from(q_moduli[g])) % p_i
+                        }
+                    })
+                })
+                .collect()
+        })
+        .collect()
 }

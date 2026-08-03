@@ -364,26 +364,18 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
              max_plaintext: BigUint,
              p_max_trace: BigUint,
              helper_circuit: &mut PolyCircuit<P>| {
-                let mut inner = Vec::with_capacity(active_levels);
-                for q_idx in 0..active_levels {
-                    if q_idx == target_q_idx {
-                        inner.push(target_row);
-                    } else {
-                        inner.push(helper_ctx.zero_level_batch(helper_circuit));
-                    }
-                }
-                let mut max_plaintexts = vec![BigUint::ZERO; active_levels];
-                let mut p_max_traces = vec![BigUint::ZERO; active_levels];
-                max_plaintexts[target_q_idx] = max_plaintext;
-                p_max_traces[target_q_idx] = p_max_trace;
-                NestedRnsPoly::new(
+                NestedRnsPoly::sparse_level_poly_from_row_with_metadata(
                     helper_ctx.clone(),
-                    inner,
-                    Some(level_offset),
+                    num_slots,
+                    active_levels,
                     Some(active_levels),
-                    max_plaintexts,
+                    level_offset,
+                    target_q_idx,
+                    target_row,
+                    max_plaintext,
+                    p_max_trace,
+                    helper_circuit,
                 )
-                .with_p_max_traces(p_max_traces)
             };
         let row_q_levels =
             (0..width).map(|_| helper_circuit.input(helper_ctx.p_moduli.len())).collect::<Vec<_>>();
@@ -406,9 +398,7 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
                 )
             })
             .collect::<Vec<_>>();
-        let mut result_inner = Vec::with_capacity(active_levels);
-        let mut result_max_plaintexts = Vec::with_capacity(active_levels);
-        let mut result_p_max_traces = Vec::with_capacity(active_levels);
+        let mut q_level_results = Vec::with_capacity(active_levels);
         for sparse_q_idx in 0..active_levels {
             let grouped_polys = grouped_term_groups[sparse_q_idx]
                 .iter()
@@ -463,18 +453,11 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
                 reduce_terms_pairwise(grouped_polys, &mut helper_circuit, |lhs, rhs, circuit| {
                     lhs.add(rhs, circuit)
                 });
-            result_inner.push(q_level_result.inner[sparse_q_idx]);
-            result_max_plaintexts.push(q_level_result.max_plaintexts[sparse_q_idx].clone());
-            result_p_max_traces.push(q_level_result.p_max_traces[sparse_q_idx].clone());
+            q_level_results.push(q_level_result);
         }
-        let result = NestedRnsPoly::new(
-            helper_ctx,
-            result_inner,
-            Some(level_offset),
-            Some(active_levels),
-            result_max_plaintexts,
-        )
-        .with_p_max_traces(result_p_max_traces);
+        let result = reduce_terms_pairwise(q_level_results, &mut helper_circuit, |lhs, rhs, c| {
+            lhs.add(rhs, c)
+        });
         helper_circuit.output(crate::circuit_gadgets::arith::flatten_gadget_entries::<P, _>(
             std::slice::from_ref(&result),
         ));
@@ -482,15 +465,15 @@ pub(crate) fn mul_rows_with_decomposed_rhs<P: Poly + 'static>(
     };
 
     let mut g_inverse_terms = Vec::with_capacity(width);
-    for q_idx in 0..active_levels {
-        let (ys, w) = rhs_top.decomposition_terms_for_level(q_idx, circuit);
-        g_inverse_terms.extend(ys);
-        g_inverse_terms.push(w);
+    let (top_ys, top_w) = rhs_top.decomposition_terms(circuit);
+    for _ in 0..active_levels {
+        g_inverse_terms.extend(top_ys.iter().copied());
+        g_inverse_terms.push(top_w);
     }
-    for q_idx in 0..active_levels {
-        let (ys, w) = rhs_bottom.decomposition_terms_for_level(q_idx, circuit);
-        g_inverse_terms.extend(ys);
-        g_inverse_terms.push(w);
+    let (bottom_ys, bottom_w) = rhs_bottom.decomposition_terms(circuit);
+    for _ in 0..active_levels {
+        g_inverse_terms.extend(bottom_ys.iter().copied());
+        g_inverse_terms.push(bottom_w);
     }
     let (lhs_row0_inputs, lhs_row1_inputs) = rayon::join(
         || flatten_q_level_rows_for_decomposition_terms(&lhs_row0, gadget_len, chunk_width),

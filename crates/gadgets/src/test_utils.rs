@@ -272,10 +272,6 @@ pub fn constant_matrix(parameters: &DCRTPolyParams, value: usize) -> DCRTPolyMat
     )
 }
 
-pub fn polynomial_matrix(parameters: &DCRTPolyParams, value: DCRTPoly) -> DCRTPolyMatrix {
-    DCRTPolyMatrix::from_poly_vec_row(parameters, vec![value])
-}
-
 pub fn diagonal_matrix(
     parameters: &DCRTPolyParams,
     diagonal: impl IntoIterator<Item = DCRTPoly>,
@@ -294,17 +290,34 @@ pub fn diagonal_matrix(
     )
 }
 
-pub fn execute_polynomial_circuit(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolyVec(pub Vec<DCRTPoly>);
+
+impl PolyVec {
+    pub fn to_diagonal_matrix(&self, parameters: &DCRTPolyParams) -> DCRTPolyMatrix {
+        diagonal_matrix(parameters, self.0.iter().cloned())
+    }
+
+    pub fn from_diagonal_matrix(matrix: &DCRTPolyMatrix) -> Self {
+        let (rows, columns) = matrix.size();
+        assert_eq!(rows, columns, "PolyVec requires a square diagonal matrix");
+        Self((0..rows).map(|slot| matrix.entry(slot, slot).clone()).collect())
+    }
+}
+
+pub fn execute_polyvec_circuit(
     name: &str,
     parameters: &DCRTPolyParams,
     circuit: &PolyCircuit<DCRTPoly>,
-    inputs: impl IntoIterator<Item = DCRTPoly>,
-) -> Vec<DCRTPoly> {
-    let inputs =
-        inputs.into_iter().map(|poly| polynomial_matrix(parameters, poly)).collect::<Vec<_>>();
-    execute_circuit(name, parameters, circuit, &inputs)
-        .into_iter()
-        .map(|matrix| matrix.entry(0, 0).clone())
+    inputs: Vec<PolyVec>,
+    wire_size: usize,
+) -> Vec<PolyVec> {
+    assert!(inputs.iter().all(|input| input.0.len() == wire_size));
+    let matrices =
+        inputs.iter().map(|input| input.to_diagonal_matrix(parameters)).collect::<Vec<_>>();
+    execute_circuit_with_shape(name, parameters, circuit, &matrices, (wire_size, wire_size))
+        .iter()
+        .map(PolyVec::from_diagonal_matrix)
         .collect()
 }
 
@@ -505,12 +518,14 @@ impl ModularArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
 
     fn input(
         context: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Self {
         Self::input_with_metadata(
             context,
+            num_coefficient_slots,
             enable_levels,
             level_offset,
             vec![BigUint::from(1u8)],
@@ -521,6 +536,7 @@ impl ModularArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
 
     fn input_with_metadata(
         context: Arc<Self::Context>,
+        _num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         max_plaintexts: Vec<BigUint>,
@@ -557,6 +573,7 @@ impl ModularArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
 
     fn sparse_level_poly_with_metadata(
         context: Arc<Self::Context>,
+        _num_coefficient_slots: usize,
         active_levels: usize,
         enable_levels: Option<usize>,
         level_offset: usize,
@@ -661,6 +678,7 @@ impl ModularArithmeticPlanner<DCRTPoly> for ScalarArithmeticEntry {
 
     fn input_with_planner_metadata(
         context: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         metadata: &Self::Metadata,
@@ -668,6 +686,7 @@ impl ModularArithmeticPlanner<DCRTPoly> for ScalarArithmeticEntry {
     ) -> Self {
         Self::input_with_metadata(
             context,
+            num_coefficient_slots,
             enable_levels,
             level_offset,
             metadata.0.clone(),
@@ -739,11 +758,12 @@ impl DecomposeArithmeticGadget<DCRTPoly> for ScalarArithmeticEntry {
 
     fn gadget_vector(
         context: Arc<Self::Context>,
+        num_coefficient_slots: usize,
         enable_levels: Option<usize>,
         level_offset: Option<usize>,
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Vec<Self> {
-        vec![Self::input(context, enable_levels, level_offset, circuit)]
+        vec![Self::input(context, num_coefficient_slots, enable_levels, level_offset, circuit)]
     }
 
     fn gadget_decompose(&self, _circuit: &mut PolyCircuit<DCRTPoly>) -> Vec<Self> {

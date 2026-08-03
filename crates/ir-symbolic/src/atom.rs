@@ -126,6 +126,8 @@ pub enum SourceKind {
     HashTarget {
         variant: HashVariant,
     },
+    /// Exact matrix reconstructed from threshold-decoded canonical bits.
+    PackedPolynomialCoefficients,
     External {
         kind: ExternalSourceKind,
     },

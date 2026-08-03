@@ -687,6 +687,16 @@ impl State<'_> {
                     self.expressions.crt_recompose(ty, inputs, moduli, coefficients)?;
                 vec![matrix_output(expression)]
             }
+            NodeKind::PackPolynomialCoefficients { .. } => {
+                let id = local(0);
+                self.insert_source_atom(
+                    id.clone(),
+                    AtomKind::Large,
+                    matrix_type(&output_type(0)).expect("validated packed polynomial").clone(),
+                    SourceKind::PackedPolynomialCoefficients,
+                )?;
+                vec![matrix_output(self.expressions.atom(id, &self.atoms)?)]
+            }
             NodeKind::ThresholdDecode { plaintext_modulus, length, .. } => {
                 self.decode_targets.push(DecodeTarget {
                     input: ScopedWireRef { scope: scope.clone(), wire: args[0] },
@@ -696,6 +706,9 @@ impl State<'_> {
                 outputs.iter().map(|_| SymbolicOutput::default()).collect()
             }
             NodeKind::FamilyPack { .. } => {
+                if matrix_type(&output_type(0)).is_none() {
+                    return Ok(vec![SymbolicOutput::default()]);
+                }
                 let members = args
                     .iter()
                     .map(|argument| self.matrix_expression(scope, node, *argument, wires))

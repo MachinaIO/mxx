@@ -28,6 +28,10 @@ pub struct NaiveBggNoiseRefreshCompiler {
     pub crt_plaintext_moduli: Vec<IntExpr>,
     pub reconstruction_coefficients: Vec<IntExpr>,
     pub decoder_public_columns: usize,
+    /// Zero rows appended below each decoder target. Diamond applications use
+    /// one row so the target matches the two-row final injector basis; callers
+    /// with a scalar decoder trapdoor use zero.
+    pub decoder_zero_rows: usize,
     pub decoder_trapdoor_sigma: RealExpr,
 }
 
@@ -105,10 +109,17 @@ impl NaiveBggNoiseRefreshCompiler {
         let decoder_by_crt =
             self.preprocess_decoder_keys(one, refreshed_input, &a_prime, &refresh_terms)?;
         let decoder_public_keys = self.flatten_crt_families(&decoder_by_crt)?;
+        let decoder_columns = self.decoder_public_columns;
+        let public_columns = self.public_key_columns();
+        let zero_rows = self.decoder_zero_rows;
+        let ring = self.ring();
         let decoder_preimages = decoder_public_keys.clone().parallel_map(move |_, target| {
-            decoder_trapdoor
-                .sample_preimage(target, (self.decoder_public_columns, self.public_key_columns()))
-                .as_mat()
+            let target = if zero_rows == 0 {
+                target
+            } else {
+                Mat::concat(ConcatAxis::Rows, vec![target, ring.zero((zero_rows, public_columns))])
+            };
+            decoder_trapdoor.sample_preimage(target, (decoder_columns, public_columns)).as_mat()
         })?;
         Ok(NaiveBggNoiseRefreshPreprocessingWires {
             a_prime,
@@ -565,6 +576,7 @@ mod tests {
             crt_plaintext_moduli: vec![5.into()],
             reconstruction_coefficients: vec![1.into()],
             decoder_public_columns: 22,
+            decoder_zero_rows: 0,
             decoder_trapdoor_sigma: RealExpr::from_integer(5),
         };
         let public = |name: &str| NaiveBggPublicKeyVecWire {
@@ -666,6 +678,7 @@ mod tests {
                 .map(IntExpr::constant)
                 .collect(),
             decoder_public_columns: digit_count + 2,
+            decoder_zero_rows: 0,
             decoder_trapdoor_sigma: RealExpr::from_integer(5),
         };
         assert_eq!(depth, compiler.crt_depth());

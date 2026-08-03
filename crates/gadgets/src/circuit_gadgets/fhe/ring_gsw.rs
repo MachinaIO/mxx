@@ -117,6 +117,7 @@ pub struct RingGswContext<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArit
     pub(super) sub_entry_cache: DashMap<A::SubPlanKey, usize>,
     pub mul_subcircuit_id: usize,
     pub mul_output_metadata: A::Metadata,
+    circuit_template: PolyCircuit<P>,
 }
 
 impl<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>> RingGswContext<P, A> {
@@ -126,6 +127,24 @@ impl<P: Poly, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlanner<P>> Rin
 
     pub fn gadget_len(&self) -> usize {
         self.arith_ctx.gadget_len(Some(self.active_levels), Some(self.level_offset))
+    }
+
+    /// Number of scalar polynomial matrices used to bind one flattened
+    /// ciphertext to the declarative graph.  A ciphertext has two rows and
+    /// `width()` entries per row; every modular entry contributes one row of
+    /// p-residues for each active q-level.
+    pub fn flattened_ciphertext_input_count(&self) -> usize {
+        2usize
+            .checked_mul(self.width())
+            .and_then(|count| count.checked_mul(self.active_levels))
+            .and_then(|count| count.checked_mul(self.arith_ctx.q_level_row_width()))
+            .expect("Ring-GSW flattened ciphertext input count overflow")
+    }
+
+    /// Creates a circuit sharing the sub-circuit registries prepared while
+    /// this Ring-GSW context was constructed.
+    pub fn fresh_circuit(&self) -> PolyCircuit<P> {
+        self.circuit_template.fresh_sub_circuit()
     }
 }
 
@@ -222,6 +241,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             width,
             mul_subcircuit_start.elapsed().as_millis()
         );
+        let circuit_template = circuit.clone();
         let ctx = Arc::new(Self {
             params: params.clone(),
             num_slots,
@@ -233,6 +253,7 @@ impl<P: Poly + 'static, A: DecomposeArithmeticGadget<P> + ModularArithmeticPlann
             sub_entry_cache: DashMap::new(),
             mul_subcircuit_id,
             mul_output_metadata: A::metadata(&mul_output_template),
+            circuit_template,
         });
         debug!(
             "RingGswContext::from_arith_context completed: width={}, wrapper_prebuild_elapsed_ms={}, total_elapsed_ms={}",

@@ -789,6 +789,37 @@ where
             .collect())
     }
 
+    fn pack_polynomial_coefficients(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        bits: &[bool],
+        coefficient_bits: usize,
+    ) -> Result<M, Self::Error> {
+        if !ty.is_scalar() ||
+            coefficient_bits == 0 ||
+            bits.len() != ty.ring_dimension.saturating_mul(coefficient_bits)
+        {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let parameters = self.parameters(ty)?;
+        let modulus: Arc<BigUint> = parameters.modulus().into();
+        let coefficients = bits
+            .chunks_exact(coefficient_bits)
+            .map(|coefficient_bits| {
+                let mut coefficient = BigUint::zero();
+                for (position, bit) in coefficient_bits.iter().copied().enumerate() {
+                    if bit {
+                        coefficient |= BigUint::one() << position;
+                    }
+                }
+                (coefficient < *modulus)
+                    .then_some(coefficient)
+                    .ok_or(PolyBackendError::InvalidInteger)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(M::from_poly_vec_row(parameters, vec![M::P::from_biguints(parameters, &coefficients)]))
+    }
+
     fn crt_recompose(
         &mut self,
         levels: &[M],

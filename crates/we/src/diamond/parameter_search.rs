@@ -256,7 +256,7 @@ impl DiamondParameterSearch {
             !self.trapdoor_sigma.is_finite() ||
             !self.error_sigma.is_finite() ||
             self.trapdoor_sigma <= 0.0 ||
-            self.error_sigma < 0.0
+            self.error_sigma <= 0.0
         {
             return Err(DiamondParameterSearchError::InvalidRange);
         }
@@ -269,8 +269,8 @@ fn lattice_security_bits(
     error_sigma: f64,
 ) -> Result<u64, DiamondParameterSearchError> {
     let modulus: Arc<BigUint> = parameters.modulus();
-    let secret = r#"{"name":"Ternary"}"#;
-    let error = format!(r#"{{"name":"DiscreteGaussian","stddev":"{error_sigma}"}}"#);
+    let secret = ternary_distribution_json();
+    let error = discrete_gaussian_distribution_json(error_sigma);
     let output = Command::new("lattice-estimator-cli")
         .arg(parameters.ring_dimension().to_string())
         .arg(modulus.to_string())
@@ -289,9 +289,26 @@ fn lattice_security_bits(
     value.parse().map_err(|_| DiamondParameterSearchError::EstimatorOutput(stdout.into_owned()))
 }
 
+fn ternary_distribution_json() -> &'static str {
+    r#"{"name":"Ternary"}"#
+}
+
+fn discrete_gaussian_distribution_json(sigma: f64) -> String {
+    format!(r#"{{"name":"DiscreteGaussian","stddev":{sigma}}}"#)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimator_distribution_arguments_are_valid_unescaped_json() {
+        assert_eq!(ternary_distribution_json(), r#"{"name":"Ternary"}"#);
+        assert_eq!(
+            discrete_gaussian_distribution_json(4.5),
+            r#"{"name":"DiscreteGaussian","stddev":4.5}"#
+        );
+    }
 
     #[test]
     fn search_selects_the_smallest_correct_crt_depth_and_ring_dimension() {
@@ -310,7 +327,7 @@ mod tests {
             digit_base: 2,
             batch_bits: 1,
             trapdoor_sigma: 4.578,
-            error_sigma: 0.0,
+            error_sigma: 1.0,
             bgg_tag: b"diamond-search-test".to_vec(),
         };
         let selected = search
@@ -318,9 +335,16 @@ mod tests {
                 Ok(if parameters.ring_dimension() >= 8 { 1 } else { 0 })
             })
             .unwrap();
-        assert_eq!(selected.crt_depth, 1);
+        assert_eq!(selected.crt_depth, 3);
         assert_eq!(selected.ring_dimension, 8);
         assert!(selected.simulation.final_decode.estimate.has_signal);
         assert!(selected.simulation.final_decode.within_threshold);
+
+        let mut invalid = search;
+        invalid.error_sigma = 0.0;
+        assert!(matches!(
+            invalid.search_with_security_estimator(&circuit, &[], |_, _| Ok(1)),
+            Err(DiamondParameterSearchError::InvalidRange)
+        ));
     }
 }

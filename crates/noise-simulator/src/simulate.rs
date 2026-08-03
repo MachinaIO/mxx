@@ -738,7 +738,8 @@ impl Evaluator<'_> {
             }
             SourceKind::TrapdoorUniform { .. } |
             SourceKind::HashSample { base: None, .. } |
-            SourceKind::HashTarget { .. } => {
+            SourceKind::HashTarget { .. } |
+            SourceKind::PackedPolynomialCoefficients => {
                 return Err(SimulationError::MixedBoundedAlternative);
             }
         })

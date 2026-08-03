@@ -607,7 +607,8 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for NaiveEncodingLowering<P> {
     }
 }
 
-struct NaivePublicKeySlotOperations;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NaivePublicKeySlotOperations;
 
 impl CircuitLoweringTypes for NaivePublicKeySlotOperations {
     type Wire = NaiveBggPublicKeyVecWire;
@@ -634,7 +635,8 @@ impl<P: Poly> SlotOperationLowering<P> for NaivePublicKeySlotOperations {
     }
 }
 
-struct NaiveEncodingSlotOperations;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NaiveEncodingSlotOperations;
 
 impl CircuitLoweringTypes for NaiveEncodingSlotOperations {
     type Wire = NaiveBggEncodingVecWire;

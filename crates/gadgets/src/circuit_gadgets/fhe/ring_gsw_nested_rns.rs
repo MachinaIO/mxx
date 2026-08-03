@@ -17,6 +17,8 @@ use crate::{
     },
 };
 use keccak_asm::Keccak256;
+use mxx_dsl::{BoundedMetadata, Family, Mat, Ring, VirtualMat};
+use mxx_ir_core::RealExpr;
 use num_bigint::BigUint;
 use rayon::prelude::*;
 
@@ -24,6 +26,67 @@ pub type NestedRnsRingGswEntry<P> = NestedRnsPoly<P>;
 pub type NestedRnsRingGswContext<P> = RingGswContext<P, NestedRnsRingGswEntry<P>>;
 pub type NestedRnsRingGswCiphertext<P> = RingGswCiphertext<P, NestedRnsRingGswEntry<P>>;
 pub type NativeRingGswCiphertext<P> = [Vec<P>; 2];
+
+/// Declarative scalar-family inputs corresponding to one native Ring-GSW
+/// ciphertext after nested-RNS encoding.
+///
+/// Each family is one circuit input wire and contains one scalar polynomial
+/// per SIMD slot. This layout is deliberately shared by public-key and
+/// encoding compilation: both sides must lift the exact same native
+/// ciphertext entries and preserve their external source identities.
+#[derive(Clone)]
+pub struct NativeRingGswDslInputs {
+    pub scalar_families: Vec<Family<Mat>>,
+    pub input_names: Vec<String>,
+    pub slot_count: usize,
+}
+
+/// Declares the executable inputs used by [`native_ring_gsw_scalar_bindings`]
+/// and separates modulus-scale signal from native encryption error.
+///
+/// The values are not sampled by the graph: obfuscation samples the private
+/// seed ciphertext natively and binds the resulting nested-RNS values at
+/// execution. Top-row entries are pure Large signal. Bottom-row entries are
+/// reinterpreted as Large signal plus the bounded `eR` term from the noisy
+/// public key and binary ciphertext randomizer. Unknown dependencies keep the
+/// simulator on conservative addition rather than assuming CLT independence.
+pub fn declare_native_ring_gsw_dsl_inputs(
+    ring: &Ring,
+    prefix: &str,
+    wire_count: usize,
+    slot_count: usize,
+    ciphertext_error_norm: RealExpr,
+) -> Result<NativeRingGswDslInputs, mxx_dsl::DslError> {
+    assert!(wire_count.is_multiple_of(2), "Ring-GSW ciphertext must have two equally sized rows");
+    let bottom_row_start = wire_count / 2;
+    let mut scalar_families = Vec::with_capacity(wire_count);
+    let mut input_names = Vec::with_capacity(wire_count);
+    for wire in 0..wire_count {
+        let name = format!("{prefix}-{wire}");
+        let scalar_type = ring.matrix_type((1, 1));
+        let error_norm = ciphertext_error_norm.clone();
+        let family = ring.input_family(name.clone(), slot_count, (1, 1)).parallel_map(
+            move |_, scalar| {
+                let signal =
+                    VirtualMat::large(format!("{name}:nested-rns-signal"), scalar_type.clone());
+                if wire < bottom_row_start {
+                    scalar.assume(signal)
+                } else {
+                    let error = VirtualMat::bounded(
+                        format!("{name}:native-encryption-error"),
+                        scalar_type.clone(),
+                        BoundedMetadata::conservative(error_norm.clone()),
+                    );
+                    scalar.assume(signal + error)
+                }
+                .expect("native Ring-GSW scalar assumption is shape preserving")
+            },
+        )?;
+        scalar_families.push(family);
+        input_names.push(format!("{prefix}-{wire}"));
+    }
+    Ok(NativeRingGswDslInputs { scalar_families, input_names, slot_count })
+}
 
 pub fn active_q_modulus(ctx: &NestedRnsPolyContext) -> BigUint {
     BigUint::from(*ctx.q_moduli().first().expect("Ring-GSW helpers require one active q modulus"))
@@ -368,13 +431,17 @@ where
     (top, bottom)
 }
 
-pub fn ciphertext_inputs_from_native(
-    params: &DCRTPolyParams,
+pub fn ciphertext_inputs_from_native<P, M>(
+    params: &P::Params,
     ctx: &NestedRnsPolyContext,
-    ciphertext: &NativeRingGswCiphertext<DCRTPoly>,
+    ciphertext: &NativeRingGswCiphertext<P>,
     level_offset: usize,
     enable_levels: Option<usize>,
-) -> Vec<DCRTPolyMatrix> {
+) -> Vec<M>
+where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+{
     ciphertext
         .par_iter()
         .map(|row| {
@@ -384,7 +451,7 @@ pub fn ciphertext_inputs_from_native(
                         .coeffs_biguints()
                         .into_par_iter()
                         .map(|coeff| {
-                            encode_nested_rns_poly_with_offset::<DCRTPoly>(
+                            encode_nested_rns_poly_with_offset::<P>(
                                 ctx.p_moduli_bits,
                                 ctx.max_unreduced_muls,
                                 params,
@@ -408,8 +475,8 @@ pub fn ciphertext_inputs_from_native(
                                 .iter()
                                 .map(|encoded| encoded[gate_idx].clone())
                                 .collect::<Vec<_>>();
-                            let zero = DCRTPoly::const_zero(params);
-                            DCRTPolyMatrix::from_poly_vec(
+                            let zero = P::const_zero(params);
+                            M::from_poly_vec(
                                 params,
                                 (0..diagonal.len())
                                     .map(|row_idx| {
@@ -434,6 +501,42 @@ pub fn ciphertext_inputs_from_native(
         .into_iter()
         .flatten()
         .flatten()
+        .collect()
+}
+
+/// Converts one native ciphertext into the host values expected by
+/// [`declare_native_ring_gsw_dsl_inputs`].
+///
+/// The outer vector follows Ring-GSW circuit-input order. Each inner vector is
+/// an indexed family of `slot_count` scalar matrices. The conversion extracts
+/// exactly the diagonal SIMD entry that the pre-DSL implementation used for
+/// the corresponding BGG slot; off-diagonal zero padding is not exposed to the
+/// graph and therefore cannot be accidentally interpreted as additional
+/// slots.
+pub fn native_ring_gsw_scalar_bindings<P, M>(
+    params: &P::Params,
+    ctx: &NestedRnsPolyContext,
+    ciphertext: &NativeRingGswCiphertext<P>,
+    level_offset: usize,
+    enable_levels: Option<usize>,
+) -> Vec<Vec<M>>
+where
+    P: Poly + 'static,
+    M: PolyMatrix<P = P>,
+{
+    ciphertext_inputs_from_native::<P, M>(params, ctx, ciphertext, level_offset, enable_levels)
+        .into_par_iter()
+        .map(|encoded| {
+            assert_eq!(
+                encoded.row_size(),
+                encoded.col_size(),
+                "nested-RNS Ring-GSW inputs must be square SIMD matrices"
+            );
+            (0..encoded.row_size())
+                .into_par_iter()
+                .map(|slot| M::from_poly_vec(params, vec![vec![encoded.entry(slot, slot)]]))
+                .collect()
+        })
         .collect()
 }
 
@@ -522,7 +625,10 @@ mod tests {
         circuit_gadgets::fhe::ring_gsw::MUL_COLUMN_SUBCIRCUIT_BATCH,
         test_utils::{build_circuit_graph, diagonal_matrix, execute_circuit_with_shape},
     };
+    use mxx_dsl::DslContext;
     use mxx_ir_core::node::NodeKind;
+    use mxx_primitives::poly::PolyParams;
+    use num_bigint::BigInt;
     use num_traits::ToPrimitive;
     use rand::Rng;
     use std::sync::Arc;
@@ -630,7 +736,7 @@ mod tests {
         );
         let ciphertext =
             encrypt_plaintext_bit(&params, context.nested_rns.as_ref(), &public_key, true);
-        let inputs = ciphertext_inputs_from_native(
+        let inputs = ciphertext_inputs_from_native::<DCRTPoly, DCRTPolyMatrix>(
             &params,
             context.nested_rns.as_ref(),
             &ciphertext,
@@ -642,6 +748,76 @@ mod tests {
             input.row_size() == ring_dimension as usize &&
                 input.col_size() == ring_dimension as usize
         }));
+    }
+
+    #[test]
+    fn native_scalar_binding_layout_matches_every_simd_diagonal_entry() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (params, context) = test_context(&mut circuit);
+        let secret_key = sample_secret_key(&params);
+        let public_key = sample_public_key(
+            &params,
+            context.width(),
+            &secret_key,
+            sample_hash_key(),
+            b"ring-gsw-dsl-scalar-binding",
+            None,
+        );
+        let ciphertext =
+            encrypt_plaintext_bit(&params, context.nested_rns.as_ref(), &public_key, true);
+        let matrix_inputs = ciphertext_inputs_from_native::<DCRTPoly, DCRTPolyMatrix>(
+            &params,
+            context.nested_rns.as_ref(),
+            &ciphertext,
+            context.level_offset,
+            Some(context.active_levels),
+        );
+        let scalar_inputs = native_ring_gsw_scalar_bindings::<DCRTPoly, DCRTPolyMatrix>(
+            &params,
+            context.nested_rns.as_ref(),
+            &ciphertext,
+            context.level_offset,
+            Some(context.active_levels),
+        );
+        assert_eq!(scalar_inputs.len(), context.flattened_ciphertext_input_count());
+        assert_eq!(scalar_inputs.len(), matrix_inputs.len());
+        for (family, matrix) in scalar_inputs.iter().zip(&matrix_inputs) {
+            assert_eq!(family.len(), matrix.row_size());
+            for (slot, scalar) in family.iter().enumerate() {
+                assert_eq!(scalar.size(), (1, 1));
+                assert_eq!(scalar.entry(0, 0), matrix.entry(slot, slot));
+            }
+        }
+
+        let modulus: std::sync::Arc<BigUint> = params.modulus();
+        let ring = Ring::new(BigInt::from(modulus.as_ref().clone()), RING_DIMENSION as usize);
+        let declared = declare_native_ring_gsw_dsl_inputs(
+            &ring,
+            "ring-gsw-seed",
+            scalar_inputs.len(),
+            RING_DIMENSION as usize,
+            RealExpr::from_integer(1),
+        )
+        .unwrap();
+        assert_eq!(declared.input_names.len(), scalar_inputs.len());
+        assert_eq!(declared.scalar_families.len(), scalar_inputs.len());
+        let graph = declared
+            .scalar_families
+            .into_iter()
+            .enumerate()
+            .try_fold(
+                DslContext::new("ring-gsw-native-scalar-adapter"),
+                |context, (wire, family)| {
+                    context.public_family_output(format!("wire-{wire}"), family)
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
+        let elaborated = graph.elaborate(&mxx_ir_core::ParamEnv::default()).unwrap();
+        let bounded_atoms = elaborated.atoms.values().filter(|atom| !atom.is_large()).count();
+        assert_eq!(bounded_atoms, scalar_inputs.len() / 2);
     }
 
     #[test]

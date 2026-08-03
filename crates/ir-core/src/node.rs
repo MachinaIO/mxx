@@ -110,6 +110,14 @@ pub enum NodeKind {
         plaintext_moduli: Vec<IntExpr>,
         reconstruction_coefficients: Vec<IntExpr>,
     },
+    /// Reconstructs one polynomial from canonical coefficient bits.
+    ///
+    /// The input is a fixed-length boolean family ordered coefficient-major
+    /// and little-endian within each coefficient.
+    PackPolynomialCoefficients {
+        matrix_type: crate::types::MatrixType,
+        coefficient_bits: IntExpr,
+    },
     SubgraphCall(SubgraphCall),
     ParallelLoop(ParallelLoop),
     FamilyPack {

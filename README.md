@@ -6,7 +6,8 @@ The repository includes:
 
 - [BGG+ encodings](https://eprint.iacr.org/2014/356.pdf) as declarative DSL programs in `crates/bgg/`.
 - Evaluation and decryption of [GSW-FHE](https://eprint.iacr.org/2013/340.pdf) over BGG+ encodings, following [this construction](https://eprint.iacr.org/2015/029.pdf), in `crates/gadgets/src/circuit_gadgets/fhe/`.
-- [Diamond witness encryption](https://eprint.iacr.org/2025/375) as declarative encryption and decryption graphs, with symbolic noise simulation, automatic parameter search, and CPU/GPU execution, in `crates/we/`. Indistinguishability-obfuscation implementations remain disabled pending their DSL cutover.
+- [Diamond witness encryption](https://eprint.iacr.org/2025/375) as declarative encryption and decryption graphs, with symbolic noise simulation, automatic parameter search, and CPU/GPU execution, in `crates/we/`.
+- AKY24 and Diamond indistinguishability obfuscation as manifest-linked declarative preprocessing and evaluation graphs, with symbolic noise simulation, automatic parameter search, and CPU/GPU runtime support, in `crates/io/`.
 
 ## Workspace layout
 
@@ -25,7 +26,7 @@ The repository is a virtual Cargo workspace with no root facade crate:
 | `mxx-bgg` | Declarative BGG+ public keys, encodings, samplers, polynomial/naive families, circuit evaluation, masked decoding, slot transfer, artifacts, and noise refresh. |
 | `mxx-func-enc` | Functional-encryption interfaces. AKY24 functional encryption is disabled pending a separate specification of its raw-mask semantics. |
 | `mxx-we` | Diamond witness encryption: declarative preprocessing, encryption and decryption graphs, symbolic noise simulation, parameter search, cost estimation, and CPU/GPU runtime integration. |
-| `mxx-io` | Indistinguishability-obfuscation interfaces. AKY24 iO and Diamond iO are disabled pending separate application cutovers. |
+| `mxx-io` | AKY24 and Diamond indistinguishability obfuscation: declarative preprocessing and evaluation graphs, public artifact schemas, symbolic noise simulation, parameter search, and CPU/GPU runtime integration. |
 
 The principal dependency directions are shown with consumers on the left:
 

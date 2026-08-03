@@ -703,6 +703,46 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(first)]
         }
+        NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
+            require_arity(scope, node, 1)?;
+            let output = concrete_matrix(matrix_type, env, scope, node.id)?;
+            if !output.is_scalar() {
+                return node_error(scope, node.id, "packed polynomial output must be a 1x1 matrix");
+            }
+            let coefficient_bits = positive_usize(
+                coefficient_bits.evaluate(env)?,
+                "coefficient bit width",
+                scope,
+                node.id,
+            )?;
+            if (BigInt::one() << coefficient_bits) < output.modulus {
+                return node_error(
+                    scope,
+                    node.id,
+                    "coefficient bit width does not cover the modulus",
+                );
+            }
+            let expected_count =
+                output.ring_dimension.checked_mul(coefficient_bits).ok_or_else(|| {
+                    ValidationError::Node {
+                        scope: scope.clone(),
+                        node: node.id,
+                        message: "packed polynomial bit count overflow".to_owned(),
+                    }
+                })?;
+            match argument(scope, values, node, 0)? {
+                ConcreteWireType::IndexedFamily { element, count }
+                    if element.as_ref() == &ConcreteWireType::Bool && *count == expected_count => {}
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "packed polynomial requires the exact boolean coefficient-bit family",
+                    )
+                }
+            }
+            vec![ConcreteWireType::Matrix(output)]
+        }
         NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) => node
             .output_types
             .iter()
@@ -1450,6 +1490,36 @@ mod tests {
                 validate(&graph("invalid-decode", decode), &ParamEnv::default()).unwrap_err()
             ),
             "invalid threshold decoding parameters"
+        );
+    }
+
+    #[test]
+    fn packed_polynomial_validation_requires_canonical_width_and_exact_bool_count() {
+        let bools = (0..8)
+            .map(|_| value(NodeKind::ConstantBool(false), Vec::new(), vec![WireType::ConstantBool]))
+            .collect::<Vec<_>>();
+        let family = value(
+            NodeKind::FamilyPack { count: IntExpr::constant(8) },
+            bools,
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::ConstantBool),
+                count: IntExpr::constant(8),
+            }],
+        );
+        let packed = value(
+            NodeKind::PackPolynomialCoefficients {
+                matrix_type: matrix_type(257, 1, 1),
+                coefficient_bits: IntExpr::constant(8),
+            },
+            vec![family],
+            vec![WireType::Matrix(matrix_type(257, 1, 1))],
+        );
+        assert_eq!(
+            node_message(
+                validate(&graph("invalid-packed-polynomial", packed), &ParamEnv::default())
+                    .unwrap_err()
+            ),
+            "coefficient bit width does not cover the modulus"
         );
     }
 

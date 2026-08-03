@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-pub const IR_VERSION: u32 = 4;
+pub const IR_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum EncodingError {

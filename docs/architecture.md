@@ -25,8 +25,10 @@ mxx-func-enc/we/io   -> lower layers, never one another
 ```
 
 `mxx-we` contains the active Diamond witness-encryption protocol graphs.
-Functional encryption and indistinguishability obfuscation remain disabled
-until their separate declarative-DSL migrations.
+`mxx-io` contains the active AKY24 and Diamond indistinguishability-obfuscation
+graphs. AKY24 functional encryption remains disabled; the private prFE
+machinery in `mxx-io` is internal to the AKY24 iO cascade rather than a public
+functional-encryption API.
 
 ## Crate responsibilities
 
@@ -170,11 +172,38 @@ current implementation. Decoder and noise-refresh circuit templates remain in
 and decryption computations are declarative DSL graphs over `mxx-bgg`; runtime
 execution is provided for CPU and GPU backends without a separate protocol
 implementation. Public preprocessing values are passed through runtime
-sessions and artifact manifests rather than a protocol-specific disk feature.
+sessions and typed artifact manifests.
 
 The crate also owns Diamond-specific symbolic noise simulation, automatic
 ring-dimension and modulus search, and graph cost estimation. See
 `docs/diamond-we.md` for the protocol graph and validation details.
+
+### `mxx-io`
+
+`crates/io/` owns the Diamond indistinguishability-obfuscation application.
+Preprocessing and evaluation are separate declarative DSL graphs linked by
+typed public artifact manifests. Private trapdoors are used only as internal
+preprocessing witnesses and are never exported as graph outputs or artifacts.
+
+The AKY24 implementation source is retained under `crates/io/src/aky24/`, but
+its crate module and integration target are temporarily disabled pending full
+end-to-end validation of the private-prFE cascade. The Diamond implementation
+reuses the shared input injector, BGG+ public lookup, Ring-GSW, decoder, and
+noise-refresh gadgets. Its graph definitions drive runtime execution and linked
+noise simulation, and it provides automatic ring-dimension and modulus search.
+The heavyweight GPU round-trip test is an explicit ignored integration target.
+
+Diamond's native Ring-GSW public key always uses a strictly positive Gaussian
+error. When native ciphertexts enter the declarative graph, their flattened top
+row is Large signal and their bottom row is Large signal plus a bounded `eR`
+term. Its physical nested-RNS bound is the conservative coefficient envelope
+`6.5 * sigma * public_key_width * ring_dimension + max(p_j) - 1`. The second
+term covers residue changes when `(c mod q_i) mod p_j` crosses a `q_i`
+boundary. Dependency metadata remains unknown, so the simulator cannot apply
+an unjustified CLT reduction. Parameter search checks lattice security for both
+the ordinary protocol error and this native Ring-GSW error distribution, and
+accepts a candidate only when the linked graph remains within every decode
+threshold.
 
 ## Parallelism
 

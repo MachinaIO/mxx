@@ -519,18 +519,17 @@ dependencies = [
  "digest",
  "keccak-asm",
  "mxx-bgg",
+ "mxx-dsl",
  "mxx-gadgets",
  "mxx-ir-core",
+ "mxx-ir-symbolic",
+ "mxx-noise-simulator",
  "mxx-primitives",
  "mxx-runtime",
  "num-bigint",
- "num-traits",
  "rand 0.9.2",
- "serial_test",
+ "rayon",
  "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

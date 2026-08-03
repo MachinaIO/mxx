@@ -34,6 +34,75 @@ pub enum NaiveVecCompileError {
 }
 
 impl NaiveBggVecCompiler {
+    /// Lifts one scalar family into a per-slot public-key vector.
+    ///
+    /// This is the public-key counterpart of
+    /// [`Self::large_scalar_mul_encoding_families`]. Diamond iO uses the two
+    /// methods on the same native Ring-GSW scalar layout during preprocessing
+    /// and online evaluation respectively.
+    pub fn large_scalar_mul_public_key_families(
+        &self,
+        input: &NaiveBggPublicKeyVecWire,
+        scalars: Family<Mat>,
+    ) -> Result<NaiveBggPublicKeyVecWire, NaiveVecCompileError> {
+        if input.matrices.count() != scalars.count() {
+            return Err(NaiveVecCompileError::SlotCountMismatch);
+        }
+        let compiler = self.public_key.clone();
+        let reveal = input.reveal_plaintext;
+        let matrices = input.matrices.clone().parallel_zip(scalars, move |_, matrix, scalar| {
+            compiler
+                .large_scalar_mul(&BggPublicKeyWire { matrix, reveal_plaintext: reveal }, &scalar)
+                .matrix
+        })?;
+        Ok(NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: reveal })
+    }
+
+    /// Lifts one scalar family into a per-slot encoding vector using the same
+    /// BGG+ formula as ordinary large-scalar circuit lowering.
+    pub fn large_scalar_mul_encoding_families(
+        &self,
+        input: &NaiveBggEncodingVecWire,
+        scalars: Family<Mat>,
+    ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
+        validate_encoding(input)?;
+        if input.vectors.count() != scalars.count() {
+            return Err(NaiveVecCompileError::SlotCountMismatch);
+        }
+        let vector_compiler = self.public_key.clone();
+        let reveal = input.pubkey_reveal_plaintext;
+        let factors =
+            input.pubkeys.clone().parallel_zip(scalars.clone(), move |_, matrix, scalar| {
+                vector_compiler.large_scalar_decomposition(
+                    &BggPublicKeyWire { matrix, reveal_plaintext: reveal },
+                    &scalar,
+                )
+            })?;
+        let vectors =
+            input.vectors.clone().parallel_zip(factors, |_, vector, factor| vector * factor)?;
+        let key_compiler = self.public_key.clone();
+        let pubkeys =
+            input.pubkeys.clone().parallel_zip(scalars.clone(), move |_, matrix, scalar| {
+                key_compiler
+                    .large_scalar_mul(
+                        &BggPublicKeyWire { matrix, reveal_plaintext: reveal },
+                        &scalar,
+                    )
+                    .matrix
+            })?;
+        let plaintexts = input
+            .plaintexts
+            .clone()
+            .map(|values| values.parallel_zip(scalars, |_, value, scalar| value * scalar))
+            .transpose()?;
+        Ok(NaiveBggEncodingVecWire {
+            vectors,
+            pubkeys,
+            pubkey_reveal_plaintext: reveal,
+            plaintexts,
+        })
+    }
+
     pub fn matrix_mul_public_keys(
         &self,
         input: &NaiveBggPublicKeyVecWire,
@@ -366,6 +435,46 @@ mod tests {
     use mxx_runtime::RuntimeValue;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn native_scalar_family_lift_is_symmetric_for_public_keys_and_encodings() {
+        let ring = Ring::new(257, 8);
+        let compiler = NaiveBggVecCompiler {
+            public_key: BggPublicKeyCompiler {
+                ring: ring.clone(),
+                base: 4.into(),
+                digit_count: 4.into(),
+            },
+        };
+        let scalars = ring.input_family("native-scalars", 2, (1, 1));
+        let public = NaiveBggPublicKeyVecWire {
+            matrices: ring.input_family("public-keys", 2, (1, 4)),
+            reveal_plaintext: true,
+        };
+        let encoding = NaiveBggEncodingVecWire {
+            vectors: ring.input_family("encoding-vectors", 2, (1, 4)),
+            pubkeys: public.matrices.clone(),
+            pubkey_reveal_plaintext: true,
+            plaintexts: Some(ring.input_family("plaintexts", 2, (1, 1))),
+        };
+        let public_output =
+            compiler.large_scalar_mul_public_key_families(&public, scalars.clone()).unwrap();
+        let encoding_output =
+            compiler.large_scalar_mul_encoding_families(&encoding, scalars).unwrap();
+        let graph = DslContext::new("native-ring-gsw-bgg-lift")
+            .family_output("public", public_output.matrices)
+            .unwrap()
+            .family_output("vectors", encoding_output.vectors)
+            .unwrap()
+            .family_output("encoding-public", encoding_output.pubkeys)
+            .unwrap()
+            .family_output("plaintexts", encoding_output.plaintexts.unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
+        graph.elaborate(&ParamEnv::default()).unwrap();
+    }
 
     #[test]
     fn naive_encoding_multiplication_elaborates_all_indexed_families() {

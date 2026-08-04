@@ -5,10 +5,19 @@ edition.workspace = true
 license.workspace = true
 description = "Witness encryption constructions for mxx"
 
-[features]
-default = []
-gpu = []
-
 [dependencies]
 mxx-primitives.workspace = true
 mxx-gadgets.workspace = true
+mxx-bgg.workspace = true
+mxx-dsl.workspace = true
+mxx-ir-core.workspace = true
+mxx-runtime.workspace = true
+mxx-correctness.workspace = true
+mxx-bench-estimator.workspace = true
+num-bigint.workspace = true
+num-integer.workspace = true
+num-traits.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+keccak-asm.workspace = true

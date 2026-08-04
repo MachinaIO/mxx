@@ -1,11 +1,10 @@
 use mxx_dsl::{IdealSpec, PurePredicateSpec};
-use mxx_ir_core::{
-    CompileParameter, Graph, IntExpr, Rational, WireType, artifact::ArtifactConfidentiality,
-    node::NodeKind,
-};
+use mxx_ir_core::{CompileParameter, Graph, IntExpr, Rational, WireType, node::NodeKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
+
+use crate::certificate::{CertificateValidationError, SemanticCertificate};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct StageId(pub String);
@@ -34,8 +33,15 @@ pub struct ProtocolStage {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactBinding {
+    /// Consumer input whose executable graph carries a concrete runtime
+    /// `ProductionId`. That runtime identity is not part of protocol identity.
     pub consumer_input: StageInputName,
+    /// Stage-relative producer identity used by the protocol hash and Lean
+    /// workflow denotation.
     pub producer_stage: StageId,
+    /// The producer output must equal the artifact name read by the consumer
+    /// graph. Validation checks this so runtime and Lean cannot select
+    /// different artifacts.
     pub producer_output: ArtifactName,
 }
 
@@ -101,6 +107,7 @@ pub struct ProtocolDecl {
     pub params: ParamDecls,
     pub stages: Vec<ProtocolStage>,
     pub entrypoint: StageId,
+    pub semantic_certificate: SemanticCertificate,
     pub correctness: CorrectnessDecl,
 }
 
@@ -122,6 +129,8 @@ pub enum ProtocolError {
     MissingProducerStage,
     #[error("an artifact binding names a missing producer output")]
     MissingProducerOutput,
+    #[error("an artifact binding names a different producer artifact than its runtime input")]
+    ArtifactNameMismatch,
     #[error("an artifact binding connects incompatible wire types")]
     ArtifactTypeMismatch,
     #[error("an artifact binding connects incompatible confidentiality declarations")]
@@ -164,6 +173,8 @@ pub enum ProtocolError {
     ComparatorTypeMismatch,
     #[error("a rational comparator bound references an undeclared parameter")]
     UndeclaredBoundParameter,
+    #[error(transparent)]
+    InvalidSemanticCertificate(#[from] CertificateValidationError),
 }
 
 impl ProtocolDecl {
@@ -186,6 +197,7 @@ impl ProtocolDecl {
         self.validate_inputs(&stages)?;
         self.validate_correctness_graphs(&stages)?;
         self.validate_reachability(&stages)?;
+        self.semantic_certificate.validate_references(self)?;
         for output in &self.correctness.compared_outputs {
             if output.stage != self.entrypoint {
                 return Err(ProtocolError::ComparedOutputOutsideEntrypoint);
@@ -248,17 +260,16 @@ impl ProtocolDecl {
 
     fn stage_inputs(
         stage: &ProtocolStage,
-    ) -> BTreeMap<String, (&WireType, Option<ArtifactConfidentiality>)> {
+    ) -> BTreeMap<String, (&WireType, Option<&mxx_ir_core::node::ArtifactInput>)> {
         stage
             .graph
             .root_scope()
             .nodes()
             .iter()
             .filter_map(|node| match node.kind() {
-                NodeKind::Input { name, artifact, .. } => Some((
-                    name.clone(),
-                    (&node.output_types()[0], artifact.as_ref().map(|value| value.confidentiality)),
-                )),
+                NodeKind::Input { name, artifact, .. } => {
+                    Some((name.clone(), (&node.output_types()[0], artifact.as_ref())))
+                }
                 _ => None,
             })
             .collect()
@@ -301,13 +312,18 @@ impl ProtocolDecl {
                     .node(output.value.node)
                     .ok_or(ProtocolError::MissingProducerOutput)?;
                 let producer_type = &producer_node.output_types()[output.value.port.0 as usize];
-                let (consumer_type, consumer_confidentiality) = inputs
+                let (consumer_type, consumer_artifact) = inputs
                     .get(&binding.consumer_input.0)
                     .ok_or(ProtocolError::InvalidArtifactConsumer)?;
+                let consumer_artifact =
+                    consumer_artifact.ok_or(ProtocolError::InvalidArtifactConsumer)?;
+                if consumer_artifact.artifact_name != binding.producer_output.0 {
+                    return Err(ProtocolError::ArtifactNameMismatch);
+                }
                 if producer_type != *consumer_type {
                     return Err(ProtocolError::ArtifactTypeMismatch);
                 }
-                if output.confidentiality != *consumer_confidentiality {
+                if output.confidentiality != Some(consumer_artifact.confidentiality) {
                     return Err(ProtocolError::ArtifactConfidentialityMismatch);
                 }
             }
@@ -570,7 +586,7 @@ pub fn sampler_cutoffs(graph: &Graph) -> Vec<IntExpr> {
 mod tests {
     use super::*;
     use mxx_dsl::{DslContext, IdealSpec, Ring};
-    use mxx_ir_core::artifact::{ProductionId, SpecHash};
+    use mxx_ir_core::artifact::{ArtifactConfidentiality, ProductionId, SpecHash};
 
     fn valid_protocol() -> ProtocolDecl {
         let ring = Ring::new(17, 1);
@@ -619,6 +635,7 @@ mod tests {
                 },
             ],
             entrypoint: StageId("consumer".to_owned()),
+            semantic_certificate: Default::default(),
             correctness: CorrectnessDecl {
                 protocol_inputs: vec![(
                     ProtoInputName("message".to_owned()),
@@ -653,6 +670,21 @@ mod tests {
         let mut output = valid_protocol();
         output.stages[1].bindings[0].producer_output = ArtifactName("absent".to_owned());
         assert_eq!(output.validate(), Err(ProtocolError::MissingProducerOutput));
+    }
+
+    #[test]
+    fn artifact_binding_must_name_the_runtime_artifact() {
+        let mut protocol = valid_protocol();
+        let ring = Ring::new(17, 1);
+        protocol.stages[0].graph = DslContext::new("producer")
+            .public_output("other", ring.input("message", (1, 1)))
+            .unwrap()
+            .build()
+            .unwrap()
+            .graph;
+        protocol.stages[1].bindings[0].producer_output = ArtifactName("other".to_owned());
+
+        assert_eq!(protocol.validate(), Err(ProtocolError::ArtifactNameMismatch));
     }
 
     #[test]

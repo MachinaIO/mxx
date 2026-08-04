@@ -24,5 +24,5 @@ mod test_utils_gpu;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use mxx_primitives::rlwe_enc;
-pub(crate) use mxx_primitives::{element, matrix, poly, sampler};
 pub use mxx_primitives::{element::PolyElem, impl_binop_with_refs, parallel_iter, poly::Poly};
+pub(crate) use mxx_primitives::{matrix, poly, sampler};

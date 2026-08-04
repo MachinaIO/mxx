@@ -322,7 +322,7 @@ impl SerializablePolyCircuit {
 
     fn to_circuit_with_registries<P: Poly>(
         self,
-        lookup_registry: Arc<crate::circuit::poly_circuit::LookupRegistry<P>>,
+        lookup_registry: Arc<crate::circuit::poly_circuit::LookupRegistry>,
         binding_registry: Arc<crate::circuit::poly_circuit::BindingRegistry>,
         input_set_registry: Arc<crate::circuit::poly_circuit::InputSetRegistry>,
         sub_circuit_registry: Arc<crate::circuit::poly_circuit::SubCircuitRegistry<P>>,

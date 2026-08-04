@@ -103,9 +103,10 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
                 let binding_names = match node.kind() {
                     NodeKind::SubgraphCall(call) => &call.bindings,
                     NodeKind::ParallelLoop(loop_spec) => &loop_spec.bindings,
+                    NodeKind::SequentialLoop(loop_spec) => &loop_spec.bindings,
                     _ => continue,
                 };
-                let target = declared_by_scope.entry(child).or_default();
+                let target = declared_by_scope.entry(child.clone()).or_default();
                 let before = target.len();
                 target.extend(parent_declared.iter().cloned());
                 target.extend(binding_names.iter().map(|(name, _)| name.clone()));
@@ -117,19 +118,99 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
         }
     }
 
+    let empty_dependencies = graph
+        .scopes()
+        .keys()
+        .cloned()
+        .map(|scope| (scope, BTreeSet::<String>::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut loop_dependent_by_scope = empty_dependencies.clone();
+    loop {
+        let mut next = empty_dependencies.clone();
+        for (scope_id, scope) in graph.scopes() {
+            let parent = loop_dependent_by_scope.get(scope_id).cloned().unwrap_or_default();
+            for (position, node) in scope.nodes().iter().enumerate() {
+                let Some(child) = graph.child_scope_id(scope_id, NodeId(position as u64)) else {
+                    continue;
+                };
+                let bindings = match node.kind() {
+                    NodeKind::SubgraphCall(call) => &call.bindings,
+                    NodeKind::ParallelLoop(loop_spec) => &loop_spec.bindings,
+                    NodeKind::SequentialLoop(loop_spec) => &loop_spec.bindings,
+                    _ => continue,
+                };
+                next.entry(child).or_default().extend(child_loop_dependencies(&parent, bindings));
+            }
+        }
+        if next == loop_dependent_by_scope {
+            break;
+        }
+        loop_dependent_by_scope = next;
+    }
+
     for (scope_id, scope) in graph.scopes() {
         let allowed_slots = structural_loop_slots(graph, scope_id);
-        for node in scope.nodes() {
+        for (position, node) in scope.nodes().iter().enumerate() {
             let kind = serde_json::to_value(node.kind()).expect("NodeKind is serializable");
             let mut variables = BTreeSet::new();
             let mut loop_slots = BTreeSet::new();
             collect_expression_references(&kind, &mut variables, &mut loop_slots);
             let declared = &declared_by_scope[scope_id];
-            if let Some(name) = variables.into_iter().find(|name| !declared.contains(name)) {
-                return Err(ValidationError::UndeclaredCompileVariable(name));
+            if let Some(name) = variables.iter().find(|name| !declared.contains(*name)) {
+                return Err(ValidationError::UndeclaredCompileVariable(name.clone()));
             }
-            if let Some(slot) = loop_slots.into_iter().find(|slot| !allowed_slots.contains(slot)) {
+            let mut node_allowed_slots = allowed_slots.clone();
+            match node.kind() {
+                NodeKind::ParallelLoop(loop_spec) => {
+                    let value =
+                        serde_json::to_value(&loop_spec.count).expect("IntExpr is serializable");
+                    let mut ignored = BTreeSet::new();
+                    let mut count_slots = BTreeSet::new();
+                    collect_expression_references(&value, &mut ignored, &mut count_slots);
+                    if count_slots.contains(&loop_spec.index_slot) {
+                        return Err(ValidationError::IllegalLoopIndex {
+                            scope: scope_id.clone(),
+                            slot: loop_spec.index_slot,
+                        });
+                    }
+                    node_allowed_slots.insert(loop_spec.index_slot);
+                }
+                NodeKind::SequentialLoop(loop_spec) => {
+                    let value =
+                        serde_json::to_value(&loop_spec.count).expect("IntExpr is serializable");
+                    let mut ignored = BTreeSet::new();
+                    let mut count_slots = BTreeSet::new();
+                    collect_expression_references(&value, &mut ignored, &mut count_slots);
+                    if count_slots.contains(&loop_spec.index_slot) {
+                        return Err(ValidationError::IllegalLoopIndex {
+                            scope: scope_id.clone(),
+                            slot: loop_spec.index_slot,
+                        });
+                    }
+                    node_allowed_slots.insert(loop_spec.index_slot);
+                }
+                _ => {}
+            }
+            if let Some(slot) =
+                loop_slots.iter().copied().find(|slot| !node_allowed_slots.contains(slot))
+            {
                 return Err(ValidationError::IllegalLoopIndex { scope: scope_id.clone(), slot });
+            }
+            if matches!(node.kind(), NodeKind::FamilyGetStatic { .. }) && !loop_slots.is_empty() {
+                return node_error(
+                    scope_id,
+                    NodeId(position as u64),
+                    "loop-dependent family access must use FamilyGetDynamic",
+                );
+            }
+            if matches!(node.kind(), NodeKind::FamilyGetStatic { .. }) &&
+                variables.iter().any(|name| loop_dependent_by_scope[scope_id].contains(name))
+            {
+                return node_error(
+                    scope_id,
+                    NodeId(position as u64),
+                    "loop-dependent family access must use FamilyGetDynamic",
+                );
             }
             for wire_type in node.output_types() {
                 let value = serde_json::to_value(wire_type).expect("WireType is serializable");
@@ -151,11 +232,20 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
 fn structural_loop_slots(graph: &Graph, scope: &FrozenGraphScopeId) -> BTreeSet<u32> {
     let mut slots = BTreeSet::new();
     let mut current = scope;
-    while let FrozenGraphScopeId::ParallelBody { parent, owner } = current {
-        if let Some(NodeKind::ParallelLoop(loop_spec)) =
-            graph.scope(parent).and_then(|scope| scope.node(*owner)).map(NodeHandle::kind)
-        {
-            slots.insert(loop_spec.index_slot);
+    loop {
+        let (parent, owner) = match current {
+            FrozenGraphScopeId::ParallelBody { parent, owner } |
+            FrozenGraphScopeId::SequentialBody { parent, owner } => (parent, owner),
+            _ => break,
+        };
+        match graph.scope(parent).and_then(|scope| scope.node(*owner)).map(NodeHandle::kind) {
+            Some(NodeKind::ParallelLoop(loop_spec)) => {
+                slots.insert(loop_spec.index_slot);
+            }
+            Some(NodeKind::SequentialLoop(loop_spec)) => {
+                slots.insert(loop_spec.index_slot);
+            }
+            _ => {}
         }
         current = parent;
     }
@@ -191,6 +281,28 @@ fn collect_expression_references(
         }
         _ => {}
     }
+}
+
+fn child_loop_dependencies(
+    parent: &BTreeSet<String>,
+    bindings: &[(String, IntExpr)],
+) -> BTreeSet<String> {
+    let binding_names = bindings.iter().map(|(name, _)| name).collect::<BTreeSet<_>>();
+    let mut child = parent
+        .iter()
+        .filter(|name| !binding_names.contains(name))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for (name, expression) in bindings {
+        let value = serde_json::to_value(expression).expect("IntExpr is serializable");
+        let mut variables = BTreeSet::new();
+        let mut loop_slots = BTreeSet::new();
+        collect_expression_references(&value, &mut variables, &mut loop_slots);
+        if !loop_slots.is_empty() || variables.iter().any(|variable| parent.contains(variable)) {
+            child.insert(name.clone());
+        }
+    }
+    child
 }
 
 pub fn validate(graph: &Graph, bindings: &ParamEnv) -> Result<ValidatedGraph, ValidationError> {
@@ -249,6 +361,11 @@ fn collect_scope_bindings(
         let child_env = match node.kind() {
             NodeKind::SubgraphCall(call) => child_bindings(&env, &call.bindings)?,
             NodeKind::ParallelLoop(loop_spec) => {
+                let mut loop_env = env.clone();
+                loop_env.loop_indices.insert(loop_spec.index_slot, BigInt::zero());
+                child_bindings(&loop_env, &loop_spec.bindings)?
+            }
+            NodeKind::SequentialLoop(loop_spec) => {
                 let mut loop_env = env.clone();
                 loop_env.loop_indices.insert(loop_spec.index_slot, BigInt::zero());
                 child_bindings(&loop_env, &loop_spec.bindings)?
@@ -773,7 +890,7 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(output)]
         }
-        NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) => node
+        NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) => node
             .output_types
             .iter()
             .map(|ty| concrete_wire(ty, env, scope, node.id))
@@ -874,6 +991,67 @@ fn validate_structural_boundaries(
             })?;
             let child = &scopes[&child_id];
             let args = scope.arguments(handle).expect("frozen arguments");
+            if let NodeKind::SequentialLoop(loop_spec) = handle.kind() {
+                let _ = nonnegative_usize(
+                    loop_spec.count.evaluate(env)?,
+                    "sequential loop count",
+                    scope_id,
+                    node_id,
+                )?;
+                let mut loop_env = env.clone();
+                loop_env.loop_indices.insert(loop_spec.index_slot, BigInt::zero());
+                let _ = child_bindings(&loop_env, &loop_spec.bindings)?;
+                if loop_spec.carried_count == 0 || loop_spec.carried_count > args.len() {
+                    return node_error(scope_id, node_id, "invalid sequential carried count");
+                }
+                if child_scope.inputs().len() != args.len() {
+                    return node_error(
+                        scope_id,
+                        node_id,
+                        "sequential body input count does not match arguments",
+                    );
+                }
+                if child_scope.outputs().len() != loop_spec.carried_count ||
+                    handle.output_types().len() != loop_spec.carried_count
+                {
+                    return node_error(
+                        scope_id,
+                        node_id,
+                        "sequential body output count does not match carried count",
+                    );
+                }
+                for (arg, input) in args.iter().zip(child_scope.inputs()) {
+                    let outer = validated.wire_types.get(arg).ok_or_else(|| {
+                        ValidationError::MissingWire {
+                            scope: scope_id.clone(),
+                            node: node_id,
+                            wire: *arg,
+                        }
+                    })?;
+                    let inner = child.wire_types.get(input).ok_or_else(|| {
+                        ValidationError::MissingWire {
+                            scope: child_id.clone(),
+                            node: input.node,
+                            wire: *input,
+                        }
+                    })?;
+                    if !structural_type_compatible(outer, inner) {
+                        return node_error(scope_id, node_id, "sequential body input type mismatch");
+                    }
+                }
+                for port in 0..loop_spec.carried_count {
+                    let initial_type = &validated.wire_types[&args[port]];
+                    let body_type = &child.wire_types[&child_scope.outputs()[port]];
+                    let output_type =
+                        &validated.wire_types[&WireRef { node: node_id, port: Port(port as u32) }];
+                    if !structural_type_compatible(body_type, output_type) ||
+                        !structural_type_compatible(initial_type, output_type)
+                    {
+                        return node_error(scope_id, node_id, "sequential carried type mismatch");
+                    }
+                }
+                continue;
+            }
             let modes = match handle.kind() {
                 NodeKind::SubgraphCall(call) => {
                     let _ = child_bindings(env, &call.bindings)?;
@@ -1359,7 +1537,7 @@ mod tests {
     use super::*;
     use crate::{
         graph::{GraphOutput, ValueHandle},
-        node::SampleRange,
+        node::{LoopInputMode, ParallelLoop, SampleRange, SequentialLoop},
     };
 
     fn matrix_type(modulus: i64, rows: i64, columns: i64) -> MatrixType {
@@ -1597,6 +1775,256 @@ mod tests {
         assert_eq!(validated.warnings.len(), 1);
         assert_eq!(validated.warnings[0].kind, WarningKind::RuntimeSelectBoundsCheck);
     }
+
+    #[test]
+    fn loop_dependent_family_access_requires_dynamic_indexing() {
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Int),
+            count: IntExpr::constant(2),
+        };
+        let family = value(
+            NodeKind::Input {
+                name: "family".to_owned(),
+                wire_type: family_type.clone(),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![family_type.clone()],
+        );
+
+        let parallel = |dynamic, aliased| {
+            let (inputs, selected, scope) = crate::with_new_construction_scope(|scope| {
+                let input = value(
+                    NodeKind::Input {
+                        name: "family".to_owned(),
+                        wire_type: family_type.clone(),
+                        artifact: None,
+                    },
+                    Vec::new(),
+                    vec![family_type.clone()],
+                );
+                let loop_index =
+                    if aliased { IntExpr::Var("i".to_owned()) } else { IntExpr::LoopIndex(0) };
+                let selected = if dynamic {
+                    let index = value(
+                        NodeKind::EvaluateInt(loop_index.clone()),
+                        Vec::new(),
+                        vec![WireType::ConstantInt],
+                    );
+                    value(
+                        NodeKind::FamilyGetDynamic,
+                        vec![input.clone(), index],
+                        vec![WireType::Int],
+                    )
+                } else {
+                    value(
+                        NodeKind::FamilyGetStatic { index: loop_index },
+                        vec![input.clone()],
+                        vec![WireType::Int],
+                    )
+                };
+                (vec![input], selected, scope)
+            });
+            let body = crate::SubgraphHandle::new(
+                if dynamic { "dynamic-parallel" } else { "static-parallel" },
+                scope,
+                inputs,
+                vec![selected],
+            )
+            .unwrap();
+            NodeHandle::parallel_loop(
+                body,
+                vec![family.clone()],
+                vec![WireType::IndexedFamily {
+                    element: Box::new(WireType::Int),
+                    count: IntExpr::constant(2),
+                }],
+                ParallelLoop {
+                    count: IntExpr::constant(2),
+                    minimum_count: 0,
+                    index_slot: 0,
+                    bindings: if aliased {
+                        vec![("i".to_owned(), IntExpr::LoopIndex(0))]
+                    } else {
+                        Vec::new()
+                    },
+                    input_modes: vec![LoopInputMode::Broadcast],
+                },
+            )
+            .output(0)
+            .unwrap()
+        };
+
+        let static_parallel = graph("static-parallel", parallel(false, false));
+        assert_eq!(
+            node_message(validate(&static_parallel, &ParamEnv::default()).unwrap_err()),
+            "loop-dependent family access must use FamilyGetDynamic"
+        );
+        validate(&graph("dynamic-parallel", parallel(true, false)), &ParamEnv::default()).unwrap();
+        assert_eq!(
+            node_message(
+                validate(
+                    &graph("aliased-static-parallel", parallel(false, true)),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            ),
+            "loop-dependent family access must use FamilyGetDynamic"
+        );
+
+        let sequential = |dynamic, aliased| {
+            let (inputs, selected, scope) = crate::with_new_construction_scope(|scope| {
+                let state = value(
+                    NodeKind::Input {
+                        name: "state".to_owned(),
+                        wire_type: WireType::Int,
+                        artifact: None,
+                    },
+                    Vec::new(),
+                    vec![WireType::Int],
+                );
+                let invariant = value(
+                    NodeKind::Input {
+                        name: "family".to_owned(),
+                        wire_type: family_type.clone(),
+                        artifact: None,
+                    },
+                    Vec::new(),
+                    vec![family_type.clone()],
+                );
+                let loop_index =
+                    if aliased { IntExpr::Var("i".to_owned()) } else { IntExpr::LoopIndex(0) };
+                let selected = if dynamic {
+                    let index = value(
+                        NodeKind::EvaluateInt(loop_index.clone()),
+                        Vec::new(),
+                        vec![WireType::ConstantInt],
+                    );
+                    value(
+                        NodeKind::FamilyGetDynamic,
+                        vec![invariant.clone(), index],
+                        vec![WireType::Int],
+                    )
+                } else {
+                    value(
+                        NodeKind::FamilyGetStatic { index: loop_index },
+                        vec![invariant.clone()],
+                        vec![WireType::Int],
+                    )
+                };
+                (vec![state, invariant], selected, scope)
+            });
+            let body = crate::SubgraphHandle::new(
+                if dynamic { "dynamic-sequential" } else { "static-sequential" },
+                scope,
+                inputs,
+                vec![selected],
+            )
+            .unwrap();
+            let initial = value(
+                NodeKind::ConstantInt(BigInt::from(0)),
+                Vec::new(),
+                vec![WireType::ConstantInt],
+            );
+            NodeHandle::sequential_loop(
+                body,
+                vec![initial, family.clone()],
+                vec![WireType::Int],
+                SequentialLoop {
+                    count: IntExpr::constant(2),
+                    index_slot: 0,
+                    bindings: if aliased {
+                        vec![("i".to_owned(), IntExpr::LoopIndex(0))]
+                    } else {
+                        Vec::new()
+                    },
+                    carried_count: 1,
+                },
+            )
+            .output(0)
+            .unwrap()
+        };
+
+        let static_sequential = graph("static-sequential", sequential(false, false));
+        assert_eq!(
+            node_message(validate(&static_sequential, &ParamEnv::default()).unwrap_err()),
+            "loop-dependent family access must use FamilyGetDynamic"
+        );
+        validate(&graph("dynamic-sequential", sequential(true, false)), &ParamEnv::default())
+            .unwrap();
+        assert_eq!(
+            node_message(
+                validate(
+                    &graph("aliased-static-sequential", sequential(false, true)),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            ),
+            "loop-dependent family access must use FamilyGetDynamic"
+        );
+    }
+
+    #[test]
+    fn loop_dependency_bindings_respect_shadowing_and_transitive_aliases() {
+        let parent = BTreeSet::from(["i".to_owned()]);
+        assert!(
+            child_loop_dependencies(&parent, &[("i".to_owned(), IntExpr::constant(0))]).is_empty()
+        );
+        assert_eq!(
+            child_loop_dependencies(&parent, &[("j".to_owned(), IntExpr::Var("i".to_owned()))]),
+            BTreeSet::from(["i".to_owned(), "j".to_owned()])
+        );
+        assert_eq!(
+            child_loop_dependencies(&parent, &[("i".to_owned(), IntExpr::Var("i".to_owned()))]),
+            BTreeSet::from(["i".to_owned()])
+        );
+    }
+
+    #[test]
+    fn sequential_loop_validation_rejects_a_carried_arity_mismatch() {
+        let initial =
+            value(NodeKind::ConstantInt(BigInt::from(0)), Vec::new(), vec![WireType::ConstantInt]);
+        let (body, scope) = crate::with_new_construction_scope(|scope| {
+            let input = NodeHandle::new(
+                NodeKind::Input {
+                    name: "state".to_owned(),
+                    wire_type: WireType::Int,
+                    artifact: None,
+                },
+                Vec::new(),
+                vec![WireType::Int],
+            )
+            .output(0)
+            .unwrap();
+            (input, scope)
+        });
+        let body = crate::SubgraphHandle::new(
+            "invalid-sequential-body",
+            scope,
+            vec![body.clone()],
+            vec![body],
+        )
+        .unwrap();
+        let output = NodeHandle::sequential_loop(
+            body,
+            vec![initial],
+            vec![WireType::Int],
+            SequentialLoop {
+                count: IntExpr::constant(1),
+                index_slot: 0,
+                bindings: Vec::new(),
+                carried_count: 2,
+            },
+        )
+        .output(0)
+        .unwrap();
+        assert_eq!(
+            node_message(
+                validate(&graph("invalid-sequential", output), &ParamEnv::default()).unwrap_err()
+            ),
+            "invalid sequential carried count"
+        );
+    }
 }
 
 fn runtime_bounds_warning(node: NodeId, message: &str) -> ElaborationWarning {
@@ -1609,6 +2037,16 @@ fn runtime_bounds_warning(node: NodeId, message: &str) -> ElaborationWarning {
 
 fn is_integer(ty: &ConcreteWireType) -> bool {
     matches!(ty, ConcreteWireType::Int | ConcreteWireType::ConstantInt)
+}
+
+fn structural_type_compatible(actual: &ConcreteWireType, expected: &ConcreteWireType) -> bool {
+    actual == expected ||
+        matches!(
+            (actual, expected),
+            (ConcreteWireType::ConstantInt, ConcreteWireType::Int) |
+                (ConcreteWireType::ConstantBool, ConcreteWireType::Bool) |
+                (ConcreteWireType::ConstantReal, ConcreteWireType::Real)
+        )
 }
 
 fn is_real(ty: &ConcreteWireType) -> bool {

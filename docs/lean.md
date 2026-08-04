@@ -2,16 +2,16 @@
 
 The `lean/` package contains the Graph IR semantics, hard-bounded sampler contract, and
 protocol-independent proof lemmas under `lean/Mxx`. Each crate owns its generated protocol
-statements and human-written proofs. For example, `mxx-correctness` uses
-`crates/correctness/lean/MxxCorrectness`, while `mxx-gadgets` uses
-`crates/gadgets/lean/MxxGadgets`.
+statements and human-written proofs. `mxx-correctness` uses
+`crates/correctness/lean/MxxCorrectness`; application-specific checker sources live with their
+owning crate, such as `crates/we/lean/MxxWe`.
 
-`ProtocolDecl` is the single protocol source. The owning crate exposes an argument-free generation
-example. The current checked-in protocols are regenerated with
+`ProtocolDecl` is the single protocol source. Each owning crate exposes an argument-free generation
+example. The common toy protocol and Diamond WE family are regenerated with
 
 ```text
 cargo run -p mxx-correctness --example emit_correctness
-cargo run -p mxx-gadgets --example emit_correctness
+cargo run -p mxx-we --example emit_correctness
 ```
 
 Each command mechanically translates its linked workflow, stage graph, artifact binding,
@@ -23,11 +23,36 @@ checkers and proofs under the owning crate's `lean` directory are the hand-writt
 emitter creates a proof scaffold only when the proof is absent and never overwrites an existing
 proof.
 
-The generated statement has a closed assumption interface: the bounded-sampler contract, an
-accepted checker result, generated parameter validity, generated input well-formedness, and the
-explicitly declared pure preconditions. Producer-artifact correctness is not assumed; all linked
-stages execute inside the generated workflow denotation. The theorem proves exact zero failure
-probability for fixed parameters. It contains no negligible-probability, CLT, or union-bound model.
+Application certificates retain typed operation handles while the DSL graph is being constructed.
+Freezing resolves each retained handle to exactly one stage, structural scope, node, and output
+port. A missing or multiply-owned handle is rejected; the emitter never scans the frozen graph to
+rediscover a semantic role from a node kind, source location, name, or position. Nested scope
+references retain their parent scope and owning loop node, and Lean verifies that ownership against
+the executable node. Numeric node identifiers occur only in regenerated certificate data, never as
+hand-written proof constants.
+
+Protocol artifact identity is stage-relative. An `ArtifactBinding` commits to the producer stage
+and output, and validation requires that output name to equal the artifact name read by the
+consumer graph. Concrete `ProductionId` values embedded in executable consumer graphs are runtime
+session data and are excluded from the protocol hash. At runtime, `spec_hash` still commits to the
+complete `ParamEnv`, and the execution nonce is added to form the `ProductionId`; manifest lookup
+then checks that exact production, artifact name, type, family cardinality, and confidentiality.
+Consequently parameter search can reuse one generic protocol hash without allowing artifacts from
+different concrete parameter bindings to be interchanged.
+
+The Diamond certificate enumerates every artifact edge with the exact producer output wire and
+consumer input node, not only the public-key edge. Lean checks these references against the workflow
+and follows the compared output's existing executable dependencies across loop boundaries and
+artifact edges. The certificate is untrusted data: it does not add a second graph or supply an
+equation that is absent from the executable IR.
+
+The generated Diamond statement has a closed intended assumption interface: the bounded-sampler
+contract, an accepted checker result, generated parameter validity, generated input
+well-formedness, and the explicitly declared pure preconditions. The final bridge from the
+certificate to execution of all linked stages is still under construction, so no end-to-end
+Diamond theorem is currently exported. See `docs/diamond-we-correctness-status.md` for the exact
+review boundary. The target theorem uses exact zero failure probability and contains no
+negligible-probability, CLT, or union-bound model.
 
 The committed toy example workflow is a two-stage executable example: encryption maps a Boolean to
 the `q/2` representative, adds a hard-bounded Gaussian sample, and exports a ciphertext artifact.
@@ -51,12 +76,16 @@ Useful local gates are:
 ```text
 scripts/verified_build.sh
 cargo run -p mxx-correctness --example verify_correctness
-cargo run -p mxx-gadgets --example verify_correctness
 ```
 
-`scripts/verified_build.sh` is the repository's verified build gate. It regenerates both owning
-crates into a temporary directory, checks that the committed generated files are current, builds
-the common and crate-owned Lean libraries, verifies theorem hashes and axiom dependencies, and
-finally builds the Rust workspace. Ordinary downstream Cargo builds do not run Lean recursively
-from `build.rs`; doing so would create a same-crate generator cycle and mutate source files during
-dependency builds.
+`scripts/verified_build.sh` regenerates checked-in declarations into a temporary directory,
+verifies that they are current, builds the common and crate-owned stable Lean libraries, verifies
+completed theorem packages, and finally builds the Rust workspace. It does not verify the
+unfinished Diamond WE end-to-end theorem.
+
+`mxx-we` builds its crate-owned hard-bound checker from `build.rs` and exposes the resulting private
+executable to parameter search. Diamond `ProtocolDecl` emission remains a separate operation, but
+emits one parameterized protocol family rather than a selected shape or cryptographic
+configuration. The build script checks the generated family, stable structural verifier, and
+executable parameter checker. It does not import the unfinished execution bridges or final family
+proof. Parameter search evaluates the compiled checker for a concrete binding.

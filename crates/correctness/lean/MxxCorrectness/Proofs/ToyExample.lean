@@ -92,7 +92,7 @@ theorem toyExampleConcreteOutcome
     Mxx.Ir.evaluateNode, Mxx.Ir.arguments, Mxx.Ir.lookupWire,
     Mxx.Ir.bindOutputs, Mxx.Ir.collectOutputs, Mxx.Ir.IntExpr.evaluate,
     Mxx.Ir.MatrixTypeExpr.evaluate, Mxx.Matrix.withSamplerParams,
-    toyExampleSamplerParams, Mxx.Ir.lookupParam, Mxx.reduceCoefficient,
+    toyExampleSamplerParams, Mxx.Ir.lookupParam, Mxx.matrixAdd, Mxx.reduceCoefficient,
     cutoffNonnegative] using member
 
 theorem toyExampleFailureBoolSafe
@@ -130,7 +130,7 @@ theorem toyExampleFailureBoolSafe
         Mxx.Ir.projectOutputs, Mxx.Ir.lookupEnvironment, Mxx.Ir.rebindInputs,
         Mxx.Ir.environmentValues, Mxx.Ir.environmentValid, Mxx.Ir.Value.isValid,
         Mxx.Ir.valuesEqual, Mxx.Ir.Value.equal, Mxx.Ir.addCoefficients,
-        Mxx.reduceCoefficient] at decoded ⊢ <;>
+        Mxx.addCoefficients, Mxx.reduceCoefficient] at decoded ⊢ <;>
       exact decoded
 
 def toyExampleChecker (p : ToyExampleParams) : Bool :=
@@ -138,6 +138,9 @@ def toyExampleChecker (p : ToyExampleParams) : Bool :=
 
 theorem toyExample_correct : ToyExampleCorrectStatement toyExampleChecker := by
   constructor
+  · refine ⟨{ cutoff := 0 }, ?_, ?_⟩
+    · decide
+    · norm_num [ToyExampleParamsValid]
   intro samplers contract p checker _ x _ _
   have checkerFacts : 4 * p.cutoff < 256 := by
     simpa [toyExampleChecker] using checker

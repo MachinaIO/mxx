@@ -6,10 +6,11 @@ use crate::{
 };
 use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Ring, Trapdoor, parallel_zip};
 use mxx_gadgets::{
-    Poly, PolyElem,
+    Poly,
     circuit::{
         ArithmeticCircuitLowering, CircuitLowerError, CircuitLoweringTypes, GateInstance,
-        PolyCircuit, PolyGateKind, PublicLookupLowering, SlotOperationLowering, lower_circuit,
+        PolyCircuit, PolyGateKind, PublicLookupLowering, PublicLutProgram, SlotOperationLowering,
+        lower_circuit,
     },
 };
 use mxx_ir_core::{
@@ -208,12 +209,9 @@ impl LweLookupTable {
         Ok(Self { entries })
     }
 
-    pub fn from_public_lut<P: Poly>(
-        parameters: &P::Params,
-        table: &mxx_gadgets::circuit::PublicLut<P>,
-    ) -> Result<Self, LweLookupCompileError> {
+    pub fn from_public_lut(table: &PublicLutProgram) -> Result<Self, LweLookupCompileError> {
         let mut entries = vec![None; table.len()];
-        for (input, (row, output)) in table.entries(parameters) {
+        for (input, (row, output)) in table.entries() {
             let input = usize::try_from(input)
                 .map_err(|_| LweLookupCompileError::InputOutOfRange(input))?;
             let row =
@@ -221,7 +219,7 @@ impl LweLookupTable {
             if input >= entries.len() {
                 return Err(LweLookupCompileError::InputOutOfRange(input as u64));
             }
-            entries[input] = Some((row, BigInt::from_biguint(Sign::Plus, output.value().clone())));
+            entries[input] = Some((row, output));
         }
         Self::new(
             entries
@@ -437,11 +435,11 @@ impl LweLookupInvocation {
     pub fn bind<P: Poly>(
         compiler: LweLookupCompiler,
         artifacts: LweLookupArtifacts,
-        parameters: &P::Params,
+        _parameters: &P::Params,
         circuit: &PolyCircuit<P>,
     ) -> Result<Self, LweLookupCompileError> {
         let circuit_table = circuit.lookup_table(compiler.identity.lookup);
-        let materialized = LweLookupTable::from_public_lut(parameters, circuit_table.as_ref())?;
+        let materialized = LweLookupTable::from_public_lut(circuit_table.as_ref())?;
         if materialized != compiler.table {
             return Err(LweLookupCompileError::CircuitTableMismatch);
         }
@@ -744,17 +742,14 @@ fn same_matrix_type(lhs: &MatrixType, rhs: &MatrixType) -> bool {
 }
 
 fn lookup_compiler_for_circuit<P: Poly>(
-    parameters: &P::Params,
+    _parameters: &P::Params,
     circuit: &PolyCircuit<P>,
     identity: LweLookupIdentity,
     public_key_type: MatrixType,
     gadget_base: IntExpr,
     digit_count: IntExpr,
 ) -> Result<LweLookupCompiler, LweLookupCompileError> {
-    let table = LweLookupTable::from_public_lut(
-        parameters,
-        circuit.lookup_table(identity.lookup).as_ref(),
-    )?;
+    let table = LweLookupTable::from_public_lut(circuit.lookup_table(identity.lookup).as_ref())?;
     let public_columns = public_key_type.columns.clone();
     let high_rows = IntExpr::Mul(
         Box::new(public_key_type.rows.clone()),
@@ -1246,12 +1241,16 @@ mod tests {
     use super::*;
     use crate::{BggEncodingCompiler, BggPublicKeyCompiler};
     use mxx_dsl::DslContext;
-    use mxx_gadgets::circuit::{PolyCircuit, PublicLut};
+    use mxx_gadgets::circuit::{LutExpr, PolyCircuit, PublicLutProgram};
     use mxx_ir_core::{ParamEnv, artifact::SpecHash, node::NodeKind};
     use mxx_primitives::poly::{
-        Poly as ConcretePoly, PolyParams,
+        PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
+
+    fn identity_lut(length: u64) -> PublicLutProgram {
+        PublicLutProgram::new(length, LutExpr::input()).expect("identity LUT")
+    }
 
     fn matrix_type(parameters: &DCRTPolyParams, rows: usize, columns: usize) -> MatrixType {
         MatrixType {
@@ -1302,20 +1301,9 @@ mod tests {
 
     #[test]
     fn lookup_identity_collection_matches_the_lowering_identity() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
-            &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                Some((
-                    input,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
-                ))
-            },
-            None,
-        ));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output = circuit.public_lookup_gate(input, lookup_id).as_single_wire();
         circuit.output([output]);
         assert_eq!(
@@ -1338,17 +1326,7 @@ mod tests {
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
-            &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                Some((
-                    input,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
-                ))
-            },
-            None,
-        ));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output = circuit.public_lookup_gate(input, lookup_id);
         circuit.output([output]);
         let public_key = |name: &str| NaiveBggPublicKeyVecWire {
@@ -1408,17 +1386,7 @@ mod tests {
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
-            &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                Some((
-                    input,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
-                ))
-            },
-            None,
-        ));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
         circuit.output([output_gate]);
         let lookup = compiler(
@@ -1430,7 +1398,7 @@ mod tests {
                 lookup: lookup_id,
                 slot: None,
             },
-            LweLookupTable::from_public_lut(&parameters, circuit.lookup_table(lookup_id).as_ref())
+            LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
                 .expect("table"),
         );
         let invocation = LweLookupInvocation::bind(
@@ -1538,17 +1506,7 @@ mod tests {
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
-            &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                Some((
-                    input,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
-                ))
-            },
-            None,
-        ));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
         circuit.output([output_gate]);
         let identity = LweLookupIdentity {
@@ -1558,9 +1516,8 @@ mod tests {
             lookup: lookup_id,
             slot: None,
         };
-        let table =
-            LweLookupTable::from_public_lut(&parameters, circuit.lookup_table(lookup_id).as_ref())
-                .expect("table");
+        let table = LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
+            .expect("table");
         let lookup = compiler(&parameters, identity.clone(), table.clone());
         let invocation = LweLookupInvocation::bind(
             lookup.clone(),

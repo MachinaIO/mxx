@@ -60,7 +60,7 @@ impl<P: Poly + 'static> MontgomeryPolyContext<P> {
             .expect("q_moduli_big must be non-empty")
             .div_ceil(limb_bit_size);
         let carry_arith_ctx =
-            Arc::new(CarryArithPolyContext::setup(circuit, params, limb_bit_size, dummy_scalar));
+            Arc::new(CarryArithPolyContext::setup(circuit, limb_bit_size, dummy_scalar));
 
         let r_bits = limb_bit_size * num_limbs;
         let r = BigUint::one() << r_bits;

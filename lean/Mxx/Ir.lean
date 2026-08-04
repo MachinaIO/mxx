@@ -22,7 +22,14 @@ inductive ParamValue where
   | integer (value : Int)
   | rational (value : Rat)
 
-abbrev ParamEnvironment := List (String × ParamValue)
+inductive ParamKey where
+  | parameter (name : String)
+  | loopIndex (slot : Nat)
+  deriving BEq, DecidableEq
+
+instance : Coe String ParamKey := ⟨ParamKey.parameter⟩
+
+abbrev ParamEnvironment := List (ParamKey × ParamValue)
 
 inductive IntExpr where
   | constant (value : Int)
@@ -37,7 +44,15 @@ inductive IntExpr where
 
 def lookupParam (name : String) : ParamEnvironment → Option ParamValue
   | [] => none
-  | (candidate, value) :: tail => if candidate = name then some value else lookupParam name tail
+  | (.parameter candidate, value) :: tail =>
+      if candidate = name then some value else lookupParam name tail
+  | (.loopIndex _, _) :: tail => lookupParam name tail
+
+def lookupLoopIndex (slot : Nat) : ParamEnvironment → Option Int
+  | [] => none
+  | (.loopIndex candidate, .integer value) :: tail =>
+      if candidate = slot then some value else lookupLoopIndex slot tail
+  | _ :: tail => lookupLoopIndex slot tail
 
 def IntExpr.evaluate (environment : ParamEnvironment) : IntExpr → Option Int
   | .constant value => some value
@@ -45,10 +60,7 @@ def IntExpr.evaluate (environment : ParamEnvironment) : IntExpr → Option Int
       match lookupParam name environment with
       | some (.integer value) => some value
       | _ => none
-  | .loopIndex slot =>
-      match lookupParam s!"__loop_{slot}" environment with
-      | some (.integer value) => some value
-      | _ => none
+  | .loopIndex slot => lookupLoopIndex slot environment
   | .add left right => do return (← left.evaluate environment) + (← right.evaluate environment)
   | .subtract left right => do return (← left.evaluate environment) - (← right.evaluate environment)
   | .multiply left right => do return (← left.evaluate environment) * (← right.evaluate environment)
@@ -60,6 +72,18 @@ def IntExpr.evaluate (environment : ParamEnvironment) : IntExpr → Option Int
       if denominator = 0 then none
       else return roundDiv (← left.evaluate environment) denominator
   | .log2Ceil value => do return Mxx.Ir.log2Ceil (← value.evaluate environment)
+
+theorem loopIndexNamespace_is_disjoint_from_userParameters :
+    let environment : ParamEnvironment :=
+      [(.loopIndex 0, .integer 3), (.parameter "__loop_0", .integer 99)]
+    (IntExpr.loopIndex 0).evaluate environment = some 3 ∧
+      (IntExpr.parameter "__loop_0").evaluate environment = some 99 := by
+  decide
+
+def evaluateOptionalIntExpr (environment : ParamEnvironment) :
+    Option IntExpr → Option (Option Int)
+  | none => some none
+  | some expression => expression.evaluate environment |>.map some
 
 inductive Value where
   | integer (value : Int)
@@ -139,6 +163,7 @@ inductive NodeKind where
   | zeroMatrix (matrixType : MatrixTypeExpr)
   | identityMatrix (matrixType : MatrixTypeExpr)
   | constantMatrix (matrixType : MatrixTypeExpr) (coefficients : List IntExpr)
+  | gadgetMatrix (matrixType : MatrixTypeExpr) (base : IntExpr)
   | boolToInt
   | intBinary (operation : IntBinaryOp)
   | intCompare (operation : IntCompareOp)
@@ -147,6 +172,13 @@ inductive NodeKind where
   | select
   | uniformSample (matrixType : MatrixTypeExpr) (minimum maximum : IntExpr)
   | gaussianSample (matrixType : MatrixTypeExpr) (maxCoefficientBound : IntExpr)
+  | hashSample
+      (matrixType : MatrixTypeExpr)
+      (variant : Mxx.HashVariant)
+      (tagPrefix : List Nat)
+      (tagExpressions tagDecimalExpressions tagU64LeExpressions : List IntExpr)
+      (base digitCount : Option IntExpr)
+  | gadgetDecompose (matrixType : MatrixTypeExpr) (base digitCount : IntExpr)
   | trapdoorSample (matrixType : MatrixTypeExpr) (maxCoefficientBound : IntExpr)
   | trapdoorPublic
   | preimageSample (matrixType : MatrixTypeExpr) (maxCoefficientBound : IntExpr)
@@ -155,6 +187,8 @@ inductive NodeKind where
   | matrixMultiply
   | matrixNegate
   | matrixScale (scalar : IntExpr)
+  | slice (rows columns : Option (IntExpr × IntExpr))
+  | reshape (rows columns : IntExpr)
   | concat (axis : ConcatAxis)
   | thresholdDecodeBool
       (ciphertextModulus plaintextModulus length : IntExpr)
@@ -168,6 +202,12 @@ inductive NodeKind where
       (indexSlot : Nat)
       (bindings : List (String × IntExpr))
       (inputModes : List LoopInputMode)
+  | sequentialLoop
+      (definition : String)
+      (count : IntExpr)
+      (indexSlot : Nat)
+      (bindings : List (String × IntExpr))
+      (carriedCount : Nat)
 
 structure Node where
   kind : NodeKind
@@ -192,17 +232,9 @@ def lookupWire (wire : WireRef) : WireEnvironment → Option Value
 def arguments (node : Node) (environment : WireEnvironment) : Option (List Value) :=
   node.arguments.mapM (fun wire => lookupWire wire environment)
 
-def addCoefficients : List Int → List Int → List Int
-  | [], right => right
-  | left, [] => left
-  | left :: leftTail, right :: rightTail =>
-      (left + right) :: addCoefficients leftTail rightTail
+abbrev addCoefficients := Mxx.addCoefficients
 
-def subtractCoefficients : List Int → List Int → List Int
-  | [], right => right.map (-·)
-  | left, [] => left
-  | left :: leftTail, right :: rightTail =>
-      (left - right) :: subtractCoefficients leftTail rightTail
+abbrev subtractCoefficients := Mxx.subtractCoefficients
 
 def evaluateIntBinary (operation : IntBinaryOp) (left right : Int) : Option Int :=
   match operation with
@@ -235,7 +267,7 @@ def evaluateBindings (params : ParamEnvironment) :
   | [] => some []
   | (name, expression) :: tail => do
       let value ← expression.evaluate params
-      return (name, .integer value) :: (← evaluateBindings params tail)
+      return (.parameter name, .integer value) :: (← evaluateBindings params tail)
 
 def loopArgument (mode : LoopInputMode) (index : Nat) (value : Value) : Value :=
   match mode, value with
@@ -280,7 +312,7 @@ def evaluateParallelIterations
     List Nat → List (List (List Value)) → List (List (List Value))
   | [], states => states
   | index :: tail, states =>
-      let iterationParams := (s!"__loop_{indexSlot}", .integer index) :: params
+      let iterationParams := (.loopIndex indexSlot, .integer index) :: params
       let next := match evaluateBindings iterationParams bindings with
         | none => []
         | some evaluatedBindings =>
@@ -291,6 +323,334 @@ def evaluateParallelIterations
                 appendPortValues state values
       evaluateParallelIterations runChild definition params indexSlot bindings modes arguments
         outputCount tail next
+
+def evaluateSequentialIterations
+    (runChild : ChildRunner)
+    (definition : String)
+    (params : ParamEnvironment)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (invariantArguments : List Value) :
+    List Nat → List (List Value) → List (List Value)
+  | [], states => states
+  | index :: tail, states =>
+      let iterationParams := (.loopIndex indexSlot, .integer index) :: params
+      let next := match evaluateBindings iterationParams bindings with
+        | none => []
+        | some evaluatedBindings =>
+            states.flatMap fun state =>
+              runChild definition (evaluatedBindings ++ iterationParams)
+                (state ++ invariantArguments)
+      evaluateSequentialIterations runChild definition params indexSlot bindings
+        invariantArguments tail next
+
+@[simp] theorem evaluateSequentialIterations_empty
+    (runChild : ChildRunner)
+    (definition : String)
+    (params : ParamEnvironment)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (invariantArguments : List Value)
+    (indices : List Nat) :
+    evaluateSequentialIterations runChild definition params indexSlot bindings
+      invariantArguments indices [] = [] := by
+  induction indices with
+  | nil => rfl
+  | cons index tail induction =>
+      simp only [evaluateSequentialIterations]
+      split <;> simp_all
+
+@[simp] theorem evaluateParallelIterations_empty
+    (runChild : ChildRunner)
+    (definition : String)
+    (params : ParamEnvironment)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (modes : List LoopInputMode)
+    (arguments : List Value)
+    (outputCount : Nat)
+    (indices : List Nat) :
+    evaluateParallelIterations runChild definition params indexSlot bindings modes arguments
+      outputCount indices [] = [] := by
+  induction indices with
+  | nil => rfl
+  | cons index tail induction =>
+      simp only [evaluateParallelIterations]
+      split <;> simp_all
+
+/-- A single nondeterministic execution trace through a sequential loop.  Every constructor
+records the evaluated parameter bindings and the concrete child-support member selected at that
+iteration, without materializing the Cartesian product of all sampler supports. -/
+inductive SequentialIterationsTrace
+    (runChild : ChildRunner)
+    (definition : String)
+    (params : ParamEnvironment)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (invariantArguments : List Value) :
+    List Nat → List Value → List Value → Prop
+  | nil (state) :
+      SequentialIterationsTrace runChild definition params indexSlot bindings
+        invariantArguments [] state state
+  | cons (index : Nat) (tail) (state) (evaluatedBindings) (next) (final)
+      (bindingsEvaluate :
+        evaluateBindings ((.loopIndex indexSlot, .integer index) :: params) bindings =
+          some evaluatedBindings)
+      (childMember : next ∈
+        runChild definition
+          (evaluatedBindings ++ ((.loopIndex indexSlot, .integer index) :: params))
+          (state ++ invariantArguments))
+      (rest : SequentialIterationsTrace runChild definition params indexSlot bindings
+        invariantArguments tail next final) :
+      SequentialIterationsTrace runChild definition params indexSlot bindings
+        invariantArguments (index :: tail) state final
+
+theorem mem_evaluateSequentialIterations_iff_exists_trace
+    (runChild : ChildRunner)
+    (definition : String)
+    (params : ParamEnvironment)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (invariantArguments : List Value)
+    (indices : List Nat)
+    (states : List (List Value))
+    (final : List Value) :
+    final ∈ evaluateSequentialIterations runChild definition params indexSlot bindings
+      invariantArguments indices states ↔
+      ∃ initial ∈ states,
+        SequentialIterationsTrace runChild definition params indexSlot bindings
+          invariantArguments indices initial final := by
+  induction indices generalizing states final with
+  | nil =>
+      constructor
+      · intro member
+        exact ⟨final, member, .nil final⟩
+      · rintro ⟨initial, member, trace⟩
+        cases trace
+        exact member
+  | cons index tail induction =>
+      simp only [evaluateSequentialIterations]
+      let iterationParams := (.loopIndex indexSlot, .integer index) :: params
+      cases bindingsResult : evaluateBindings iterationParams bindings with
+      | none =>
+          simp only
+          simp only [evaluateSequentialIterations_empty, List.not_mem_nil, false_iff]
+          rintro ⟨initial, initialMember, trace⟩
+          cases trace with
+          | cons _ _ _ evaluatedBindings _ _ bindingsEvaluate _ _ =>
+              rw [bindingsResult] at bindingsEvaluate
+              contradiction
+      | some evaluatedBindings =>
+          simp only
+          rw [induction]
+          constructor
+          · rintro ⟨next, nextMember, rest⟩
+            simp only [List.mem_flatMap] at nextMember
+            obtain ⟨initial, initialMember, childMember⟩ := nextMember
+            exact ⟨initial, initialMember,
+              .cons index tail initial evaluatedBindings next final bindingsResult childMember rest⟩
+          · rintro ⟨initial, initialMember, trace⟩
+            cases trace with
+            | cons _ _ _ chosenBindings next _ bindingsEvaluate childMember rest =>
+                rw [bindingsResult] at bindingsEvaluate
+                cases bindingsEvaluate
+                refine ⟨next, ?_, rest⟩
+                simp only [List.mem_flatMap]
+                exact ⟨initial, initialMember, childMember⟩
+
+theorem SequentialIterationsTrace.invariant
+    {runChild : ChildRunner}
+    {definition : String}
+    {params : ParamEnvironment}
+    {indexSlot : Nat}
+    {bindings : List (String × IntExpr)}
+    {invariantArguments : List Value}
+    (predicate : List Value → Prop)
+    (preserved : ∀ (index : Nat) evaluatedBindings state next,
+      evaluateBindings ((.loopIndex indexSlot, .integer index) :: params) bindings =
+        some evaluatedBindings →
+      next ∈ runChild definition
+        (evaluatedBindings ++ ((.loopIndex indexSlot, .integer index) :: params))
+        (state ++ invariantArguments) →
+      predicate state → predicate next) :
+    ∀ {indices initial final},
+      SequentialIterationsTrace runChild definition params indexSlot bindings
+        invariantArguments indices initial final →
+      predicate initial → predicate final := by
+  intro indices initial final trace initialProperty
+  induction trace with
+  | nil => exact initialProperty
+  | cons index _ state evaluatedBindings next _ bindingsEvaluate childMember _ induction =>
+      exact induction (preserved index evaluatedBindings state next bindingsEvaluate childMember
+        initialProperty)
+
+theorem evaluateSequentialIterations_invariant
+    (runChild : ChildRunner)
+    (definition : String)
+    (params : ParamEnvironment)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (invariantArguments : List Value)
+    (indices : List Nat)
+    (states : List (List Value))
+    (predicate : List Value → Prop)
+    (initial : ∀ state ∈ states, predicate state)
+    (preserved : ∀ (index : Nat) evaluatedBindings state next,
+      evaluateBindings ((.loopIndex indexSlot, .integer index) :: params) bindings =
+        some evaluatedBindings →
+      next ∈ runChild definition
+        (evaluatedBindings ++ ((.loopIndex indexSlot, .integer index) :: params))
+        (state ++ invariantArguments) →
+      predicate state → predicate next)
+    {final : List Value}
+    (finalMember : final ∈
+      evaluateSequentialIterations runChild definition params indexSlot bindings
+        invariantArguments indices states) :
+    predicate final := by
+  obtain ⟨first, firstMember, trace⟩ :=
+    (mem_evaluateSequentialIterations_iff_exists_trace runChild definition params indexSlot
+      bindings invariantArguments indices states final).mp finalMember
+  exact trace.invariant predicate preserved (initial first firstMember)
+
+/-- A concrete parallel-loop accumulator trace.  `next` is exactly the port-wise append of the
+selected child output to the previous accumulator, so the relation preserves iteration order. -/
+inductive ParallelIterationsTrace
+    (runChild : ChildRunner)
+    (definition : String)
+    (params : ParamEnvironment)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (modes : List LoopInputMode)
+    (arguments : List Value) :
+    List Nat → List (List Value) → List (List Value) → Prop
+  | nil (state) :
+      ParallelIterationsTrace runChild definition params indexSlot bindings modes arguments
+        [] state state
+  | cons (index : Nat) (tail) (state) (evaluatedBindings) (childValues) (final)
+      (bindingsEvaluate :
+        evaluateBindings ((.loopIndex indexSlot, .integer index) :: params) bindings =
+          some evaluatedBindings)
+      (childMember : childValues ∈
+        runChild definition
+          (evaluatedBindings ++ ((.loopIndex indexSlot, .integer index) :: params))
+          ((modes.zip arguments).map fun (mode, value) => loopArgument mode index value))
+      (rest : ParallelIterationsTrace runChild definition params indexSlot bindings modes arguments
+        tail (appendPortValues state childValues) final) :
+      ParallelIterationsTrace runChild definition params indexSlot bindings modes arguments
+        (index :: tail) state final
+
+theorem mem_evaluateParallelIterations_iff_exists_trace
+    (runChild : ChildRunner)
+    (definition : String)
+    (params : ParamEnvironment)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (modes : List LoopInputMode)
+    (arguments : List Value)
+    (outputCount : Nat)
+    (indices : List Nat)
+    (states : List (List (List Value)))
+    (final : List (List Value)) :
+    final ∈ evaluateParallelIterations runChild definition params indexSlot bindings modes
+      arguments outputCount indices states ↔
+      ∃ initial ∈ states,
+        ParallelIterationsTrace runChild definition params indexSlot bindings modes arguments
+          indices initial final := by
+  induction indices generalizing states final with
+  | nil =>
+      constructor
+      · intro member
+        exact ⟨final, member, .nil final⟩
+      · rintro ⟨initial, member, trace⟩
+        cases trace
+        exact member
+  | cons index tail induction =>
+      simp only [evaluateParallelIterations]
+      let iterationParams := (.loopIndex indexSlot, .integer index) :: params
+      cases bindingsResult : evaluateBindings iterationParams bindings with
+      | none =>
+          simp only
+          simp only [evaluateParallelIterations_empty, List.not_mem_nil, false_iff]
+          rintro ⟨initial, initialMember, trace⟩
+          cases trace with
+          | cons _ _ _ evaluatedBindings _ _ bindingsEvaluate _ _ =>
+              rw [bindingsResult] at bindingsEvaluate
+              contradiction
+      | some evaluatedBindings =>
+          simp only
+          rw [induction]
+          constructor
+          · rintro ⟨next, nextMember, rest⟩
+            simp only [List.mem_flatMap, List.mem_map] at nextMember
+            obtain ⟨initial, initialMember, childValues, childMember, rfl⟩ := nextMember
+            exact ⟨initial, initialMember,
+              .cons index tail initial evaluatedBindings childValues final bindingsResult
+                childMember rest⟩
+          · rintro ⟨initial, initialMember, trace⟩
+            cases trace with
+            | cons _ _ _ chosenBindings childValues _ bindingsEvaluate childMember rest =>
+                rw [bindingsResult] at bindingsEvaluate
+                cases bindingsEvaluate
+                refine ⟨appendPortValues initial childValues, ?_, rest⟩
+                simp only [List.mem_flatMap, List.mem_map]
+                exact ⟨initial, initialMember, childValues, childMember, rfl⟩
+
+theorem ParallelIterationsTrace.invariant
+    {runChild : ChildRunner}
+    {definition : String}
+    {params : ParamEnvironment}
+    {indexSlot : Nat}
+    {bindings : List (String × IntExpr)}
+    {modes : List LoopInputMode}
+    {arguments : List Value}
+    (predicate : List (List Value) → Prop)
+    (preserved : ∀ (index : Nat) evaluatedBindings state childValues,
+      evaluateBindings ((.loopIndex indexSlot, .integer index) :: params) bindings =
+        some evaluatedBindings →
+      childValues ∈ runChild definition
+        (evaluatedBindings ++ ((.loopIndex indexSlot, .integer index) :: params))
+        ((modes.zip arguments).map fun (mode, value) => loopArgument mode index value) →
+      predicate state → predicate (appendPortValues state childValues)) :
+    ∀ {indices initial final},
+      ParallelIterationsTrace runChild definition params indexSlot bindings modes arguments
+        indices initial final →
+      predicate initial → predicate final := by
+  intro indices initial final trace initialProperty
+  induction trace with
+  | nil => exact initialProperty
+  | cons index _ state evaluatedBindings childValues _ bindingsEvaluate childMember _ induction =>
+      exact induction (preserved index evaluatedBindings state childValues bindingsEvaluate
+        childMember initialProperty)
+
+theorem evaluateParallelIterations_invariant
+    (runChild : ChildRunner)
+    (definition : String)
+    (params : ParamEnvironment)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (modes : List LoopInputMode)
+    (arguments : List Value)
+    (outputCount : Nat)
+    (indices : List Nat)
+    (states : List (List (List Value)))
+    (predicate : List (List Value) → Prop)
+    (initial : ∀ state ∈ states, predicate state)
+    (preserved : ∀ (index : Nat) evaluatedBindings state childValues,
+      evaluateBindings ((.loopIndex indexSlot, .integer index) :: params) bindings =
+        some evaluatedBindings →
+      childValues ∈ runChild definition
+        (evaluatedBindings ++ ((.loopIndex indexSlot, .integer index) :: params))
+        ((modes.zip arguments).map fun (mode, value) => loopArgument mode index value) →
+      predicate state → predicate (appendPortValues state childValues))
+    {final : List (List Value)}
+    (finalMember : final ∈
+      evaluateParallelIterations runChild definition params indexSlot bindings modes arguments
+        outputCount indices states) :
+    predicate final := by
+  obtain ⟨first, firstMember, trace⟩ :=
+    (mem_evaluateParallelIterations_iff_exists_trace runChild definition params indexSlot bindings
+      modes arguments outputCount indices states final).mp finalMember
+  exact trace.invariant predicate preserved (initial first firstMember)
 
 def evaluateNode
     (runChild : ChildRunner)
@@ -333,6 +693,12 @@ def evaluateNode
             { coefficients := values.map (Mxx.reduceCoefficient matrixParams.modulus) }
             matrixParams)]]
       | _, _ => [[.invalid "constant-matrix evaluation failed"]]
+  | .gadgetMatrix matrixType base =>
+      match matrixType.evaluate params, base.evaluate params with
+      | some matrixParams, some base =>
+          let digits := if matrixParams.rows = 0 then 0 else matrixParams.columns / matrixParams.rows
+          [[.matrix (Mxx.gadgetMatrix matrixParams base digits)]]
+      | _, _ => [[.invalid "gadget-matrix evaluation failed"]]
   | .boolToInt =>
       match arguments node wires with
       | some [.boolean value] => [[.integer (if value then 1 else 0)]]
@@ -376,6 +742,35 @@ def evaluateNode
           (samplers.gaussianSample matrixParams).map (fun sample =>
             [.matrix (sample.withSamplerParams matrixParams)])
       | none => [[.invalid "Gaussian parameter evaluation failed"]]
+  | .hashSample matrixType variant tagPrefix tagExpressions tagDecimalExpressions
+      tagU64LeExpressions base digitCount =>
+      match arguments node wires, matrixType.evaluate params (.constant 0),
+          tagExpressions.mapM (IntExpr.evaluate params),
+          tagDecimalExpressions.mapM (IntExpr.evaluate params),
+          tagU64LeExpressions.mapM (IntExpr.evaluate params),
+          evaluateOptionalIntExpr params base, evaluateOptionalIntExpr params digitCount with
+      | some [.bytes key], some matrixParams, some tagValues, some tagDecimalValues,
+          some tagU64LeValues, some base, some digitCount =>
+          let query : Mxx.HashQuery := {
+            params := matrixParams
+            key
+            variant
+            tagPrefix
+            tagValues
+            tagDecimalValues
+            tagU64LeValues
+            base
+            digitCount
+          }
+          [[.matrix ((samplers.hashSample query).withSamplerParams matrixParams)]]
+      | _, _, _, _, _, _, _ => [[.invalid "hash-sample parameter evaluation failed"]]
+  | .gadgetDecompose matrixType base digitCount =>
+      match arguments node wires, matrixType.evaluate params (.constant 0),
+          base.evaluate params, digitCount.evaluate params with
+      | some [.matrix value], some matrixParams, some base, some digitCount =>
+          (samplers.gadgetDecompose matrixParams base digitCount.toNat value).map (fun output =>
+            [.matrix (output.withSamplerParams matrixParams)])
+      | _, _, _, _ => [[.invalid "gadget-decomposition argument mismatch"]]
   | .trapdoorSample matrixType cutoff =>
       match matrixType.evaluate params cutoff with
       | some matrixParams =>
@@ -398,36 +793,45 @@ def evaluateNode
       | _, _ => [[.invalid "preimage-sample argument mismatch"]]
   | .matrixAdd =>
       match arguments node wires with
-      | some [.matrix left, .matrix right] =>
-          let coefficients := List.map (Mxx.reduceCoefficient left.modulus)
-            (addCoefficients left.coefficients right.coefficients)
-          [[.matrix { left with coefficients }]]
+      | some [.matrix left, .matrix right] => [[.matrix (Mxx.matrixAdd left right)]]
       | _ => [[.invalid "matrix addition argument mismatch"]]
   | .matrixSubtract =>
       match arguments node wires with
-      | some [.matrix left, .matrix right] =>
-          let coefficients := List.map (Mxx.reduceCoefficient left.modulus)
-            (subtractCoefficients left.coefficients right.coefficients)
-          [[.matrix { left with coefficients }]]
+      | some [.matrix left, .matrix right] => [[.matrix (Mxx.matrixSubtract left right)]]
       | _ => [[.invalid "matrix subtraction argument mismatch"]]
   | .matrixMultiply =>
       match arguments node wires with
-      | some [.matrix left, .matrix right] => [[.matrix (Mxx.matrixMul left right)]]
+      | some [.matrix left, .matrix right] => [[.matrix (Mxx.matrixMultiply left right)]]
       | _ => [[.invalid "matrix multiplication argument mismatch"]]
   | .matrixNegate =>
       match arguments node wires with
-      | some [.matrix value] =>
-          let coefficients := value.coefficients.map fun coefficient =>
-            Mxx.reduceCoefficient value.modulus (-coefficient)
-          [[.matrix { value with coefficients }]]
+      | some [.matrix value] => [[.matrix (Mxx.matrixNegate value)]]
       | _ => [[.invalid "matrix negation argument mismatch"]]
   | .matrixScale scalar =>
       match arguments node wires, scalar.evaluate params with
-      | some [.matrix value], some scalar =>
-          let coefficients := value.coefficients.map fun coefficient =>
-            Mxx.reduceCoefficient value.modulus (scalar * coefficient)
-          [[.matrix { value with coefficients }]]
+      | some [.matrix value], some scalar => [[.matrix (Mxx.matrixScale scalar value)]]
       | _, _ => [[.invalid "matrix scaling argument mismatch"]]
+  | .slice rows columns =>
+      match arguments node wires with
+      | some [.matrix value] =>
+          let evaluateRange (range : Option (IntExpr × IntExpr)) (length : Nat) :=
+            match range with
+            | none => some (0, length)
+            | some (start, stop) => do
+                let start ← start.evaluate params
+                let stop ← stop.evaluate params
+                if start < 0 ∨ stop < start then none else some (start.toNat, stop.toNat)
+          match evaluateRange rows value.rows, evaluateRange columns value.columns with
+          | some (rowStart, rowEnd), some (columnStart, columnEnd) =>
+              [[.matrix (Mxx.matrixSlice value rowStart rowEnd columnStart columnEnd)]]
+          | _, _ => [[.invalid "Slice range evaluation failed"]]
+      | _ => [[.invalid "Slice argument mismatch"]]
+  | .reshape rows columns =>
+      match arguments node wires, rows.evaluate params, columns.evaluate params with
+      | some [.matrix value], some rows, some columns =>
+          if rows < 0 ∨ columns < 0 then [[.invalid "negative reshape dimension"]]
+          else [[.matrix (Mxx.matrixReshape value rows.toNat columns.toNat)]]
+      | _, _, _ => [[.invalid "Reshape argument mismatch"]]
   | .concat axis =>
       match arguments node wires with
       | some values =>
@@ -477,6 +881,65 @@ def evaluateNode
             node.outputCount (List.range count.toNat) initial).map fun outputs =>
               outputs.map Value.family
       | _, _ => [[.invalid "ParallelLoop argument mismatch"]]
+  | .sequentialLoop definition count indexSlot bindings carriedCount =>
+      match arguments node wires, count.evaluate params with
+      | some values, some count =>
+          evaluateSequentialIterations runChild definition params indexSlot bindings
+            (values.drop carriedCount) (List.range count.toNat) [values.take carriedCount]
+      | _, _ => [[.invalid "SequentialLoop argument mismatch"]]
+
+theorem evaluateNode_parallelLoop_of_arguments
+    (runChild : ChildRunner)
+    (samplers : MxxSamplerFamily)
+    (params : ParamEnvironment)
+    (inputs : Environment)
+    (wires : WireEnvironment)
+    (definition : String)
+    (count : IntExpr)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (modes : List LoopInputMode)
+    (argumentRefs : List WireRef)
+    (outputCount : Nat)
+    (values : List Value)
+    (evaluatedCount : Int)
+    (argumentsEvaluate : argumentRefs.mapM (fun wire => lookupWire wire wires) = some values)
+    (countEvaluate : count.evaluate params = some evaluatedCount) :
+    evaluateNode runChild samplers params inputs wires {
+        kind := .parallelLoop definition count indexSlot bindings modes
+        arguments := argumentRefs
+        outputCount
+      } =
+      (evaluateParallelIterations runChild definition params indexSlot bindings modes values
+        outputCount (List.range evaluatedCount.toNat)
+        [List.replicate outputCount []]).map fun outputs => outputs.map Value.family := by
+  simp [evaluateNode, arguments, argumentsEvaluate, countEvaluate]
+
+theorem evaluateNode_sequentialLoop_of_arguments
+    (runChild : ChildRunner)
+    (samplers : MxxSamplerFamily)
+    (params : ParamEnvironment)
+    (inputs : Environment)
+    (wires : WireEnvironment)
+    (definition : String)
+    (count : IntExpr)
+    (indexSlot : Nat)
+    (bindings : List (String × IntExpr))
+    (carriedCount : Nat)
+    (argumentRefs : List WireRef)
+    (outputCount : Nat)
+    (values : List Value)
+    (evaluatedCount : Int)
+    (argumentsEvaluate : argumentRefs.mapM (fun wire => lookupWire wire wires) = some values)
+    (countEvaluate : count.evaluate params = some evaluatedCount) :
+    evaluateNode runChild samplers params inputs wires {
+        kind := .sequentialLoop definition count indexSlot bindings carriedCount
+        arguments := argumentRefs
+        outputCount
+      } =
+      evaluateSequentialIterations runChild definition params indexSlot bindings
+        (values.drop carriedCount) (List.range evaluatedCount.toNat) [values.take carriedCount] := by
+  simp [evaluateNode, arguments, argumentsEvaluate, countEvaluate]
 
 def bindOutputs (nodeId : Nat) (values : List Value) : WireEnvironment :=
   values.zipIdx.map (fun (value, port) => (⟨nodeId, port⟩, value))
@@ -493,6 +956,211 @@ def evaluateNodes
         (evaluateNode runChild samplers params inputs state node).map fun values =>
           state ++ bindOutputs nodeId values
       evaluateNodes runChild samplers params inputs tail (nodeId + 1) next
+
+theorem evaluateNodes_append
+    (runChild : ChildRunner)
+    (samplers : MxxSamplerFamily)
+    (params : ParamEnvironment)
+    (inputs : Environment)
+    (left right : List Node)
+    (nodeId : Nat)
+    (states : List WireEnvironment) :
+    evaluateNodes runChild samplers params inputs (left ++ right) nodeId states =
+      evaluateNodes runChild samplers params inputs right (nodeId + left.length)
+        (evaluateNodes runChild samplers params inputs left nodeId states) := by
+  induction left generalizing nodeId states with
+  | nil => simp [evaluateNodes]
+  | cons head tail induction =>
+      simp only [List.cons_append, evaluateNodes, List.length_cons]
+      rw [induction]
+      congr 1
+      omega
+
+/-- One concrete execution path through a node list. Unlike `evaluateNodes`, this relation does
+not materialize the Cartesian product of every sampler support and is therefore suitable for
+proofs that start from membership in the executable support. -/
+inductive EvaluatesNodesPath
+    (runChild : ChildRunner)
+    (samplers : MxxSamplerFamily)
+    (params : ParamEnvironment)
+    (inputs : Environment) :
+    Nat → List Node → WireEnvironment → WireEnvironment → Prop
+  | nil (nodeId state) : EvaluatesNodesPath runChild samplers params inputs nodeId [] state state
+  | cons (nodeId node nodes state values output)
+      (valuesMember : values ∈ evaluateNode runChild samplers params inputs state node)
+      (tail : EvaluatesNodesPath runChild samplers params inputs (nodeId + 1) nodes
+        (state ++ bindOutputs nodeId values) output) :
+      EvaluatesNodesPath runChild samplers params inputs nodeId (node :: nodes) state output
+
+theorem evaluatesNodesPath_cons_iff
+    (runChild : ChildRunner)
+    (samplers : MxxSamplerFamily)
+    (params : ParamEnvironment)
+    (inputs : Environment)
+    (nodeId : Nat)
+    (node : Node)
+    (nodes : List Node)
+    (state output : WireEnvironment) :
+    EvaluatesNodesPath runChild samplers params inputs nodeId (node :: nodes) state output ↔
+      ∃ values ∈ evaluateNode runChild samplers params inputs state node,
+        EvaluatesNodesPath runChild samplers params inputs (nodeId + 1) nodes
+          (state ++ bindOutputs nodeId values) output := by
+  constructor
+  · intro path
+    cases path with
+    | cons _ _ _ _ values _ valuesMember tail => exact ⟨values, valuesMember, tail⟩
+  · rintro ⟨values, valuesMember, tail⟩
+    exact .cons _ _ _ _ _ _ valuesMember tail
+
+theorem mem_evaluateNodes_iff_exists_path
+    (runChild : ChildRunner)
+    (samplers : MxxSamplerFamily)
+    (params : ParamEnvironment)
+    (inputs : Environment)
+    (nodes : List Node)
+    (nodeId : Nat)
+    (states : List WireEnvironment)
+    (output : WireEnvironment) :
+    output ∈ evaluateNodes runChild samplers params inputs nodes nodeId states ↔
+      ∃ initial ∈ states,
+        EvaluatesNodesPath runChild samplers params inputs nodeId nodes initial output := by
+  induction nodes generalizing nodeId states output with
+  | nil =>
+      constructor
+      · intro member
+        exact ⟨output, member, .nil _ _⟩
+      · rintro ⟨initial, member, path⟩
+        cases path
+        exact member
+  | cons node nodes induction =>
+      rw [evaluateNodes, induction]
+      constructor
+      · rintro ⟨next, nextMember, path⟩
+        simp only [List.mem_flatMap, List.mem_map] at nextMember
+        obtain ⟨initial, initialMember, values, valuesMember, rfl⟩ := nextMember
+        exact ⟨initial, initialMember, .cons _ _ _ _ _ _ valuesMember path⟩
+      · rintro ⟨initial, initialMember, path⟩
+        cases path with
+        | cons _ _ _ _ values _ valuesMember tail =>
+            refine ⟨_, ?_, tail⟩
+            simp only [List.mem_flatMap, List.mem_map]
+            exact ⟨initial, initialMember, values, valuesMember, rfl⟩
+
+/-- Split a concrete IR execution path at a syntactic node-list boundary. Generated protocol
+proofs use this lemma instead of destructing every preceding node by hand. -/
+theorem EvaluatesNodesPath.split
+    {runChild : ChildRunner}
+    {samplers : MxxSamplerFamily}
+    {params : ParamEnvironment}
+    {inputs : Environment}
+    {nodeId : Nat}
+    {left right : List Node}
+    {initial output : WireEnvironment}
+    (path : EvaluatesNodesPath runChild samplers params inputs nodeId
+      (left ++ right) initial output) :
+    ∃ middle,
+      EvaluatesNodesPath runChild samplers params inputs nodeId left initial middle ∧
+      EvaluatesNodesPath runChild samplers params inputs (nodeId + left.length) right
+        middle output := by
+  induction left generalizing nodeId initial with
+  | nil =>
+      exact ⟨initial, .nil nodeId initial, by simpa using path⟩
+  | cons node tail induction =>
+      cases path with
+      | cons _ _ _ _ values _ valuesMember rest =>
+          obtain ⟨middle, leftPath, rightPath⟩ := induction rest
+          refine ⟨middle, .cons _ _ _ _ _ _ valuesMember leftPath, ?_⟩
+          have nodeIdEq : nodeId + 1 + tail.length = nodeId + (node :: tail).length := by
+            simp
+            omega
+          rw [← nodeIdEq]
+          exact rightPath
+
+/-- Invert only a selected generated node. The returned prefix state is the exact wire
+environment passed to that node, and `valuesMember` retains its sampler-support obligation. -/
+theorem EvaluatesNodesPath.atNode
+    {runChild : ChildRunner}
+    {samplers : MxxSamplerFamily}
+    {params : ParamEnvironment}
+    {inputs : Environment}
+    {nodeId : Nat}
+    {preNodes postNodes : List Node}
+    {node : Node}
+    {initial output : WireEnvironment}
+    (path : EvaluatesNodesPath runChild samplers params inputs nodeId
+      (preNodes ++ node :: postNodes) initial output) :
+    ∃ before values,
+      EvaluatesNodesPath runChild samplers params inputs nodeId preNodes initial before ∧
+      values ∈ evaluateNode runChild samplers params inputs before node ∧
+      EvaluatesNodesPath runChild samplers params inputs (nodeId + preNodes.length + 1)
+        postNodes (before ++ bindOutputs (nodeId + preNodes.length) values) output := by
+  obtain ⟨before, prefixPath, afterPath⟩ :=
+    path.split (left := preNodes) (right := node :: postNodes)
+  cases afterPath with
+  | cons _ _ _ _ values _ valuesMember suffixPath =>
+      exact ⟨before, values, prefixPath, valuesMember, by simpa [Nat.add_assoc] using suffixPath⟩
+
+/-- Index-based form of `atNode`, convenient for large generated node lists. -/
+theorem EvaluatesNodesPath.atNodeIndex
+    {runChild : ChildRunner}
+    {samplers : MxxSamplerFamily}
+    {params : ParamEnvironment}
+    {inputs : Environment}
+    {nodeId : Nat}
+    {nodes : List Node}
+    {initial output : WireEnvironment}
+    (path : EvaluatesNodesPath runChild samplers params inputs nodeId nodes initial output)
+    (index : Nat)
+    (inBounds : index < nodes.length) :
+    ∃ before values,
+      EvaluatesNodesPath runChild samplers params inputs nodeId (nodes.take index) initial before ∧
+      values ∈ evaluateNode runChild samplers params inputs before nodes[index] ∧
+      EvaluatesNodesPath runChild samplers params inputs (nodeId + index + 1)
+        (nodes.drop (index + 1))
+        (before ++ bindOutputs (nodeId + index) values) output := by
+  have decomposition : nodes = nodes.take index ++ nodes[index] :: nodes.drop (index + 1) := by
+    calc
+      nodes = nodes.take index ++ nodes.drop index := (List.take_append_drop index nodes).symm
+      _ = nodes.take index ++ nodes[index] :: nodes.drop (index + 1) := by
+        rw [List.cons_getElem_drop_succ (l := nodes) (n := index)]
+  rw [decomposition] at path
+  simpa [Nat.min_eq_left (Nat.le_of_lt inBounds)] using path.atNode
+
+/-- Appending new SSA bindings cannot change an already-resolved wire. -/
+theorem lookupWire_append_of_eq_some
+    {wire : WireRef} {value : Value} {left right : WireEnvironment}
+    (resolved : lookupWire wire left = some value) :
+    lookupWire wire (left ++ right) = some value := by
+  induction left with
+  | nil => simp [lookupWire] at resolved
+  | cons head tail induction =>
+      rcases head with ⟨candidate, candidateValue⟩
+      by_cases same : candidate = wire
+      · rw [lookupWire, if_pos same] at resolved
+        rw [List.cons_append, lookupWire, if_pos same]
+        exact resolved
+      · rw [lookupWire, if_neg same] at resolved
+        rw [List.cons_append, lookupWire, if_neg same]
+        exact induction resolved
+
+/-- Once an SSA wire is present, every later node on the same path preserves its value. -/
+theorem EvaluatesNodesPath.lookupWire_preserved
+    {runChild : ChildRunner}
+    {samplers : MxxSamplerFamily}
+    {params : ParamEnvironment}
+    {inputs : Environment}
+    {nodeId : Nat}
+    {nodes : List Node}
+    {initial output : WireEnvironment}
+    {wire : WireRef}
+    {value : Value}
+    (path : EvaluatesNodesPath runChild samplers params inputs nodeId nodes initial output)
+    (resolved : lookupWire wire initial = some value) :
+    lookupWire wire output = some value := by
+  induction path with
+  | nil => exact resolved
+  | cons _ _ _ _ values _ _ _ induction =>
+      exact induction (lookupWire_append_of_eq_some resolved)
 
 def collectOutputs (outputs : List (String × WireRef)) (wires : WireEnvironment) : Environment :=
   outputs.map fun (name, wire) =>
@@ -551,6 +1219,8 @@ def denote (samplers : MxxSamplerFamily) (program : Prog)
 
 def emptySamplerFamily : MxxSamplerFamily where
   gaussianSample := fun _ => []
+  hashSample := fun _ => { coefficients := [] }
+  gadgetDecompose := fun _ _ _ _ => []
   trapdoorSample := fun _ => []
   samplePreimage := fun _ _ _ => []
 

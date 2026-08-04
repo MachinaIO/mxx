@@ -34,21 +34,81 @@ def matrixMul (left right : Matrix) : Matrix :=
   if left.modulus = right.modulus ∧ left.ringDimension = right.ringDimension ∧
       left.columns = right.rows then
     { coefficients :=
-        (List.range left.rows).flatMap fun row =>
-          (List.range right.columns).flatMap fun column =>
-            (List.range left.ringDimension).map fun coefficient =>
-              reduceCoefficient left.modulus <|
-              (List.range left.columns).foldl (fun total inner =>
-                total + negacyclicCoefficient left.ringDimension
-                  (left.coefficient row inner)
-                  (right.coefficient inner column)
-                  coefficient) 0
+        List.ofFn fun linear : Fin (left.rows * right.columns * left.ringDimension) =>
+          let coefficient := linear.val % left.ringDimension
+          let entry := linear.val / left.ringDimension
+          let column := entry % right.columns
+          let row := entry / right.columns
+          reduceCoefficient left.modulus <|
+            (List.range left.columns).foldl (fun total inner =>
+              total + negacyclicCoefficient left.ringDimension
+                (left.coefficient row inner)
+                (right.coefficient inner column)
+                coefficient) 0
       modulus := left.modulus
       ringDimension := left.ringDimension
       rows := left.rows
       columns := right.columns }
   else
     { coefficients := [] }
+
+/-- Entrywise multiplication by a polynomial scalar. This is the executable meaning of matrix
+multiplication when either operand has shape `1 × 1`; the Rust backend applies the same scalar
+broadcast rule before ordinary matrix multiplication. -/
+def matrixPolynomialScale (scalar matrix : Matrix) : Matrix :=
+  { coefficients :=
+      List.ofFn fun linear : Fin (matrix.rows * matrix.columns * matrix.ringDimension) =>
+        let coefficient := linear.val % matrix.ringDimension
+        let entry := linear.val / matrix.ringDimension
+        let column := entry % matrix.columns
+        let row := entry / matrix.columns
+        reduceCoefficient matrix.modulus <|
+          negacyclicCoefficient matrix.ringDimension
+            (scalar.coefficient 0 0) (matrix.coefficient row column) coefficient
+    modulus := matrix.modulus
+    ringDimension := matrix.ringDimension
+    rows := matrix.rows
+    columns := matrix.columns }
+
+/-- Runtime matrix multiplication, including the DSL's `1 × 1` polynomial-scalar broadcast. -/
+def matrixMultiply (left right : Matrix) : Matrix :=
+  if left.rows = 1 ∧ left.columns = 1 then
+    if right.rows = 1 then matrixMul left right else matrixPolynomialScale left right
+  else if right.rows = 1 ∧ right.columns = 1 then
+    if left.rows = 1 then matrixMul right left else matrixPolynomialScale right left
+  else matrixMul left right
+
+def addCoefficients : List Int → List Int → List Int
+  | [], right => right
+  | left, [] => left
+  | left :: leftTail, right :: rightTail =>
+      (left + right) :: addCoefficients leftTail rightTail
+
+def subtractCoefficients : List Int → List Int → List Int
+  | [], right => right.map (-·)
+  | left, [] => left
+  | left :: leftTail, right :: rightTail =>
+      (left - right) :: subtractCoefficients leftTail rightTail
+
+def matrixAdd (left right : Matrix) : Matrix :=
+  { left with
+    coefficients := (addCoefficients left.coefficients right.coefficients).map
+      (reduceCoefficient left.modulus) }
+
+def matrixSubtract (left right : Matrix) : Matrix :=
+  { left with
+    coefficients := (subtractCoefficients left.coefficients right.coefficients).map
+      (reduceCoefficient left.modulus) }
+
+def matrixNegate (matrix : Matrix) : Matrix :=
+  { matrix with
+    coefficients := matrix.coefficients.map fun coefficient =>
+      reduceCoefficient matrix.modulus (-coefficient) }
+
+def matrixScale (scalar : Int) (matrix : Matrix) : Matrix :=
+  { matrix with
+    coefficients := matrix.coefficients.map fun coefficient =>
+      reduceCoefficient matrix.modulus (scalar * coefficient) }
 
 def matrixConcatRows : List Matrix → Matrix
   | [] => { coefficients := [] }
@@ -74,6 +134,20 @@ def matrixConcatColumns : List Matrix → Matrix
         ringDimension := first.ringDimension
         rows := first.rows
         columns := (matrices.map Matrix.columns).sum }
+
+def matrixSlice (matrix : Matrix) (rowStart rowEnd columnStart columnEnd : Nat) : Matrix :=
+  { coefficients :=
+      (List.range (rowEnd - rowStart)).flatMap fun row =>
+        (List.range (columnEnd - columnStart)).flatMap fun column =>
+          (List.range matrix.ringDimension).map fun coefficient =>
+            matrix.coefficient (rowStart + row) (columnStart + column) coefficient
+    modulus := matrix.modulus
+    ringDimension := matrix.ringDimension
+    rows := rowEnd - rowStart
+    columns := columnEnd - columnStart }
+
+def matrixReshape (matrix : Matrix) (rows columns : Nat) : Matrix :=
+  { matrix with rows, columns }
 
 def diagonalCoefficient (matrices : List Matrix)
     (row column coefficient rowOffset columnOffset : Nat) : Int :=
@@ -145,6 +219,27 @@ structure SamplerParams where
   ringDimension : Nat := 0
   rows : Nat := 0
   columns : Nat := 0
+  deriving DecidableEq
+
+inductive HashVariant where
+  | plain
+  | decomposed
+  | smallDecomposed
+  deriving DecidableEq
+
+/-- Every input that determines a hash-to-matrix result. Hash sampling is deterministic: two
+nodes with equal queries necessarily receive the same matrix. -/
+structure HashQuery where
+  params : SamplerParams
+  key : ByteArray
+  variant : HashVariant
+  tagPrefix : List Nat
+  tagValues : List Int
+  tagDecimalValues : List Int
+  tagU64LeValues : List Int
+  base : Option Int
+  digitCount : Option Int
+  deriving DecidableEq
 
 def Matrix.withSamplerParams (matrix : Matrix) (params : SamplerParams) : Matrix :=
   let count := params.rows * params.columns * params.ringDimension
@@ -157,8 +252,21 @@ def Matrix.withSamplerParams (matrix : Matrix) (params : SamplerParams) : Matrix
     rows := params.rows
     columns := params.columns }
 
+def gadgetMatrix (params : SamplerParams) (base : Int) (digitCount : Nat) : Matrix :=
+  let matrixParams := { params with rows := params.rows, columns := params.rows * digitCount }
+  let coefficients :=
+    (List.range matrixParams.rows).flatMap fun row =>
+      (List.range matrixParams.columns).flatMap fun column =>
+        (List.range matrixParams.ringDimension).map fun coefficient =>
+          if digitCount ≠ 0 ∧ column / digitCount = row ∧ coefficient = 0 then
+            reduceCoefficient matrixParams.modulus (base ^ (column % digitCount))
+          else 0
+  Matrix.withSamplerParams { coefficients } matrixParams
+
 structure MxxSamplerFamily where
   gaussianSample : SamplerParams → List Matrix
+  hashSample : HashQuery → Matrix
+  gadgetDecompose : SamplerParams → Int → Nat → Matrix → List Matrix
   trapdoorSample : SamplerParams → List Matrix
   samplePreimage : SamplerParams → Matrix → Matrix → List Matrix
 
@@ -166,6 +274,23 @@ structure MxxBoundedSamplerContract (samplers : MxxSamplerFamily) : Prop where
   gaussianHardSupport :
     ∀ params sample, sample ∈ samplers.gaussianSample params →
       maxCenteredCoefficientNorm (sample.withSamplerParams params) ≤ params.maxCoefficientBound
+  gadgetDecomposeContract :
+    ∀ params base digitCount input output,
+      output ∈ samplers.gadgetDecompose params base digitCount input →
+      matrixMul
+        (gadgetMatrix { params with rows := input.rows, columns := input.rows * digitCount }
+          base digitCount)
+        (output.withSamplerParams params) = input ∧
+      maxCenteredCoefficientNorm (output.withSamplerParams params) ≤
+        max (base.natAbs / 2) 1
+  /-- Gadget decomposition is a deterministic primitive, unlike Gaussian and preimage sampling.
+  Re-evaluating the same query in two protocol stages therefore yields the same normalized
+  matrix. -/
+  gadgetDecomposeUnique :
+    ∀ params base digitCount input left right,
+      left ∈ samplers.gadgetDecompose params base digitCount input →
+      right ∈ samplers.gadgetDecompose params base digitCount input →
+      left.withSamplerParams params = right.withSamplerParams params
   preimageContract :
     ∀ params b p k, k ∈ samplers.samplePreimage params b p →
       matrixMul b (k.withSamplerParams params) = p ∧

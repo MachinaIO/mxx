@@ -1,12 +1,15 @@
 //! Declarative BGG+ public-key and encoding samplers.
 
 use crate::{
-    BggEncodingWire, BggPolyEncodingWire, BggPublicKeyWire, NaiveBggEncodingVecWire,
-    NaiveBggPublicKeyVecWire,
+    BggEncodingWire, BggPolyEncodingWire, BggPublicKeyFamily, BggPublicKeyWire,
+    NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire,
 };
-use mxx_dsl::{Bytes, Family, HashTag, Mat, Parallel, Ring, parallel_zip};
+use mxx_dsl::{
+    BodyTraceRemapper, Bytes, DslError, Family, HashTag, LoopConstructionTrace, Mat, Parallel,
+    RemapConstructionTrace, Ring, parallel_zip,
+};
 use mxx_ir_core::{
-    IntExpr, RealExpr,
+    IntExpr, RealExpr, ValueHandle,
     node::{ConcatAxis, IndexRange},
 };
 use rayon::prelude::*;
@@ -37,6 +40,30 @@ impl BggSamplerLayout {
 #[derive(Clone)]
 pub struct BggPublicKeySampler {
     pub layout: BggSamplerLayout,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct BggPublicKeyFamilySamplingTrace {
+    pub hash_key: ValueHandle,
+    pub packed: ValueHandle,
+    pub slices: LoopConstructionTrace<PublicKeySliceConstructionTrace>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct PublicKeySliceConstructionTrace {
+    pub packed: ValueHandle,
+    pub slice: ValueHandle,
+}
+
+impl RemapConstructionTrace for PublicKeySliceConstructionTrace {
+    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
+        Ok(Self {
+            packed: self.packed.remap_current_body(map)?,
+            slice: self.slice.remap_current_body(map)?,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -361,6 +388,67 @@ impl NaiveBggEncodingVecSampler {
 }
 
 impl BggPublicKeySampler {
+    /// Samples one packed public matrix and exposes a dynamically sized family of deterministic
+    /// slices with the caller-supplied symbolic column count. Every member reveals its plaintext
+    /// relation.
+    pub fn sample_family(
+        &self,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        count: impl Into<IntExpr>,
+        public_key_columns: impl Into<IntExpr>,
+    ) -> Result<BggPublicKeyFamily, mxx_dsl::DslError> {
+        self.sample_family_traced(hash_key, tag, count, public_key_columns)
+            .map(|(family, _)| family)
+    }
+
+    #[doc(hidden)]
+    pub fn sample_family_traced(
+        &self,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        count: impl Into<IntExpr>,
+        public_key_columns: impl Into<IntExpr>,
+    ) -> Result<(BggPublicKeyFamily, BggPublicKeyFamilySamplingTrace), mxx_dsl::DslError> {
+        let count = count.into();
+        let columns = public_key_columns.into();
+        let hash_key_handle = hash_key.value_handle().clone();
+        let packed = self.layout.ring().hash_matrix(
+            hash_key,
+            tag,
+            (
+                IntExpr::constant(self.layout.secret_dimension),
+                IntExpr::Mul(Box::new(columns.clone()), Box::new(count.clone())),
+            ),
+        );
+        let packed_handle = packed.value_handle().clone();
+        let (matrices, slices) = Parallel::range(count).map_values_traced(|index| {
+            let start = IntExpr::Mul(Box::new(columns.clone()), Box::new(index.expression()));
+            let slice = packed.clone().slice(
+                None,
+                Some(IndexRange {
+                    start: start.clone(),
+                    end: IntExpr::Add(Box::new(start), Box::new(columns.clone())),
+                }),
+            );
+            (
+                slice.clone(),
+                PublicKeySliceConstructionTrace {
+                    packed: packed.value_handle().clone(),
+                    slice: slice.value_handle().clone(),
+                },
+            )
+        })?;
+        Ok((
+            BggPublicKeyFamily { matrices, reveal_plaintext: true },
+            BggPublicKeyFamilySamplingTrace {
+                hash_key: hash_key_handle,
+                packed: packed_handle,
+                slices,
+            },
+        ))
+    }
+
     /// Samples the packed public matrices once and exposes deterministic slices.
     pub fn sample(
         &self,
@@ -543,6 +631,16 @@ mod tests {
             b"packed".to_vec(),
             &[true],
         );
+        let public_key_columns = IntExpr::Var("public-key-columns".to_owned());
+        let public_key_family = BggPublicKeySampler { layout: layout.clone() }
+            .sample_family(
+                ring.bytes_input("packed-family-key", 32),
+                b"packed-family".to_vec(),
+                3,
+                public_key_columns.clone(),
+            )
+            .unwrap();
+        assert_eq!(public_key_family.matrices.element_type().columns, public_key_columns);
         let plaintexts = Family::pack(
             (0..2).map(|slot| ring.input(format!("plaintext-{slot}"), (1, 1))).collect(),
         )
@@ -567,6 +665,9 @@ mod tests {
         .sample(ring.input("naive-secret", (1, 1)), &naive_keys, std::slice::from_ref(&plaintexts))
         .unwrap();
         let built = DslContext::new("bgg-family-samplers")
+            .int_parameter("public-key-columns")
+            .family_output("public-keys", public_key_family.matrices)
+            .unwrap()
             .family_output("poly", poly.encodings[1].vectors.clone())
             .unwrap()
             .family_output("poly-secrets", poly.slot_secret_matrices)
@@ -575,8 +676,12 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built
+            .validate(&ParamEnv {
+                integers: BTreeMap::from([("public-key-columns".to_owned(), 5.into())]),
+                ..ParamEnv::default()
+            })
+            .unwrap();
     }
 
     #[test]

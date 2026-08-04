@@ -10,13 +10,14 @@ mxx-runtime              -> mxx-ir-core, mxx-primitives
 mxx-bench-estimator      -> mxx-ir-core, mxx-runtime
 mxx-dsl                  -> mxx-ir-core
 mxx-correctness          -> mxx-ir-core, mxx-dsl
-mxx-gadgets              -> mxx-correctness, mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
+mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
 mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core
-mxx-func-enc/we/io       -> lower layers when their application modules are enabled
+mxx-we                   -> mxx-bgg, mxx-correctness, mxx-gadgets, mxx-runtime
+mxx-func-enc/io          -> lower layers when their application modules are enabled
 ```
 
-Application crates never depend on one another. Their protocol modules are temporarily disabled
-while application-specific hard-bound recurrences or certified checkers are developed.
+Application crates never depend on one another. Diamond WE is active in `mxx-we`; functional
+encryption and iO protocol modules remain disabled.
 
 ## Responsibilities
 
@@ -63,6 +64,11 @@ slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
 
 ### Application crates
 
-`mxx-func-enc`, `mxx-we`, and `mxx-io` currently expose compiling interface shells. Their
-protocol graphs and parameter searches remain source-disabled until migrated to application-specific
-hard bounds or verified correctness checkers.
+`mxx-we` owns the implementation-independent witness-encryption declaration/runtime traits and the
+Diamond protocol. A Diamond protocol fixes a layered Boolean shape but accepts gate opcodes and
+previous-layer indices as public runtime families. Encryption and decryption consume the same
+circuit assignment; witness bits are decryption-only inputs. Parameter search uses deterministic
+worst-case bounds and accepts a candidate only after the Lean hard-bound checker returns true.
+
+`mxx-func-enc` and `mxx-io` currently expose compiling interface shells. Their protocol modules
+remain disabled.

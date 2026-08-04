@@ -18,38 +18,9 @@ where
 ///
 /// `NestedRnsPolyContext::setup` allocates all helper LUTs and sub-circuits in one pass. This tiny
 /// LUT preserves the previous initialization flow without changing any call sites.
-fn dummy_lut<P: Poly + 'static>(params: &P::Params) -> PublicLut<P> {
-    PublicLut::new(
-        params,
-        1,
-        |params, x| {
-            if x != 0 {
-                return None;
-            }
-            let y_elem = P::from_usize_to_constant(params, 0)
-                .coeffs()
-                .into_iter()
-                .next()
-                .expect("constant-term coefficient must exist");
-            Some((0, y_elem))
-        },
-        None,
-    )
-}
-
-/// Convert one integer constant into the `(row_idx, coeff)` format expected by `PublicLut::new`.
-///
-/// Several setup-time LUT constructors start from a `BigUint` semantic value, then need the maximum
-/// coefficient row representation that the lookup API consumes.
-fn max_output_row_from_biguint<P: Poly>(
-    params: &P::Params,
-    idx: usize,
-    value: BigUint,
-) -> (u64, P::Elem) {
-    let poly = P::from_biguint_to_constant(params, value);
-    let coeff =
-        poly.coeffs().into_iter().max().expect("max_output_row requires at least one coefficient");
-    (u64::try_from(idx).expect("row index must fit in u64"), coeff)
+fn dummy_lut() -> PublicLutProgram {
+    PublicLutProgram::new(1, LutExpr::constant(0))
+        .expect("the constant-zero lookup program is valid")
 }
 
 // Conservative output bound for the integer represented by one q-level after full_reduce.
@@ -318,7 +289,7 @@ impl NestedRnsPolyContext {
             precompute_nested_rns_gadget_values(&active_q_moduli, &p_full, &p_over_pis);
 
         if dummy_scalar {
-            let dummy_lut = dummy_lut::<P>(params);
+            let dummy_lut = dummy_lut();
             let dummy_lut_id = circuit.register_public_lookup(dummy_lut);
             let lut_mod_p_ids = vec![dummy_lut_id; p_moduli_depth];
             let lut_x_to_y_ids = vec![dummy_lut_id; p_moduli_depth];
@@ -372,127 +343,40 @@ impl NestedRnsPolyContext {
                 "LUT size exceeds q modulus size; increase q_moduli_bits or decrease p_moduli_bits"
             );
             let lut_mod_p_len = lut_mod_p_map_size as usize;
-            let max_mod_p_row = max_output_row_from_biguint::<P>(
-                params,
-                (p_i - 1) as usize,
-                BigUint::from(p_i - 1),
-            );
-            let lut_mod_p_lut = PublicLut::<P>::new(
-                params,
-                lut_mod_p_len as u64,
-                move |params, t| {
-                    if t >= lut_mod_p_len as u64 {
-                        return None;
-                    }
-                    let output = BigUint::from(t % p_i);
-                    let y_elem = P::from_biguint_to_constant(params, output)
-                        .coeffs()
-                        .into_iter()
-                        .next()
-                        .expect("constant-term coefficient must exist");
-                    Some((t, y_elem))
-                },
-                Some(max_mod_p_row),
-            );
+            let input = LutExpr::input();
+            let lut_mod_p_lut =
+                PublicLutProgram::new(lut_mod_p_len as u64, input.clone().modulo(p_i))
+                    .expect("nested-RNS modulus lookup program is valid");
             lut_mod_p.push(lut_mod_p_lut);
 
             let p_moduli_big = BigUint::from(p_i);
             let p_over_pi_mod_pi = (&p_over_pis[p_i_idx] % &p_moduli_big)
                 .to_u64()
                 .expect("CRT residue must fit in u64");
-            let p_over_pi_inv = Arc::new(BigUint::from(
+            let p_over_pi_inv = BigUint::from(
                 mod_inverse(p_over_pi_mod_pi, p_i).expect("CRT moduli must be coprime"),
-            ));
-            let max_idx_mod_pi =
-                (((p_i - 1) as u128 * p_over_pi_mod_pi as u128) % p_i as u128) as usize;
-            let max_x_to_y_row =
-                max_output_row_from_biguint::<P>(params, max_idx_mod_pi, BigUint::from(p_i - 1));
-            let max_x_to_real_value = round_div((p_i - 1) * scale, p_i);
-            let max_x_to_real_row = max_output_row_from_biguint::<P>(
-                params,
-                max_idx_mod_pi,
-                BigUint::from(max_x_to_real_value),
             );
 
-            let p_moduli_big = Arc::new(p_moduli_big);
             let lut_x_to_y_len = lut_mod_p_map_size as usize;
-            let lut_x_to_y_lut = PublicLut::<P>::new(
-                params,
-                lut_x_to_y_len as u64,
-                {
-                    let p_over_pi_inv = Arc::clone(&p_over_pi_inv);
-                    let p_moduli_big = Arc::clone(&p_moduli_big);
-                    move |params, t| {
-                        if t >= lut_x_to_y_len as u64 {
-                            return None;
-                        }
-                        let input = BigUint::from(t);
-                        let output = (&input * p_over_pi_inv.as_ref()) % p_moduli_big.as_ref();
-                        let y_elem = P::from_biguint_to_constant(params, output)
-                            .coeffs()
-                            .into_iter()
-                            .next()
-                            .expect("constant-term coefficient must exist");
-                        Some((t, y_elem))
-                    }
-                },
-                Some(max_x_to_y_row),
-            );
+            let y = input.clone().mul(LutExpr::constant(p_over_pi_inv)).modulo(p_i);
+            let lut_x_to_y_lut = PublicLutProgram::new(lut_x_to_y_len as u64, y.clone())
+                .expect("nested-RNS CRT conversion lookup program is valid");
             lut_x_to_y.push(lut_x_to_y_lut);
 
             let lut_x_to_real_len = lut_mod_p_map_size as usize;
-            let lut_x_to_real_lut = PublicLut::<P>::new(
-                params,
+            let lut_x_to_real_lut = PublicLutProgram::new(
                 lut_x_to_real_len as u64,
-                {
-                    let p_over_pi_inv = Arc::clone(&p_over_pi_inv);
-                    let p_moduli_big = Arc::clone(&p_moduli_big);
-                    move |params, t| {
-                        if t >= lut_x_to_real_len as u64 {
-                            return None;
-                        }
-                        let input = BigUint::from(t);
-                        let y = ((&input * p_over_pi_inv.as_ref()) % p_moduli_big.as_ref())
-                            .to_u64()
-                            .expect("y must fit in u64");
-                        let output = BigUint::from(round_div(y * scale, p_i));
-                        let y_elem = P::from_biguint_to_constant(params, output)
-                            .coeffs()
-                            .into_iter()
-                            .next()
-                            .expect("constant-term coefficient must exist");
-                        Some((t, y_elem))
-                    }
-                },
-                Some(max_x_to_real_row),
-            );
+                y.mul(LutExpr::constant(scale)).round_div(p_i),
+            )
+            .expect("nested-RNS scaled lookup program is valid");
             lut_x_to_real.push(lut_x_to_real_lut);
         }
 
         let max_real = scale * p_moduli_depth as u64;
         let lut_real_to_v_len = max_real as usize + 1;
-        let max_real_to_v_row = max_output_row_from_biguint::<P>(
-            params,
-            max_real as usize,
-            BigUint::from(round_div(max_real, scale)),
-        );
-        let lut_real_to_v_lut = PublicLut::<P>::new(
-            params,
-            lut_real_to_v_len as u64,
-            move |params, t| {
-                if t >= lut_real_to_v_len as u64 {
-                    return None;
-                }
-                let output = BigUint::from(round_div(t, scale));
-                let y_elem = P::from_biguint_to_constant(params, output)
-                    .coeffs()
-                    .into_iter()
-                    .next()
-                    .expect("constant-term coefficient must exist");
-                Some((t, y_elem))
-            },
-            Some(max_real_to_v_row),
-        );
+        let lut_real_to_v_lut =
+            PublicLutProgram::new(lut_real_to_v_len as u64, LutExpr::input().round_div(scale))
+                .expect("nested-RNS rounding lookup program is valid");
 
         let lut_mod_p_ids = lut_mod_p
             .iter()

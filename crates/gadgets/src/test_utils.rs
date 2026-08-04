@@ -16,7 +16,6 @@ use crate::{
 use mxx_dsl::{ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph};
 use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange, validate::ValidatedGraph};
 use mxx_primitives::{
-    element::PolyElem,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -144,10 +143,8 @@ impl PublicLookupLowering<DCRTPoly> for RuntimeLowering {
     ) -> Result<Mat, Infallible> {
         let branches = circuit
             .lookup_table(lookup_id)
-            .entries(&self.parameters)
-            .map(|(_input, (_row, output))| {
-                self.ring.polynomial([IntExpr::constant(output.value().clone())])
-            })
+            .entries()
+            .map(|(_input, (_row, output))| self.ring.polynomial([IntExpr::constant(output)]))
             .collect::<Vec<_>>();
         if self.wire_size == 1 {
             return Ok(input

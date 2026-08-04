@@ -16,7 +16,8 @@ and circuit gadgets, runtime backends, and a kernel-checked perfect-correctness 
 | `mxx-bench-estimator` | Validated-graph cost and memory composition. |
 | `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
 | `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |
-| `mxx-func-enc`, `mxx-we`, `mxx-io` | Application interfaces; protocol modules are temporarily disabled during correctness migration. |
+| `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. |
+| `mxx-func-enc`, `mxx-io` | Application interfaces whose protocol modules are currently disabled. |
 
 The retired symbolic IR and probabilistic noise simulator are not part of the workspace.
 Correctness uses enforced integer coefficient cutoffs and deterministic worst-case bounds. CPU

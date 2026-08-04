@@ -18,8 +18,8 @@ pub use constraints::{ParamConstraint, derive_param_constraints};
 pub use expr::{IntExpr, ParamEnv, Rational, RealExpr};
 pub use graph::{
     CapturePolicy, CapturedValue, CompileParameter, CompileParameterKind, ConstructionScopeId,
-    FreezeError, FreezeMap, FrozenGraphScopeId, Graph, GraphOutput, GraphScope, NodeHandle,
-    OutputRoot, ScopedWireRef, SealMap, SealedSubgraph, SourceLocation, SubgraphHandle,
+    FreezeError, FreezeMap, FreezeResolveError, FrozenGraphScopeId, Graph, GraphOutput, GraphScope,
+    NodeHandle, OutputRoot, ScopedWireRef, SealMap, SealedSubgraph, SourceLocation, SubgraphHandle,
     ValueHandle, current_construction_scope, with_new_construction_scope,
 };
 pub use types::{NodeId, Port, WireRef, WireType};

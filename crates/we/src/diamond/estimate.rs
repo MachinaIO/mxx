@@ -2,9 +2,7 @@ use super::{DiamondCompileError, DiamondWeCompiler};
 use mxx_bench_estimator::{
     CostReport, EstimateConfig, EstimateError, MeasurementBackend, estimate,
 };
-use mxx_gadgets::{Poly, circuit::PolyCircuit};
 use mxx_ir_core::{
-    ParamEnv,
     artifact::{export_validated_manifest, production_id},
     encoding::spec_hash,
 };
@@ -29,19 +27,16 @@ pub enum DiamondEstimateError {
     Manifest(String),
 }
 
-pub fn estimate_diamond_cost<P, B>(
+pub fn estimate_diamond_cost<B>(
     compiler: &DiamondWeCompiler,
-    circuit: &PolyCircuit<P>,
-    instance: &[bool],
     backend: &mut B,
     config: &EstimateConfig,
 ) -> Result<DiamondCostEstimate, DiamondEstimateError>
 where
-    P: Poly,
     B: MeasurementBackend,
 {
-    let bindings = ParamEnv::default();
-    let encryption = compiler.build_encryption(circuit, instance)?.graph;
+    let bindings = compiler.circuit_bindings()?;
+    let encryption = compiler.build_encryption()?.graph;
     let validated_encryption = encryption
         .validate(&bindings)
         .map_err(|error| DiamondEstimateError::Validation(error.to_string()))?;
@@ -54,7 +49,7 @@ where
         .map_err(|error| DiamondEstimateError::Manifest(error.to_string()))?;
     let encryption_report = estimate(&validated_encryption, backend, config)?;
 
-    let decryption = compiler.build_decryption(circuit, instance, encryption_id.clone())?.graph;
+    let decryption = compiler.build_decryption(encryption_id.clone())?.graph;
     let validated_decryption = decryption
         .validate_with_manifests(&bindings, &BTreeMap::from([(encryption_id, artifact_manifest)]))
         .map_err(|error| DiamondEstimateError::Validation(error.to_string()))?;
@@ -67,8 +62,8 @@ mod tests {
     use super::*;
     use crate::diamond::{DiamondWeCompiler, DiamondWeConfig};
     use mxx_bench_estimator::{MeasurementNode, NodeMeasurement};
-    use mxx_ir_core::{RealExpr, types::ConcreteWireType};
-    use mxx_primitives::poly::dcrt::poly::DCRTPoly;
+    use mxx_gadgets::circuit::BooleanCircuitShape;
+    use mxx_ir_core::{ParamEnv, RealExpr, types::ConcreteWireType};
     use std::convert::Infallible;
 
     struct UnitBackend;
@@ -97,26 +92,31 @@ mod tests {
 
     #[test]
     fn estimator_consumes_the_actual_encryption_and_decryption_graphs() {
-        let compiler = DiamondWeCompiler::new(DiamondWeConfig {
-            modulus: 257.into(),
-            ring_dimension: 8,
-            input_count: 1,
-            digit_base: 2,
-            batch_bits: 1,
-            gadget_base: 4.into(),
-            digit_count: 2,
-            trapdoor_sigma: RealExpr::from_integer(4),
-            error_sigma: RealExpr::from_integer(1),
-            bgg_tag: b"diamond-estimate-test".to_vec(),
-        })
+        let compiler = DiamondWeCompiler::new(
+            DiamondWeConfig {
+                modulus: 257.into(),
+                ring_dimension: 8,
+                input_count: 1,
+                digit_base: 2,
+                batch_bits: 1,
+                gadget_base: 4.into(),
+                digit_count: 2,
+                trapdoor_sigma: RealExpr::from_integer(4),
+                error_sigma: RealExpr::from_integer(1),
+                error_max_coefficient_bound: 6.into(),
+                preimage_max_coefficient_bound: 26.into(),
+                bgg_tag: b"diamond-estimate-test".to_vec(),
+            },
+            BooleanCircuitShape {
+                instance_width: 0,
+                witness_width: 1,
+                depth: 1,
+                max_layer_width: 1,
+            },
+        )
         .unwrap();
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let input = circuit.input(1);
-        circuit.output([input]);
         let estimate = estimate_diamond_cost(
             &compiler,
-            &circuit,
-            &[],
             &mut UnitBackend,
             &EstimateConfig { device_pool_size: 2, per_instance_occupancy: 1 },
         )

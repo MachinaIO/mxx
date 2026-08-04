@@ -80,6 +80,7 @@ pub fn protocol() -> ProtocolDecl {
             },
         ],
         entrypoint: StageId("decrypt".to_owned()),
+        semantic_certificate: Default::default(),
         correctness: CorrectnessDecl {
             protocol_inputs: vec![(
                 ProtoInputName("message".to_owned()),

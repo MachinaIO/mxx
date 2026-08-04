@@ -145,8 +145,12 @@ impl BggEncodingCompiler {
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
             .as_mat();
         Ok(BggEncodingWire {
-            vector: lhs.vector.clone() * decomposed_rhs + rhs.vector.clone() * plaintext,
-            pubkey: self.public_key.mul(&lhs.pubkey, &rhs.pubkey),
+            vector: lhs.vector.clone() * decomposed_rhs.clone() + rhs.vector.clone() * plaintext,
+            pubkey: self.public_key.mul_with_decomposition(
+                &lhs.pubkey,
+                &rhs.pubkey,
+                decomposed_rhs,
+            ),
             plaintext: binary_plaintext(lhs, rhs, |left, right| left * right),
         })
     }
@@ -194,6 +198,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output, row};
     use mxx_dsl::{DslContext, Ring, Subgraph};
+    use mxx_ir_core::node::NodeKind;
 
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -298,6 +303,14 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
+        let decomposition_count = graph
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .filter(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. }))
+            .count();
+        assert_eq!(decomposition_count, 1, "the right public key is decomposed exactly once");
 
         let lhs_vector = row(&parameters, columns, 0);
         let rhs_vector = row(&parameters, columns, 1);

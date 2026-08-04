@@ -20,16 +20,13 @@ pub enum DiamondIoArtifactNameError {
 
 impl DiamondIoArtifactNames {
     pub const INJECTOR_INITIAL_STATE: &'static str = "diamond-io/injector/initial-state";
+    pub const INJECTOR_TRANSITIONS: &'static str = "diamond-io/injector/transitions";
     pub const HASH_KEY: &'static str = "diamond-io/hash-key";
     pub const SCALAR_ONE_PUBLIC_KEY: &'static str = "diamond-io/scalar/one/public-key";
     pub const SCALAR_K_PUBLIC_KEY: &'static str = "diamond-io/scalar/k/public-key";
     pub const ONE_PROJECTION: &'static str = "diamond-io/projection/one";
     pub const K_PROJECTION: &'static str = "diamond-io/projection/k";
     pub const LOOKUP_BASE_PROJECTION: &'static str = "diamond-io/projection/lookup-base";
-
-    pub fn injector_transition(level: usize, digit: usize, state: usize) -> String {
-        format!("diamond-io/injector/level/{level}/digit/{digit}/state/{state}/transition")
-    }
 
     pub fn scalar_input_public_key(bit: usize) -> String {
         format!("diamond-io/scalar/input/{bit}/public-key")
@@ -107,6 +104,7 @@ impl DiamondIoArtifactNames {
             .ok_or(DiamondIoArtifactNameError::LayoutOverflow)?;
         let mut names = vec![
             Self::INJECTOR_INITIAL_STATE.to_owned(),
+            Self::INJECTOR_TRANSITIONS.to_owned(),
             Self::HASH_KEY.to_owned(),
             Self::SCALAR_ONE_PUBLIC_KEY.to_owned(),
             Self::SCALAR_K_PUBLIC_KEY.to_owned(),
@@ -115,15 +113,6 @@ impl DiamondIoArtifactNames {
             Self::LOOKUP_BASE_PROJECTION.to_owned(),
         ];
 
-        for level in 1..=config.input_count {
-            let state_count =
-                input.state_count_at_level(level).map_err(DiamondIoConfigError::from)?;
-            for digit in 0..config.digit_base {
-                names.extend(
-                    (0..state_count).map(|state| Self::injector_transition(level, digit, state)),
-                );
-            }
-        }
         for bit in 0..input_bits {
             names.push(Self::scalar_input_public_key(bit));
             names.push(Self::input_projection(bit));

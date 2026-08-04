@@ -169,6 +169,13 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         format!("{prefix}: loop count"),
                     );
                 }
+                NodeKind::SequentialLoop(loop_spec) => {
+                    nonnegative(
+                        &mut constraints,
+                        &loop_spec.count,
+                        format!("{prefix}: sequential loop count"),
+                    );
+                }
                 NodeKind::Concat {
                     axis: ConcatAxis::Rows | ConcatAxis::Columns | ConcatAxis::Diagonal,
                 } |

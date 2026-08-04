@@ -12,7 +12,7 @@ use std::{
 
 use crate::{
     circuit::{
-        GateParamSource, PolyGate, PolyGateKind, PolyGateType, PublicLut, SlotTransferSpec,
+        GateParamSource, PolyGate, PolyGateKind, PolyGateType, PublicLutProgram, SlotTransferSpec,
         SubCircuitParamKind, SubCircuitParamSpec, SubCircuitParamValue, gate::GateId,
     },
     poly::Poly,
@@ -182,9 +182,9 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) struct LookupRegistry<P: Poly> {
+pub(crate) struct LookupRegistry {
     next_id: AtomicUsize,
-    lookups: DashMap<usize, Arc<PublicLut<P>>>,
+    lookups: DashMap<usize, Arc<PublicLutProgram>>,
 }
 
 #[derive(Debug)]
@@ -206,7 +206,7 @@ pub(crate) struct SubCircuitRegistry<P: Poly> {
     sub_circuits: DashMap<usize, Arc<PolyCircuit<P>>>,
 }
 
-impl<P: Poly> LookupRegistry<P> {
+impl LookupRegistry {
     pub(crate) fn new() -> Self {
         Self { next_id: AtomicUsize::new(0), lookups: DashMap::new() }
     }
@@ -215,7 +215,7 @@ impl<P: Poly> LookupRegistry<P> {
         self.lookups.is_empty()
     }
 
-    fn register(&self, lookup: PublicLut<P>) -> usize {
+    fn register(&self, lookup: PublicLutProgram) -> usize {
         let lut_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.lookups.insert(lut_id, Arc::new(lookup));
         lut_id
@@ -381,7 +381,7 @@ pub struct PolyCircuit<P: Poly> {
     pub(crate) output_ids: Vec<GateId>,
     pub(crate) num_input: usize,
     pub(crate) gate_counts: HashMap<PolyGateKind, usize>,
-    pub(crate) lookup_registry: Arc<LookupRegistry<P>>,
+    pub(crate) lookup_registry: Arc<LookupRegistry>,
     pub(crate) binding_registry: Arc<BindingRegistry>,
     pub(crate) input_set_registry: Arc<InputSetRegistry>,
     pub(crate) sub_circuit_registry: Arc<SubCircuitRegistry<P>>,

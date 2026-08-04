@@ -19,6 +19,25 @@ converts an unresolved `RealExpr` sigma itself.
 `Family::parallel_map`, `parallel_zip`, and `Parallel::range` create structural
 `ParallelLoop` nodes rather than expanding one body per member.
 
+Protocol builders may use crate-internal traced variants of these loop combinators to retain the
+handles of operations they just created for correctness certificates. Sealing remaps body-local
+handles and captured values to the exact sealed scope before freezing. Ordinary DSL users still
+receive only `BuiltGraph`; construction traces and the temporary freeze map are not runtime graph
+state or a second expression language.
+
+Fixed public circuit descriptions use `DslContext::int_family_input`. `parallel_gather` broadcasts
+one read-only source family and dynamically gathers one member for every zipped index. Heterogeneous
+zip bundles keep composite values such as a BGG encoding's vector, public key, and plaintext in one
+parallel iteration while still lowering every component to ordinary core wires.
+
+`Parallel::range(count).map_values` can also return `Trapdoor`. Because one trapdoor consists of a
+public matrix wire and a private trapdoor wire, the result is a `TrapdoorFamily` that keeps those
+two indexed families aligned. `public_matrices` exposes the public half, while `get`,
+`parallel_map_values`, and `parallel_zip_mat_values` feed matching trapdoors into preimage
+preprocessing without expanding a parameterized count. Persist the public half with
+`public_family_output` and the private half with `private_trapdoor_family_output`; import the pair
+with `trapdoor_family_artifact_input`.
+
 Correctness declarations use `IdealSpec::new` and `PurePredicateSpec::new`. These wrappers reject
 sampling nodes and retain a deterministic graph consumed by `mxx-correctness::ProtocolDecl`.
 There is no virtual matrix, assumption, symbolic overlay, or second expression DAG.

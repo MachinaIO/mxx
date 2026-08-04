@@ -795,7 +795,7 @@ mod tests {
         LweLookupInvocation, LweLookupPublicKeyLowering, LweLookupTable,
     };
     use mxx_dsl::{DslContext, Ring};
-    use mxx_gadgets::{PolyElem, circuit::PublicLut};
+    use mxx_gadgets::circuit::{LutExpr, PublicLutProgram};
     use mxx_ir_core::{
         IntExpr, ParamEnv,
         artifact::{ProductionId, SpecHash},
@@ -803,7 +803,7 @@ mod tests {
         types::MatrixType,
     };
     use mxx_primitives::poly::{
-        Poly as ConcretePoly, PolyParams,
+        PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
     use num_bigint::BigInt;
@@ -858,17 +858,9 @@ mod tests {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
         let transferred = circuit.slot_transfer_gate(input_gate, &[(0, None)]);
-        let lookup_id = circuit.register_public_lookup(PublicLut::new(
-            &parameters,
-            2,
-            |parameters: &DCRTPolyParams, input| {
-                Some((
-                    input,
-                    <DCRTPoly as ConcretePoly>::Elem::constant(&parameters.modulus(), input),
-                ))
-            },
-            None,
-        ));
+        let lookup_id = circuit.register_public_lookup(
+            PublicLutProgram::new(2, LutExpr::input()).expect("identity LUT"),
+        );
         let looked_up = circuit.public_lookup_gate(transferred, lookup_id);
         circuit.output([looked_up]);
 
@@ -879,9 +871,8 @@ mod tests {
             lookup: lookup_id,
             slot: None,
         };
-        let table =
-            LweLookupTable::from_public_lut(&parameters, circuit.lookup_table(lookup_id).as_ref())
-                .expect("lookup table");
+        let table = LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
+            .expect("lookup table");
         let lookup = LweLookupCompiler {
             identity,
             table,

@@ -597,6 +597,38 @@ theorem matrixConcatColumns_two_norm_le (q : Nat) (left right : Mxx.Matrix)
         centeredEntry_natAbs_le_norm right row column coefficient)
       (le_max_right _ _)
 
+/-- Binary block-diagonal concatenation only copies coefficients from one input or inserts zero,
+so its centered coefficient norm is bounded by the larger input norm. -/
+theorem matrixConcatDiagonal_two_norm_le (q : Nat) (left right : Mxx.Matrix)
+    (leftModulus : left.modulus = q) (rightModulus : right.modulus = q) :
+    Mxx.maxCenteredCoefficientNorm (Mxx.matrixConcatDiagonal [left, right]) ≤
+      max (Mxx.maxCenteredCoefficientNorm left)
+        (Mxx.maxCenteredCoefficientNorm right) := by
+  unfold Mxx.maxCenteredCoefficientNorm
+  simp only [Mxx.matrixConcatDiagonal]
+  rw [leftModulus]
+  apply coefficientNorm_le
+  intro centered centeredMember
+  obtain ⟨coefficientValue, coefficientMember, rfl⟩ := List.mem_map.mp centeredMember
+  obtain ⟨row, _, rowMember⟩ := List.mem_flatMap.mp coefficientMember
+  obtain ⟨column, _, columnMember⟩ := List.mem_flatMap.mp rowMember
+  obtain ⟨coefficient, _, rfl⟩ := List.mem_map.mp columnMember
+  by_cases inLeft : row < left.rows ∧ column < left.columns
+  · simp [Mxx.diagonalCoefficient, inLeft]
+    exact Or.inl (by simpa [Mxx.maxCenteredCoefficientNorm, leftModulus] using
+      (centeredEntry_natAbs_le_norm left row column coefficient))
+  · by_cases inRight : left.rows ≤ row ∧ row < left.rows + right.rows ∧
+        left.columns ≤ column ∧ column < left.columns + right.columns
+    · simp [Mxx.diagonalCoefficient, inLeft, inRight]
+      exact Or.inr (by simpa [Mxx.maxCenteredCoefficientNorm, leftModulus, rightModulus] using
+        (centeredEntry_natAbs_le_norm right
+          (row - left.rows) (column - left.columns) coefficient))
+    · have centeredZero : Mxx.centeredCoefficient q 0 = 0 := by
+        by_cases qZero : q = 0
+        · simp [qZero, Mxx.centeredCoefficient]
+        · simp [Mxx.centeredCoefficient, Mxx.reduceCoefficient, qZero]
+      simp [Mxx.diagonalCoefficient, inLeft, inRight, centeredZero]
+
 def addBound (left right : Nat) : Nat := left + right
 def subtractBound (left right : Nat) : Nat := left + right
 def scaleBound (scalarAbs bound : Nat) : Nat := scalarAbs * bound

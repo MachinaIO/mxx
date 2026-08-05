@@ -1,12 +1,10 @@
 //! Parameterized layered Boolean circuits represented by flattened DSL families.
 
 use mxx_dsl::{
-    BodyTraceRemapper, Bool, DslContext, DslError, EvaluateIntConstructionTrace, Family,
-    GatherConstructionTrace, Int, LoopConstructionTrace, LoopIndex, Mat, Parallel,
-    RemapConstructionTrace, Sequential, parallel_zip_bundle, parallel_zip_bundle_result,
-    parallel_zip_bundle_result_traced,
+    Bool, DslContext, DslError, Family, Int, LoopIndex, Mat, Parallel, Sequential,
+    parallel_zip_bundle, parallel_zip_bundle_result,
 };
-use mxx_ir_core::{IntExpr, ValueHandle};
+use mxx_ir_core::IntExpr;
 
 pub const BOOLEAN_INSTANCE_INPUT: &str = "boolean-instance";
 pub const BOOLEAN_WITNESS_INPUT: &str = "boolean-witness";
@@ -140,130 +138,10 @@ pub struct GateSlot {
 }
 
 pub trait BooleanLayerGate<T> {
-    type ConstructionTrace: RemapConstructionTrace;
-
     /// Builds the six candidates in opcode order: false, true, copy, not, and, xor.
     ///
     /// A single call lets handlers share common executable subexpressions across candidates.
-    fn candidates(
-        &self,
-        slot: GateSlot,
-        left: T,
-        right: T,
-    ) -> Result<([T; 6], Self::ConstructionTrace), DslError>;
-}
-
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub struct SelectConstructionTrace<const N: usize> {
-    pub selector: ValueHandle,
-    pub branches: [ValueHandle; N],
-    pub output: ValueHandle,
-}
-
-impl<const N: usize> RemapConstructionTrace for SelectConstructionTrace<N> {
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        Ok(Self {
-            selector: self.selector.remap_current_body(map)?,
-            branches: self.branches.remap_current_body(map)?,
-            output: self.output.remap_current_body(map)?,
-        })
-    }
-}
-
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub struct MatrixBooleanGateSlotConstructionTrace<G> {
-    pub opcode: ValueHandle,
-    pub left: ValueHandle,
-    pub right: ValueHandle,
-    pub gate: G,
-    pub candidate_select: SelectConstructionTrace<6>,
-    pub active_gate_count: ValueHandle,
-    pub active_select: SelectConstructionTrace<2>,
-}
-
-impl<G: RemapConstructionTrace> RemapConstructionTrace
-    for MatrixBooleanGateSlotConstructionTrace<G>
-{
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        Ok(Self {
-            opcode: self.opcode.remap_current_body(map)?,
-            left: self.left.remap_current_body(map)?,
-            right: self.right.remap_current_body(map)?,
-            gate: self.gate.remap_current_body(map)?,
-            candidate_select: self.candidate_select.remap_current_body(map)?,
-            active_gate_count: self.active_gate_count.remap_current_body(map)?,
-            active_select: self.active_select.remap_current_body(map)?,
-        })
-    }
-}
-
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub struct MatrixBooleanLayerBodyConstructionTrace<G> {
-    pub body_state: ValueHandle,
-    pub body_active_gate_counts: ValueHandle,
-    pub body_gate_kinds: ValueHandle,
-    pub body_left_sources: ValueHandle,
-    pub body_right_sources: ValueHandle,
-    pub active_gate_count: GatherConstructionTrace,
-    pub metadata: LayerMetadataConstructionTrace,
-    pub left_values: LoopConstructionTrace<GatherConstructionTrace>,
-    pub right_values: LoopConstructionTrace<GatherConstructionTrace>,
-    pub gate_slots: LoopConstructionTrace<MatrixBooleanGateSlotConstructionTrace<G>>,
-    pub body_output: ValueHandle,
-}
-
-impl<G: RemapConstructionTrace> RemapConstructionTrace
-    for MatrixBooleanLayerBodyConstructionTrace<G>
-{
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        Ok(Self {
-            body_state: self.body_state.remap_current_body(map)?,
-            body_active_gate_counts: self.body_active_gate_counts.remap_current_body(map)?,
-            body_gate_kinds: self.body_gate_kinds.remap_current_body(map)?,
-            body_left_sources: self.body_left_sources.remap_current_body(map)?,
-            body_right_sources: self.body_right_sources.remap_current_body(map)?,
-            active_gate_count: self.active_gate_count.remap_current_body(map)?,
-            metadata: self.metadata.remap_current_body(map)?,
-            left_values: self.left_values.remap_current_body(map)?,
-            right_values: self.right_values.remap_current_body(map)?,
-            gate_slots: self.gate_slots.remap_current_body(map)?,
-            body_output: self.body_output.remap_current_body(map)?,
-        })
-    }
-}
-
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub struct LayerMetadataConstructionTrace {
-    pub flattened_indices: LoopConstructionTrace<EvaluateIntConstructionTrace>,
-    pub gate_kinds: LoopConstructionTrace<GatherConstructionTrace>,
-    pub left_sources: LoopConstructionTrace<GatherConstructionTrace>,
-    pub right_sources: LoopConstructionTrace<GatherConstructionTrace>,
-}
-
-impl RemapConstructionTrace for LayerMetadataConstructionTrace {
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        Ok(Self {
-            flattened_indices: self.flattened_indices.remap_current_body(map)?,
-            gate_kinds: self.gate_kinds.remap_current_body(map)?,
-            left_sources: self.left_sources.remap_current_body(map)?,
-            right_sources: self.right_sources.remap_current_body(map)?,
-        })
-    }
-}
-
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub struct MatrixBooleanLayerConstructionTrace<G> {
-    pub initial_state: ValueHandle,
-    pub active_gate_counts: ValueHandle,
-    pub gate_kinds: ValueHandle,
-    pub left_sources: ValueHandle,
-    pub right_sources: ValueHandle,
-    pub layer_scan: LoopConstructionTrace<MatrixBooleanLayerBodyConstructionTrace<G>>,
+    fn candidates(&self, slot: GateSlot, left: T, right: T) -> Result<[T; 6], DslError>;
 }
 
 fn layer_metadata(
@@ -273,31 +151,13 @@ fn layer_metadata(
     gate_kinds: Family<Int>,
     left_sources: Family<Int>,
     right_sources: Family<Int>,
-) -> Result<
-    (Family<Int>, Family<Int>, Family<Int>, Family<Int>, LayerMetadataConstructionTrace),
-    DslError,
-> {
-    let (flattened_indices, flattened_indices_trace) =
-        Parallel::range(params.max_layer_width.clone()).map_values_traced(|slot| {
-            context.evaluate_int_traced(params.flattened_index(layer, &slot))
-        })?;
-    let (kinds, gate_kinds_trace) = gate_kinds.parallel_gather_traced(flattened_indices.clone())?;
-    let (left_indices, left_sources_trace) =
-        left_sources.parallel_gather_traced(flattened_indices.clone())?;
-    let (right_indices, right_sources_trace) =
-        right_sources.parallel_gather_traced(flattened_indices.clone())?;
-    Ok((
-        flattened_indices,
-        kinds,
-        left_indices,
-        right_indices,
-        LayerMetadataConstructionTrace {
-            flattened_indices: flattened_indices_trace,
-            gate_kinds: gate_kinds_trace,
-            left_sources: left_sources_trace,
-            right_sources: right_sources_trace,
-        },
-    ))
+) -> Result<(Family<Int>, Family<Int>, Family<Int>, Family<Int>), DslError> {
+    let flattened_indices = Parallel::range(params.max_layer_width.clone())
+        .map_values(|slot| context.evaluate_int(params.flattened_index(layer, &slot)))?;
+    let kinds = gate_kinds.parallel_gather(flattened_indices.clone())?;
+    let left_indices = left_sources.parallel_gather(flattened_indices.clone())?;
+    let right_indices = right_sources.parallel_gather(flattened_indices.clone())?;
+    Ok((flattened_indices, kinds, left_indices, right_indices))
 }
 
 pub fn evaluate_boolean_matrix_family<H>(
@@ -306,113 +166,38 @@ pub fn evaluate_boolean_matrix_family<H>(
     circuit: BooleanCircuitFamilyInputs,
     preceding: Family<Mat>,
     handler: H,
-) -> Result<(Family<Mat>, MatrixBooleanLayerConstructionTrace<H::ConstructionTrace>), DslError>
+) -> Result<Family<Mat>, DslError>
 where
     H: BooleanLayerGate<Mat> + Clone,
 {
-    let initial_state = preceding.value_handle().clone();
-    let active_gate_counts = circuit.active_gate_counts.value_handle().clone();
-    let gate_kinds = circuit.gate_kinds.value_handle().clone();
-    let left_sources = circuit.left_sources.value_handle().clone();
-    let right_sources = circuit.right_sources.value_handle().clone();
     let invariants = (
         circuit.active_gate_counts,
         (circuit.gate_kinds, (circuit.left_sources, circuit.right_sources)),
     );
-    let (final_state, layer_scan) = Sequential::range(params.depth.clone()).scan_traced(
+    Sequential::range(params.depth.clone()).scan(
         preceding,
         invariants,
         |layer, preceding, (active_gate_counts, (gate_kinds, (left_sources, right_sources)))| {
-            let active_count_index = layer.as_int();
-            let active_count_index_handle = active_count_index.value_handle().clone();
-            let active_gate_counts_handle = active_gate_counts.value_handle().clone();
-            let active_count = active_gate_counts.get(active_count_index);
-            let body_state = preceding.value_handle().clone();
-            let body_active_gate_counts = active_gate_counts.value_handle().clone();
-            let body_gate_kinds = gate_kinds.value_handle().clone();
-            let body_left_sources = left_sources.value_handle().clone();
-            let body_right_sources = right_sources.value_handle().clone();
-            let active_gate_count = GatherConstructionTrace {
-                index: active_count_index_handle,
-                sources: vec![active_gate_counts_handle],
-                outputs: vec![active_count.value_handle().clone()],
-            };
-            let (_, kinds, left_indices, right_indices, metadata) =
+            let active_count = active_gate_counts.get(layer.as_int());
+            let (_, kinds, left_indices, right_indices) =
                 layer_metadata(context, params, &layer, gate_kinds, left_sources, right_sources)?;
-            let (left_values, left_values_trace) =
-                preceding.clone().parallel_gather_traced(left_indices)?;
-            let (right_values, right_values_trace) =
-                preceding.parallel_gather_traced(right_indices)?;
+            let left_values = preceding.clone().parallel_gather(left_indices)?;
+            let right_values = preceding.parallel_gather(right_indices)?;
             let layer_handler = handler.clone();
-            let (output, gate_slots) = parallel_zip_bundle_result_traced(
+            parallel_zip_bundle_result(
                 (kinds, left_values, right_values),
                 move |index, (kind, left, right)| {
                     let slot = GateSlot { layer: layer.clone(), index: index.clone() };
-                    let opcode = kind.value_handle().clone();
-                    let left_handle = left.value_handle().clone();
-                    let right_handle = right.value_handle().clone();
-                    let (candidates, gate) = layer_handler.candidates(slot, left, right)?;
+                    let candidates = layer_handler.candidates(slot, left, right)?;
                     let constant_false = candidates[0].clone();
-                    let candidate_handles =
-                        candidates.each_ref().map(|value| value.value_handle().clone());
                     let selected = kind.select(candidates.into_iter().collect())?;
                     let active =
                         index.as_int().less_equal(active_count.clone().sub(Int::constant(1)));
-                    let active = active.to_int();
-                    let active_selector = active.value_handle().clone();
-                    let active_branches =
-                        [constant_false.value_handle().clone(), selected.value_handle().clone()];
-                    let output = active.select(vec![constant_false, selected])?;
-                    Ok((
-                        output.clone(),
-                        MatrixBooleanGateSlotConstructionTrace {
-                            opcode: opcode.clone(),
-                            left: left_handle,
-                            right: right_handle,
-                            gate,
-                            candidate_select: SelectConstructionTrace {
-                                selector: opcode,
-                                branches: candidate_handles,
-                                output: active_branches[1].clone(),
-                            },
-                            active_gate_count: active_count.value_handle().clone(),
-                            active_select: SelectConstructionTrace {
-                                selector: active_selector,
-                                branches: active_branches,
-                                output: output.value_handle().clone(),
-                            },
-                        },
-                    ))
+                    active.to_int().select(vec![constant_false, selected])
                 },
-            )?;
-            let body_output = output.value_handle().clone();
-            Ok((
-                output,
-                MatrixBooleanLayerBodyConstructionTrace {
-                    body_state,
-                    body_active_gate_counts,
-                    body_gate_kinds,
-                    body_left_sources,
-                    body_right_sources,
-                    active_gate_count,
-                    metadata,
-                    left_values: left_values_trace,
-                    right_values: right_values_trace,
-                    gate_slots,
-                    body_output,
-                },
-            ))
+            )
         },
-    )?;
-    let trace = MatrixBooleanLayerConstructionTrace {
-        initial_state,
-        active_gate_counts,
-        gate_kinds,
-        left_sources,
-        right_sources,
-        layer_scan,
-    };
-    Ok((final_state, trace))
+    )
 }
 
 pub fn evaluate_boolean_family(
@@ -430,7 +215,7 @@ pub fn evaluate_boolean_family(
         invariants,
         |layer, preceding, (active_gate_counts, (gate_kinds, (left_sources, right_sources)))| {
             let active_count = active_gate_counts.get(layer.as_int());
-            let (_, kinds, left_indices, right_indices, _) =
+            let (_, kinds, left_indices, right_indices) =
                 layer_metadata(context, params, &layer, gate_kinds, left_sources, right_sources)?;
             let left_values = preceding.clone().parallel_gather(left_indices)?;
             let right_values = preceding.parallel_gather(right_indices)?;
@@ -535,7 +320,7 @@ pub fn boolean_circuit_validity_predicate(
          (previous_validity, previous_width),
          (active_gate_counts, (gate_kinds, (left_sources, right_sources)))| {
             let active_count = active_gate_counts.get(layer.as_int());
-            let (_, kinds, left, right, _) =
+            let (_, kinds, left, right) =
                 layer_metadata(&context, &params, &layer, gate_kinds, left_sources, right_sources)?;
             let records = parallel_zip_bundle((kinds, left, right), {
                 let active_count = active_count.clone();

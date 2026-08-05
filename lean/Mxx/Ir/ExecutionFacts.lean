@@ -36,18 +36,43 @@ private theorem lookupWire_zipIdx
       | zero => simp [lookupWire]
       | succ port =>
           simp only [List.zipIdx, List.map_cons, lookupWire]
-          split
-          · rename_i same
+          have different :
+              (⟨nodeId, start⟩ : WireRef) ≠ ⟨nodeId, start + (port + 1)⟩ := by
+            intro same
             have portsEqual := congrArg WireRef.port same
-            simp at portsEqual
-          · simpa [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
-              induction (start + 1) port
+            simp only at portsEqual
+            omega
+          rw [if_neg different]
+          simpa only [List.getElem?_cons_succ, Nat.add_assoc, Nat.add_comm,
+            Nat.add_left_comm] using induction (start + 1) port
+
+private theorem lookupWire_zipIdx_node_ne
+    (nodeId otherNode start port : Nat)
+    (values : List Value)
+    (different : otherNode ≠ nodeId) :
+    lookupWire ⟨otherNode, port⟩
+      (values.zipIdx start |>.map fun (value, index) => (⟨nodeId, index⟩, value)) = none := by
+  induction values generalizing start port with
+  | nil => rfl
+  | cons head tail induction =>
+      simp only [List.zipIdx, List.map_cons, lookupWire]
+      split
+      · rename_i same
+        exact (different (congrArg WireRef.node same).symm).elim
+      · exact induction (start := start + 1) (port := port)
 
 theorem lookupWire_bindOutputs
     (nodeId port : Nat) (values : List Value) (inBounds : port < values.length) :
     lookupWire ⟨nodeId, port⟩ (bindOutputs nodeId values) = some values[port] := by
   rw [show some values[port] = values[port]? from (List.getElem?_eq_getElem inBounds).symm]
   simpa [bindOutputs] using lookupWire_zipIdx nodeId 0 port values
+
+theorem lookupWire_bindOutputs_of_node_ne
+    (nodeId otherNode port : Nat)
+    (values : List Value)
+    (different : otherNode ≠ nodeId) :
+    lookupWire ⟨otherNode, port⟩ (bindOutputs nodeId values) = none := by
+  simpa [bindOutputs] using lookupWire_zipIdx_node_ne nodeId otherNode 0 port values different
 
 theorem lookupWire_append_bindOutputs
     {state : WireEnvironment} {nodeId port : Nat} {values : List Value}
@@ -77,6 +102,50 @@ theorem EvaluatesNodesPath.outputAtHead
       refine ⟨values, valuesMember, fun portValid ↦ ?_⟩
       apply tail.lookupWire_preserved
       exact lookupWire_append_bindOutputs fresh portValid
+
+/-- A concrete SSA path cannot bind a wire whose node identifier lies at or after the end of the
+path. This discharges output freshness mechanically; callers of certificate soundness never
+supply a freshness or per-node soundness callback. -/
+theorem EvaluatesNodesPath.lookupWire_after_end
+    {runChild : ChildRunner} {samplers : MxxSamplerFamily}
+    {params : ParamEnvironment} {inputs : Environment}
+    {nodeId : Nat} {nodes : List Node} {state output : WireEnvironment}
+    (path : EvaluatesNodesPath runChild samplers params inputs nodeId nodes state output)
+    (targetNode port : Nat)
+    (after : nodeId + nodes.length ≤ targetNode)
+    (initialMissing : lookupWire ⟨targetNode, port⟩ state = none) :
+    lookupWire ⟨targetNode, port⟩ output = none := by
+  induction path with
+  | nil => exact initialMissing
+  | @cons current node tail currentState values final valuesMember tailPath induction =>
+      have tailAfter : current + 1 + tail.length ≤ targetNode := by
+        simp only [List.length_cons] at after
+        omega
+      have different : targetNode ≠ current := by omega
+      apply induction tailAfter
+      · rw [lookupWire_append_of_eq_none initialMissing]
+        exact lookupWire_bindOutputs_of_node_ne current targetNode port values different
+
+/-- A path starting strictly after a wire's node identifier cannot change that wire's lookup.
+This is the reverse bridge needed to recover node arguments from the selected final SSA state. -/
+theorem EvaluatesNodesPath.lookupWire_before_start
+    {runChild : ChildRunner} {samplers : MxxSamplerFamily}
+    {params : ParamEnvironment} {inputs : Environment}
+    {nodeId : Nat} {nodes : List Node} {state output : WireEnvironment}
+    (path : EvaluatesNodesPath runChild samplers params inputs nodeId nodes state output)
+    (targetNode port : Nat)
+    (before : targetNode < nodeId) :
+    lookupWire ⟨targetNode, port⟩ output = lookupWire ⟨targetNode, port⟩ state := by
+  induction path with
+  | nil => rfl
+  | @cons current node tail currentState values final valuesMember tailPath induction =>
+      rw [induction (by omega)]
+      cases resolved : lookupWire ⟨targetNode, port⟩ currentState with
+      | some value =>
+          exact lookupWire_append_of_eq_some resolved
+      | none =>
+          rw [lookupWire_append_of_eq_none resolved]
+          exact lookupWire_bindOutputs_of_node_ne current targetNode port values (by omega)
 
 theorem mem_evaluateNode_input
     (runChild : ChildRunner) (samplers : MxxSamplerFamily)

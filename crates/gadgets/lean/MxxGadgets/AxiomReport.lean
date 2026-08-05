@@ -1,0 +1,9 @@
+import MxxGadgets.Proofs.InputInjector
+
+#print axioms MxxGadgets.InputInjector.transition_affine
+#print axioms MxxGadgets.InputInjector.projection_affine
+#print axioms MxxGadgets.InputInjector.ValidatedInputInjectorFacts.transitionsArtifact_source_value
+#print axioms MxxGadgets.InputInjector.sequential_scan_preserves
+#print axioms MxxGadgets.InputInjector.sampled_transition_contract
+#print axioms MxxGadgets.InputInjector.projectInputInjectorFacts_validated
+#print axioms MxxGadgets.InputInjector.validated_input_injector_end_to_end

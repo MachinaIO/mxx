@@ -42,9 +42,9 @@ separate projection used by the final decoder.
 
 ## Correctness and parameters
 
-The end-to-end Lean correctness theorem is still in progress. The generated family, structural
-certificate verification, hard-bound algebra, and executable parameter checker are available for
-review, while the unfinished execution bridges are excluded from the normal `MxxWe` build. The
+The end-to-end Lean correctness theorem is still in progress. The generated closed protocol,
+registered-rule analysis, hard-bound algebra, and executable parameter checker are available for
+review, while the unfinished endpoint composition is excluded from the normal `MxxWe` build. The
 precise boundary and review commands are documented in `docs/diamond-we-correctness-status.md`.
 
 `DiamondWeProtocolFamily::protocol_decl` returns a validated `WitnessEncryptionProtocolDecl`. The

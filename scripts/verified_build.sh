@@ -7,10 +7,12 @@ trap 'rm -rf "${scratch}"' EXIT
 
 cd "${workspace_root}"
 
-MXX_CORRECTNESS_OUT_DIR="${scratch}/correctness" \
+MXX_REGENERATE_CORRECTNESS=1 \
+    MXX_CORRECTNESS_OUT_DIR="${scratch}/correctness" \
     cargo run -p mxx-correctness --example emit_correctness
 
-MXX_CORRECTNESS_OUT_DIR="${scratch}/we" \
+MXX_REGENERATE_CORRECTNESS=1 \
+    MXX_CORRECTNESS_OUT_DIR="${scratch}/we" \
     cargo run -p mxx-we --example emit_correctness
 
 diff -ru \
@@ -23,8 +25,10 @@ diff -ru \
 
 (
     cd lean
-    lake build Mxx MxxCorrectness MxxWe mxx_diamond_checker
+    lake build Mxx MxxCorrectness MxxWe mxx_diamond_checker mxx_analysis_facts
 )
 
-cargo run -p mxx-correctness --example verify_correctness
+lean/.lake/build/bin/mxx_analysis_facts target/correctness/m0-analysis-facts.json
+python3 scripts/audit_correctness_ir.py --check
+
 cargo build --workspace "$@"

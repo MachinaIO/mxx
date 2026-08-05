@@ -26,7 +26,9 @@ encryption and iO protocol modules remain disabled.
 Owns polynomial and matrix representations, OpenFHE integration, concrete sampling, and native
 CUDA. CPU Gaussian sampling resamples individual coefficients outside the authoritative integer
 cutoff. CPU preimage sampling rejects a whole candidate outside its cutoff so `B * K = P` is
-preserved. GPU enforcement is not yet part of runtime correspondence.
+preserved. GPU Gaussian sampling enforces the same cutoff per coefficient in CUDA. Batched GPU
+preimage sampling rejects a whole GPU-generated candidate after full-CRT centered-norm checking,
+preserving both the preimage equation and the authoritative cutoff.
 
 ### `mxx-ir-core`
 
@@ -49,8 +51,8 @@ transcripts, sessions, artifacts, and bounded parallel waves.
 
 ### `mxx-correctness`
 
-The library validates linked workflow declarations, emits checked-in Lean terms and statements,
-and verifies theorem hashes and axiom dependencies. Emission is mechanical from `ProtocolDecl`;
+The library validates linked workflow declarations, emits checked-in Lean closed-protocol terms,
+and verifies source, workflow, and toolkit hashes together with theorem axiom dependencies. Emission is mechanical from `ProtocolDecl`;
 generated IR contains a Lean constructor tree, not an embedded JSON string. Each crate owns its
 protocol declarations, generated Lean modules, proofs, and small generation and verification
 examples. There is no central protocol registry or parameter-check executable. The shared Lean

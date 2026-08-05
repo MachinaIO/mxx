@@ -12,8 +12,7 @@ pub use boolean::{
 };
 pub use boolean_dsl::{
     BOOLEAN_INSTANCE_INPUT, BOOLEAN_WITNESS_INPUT, BooleanCircuitFamilyInputs,
-    BooleanCircuitFamilyParams, BooleanLayerGate, GateSlot, LayerMetadataConstructionTrace,
-    MatrixBooleanLayerConstructionTrace, boolean_circuit_satisfaction_predicate,
+    BooleanCircuitFamilyParams, BooleanLayerGate, GateSlot, boolean_circuit_satisfaction_predicate,
     boolean_circuit_validity_predicate, evaluate_boolean_family, evaluate_boolean_matrix_family,
     select_boolean_matrix_output, select_boolean_output,
 };

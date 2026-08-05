@@ -244,12 +244,16 @@ unsafe extern "C" {
         out: *mut GpuMatrixOpaque,
         dist_type: c_int,
         sigma: f64,
+        max_coefficient_bound: u64,
+        coefficient_modulus: u64,
         seed: GpuRngSeed,
     ) -> c_int;
     pub(crate) fn gpu_matrix_sample_distribution_columns(
         out: *mut GpuMatrixOpaque,
         dist_type: c_int,
         sigma: f64,
+        max_coefficient_bound: u64,
+        coefficient_modulus: u64,
         seed: GpuRngSeed,
         full_ncol: usize,
         col_offset: usize,

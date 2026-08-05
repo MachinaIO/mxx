@@ -159,14 +159,14 @@ where
             })
             .collect();
     }
-    // Device-side cutoff enforcement is intentionally deferred. GPU execution is excluded from
-    // concrete-runtime correspondence until bounded GPU preimage sampling lands.
     PolyBackend::<M, U, H, T>::validate_regular_gadget_layout(
         parameters,
         &first.gadget_base,
         first.digit_count,
     )?;
     let sampler = T::new(parameters, first.sigma);
+    let max_coefficient_bound =
+        first.max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
     let batched = requests
         .iter()
         .enumerate()
@@ -176,6 +176,7 @@ where
             trapdoor: request.trapdoor.as_ref(),
             public_matrix: request.public.as_ref(),
             target: request.target.as_ref().clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
         })
         .collect();
     let mut results = sampler.preimage_batched_sharded(batched);

@@ -4,7 +4,8 @@
 
 use mxx_ir_core::{
     CapturePolicy, CompileParameter, CompileParameterKind, FreezeError, Graph, GraphOutput,
-    IntExpr, NodeHandle, ParamEnv, RealExpr, SealMap, SealedSubgraph, SubgraphHandle, ValueHandle,
+    IntExpr, NodeHandle, ParamEnv, RealExpr, ScopedWireRef, SealMap, SealedSubgraph,
+    SubgraphHandle, ValueHandle,
     artifact::{ArtifactConfidentiality, ProductionId},
     graph::with_new_construction_scope,
     node::{
@@ -15,7 +16,7 @@ use mxx_ir_core::{
 };
 use std::{
     cell::Cell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ops::{Add, Mul, Neg, Sub},
 };
 use thiserror::Error;
@@ -64,253 +65,8 @@ pub enum DslError {
     NonPureSpecification,
     #[error("a pure predicate must have exactly one boolean output")]
     PredicateOutput,
-    #[error(
-        "a construction trace value does not belong to the body being sealed or one of its captures"
-    )]
-    TraceRemap,
-}
-
-/// Resolves handles retained while a closure body was being constructed to
-/// the handles that occur in the sealed child scope.
-#[doc(hidden)]
-pub struct BodyTraceRemapper<'a> {
-    local: &'a SealMap,
-    captures: &'a [mxx_ir_core::CapturedValue],
-}
-
-impl<'a> BodyTraceRemapper<'a> {
-    fn new(sealed: &'a SealedSubgraph) -> Self {
-        Self { local: &sealed.remap, captures: &sealed.captures }
-    }
-
-    pub fn remap_value(&self, value: &ValueHandle) -> Result<ValueHandle, DslError> {
-        if let Some(remapped) = self.local.resolve(value) {
-            return Ok(remapped.clone());
-        }
-        self.captures
-            .iter()
-            .find(|capture| capture.outer == *value)
-            .map(|capture| capture.placeholder.clone())
-            .ok_or(DslError::TraceRemap)
-    }
-}
-
-/// Construction-only remapping for fields created in the current closure
-/// body. Implementations must remap every raw handle exactly once.
-#[doc(hidden)]
-pub trait RemapConstructionTrace: Sized {
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError>;
-}
-
-impl RemapConstructionTrace for () {
-    fn remap_current_body(self, _map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        Ok(self)
-    }
-}
-
-impl RemapConstructionTrace for ValueHandle {
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        map.remap_value(&self)
-    }
-}
-
-impl<T: RemapConstructionTrace> RemapConstructionTrace for Option<T> {
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        self.map(|value| value.remap_current_body(map)).transpose()
-    }
-}
-
-impl<T: RemapConstructionTrace> RemapConstructionTrace for Vec<T> {
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        self.into_iter().map(|value| value.remap_current_body(map)).collect()
-    }
-}
-
-impl<T: RemapConstructionTrace> RemapConstructionTrace for Box<T> {
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        Ok(Box::new((*self).remap_current_body(map)?))
-    }
-}
-
-impl<T: RemapConstructionTrace, const N: usize> RemapConstructionTrace for [T; N] {
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        let values = self
-            .into_iter()
-            .map(|value| value.remap_current_body(map))
-            .collect::<Result<Vec<_>, _>>()?;
-        match values.try_into() {
-            Ok(values) => Ok(values),
-            Err(_) => unreachable!("an array iterator preserves its length"),
-        }
-    }
-}
-
-macro_rules! construction_trace_tuple {
-    ($(($($type:ident $field:tt),+)),+ $(,)?) => {
-        $(
-            impl<$($type: RemapConstructionTrace),+> RemapConstructionTrace for ($($type,)+) {
-                fn remap_current_body(
-                    self,
-                    map: &BodyTraceRemapper<'_>,
-                ) -> Result<Self, DslError> {
-                    Ok(($(self.$field.remap_current_body(map)?,)+))
-                }
-            }
-        )+
-    };
-}
-
-construction_trace_tuple! {
-    (A 0, B 1),
-    (A 0, B 1, C 2),
-    (A 0, B 1, C 2, D 3),
-    (A 0, B 1, C 2, D 3, E 4),
-    (A 0, B 1, C 2, D 3, E 4, F 5),
-}
-
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct SealedCaptureTrace {
-    pub parent_source: ValueHandle,
-    pub child_placeholder: ValueHandle,
-}
-
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct SealedScopeTrace<T> {
-    pub body: T,
-    pub captures: Vec<SealedCaptureTrace>,
-}
-
-impl<T> SealedScopeTrace<T> {
-    fn remap_parent_sources(mut self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        for capture in &mut self.captures {
-            capture.parent_source = map.remap_value(&capture.parent_source)?;
-        }
-        Ok(self)
-    }
-}
-
-impl<T> RemapConstructionTrace for SealedScopeTrace<T> {
-    fn remap_current_body(self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        self.remap_parent_sources(map)
-    }
-}
-
-/// Exact construction handles for one structural loop and its already-sealed
-/// child scope.
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct LoopConstructionTrace<T> {
-    pub outputs: Vec<ValueHandle>,
-    pub scope: SealedScopeTrace<T>,
-}
-
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct GatherConstructionTrace {
-    pub index: ValueHandle,
-    pub sources: Vec<ValueHandle>,
-    pub outputs: Vec<ValueHandle>,
-}
-
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct EvaluateIntConstructionTrace {
-    /// The raw `EvaluateInt` output before ordinary family-compatible materialization.
-    pub expression: ValueHandle,
-    /// The existing zero operand used by `DslContext::evaluate_int`.
-    pub zero: ValueHandle,
-    /// The existing `expression + zero` result returned by `DslContext::evaluate_int`.
-    pub output: ValueHandle,
-}
-
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct SelectConstructionTrace {
-    pub selector: ValueHandle,
-    pub branches: Vec<ValueHandle>,
-    pub output: ValueHandle,
-}
-
-/// Construction trace for one outer segment of little-endian bit packing.
-/// The nested scan carries `(sum, weight)` and the outer output is its final
-/// sum component.
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct PackedBitsConstructionTrace {
-    pub scan: LoopConstructionTrace<Vec<ValueHandle>>,
-    pub output: ValueHandle,
-}
-
-impl RemapConstructionTrace for PackedBitsConstructionTrace {
-    fn remap_current_body(mut self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        self.scan = self.scan.remap_current_body(map)?;
-        self.output = map.remap_value(&self.output)?;
-        Ok(self)
-    }
-}
-
-impl RemapConstructionTrace for SelectConstructionTrace {
-    fn remap_current_body(mut self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        self.selector = map.remap_value(&self.selector)?;
-        self.branches = self.branches.remap_current_body(map)?;
-        self.output = map.remap_value(&self.output)?;
-        Ok(self)
-    }
-}
-
-impl RemapConstructionTrace for EvaluateIntConstructionTrace {
-    fn remap_current_body(mut self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        self.expression = map.remap_value(&self.expression)?;
-        self.zero = map.remap_value(&self.zero)?;
-        self.output = map.remap_value(&self.output)?;
-        Ok(self)
-    }
-}
-
-impl RemapConstructionTrace for GatherConstructionTrace {
-    fn remap_current_body(mut self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        self.index = map.remap_value(&self.index)?;
-        self.sources = self.sources.remap_current_body(map)?;
-        self.outputs = self.outputs.remap_current_body(map)?;
-        Ok(self)
-    }
-}
-
-impl<T> RemapConstructionTrace for LoopConstructionTrace<T> {
-    fn remap_current_body(mut self, map: &BodyTraceRemapper<'_>) -> Result<Self, DslError> {
-        self.outputs = self.outputs.remap_current_body(map)?;
-        self.scope = self.scope.remap_parent_sources(map)?;
-        Ok(self)
-    }
-}
-
-fn finish_scope_trace<T: RemapConstructionTrace>(
-    sealed: &SealedSubgraph,
-    raw: T,
-) -> Result<SealedScopeTrace<T>, DslError> {
-    let body = raw.remap_current_body(&BodyTraceRemapper::new(sealed))?;
-    let captures = sealed
-        .captures
-        .iter()
-        .map(|capture| SealedCaptureTrace {
-            parent_source: capture.outer.clone(),
-            child_placeholder: capture.placeholder.clone(),
-        })
-        .collect();
-    Ok(SealedScopeTrace { body, captures })
-}
-
-fn loop_construction_trace<T: RemapConstructionTrace>(
-    node: &NodeHandle,
-    sealed: &SealedSubgraph,
-    raw: T,
-) -> Result<LoopConstructionTrace<T>, DslError> {
-    let outputs = (0..node.output_types().len())
-        .map(|port| node.output(port as u32).expect("known loop output port"))
-        .collect();
-    Ok(LoopConstructionTrace { outputs, scope: finish_scope_trace(sealed, raw)? })
+    #[error("semantic anchor could not be resolved in the frozen graph: {0}")]
+    SemanticAnchorResolution(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -1387,18 +1143,10 @@ impl TrapdoorFamily {
     }
 
     pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError> {
-        self.parallel_gather_traced(indices).map(|(family, _)| family)
-    }
-
-    #[doc(hidden)]
-    pub fn parallel_gather_traced(
-        self,
-        indices: Family<Int>,
-    ) -> Result<(Self, LoopConstructionTrace<GatherConstructionTrace>), DslError> {
         let source_count = self.count.clone();
         let output_count = indices.count.clone();
         let schema = self.element_schema.clone();
-        let (index_slot, (body_value, raw_trace, explicit_inputs, scope)) = with_loop_index(|_| {
+        let (index_slot, (body_value, explicit_inputs, scope)) = with_loop_index(|_| {
             with_new_construction_scope(|scope| {
                 let index = IntType.placeholders();
                 let public = Family::<Mat>::source_input(
@@ -1417,12 +1165,7 @@ impl TrapdoorFamily {
                 let mut explicit_inputs = vec![index.value.clone()];
                 explicit_inputs.extend(source.flatten());
                 let output = source.get(index.clone());
-                let raw_trace = GatherConstructionTrace {
-                    index: index.value,
-                    sources: source.flatten(),
-                    outputs: output.flatten(),
-                };
-                (output, raw_trace, explicit_inputs, scope)
+                (output, explicit_inputs, scope)
             })
         });
         let sealed = SubgraphHandle::seal(
@@ -1453,9 +1196,7 @@ impl TrapdoorFamily {
             self.pending,
             body_value.pending().remap(&sealed.remap),
         ]);
-        let family = body_value.parallel_families(&node, &mut 0, &output_count, pending)?;
-        let trace = loop_construction_trace(&node, &sealed, raw_trace)?;
-        Ok((family, trace))
+        body_value.parallel_families(&node, &mut 0, &output_count, pending)
     }
 
     pub fn parallel_map_values<R: ParallelOutput>(
@@ -1503,35 +1244,22 @@ impl TrapdoorFamily {
         matrices: Family<Mat>,
         body: impl FnOnce(LoopIndex, Trapdoor, Mat) -> R,
     ) -> Result<R::Families, DslError> {
-        self.parallel_zip_mat_values_traced(matrices, |index, trapdoor, matrix| {
-            (body(index, trapdoor, matrix), ())
-        })
-        .map(|(families, _)| families)
-    }
-
-    #[doc(hidden)]
-    pub fn parallel_zip_mat_values_traced<R: ParallelOutput, T: RemapConstructionTrace>(
-        self,
-        matrices: Family<Mat>,
-        body: impl FnOnce(LoopIndex, Trapdoor, Mat) -> (R, T),
-    ) -> Result<(R::Families, LoopConstructionTrace<T>), DslError> {
         if self.count != matrices.count {
             return Err(DslError::FamilyCountMismatch);
         }
         let count = self.count.clone();
         let trapdoor_schema = self.element_schema.clone();
         let matrix_schema = MatType(matrices.element_schema.matrix_type.clone());
-        let (index_slot, (body_value, raw_trace, explicit_inputs, scope)) =
-            with_loop_index(|index| {
-                with_new_construction_scope(|scope| {
-                    let trapdoor = trapdoor_schema.placeholders();
-                    let matrix = matrix_schema.placeholders();
-                    let mut explicit_inputs = trapdoor.flatten();
-                    explicit_inputs.extend(matrix.flatten());
-                    let (body_value, raw_trace) = body(index, trapdoor, matrix);
-                    (body_value, raw_trace, explicit_inputs, scope)
-                })
-            });
+        let (index_slot, (body_value, explicit_inputs, scope)) = with_loop_index(|index| {
+            with_new_construction_scope(|scope| {
+                let trapdoor = trapdoor_schema.placeholders();
+                let matrix = matrix_schema.placeholders();
+                let mut explicit_inputs = trapdoor.flatten();
+                explicit_inputs.extend(matrix.flatten());
+                let body_value = body(index, trapdoor, matrix);
+                (body_value, explicit_inputs, scope)
+            })
+        });
         let sealed = SubgraphHandle::seal(
             "parallel-zip-trapdoor-mat-body",
             scope,
@@ -1560,9 +1288,7 @@ impl TrapdoorFamily {
             matrices.pending,
             body_value.pending().remap(&sealed.remap),
         ]);
-        let families = body_value.parallel_families(&node, &mut 0, &count, pending)?;
-        let trace = loop_construction_trace(&node, &sealed, raw_trace)?;
-        Ok((families, trace))
+        body_value.parallel_families(&node, &mut 0, &count, pending)
     }
 }
 
@@ -1778,30 +1504,8 @@ impl Family<Bool> {
         scalar_parallel_map(self, "parallel-map-bool-body", WireType::Bool, body)
     }
 
-    #[doc(hidden)]
-    pub fn parallel_map_traced<T: RemapConstructionTrace>(
-        self,
-        body: impl FnOnce(LoopIndex, Bool) -> (Bool, T),
-    ) -> Result<(Self, LoopConstructionTrace<T>), DslError> {
-        scalar_parallel_map_traced(self, "parallel-map-bool-body", WireType::Bool, body)
-    }
-
     pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError> {
         scalar_parallel_gather(
-            self,
-            indices,
-            "parallel-gather-bool-body",
-            WireType::Bool,
-            |value, pending| Bool { value, pending },
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn parallel_gather_traced(
-        self,
-        indices: Family<Int>,
-    ) -> Result<(Self, LoopConstructionTrace<GatherConstructionTrace>), DslError> {
-        scalar_parallel_gather_traced(
             self,
             indices,
             "parallel-gather-bool-body",
@@ -1831,30 +1535,8 @@ impl Family<Int> {
         scalar_parallel_map(self, "parallel-map-int-body", WireType::Int, body)
     }
 
-    #[doc(hidden)]
-    pub fn parallel_map_traced<T: RemapConstructionTrace>(
-        self,
-        body: impl FnOnce(LoopIndex, Int) -> (Int, T),
-    ) -> Result<(Self, LoopConstructionTrace<T>), DslError> {
-        scalar_parallel_map_traced(self, "parallel-map-int-body", WireType::Int, body)
-    }
-
     pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError> {
         scalar_parallel_gather(
-            self,
-            indices,
-            "parallel-gather-int-body",
-            WireType::Int,
-            |value, pending| Int { value, pending },
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn parallel_gather_traced(
-        self,
-        indices: Family<Int>,
-    ) -> Result<(Self, LoopConstructionTrace<GatherConstructionTrace>), DslError> {
-        scalar_parallel_gather_traced(
             self,
             indices,
             "parallel-gather-int-body",
@@ -1873,16 +1555,6 @@ impl Family<Int> {
         segment_count: impl Into<IntExpr>,
         bits_per_segment: impl Into<IntExpr>,
     ) -> Result<Self, DslError> {
-        self.parallel_pack_little_endian_bits_traced(segment_count, bits_per_segment)
-            .map(|(family, _)| family)
-    }
-
-    #[doc(hidden)]
-    pub fn parallel_pack_little_endian_bits_traced(
-        self,
-        segment_count: impl Into<IntExpr>,
-        bits_per_segment: impl Into<IntExpr>,
-    ) -> Result<(Self, LoopConstructionTrace<PackedBitsConstructionTrace>), DslError> {
         let segment_count = segment_count.into();
         let bits_per_segment = bits_per_segment.into();
         let expected_count =
@@ -1925,7 +1597,7 @@ impl Family<Int> {
                     pending: Pending::default(),
                 };
                 Sequential::range(bits_per_segment.clone())
-                    .scan_traced(
+                    .scan(
                         (Int::constant(0), Int::constant(1)),
                         source.clone(),
                         move |bit, (sum, weight), source| {
@@ -1933,25 +1605,13 @@ impl Family<Int> {
                             let value = source.get(source_index);
                             let next_sum = sum.add(value.mul(weight.clone()));
                             let next_weight = weight.mul(Int::constant(2));
-                            let body_outputs = vec![
-                                next_sum.value_handle().clone(),
-                                next_weight.value_handle().clone(),
-                            ];
-                            Ok(((next_sum, next_weight), body_outputs))
+                            Ok((next_sum, next_weight))
                         },
                     )
-                    .map(|((sum, _), scan)| {
-                        let output = sum.value_handle().clone();
-                        (
-                            sum,
-                            PackedBitsConstructionTrace { scan, output },
-                            vec![source.value],
-                            scope,
-                        )
-                    })
+                    .map(|(sum, _)| (sum, vec![source.value], scope))
             })
         });
-        let (body_value, body_trace, explicit_inputs, scope) = body_result?;
+        let (body_value, explicit_inputs, scope) = body_result?;
         let sealed = SubgraphHandle::seal(
             "parallel-pack-little-endian-bits-body",
             scope,
@@ -1979,23 +1639,13 @@ impl Family<Int> {
             },
         );
         let pending = Pending::merge([self.pending, body_value.pending().remap(&sealed.remap)]);
-        let trace = loop_construction_trace(&node, &sealed, body_trace)?;
-        let family = body_value.parallel_families(&node, &mut 0, &segment_count, pending)?;
-        Ok((family, trace))
+        body_value.parallel_families(&node, &mut 0, &segment_count, pending)
     }
 
     pub fn parallel_select_mats(
         self,
         candidates: Vec<Family<Mat>>,
     ) -> Result<Family<Mat>, DslError> {
-        self.parallel_select_mats_traced(candidates).map(|(family, _)| family)
-    }
-
-    #[doc(hidden)]
-    pub fn parallel_select_mats_traced(
-        self,
-        candidates: Vec<Family<Mat>>,
-    ) -> Result<(Family<Mat>, LoopConstructionTrace<SelectConstructionTrace>), DslError> {
         let Some(first) = candidates.first() else {
             return Err(DslError::Schema);
         };
@@ -2017,19 +1667,10 @@ impl Family<Int> {
                     .collect::<Vec<_>>();
                 let mut inputs = selector.flatten();
                 inputs.extend(branches.iter().flat_map(GraphValue::flatten));
-                let selector_handle = selector.value.clone();
-                let branch_handles = branches.iter().flat_map(GraphValue::flatten).collect();
-                selector.select(branches).map(|output| {
-                    let trace = SelectConstructionTrace {
-                        selector: selector_handle,
-                        branches: branch_handles,
-                        output: output.value.clone(),
-                    };
-                    (output, trace, inputs, scope)
-                })
+                selector.select(branches).map(|output| (output, inputs, scope))
             })
         });
-        let (body_value, raw_trace, explicit_inputs, scope) = body_result?;
+        let (body_value, explicit_inputs, scope) = body_result?;
         let sealed = SubgraphHandle::seal(
             "parallel-select-mats-body",
             scope,
@@ -2059,9 +1700,7 @@ impl Family<Int> {
                 .chain(candidates.into_iter().map(|candidate| candidate.pending))
                 .chain(std::iter::once(body_value.pending().remap(&sealed.remap))),
         );
-        let family = body_value.parallel_families(&node, &mut 0, &count, pending)?;
-        let trace = loop_construction_trace(&node, &sealed, raw_trace)?;
-        Ok((family, trace))
+        body_value.parallel_families(&node, &mut 0, &count, pending)
     }
 }
 
@@ -2221,34 +1860,17 @@ where
     T: ParallelOutput<Families = Family<T>> + FamilyElement + GraphValue + Clone,
     T::Schema: GraphValueSchema<Value = T>,
 {
-    scalar_parallel_map_traced(family, body_name, wire_type, |index, value| {
-        (body(index, value), ())
-    })
-    .map(|(family, _)| family)
-}
-
-fn scalar_parallel_map_traced<T, U>(
-    family: Family<T>,
-    body_name: &'static str,
-    wire_type: WireType,
-    body: impl FnOnce(LoopIndex, T) -> (T, U),
-) -> Result<(Family<T>, LoopConstructionTrace<U>), DslError>
-where
-    T: ParallelOutput<Families = Family<T>> + FamilyElement + GraphValue + Clone,
-    T::Schema: GraphValueSchema<Value = T>,
-    U: RemapConstructionTrace,
-{
     let count = family.count.clone();
     let schema = family.element_schema.schema();
-    let (index_slot, (body_value, raw_trace, explicit_input, scope)) = with_loop_index(|index| {
+    let (index_slot, (body_value, explicit_input, scope)) = with_loop_index(|index| {
         with_new_construction_scope(|scope| {
             let input = schema.placeholders();
             let input_values = input.flatten();
             let [input_value] = input_values.as_slice() else {
                 panic!("scalar family item schema must contain one value")
             };
-            let (output, raw_trace) = body(index, input);
-            (output.normalize_for_family(), raw_trace, input_value.clone(), scope)
+            let output = body(index, input);
+            (output.normalize_for_family(), input_value.clone(), scope)
         })
     });
     let sealed = SubgraphHandle::seal(
@@ -2275,9 +1897,7 @@ where
         },
     );
     let pending = Pending::merge([family.pending, body_value.pending().remap(&sealed.remap)]);
-    let family = body_value.parallel_families(&node, &mut 0, &count, pending)?;
-    let trace = loop_construction_trace(&node, &sealed, raw_trace)?;
-    Ok((family, trace))
+    body_value.parallel_families(&node, &mut 0, &count, pending)
 }
 
 fn scalar_parallel_gather<T>(
@@ -2290,24 +1910,10 @@ fn scalar_parallel_gather<T>(
 where
     T: ParallelOutput<Families = Family<T>> + GraphValue + Clone,
 {
-    scalar_parallel_gather_traced(source, indices, body_name, wire_type, parts)
-        .map(|(family, _)| family)
-}
-
-fn scalar_parallel_gather_traced<T>(
-    source: Family<T>,
-    indices: Family<Int>,
-    body_name: &'static str,
-    wire_type: WireType,
-    parts: impl Fn(ValueHandle, Pending) -> T + Copy,
-) -> Result<(Family<T>, LoopConstructionTrace<GatherConstructionTrace>), DslError>
-where
-    T: ParallelOutput<Families = Family<T>> + GraphValue + Clone,
-{
     let source_count = source.count.clone();
     let output_count = indices.count.clone();
     let source_element_type = family_element_wire_type(&source.value).unwrap_or(wire_type.clone());
-    let (index_slot, (body_value, raw_trace, explicit_inputs, scope)) = with_loop_index(|_| {
+    let (index_slot, (body_value, explicit_inputs, scope)) = with_loop_index(|_| {
         with_new_construction_scope(|scope| {
             let index = IntType.placeholders();
             let family_wire_type = WireType::IndexedFamily {
@@ -2342,12 +1948,7 @@ where
             };
             let output =
                 scalar_family_get(&family, index.clone(), source_element_type.clone(), parts);
-            let raw_trace = GatherConstructionTrace {
-                index: index.value.clone(),
-                sources: vec![family.value.clone()],
-                outputs: output.flatten(),
-            };
-            (output, raw_trace, vec![index.value, family.value], scope)
+            (output, vec![index.value, family.value], scope)
         })
     });
     let sealed = SubgraphHandle::seal(
@@ -2377,9 +1978,7 @@ where
         source.pending,
         body_value.pending().remap(&sealed.remap),
     ]);
-    let family = body_value.parallel_families(&node, &mut 0, &output_count, pending)?;
-    let trace = loop_construction_trace(&node, &sealed, raw_trace)?;
-    Ok((family, trace))
+    body_value.parallel_families(&node, &mut 0, &output_count, pending)
 }
 
 fn family_element_wire_type(value: &ValueHandle) -> Option<WireType> {
@@ -2453,18 +2052,10 @@ impl Family<Mat> {
     }
 
     pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError> {
-        self.parallel_gather_traced(indices).map(|(family, _)| family)
-    }
-
-    #[doc(hidden)]
-    pub fn parallel_gather_traced(
-        self,
-        indices: Family<Int>,
-    ) -> Result<(Self, LoopConstructionTrace<GatherConstructionTrace>), DslError> {
         let source_count = self.count.clone();
         let output_count = indices.count.clone();
         let matrix_type = self.element_schema.matrix_type.clone();
-        let (index_slot, (body_value, raw_trace, explicit_inputs, scope)) = with_loop_index(|_| {
+        let (index_slot, (body_value, explicit_inputs, scope)) = with_loop_index(|_| {
             with_new_construction_scope(|scope| {
                 let index = IntType.placeholders();
                 let source = Family::<Mat>::source_input(
@@ -2474,12 +2065,7 @@ impl Family<Mat> {
                     None,
                 );
                 let output = source.get(index.clone());
-                let raw_trace = GatherConstructionTrace {
-                    index: index.value.clone(),
-                    sources: vec![source.value.clone()],
-                    outputs: vec![output.value.clone()],
-                };
-                (output, raw_trace, vec![index.value, source.value], scope)
+                (output, vec![index.value, source.value], scope)
             })
         });
         let sealed = SubgraphHandle::seal(
@@ -2506,9 +2092,7 @@ impl Family<Mat> {
             self.pending,
             body_value.pending().remap(&sealed.remap),
         ]);
-        let family = body_value.parallel_families(&node, &mut 0, &output_count, pending)?;
-        let trace = loop_construction_trace(&node, &sealed, raw_trace)?;
-        Ok((family, trace))
+        body_value.parallel_families(&node, &mut 0, &output_count, pending)
     }
 
     pub fn parallel_zip_many_values<R: ParallelOutput>(
@@ -2579,26 +2163,16 @@ impl Family<Mat> {
         self,
         body: impl FnOnce(LoopIndex, Mat) -> R,
     ) -> Result<R::Families, DslError> {
-        self.parallel_map_values_traced(|index, value| (body(index, value), ()))
-            .map(|(families, _)| families)
-    }
-
-    #[doc(hidden)]
-    pub fn parallel_map_values_traced<R: ParallelOutput, T: RemapConstructionTrace>(
-        self,
-        body: impl FnOnce(LoopIndex, Mat) -> (R, T),
-    ) -> Result<(R::Families, LoopConstructionTrace<T>), DslError> {
         let outer_family = self.value.clone();
         let count = self.count.clone();
         let element_type = self.element_schema.matrix_type.clone();
-        let (index_slot, (body_value, raw_trace, explicit_input, scope)) =
-            with_loop_index(|index| {
-                with_new_construction_scope(|scope| {
-                    let input = Mat::source_input("item".to_owned(), element_type, None);
-                    let (output, raw_trace) = body(index, input.clone());
-                    (output, raw_trace, input.value, scope)
-                })
-            });
+        let (index_slot, (body_value, explicit_input, scope)) = with_loop_index(|index| {
+            with_new_construction_scope(|scope| {
+                let input = Mat::source_input("item".to_owned(), element_type, None);
+                let output = body(index, input.clone());
+                (output, input.value, scope)
+            })
+        });
         let body_outputs = body_value.flatten();
         let sealed = SubgraphHandle::seal(
             "parallel-map-body",
@@ -2626,9 +2200,7 @@ impl Family<Mat> {
         );
         let pending = Pending::merge([self.pending, body_value.pending().remap(&sealed.remap)]);
         let mut next_port = 0;
-        let families = body_value.parallel_families(&node, &mut next_port, &count, pending)?;
-        let trace = loop_construction_trace(&node, &sealed, raw_trace)?;
-        Ok((families, trace))
+        body_value.parallel_families(&node, &mut next_port, &count, pending)
     }
 
     pub fn parallel_threshold_decode_ints(
@@ -3005,24 +2577,6 @@ impl SequentialRange {
         S: GraphValue,
         I: GraphValue,
     {
-        self.scan_traced(initial, invariants, |index, state, invariants| {
-            body(index, state, invariants).map(|state| (state, ()))
-        })
-        .map(|(state, _)| state)
-    }
-
-    #[doc(hidden)]
-    pub fn scan_traced<S, I, T>(
-        self,
-        initial: S,
-        invariants: I,
-        body: impl FnOnce(LoopIndex, S, I) -> Result<(S, T), DslError>,
-    ) -> Result<(S, LoopConstructionTrace<T>), DslError>
-    where
-        S: GraphValue,
-        I: GraphValue,
-        T: RemapConstructionTrace,
-    {
         let count = self.count;
         let state_schema = initial.schema();
         let invariant_schema = invariants.schema();
@@ -3039,10 +2593,10 @@ impl SequentialRange {
                 let mut explicit_inputs = state.flatten();
                 explicit_inputs.extend(invariant_values.flatten());
                 body(index, state, invariant_values)
-                    .map(|(next_state, trace)| (next_state, trace, explicit_inputs, scope))
+                    .map(|next_state| (next_state, explicit_inputs, scope))
             })
         });
-        let (next_state, raw_trace, explicit_inputs, scope) = body_result?;
+        let (next_state, explicit_inputs, scope) = body_result?;
         if next_state.schema().wire_types() != state_types {
             return Err(DslError::Schema);
         }
@@ -3076,9 +2630,7 @@ impl SequentialRange {
         let values = (0..state_types.len())
             .map(|port| node.output(port as u32).ok_or(DslError::Schema))
             .collect::<Result<Vec<_>, _>>()?;
-        let state = S::from_values(&state_schema, &values, pending)?;
-        let trace = loop_construction_trace(&node, &sealed, raw_trace)?;
-        Ok((state, trace))
+        S::from_values(&state_schema, &values, pending)
     }
 }
 
@@ -3091,21 +2643,9 @@ impl ParallelRange {
         self,
         body: impl FnOnce(LoopIndex) -> R,
     ) -> Result<R::Families, DslError> {
-        self.map_values_traced(|index| (body(index), ())).map(|(families, _)| families)
-    }
-
-    #[doc(hidden)]
-    pub fn map_values_traced<R: ParallelOutput, T: RemapConstructionTrace>(
-        self,
-        body: impl FnOnce(LoopIndex) -> (R, T),
-    ) -> Result<(R::Families, LoopConstructionTrace<T>), DslError> {
         let count = self.count;
-        let (index_slot, (body_value, raw_trace, scope)) = with_loop_index(|index| {
-            with_new_construction_scope(|scope| {
-                let (body_value, raw_trace) = body(index);
-                (body_value, raw_trace, scope)
-            })
-        });
+        let (index_slot, (body_value, scope)) =
+            with_loop_index(|index| with_new_construction_scope(|scope| (body(index), scope)));
         let body_outputs = body_value.flatten();
         let sealed = SubgraphHandle::seal(
             "parallel-range-body",
@@ -3130,9 +2670,7 @@ impl ParallelRange {
             },
         );
         let pending = body_value.pending().remap(&sealed.remap);
-        let families = body_value.parallel_families(&node, &mut 0, &count, pending)?;
-        let trace = loop_construction_trace(&node, &sealed, raw_trace)?;
-        Ok((families, trace))
+        body_value.parallel_families(&node, &mut 0, &count, pending)
     }
 }
 
@@ -3145,11 +2683,6 @@ pub trait ParallelZipTuple {
         self,
         body: impl FnOnce(LoopIndex, Self::Items) -> Result<R, DslError>,
     ) -> Result<R::Families, DslError>;
-    #[doc(hidden)]
-    fn parallel_zip_tuple_result_traced<R: ParallelOutput, T: RemapConstructionTrace>(
-        self,
-        body: impl FnOnce(LoopIndex, Self::Items) -> Result<(R, T), DslError>,
-    ) -> Result<(R::Families, LoopConstructionTrace<T>), DslError>;
     type Items;
 }
 
@@ -3171,16 +2704,6 @@ where
         self,
         body: impl FnOnce(LoopIndex, Self::Items) -> Result<R, DslError>,
     ) -> Result<R::Families, DslError> {
-        self.parallel_zip_tuple_result_traced(|index, items| {
-            body(index, items).map(|output| (output, ()))
-        })
-        .map(|(families, _)| families)
-    }
-
-    fn parallel_zip_tuple_result_traced<R: ParallelOutput, T: RemapConstructionTrace>(
-        self,
-        body: impl FnOnce(LoopIndex, Self::Items) -> Result<(R, T), DslError>,
-    ) -> Result<(R::Families, LoopConstructionTrace<T>), DslError> {
         if self.0.count != self.1.count {
             return Err(DslError::FamilyCountMismatch);
         }
@@ -3194,15 +2717,15 @@ where
                 let second = second_schema.placeholders_from(&mut next);
                 let mut explicit_inputs = first.flatten();
                 explicit_inputs.extend(second.flatten());
-                let (output, trace) = body(index, (first, second))?;
-                Ok::<_, DslError>((output, trace, explicit_inputs, scope))
+                let output = body(index, (first, second))?;
+                Ok::<_, DslError>((output, explicit_inputs, scope))
             })
         });
-        let (body_value, trace, explicit_inputs, scope) = body_result?;
+        let (body_value, explicit_inputs, scope) = body_result?;
         if explicit_inputs.len() != 2 {
             return Err(DslError::Schema);
         }
-        finish_parallel_zip_traced(
+        finish_parallel_zip(
             count,
             vec![self.0.value, self.1.value],
             vec![self.0.pending, self.1.pending],
@@ -3211,7 +2734,6 @@ where
             scope,
             index_slot,
             "parallel-zip-bundle2-body",
-            trace,
         )
     }
 }
@@ -3235,16 +2757,6 @@ where
         self,
         body: impl FnOnce(LoopIndex, Self::Items) -> Result<R, DslError>,
     ) -> Result<R::Families, DslError> {
-        self.parallel_zip_tuple_result_traced(|index, items| {
-            body(index, items).map(|output| (output, ()))
-        })
-        .map(|(families, _)| families)
-    }
-
-    fn parallel_zip_tuple_result_traced<R: ParallelOutput, T: RemapConstructionTrace>(
-        self,
-        body: impl FnOnce(LoopIndex, Self::Items) -> Result<(R, T), DslError>,
-    ) -> Result<(R::Families, LoopConstructionTrace<T>), DslError> {
         if self.0.count != self.1.count || self.0.count != self.2.count {
             return Err(DslError::FamilyCountMismatch);
         }
@@ -3261,15 +2773,15 @@ where
                 let mut explicit_inputs = first.flatten();
                 explicit_inputs.extend(second.flatten());
                 explicit_inputs.extend(third.flatten());
-                let (output, trace) = body(index, (first, second, third))?;
-                Ok::<_, DslError>((output, trace, explicit_inputs, scope))
+                let output = body(index, (first, second, third))?;
+                Ok::<_, DslError>((output, explicit_inputs, scope))
             })
         });
-        let (body_value, trace, explicit_inputs, scope) = body_result?;
+        let (body_value, explicit_inputs, scope) = body_result?;
         if explicit_inputs.len() != 3 {
             return Err(DslError::Schema);
         }
-        finish_parallel_zip_traced(
+        finish_parallel_zip(
             count,
             vec![self.0.value, self.1.value, self.2.value],
             vec![self.0.pending, self.1.pending, self.2.pending],
@@ -3278,12 +2790,11 @@ where
             scope,
             index_slot,
             "parallel-zip-bundle3-body",
-            trace,
         )
     }
 }
 
-fn finish_parallel_zip_traced<R: ParallelOutput, T: RemapConstructionTrace>(
+fn finish_parallel_zip<R: ParallelOutput>(
     count: IntExpr,
     mut arguments: Vec<ValueHandle>,
     pendings: Vec<Pending>,
@@ -3292,8 +2803,7 @@ fn finish_parallel_zip_traced<R: ParallelOutput, T: RemapConstructionTrace>(
     scope: mxx_ir_core::ConstructionScopeId,
     index_slot: u32,
     body_name: &'static str,
-    raw_trace: T,
-) -> Result<(R::Families, LoopConstructionTrace<T>), DslError> {
+) -> Result<R::Families, DslError> {
     let body_outputs = body_value.flatten();
     let sealed = SubgraphHandle::seal(
         body_name,
@@ -3321,9 +2831,7 @@ fn finish_parallel_zip_traced<R: ParallelOutput, T: RemapConstructionTrace>(
     let pending = Pending::merge(
         pendings.into_iter().chain(std::iter::once(body_value.pending().remap(&sealed.remap))),
     );
-    let families = body_value.parallel_families(&node, &mut 0, &count, pending)?;
-    let trace = loop_construction_trace(&node, &sealed, raw_trace)?;
-    Ok((families, trace))
+    body_value.parallel_families(&node, &mut 0, &count, pending)
 }
 
 pub fn parallel_zip<T: ParallelZipTuple, R: ParallelOutput>(
@@ -3347,18 +2855,6 @@ pub fn parallel_zip_bundle_result<T: ParallelZipTuple, R: ParallelOutput>(
     families.parallel_zip_tuple_result(body)
 }
 
-#[doc(hidden)]
-pub fn parallel_zip_bundle_result_traced<
-    Z: ParallelZipTuple,
-    R: ParallelOutput,
-    T: RemapConstructionTrace,
->(
-    families: Z,
-    body: impl FnOnce(LoopIndex, Z::Items) -> Result<(R, T), DslError>,
-) -> Result<(R::Families, LoopConstructionTrace<T>), DslError> {
-    families.parallel_zip_tuple_result_traced(body)
-}
-
 impl LoopIndex {
     pub fn expression(&self) -> IntExpr {
         self.expression.clone()
@@ -3374,20 +2870,81 @@ impl LoopIndex {
     }
 }
 
+/// Semantic wire sets retained by the DSL and resolved exactly once when the graph is frozen.
+///
+/// Labels are proof-facing names, not executable nodes. A label may name more than one wire so
+/// callers can identify a typed tuple or family interface without reconstructing it by searching
+/// the frozen graph.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct FrozenSemanticAnchors {
+    entries: BTreeMap<String, Vec<ScopedWireRef>>,
+}
+
+impl FrozenSemanticAnchors {
+    pub fn get(&self, name: &str) -> Option<&[ScopedWireRef]> {
+        self.entries.get(name).map(Vec::as_slice)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[ScopedWireRef])> {
+        self.entries.iter().map(|(name, wires)| (name.as_str(), wires.as_slice()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 #[derive(Clone, Default)]
 #[doc(hidden)]
-pub struct Pending;
+pub struct Pending {
+    semantic_anchors: BTreeMap<String, Vec<ValueHandle>>,
+}
 
 impl Pending {
     #[doc(hidden)]
-    pub fn merge(_values: impl IntoIterator<Item = Pending>) -> Self {
-        Self
+    pub fn merge(values: impl IntoIterator<Item = Pending>) -> Self {
+        let mut merged = Self::default();
+        for pending in values {
+            for (name, wires) in pending.semantic_anchors {
+                merged.semantic_anchors.entry(name).or_default().extend(wires);
+            }
+        }
+        merged
     }
 
-    fn remap(&self, _map: &SealMap) -> Self {
-        Self
+    fn remap(&self, map: &SealMap) -> Self {
+        let semantic_anchors = self
+            .semantic_anchors
+            .iter()
+            .map(|(name, wires)| {
+                let wires = wires
+                    .iter()
+                    .map(|wire| map.resolve(wire).cloned().unwrap_or_else(|| wire.clone()))
+                    .collect();
+                (name.clone(), wires)
+            })
+            .collect();
+        Self { semantic_anchors }
+    }
+
+    fn with_semantic_anchor(mut self, name: String, wires: Vec<ValueHandle>) -> Self {
+        self.semantic_anchors.entry(name).or_default().extend(wires);
+        self
     }
 }
+
+/// Adds a proof-facing name to a DSL value without changing the executable graph.
+pub trait SemanticAnchor: GraphValue + Sized {
+    fn semantic_anchor(self, name: impl Into<String>) -> Result<Self, DslError> {
+        let schema = self.schema();
+        let wires = self.flatten();
+        let pending = self.pending().with_semantic_anchor(name.into(), wires.clone());
+        Self::from_values(&schema, &wires, pending)
+    }
+}
+
+impl<T: GraphValue> SemanticAnchor for T {}
+
 pub struct DslContext {
     name: String,
     parameters: Vec<CompileParameter>,
@@ -3397,6 +2954,7 @@ pub struct DslContext {
 
 struct PendingOutput {
     value: ValueHandle,
+    pending: Pending,
     confidentiality: Option<ArtifactConfidentiality>,
 }
 
@@ -3427,29 +2985,13 @@ impl DslContext {
     /// This is primarily useful inside structural loop bodies when a flattened family index
     /// combines loop indices with symbolic compile parameters.
     pub fn evaluate_int(&self, expression: impl Into<IntExpr>) -> Int {
-        self.evaluate_int_traced(expression).0
-    }
-
-    #[doc(hidden)]
-    pub fn evaluate_int_traced(
-        &self,
-        expression: impl Into<IntExpr>,
-    ) -> (Int, EvaluateIntConstructionTrace) {
         let node = NodeHandle::new(
             NodeKind::EvaluateInt(expression.into()),
             Vec::new(),
             vec![WireType::ConstantInt],
         );
         let expression = node.output(0).expect("evaluated integer expression");
-        let zero = Int::constant(0);
-        let output =
-            Int { value: expression.clone(), pending: Pending::default() }.add(zero.clone());
-        let trace = EvaluateIntConstructionTrace {
-            expression,
-            zero: zero.value,
-            output: output.value.clone(),
-        };
-        (output, trace)
+        Int { value: expression, pending: Pending::default() }.add(Int::constant(0))
     }
 
     #[track_caller]
@@ -3554,7 +3096,10 @@ impl DslContext {
     ) -> Result<(), DslError> {
         if self
             .outputs
-            .insert(name.clone(), PendingOutput { value: mat.value, confidentiality })
+            .insert(
+                name.clone(),
+                PendingOutput { value: mat.value, pending: mat.pending, confidentiality },
+            )
             .is_some()
         {
             return Err(DslError::DuplicateOutput(name));
@@ -3620,10 +3165,14 @@ impl DslContext {
         &mut self,
         name: String,
         value: ValueHandle,
-        _pending: Pending,
+        pending: Pending,
         confidentiality: Option<ArtifactConfidentiality>,
     ) -> Result<(), DslError> {
-        if self.outputs.insert(name.clone(), PendingOutput { value, confidentiality }).is_some() {
+        if self
+            .outputs
+            .insert(name.clone(), PendingOutput { value, pending, confidentiality })
+            .is_some()
+        {
             return Err(DslError::DuplicateOutput(name));
         }
         Ok(())
@@ -3635,6 +3184,14 @@ impl DslContext {
 
     #[doc(hidden)]
     pub fn build_with_freeze_map(self) -> Result<(BuiltGraph, mxx_ir_core::FreezeMap), DslError> {
+        let pending = Pending::merge(self.outputs.values().map(|output| output.pending.clone()));
+        let root_scope = mxx_ir_core::current_construction_scope();
+        let retained_roots = pending
+            .semantic_anchors
+            .values()
+            .flat_map(|wires| wires.iter().cloned())
+            .filter(|wire| wire.construction_scope() == root_scope)
+            .collect();
         let outputs = self
             .outputs
             .into_iter()
@@ -3646,17 +3203,32 @@ impl DslContext {
             self.name,
             self.parameters,
             outputs,
-            Vec::new(),
+            retained_roots,
             Vec::new(),
             self.real_constants,
         )?;
         mxx_ir_core::validate_structure(&graph)?;
-        Ok((BuiltGraph { graph }, freeze_map))
+        let anchors = pending
+            .semantic_anchors
+            .into_iter()
+            .map(|(name, wires)| {
+                let wires = wires
+                    .iter()
+                    .map(|wire| freeze_map.resolve_unique(wire).cloned())
+                    .collect::<Result<BTreeSet<_>, _>>()?
+                    .into_iter()
+                    .collect();
+                Ok((name, wires))
+            })
+            .collect::<Result<BTreeMap<_, _>, mxx_ir_core::FreezeResolveError>>()
+            .map_err(|error| DslError::SemanticAnchorResolution(error.to_string()))?;
+        Ok((BuiltGraph { graph, anchors: FrozenSemanticAnchors { entries: anchors } }, freeze_map))
     }
 }
 
 pub struct BuiltGraph {
     pub graph: Graph,
+    pub anchors: FrozenSemanticAnchors,
 }
 
 #[derive(Clone)]
@@ -4752,6 +4324,40 @@ mod tests {
     }
 
     #[test]
+    fn semantic_anchor_resolves_to_the_frozen_output_without_an_ir_node() {
+        let ring = Ring::new(17, 8);
+        let input = ring.input("input", (2, 2));
+        let output = (input.clone() + input).semantic_anchor("result-carrier").unwrap();
+        let built = DslContext::new("anchored-sum").output("sum", output).unwrap().build().unwrap();
+
+        let anchor = built.anchors.get("result-carrier").unwrap();
+        assert_eq!(anchor.len(), 1);
+        assert_eq!(anchor[0].scope, mxx_ir_core::FrozenGraphScopeId::Root);
+        assert_eq!(anchor[0].wire, built.graph.outputs()["sum"].value);
+    }
+
+    #[test]
+    fn semantic_anchor_is_remapped_into_a_sealed_loop_body() {
+        let ring = Ring::new(17, 8);
+        let captured = ring.input("captured", (1, 1));
+        let family = Parallel::range(2)
+            .map(move |_| {
+                (captured.clone() + captured.clone()).semantic_anchor("loop-body-sum").unwrap()
+            })
+            .unwrap();
+        let built = DslContext::new("anchored-loop")
+            .family_output("values", family)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let [anchor] = built.anchors.get("loop-body-sum").unwrap() else {
+            panic!("one body-template wire must be anchored")
+        };
+        assert!(matches!(anchor.scope, mxx_ir_core::FrozenGraphScopeId::ParallelBody { .. }));
+    }
+
+    #[test]
     fn sampler_cutoff_is_serialized_and_validated() {
         let ring = Ring::new(257, 8);
         let sample = ring.gaussian((1, 1), 3, 19);
@@ -5008,254 +4614,6 @@ mod tests {
         let decoded: Graph = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(built.graph, decoded);
         mxx_ir_core::validate(&decoded, &ParamEnv::default()).unwrap();
-    }
-
-    #[test]
-    fn traced_nested_loops_remap_local_and_captured_endpoints_exactly() {
-        let context = DslContext::new("traced-nested-captures");
-        let root_capture = Int::constant(7).add(Int::constant(0));
-        let initial = Int::constant(1).add(Int::constant(0));
-        let (final_state, trace) = Sequential::range(2)
-            .scan_traced(initial, root_capture.clone(), |_, state, invariant| {
-                let local = state.add(invariant);
-                let local_handle = local.value_handle().clone();
-                let (mapped, nested) = Parallel::range(2).map_values_traced(|_| {
-                    let output = local.clone().add(root_capture.clone());
-                    let raw = vec![
-                        local.value_handle().clone(),
-                        root_capture.value_handle().clone(),
-                        output.value_handle().clone(),
-                    ];
-                    (output, raw)
-                })?;
-                Ok((mapped.get_static(0), (local_handle, nested)))
-            })
-            .unwrap();
-        let (built, freeze_map) =
-            context.int_output("state", final_state).unwrap().build_with_freeze_map().unwrap();
-
-        let sequential_output = freeze_map.resolve_unique(&trace.outputs[0]).unwrap();
-        assert_eq!(sequential_output.scope, mxx_ir_core::FrozenGraphScopeId::Root);
-        let (local, nested) = &trace.scope.body;
-        assert!(matches!(
-            freeze_map.resolve_unique(local).unwrap().scope,
-            mxx_ir_core::FrozenGraphScopeId::SequentialBody { .. }
-        ));
-        assert!(matches!(
-            freeze_map.resolve_unique(&nested.outputs[0]).unwrap().scope,
-            mxx_ir_core::FrozenGraphScopeId::SequentialBody { .. }
-        ));
-        assert_eq!(nested.scope.body.len(), 3);
-        for value in &nested.scope.body {
-            assert!(matches!(
-                freeze_map.resolve_unique(value).unwrap().scope,
-                mxx_ir_core::FrozenGraphScopeId::ParallelBody { .. }
-            ));
-        }
-        assert_eq!(nested.scope.captures.len(), 2);
-        for capture in &nested.scope.captures {
-            assert!(matches!(
-                freeze_map.resolve_unique(&capture.parent_source).unwrap().scope,
-                mxx_ir_core::FrozenGraphScopeId::SequentialBody { .. }
-            ));
-            assert!(matches!(
-                freeze_map.resolve_unique(&capture.child_placeholder).unwrap().scope,
-                mxx_ir_core::FrozenGraphScopeId::ParallelBody { .. }
-            ));
-        }
-        assert_eq!(trace.scope.captures.len(), 1);
-        assert_eq!(
-            freeze_map.resolve_unique(&trace.scope.captures[0].parent_source).unwrap().scope,
-            mxx_ir_core::FrozenGraphScopeId::Root
-        );
-        assert!(matches!(
-            freeze_map.resolve_unique(&trace.scope.captures[0].child_placeholder).unwrap().scope,
-            mxx_ir_core::FrozenGraphScopeId::SequentialBody { .. }
-        ));
-
-        let outer_capture = &trace.scope.captures[0];
-        let outer_source = freeze_map.resolve_unique(&outer_capture.parent_source).unwrap();
-        let sequential_placeholder =
-            freeze_map.resolve_unique(&outer_capture.child_placeholder).unwrap();
-        let sequential_node = built
-            .graph
-            .root_scope()
-            .node(sequential_output.wire.node)
-            .expect("sequential loop node");
-        let sequential_arguments =
-            built.graph.root_scope().arguments(sequential_node).expect("root arguments");
-        assert_eq!(sequential_arguments[2], outer_source.wire);
-        let sequential_scope =
-            built.graph.scope(&sequential_placeholder.scope).expect("sequential child scope");
-        assert_eq!(sequential_scope.inputs()[2], sequential_placeholder.wire);
-
-        let nested_output = freeze_map.resolve_unique(&nested.outputs[0]).unwrap();
-        let nested_node =
-            sequential_scope.node(nested_output.wire.node).expect("nested parallel loop node");
-        let nested_arguments = sequential_scope.arguments(nested_node).expect("nested arguments");
-        assert_eq!(nested_arguments.len(), nested.scope.captures.len());
-        for (argument, capture) in nested_arguments.iter().zip(&nested.scope.captures) {
-            assert_eq!(*argument, freeze_map.resolve_unique(&capture.parent_source).unwrap().wire);
-        }
-        let root_capture_in_nested = nested
-            .scope
-            .captures
-            .iter()
-            .find(|capture| {
-                freeze_map.resolve_unique(&capture.parent_source).unwrap() == sequential_placeholder
-            })
-            .expect("root capture must flow through the sequential placeholder");
-        let parallel_placeholder =
-            freeze_map.resolve_unique(&root_capture_in_nested.child_placeholder).unwrap();
-        let parallel_scope =
-            built.graph.scope(&parallel_placeholder.scope).expect("parallel child scope");
-        let capture_index = nested
-            .scope
-            .captures
-            .iter()
-            .position(|capture| std::ptr::eq(capture, root_capture_in_nested))
-            .unwrap();
-        assert_eq!(nested_arguments[capture_index], sequential_placeholder.wire);
-        assert_eq!(parallel_scope.inputs()[capture_index], parallel_placeholder.wire);
-    }
-
-    #[test]
-    fn body_trace_remap_covers_identity_preserving_and_forced_clone_paths() {
-        use std::{cell::RefCell, rc::Rc};
-
-        let captured = Int::constant(5).add(Int::constant(0));
-        let raw_preserved = Rc::new(RefCell::new(None));
-        let raw_cloned = Rc::new(RefCell::new(None));
-        let (outputs, trace) = Parallel::range(1)
-            .map_values_traced({
-                let raw_preserved = raw_preserved.clone();
-                let raw_cloned = raw_cloned.clone();
-                move |_| {
-                    let preserved = Int::constant(1).add(Int::constant(0));
-                    let cloned = preserved.clone().add(captured.clone());
-                    *raw_preserved.borrow_mut() = Some(preserved.value_handle().clone());
-                    *raw_cloned.borrow_mut() = Some(cloned.value_handle().clone());
-                    (
-                        cloned.clone(),
-                        (preserved.value_handle().clone(), cloned.value_handle().clone()),
-                    )
-                }
-            })
-            .unwrap();
-        let raw_preserved = raw_preserved.borrow().clone().unwrap();
-        let raw_cloned = raw_cloned.borrow().clone().unwrap();
-        assert_eq!(trace.scope.body.0, raw_preserved);
-        assert_ne!(trace.scope.body.1, raw_cloned);
-
-        let (_, freeze_map) = DslContext::new("remap-clone-paths")
-            .int_family_output("outputs", outputs)
-            .unwrap()
-            .build_with_freeze_map()
-            .unwrap();
-        assert!(freeze_map.resolve_unique(&trace.scope.body.0).is_ok());
-        assert!(freeze_map.resolve_unique(&trace.scope.body.1).is_ok());
-    }
-
-    #[test]
-    fn traced_loop_rejects_unreachable_raw_body_handle() {
-        let result = Parallel::range(1).map_values_traced(|_| {
-            let output = Int::constant(1).add(Int::constant(0));
-            let unreachable = Int::constant(9);
-            (output, unreachable.value_handle().clone())
-        });
-        assert!(matches!(result, Err(DslError::TraceRemap)));
-    }
-
-    #[test]
-    fn ordinary_and_traced_nested_loop_builders_freeze_identically() {
-        fn ordinary() -> Graph {
-            let context = DslContext::new("nested-loop-equivalence");
-            let initial = context.int_family_input("initial", 3);
-            let state = Sequential::range(2)
-                .scan(initial, Bool::constant(true), |_, state, _| {
-                    let indices = Parallel::range(3)
-                        .map_values(|index| index.as_int().add(Int::constant(0)))?;
-                    let gathered = state.clone().parallel_gather(indices)?;
-                    parallel_zip_bundle_result((state, gathered), |_, (left, right)| {
-                        Ok(left.add(right))
-                    })
-                })
-                .unwrap();
-            context.int_family_output("state", state).unwrap().build().unwrap().graph
-        }
-
-        fn traced() -> Graph {
-            let context = DslContext::new("nested-loop-equivalence");
-            let initial = context.int_family_input("initial", 3);
-            let (state, _) = Sequential::range(2)
-                .scan_traced(initial, Bool::constant(true), |_, state, _| {
-                    let (indices, map_trace) = Parallel::range(3).map_values_traced(|index| {
-                        let value = index.as_int().add(Int::constant(0));
-                        let handle = value.value_handle().clone();
-                        (value, handle)
-                    })?;
-                    let (gathered, gather_trace) = state.clone().parallel_gather_traced(indices)?;
-                    let (next, zip_trace) = parallel_zip_bundle_result_traced(
-                        (state, gathered),
-                        |_, (left, right)| {
-                            let output = left.add(right);
-                            let handle = output.value_handle().clone();
-                            Ok((output, handle))
-                        },
-                    )?;
-                    Ok((next, (map_trace, gather_trace, zip_trace)))
-                })
-                .unwrap();
-            context.int_family_output("state", state).unwrap().build().unwrap().graph
-        }
-
-        assert_eq!(ordinary(), traced());
-    }
-
-    #[test]
-    fn ordinary_and_traced_trapdoor_matrix_zip_freeze_identically() {
-        fn build(traced: bool) -> Graph {
-            let ring = Ring::new(257, 8);
-            let trapdoors = Parallel::range(2)
-                .map_values(|_| ring.sample_trapdoor(1, 5, 4, 4, 1_000_000))
-                .unwrap();
-            let targets = Parallel::range(2).map(|_| ring.zero((1, 1))).unwrap();
-            let outputs = if traced {
-                trapdoors
-                    .parallel_zip_mat_values_traced(targets, |_, trapdoor, target| {
-                        let public = trapdoor.public_matrix();
-                        let trapdoor_handle = trapdoor.value_handle().clone();
-                        let target_handle = target.value_handle().clone();
-                        let preimage = trapdoor.sample_preimage(target, (6, 1));
-                        let preimage_handle = preimage.value_handle().clone();
-                        let output = preimage.as_mat();
-                        let trace = vec![
-                            public.value_handle().clone(),
-                            trapdoor_handle,
-                            target_handle,
-                            preimage_handle,
-                            output.value_handle().clone(),
-                        ];
-                        (output, trace)
-                    })
-                    .unwrap()
-                    .0
-            } else {
-                trapdoors
-                    .parallel_zip_mat_values(targets, |_, trapdoor, target| {
-                        trapdoor.sample_preimage(target, (6, 1)).as_mat()
-                    })
-                    .unwrap()
-            };
-            DslContext::new("trapdoor-zip-equivalence")
-                .private_family_output("outputs", outputs)
-                .unwrap()
-                .build()
-                .unwrap()
-                .graph
-        }
-
-        assert_eq!(build(false), build(true));
     }
 
     #[test]

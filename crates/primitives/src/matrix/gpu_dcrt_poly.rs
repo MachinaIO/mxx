@@ -513,13 +513,23 @@ impl GpuDCRTPolyMatrix {
         ncol: usize,
         dist: GpuMatrixSampleDist,
         sigma: f64,
+        max_coefficient_bound: u64,
         seed: GpuRngSeed,
     ) -> Self {
         let out = Self::new_empty(params, nrow, ncol);
         if nrow == 0 || ncol == 0 {
             return out;
         }
-        let status = unsafe { gpu_matrix_sample_distribution(out.raw, dist.as_ffi(), sigma, seed) };
+        let status = unsafe {
+            gpu_matrix_sample_distribution(
+                out.raw,
+                dist.as_ffi(),
+                sigma,
+                max_coefficient_bound,
+                params.modulus().to_u64().unwrap_or(0),
+                seed,
+            )
+        };
         check_status(status, "gpu_matrix_sample_distribution");
         out
     }
@@ -532,6 +542,7 @@ impl GpuDCRTPolyMatrix {
         col_len: usize,
         dist: GpuMatrixSampleDist,
         sigma: f64,
+        max_coefficient_bound: u64,
         seed: GpuRngSeed,
     ) -> Self {
         let col_end = col_start
@@ -553,6 +564,8 @@ impl GpuDCRTPolyMatrix {
                 out.raw,
                 dist.as_ffi(),
                 sigma,
+                max_coefficient_bound,
+                params.modulus().to_u64().unwrap_or(0),
                 seed,
                 total_ncol,
                 col_start,

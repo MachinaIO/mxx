@@ -41,6 +41,21 @@ inductive IntExpr where
   | divide (left right : IntExpr)
   | roundDivide (left right : IntExpr)
   | log2Ceil (value : IntExpr)
+  deriving BEq, DecidableEq
+
+/-- Lossless syntax mirror of the compile-time real expressions carried by Graph IR types.
+The correctness analyzer transports this syntax for type identity; hard-bound evaluation uses the
+integer cutoff recorded by sampler nodes and never re-evaluates a Gaussian sigma. -/
+inductive RealExpr where
+  | rational (value : Rat)
+  | parameter (name : String)
+  | fromInt (value : IntExpr)
+  | add (left right : RealExpr)
+  | subtract (left right : RealExpr)
+  | multiply (left right : RealExpr)
+  | divide (left right : RealExpr)
+  | sqrt (value : RealExpr)
+  deriving BEq, DecidableEq
 
 def lookupParam (name : String) : ParamEnvironment → Option ParamValue
   | [] => none
@@ -135,6 +150,28 @@ structure MatrixTypeExpr where
   ringDimension : IntExpr
   rows : IntExpr
   columns : IntExpr
+  deriving BEq, DecidableEq
+
+/-- Exact transport of the Rust Graph IR wire type. Generated correctness modules populate this
+for every node output. The default exists only so pre-redesign hand-written theorem fixtures keep
+compiling; the certificate analyzer rejects missing output types in generated workflows. -/
+inductive WireTypeExpr where
+  | constantInt
+  | constantReal
+  | constantBool
+  | integer
+  | real
+  | boolean
+  | bytes (length : IntExpr)
+  | typedBlob (typeName : String) (schemaHash : List Nat)
+  | matrix (type : MatrixTypeExpr)
+  | trapdoor
+      (matrix : MatrixTypeExpr)
+      (sigma : RealExpr)
+      (gadgetBase digitCount preimageMaxCoefficientBound : IntExpr)
+  | preimage (type : MatrixTypeExpr)
+  | indexedFamily (element : WireTypeExpr) (count : IntExpr)
+  deriving BEq, DecidableEq
 
 def MatrixTypeExpr.evaluate
     (matrixType : MatrixTypeExpr)
@@ -213,6 +250,7 @@ structure Node where
   kind : NodeKind
   arguments : List WireRef
   outputCount : Nat := 1
+  outputTypes : List WireTypeExpr := []
 
 structure Scope where
   nodes : List Node
@@ -724,7 +762,8 @@ def evaluateNode
   | .extractCoefficient position =>
       match arguments node wires, position.evaluate params with
       | some [.matrix matrix], some position =>
-          [[.integer (matrix.coefficients.getD position.toNat 0)]]
+          [[.integer (Mxx.reduceCoefficient matrix.modulus
+            (matrix.coefficients.getD position.toNat 0))]]
       | _, _ => [[.invalid "coefficient-extraction argument mismatch"]]
   | .select =>
       match arguments node wires with

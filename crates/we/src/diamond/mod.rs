@@ -14,8 +14,8 @@ pub use config::{
 };
 pub use estimate::{DiamondCostEstimate, DiamondEstimateError, estimate_diamond_cost};
 pub use graph::{
-    DiamondCompileError, DiamondDecryptionGraph, DiamondEncryptionGraph, DiamondWeCompiler,
-    DiamondWeProtocolFamily,
+    DIAMOND_PROTOCOL_SOURCE_PATHS, DiamondCompileError, DiamondDecryptionGraph,
+    DiamondEncryptionGraph, DiamondWeCompiler, DiamondWeProtocolFamily,
 };
 pub use parameter_search::{
     DiamondParameterSearch, DiamondParameterSearchError, DiamondSelectedParameters,

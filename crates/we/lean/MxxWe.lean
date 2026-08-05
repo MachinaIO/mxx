@@ -1,12 +1,1 @@
-import MxxWe.BoundRecurrence
-import MxxWe.Correctness
-import MxxWe.DiamondGeneric
-import MxxWe.GenericInputInjection
-import MxxWe.GenericSamplerFacts
-import MxxWe.GenericBooleanLayers
-import MxxWe.GenericDiamondExecution
-import MxxWe.Certificate
-import MxxWe.DiamondFamilyChecker
-import MxxWe.GeneratedPreconditions
-import MxxWe.GeneratedDecryptExecution
-import MxxWe.Generated.DiamondWeFamily.Statement
+import MxxWe.Generated.DiamondWeFamily.Ir

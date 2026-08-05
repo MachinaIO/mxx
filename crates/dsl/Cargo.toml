@@ -8,6 +8,7 @@ description = "Declarative typed DSL for mxx executable graphs and pure correctn
 [dependencies]
 mxx-ir-core.workspace = true
 num-bigint.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

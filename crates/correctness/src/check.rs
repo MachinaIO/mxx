@@ -5,11 +5,26 @@ use std::{
 };
 use thiserror::Error;
 
+use crate::FreshnessMetadata;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TheoremReport {
     pub axioms: Vec<String>,
-    pub protocol_hash: String,
-    pub uses_native_decide: bool,
+    pub freshness: FreshnessMetadata,
+    pub native_decide_uses: Vec<NativeDecideUse>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeDecideUse {
+    pub source_path: String,
+    pub line: usize,
+    pub declaration: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeDecideAllowance<'a> {
+    pub source_path: &'a str,
+    pub declaration: &'a str,
 }
 
 #[derive(Debug, Error)]
@@ -22,28 +37,31 @@ pub enum VerifyError {
     ForbiddenAxiom(String),
     #[error("Lean source contains a forbidden axiom declaration: {0}")]
     ForbiddenDeclaration(PathBuf),
+    #[error("Lean source contains the proof hole `{term}` at {path}:{line}")]
+    ForbiddenProofHole { path: PathBuf, line: usize, term: &'static str },
+    #[error("Lean source contains native_decide outside the checker-evaluation allowlist: {0:?}")]
+    ForbiddenNativeDecide(NativeDecideUse),
 }
 
 pub fn verify_theorem_at(
     protocol: &str,
-    protocol_hash: &str,
+    freshness: &FreshnessMetadata,
     proof_module: &str,
+    theorem_name: &str,
     module_root: &str,
     source_directories: &[&str],
+    native_decide_allowlist: &[NativeDecideAllowance<'_>],
 ) -> Result<TheoremReport, VerifyError> {
     let root = workspace_root();
     let lean_name = lean_identifier(protocol);
-    let lower = lower_identifier(protocol);
     for directory in source_directories {
-        reject_axiom_declarations(&root.join(directory))?;
+        reject_unreviewed_constructs(&root.join(directory))?;
     }
     let scratch = ScratchDir::new("verify")?;
     let probe = scratch.path.join("Probe.lean");
     fs::write(
         &probe,
-        format!(
-            "import {proof_module}\nopen {module_root}.Generated.{lean_name}\nexample : {lean_name}CorrectStatement {lower}Checker := {lower}_correct\nexample : {lean_name}_protocolHash = \"{protocol_hash}\" := rfl\n#print axioms {lower}_correct\n"
-        ),
+        verification_probe(proof_module, theorem_name, module_root, &lean_name, freshness),
     )?;
     let output = Command::new("lake")
         .args(["env", "lean"])
@@ -59,17 +77,42 @@ pub fn verify_theorem_at(
         return Err(VerifyError::Lean(combined));
     }
     let axioms = parse_axioms(&combined)?;
-    Ok(TheoremReport {
-        axioms,
-        protocol_hash: protocol_hash.to_owned(),
-        uses_native_decide: source_directories.iter().try_fold(false, |found, directory| {
-            if found {
-                Ok(true)
-            } else {
-                source_tree_contains(&root.join(directory), "native_decide")
-            }
-        })?,
-    })
+    let native_decide_uses =
+        source_directories.iter().try_fold(Vec::new(), |mut uses, directory| {
+            collect_native_decide_uses(&root.join(directory), &root, &mut uses)?;
+            Ok::<_, std::io::Error>(uses)
+        })?;
+    for usage in &native_decide_uses {
+        if !native_decide_allowlist.iter().any(|allowed| {
+            usage.source_path == allowed.source_path &&
+                usage.declaration.as_deref() == Some(allowed.declaration)
+        }) {
+            return Err(VerifyError::ForbiddenNativeDecide(usage.clone()));
+        }
+    }
+    Ok(TheoremReport { axioms, freshness: freshness.clone(), native_decide_uses })
+}
+
+fn verification_probe(
+    proof_module: &str,
+    theorem_name: &str,
+    module_root: &str,
+    lean_name: &str,
+    freshness: &FreshnessMetadata,
+) -> String {
+    let source_paths = freshness
+        .protocol_source_paths
+        .iter()
+        .map(|path| format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "import {proof_module}\nopen {module_root}.Generated.{lean_name}\nexample : {lean_name}_generatorVersion = \"{}\" := rfl\nexample : {lean_name}_protocolSourcePaths = [{source_paths}] := rfl\nexample : {lean_name}_protocolSourceHash = \"{}\" := rfl\nexample : {lean_name}_workflowHash = \"{}\" := rfl\nexample : {lean_name}_toolkitHash = \"{}\" := rfl\n#check {theorem_name}\n#print axioms {theorem_name}\n",
+        freshness.generator_version,
+        freshness.protocol_source_hash,
+        freshness.workflow_hash,
+        freshness.toolkit_hash,
+    )
 }
 
 fn parse_axioms(output: &str) -> Result<Vec<String>, VerifyError> {
@@ -102,36 +145,117 @@ fn parse_axioms(output: &str) -> Result<Vec<String>, VerifyError> {
     Ok(axioms)
 }
 
-fn reject_axiom_declarations(directory: &Path) -> Result<(), VerifyError> {
+fn reject_unreviewed_constructs(directory: &Path) -> Result<(), VerifyError> {
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
         if path.is_dir() {
-            reject_axiom_declarations(&path)?;
-        } else if path.extension().is_some_and(|extension| extension == "lean") &&
-            fs::read_to_string(&path)?
-                .lines()
-                .any(|line| line.trim_start().starts_with("axiom "))
-        {
-            return Err(VerifyError::ForbiddenDeclaration(path));
+            reject_unreviewed_constructs(&path)?;
+        } else if path.extension().is_some_and(|extension| extension == "lean") {
+            let source = fs::read_to_string(&path)?;
+            let mut comment_depth = 0usize;
+            for (line_index, line) in source.lines().enumerate() {
+                let code = lean_code_without_comments(line, &mut comment_depth);
+                let tokens = code
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .collect::<Vec<_>>();
+                if tokens.contains(&"axiom") {
+                    return Err(VerifyError::ForbiddenDeclaration(path));
+                }
+                for term in ["sorry", "admit"] {
+                    if tokens.contains(&term) {
+                        return Err(VerifyError::ForbiddenProofHole {
+                            path,
+                            line: line_index + 1,
+                            term,
+                        });
+                    }
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn source_tree_contains(directory: &Path, needle: &str) -> Result<bool, std::io::Error> {
+fn collect_native_decide_uses(
+    directory: &Path,
+    workspace_root: &Path,
+    output: &mut Vec<NativeDecideUse>,
+) -> Result<(), std::io::Error> {
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
         if path.is_dir() {
-            if source_tree_contains(&path, needle)? {
-                return Ok(true);
+            collect_native_decide_uses(&path, workspace_root, output)?;
+        } else if path.extension().is_some_and(|extension| extension == "lean") {
+            let source = fs::read_to_string(&path)?;
+            let source_path =
+                path.strip_prefix(workspace_root).unwrap_or(&path).to_string_lossy().into_owned();
+            let mut comment_depth = 0usize;
+            let mut declaration = None;
+            for (line_index, line) in source.lines().enumerate() {
+                let code = lean_code_without_comments(line, &mut comment_depth);
+                if let Some(name) = declaration_name(&code) {
+                    declaration = Some(name);
+                }
+                if code
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .any(|token| token == "native_decide")
+                {
+                    output.push(NativeDecideUse {
+                        source_path: source_path.clone(),
+                        line: line_index + 1,
+                        declaration: declaration.clone(),
+                    });
+                }
             }
-        } else if path.extension().is_some_and(|extension| extension == "lean") &&
-            fs::read_to_string(path)?.contains(needle)
-        {
-            return Ok(true);
         }
     }
-    Ok(false)
+    Ok(())
+}
+
+fn lean_code_without_comments(line: &str, comment_depth: &mut usize) -> String {
+    let bytes = line.as_bytes();
+    let mut output = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if *comment_depth == 0 &&
+            index + 1 < bytes.len() &&
+            bytes[index] == b'-' &&
+            bytes[index + 1] == b'-'
+        {
+            break;
+        }
+        if index + 1 < bytes.len() && bytes[index] == b'/' && bytes[index + 1] == b'-' {
+            *comment_depth += 1;
+            index += 2;
+        } else if *comment_depth > 0 &&
+            index + 1 < bytes.len() &&
+            bytes[index] == b'-' &&
+            bytes[index + 1] == b'/'
+        {
+            *comment_depth -= 1;
+            index += 2;
+        } else {
+            if *comment_depth == 0 {
+                output.push(bytes[index] as char);
+            }
+            index += 1;
+        }
+    }
+    output
+}
+
+fn declaration_name(code: &str) -> Option<String> {
+    let trimmed = code.trim_start();
+    let trimmed = ["private ", "protected ", "noncomputable "]
+        .iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix))
+        .unwrap_or(trimmed);
+    let rest =
+        ["theorem ", "lemma ", "def "].iter().find_map(|prefix| trimmed.strip_prefix(prefix))?;
+    let name = rest
+        .split(|character: char| character.is_whitespace() || matches!(character, ':' | '(' | '{'))
+        .next()?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 fn workspace_root() -> PathBuf {
@@ -176,12 +300,6 @@ fn lean_identifier(value: &str) -> String {
         .collect::<String>()
 }
 
-fn lower_identifier(value: &str) -> String {
-    let value = lean_identifier(value);
-    let mut chars = value.chars();
-    chars.next().unwrap_or('p').to_ascii_lowercase().to_string() + chars.as_str()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +319,63 @@ mod tests {
             parse_axioms("'proof' does not depend on any axioms").unwrap(),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn probe_checks_the_lean_owned_theorem_without_reconstructing_its_type() {
+        let freshness = FreshnessMetadata {
+            generator_version: "generator".to_owned(),
+            protocol_source_paths: vec!["crates/example/src".to_owned()],
+            protocol_source_hash: "source".to_owned(),
+            workflow_hash: "workflow".to_owned(),
+            toolkit_hash: "toolkit".to_owned(),
+        };
+        let probe = verification_probe(
+            "MxxWe.Proofs.DiamondWe",
+            "MxxWe.Proofs.DiamondWe.correct",
+            "MxxWe",
+            "DiamondWeFamily",
+            &freshness,
+        );
+        assert!(probe.contains("#check MxxWe.Proofs.DiamondWe.correct"));
+        assert!(probe.contains("#print axioms MxxWe.Proofs.DiamondWe.correct"));
+        assert!(!probe.contains("CorrectStatement"));
+        assert!(!probe.contains("Checker :="));
+    }
+
+    #[test]
+    fn native_decide_scanner_ignores_comments_and_records_the_declaration() {
+        let mut depth = 0;
+        assert_eq!(lean_code_without_comments("/-- native_decide -/", &mut depth), "");
+        assert_eq!(depth, 0);
+        let code = lean_code_without_comments(
+            "theorem checker_accepts : true := by native_decide -- native_decide",
+            &mut depth,
+        );
+        assert_eq!(declaration_name(&code).as_deref(), Some("checker_accepts"));
+        assert_eq!(
+            code.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .filter(|token| *token == "native_decide")
+                .count(),
+            1
+        );
+        assert_eq!(
+            declaration_name("private theorem closedCheckerFact : True := by trivial").as_deref(),
+            Some("closedCheckerFact")
+        );
+    }
+
+    #[test]
+    fn source_gate_ignores_comments_and_rejects_proof_holes() {
+        let scratch = ScratchDir::new("source-gate").unwrap();
+        let source = scratch.path.join("Proof.lean");
+        fs::write(&source, "/-- sorry axiom -/\ntheorem complete : True := by trivial\n").unwrap();
+        reject_unreviewed_constructs(&scratch.path).unwrap();
+
+        fs::write(&source, "private theorem incomplete : True := by sorry\n").unwrap();
+        assert!(matches!(
+            reject_unreviewed_constructs(&scratch.path),
+            Err(VerifyError::ForbiddenProofHole { term: "sorry", .. })
+        ));
     }
 }

@@ -1,4 +1,5 @@
 import Mxx.Assumptions
+import Mxx.Certificate
 import Mxx.Correctness
 import Mxx.Ir
 import Mxx.Ir.ExecutionFacts

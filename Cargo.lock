@@ -472,6 +472,7 @@ version = "0.1.0"
 dependencies = [
  "mxx-ir-core",
  "num-bigint",
+ "serde",
  "serde_json",
  "thiserror",
 ]
@@ -598,6 +599,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "rand 0.9.2",
+ "sha2",
  "thiserror",
  "tracing",
 ]

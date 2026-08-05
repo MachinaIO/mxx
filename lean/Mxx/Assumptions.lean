@@ -78,6 +78,50 @@ def matrixMultiply (left right : Matrix) : Matrix :=
     if left.rows = 1 then matrixMul right left else matrixPolynomialScale right left
   else matrixMul left right
 
+/-- Typed equality of executable matrices modulo their common coefficient modulus. The shape and
+coefficient ring are part of the relation; coefficients are compared only at valid matrix and
+polynomial indices. This is the cycle-free sampler-contract form of equality in `R_q`. -/
+structure MatrixModEq (left right : Matrix) : Prop where
+  modulus : left.modulus = right.modulus
+  ringDimension : left.ringDimension = right.ringDimension
+  rows : left.rows = right.rows
+  columns : left.columns = right.columns
+  coefficients : ∀ row column coefficient,
+    row < left.rows → column < left.columns → coefficient < left.ringDimension →
+    reduceCoefficient left.modulus (left.coefficient row column coefficient) =
+      reduceCoefficient right.modulus (right.coefficient row column coefficient)
+
+namespace MatrixModEq
+
+/-- Typed equality modulo the coefficient modulus is reflexive, independently of the stored
+coefficient representatives. -/
+theorem refl (matrix : Matrix) : MatrixModEq matrix matrix := by
+  exact ⟨rfl, rfl, rfl, rfl, fun _ _ _ _ _ _ ↦ rfl⟩
+
+theorem symm {left right : Matrix} (relation : MatrixModEq left right) :
+    MatrixModEq right left := by
+  refine ⟨relation.modulus.symm, relation.ringDimension.symm, relation.rows.symm,
+    relation.columns.symm, ?_⟩
+  intro row column coefficient rowLt columnLt coefficientLt
+  exact (relation.coefficients row column coefficient
+    (relation.rows ▸ rowLt) (relation.columns ▸ columnLt)
+    (relation.ringDimension ▸ coefficientLt)).symm
+
+theorem trans {left middle right : Matrix}
+    (leftMiddle : MatrixModEq left middle)
+    (middleRight : MatrixModEq middle right) : MatrixModEq left right := by
+  refine ⟨leftMiddle.modulus.trans middleRight.modulus,
+    leftMiddle.ringDimension.trans middleRight.ringDimension,
+    leftMiddle.rows.trans middleRight.rows,
+    leftMiddle.columns.trans middleRight.columns, ?_⟩
+  intro row column coefficient rowLt columnLt coefficientLt
+  exact (leftMiddle.coefficients row column coefficient rowLt columnLt coefficientLt).trans <|
+    middleRight.coefficients row column coefficient
+      (leftMiddle.rows ▸ rowLt) (leftMiddle.columns ▸ columnLt)
+      (leftMiddle.ringDimension ▸ coefficientLt)
+
+end MatrixModEq
+
 def addCoefficients : List Int → List Int → List Int
   | [], right => right
   | left, [] => left
@@ -277,10 +321,10 @@ structure MxxBoundedSamplerContract (samplers : MxxSamplerFamily) : Prop where
   gadgetDecomposeContract :
     ∀ params base digitCount input output,
       output ∈ samplers.gadgetDecompose params base digitCount input →
-      matrixMul
+      MatrixModEq (matrixMul
         (gadgetMatrix { params with rows := input.rows, columns := input.rows * digitCount }
           base digitCount)
-        (output.withSamplerParams params) = input ∧
+        (output.withSamplerParams params)) input ∧
       maxCenteredCoefficientNorm (output.withSamplerParams params) ≤
         max (base.natAbs / 2) 1
   /-- Gadget decomposition is a deterministic primitive, unlike Gaussian and preimage sampling.
@@ -293,7 +337,35 @@ structure MxxBoundedSamplerContract (samplers : MxxSamplerFamily) : Prop where
       left.withSamplerParams params = right.withSamplerParams params
   preimageContract :
     ∀ params b p k, k ∈ samplers.samplePreimage params b p →
-      matrixMul b (k.withSamplerParams params) = p ∧
+      MatrixModEq (matrixMul b (k.withSamplerParams params)) p ∧
       maxCenteredCoefficientNorm (k.withSamplerParams params) ≤ params.maxCoefficientBound
+
+private def matrixModEqFixture (value : Int) : Matrix := {
+  coefficients := [value]
+  modulus := 5
+  ringDimension := 1
+  rows := 1
+  columns := 1
+}
+
+/-- Distinct stored representatives of the same residue are related. -/
+example : MatrixModEq (matrixModEqFixture 2) (matrixModEqFixture 7) := by
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro row column coefficient rowLt columnLt coefficientLt
+  have rowZero : row = 0 := Nat.lt_one_iff.mp (by simpa [matrixModEqFixture] using rowLt)
+  have columnZero : column = 0 :=
+    Nat.lt_one_iff.mp (by simpa [matrixModEqFixture] using columnLt)
+  have coefficientZero : coefficient = 0 :=
+    Nat.lt_one_iff.mp (by simpa [matrixModEqFixture] using coefficientLt)
+  subst row
+  subst column
+  subst coefficient
+  rfl
+
+/-- Different residues are not related. -/
+example : ¬ MatrixModEq (matrixModEqFixture 2) (matrixModEqFixture 3) := by
+  intro relation
+  have unequal := relation.coefficients 0 0 0 (by decide) (by decide) (by decide)
+  norm_num [matrixModEqFixture, Matrix.coefficient, reduceCoefficient] at unequal
 
 end Mxx

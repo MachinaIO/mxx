@@ -5,10 +5,13 @@ reviewable without presenting the unfinished end-to-end theorem as part of the n
 
 ## Included in the normal build
 
-- The generated parameterized workflow, statement, and structural certificate.
-- The executable structural verifier and its soundness theorem.
-- The protocol-independent hard-bound recurrence and Boolean algebra lemmas.
-- The executable Diamond family parameter checker in `MxxWe.DiamondFamilyChecker`.
+- The generated parameterized `ClosedProtocolDecl`.
+- The typed certificate identities, expressions, affine facts, recurrence paths, and closed rule
+  universe under `lean/Mxx/Certificate`.
+- Proof-producing symbolic normalization and the exact Lean hard-bound expression evaluator.
+- DSL semantic anchors resolved directly at freeze time, with no graph-search fallback.
+- The checked-in M0 node, transform, loop-bound, and origin audit.
+- The executable Diamond Phase-B parameter checker over the generated closed bundle.
 - The standalone `mxx_diamond_checker` executable used by Rust parameter search.
 
 Building `MxxWe` establishes only that this stable subset type-checks. Checker acceptance proves
@@ -16,21 +19,10 @@ the checked parameter inequalities; it is not an end-to-end correctness theorem.
 
 ## Work in progress
 
-The following source modules are intentionally excluded from the `MxxWe` root until their proof
-obligations are closed:
-
-- `MxxWe.Certificate.InputInjectionExecutionBridge`
-- `MxxWe.Certificate.InputInjectionWorkflowBridge`
-- `MxxWe.Certificate.BooleanExecutionBridge`
-- `MxxWe.Certificate.EncryptionExecutionBridge`
-- `MxxWe.Certificate.TransitionSelectorExecutionBridge`
-- `MxxWe.Certificate.ProducerLoopExecutionBridge`
-- `MxxWe.Proofs.DiamondWeFamily`
-
-These modules connect certificate-verified graph references to the exact denotational execution of
-the linked encryption and decryption stages. The remaining blocker is construction of the closed
-execution evidence required by the final family theorem. The proof source deliberately exposes
-only a private conditional theorem; there is no public `diamondWeFamily_correct` theorem yet.
+The generic analyzer connects facts to exact denotational execution through typed
+workflow traces, artifact origins, family templates, and recurrence paths. The remaining work is to
+complete the registered node-rule soundness proofs, workflow and bundle erasure theorems, and the
+Diamond endpoint composition. There is no public `MxxWe.Proofs.DiamondWe.correct` theorem yet.
 
 `crates/we/examples/verify_correctness.rs` remains the final theorem gate. It is intentionally not
 called by `scripts/verified_build.sh` at this checkpoint and must fail until the public theorem is
@@ -46,15 +38,7 @@ cd lean
 lake build MxxWe mxx_diamond_checker
 ```
 
-Run individual work-in-progress modules to inspect their remaining goals without changing the
-normal build boundary. For example:
-
-```text
-cd lean
-lake build MxxWe.Certificate.TransitionSelectorExecutionBridge
-```
-
-The repository-wide generated-source and Rust build gate remains:
+The repository-wide generated-source and Rust build gate is:
 
 ```text
 scripts/verified_build.sh

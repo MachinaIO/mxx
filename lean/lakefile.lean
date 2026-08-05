@@ -17,9 +17,16 @@ require VCVio from git
 lean_lib MxxCorrectness where
   srcDir := "../crates/correctness/lean"
 
+lean_lib MxxGadgets where
+  srcDir := "../crates/gadgets/lean"
+
 lean_lib MxxWe where
   srcDir := "../crates/we/lean"
 
 lean_exe mxx_diamond_checker where
   root := `MxxWe.DiamondChecker
+  srcDir := "../crates/we/lean"
+
+lean_exe mxx_analysis_facts where
+  root := `MxxWe.AnalysisFacts
   srcDir := "../crates/we/lean"

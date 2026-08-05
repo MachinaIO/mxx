@@ -21,9 +21,8 @@ pub enum DistType {
     /// * `sigma` - The Gaussian parameter (standard deviation).
     GaussDist {
         sigma: f64,
-        /// When present, the CPU sampler independently rejection-resamples coefficients until
-        /// their centered magnitude is at most this authoritative hard cutoff. GPU enforcement is
-        /// a tracked follow-up and GPU execution is excluded from correctness correspondence.
+        /// When present, CPU and GPU samplers independently rejection-resample coefficients until
+        /// their centered magnitude is at most this authoritative hard cutoff.
         max_coefficient_bound: Option<BigUint>,
     },
     /// Distribution that produces random bits (0 or 1).
@@ -191,12 +190,20 @@ pub trait PolyTrapdoorSampler {
         requests
             .into_iter()
             .map(|request| {
-                let out = self.preimage(
-                    request.params,
-                    request.trapdoor,
-                    request.public_matrix,
-                    &request.target,
-                );
+                let out = loop {
+                    let candidate = self.preimage(
+                        request.params,
+                        request.trapdoor,
+                        request.public_matrix,
+                        &request.target,
+                    );
+                    if bounds::matrix_within_coefficient_bound(
+                        &candidate,
+                        &request.max_coefficient_bound,
+                    ) {
+                        break candidate;
+                    }
+                };
                 (request.entry_idx, out)
             })
             .collect()

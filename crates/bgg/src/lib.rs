@@ -59,9 +59,8 @@ pub use noise_refresh::{
 pub use poly_encoding::{BggPolyEncodingCompiler, BggPolyEncodingWire, PolyEncodingCompileError};
 pub use public_key::{BggPublicKeyCompiler, BggPublicKeyType, BggPublicKeyWire};
 pub use sampler::{
-    BggEncodingSampler, BggPolyEncodingSample, BggPolyEncodingSampler,
-    BggPublicKeyFamilySamplingTrace, BggPublicKeySampler, BggSampleError, BggSamplerLayout,
-    NaiveBggEncodingVecSampler, NaiveBggPublicKeyVecSampler,
+    BggEncodingSampler, BggPolyEncodingSample, BggPolyEncodingSampler, BggPublicKeySampler,
+    BggSampleError, BggSamplerLayout, NaiveBggEncodingVecSampler, NaiveBggPublicKeyVecSampler,
 };
 pub use slot_transfer::{NaiveBggSlotTransferCompiler, SlotFamilyCompileError};
 pub use slot_transfer_artifact::{

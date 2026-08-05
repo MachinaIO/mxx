@@ -488,6 +488,35 @@ structure MatrixLayout (matrix : Mxx.Matrix) (modulus : Int)
     extends MatrixShape matrix modulus n rowCount columnCount where
   coefficientCount : matrix.coefficients.length = rowCount * columnCount * n
 
+/-- The cycle-free coefficient relation used by sampler contracts implies equality in the exact
+negacyclic quotient. Complete layouts supply the typed matrix dimensions; stored coefficient
+representatives may differ by arbitrary multiples of `q`. -/
+theorem matrixValue_eq_of_modEq
+    (q n rows columns : Nat) [NeZero q]
+    (left right : Mxx.Matrix)
+    (leftLayout : MatrixLayout left q n rows columns)
+    (rightLayout : MatrixLayout right q n rows columns)
+    (relation : Mxx.MatrixModEq left right) :
+    matrixValue q n rows columns left = matrixValue q n rows columns right := by
+  funext row column
+  unfold matrixValue negacyclicValue
+  apply Finset.sum_congr rfl
+  intro coefficient _
+  have reducedEqual := relation.coefficients row.val column.val coefficient.val
+    (relation.rows.symm ▸ rightLayout.rows.symm ▸ row.isLt)
+    (relation.columns.symm ▸ rightLayout.columns.symm ▸ column.isLt)
+    (relation.ringDimension.symm ▸ rightLayout.ringDimension.symm ▸ coefficient.isLt)
+  have reducedEqualCommon :
+      Mxx.reduceCoefficient left.modulus
+          (left.coefficient row.val column.val coefficient.val) =
+        Mxx.reduceCoefficient left.modulus
+          (right.coefficient row.val column.val coefficient.val) := by
+    rw [← relation.modulus] at reducedEqual
+    exact reducedEqual
+  rw [← negacyclicEmbed_reduce q n (left.coefficient row.val column.val coefficient.val),
+    ← negacyclicEmbed_reduce q n (right.coefficient row.val column.val coefficient.val),
+    ← leftLayout.modulus, reducedEqualCommon]
+
 theorem withSamplerParams_shape (matrix : Mxx.Matrix) (params : Mxx.SamplerParams) :
     MatrixShape (matrix.withSamplerParams params) params.modulus params.ringDimension
       params.rows params.columns := by

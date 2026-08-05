@@ -2,7 +2,10 @@
 
 pub mod diamond;
 
-use mxx_correctness::{Comparator, ProtoInputName, ProtocolDecl, StageId, StageInputName};
+use mxx_correctness::{
+    ComparatorSpec, ProtocolDecl, ProtocolInputDestination, ProtocolInputId, StageId,
+    StageInputName,
+};
 use mxx_gadgets::circuit::{BooleanCircuitData, BooleanCircuitShape};
 use mxx_ir_core::node::NodeKind;
 use std::collections::BTreeSet;
@@ -18,9 +21,9 @@ pub struct WitnessEncryptionProtocolDecl {
 pub struct WitnessEncryptionInterface {
     pub encryption_stage: StageId,
     pub decryption_stage: StageId,
-    pub message: ProtoInputName,
-    pub instance: ProtoInputName,
-    pub witness: ProtoInputName,
+    pub message: ProtocolInputId,
+    pub instance: ProtocolInputId,
+    pub witness: ProtocolInputId,
 }
 
 #[derive(Debug, Error)]
@@ -44,8 +47,8 @@ impl WitnessEncryptionProtocolDecl {
         protocol: ProtocolDecl,
         interface: WitnessEncryptionInterface,
     ) -> Result<Self, WitnessEncryptionDeclError> {
-        if !protocol.stages.iter().any(|stage| stage.id == interface.encryption_stage) ||
-            !protocol.stages.iter().any(|stage| stage.id == interface.decryption_stage)
+        if !protocol.stages().iter().any(|stage| stage.id == interface.encryption_stage) ||
+            !protocol.stages().iter().any(|stage| stage.id == interface.decryption_stage)
         {
             return Err(WitnessEncryptionDeclError::MissingStage);
         }
@@ -62,26 +65,39 @@ impl WitnessEncryptionProtocolDecl {
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
         for name in &circuit_names {
-            let Some((_, destinations)) =
-                protocol.correctness.protocol_inputs.iter().find(|(input, _)| input.0 == *name)
+            let Some(binding) =
+                protocol.bundle.input_bindings.iter().find(|binding| binding.input.0 == *name)
             else {
                 return Err(WitnessEncryptionDeclError::MissingCircuitInputMapping);
             };
             if circuit_consumers.iter().any(|consumer| {
-                !destinations.iter().any(|(stage, input)| stage == consumer && input.0 == *name)
+                !binding.destinations.iter().any(|destination| {
+                    matches!(destination,
+                        ProtocolInputDestination::WorkflowStage { stage, input }
+                            if stage == consumer && input.0 == *name)
+                })
             }) {
                 return Err(WitnessEncryptionDeclError::MissingCircuitInputMapping);
             }
         }
-        let destinations = |name: &ProtoInputName| {
-            protocol
-                .correctness
-                .protocol_inputs
-                .iter()
-                .find(|(candidate, _)| candidate == name)
-                .map(|(_, values)| values.iter().cloned().collect::<BTreeSet<_>>())
+        let destinations = |name: &ProtocolInputId| {
+            protocol.bundle.input_bindings.iter().find(|binding| &binding.input == name).map(
+                |binding| {
+                    binding
+                        .destinations
+                        .iter()
+                        .filter_map(|destination| match destination {
+                            ProtocolInputDestination::WorkflowStage { stage, input } => {
+                                Some((stage.clone(), input.clone()))
+                            }
+                            ProtocolInputDestination::Requirement { .. } |
+                            ProtocolInputDestination::Ideal { .. } => None,
+                        })
+                        .collect::<BTreeSet<_>>()
+                },
+            )
         };
-        let both = |name: &ProtoInputName| {
+        let both = |name: &ProtocolInputId| {
             BTreeSet::from([
                 (interface.encryption_stage.clone(), StageInputName(name.0.clone())),
                 (interface.decryption_stage.clone(), StageInputName(name.0.clone())),
@@ -116,8 +132,8 @@ impl WitnessEncryptionProtocolDecl {
         satisfaction_names.insert(interface.instance.0.clone());
         satisfaction_names.insert(interface.witness.0.clone());
         let requirement_inputs = protocol
-            .correctness
-            .requires
+            .bundle
+            .requirements
             .iter()
             .map(|requirement| graph_inputs(&requirement.graph))
             .collect::<Vec<_>>();
@@ -128,13 +144,13 @@ impl WitnessEncryptionProtocolDecl {
         {
             return Err(WitnessEncryptionDeclError::InvalidCorrectnessPredicates);
         }
-        if graph_inputs(&protocol.correctness.ideal.graph) !=
+        if graph_inputs(&protocol.bundle.ideal.graph) !=
             BTreeSet::from([interface.message.0.clone()]) ||
-            protocol.correctness.ideal.graph.outputs().len() != 1
+            protocol.bundle.ideal.graph.outputs().len() != 1
         {
             return Err(WitnessEncryptionDeclError::InvalidIdeal);
         }
-        if !matches!(protocol.correctness.comparator, Comparator::Equal) {
+        if !matches!(protocol.bundle.comparator, ComparatorSpec::Equality { .. }) {
             return Err(WitnessEncryptionDeclError::InvalidComparator);
         }
         Ok(Self { protocol, interface })

@@ -46,6 +46,9 @@ inductive SymbolicMatrixForm.Denotes
   | affineLeaf {form value}
       (holds : AffineForm.Holds environment form value) :
       SymbolicMatrixForm.Denotes environment arena (.affineLeaf form) value
+  | boundedAffineLeaf {form totalBound value}
+      (holds : AffineForm.Holds environment form value) :
+      SymbolicMatrixForm.Denotes environment arena (.boundedAffineLeaf form totalBound) value
   | add {left right leftValue rightValue}
       (leftDenotes : SymbolicMatrixFormArena.Denotes environment arena left leftValue)
       (rightDenotes : SymbolicMatrixFormArena.Denotes environment arena right rightValue) :
@@ -116,21 +119,6 @@ inductive SymbolicMatrixForm.Denotes
 
 end
 
-/-- A symbolic matrix fact relates one actual matrix to both its immutable exact expression and
-its independently normalized decomposition.  Bound-witness soundness is a separate Phase-A
-judgment and is therefore not smuggled into this value-denotation predicate. -/
-def MatrixSymbolicFact.Holds
-    (environment : FactEnvironment)
-    (arena : SymbolicMatrixFormArena)
-    (fact : MatrixSymbolicFact)
-    (value : Mxx.Matrix) : Prop :=
-  environment.values fact.subject = some (.matrix value) ∧
-    (∃ exactExpression,
-      environment.expressionArena.lookupMatrix fact.exactValue = some exactExpression ∧
-      MatrixExpr.Denotes environment exactExpression value) ∧
-    SymbolicMatrixFormArena.Denotes environment arena fact.decomposition value ∧
-    ∀ relation ∈ fact.relations, relation.Holds environment
-
 /-- A matrix-expression leaf can be embedded without changing its denotation. -/
 theorem SymbolicMatrixForm.signalAtom_sound
     {environment : FactEnvironment}
@@ -162,6 +150,15 @@ theorem SymbolicMatrixForm.affineLeaf_sound
     (holds : AffineForm.Holds environment form value) :
     SymbolicMatrixForm.Denotes environment arena (.affineLeaf form) value :=
   .affineLeaf holds
+
+/-- A normalized affine leaf retains its independently proved total bound as symbolic syntax. -/
+theorem SymbolicMatrixForm.boundedAffineLeaf_sound
+    {environment : FactEnvironment}
+    {arena : SymbolicMatrixFormArena}
+    {form totalBound value}
+    (holds : AffineForm.Holds environment form value) :
+    SymbolicMatrixForm.Denotes environment arena (.boundedAffineLeaf form totalBound) value :=
+  .boundedAffineLeaf holds
 
 /-- Symbolic addition uses exactly the runtime matrix-addition operation. -/
 theorem SymbolicMatrixForm.add_sound

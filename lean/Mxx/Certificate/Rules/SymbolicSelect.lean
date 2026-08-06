@@ -34,21 +34,13 @@ theorem selectMaximumBounds_evaluate
         .ok (Mxx.Toolkit.selectBound values)
   | [], [], .nil => rfl
   | bound :: bounds, value :: values, .cons head tail => by
-      have head' :
-          BoundExpr.evaluateWithRecurrences environment {} bound = .ok value := by
-        simpa [BoundExpr.evaluate] using head
-      have tail' :
-          BoundExpr.evaluateWithRecurrences environment {} (selectMaximumBounds bounds) =
-            .ok (Mxx.Toolkit.selectBound values) := by
-        simpa [BoundExpr.evaluate] using selectMaximumBounds_evaluate environment tail
       change
         (do
-          let left ← BoundExpr.evaluateWithRecurrences environment {} bound
-          let right ←
-            BoundExpr.evaluateWithRecurrences environment {} (selectMaximumBounds bounds)
+          let left ← BoundExpr.evaluate environment bound
+          let right ← BoundExpr.evaluate environment (selectMaximumBounds bounds)
           pure (Nat.max left right)) =
           .ok (Nat.max value (Mxx.Toolkit.selectBound values))
-      rw [head', tail']
+      rw [head, selectMaximumBounds_evaluate environment tail]
       rfl
 
 /-- A branch maximum dominates every successfully evaluated branch bound. -/

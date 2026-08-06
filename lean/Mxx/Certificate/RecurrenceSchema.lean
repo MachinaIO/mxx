@@ -1,5 +1,6 @@
 import Mxx.Certificate.SymbolicForm
 import Mxx.Certificate.Bounds
+import Mxx.Certificate.ValueSemantics
 
 namespace Mxx.Certificate
 
@@ -21,13 +22,66 @@ inductive CarriedValueSchema where
   | family (count : IntExpr) (element : CarriedValueSchema)
   deriving BEq, DecidableEq
 
-inductive CarriedBoundSchema where
-  | matrixSummary
-  | integerInterval
-  | boolean
-  | bytes
-  | family (count : IntExpr) (element : CarriedBoundSchema)
-  deriving BEq, DecidableEq
+/-- Closed runtime meaning of one coarse carried-value schema. Matrix shape, modulus, coefficient
+ring, and representation are checked against the actual runtime matrix. Family counts and every
+nested element are checked recursively. -/
+def CarriedValueSchema.Holds
+    (schema : CarriedValueSchema)
+    (parameters : Mxx.Ir.ParamEnvironment)
+    (value : Mxx.Ir.Value) : Prop :=
+  match schema with
+  | .matrix matrixType representation =>
+      match value with
+      | Mxx.Ir.Value.matrix runtimeMatrix =>
+          matrixType.Holds parameters runtimeMatrix ∧
+            representation.Holds parameters runtimeMatrix
+      | _ => False
+  | .integer =>
+      match value with
+      | Mxx.Ir.Value.integer _ => True
+      | _ => False
+  | .boolean =>
+      match value with
+      | Mxx.Ir.Value.boolean _ => True
+      | _ => False
+  | .bytes =>
+      match value with
+      | Mxx.Ir.Value.bytes _ => True
+      | _ => False
+  | .family count element =>
+      match value with
+      | Mxx.Ir.Value.family values =>
+          ∃ evaluatedCount,
+            evaluateIntExpr parameters count = .ok evaluatedCount ∧
+            0 ≤ evaluatedCount ∧
+            values.length = evaluatedCount.toNat ∧
+            ∀ value ∈ values, element.Holds parameters value
+      | _ => False
+
+/-- The actual carried tuple has exactly the analyzer-derived schema, slot by slot. This closed
+inductive relation cannot be replaced by a certificate-supplied invariant. -/
+inductive CarriedState.Holds
+    (parameters : Mxx.Ir.ParamEnvironment) :
+    List CarriedValueSchema → List Mxx.Ir.Value → Prop where
+  | nil : CarriedState.Holds parameters [] []
+  | cons {schema value schemas values}
+      (head : schema.Holds parameters value)
+      (tail : CarriedState.Holds parameters schemas values) :
+      CarriedState.Holds parameters (schema :: schemas) (value :: values)
+
+example :
+    (CarriedValueSchema.family (.constant 2) .integer).Holds []
+      (.family [.integer 7, .integer (-3)]) := by
+  simp [CarriedValueSchema.Holds, evaluateIntExpr]
+
+example :
+    ¬ (CarriedValueSchema.family (.constant 2) .integer).Holds []
+      (.family [.integer 7]) := by
+  simp [CarriedValueSchema.Holds, evaluateIntExpr]
+
+example (matrixType : MatrixTypeExpr) (representation : CoefficientRepresentation) :
+    ¬ (CarriedValueSchema.matrix matrixType representation).Holds [] (.integer 0) := by
+  simp [CarriedValueSchema.Holds]
 
 def CarriedValueSchema.boundSchema : CarriedValueSchema → CarriedBoundSchema
   | .matrix _ _ => .matrixSummary
@@ -45,15 +99,13 @@ inductive CarriedBoundTemplateState : CarriedBoundSchema → Type where
       (element : CarriedBoundTemplateState elementSchema) :
       CarriedBoundTemplateState (.family count elementSchema)
 
-inductive EvaluatedCarriedBoundState : CarriedBoundSchema → Type where
-  | matrix (signal : Bool) (coefficientL1 noise total : Nat) :
-      EvaluatedCarriedBoundState .matrixSummary
-  | integer (lower upper : Int) : EvaluatedCarriedBoundState .integerInterval
-  | boolean : EvaluatedCarriedBoundState .boolean
-  | bytes : EvaluatedCarriedBoundState .bytes
-  | familyEnvelope {count : IntExpr} {elementSchema : CarriedBoundSchema}
-      (element : EvaluatedCarriedBoundState elementSchema) :
-      EvaluatedCarriedBoundState (.family count elementSchema)
+/-- Schema-indexed initial bound templates. -/
+inductive CarriedBoundTemplateVector : List CarriedBoundSchema → Type where
+  | nil : CarriedBoundTemplateVector []
+  | cons {schema schemas}
+      (head : CarriedBoundTemplateState schema)
+      (tail : CarriedBoundTemplateVector schemas) :
+      CarriedBoundTemplateVector (schema :: schemas)
 
 inductive RecurrenceSchemaEvalError where
   | natural (error : BoundEvalError)
@@ -71,26 +123,40 @@ private def signalPresenceToBool : SignalPresence → Bool
 def CarriedBoundTemplateState.evaluate
     {schema : CarriedBoundSchema}
     (environment : Mxx.Ir.ParamEnvironment)
-    (recurrenceBounds : CheckedRecurrenceBoundTable) :
+    (recurrenceStates : CheckedSymbolicRecurrenceStateTable) :
     CarriedBoundTemplateState schema →
       Except RecurrenceSchemaEvalError (EvaluatedCarriedBoundState schema)
   | .matrix summary => do
-      let coefficient ← summary.coefficientL1Bound.evaluateWithRecurrences
-        environment recurrenceBounds |>.mapError .natural
-      let noise ← summary.noiseBound.evaluateWithRecurrences
-        environment recurrenceBounds |>.mapError .natural
-      let total ← summary.totalBound.evaluateWithRecurrences
-        environment recurrenceBounds |>.mapError .natural
+      let coefficient ← summary.coefficientL1Bound.evaluateWithSymbolicRecurrences
+        environment recurrenceStates |>.mapError .natural
+      let noise ← summary.noiseBound.evaluateWithSymbolicRecurrences
+        environment recurrenceStates |>.mapError .natural
+      let total ← summary.totalBound.evaluateWithSymbolicRecurrences
+        environment recurrenceStates |>.mapError .natural
       return .matrix (signalPresenceToBool summary.signal) coefficient noise total
   | .integer lower upper => do
-      let lower' ← lower.evaluate environment recurrenceBounds |>.mapError .integer
-      let upper' ← upper.evaluate environment recurrenceBounds |>.mapError .integer
+      let lower' ← lower.evaluateWithSymbolicRecurrences
+        environment recurrenceStates |>.mapError .integer
+      let upper' ← upper.evaluateWithSymbolicRecurrences
+        environment recurrenceStates |>.mapError .integer
       return .integer lower' upper'
   | .boolean => .ok .boolean
   | .bytes => .ok .bytes
   | .familyEnvelope element => do
-      let element' ← element.evaluate environment recurrenceBounds
+      let element' ← element.evaluate environment recurrenceStates
       return .familyEnvelope element'
+
+def CarriedBoundTemplateVector.evaluate
+    {schemas : List CarriedBoundSchema}
+    (environment : Mxx.Ir.ParamEnvironment)
+    (recurrenceStates : CheckedSymbolicRecurrenceStateTable) :
+    CarriedBoundTemplateVector schemas →
+      Except RecurrenceSchemaEvalError (CarriedBoundStateVector schemas)
+  | .nil => .ok .nil
+  | .cons head tail => do
+      let head' ← head.evaluate environment recurrenceStates
+      let tail' ← tail.evaluate environment recurrenceStates
+      return .cons head' tail'
 
 /-! Typed paths through a carried slot and through lane-uniform family envelopes. -/
 
@@ -107,13 +173,6 @@ inductive CarriedBoundStatePath : List CarriedBoundSchema → CarriedBoundSchema
   | tail {schema leaf : CarriedBoundSchema} {tail : List CarriedBoundSchema}
       (path : CarriedBoundStatePath tail leaf) :
       CarriedBoundStatePath (schema :: tail) leaf
-
-inductive CarriedBoundStateVector : List CarriedBoundSchema → Type where
-  | nil : CarriedBoundStateVector []
-  | cons {schema : CarriedBoundSchema} {schemas : List CarriedBoundSchema}
-      (head : EvaluatedCarriedBoundState schema)
-      (tail : CarriedBoundStateVector schemas) :
-      CarriedBoundStateVector (schema :: schemas)
 
 def CarriedBoundNestedPath.read
     {schema leaf : CarriedBoundSchema}
@@ -156,6 +215,7 @@ inductive SignalTransitionExpr (previous : List CarriedBoundSchema) where
 inductive NatBoundTransitionExpr (previous : List CarriedBoundSchema) where
   | constant (value : Nat)
   | parameter (value : IntExpr)
+  | absolute (value : IntExpr)
   | previousState
       (path : CarriedBoundStatePath previous .matrixSummary)
       (field : MatrixBoundField)
@@ -163,10 +223,16 @@ inductive NatBoundTransitionExpr (previous : List CarriedBoundSchema) where
   | multiply (left right : NatBoundTransitionExpr previous)
   | minimum (left right : NatBoundTransitionExpr previous)
   | maximum (left right : NatBoundTransitionExpr previous)
+  | floorDivide (value : NatBoundTransitionExpr previous) (divisor : Nat)
   | matrixProduct
       (ringDimension innerDimension : IntExpr)
       (left right : NatBoundTransitionExpr previous)
   | centeredModulusCap (modulus : IntExpr) (value : NatBoundTransitionExpr previous)
+  /-- A checked bound produced by another analyzer-owned recurrence. This leaf is closed to a
+  constant before the current recurrence is iterated. -/
+  | externalRecurrence
+      (recurrence : SequentialRecurrenceInstanceRef)
+      (path : BoundFactPath)
 
 inductive IntBoundTransitionExpr (previous : List CarriedBoundSchema) where
   | constant (value : Int)
@@ -181,6 +247,78 @@ inductive IntBoundTransitionExpr (previous : List CarriedBoundSchema) where
   | divide (left right : IntBoundTransitionExpr previous)
   | minimum (left right : IntBoundTransitionExpr previous)
   | maximum (left right : IntBoundTransitionExpr previous)
+  /-- Signed counterpart of `NatBoundTransitionExpr.externalRecurrence`. -/
+  | externalRecurrence
+      (recurrence : SequentialRecurrenceInstanceRef)
+      (path : IntBoundFactPath)
+
+def NatBoundTransitionExpr.closeExternalRecurrences
+    {previous : List CarriedBoundSchema}
+    (environment : Mxx.Ir.ParamEnvironment)
+    (states : CheckedSymbolicRecurrenceStateTable) :
+    NatBoundTransitionExpr previous →
+      Except RecurrenceSchemaEvalError (NatBoundTransitionExpr previous)
+  | .constant value => .ok (.constant value)
+  | .parameter value => .ok (.parameter value)
+  | .absolute value => .ok (.absolute value)
+  | .previousState path field => .ok (.previousState path field)
+  | .add left right => return (.add
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .multiply left right => return (.multiply
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .minimum left right => return (.minimum
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .maximum left right => return (.maximum
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .floorDivide value divisor => return (.floorDivide
+      (← value.closeExternalRecurrences environment states) divisor)
+  | .matrixProduct ringDimension innerDimension left right => return (.matrixProduct
+      ringDimension innerDimension
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .centeredModulusCap modulus value => return (.centeredModulusCap modulus
+      (← value.closeExternalRecurrences environment states))
+  | .externalRecurrence recurrence path => do
+      let value ← (BoundExpr.recurrenceResult recurrence path).evaluateWithSymbolicRecurrences
+        environment states |>.mapError .natural
+      return .constant value
+
+def IntBoundTransitionExpr.closeExternalRecurrences
+    {previous : List CarriedBoundSchema}
+    (environment : Mxx.Ir.ParamEnvironment)
+    (states : CheckedSymbolicRecurrenceStateTable) :
+    IntBoundTransitionExpr previous →
+      Except RecurrenceSchemaEvalError (IntBoundTransitionExpr previous)
+  | .constant value => .ok (.constant value)
+  | .parameter value => .ok (.parameter value)
+  | .previousState path field => .ok (.previousState path field)
+  | .negate value => return (.negate (← value.closeExternalRecurrences environment states))
+  | .add left right => return (.add
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .subtract left right => return (.subtract
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .multiply left right => return (.multiply
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .divide left right => return (.divide
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .minimum left right => return (.minimum
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .maximum left right => return (.maximum
+      (← left.closeExternalRecurrences environment states)
+      (← right.closeExternalRecurrences environment states))
+  | .externalRecurrence recurrence path => do
+      let value ← (IntBoundExpr.recurrenceResult recurrence path).evaluateWithSymbolicRecurrences
+        environment states |>.mapError .integer
+      return .constant value
 
 private def evaluateNaturalParameter
     (environment : Mxx.Ir.ParamEnvironment)
@@ -211,6 +349,8 @@ def NatBoundTransitionExpr.evaluate
     NatBoundTransitionExpr previous → Except RecurrenceSchemaEvalError Nat
   | .constant value => .ok value
   | .parameter value => evaluateNaturalParameter environment value
+  | .absolute value =>
+      return (← evaluateIntExpr environment value |>.mapError .expression).natAbs
   | .previousState path field =>
       match path.read previousState, field with
       | .matrix _ coefficient _ _, .coefficientL1 => .ok coefficient
@@ -228,6 +368,9 @@ def NatBoundTransitionExpr.evaluate
       let left' ← left.evaluate environment previousState
       let right' ← right.evaluate environment previousState
       return Nat.max left' right'
+  | .floorDivide value divisor =>
+      if divisor = 0 then .error .divisionByZero
+      else return (← value.evaluate environment previousState) / divisor
   | .matrixProduct ringDimension innerDimension left right => do
       let ring ← evaluatePositiveDimensionForTransition environment ringDimension
       let inner ← evaluatePositiveDimensionForTransition environment innerDimension
@@ -236,6 +379,8 @@ def NatBoundTransitionExpr.evaluate
   | .centeredModulusCap modulus value => do
       let modulus ← evaluateIntExpr environment modulus |>.mapError .expression
       return Nat.min (modulus.natAbs / 2) (← value.evaluate environment previousState)
+  | .externalRecurrence recurrence path =>
+      .error (.natural (.unresolvedRecurrence recurrence path))
 
 def IntBoundTransitionExpr.evaluate
     {previous : List CarriedBoundSchema}
@@ -267,6 +412,8 @@ def IntBoundTransitionExpr.evaluate
       let left' ← left.evaluate environment previousState
       let right' ← right.evaluate environment previousState
       return max left' right'
+  | .externalRecurrence recurrence path =>
+      .error (.integer (.unresolvedRecurrence recurrence path))
 
 structure MatrixSummaryTransition (previous : List CarriedBoundSchema) where
   signal : SignalTransitionExpr previous
@@ -308,6 +455,28 @@ def CarriedBoundTransition.evaluate
       let element' ← element.evaluate environment previousState
       return .familyEnvelope element'
 
+def CarriedBoundTransition.closeExternalRecurrences
+    {previous : List CarriedBoundSchema} {schema : CarriedBoundSchema}
+    (environment : Mxx.Ir.ParamEnvironment)
+    (states : CheckedSymbolicRecurrenceStateTable) :
+    CarriedBoundTransition previous schema →
+      Except RecurrenceSchemaEvalError (CarriedBoundTransition previous schema)
+  | .matrix fields => do
+      return .matrix {
+        signal := fields.signal
+        coefficientL1Bound := ← fields.coefficientL1Bound.closeExternalRecurrences
+          environment states
+        noiseBound := ← fields.noiseBound.closeExternalRecurrences environment states
+        totalBound := ← fields.totalBound.closeExternalRecurrences environment states
+      }
+  | .integer lower upper => return (.integer
+      (← lower.closeExternalRecurrences environment states)
+      (← upper.closeExternalRecurrences environment states))
+  | .boolean => .ok .boolean
+  | .bytes => .ok .bytes
+  | .familyEnvelope element => return (.familyEnvelope
+      (← element.closeExternalRecurrences environment states))
+
 inductive CarriedBoundTransitionVector
     (previous : List CarriedBoundSchema) : List CarriedBoundSchema → Type where
   | nil : CarriedBoundTransitionVector previous []
@@ -327,6 +496,17 @@ def CarriedBoundTransitionVector.evaluate
       let head' ← head.evaluate environment previousState
       let tail' ← tail.evaluate environment previousState
       return .cons head' tail'
+
+def CarriedBoundTransitionVector.closeExternalRecurrences
+    {previous output : List CarriedBoundSchema}
+    (environment : Mxx.Ir.ParamEnvironment)
+    (states : CheckedSymbolicRecurrenceStateTable) :
+    CarriedBoundTransitionVector previous output →
+      Except RecurrenceSchemaEvalError (CarriedBoundTransitionVector previous output)
+  | .nil => .ok .nil
+  | .cons head tail => return (.cons
+      (← head.closeExternalRecurrences environment states)
+      (← tail.closeExternalRecurrences environment states))
 
 def iterateCarriedBoundTransition
     {schema : List CarriedBoundSchema}

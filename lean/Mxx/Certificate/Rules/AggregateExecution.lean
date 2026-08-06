@@ -278,9 +278,11 @@ theorem familyGet_integerHolds
     (indexDenotes : RuntimeIntExpr.Denotes
       (environment.bindFamilyElement wire aggregate indexRef (.integer value))
       indexExpression indexValue)
-    (lowerEvaluates : lower.evaluate environment.parameters environment.recurrenceBounds =
+    (lowerEvaluates : lower.evaluateWithSymbolicRecurrences
+      environment.parameters environment.recurrenceStates =
       .ok lowerValue)
-    (upperEvaluates : upper.evaluate environment.parameters environment.recurrenceBounds =
+    (upperEvaluates : upper.evaluateWithSymbolicRecurrences
+      environment.parameters environment.recurrenceStates =
       .ok upperValue)
     (lowerValid : lowerValue ≤ value)
     (upperValid : value ≤ upperValue) :
@@ -371,146 +373,5 @@ theorem familyGet_familyHolds
   have lookups := environment.bindFamilyElement_lookups wire aggregate indexRef (.family values)
     different
   exact ⟨values, lookups.2⟩
-
-/-- Bind both names of one final carried slot: the executable output wire and the analyzer-owned
-recurrence-result identity used by projected expressions. -/
-def RecurrenceSemanticResult.bindSlot
-    {analysis : AnalysisResult}
-    {runChild : Mxx.Ir.ChildRunner}
-    {samplers : Mxx.MxxSamplerFamily}
-    {params : Mxx.Ir.ParamEnvironment}
-    {inputs : Mxx.Ir.Environment}
-    {recurrence : FactRecurrenceInstanceRef}
-    (result : RecurrenceSemanticResult analysis runChild samplers params inputs recurrence)
-    (environment : FactEnvironment)
-    (wire : CoreWireRef)
-    (slot : Nat) : Option FactEnvironment := do
-  let value ← result.slotValue slot
-  return (environment.bind (.recurrenceResult recurrence slot) value).bind
-    (.ofCoreWire wire) value
-
-theorem RecurrenceSemanticResult.bindSlot_recurrenceLookup
-    {analysis : AnalysisResult}
-    {runChild : Mxx.Ir.ChildRunner}
-    {samplers : Mxx.MxxSamplerFamily}
-    {params : Mxx.Ir.ParamEnvironment}
-    {inputs : Mxx.Ir.Environment}
-    {recurrence : FactRecurrenceInstanceRef}
-    (result : RecurrenceSemanticResult analysis runChild samplers params inputs recurrence)
-    (environment : FactEnvironment)
-    (wire : CoreWireRef)
-    (slot : Nat)
-    {boundEnvironment : FactEnvironment}
-    (different : ValueInstanceRef.ofCoreWire wire ≠ .recurrenceResult recurrence slot)
-    (bound : result.bindSlot environment wire slot = some boundEnvironment) :
-    ∃ value,
-      result.slotValue slot = some value ∧
-      boundEnvironment.values (.recurrenceResult recurrence slot) = some value ∧
-      boundEnvironment.values (.ofCoreWire wire) = some value := by
-  cases lookup : result.slotValue slot with
-  | none => simp [RecurrenceSemanticResult.bindSlot, lookup] at bound
-  | some value =>
-    simp [RecurrenceSemanticResult.bindSlot, lookup] at bound
-    subst boundEnvironment
-    refine ⟨value, rfl, ?_, FactEnvironment.bind_same _ _ _⟩
-    rw [FactEnvironment.bind_other]
-    · exact FactEnvironment.bind_same _ _ _
-    · exact Ne.symm different
-
-theorem RecurrenceSemanticResult.bindSlot_integerHolds
-    {analysis : AnalysisResult}
-    {runChild : Mxx.Ir.ChildRunner}
-    {samplers : Mxx.MxxSamplerFamily}
-    {params : Mxx.Ir.ParamEnvironment}
-    {inputs : Mxx.Ir.Environment}
-    {recurrence : FactRecurrenceInstanceRef}
-    (result : RecurrenceSemanticResult analysis runChild samplers params inputs recurrence)
-    (environment : FactEnvironment)
-    (wire : CoreWireRef)
-    (slot : Nat)
-    (lower upper : IntBoundExpr)
-    (value evaluatedLower evaluatedUpper : Int)
-    {boundEnvironment : FactEnvironment}
-    (different : ValueInstanceRef.ofCoreWire wire ≠ .recurrenceResult recurrence slot)
-    (slotLookup : result.slotValue slot = some (.integer value))
-    (bound : result.bindSlot environment wire slot = some boundEnvironment)
-    (lowerEvaluates : lower.evaluate boundEnvironment.parameters
-      boundEnvironment.recurrenceBounds = .ok evaluatedLower)
-    (upperEvaluates : upper.evaluate boundEnvironment.parameters
-      boundEnvironment.recurrenceBounds = .ok evaluatedUpper)
-    (lowerValid : evaluatedLower ≤ value)
-    (upperValid : value ≤ evaluatedUpper) :
-    ScopedWireFact.Holds boundEnvironment {
-      wire
-      matrixType := none
-      fact := .integer {
-        expression := .intWire (.recurrenceResult recurrence slot)
-        lower
-        upper
-      }
-    } := by
-  obtain ⟨actual, actualLookup, recurrenceLookup, outputLookup⟩ :=
-    result.bindSlot_recurrenceLookup environment wire slot different bound
-  rw [slotLookup] at actualLookup
-  cases actualLookup
-  exact ⟨value, evaluatedLower, evaluatedUpper, outputLookup, .intWire recurrenceLookup,
-    lowerEvaluates, upperEvaluates, lowerValid, upperValid⟩
-
-theorem RecurrenceSemanticResult.bindSlot_booleanHolds
-    {analysis : AnalysisResult}
-    {runChild : Mxx.Ir.ChildRunner}
-    {samplers : Mxx.MxxSamplerFamily}
-    {params : Mxx.Ir.ParamEnvironment}
-    {inputs : Mxx.Ir.Environment}
-    {recurrence : FactRecurrenceInstanceRef}
-    (result : RecurrenceSemanticResult analysis runChild samplers params inputs recurrence)
-    (environment : FactEnvironment)
-    (wire : CoreWireRef)
-    (slot : Nat)
-    (value : Bool)
-    {boundEnvironment : FactEnvironment}
-    (different : ValueInstanceRef.ofCoreWire wire ≠ .recurrenceResult recurrence slot)
-    (slotLookup : result.slotValue slot = some (.boolean value))
-    (bound : result.bindSlot environment wire slot = some boundEnvironment) :
-    ScopedWireFact.Holds boundEnvironment {
-      wire
-      matrixType := none
-      fact := .boolean {
-        expression := .boolWire (.recurrenceResult recurrence slot)
-      }
-    } := by
-  obtain ⟨actual, actualLookup, recurrenceLookup, outputLookup⟩ :=
-    result.bindSlot_recurrenceLookup environment wire slot different bound
-  rw [slotLookup] at actualLookup
-  cases actualLookup
-  exact ⟨value, outputLookup, .boolWire recurrenceLookup⟩
-
-theorem RecurrenceSemanticResult.bindSlot_familyHolds
-    {analysis : AnalysisResult}
-    {runChild : Mxx.Ir.ChildRunner}
-    {samplers : Mxx.MxxSamplerFamily}
-    {params : Mxx.Ir.ParamEnvironment}
-    {inputs : Mxx.Ir.Environment}
-    {recurrence : FactRecurrenceInstanceRef}
-    (result : RecurrenceSemanticResult analysis runChild samplers params inputs recurrence)
-    (environment : FactEnvironment)
-    (wire : CoreWireRef)
-    (slot : Nat)
-    (values : List Mxx.Ir.Value)
-    (family : FamilyFact)
-    {boundEnvironment : FactEnvironment}
-    (different : ValueInstanceRef.ofCoreWire wire ≠ .recurrenceResult recurrence slot)
-    (slotLookup : result.slotValue slot = some (.family values))
-    (bound : result.bindSlot environment wire slot = some boundEnvironment) :
-    ScopedWireFact.Holds boundEnvironment {
-      wire
-      matrixType := none
-      fact := .family family
-    } := by
-  obtain ⟨actual, actualLookup, _, outputLookup⟩ :=
-    result.bindSlot_recurrenceLookup environment wire slot different bound
-  rw [slotLookup] at actualLookup
-  cases actualLookup
-  exact ⟨values, outputLookup⟩
 
 end Mxx.Certificate

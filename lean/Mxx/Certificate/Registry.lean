@@ -81,7 +81,7 @@ inductive RuleInputRef where
   | matrixFact (reference : ValueInstanceRef)
   | trapdoorFact (reference : ValueInstanceRef)
   | family (reference : JointFamilyId)
-  | recurrence (reference : FactRecurrenceRef)
+  | recurrence (reference : SequentialRecurrenceRef)
   deriving BEq, DecidableEq, Repr
 
 /-- An override chooses a closed rule and existing inputs, but cannot state its output fact. -/

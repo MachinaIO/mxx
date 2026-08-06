@@ -7,6 +7,8 @@ private def describeVerifyError : Mxx.Certificate.VerifyError → String
   | .disabledRule _ => "disabled rule"
   | .unsupportedNode stage node =>
       s!"unsupported node {stage.name}:{node.value}"
+  | .unsupportedNodeInScope stage scope node =>
+      s!"unsupported node {stage.name}:{repr scope.path}:{node.value}"
   | .unsupportedDefinition stage name =>
       s!"unsupported definition {stage.name}:{name}"
   | .missingInputFact stage node input =>
@@ -16,7 +18,7 @@ private def describeVerifyError : Mxx.Certificate.VerifyError → String
         s!"{wire.node.value}:{wire.port}"
   | .expectedTrapdoorFact wire =>
       s!"expected trapdoor fact {wire.stage.name}:{wire.node.value}:{wire.port}"
-  | .trapdoorPublicMismatch wire =>
+  | .trapdoorPublicMismatch wire _ _ =>
       s!"trapdoor/public mismatch {wire.stage.name}:{wire.node.value}:{wire.port}"
   | .missingAnchorBinding _ => "missing semantic-anchor binding"
   | .invalidAnchorWire _ _ => "invalid semantic-anchor wire"
@@ -33,6 +35,12 @@ private def describeVerifyError : Mxx.Certificate.VerifyError → String
   | .invalidInputDestination _ => "invalid input destination"
   | .invalidEndpointCoverage _ => "invalid endpoint coverage"
   | .invalidEndpointConnection _ => "invalid endpoint connection"
+  | .diamondEndpoint error => s!"invalid Diamond endpoint: {repr error}"
+  | .frozenRecurrenceInterface recurrence error =>
+      s!"invalid frozen recurrence {repr recurrence}: {repr error}"
+  | .bggRecurrencePrefilter error => s!"invalid BGG recurrence prefilter: {repr error}"
+  | .bggCarriedRoleInference error => s!"invalid BGG carried-role inference: {repr error}"
+  | .bggThreeTraceInterface error => s!"invalid BGG three-trace interface: {repr error}"
   | .invalidPreconditionSpec => "invalid precondition specification"
   | .duplicateInputId _ => "duplicate input id"
   | .duplicateInputName name => s!"duplicate input name {name}"
@@ -62,10 +70,6 @@ private def describeVerifyError : Mxx.Certificate.VerifyError → String
       s!"invalid loop arity {stage.name}:{node.value}"
   | .invalidLoopArityInScope stage scope node =>
       s!"invalid loop arity {stage.name}:{reprStr scope.path}:{node.value}"
-  | .recurrenceSchemaMismatch stage node _ _ =>
-      s!"recurrence schema mismatch {stage.name}:{node.value}"
-  | .invalidRecurrenceProjection stage node slot =>
-      s!"invalid recurrence projection {stage.name}:{node.value}:{slot}"
   | .escapedCarriedInput stage node slot =>
       s!"escaped carried input {stage.name}:{node.value}:{slot}"
   | .unsupportedCarriedKind stage node slot =>
@@ -74,11 +78,14 @@ private def describeVerifyError : Mxx.Certificate.VerifyError → String
       s!"relation-bearing carried matrix {stage.name}:{node.value}:{slot}"
   | .invalidExpressionReference => "invalid expression reference"
   | .scalarControl _ => "unsupported or invalid scalar-control operation"
-  | .matrixAffine _ => "unsupported or invalid affine matrix operation"
+  | .matrixAffine stage scope node _ =>
+      s!"unsupported or invalid affine matrix operation at " ++
+        s!"{stage.name}:{repr scope.path}:{node.value}"
   | .matrixSelect wire _ => s!"unsupported or invalid matrix selection at {reprStr wire}"
   | .transform _ => "unsupported or invalid matrix transform"
   | .affineNormalize wire _ =>
       s!"affine normalization failed at {reprStr wire}"
+  | _ => "unsupported correctness-analysis error"
 
 private def parseNat (value : String) : IO Nat :=
   match value.toNat? with

@@ -5,18 +5,18 @@ namespace Mxx.Certificate
 /-- A concrete static check failed. The obligation is retained for a precise diagnostic. -/
 inductive CheckError where
   | unsatisfied (obligation : StaticObligation)
-  | recurrence (error : ResolveRecurrenceBoundsError)
+  | symbolicRecurrence (error : ResolveSymbolicRecurrencesError)
 
 /-- Evidence returned by phase B. It contains no caller-provided facts: success means that the
 checker evaluated every obligation derived by phase A. -/
 structure CheckedStaticObligations where
   checked : List StaticObligation
-  recurrenceBounds : CheckedRecurrenceBoundTable := {}
+  symbolicRecurrenceStates : CheckedSymbolicRecurrenceStateTable := {}
 
 /-- Exact meaning of each parameter-only obligation. Runtime values never occur here. -/
 def StaticObligation.Holds
     (environment : Mxx.Ir.ParamEnvironment)
-    (recurrenceBounds : CheckedRecurrenceBoundTable) : StaticObligation → Prop
+    (recurrenceStates : CheckedSymbolicRecurrenceStateTable) : StaticObligation → Prop
   | .positiveModulus value =>
       match evaluateIntExpr environment value with
       | .ok evaluated => 0 < evaluated
@@ -37,19 +37,20 @@ def StaticObligation.Holds
             leftRows = rightRows ∧ leftColumns = rightColumns
       | _, _, _, _, _, _, _, _ => False
   | .intBoundNonnegative value =>
-      match value.evaluate environment recurrenceBounds with
+      match value.evaluateWithSymbolicRecurrences environment recurrenceStates with
       | .ok evaluated => 0 ≤ evaluated
       | .error _ => False
   | .intBoundPositive value =>
-      match value.evaluate environment recurrenceBounds with
+      match value.evaluateWithSymbolicRecurrences environment recurrenceStates with
       | .ok evaluated => 0 < evaluated
       | .error _ => False
   | .intBoundsOrdered lower upper =>
-      match lower.evaluate environment recurrenceBounds, upper.evaluate environment recurrenceBounds with
+      match lower.evaluateWithSymbolicRecurrences environment recurrenceStates,
+          upper.evaluateWithSymbolicRecurrences environment recurrenceStates with
       | .ok lowerValue, .ok upperValue => lowerValue ≤ upperValue
       | _, _ => False
   | .thresholdNoise noise ciphertextModulus plaintextModulus =>
-      match noise.evaluateWithRecurrences environment recurrenceBounds,
+      match noise.evaluateWithSymbolicRecurrences environment recurrenceStates,
           evaluateIntExpr environment ciphertextModulus,
           evaluateIntExpr environment plaintextModulus with
       | .ok noiseValue, .ok ciphertextValue, .ok plaintextValue =>
@@ -57,7 +58,7 @@ def StaticObligation.Holds
             2 * plaintextValue.toNat * noiseValue < ciphertextValue.toNat
       | _, _, _ => False
   | .diamondFalseInterval noise ciphertextModulus =>
-      match noise.evaluateWithRecurrences environment recurrenceBounds,
+      match noise.evaluateWithSymbolicRecurrences environment recurrenceStates,
           evaluateIntExpr environment ciphertextModulus with
       | .ok noiseValue, .ok ciphertextValue =>
           let quarter := Mxx.Ir.roundDiv (ciphertextValue - 2) 4
@@ -66,7 +67,7 @@ def StaticObligation.Holds
             3 * quarter + noiseValue < ciphertextValue
       | _, _ => False
   | .diamondTrueInterval noise ciphertextModulus =>
-      match noise.evaluateWithRecurrences environment recurrenceBounds,
+      match noise.evaluateWithSymbolicRecurrences environment recurrenceStates,
           evaluateIntExpr environment ciphertextModulus with
       | .ok noiseValue, .ok ciphertextValue =>
           let quarter := Mxx.Ir.roundDiv (ciphertextValue - 2) 4
@@ -77,7 +78,7 @@ def StaticObligation.Holds
 
 private def checkOne
     (environment : Mxx.Ir.ParamEnvironment)
-    (recurrenceBounds : CheckedRecurrenceBoundTable)
+    (recurrenceStates : CheckedSymbolicRecurrenceStateTable)
     (obligation : StaticObligation) : Except CheckError Unit :=
   match obligation with
   | .positiveModulus expression =>
@@ -103,20 +104,21 @@ private def checkOne
           else .error (.unsatisfied obligation)
       | _, _, _, _, _, _, _, _ => .error (.unsatisfied obligation)
   | .intBoundNonnegative value =>
-      match value.evaluate environment recurrenceBounds with
+      match value.evaluateWithSymbolicRecurrences environment recurrenceStates with
       | .ok evaluated => if 0 ≤ evaluated then .ok () else .error (.unsatisfied obligation)
       | .error _ => .error (.unsatisfied obligation)
   | .intBoundPositive value =>
-      match value.evaluate environment recurrenceBounds with
+      match value.evaluateWithSymbolicRecurrences environment recurrenceStates with
       | .ok evaluated => if 0 < evaluated then .ok () else .error (.unsatisfied obligation)
       | .error _ => .error (.unsatisfied obligation)
   | .intBoundsOrdered lower upper =>
-      match lower.evaluate environment recurrenceBounds, upper.evaluate environment recurrenceBounds with
+      match lower.evaluateWithSymbolicRecurrences environment recurrenceStates,
+          upper.evaluateWithSymbolicRecurrences environment recurrenceStates with
       | .ok lowerValue, .ok upperValue =>
           if lowerValue ≤ upperValue then .ok () else .error (.unsatisfied obligation)
       | _, _ => .error (.unsatisfied obligation)
   | .thresholdNoise noise ciphertextModulus plaintextModulus =>
-      match noise.evaluateWithRecurrences environment recurrenceBounds,
+      match noise.evaluateWithSymbolicRecurrences environment recurrenceStates,
           evaluateIntExpr environment ciphertextModulus,
           evaluateIntExpr environment plaintextModulus with
       | .ok noiseValue, .ok ciphertextValue, .ok plaintextValue =>
@@ -126,7 +128,7 @@ private def checkOne
           else .error (.unsatisfied obligation)
       | _, _, _ => .error (.unsatisfied obligation)
   | .diamondFalseInterval noise ciphertextModulus =>
-      match noise.evaluateWithRecurrences environment recurrenceBounds,
+      match noise.evaluateWithSymbolicRecurrences environment recurrenceStates,
           evaluateIntExpr environment ciphertextModulus with
       | .ok noiseValue, .ok ciphertextValue =>
           let quarter := Mxx.Ir.roundDiv (ciphertextValue - 2) 4
@@ -136,7 +138,7 @@ private def checkOne
           else .error (.unsatisfied obligation)
       | _, _ => .error (.unsatisfied obligation)
   | .diamondTrueInterval noise ciphertextModulus =>
-      match noise.evaluateWithRecurrences environment recurrenceBounds,
+      match noise.evaluateWithSymbolicRecurrences environment recurrenceStates,
           evaluateIntExpr environment ciphertextModulus with
       | .ok noiseValue, .ok ciphertextValue =>
           let quarter := Mxx.Ir.roundDiv (ciphertextValue - 2) 4
@@ -148,38 +150,38 @@ private def checkOne
 
 private theorem checkOne_sound
     {environment : Mxx.Ir.ParamEnvironment}
-    {recurrenceBounds : CheckedRecurrenceBoundTable}
+    {recurrenceStates : CheckedSymbolicRecurrenceStateTable}
     {obligation : StaticObligation}
-    (accepted : checkOne environment recurrenceBounds obligation = .ok ()) :
-    obligation.Holds environment recurrenceBounds := by
+    (accepted : checkOne environment recurrenceStates obligation = .ok ()) :
+    obligation.Holds environment recurrenceStates := by
   cases obligation <;>
     simp only [checkOne, StaticObligation.Holds] at accepted ⊢ <;>
     split at accepted <;> simp_all
 
 private def checkAll
     (environment : Mxx.Ir.ParamEnvironment) :
-    (recurrenceBounds : CheckedRecurrenceBoundTable) →
+    (recurrenceStates : CheckedSymbolicRecurrenceStateTable) →
     List StaticObligation → Except CheckError Unit
   | _, [] => .ok ()
-  | recurrenceBounds, obligation :: tail =>
-      match checkOne environment recurrenceBounds obligation with
+  | recurrenceStates, obligation :: tail =>
+      match checkOne environment recurrenceStates obligation with
       | .error error => .error error
-      | .ok () => checkAll environment recurrenceBounds tail
+      | .ok () => checkAll environment recurrenceStates tail
 
 private theorem checkAll_sound
     {environment : Mxx.Ir.ParamEnvironment}
-    {recurrenceBounds : CheckedRecurrenceBoundTable}
+    {recurrenceStates : CheckedSymbolicRecurrenceStateTable}
     {obligations : List StaticObligation}
-    (accepted : checkAll environment recurrenceBounds obligations = .ok ()) :
-    ∀ obligation ∈ obligations, obligation.Holds environment recurrenceBounds := by
+    (accepted : checkAll environment recurrenceStates obligations = .ok ()) :
+    ∀ obligation ∈ obligations, obligation.Holds environment recurrenceStates := by
   induction obligations with
   | nil => simp
   | cons head tail inductionHypothesis =>
-      cases headAccepted : checkOne environment recurrenceBounds head with
+      cases headAccepted : checkOne environment recurrenceStates head with
       | error error => simp [checkAll, headAccepted] at accepted
       | ok value =>
         cases value
-        have tailAccepted : checkAll environment recurrenceBounds tail = .ok () := by
+        have tailAccepted : checkAll environment recurrenceStates tail = .ok () := by
           simpa [checkAll, headAccepted] using accepted
         intro obligation member
         simp only [List.mem_cons] at member
@@ -187,28 +189,21 @@ private theorem checkAll_sound
         · exact checkOne_sound headAccepted
         · exact inductionHypothesis tailAccepted obligation member
 
-private def resolveAllRecurrenceBounds
-    (analysis : AnalysisResult)
-    (environment : Mxx.Ir.ParamEnvironment) :
-    Except CheckError CheckedRecurrenceBoundTable := do
-  let mut resolved : CheckedRecurrenceBoundTable := {}
-  for (reference, _) in analysis.recurrences do
-    resolved ← resolveRecurrenceBounds analysis environment resolved reference
-      |>.mapError .recurrence
-  return resolved
-
 /-- Phase B of the verifier. All arithmetic is evaluated by Lean over `Int`/`Nat`; no floating
 point conversion and no Rust-side mirror participates in acceptance. -/
 def checkStaticParameters
     (analysis : AnalysisResult)
     (environment : Mxx.Ir.ParamEnvironment) :
     Except CheckError CheckedStaticObligations :=
-  match resolveAllRecurrenceBounds analysis environment with
-  | .error error => .error error
-  | .ok recurrenceBounds =>
-      match checkAll environment recurrenceBounds analysis.staticObligations with
+  match resolveSymbolicRecurrences environment analysis.symbolicRecurrences with
+  | .error error => .error (.symbolicRecurrence error)
+  | .ok symbolicRecurrenceStates =>
+      match checkAll environment symbolicRecurrenceStates analysis.staticObligations with
       | .error error => .error error
-      | .ok () => .ok { checked := analysis.staticObligations, recurrenceBounds }
+      | .ok () => .ok {
+          checked := analysis.staticObligations
+          symbolicRecurrenceStates
+        }
 
 theorem checkStaticParameters_sound
     {analysis : AnalysisResult}
@@ -216,27 +211,32 @@ theorem checkStaticParameters_sound
     {checked : CheckedStaticObligations}
     (accepted : checkStaticParameters analysis environment = .ok checked) :
     ∀ obligation ∈ analysis.staticObligations,
-      obligation.Holds environment checked.recurrenceBounds := by
-  cases recurrenceResolved : resolveAllRecurrenceBounds analysis environment with
-  | error error => simp [checkStaticParameters, recurrenceResolved] at accepted
-  | ok recurrenceBounds =>
-      cases checkedAll : checkAll environment recurrenceBounds analysis.staticObligations with
-      | error error => simp [checkStaticParameters, recurrenceResolved, checkedAll] at accepted
+      obligation.Holds environment checked.symbolicRecurrenceStates := by
+  cases symbolicResolved :
+      resolveSymbolicRecurrences environment analysis.symbolicRecurrences with
+  | error error => simp [checkStaticParameters, symbolicResolved] at accepted
+  | ok symbolicRecurrenceStates =>
+      cases checkedAll : checkAll environment symbolicRecurrenceStates analysis.staticObligations with
+      | error error =>
+          simp [checkStaticParameters, symbolicResolved, checkedAll] at accepted
       | ok value =>
           cases value
-          simp only [checkStaticParameters, recurrenceResolved, checkedAll, Except.ok.injEq]
+          simp only [checkStaticParameters, symbolicResolved, checkedAll, Except.ok.injEq]
             at accepted
           subst checked
           exact checkAll_sound checkedAll
 
-private def integerRecurrenceCheckerFixture : FactRecurrence := {
+private def integerRecurrenceCheckerFixture : SequentialRecurrenceSource := {
   loop := { site := { stage := ⟨"checker"⟩, scope := ⟨[]⟩, node := ⟨0⟩ } }
   count := .constant 0
   carriedArity := 1
-  initial := ⟨#[.integer {
-    expression := .intConstant 3
-    lower := .integer (.constant 3)
-    upper := .integer (.constant 3)
+  initial := ⟨#[{
+    fact := .integer {
+      expression := .intConstant 3
+      lower := .integer (.constant 3)
+      upper := .integer (.constant 3)
+    }
+    schema := .integer
   }], rfl⟩
   bodyInputs := ⟨#[{
     definition := { stage := ⟨"checker"⟩, name := "body" }
@@ -256,32 +256,152 @@ private def integerRecurrenceCheckerFixture : FactRecurrence := {
   iterationVariable := ⟨0⟩
 }
 
+private def integerRecurrenceCheckerRef : SequentialRecurrenceInstanceRef := {
+  recurrence := ⟨integerRecurrenceCheckerFixture.loop.site⟩
+  path := []
+}
+
+private def symbolicCheckerIntegerPath :
+    CarriedBoundStatePath [.integerInterval] .integerInterval :=
+  .head .here
+
+private def symbolicCheckerZeroCountTransfer : SymbolicRecurrenceTransfer where
+  identity := integerRecurrenceCheckerRef
+  source := integerRecurrenceCheckerFixture
+  sourceIdentity := rfl
+  carriedSchemas := [.integer]
+  initialBounds := .cons
+    (.integer (.integer (.constant 3)) (.integer (.constant 3))) .nil
+  bodyOutputs := .cons (.integer ⟨0⟩) .nil
+  boundTransition := .cons
+    (.integer
+      (.previousState symbolicCheckerIntegerPath .lower)
+      (.previousState symbolicCheckerIntegerPath .upper))
+    .nil
+  schemaValidation := rfl
+
+private def symbolicCheckerZeroCountAnalysis : AnalysisResult where
+  facts := []
+  families := []
+  symbolicRecurrences := [symbolicCheckerZeroCountTransfer]
+  staticObligations := []
+  inputObligations := []
+  semanticObligations := []
+  endpointFacts := []
+  usedRules := []
+
+private def symbolicMatrixState : CheckedSymbolicRecurrenceState where
+  identity := integerRecurrenceCheckerRef
+  schemas := [.matrixSummary]
+  values := .cons (.matrix true 7 11 13) .nil
+
+private def symbolicMatrixStateTable : CheckedSymbolicRecurrenceStateTable := {
+  entries := [symbolicMatrixState]
+}
+
+example :
+    (BoundExpr.recurrenceResult integerRecurrenceCheckerRef
+      (.affineCoefficientBound 0 9)).evaluateWithSymbolicRecurrences []
+        symbolicMatrixStateTable = .ok 7 := by
+  rfl
+
+private def symbolicMatrixLaneReference : SequentialRecurrenceInstanceRef :=
+  integerRecurrenceCheckerRef.appendPath [
+    .parallelLane { integerRecurrenceCheckerRef.recurrence.site with node := ⟨8⟩ } ⟨3⟩,
+    .parallelLane { integerRecurrenceCheckerRef.recurrence.site with node := ⟨9⟩ } ⟨4⟩
+  ]
+
+/-- Phase B uses the same lane-uniform identity matcher as recurrence construction. -/
+example :
+    (BoundExpr.recurrenceResult symbolicMatrixLaneReference
+      (.matrixTotalBound 0)).evaluateWithSymbolicRecurrences [] symbolicMatrixStateTable =
+      .ok 13 := by
+  rfl
+
+/-- A sequential occurrence is never canonicalized to the lane-uniform base state. -/
+example :
+    let sequentialReference := integerRecurrenceCheckerRef.appendPath [
+      .sequentialIteration { integerRecurrenceCheckerRef.recurrence.site with node := ⟨8⟩ } ⟨3⟩
+    ]
+    (BoundExpr.recurrenceResult sequentialReference
+      (.matrixTotalBound 0)).evaluateWithSymbolicRecurrences [] symbolicMatrixStateTable =
+      .error (.unresolvedRecurrence sequentialReference (.matrixTotalBound 0)) := by
+  rfl
+
+/-- A path whose carried slot is outside the dependent schema fails closed. -/
+example :
+    (BoundExpr.recurrenceResult integerRecurrenceCheckerRef
+      (.matrixTotalBound 1)).evaluateWithSymbolicRecurrences [] symbolicMatrixStateTable =
+      .error (.unresolvedRecurrence integerRecurrenceCheckerRef (.matrixTotalBound 1)) := by
+  rfl
+
+/-- An integer path cannot read a matrix state. -/
+example :
+    (IntBoundExpr.recurrenceResult integerRecurrenceCheckerRef
+      (.lower 0)).evaluateWithSymbolicRecurrences [] symbolicMatrixStateTable =
+      .error (.unresolvedRecurrence integerRecurrenceCheckerRef (.lower 0)) := by
+  rfl
+
+/-- Even a manually duplicated checked identity is rejected rather than choosing one state. -/
+example :
+    (BoundExpr.recurrenceResult integerRecurrenceCheckerRef
+      (.matrixTotalBound 0)).evaluateWithSymbolicRecurrences [] {
+        entries := [symbolicMatrixState, symbolicMatrixState]
+      } =
+      .error (.unresolvedRecurrence integerRecurrenceCheckerRef (.matrixTotalBound 0)) := by
+  rfl
+
+private def symbolicFamilyMatrixStateTable : CheckedSymbolicRecurrenceStateTable := {
+  entries := [{
+    identity := integerRecurrenceCheckerRef
+    schemas := [.family (.constant 2) .matrixSummary]
+    values := .cons (.familyEnvelope (.matrix false 5 8 13)) .nil
+  }]
+}
+
+/-- A family path is accepted only by recursively matching the family-envelope schema. -/
+example :
+    (BoundExpr.recurrenceResult integerRecurrenceCheckerRef
+      (.familyElement 0 ⟨0⟩ (.matrixTotalBound 0))).evaluateWithSymbolicRecurrences []
+        symbolicFamilyMatrixStateTable = .ok 13 := by
+  rfl
+
+/-- Phase B consumes the schema-indexed symbolic recurrence list even when the legacy list is
+empty. A zero-count loop returns its initial state unchanged. -/
+example : checkStaticParameters symbolicCheckerZeroCountAnalysis [] = .ok {
+    checked := []
+    symbolicRecurrenceStates := { entries := [{
+      identity := integerRecurrenceCheckerRef
+      schemas := [.integerInterval]
+      values := .cons (.integer 3 3) .nil
+    }] }
+  } := by
+  rfl
+
 private def integerRecurrenceCheckerAnalysis : AnalysisResult where
   facts := []
   families := []
-  recurrences := [({ recurrence := ⟨"checker-integer"⟩, path := [] },
-    integerRecurrenceCheckerFixture)]
+  symbolicRecurrences := [symbolicCheckerZeroCountTransfer]
   staticObligations := [
     .intBoundNonnegative (.recurrenceResult
-      { recurrence := ⟨"checker-integer"⟩, path := [] } (.lower 0)),
+      integerRecurrenceCheckerRef (.lower 0)),
     .intBoundPositive (.recurrenceResult
-      { recurrence := ⟨"checker-integer"⟩, path := [] } (.lower 0)),
+      integerRecurrenceCheckerRef (.lower 0)),
     .intBoundsOrdered
-      (.recurrenceResult { recurrence := ⟨"checker-integer"⟩, path := [] } (.lower 0))
-      (.recurrenceResult { recurrence := ⟨"checker-integer"⟩, path := [] } (.upper 0))
+      (.recurrenceResult integerRecurrenceCheckerRef (.lower 0))
+      (.recurrenceResult integerRecurrenceCheckerRef (.upper 0))
   ]
   inputObligations := []
   semanticObligations := []
   endpointFacts := []
   usedRules := []
 
-/-- Phase B derives the recurrence table internally before checking signed endpoint obligations. -/
+/-- Phase B checks signed endpoint obligations against the schema-indexed recurrence state. -/
 example : (checkStaticParameters integerRecurrenceCheckerAnalysis []).isOk = true := rfl
 
 private def invalidIntBoundAnalysis : AnalysisResult where
   facts := []
   families := []
-  recurrences := []
   staticObligations := [.intBoundPositive (.integer (.constant 0))]
   inputObligations := []
   semanticObligations := []
@@ -294,7 +414,6 @@ example : checkStaticParameters invalidIntBoundAnalysis [] =
 private def thresholdTestAnalysis (noise : Nat) : AnalysisResult where
   facts := []
   families := []
-  recurrences := []
   staticObligations := [
     .thresholdNoise (.constant noise) (.constant 256) (.constant 2)
   ]
@@ -317,7 +436,6 @@ example :
 private def diamondIntervalTestAnalysis (noise : Nat) : AnalysisResult where
   facts := []
   families := []
-  recurrences := []
   staticObligations := [
     .diamondFalseInterval (.constant noise) (.constant 256),
     .diamondTrueInterval (.constant noise) (.constant 256)
@@ -339,7 +457,6 @@ private def oneDiamondIntervalTestAnalysis
     (trueCarrier : Bool) (noise modulus : Nat) : AnalysisResult where
   facts := []
   families := []
-  recurrences := []
   staticObligations := [if trueCarrier then
     .diamondTrueInterval (.constant noise) (.constant modulus)
   else

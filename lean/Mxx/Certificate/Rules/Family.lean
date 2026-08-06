@@ -360,12 +360,8 @@ def parallelJointFamilyId (site : CoreNodeRef) : JointFamilyId := ⟨
     s!":node:{site.node.value}"
 ⟩
 
-/-- Canonical naming convention for a sequential-loop recurrence. -/
-def sequentialFactRecurrenceRef (site : CoreNodeRef) : FactRecurrenceRef := ⟨
-  "sequential:" ++ encodeIdentityPart site.stage.name ++
-    String.join (site.scope.path.map (fun part ↦ ":" ++ encodeIdentityPart part)) ++
-    s!":node:{site.node.value}"
-⟩
+/-- Structural identity for a sequential-loop recurrence. -/
+def sequentialSequentialRecurrenceRef (site : CoreNodeRef) : SequentialRecurrenceRef := ⟨site⟩
 
 def instantiateParallelTemplate
     (loopSite : CoreNodeRef)

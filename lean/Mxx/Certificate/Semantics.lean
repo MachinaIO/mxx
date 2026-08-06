@@ -1,14 +1,14 @@
 import Mxx.Certificate.LocalSoundness
 import Mxx.Certificate.Bounds
 import Mxx.Certificate.Workflow
-import Mxx.Certificate.CanonicalResidues
+import Mxx.Certificate.ValueSemantics
 
 namespace Mxx.Certificate
 
 /-- Values assigned to stable certificate identities while interpreting derived facts. -/
 structure FactEnvironment where
   parameters : Mxx.Ir.ParamEnvironment
-  recurrenceBounds : CheckedRecurrenceBoundTable := {}
+  recurrenceStates : CheckedSymbolicRecurrenceStateTable := {}
   analysis : Option AnalysisResult := none
   expressionArena : ExpressionArena := {}
   values : ValueInstanceRef → Option Mxx.Ir.Value
@@ -56,6 +56,14 @@ def FactEnvironment.ofWireEnvironment
         if wire.stage = stage && wire.scope = scope then
           Mxx.Ir.lookupWire ⟨wire.node.value, wire.port⟩ wires
         else none
+    | .template wire =>
+        match scope.path with
+        | [] => none
+        | definitionName :: bodyScope =>
+            if wire.definition.stage = stage && wire.definition.name = definitionName &&
+                wire.bodyScope.path = bodyScope then
+              Mxx.Ir.lookupWire ⟨wire.node.value, wire.port⟩ wires
+            else none
     | _ => none
 }
 
@@ -74,6 +82,27 @@ theorem FactEnvironment.ofWireEnvironment_lookup
         }) =
       Mxx.Ir.lookupWire wire wires := by
   simp [FactEnvironment.ofWireEnvironment]
+
+/-- The selected scope determines whether a frozen core wire is concrete or a template; either
+representation resolves to the same executable SSA wire without a caller-provided binding. -/
+theorem FactEnvironment.ofWireEnvironment_lookupCore
+    (parameters : Mxx.Ir.ParamEnvironment)
+    (stage : StageId)
+    (scope : StaticScopeId)
+    (wires : Mxx.Ir.WireEnvironment)
+    (wire : CoreWireRef)
+    (sameStage : wire.stage = stage)
+    (sameScope : wire.scope = scope) :
+    (FactEnvironment.ofWireEnvironment parameters stage scope wires).values
+        (.ofCoreWire wire) =
+      Mxx.Ir.lookupWire ⟨wire.node.value, wire.port⟩ wires := by
+  cases scope with
+  | mk path =>
+      cases path with
+      | nil =>
+          simp_all [FactEnvironment.ofWireEnvironment, ValueInstanceRef.ofCoreWire]
+      | cons definitionName bodyScope =>
+          simp_all [FactEnvironment.ofWireEnvironment, ValueInstanceRef.ofCoreWire]
 
 mutual
 /-- Denotation for the closed scalar fragment currently used by certificate rules. Constructors
@@ -367,12 +396,7 @@ def MatrixFact.Holds
     (∀ relation ∈ fact.relations, relation.Holds environment) ∧
     fact.totalNormBound.evaluate environment.parameters = .ok totalBound ∧
     Mxx.maxCenteredCoefficientNorm value ≤ totalBound ∧
-    match fact.coefficientRepresentation with
-    | .unknown => True
-    | .canonicalResidues modulus =>
-        ∃ evaluatedModulus,
-          evaluateIntExpr environment.parameters modulus = .ok evaluatedModulus ∧
-          0 < evaluatedModulus ∧ MatrixHasCanonicalResidues evaluatedModulus value
+    fact.coefficientRepresentation.Holds environment.parameters value
 
 theorem exactMatrixFact_holds
     (environment : FactEnvironment)
@@ -453,8 +477,10 @@ def ScopedWireFact.Holds
   | .integer integer => ∃ value lower upper,
       environment.values (.ofCoreWire fact.wire) = some (.integer value) ∧
         RuntimeIntExpr.Denotes environment integer.expression value ∧
-        integer.lower.evaluate environment.parameters environment.recurrenceBounds = .ok lower ∧
-        integer.upper.evaluate environment.parameters environment.recurrenceBounds = .ok upper ∧
+        integer.lower.evaluateWithSymbolicRecurrences
+          environment.parameters environment.recurrenceStates = .ok lower ∧
+        integer.upper.evaluateWithSymbolicRecurrences
+          environment.parameters environment.recurrenceStates = .ok upper ∧
         lower ≤ value ∧ value ≤ upper
   | .boolean boolean => ∃ value,
       environment.values (.ofCoreWire fact.wire) = some (.boolean value) ∧
@@ -465,7 +491,10 @@ def ScopedWireFact.Holds
   | .family _ => ∃ values,
       environment.values (.ofCoreWire fact.wire) = some (.family values)
 
-def AnalysisHolds (environment : FactEnvironment) (analysis : AnalysisResult) : Prop :=
+/-- Core fact-table soundness, before the analyzer-owned symbolic evaluation table is interpreted.
+`AnalysisHolds` strengthens this predicate in `SymbolicEvaluationSoundness`, after the symbolic
+form and bound-witness semantics are available without creating an import cycle. -/
+def BaseAnalysisHolds (environment : FactEnvironment) (analysis : AnalysisResult) : Prop :=
   environment.analysis = some analysis ∧
     environment.expressionArena = analysis.expressionArena ∧
     analysis.expressionArena.WF = true ∧

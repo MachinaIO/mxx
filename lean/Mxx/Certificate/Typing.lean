@@ -15,13 +15,25 @@ private def isOne (value : IntExpr) : Bool := value == .constant 1
 private def normalizeDimension : IntExpr → IntExpr
   | .add left right =>
       match normalizeDimension left, normalizeDimension right with
+      | .constant left, .constant right => .constant (left + right)
       | .constant 0, value | value, .constant 0 => value
       | left, right => .add left right
   | .multiply left right =>
       match normalizeDimension left, normalizeDimension right with
+      | .constant left, .constant right => .constant (left * right)
       | .constant 1, value | value, .constant 1 => value
       | left, right => .multiply left right
-  | .subtract left right => .subtract (normalizeDimension left) (normalizeDimension right)
+  | .subtract left right =>
+      let left := normalizeDimension left
+      let right := normalizeDimension right
+      if left == right then .constant 0
+      else match left, right with
+        | .constant left, .constant right => .constant (left - right)
+        | .add first extra, right =>
+            if first == right then extra
+            else if extra == right then first
+            else .subtract left right
+        | _, _ => .subtract left right
   | .divide left right => .divide (normalizeDimension left) (normalizeDimension right)
   | .roundDivide left right => .roundDivide (normalizeDimension left) (normalizeDimension right)
   | .log2Ceil value => .log2Ceil (normalizeDimension value)
@@ -75,7 +87,7 @@ def MatrixExpr.inferType : MatrixExpr → Option MatrixTypeExpr
   | .add left right => do
       let leftType ← left.inferType
       let rightType ← right.inferType
-      if leftType == rightType then some leftType else none
+      if equivalentMatrixType leftType rightType then some leftType else none
   | .negate value | .scalarMultiply _ value => value.inferType
   | .multiply left right => do
       let leftType ← left.inferType

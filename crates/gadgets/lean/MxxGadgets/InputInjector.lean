@@ -51,7 +51,9 @@ structure ProjectionRequest where
   inputDigits : Mxx.Certificate.CoreWireRef
   initialStatesFamily : Mxx.Certificate.JointFamilyId
   initialStatesOutput : Mxx.Certificate.CoreWireRef
-  outputStates : Mxx.Certificate.FactRecurrenceRef
+  outputStates : Mxx.Certificate.SequentialRecurrenceRef
+  /-- Carried slot containing the projected injector state. -/
+  outputStateSlot : Nat
   initialArtifact : ArtifactRoute
   transitionsArtifact : ArtifactRoute
 
@@ -63,8 +65,15 @@ inductive ProjectionError where
   | missingFamily (family : Mxx.Certificate.JointFamilyId)
   | familyIdentityMismatch (family : Mxx.Certificate.JointFamilyId)
   | familyOutputMismatch (family : Mxx.Certificate.JointFamilyId)
-  | missingRecurrence (recurrence : Mxx.Certificate.FactRecurrenceRef)
-  | recurrenceInputMismatch (recurrence : Mxx.Certificate.FactRecurrenceRef)
+  | missingRecurrence (recurrence : Mxx.Certificate.SequentialRecurrenceRef)
+  | duplicateRecurrence (recurrence : Mxx.Certificate.SequentialRecurrenceRef)
+  | recurrenceInputMismatch (recurrence : Mxx.Certificate.SequentialRecurrenceRef)
+  | missingOutputState (recurrence : Mxx.Certificate.SequentialRecurrenceRef) (slot : Nat)
+  | outputStateNotMatrix (recurrence : Mxx.Certificate.SequentialRecurrenceRef) (slot : Nat)
+  | outputStateRelationsUnsupported
+      (recurrence : Mxx.Certificate.SequentialRecurrenceRef) (slot : Nat)
+  | outputStateNotSingleAffine
+      (recurrence : Mxx.Certificate.SequentialRecurrenceRef) (slot : Nat)
   | missingArtifact (route : ArtifactRoute)
   deriving Repr
 
@@ -100,20 +109,22 @@ private def findFamily
 
 private def findRecurrence
     (analysis : Mxx.Certificate.AnalysisResult)
-    (reference : Mxx.Certificate.FactRecurrenceRef) :
-    Except ProjectionError { fact // (reference, fact) ∈ analysis.recurrences } :=
-  match found : analysis.recurrences.find? (fun entry :
-      Mxx.Certificate.FactRecurrenceRef × Mxx.Certificate.FactRecurrence =>
-        decide (entry.1 = reference)) with
-  | none => .error (.missingRecurrence reference)
-  | some entry =>
-      have key : entry.1 = reference := of_decide_eq_true (List.find?_some
-        (p := fun candidate :
-          Mxx.Certificate.FactRecurrenceRef × Mxx.Certificate.FactRecurrence =>
-            decide (candidate.1 = reference)) found)
-      .ok ⟨entry.2, by
-        rw [← key]
-        exact List.mem_of_find?_eq_some found⟩
+    (reference : Mxx.Certificate.SequentialRecurrenceRef) :
+    Except ProjectionError { transfer //
+      transfer ∈ analysis.symbolicRecurrences ∧ transfer.identity.recurrence = reference } :=
+  match found : analysis.symbolicRecurrences.filter (fun transfer =>
+      decide (transfer.identity.recurrence = reference)) with
+  | [] => .error (.missingRecurrence reference)
+  | [transfer] =>
+      have selected : transfer ∈ analysis.symbolicRecurrences.filter (fun candidate =>
+          decide (candidate.identity.recurrence = reference)) := by
+        rw [found]
+        simp
+      have member : transfer ∈ analysis.symbolicRecurrences := (List.mem_filter.mp selected).1
+      have key : transfer.identity.recurrence = reference :=
+        of_decide_eq_true (List.mem_filter.mp selected).2
+      .ok ⟨transfer, member, key⟩
+  | _ => .error (.duplicateRecurrence reference)
 
 private def findArtifact
     {samplers : Mxx.MxxSamplerFamily}
@@ -148,6 +159,52 @@ private def rootFamilyAggregate
 private structure Evidence (statement : Prop) : Type where
   proof : statement
   token : Unit
+
+/-- Analyzer-owned shape of the carried injector state.  The projector extracts every field from
+the retained recurrence body output; callers cannot choose its coefficient, basis, or bounds. -/
+structure SingleAffineCarriedOutput
+    (source : Mxx.Certificate.SequentialRecurrenceSource)
+    (slot : Nat) where
+  template : Mxx.Certificate.ValueFactTemplate
+  templateEq : source.bodyOutputs[slot]? = some template
+  matrix : Mxx.Certificate.MatrixFact
+  matrixEq : template.fact = .matrix matrix
+  term : Mxx.Certificate.SignalTerm
+  noiseBound : Mxx.Certificate.BoundExpr
+  primaryEq : matrix.primary = .affine { terms := [term], noiseBound }
+  relationsEmpty : matrix.relations = []
+  ordinaryProduct : term.mode = .ordinaryMatrixProduct
+
+private def requireSingleAffineCarriedOutput
+    (recurrence : Mxx.Certificate.SequentialRecurrenceRef)
+    (source : Mxx.Certificate.SequentialRecurrenceSource)
+    (slot : Nat) : Except ProjectionError (SingleAffineCarriedOutput source slot) := do
+  let template ← match selected : source.bodyOutputs[slot]? with
+    | none => throw (.missingOutputState recurrence slot)
+    | some template => pure (⟨template, selected⟩ :
+        { template // source.bodyOutputs[slot]? = some template })
+  let matrix ← match matrixEq : template.val.fact with
+    | .matrix matrix => pure (⟨matrix, matrixEq⟩ :
+        { matrix // template.val.fact = .matrix matrix })
+    | _ => throw (.outputStateNotMatrix recurrence slot)
+  if relationsEmpty : matrix.val.relations = [] then
+    match primaryEq : matrix.val.primary with
+    | .affine { terms := [term], noiseBound } =>
+        if ordinaryProduct : term.mode = .ordinaryMatrixProduct then
+          return {
+            template := template.val
+            templateEq := template.property
+            matrix := matrix.val
+            matrixEq := matrix.property
+            term
+            noiseBound
+            primaryEq
+            relationsEmpty
+            ordinaryProduct
+          }
+        else throw (.outputStateNotSingleAffine recurrence slot)
+    | _ => throw (.outputStateNotSingleAffine recurrence slot)
+  else throw (.outputStateRelationsUnsupported recurrence slot)
 
 private def requireMatrixFact
     {analysis : Mxx.Certificate.AnalysisResult}
@@ -215,13 +272,15 @@ structure ValidatedInputInjectorFacts
   initialStates : { fact // (request.initialStatesFamily, fact) ∈ analysis.families ∧
     fact.id = request.initialStatesFamily }
   initialStatesOutput : request.initialStatesOutput ∈ initialStates.val.outputFamilies
-  outputStates : { fact // (request.outputStates, fact) ∈ analysis.recurrences }
+  outputStates : { transfer // transfer ∈ analysis.symbolicRecurrences ∧
+    transfer.identity.recurrence = request.outputStates }
+  outputState : SingleAffineCarriedOutput outputStates.val.source request.outputStateSlot
   recurrenceInitial : containsFamilyFact (rootFamilyAggregate initialStates.val.id 0)
-    outputStates.val.initial.toList = true
+    (outputStates.val.source.initial.toList.map fun template => template.fact) = true
   recurrenceDigits : containsFamilyFact inputDigitsFact.aggregate
-    outputStates.val.invariantInputs = true
+    (outputStates.val.source.invariantInputs.map (·.fact)) = true
   recurrenceTransitions : containsFamilyFact (rootFamilyAggregate transitions.val.id 0)
-    outputStates.val.invariantInputs = true
+    (outputStates.val.source.invariantInputs.map (·.fact)) = true
   initialArtifact : { binding // binding ∈ execution.artifactBindings ∧
     request.initialArtifact.Matches binding }
   transitionsArtifact : { binding // binding ∈ execution.artifactBindings ∧
@@ -263,25 +322,28 @@ def projectInputInjectorFacts
   let initialOutput ← requireFamilyOutput request.initialStatesFamily
     initialStates.val.outputFamilies request.initialStatesOutput
   let outputStates ← findRecurrence analysis request.outputStates
+  let outputState ← requireSingleAffineCarriedOutput request.outputStates outputStates.val.source
+    request.outputStateSlot
   let recurrenceInitialProof ← if recurrenceInitial :
       containsFamilyFact (rootFamilyAggregate initialStates.val.id 0)
-        outputStates.val.initial.toList = true then
+        (outputStates.val.source.initial.toList.map fun template => template.fact) = true then
     pure (⟨recurrenceInitial, ()⟩ : Evidence
       (containsFamilyFact (rootFamilyAggregate initialStates.val.id 0)
-        outputStates.val.initial.toList = true))
+        (outputStates.val.source.initial.toList.map fun template => template.fact) = true))
   else throw (ProjectionError.recurrenceInputMismatch request.outputStates)
   let recurrenceDigitsProof ← if recurrenceDigits :
-      containsFamilyFact inputDigitsFact.val.aggregate outputStates.val.invariantInputs = true then
+      containsFamilyFact inputDigitsFact.val.aggregate
+        (outputStates.val.source.invariantInputs.map (·.fact)) = true then
     pure (⟨recurrenceDigits, ()⟩ : Evidence
       (containsFamilyFact inputDigitsFact.val.aggregate
-        outputStates.val.invariantInputs = true))
+        (outputStates.val.source.invariantInputs.map (·.fact)) = true))
   else throw (ProjectionError.recurrenceInputMismatch request.outputStates)
   let recurrenceTransitionsProof ← if recurrenceTransitions :
       containsFamilyFact (rootFamilyAggregate transitions.val.id 0)
-        outputStates.val.invariantInputs = true then
+        (outputStates.val.source.invariantInputs.map (·.fact)) = true then
     pure (⟨recurrenceTransitions, ()⟩ : Evidence
       (containsFamilyFact (rootFamilyAggregate transitions.val.id 0)
-        outputStates.val.invariantInputs = true))
+        (outputStates.val.source.invariantInputs.map (·.fact)) = true))
   else throw (ProjectionError.recurrenceInputMismatch request.outputStates)
   let initialArtifact ← findArtifact execution request.initialArtifact
   let transitionsArtifact ← findArtifact execution request.transitionsArtifact
@@ -304,6 +366,7 @@ def projectInputInjectorFacts
     initialStates
     initialStatesOutput := initialOutput.proof
     outputStates
+    outputState
     recurrenceInitial := recurrenceInitialProof.proof
     recurrenceDigits := recurrenceDigitsProof.proof
     recurrenceTransitions := recurrenceTransitionsProof.proof

@@ -58,7 +58,7 @@ inductive MatrixExprKey where
   | diagonalBasisEmbed (layout : ConcatLayoutKey) (part : Nat) (value : MatrixExprKey)
   | loopResult
       (type : MatrixTypeExpr)
-      (summary : FactRecurrenceInstanceRef)
+      (summary : SequentialRecurrenceInstanceRef)
       (path : MatrixFactPath)
   | carriedInput (type : MatrixTypeExpr) (path : MatrixFactPath)
   deriving BEq

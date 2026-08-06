@@ -1,4 +1,4 @@
-import Mxx.Certificate.Facts
+import Mxx.Certificate.CheckedRecurrenceState
 
 namespace Mxx.Certificate
 
@@ -120,64 +120,9 @@ inductive BoundEvalError where
   | negativeParameter (value : Int)
   | nonPositiveDimension (value : Int)
   | nonPositiveDivisor
-  | unresolvedRecurrence (recurrence : FactRecurrenceInstanceRef) (path : BoundFactPath)
+  | unresolvedRecurrence (recurrence : SequentialRecurrenceInstanceRef) (path : BoundFactPath)
   | escapedCarriedInput (path : BoundFactPath)
   deriving BEq, DecidableEq, Repr
-
-structure NaturalRecurrenceBound where
-  recurrence : FactRecurrenceInstanceRef
-  path : BoundFactPath
-  value : Nat
-
-structure IntegerRecurrenceBound where
-  recurrence : FactRecurrenceInstanceRef
-  path : IntBoundFactPath
-  value : Int
-
-/-- Analyzer-produced numeric results of checked sequential recurrences.  Both components are
-committed simultaneously after each step by the recurrence resolver. -/
-structure CheckedRecurrenceBoundTable where
-  natural : List NaturalRecurrenceBound := []
-  integer : List IntegerRecurrenceBound := []
-
-structure CarriedNaturalBound where
-  path : BoundFactPath
-  value : Nat
-
-structure CarriedIntegerBound where
-  path : IntBoundFactPath
-  value : Int
-
-/-- One immutable numeric snapshot used while evaluating a recurrence body template. -/
-structure CarriedBoundTable where
-  natural : List CarriedNaturalBound := []
-  integer : List CarriedIntegerBound := []
-
-private def lookupCarriedNatural (path : BoundFactPath) : List CarriedNaturalBound → Option Nat
-  | [] => none
-  | entry :: tail =>
-      if entry.path.sameUniformLocation path then some entry.value else lookupCarriedNatural path tail
-
-private def lookupCarriedInteger (path : IntBoundFactPath) : List CarriedIntegerBound → Option Int
-  | [] => none
-  | entry :: tail =>
-      if entry.path.sameUniformLocation path then some entry.value else lookupCarriedInteger path tail
-
-private def lookupNaturalRecurrenceBound
-    (recurrence : FactRecurrenceInstanceRef)
-    (path : BoundFactPath) : List NaturalRecurrenceBound → Option Nat
-  | [] => none
-  | entry :: tail =>
-      if entry.recurrence = recurrence && entry.path.sameUniformLocation path then some entry.value
-      else lookupNaturalRecurrenceBound recurrence path tail
-
-private def lookupIntegerRecurrenceBound
-    (recurrence : FactRecurrenceInstanceRef)
-    (path : IntBoundFactPath) : List IntegerRecurrenceBound → Option Int
-  | [] => none
-  | entry :: tail =>
-      if entry.recurrence = recurrence && entry.path.sameUniformLocation path then some entry.value
-      else lookupIntegerRecurrenceBound recurrence path tail
 
 private def evaluateBoundParameter
     (environment : Mxx.Ir.ParamEnvironment)
@@ -191,177 +136,338 @@ private def evaluatePositiveDimension
   let value ← (evaluateIntExpr environment expression).mapError .integer
   if value ≤ 0 then .error (.nonPositiveDimension value) else .ok value.toNat
 
-/-- Evaluate a hard-bound expression exactly in `Nat`; no floating-point conversion is used. -/
-def BoundExpr.evaluateWithRecurrences
+private def boundPathRootSlot : BoundFactPath → Nat
+  | .affineCoefficientBound slot _ | .affineNoiseBound slot | .matrixTotalBound slot |
+      .familyElement slot _ _ => slot
+
+private def intBoundPathRootSlot : IntBoundFactPath → Nat
+  | .lower slot | .upper slot | .familyElement slot _ _ => slot
+
+private def lookupNaturalNested
+    (rootSlot : Nat) {schema : CarriedBoundSchema}
+    (state : EvaluatedCarriedBoundState schema) : BoundFactPath → Option Nat
+  | .affineCoefficientBound slot _ =>
+      if slot != rootSlot then none else
+        match state with
+        | .matrix _ coefficient _ _ => some coefficient
+        | _ => none
+  | .affineNoiseBound slot =>
+      if slot != rootSlot then none else
+        match state with
+        | .matrix _ _ noise _ => some noise
+        | _ => none
+  | .matrixTotalBound slot =>
+      if slot != rootSlot then none else
+        match state with
+        | .matrix _ _ _ total => some total
+        | _ => none
+  | .familyElement slot _ nested =>
+      if slot != rootSlot then none else
+        match state with
+        | .familyEnvelope element => lookupNaturalNested rootSlot element nested
+        | _ => none
+
+private def lookupIntegerNested
+    (rootSlot : Nat) {schema : CarriedBoundSchema}
+    (state : EvaluatedCarriedBoundState schema) : IntBoundFactPath → Option Int
+  | .lower slot =>
+      if slot != rootSlot then none else
+        match state with
+        | .integer lower _ => some lower
+        | _ => none
+  | .upper slot =>
+      if slot != rootSlot then none else
+        match state with
+        | .integer _ upper => some upper
+        | _ => none
+  | .familyElement slot _ nested =>
+      if slot != rootSlot then none else
+        match state with
+        | .familyEnvelope element => lookupIntegerNested rootSlot element nested
+        | _ => none
+
+private def lookupNaturalSlot
+    (rootSlot : Nat) :
+    (slot : Nat) → {schemas : List CarriedBoundSchema} →
+      CarriedBoundStateVector schemas → BoundFactPath → Option Nat
+  | _, _, .nil, _ => none
+  | 0, _, .cons head _, path => lookupNaturalNested rootSlot head path
+  | slot + 1, _, .cons _ tail, path => lookupNaturalSlot rootSlot slot tail path
+
+private def lookupIntegerSlot
+    (rootSlot : Nat) :
+    (slot : Nat) → {schemas : List CarriedBoundSchema} →
+      CarriedBoundStateVector schemas → IntBoundFactPath → Option Int
+  | _, _, .nil, _ => none
+  | 0, _, .cons head _, path => lookupIntegerNested rootSlot head path
+  | slot + 1, _, .cons _ tail, path => lookupIntegerSlot rootSlot slot tail path
+
+private def lookupNaturalSymbolicRecurrence
+    (identity : SequentialRecurrenceInstanceRef)
+    (path : BoundFactPath)
+    (entries : List CheckedSymbolicRecurrenceState) : Option Nat := do
+  let entry ← uniqueLaneUniformRecurrenceMatch? identity entries (·.identity)
+  lookupNaturalSlot (boundPathRootSlot path) (boundPathRootSlot path) entry.values path
+
+private def lookupIntegerSymbolicRecurrence
+    (identity : SequentialRecurrenceInstanceRef)
+    (path : IntBoundFactPath)
+    (entries : List CheckedSymbolicRecurrenceState) : Option Int := do
+  let entry ← uniqueLaneUniformRecurrenceMatch? identity entries (·.identity)
+  lookupIntegerSlot (intBoundPathRootSlot path) (intBoundPathRootSlot path) entry.values path
+
+/-- Exact hard-bound evaluation against the dependent table returned by symbolic recurrence
+checking. Missing, duplicate, or ill-typed paths fail closed. -/
+def BoundExpr.evaluateWithSymbolicRecurrences
     (environment : Mxx.Ir.ParamEnvironment)
-    (recurrenceBounds : CheckedRecurrenceBoundTable) :
-    BoundExpr → Except BoundEvalError Nat
+    (states : CheckedSymbolicRecurrenceStateTable) : BoundExpr → Except BoundEvalError Nat
   | .constant value => .ok value
   | .parameter value => evaluateBoundParameter environment value
-  | .add left right => return (← left.evaluateWithRecurrences environment recurrenceBounds) +
-      (← right.evaluateWithRecurrences environment recurrenceBounds)
-  | .multiply left right =>
-      return (← left.evaluateWithRecurrences environment recurrenceBounds) *
-        (← right.evaluateWithRecurrences environment recurrenceBounds)
-  | .maximum left right =>
-      return Nat.max (← left.evaluateWithRecurrences environment recurrenceBounds)
-        (← right.evaluateWithRecurrences environment recurrenceBounds)
-  | .absolute value =>
-      return (← (evaluateIntExpr environment value).mapError BoundEvalError.integer).natAbs
-  | .floorDivide value positiveDivisor =>
-      if positiveDivisor = 0 then .error .nonPositiveDivisor
-      else return (← value.evaluateWithRecurrences environment recurrenceBounds) / positiveDivisor
-  | .matrixProduct ringDimension innerDimension left right => do
-      let ringDimension ← evaluatePositiveDimension environment ringDimension
-      let innerDimension ← evaluatePositiveDimension environment innerDimension
-      return ringDimension * innerDimension *
-        (← left.evaluateWithRecurrences environment recurrenceBounds) *
-        (← right.evaluateWithRecurrences environment recurrenceBounds)
-  | .minimum left right =>
-      return Nat.min (← left.evaluateWithRecurrences environment recurrenceBounds)
-        (← right.evaluateWithRecurrences environment recurrenceBounds)
-  | .recurrenceResult recurrence path =>
-      match lookupNaturalRecurrenceBound recurrence path recurrenceBounds.natural with
-      | some value => .ok value
-      | none => .error (.unresolvedRecurrence recurrence path)
-  | .carriedInput path => .error (.escapedCarriedInput path)
-
-def BoundExpr.evaluate (environment : Mxx.Ir.ParamEnvironment) (expression : BoundExpr) :
-    Except BoundEvalError Nat :=
-  expression.evaluateWithRecurrences environment {}
-
-/-- Evaluate a recurrence body bound against one immutable previous-state snapshot. -/
-def BoundExpr.evaluateTemplate
-    (environment : Mxx.Ir.ParamEnvironment)
-    (recurrenceBounds : CheckedRecurrenceBoundTable)
-    (carried : CarriedBoundTable) : BoundExpr → Except BoundEvalError Nat
-  | .constant value => .ok value
-  | .parameter value => evaluateBoundParameter environment value
-  | .add left right => do
-      let left' ← left.evaluateTemplate environment recurrenceBounds carried
-      let right' ← right.evaluateTemplate environment recurrenceBounds carried
-      return left' + right'
-  | .multiply left right => do
-      let left' ← left.evaluateTemplate environment recurrenceBounds carried
-      let right' ← right.evaluateTemplate environment recurrenceBounds carried
-      return left' * right'
+  | .add left right => return (← left.evaluateWithSymbolicRecurrences environment states) +
+      (← right.evaluateWithSymbolicRecurrences environment states)
+  | .multiply left right => return (← left.evaluateWithSymbolicRecurrences environment states) *
+      (← right.evaluateWithSymbolicRecurrences environment states)
   | .maximum left right => do
-      let left' ← left.evaluateTemplate environment recurrenceBounds carried
-      let right' ← right.evaluateTemplate environment recurrenceBounds carried
+      let left' ← left.evaluateWithSymbolicRecurrences environment states
+      let right' ← right.evaluateWithSymbolicRecurrences environment states
       return Nat.max left' right'
   | .absolute value =>
       return (← (evaluateIntExpr environment value).mapError BoundEvalError.integer).natAbs
   | .floorDivide value divisor =>
       if divisor = 0 then .error .nonPositiveDivisor
-      else return (← value.evaluateTemplate environment recurrenceBounds carried) / divisor
-  | .matrixProduct ring inner left right => do
-      let ring ← evaluatePositiveDimension environment ring
-      let inner ← evaluatePositiveDimension environment inner
-      return ring * inner * (← left.evaluateTemplate environment recurrenceBounds carried) *
-        (← right.evaluateTemplate environment recurrenceBounds carried)
+      else return (← value.evaluateWithSymbolicRecurrences environment states) / divisor
+  | .matrixProduct ringDimension innerDimension left right => do
+      let ring ← evaluatePositiveDimension environment ringDimension
+      let inner ← evaluatePositiveDimension environment innerDimension
+      return ring * inner * (← left.evaluateWithSymbolicRecurrences environment states) *
+        (← right.evaluateWithSymbolicRecurrences environment states)
   | .minimum left right => do
-      let left' ← left.evaluateTemplate environment recurrenceBounds carried
-      let right' ← right.evaluateTemplate environment recurrenceBounds carried
+      let left' ← left.evaluateWithSymbolicRecurrences environment states
+      let right' ← right.evaluateWithSymbolicRecurrences environment states
       return Nat.min left' right'
-  | .recurrenceResult recurrence path =>
-      match lookupNaturalRecurrenceBound recurrence path recurrenceBounds.natural with
+  | .recurrenceResult identity path =>
+      match lookupNaturalSymbolicRecurrence identity path states.entries with
       | some value => .ok value
-      | none => .error (.unresolvedRecurrence recurrence path)
-  | .carriedInput path =>
-      match lookupCarriedNatural path carried.natural with
-      | some value => .ok value
-      | none => .error (.escapedCarriedInput path)
+      | none => .error (.unresolvedRecurrence identity path)
+  | .carriedInput path => .error (.escapedCarriedInput path)
+
+/-- Evaluate a closed hard-bound expression. Recurrence results and carried placeholders are
+rejected directly; this evaluator does not consult the legacy flat recurrence table. -/
+def BoundExpr.evaluate (environment : Mxx.Ir.ParamEnvironment) :
+    BoundExpr → Except BoundEvalError Nat
+  | .constant value => .ok value
+  | .parameter value => evaluateBoundParameter environment value
+  | .add left right => return (← left.evaluate environment) + (← right.evaluate environment)
+  | .multiply left right =>
+      return (← left.evaluate environment) * (← right.evaluate environment)
+  | .maximum left right =>
+      return Nat.max (← left.evaluate environment) (← right.evaluate environment)
+  | .absolute value =>
+      return (← (evaluateIntExpr environment value).mapError BoundEvalError.integer).natAbs
+  | .floorDivide value positiveDivisor =>
+      if positiveDivisor = 0 then .error .nonPositiveDivisor
+      else return (← value.evaluate environment) / positiveDivisor
+  | .matrixProduct ringDimension innerDimension left right => do
+      let ringDimension ← evaluatePositiveDimension environment ringDimension
+      let innerDimension ← evaluatePositiveDimension environment innerDimension
+      return ringDimension * innerDimension * (← left.evaluate environment) *
+        (← right.evaluate environment)
+  | .minimum left right =>
+      return Nat.min (← left.evaluate environment) (← right.evaluate environment)
+  | .recurrenceResult recurrence path => .error (.unresolvedRecurrence recurrence path)
+  | .carriedInput path => .error (.escapedCarriedInput path)
+
+/-- Successful closed bound evaluation is unchanged by the recurrence-aware evaluator. The two
+additional constructors cannot occur on a successful strict closed-evaluation path. -/
+theorem BoundExpr.evaluateWithSymbolicRecurrences_of_evaluate_eq_ok
+    (environment : Mxx.Ir.ParamEnvironment)
+    (states : CheckedSymbolicRecurrenceStateTable) :
+    ∀ {expression : BoundExpr} {value : Nat}, expression.evaluate environment = .ok value →
+      expression.evaluateWithSymbolicRecurrences environment states = .ok value := by
+  intro expression
+  induction expression <;> intro value evaluates
+  case constant => exact evaluates
+  case parameter => exact evaluates
+  case add left right leftIH rightIH =>
+    simp only [BoundExpr.evaluate] at evaluates
+    cases leftResult : left.evaluate environment with
+    | error error =>
+        rw [leftResult] at evaluates
+        contradiction
+    | ok leftValue =>
+        have leftRec := leftIH leftResult
+        cases rightResult : right.evaluate environment with
+        | error error =>
+            rw [leftResult, rightResult] at evaluates
+            contradiction
+        | ok rightValue =>
+            have rightRec := rightIH rightResult
+            simp [BoundExpr.evaluateWithSymbolicRecurrences, leftRec, rightRec]
+            simpa [leftResult, rightResult] using evaluates
+  case multiply left right leftIH rightIH =>
+    simp only [BoundExpr.evaluate] at evaluates
+    cases leftResult : left.evaluate environment with
+    | error error =>
+        rw [leftResult] at evaluates
+        contradiction
+    | ok leftValue =>
+        have leftRec := leftIH leftResult
+        cases rightResult : right.evaluate environment with
+        | error error =>
+            rw [leftResult, rightResult] at evaluates
+            contradiction
+        | ok rightValue =>
+            have rightRec := rightIH rightResult
+            simp [BoundExpr.evaluateWithSymbolicRecurrences, leftRec, rightRec]
+            simpa [leftResult, rightResult] using evaluates
+  case maximum left right leftIH rightIH =>
+    simp only [BoundExpr.evaluate] at evaluates
+    cases leftResult : left.evaluate environment with
+    | error error =>
+        rw [leftResult] at evaluates
+        contradiction
+    | ok leftValue =>
+        have leftRec := leftIH leftResult
+        cases rightResult : right.evaluate environment with
+        | error error =>
+            rw [leftResult, rightResult] at evaluates
+            contradiction
+        | ok rightValue =>
+            have rightRec := rightIH rightResult
+            simp [BoundExpr.evaluateWithSymbolicRecurrences, leftRec, rightRec]
+            simpa [leftResult, rightResult] using evaluates
+  case absolute => exact evaluates
+  case floorDivide expression divisor induction =>
+    simp only [BoundExpr.evaluate] at evaluates
+    by_cases divisorZero : divisor = 0
+    · rw [if_pos divisorZero] at evaluates
+      contradiction
+    · rw [if_neg divisorZero] at evaluates
+      cases result : expression.evaluate environment with
+      | error error =>
+          rw [result] at evaluates
+          contradiction
+      | ok resultValue =>
+          have recurrenceResult := induction result
+          simp [BoundExpr.evaluateWithSymbolicRecurrences, divisorZero, recurrenceResult]
+          simpa [result] using evaluates
+  case matrixProduct ringDimension innerDimension left right leftIH rightIH =>
+    simp only [BoundExpr.evaluate] at evaluates
+    cases ringResult : evaluatePositiveDimension environment ringDimension with
+    | error error =>
+        rw [ringResult] at evaluates
+        contradiction
+    | ok ring =>
+        cases innerResult : evaluatePositiveDimension environment innerDimension with
+        | error error =>
+            rw [ringResult, innerResult] at evaluates
+            contradiction
+        | ok inner =>
+            cases leftResult : left.evaluate environment with
+            | error error =>
+                rw [ringResult, innerResult, leftResult] at evaluates
+                contradiction
+            | ok leftValue =>
+                have leftRec := leftIH leftResult
+                cases rightResult : right.evaluate environment with
+                | error error =>
+                    rw [ringResult, innerResult, leftResult, rightResult] at evaluates
+                    contradiction
+                | ok rightValue =>
+                    have rightRec := rightIH rightResult
+                    simp [BoundExpr.evaluateWithSymbolicRecurrences, ringResult, innerResult,
+                      leftRec, rightRec]
+                    simpa [ringResult, innerResult, leftResult, rightResult] using evaluates
+  case minimum left right leftIH rightIH =>
+    simp only [BoundExpr.evaluate] at evaluates
+    cases leftResult : left.evaluate environment with
+    | error error =>
+        rw [leftResult] at evaluates
+        contradiction
+    | ok leftValue =>
+        have leftRec := leftIH leftResult
+        cases rightResult : right.evaluate environment with
+        | error error =>
+            rw [leftResult, rightResult] at evaluates
+            contradiction
+        | ok rightValue =>
+            have rightRec := rightIH rightResult
+            simp [BoundExpr.evaluateWithSymbolicRecurrences, leftRec, rightRec]
+            simpa [leftResult, rightResult] using evaluates
+  case recurrenceResult => simp [BoundExpr.evaluate] at evaluates
+  case carriedInput => simp [BoundExpr.evaluate] at evaluates
 
 inductive IntBoundEvalError where
   | integer (error : IntEvalError)
   | natural (error : BoundEvalError)
   | divisionByZero
-  | unresolvedRecurrence (recurrence : FactRecurrenceInstanceRef) (path : IntBoundFactPath)
+  | unresolvedRecurrence (recurrence : SequentialRecurrenceInstanceRef) (path : IntBoundFactPath)
   | escapedCarriedInput (path : IntBoundFactPath)
   deriving BEq, DecidableEq, Repr
 
-/-- Evaluate a signed integer interval endpoint from parameters and a checked recurrence table. -/
-def IntBoundExpr.evaluate
+def IntBoundExpr.evaluateWithSymbolicRecurrences
     (environment : Mxx.Ir.ParamEnvironment)
-    (recurrenceBounds : CheckedRecurrenceBoundTable) :
+    (states : CheckedSymbolicRecurrenceStateTable) :
     IntBoundExpr → Except IntBoundEvalError Int
-  | .integer value => (evaluateIntExpr environment value).mapError .integer
+  | .integer value => evaluateIntExpr environment value |>.mapError .integer
   | .natural value =>
-      return (← value.evaluateWithRecurrences environment recurrenceBounds |>.mapError .natural)
-  | .negate value => return -(← value.evaluate environment recurrenceBounds)
-  | .add left right =>
-      return (← left.evaluate environment recurrenceBounds) +
-        (← right.evaluate environment recurrenceBounds)
-  | .subtract left right =>
-      return (← left.evaluate environment recurrenceBounds) -
-        (← right.evaluate environment recurrenceBounds)
-  | .multiply left right =>
-      return (← left.evaluate environment recurrenceBounds) *
-        (← right.evaluate environment recurrenceBounds)
+      return (← value.evaluateWithSymbolicRecurrences environment states |>.mapError .natural)
+  | .negate value => return -(← value.evaluateWithSymbolicRecurrences environment states)
+  | .add left right => return (← left.evaluateWithSymbolicRecurrences environment states) +
+      (← right.evaluateWithSymbolicRecurrences environment states)
+  | .subtract left right => return (← left.evaluateWithSymbolicRecurrences environment states) -
+      (← right.evaluateWithSymbolicRecurrences environment states)
+  | .multiply left right => return (← left.evaluateWithSymbolicRecurrences environment states) *
+      (← right.evaluateWithSymbolicRecurrences environment states)
   | .divide left right => do
-      let denominator ← right.evaluate environment recurrenceBounds
+      let denominator ← right.evaluateWithSymbolicRecurrences environment states
       if denominator = 0 then .error .divisionByZero
-      else return (← left.evaluate environment recurrenceBounds) / denominator
-  | .minimum left right =>
-      return min (← left.evaluate environment recurrenceBounds)
-        (← right.evaluate environment recurrenceBounds)
-  | .maximum left right =>
-      return max (← left.evaluate environment recurrenceBounds)
-        (← right.evaluate environment recurrenceBounds)
-  | .carriedInput path => .error (.escapedCarriedInput path)
-  | .recurrenceResult recurrence path =>
-      match lookupIntegerRecurrenceBound recurrence path recurrenceBounds.integer with
-      | some value => .ok value
-      | none => .error (.unresolvedRecurrence recurrence path)
-
-/-- Signed counterpart of `BoundExpr.evaluateTemplate`, using the same immutable snapshot. -/
-def IntBoundExpr.evaluateTemplate
-    (environment : Mxx.Ir.ParamEnvironment)
-    (recurrenceBounds : CheckedRecurrenceBoundTable)
-    (carried : CarriedBoundTable) : IntBoundExpr → Except IntBoundEvalError Int
-  | .integer value => (evaluateIntExpr environment value).mapError .integer
-  | .natural value =>
-      return (← value.evaluateTemplate environment recurrenceBounds carried |>.mapError .natural)
-  | .negate value => return -(← value.evaluateTemplate environment recurrenceBounds carried)
-  | .add left right => do
-      let left' ← left.evaluateTemplate environment recurrenceBounds carried
-      let right' ← right.evaluateTemplate environment recurrenceBounds carried
-      return left' + right'
-  | .subtract left right => do
-      let left' ← left.evaluateTemplate environment recurrenceBounds carried
-      let right' ← right.evaluateTemplate environment recurrenceBounds carried
-      return left' - right'
-  | .multiply left right => do
-      let left' ← left.evaluateTemplate environment recurrenceBounds carried
-      let right' ← right.evaluateTemplate environment recurrenceBounds carried
-      return left' * right'
-  | .divide left right => do
-      let denominator ← right.evaluateTemplate environment recurrenceBounds carried
-      if denominator = 0 then .error .divisionByZero
-      else return (← left.evaluateTemplate environment recurrenceBounds carried) / denominator
+      else return (← left.evaluateWithSymbolicRecurrences environment states) / denominator
   | .minimum left right => do
-      let left' ← left.evaluateTemplate environment recurrenceBounds carried
-      let right' ← right.evaluateTemplate environment recurrenceBounds carried
+      let left' ← left.evaluateWithSymbolicRecurrences environment states
+      let right' ← right.evaluateWithSymbolicRecurrences environment states
       return min left' right'
   | .maximum left right => do
-      let left' ← left.evaluateTemplate environment recurrenceBounds carried
-      let right' ← right.evaluateTemplate environment recurrenceBounds carried
+      let left' ← left.evaluateWithSymbolicRecurrences environment states
+      let right' ← right.evaluateWithSymbolicRecurrences environment states
       return max left' right'
-  | .carriedInput path =>
-      match lookupCarriedInteger path carried.integer with
+  | .carriedInput path => .error (.escapedCarriedInput path)
+  | .recurrenceResult identity path =>
+      match lookupIntegerSymbolicRecurrence identity path states.entries with
       | some value => .ok value
-      | none => .error (.escapedCarriedInput path)
-  | .recurrenceResult recurrence path =>
-      match lookupIntegerRecurrenceBound recurrence path recurrenceBounds.integer with
-      | some value => .ok value
-      | none => .error (.unresolvedRecurrence recurrence path)
+      | none => .error (.unresolvedRecurrence identity path)
+
+/-- Evaluate a closed signed bound expression without consulting the legacy flat recurrence
+table. Recurrence results and carried placeholders are rejected directly. -/
+def IntBoundExpr.evaluateClosed
+    (environment : Mxx.Ir.ParamEnvironment) :
+    IntBoundExpr → Except IntBoundEvalError Int
+  | .integer value => (evaluateIntExpr environment value).mapError .integer
+  | .natural value => return (← value.evaluate environment |>.mapError .natural)
+  | .negate value => return -(← value.evaluateClosed environment)
+  | .add left right =>
+      return (← left.evaluateClosed environment) + (← right.evaluateClosed environment)
+  | .subtract left right =>
+      return (← left.evaluateClosed environment) - (← right.evaluateClosed environment)
+  | .multiply left right =>
+      return (← left.evaluateClosed environment) * (← right.evaluateClosed environment)
+  | .divide left right => do
+      let denominator ← right.evaluateClosed environment
+      if denominator = 0 then .error .divisionByZero
+      else return (← left.evaluateClosed environment) / denominator
+  | .minimum left right =>
+      return min (← left.evaluateClosed environment) (← right.evaluateClosed environment)
+  | .maximum left right =>
+      return max (← left.evaluateClosed environment) (← right.evaluateClosed environment)
+  | .carriedInput path => .error (.escapedCarriedInput path)
+  | .recurrenceResult recurrence path => .error (.unresolvedRecurrence recurrence path)
 
 theorem BoundExpr.evaluate_parameter_nat (name : String) (value : Nat) :
     (BoundExpr.parameter (.parameter name)).evaluate
       [(name, .integer value)] = .ok value := by
   have evaluated : evaluateIntExpr [(name, .integer value)] (.parameter name) = .ok value := by
     simp [evaluateIntExpr, Mxx.Ir.lookupParam]
-  unfold BoundExpr.evaluate BoundExpr.evaluateWithRecurrences evaluateBoundParameter
+  unfold BoundExpr.evaluate evaluateBoundParameter
   rw [evaluated]
   change (if (value : Int) < 0 then Except.error (.negativeParameter value)
     else Except.ok (value : Int).toNat) = Except.ok value

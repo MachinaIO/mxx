@@ -19,7 +19,7 @@ Regenerate the inputs and repeat the structural audit with:
 MXX_REGENERATE_CORRECTNESS=1 cargo run -p mxx-correctness --example emit_correctness
 MXX_REGENERATE_CORRECTNESS=1 cargo run -p mxx-we --example emit_correctness
 (cd lean && lake build mxx_analysis_facts)
-lean/.lake/build/bin/mxx_analysis_facts target/correctness/m0-analysis-facts.json
+lean/.lake/build/bin/mxx_analysis_facts /tmp/mxx-diamond-analysis-facts-20260806.json
 python3 scripts/audit_correctness_ir.py --check
 ```
 
@@ -32,8 +32,8 @@ Both generated modules identify `mxx-correctness-emitter-v5`. Their closed-workf
 
 | Closed workflow | Workflow hash |
 |---|---|
-| Toy example | `50d3fa2842746284fe6afc1d2b1004bec7e32982cdca391b9f6170b57877c374` |
-| Diamond WE family, including the input injector | `60b0219e7732db469820f1b3a636c9d04528f62dc47ec09a8dc5cb54820dd01b` |
+| Toy example | `1cffc358ce796800fad2b9513f767c5df8e2eaf8e62bca1329a8b0012874b0df` |
+| Diamond WE family, including the input injector | `ce6395d760eba47744a2e1ee2e692af2a316a95e60d9943589c3d0cef891de27` |
 
 The audit does not trust copied source or toolkit hashes. It reads each generated
 `protocolSourcePaths`, recomputes `protocolSourceHash` over that exact source set, and recomputes
@@ -164,6 +164,23 @@ a sampler bound must fail the semantic M0 check as `UnsupportedIndexedBound`;
 the current text-level audit is intentionally not treated as the long-term
 semantic verifier.
 
+Five sequential-loop bodies contain parallel-family construction. The complete generated-scope
+classification is:
+
+| Program and sequential scope | Parallel nodes |
+|---|---:|
+| Encrypt `sequential:__root:32` | 7 |
+| Decrypt `sequential:__root:8` | 5 |
+| Decrypt `sequential:__root:67` | 41 |
+| Requirement 1 `sequential:__root:79` | 6 |
+| Requirement 2 `sequential:__root:27` | 7 |
+
+These 66 sites all use the same uniform-template rule. A concrete aggregate retains its
+sequential-iteration path as value identity, while family-element schema and hard-bound metadata
+are selected by the frozen joint-family identity and output slot. Repeated analyzer entries for
+that same frozen key resolve deterministically to the analyzer-owned template; no certificate
+chooses the template.
+
 ## Artifact and residual origin paths
 
 The current workflow preserves direct artifact wiring for the decoder inputs:
@@ -192,7 +209,7 @@ exporter serializes these values directly from `AnalysisResult`:
 
 - `ValueInstanceRef`, including the common protocol/artifact origin;
 - `JointFamilyId` and output slot plus normalized family index;
-- `FactRecurrenceRef` for a sequential carried value;
+- `SequentialRecurrenceInstanceRef` for a sequential carried value;
 - `MatrixFactPath` for each residual coefficient and basis;
 - `BoundFactPath` for the associated coefficient/noise/total bounds.
 
@@ -203,9 +220,12 @@ paths, and any recurrence/family projection. The audit compares these typed valu
 equality. A human-readable construction trace or a claim that separately computed matrices have
 equal values is insufficient.
 
-There is not yet a successful Diamond analyzer result to serialize: analysis stops at the first
-missing loop-body input fact. The exporter therefore exits nonzero without writing JSON, and the
-audit remains failed closed.
+There is not yet a successful Diamond analyzer result to serialize. The latest completed Phase A
+run rejected a parallel-family aggregate under encrypt `sequential:__root:32` because the concrete
+aggregate carried a sequential-iteration instance path while the uniform element template was
+registered at its frozen joint/output key. The complete 66-site class is recorded above and the
+analyzer lookup has been updated coherently; a post-fix exporter run is still required before this
+report can claim Phase A acceptance.
 
 ## M0 disposition: failed closed
 
@@ -224,8 +244,8 @@ The complete M0 audit fails because:
 - complete residual cancellation equality lacks typed
   artifact/family/recurrence/result-path identities, despite the four direct
   artifact edges being present;
-- the analyzer stops before the exporter can emit the semantic-anchor facts consumed by the exact
-  residual-term comparison.
+- the latest completed analyzer run stopped before the exporter could emit the semantic-anchor
+  facts consumed by the exact residual-term comparison; the post-fix run is still pending.
 
 The old `trace_*`, `*ConstructionTrace`, and manual certificate APIs have been deleted; repository
 search returns no remaining occurrence. The audit command deliberately returns a failure status

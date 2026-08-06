@@ -14,7 +14,7 @@ inductive BoundExpr where
       (ringDimension innerDimension : IntExpr)
       (left right : BoundExpr)
   | minimum (left right : BoundExpr)
-  | recurrenceResult (recurrence : FactRecurrenceInstanceRef) (path : BoundFactPath)
+  | recurrenceResult (recurrence : SequentialRecurrenceInstanceRef) (path : BoundFactPath)
   /-- Analyzer-only placeholder for a bound inside the previous carried state. -/
   | carriedInput (path : BoundFactPath)
 
@@ -32,7 +32,7 @@ inductive IntBoundExpr where
   | maximum (left right : IntBoundExpr)
   | carriedInput (path : IntBoundFactPath)
   | recurrenceResult
-      (recurrence : FactRecurrenceInstanceRef)
+      (recurrence : SequentialRecurrenceInstanceRef)
       (path : IntBoundFactPath)
 
 structure BoundedMatrixExpr where
@@ -158,14 +158,23 @@ structure JointFamilyFact where
   outputArity : Nat
   elementTuple : Vector ValueFactTemplate outputArity
 
-structure FactRecurrence where
+/-- One loop-invariant argument and the fact transported from that exact frozen input wire. -/
+structure InvariantInputFact where
+  wire : CoreWireRef
+  fact : ValueFact
+
+structure SequentialRecurrenceSource where
   loop : LoopRef
   count : IntExpr
   carriedArity : Nat
-  initial : Vector ValueFact carriedArity
+  /-- Typed facts for the actual initial carried wires. Keeping the owning schema here is
+  necessary for matrix-carried loops; a bare `ValueFact.matrix` does not contain its matrix type. -/
+  initial : Vector ValueFactTemplate carriedArity
   bodyInputs : Vector TemplateWireRef carriedArity
   bodyOutputs : Vector ValueFactTemplate carriedArity
-  invariantInputs : List ValueFact
+  /-- Analyzer-owned element templates for family aggregates reachable from carried facts. -/
+  familyElementTemplates : List (FamilyAggregateRef × ValueFactTemplate) := []
+  invariantInputs : List InvariantInputFact
   iterationVariable : IndexVar
 
 end Mxx.Certificate

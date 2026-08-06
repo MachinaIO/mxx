@@ -327,13 +327,14 @@ structure MxxBoundedSamplerContract (samplers : MxxSamplerFamily) : Prop where
         (output.withSamplerParams params)) input ∧
       maxCenteredCoefficientNorm (output.withSamplerParams params) ≤
         max (base.natAbs / 2) 1
-  /-- Gadget decomposition is a deterministic primitive, unlike Gaussian and preimage sampling.
-  Re-evaluating the same query in two protocol stages therefore yields the same normalized
-  matrix. -/
-  gadgetDecomposeUnique :
-    ∀ params base digitCount input left right,
-      left ∈ samplers.gadgetDecompose params base digitCount input →
-      right ∈ samplers.gadgetDecompose params base digitCount input →
+  /-- Gadget decomposition first canonicalizes its input coefficients in `R_q` and is then
+  deterministic.  Consequently, quotient-equal inputs produce the same normalized digit
+  matrix, even when their stored integer representatives differ. -/
+  gadgetDecomposeCongruent :
+    ∀ params base digitCount leftInput rightInput left right,
+      MatrixModEq leftInput rightInput →
+      left ∈ samplers.gadgetDecompose params base digitCount leftInput →
+      right ∈ samplers.gadgetDecompose params base digitCount rightInput →
       left.withSamplerParams params = right.withSamplerParams params
   preimageContract :
     ∀ params b p k, k ∈ samplers.samplePreimage params b p →

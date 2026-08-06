@@ -27,10 +27,6 @@ structure JointFamilyId where
   name : String
   deriving BEq, DecidableEq, Repr
 
-structure FactRecurrenceRef where
-  name : String
-  deriving BEq, DecidableEq, Repr
-
 structure IndexVar where
   slot : Nat
   deriving BEq, DecidableEq, Repr
@@ -59,6 +55,12 @@ structure TemplateWireRef where
   deriving BEq, DecidableEq, Repr
 
 structure LoopRef where
+  site : CoreNodeRef
+  deriving BEq, DecidableEq, Repr
+
+/-- Frozen structural identity of a sequential-loop occurrence.  It is the exact loop node, not
+a certificate-provided name. -/
+structure SequentialRecurrenceRef where
   site : CoreNodeRef
   deriving BEq, DecidableEq, Repr
 
@@ -99,7 +101,7 @@ inductive FamilyAggregateRef where
       (path : AggregateInstancePath)
   | carriedInput (carriedSlot : Nat)
   | recurrenceResult
-      (recurrence : FactRecurrenceRef)
+      (recurrence : SequentialRecurrenceRef)
       (path : AggregateInstancePath)
       (slot : Nat)
   | familyElement
@@ -108,10 +110,102 @@ inductive FamilyAggregateRef where
   deriving BEq, DecidableEq, Repr
 
 /-- A dynamic occurrence of a statically named recurrence. -/
-structure FactRecurrenceInstanceRef where
-  recurrence : FactRecurrenceRef
+structure SequentialRecurrenceInstanceRef where
+  recurrence : SequentialRecurrenceRef
   path : AggregateInstancePath
   deriving BEq, DecidableEq, Repr
+
+private def InstanceFrame.isParallelLane : InstanceFrame → Bool
+  | .parallelLane .. => true
+  | .subgraphCall _ | .sequentialIteration .. => false
+
+/-- A materialized lane of a uniform parallel-family template may append only `parallelLane`
+frames to the analyzer-owned recurrence occurrence.  Frozen sites and the complete base path
+remain exact; sequential iterations and subgraph calls are never erased. -/
+def SequentialRecurrenceInstanceRef.isLaneUniformInstantiationOf
+    (reference base : SequentialRecurrenceInstanceRef) : Bool :=
+  if reference.recurrence != base.recurrence then false
+  else
+    let rec checkPath : AggregateInstancePath → AggregateInstancePath → Bool
+      | [], suffix => suffix.all InstanceFrame.isParallelLane
+      | baseHead :: baseTail, referenceHead :: referenceTail =>
+          baseHead == referenceHead && checkPath baseTail referenceTail
+      | _ :: _, [] => false
+    checkPath base.path reference.path
+
+/-- Return the unique analyzer-owned entry whose recurrence identity is the lane-uniform base of
+`reference`.  Ambiguous prefixes fail closed; callers must not choose a longest prefix. -/
+def uniqueLaneUniformRecurrenceMatch?
+    {α : Type}
+    (reference : SequentialRecurrenceInstanceRef)
+    (entries : List α)
+    (identity : α → SequentialRecurrenceInstanceRef) : Option α :=
+  match entries.filter (fun entry => reference.isLaneUniformInstantiationOf (identity entry)) with
+  | [entry] => some entry
+  | _ => none
+
+def SequentialRecurrenceInstanceRef.appendPath
+    (reference : SequentialRecurrenceInstanceRef)
+    (suffix : InstancePathExpr) : SequentialRecurrenceInstanceRef :=
+  { reference with path := reference.path ++ suffix }
+
+private def laneMatchSite (node : Nat) : CoreNodeRef := {
+  stage := ⟨"lane-match"⟩
+  scope := ⟨[]⟩
+  node := ⟨node⟩
+}
+
+private def laneMatchIndex (id : Nat) : RuntimeExprRef .integer := ⟨id⟩
+
+private def laneMatchBase : SequentialRecurrenceInstanceRef := {
+  recurrence := ⟨laneMatchSite 8⟩
+  path := []
+}
+
+private def laneMatchReference : SequentialRecurrenceInstanceRef :=
+  laneMatchBase.appendPath [
+    .parallelLane (laneMatchSite 29) (laneMatchIndex 83),
+    .parallelLane (laneMatchSite 31) (laneMatchIndex 85),
+    .parallelLane (laneMatchSite 32) (laneMatchIndex 86),
+    .parallelLane (laneMatchSite 33) (laneMatchIndex 90)
+  ]
+
+example : laneMatchReference.isLaneUniformInstantiationOf laneMatchBase = true := by
+  rfl
+
+example : uniqueLaneUniformRecurrenceMatch? laneMatchReference [laneMatchBase] id =
+    some laneMatchBase := by
+  rfl
+
+example :
+    let sequential := laneMatchBase.appendPath [
+      .sequentialIteration (laneMatchSite 29) (laneMatchIndex 83)
+    ]
+    uniqueLaneUniformRecurrenceMatch? sequential [laneMatchBase] id = none := by
+  rfl
+
+example :
+    let wrongSite : SequentialRecurrenceInstanceRef := {
+      recurrence := ⟨laneMatchSite 9⟩
+      path := laneMatchReference.path
+    }
+    uniqueLaneUniformRecurrenceMatch? wrongSite [laneMatchBase] id = none := by
+  rfl
+
+example :
+    let nonPrefix : SequentialRecurrenceInstanceRef := {
+      laneMatchBase with
+      path := [.parallelLane (laneMatchSite 30) (laneMatchIndex 84)]
+    }
+    uniqueLaneUniformRecurrenceMatch? laneMatchReference [nonPrefix] id = none := by
+  rfl
+
+example :
+    let longerBase := laneMatchBase.appendPath [
+      .parallelLane (laneMatchSite 29) (laneMatchIndex 83)
+    ]
+    uniqueLaneUniformRecurrenceMatch? laneMatchReference [laneMatchBase, longerBase] id = none := by
+  rfl
 
 def FamilyAggregateRef.appendPath
     (suffix : InstancePathExpr) : FamilyAggregateRef → FamilyAggregateRef
@@ -122,11 +216,6 @@ def FamilyAggregateRef.appendPath
       .recurrenceResult recurrence (path ++ suffix) slot
   | .familyElement parent index => .familyElement (parent.appendPath suffix) index
 
-def FactRecurrenceInstanceRef.appendPath
-    (reference : FactRecurrenceInstanceRef)
-    (suffix : InstancePathExpr) : FactRecurrenceInstanceRef :=
-  { reference with path := reference.path ++ suffix }
-
 inductive ValueInstanceRef where
   | protocolInput (input : ProtocolInputId)
   | concrete (wire : CoreWireRef)
@@ -135,7 +224,7 @@ inductive ValueInstanceRef where
   | familyElement
       (aggregate : FamilyAggregateRef)
       (index : RuntimeExprRef .integer)
-  | recurrenceResult (recurrence : FactRecurrenceInstanceRef) (slot : Nat)
+  | recurrenceResult (recurrence : SequentialRecurrenceInstanceRef) (slot : Nat)
   deriving BEq, DecidableEq, Repr
 
 /-- Canonical stable identity for a frozen wire. Root wires are concrete; a non-root static scope

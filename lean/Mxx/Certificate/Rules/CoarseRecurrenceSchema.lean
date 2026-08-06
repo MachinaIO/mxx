@@ -56,8 +56,15 @@ def ValueFact.coarseSchemaAgainst
 
 def ValueFactTemplate.toCarriedValueSchema
     (template : ValueFactTemplate) :
-    Except CoarseRecurrenceSchemaError CarriedValueSchema :=
-  template.fact.coarseSchemaAgainst template.schema
+    Except CoarseRecurrenceSchemaError CarriedValueSchema := do
+  match template.fact, template.schema with
+  | .matrix fact, .matrix matrixType _ relations representation =>
+      if !relations.isEmpty || !fact.relations.isEmpty then
+        throw .carriedMatrixRelation
+      if fact.coefficientRepresentation != representation then
+        throw .factSchemaMismatch
+      return .matrix matrixType representation
+  | fact, schema => fact.coarseSchemaAgainst schema
 
 /-- Coarse loop validation deliberately ignores exact-vs-affine representation and affine term
 count. Any retained type, count, coefficient-representation, or value-kind difference still
@@ -128,7 +135,7 @@ example : fiveTermAffineFamilyTemplate.toCarriedValueSchema = .ok
 example : exactFamilyTemplate.sameCarriedValueSchema fiveTermAffineFamilyTemplate = .ok true := by
   rfl
 
-example : relatedMatrixTemplate.toCarriedValueSchema = .error .factSchemaMismatch := by
+example : relatedMatrixTemplate.toCarriedValueSchema = .error .carriedMatrixRelation := by
   rfl
 
 example :

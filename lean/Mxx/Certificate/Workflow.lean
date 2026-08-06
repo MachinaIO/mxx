@@ -163,6 +163,68 @@ structure ScopedWireFact where
 
 abbrev ScopedWireFactTable := List ScopedWireFact
 
+/-- Analyzer-owned provenance for one parallel-family summary.  This is emitted by the same
+analysis branch that constructs the corresponding `JointFamilyFact`; it is not certificate or
+protocol input.  Retaining the exact frozen loop and the body-analysis products lets semantic
+soundness replay the actual parallel trace instead of trusting `elementTuple` as an assertion. -/
+structure ParallelFamilyDerivationSource where
+  family : JointFamilyId
+  loopSite : CoreNodeRef
+  childScope : StaticScopeId
+  definition : String
+  count : IntExpr
+  indexSlot : Nat
+  /-- The analyzer-owned arena reference for this loop's index expression.  Retaining the
+  reference is necessary when the body output template is instantiated at an actual lane; it is
+  not certificate input. -/
+  indexReference : RuntimeExprRef .integer
+  indexExpression : RuntimeExpr .integer
+  bindings : List (String × IntExpr)
+  modes : List Mxx.Ir.LoopInputMode
+  argumentRefs : List Mxx.Ir.WireRef
+  outputCount : Nat
+  outputTypes : List Mxx.Ir.WireTypeExpr
+  body : Mxx.Ir.Scope
+  seededFacts : ScopedWireFactTable
+  analyzedFacts : ScopedWireFactTable
+  outputFacts : ScopedWireFactTable
+  elementTemplates : List ValueFactTemplate
+
+/-- Internal consistency required before a retained parallel-family source may be used by a
+semantic proof.  In particular, the element templates are recovered from the exact analyzed body
+outputs rather than trusted independently from the family summary. -/
+def ParallelFamilyDerivationSource.MatchesFamily
+    (source : ParallelFamilyDerivationSource)
+    (family : JointFamilyFact) : Prop :=
+  source.family = family.id ∧
+    source.count = family.count ∧
+    source.indexSlot = family.indexVariable.slot ∧
+    source.outputCount = family.outputArity ∧
+    source.elementTemplates = family.elementTuple.toList
+
+/-- The retained output facts are exactly the frozen child scope outputs, in port order. -/
+def ParallelFamilyDerivationSource.OutputFactsMatchBody
+    (source : ParallelFamilyDerivationSource) : Prop :=
+  source.childScope = ⟨source.loopSite.scope.path ++ [source.definition]⟩ ∧
+    source.body.outputs.length = source.outputCount ∧
+    source.outputFacts.map (fun fact => fact.wire) =
+      source.body.outputs.map (fun output =>
+        { stage := source.loopSite.stage
+          scope := source.childScope
+          node := ⟨output.2.node⟩
+          port := output.2.port })
+
+/-- Analyzer-owned public summary of a requirement acceptance wrapper. The detailed dependent
+wrapper proof stays in the analyzer; this summary carries only frozen identities needed for later
+coupling lookup. -/
+structure RequirementAcceptanceSummary where
+  requirementIndex : Nat
+  outputName : String
+  outputWire : CoreWireRef
+  selectedRecurrence : SequentialRecurrenceInstanceRef
+  selectedSlot : Nat
+  deriving BEq, DecidableEq, Repr
+
 structure AnalysisResult where
   expressionArena : ExpressionArena := { entries := [] }
   symbolicFormArena : SymbolicMatrixFormArena := {}
@@ -170,8 +232,9 @@ structure AnalysisResult where
   symbolicMatrixFacts : List MatrixSymbolicFact := []
   facts : ScopedWireFactTable
   families : List (JointFamilyId × JointFamilyFact)
-  recurrences : List (FactRecurrenceInstanceRef × FactRecurrence)
+  parallelFamilyDerivations : List ParallelFamilyDerivationSource := []
   symbolicRecurrences : List SymbolicRecurrenceTransfer := []
+  requirementAcceptances : List RequirementAcceptanceSummary := []
   staticObligations : List StaticObligation
   inputObligations : List InputObligation
   semanticObligations : List SemanticObligation

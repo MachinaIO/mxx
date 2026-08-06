@@ -7,6 +7,8 @@ inductive MatrixAffineError where
   | typing (error : TypingError)
   | unsupportedScale (scalar : IntExpr)
   | generalAffineProduct
+  | unknownCoefficientType (expression : MatrixExpr)
+  | unknownBasisType (expression : MatrixExpr)
 
 structure DerivedMatrixFact where
   type : MatrixTypeExpr
@@ -147,8 +149,12 @@ private def multiplyAffineRight
     (leftType rightType : MatrixTypeExpr)
     (form : AffineForm)
     (right : BoundedMatrixExpr) : Except MatrixAffineError AffineForm := do
-  let terms ← form.terms.mapM fun term ↦
-    mkSignalTerm term.coefficient (.multiply term.basis right.expression) |>.mapError .typing
+  let terms ← form.terms.mapM fun term ↦ do
+    if term.coefficient.expression.inferType.isNone then
+      throw (.unknownCoefficientType term.coefficient.expression)
+    let basis := MatrixExpr.multiply term.basis right.expression
+    if basis.inferType.isNone then throw (.unknownBasisType basis)
+    mkSignalTerm term.coefficient basis |>.mapError .typing
   let (_, noiseBound) ← productBound leftType rightType form.noiseBound right.normBound
   return { terms, noiseBound }
 
@@ -159,11 +165,13 @@ private def multiplyAffineLeft
   let terms ← form.terms.mapM fun term ↦ do
     let coefficientType ← match term.coefficient.expression.inferType with
       | some type => pure type
-      | none => throw (.typing .unknownExpressionType)
+      | none => throw (.unknownCoefficientType term.coefficient.expression)
     let (_, coefficientBound) ← productBound leftType coefficientType
       left.normBound term.coefficient.normBound
+    let coefficient := MatrixExpr.multiply left.expression term.coefficient.expression
+    if coefficient.inferType.isNone then throw (.unknownCoefficientType coefficient)
     mkSignalTerm {
-      expression := .multiply left.expression term.coefficient.expression
+      expression := coefficient
       normBound := coefficientBound
     } term.basis |>.mapError .typing
   let (_, noiseBound) ← productBound leftType rightType left.normBound form.noiseBound

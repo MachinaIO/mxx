@@ -67,6 +67,13 @@ theorem lookupWire_bindOutputs
   rw [show some values[port] = values[port]? from (List.getElem?_eq_getElem inBounds).symm]
   simpa [bindOutputs] using lookupWire_zipIdx nodeId 0 port values
 
+theorem lookupWire_bindOutputs_eq_none_of_not_lt
+    (nodeId port : Nat) (values : List Value) (outOfBounds : ¬port < values.length) :
+    lookupWire ⟨nodeId, port⟩ (bindOutputs nodeId values) = none := by
+  rw [show lookupWire ⟨nodeId, port⟩ (bindOutputs nodeId values) = values[port]? by
+    simpa [bindOutputs] using lookupWire_zipIdx nodeId 0 port values]
+  exact List.getElem?_eq_none (by omega)
+
 theorem lookupWire_bindOutputs_of_node_ne
     (nodeId otherNode port : Nat)
     (values : List Value)
@@ -464,47 +471,56 @@ theorem mem_evaluateNode_preimageSample_of_arguments
   obtain ⟨sample, sampleMember, rfl⟩ := member
   exact ⟨sample, sampleMember, rfl⟩
 
-/-- `gadgetDecompose` is deterministic from its evaluated input, matrix parameters, base, and
-digit count.  The two evaluations may occur in different SSA environments; no ciphertext or
-artifact identity is used. -/
-theorem mem_evaluateNode_gadgetDecompose_unique_of_same_arguments
-    (runChild : ChildRunner) (samplers : MxxSamplerFamily)
+/-- `gadgetDecompose` canonicalizes coefficients in `R_q` before its deterministic digit
+expansion.  Therefore executions on quotient-equal inputs return the same normalized digit
+matrix, even when their stored representatives or SSA environments differ. -/
+theorem mem_evaluateNode_gadgetDecompose_congruent_of_arguments
+    (leftRunner rightRunner : ChildRunner) (samplers : MxxSamplerFamily)
     (contract : MxxBoundedSamplerContract samplers)
-    (params : ParamEnvironment) (inputs : Environment)
+    (leftParams rightParams : ParamEnvironment)
+    (leftInputs rightInputs : Environment)
     (leftWires rightWires : WireEnvironment) (leftRef rightRef : WireRef)
-    (input : Mxx.Matrix) (matrixType : MatrixTypeExpr) (base digitCount : IntExpr)
+    (leftInput rightInput : Mxx.Matrix)
+    (leftMatrixType rightMatrixType : MatrixTypeExpr)
+    (leftBase rightBase leftDigitCount rightDigitCount : IntExpr)
     (matrixParams : Mxx.SamplerParams) (evaluatedBase evaluatedDigitCount : Int)
-    (outputCount : Nat)
+    (leftOutputCount rightOutputCount : Nat)
     (leftArgumentsEvaluate : [leftRef].mapM (fun wire => lookupWire wire leftWires) =
-      some [.matrix input])
+      some [.matrix leftInput])
     (rightArgumentsEvaluate : [rightRef].mapM (fun wire => lookupWire wire rightWires) =
-      some [.matrix input])
-    (matrixTypeEvaluate : matrixType.evaluate params (.constant 0) = some matrixParams)
-    (baseEvaluate : base.evaluate params = some evaluatedBase)
-    (digitCountEvaluate : digitCount.evaluate params = some evaluatedDigitCount)
+      some [.matrix rightInput])
+    (inputsCongruent : Mxx.MatrixModEq leftInput rightInput)
+    (leftMatrixTypeEvaluate :
+      leftMatrixType.evaluate leftParams (.constant 0) = some matrixParams)
+    (rightMatrixTypeEvaluate :
+      rightMatrixType.evaluate rightParams (.constant 0) = some matrixParams)
+    (leftBaseEvaluate : leftBase.evaluate leftParams = some evaluatedBase)
+    (rightBaseEvaluate : rightBase.evaluate rightParams = some evaluatedBase)
+    (leftDigitCountEvaluate : leftDigitCount.evaluate leftParams = some evaluatedDigitCount)
+    (rightDigitCountEvaluate : rightDigitCount.evaluate rightParams = some evaluatedDigitCount)
     {leftValues rightValues : List Value}
-    (leftMember : leftValues ∈ evaluateNode runChild samplers params inputs leftWires {
-      kind := .gadgetDecompose matrixType base digitCount
+    (leftMember : leftValues ∈ evaluateNode leftRunner samplers leftParams leftInputs leftWires {
+      kind := .gadgetDecompose leftMatrixType leftBase leftDigitCount
       arguments := [leftRef]
-      outputCount
+      outputCount := leftOutputCount
     })
-    (rightMember : rightValues ∈ evaluateNode runChild samplers params inputs rightWires {
-      kind := .gadgetDecompose matrixType base digitCount
+    (rightMember : rightValues ∈ evaluateNode rightRunner samplers rightParams rightInputs rightWires {
+      kind := .gadgetDecompose rightMatrixType rightBase rightDigitCount
       arguments := [rightRef]
-      outputCount
+      outputCount := rightOutputCount
     }) :
     leftValues = rightValues := by
   obtain ⟨left, leftSupport, rfl⟩ := mem_evaluateNode_gadgetDecompose_of_arguments
-    runChild samplers params inputs leftWires leftRef input matrixType base digitCount matrixParams
-    evaluatedBase evaluatedDigitCount outputCount leftArgumentsEvaluate matrixTypeEvaluate
-    baseEvaluate digitCountEvaluate leftMember
+    leftRunner samplers leftParams leftInputs leftWires leftRef leftInput leftMatrixType leftBase
+    leftDigitCount matrixParams evaluatedBase evaluatedDigitCount leftOutputCount
+    leftArgumentsEvaluate leftMatrixTypeEvaluate leftBaseEvaluate leftDigitCountEvaluate leftMember
   obtain ⟨right, rightSupport, rfl⟩ := mem_evaluateNode_gadgetDecompose_of_arguments
-    runChild samplers params inputs rightWires rightRef input matrixType base digitCount
-    matrixParams
-    evaluatedBase evaluatedDigitCount outputCount rightArgumentsEvaluate matrixTypeEvaluate
-    baseEvaluate digitCountEvaluate rightMember
-  rw [contract.gadgetDecomposeUnique matrixParams evaluatedBase evaluatedDigitCount.toNat input
-    left right leftSupport rightSupport]
+    rightRunner samplers rightParams rightInputs rightWires rightRef rightInput rightMatrixType
+    rightBase rightDigitCount matrixParams evaluatedBase evaluatedDigitCount rightOutputCount
+    rightArgumentsEvaluate rightMatrixTypeEvaluate rightBaseEvaluate rightDigitCountEvaluate
+    rightMember
+  rw [contract.gadgetDecomposeCongruent matrixParams evaluatedBase evaluatedDigitCount.toNat
+    leftInput rightInput left right inputsCongruent leftSupport rightSupport]
 
 /-- Inverting a sequential-loop node produces the exact inductive trace selected by that
 execution, with no materialization of the other sampler outcomes. -/
@@ -637,6 +653,141 @@ theorem ParallelIterationsTrace.everyChild
       · refine ⟨_, _, childValues, childMember, ?_⟩
         exact holds _ evaluatedBindings childValues bindingsEvaluate childMember
       · exact ih queried member
+
+/-- Port-wise append preserves one selected port when both lists have the same arity. -/
+theorem appendPortValues_getElem?_of_length_eq
+    {state : List (List Value)}
+    {childValues : List Value}
+    {port outputCount : Nat}
+    {initialValues : List Value}
+    {value : Value}
+    (stateLength : state.length = outputCount)
+    (childLength : childValues.length = outputCount)
+    (portInBounds : port < outputCount)
+    (statePort : state[port]? = some initialValues)
+    (childPort : childValues[port]? = some value) :
+    (appendPortValues state childValues)[port]? = some (initialValues ++ [value]) := by
+  subst outputCount
+  induction state generalizing childValues port initialValues value with
+  | nil =>
+      simp at portInBounds
+  | cons stateHead stateTail induction =>
+      cases childValues with
+      | nil =>
+          simp at childLength
+      | cons childHead childTail =>
+          cases port with
+          | zero =>
+              simp only [List.getElem?_cons_zero] at statePort childPort
+              have stateEq : stateHead = initialValues := Option.some.inj statePort
+              have childEq : childHead = value := Option.some.inj childPort
+              subst initialValues
+              subst value
+              rfl
+          | succ port =>
+              simp only [List.length_cons] at childLength
+              simp only [List.getElem?_cons_succ] at statePort childPort
+              simp only [appendPortValues, List.getElem?_cons_succ]
+              have tailPortInBounds : port < stateTail.length := by simpa using portInBounds
+              exact induction statePort childPort (by omega) tailPortInBounds
+
+/-- Port-wise append preserves the common arity of the accumulator and child output. -/
+theorem appendPortValues_length_of_length_eq
+    {state : List (List Value)}
+    {childValues : List Value}
+    {outputCount : Nat}
+    (stateLength : state.length = outputCount)
+    (childLength : childValues.length = outputCount) :
+    (appendPortValues state childValues).length = outputCount := by
+  subst outputCount
+  induction state generalizing childValues with
+  | nil =>
+      cases childValues <;> simp_all [appendPortValues]
+  | cons stateHead stateTail induction =>
+      cases childValues with
+      | nil =>
+          simp at childLength
+      | cons childHead childTail =>
+          simp only [List.length_cons] at childLength
+          simp only [appendPortValues, List.length_cons]
+          have tailLength : childTail.length = stateTail.length := by omega
+          exact congrArg Nat.succ (induction tailLength)
+
+/-- With fixed child-output arity, the selected port of a parallel trace contains exactly one
+value per iteration, in iteration order.  Each gathered value is tied to the actual child support
+member stored by the trace; no replacement runner or child output is accepted. -/
+theorem ParallelIterationsTrace.portValues
+    {runChild : ChildRunner}
+    {definition : String}
+    {params : ParamEnvironment}
+    {indexSlot : Nat}
+    {bindings : List (String × IntExpr)}
+    {modes : List LoopInputMode}
+    {arguments : List Value}
+    {indices : List Nat}
+    {initial final : List (List Value)}
+    (trace : ParallelIterationsTrace runChild definition params indexSlot bindings modes
+      arguments indices initial final)
+    (outputCount port : Nat)
+    (initialLength : initial.length = outputCount)
+    (portInBounds : port < outputCount)
+    (childArity : ∀ (index : Nat) evaluatedBindings childValues,
+      evaluateBindings ((.loopIndex indexSlot, .integer index) :: params) bindings =
+        some evaluatedBindings →
+      childValues ∈ runChild definition
+        (evaluatedBindings ++ ((.loopIndex indexSlot, .integer index) :: params))
+        ((modes.zip arguments).map fun (mode, value) ↦ loopArgument mode index value) →
+      childValues.length = outputCount) :
+    ∀ {initialValues : List Value}, initial[port]? = some initialValues →
+      ∃ gathered,
+        final[port]? = some (initialValues ++ gathered) ∧
+        gathered.length = indices.length ∧
+        ∀ (position : Nat) (positionInBounds : position < indices.length),
+          ∃ evaluatedBindings childValues,
+            evaluateBindings
+                ((.loopIndex indexSlot, .integer indices[position]) :: params) bindings =
+              some evaluatedBindings ∧
+            childValues ∈ runChild definition
+              (evaluatedBindings ++
+                ((.loopIndex indexSlot, .integer indices[position]) :: params))
+              ((modes.zip arguments).map fun (mode, value) ↦
+                loopArgument mode indices[position] value) ∧
+            childValues[port]? = gathered[position]? := by
+  intro initialValues initialPort
+  induction trace generalizing initialValues with
+  | nil state =>
+      refine ⟨[], ?_, by simp, ?_⟩
+      · simpa using initialPort
+      · intro position positionInBounds
+        simp at positionInBounds
+  | @cons index tail state evaluatedBindings childValues traceFinal bindingsEvaluate childMember
+      rest induction =>
+      have childLength := childArity index evaluatedBindings childValues bindingsEvaluate childMember
+      have childPortExists : ∃ value, childValues[port]? = some value := by
+        rw [List.getElem?_eq_getElem (by omega)]
+        exact ⟨childValues[port], rfl⟩
+      obtain ⟨value, childPort⟩ := childPortExists
+      have nextLength : (appendPortValues state childValues).length = outputCount :=
+        appendPortValues_length_of_length_eq initialLength childLength
+      have nextPort : (appendPortValues state childValues)[port]? =
+          some (initialValues ++ [value]) :=
+        appendPortValues_getElem?_of_length_eq initialLength childLength portInBounds initialPort
+          childPort
+      obtain ⟨tailValues, finalPort, tailLength, tailEvidence⟩ :=
+        induction nextLength nextPort
+      refine ⟨value :: tailValues, ?_, by simp [tailLength], ?_⟩
+      · simpa [List.append_assoc] using finalPort
+      · intro position positionInBounds
+        cases position with
+        | zero =>
+            refine ⟨evaluatedBindings, childValues, ?_, childMember, ?_⟩
+            · simpa using bindingsEvaluate
+            · simpa using childPort
+        | succ position =>
+            obtain ⟨tailBindings, tailChildValues, tailBindingsEvaluate, tailChildMember,
+              tailPort⟩ := tailEvidence position (by simpa using positionInBounds)
+            exact ⟨tailBindings, tailChildValues, by simpa using tailBindingsEvaluate,
+              by simpa using tailChildMember, by simpa using tailPort⟩
 
 /-- Membership in a program's root support is exactly one selected SSA execution path.  Keeping
 the final wire environment makes certificate-referenced root nodes and outputs available without

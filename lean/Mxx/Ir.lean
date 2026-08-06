@@ -129,21 +129,25 @@ inductive IntBinaryOp where
   | multiply
   | divide
   | remainder
+  deriving BEq, DecidableEq
 
 inductive IntCompareOp where
   | equal
   | less
   | lessEqual
+  deriving BEq, DecidableEq
 
 inductive LoopInputMode where
   | broadcast
   | zip
   | zipOffset (offset : Nat)
+  deriving BEq, DecidableEq
 
 inductive ConcatAxis where
   | rows
   | columns
   | diagonal
+  deriving BEq, DecidableEq
 
 structure MatrixTypeExpr where
   modulus : IntExpr
@@ -245,21 +249,25 @@ inductive NodeKind where
       (indexSlot : Nat)
       (bindings : List (String × IntExpr))
       (carriedCount : Nat)
+  deriving BEq, DecidableEq
 
 structure Node where
   kind : NodeKind
   arguments : List WireRef
   outputCount : Nat := 1
   outputTypes : List WireTypeExpr := []
+  deriving BEq, DecidableEq
 
 structure Scope where
   nodes : List Node
   outputs : List (String × WireRef)
   inputNames : List String
+  deriving BEq, DecidableEq
 
 structure Prog where
   root : Scope
   definitions : List (String × Scope) := []
+  deriving BEq, DecidableEq
 
 abbrev WireEnvironment := List (WireRef × Value)
 

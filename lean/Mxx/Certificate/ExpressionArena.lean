@@ -57,6 +57,11 @@ recursive substitution well-founded without accepting any expression supplied by
 structure ExpressionArena where
   entries : SymbolicExprTable := []
 
+/-- Append-only extension relation used to transport successful references across later analyzer
+construction steps. -/
+def ExpressionArena.Extends (older newer : ExpressionArena) : Prop :=
+  ∃ suffix, newer.entries = older.entries ++ suffix
+
 def ExpressionArena.WF (arena : ExpressionArena) : Bool :=
   arena.entries.zipIdx.all fun (entry, index) => entry.refsBefore index
 
@@ -98,6 +103,49 @@ def ExpressionArena.lookupMatrix
   match arena.entries[reference.id]? with
   | some (.matrix expression) => some expression
   | _ => none
+
+/-- The reference returned by matrix interning resolves to the appended expression. -/
+theorem ExpressionArena.lookupMatrix_internMatrix_eq
+    (arena next : ExpressionArena) (expression : MatrixExpr) (reference : MatrixExprRef)
+    (interned : arena.internMatrix expression = some (next, reference)) :
+    next.lookupMatrix reference = some expression := by
+  simp [ExpressionArena.internMatrix] at interned
+  rcases interned with ⟨_, rfl, rfl⟩
+  simp [ExpressionArena.lookupMatrix]
+
+/-- Matrix interning preserves every previously successful matrix lookup. -/
+theorem ExpressionArena.lookupMatrix_internMatrix_preserved
+    (arena next : ExpressionArena) (expression : MatrixExpr) (reference old : MatrixExprRef)
+    (oldExpression : MatrixExpr)
+    (oldLookup : arena.lookupMatrix old = some oldExpression)
+    (interned : arena.internMatrix expression = some (next, reference)) :
+    next.lookupMatrix old = arena.lookupMatrix old := by
+  simp [ExpressionArena.internMatrix] at interned
+  rcases interned with ⟨_, rfl, rfl⟩
+  have oldInBounds : old.id < arena.entries.length := by
+    unfold ExpressionArena.lookupMatrix at oldLookup
+    cases lookup : arena.entries[old.id]? with
+    | none => simp [lookup] at oldLookup
+    | some entry => exact (List.getElem?_eq_some_iff.mp lookup).1
+  simp only [ExpressionArena.lookupMatrix]
+  rw [List.getElem?_append_left]
+  exact oldInBounds
+
+theorem ExpressionArena.Extends.lookupMatrix
+    {older newer : ExpressionArena}
+    (extension : older.Extends newer)
+    {reference : MatrixExprRef}
+    {expression : MatrixExpr}
+    (lookup : older.lookupMatrix reference = some expression) :
+    newer.lookupMatrix reference = some expression := by
+  obtain ⟨suffix, extensionEq⟩ := extension
+  unfold ExpressionArena.lookupMatrix at lookup ⊢
+  have inBounds : reference.id < older.entries.length := by
+    cases entryLookup : older.entries[reference.id]? with
+    | none => simp [entryLookup] at lookup
+    | some entry => exact (List.getElem?_eq_some_iff.mp entryLookup).1
+  rw [extensionEq, List.getElem?_append_left inBounds]
+  exact lookup
 
 example :
     (ExpressionArena.internInteger { entries := [] } (.intConstant 3)).map

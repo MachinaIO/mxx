@@ -6,6 +6,28 @@ open Lean
 
 namespace MxxWe.AnalysisFacts
 
+private def matrixExprShape : Mxx.Certificate.MatrixExpr → String
+  | .wire _ => "wire"
+  | .zero _ => "zero"
+  | .identity _ => "identity"
+  | .gadget _ _ => "gadget"
+  | .add left right => s!"add({matrixExprShape left},{matrixExprShape right})"
+  | .negate value => s!"negate({matrixExprShape value})"
+  | .multiply left right => s!"multiply({matrixExprShape left},{matrixExprShape right})"
+  | .scalarMultiply _ value => s!"scale({matrixExprShape value})"
+  | .rowSlice value _ _ => s!"rowSlice({matrixExprShape value})"
+  | .columnSlice value _ _ => s!"columnSlice({matrixExprShape value})"
+  | .rowConcat _ => "rowConcat"
+  | .columnConcat _ => "columnConcat"
+  | .diagonalConcat _ => "diagonalConcat"
+  | .rowCoefficientEmbed _ _ value => s!"rowCoefficientEmbed({matrixExprShape value})"
+  | .columnBasisEmbed _ _ value => s!"columnBasisEmbed({matrixExprShape value})"
+  | .diagonalCoefficientEmbed _ _ value => s!"diagonalCoefficientEmbed({matrixExprShape value})"
+  | .diagonalBasisEmbed _ _ value => s!"diagonalBasisEmbed({matrixExprShape value})"
+  | .select _ _ => "select"
+  | .loopResult _ _ _ => "loopResult"
+  | .carriedInput _ _ => "carriedInput"
+
 private def object (fields : List (String × Json)) : Json := Json.mkObj fields
 
 private def array (values : List Json) : Json := .arr values.toArray
@@ -89,7 +111,7 @@ private def familyAggregateRefJson : Mxx.Certificate.FamilyAggregateRef → Json
     ]
   | .recurrenceResult recurrence path slot => object [
       ("kind", "recurrenceResult"),
-      ("recurrence", recurrence.name),
+      ("recurrence", coreNodeRefJson recurrence.site),
       ("path", instancePathJson path),
       ("slot", slot)
     ]
@@ -100,8 +122,8 @@ private def familyAggregateRefJson : Mxx.Certificate.FamilyAggregateRef → Json
     ]
 
 private def recurrenceInstanceRefJson
-    (reference : Mxx.Certificate.FactRecurrenceInstanceRef) : Json := object [
-  ("recurrence", reference.recurrence.name),
+    (reference : Mxx.Certificate.SequentialRecurrenceInstanceRef) : Json := object [
+  ("recurrence", coreNodeRefJson reference.recurrence.site),
   ("path", instancePathJson reference.path)
 ]
 
@@ -444,20 +466,25 @@ private def familyJson (entry : Mxx.Certificate.JointFamilyId ×
     ]))
   ]
 
-private def recurrenceJson (entry : Mxx.Certificate.FactRecurrenceInstanceRef ×
-    Mxx.Certificate.FactRecurrence) : Json :=
-  let (key, fact) := entry
+private def recurrenceJson (transfer : Mxx.Certificate.SymbolicRecurrenceTransfer) : Json :=
+  let key := transfer.identity
+  let fact := transfer.source
   object [
     ("key", recurrenceInstanceRefJson key),
     ("loopSite", coreNodeRefJson fact.loop.site),
     ("count", intExprJson fact.count),
     ("carriedArity", fact.carriedArity),
-    ("initial", array (fact.initial.toList.map valueFactJson)),
+    ("initial", array (fact.initial.toList.map fun template => object [
+      ("fact", valueFactJson template.fact)
+    ])),
     ("bodyInputs", array (fact.bodyInputs.toList.map templateWireRefJson)),
     ("bodyOutputs", array (fact.bodyOutputs.toList.map fun template => object [
       ("fact", valueFactJson template.fact)
     ])),
-    ("invariantInputs", array (fact.invariantInputs.map valueFactJson)),
+    ("invariantInputs", array (fact.invariantInputs.map fun input => object [
+      ("wire", coreWireRefJson input.wire),
+      ("fact", valueFactJson input.fact)
+    ])),
     ("iterationVariable", fact.iterationVariable.slot)
   ]
 
@@ -527,26 +554,15 @@ private def analysisJson (analysis : Mxx.Certificate.AnalysisResult) :
     ("workflowHash", DiamondWeFamily_workflowHash),
     ("wireFacts", array (matrixWireFacts analysis.facts)),
     ("families", array (analysis.families.map familyJson)),
-    ("recurrences", array (analysis.recurrences.map recurrenceJson)),
+    ("symbolicRecurrences", array (analysis.symbolicRecurrences.map recurrenceJson)),
     ("semanticAnchors", array anchors)
   ]
-
-private def schemaSummary : Mxx.Certificate.ValueFactSchema → String
-  | .matrix _ .exact relations _ => s!"matrix.exact(relations={relations.length})"
-  | .matrix _ (.affine terms) relations _ =>
-      s!"matrix.affine(terms={terms.length},relations={relations.length})"
-  | .trapdoor => "trapdoor"
-  | .integer => "integer"
-  | .boolean => "boolean"
-  | .bytes => "bytes"
-  | .family _ element => s!"family({schemaSummary element})"
-
-private def schemaListSummary (schemas : List Mxx.Certificate.ValueFactSchema) : String :=
-  String.intercalate "," (schemas.map schemaSummary)
 
 private def verifyErrorMessage : Mxx.Certificate.VerifyError → String
   | .disabledRule rule => s!"disabledRule {repr rule}"
   | .unsupportedNode stage node => s!"unsupportedNode stage={stage.name} node={node.value}"
+  | .unsupportedNodeInScope stage scope node =>
+      s!"unsupportedNode stage={stage.name} scope={repr scope.path} node={node.value}"
   | .unsupportedDefinition stage name =>
       s!"unsupportedDefinition stage={stage.name} name={name}"
   | .missingInputFact stage node input =>
@@ -554,7 +570,8 @@ private def verifyErrorMessage : Mxx.Certificate.VerifyError → String
         s!"inputNode={input.node} inputPort={input.port}"
   | .expectedMatrixFact wire => s!"expectedMatrixFact wire={repr wire}"
   | .expectedTrapdoorFact wire => s!"expectedTrapdoorFact wire={repr wire}"
-  | .trapdoorPublicMismatch wire => s!"trapdoorPublicMismatch wire={repr wire}"
+  | .trapdoorPublicMismatch wire expected actual =>
+      s!"trapdoorPublicMismatch wire={repr wire} expected={repr expected} actual={repr actual}"
   | .missingAnchorBinding anchor =>
       s!"missingAnchorBinding stage={anchor.stage.name} label={anchor.label}"
   | .invalidAnchorWire anchor wire =>
@@ -576,6 +593,12 @@ private def verifyErrorMessage : Mxx.Certificate.VerifyError → String
   | .invalidEndpointCoverage endpoint => s!"invalidEndpointCoverage endpoint={repr endpoint}"
   | .invalidEndpointConnection endpoint =>
       s!"invalidEndpointConnection endpoint={repr endpoint}"
+  | .diamondEndpoint error => s!"diamondEndpoint {repr error}"
+  | .frozenRecurrenceInterface recurrence error =>
+      s!"frozenRecurrenceInterface recurrence={repr recurrence} error={repr error}"
+  | .bggRecurrencePrefilter error => s!"bggRecurrencePrefilter error={repr error}"
+  | .bggCarriedRoleInference error => s!"bggCarriedRoleInference error={repr error}"
+  | .bggThreeTraceInterface error => s!"bggThreeTraceInterface error={repr error}"
   | .invalidPreconditionSpec => "invalidPreconditionSpec"
   | .duplicateInputId input => s!"duplicateInputId input={input.name}"
   | .duplicateInputName name => s!"duplicateInputName name={name}"
@@ -609,21 +632,38 @@ private def verifyErrorMessage : Mxx.Certificate.VerifyError → String
       s!"invalidLoopArity stage={stage.name} node={node.value}"
   | .invalidLoopArityInScope stage scope node =>
       s!"invalidLoopArity stage={stage.name} scope={reprStr scope.path} node={node.value}"
-  | .recurrenceSchemaMismatch stage node initial body =>
-      s!"recurrence schema mismatch stage={stage.name} node={node.value}: initial=[{schemaListSummary initial}] body=[{schemaListSummary body}]"
+  | .unsupportedSequentialRecurrence stage node =>
+      s!"unsupportedSequentialRecurrence stage={stage.name} node={node.value}"
   | .unsupportedCarriedKind stage node slot =>
       s!"unsupportedCarriedKind stage={stage.name} node={node.value} slot={slot}"
+  | .nonUniformNestedRecurrenceInput stage node slot =>
+      s!"nonUniformNestedRecurrenceInput stage={stage.name} node={node.value} slot={slot}"
   | .relationBearingCarriedMatrix stage node slot =>
       s!"relationBearingCarriedMatrix stage={stage.name} node={node.value} slot={slot}"
-  | .invalidRecurrenceProjection stage node slot =>
-      s!"invalidRecurrenceProjection stage={stage.name} node={node.value} slot={slot}"
   | .escapedCarriedInput stage node slot =>
       s!"escapedCarriedInput stage={stage.name} node={node.value} slot={slot}"
   | .invalidExpressionReference => "invalidExpressionReference"
   | .missingFamily joint => s!"missingFamily joint={joint.name}"
   | .invalidFamilySlot joint slot => s!"invalidFamilySlot joint={joint.name} slot={slot}"
   | .scalarControl (.unsupportedNodeKind _) => "scalarControl unsupportedNodeKind"
-  | .matrixAffine _ => "matrixAffine unsupported or invalid matrix operation"
+  | .matrixAffine stage scope node (.typing .unknownExpressionType) =>
+      s!"matrixAffine stage={stage.name} scope={repr scope.path} node={node.value} " ++
+        "typing=unknownExpressionType"
+  | .matrixAffine stage scope node (.typing (.incompatibleMatrixProduct _ _)) =>
+      s!"matrixAffine stage={stage.name} scope={repr scope.path} node={node.value} " ++
+        "typing=incompatibleMatrixProduct"
+  | .matrixAffine stage scope node (.unsupportedScale _) =>
+      s!"matrixAffine stage={stage.name} scope={repr scope.path} node={node.value} " ++
+        "unsupportedScale"
+  | .matrixAffine stage scope node .generalAffineProduct =>
+      s!"matrixAffine stage={stage.name} scope={repr scope.path} node={node.value} " ++
+        "generalAffineProduct"
+  | .matrixAffine stage scope node (.unknownCoefficientType _) =>
+      s!"matrixAffine stage={stage.name} scope={repr scope.path} node={node.value} " ++
+        "unknownCoefficientType"
+  | .matrixAffine stage scope node (.unknownBasisType expression) =>
+      s!"matrixAffine stage={stage.name} scope={repr scope.path} node={node.value} " ++
+        s!"unknownBasisType={matrixExprShape expression}"
   | .matrixSelect wire .emptyBranches => s!"matrixSelect empty branches at {reprStr wire}"
   | .matrixSelect wire (.mismatchedBranchType _ _) =>
       s!"matrixSelect mismatched branch type at {reprStr wire}"
@@ -651,6 +691,8 @@ private def verifyErrorMessage : Mxx.Certificate.VerifyError → String
   | .transform .relationBearingInput => "transform relationBearingInput"
   | .transform .affineSignalInput => "transform affineSignalInput"
   | .transform .emptyConcat => "transform emptyConcat"
+  | .symbolicEvaluation error => s!"symbolicEvaluation {repr error}"
+  | .symbolicRecurrence error => s!"symbolicRecurrence {repr error}"
 
 def run (args : List String) : IO UInt32 := do
   let output ← match args with
@@ -677,7 +719,7 @@ def run (args : List String) : IO UInt32 := do
   IO.FS.writeFile output payload.pretty
   IO.println <| s!"wrote {(matrixWireFacts analysis.facts).length} matrix wire facts, " ++
     s!"{analysis.families.length} families, and " ++
-    s!"{analysis.recurrences.length} recurrences to {output}"
+    s!"{analysis.symbolicRecurrences.length} symbolic recurrences to {output}"
   return 0
 
 end MxxWe.AnalysisFacts

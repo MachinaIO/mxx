@@ -1,5 +1,6 @@
 import Mxx.Certificate.Bounds
 import Mxx.Certificate.Execution
+import Mxx.Certificate.ValueSemantics
 
 namespace Mxx.Certificate
 
@@ -22,24 +23,13 @@ def ClosedProtocolDecl.ParamsWF
     ∃ value, Mxx.Ir.lookupParam declaration.name parameters = some value ∧
       declaration.ValueWF value
 
-private def matrixHasType
-    (parameters : Mxx.Ir.ParamEnvironment)
-    (matrixType : MatrixTypeExpr)
-    (matrix : Mxx.Matrix) : Prop :=
-  ∃ evaluated,
-    matrixType.evaluate parameters = some evaluated ∧
-    matrix.modulus = evaluated.modulus ∧
-    matrix.ringDimension = evaluated.ringDimension ∧
-    matrix.rows = evaluated.rows ∧
-    matrix.columns = evaluated.columns
-
 /-- Runtime meaning of an input contract. Every numerical expression is evaluated in the same
 parameter environment used by protocol execution. -/
 def InputValueContract.Holds
     (parameters : Mxx.Ir.ParamEnvironment) : InputValueContract → Mxx.Ir.Value → Prop
-  | .matrixExact matrixType, .matrix matrix => matrixHasType parameters matrixType matrix
+  | .matrixExact matrixType, .matrix matrix => matrixType.Holds parameters matrix
   | .matrixBounded matrixType declaredBound, .matrix matrix =>
-      matrixHasType parameters matrixType matrix ∧
+      matrixType.Holds parameters matrix ∧
         ∃ bound, declaredBound.toBoundExpr.evaluate parameters = .ok bound ∧
           Mxx.maxCenteredCoefficientNorm matrix ≤ bound
   | .integerRange lower upper, .integer value =>

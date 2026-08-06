@@ -4,6 +4,7 @@ import Mxx.Certificate.Preconditions
 import Mxx.Certificate.Rules.DeterministicLeaves
 import Mxx.Certificate.Rules.ScalarWorkflow
 import Mxx.Certificate.Semantics
+import Mxx.Certificate.SymbolicEvaluationSoundness
 
 namespace Mxx.Certificate
 
@@ -82,9 +83,13 @@ theorem AnalysisHolds.of_fact_table
     (analysisOwned : environment.analysis = some analysis)
     (arenaOwned : environment.expressionArena = analysis.expressionArena)
     (arenaWellFormed : analysis.expressionArena.WF = true)
-    (factsHold : analysis.facts.Holds environment) :
+    (factsHold : analysis.facts.Holds environment)
+    (symbolicFactsHold : ∀ fact ∈ analysis.symbolicMatrixFacts,
+      fact.SemanticallyHolds environment analysis.symbolicFormArena analysis.boundWitnessArena)
+    (parallelFamiliesOwned : ParallelFamilyAnalysesOwned analysis) :
     AnalysisHolds environment analysis :=
-  ⟨analysisOwned, arenaOwned, arenaWellFormed, factsHold⟩
+  ⟨⟨analysisOwned, arenaOwned, arenaWellFormed, factsHold⟩, symbolicFactsHold,
+    parallelFamiliesOwned⟩
 
 /-- Internal wire state selected by an existing root-scope denotation. It is proof data extracted
 from `evaluateNodes`, not an independently executed trace. -/
@@ -278,6 +283,7 @@ theorem applyRule_sound
     {environment : FactEnvironment}
     {facts result : ScopedWireFactTable}
     {stage : StageId}
+    {scope : StaticScopeId}
     {nodeId : Nat}
     {matrixType : MatrixTypeExpr}
     {cutoff : IntExpr}
@@ -288,6 +294,7 @@ theorem applyRule_sound
     {endpoints : List EndpointFact}
     (accepted : applyRule facts {
       stage
+      scope
       nodeId
       node := {
         kind := .gaussianSample matrixType cutoff
@@ -298,9 +305,9 @@ theorem applyRule_sound
       rule := .introduceGaussian
     } = .ok (result, obligations, endpoints))
     (factsHold : facts.Holds environment)
-    (outputLookup : environment.values (.concrete {
+    (outputLookup : environment.values (.ofCoreWire {
       stage
-      scope := ⟨[]⟩
+      scope
       node := ⟨nodeId⟩
       port := 0
     }) = some (.matrix output))
@@ -318,6 +325,7 @@ theorem applyRule_sound_zero
     {environment : FactEnvironment}
     {facts result : ScopedWireFactTable}
     {stage : StageId}
+    {scope : StaticScopeId}
     {nodeId : Nat}
     {matrixType : MatrixTypeExpr}
     {outputTypes : List Mxx.Ir.WireTypeExpr}
@@ -326,6 +334,7 @@ theorem applyRule_sound_zero
     {endpoints : List EndpointFact}
     (accepted : applyRule facts {
       stage
+      scope
       nodeId
       node := {
         kind := .zeroMatrix matrixType
@@ -337,9 +346,9 @@ theorem applyRule_sound_zero
     } = .ok (result, obligations, endpoints))
     (factsHold : facts.Holds environment)
     (typeEvaluates : matrixType.evaluate environment.parameters = some parameters)
-    (outputLookup : environment.values (.concrete {
+    (outputLookup : environment.values (.ofCoreWire {
       stage
-      scope := ⟨[]⟩
+      scope
       node := ⟨nodeId⟩
       port := 0
     }) = some (.matrix (zeroConstantOutput parameters))) :
@@ -356,6 +365,7 @@ theorem applyRule_sound_identity
     {environment : FactEnvironment}
     {facts result : ScopedWireFactTable}
     {stage : StageId}
+    {scope : StaticScopeId}
     {nodeId : Nat}
     {matrixType : MatrixTypeExpr}
     {outputTypes : List Mxx.Ir.WireTypeExpr}
@@ -364,6 +374,7 @@ theorem applyRule_sound_identity
     {endpoints : List EndpointFact}
     (accepted : applyRule facts {
       stage
+      scope
       nodeId
       node := {
         kind := .identityMatrix matrixType
@@ -374,12 +385,12 @@ theorem applyRule_sound_identity
       rule := .introduceExactConstant
     } = .ok (result, obligations, endpoints))
     (factsHold : facts.Holds environment)
-    (outputLookup : environment.values (.concrete {
-      stage
-      scope := ⟨[]⟩
-      node := ⟨nodeId⟩
-      port := 0
-    }) = some (.matrix output))
+    (outputLookup : environment.values (.ofCoreWire {
+        stage
+        scope
+        node := ⟨nodeId⟩
+        port := 0
+      }) = some (.matrix output))
     (outputNorm : Mxx.maxCenteredCoefficientNorm output ≤ 1) :
     result.Holds environment := by
   have enabled : isInitialRuleEnabled .introduceExactConstant = true := by decide
@@ -387,9 +398,9 @@ theorem applyRule_sound_identity
   obtain ⟨rfl, rfl, rfl⟩ := accepted
   apply factsHold.append_singleton
   exact exactMatrixFact_holds environment _ (.wire {
-      value := .concrete {
+      value := .ofCoreWire {
         stage
-        scope := ⟨[]⟩
+        scope
         node := ⟨nodeId⟩
         port := 0
       }
@@ -400,6 +411,7 @@ theorem applyRule_sound_constantMatrix
     {environment : FactEnvironment}
     {facts result : ScopedWireFactTable}
     {stage : StageId}
+    {scope : StaticScopeId}
     {nodeId : Nat}
     {matrixType : MatrixTypeExpr}
     {coefficients : List IntExpr}
@@ -410,6 +422,7 @@ theorem applyRule_sound_constantMatrix
     {endpoints : List EndpointFact}
     (accepted : applyRule facts {
       stage
+      scope
       nodeId
       node := {
         kind := .constantMatrix matrixType coefficients
@@ -420,9 +433,9 @@ theorem applyRule_sound_constantMatrix
       rule := .introduceExactConstant
     } = .ok (result, obligations, endpoints))
     (factsHold : facts.Holds environment)
-    (outputLookup : environment.values (.concrete {
+    (outputLookup : environment.values (.ofCoreWire {
       stage
-      scope := ⟨[]⟩
+      scope
       node := ⟨nodeId⟩
       port := 0
     }) = some (.matrix output))
@@ -436,9 +449,9 @@ theorem applyRule_sound_constantMatrix
   obtain ⟨rfl, rfl, rfl⟩ := accepted
   apply factsHold.append_singleton
   exact exactMatrixFact_holds environment _ (.wire {
-      value := .concrete {
+      value := .ofCoreWire {
         stage
-        scope := ⟨[]⟩
+        scope
         node := ⟨nodeId⟩
         port := 0
       }
@@ -449,6 +462,7 @@ theorem applyRule_sound_gadgetMatrix
     {environment : FactEnvironment}
     {facts result : ScopedWireFactTable}
     {stage : StageId}
+    {scope : StaticScopeId}
     {nodeId : Nat}
     {matrixType : MatrixTypeExpr}
     {base : IntExpr}
@@ -460,6 +474,7 @@ theorem applyRule_sound_gadgetMatrix
     {endpoints : List EndpointFact}
     (accepted : applyRule facts {
       stage
+      scope
       nodeId
       node := {
         kind := .gadgetMatrix matrixType base
@@ -472,9 +487,9 @@ theorem applyRule_sound_gadgetMatrix
     (factsHold : facts.Holds environment)
     (typeEvaluates : matrixType.evaluate environment.parameters = some parameters)
     (baseEvaluates : base.evaluate environment.parameters = some evaluatedBase)
-    (outputLookup : environment.values (.concrete {
+    (outputLookup : environment.values (.ofCoreWire {
       stage
-      scope := ⟨[]⟩
+      scope
       node := ⟨nodeId⟩
       port := 0
     }) = some (.matrix (Mxx.gadgetMatrix parameters evaluatedBase

@@ -180,6 +180,68 @@ theorem affineRelationProduct_matrixValue
       inputNoise subject inputNoiseLayout subjectLayout]
   rw [Matrix.mul_add, Matrix.mul_assoc, add_assoc]
 
+/-- The affine preimage rewrite as the executable `MatrixModEq` relation consumed by symbolic
+facts.  This is the same quotient-ring theorem as `affineRelationProduct_matrixValue`; complete
+layouts merely convert its result back to canonical coefficient congruence. -/
+theorem affineRelationProduct_modEq
+    (q ringDimension outputRows basisRows inner targetInner columns : Nat)
+    [Fact (1 < q)] [NeZero ringDimension]
+    (signalCoefficient basis inputNoise subject target targetCoefficient targetBasis
+      targetNoise : Mxx.Matrix)
+    (signalCoefficientLayout : Mxx.Toolkit.MatrixLayout signalCoefficient q ringDimension
+      outputRows basisRows)
+    (basisLayout : Mxx.Toolkit.MatrixLayout basis q ringDimension basisRows inner)
+    (inputNoiseLayout : Mxx.Toolkit.MatrixLayout inputNoise q ringDimension outputRows inner)
+    (subjectLayout : Mxx.Toolkit.MatrixLayout subject q ringDimension inner columns)
+    (targetLayout : Mxx.Toolkit.MatrixLayout target q ringDimension basisRows columns)
+    (targetCoefficientLayout : Mxx.Toolkit.MatrixLayout targetCoefficient q ringDimension
+      basisRows targetInner)
+    (targetBasisLayout : Mxx.Toolkit.MatrixLayout targetBasis q ringDimension targetInner columns)
+    (targetNoiseLayout : Mxx.Toolkit.MatrixLayout targetNoise q ringDimension basisRows columns)
+    (basisRelation : Mxx.MatrixModEq (Mxx.matrixMul basis subject) target)
+    (targetRelation : Mxx.MatrixModEq target
+      (Mxx.matrixAdd (Mxx.matrixMultiply targetCoefficient targetBasis) targetNoise)) :
+    Mxx.MatrixModEq
+      (Mxx.matrixMultiply
+        (Mxx.matrixAdd (Mxx.matrixMultiply signalCoefficient basis) inputNoise) subject)
+      (Mxx.matrixAdd
+        (Mxx.matrixMultiply
+          (Mxx.matrixMultiply signalCoefficient targetCoefficient) targetBasis)
+        (Mxx.matrixAdd (Mxx.matrixMultiply signalCoefficient targetNoise)
+          (Mxx.matrixMultiply inputNoise subject))) := by
+  have coefficientBasisLayout := Mxx.Toolkit.matrixMultiply_layout signalCoefficient basis
+    signalCoefficientLayout basisLayout
+  have affineInputLayout := Mxx.Toolkit.matrixAdd_layout
+    (Mxx.matrixMultiply signalCoefficient basis) inputNoise
+    coefficientBasisLayout inputNoiseLayout
+  have leftLayout := Mxx.Toolkit.matrixMultiply_layout
+    (Mxx.matrixAdd (Mxx.matrixMultiply signalCoefficient basis) inputNoise) subject
+    affineInputLayout subjectLayout
+  have coefficientProductLayout := Mxx.Toolkit.matrixMultiply_layout
+    signalCoefficient targetCoefficient signalCoefficientLayout targetCoefficientLayout
+  have signalLayout := Mxx.Toolkit.matrixMultiply_layout
+    (Mxx.matrixMultiply signalCoefficient targetCoefficient) targetBasis
+    coefficientProductLayout targetBasisLayout
+  have signalNoiseLayout := Mxx.Toolkit.matrixMultiply_layout signalCoefficient targetNoise
+    signalCoefficientLayout targetNoiseLayout
+  have inputNoiseSubjectLayout := Mxx.Toolkit.matrixMultiply_layout inputNoise subject
+    inputNoiseLayout subjectLayout
+  have noiseLayout := Mxx.Toolkit.matrixAdd_layout
+    (Mxx.matrixMultiply signalCoefficient targetNoise)
+    (Mxx.matrixMultiply inputNoise subject) signalNoiseLayout inputNoiseSubjectLayout
+  have rightLayout := Mxx.Toolkit.matrixAdd_layout
+    (Mxx.matrixMultiply
+      (Mxx.matrixMultiply signalCoefficient targetCoefficient) targetBasis)
+    (Mxx.matrixAdd (Mxx.matrixMultiply signalCoefficient targetNoise)
+      (Mxx.matrixMultiply inputNoise subject)) signalLayout noiseLayout
+  apply Mxx.Toolkit.modEq_of_matrixValue_eq q ringDimension outputRows columns
+    _ _ leftLayout rightLayout
+  exact affineRelationProduct_matrixValue q ringDimension outputRows basisRows inner
+    targetInner columns signalCoefficient basis inputNoise subject target targetCoefficient
+    targetBasis targetNoise signalCoefficientLayout basisLayout inputNoiseLayout subjectLayout
+    targetLayout targetCoefficientLayout targetBasisLayout targetNoiseLayout basisRelation
+    targetRelation
+
 /-- The opaque noise introduced by the affine relation rewrite is bounded by the sum of the two
 existing worst-case product bounds.  This is deterministic hard-bound arithmetic: it uses neither
 independence nor a CLT assumption. -/

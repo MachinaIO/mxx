@@ -517,6 +517,35 @@ theorem matrixValue_eq_of_modEq
     ← negacyclicEmbed_reduce q n (right.coefficient row.val column.val coefficient.val),
     ← leftLayout.modulus, reducedEqualCommon]
 
+/-- Equality in the exact negacyclic quotient implies the executable coefficient relation
+`MatrixModEq` when both matrices have complete typed layouts.  Together with
+`matrixValue_eq_of_modEq`, this makes quotient equality and canonical coefficient equality
+interchangeable without assuming equality of the stored integer representatives. -/
+theorem modEq_of_matrixValue_eq
+    (q n rows columns : Nat) [Fact (1 < q)] [NeZero n]
+    (left right : Mxx.Matrix)
+    (leftLayout : MatrixLayout left q n rows columns)
+    (rightLayout : MatrixLayout right q n rows columns)
+    (equal : matrixValue q n rows columns left = matrixValue q n rows columns right) :
+    Mxx.MatrixModEq left right := by
+  refine ⟨leftLayout.modulus.trans rightLayout.modulus.symm,
+    leftLayout.ringDimension.trans rightLayout.ringDimension.symm,
+    leftLayout.rows.trans rightLayout.rows.symm,
+    leftLayout.columns.trans rightLayout.columns.symm, ?_⟩
+  intro row column coefficient rowLt columnLt coefficientLt
+  have rowBound : row < rows := leftLayout.rows ▸ rowLt
+  have columnBound : column < columns := leftLayout.columns ▸ columnLt
+  have coefficientBound : coefficient < n := leftLayout.ringDimension ▸ coefficientLt
+  have entryEqual := congrFun (congrFun equal ⟨row, rowBound⟩) ⟨column, columnBound⟩
+  have coefficientEqual :=
+    (negacyclicValue_eq_iff q n (left.coefficient row column)
+      (right.coefficient row column)).mp entryEqual ⟨coefficient, coefficientBound⟩
+  rw [leftLayout.modulus, rightLayout.modulus]
+  simpa [Mxx.reduceCoefficient, NeZero.ne q] using
+    int_emod_eq_of_zmod_eq q
+      (left.coefficient row column coefficient)
+      (right.coefficient row column coefficient) coefficientEqual
+
 theorem withSamplerParams_shape (matrix : Mxx.Matrix) (params : Mxx.SamplerParams) :
     MatrixShape (matrix.withSamplerParams params) params.modulus params.ringDimension
       params.rows params.columns := by
@@ -1100,6 +1129,47 @@ theorem matrixMultiply_layout {q : Int} {n rows inner columns : Nat}
     · simp only [Mxx.matrixMultiply, if_neg leftScalar, if_neg rightScalar]
       exact matrixMul_layout left right leftLayout rightLayout
 
+/-- A polynomial scalar on the left broadcasts over an arbitrary matrix and preserves that
+matrix's layout.  This covers the BGG plaintext-times-gadget operation whose ordinary inner
+dimensions intentionally do not match. -/
+theorem matrixMultiply_leftBroadcast_layout {q : Int} {n rows columns : Nat}
+    (scalar matrix : Mxx.Matrix)
+    (scalarLayout : MatrixLayout scalar q n 1 1)
+    (matrixLayout : MatrixLayout matrix q n rows columns) :
+    MatrixLayout (Mxx.matrixMultiply scalar matrix) q n rows columns := by
+  by_cases oneRow : rows = 1
+  · subst rows
+    rw [show Mxx.matrixMultiply scalar matrix = Mxx.matrixMul scalar matrix by
+      simp [Mxx.matrixMultiply, scalarLayout.rows, scalarLayout.columns, matrixLayout.rows]]
+    exact matrixMul_layout scalar matrix scalarLayout matrixLayout
+  · rw [show Mxx.matrixMultiply scalar matrix = Mxx.matrixPolynomialScale scalar matrix by
+      simp [Mxx.matrixMultiply, scalarLayout.rows, scalarLayout.columns, matrixLayout.rows,
+        oneRow]]
+    exact matrixPolynomialScale_layout scalar matrix matrixLayout
+
+/-- A polynomial scalar on the right broadcasts over an arbitrary matrix and preserves that
+matrix's layout. -/
+theorem matrixMultiply_rightBroadcast_layout {q : Int} {n rows columns : Nat}
+    (matrix scalar : Mxx.Matrix)
+    (matrixLayout : MatrixLayout matrix q n rows columns)
+    (scalarLayout : MatrixLayout scalar q n 1 1) :
+    MatrixLayout (Mxx.matrixMultiply matrix scalar) q n rows columns := by
+  by_cases oneRow : rows = 1
+  · subst rows
+    by_cases oneColumn : columns = 1
+    · subst columns
+      rw [show Mxx.matrixMultiply matrix scalar = Mxx.matrixMul matrix scalar by
+        simp [Mxx.matrixMultiply, matrixLayout.rows, matrixLayout.columns, scalarLayout.rows]]
+      exact matrixMul_layout matrix scalar matrixLayout scalarLayout
+    · rw [show Mxx.matrixMultiply matrix scalar = Mxx.matrixMul scalar matrix by
+        simp [Mxx.matrixMultiply, matrixLayout.rows, matrixLayout.columns, scalarLayout.rows,
+          scalarLayout.columns, oneColumn]]
+      exact matrixMul_layout scalar matrix scalarLayout matrixLayout
+  · rw [show Mxx.matrixMultiply matrix scalar = Mxx.matrixPolynomialScale scalar matrix by
+      simp [Mxx.matrixMultiply, matrixLayout.rows, scalarLayout.rows, scalarLayout.columns,
+        oneRow]]
+    exact matrixPolynomialScale_layout scalar matrix matrixLayout
+
 /-- Polynomial-scalar broadcast in the executable semantics is entrywise multiplication in the
 exact negacyclic quotient. -/
 theorem matrixValue_polynomialScale (q n rows columns : Nat) [NeZero q] [NeZero n]
@@ -1223,6 +1293,82 @@ theorem matrixValue_matrixMultiply (q n rows inner columns : Nat) [NeZero q] [Ne
         simp [Mxx.matrixMultiply, leftScalar, rightScalar]]
       exact matrixValue_mul q n rows inner columns left right leftType rightType
 
+/-- Exact quotient semantics of left polynomial-scalar broadcasting. -/
+theorem matrixValue_matrixMultiply_leftBroadcast
+    (q n rows columns : Nat) [NeZero q] [NeZero n]
+    (scalar matrix : Mxx.Matrix)
+    (scalarLayout : MatrixLayout scalar q n 1 1)
+    (matrixLayout : MatrixLayout matrix q n rows columns) :
+    matrixValue q n rows columns (Mxx.matrixMultiply scalar matrix) =
+      fun row column ↦ (matrixValue q n 1 1 scalar) 0 0 *
+        (matrixValue q n rows columns matrix) row column := by
+  by_cases oneRow : rows = 1
+  · subst rows
+    rw [show Mxx.matrixMultiply scalar matrix = Mxx.matrixMul scalar matrix by
+      simp [Mxx.matrixMultiply, scalarLayout.rows, scalarLayout.columns, matrixLayout.rows]]
+    rw [matrixValue_mul q n 1 1 columns scalar matrix
+      ⟨scalarLayout.modulus, scalarLayout.ringDimension, scalarLayout.rows,
+        scalarLayout.columns⟩
+      ⟨matrixLayout.modulus, matrixLayout.ringDimension, matrixLayout.rows,
+        matrixLayout.columns⟩]
+    ext row column
+    fin_cases row
+    simp [_root_.Matrix.mul_apply]
+  · rw [show Mxx.matrixMultiply scalar matrix = Mxx.matrixPolynomialScale scalar matrix by
+      simp [Mxx.matrixMultiply, scalarLayout.rows, scalarLayout.columns, matrixLayout.rows,
+        oneRow]]
+    exact matrixValue_polynomialScale q n rows columns scalar matrix
+      ⟨matrixLayout.modulus, matrixLayout.ringDimension, matrixLayout.rows,
+        matrixLayout.columns⟩
+
+/-- Exact quotient semantics of right polynomial-scalar broadcasting. -/
+theorem matrixValue_matrixMultiply_rightBroadcast
+    (q n rows columns : Nat) [NeZero q] [NeZero n]
+    (matrix scalar : Mxx.Matrix)
+    (matrixLayout : MatrixLayout matrix q n rows columns)
+    (scalarLayout : MatrixLayout scalar q n 1 1) :
+    matrixValue q n rows columns (Mxx.matrixMultiply matrix scalar) =
+      fun row column ↦ (matrixValue q n rows columns matrix) row column *
+        (matrixValue q n 1 1 scalar) 0 0 := by
+  rw [show (fun row column ↦ (matrixValue q n rows columns matrix) row column *
+      (matrixValue q n 1 1 scalar) 0 0) =
+      (fun row column ↦ (matrixValue q n 1 1 scalar) 0 0 *
+        (matrixValue q n rows columns matrix) row column) by
+      funext row column
+      exact mul_comm _ _]
+  by_cases oneRow : rows = 1
+  · subst rows
+    by_cases oneColumn : columns = 1
+    · subst columns
+      rw [show Mxx.matrixMultiply matrix scalar = Mxx.matrixMul matrix scalar by
+        simp [Mxx.matrixMultiply, matrixLayout.rows, matrixLayout.columns, scalarLayout.rows]]
+      rw [matrixValue_mul q n 1 1 1 matrix scalar
+        ⟨matrixLayout.modulus, matrixLayout.ringDimension, matrixLayout.rows,
+          matrixLayout.columns⟩
+        ⟨scalarLayout.modulus, scalarLayout.ringDimension, scalarLayout.rows,
+          scalarLayout.columns⟩]
+      ext row column
+      fin_cases row
+      fin_cases column
+      simp [_root_.Matrix.mul_apply, mul_comm]
+    · rw [show Mxx.matrixMultiply matrix scalar = Mxx.matrixMul scalar matrix by
+        simp [Mxx.matrixMultiply, matrixLayout.rows, matrixLayout.columns, scalarLayout.rows,
+          scalarLayout.columns, oneColumn]]
+      rw [matrixValue_mul q n 1 1 columns scalar matrix
+        ⟨scalarLayout.modulus, scalarLayout.ringDimension, scalarLayout.rows,
+          scalarLayout.columns⟩
+        ⟨matrixLayout.modulus, matrixLayout.ringDimension, matrixLayout.rows,
+          matrixLayout.columns⟩]
+      ext row column
+      fin_cases row
+      simp [_root_.Matrix.mul_apply]
+  · rw [show Mxx.matrixMultiply matrix scalar = Mxx.matrixPolynomialScale scalar matrix by
+      simp [Mxx.matrixMultiply, matrixLayout.rows, scalarLayout.rows, scalarLayout.columns,
+        oneRow]]
+    exact matrixValue_polynomialScale q n rows columns scalar matrix
+      ⟨matrixLayout.modulus, matrixLayout.ringDimension, matrixLayout.rows,
+        matrixLayout.columns⟩
+
 /-- Reshaping a matrix back to its existing dimensions preserves every polynomial entry. -/
 theorem matrixValue_reshape_same (q n rows columns : Nat) (matrix : Mxx.Matrix)
     (layout : MatrixLayout matrix q n rows columns) :
@@ -1325,6 +1471,170 @@ theorem matrixValue_scale (q n rows columns : Nat) [Fact (1 < q)] [NeZero n]
       simp [Mxx.reduceCoefficient, NeZero.ne q]]
     rw [List.getD_map]
   rw [cast_reduce]
+
+/-- Addition respects independently proved quotient-ring equalities. -/
+theorem MatrixModEq.add
+    (q n rows columns : Nat) [Fact (1 < q)] [NeZero n]
+    (leftA leftB rightA rightB : Mxx.Matrix)
+    (leftALayout : MatrixLayout leftA q n rows columns)
+    (leftBLayout : MatrixLayout leftB q n rows columns)
+    (rightALayout : MatrixLayout rightA q n rows columns)
+    (rightBLayout : MatrixLayout rightB q n rows columns)
+    (leftRelation : Mxx.MatrixModEq leftA leftB)
+    (rightRelation : Mxx.MatrixModEq rightA rightB) :
+    Mxx.MatrixModEq (Mxx.matrixAdd leftA rightA) (Mxx.matrixAdd leftB rightB) := by
+  have leftOutputLayout := matrixAdd_layout leftA rightA leftALayout rightALayout
+  have rightOutputLayout := matrixAdd_layout leftB rightB leftBLayout rightBLayout
+  apply modEq_of_matrixValue_eq q n rows columns _ _ leftOutputLayout rightOutputLayout
+  rw [matrixValue_add q n rows columns leftA rightA
+      ⟨leftALayout.modulus, leftALayout.ringDimension, leftALayout.rows, leftALayout.columns⟩
+      ⟨rightALayout.modulus, rightALayout.ringDimension, rightALayout.rows,
+        rightALayout.columns⟩,
+    matrixValue_add q n rows columns leftB rightB
+      ⟨leftBLayout.modulus, leftBLayout.ringDimension, leftBLayout.rows, leftBLayout.columns⟩
+      ⟨rightBLayout.modulus, rightBLayout.ringDimension, rightBLayout.rows,
+        rightBLayout.columns⟩,
+    matrixValue_eq_of_modEq q n rows columns leftA leftB leftALayout leftBLayout leftRelation,
+    matrixValue_eq_of_modEq q n rows columns rightA rightB rightALayout rightBLayout
+      rightRelation]
+
+/-- Subtraction respects independently proved quotient-ring equalities. -/
+theorem MatrixModEq.subtract
+    (q n rows columns : Nat) [Fact (1 < q)] [NeZero n]
+    (leftA leftB rightA rightB : Mxx.Matrix)
+    (leftALayout : MatrixLayout leftA q n rows columns)
+    (leftBLayout : MatrixLayout leftB q n rows columns)
+    (rightALayout : MatrixLayout rightA q n rows columns)
+    (rightBLayout : MatrixLayout rightB q n rows columns)
+    (leftRelation : Mxx.MatrixModEq leftA leftB)
+    (rightRelation : Mxx.MatrixModEq rightA rightB) :
+    Mxx.MatrixModEq
+      (Mxx.matrixSubtract leftA rightA) (Mxx.matrixSubtract leftB rightB) := by
+  have leftOutputLayout := matrixSubtract_layout leftA rightA leftALayout rightALayout
+  have rightOutputLayout := matrixSubtract_layout leftB rightB leftBLayout rightBLayout
+  apply modEq_of_matrixValue_eq q n rows columns _ _ leftOutputLayout rightOutputLayout
+  rw [matrixValue_subtract q n rows columns leftA rightA
+      ⟨leftALayout.modulus, leftALayout.ringDimension, leftALayout.rows, leftALayout.columns⟩
+      ⟨rightALayout.modulus, rightALayout.ringDimension, rightALayout.rows,
+        rightALayout.columns⟩,
+    matrixValue_subtract q n rows columns leftB rightB
+      ⟨leftBLayout.modulus, leftBLayout.ringDimension, leftBLayout.rows, leftBLayout.columns⟩
+      ⟨rightBLayout.modulus, rightBLayout.ringDimension, rightBLayout.rows,
+        rightBLayout.columns⟩,
+    matrixValue_eq_of_modEq q n rows columns leftA leftB leftALayout leftBLayout leftRelation,
+    matrixValue_eq_of_modEq q n rows columns rightA rightB rightALayout rightBLayout
+      rightRelation]
+
+/-- Matrix multiplication respects independently proved quotient-ring equalities. -/
+theorem MatrixModEq.multiply
+    (q n rows inner columns : Nat) [Fact (1 < q)] [NeZero n]
+    (leftA leftB rightA rightB : Mxx.Matrix)
+    (leftALayout : MatrixLayout leftA q n rows inner)
+    (leftBLayout : MatrixLayout leftB q n rows inner)
+    (rightALayout : MatrixLayout rightA q n inner columns)
+    (rightBLayout : MatrixLayout rightB q n inner columns)
+    (leftRelation : Mxx.MatrixModEq leftA leftB)
+    (rightRelation : Mxx.MatrixModEq rightA rightB) :
+    Mxx.MatrixModEq
+      (Mxx.matrixMultiply leftA rightA) (Mxx.matrixMultiply leftB rightB) := by
+  have leftOutputLayout := matrixMultiply_layout leftA rightA leftALayout rightALayout
+  have rightOutputLayout := matrixMultiply_layout leftB rightB leftBLayout rightBLayout
+  apply modEq_of_matrixValue_eq q n rows columns _ _ leftOutputLayout rightOutputLayout
+  rw [matrixValue_matrixMultiply q n rows inner columns leftA rightA leftALayout rightALayout,
+    matrixValue_matrixMultiply q n rows inner columns leftB rightB leftBLayout rightBLayout,
+    matrixValue_eq_of_modEq q n rows inner leftA leftB leftALayout leftBLayout leftRelation,
+    matrixValue_eq_of_modEq q n inner columns rightA rightB rightALayout rightBLayout
+      rightRelation]
+
+/-- Left polynomial-scalar broadcasting respects independently proved quotient-ring
+equalities.  This is distinct from ordinary matrix multiplication because the scalar's `1 × 1`
+shape intentionally does not match the matrix's row count. -/
+theorem MatrixModEq.multiplyLeftBroadcast
+    (q n rows columns : Nat) [Fact (1 < q)] [NeZero n]
+    (scalarA scalarB matrixA matrixB : Mxx.Matrix)
+    (scalarALayout : MatrixLayout scalarA q n 1 1)
+    (scalarBLayout : MatrixLayout scalarB q n 1 1)
+    (matrixALayout : MatrixLayout matrixA q n rows columns)
+    (matrixBLayout : MatrixLayout matrixB q n rows columns)
+    (scalarRelation : Mxx.MatrixModEq scalarA scalarB)
+    (matrixRelation : Mxx.MatrixModEq matrixA matrixB) :
+    Mxx.MatrixModEq
+      (Mxx.matrixMultiply scalarA matrixA) (Mxx.matrixMultiply scalarB matrixB) := by
+  have leftOutputLayout := matrixMultiply_leftBroadcast_layout scalarA matrixA
+    scalarALayout matrixALayout
+  have rightOutputLayout := matrixMultiply_leftBroadcast_layout scalarB matrixB
+    scalarBLayout matrixBLayout
+  apply modEq_of_matrixValue_eq q n rows columns _ _ leftOutputLayout rightOutputLayout
+  rw [matrixValue_matrixMultiply_leftBroadcast q n rows columns scalarA matrixA
+      scalarALayout matrixALayout,
+    matrixValue_matrixMultiply_leftBroadcast q n rows columns scalarB matrixB
+      scalarBLayout matrixBLayout,
+    matrixValue_eq_of_modEq q n 1 1 scalarA scalarB scalarALayout scalarBLayout scalarRelation,
+    matrixValue_eq_of_modEq q n rows columns matrixA matrixB matrixALayout matrixBLayout
+      matrixRelation]
+
+/-- Right polynomial-scalar broadcasting respects independently proved quotient-ring
+equalities. -/
+theorem MatrixModEq.multiplyRightBroadcast
+    (q n rows columns : Nat) [Fact (1 < q)] [NeZero n]
+    (matrixA matrixB scalarA scalarB : Mxx.Matrix)
+    (matrixALayout : MatrixLayout matrixA q n rows columns)
+    (matrixBLayout : MatrixLayout matrixB q n rows columns)
+    (scalarALayout : MatrixLayout scalarA q n 1 1)
+    (scalarBLayout : MatrixLayout scalarB q n 1 1)
+    (matrixRelation : Mxx.MatrixModEq matrixA matrixB)
+    (scalarRelation : Mxx.MatrixModEq scalarA scalarB) :
+    Mxx.MatrixModEq
+      (Mxx.matrixMultiply matrixA scalarA) (Mxx.matrixMultiply matrixB scalarB) := by
+  have leftOutputLayout := matrixMultiply_rightBroadcast_layout matrixA scalarA
+    matrixALayout scalarALayout
+  have rightOutputLayout := matrixMultiply_rightBroadcast_layout matrixB scalarB
+    matrixBLayout scalarBLayout
+  apply modEq_of_matrixValue_eq q n rows columns _ _ leftOutputLayout rightOutputLayout
+  rw [matrixValue_matrixMultiply_rightBroadcast q n rows columns matrixA scalarA
+      matrixALayout scalarALayout,
+    matrixValue_matrixMultiply_rightBroadcast q n rows columns matrixB scalarB
+      matrixBLayout scalarBLayout,
+    matrixValue_eq_of_modEq q n rows columns matrixA matrixB matrixALayout matrixBLayout
+      matrixRelation,
+    matrixValue_eq_of_modEq q n 1 1 scalarA scalarB scalarALayout scalarBLayout scalarRelation]
+
+/-- Negation respects quotient-ring equality. -/
+theorem MatrixModEq.negate
+    (q n rows columns : Nat) [Fact (1 < q)] [NeZero n]
+    (left right : Mxx.Matrix)
+    (leftLayout : MatrixLayout left q n rows columns)
+    (rightLayout : MatrixLayout right q n rows columns)
+    (relation : Mxx.MatrixModEq left right) :
+    Mxx.MatrixModEq (Mxx.matrixNegate left) (Mxx.matrixNegate right) := by
+  have leftOutputLayout := matrixNegate_layout left leftLayout
+  have rightOutputLayout := matrixNegate_layout right rightLayout
+  apply modEq_of_matrixValue_eq q n rows columns _ _ leftOutputLayout rightOutputLayout
+  rw [matrixValue_negate q n rows columns left
+      ⟨leftLayout.modulus, leftLayout.ringDimension, leftLayout.rows, leftLayout.columns⟩,
+    matrixValue_negate q n rows columns right
+      ⟨rightLayout.modulus, rightLayout.ringDimension, rightLayout.rows,
+        rightLayout.columns⟩,
+    matrixValue_eq_of_modEq q n rows columns left right leftLayout rightLayout relation]
+
+/-- Multiplication by the same integer scalar respects quotient-ring equality. -/
+theorem MatrixModEq.scale
+    (q n rows columns : Nat) [Fact (1 < q)] [NeZero n]
+    (scalar : Int)
+    (left right : Mxx.Matrix)
+    (leftLayout : MatrixLayout left q n rows columns)
+    (rightLayout : MatrixLayout right q n rows columns)
+    (relation : Mxx.MatrixModEq left right) :
+    Mxx.MatrixModEq (Mxx.matrixScale scalar left) (Mxx.matrixScale scalar right) := by
+  have leftOutputLayout := matrixScale_layout scalar left leftLayout
+  have rightOutputLayout := matrixScale_layout scalar right rightLayout
+  apply modEq_of_matrixValue_eq q n rows columns _ _ leftOutputLayout rightOutputLayout
+  rw [matrixValue_scale q n rows columns scalar left
+      ⟨leftLayout.modulus, leftLayout.ringDimension, leftLayout.rows, leftLayout.columns⟩,
+    matrixValue_scale q n rows columns scalar right
+      ⟨rightLayout.modulus, rightLayout.ringDimension, rightLayout.rows,
+        rightLayout.columns⟩,
+    matrixValue_eq_of_modEq q n rows columns left right leftLayout rightLayout relation]
 
 /-- A full zero coefficient buffer remains the zero matrix after applying its sampler layout. -/
 theorem matrixValue_withSamplerParams_zero (q n rows columns bound : Nat) :

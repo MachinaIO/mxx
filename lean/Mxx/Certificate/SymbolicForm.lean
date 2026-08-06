@@ -120,6 +120,13 @@ def select
 
 end MatrixBoundSummary
 
+/-- Hard coefficient mass of an affine form, preserving the analyzer's term order. -/
+def AffineForm.coefficientL1Bound (form : AffineForm) : BoundExpr :=
+  match form.terms with
+  | [] => .constant 0
+  | head :: tail => tail.foldl (fun bound term => .add bound term.coefficient.normBound)
+      head.coefficient.normBound
+
 /-- Closed semantic roles for bounds.  Protocols cannot add role names. -/
 inductive BoundRole where
   | coefficient
@@ -155,7 +162,7 @@ inductive BoundWitness where
       (relation : GadgetDecompositionRelationRef)
       (matched unmatched : BoundWitnessRef)
   | recurrenceResult
-      (recurrence : FactRecurrenceInstanceRef)
+      (recurrence : SequentialRecurrenceInstanceRef)
       (slot : Nat)
       (role : BoundRole)
 
@@ -164,11 +171,17 @@ structure BoundWitnessEntry where
   role : BoundRole
   witness : BoundWitness
 
+/-- Independent roots for the three numeric claims made by a matrix summary. -/
+structure MatrixBoundWitnessRefs where
+  coefficientL1 : BoundWitnessRef
+  noise : BoundWitnessRef
+  total : BoundWitnessRef
+
 structure BoundWitnessWFContext where
   runtimeExpressionCount : Nat
   preimageRelationCount : Nat
   gadgetRelationCount : Nat
-  recurrences : List (FactRecurrenceInstanceRef × Nat)
+  recurrences : List (SequentialRecurrenceInstanceRef × Nat)
   allowCarriedBounds : Bool := false
 
 private def boundHasCarriedInput : BoundExpr → Bool
@@ -181,8 +194,8 @@ private def boundHasCarriedInput : BoundExpr → Bool
   | .constant _ | .parameter _ | .absolute _ | .recurrenceResult _ _ => false
 
 private def recurrenceSlotIsValid
-    (recurrences : List (FactRecurrenceInstanceRef × Nat))
-    (recurrence : FactRecurrenceInstanceRef)
+    (recurrences : List (SequentialRecurrenceInstanceRef × Nat))
+    (recurrence : SequentialRecurrenceInstanceRef)
     (slot : Nat) : Bool :=
   recurrences.any fun registered => registered.1 == recurrence && slot < registered.2
 
@@ -227,6 +240,9 @@ def BoundWitnessEntry.refsBefore
 structure BoundWitnessArena where
   entries : List BoundWitnessEntry := []
 
+def BoundWitnessArena.Extends (older newer : BoundWitnessArena) : Prop :=
+  ∃ suffix, newer.entries = older.entries ++ suffix
+
 def BoundWitnessArena.WF
     (context : BoundWitnessWFContext)
     (arena : BoundWitnessArena) : Bool :=
@@ -241,12 +257,66 @@ def BoundWitnessArena.intern
     some (⟨arena.entries ++ [entry]⟩, ⟨arena.entries.length⟩)
   else none
 
+def BoundWitnessArena.lookup
+    (arena : BoundWitnessArena)
+    (reference : BoundWitnessRef) : Option BoundWitnessEntry :=
+  arena.entries[reference.id]?
+
+/-- The reference returned by witness interning resolves to the appended entry. -/
+theorem BoundWitnessArena.lookup_intern_eq
+    (context : BoundWitnessWFContext) (arena next : BoundWitnessArena)
+    (entry : BoundWitnessEntry) (reference : BoundWitnessRef)
+    (interned : arena.intern context entry = some (next, reference)) :
+    next.lookup reference = some entry := by
+  simp [BoundWitnessArena.intern] at interned
+  rcases interned with ⟨_, rfl, rfl⟩
+  simp [BoundWitnessArena.lookup]
+
+/-- Witness interning preserves every previously successful witness lookup. -/
+theorem BoundWitnessArena.lookup_intern_preserved
+    (context : BoundWitnessWFContext) (arena next : BoundWitnessArena)
+    (entry oldEntry : BoundWitnessEntry)
+    (reference old : BoundWitnessRef)
+    (oldLookup : arena.lookup old = some oldEntry)
+    (interned : arena.intern context entry = some (next, reference)) :
+    next.lookup old = arena.lookup old := by
+  simp [BoundWitnessArena.intern] at interned
+  rcases interned with ⟨_, rfl, rfl⟩
+  have oldInBounds : old.id < arena.entries.length :=
+    (List.getElem?_eq_some_iff.mp oldLookup).1
+  simp only [BoundWitnessArena.lookup]
+  rw [List.getElem?_append_left]
+  exact oldInBounds
+
+theorem BoundWitnessArena.Extends.lookup
+    {older newer : BoundWitnessArena}
+    (extension : older.Extends newer)
+    {reference : BoundWitnessRef}
+    {entry : BoundWitnessEntry}
+    (lookup : older.lookup reference = some entry) :
+    newer.lookup reference = some entry := by
+  obtain ⟨suffix, extensionEq⟩ := extension
+  unfold BoundWitnessArena.lookup at lookup ⊢
+  have inBounds := (List.getElem?_eq_some_iff.mp lookup).1
+  rw [extensionEq, List.getElem?_append_left inBounds]
+  exact lookup
+
+/-- The three roots must exist and carry exactly their closed semantic roles. -/
+def MatrixBoundWitnessRefs.MatchRoles
+    (references : MatrixBoundWitnessRefs)
+    (arena : BoundWitnessArena) : Prop :=
+  (∃ entry, arena.lookup references.coefficientL1 = some entry ∧
+      entry.role = .coefficient) ∧
+  (∃ entry, arena.lookup references.noise = some entry ∧ entry.role = .noise) ∧
+  ∃ entry, arena.lookup references.total = some entry ∧ entry.role = .total
+
 /-- Residual symbolic structure retained when eager affine normalization would duplicate a
 dynamic selection or sequential recurrence. -/
 inductive SymbolicMatrixForm where
   | signalAtom (expression : MatrixExprRef)
   | boundedAtom (expression : MatrixExprRef) (bound : BoundExpr)
   | affineLeaf (form : AffineForm)
+  | boundedAffineLeaf (form : AffineForm) (totalBound : BoundExpr)
   | add (left right : SymbolicMatrixFormRef)
   | negate (value : SymbolicMatrixFormRef)
   | multiply (left right : SymbolicMatrixFormRef)
@@ -268,7 +338,7 @@ inductive SymbolicMatrixForm where
   | carriedInput (matrixType : MatrixTypeExpr) (slot : Nat)
   | recurrenceResult
       (matrixType : MatrixTypeExpr)
-      (recurrence : FactRecurrenceInstanceRef)
+      (recurrence : SequentialRecurrenceInstanceRef)
       (slot : Nat)
 
 /-- Every symbolic-form node carries its checked result type in its arena entry. -/
@@ -281,7 +351,7 @@ structure SymbolicFormWFContext where
   preimageRelationCount : Nat
   gadgetRelationCount : Nat
   carriedArity : Nat
-  recurrences : List (FactRecurrenceInstanceRef × Nat)
+  recurrences : List (SequentialRecurrenceInstanceRef × Nat)
   allowCarriedInputs : Bool := false
 
 private def symbolicRefHasType
@@ -337,6 +407,9 @@ def SymbolicMatrixFormEntry.refsBefore
       matrixRefHasType context expression entry.matrixType &&
         (context.allowCarriedInputs || !boundHasCarriedInput bound)
   | .affineLeaf form => affineLeafHasType form entry.matrixType
+  | .boundedAffineLeaf form totalBound =>
+      affineLeafHasType form entry.matrixType &&
+        (context.allowCarriedInputs || !boundHasCarriedInput totalBound)
   | .add left right =>
       symbolicRefHasType priorEntries left entry.matrixType &&
         symbolicRefHasType priorEntries right entry.matrixType
@@ -374,6 +447,10 @@ def SymbolicMatrixFormEntry.refsBefore
 structure SymbolicMatrixFormArena where
   entries : List SymbolicMatrixFormEntry := []
 
+def SymbolicMatrixFormArena.Extends
+    (older newer : SymbolicMatrixFormArena) : Prop :=
+  ∃ suffix, newer.entries = older.entries ++ suffix
+
 def SymbolicMatrixFormArena.WF
     (context : SymbolicFormWFContext)
     (arena : SymbolicMatrixFormArena) : Bool :=
@@ -393,6 +470,45 @@ def SymbolicMatrixFormArena.lookup
     (reference : SymbolicMatrixFormRef) : Option SymbolicMatrixFormEntry :=
   arena.entries[reference.id]?
 
+/-- The reference returned by symbolic-form interning resolves to the appended entry. -/
+theorem SymbolicMatrixFormArena.lookup_intern_eq
+    (context : SymbolicFormWFContext) (arena next : SymbolicMatrixFormArena)
+    (entry : SymbolicMatrixFormEntry) (reference : SymbolicMatrixFormRef)
+    (interned : arena.intern context entry = some (next, reference)) :
+    next.lookup reference = some entry := by
+  simp [SymbolicMatrixFormArena.intern] at interned
+  rcases interned with ⟨_, rfl, rfl⟩
+  simp [SymbolicMatrixFormArena.lookup]
+
+/-- Symbolic-form interning preserves every previously successful lookup. -/
+theorem SymbolicMatrixFormArena.lookup_intern_preserved
+    (context : SymbolicFormWFContext) (arena next : SymbolicMatrixFormArena)
+    (entry oldEntry : SymbolicMatrixFormEntry)
+    (reference old : SymbolicMatrixFormRef)
+    (oldLookup : arena.lookup old = some oldEntry)
+    (interned : arena.intern context entry = some (next, reference)) :
+    next.lookup old = arena.lookup old := by
+  simp [SymbolicMatrixFormArena.intern] at interned
+  rcases interned with ⟨_, rfl, rfl⟩
+  have oldInBounds : old.id < arena.entries.length :=
+    (List.getElem?_eq_some_iff.mp oldLookup).1
+  simp only [SymbolicMatrixFormArena.lookup]
+  rw [List.getElem?_append_left]
+  exact oldInBounds
+
+theorem SymbolicMatrixFormArena.Extends.lookup
+    {older newer : SymbolicMatrixFormArena}
+    (extension : older.Extends newer)
+    {reference : SymbolicMatrixFormRef}
+    {entry : SymbolicMatrixFormEntry}
+    (lookup : older.lookup reference = some entry) :
+    newer.lookup reference = some entry := by
+  obtain ⟨suffix, extensionEq⟩ := extension
+  unfold SymbolicMatrixFormArena.lookup at lookup ⊢
+  have inBounds := (List.getElem?_eq_some_iff.mp lookup).1
+  rw [extensionEq, List.getElem?_append_left inBounds]
+  exact lookup
+
 /-- Analyzer-owned matrix fact with immutable exact identity and an independently normalized
 signal/noise decomposition. -/
 structure MatrixSymbolicFact where
@@ -401,7 +517,7 @@ structure MatrixSymbolicFact where
   exactValue : MatrixExprRef
   decomposition : SymbolicMatrixFormRef
   bounds : MatrixBoundSummary
-  boundWitness : BoundWitnessRef
+  boundWitnesses : MatrixBoundWitnessRefs
   relations : List MatrixRelation
   coefficientRepresentation : CoefficientRepresentation
 

@@ -133,7 +133,7 @@ inductive MatrixExpr where
   | select (index : RuntimeExpr .integer) (branches : List MatrixExpr)
   | loopResult
       (type : MatrixTypeExpr)
-      (summary : FactRecurrenceInstanceRef)
+      (summary : SequentialRecurrenceInstanceRef)
       (path : MatrixFactPath)
   /-- Analyzer-only typed placeholder. It has no ordinary matrix denotation. -/
   | carriedInput (type : MatrixTypeExpr) (path : MatrixFactPath)

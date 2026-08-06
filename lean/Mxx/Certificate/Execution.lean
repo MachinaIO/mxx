@@ -203,6 +203,73 @@ structure WorkflowExecutionTrace
       [("__workflow_error", .invalid "entrypoint did not execute")] = entrypointOutput
   entrypointMember : entrypointOutput ∈ Mxx.Ir.denoteWorkflow samplers workflow params inputs
 
+/-- One workflow stage paired with the execution at the same list index.  The pairing is derived
+from `StageExecutions`, so a caller cannot select an unrelated execution with a matching stage
+name. -/
+structure WorkflowStageExecutionAt
+    {samplers : MxxSamplerFamily}
+    {workflow : Mxx.Ir.Workflow}
+    {params : Mxx.Ir.ParamEnvironment}
+    {inputs : Mxx.Ir.Environment}
+    (trace : WorkflowExecutionTrace samplers workflow params inputs)
+    (index : Nat)
+    (stage : Mxx.Ir.Stage) where
+  stageAt : workflow.stages[index]? = some stage
+  execution : StageExecution samplers
+  executionAt : trace.stageExecutions[index]? = some execution
+  stageMatches : execution.stage = stage
+  paramsMatch : execution.params = params
+  protocolInputsMatch : execution.protocolInputs = inputs
+
+private theorem StageExecutions.executionAt_exists
+    {samplers : MxxSamplerFamily}
+    {params : Mxx.Ir.ParamEnvironment}
+    {protocolInputs : Mxx.Ir.Environment}
+    {stages : List Mxx.Ir.Stage}
+    {initial final : Mxx.Ir.StageEnvironment}
+    {executions : List (StageExecution samplers)}
+    (witness : StageExecutions samplers params protocolInputs stages initial final executions)
+    (index : Nat)
+    (stage : Mxx.Ir.Stage)
+    (stageAt : stages[index]? = some stage) :
+    ∃ execution,
+      executions[index]? = some execution ∧ execution.stage = stage ∧
+        execution.params = params ∧ execution.protocolInputs = protocolInputs := by
+  induction witness generalizing index stage with
+  | nil state => simp at stageAt
+  | cons head tail state final output tailExecutions outputMember tailWitness induction =>
+      cases index with
+      | zero =>
+          simp only [List.getElem?_cons_zero] at stageAt ⊢
+          have stageEq : head = stage := Option.some.inj stageAt
+          subst stage
+          exact ⟨_, rfl, rfl, rfl, rfl⟩
+      | succ index =>
+          simp only [List.getElem?_cons_succ] at stageAt ⊢
+          exact induction index stage stageAt
+
+/-- Select the execution at an exact frozen workflow-stage index. -/
+theorem WorkflowStageExecutionAt.exists
+    {samplers : MxxSamplerFamily}
+    {workflow : Mxx.Ir.Workflow}
+    {params : Mxx.Ir.ParamEnvironment}
+    {inputs : Mxx.Ir.Environment}
+    (trace : WorkflowExecutionTrace samplers workflow params inputs)
+    (index : Nat)
+    (stage : Mxx.Ir.Stage)
+    (stageAt : workflow.stages[index]? = some stage) :
+    Nonempty (WorkflowStageExecutionAt trace index stage) := by
+  obtain ⟨execution, executionAt, stageMatches, paramsMatch, protocolInputsMatch⟩ :=
+    trace.stageExecutionWitness.executionAt_exists index stage stageAt
+  exact ⟨{
+    stageAt
+    execution
+    executionAt
+    stageMatches
+    paramsMatch
+    protocolInputsMatch
+  }⟩
+
 def WorkflowExecutionTrace.erase
     {samplers : MxxSamplerFamily}
     {workflow : Mxx.Ir.Workflow}
@@ -285,6 +352,99 @@ def PureProgramExecution.canonical
   output := Mxx.Ir.denotePure program params inputs
   outputEq := rfl
 }
+
+/-- A successful pure-program execution is a member of the existing empty-sampler denotation.
+This only unfolds the `denotePure` singleton check; it does not re-run or redefine the program. -/
+theorem PureProgramExecution.output_mem_denote
+    (execution : PureProgramExecution)
+    (output : Mxx.Ir.Environment)
+    (outputSome : execution.output = some output) :
+    output ∈ Mxx.Ir.denote Mxx.Ir.emptySamplerFamily execution.program
+      execution.params execution.inputs := by
+  have pureEq : Mxx.Ir.denotePure execution.program execution.params execution.inputs =
+      some output := by
+    rw [← execution.outputEq]
+    exact outputSome
+  unfold Mxx.Ir.denotePure at pureEq
+  split at pureEq
+  next candidate singleton =>
+    cases pureEq
+    simp [singleton]
+  next notSingleton => simp at pureEq
+
+/-- Root SSA path for the exact successful execution stored in `PureProgramExecution`. -/
+structure PureProgramRootExecutionPath
+    (execution : PureProgramExecution) where
+  output : Mxx.Ir.Environment
+  outputSome : execution.output = some output
+  wires : Mxx.Ir.WireEnvironment
+  path : Mxx.Ir.EvaluatesNodesPath
+    (Mxx.Ir.childRunnerWithFuel Mxx.Ir.emptySamplerFamily execution.program
+      execution.program.definitions.length)
+    Mxx.Ir.emptySamplerFamily execution.params execution.inputs 0
+    execution.program.root.nodes [] wires
+  outputEq : Mxx.Ir.collectOutputs execution.program.root.outputs wires = output
+
+theorem PureProgramRootExecutionPath.exists
+    (execution : PureProgramExecution)
+    (output : Mxx.Ir.Environment)
+    (outputSome : execution.output = some output) :
+    Nonempty (PureProgramRootExecutionPath execution) := by
+  have member := execution.output_mem_denote output outputSome
+  obtain ⟨wires, path, outputEq⟩ :=
+    (Mxx.Ir.mem_denote_iff_root_path Mxx.Ir.emptySamplerFamily execution.program
+      execution.params execution.inputs output).mp member
+  exact ⟨{ output, outputSome, wires, path, outputEq := outputEq.symm }⟩
+
+/-- One node selected from the exact SSA path of a successful pure-program execution.  The
+pre-node environment and support member are projections of `path`; this does not evaluate a
+second copy of the program. -/
+structure PureProgramSelectedNodeExecution
+    {execution : PureProgramExecution}
+    (root : PureProgramRootExecutionPath execution)
+    (nodeIndex : Nat)
+    (nodeInBounds : nodeIndex < execution.program.root.nodes.length) where
+  before : Mxx.Ir.WireEnvironment
+  nodeValues : List Mxx.Ir.Value
+  prefixPath : Mxx.Ir.EvaluatesNodesPath
+    (Mxx.Ir.childRunnerWithFuel Mxx.Ir.emptySamplerFamily execution.program
+      execution.program.definitions.length)
+    Mxx.Ir.emptySamplerFamily execution.params execution.inputs 0
+    (execution.program.root.nodes.take nodeIndex) [] before
+  nodeMember : nodeValues ∈ Mxx.Ir.evaluateNode
+    (Mxx.Ir.childRunnerWithFuel Mxx.Ir.emptySamplerFamily execution.program
+      execution.program.definitions.length)
+    Mxx.Ir.emptySamplerFamily execution.params execution.inputs before
+    execution.program.root.nodes[nodeIndex]
+  suffixPath : Mxx.Ir.EvaluatesNodesPath
+    (Mxx.Ir.childRunnerWithFuel Mxx.Ir.emptySamplerFamily execution.program
+      execution.program.definitions.length)
+    Mxx.Ir.emptySamplerFamily execution.params execution.inputs (nodeIndex + 1)
+    (execution.program.root.nodes.drop (nodeIndex + 1))
+    (before ++ Mxx.Ir.bindOutputs nodeIndex nodeValues) root.wires
+
+/-- Mechanically select one root node from the actual pure-program path. -/
+noncomputable def PureProgramRootExecutionPath.nodeExecutionAt
+    {execution : PureProgramExecution}
+    (root : PureProgramRootExecutionPath execution)
+    (nodeIndex : Nat)
+    (nodeInBounds : nodeIndex < execution.program.root.nodes.length) :
+    PureProgramSelectedNodeExecution root nodeIndex nodeInBounds := by
+  classical
+  let selected := root.path.atNodeIndex nodeIndex nodeInBounds
+  let before := Classical.choose selected
+  let afterBefore := Classical.choose_spec selected
+  let nodeValues := Classical.choose afterBefore
+  let facts := Classical.choose_spec afterBefore
+  exact {
+    before
+    nodeValues
+    prefixPath := facts.1
+    nodeMember := facts.2.1
+    suffixPath := by
+      dsimp [before, nodeValues]
+      simpa only [Nat.zero_add] using facts.2.2
+  }
 
 /-- Concrete comparator data, including the output environment of an optional comparator map and
 the polarity-normalized failure bit. -/

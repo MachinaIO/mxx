@@ -76,10 +76,9 @@ structure ParallelFamilyAnalysisEvidence.MatchesExecution
   outputTypesEq : execution.outputTypes = evidence.source.outputTypes
 
 /-- One actual lane selected from the executable parallel trace, paired with the exact
-analyzer-produced template instantiation for that coordinate.  This object does not assert that
-the template holds: semantic replay of the retained body rules establishes that separately.  Its
-purpose is to make the runner, lane index, child arguments, output tuple, and template identity
-inseparable, so a later primitive proof cannot substitute any of them. -/
+analyzer-produced family source for that coordinate.  Template instantiation is intentionally
+deferred to the new scope-semantic layer, where it can thread the exact arena and prove every
+rewritten expression reference. -/
 structure ParallelFamilyLaneInstance
     {analysis : AnalysisResult}
     {joint : JointFamilyId}
@@ -102,13 +101,6 @@ structure ParallelFamilyLaneInstance
     (evaluatedBindings ++ ((.loopIndex execution.indexSlot, .integer position) :: params))
     ((execution.modes.zip execution.argumentValues).map fun (mode, value) ↦
       Mxx.Ir.loopArgument mode position value)
-  instantiatedFacts : List ValueFact
-  instantiatedFactsEq : instantiatedFacts =
-    evidence.source.elementTemplates.zipIdx.map fun (template, port) ↦
-      instantiateParallelTemplate evidence.source.loopSite evidence.source.indexReference
-        evidence.source.family family.bodyOutputTemplates
-        (.familyElement (.joint evidence.source.family port []) evidence.source.indexReference)
-        template
 
 /-- Actual trace induction selects every lane and mechanically instantiates the retained output
 templates.  There is no caller-provided fact table, lane relation, or body-soundness callback. -/
@@ -154,12 +146,6 @@ theorem ParallelFamilyAnalysisEvidence.laneInstance
     childValues
     bindingsEvaluate
     childMember := exactMember
-    instantiatedFacts := evidence.source.elementTemplates.zipIdx.map fun (template, port) ↦
-      instantiateParallelTemplate evidence.source.loopSite evidence.source.indexReference
-        evidence.source.family family.bodyOutputTemplates
-        (.familyElement (.joint evidence.source.family port []) evidence.source.indexReference)
-        template
-    instantiatedFactsEq := rfl
   }⟩
 
 end Mxx.Certificate

@@ -1,7 +1,7 @@
 import Mxx.Certificate.Execution
 import Mxx.Certificate.Analyzer
 import Mxx.Certificate.Rules.Family
-import Mxx.Certificate.Rules.ClosedProgram
+import Mxx.Certificate.Rules.CarriedFactSubstitution
 import Mxx.Certificate.Rules.LoopRecurrence
 import Mxx.Certificate.SymbolicRecurrence
 
@@ -275,7 +275,8 @@ def AnalysisResult.rootInvariantInputs
       node := ⟨argument.node⟩
       port := argument.port
     }
-    (lookupRootArgumentFact analysis stage argument).map fun fact => { wire, fact }
+    (analysis.facts.find? fun entry => entry.wire = wire).bind fun entry =>
+      entry.toTemplate.map fun template => { wire, template }
 
 /-- Analyzer-owned facts at one exact root-node output range. -/
 def AnalysisResult.rootNodeOutputFacts
@@ -542,109 +543,73 @@ theorem one_step_child
 
 The step relation below is indexed by the binding equality and child-support member stored in the
 real `SequentialIterationsTrace`.  It contains no replacement runner, trace, invariant, or
-preservation function.  A body soundness proof discharges `nextFacts` by composing the registered
-local rules for that exact child member.
--/
+preservation function.  A body soundness proof discharges the complete instantiated output facts
+by composing the registered local rules for that exact child member.  Coarse carried schemas are
+not semantic evidence. -/
 
-/-- Closed runtime check for one analyzer-derived carried schema. The first implementation
-deliberately rejects canonical-residue matrix schemas and therefore cannot silently assume a
-representation property that the checked child body has not established. -/
-private def carriedValueAccepted
-    (parameters : Mxx.Ir.ParamEnvironment) : CarriedValueSchema → Mxx.Ir.Value → Bool
-  | .matrix matrixType .unknown, .matrix value =>
-      match matrixType.evaluate parameters with
-      | none => false
-      | some evaluated =>
-          value.modulus == evaluated.modulus &&
-            value.ringDimension == evaluated.ringDimension &&
-            value.rows == evaluated.rows && value.columns == evaluated.columns
-  | .matrix _ (.canonicalResidues _), _ => false
-  | .integer, .integer _ => true
-  | .boolean, .boolean _ => true
-  | .bytes, .bytes _ => true
-  | .family count element, .family values =>
-      match evaluateIntExpr parameters count with
-      | .error _ => false
-      | .ok evaluatedCount =>
-          decide (0 ≤ evaluatedCount) && values.length == evaluatedCount.toNat &&
-            values.all (carriedValueAccepted parameters element)
-  | _, _ => false
+private def templateMatrixType : ValueFactTemplate → Option MatrixTypeExpr
+  | { schema := .matrix matrixType _ _ _, .. } => some matrixType
+  | _ => none
 
-/-- Closed slot-by-slot check for the actual carried tuple selected by the executable trace. -/
-private def carriedStateAccepted
-    (parameters : Mxx.Ir.ParamEnvironment) :
-    List CarriedValueSchema → List Mxx.Ir.Value → Bool
-  | [], [] => true
-  | schema :: schemas, value :: values =>
-      carriedValueAccepted parameters schema value &&
-        carriedStateAccepted parameters schemas values
-  | _, _ => false
+private def invariantSeedFact?
+    (stage : StageId)
+    (bodyScope : StaticScopeId)
+    (body : Mxx.Ir.Scope)
+    (name : String)
+    (invariant : InvariantInputFact) : Option ScopedWireFact := do
+  if invariant.template.fact.hasCarriedInput then none else
+  let destination ← inputNodeWireInScope? stage bodyScope name body.nodes
+  return transportFact destination {
+    wire := invariant.wire
+    matrixType := templateMatrixType invariant.template
+    fact := invariant.template.fact
+  }
 
-private theorem carriedValueAccepted_sound
-    (parameters : Mxx.Ir.ParamEnvironment)
-    (schema : CarriedValueSchema)
-    (value : Mxx.Ir.Value)
-    (accepted : carriedValueAccepted parameters schema value = true) :
-    schema.Holds parameters value := by
-  induction schema generalizing value with
-  | matrix matrixType representation =>
-      cases representation <;> cases value <;>
-        simp [carriedValueAccepted, CarriedValueSchema.Holds] at accepted ⊢
-      rename_i matrix
-      split at accepted
-      · contradiction
-      · rename_i evaluated typeEvaluates
-        simp only [Bool.and_eq_true, beq_iff_eq] at accepted
-        exact ⟨⟨evaluated, typeEvaluates, accepted.1.1.1, accepted.1.1.2,
-          accepted.1.2, accepted.2⟩, trivial⟩
-  | integer => cases value <;> simp [carriedValueAccepted, CarriedValueSchema.Holds] at accepted ⊢
-  | boolean => cases value <;> simp [carriedValueAccepted, CarriedValueSchema.Holds] at accepted ⊢
-  | bytes => cases value <;> simp [carriedValueAccepted, CarriedValueSchema.Holds] at accepted ⊢
-  | family count element induction =>
-      cases value <;> simp [carriedValueAccepted, CarriedValueSchema.Holds] at accepted ⊢
-      rename_i values
-      split at accepted
-      · contradiction
-      · rename_i evaluatedCount countEvaluates
-        simp only [Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq,
-          List.all_eq_true] at accepted
-        exact ⟨evaluatedCount, countEvaluates, accepted.1.1,
-          accepted.1.2, fun value member => induction value (accepted.2 value member)⟩
+/-- Reconstruct every formal input fact of the frozen sequential body.  Carried inputs are the
+exact analyzer-only placeholders retained by the recurrence source; invariant inputs are ordinary
+transported facts.  An arity mismatch, a missing input node, or an escaped carried placeholder is
+an analysis failure rather than a fallback to a coarser schema. -/
+def bodySeedFacts?
+    {analysis : AnalysisResult}
+    {samplers : Mxx.MxxSamplerFamily}
+    {execution : StageExecution samplers}
+    {recurrenceInstance : SequentialRecurrenceInstanceRef}
+    (evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance)
+    (body : Mxx.Ir.Scope) : Option ScopedWireFactTable := do
+  let carried ← evidence.transfer.source.abstractCarriedSeedFacts?
+  let invariantNames := body.inputNames.drop evidence.transfer.source.carriedArity
+  let invariants := evidence.transfer.source.invariantInputs
+  if body.inputNames.length != evidence.transfer.source.carriedArity + invariants.length then none
+  else if invariantNames.length != invariants.length then none
+  else
+    let invariantFacts ← (invariantNames.zip invariants).mapM fun (name, invariant) =>
+      invariantSeedFact? ⟨execution.stage.id⟩ ⟨[evidence.view.definition]⟩ body name invariant
+    return carried ++ invariantFacts
 
-private theorem carriedStateAccepted_sound
-    (parameters : Mxx.Ir.ParamEnvironment)
-    (schemas : List CarriedValueSchema)
-    (values : List Mxx.Ir.Value)
-    (accepted : carriedStateAccepted parameters schemas values = true) :
-    CarriedState.Holds parameters schemas values := by
-  induction schemas generalizing values with
-  | nil =>
-      cases values with
-      | nil => exact .nil
-      | cons value values => simp [carriedStateAccepted] at accepted
-  | cons schema schemas induction =>
-      cases values with
-      | nil => simp [carriedStateAccepted] at accepted
-      | cons value values =>
-          simp only [carriedStateAccepted, Bool.and_eq_true] at accepted
-          exact .cons (carriedValueAccepted_sound parameters schema value accepted.1)
-            (induction values accepted.2)
-
-/-- Negative fixture: an unrelated Boolean result cannot satisfy an analyzer-derived integer
-carried slot, so it cannot be used to construct a local-rule step. -/
-example : carriedStateAccepted [] [.integer] [.boolean false] = false := by
-  rfl
+/-- Recover body output facts in frozen declaration order from one analyzer fact table. -/
+private def bodyOutputFacts?
+    (stage : StageId)
+    (scope : StaticScopeId)
+    (body : Mxx.Ir.Scope)
+    (facts : ScopedWireFactTable) : Option (List ScopedWireFact) :=
+  body.outputs.mapM fun output ↦ do
+    let outputWire : CoreWireRef := {
+      stage
+      scope
+      node := ⟨output.2.node⟩
+      port := output.2.port
+    }
+    facts.find? (fun candidate ↦ candidate.wire = outputWire)
 
 /-- One analyzer-produced body result, tied to one exact executable trace step.
 
 The closed-program theorem currently interprets only concrete root wires; applying it directly to
 the template identities in a child scope would be unsound. This evidence therefore records the
-frozen definition lookup, exact fail-closed analyzer acceptance, and the result of the closed
-runtime schema checker. `AnalyzerDerivedNextFacts` below applies generic local-rule soundness to
-the exact child path and retains the resulting semantic fact proof; it does not accept one from a
-certificate or theorem caller.
--/
-structure AnalyzerBodyLocalRuleStep
+frozen definition lookup, exact fail-closed analyzer acceptance seeded by the formal carried and
+invariant facts, and its frozen output templates. `AnalyzerDerivedNextFacts` below carries the
+substitution-first semantic obligation required before a local-rule composition can become a final
+recurrence proof. -/
+private structure AnalyzerBodyLocalRuleStep
     {analysis : AnalysisResult}
     {samplers : Mxx.MxxSamplerFamily}
     {execution : StageExecution samplers}
@@ -665,15 +630,148 @@ structure AnalyzerBodyLocalRuleStep
   body : Mxx.Ir.Scope
   definitionFound : Mxx.Ir.lookupDefinition evidence.view.definition
     execution.stage.program.definitions = some body
-  bodyClosed : ClosedPrimitiveNodes
-    (evaluatedBindings ++
-      ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params))
-    0 body.nodes
+  seedFacts : ScopedWireFactTable
+  seedFactsDerived : bodySeedFacts? evidence body = some seedFacts
   analyzerFacts : ScopedWireFactTable
   analyzerAccepted : inferRulesFrom ⟨execution.stage.id⟩
-    ⟨[evidence.view.definition]⟩ 0 body.nodes [] = .ok analyzerFacts
-  schemaAccepted : carriedStateAccepted execution.params evidence.transfer.carriedSchemas next =
-    true
+    ⟨[evidence.view.definition]⟩ 0 body.nodes seedFacts = .ok analyzerFacts
+  rawOutputs : List ScopedWireFact
+  rawOutputsDerived : bodyOutputFacts? ⟨execution.stage.id⟩
+    ⟨[evidence.view.definition]⟩ body analyzerFacts = some rawOutputs
+  rawOutputTemplates : List ValueFactTemplate
+  rawOutputTemplatesDerived : rawOutputs.mapM ScopedWireFact.toTemplate = some rawOutputTemplates
+  sourceOutputsMatch : rawOutputTemplates = evidence.transfer.source.bodyOutputs.toList
+
+/-- The complete initial fact table and exact initial carried values used by the abstract body.
+It is retained by the recurrence source and real loop trace, never reconstructed from a coarse
+schema or supplied by the caller. -/
+def initialSubstitution?
+    {analysis : AnalysisResult}
+    {samplers : Mxx.MxxSamplerFamily}
+    {execution : StageExecution samplers}
+    {recurrenceInstance : SequentialRecurrenceInstanceRef}
+    (evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance) :
+    Option CarriedFactSubstitution :=
+  CarriedFactSubstitution.build evidence.transfer.source.initial.toList
+    (evidence.argumentValues.take evidence.view.carriedCount)
+    evidence.transfer.source.familyElementTemplates
+
+theorem initialSubstitution_values
+    {analysis : AnalysisResult}
+    {samplers : Mxx.MxxSamplerFamily}
+    {execution : StageExecution samplers}
+    {recurrenceInstance : SequentialRecurrenceInstanceRef}
+    {evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance}
+    {substitution : CarriedFactSubstitution}
+    (derived : evidence.initialSubstitution? = some substitution) :
+    substitution.values = evidence.argumentValues.take evidence.view.carriedCount := by
+  exact CarriedFactSubstitution.build_values derived
+
+/-- Recover the complete body-output facts from the exact analyzer result attached to this step.
+The output order is the frozen subgraph output order.  Failure to recover any fact is an analysis
+failure, not an opportunity to manufacture one from `CarriedValueSchema`. -/
+def AnalyzerBodyLocalRuleStep.outputFacts?
+    {analysis : AnalysisResult}
+    {samplers : Mxx.MxxSamplerFamily}
+    {execution : StageExecution samplers}
+    {recurrenceInstance : SequentialRecurrenceInstanceRef}
+    {evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance}
+    {index : Nat}
+    {state next : List Mxx.Ir.Value}
+    {evaluatedBindings : Mxx.Ir.ParamEnvironment}
+    {bindingsEvaluate : Mxx.Ir.evaluateBindings
+      ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params)
+      evidence.view.bindings = some evaluatedBindings}
+    {childMember : next ∈ execution.rootChildRunner evidence.view.definition
+      (evaluatedBindings ++
+        ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params))
+      (state ++ evidence.invariantValues)}
+    (step : AnalyzerBodyLocalRuleStep evidence index state next evaluatedBindings
+      bindingsEvaluate childMember) : Option (List ScopedWireFact) :=
+  some step.rawOutputs
+
+/-- Repackage the exact analyzer-produced raw output facts with the actual next carried values.
+This is purely structural; semantic validity is stated by `AnalyzerDerivedNextFacts` below. -/
+def AnalyzerBodyLocalRuleStep.rawOutputSubstitution?
+    {analysis : AnalysisResult}
+    {samplers : Mxx.MxxSamplerFamily}
+    {execution : StageExecution samplers}
+    {recurrenceInstance : SequentialRecurrenceInstanceRef}
+    {evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance}
+    {index : Nat}
+    {state next : List Mxx.Ir.Value}
+    {evaluatedBindings : Mxx.Ir.ParamEnvironment}
+    {bindingsEvaluate : Mxx.Ir.evaluateBindings
+      ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params)
+      evidence.view.bindings = some evaluatedBindings}
+    {childMember : next ∈ execution.rootChildRunner evidence.view.definition
+      (evaluatedBindings ++
+        ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params))
+      (state ++ evidence.invariantValues)}
+    (step : AnalyzerBodyLocalRuleStep evidence index state next evaluatedBindings
+      bindingsEvaluate childMember) : Option CarriedFactSubstitution := do
+  CarriedFactSubstitution.build step.rawOutputTemplates next
+    evidence.transfer.source.familyElementTemplates
+
+/-- Instantiate the one abstract body-output tuple from the complete immutable carried state at
+the start of this exact trace step.  This is distinct from `rawOutputSubstitution?`: the latter
+recovers the analyzer's raw output templates for auditing, whereas this operation eliminates all
+`carriedInput` placeholders before the next state is exposed to semantics. -/
+def AnalyzerBodyLocalRuleStep.instantiatedNextSubstitution?
+    {analysis : AnalysisResult}
+    {samplers : Mxx.MxxSamplerFamily}
+    {execution : StageExecution samplers}
+    {recurrenceInstance : SequentialRecurrenceInstanceRef}
+    {evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance}
+    {index : Nat}
+    {state next : List Mxx.Ir.Value}
+    {evaluatedBindings : Mxx.Ir.ParamEnvironment}
+    {bindingsEvaluate : Mxx.Ir.evaluateBindings
+      ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params)
+      evidence.view.bindings = some evaluatedBindings}
+    {childMember : next ∈ execution.rootChildRunner evidence.view.definition
+      (evaluatedBindings ++
+        ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params))
+      (state ++ evidence.invariantValues)}
+    (step : AnalyzerBodyLocalRuleStep evidence index state next evaluatedBindings
+      bindingsEvaluate childMember)
+    (previous : CarriedFactSubstitution) : Option CarriedFactSubstitution := do
+  let _ ← step.rawOutputSubstitution?
+  previous.instantiateBodyOutputs step.rawOutputTemplates next
+    evidence.transfer.source.familyElementTemplates
+
+theorem AnalyzerBodyLocalRuleStep.instantiatedNextSubstitution_values
+    {analysis : AnalysisResult}
+    {samplers : Mxx.MxxSamplerFamily}
+    {execution : StageExecution samplers}
+    {recurrenceInstance : SequentialRecurrenceInstanceRef}
+    {evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance}
+    {index : Nat}
+    {state next : List Mxx.Ir.Value}
+    {evaluatedBindings : Mxx.Ir.ParamEnvironment}
+    {bindingsEvaluate : Mxx.Ir.evaluateBindings
+      ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params)
+      evidence.view.bindings = some evaluatedBindings}
+    {childMember : next ∈ execution.rootChildRunner evidence.view.definition
+      (evaluatedBindings ++
+        ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params))
+      (state ++ evidence.invariantValues)}
+    {step : AnalyzerBodyLocalRuleStep evidence index state next evaluatedBindings
+      bindingsEvaluate childMember}
+    {previous substitution : CarriedFactSubstitution}
+    (derived : step.instantiatedNextSubstitution? previous = some substitution) :
+    substitution.values = next := by
+  unfold AnalyzerBodyLocalRuleStep.instantiatedNextSubstitution? at derived
+  cases accepted : step.rawOutputSubstitution? with
+  | none => simp [accepted] at derived
+  | some outputTemplates =>
+      simp only [accepted] at derived
+      simp only [CarriedFactSubstitution.instantiateBodyOutputs] at derived
+      cases instantiated : previous.instantiateTemplates step.rawOutputTemplates with
+      | none => simp [instantiated] at derived
+      | some facts =>
+          simp only [instantiated] at derived
+          exact CarriedFactSubstitution.build_values derived
 
 /-- The child support member stored in a step is exactly an execution path through the frozen
 definition accepted by that step. No alternate runner or body can be supplied. -/
@@ -716,11 +814,10 @@ theorem AnalyzerBodyLocalRuleStep.bodyExecutionPath
       ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params))
     (state ++ evidence.invariantValues) next step.definitionFound).mp member
 
-/-- Evidence derived from the exact child execution and the exact analyzer result for that child.
-The caller cannot supply either the body facts or their soundness proof: both are reconstructed
-from `childMember`, `definitionFound`, and `analyzerAccepted`.  The coarse carried-state proof is
-also the result of the closed runtime schema checker rather than a preservation callback. -/
-structure AnalyzerDerivedNextFacts
+/-- Exact one-step semantic evidence after the previous complete fact state has been substituted
+into every carried placeholder. Each body output retains its full analyzer fact and proves that
+ordinary semantics holds for the exact value produced by this child execution. -/
+private structure AnalyzerDerivedNextFacts
     {analysis : AnalysisResult}
     {samplers : Mxx.MxxSamplerFamily}
     {execution : StageExecution samplers}
@@ -738,62 +835,34 @@ structure AnalyzerDerivedNextFacts
       (state ++ evidence.invariantValues)}
     (step : AnalyzerBodyLocalRuleStep evidence index state next evaluatedBindings
       bindingsEvaluate childMember)
-    (contract : Mxx.MxxBoundedSamplerContract samplers) : Prop where
-  analyzerSound : ∃ bodyWires : Mxx.Ir.WireEnvironment,
+    (_contract : Mxx.MxxBoundedSamplerContract samplers)
+    (previous : CarriedFactSubstitution) : Type where
+  bodyWires : Mxx.Ir.WireEnvironment
+  bodyPath :
     Mxx.Ir.EvaluatesNodesPath
       (Mxx.Ir.childRunnerWithFuel samplers execution.stage.program step.fuel)
       samplers
       (evaluatedBindings ++
         ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params))
       (step.body.inputNames.zip (state ++ evidence.invariantValues))
-      0 step.body.nodes [] bodyWires ∧
-    next = (Mxx.Ir.collectOutputs step.body.outputs bodyWires).map Prod.snd ∧
-    step.analyzerFacts.Holds
+      0 step.body.nodes [] bodyWires
+  outputValues : next = (Mxx.Ir.collectOutputs step.body.outputs bodyWires).map Prod.snd
+  instantiatedOutputs : List.Forall₂
+    (fun raw actual => InstantiatedScopedFact.Holds previous
       (FactEnvironment.ofWireEnvironment
         (evaluatedBindings ++
           ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params))
         ⟨execution.stage.id⟩ ⟨[evidence.view.definition]⟩ bodyWires)
-  carriedFacts : CarriedState.Holds execution.params evidence.transfer.carriedSchemas next
+      raw actual)
+    step.rawOutputs next
 
-/-- Construct the next-state evidence solely from the frozen child execution and closed checkers. -/
-theorem AnalyzerBodyLocalRuleStep.deriveNextFacts
-    {analysis : AnalysisResult}
-    {samplers : Mxx.MxxSamplerFamily}
-    {execution : StageExecution samplers}
-    {recurrenceInstance : SequentialRecurrenceInstanceRef}
-    {evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance}
-    {index : Nat}
-    {state next : List Mxx.Ir.Value}
-    {evaluatedBindings : Mxx.Ir.ParamEnvironment}
-    {bindingsEvaluate : Mxx.Ir.evaluateBindings
-      ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params)
-      evidence.view.bindings = some evaluatedBindings}
-    {childMember : next ∈ execution.rootChildRunner evidence.view.definition
-      (evaluatedBindings ++
-        ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params))
-      (state ++ evidence.invariantValues)}
-    (step : AnalyzerBodyLocalRuleStep evidence index state next evaluatedBindings
-      bindingsEvaluate childMember)
-    (contract : Mxx.MxxBoundedSamplerContract samplers) :
-    AnalyzerDerivedNextFacts step contract := by
-  obtain ⟨wires, path, outputValues⟩ := step.bodyExecutionPath
-  refine {
-    analyzerSound := ⟨wires, path, outputValues, ?_⟩
-    carriedFacts := carriedStateAccepted_sound execution.params
-      evidence.transfer.carriedSchemas next step.schemaAccepted
-  }
-  exact inferRulesFrom_sound_closedPrimitives contract path step.bodyClosed
-    (by intro target port _; rfl) step.analyzerAccepted
-    (ScopedWireFactTable.Holds.nil
-      (FactEnvironment.ofWireEnvironment
-        (evaluatedBindings ++
-          ((.loopIndex evidence.view.indexSlot, .integer index) :: execution.params))
-        ⟨execution.stage.id⟩ ⟨[evidence.view.definition]⟩ wires))
-
-/-- Dependent local-rule derivation over the exact executable recurrence trace.  Each `cons`
-constructor reuses the binding equality and child-support proof from that trace constructor.
-There is no caller-supplied induction predicate or step callback. -/
-inductive Derivation
+/-- Complete recurrence derivation over the exact executable trace.  Unlike the older
+coarse-schema helper above, this judgment transports the analyzer-owned full fact templates and
+the corresponding immutable carried runtime values at every boundary.  The only substitution
+objects it accepts are the closed computations `initialSubstitution?` and
+`AnalyzerBodyLocalRuleStep.rawOutputSubstitution?`; no theorem caller can name a replacement fact
+table or recurrence invariant. -/
+inductive CompleteDerivation
     {analysis : AnalysisResult}
     {samplers : Mxx.MxxSamplerFamily}
     {execution : StageExecution samplers}
@@ -803,11 +872,13 @@ inductive Derivation
     {indices : List Nat} → {initial final : List Mxx.Ir.Value} →
       (trace : Mxx.Ir.SequentialIterationsTrace execution.rootChildRunner evidence.view.definition
         execution.params evidence.view.indexSlot evidence.view.bindings evidence.invariantValues
-        indices initial final) →
-      CarriedState.Holds execution.params evidence.transfer.carriedSchemas initial → Type where
-  | nil {state : List Mxx.Ir.Value}
-      (stateFacts : CarriedState.Holds execution.params evidence.transfer.carriedSchemas state) :
-      Derivation evidence contract (.nil state) stateFacts
+        indices initial final) → CarriedFactSubstitution → Type where
+  | nil
+      {state : List Mxx.Ir.Value}
+      (substitution : CarriedFactSubstitution)
+      (derived : evidence.initialSubstitution? = some substitution)
+      (valuesMatch : substitution.values = state) :
+      CompleteDerivation evidence contract (.nil state) substitution
   | cons
       {index : Nat}
       {tail : List Nat}
@@ -825,51 +896,70 @@ inductive Derivation
         evidence.invariantValues tail next final)
       (step : AnalyzerBodyLocalRuleStep evidence index state next evaluatedBindings
         bindingsEvaluate childMember)
-      (stateFacts : CarriedState.Holds execution.params evidence.transfer.carriedSchemas state)
-      (derived : AnalyzerDerivedNextFacts step contract)
-      (restDerivation : Derivation evidence contract rest
-        derived.carriedFacts) :
-      Derivation evidence contract
-        (.cons index tail state evaluatedBindings next final bindingsEvaluate childMember rest)
-        stateFacts
+      {before : CarriedFactSubstitution}
+      (beforeValues : before.values = state)
+      (localFacts : AnalyzerDerivedNextFacts step contract before)
+      (nextSubstitution : CarriedFactSubstitution)
+      (nextDerived : step.instantiatedNextSubstitution? before = some nextSubstitution)
+      (nextValues : nextSubstitution.values = next)
+      (restDerivation : CompleteDerivation evidence contract rest nextSubstitution) :
+      CompleteDerivation evidence contract
+        (.cons index tail state evaluatedBindings next final bindingsEvaluate childMember rest) before
 
-theorem Derivation.initialFacts
+/-- Every complete trace derivation ends in one immutable substitution for the exact final
+carried tuple.  This induction follows trace structure only; it never unfolds symbolic forms. -/
+theorem CompleteDerivation.existsFinalSubstitution
     {analysis : AnalysisResult}
     {samplers : Mxx.MxxSamplerFamily}
     {execution : StageExecution samplers}
     {recurrenceInstance : SequentialRecurrenceInstanceRef}
-    (evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance)
-    (contract : Mxx.MxxBoundedSamplerContract samplers)
+    {evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance}
+    {contract : Mxx.MxxBoundedSamplerContract samplers}
     {indices : List Nat}
     {initial final : List Mxx.Ir.Value}
-    {trace : Mxx.Ir.SequentialIterationsTrace execution.rootChildRunner
-      evidence.view.definition
+    {trace : Mxx.Ir.SequentialIterationsTrace execution.rootChildRunner evidence.view.definition
       execution.params evidence.view.indexSlot evidence.view.bindings evidence.invariantValues
       indices initial final}
-    {initialFacts : CarriedState.Holds execution.params evidence.transfer.carriedSchemas initial}
-    (_derivation : Derivation evidence contract trace initialFacts) :
-    CarriedState.Holds execution.params evidence.transfer.carriedSchemas initial := by
-  exact initialFacts
-
-theorem Derivation.finalFacts
-    {analysis : AnalysisResult}
-    {samplers : Mxx.MxxSamplerFamily}
-    {execution : StageExecution samplers}
-    {recurrenceInstance : SequentialRecurrenceInstanceRef}
-    (evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance)
-    (contract : Mxx.MxxBoundedSamplerContract samplers)
-    {indices : List Nat}
-    {initial final : List Mxx.Ir.Value}
-    {trace : Mxx.Ir.SequentialIterationsTrace execution.rootChildRunner
-      evidence.view.definition
-      execution.params evidence.view.indexSlot evidence.view.bindings evidence.invariantValues
-      indices initial final}
-    {initialFacts : CarriedState.Holds execution.params evidence.transfer.carriedSchemas initial}
-    (derivation : Derivation evidence contract trace initialFacts) :
-    CarriedState.Holds execution.params evidence.transfer.carriedSchemas final := by
+    {initialSubstitution : CarriedFactSubstitution}
+    (derivation : CompleteDerivation evidence contract trace initialSubstitution) :
+    ∃ substitution : CarriedFactSubstitution, substitution.values = final := by
   induction derivation with
-  | nil stateFacts => exact stateFacts
-  | cons _ _ _ _ _ _ restDerivation induction => exact induction
+  | nil substitution _ valuesMatch => exact ⟨substitution, valuesMatch⟩
+  | cons _ _ _ _ _ _ _ _ _ restDerivation induction => exact induction
+
+/-- Extract the final immutable substitution without expanding the loop's symbolic expressions. -/
+noncomputable def CompleteDerivation.finalSubstitution
+    {analysis : AnalysisResult}
+    {samplers : Mxx.MxxSamplerFamily}
+    {execution : StageExecution samplers}
+    {recurrenceInstance : SequentialRecurrenceInstanceRef}
+    {evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance}
+    {contract : Mxx.MxxBoundedSamplerContract samplers}
+    {indices : List Nat}
+    {initial final : List Mxx.Ir.Value}
+    {trace : Mxx.Ir.SequentialIterationsTrace execution.rootChildRunner evidence.view.definition
+      execution.params evidence.view.indexSlot evidence.view.bindings evidence.invariantValues
+      indices initial final}
+    {initialSubstitution : CarriedFactSubstitution}
+    (derivation : CompleteDerivation evidence contract trace initialSubstitution) : CarriedFactSubstitution :=
+  Classical.choose (CompleteDerivation.existsFinalSubstitution derivation)
+
+theorem CompleteDerivation.finalValues
+    {analysis : AnalysisResult}
+    {samplers : Mxx.MxxSamplerFamily}
+    {execution : StageExecution samplers}
+    {recurrenceInstance : SequentialRecurrenceInstanceRef}
+    {evidence : TraceBoundSequentialRecurrence analysis execution recurrenceInstance}
+    {contract : Mxx.MxxBoundedSamplerContract samplers}
+    {indices : List Nat}
+    {initial final : List Mxx.Ir.Value}
+    {trace : Mxx.Ir.SequentialIterationsTrace execution.rootChildRunner evidence.view.definition
+      execution.params evidence.view.indexSlot evidence.view.bindings evidence.invariantValues
+      indices initial final}
+    {initialSubstitution : CarriedFactSubstitution}
+    (derivation : CompleteDerivation evidence contract trace initialSubstitution) :
+    derivation.finalSubstitution.values = final := by
+  exact Classical.choose_spec (CompleteDerivation.existsFinalSubstitution derivation)
 
 /-- The exact root output identity of one final carried slot. -/
 def outputIdentity
@@ -892,8 +982,8 @@ def projectedCarriedFacts
   projectRootRecurrenceOutputs evidence.transfer recurrenceInstance
     ⟨execution.stage.id⟩ evidence.nodeIndex
 
-/-- Final recurrence result: analyzer-projected facts paired with the actual final carried values
-and their closed coarse-schema proof. -/
+/-- Final recurrence result: analyzer-projected facts paired with the exact final carried values
+and the trace-derived complete substitution that owns their fact components. -/
 structure FinalProjectedCarriedFacts
     {analysis : AnalysisResult}
     {samplers : Mxx.MxxSamplerFamily}
@@ -910,7 +1000,8 @@ structure FinalProjectedCarriedFacts
   scopedFactsProject : scopedFacts.map (·.fact) = facts
   scopedFactsHold : ∀ fact ∈ scopedFacts, fact.Holds environment
   valuesEq : values = evidence.nodeValues
-  valuesHold : CarriedState.Holds execution.params evidence.transfer.carriedSchemas values
+  finalSubstitution : CarriedFactSubstitution
+  substitutionValues : finalSubstitution.values = values
 
 /-- A matrix fact selected from the projected list inherits its semantic proof from the exact
 root output fact.  This is a projection of analyzer soundness, not a caller-supplied invariant. -/
@@ -934,7 +1025,7 @@ theorem FinalProjectedCarriedFacts.matrixFactHolds
   rw [factEq] at holds
   exact holds
 
-def Derivation.finalProjection
+noncomputable def CompleteDerivation.finalProjection
     {analysis : AnalysisResult}
     {samplers : Mxx.MxxSamplerFamily}
     {execution : StageExecution samplers}
@@ -943,9 +1034,8 @@ def Derivation.finalProjection
     (contract : Mxx.MxxBoundedSamplerContract samplers)
     (environment : FactEnvironment)
     (analysisHolds : BaseAnalysisHolds environment analysis)
-    {initialFacts : CarriedState.Holds execution.params evidence.transfer.carriedSchemas
-      (evidence.argumentValues.take evidence.view.carriedCount)}
-    (derivation : Derivation evidence contract evidence.executionTrace initialFacts) :
+    {initialSubstitution : CarriedFactSubstitution}
+    (derivation : CompleteDerivation evidence contract evidence.executionTrace initialSubstitution) :
     FinalProjectedCarriedFacts evidence environment := {
   facts := evidence.projectedCarriedFacts
   scopedFacts := analysis.rootNodeOutputFacts ⟨execution.stage.id⟩ evidence.nodeIndex
@@ -958,7 +1048,8 @@ def Derivation.finalProjection
     intro fact member
     exact analysisHolds.2.2.2 fact (List.mem_of_mem_filter member)
   valuesEq := rfl
-  valuesHold := derivation.finalFacts
+  finalSubstitution := derivation.finalSubstitution
+  substitutionValues := derivation.finalValues
 }
 
 end TraceBoundSequentialRecurrence

@@ -22,6 +22,12 @@ def StaticObligation.Holds
       | .ok evaluated => 0 < evaluated
       | .error _ => False
   | .positiveDivisor value => 0 < value
+  | .loopFamilyAccessInRange loopCount offset familyCount =>
+      match evaluateIntExpr environment loopCount, evaluateIntExpr environment familyCount with
+      | .ok loopValue, .ok familyValue =>
+          0 ≤ loopValue ∧ 0 ≤ familyValue ∧
+            (loopValue ≠ 0 → loopValue - 1 + offset < familyValue)
+      | _, _ => False
   | .matchingMatrixTypes left right =>
       match evaluateIntExpr environment left.modulus,
           evaluateIntExpr environment left.ringDimension,
@@ -87,6 +93,13 @@ private def checkOne
       | .error _ => .error (.unsatisfied obligation)
   | .positiveDivisor value =>
       if 0 < value then .ok () else .error (.unsatisfied obligation)
+  | .loopFamilyAccessInRange loopCount offset familyCount =>
+      match evaluateIntExpr environment loopCount, evaluateIntExpr environment familyCount with
+      | .ok loopValue, .ok familyValue =>
+          if 0 ≤ loopValue ∧ 0 ≤ familyValue ∧
+              (loopValue = 0 ∨ loopValue - 1 + offset < familyValue) then .ok ()
+          else .error (.unsatisfied obligation)
+      | _, _ => .error (.unsatisfied obligation)
   | .matchingMatrixTypes left right =>
       match evaluateIntExpr environment left.modulus,
           evaluateIntExpr environment left.ringDimension,
@@ -421,6 +434,26 @@ private def thresholdTestAnalysis (noise : Nat) : AnalysisResult where
   semanticObligations := []
   endpointFacts := []
   usedRules := []
+
+/-- Closed Phase-B regression tests for the only dynamic-family range rule. These use the real
+checker, so a successful reduction verifies the same arithmetic used by recurrence acceptance. -/
+private def loopFamilyRangeTestAnalysis
+    (loopCount : Int) (offset : Nat) (familyCount : Int) : AnalysisResult where
+  facts := []
+  families := []
+  staticObligations := [
+    .loopFamilyAccessInRange (.constant loopCount) offset (.constant familyCount)
+  ]
+  inputObligations := []
+  semanticObligations := []
+  endpointFacts := []
+  usedRules := []
+
+example : (checkStaticParameters (loopFamilyRangeTestAnalysis 3 0 3) []).isOk = true := rfl
+example : (checkStaticParameters (loopFamilyRangeTestAnalysis 3 1 4) []).isOk = true := rfl
+example : (checkStaticParameters (loopFamilyRangeTestAnalysis 0 99 0) []).isOk = true := rfl
+example : (checkStaticParameters (loopFamilyRangeTestAnalysis 3 1 3) []).isOk = false := rfl
+example : (checkStaticParameters (loopFamilyRangeTestAnalysis (-1) 0 3) []).isOk = false := rfl
 
 example :
     checkStaticParameters (thresholdTestAnalysis 63) [] =

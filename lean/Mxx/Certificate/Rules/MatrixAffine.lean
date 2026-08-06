@@ -24,13 +24,6 @@ private def productBound
         .swappedRowVectorScalarProduct => .constant 1
   return (product, .matrixProduct leftType.ringDimension inner leftBound rightBound)
 
-private def retargetRelations
-    (output : ValueInstanceRef) : List MatrixRelation → List MatrixRelation :=
-  List.map fun
-    | .preimage _ source target trapdoor => .preimage output source target trapdoor
-    | .gadgetDecomposition _ target base digits =>
-        .gadgetDecomposition output target base digits
-
 private def negateSignalTerm (term : SignalTerm) : SignalTerm := {
   term with
   coefficient := {
@@ -105,7 +98,7 @@ def deriveMatrixScaleOne
     fact := {
       subject := output
       primary
-      relations := retargetRelations output input.relations
+      relations := input.relations.map (MatrixRelation.retargetSubject output)
       totalNormBound := input.totalNormBound
     }
   }
@@ -193,7 +186,10 @@ def deriveMatrixMultiply
         pure (.exact (.multiply leftExpression rightExpression))
     | .affine leftForm, .exact rightExpression =>
         if leftForm.terms.isEmpty then
-          pure (.affine { terms := [], noiseBound := totalBound })
+          pure (.affine {
+            terms := [← mkSignalTerm leftView rightExpression |>.mapError .typing]
+            noiseBound := .constant 0
+          })
         else
           pure (.affine (← multiplyAffineRight leftType rightType leftForm {
             expression := rightExpression

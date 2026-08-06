@@ -61,6 +61,42 @@ def IntBoundFactPath.sameUniformLocation : IntBoundFactPath → IntBoundFactPath
       slot == otherSlot && nested.sameUniformLocation otherNested
   | _, _ => false
 
+/-- Closed normal form for an integer index relative to one structural loop binder.
+`invariant` retains the exact expression identity; it does not mean equal evaluated values. -/
+inductive RelativeIndexNF where
+  | invariant (expression : RuntimeExprRef .integer)
+  | loopOffset (offset : Nat)
+  deriving BEq, DecidableEq, Repr
+
+/-- Instance-path frames after normalizing the one sequential binder selected for a recurrence.
+The representation is analyzer-only provenance, not an executable IR path. -/
+inductive RelativeInstanceFrame where
+  | subgraphCall (site : CoreNodeRef)
+  | parallelLane (site : CoreNodeRef) (index : RelativeIndexNF)
+  | selectedSequentialIteration (site : CoreNodeRef)
+  | invariantSequentialIteration (site : CoreNodeRef) (index : RuntimeExprRef .integer)
+  deriving BEq, DecidableEq, Repr
+
+/-- Stable recursive identity of an aggregate after relative path normalization. -/
+inductive NormalizedAggregateOrigin where
+  | joint (family : JointFamilyId) (outputSlot : Nat) (path : List RelativeInstanceFrame)
+  | familyElement (parent : NormalizedAggregateOrigin) (index : RelativeIndexNF)
+  deriving BEq, DecidableEq, Repr
+
+/-- Closed provenance used to compare a carried basis, a preimage source, and a successor basis.
+It records identities only; it contains no claimed matrix equality or numeric bound. -/
+inductive IndexedMatrixOrigin where
+  | invariant (matrix : MatrixInstanceRef)
+  | instantiatedTemplate
+      (wire : TemplateWireRef)
+      (path : List RelativeInstanceFrame)
+      (type : MatrixTypeExpr)
+  | familyElement
+      (aggregate : NormalizedAggregateOrigin)
+      (index : RelativeIndexNF)
+      (type : MatrixTypeExpr)
+  deriving BEq, DecidableEq
+
 inductive ConcatAxis where
   | rows
   | columns

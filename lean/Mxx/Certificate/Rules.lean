@@ -1,4 +1,5 @@
 import Mxx.Certificate.Rules.CanonicalResidues
+import Mxx.Certificate.Rules.CarriedFactSubstitution
 import Mxx.Certificate.Rules.CoarseRecurrenceSchema
 import Mxx.Certificate.Rules.AggregateExecution
 import Mxx.Certificate.Rules.BggThreeTrace
@@ -8,6 +9,7 @@ import Mxx.Certificate.Rules.Family
 import Mxx.Certificate.Rules.LoopRecurrence
 import Mxx.Certificate.Rules.MatrixAffine
 import Mxx.Certificate.Rules.MatrixRules
+import Mxx.Certificate.RecurrenceBasisAlignment
 import Mxx.Certificate.Rules.RelationProductRewrite
 import Mxx.Certificate.Rules.RecurrenceCoupling
 import Mxx.Certificate.Rules.RequirementAcceptance
@@ -34,3 +36,5 @@ import Mxx.Certificate.Rules.SymbolicBoundTransfer
 import Mxx.Certificate.Rules.SymbolicSelect
 import Mxx.Certificate.Rules.TraceBoundRecurrence
 import Mxx.Certificate.Rules.Transforms
+-- Retained for the later recurrence-correctness task; its closed fixtures are not yet stable.
+-- import Mxx.Certificate.Rules.ToyRecurrenceGate

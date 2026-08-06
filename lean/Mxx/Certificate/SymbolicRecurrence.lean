@@ -31,6 +31,14 @@ inductive SymbolicRecurrenceError where
   | sourceMismatch
   deriving BEq, DecidableEq, Repr
 
+private def validateExactRecurrenceSchemaLists :
+    Nat → List ValueFactTemplate → List ValueFactTemplate → Except SymbolicRecurrenceError Unit
+  | _, [], [] => .ok ()
+  | slot, initial :: initials, body :: bodies => do
+      if initial.schema != body.schema then throw (.initialBodyMismatch slot)
+      validateExactRecurrenceSchemaLists (slot + 1) initials bodies
+  | _, _, _ => .error .arityMismatch
+
 private def validateRecurrenceSchemaLists :
     Nat → List ValueFactTemplate → List ValueFactTemplate →
       Except SymbolicRecurrenceError (List CarriedValueSchema)
@@ -45,15 +53,17 @@ private def validateRecurrenceSchemaLists :
 /-- Derive the stable, term-count-independent carried schema from the actual initial facts and the
 analyzer-produced one-step body templates. Both sides pass through the relation-rejecting coarse
 conversion. -/
-def SequentialRecurrenceSource.validateCoarseCarriedSchemas
+def SequentialRecurrenceSource.validateCarriedSchemas
     (recurrence : SequentialRecurrenceSource) :
     Except SymbolicRecurrenceError (List CarriedValueSchema) :=
-  validateRecurrenceSchemaLists 0 recurrence.initial.toList recurrence.bodyOutputs.toList
+  do
+    validateExactRecurrenceSchemaLists 0 recurrence.initial.toList recurrence.bodyOutputs.toList
+    validateRecurrenceSchemaLists 0 recurrence.initial.toList recurrence.bodyOutputs.toList
 
-/-- Analyzer-owned closed recurrence transfer. The symbolic output vector and the numeric bound
-transition are indexed by the same coarse schema, so every simultaneous update has one fixed
-type. The validation equality records that this schema was derived from the actual recurrence,
-not supplied by a protocol certificate. -/
+/-- Analyzer-owned closed recurrence transfer.  Acceptance first requires exact
+`ValueFactSchema` equality, including affine term order and coefficient/basis types; the retained
+coarse schema below is solely the compact numeric Phase-B state shape.  The validation equality
+records that both were derived from the actual recurrence, not supplied by a protocol certificate. -/
 structure SymbolicRecurrenceTransfer where
   identity : SequentialRecurrenceInstanceRef
   source : SequentialRecurrenceSource
@@ -65,7 +75,7 @@ structure SymbolicRecurrenceTransfer where
   boundTransition : CarriedBoundTransitionVector
     (carriedSchemas.map CarriedValueSchema.boundSchema)
     (carriedSchemas.map CarriedValueSchema.boundSchema)
-  schemaValidation : source.validateCoarseCarriedSchemas = .ok carriedSchemas
+  schemaValidation : source.validateCarriedSchemas = .ok carriedSchemas
 
 inductive ResolveSymbolicRecurrenceError where
   | count (error : IntEvalError)
@@ -144,7 +154,7 @@ def SymbolicRecurrenceTransfer.build
       (schemas.map CarriedValueSchema.boundSchema)
       (schemas.map CarriedValueSchema.boundSchema)) :
     Except SymbolicRecurrenceError SymbolicRecurrenceTransfer :=
-  match validation : source.validateCoarseCarriedSchemas with
+  match validation : source.validateCarriedSchemas with
   | .error error => .error error
   | .ok actual =>
       if sourceSame : identity.recurrence.site = source.loop.site then
@@ -200,6 +210,20 @@ private def resolverFixtureSource : SequentialRecurrenceSource where
 private def resolverFixturePath :
     CarriedBoundStatePath [.integerInterval] .integerInterval :=
   .head .here
+
+/-- Coarse integer/Boolean schemas are both scalar, but recurrence acceptance must preserve the
+complete declared `ValueFactSchema`; a body may not silently change the carried kind. -/
+private def exactSchemaMismatchFixtureSource : SequentialRecurrenceSource := {
+  resolverFixtureSource with
+  bodyOutputs := ⟨#[{
+    fact := .boolean { expression := .boolConstant false }
+    schema := .boolean
+  }], rfl⟩
+}
+
+example : exactSchemaMismatchFixtureSource.validateCarriedSchemas =
+    .error (.initialBodyMismatch 0) := by
+  rfl
 
 private def resolverFixtureTransfer : SymbolicRecurrenceTransfer where
   identity := { recurrence := ⟨resolverFixtureSite⟩, path := [] }

@@ -75,6 +75,14 @@ inductive MatrixRelation where
       (target : MatrixInstanceRef)
       (base digitCount : IntExpr)
 
+/-- Change only the matrix value that owns a retained sampler relation. Source, target,
+trapdoor, decomposition base, and digit count remain exact provenance from the original node. -/
+def MatrixRelation.retargetSubject
+    (subject : ValueInstanceRef) : MatrixRelation → MatrixRelation
+  | .preimage _ source target trapdoor => .preimage subject source target trapdoor
+  | .gadgetDecomposition _ target base digitCount =>
+      .gadgetDecomposition subject target base digitCount
+
 /-- Representation of raw stored coefficients.  A centered norm never establishes this field. -/
 inductive CoefficientRepresentation where
   | unknown
@@ -111,6 +119,51 @@ structure MatrixFact where
   relations : List MatrixRelation
   totalNormBound : BoundExpr
   coefficientRepresentation : CoefficientRepresentation := .unknown
+
+/-- A closed, parameter-only range requirement for a dynamic family access under a structural
+loop. The checker evaluates it exactly in Phase B. -/
+structure LoopFamilyRangeRequirement where
+  loopCount : IntExpr
+  offset : Nat
+  familyCount : IntExpr
+  deriving BEq, DecidableEq
+
+/-- Exact alias discovered from a body-local matrix fact whose primary form is exact. It is an
+analyzer-owned bridge from a producer-lane local subject to its preserved external provenance. -/
+structure MatrixAliasTemplate where
+  subject : TemplateWireRef
+  subjectType : MatrixTypeExpr
+  exactTarget : MatrixExpr
+
+/-- One mechanically checked use of the GGH recurrence rewrite. Every identity in this key is
+fixed by frozen IR and analyzer output; a caller cannot construct it as semantic evidence. -/
+structure RecurrenceBasisAlignmentKey where
+  recurrence : SequentialRecurrenceInstanceRef
+  carriedSlot : Nat
+  signalTerm : Nat
+  multiplication : CoreNodeRef
+  rightOperandSubject : ValueInstanceRef
+  relationSubject : ValueInstanceRef
+  relationSource : MatrixInstanceRef
+  relationTarget : MatrixInstanceRef
+  sourceOrigin : IndexedMatrixOrigin
+  successorOrigin : IndexedMatrixOrigin
+  coefficientType : MatrixTypeExpr
+  basisType : MatrixTypeExpr
+  rightOperandType : MatrixTypeExpr
+  productMode : SignalProductMode
+  deriving BEq, DecidableEq
+
+/-- Analyzer output needed to instantiate the one-step GGH hard-bound transition. This is
+diagnostic data only; soundness is reconstructed from execution and the frozen trace. -/
+structure RecurrenceBasisAlignmentSummary where
+  key : RecurrenceBasisAlignmentKey
+  targetCoefficient : MatrixExpr
+  targetCoefficientBound : BoundExpr
+  targetNoiseBound : BoundExpr
+  rightTotalBound : BoundExpr
+  successorBasisBound : BoundExpr
+  rangeRequirements : List LoopFamilyRangeRequirement
 
 structure TrapdoorFact where
   privatePort : ValueInstanceRef
@@ -158,10 +211,12 @@ structure JointFamilyFact where
   outputArity : Nat
   elementTuple : Vector ValueFactTemplate outputArity
 
-/-- One loop-invariant argument and the fact transported from that exact frozen input wire. -/
+/-- One loop-invariant argument and its complete typed fact.  The template is retained rather
+than only the raw fact so a nested body trace can reconstruct the same analyzer seed table
+without guessing a matrix type. -/
 structure InvariantInputFact where
   wire : CoreWireRef
-  fact : ValueFact
+  template : ValueFactTemplate
 
 structure SequentialRecurrenceSource where
   loop : LoopRef

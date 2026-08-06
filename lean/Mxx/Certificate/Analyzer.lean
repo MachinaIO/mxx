@@ -14,6 +14,7 @@ import Mxx.Certificate.Rules.ScalarControl
 import Mxx.Certificate.Rules.Transforms
 import Mxx.Certificate.SymbolicEvaluationConstruction
 import Mxx.Certificate.SymbolicRecurrenceConstruction
+import Mxx.Certificate.RecurrenceBasisAlignment
 
 namespace Mxx.Certificate
 
@@ -150,7 +151,7 @@ private def inputNodeWire
         | _ => visit (index + 1) tail
   visit 0 nodes
 
-private def inputNodeWireInScope
+def inputNodeWireInScope?
     (stage : StageId)
     (scope : StaticScopeId)
     (name : String)
@@ -184,7 +185,11 @@ def transportFact (wire : CoreWireRef) (source : ScopedWireFact) : ScopedWireFac
   | .matrix matrix => {
       source with
       wire
-      fact := .matrix { matrix with subject := .ofCoreWire wire }
+      fact := .matrix {
+        matrix with
+        subject := .ofCoreWire wire
+        relations := matrix.relations.map (MatrixRelation.retargetSubject (.ofCoreWire wire))
+      }
     }
   | _ => { source with wire }
 
@@ -1521,6 +1526,7 @@ structure AnalysisState where
   facts : ScopedWireFactTable
   families : List (JointFamilyId × JointFamilyFact) := []
   parallelFamilyDerivations : List ParallelFamilyDerivationSource := []
+  recurrenceBasisAlignments : List RecurrenceBasisAlignmentSummary := []
   /-- Closed protocol-input family contracts.  These are analyzer-owned data copied from the
   verified bundle, not certificate input.  Unlike executable loop families they do not need a
   synthetic `JointFamilyFact`: an element fact is derived directly from its input contract. -/
@@ -1532,6 +1538,57 @@ structure AnalysisState where
   boundWitnessArena : BoundWitnessArena := {}
   symbolicMatrixFacts : List MatrixSymbolicFact := []
   staticObligations : List StaticObligation := []
+
+inductive StructuralLoopKind where
+  | parallel
+  | sequential
+  deriving BEq, DecidableEq, Repr
+
+/-- The only source of a dynamic family index's loop identity. It is built from the frozen loop
+node while descending into its body and is never supplied by a certificate or fixture. -/
+structure StructuralLoopContext where
+  kind : StructuralLoopKind
+  site : CoreNodeRef
+  count : IntExpr
+  indexSlot : Nat
+  indexReference : RuntimeExprRef .integer
+  indexExpression : RuntimeExpr .integer
+
+abbrev StructuralLoopContextStack := List StructuralLoopContext
+
+structure SequentialAlignmentCollection where
+  recurrence : SequentialRecurrenceInstanceRef
+  loopSite : CoreNodeRef
+  loopCount : IntExpr
+  carriedCount : Nat
+  eligibleSlots : List (Fin carriedCount)
+  initialFacts : Vector ValueFactTemplate carriedCount
+  bodyInputs : Vector TemplateWireRef carriedCount
+  bodyOutputs : Vector TemplateWireRef carriedCount
+
+inductive SequentialAlignmentMode where
+  | disabled
+  | collect (configuration : SequentialAlignmentCollection)
+
+/-- Immutable input to the one scope-analysis entry point.  Root prefixes and loop bodies differ
+only in their seed table and alignment mode; they never use separate inference engines. -/
+structure ScopeAnalysisRequest where
+  stage : StageId
+  definitions : List (String × Mxx.Ir.Scope)
+  scope : StaticScopeId
+  instancePath : InstancePathExpr
+  startNode : Nat
+  nodes : List Mxx.Ir.Node
+  outputs : List Mxx.Ir.WireRef
+  loopContexts : StructuralLoopContextStack
+  alignmentMode : SequentialAlignmentMode
+
+structure ScopeAnalysisResult where
+  state : AnalysisState
+  scopeOwnedFacts : ScopedWireFactTable
+  outputFacts : List ScopedWireFact
+  outputTemplates : List ValueFactTemplate
+  acceptedAlignments : List RecurrenceBasisAlignmentSummary
 
 /-- Construct the final symbolic matrix table once, after every executable program and endpoint
 has contributed its normalized facts. Existing recurrence-owned expression and form entries are
@@ -1682,75 +1739,59 @@ private def resolveJointFamilyPort
       | none => .error (.missingFamily joint)
   | _ => .error (.invalidLoopArity ⟨"family-get"⟩ ⟨0⟩)
 
+/-- Exact producer-local aliases are the only bridge from a raw relation endpoint to retained
+family provenance. Affine facts, non-template subjects, and ambiguous duplicate subjects are
+deliberately omitted. -/
+private def matrixAliasTemplates (facts : ScopedWireFactTable) : List MatrixAliasTemplate :=
+  let candidates := facts.filterMap fun entry =>
+    match entry.fact, entry.matrixType with
+    | .matrix { subject := .template subject, primary := .exact exactTarget, .. }, some subjectType =>
+        some { subject, subjectType, exactTarget }
+    | _, _ => none
+  candidates.filter fun candidate =>
+    (candidates.countP fun other => other.subject = candidate.subject) = 1
+
+private def uniqueParallelFamilyDerivation
+    (family : JointFamilyId)
+    (sources : List ParallelFamilyDerivationSource) : Option ParallelFamilyDerivationSource :=
+  let candidates := sources.filter fun source => source.family = family
+  if candidates.length = 1 then candidates.head? else none
+
 private def templateMatrixType : ValueFactTemplate → Option MatrixTypeExpr
   | ⟨_, .matrix type _ _ _⟩ => some type
   | _ => none
 
 private def instantiateFamilyElement
+    (derivation : ParallelFamilyDerivationSource)
     (family : JointFamilyFact)
     (slot : Nat)
     (index : RuntimeExprRef .integer)
     (indexExpression : RuntimeExpr .integer)
-    (output : CoreWireRef) : Except VerifyError ScopedWireFact := do
+    (output : CoreWireRef)
+    (arena : ExpressionArena)
+    (originContext : Option MatrixOriginNormalizationContext := none) :
+    Except VerifyError (ExpressionArena × ScopedWireFact) := do
+  if derivation.family != family.id || derivation.count != family.count ||
+      derivation.indexSlot != family.indexVariable.slot ||
+      derivation.outputCount != family.outputArity then
+    throw (.invalidFamilySlot family.id slot)
   let template ← match family.elementTuple[slot]? with
     | some template => pure template
     | none => throw (.invalidFamilySlot family.id slot)
-  let loopSite ← match family.outputFamilies.head? with
-    | some wire => pure { stage := wire.stage, scope := wire.scope, node := wire.node }
-    | none => throw (.invalidFamilySlot family.id slot)
-  let aggregate := FamilyAggregateRef.joint family.id slot []
-  let provenance := ValueInstanceRef.familyElement aggregate index
-  let instantiated := instantiateParallelTemplate loopSite index family.id
-    family.bodyOutputTemplates (.ofCoreWire output) template
-  let instantiated := match instantiated with
-    | .matrix fact =>
-        match templateMatrixType template, fact.primary with
-        | some matrixType, .exact _ => .matrix {
-            fact with
-            primary := .exact (.wire { value := provenance, type := matrixType })
-          }
-        | _, _ => .matrix fact
-    | .trapdoor fact =>
-        let rec findOutputSlot (target : TemplateWireRef) :
-            List (TemplateWireRef × Nat) → Option Nat
-          | [] => none
-          | (wire, outputSlot) :: tail =>
-              if wire == target then some outputSlot else findOutputSlot target tail
-        match template.fact, fact.publicMatrix with
-        | .trapdoor templateTrapdoor, .wire publicMatrix =>
-            let rec findPublicSlot (expectedType : MatrixTypeExpr) (slot : Nat) :
-                List ValueFactTemplate → Option Nat
-              | [] => none
-              | candidate :: tail =>
-                  match candidate.fact with
-                  | .matrix matrix =>
-                      if matrix.subject == templateTrapdoor.publicPort ||
-                          (templateMatrixType candidate).any (matrixTypeEqual · expectedType) then
-                        some slot
-                      else findPublicSlot expectedType (slot + 1) tail
-                  | _ => findPublicSlot expectedType (slot + 1) tail
-            let publicSlot := match templateTrapdoor.publicPort with
-              | .template publicTemplate =>
-                  findOutputSlot publicTemplate family.bodyOutputTemplates
-              | _ => findPublicSlot publicMatrix.type 0 family.elementTuple.toList
-            match publicSlot with
-                | some publicSlot =>
-                    let publicIdentity := ValueInstanceRef.familyElement
-                      (.joint family.id publicSlot []) index
-                    .trapdoor {
-                      fact with
-                      publicPort := publicIdentity
-                      publicMatrix := .wire { publicMatrix with value := publicIdentity }
-                    }
-                | none => .trapdoor fact
-        | _, _ => .trapdoor fact
-    | .integer fact => .integer { fact with
-        expression := .familyElement .integer aggregate index indexExpression }
-    | .boolean fact => .boolean { fact with
-        expression := .familyElement .boolean aggregate index indexExpression }
-    | .bytes _ => .bytes provenance
-    | fact => fact
-  return { wire := output, matrixType := templateMatrixType template, fact := instantiated }
+  let substitution : ParallelTemplateSubstitution := {
+    derivation
+    actualIndex := index
+    actualIndexExpression := indexExpression
+    originContext
+  }
+  let outputValue : ValueInstanceRef := ValueInstanceRef.ofCoreWire output
+  let ⟨rewrittenArena, fact⟩ ← instantiateParallelTemplate substitution arena outputValue template
+    |>.mapError fun _ => .invalidExpressionReference
+  return (rewrittenArena, {
+    wire := output
+    matrixType := templateMatrixType template
+    fact
+  })
 
 private def instantiateAbstractFamilyElement
     (rootSlot : Nat)
@@ -1914,6 +1955,7 @@ private def applyFamilyGet
     (scope : StaticScopeId)
     (nodeId : Nat)
     (node : Mxx.Ir.Node)
+    (loopContexts : StructuralLoopContextStack)
     (state : AnalysisState) : Except VerifyError AnalysisState := do
   let familyRef ← match node.arguments.head? with
     | some reference => pure reference
@@ -1921,7 +1963,7 @@ private def applyFamilyGet
   let familyPort ← match lookupScopedFact (scopedWire stage scope familyRef) state.facts with
     | some { fact := .family family, .. } => pure family
     | _ => throw (.invalidLoopArity stage ⟨nodeId⟩)
-  let ⟨indexExpression, arena, index⟩ ← match node.kind with
+  let ⟨indexExpression, arena, index, dynamicIndex⟩ ← match node.kind with
     | .familyGetStatic value =>
         let expression : RuntimeExpr .integer := .parameter value
         let rec findExisting (offset : Nat) : List SymbolicExprEntry →
@@ -1932,50 +1974,82 @@ private def applyFamilyGet
               else findExisting (offset + 1) tail
           | _ :: tail => findExisting (offset + 1) tail
         match findExisting 0 state.expressionArena.entries with
-        | some reference => pure (expression, state.expressionArena, reference)
+        | some reference => pure (expression, state.expressionArena, reference, false)
         | none =>
             match state.expressionArena.internInteger expression with
-            | some (arena, reference) => pure (expression, arena, reference)
+            | some (arena, reference) => pure (expression, arena, reference, false)
             | none => throw .invalidExpressionReference
     | .familyGetDynamic =>
         match node.arguments with
         | [_, indexRef] =>
             let indexFact ← requireInteger state.facts (scopedWire stage scope indexRef)
             match state.expressionArena.internInteger indexFact.expression with
-            | some (arena, reference) => pure (indexFact.expression, arena, reference)
+            | some (arena, reference) => pure (indexFact.expression, arena, reference, true)
             | none => throw .invalidExpressionReference
         | _ => throw (.invalidLoopArity stage ⟨nodeId⟩)
     | _ => throw (.unsupportedNode stage ⟨nodeId⟩)
+  let state := { state with expressionArena := arena }
+  let state ← if dynamicIndex then
+      match loopContexts.head? with
+      | none => pure state
+      | some context =>
+          match normalizeLoopRelativeIntExpr state.expressionArena ⟨context.site⟩ context.indexSlot
+              index with
+          | .ok (.invariant _) => pure state
+          | .ok (.loopOffset offset) => pure {
+              state with
+              staticObligations := state.staticObligations ++ [
+                .loopFamilyAccessInRange context.count offset familyPort.count
+              ]
+            }
+          | .error _ => throw .invalidExpressionReference
+    else pure state
   let output := scopedOutputWire stage scope nodeId
-  let fact ← match familyPort.aggregate with
+  let originContext := match loopContexts.head? with
+    | some context => match context.kind with
+      | .sequential => some {
+          arena := state.expressionArena
+          selectedLoop := ⟨context.site⟩
+          indexSlot := context.indexSlot
+        }
+      | .parallel => none
+    | none => none
+  let ⟨finalArena, fact⟩ ← match familyPort.aggregate with
     | .joint joint outputSlot _ =>
         match lookupJointFamily joint state.families with
-        | some family => instantiateFamilyElement family outputSlot index indexExpression output
+        | some family =>
+            let derivation ← match uniqueParallelFamilyDerivation joint
+                state.parallelFamilyDerivations with
+              | some derivation => pure derivation
+              | none => throw (.missingFamily joint)
+            instantiateFamilyElement derivation family outputSlot index indexExpression output
+              state.expressionArena originContext
         | none =>
             let contract ← match protocolFamilyElementContract state.protocolFamilies
                 familyPort.aggregate with
               | some contract => pure contract
               | none => throw (.missingFamily joint)
-            pure (instantiateProtocolFamilyElement familyPort.aggregate index indexExpression
-              contract output)
+            pure (state.expressionArena, instantiateProtocolFamilyElement familyPort.aggregate index
+              indexExpression contract output)
     | aggregate@(.familyElement ..) =>
         match recurrenceFamilyRoot? aggregate with
         | some (recurrence, path, slot, parentIndices) =>
-            instantiateRecurrenceFamilyElement recurrence path slot aggregate
-              (parentIndices ++ [index]) index indexExpression familyPort.elementSchema output
+            pure (state.expressionArena, ← instantiateRecurrenceFamilyElement recurrence path slot aggregate
+              (parentIndices ++ [index]) index indexExpression familyPort.elementSchema output)
         | none =>
             let contract ← match protocolFamilyElementContract state.protocolFamilies
                 aggregate with
               | some contract => pure contract
               | none => throw (.invalidLoopArity stage ⟨nodeId⟩)
-            pure (instantiateProtocolFamilyElement aggregate index indexExpression contract output)
+            pure (state.expressionArena, instantiateProtocolFamilyElement aggregate index indexExpression
+              contract output)
     | .carriedInput slot =>
-        instantiateAbstractFamilyElement slot familyPort.aggregate index indexExpression
-          familyPort.elementSchema output
+        pure (state.expressionArena, ← instantiateAbstractFamilyElement slot familyPort.aggregate index
+          indexExpression familyPort.elementSchema output)
     | .recurrenceResult recurrence path slot =>
-        instantiateRecurrenceFamilyElement recurrence path slot familyPort.aggregate [index]
-          index indexExpression familyPort.elementSchema output
-  return { state with facts := state.facts ++ [fact], expressionArena := arena }
+        pure (state.expressionArena, ← instantiateRecurrenceFamilyElement recurrence path slot
+          familyPort.aggregate [index] index indexExpression familyPort.elementSchema output)
+  return { state with expressionArena := finalArena, facts := state.facts ++ [fact] }
 
 private def internIntegerBranches :
     ExpressionArena → List IntegerFact → Option (ExpressionArena × List (RuntimeExprRef .integer))
@@ -2107,24 +2181,25 @@ private def seedParallelInputs
     (arguments : List Mxx.Ir.WireRef)
     (modes : List Mxx.Ir.LoopInputMode)
     (outerScope : StaticScopeId)
-    (state : AnalysisState) : Except VerifyError ScopedWireFactTable := do
+    (state : AnalysisState) : Except VerifyError (ExpressionArena × ScopedWireFactTable) := do
   let rec visit
       (names : List String)
       (arguments : List Mxx.Ir.WireRef)
       (modes : List Mxx.Ir.LoopInputMode)
-      (accumulator : ScopedWireFactTable) : Except VerifyError ScopedWireFactTable := do
+      (arena : ExpressionArena)
+      (accumulator : ScopedWireFactTable) : Except VerifyError (ExpressionArena × ScopedWireFactTable) := do
     match names, arguments, modes with
-    | [], [], [] => return accumulator
+    | [], [], [] => return (arena, accumulator)
     | name :: nameTail, argument :: argumentTail, mode :: modeTail =>
-        let destination ← match inputNodeWireInScope stage bodyScope name body.nodes with
+        let destination ← match inputNodeWireInScope? stage bodyScope name body.nodes with
           | some wire => pure wire
           | none => throw (.missingProgramInput stage name)
         let sourceWire := scopedWire stage outerScope argument
         let source ← match lookupScopedFact sourceWire state.facts with
           | some fact => pure fact
           | none => throw (.missingInputFact stage ⟨loopSite.node.value⟩ argument)
-        let seeded ← match mode with
-          | .broadcast => pure (transportFact destination source)
+        let ⟨nextArena, seeded⟩ ← match mode with
+          | .broadcast => pure (arena, transportFact destination source)
           | .zip =>
               match source.fact with
               | .family port =>
@@ -2132,62 +2207,111 @@ private def seedParallelInputs
                   | .joint joint outputSlot _ =>
                       match lookupJointFamily joint state.families with
                       | some family =>
-                          instantiateFamilyElement family outputSlot index indexExpression
-                            destination
+                          let derivation ← match uniqueParallelFamilyDerivation joint
+                              state.parallelFamilyDerivations with
+                            | some derivation => pure derivation
+                            | none => throw (.missingFamily joint)
+                          instantiateFamilyElement derivation family outputSlot index indexExpression
+                            destination arena
                       | none =>
                           let contract ← match protocolFamilyElementContract
                               state.protocolFamilies port.aggregate with
                             | some contract => pure contract
                             | none => throw (.missingFamily joint)
-                          pure (instantiateProtocolFamilyElement port.aggregate index
+                          pure (arena, instantiateProtocolFamilyElement port.aggregate index
                             indexExpression contract destination)
                   | aggregate@(.familyElement ..) =>
                       let contract ← match protocolFamilyElementContract state.protocolFamilies
                           aggregate with
                         | some contract => pure contract
                         | none => throw (.invalidLoopArity stage loopSite.node)
-                      pure (instantiateProtocolFamilyElement aggregate index indexExpression
+                      pure (arena, instantiateProtocolFamilyElement aggregate index indexExpression
                         contract destination)
                   | aggregate@(.carriedInput _) | aggregate@(.recurrenceResult ..) =>
                       match instantiateStructuralFamilyElement aggregate index indexExpression
                           port.elementSchema destination with
-                      | some fact => pure fact
+                      | some fact => pure (arena, fact)
                       | none => throw (.invalidLoopArity stage loopSite.node)
               | _ => throw (.invalidLoopArity stage loopSite.node)
           | .zipOffset _ => throw (.unsupportedNode stage loopSite.node)
-        visit nameTail argumentTail modeTail (accumulator ++ [seeded])
+        visit nameTail argumentTail modeTail nextArena (accumulator ++ [seeded])
     | _, _, _ => throw (.invalidLoopArity stage loopSite.node)
-  visit body.inputNames arguments modes []
+  visit body.inputNames arguments modes state.expressionArena []
 
-private def abstractCarriedFact
+/-! ## Abstract sequential-carried inputs -/
+
+/-- Rebuild the analyzer-only carried placeholder fact for one exact formal body input.
+The source is the complete template retained by the sequential recurrence, rather than an
+untyped schema.  This makes the same seed table reproducible from the frozen transfer when the
+trace soundness layer analyzes an actual iteration. -/
+def abstractCarriedTemplateFact
     (slot : Nat)
     (destination : CoreWireRef)
-    (source : ScopedWireFact) : Except VerifyError ScopedWireFact := do
-  let abstract : ValueFact ← match source.fact, source.matrixType with
-    | .matrix fact, some matrixType =>
+    (source : ValueFactTemplate) : Except VerifyError ScopedWireFact := do
+  let abstract : ValueFact ← match source.fact, source.schema with
+    | .matrix fact, .matrix matrixType _ _ _ =>
         if !fact.relations.isEmpty then
           throw (.relationBearingCarriedMatrix destination.stage destination.node slot)
+        let primary ← match fact.primary with
+          | .exact _ => pure (.exact (.carriedInput matrixType (.exactExpression slot)))
+          | .affine form => do
+              let terms ← form.terms.zipIdx.mapM fun (term, termIndex) => do
+                let coefficientType ← match term.coefficient.expression.inferType with
+                  | some type => pure type
+                  | none => throw (.typing .unknownExpressionType)
+                let basisType ← match term.basis.inferType with
+                  | some type => pure type
+                  | none => throw (.typing .unknownExpressionType)
+                pure {
+                  coefficient := {
+                    expression := .carriedInput coefficientType
+                      (.affineCoefficient slot termIndex)
+                    normBound := .carriedInput (.affineCoefficientBound slot termIndex)
+                  }
+                  basis := .carriedInput basisType (.affineBasis slot termIndex)
+                  mode := term.mode
+                }
+              pure (.affine {
+                terms
+                noiseBound := .carriedInput (.affineNoiseBound slot)
+              })
         pure (.matrix {
           subject := .ofCoreWire destination
-          primary := .exact (.carriedInput matrixType (.exactExpression slot))
+          primary
           relations := []
           totalNormBound := .carriedInput (.matrixTotalBound slot)
           coefficientRepresentation := fact.coefficientRepresentation
         })
-    | .integer _, none => pure (.integer {
+    | .integer _, .integer => pure (.integer {
         expression := .carriedInput (.integerValue slot)
         lower := .carriedInput (.lower slot)
         upper := .carriedInput (.upper slot)
       })
-    | .boolean _, none => pure (.boolean {
+    | .boolean _, .boolean => pure (.boolean {
         expression := .carriedInput (.booleanValue slot)
       })
-    | .bytes _, none => pure (.bytes (.ofCoreWire destination))
-    | .family family, none => pure (.family {
+    | .bytes _, .bytes => pure (.bytes (.ofCoreWire destination))
+    | .family family, .family _ _ => pure (.family {
         family with aggregate := .carriedInput slot
       })
     | _, _ => throw (.unsupportedCarriedKind destination.stage destination.node slot)
-  return { wire := destination, matrixType := source.matrixType, fact := abstract }
+  let matrixType := match source.schema with
+    | .matrix type _ _ _ => some type
+    | _ => none
+  return { wire := destination, matrixType, fact := abstract }
+
+/-- Reconstruct the complete carried-input seed prefix from an analyzer-owned recurrence source.
+This is intentionally independent of the original outer-scope table: trace analysis uses the
+same frozen input templates and formal body wires, so it cannot replace a carried fact with an
+ad-hoc schema or a similarly named wire. -/
+def SequentialRecurrenceSource.abstractCarriedSeedFacts?
+    (source : SequentialRecurrenceSource) : Option ScopedWireFactTable := do
+  let pairs := source.bodyInputs.toList.zip source.initial.toList
+  if pairs.length != source.carriedArity then none else
+    pairs.zipIdx.mapM fun ((input, template), slot) =>
+      match abstractCarriedTemplateFact slot input.toCoreWire template with
+      | .ok fact => some fact
+      | .error _ => none
 
 private structure SeededSequentialInputs where
   facts : ScopedWireFactTable
@@ -2217,7 +2341,7 @@ private def seedSequentialInputs
     match names, remaining with
     | [], [] => return { facts, initial, bodyInputs }
     | name :: nameTail, argument :: argumentTail =>
-        let destination ← match inputNodeWireInScope stage bodyScope name body.nodes with
+        let destination ← match inputNodeWireInScope? stage bodyScope name body.nodes with
           | some wire => pure wire
           | none => throw (.missingProgramInput stage name)
         let source ← match lookupScopedFact (scopedWire stage outerScope argument) state.facts with
@@ -2226,10 +2350,10 @@ private def seedSequentialInputs
         if source.fact.hasCarriedInput then
           throw (.nonUniformNestedRecurrenceInput stage loopSite.node slot)
         if slot < carriedCount then
-          let seeded ← abstractCarriedFact slot destination source
           let initialTemplate ← match source.toTemplate with
             | some template => pure template
             | none => throw (.unsupportedCarriedKind stage loopSite.node slot)
+          let seeded ← abstractCarriedTemplateFact slot destination initialTemplate
           let templateWire : TemplateWireRef := {
             definition := { stage, name := definition }
             bodyScope := ⟨[]⟩
@@ -2248,7 +2372,9 @@ private def wireMatrixType : Mxx.Ir.WireTypeExpr → Option MatrixTypeExpr
   | .matrix type | .preimage type => some type
   | _ => none
 
-def analyzeStateFrom
+/-- Analyze one immutable scope draft.  Semantic theorems enter through `analyzeScopeAttempt`;
+this definition remains reducible so closed checker fixtures can evaluate the frozen analyzer. -/
+def analyzeScopeNodesOnce
     (fuel : Nat)
     (stage : StageId)
     (definitions : List (String × Mxx.Ir.Scope))
@@ -2256,6 +2382,7 @@ def analyzeStateFrom
     (instancePath : InstancePathExpr)
     (nodeId : Nat)
     (nodes : List Mxx.Ir.Node)
+    (loopContexts : StructuralLoopContextStack)
     (state : AnalysisState) : Except VerifyError AnalysisState := do
   match fuel with
   | 0 => throw (.invalidLoopArity stage ⟨nodeId⟩)
@@ -2265,7 +2392,7 @@ def analyzeStateFrom
       | node :: tail =>
           let next ← match node.kind with
             | .familyGetStatic _ | .familyGetDynamic =>
-                applyFamilyGet stage scope nodeId node state
+                applyFamilyGet stage scope nodeId node loopContexts state
             | .select =>
                 match node.outputTypes with
                 | [.integer] | [.constantInt] | [.boolean] | [.constantBool] =>
@@ -2287,11 +2414,20 @@ def analyzeStateFrom
                   | some result => pure result
                   | none => throw .invalidExpressionReference
                 let childScope : StaticScopeId := ⟨scope.path ++ [definition]⟩
-                let initial ← seedParallelInputs stage childScope body loopSite index indexExpression
+                let ⟨seededArena, initial⟩ ← seedParallelInputs stage childScope body loopSite index indexExpression
                   node.arguments modes scope { state with expressionArena := arena }
                 let childPath := instancePath ++ [.parallelLane loopSite index]
-                let bodyState ← analyzeStateFrom fuel stage definitions childScope childPath 0 body.nodes
-                  { state with facts := state.facts ++ initial, expressionArena := arena }
+                let context : StructuralLoopContext := {
+                  kind := .parallel
+                  site := loopSite
+                  count
+                  indexSlot
+                  indexReference := index
+                  indexExpression
+                }
+                let bodyState ← analyzeScopeNodesOnce fuel stage definitions childScope childPath 0 body.nodes
+                  (context :: loopContexts)
+                  { state with facts := state.facts ++ initial, expressionArena := seededArena }
                   |>.mapError fun error => match error with
                     | .invalidLoopArity errorStage errorNode =>
                         .invalidLoopArityInScope errorStage childScope errorNode
@@ -2351,6 +2487,8 @@ def analyzeStateFrom
                     analyzedFacts := bodyState.facts.drop state.facts.length
                     outputFacts := bodyOutputFacts
                     elementTemplates := templates
+                    matrixAliasTemplates := matrixAliasTemplates
+                      (bodyState.facts.drop state.facts.length)
                   }
                   pure {
                     bodyState with
@@ -2375,8 +2513,16 @@ def analyzeStateFrom
                 let seeded ← seedSequentialInputs stage scope childScope definition body loopSite
                   node.arguments carriedCount { state with expressionArena := arena }
                 let childPath := instancePath ++ [.sequentialIteration loopSite index]
-                let bodyState ← analyzeStateFrom fuel stage definitions childScope childPath 0
-                  body.nodes { state with
+                let context : StructuralLoopContext := {
+                  kind := .sequential
+                  site := loopSite
+                  count
+                  indexSlot
+                  indexReference := index
+                  indexExpression
+                }
+                let bodyState ← analyzeScopeNodesOnce fuel stage definitions childScope childPath 0
+                  body.nodes (context :: loopContexts) { state with
                     facts := state.facts ++ seeded.facts
                     expressionArena := arena
                   }
@@ -2407,7 +2553,8 @@ def analyzeStateFrom
                         familyElementTemplates := recurrenceFamilyElementTemplates bodyState.families
                         invariantInputs := (node.arguments.drop carriedCount).filterMap fun argument =>
                           let wire := scopedWire stage scope argument
-                          (lookupScopedFact wire state.facts).map fun entry => { wire, fact := entry.fact }
+                          (lookupScopedFact wire state.facts).bind fun entry =>
+                            entry.toTemplate.map fun template => { wire, template }
                         iterationVariable := ⟨indexSlot⟩
                       }
                       let recurrenceRef : SequentialRecurrenceInstanceRef := {
@@ -2442,46 +2589,98 @@ def analyzeStateFrom
                 pure { state with
                   facts := (← inferNodeFacts stage scope nodeId node state.facts)
                   staticObligations := state.staticObligations ++ obligations }
-          analyzeStateFrom fuel stage definitions scope instancePath (nodeId + 1) tail next
+          analyzeScopeNodesOnce fuel stage definitions scope instancePath (nodeId + 1) tail loopContexts next
 termination_by fuel
 
-def analyzeLeafProgramState
-    (stage : StageId)
-    (program : Mxx.Ir.Prog)
-    (initial : AnalysisState)
-    (scope : StaticScopeId := rootScope) : Except VerifyError AnalysisState := do
-  let facts ← inferRulesFrom stage scope 0 program.root.nodes initial.facts
-  return { initial with facts }
+/-- Recover outputs from one immutable scope draft.  This remains reducible because closed
+checker fixtures evaluate `analyzeScopeAttempt` directly; a discarded draft cannot leak facts,
+arena entries, obligations, or nested summaries. -/
+def scopeAnalysisResult
+    (request : ScopeAnalysisRequest)
+    (baseState state : AnalysisState) : Except VerifyError ScopeAnalysisResult := do
+  let outputFacts ← request.outputs.mapM fun output =>
+    match lookupScopedFact (scopedWire request.stage request.scope output) state.facts with
+    | some fact => pure fact
+    | none => throw (.missingInputFact request.stage ⟨request.startNode⟩ output)
+  let outputTemplates ← outputFacts.mapM fun fact =>
+    match fact.toTemplate with
+    | some template => pure template
+    | none => throw (.invalidLoopArity request.stage ⟨request.startNode⟩)
+  return {
+    state
+    scopeOwnedFacts := state.facts.drop baseState.facts.length
+    outputFacts
+    outputTemplates
+    acceptedAlignments := []
+  }
 
-theorem analyzeLeafProgramState_facts
-    (stage : StageId)
-    (program : Mxx.Ir.Prog)
-    (initial : AnalysisState)
-    (scope : StaticScopeId := rootScope) :
-    (analyzeLeafProgramState stage program initial scope).map (·.facts) =
-      inferRulesFrom stage scope 0 program.root.nodes initial.facts := by
-  unfold analyzeLeafProgramState
-  generalize inferRulesFrom stage scope 0 program.root.nodes initial.facts = result
-  cases result <;> rfl
+/-- A collector can retain its speculative result only when it has no eligible recurrence slot.
+For eligible slots the current private draft intentionally falls back to a fresh disabled run
+until the complete candidate validator is installed.  This preserves the two-attempt invariant:
+the public result never mixes provisional state with an unproved alignment. -/
+private def collectScopeAttempt
+    (fuel : Nat)
+    (request : ScopeAnalysisRequest)
+    (baseState : AnalysisState)
+    (initialFacts : ScopedWireFactTable)
+    (configuration : SequentialAlignmentCollection) :
+    Except VerifyError ScopeAnalysisResult := do
+  let seededState := { baseState with facts := baseState.facts ++ initialFacts }
+  let provisional ← analyzeScopeNodesOnce fuel request.stage request.definitions request.scope
+    request.instancePath request.startNode request.nodes request.loopContexts seededState
+  let provisionalResult ← scopeAnalysisResult request baseState provisional
+  if configuration.eligibleSlots.isEmpty then
+    return provisionalResult
+  let baselineRequest := { request with alignmentMode := .disabled }
+  let baselineState := { baseState with facts := baseState.facts ++ initialFacts }
+  let baseline ← analyzeScopeNodesOnce fuel baselineRequest.stage baselineRequest.definitions
+    baselineRequest.scope baselineRequest.instancePath baselineRequest.startNode baselineRequest.nodes
+    baselineRequest.loopContexts baselineState
+  scopeAnalysisResult baselineRequest baseState baseline
+
+/-- Analyze one immutable scope attempt.  A failing speculative attempt is rebuilt from the
+unchanged base state in disabled mode; callers therefore cannot observe provisional facts. -/
+def analyzeScopeAttempt
+    (fuel : Nat)
+    (request : ScopeAnalysisRequest)
+    (baseState : AnalysisState)
+    (initialFacts : ScopedWireFactTable) :
+    Except VerifyError ScopeAnalysisResult := do
+  match request.alignmentMode with
+  | .collect configuration =>
+      collectScopeAttempt fuel request baseState initialFacts configuration
+  | .disabled =>
+      let seededState := { baseState with facts := baseState.facts ++ initialFacts }
+      let state ← analyzeScopeNodesOnce fuel request.stage request.definitions request.scope
+        request.instancePath request.startNode request.nodes request.loopContexts seededState
+      scopeAnalysisResult request baseState state
 
 def analyzeProgramState
     (stage : StageId)
     (program : Mxx.Ir.Prog)
     (initial : AnalysisState)
     (scope : StaticScopeId := rootScope) : Except VerifyError AnalysisState :=
-  analyzeStateFrom (program.root.nodes.length +
+  (analyzeScopeAttempt (program.root.nodes.length +
       (program.definitions.map (fun definition => definition.2.nodes.length)).sum +
       program.definitions.length + 1)
-    stage program.definitions scope [] 0 program.root.nodes initial
+    {
+      stage
+      definitions := program.definitions
+      scope
+      instancePath := []
+      startNode := 0
+      nodes := program.root.nodes
+      outputs := program.root.outputs.map Prod.snd
+      loopContexts := []
+      alignmentMode := .disabled
+    } initial []).map (·.state)
 
 def analyzeProgram
     (stage : StageId)
     (program : Mxx.Ir.Prog)
     (initialFacts : ScopedWireFactTable := [])
     (scope : StaticScopeId := rootScope) : Except VerifyError ScopedWireFactTable := do
-  match program.definitions with
-  | [] => inferRules stage program.root.nodes initialFacts scope
-  | _ => return (← analyzeProgramState stage program { facts := initialFacts } scope).facts
+  return (← analyzeProgramState stage program { facts := initialFacts } scope).facts
 
 private def seedProtocolInput
     (bundle : ClosedProtocolBundle)
@@ -3187,6 +3386,7 @@ def analyzeProtocol
     facts := state.facts
     families := state.families
     parallelFamilyDerivations := state.parallelFamilyDerivations
+    recurrenceBasisAlignments := state.recurrenceBasisAlignments
     symbolicRecurrences := state.symbolicRecurrences
     requirementAcceptances := state.requirementAcceptances.map (·.summary)
     staticObligations := state.staticObligations ++ endpointObligations

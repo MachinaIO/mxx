@@ -13,7 +13,7 @@ family-element templates.
 structure ValidatedSequentialRecurrenceSource where
   source : SequentialRecurrenceSource
   schemas : List CarriedValueSchema
-  schemaValidation : source.validateCoarseCarriedSchemas = .ok schemas
+  schemaValidation : source.validateCarriedSchemas = .ok schemas
 
 inductive SymbolicRecurrenceConstructionError where
   | schema (error : SymbolicRecurrenceError)
@@ -77,7 +77,7 @@ def SequentialRecurrenceSource.validateForSymbolicConstruction
   if intExprHasLoopIndex source.count then
     .error (.loopIndexedBound 0)
   else
-  match validation : source.validateCoarseCarriedSchemas with
+  match validation : source.validateCarriedSchemas with
   | .error error => .error (.schema error)
   | .ok schemas => .ok { source, schemas, schemaValidation := validation }
 

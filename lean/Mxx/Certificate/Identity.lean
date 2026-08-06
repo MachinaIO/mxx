@@ -54,6 +54,16 @@ structure TemplateWireRef where
   port : Nat
   deriving BEq, DecidableEq, Repr
 
+/-- Recover the immutable core-wire location represented by a reusable-definition wire.
+The conversion is structural: a template is always evaluated in the scope consisting of its
+definition name followed by its nested body scope. -/
+def TemplateWireRef.toCoreWire (wire : TemplateWireRef) : CoreWireRef := {
+  stage := wire.definition.stage
+  scope := ⟨wire.definition.name :: wire.bodyScope.path⟩
+  node := wire.node
+  port := wire.port
+}
+
 structure LoopRef where
   site : CoreNodeRef
   deriving BEq, DecidableEq, Repr
@@ -242,5 +252,6 @@ def ValueInstanceRef.ofCoreWire (wire : CoreWireRef) : ValueInstanceRef :=
 structure MatrixInstanceRef where
   value : ValueInstanceRef
   type : MatrixTypeExpr
+  deriving BEq, DecidableEq
 
 end Mxx.Certificate

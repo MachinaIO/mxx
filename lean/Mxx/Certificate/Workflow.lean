@@ -122,6 +122,7 @@ structure ClosedProtocolDecl where
 inductive StaticObligation where
   | positiveModulus (value : IntExpr)
   | positiveDivisor (value : Nat)
+  | loopFamilyAccessInRange (loopCount : IntExpr) (offset : Nat) (familyCount : IntExpr)
   | matchingMatrixTypes (left right : MatrixTypeExpr)
   | intBoundNonnegative (value : IntBoundExpr)
   | intBoundPositive (value : IntBoundExpr)
@@ -189,6 +190,7 @@ structure ParallelFamilyDerivationSource where
   analyzedFacts : ScopedWireFactTable
   outputFacts : ScopedWireFactTable
   elementTemplates : List ValueFactTemplate
+  matrixAliasTemplates : List MatrixAliasTemplate := []
 
 /-- Internal consistency required before a retained parallel-family source may be used by a
 semantic proof.  In particular, the element templates are recovered from the exact analyzed body
@@ -233,6 +235,7 @@ structure AnalysisResult where
   facts : ScopedWireFactTable
   families : List (JointFamilyId × JointFamilyFact)
   parallelFamilyDerivations : List ParallelFamilyDerivationSource := []
+  recurrenceBasisAlignments : List RecurrenceBasisAlignmentSummary := []
   symbolicRecurrences : List SymbolicRecurrenceTransfer := []
   requirementAcceptances : List RequirementAcceptanceSummary := []
   staticObligations : List StaticObligation

@@ -200,7 +200,7 @@ private theorem argumentLookup_before_current
   | some currentValue =>
       rw [Mxx.Ir.lookupWire_append_of_eq_some resolved] at finalLookup
       injection finalLookup with equality
-      simpa [equality] using resolved
+      exact congrArg some equality
   | none =>
       rw [Mxx.Ir.lookupWire_append_of_eq_none resolved,
         Mxx.Ir.lookupWire_bindOutputs_of_node_ne current reference.node reference.port values

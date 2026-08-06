@@ -1475,7 +1475,7 @@ theorem NestedParallelTrace.gatheredPort
     ∃ gathered,
       trace.final[port]? = some gathered ∧
       gathered.length = trace.evaluatedCount.toNat ∧
-      ∀ (position : Nat) (positionInBounds : position < trace.evaluatedCount.toNat),
+      ∀ position : Nat, position < trace.evaluatedCount.toNat →
         ∃ evaluatedBindings childValues,
           Mxx.Ir.evaluateBindings
               ((.loopIndex view.indexSlot, .integer position) :: params) view.bindings =
@@ -1502,7 +1502,8 @@ theorem NestedParallelTrace.gatheredPort
   · simpa using finalPort
   · intro position positionInBounds
     have rangeBound : position < (List.range trace.evaluatedCount.toNat).length := by
-      simpa using positionInBounds
+      rw [List.length_range]
+      exact positionInBounds
     have indexEq : (List.range trace.evaluatedCount.toNat)[position]'rangeBound = position := by
       simp
     simpa only [indexEq] using coordinates position rangeBound

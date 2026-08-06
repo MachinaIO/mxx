@@ -928,9 +928,10 @@ theorem FinalProjectedCarriedFacts.matrixFactHolds
   have mapped : ValueFact.matrix matrix ∈ projection.scopedFacts.map (·.fact) := by
     rw [projection.scopedFactsProject]
     exact member
-  obtain ⟨scoped, scopedMember, factEq⟩ := List.mem_map.mp mapped
-  have holds := projection.scopedFactsHold scoped scopedMember
-  rw [← factEq] at holds
+  obtain ⟨scopedFact, scopedMember, factEq⟩ := List.mem_map.mp mapped
+  have holds := projection.scopedFactsHold scopedFact scopedMember
+  unfold ScopedWireFact.Holds at holds
+  rw [factEq] at holds
   exact holds
 
 def Derivation.finalProjection

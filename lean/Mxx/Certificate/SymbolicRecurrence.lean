@@ -31,14 +31,6 @@ inductive SymbolicRecurrenceError where
   | sourceMismatch
   deriving BEq, DecidableEq, Repr
 
-private def validateExactRecurrenceSchemaLists :
-    Nat → List ValueFactTemplate → List ValueFactTemplate → Except SymbolicRecurrenceError Unit
-  | _, [], [] => .ok ()
-  | slot, initial :: initials, body :: bodies => do
-      if initial.schema != body.schema then throw (.initialBodyMismatch slot)
-      validateExactRecurrenceSchemaLists (slot + 1) initials bodies
-  | _, _, _ => .error .arityMismatch
-
 private def validateRecurrenceSchemaLists :
     Nat → List ValueFactTemplate → List ValueFactTemplate →
       Except SymbolicRecurrenceError (List CarriedValueSchema)
@@ -56,14 +48,11 @@ conversion. -/
 def SequentialRecurrenceSource.validateCarriedSchemas
     (recurrence : SequentialRecurrenceSource) :
     Except SymbolicRecurrenceError (List CarriedValueSchema) :=
-  do
-    validateExactRecurrenceSchemaLists 0 recurrence.initial.toList recurrence.bodyOutputs.toList
-    validateRecurrenceSchemaLists 0 recurrence.initial.toList recurrence.bodyOutputs.toList
+  validateRecurrenceSchemaLists 0 recurrence.initial.toList recurrence.bodyOutputs.toList
 
-/-- Analyzer-owned closed recurrence transfer.  Acceptance first requires exact
-`ValueFactSchema` equality, including affine term order and coefficient/basis types; the retained
-coarse schema below is solely the compact numeric Phase-B state shape.  The validation equality
-records that both were derived from the actual recurrence, not supplied by a protocol certificate. -/
+/-- Analyzer-owned closed recurrence transfer.  The recurrence boundary validates only stable
+value type, matrix type, coefficient representation, and recursive family shape. Exact/affine
+form and affine term count are body-local symbolic details and must not constrain later states. -/
 structure SymbolicRecurrenceTransfer where
   identity : SequentialRecurrenceInstanceRef
   source : SequentialRecurrenceSource
@@ -71,10 +60,18 @@ structure SymbolicRecurrenceTransfer where
   carriedSchemas : List CarriedValueSchema
   initialBounds : CarriedBoundTemplateVector
     (carriedSchemas.map CarriedValueSchema.boundSchema)
+  /-- Whole symbolic forms for the concrete initial carried tuple.  Unlike the numeric
+  `initialBounds`, this preserves whether a matrix begins exact or affine and retains all of
+  its symbolic terms.  The recurrence boundary deliberately does not require these forms to
+  have the same shape as `bodyOutputs`: a one-step body may turn an exact carried value into a
+  multi-term affine value. -/
+  initialOutputs : SymbolicCarriedOutputVector carriedSchemas
   bodyOutputs : SymbolicCarriedOutputVector carriedSchemas
   boundTransition : CarriedBoundTransitionVector
     (carriedSchemas.map CarriedValueSchema.boundSchema)
     (carriedSchemas.map CarriedValueSchema.boundSchema)
+  stepRangeObligations : List (RecurrenceStepRangeObligation
+    (carriedSchemas.map CarriedValueSchema.boundSchema)) := []
   schemaValidation : source.validateCarriedSchemas = .ok carriedSchemas
 
 inductive ResolveSymbolicRecurrenceError where
@@ -103,7 +100,11 @@ def SymbolicRecurrenceTransfer.resolveBounds
   let initial ← transfer.initialBounds.evaluate environment priorStates |>.mapError .initial
   let closedTransition ← transfer.boundTransition.closeExternalRecurrences environment priorStates
     |>.mapError .transition
-  let final ← iterateCarriedBoundTransition environment closedTransition count.toNat initial
+  let closedRangeObligations ← transfer.stepRangeObligations.mapM
+    (RecurrenceStepRangeObligation.closeExternalRecurrences environment priorStates)
+    |>.mapError .transition
+  let final ← iterateCarriedBoundTransitionWithRangeChecks environment closedTransition
+    closedRangeObligations count.toNat initial
     |>.mapError .transition
   return {
     identity := transfer.identity
@@ -141,7 +142,7 @@ def resolveSymbolicRecurrences
     Except ResolveSymbolicRecurrencesError CheckedSymbolicRecurrenceStateTable :=
   resolveSymbolicRecurrencesFrom environment transfers {}
 
-/-- The only public constructor checks initial/body coarse equality and relation-freedom before
+/-- The only public constructor checks stable coarse equality and relation-freedom before
 packaging already type-indexed symbolic outputs and bound transitions. -/
 def SymbolicRecurrenceTransfer.build
     {schemas : List CarriedValueSchema}
@@ -149,10 +150,13 @@ def SymbolicRecurrenceTransfer.build
     (source : SequentialRecurrenceSource)
     (initialBounds : CarriedBoundTemplateVector
       (schemas.map CarriedValueSchema.boundSchema))
+    (initialOutputs : SymbolicCarriedOutputVector schemas)
     (bodyOutputs : SymbolicCarriedOutputVector schemas)
     (boundTransition : CarriedBoundTransitionVector
       (schemas.map CarriedValueSchema.boundSchema)
-      (schemas.map CarriedValueSchema.boundSchema)) :
+      (schemas.map CarriedValueSchema.boundSchema))
+    (stepRangeObligations : List (RecurrenceStepRangeObligation
+      (schemas.map CarriedValueSchema.boundSchema))) :
     Except SymbolicRecurrenceError SymbolicRecurrenceTransfer :=
   match validation : source.validateCarriedSchemas with
   | .error error => .error error
@@ -165,8 +169,10 @@ def SymbolicRecurrenceTransfer.build
             sourceIdentity := sourceSame
             carriedSchemas := schemas
             initialBounds
+            initialOutputs
             bodyOutputs
             boundTransition
+            stepRangeObligations
             schemaValidation := by simpa [same] using validation
           }
         else .error .suppliedSchemaMismatch
@@ -211,8 +217,8 @@ private def resolverFixturePath :
     CarriedBoundStatePath [.integerInterval] .integerInterval :=
   .head .here
 
-/-- Coarse integer/Boolean schemas are both scalar, but recurrence acceptance must preserve the
-complete declared `ValueFactSchema`; a body may not silently change the carried kind. -/
+/-- Coarse schemas retain the scalar kind, so a body may not silently change a carried integer
+into a Boolean. -/
 private def exactSchemaMismatchFixtureSource : SequentialRecurrenceSource := {
   resolverFixtureSource with
   bodyOutputs := ⟨#[{
@@ -232,6 +238,7 @@ private def resolverFixtureTransfer : SymbolicRecurrenceTransfer where
   carriedSchemas := [.integer]
   initialBounds := .cons
     (.integer (.integer (.constant 3)) (.integer (.constant 3))) .nil
+  initialOutputs := .cons (.integer ⟨0⟩) .nil
   bodyOutputs := .cons (.integer ⟨0⟩) .nil
   boundTransition := .cons (.integer
     (.add (.previousState resolverFixturePath .lower) (.constant 1))
@@ -255,6 +262,7 @@ private def zeroCountResolverFixtureTransfer : SymbolicRecurrenceTransfer where
   sourceIdentity := rfl
   carriedSchemas := [.integer]
   initialBounds := resolverFixtureTransfer.initialBounds
+  initialOutputs := resolverFixtureTransfer.initialOutputs
   bodyOutputs := resolverFixtureTransfer.bodyOutputs
   boundTransition := resolverFixtureTransfer.boundTransition
   schemaValidation := rfl
@@ -348,6 +356,7 @@ private def simultaneousFixtureTransfer : SymbolicRecurrenceTransfer where
   initialBounds := .cons
     (.integer (.integer (.constant 1)) (.integer (.constant 2)))
     (.cons (.integer (.integer (.constant 10)) (.integer (.constant 20))) .nil)
+  initialOutputs := .cons (.integer ⟨0⟩) (.cons (.integer ⟨1⟩) .nil)
   bodyOutputs := .cons (.integer ⟨1⟩) (.cons (.integer ⟨0⟩) .nil)
   boundTransition := .cons
     (.integer

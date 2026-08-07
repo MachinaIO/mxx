@@ -28,6 +28,13 @@ def StaticObligation.Holds
           0 ≤ loopValue ∧ 0 ≤ familyValue ∧
             (loopValue ≠ 0 → loopValue - 1 + offset < familyValue)
       | _, _ => False
+  | .dynamicFamilyIndexInRange _ lower upper familyCount =>
+      match lower.evaluateWithSymbolicRecurrences environment recurrenceStates,
+          upper.evaluateWithSymbolicRecurrences environment recurrenceStates,
+          evaluateIntExpr environment familyCount with
+      | .ok lowerValue, .ok upperValue, .ok familyValue =>
+          0 ≤ lowerValue ∧ lowerValue ≤ upperValue ∧ upperValue < familyValue
+      | _, _, _ => False
   | .matchingMatrixTypes left right =>
       match evaluateIntExpr environment left.modulus,
           evaluateIntExpr environment left.ringDimension,
@@ -100,6 +107,14 @@ private def checkOne
               (loopValue = 0 ∨ loopValue - 1 + offset < familyValue) then .ok ()
           else .error (.unsatisfied obligation)
       | _, _ => .error (.unsatisfied obligation)
+  | .dynamicFamilyIndexInRange _ lower upper familyCount =>
+      match lower.evaluateWithSymbolicRecurrences environment recurrenceStates,
+          upper.evaluateWithSymbolicRecurrences environment recurrenceStates,
+          evaluateIntExpr environment familyCount with
+      | .ok lowerValue, .ok upperValue, .ok familyValue =>
+          if 0 ≤ lowerValue ∧ lowerValue ≤ upperValue ∧ upperValue < familyValue then .ok ()
+          else .error (.unsatisfied obligation)
+      | _, _, _ => .error (.unsatisfied obligation)
   | .matchingMatrixTypes left right =>
       match evaluateIntExpr environment left.modulus,
           evaluateIntExpr environment left.ringDimension,
@@ -285,6 +300,7 @@ private def symbolicCheckerZeroCountTransfer : SymbolicRecurrenceTransfer where
   carriedSchemas := [.integer]
   initialBounds := .cons
     (.integer (.integer (.constant 3)) (.integer (.constant 3))) .nil
+  initialOutputs := .cons (.integer ⟨0⟩) .nil
   bodyOutputs := .cons (.integer ⟨0⟩) .nil
   boundTransition := .cons
     (.integer
@@ -454,6 +470,28 @@ example : (checkStaticParameters (loopFamilyRangeTestAnalysis 3 1 4) []).isOk = 
 example : (checkStaticParameters (loopFamilyRangeTestAnalysis 0 99 0) []).isOk = true := rfl
 example : (checkStaticParameters (loopFamilyRangeTestAnalysis 3 1 3) []).isOk = false := rfl
 example : (checkStaticParameters (loopFamilyRangeTestAnalysis (-1) 0 3) []).isOk = false := rfl
+
+private def dynamicFamilyRangeTestSite : CoreNodeRef := {
+  stage := ⟨"checker"⟩
+  scope := ⟨[]⟩
+  node := ⟨0⟩
+}
+
+private def dynamicFamilyRangeTestAnalysis
+    (lower upper familyCount : Int) : AnalysisResult where
+  facts := []
+  families := []
+  staticObligations := [.dynamicFamilyIndexInRange dynamicFamilyRangeTestSite
+    (.integer (.constant lower)) (.integer (.constant upper)) (.constant familyCount)]
+  inputObligations := []
+  semanticObligations := []
+  endpointFacts := []
+  usedRules := []
+
+example : (checkStaticParameters (dynamicFamilyRangeTestAnalysis 0 2 3) []).isOk = true := rfl
+example : (checkStaticParameters (dynamicFamilyRangeTestAnalysis (-1) 2 3) []).isOk = false := rfl
+example : (checkStaticParameters (dynamicFamilyRangeTestAnalysis 0 3 3) []).isOk = false := rfl
+example : (checkStaticParameters (dynamicFamilyRangeTestAnalysis 2 1 3) []).isOk = false := rfl
 
 example :
     checkStaticParameters (thresholdTestAnalysis 63) [] =

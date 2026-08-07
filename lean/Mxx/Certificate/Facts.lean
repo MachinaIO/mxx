@@ -218,6 +218,15 @@ structure InvariantInputFact where
   wire : CoreWireRef
   template : ValueFactTemplate
 
+/-- A dynamic family-index interval discovered while analyzing one sequential-loop body. The
+interval is still symbolic here because it may read the previous carried state; construction
+translates it to typed recurrence paths before Phase B evaluates each step. -/
+structure SequentialBodyRangeRequirement where
+  site : CoreNodeRef
+  lower : IntBoundExpr
+  upper : IntBoundExpr
+  familyCount : IntExpr
+
 structure SequentialRecurrenceSource where
   loop : LoopRef
   count : IntExpr
@@ -229,6 +238,7 @@ structure SequentialRecurrenceSource where
   bodyOutputs : Vector ValueFactTemplate carriedArity
   /-- Analyzer-owned element templates for family aggregates reachable from carried facts. -/
   familyElementTemplates : List (FamilyAggregateRef × ValueFactTemplate) := []
+  bodyRangeRequirements : List SequentialBodyRangeRequirement := []
   invariantInputs : List InvariantInputFact
   iterationVariable : IndexVar
 

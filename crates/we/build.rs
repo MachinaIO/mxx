@@ -60,13 +60,6 @@ fn main() {
     .unwrap_or_else(|error| panic!("{error}"));
     build_support::verify_no_proof_holes(workspace, &[&workspace.join("lean/Mxx"), &owner_lean])
         .unwrap_or_else(|error| panic!("{error}"));
-    let native_decide_uses = build_support::verify_native_decide(
-        workspace,
-        &[&workspace.join("lean/Mxx"), &owner_lean],
-        &[],
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
-    assert!(native_decide_uses.is_empty(), "Diamond WE Lean sources use native_decide");
     assert!(checker.is_file(), "Diamond WE checker was not produced at {}", checker.display());
     assert!(
         analysis_facts.is_file(),

@@ -200,12 +200,12 @@ private def recurrenceSlotIsValid
   recurrences.any fun registered => registered.1 == recurrence && slot < registered.2
 
 private def witnessRefIsValid
-    (priorEntries : List BoundWitnessEntry)
+    (priorEntries : Array BoundWitnessEntry)
     (reference : BoundWitnessRef) : Bool :=
-  reference.id < priorEntries.length
+  reference.id < priorEntries.size
 
 private def witnessRefHasRole
-    (priorEntries : List BoundWitnessEntry)
+    (priorEntries : Array BoundWitnessEntry)
     (reference : BoundWitnessRef)
     (role : BoundRole) : Bool :=
   match priorEntries[reference.id]? with
@@ -214,7 +214,7 @@ private def witnessRefHasRole
 
 def BoundWitnessEntry.refsBefore
     (context : BoundWitnessWFContext)
-    (priorEntries : List BoundWitnessEntry)
+    (priorEntries : Array BoundWitnessEntry)
     (entry : BoundWitnessEntry) : Bool :=
   match entry.witness with
   | .atom role bound =>
@@ -238,7 +238,7 @@ def BoundWitnessEntry.refsBefore
 
 /-- Immutable append-only witness arena. -/
 structure BoundWitnessArena where
-  entries : List BoundWitnessEntry := []
+  entries : Array BoundWitnessEntry := #[]
 
 def BoundWitnessArena.Extends (older newer : BoundWitnessArena) : Prop :=
   ∃ suffix, newer.entries = older.entries ++ suffix
@@ -246,7 +246,7 @@ def BoundWitnessArena.Extends (older newer : BoundWitnessArena) : Prop :=
 def BoundWitnessArena.WF
     (context : BoundWitnessWFContext)
     (arena : BoundWitnessArena) : Bool :=
-  arena.entries.zipIdx.all fun (entry, index) =>
+  arena.entries.toList.zipIdx.all fun (entry, index) =>
     entry.refsBefore context (arena.entries.take index)
 
 def BoundWitnessArena.intern
@@ -254,7 +254,7 @@ def BoundWitnessArena.intern
     (arena : BoundWitnessArena)
     (entry : BoundWitnessEntry) : Option (BoundWitnessArena × BoundWitnessRef) :=
   if entry.refsBefore context arena.entries then
-    some (⟨arena.entries ++ [entry]⟩, ⟨arena.entries.length⟩)
+    some (⟨arena.entries.push entry⟩, ⟨arena.entries.size⟩)
   else none
 
 def BoundWitnessArena.lookup
@@ -282,11 +282,12 @@ theorem BoundWitnessArena.lookup_intern_preserved
     next.lookup old = arena.lookup old := by
   simp [BoundWitnessArena.intern] at interned
   rcases interned with ⟨_, rfl, rfl⟩
-  have oldInBounds : old.id < arena.entries.length :=
-    (List.getElem?_eq_some_iff.mp oldLookup).1
+  have oldInBounds : old.id < arena.entries.size :=
+    (Array.getElem?_eq_some_iff.mp oldLookup).1
+  have oldLookupEntry : arena.entries[old.id]? = some arena.entries[old.id] := by
+    simp [oldInBounds]
   simp only [BoundWitnessArena.lookup]
-  rw [List.getElem?_append_left]
-  exact oldInBounds
+  rw [Array.getElem?_push_lt oldInBounds, oldLookupEntry]
 
 theorem BoundWitnessArena.Extends.lookup
     {older newer : BoundWitnessArena}
@@ -297,8 +298,8 @@ theorem BoundWitnessArena.Extends.lookup
     newer.lookup reference = some entry := by
   obtain ⟨suffix, extensionEq⟩ := extension
   unfold BoundWitnessArena.lookup at lookup ⊢
-  have inBounds := (List.getElem?_eq_some_iff.mp lookup).1
-  rw [extensionEq, List.getElem?_append_left inBounds]
+  have inBounds := (Array.getElem?_eq_some_iff.mp lookup).1
+  rw [extensionEq, Array.getElem?_append_left inBounds]
   exact lookup
 
 /-- The three roots must exist and carry exactly their closed semantic roles. -/
@@ -355,7 +356,7 @@ structure SymbolicFormWFContext where
   allowCarriedInputs : Bool := false
 
 private def symbolicRefHasType
-    (priorEntries : List SymbolicMatrixFormEntry)
+    (priorEntries : Array SymbolicMatrixFormEntry)
     (reference : SymbolicMatrixFormRef)
     (expected : MatrixTypeExpr) : Bool :=
   match priorEntries[reference.id]? with
@@ -382,24 +383,24 @@ private def affineLeafHasType (form : AffineForm) (expected : MatrixTypeExpr) : 
   form.terms.all fun term => signalTermHasType term expected
 
 private def symbolicRefsHaveType
-    (priorEntries : List SymbolicMatrixFormEntry)
+    (priorEntries : Array SymbolicMatrixFormEntry)
     (references : NonemptyRefs SymbolicMatrixFormRef)
     (expected : MatrixTypeExpr) : Bool :=
   references.all fun reference => symbolicRefHasType priorEntries reference expected
 
 private def symbolicRefExists
-    (priorEntries : List SymbolicMatrixFormEntry)
+    (priorEntries : Array SymbolicMatrixFormEntry)
     (reference : SymbolicMatrixFormRef) : Bool :=
-  reference.id < priorEntries.length
+  reference.id < priorEntries.size
 
 private def symbolicRefsExist
-    (priorEntries : List SymbolicMatrixFormEntry)
+    (priorEntries : Array SymbolicMatrixFormEntry)
     (references : NonemptyRefs SymbolicMatrixFormRef) : Bool :=
   references.all fun reference => symbolicRefExists priorEntries reference
 
 def SymbolicMatrixFormEntry.refsBefore
     (context : SymbolicFormWFContext)
-    (priorEntries : List SymbolicMatrixFormEntry)
+    (priorEntries : Array SymbolicMatrixFormEntry)
     (entry : SymbolicMatrixFormEntry) : Bool :=
   match entry.form with
   | .signalAtom expression => matrixRefHasType context expression entry.matrixType
@@ -445,7 +446,7 @@ def SymbolicMatrixFormEntry.refsBefore
 
 /-- Immutable append-only symbolic-form arena. -/
 structure SymbolicMatrixFormArena where
-  entries : List SymbolicMatrixFormEntry := []
+  entries : Array SymbolicMatrixFormEntry := #[]
 
 def SymbolicMatrixFormArena.Extends
     (older newer : SymbolicMatrixFormArena) : Prop :=
@@ -454,7 +455,7 @@ def SymbolicMatrixFormArena.Extends
 def SymbolicMatrixFormArena.WF
     (context : SymbolicFormWFContext)
     (arena : SymbolicMatrixFormArena) : Bool :=
-  arena.entries.zipIdx.all fun (entry, index) =>
+  arena.entries.toList.zipIdx.all fun (entry, index) =>
     entry.refsBefore context (arena.entries.take index)
 
 def SymbolicMatrixFormArena.intern
@@ -462,7 +463,7 @@ def SymbolicMatrixFormArena.intern
     (arena : SymbolicMatrixFormArena)
     (entry : SymbolicMatrixFormEntry) : Option (SymbolicMatrixFormArena × SymbolicMatrixFormRef) :=
   if entry.refsBefore context arena.entries then
-    some (⟨arena.entries ++ [entry]⟩, ⟨arena.entries.length⟩)
+    some (⟨arena.entries.push entry⟩, ⟨arena.entries.size⟩)
   else none
 
 def SymbolicMatrixFormArena.lookup
@@ -490,11 +491,12 @@ theorem SymbolicMatrixFormArena.lookup_intern_preserved
     next.lookup old = arena.lookup old := by
   simp [SymbolicMatrixFormArena.intern] at interned
   rcases interned with ⟨_, rfl, rfl⟩
-  have oldInBounds : old.id < arena.entries.length :=
-    (List.getElem?_eq_some_iff.mp oldLookup).1
+  have oldInBounds : old.id < arena.entries.size :=
+    (Array.getElem?_eq_some_iff.mp oldLookup).1
+  have oldLookupEntry : arena.entries[old.id]? = some arena.entries[old.id] := by
+    simp [oldInBounds]
   simp only [SymbolicMatrixFormArena.lookup]
-  rw [List.getElem?_append_left]
-  exact oldInBounds
+  rw [Array.getElem?_push_lt oldInBounds, oldLookupEntry]
 
 theorem SymbolicMatrixFormArena.Extends.lookup
     {older newer : SymbolicMatrixFormArena}
@@ -505,8 +507,8 @@ theorem SymbolicMatrixFormArena.Extends.lookup
     newer.lookup reference = some entry := by
   obtain ⟨suffix, extensionEq⟩ := extension
   unfold SymbolicMatrixFormArena.lookup at lookup ⊢
-  have inBounds := (List.getElem?_eq_some_iff.mp lookup).1
-  rw [extensionEq, List.getElem?_append_left inBounds]
+  have inBounds := (Array.getElem?_eq_some_iff.mp lookup).1
+  rw [extensionEq, Array.getElem?_append_left inBounds]
   exact lookup
 
 /-- Analyzer-owned matrix fact with immutable exact identity and an independently normalized

@@ -123,6 +123,10 @@ inductive StaticObligation where
   | positiveModulus (value : IntExpr)
   | positiveDivisor (value : Nat)
   | loopFamilyAccessInRange (loopCount : IntExpr) (offset : Nat) (familyCount : IntExpr)
+  | dynamicFamilyIndexInRange
+      (site : CoreNodeRef)
+      (lower upper : IntBoundExpr)
+      (familyCount : IntExpr)
   | matchingMatrixTypes (left right : MatrixTypeExpr)
   | intBoundNonnegative (value : IntBoundExpr)
   | intBoundPositive (value : IntBoundExpr)
@@ -228,7 +232,7 @@ structure RequirementAcceptanceSummary where
   deriving BEq, DecidableEq, Repr
 
 structure AnalysisResult where
-  expressionArena : ExpressionArena := { entries := [] }
+  expressionArena : ExpressionArena := { entries := #[] }
   symbolicFormArena : SymbolicMatrixFormArena := {}
   boundWitnessArena : BoundWitnessArena := {}
   symbolicMatrixFacts : List MatrixSymbolicFact := []

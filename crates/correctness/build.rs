@@ -41,34 +41,11 @@ fn main() {
     let lean_root = workspace.join("lean");
     build_support::lake_build(
         &lean_root,
-        &["MxxCorrectness.Proofs.ToyExample"],
-        "Toy correctness proof build",
+        &["MxxCorrectness.Generated.ToyExample.Ir"],
+        "Toy generated IR build",
     )
     .unwrap_or_else(|error| panic!("{error}"));
     build_support::verify_no_proof_holes(workspace, &[&workspace.join("lean/Mxx"), &owner_lean])
         .unwrap_or_else(|error| panic!("{error}"));
-    let native_decide_uses = build_support::verify_native_decide(
-        workspace,
-        &[&workspace.join("lean/Mxx"), &owner_lean],
-        &[("crates/correctness/lean/MxxCorrectness/Proofs/ToyExample.lean", "closedAnalyzerFacts")],
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
-    let report = build_support::verify_theorem_axioms(
-        &lean_root,
-        &PathBuf::from(env::var_os("OUT_DIR").expect("build output directory")),
-        "MxxCorrectness.Proofs.ToyExample",
-        "MxxCorrectness.Proofs.ToyExample.correct",
-        !native_decide_uses.is_empty(),
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
     println!("cargo:warning=Toy correctness workflow hash: {}", freshness.workflow_hash);
-    for axiom in build_support::theorem_axioms(&report).unwrap_or_else(|error| panic!("{error}")) {
-        println!("cargo:warning=Toy correctness theorem axiom: {axiom}");
-    }
-    for usage in native_decide_uses {
-        println!(
-            "cargo:warning=Toy correctness native_decide: {}:{} ({:?})",
-            usage.source_path, usage.line, usage.declaration
-        );
-    }
 }

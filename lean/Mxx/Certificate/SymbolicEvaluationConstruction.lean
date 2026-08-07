@@ -24,7 +24,9 @@ structure SymbolicEvaluationConstructionState where
   expressionArena : ExpressionArena := {}
   symbolicFormArena : SymbolicMatrixFormArena := {}
   boundWitnessArena : BoundWitnessArena := {}
-  symbolicMatrixFacts : List MatrixSymbolicFact := []
+  /-- The final symbolic table is built by a single traversal.  An array keeps that construction
+  linear while the public analysis result retains its proof-friendly list representation. -/
+  symbolicMatrixFacts : Array MatrixSymbolicFact := #[]
 
 structure SymbolicEvaluationConstructionState.Extends
     (older newer : SymbolicEvaluationConstructionState) : Prop where
@@ -34,7 +36,7 @@ structure SymbolicEvaluationConstructionState.Extends
 
 theorem SymbolicEvaluationConstructionState.Extends.refl
     (state : SymbolicEvaluationConstructionState) : state.Extends state :=
-  ⟨⟨[], by simp⟩, ⟨[], by simp⟩, ⟨[], by simp⟩⟩
+  ⟨⟨#[], by simp⟩, ⟨#[], by simp⟩, ⟨#[], by simp⟩⟩
 
 theorem SymbolicEvaluationConstructionState.Extends.trans
     {first second third : SymbolicEvaluationConstructionState}
@@ -46,9 +48,9 @@ theorem SymbolicEvaluationConstructionState.Extends.trans
     ⟨witnessRight, witnessRightEq⟩⟩
   refine ⟨⟨expressionLeft ++ expressionRight, ?_⟩,
     ⟨formLeft ++ formRight, ?_⟩, ⟨witnessLeft ++ witnessRight, ?_⟩⟩
-  · rw [expressionRightEq, expressionLeftEq, List.append_assoc]
-  · rw [formRightEq, formLeftEq, List.append_assoc]
-  · rw [witnessRightEq, witnessLeftEq, List.append_assoc]
+  · simp [expressionRightEq, expressionLeftEq, Array.append_assoc]
+  · simp [formRightEq, formLeftEq, Array.append_assoc]
+  · simp [witnessRightEq, witnessLeftEq, Array.append_assoc]
 
 private def centeredRepresentativeBound (matrixType : MatrixTypeExpr) : BoundExpr :=
   .floorDivide (.absolute matrixType.modulus) 2
@@ -117,7 +119,7 @@ private def symbolicFormContext
 
 private def boundWitnessContext
     (expressionArena : ExpressionArena) : BoundWitnessWFContext where
-  runtimeExpressionCount := expressionArena.entries.length
+  runtimeExpressionCount := expressionArena.entries.size
   preimageRelationCount := 0
   gadgetRelationCount := 0
   recurrences := []
@@ -201,7 +203,7 @@ def SymbolicEvaluationConstructionState.appendScopedMatrixFact
     relations := fact.relations
     coefficientRepresentation := fact.coefficientRepresentation
   }
-  return { state with symbolicMatrixFacts := state.symbolicMatrixFacts ++ [symbolicFact] }
+  return { state with symbolicMatrixFacts := state.symbolicMatrixFacts.push symbolicFact }
 
 /-- Construct symbolic evaluations for the final analyzer fact table in table order.  Scalar,
 Boolean, byte, and family facts deliberately have no matrix symbolic evaluation and are skipped.
@@ -228,7 +230,7 @@ def SymbolicEvaluationConstructionState.rebuildMatrixFacts
     (state : SymbolicEvaluationConstructionState)
     (facts : ScopedWireFactTable) :
     Except SymbolicEvaluationConstructionError SymbolicEvaluationConstructionState :=
-  { state with symbolicMatrixFacts := [] }.appendMatrixFacts facts
+  { state with symbolicMatrixFacts := #[] }.appendMatrixFacts facts
 
 namespace SymbolicEvaluationConstructionFixtures
 
@@ -295,7 +297,7 @@ example : planPrimary matrixType ⟨7⟩ (.exact (.identity matrixType)) (.const
 example :
     (({} : SymbolicEvaluationConstructionState).appendScopedMatrixFact
       (scopedFact 1 (.affine { terms := [], noiseBound := .constant 3 }) (.constant 3))
-    ).map (fun state => state.symbolicMatrixFacts.head?.map (fun fact => fact.bounds.signal)) =
+    ).map (fun state => state.symbolicMatrixFacts.toList.head?.map (fun fact => fact.bounds.signal)) =
       .ok (some .none) := by
   rfl
 
@@ -315,7 +317,7 @@ example :
     let right := scopedFact 7 (.affine { terms := [], noiseBound := .constant 3 }) (.constant 3)
     (Except.bind (({} : SymbolicEvaluationConstructionState).appendScopedMatrixFact left)
       (fun previous => previous.rebuildMatrixFacts [left, scalarFact, right])).map
-        (fun state => state.symbolicMatrixFacts.map (fun fact => fact.subject)) =
+        (fun state => state.symbolicMatrixFacts.toList.map (fun fact => fact.subject)) =
       .ok [.ofCoreWire (wire 6), .ofCoreWire (wire 7)] := by
   rfl
 
@@ -327,10 +329,10 @@ example :
     let right := scopedFact 7 (.affine { terms := [], noiseBound := .constant 3 }) (.constant 3)
     (({} : SymbolicEvaluationConstructionState).appendMatrixFacts [left, scalarFact, right]).map
       (fun state =>
-        (state.symbolicMatrixFacts.map (fun fact => fact.subject),
-          state.expressionArena.entries.length,
-          state.symbolicFormArena.entries.length,
-          state.boundWitnessArena.entries.length)) =
+        (state.symbolicMatrixFacts.toList.map (fun fact => fact.subject),
+          state.expressionArena.entries.size,
+          state.symbolicFormArena.entries.size,
+          state.boundWitnessArena.entries.size)) =
       .ok ([.ofCoreWire (wire 6), .ofCoreWire (wire 7)], 2, 2, 6) := by
   rfl
 
@@ -385,7 +387,7 @@ example :
         relations := [relation]
         totalNormBound := .constant 3
       }
-    }).map (fun state => state.symbolicMatrixFacts.head?.map (·.relations)) =
+    }).map (fun state => state.symbolicMatrixFacts.toList.head?.map (·.relations)) =
       .ok (some [relation]) := by
   rfl
 

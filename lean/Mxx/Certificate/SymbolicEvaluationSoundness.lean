@@ -1157,14 +1157,14 @@ private def addWitness : BoundWitnessRef := ⟨2⟩
 private def selectWitness : BoundWitnessRef := ⟨3⟩
 private def index : RuntimeExprRef .integer := ⟨0⟩
 
-private def formArena : SymbolicMatrixFormArena := ⟨[
+private def formArena : SymbolicMatrixFormArena := ⟨#[
   { matrixType, form := .boundedAtom ⟨0⟩ (.constant 3) },
   { matrixType, form := .boundedAtom ⟨1⟩ (.constant 5) },
   { matrixType, form := .add leftForm rightForm },
   { matrixType, form := .select index ⟨leftForm, [rightForm]⟩ }
 ]⟩
 
-private def witnessArena : BoundWitnessArena := ⟨[
+private def witnessArena : BoundWitnessArena := ⟨#[
   { role := .total, witness := .atom .total (.constant 3) },
   { role := .total, witness := .atom .total (.constant 5) },
   { role := .total, witness := .add leftWitness rightWitness },

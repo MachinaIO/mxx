@@ -26,7 +26,10 @@ inductive VerifyError where
   | missingInputFact (stage : StageId) (node : NodeId) (input : Mxx.Ir.WireRef)
   | expectedMatrixFact (wire : CoreWireRef)
   | expectedTrapdoorFact (wire : CoreWireRef)
-  | trapdoorPublicMismatch (wire : CoreWireRef) (expected actual : ValueInstanceRef)
+  | trapdoorPublicMismatch
+      (wire : CoreWireRef)
+      (expected actual : ValueInstanceRef)
+      (sourcePrimary : Option ValueInstanceRef)
   | missingAnchorBinding (anchor : SemanticAnchorRef)
   | invalidAnchorWire (anchor : SemanticAnchorRef) (wire : CoreWireRef)
   | unsupportedOverride (anchor : SemanticAnchorRef)
@@ -74,7 +77,7 @@ inductive VerifyError where
   | nonUniformNestedRecurrenceInput (stage : StageId) (node : NodeId) (slot : Nat)
   | relationBearingCarriedMatrix (stage : StageId) (node : NodeId) (slot : Nat)
   | escapedCarriedInput (stage : StageId) (node : NodeId) (slot : Nat)
-  | invalidExpressionReference
+  | invalidExpressionReference (detail : String)
   | scalarControl (error : ScalarControlRuleError)
   | matrixAffine
       (stage : StageId)
@@ -818,7 +821,8 @@ structure RuleApplication where
 /-- Apply one inferred leaf rule. Every output fact is reconstructed from the frozen node. -/
 def applyRule
     (facts : ScopedWireFactTable)
-    (application : RuleApplication) :
+    (application : RuleApplication)
+    (arena : ExpressionArena := {}) :
     Except VerifyError (ScopedWireFactTable × DerivedObligations × List EndpointFact) := do
   if !isInitialRuleEnabled application.rule then
     throw (.disabledRule application.rule)
@@ -865,12 +869,16 @@ def applyRule
           let publicIdentityMatches := trapdoor.publicPort == source.subject ||
             match trapdoor.publicMatrix, source.primary with
             | .wire expected, .exact (.wire actual) =>
-                expected.value == actual.value && matrixTypeEqual expected.type actual.type
+                arena.sameValue expected.value actual.value &&
+                  matrixTypeEqual expected.type actual.type
             | _, _ => false
           if !publicIdentityMatches then
+            let sourcePrimary := match source.primary with
+              | .exact (.wire actual) => some actual.value
+              | _ => none
             throw (.trapdoorPublicMismatch
               (scopedWire application.stage application.scope trapdoorRef)
-              trapdoor.publicPort source.subject)
+              trapdoor.publicPort source.subject sourcePrimary)
           let ⟨_target, targetType⟩ ←
             requireMatrix facts (scopedWire application.stage application.scope targetRef)
           let relation := MatrixRelation.preimage (.ofCoreWire output)
@@ -1169,13 +1177,14 @@ def inferNodeFacts
     (scope : StaticScopeId)
     (nodeId : Nat)
     (node : Mxx.Ir.Node)
-    (facts : ScopedWireFactTable) : Except VerifyError ScopedWireFactTable := do
+    (facts : ScopedWireFactTable)
+    (arena : ExpressionArena := {}) : Except VerifyError ScopedWireFactTable := do
   let inferred : Option Rule ← match node.kind with
     | .matrixMultiply => (inferredMatrixMultiplyRule facts stage scope nodeId node).map some
     | _ => pure (inferredRule node.kind)
   match inferred with
   | some rule =>
-      let ⟨nextFacts, _, _⟩ ← applyRule facts { stage, scope, nodeId, node, rule }
+      let ⟨nextFacts, _, _⟩ ← applyRule facts { stage, scope, nodeId, node, rule } arena
       return nextFacts
   | none =>
       match node.kind with
@@ -1533,7 +1542,7 @@ structure AnalysisState where
   protocolFamilies : List (JointFamilyId × InputValueContract) := []
   symbolicRecurrences : List SymbolicRecurrenceTransfer := []
   requirementAcceptances : List CheckedRequirementAcceptance := []
-  expressionArena : ExpressionArena := { entries := [] }
+  expressionArena : ExpressionArena := { entries := #[] }
   symbolicFormArena : SymbolicMatrixFormArena := {}
   boundWitnessArena : BoundWitnessArena := {}
   symbolicMatrixFacts : List MatrixSymbolicFact := []
@@ -1555,6 +1564,61 @@ structure StructuralLoopContext where
   indexExpression : RuntimeExpr .integer
 
 abbrev StructuralLoopContextStack := List StructuralLoopContext
+
+private inductive DynamicFamilyIndexClassification where
+  | loopOffset (context : StructuralLoopContext) (offset : Nat)
+  | interval (lower upper : IntBoundExpr)
+
+private def boundContainsCarriedInput : BoundExpr → Bool
+  | .constant _ | .parameter _ | .absolute _ | .recurrenceResult _ _ => false
+  | .add left right | .multiply left right | .maximum left right | .minimum left right =>
+      boundContainsCarriedInput left || boundContainsCarriedInput right
+  | .floorDivide value _ => boundContainsCarriedInput value
+  | .matrixProduct _ _ left right =>
+      boundContainsCarriedInput left || boundContainsCarriedInput right
+  | .carriedInput _ => true
+
+private def intBoundContainsCarriedInput : IntBoundExpr → Bool
+  | .integer _ | .recurrenceResult _ _ => false
+  | .natural value => boundContainsCarriedInput value
+  | .negate value => intBoundContainsCarriedInput value
+  | .add left right | .subtract left right | .multiply left right | .divide left right |
+      .minimum left right | .maximum left right =>
+      intBoundContainsCarriedInput left || intBoundContainsCarriedInput right
+  | .carriedInput _ => true
+
+private def classifyDynamicFamilyIndex
+    (arena : ExpressionArena)
+    (contexts : StructuralLoopContextStack)
+    (index : RuntimeExprRef .integer)
+    (fact : IntegerFact) : Except VerifyError DynamicFamilyIndexClassification := do
+  -- `index` is allocated immediately from `fact.expression` by `applyFamilyGet`; the arena is
+  -- append-only, so a successful typed lookup is the relevant integrity check here.  Runtime
+  -- expressions intentionally have no decidable structural equality because their identity is
+  -- the arena reference retained below.
+  match arena.lookupInteger index with
+  | none => throw (.invalidExpressionReference "dynamic-family-index-arena-integrity")
+  | some _ => pure ()
+  match contexts.head? with
+  | none => pure (.interval fact.lower fact.upper)
+  | some context =>
+      match normalizeLoopRelativeIntExpr arena ⟨context.site⟩ context.indexSlot index with
+      | .ok (.loopOffset offset) => pure (.loopOffset context offset)
+      | .ok (.invariant _) => pure (.interval fact.lower fact.upper)
+      | .error error => match error with
+          | .wrongLoopBinder .. | .wrongLoopIndexSlot .. | .unsupportedIndex | .negativeOffset _ |
+              .unsupportedArithmetic => pure (.interval fact.lower fact.upper)
+          | _ => throw (.invalidExpressionReference "dynamic-family-index-normalization")
+
+private def carriedDynamicFamilyRange? : StaticObligation → Option SequentialBodyRangeRequirement
+  | .dynamicFamilyIndexInRange site lower upper familyCount =>
+      if intBoundContainsCarriedInput lower || intBoundContainsCarriedInput upper then
+        some { site, lower, upper, familyCount }
+      else none
+  | _ => none
+
+private def retainedBodyStaticObligations : List StaticObligation → List StaticObligation :=
+  List.filter fun obligation => (carriedDynamicFamilyRange? obligation).isNone
 
 structure SequentialAlignmentCollection where
   recurrence : SequentialRecurrenceInstanceRef
@@ -1600,7 +1664,7 @@ private def constructFinalSymbolicMatrixFacts
     expressionArena := state.expressionArena
     symbolicFormArena := state.symbolicFormArena
     boundWitnessArena := state.boundWitnessArena
-    symbolicMatrixFacts := state.symbolicMatrixFacts
+    symbolicMatrixFacts := state.symbolicMatrixFacts.toArray
   }
   let construction ← construction.rebuildMatrixFacts state.facts
     |>.mapError .symbolicEvaluation
@@ -1609,7 +1673,7 @@ private def constructFinalSymbolicMatrixFacts
     expressionArena := construction.expressionArena
     symbolicFormArena := construction.symbolicFormArena
     boundWitnessArena := construction.boundWitnessArena
-    symbolicMatrixFacts := construction.symbolicMatrixFacts
+    symbolicMatrixFacts := construction.symbolicMatrixFacts.toList
   }
 
 private def lookupJointFamily
@@ -1786,7 +1850,7 @@ private def instantiateFamilyElement
   }
   let outputValue : ValueInstanceRef := ValueInstanceRef.ofCoreWire output
   let ⟨rewrittenArena, fact⟩ ← instantiateParallelTemplate substitution arena outputValue template
-    |>.mapError fun _ => .invalidExpressionReference
+    |>.mapError fun _ => .invalidExpressionReference "parallel-template-instantiation"
   return (rewrittenArena, {
     wire := output
     matrixType := templateMatrixType template
@@ -1963,47 +2027,43 @@ private def applyFamilyGet
   let familyPort ← match lookupScopedFact (scopedWire stage scope familyRef) state.facts with
     | some { fact := .family family, .. } => pure family
     | _ => throw (.invalidLoopArity stage ⟨nodeId⟩)
-  let ⟨indexExpression, arena, index, dynamicIndex⟩ ← match node.kind with
+  let ⟨indexExpression, arena, index, indexFact⟩ ← match node.kind with
     | .familyGetStatic value =>
         let expression : RuntimeExpr .integer := .parameter value
-        let rec findExisting (offset : Nat) : List SymbolicExprEntry →
-            Option (RuntimeExprRef .integer)
-          | [] => none
-          | .integer (.parameter existing) :: tail =>
-              if intExprEqual existing value then some ⟨offset⟩
-              else findExisting (offset + 1) tail
-          | _ :: tail => findExisting (offset + 1) tail
-        match findExisting 0 state.expressionArena.entries with
-        | some reference => pure (expression, state.expressionArena, reference, false)
+        let existing := state.expressionArena.entries.toList.findIdx? fun entry =>
+          match entry with
+          | .integer (.parameter parameter) => intExprEqual parameter value
+          | _ => false
+        match existing with
+        | some reference => pure (expression, state.expressionArena, ⟨reference⟩, {
+            expression
+            lower := .integer value
+            upper := .integer value
+          })
         | none =>
             match state.expressionArena.internInteger expression with
-            | some (arena, reference) => pure (expression, arena, reference, false)
-            | none => throw .invalidExpressionReference
+            | some (arena, reference) => pure (expression, arena, reference, {
+                expression
+                lower := .integer value
+                upper := .integer value
+              })
+            | none => throw (.invalidExpressionReference "static-family-index")
     | .familyGetDynamic =>
         match node.arguments with
         | [_, indexRef] =>
-            let indexFact ← requireInteger state.facts (scopedWire stage scope indexRef)
-            match state.expressionArena.internInteger indexFact.expression with
-            | some (arena, reference) => pure (indexFact.expression, arena, reference, true)
-            | none => throw .invalidExpressionReference
+            let fact ← requireInteger state.facts (scopedWire stage scope indexRef)
+            match state.expressionArena.internInteger fact.expression with
+            | some (arena, reference) => pure (fact.expression, arena, reference, fact)
+            | none => throw (.invalidExpressionReference "dynamic-family-index")
         | _ => throw (.invalidLoopArity stage ⟨nodeId⟩)
     | _ => throw (.unsupportedNode stage ⟨nodeId⟩)
   let state := { state with expressionArena := arena }
-  let state ← if dynamicIndex then
-      match loopContexts.head? with
-      | none => pure state
-      | some context =>
-          match normalizeLoopRelativeIntExpr state.expressionArena ⟨context.site⟩ context.indexSlot
-              index with
-          | .ok (.invariant _) => pure state
-          | .ok (.loopOffset offset) => pure {
-              state with
-              staticObligations := state.staticObligations ++ [
-                .loopFamilyAccessInRange context.count offset familyPort.count
-              ]
-            }
-          | .error _ => throw .invalidExpressionReference
-    else pure state
+  let classification ← classifyDynamicFamilyIndex state.expressionArena loopContexts index indexFact
+  let site : CoreNodeRef := { stage, scope, node := ⟨nodeId⟩ }
+  let obligation := match classification with
+    | .loopOffset context offset => .loopFamilyAccessInRange context.count offset familyPort.count
+    | .interval lower upper => .dynamicFamilyIndexInRange site lower upper familyPort.count
+  let state := { state with staticObligations := state.staticObligations ++ [obligation] }
   let output := scopedOutputWire stage scope nodeId
   let originContext := match loopContexts.head? with
     | some context => match context.kind with
@@ -2087,7 +2147,7 @@ private def applyScalarSelect
       let first :: rest := branches | throw (.unsupportedNode stage ⟨nodeId⟩)
       let ⟨arena, references⟩ ← match internIntegerBranches state.expressionArena branches with
         | some result => pure result
-        | none => throw .invalidExpressionReference
+        | none => throw (.invalidExpressionReference "integer-select-branches")
       let fact := scalarFact output (.integer {
         expression := .select .integer index.expression references
         lower := rest.foldl (fun lower branch => .minimum lower branch.lower) first.lower
@@ -2100,7 +2160,7 @@ private def applyScalarSelect
       if branches.isEmpty then throw (.unsupportedNode stage ⟨nodeId⟩)
       let ⟨arena, references⟩ ← match internBooleanBranches state.expressionArena branches with
         | some result => pure result
-        | none => throw .invalidExpressionReference
+        | none => throw (.invalidExpressionReference "boolean-select-branches")
       let fact := scalarFact output (.boolean {
         expression := .select .boolean index.expression references
       })
@@ -2148,7 +2208,7 @@ private def applyExtractCoefficient
   let expression := MatrixExpr.wire { value := input.subject, type := inputType }
   let ⟨arena, matrixReference⟩ ← match state.expressionArena.internMatrix expression with
     | some result => pure result
-    | none => throw .invalidExpressionReference
+    | none => throw (.invalidExpressionReference "extract-coefficient-matrix")
   let derived := deriveExtractCoefficientOutput matrixReference position inputType.modulus
   let output := scopedOutputWire stage scope nodeId
   match derived with
@@ -2171,25 +2231,64 @@ private def definitionByName
   | definition :: tail => if definition.1 = name then some definition.2 else
       definitionByName name tail
 
+private structure SeededParallelInputs where
+  expressionArena : ExpressionArena
+  facts : ScopedWireFactTable
+  staticObligations : List StaticObligation
+
+private def instantiateParallelInputFamily
+    (stage : StageId)
+    (loopSite : CoreNodeRef)
+    (port : FamilyFact)
+    (index : RuntimeExprRef .integer)
+    (indexExpression : RuntimeExpr .integer)
+    (destination : CoreWireRef)
+    (arena : ExpressionArena)
+    (state : AnalysisState) : Except VerifyError (ExpressionArena × ScopedWireFact) := do
+  match port.aggregate with
+  | .joint joint outputSlot _ =>
+      match lookupJointFamily joint state.families with
+      | some family =>
+          let derivation ← match uniqueParallelFamilyDerivation joint state.parallelFamilyDerivations with
+            | some derivation => pure derivation
+            | none => throw (.missingFamily joint)
+          instantiateFamilyElement derivation family outputSlot index indexExpression destination arena
+      | none =>
+          let contract ← match protocolFamilyElementContract state.protocolFamilies port.aggregate with
+            | some contract => pure contract
+            | none => throw (.missingFamily joint)
+          pure (arena, instantiateProtocolFamilyElement port.aggregate index indexExpression contract destination)
+  | aggregate@(.familyElement ..) =>
+      let contract ← match protocolFamilyElementContract state.protocolFamilies aggregate with
+        | some contract => pure contract
+        | none => throw (.invalidLoopArity stage loopSite.node)
+      pure (arena, instantiateProtocolFamilyElement aggregate index indexExpression contract destination)
+  | aggregate@(.carriedInput _) | aggregate@(.recurrenceResult ..) =>
+      match instantiateStructuralFamilyElement aggregate index indexExpression port.elementSchema destination with
+      | some fact => pure (arena, fact)
+      | none => throw (.invalidLoopArity stage loopSite.node)
+
 private def seedParallelInputs
     (stage : StageId)
     (bodyScope : StaticScopeId)
     (body : Mxx.Ir.Scope)
     (loopSite : CoreNodeRef)
+    (count : IntExpr)
     (index : RuntimeExprRef .integer)
     (indexExpression : RuntimeExpr .integer)
     (arguments : List Mxx.Ir.WireRef)
     (modes : List Mxx.Ir.LoopInputMode)
     (outerScope : StaticScopeId)
-    (state : AnalysisState) : Except VerifyError (ExpressionArena × ScopedWireFactTable) := do
+    (state : AnalysisState) : Except VerifyError SeededParallelInputs := do
   let rec visit
       (names : List String)
       (arguments : List Mxx.Ir.WireRef)
       (modes : List Mxx.Ir.LoopInputMode)
       (arena : ExpressionArena)
-      (accumulator : ScopedWireFactTable) : Except VerifyError (ExpressionArena × ScopedWireFactTable) := do
+      (accumulator : ScopedWireFactTable)
+      (obligations : List StaticObligation) : Except VerifyError SeededParallelInputs := do
     match names, arguments, modes with
-    | [], [], [] => return (arena, accumulator)
+    | [], [], [] => return { expressionArena := arena, facts := accumulator, staticObligations := obligations }
     | name :: nameTail, argument :: argumentTail, mode :: modeTail =>
         let destination ← match inputNodeWireInScope? stage bodyScope name body.nodes with
           | some wire => pure wire
@@ -2198,45 +2297,31 @@ private def seedParallelInputs
         let source ← match lookupScopedFact sourceWire state.facts with
           | some fact => pure fact
           | none => throw (.missingInputFact stage ⟨loopSite.node.value⟩ argument)
-        let ⟨nextArena, seeded⟩ ← match mode with
-          | .broadcast => pure (arena, transportFact destination source)
+        let ⟨nextArena, seeded, rangeObligations⟩ ← match mode with
+          | .broadcast => pure (arena, transportFact destination source, [])
           | .zip =>
               match source.fact with
               | .family port =>
-                  match port.aggregate with
-                  | .joint joint outputSlot _ =>
-                      match lookupJointFamily joint state.families with
-                      | some family =>
-                          let derivation ← match uniqueParallelFamilyDerivation joint
-                              state.parallelFamilyDerivations with
-                            | some derivation => pure derivation
-                            | none => throw (.missingFamily joint)
-                          instantiateFamilyElement derivation family outputSlot index indexExpression
-                            destination arena
-                      | none =>
-                          let contract ← match protocolFamilyElementContract
-                              state.protocolFamilies port.aggregate with
-                            | some contract => pure contract
-                            | none => throw (.missingFamily joint)
-                          pure (arena, instantiateProtocolFamilyElement port.aggregate index
-                            indexExpression contract destination)
-                  | aggregate@(.familyElement ..) =>
-                      let contract ← match protocolFamilyElementContract state.protocolFamilies
-                          aggregate with
-                        | some contract => pure contract
-                        | none => throw (.invalidLoopArity stage loopSite.node)
-                      pure (arena, instantiateProtocolFamilyElement aggregate index indexExpression
-                        contract destination)
-                  | aggregate@(.carriedInput _) | aggregate@(.recurrenceResult ..) =>
-                      match instantiateStructuralFamilyElement aggregate index indexExpression
-                          port.elementSchema destination with
-                      | some fact => pure (arena, fact)
-                      | none => throw (.invalidLoopArity stage loopSite.node)
+                  let (nextArena, seeded) ← instantiateParallelInputFamily stage loopSite port index
+                    indexExpression destination arena state
+                  pure (nextArena, seeded, [.loopFamilyAccessInRange count 0 port.count])
               | _ => throw (.invalidLoopArity stage loopSite.node)
-          | .zipOffset _ => throw (.unsupportedNode stage loopSite.node)
+          | .zipOffset offset =>
+              match source.fact with
+              | .family port =>
+                  let shiftedExpression : RuntimeExpr .integer :=
+                    .intBinary .add indexExpression (.intConstant offset)
+                  let ⟨shiftedArena, shiftedIndex⟩ ← match arena.internInteger shiftedExpression with
+                    | some result => pure result
+                    | none => throw (.invalidExpressionReference "parallel-zip-offset-index")
+                  let (nextArena, seeded) ← instantiateParallelInputFamily stage loopSite port shiftedIndex
+                    shiftedExpression destination shiftedArena state
+                  pure (nextArena, seeded, [.loopFamilyAccessInRange count offset port.count])
+              | _ => throw (.invalidLoopArity stage loopSite.node)
         visit nameTail argumentTail modeTail nextArena (accumulator ++ [seeded])
+          (obligations ++ rangeObligations)
     | _, _, _ => throw (.invalidLoopArity stage loopSite.node)
-  visit body.inputNames arguments modes state.expressionArena []
+  visit body.inputNames arguments modes state.expressionArena [] []
 
 /-! ## Abstract sequential-carried inputs -/
 
@@ -2399,7 +2484,7 @@ def analyzeScopeNodesOnce
                     applyScalarSelect stage scope nodeId node state
                 | _ =>
                     pure { state with
-                      facts := (← inferNodeFacts stage scope nodeId node state.facts) }
+                      facts := (← inferNodeFacts stage scope nodeId node state.facts state.expressionArena) }
             | .bitExtract position =>
                 applyBitExtract stage scope nodeId node position state
             | .extractCoefficient position =>
@@ -2412,9 +2497,9 @@ def analyzeScopeNodesOnce
                 let indexExpression : RuntimeExpr .integer := .loopIndex { site := loopSite }
                 let ⟨arena, index⟩ ← match state.expressionArena.internInteger indexExpression with
                   | some result => pure result
-                  | none => throw .invalidExpressionReference
+                  | none => throw (.invalidExpressionReference "parallel-loop-index")
                 let childScope : StaticScopeId := ⟨scope.path ++ [definition]⟩
-                let ⟨seededArena, initial⟩ ← seedParallelInputs stage childScope body loopSite index indexExpression
+                let seeded ← seedParallelInputs stage childScope body loopSite count index indexExpression
                   node.arguments modes scope { state with expressionArena := arena }
                 let childPath := instancePath ++ [.parallelLane loopSite index]
                 let context : StructuralLoopContext := {
@@ -2427,7 +2512,11 @@ def analyzeScopeNodesOnce
                 }
                 let bodyState ← analyzeScopeNodesOnce fuel stage definitions childScope childPath 0 body.nodes
                   (context :: loopContexts)
-                  { state with facts := state.facts ++ initial, expressionArena := seededArena }
+                  { state with
+                    facts := state.facts ++ seeded.facts
+                    expressionArena := seeded.expressionArena
+                    staticObligations := state.staticObligations ++ seeded.staticObligations
+                  }
                   |>.mapError fun error => match error with
                     | .invalidLoopArity errorStage errorNode =>
                         .invalidLoopArityInScope errorStage childScope errorNode
@@ -2483,7 +2572,7 @@ def analyzeScopeNodesOnce
                     outputCount := node.outputCount
                     outputTypes := node.outputTypes
                     body
-                    seededFacts := initial
+                    seededFacts := seeded.facts
                     analyzedFacts := bodyState.facts.drop state.facts.length
                     outputFacts := bodyOutputFacts
                     elementTemplates := templates
@@ -2508,7 +2597,7 @@ def analyzeScopeNodesOnce
                 let indexExpression : RuntimeExpr .integer := .loopIndex { site := loopSite }
                 let ⟨arena, index⟩ ← match state.expressionArena.internInteger indexExpression with
                   | some result => pure result
-                  | none => throw .invalidExpressionReference
+                  | none => throw (.invalidExpressionReference "sequential-loop-index")
                 let childScope : StaticScopeId := ⟨scope.path ++ [definition]⟩
                 let seeded ← seedSequentialInputs stage scope childScope definition body loopSite
                   node.arguments carriedCount { state with expressionArena := arena }
@@ -2543,6 +2632,7 @@ def analyzeScopeNodesOnce
                 if outputLength : templates.length = carriedCount then
                   if initialLength : seeded.initial.length = carriedCount then
                     if inputLength : seeded.bodyInputs.length = carriedCount then
+                      let bodyObligations := bodyState.staticObligations.drop state.staticObligations.length
                       let recurrence : SequentialRecurrenceSource := {
                         loop := ⟨loopSite⟩
                         count
@@ -2551,6 +2641,7 @@ def analyzeScopeNodesOnce
                         bodyInputs := ⟨seeded.bodyInputs.toArray, by simp [inputLength]⟩
                         bodyOutputs := ⟨templates.toArray, by simp [outputLength]⟩
                         familyElementTemplates := recurrenceFamilyElementTemplates bodyState.families
+                        bodyRangeRequirements := bodyObligations.filterMap carriedDynamicFamilyRange?
                         invariantInputs := (node.arguments.drop carriedCount).filterMap fun argument =>
                           let wire := scopedWire stage scope argument
                           (lookupScopedFact wire state.facts).bind fun entry =>
@@ -2576,6 +2667,8 @@ def analyzeScopeNodesOnce
                       pure {
                         bodyState with
                         facts := state.facts ++ outputFacts
+                        staticObligations := state.staticObligations ++
+                          retainedBodyStaticObligations bodyObligations
                         symbolicRecurrences :=
                           bodyState.symbolicRecurrences ++ [constructed.transfer]
                         expressionArena := constructed.expressionArena
@@ -2587,7 +2680,7 @@ def analyzeScopeNodesOnce
             | _ =>
                 let obligations ← scalarRangeObligations stage scope nodeId node state.facts
                 pure { state with
-                  facts := (← inferNodeFacts stage scope nodeId node state.facts)
+                  facts := (← inferNodeFacts stage scope nodeId node state.facts state.expressionArena)
                   staticObligations := state.staticObligations ++ obligations }
           analyzeScopeNodesOnce fuel stage definitions scope instancePath (nodeId + 1) tail loopContexts next
 termination_by fuel

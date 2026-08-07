@@ -7,11 +7,11 @@ def DiamondWeFamily_generatorVersion : String := "mxx-correctness-emitter-v5"
 
 def DiamondWeFamily_protocolSourcePaths : List String := ["crates/bgg/Cargo.toml", "crates/bgg/src", "crates/correctness/Cargo.toml", "crates/correctness/src", "crates/dsl/Cargo.toml", "crates/dsl/src", "crates/gadgets/Cargo.toml", "crates/gadgets/src", "crates/ir-core/Cargo.toml", "crates/ir-core/src", "crates/we/Cargo.toml", "crates/we/examples/emit_correctness.rs", "crates/we/src"]
 
-def DiamondWeFamily_protocolSourceHash : String := "79eb1de9a113f20a1adc8e1c95b855ffa014157b45baae0d3ce98174cfc28290"
+def DiamondWeFamily_protocolSourceHash : String := "989c96086017e45586da544b8bd9ce3546aefd9360ae8eba943d22a678176a02"
 
 def DiamondWeFamily_workflowHash : String := "ce6395d760eba47744a2e1ee2e692af2a316a95e60d9943589c3d0cef891de27"
 
-def DiamondWeFamily_toolkitHash : String := "3974c07be50323fae267eaffdbfa4b513fe1070a6c706bd74741686f92ef2d6a"
+def DiamondWeFamily_toolkitHash : String := "568403504194710bf4e0845a563878da03ca59213e54bafc2a7f5209b85580f2"
 
 def DiamondWeFamily_stage_encrypt : Mxx.Ir.Prog :=
   { root :=

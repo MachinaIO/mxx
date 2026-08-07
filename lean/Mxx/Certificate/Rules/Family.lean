@@ -468,8 +468,47 @@ private def ParallelTemplateSubstitution.rewriteIntegerReference
     Except ParallelTemplateInstantiationError (RuntimeExprRef .integer) :=
   if reference == substitution.templateIndex then pure substitution.actualIndex
   else match state.lookupInteger reference with
-    | some rewritten => pure rewritten
-    | none => throw .invalidExpressionReference
+  | some rewritten => pure rewritten
+  | none => throw .invalidExpressionReference
+
+/-! The structural `replace*` functions above substitute a loop's direct index.  A nested family
+may instead carry an arena reference to an expression derived from that index.  Such references
+must use the arena's old-to-new mapping as well; leaving them unchanged would pair a trapdoor lane
+with a different public-matrix identity after template instantiation. -/
+private def ParallelTemplateSubstitution.rewriteAggregate
+    (substitution : ParallelTemplateSubstitution)
+    (state : ParallelArenaRewriteState) : FamilyAggregateRef →
+      Except ParallelTemplateInstantiationError FamilyAggregateRef
+  | .joint joint outputSlot path => pure (.joint joint outputSlot (substitution.replacePath path))
+  | .familyElement parent index =>
+      return .familyElement (← substitution.rewriteAggregate state parent)
+        (← substitution.rewriteIntegerReference state index)
+  | .carriedInput slot => pure (.carriedInput slot)
+  | .recurrenceResult recurrence path slot =>
+      pure (.recurrenceResult recurrence (substitution.replacePath path) slot)
+
+private def ParallelTemplateSubstitution.rewriteValue
+    (substitution : ParallelTemplateSubstitution)
+    (state : ParallelArenaRewriteState) : ValueInstanceRef →
+      Except ParallelTemplateInstantiationError ValueInstanceRef
+  | .template wire =>
+      match substitution.outputSlot? wire with
+      | some outputSlot => pure (.familyElement (.joint substitution.derivation.family outputSlot [])
+          substitution.actualIndex)
+      | none => pure (.instantiatedTemplate wire [substitution.laneFrame])
+  | .instantiatedTemplate wire path =>
+      pure (.instantiatedTemplate wire (substitution.replacePath path))
+  | .familyElement aggregate index =>
+      return .familyElement (← substitution.rewriteAggregate state aggregate)
+        (← substitution.rewriteIntegerReference state index)
+  | .recurrenceResult recurrence slot => pure (.recurrenceResult recurrence slot)
+  | value => pure value
+
+private def ParallelTemplateSubstitution.rewriteMatrixInstance
+    (substitution : ParallelTemplateSubstitution)
+    (state : ParallelArenaRewriteState) (reference : MatrixInstanceRef) :
+    Except ParallelTemplateInstantiationError MatrixInstanceRef :=
+  return { reference with value := ← substitution.rewriteValue state reference.value }
 
 private def ParallelArenaRewriteState.rewriteBooleanReference
     (state : ParallelArenaRewriteState) (reference : RuntimeExprRef .boolean) :
@@ -489,8 +528,8 @@ private def ParallelTemplateSubstitution.rewriteRuntime
     (substitution : ParallelTemplateSubstitution)
     (state : ParallelArenaRewriteState) :
     {type : RuntimeScalarType} → RuntimeExpr type → Except ParallelTemplateInstantiationError (RuntimeExpr type)
-  | _, .intWire wire => pure (.intWire (substitution.replaceValue wire))
-  | _, .boolWire wire => pure (.boolWire (substitution.replaceValue wire))
+  | _, .intWire wire => return .intWire (← substitution.rewriteValue state wire)
+  | _, .boolWire wire => return .boolWire (← substitution.rewriteValue state wire)
   | _, .intConstant value => pure (.intConstant value)
   | _, .boolConstant value => pure (.boolConstant value)
   | _, .parameter value => pure (.parameter value)
@@ -504,12 +543,13 @@ private def ParallelTemplateSubstitution.rewriteRuntime
       return .bitExtract (← substitution.rewriteRuntime state value) position
   | _, .boolToInt value => return .boolToInt (← substitution.rewriteRuntime state value)
   | _, .thresholdDecodeBool matrix q p position =>
-      pure (.thresholdDecodeBool (substitution.replaceValue matrix) q p position)
+      return .thresholdDecodeBool (← substitution.rewriteValue state matrix) q p position
   | _, .extractCoefficient matrix position =>
       return .extractCoefficient (← state.rewriteMatrixReference matrix) position
   | _, .familyElement type aggregate indexRef index => do
+      let rewrittenAggregate ← substitution.rewriteAggregate state aggregate
       let rewrittenIndex ← substitution.rewriteIntegerReference state indexRef
-      return .familyElement type (substitution.replaceAggregate aggregate) rewrittenIndex
+      return .familyElement type rewrittenAggregate rewrittenIndex
         (substitution.replaceIndexExpression indexRef (← substitution.rewriteRuntime state index))
   | .integer, .select .integer index branches => do
       let rewrittenBranches ← branches.mapM (substitution.rewriteIntegerReference state)
@@ -523,7 +563,7 @@ private def ParallelTemplateSubstitution.rewriteRuntime
 private def ParallelTemplateSubstitution.rewriteMatrix
     (substitution : ParallelTemplateSubstitution)
     (state : ParallelArenaRewriteState) : MatrixExpr → Except ParallelTemplateInstantiationError MatrixExpr
-  | .wire reference => pure (.wire (substitution.replaceMatrixInstance reference))
+  | .wire reference => return .wire (← substitution.rewriteMatrixInstance state reference)
   | .zero type => pure (.zero type)
   | .identity type => pure (.identity type)
   | .gadget type base => pure (.gadget type base)
@@ -590,7 +630,7 @@ private def ParallelTemplateSubstitution.rewriteArenaEntries
 private def ParallelTemplateSubstitution.rewriteArena
     (substitution : ParallelTemplateSubstitution)
     (arena : ExpressionArena) : Except ParallelTemplateInstantiationError ParallelArenaRewriteState :=
-  substitution.rewriteArenaEntries arena.entries 0 { arena }
+  substitution.rewriteArenaEntries arena.entries.toList 0 { arena }
 
 private def ParallelTemplateSubstitution.aliasesFor
     (substitution : ParallelTemplateSubstitution)
@@ -698,16 +738,20 @@ private def ParallelTemplateSubstitution.replaceIntBound
   | expression => expression
 
 private def ParallelTemplateSubstitution.replaceRelation
-    (substitution : ParallelTemplateSubstitution) : MatrixRelation → Except ParallelTemplateInstantiationError MatrixRelation
-  | .preimage subject source target trapdoor => pure (.preimage
-      (substitution.replaceValue subject)
-      (substitution.replaceMatrixInstance source)
-      (substitution.replaceMatrixInstance target)
-      (substitution.replaceValue trapdoor))
-  | .gadgetDecomposition subject target base digitCount => pure (.gadgetDecomposition
-      (substitution.replaceValue subject)
-      (substitution.replaceMatrixInstance target)
-      base digitCount)
+    (substitution : ParallelTemplateSubstitution)
+    (state : ParallelArenaRewriteState) : MatrixRelation →
+      Except ParallelTemplateInstantiationError MatrixRelation
+  | .preimage subject source target trapdoor => do
+      return .preimage
+        (← substitution.rewriteValue state subject)
+        (← substitution.rewriteMatrixInstance state source)
+        (← substitution.rewriteMatrixInstance state target)
+        (← substitution.rewriteValue state trapdoor)
+  | .gadgetDecomposition subject target base digitCount => do
+      return .gadgetDecomposition
+        (← substitution.rewriteValue state subject)
+        (← substitution.rewriteMatrixInstance state target)
+        base digitCount
 
 private def ParallelTemplateSubstitution.replaceFact
     (substitution : ParallelTemplateSubstitution)
@@ -733,10 +777,10 @@ private def ParallelTemplateSubstitution.replaceFact
               terms
               noiseBound := substitution.replaceBound form.noiseBound
             })
-      let relations ← fact.relations.mapM substitution.replaceRelation
+      let relations ← fact.relations.mapM (substitution.replaceRelation state)
       pure (.matrix {
         fact with
-        subject := substitution.replaceValue fact.subject
+        subject := ← substitution.rewriteValue state fact.subject
         primary
         relations
         totalNormBound := substitution.replaceBound fact.totalNormBound
@@ -744,8 +788,8 @@ private def ParallelTemplateSubstitution.replaceFact
   | .trapdoor fact => do
       let publicMatrix ← substitution.rewriteMatrix state fact.publicMatrix
       pure (.trapdoor {
-        privatePort := substitution.replaceValue fact.privatePort
-        publicPort := substitution.replaceValue fact.publicPort
+        privatePort := ← substitution.rewriteValue state fact.privatePort
+        publicPort := ← substitution.rewriteValue state fact.publicPort
         publicMatrix
       })
   | .integer fact => do
@@ -759,8 +803,10 @@ private def ParallelTemplateSubstitution.replaceFact
   | .boolean fact => do
       let expression ← substitution.rewriteRuntime state fact.expression
       pure (.boolean { fact with expression })
-  | .bytes wire => pure (.bytes (substitution.replaceValue wire))
-  | .family fact => pure (.family { fact with aggregate := substitution.replaceAggregate fact.aggregate })
+  | .bytes wire => return .bytes (← substitution.rewriteValue state wire)
+  | .family fact => return .family {
+      fact with aggregate := ← substitution.rewriteAggregate state fact.aggregate
+    }
 
 def instantiateParallelTemplate
     (substitution : ParallelTemplateSubstitution)
@@ -830,7 +876,7 @@ private def familyTestSubstitution : ParallelTemplateSubstitution := {
 
 /-- A scalar select owns branch references in the expression arena.  Instantiation rewrites both
 branches and allocates fresh references after the immutable source entries. -/
-private def familySelectArena : ExpressionArena := { entries := [
+private def familySelectArena : ExpressionArena := { entries := #[
   .integer (.intConstant 0),
   .integer (.intWire (.template familyTestTemplate)),
   .integer (.select .integer (.intConstant 0) [⟨0⟩, ⟨1⟩])
@@ -839,7 +885,7 @@ private def familySelectArena : ExpressionArena := { entries := [
 example :
     (familyTestSubstitution.rewriteArena familySelectArena).map
       (fun state => state.arena.lookupInteger ⟨5⟩) =
-      .ok (some (.select .integer (.intConstant 0) [⟨3⟩, ⟨4⟩])) := by
+    .ok (some (.select .integer (.intConstant 0) [⟨3⟩, ⟨4⟩])) := by
   rfl
 
 private def familyTestLocalTemplate : TemplateWireRef where
@@ -868,7 +914,7 @@ private def familyTestAliasSubstitution : ParallelTemplateSubstitution := {
   actualIndex := ⟨3⟩
   actualIndexExpression := .intConstant 3
   originContext := some {
-    arena := { entries := [] }
+    arena := { entries := #[] }
     selectedLoop := ⟨familyTestLoopSite⟩
     indexSlot := 0
   }
@@ -888,10 +934,10 @@ example :
 example :
     instantiateParallelTemplate
       familyTestSubstitution
-      { entries := [] }
+      { entries := #[] }
       (ValueInstanceRef.familyElement (.joint ⟨"joint"⟩ 0 []) ⟨3⟩)
       familyTestFact =
-    .ok ({ entries := [] }, .matrix {
+    .ok ({ entries := #[] }, .matrix {
       subject := ValueInstanceRef.familyElement (.joint ⟨"joint"⟩ 0 []) ⟨3⟩
       primary := .exact (.wire {
         value := .familyElement (.joint ⟨"joint"⟩ 0 []) ⟨3⟩
@@ -902,10 +948,8 @@ example :
     }) := by
   simp [instantiateParallelTemplate, ParallelTemplateSubstitution.rewriteArena,
     ParallelTemplateSubstitution.rewriteArenaEntries, ParallelTemplateSubstitution.replaceFact,
-    ParallelTemplateSubstitution.rewriteMatrix, ParallelTemplateSubstitution.replaceMatrixInstance,
-    ParallelTemplateSubstitution.replaceValue, ParallelTemplateSubstitution.outputSlot?,
-    findParallelOutputSlot, ValueFact.ownedTemplateWire?, ParallelTemplateSubstitution.replaceBound,
-    ValueFact.retargetOutput, familyTestSubstitution, familyTestSource, familyTestFact]
+    ParallelTemplateSubstitution.rewriteMatrix, ParallelTemplateSubstitution.replaceBound,
+    familyTestSubstitution, familyTestSource, familyTestFact]
   rfl
 
 private def familyTestPublicTemplate : TemplateWireRef :=
@@ -966,10 +1010,10 @@ the same joint-family identity and index instead of being collapsed into the pri
 example :
     instantiateParallelTemplate
       familyTestTrapdoorSubstitution
-      { entries := [] }
+      { entries := #[] }
       (.concrete { stage := ⟨"family-test"⟩, scope := ⟨[]⟩, node := ⟨2⟩, port := 0 })
       familyTestTrapdoorTemplate =
-    .ok ({ entries := [] }, .trapdoor {
+    .ok ({ entries := #[] }, .trapdoor {
       privatePort := .concrete {
         stage := ⟨"family-test"⟩, scope := ⟨[]⟩, node := ⟨2⟩, port := 0
       }
@@ -981,11 +1025,9 @@ example :
     }) := by
   simp [instantiateParallelTemplate, ParallelTemplateSubstitution.rewriteArena,
     ParallelTemplateSubstitution.rewriteArenaEntries, ParallelTemplateSubstitution.replaceFact,
-    ParallelTemplateSubstitution.rewriteMatrix, ParallelTemplateSubstitution.replaceMatrixInstance,
-    ParallelTemplateSubstitution.replaceValue, ParallelTemplateSubstitution.outputSlot?,
-    findParallelOutputSlot, ValueFact.ownedTemplateWire?, ValueFact.retargetOutput,
-    familyTestTrapdoorSubstitution, familyTestTrapdoorSource, familyTestTrapdoorTemplate,
-    familyTestPublicFact, familyTestPublicTemplate, familyTestPrivateTemplate, familyTestTemplate]
+    ParallelTemplateSubstitution.rewriteMatrix, familyTestTrapdoorSubstitution,
+    familyTestTrapdoorSource, familyTestTrapdoorTemplate, familyTestPublicFact,
+    familyTestPublicTemplate, familyTestPrivateTemplate, familyTestTemplate]
   rfl
 
 end Mxx.Certificate

@@ -483,7 +483,7 @@ private def recurrenceJson (transfer : Mxx.Certificate.SymbolicRecurrenceTransfe
     ])),
     ("invariantInputs", array (fact.invariantInputs.map fun input => object [
       ("wire", coreWireRefJson input.wire),
-      ("fact", valueFactJson input.fact)
+      ("fact", valueFactJson input.template.fact)
     ])),
     ("iterationVariable", fact.iterationVariable.slot)
   ]
@@ -570,8 +570,9 @@ private def verifyErrorMessage : Mxx.Certificate.VerifyError → String
         s!"inputNode={input.node} inputPort={input.port}"
   | .expectedMatrixFact wire => s!"expectedMatrixFact wire={repr wire}"
   | .expectedTrapdoorFact wire => s!"expectedTrapdoorFact wire={repr wire}"
-  | .trapdoorPublicMismatch wire expected actual =>
-      s!"trapdoorPublicMismatch wire={repr wire} expected={repr expected} actual={repr actual}"
+  | .trapdoorPublicMismatch wire expected actual sourcePrimary =>
+      s!"trapdoorPublicMismatch wire={repr wire} expected={repr expected} actual={repr actual} " ++
+        s!"sourcePrimary={repr sourcePrimary}"
   | .missingAnchorBinding anchor =>
       s!"missingAnchorBinding stage={anchor.stage.name} label={anchor.label}"
   | .invalidAnchorWire anchor wire =>
@@ -642,7 +643,7 @@ private def verifyErrorMessage : Mxx.Certificate.VerifyError → String
       s!"relationBearingCarriedMatrix stage={stage.name} node={node.value} slot={slot}"
   | .escapedCarriedInput stage node slot =>
       s!"escapedCarriedInput stage={stage.name} node={node.value} slot={slot}"
-  | .invalidExpressionReference => "invalidExpressionReference"
+  | .invalidExpressionReference detail => s!"invalidExpressionReference detail={detail}"
   | .missingFamily joint => s!"missingFamily joint={joint.name}"
   | .invalidFamilySlot joint slot => s!"invalidFamilySlot joint={joint.name} slot={slot}"
   | .scalarControl (.unsupportedNodeKind _) => "scalarControl unsupportedNodeKind"

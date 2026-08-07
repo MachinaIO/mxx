@@ -317,6 +317,23 @@ private def translateIntegerBound
         .ok (.externalRecurrence identity path)
       else .error (.invalidExternalIntegerBound outputSlot identity path)
 
+private def buildStepRangeObligations
+    (dependencies : List SymbolicRecurrenceTransfer)
+    (previous : List CarriedBoundSchema) :
+    List SequentialBodyRangeRequirement →
+      Except SymbolicRecurrenceConstructionError (List (RecurrenceStepRangeObligation previous))
+  | [] => .ok []
+  | requirement :: tail => do
+      if intExprHasLoopIndex requirement.familyCount then
+        throw (.loopIndexedBound 0)
+      let head : RecurrenceStepRangeObligation previous := {
+        site := requirement.site
+        lower := ← translateIntegerBound 0 dependencies previous requirement.lower
+        upper := ← translateIntegerBound 0 dependencies previous requirement.upper
+        familyCount := requirement.familyCount
+      }
+      return head :: (← buildStepRangeObligations dependencies previous tail)
+
 private def internMatrixBodyForm
     (slot : Nat)
     (carriedArity : Nat)
@@ -515,14 +532,19 @@ def ValidatedSequentialRecurrenceSource.constructTransfer
     Except SymbolicRecurrenceConstructionError ConstructedSymbolicRecurrenceTransfer := do
   let initialBounds ← buildInitialBounds validated.source dependencies 0 validated.schemas
     validated.source.initial.toList
+  let (expressionArena, symbolicFormArena, initialOutputs) ← buildBodyOutputs
+    validated.source.carriedArity 0 validated.schemas validated.source.initial.toList
+    expressionArena symbolicFormArena
   let (expressionArena, symbolicFormArena, bodyOutputs) ← buildBodyOutputs
     validated.source.carriedArity 0 validated.schemas validated.source.bodyOutputs.toList
     expressionArena symbolicFormArena
   let previous := validated.schemas.map CarriedValueSchema.boundSchema
   let boundTransition ← buildBoundTransition validated.source dependencies 0 previous
     validated.schemas validated.source.bodyOutputs.toList
-  let transfer ← SymbolicRecurrenceTransfer.build identity validated.source initialBounds
-    bodyOutputs boundTransition |>.mapError .transfer
+  let stepRangeObligations ← buildStepRangeObligations dependencies previous
+    validated.source.bodyRangeRequirements
+  let transfer ← SymbolicRecurrenceTransfer.build identity validated.source initialBounds initialOutputs
+    bodyOutputs boundTransition stepRangeObligations |>.mapError .transfer
   return { expressionArena, symbolicFormArena, transfer }
 
 def SequentialRecurrenceSource.constructSymbolicTransfer
@@ -690,8 +712,8 @@ private def matrixFixtureSource : SequentialRecurrenceSource where
 example :
     (matrixFixtureSource.constructSymbolicTransfer constructionFixtureIdentity []).map
       (fun result =>
-        (result.transfer.carriedSchemas, result.symbolicFormArena.entries.length)) =
-      .ok ([.matrix matrixFixtureType .unknown], 1) := by
+        (result.transfer.carriedSchemas, result.symbolicFormArena.entries.size)) =
+    .ok ([.matrix matrixFixtureType .unknown], 2) := by
   native_decide
 
 private def matrixFixtureResolved : Option (Bool × Nat × Nat × Nat) :=

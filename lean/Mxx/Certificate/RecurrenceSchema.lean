@@ -114,6 +114,7 @@ inductive RecurrenceSchemaEvalError where
   | negativeNatural (value : Int)
   | nonPositiveDimension (value : Int)
   | divisionByZero
+  | familyIndexOutOfRange (site : CoreNodeRef)
   deriving BEq, DecidableEq, Repr
 
 private def signalPresenceToBool : SignalPresence → Bool
@@ -252,6 +253,14 @@ inductive IntBoundTransitionExpr (previous : List CarriedBoundSchema) where
       (recurrence : SequentialRecurrenceInstanceRef)
       (path : IntBoundFactPath)
 
+/-- A family-index range requirement evaluated against one immutable sequential-loop state before
+the body's simultaneous bound transition. -/
+structure RecurrenceStepRangeObligation (previous : List CarriedBoundSchema) where
+  site : CoreNodeRef
+  lower : IntBoundTransitionExpr previous
+  upper : IntBoundTransitionExpr previous
+  familyCount : IntExpr
+
 def NatBoundTransitionExpr.closeExternalRecurrences
     {previous : List CarriedBoundSchema}
     (environment : Mxx.Ir.ParamEnvironment)
@@ -319,6 +328,18 @@ def IntBoundTransitionExpr.closeExternalRecurrences
       let value ← (IntBoundExpr.recurrenceResult recurrence path).evaluateWithSymbolicRecurrences
         environment states |>.mapError .integer
       return .constant value
+
+def RecurrenceStepRangeObligation.closeExternalRecurrences
+    {previous : List CarriedBoundSchema}
+    (environment : Mxx.Ir.ParamEnvironment)
+    (states : CheckedSymbolicRecurrenceStateTable)
+    (obligation : RecurrenceStepRangeObligation previous) :
+    Except RecurrenceSchemaEvalError (RecurrenceStepRangeObligation previous) := do
+  return {
+    obligation with
+    lower := ← obligation.lower.closeExternalRecurrences environment states
+    upper := ← obligation.upper.closeExternalRecurrences environment states
+  }
 
 private def evaluateNaturalParameter
     (environment : Mxx.Ir.ParamEnvironment)
@@ -414,6 +435,27 @@ def IntBoundTransitionExpr.evaluate
       return max left' right'
   | .externalRecurrence recurrence path =>
       .error (.integer (.unresolvedRecurrence recurrence path))
+
+def RecurrenceStepRangeObligation.check
+    {previous : List CarriedBoundSchema}
+    (environment : Mxx.Ir.ParamEnvironment)
+    (previousState : CarriedBoundStateVector previous)
+    (obligation : RecurrenceStepRangeObligation previous) : Except RecurrenceSchemaEvalError Unit := do
+  let lower ← obligation.lower.evaluate environment previousState
+  let upper ← obligation.upper.evaluate environment previousState
+  let familyCount ← evaluateIntExpr environment obligation.familyCount |>.mapError .expression
+  if 0 ≤ lower ∧ lower ≤ upper ∧ upper < familyCount then .ok ()
+  else .error (.familyIndexOutOfRange obligation.site)
+
+private def checkRecurrenceStepRangeObligations
+    {previous : List CarriedBoundSchema}
+    (environment : Mxx.Ir.ParamEnvironment)
+    (previousState : CarriedBoundStateVector previous) :
+    List (RecurrenceStepRangeObligation previous) → Except RecurrenceSchemaEvalError Unit
+  | [] => .ok ()
+  | obligation :: tail => do
+      obligation.check environment previousState
+      checkRecurrenceStepRangeObligations environment previousState tail
 
 structure MatrixSummaryTransition (previous : List CarriedBoundSchema) where
   signal : SignalTransitionExpr previous
@@ -519,6 +561,19 @@ def iterateCarriedBoundTransition
       let next ← transition.evaluate environment initial
       iterateCarriedBoundTransition environment transition count next
 
+def iterateCarriedBoundTransitionWithRangeChecks
+    {schema : List CarriedBoundSchema}
+    (environment : Mxx.Ir.ParamEnvironment)
+    (transition : CarriedBoundTransitionVector schema schema)
+    (rangeChecks : List (RecurrenceStepRangeObligation schema)) :
+    Nat → CarriedBoundStateVector schema →
+      Except RecurrenceSchemaEvalError (CarriedBoundStateVector schema)
+  | 0, initial => .ok initial
+  | count + 1, initial => do
+      checkRecurrenceStepRangeObligations environment initial rangeChecks
+      let next ← transition.evaluate environment initial
+      iterateCarriedBoundTransitionWithRangeChecks environment transition rangeChecks count next
+
 theorem iterateCarriedBoundTransition_zero
     {schema : List CarriedBoundSchema}
     (environment : Mxx.Ir.ParamEnvironment)
@@ -538,6 +593,44 @@ private def firstIntegerPath :
 private def secondIntegerPath :
     CarriedBoundStatePath twoIntegerSchemas .integerInterval :=
   .tail (.head .here)
+
+private def rangeCheckFixtureSite : CoreNodeRef := {
+  stage := ⟨"recurrence-range"⟩
+  scope := ⟨[]⟩
+  node := ⟨0⟩
+}
+
+private def preserveFirstInteger :
+    CarriedBoundTransitionVector twoIntegerSchemas twoIntegerSchemas :=
+  .cons (.integer
+      (.previousState firstIntegerPath .lower)
+      (.previousState firstIntegerPath .upper))
+    (.cons (.integer
+        (.previousState secondIntegerPath .lower)
+        (.previousState secondIntegerPath .upper))
+      .nil)
+
+private def firstIntegerRangeCheck : RecurrenceStepRangeObligation twoIntegerSchemas where
+  site := rangeCheckFixtureSite
+  lower := .previousState firstIntegerPath .lower
+  upper := .previousState firstIntegerPath .upper
+  familyCount := .constant 3
+
+example :
+    iterateCarriedBoundTransitionWithRangeChecks [] preserveFirstInteger [firstIntegerRangeCheck] 1
+      (.cons (.integer 0 2) (.cons (.integer 10 20) .nil)) =
+      .ok (.cons (.integer 0 2) (.cons (.integer 10 20) .nil)) := by
+  rfl
+
+example :
+    iterateCarriedBoundTransitionWithRangeChecks [] preserveFirstInteger [firstIntegerRangeCheck] 1
+      (.cons (.integer 0 3) (.cons (.integer 10 20) .nil)) =
+      .error (.familyIndexOutOfRange rangeCheckFixtureSite) := by
+  rfl
+
+example :
+    (iterateCarriedBoundTransitionWithRangeChecks [] preserveFirstInteger [firstIntegerRangeCheck] 0
+      (.cons (.integer 0 3) (.cons (.integer 10 20) .nil))).isOk = true := rfl
 
 private def swapIntegerIntervals :
     CarriedBoundTransitionVector twoIntegerSchemas twoIntegerSchemas :=

@@ -278,9 +278,9 @@ structure ValidatedInputInjectorFacts
   recurrenceInitial : containsFamilyFact (rootFamilyAggregate initialStates.val.id 0)
     (outputStates.val.source.initial.toList.map fun template => template.fact) = true
   recurrenceDigits : containsFamilyFact inputDigitsFact.aggregate
-    (outputStates.val.source.invariantInputs.map (·.fact)) = true
+    (outputStates.val.source.invariantInputs.map (·.template.fact)) = true
   recurrenceTransitions : containsFamilyFact (rootFamilyAggregate transitions.val.id 0)
-    (outputStates.val.source.invariantInputs.map (·.fact)) = true
+    (outputStates.val.source.invariantInputs.map (·.template.fact)) = true
   initialArtifact : { binding // binding ∈ execution.artifactBindings ∧
     request.initialArtifact.Matches binding }
   transitionsArtifact : { binding // binding ∈ execution.artifactBindings ∧
@@ -333,17 +333,17 @@ def projectInputInjectorFacts
   else throw (ProjectionError.recurrenceInputMismatch request.outputStates)
   let recurrenceDigitsProof ← if recurrenceDigits :
       containsFamilyFact inputDigitsFact.val.aggregate
-        (outputStates.val.source.invariantInputs.map (·.fact)) = true then
+        (outputStates.val.source.invariantInputs.map (·.template.fact)) = true then
     pure (⟨recurrenceDigits, ()⟩ : Evidence
       (containsFamilyFact inputDigitsFact.val.aggregate
-        (outputStates.val.source.invariantInputs.map (·.fact)) = true))
+        (outputStates.val.source.invariantInputs.map (·.template.fact)) = true))
   else throw (ProjectionError.recurrenceInputMismatch request.outputStates)
   let recurrenceTransitionsProof ← if recurrenceTransitions :
       containsFamilyFact (rootFamilyAggregate transitions.val.id 0)
-        (outputStates.val.source.invariantInputs.map (·.fact)) = true then
+        (outputStates.val.source.invariantInputs.map (·.template.fact)) = true then
     pure (⟨recurrenceTransitions, ()⟩ : Evidence
       (containsFamilyFact (rootFamilyAggregate transitions.val.id 0)
-        (outputStates.val.source.invariantInputs.map (·.fact)) = true))
+        (outputStates.val.source.invariantInputs.map (·.template.fact)) = true))
   else throw (ProjectionError.recurrenceInputMismatch request.outputStates)
   let initialArtifact ← findArtifact execution request.initialArtifact
   let transitionsArtifact ← findArtifact execution request.transitionsArtifact

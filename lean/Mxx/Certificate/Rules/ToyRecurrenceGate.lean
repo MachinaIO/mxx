@@ -143,7 +143,7 @@ private def toyAnalysisState : AnalysisState :=
 not make three symbolic copies of the body when Phase B later instantiates the count at three. -/
 example :
     toyAnalysisState.symbolicRecurrences.length = 1 ∧
-      toyAnalysisState.symbolicFormArena.entries.length = 1 := by
+      toyAnalysisState.symbolicFormArena.entries.size = 1 := by
   decide
 
 private def toyRecurrence : SymbolicRecurrenceTransfer :=

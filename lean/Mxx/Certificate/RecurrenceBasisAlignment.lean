@@ -207,7 +207,7 @@ private def normalizerTestSite (node : Nat) : CoreNodeRef := {
 private def normalizerTestLoop : LoopRef := ⟨normalizerTestSite 0⟩
 
 private def normalizerTestArena : ExpressionArena := {
-  entries := [
+  entries := #[
     .integer (.loopIndex normalizerTestLoop),
     .integer (.intBinary .add (.loopIndex normalizerTestLoop) (.intConstant 1)),
     .integer (.intBinary .add (.intConstant 1) (.loopIndex normalizerTestLoop)),

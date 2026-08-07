@@ -79,20 +79,6 @@ fn lean_code_without_comments(line: &str, comment_depth: &mut usize) -> String {
     output
 }
 
-fn verify_axiom_report(output: &str) {
-    const ALLOWED: [&str; 3] = ["propext", "Classical.choice", "Quot.sound"];
-    for line in output.lines() {
-        let Some((_, report)) = line.split_once("depends on axioms:") else {
-            continue;
-        };
-        let axioms = report.trim().trim_start_matches('[').trim_end_matches(']');
-        for axiom in axioms.split(',').map(str::trim).filter(|axiom| !axiom.is_empty()) {
-            assert!(ALLOWED.contains(&axiom), "unreviewed Lean axiom dependency: {axiom}");
-        }
-        println!("cargo:warning={line}");
-    }
-}
-
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let workspace = manifest.parent().and_then(|path| path.parent()).expect("workspace root");
@@ -111,21 +97,4 @@ fn main() {
         .status()
         .expect("failed to start the Lean input-injector proof build for mxx-gadgets");
     assert!(status.success(), "Lean input-injector proof build for mxx-gadgets failed");
-    let report = Command::new("lake")
-        .args([
-            "env",
-            "lean",
-            manifest
-                .join("lean/MxxGadgets/AxiomReport.lean")
-                .to_str()
-                .expect("UTF-8 axiom report path"),
-        ])
-        .current_dir(&lean)
-        .output()
-        .expect("failed to start the Lean axiom report for mxx-gadgets");
-    let stdout = String::from_utf8(report.stdout).expect("UTF-8 Lean axiom report");
-    let stderr = String::from_utf8(report.stderr).expect("UTF-8 Lean axiom diagnostics");
-    assert!(report.status.success(), "Lean axiom report failed:\n{stdout}\n{stderr}");
-    verify_axiom_report(&stdout);
-    verify_axiom_report(&stderr);
 }

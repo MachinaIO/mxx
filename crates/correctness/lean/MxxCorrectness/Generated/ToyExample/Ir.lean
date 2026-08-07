@@ -11,7 +11,7 @@ def ToyExample_protocolSourceHash : String := "e7b179bba826b3bb584fda61083591285
 
 def ToyExample_workflowHash : String := "1cffc358ce796800fad2b9513f767c5df8e2eaf8e62bca1329a8b0012874b0df"
 
-def ToyExample_toolkitHash : String := "568403504194710bf4e0845a563878da03ca59213e54bafc2a7f5209b85580f2"
+def ToyExample_toolkitHash : String := "dc0b31b3dc75b70bca33feb76285efd8a25e231976897a9cba2e069ee0fee9b3"
 
 def ToyExample_stage_encrypt : Mxx.Ir.Prog :=
   { root :=

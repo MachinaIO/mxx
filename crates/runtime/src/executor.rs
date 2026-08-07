@@ -20,8 +20,9 @@ use mxx_ir_core::{
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Instant};
 use thiserror::Error;
+use tracing::debug;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionConfig {
@@ -1605,6 +1606,17 @@ where
                 for wave_start in (0..count).step_by(wave_size) {
                     let wave_end = count.min(wave_start.saturating_add(wave_size));
                     let wave_len = wave_end - wave_start;
+                    let wave_started = Instant::now();
+                    debug!(
+                        scope = ?scope_id,
+                        node = node.id.0,
+                        wave_start,
+                        wave_end,
+                        wave_len,
+                        wave_size,
+                        placement_count,
+                        "starting parallel loop wave"
+                    );
                     let mut child_envs = Vec::with_capacity(wave_len);
                     let mut child_paths = Vec::with_capacity(wave_len);
                     let mut child_inputs = Vec::with_capacity(wave_len);
@@ -1664,6 +1676,14 @@ where
                             }
                         }
                     }
+                    debug!(
+                        scope = ?scope_id,
+                        node = node.id.0,
+                        wave_start,
+                        wave_end,
+                        elapsed_seconds = wave_started.elapsed().as_secs_f64(),
+                        "finished parallel loop wave"
+                    );
                 }
                 self.set_placement(parent_placement)?;
                 for (port, family) in families.into_iter().enumerate() {

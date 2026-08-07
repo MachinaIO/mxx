@@ -15,6 +15,7 @@ extern "C"
         int format,
         GpuMatrix **out);
     void gpu_matrix_destroy(GpuMatrix *mat);
+    int gpu_matrix_wait_until_ready(const GpuMatrix *mat);
     int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src);
     int gpu_matrix_copy_block(
         GpuMatrix *out,

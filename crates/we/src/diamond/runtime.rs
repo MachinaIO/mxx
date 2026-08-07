@@ -17,8 +17,9 @@ use mxx_runtime::{
     execute_in_session_with_config, transcript::SamplingMode,
 };
 use rand::random;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Instant};
 use thiserror::Error;
+use tracing::{debug, info};
 
 use super::graph::{DECODED_OUTPUT, HASH_KEY_INPUT, MESSAGE_INPUT};
 
@@ -117,17 +118,39 @@ where
         message: bool,
         hash_key: [u8; 32],
     ) -> Result<DiamondWeCiphertext, DiamondRuntimeError> {
+        let total_started = Instant::now();
+        let validation_started = Instant::now();
         self.validate_public_inputs(circuit, instance)?;
+        debug!(
+            elapsed_seconds = validation_started.elapsed().as_secs_f64(),
+            "validated Diamond encryption inputs"
+        );
+        let graph_started = Instant::now();
         let built = self.compiler.build_encryption()?.graph;
+        debug!(
+            elapsed_seconds = graph_started.elapsed().as_secs_f64(),
+            "built Diamond encryption graph"
+        );
+        let validation_started = Instant::now();
         let bindings = self.compiler.circuit_bindings()?;
         let validated = built
             .validate(&bindings)
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
+        debug!(
+            elapsed_seconds = validation_started.elapsed().as_secs_f64(),
+            "validated Diamond encryption graph"
+        );
+        let production_started = Instant::now();
         let production = production_id(
             spec_hash(&validated.source, &validated.bindings)
                 .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?,
             hash_key,
         );
+        debug!(
+            elapsed_seconds = production_started.elapsed().as_secs_f64(),
+            "constructed Diamond encryption production identity"
+        );
+        let inputs_started = Instant::now();
         let mut inputs = circuit_inputs::<PolyBackend<M, U, H, T>>(circuit, &self.compiler.shape);
         insert_boolean_family_input(
             &mut inputs,
@@ -137,6 +160,12 @@ where
         );
         inputs.insert(HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.to_vec()));
         inputs.insert(MESSAGE_INPUT.to_owned(), RuntimeValue::Bool(message));
+        debug!(
+            elapsed_seconds = inputs_started.elapsed().as_secs_f64(),
+            "constructed Diamond encryption runtime inputs"
+        );
+        let execution_started = Instant::now();
+        info!("starting Diamond encryption graph execution");
         execute_in_session_with_config(
             &validated,
             &mut self.backend,
@@ -146,6 +175,11 @@ where
             self.execution_config,
         )
         .map_err(|error| DiamondRuntimeError::Execution(error.to_string()))?;
+        info!(
+            execution_elapsed_seconds = execution_started.elapsed().as_secs_f64(),
+            total_elapsed_seconds = total_started.elapsed().as_secs_f64(),
+            "finished Diamond encryption graph execution"
+        );
         Ok(DiamondWeCiphertext { hash_key, encryption: production })
     }
 
@@ -156,6 +190,8 @@ where
         witness: &[bool],
         ciphertext: &DiamondWeCiphertext,
     ) -> Result<bool, DiamondRuntimeError> {
+        let total_started = Instant::now();
+        let validation_started = Instant::now();
         self.validate_public_inputs(circuit, instance)?;
         if witness.len() != self.compiler.shape.witness_width {
             return Err(DiamondRuntimeError::WitnessLength);
@@ -163,6 +199,11 @@ where
         if ciphertext.hash_key != ciphertext.encryption.execution_nonce {
             return Err(DiamondRuntimeError::ProductionNonceMismatch);
         }
+        debug!(
+            elapsed_seconds = validation_started.elapsed().as_secs_f64(),
+            "validated Diamond decryption inputs"
+        );
+        let encryption_graph_started = Instant::now();
         let encryption_graph = self
             .compiler
             .build_encryption()?
@@ -174,27 +215,58 @@ where
         if graph_hash != ciphertext.encryption.spec_hash {
             return Err(DiamondRuntimeError::ProductionGraphMismatch);
         }
+        debug!(
+            elapsed_seconds = encryption_graph_started.elapsed().as_secs_f64(),
+            "validated Diamond encryption provenance for decryption"
+        );
+        let graph_started = Instant::now();
         let built = self.compiler.build_decryption(ciphertext.encryption.clone())?.graph;
+        debug!(
+            elapsed_seconds = graph_started.elapsed().as_secs_f64(),
+            "built Diamond decryption graph"
+        );
+        let manifest_started = Instant::now();
         let manifest = self
             .store
             .load_manifest(&ciphertext.encryption)
             .map_err(|error| DiamondRuntimeError::Store(error.to_string()))?;
+        debug!(
+            elapsed_seconds = manifest_started.elapsed().as_secs_f64(),
+            "loaded Diamond encryption manifest for decryption"
+        );
+        let validation_started = Instant::now();
         let validated = built
             .validate_with_manifests(
                 &self.compiler.circuit_bindings()?,
                 &BTreeMap::from([(ciphertext.encryption.clone(), manifest)]),
             )
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
+        debug!(
+            elapsed_seconds = validation_started.elapsed().as_secs_f64(),
+            "validated Diamond decryption graph"
+        );
+        let inputs_started = Instant::now();
         let maximum_width = self.compiler.shape.analyze()?.maximum_layer_width;
         let mut inputs = circuit_inputs::<PolyBackend<M, U, H, T>>(circuit, &self.compiler.shape);
         insert_boolean_family_input(&mut inputs, BOOLEAN_INSTANCE_INPUT, instance, maximum_width);
         insert_boolean_family_input(&mut inputs, BOOLEAN_WITNESS_INPUT, witness, maximum_width);
+        debug!(
+            elapsed_seconds = inputs_started.elapsed().as_secs_f64(),
+            "constructed Diamond decryption runtime inputs"
+        );
+        let execution_started = Instant::now();
+        info!("starting Diamond decryption graph execution");
         let result =
             execute(&validated, &mut self.backend, inputs, &mut self.store, SamplingMode::Fresh)
                 .map_err(|error| DiamondRuntimeError::Execution(error.to_string()))?;
         let Some(RuntimeValue::Bool(decoded)) = result.outputs.get(DECODED_OUTPUT) else {
             return Err(DiamondRuntimeError::DecodeOutput);
         };
+        info!(
+            execution_elapsed_seconds = execution_started.elapsed().as_secs_f64(),
+            total_elapsed_seconds = total_started.elapsed().as_secs_f64(),
+            "finished Diamond decryption graph execution"
+        );
         Ok(*decoded)
     }
 

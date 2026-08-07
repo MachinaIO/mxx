@@ -470,6 +470,35 @@ extern "C" void gpu_matrix_destroy(GpuMatrix *mat)
     delete mat;
 }
 
+extern "C" int gpu_matrix_wait_until_ready(const GpuMatrix *mat)
+{
+    if (!mat)
+    {
+        return set_error("invalid gpu_matrix_wait_until_ready arguments");
+    }
+    for (const auto &partition : mat->exec_limb_states)
+    {
+        for (const auto &state : partition)
+        {
+            if (!state.write_done || !state.write_done_valid)
+            {
+                continue;
+            }
+            cudaError_t err = cudaSetDevice(state.device);
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaEventSynchronize(state.write_done);
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
+            }
+        }
+    }
+    return 0;
+}
+
 extern "C" int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src)
 {
     if (!dst || !src)

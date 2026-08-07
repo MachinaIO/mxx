@@ -68,6 +68,15 @@ impl PartialEq for GpuDCRTTrapdoor {
 impl Eq for GpuDCRTTrapdoor {}
 
 impl GpuDCRTTrapdoor {
+    /// Waits for every matrix required to consume this trapdoor.
+    pub fn wait_until_ready(&self) {
+        self.r.wait_until_ready();
+        self.e.wait_until_ready();
+        self.a_mat_coeff.wait_until_ready();
+        self.b_mat_coeff.wait_until_ready();
+        self.d_mat_coeff.wait_until_ready();
+    }
+
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();

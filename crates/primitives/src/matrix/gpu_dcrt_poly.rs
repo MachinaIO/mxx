@@ -22,6 +22,7 @@ use crate::{
                 gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_columns,
                 gpu_matrix_sample_p1_full_cached, gpu_matrix_store_compact_bytes,
                 gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                gpu_matrix_wait_until_ready,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -220,6 +221,15 @@ impl PartialEq for GpuDCRTPolyMatrix {
 impl Eq for GpuDCRTPolyMatrix {}
 
 impl GpuDCRTPolyMatrix {
+    /// Waits only for CUDA work recorded for this matrix's limb buffers.
+    ///
+    /// This is intended for measurement and explicit host-consumption boundaries. It does not
+    /// synchronize unrelated streams or devices.
+    pub fn wait_until_ready(&self) {
+        let status = unsafe { gpu_matrix_wait_until_ready(self.raw) };
+        check_status(status, "gpu_matrix_wait_until_ready");
+    }
+
     pub(crate) fn new_empty_with_state(
         params: &GpuDCRTPolyParams,
         nrow: usize,

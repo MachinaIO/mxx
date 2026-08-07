@@ -11,9 +11,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::Arc,
+    time::Instant,
 };
 use thiserror::Error;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Clone, Debug)]
 pub struct DiamondParameterSearch {
@@ -91,11 +92,27 @@ impl DiamondParameterSearch {
     where
         F: FnMut(&DCRTPolyParams, f64) -> Result<u64, DiamondParameterSearchError>,
     {
+        let search_started = Instant::now();
         self.validate()?;
+        info!(
+            min_crt_depth = self.min_crt_depth,
+            initial_max_crt_depth = self.initial_max_crt_depth,
+            max_crt_depth = self.max_crt_depth,
+            min_log_ring_dimension = self.min_log_ring_dimension,
+            max_log_ring_dimension = self.max_log_ring_dimension,
+            security_bits = self.security_bits,
+            crt_modulus_bits = self.crt_modulus_bits,
+            gadget_base_bits = self.gadget_base_bits,
+            trapdoor_sigma = self.trapdoor_sigma,
+            error_sigma = self.error_sigma,
+            "starting Diamond WE parameter search"
+        );
         let mut checker = LeanCheckerSession::start()?;
         let mut cache = BTreeMap::<usize, Candidate>::new();
         let mut evaluate = |crt_depth: usize| -> Result<bool, DiamondParameterSearchError> {
+            let started = Instant::now();
             if let std::collections::btree_map::Entry::Vacant(entry) = cache.entry(crt_depth) {
+                info!(crt_depth, "evaluating Diamond WE parameter candidate");
                 let (log_ring_dimension, achieved) =
                     self.select_ring_dimension(crt_depth, &mut estimate_security)?;
                 entry.insert(self.evaluate_candidate(
@@ -104,6 +121,18 @@ impl DiamondParameterSearch {
                     achieved,
                     &mut checker,
                 )?);
+                let candidate = cache.get(&crt_depth).expect("inserted candidate");
+                info!(
+                    crt_depth,
+                    ring_dimension = candidate.selected.ring_dimension,
+                    modulus_bits = candidate.selected.modulus_bits,
+                    achieved_security_bits = candidate.selected.achieved_security_bits,
+                    accepted = candidate.correct,
+                    elapsed_seconds = started.elapsed().as_secs_f64(),
+                    "finished Diamond WE parameter candidate"
+                );
+            } else {
+                debug!(crt_depth, "reusing cached Diamond WE parameter candidate");
             }
             Ok(cache.get(&crt_depth).expect("inserted candidate").correct)
         };
@@ -135,10 +164,19 @@ impl DiamondParameterSearch {
                 low = depth + 1;
             }
         }
-        cache
+        let selected = cache
             .remove(&best)
             .map(|candidate| candidate.selected)
-            .ok_or(DiamondParameterSearchError::NoCorrectParameters)
+            .ok_or(DiamondParameterSearchError::NoCorrectParameters)?;
+        info!(
+            crt_depth = selected.crt_depth,
+            ring_dimension = selected.ring_dimension,
+            modulus_bits = selected.modulus_bits,
+            achieved_security_bits = selected.achieved_security_bits,
+            elapsed_seconds = search_started.elapsed().as_secs_f64(),
+            "selected Diamond WE parameters"
+        );
+        Ok(selected)
     }
 
     fn select_ring_dimension<F>(
@@ -162,7 +200,21 @@ impl DiamondParameterSearch {
                 self.crt_modulus_bits,
                 self.gadget_base_bits,
             );
+            let started = Instant::now();
+            debug!(
+                crt_depth,
+                ring_dimension,
+                modulus_bits = parameters.modulus().bits(),
+                "starting Diamond WE lattice security estimate"
+            );
             let achieved = estimate_security(&parameters, self.error_sigma)?;
+            info!(
+                crt_depth,
+                ring_dimension,
+                achieved_security_bits = achieved,
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "finished Diamond WE lattice security estimate"
+            );
             if achieved >= self.security_bits as u64 {
                 selected = Some((log, achieved));
                 if log == 0 {
@@ -183,6 +235,7 @@ impl DiamondParameterSearch {
         achieved_security_bits: u64,
         checker: &mut LeanCheckerSession,
     ) -> Result<Candidate, DiamondParameterSearchError> {
+        let started = Instant::now();
         let ring_dimension = 1u32
             .checked_shl(log_ring_dimension as u32)
             .ok_or(DiamondParameterSearchError::InvalidRange)?;
@@ -224,7 +277,23 @@ impl DiamondParameterSearch {
             self.shape.clone(),
         )
         .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?;
+        debug!(
+            crt_depth,
+            ring_dimension,
+            error_max_coefficient_bound = %compiler.config.error_max_coefficient_bound,
+            preimage_max_coefficient_bound = %compiler.config.preimage_max_coefficient_bound,
+            setup_elapsed_seconds = started.elapsed().as_secs_f64(),
+            "constructed Diamond WE checker candidate"
+        );
+        let checker_started = Instant::now();
         let correct = checker.accepts(&compiler)?;
+        info!(
+            crt_depth,
+            ring_dimension,
+            accepted = correct,
+            elapsed_seconds = checker_started.elapsed().as_secs_f64(),
+            "finished Diamond WE Lean hard-bound check"
+        );
         Ok(Candidate {
             selected: DiamondSelectedParameters {
                 parameters,

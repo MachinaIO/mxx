@@ -7,7 +7,7 @@ def DiamondWeFamily_generatorVersion : String := "mxx-correctness-emitter-v6"
 
 def DiamondWeFamily_protocolSourcePaths : List String := ["crates/bgg/Cargo.toml", "crates/bgg/src", "crates/correctness/Cargo.toml", "crates/correctness/src", "crates/dsl/Cargo.toml", "crates/dsl/src", "crates/gadgets/Cargo.toml", "crates/gadgets/src", "crates/ir-core/Cargo.toml", "crates/ir-core/src", "crates/we/Cargo.toml", "crates/we/examples/emit_correctness.rs", "crates/we/src"]
 
-def DiamondWeFamily_protocolSourceHash : String := "018981fab5acca554345661d5d86e36f0e17b3e0b01272839adb2889e9cdae1b"
+def DiamondWeFamily_protocolSourceHash : String := "4a562a803de9a8ff88d81846e2b59aeb9b020d581515074af8e1afe69bb9420b"
 
 def DiamondWeFamily_workflowHash : String := "df98e6fb7b9da2efdecc07137f81b853a0e8dec1d8af1342f4be45a86439fce1"
 

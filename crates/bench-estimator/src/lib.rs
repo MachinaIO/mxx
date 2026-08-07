@@ -24,7 +24,9 @@ pub struct MeasurementNode<'a> {
     pub id: NodeId,
     pub kind: &'a NodeKind,
     pub arguments: &'a [WireRef],
+    pub argument_types: &'a [ConcreteWireType],
     pub output_types: &'a [WireType],
+    pub concrete_output_types: &'a [ConcreteWireType],
 }
 
 pub trait MeasurementBackend {
@@ -209,12 +211,31 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         for (position, handle) in plan.execution_order.iter().enumerate() {
             let id = NodeId(position as u64);
             let arguments = scope.arguments(handle).expect("plan node belongs to scope");
+            let argument_types = arguments
+                .iter()
+                .map(|wire| {
+                    plan.wire_types
+                        .get(wire)
+                        .expect("validated plan argument has a concrete wire type")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let concrete_output_types = (0..handle.output_types().len())
+                .map(|port| {
+                    plan.wire_types
+                        .get(&WireRef { node: id, port: mxx_ir_core::Port(port as u32) })
+                        .expect("validated plan output has a concrete wire type")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
             let node = MeasurementNode {
                 scope: scope_id,
                 id,
                 kind: handle.kind(),
                 arguments: &arguments,
+                argument_types: &argument_types,
                 output_types: handle.output_types(),
+                concrete_output_types: &concrete_output_types,
             };
             let predecessor = arguments
                 .iter()

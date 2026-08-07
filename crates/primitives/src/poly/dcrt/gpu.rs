@@ -92,6 +92,7 @@ unsafe extern "C" {
         out_mat: *mut *mut GpuMatrixOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_destroy(mat: *mut GpuMatrixOpaque);
+    pub(crate) fn gpu_matrix_wait_until_ready(mat: *const GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_copy(dst: *mut GpuMatrixOpaque, src: *const GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_load_rns_batch(
         mat: *mut GpuMatrixOpaque,

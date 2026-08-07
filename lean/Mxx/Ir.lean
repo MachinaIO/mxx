@@ -137,6 +137,13 @@ inductive IntCompareOp where
   | lessEqual
   deriving BEq, DecidableEq
 
+inductive RealBinaryOp where
+  | add
+  | subtract
+  | multiply
+  | divide
+  deriving BEq, DecidableEq
+
 inductive LoopInputMode where
   | broadcast
   | zip
@@ -200,16 +207,27 @@ inductive NodeKind where
   | input (name : String)
   | constantInt (value : Int)
   | evaluateInt (value : IntExpr)
+  | constantReal (value : RealExpr)
   | constantBool (value : Bool)
   | zeroMatrix (matrixType : MatrixTypeExpr)
   | identityMatrix (matrixType : MatrixTypeExpr)
   | constantMatrix (matrixType : MatrixTypeExpr) (coefficients : List IntExpr)
+  | unitRowMatrix (matrixType : MatrixTypeExpr) (index : IntExpr)
+  | unitColumnMatrix (matrixType : MatrixTypeExpr) (index : IntExpr)
   | gadgetMatrix (matrixType : MatrixTypeExpr) (base : IntExpr)
+  | smallGadgetMatrix (matrixType : MatrixTypeExpr) (base : IntExpr)
+  | powerOfBaseMatrix (matrixType : MatrixTypeExpr) (base exponent : IntExpr)
+  | rotationMatrix (matrixType : MatrixTypeExpr) (exponent : IntExpr)
+  | gadgetTrapdoor (matrixType : MatrixTypeExpr) (base : IntExpr)
   | boolToInt
+  | intToReal
   | intBinary (operation : IntBinaryOp)
+  | realBinary (operation : RealBinaryOp)
+  | realSqrt
   | intCompare (operation : IntCompareOp)
   | bitExtract (bit : IntExpr)
   | extractCoefficient (position : IntExpr)
+  | constantCoefficient (position : IntExpr)
   | select
   | uniformSample (matrixType : MatrixTypeExpr) (minimum maximum : IntExpr)
   | gaussianSample (matrixType : MatrixTypeExpr) (maxCoefficientBound : IntExpr)
@@ -228,11 +246,17 @@ inductive NodeKind where
   | matrixMultiply
   | matrixNegate
   | matrixScale (scalar : IntExpr)
+  | transpose
   | slice (rows columns : Option (IntExpr × IntExpr))
+  | tensor
   | reshape (rows columns : IntExpr)
   | concat (axis : ConcatAxis)
   | thresholdDecodeBool
       (ciphertextModulus plaintextModulus length : IntExpr)
+  | thresholdDecodeInt
+      (ciphertextModulus plaintextModulus length : IntExpr)
+  | crtRecompose (plaintextModuli reconstructionCoefficients : List IntExpr)
+  | packPolynomialCoefficients (matrixType : MatrixTypeExpr) (coefficientBits : IntExpr)
   | familyPack
   | familyGetStatic (index : IntExpr)
   | familyGetDynamic
@@ -714,6 +738,7 @@ def evaluateNode
       match value.evaluate params with
       | some value => [[.integer value]]
       | none => [[.invalid "integer-expression evaluation failed"]]
+  | .constantReal _ => [[.invalid "exact real-expression execution is unavailable"]]
   | .constantBool value => [[.boolean value]]
   | .zeroMatrix matrixType =>
       match matrixType.evaluate params with
@@ -739,6 +764,9 @@ def evaluateNode
             { coefficients := values.map (Mxx.reduceCoefficient matrixParams.modulus) }
             matrixParams)]]
       | _, _ => [[.invalid "constant-matrix evaluation failed"]]
+  | .unitRowMatrix _ _ | .unitColumnMatrix _ _ | .smallGadgetMatrix _ _ |
+      .powerOfBaseMatrix _ _ _ | .rotationMatrix _ _ | .gadgetTrapdoor _ _ =>
+      [[.invalid "constant-matrix variant execution is unavailable"]]
   | .gadgetMatrix matrixType base =>
       match matrixType.evaluate params, base.evaluate params with
       | some matrixParams, some base =>
@@ -749,6 +777,8 @@ def evaluateNode
       match arguments node wires with
       | some [.boolean value] => [[.integer (if value then 1 else 0)]]
       | _ => [[.invalid "BoolToInt argument mismatch"]]
+  | .intToReal | .realBinary _ | .realSqrt =>
+      [[.invalid "exact real-expression execution is unavailable"]]
   | .intBinary operation =>
       match arguments node wires with
       | some [.integer left, .integer right] =>
@@ -773,6 +803,7 @@ def evaluateNode
           [[.integer (Mxx.reduceCoefficient matrix.modulus
             (matrix.coefficients.getD position.toNat 0))]]
       | _, _ => [[.invalid "coefficient-extraction argument mismatch"]]
+  | .constantCoefficient _ => [[.invalid "constant-coefficient execution is unavailable"]]
   | .select =>
       match arguments node wires with
       | some (.integer index :: branches) =>
@@ -858,6 +889,7 @@ def evaluateNode
       match arguments node wires, scalar.evaluate params with
       | some [.matrix value], some scalar => [[.matrix (Mxx.matrixScale scalar value)]]
       | _, _ => [[.invalid "matrix scaling argument mismatch"]]
+  | .transpose | .tensor => [[.invalid "matrix transform execution is unavailable"]]
   | .slice rows columns =>
       match arguments node wires with
       | some [.matrix value] =>
@@ -902,6 +934,8 @@ def evaluateNode
           else [((value.coefficients.take length.toNat).map fun coefficient =>
             .boolean (thresholdDecodeBool ciphertextModulus plaintextModulus coefficient))]
       | _, _, _, _ => [[.invalid "threshold decode argument mismatch"]]
+  | .thresholdDecodeInt _ _ _ | .crtRecompose _ _ | .packPolynomialCoefficients _ _ =>
+      [[.invalid "matrix transform execution is unavailable"]]
   | .familyPack =>
       match arguments node wires with
       | some values => [[.family values]]

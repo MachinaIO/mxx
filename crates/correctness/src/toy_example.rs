@@ -80,12 +80,14 @@ pub fn protocol() -> ProtocolDecl {
                         id: StageId("encrypt".to_owned()),
                         graph: encrypt.graph,
                         semantic_anchors: encrypt.anchors,
+                        derivation_attachments: encrypt.derivation_attachments,
                         bindings: Vec::new(),
                     },
                     ProtocolStage {
                         id: StageId("decrypt".to_owned()),
                         graph: decrypt.graph,
                         semantic_anchors: decrypt.anchors,
+                        derivation_attachments: decrypt.derivation_attachments,
                         bindings: vec![ArtifactBinding {
                             consumer_input: StageInputName("ciphertext".to_owned()),
                             producer_stage: StageId("encrypt".to_owned()),

@@ -16,5 +16,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("ToyExample");
     fs::create_dir_all(&generated)?;
     fs::write(generated.join("Ir.lean"), emitted.ir)?;
+    fs::write(generated.join("Derivation.lean"), emitted.derivation_ir)?;
     Ok(())
 }

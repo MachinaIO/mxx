@@ -25,7 +25,7 @@ diff -ru \
 
 (
     cd lean
-    lake build Mxx MxxCorrectness MxxWe mxx_diamond_checker mxx_analysis_facts
+    lake build Mxx MxxCorrectness MxxWe mxx_diamond_checker mxx_diamond_derivation_checker mxx_analysis_facts
 )
 
 lean/.lake/build/bin/mxx_analysis_facts target/correctness/m0-analysis-facts.json

@@ -5,10 +5,11 @@ use std::{
     process::Command,
 };
 
-pub const GENERATOR_VERSION: &str = "mxx-correctness-emitter-v5";
+pub const GENERATOR_VERSION: &str = "mxx-correctness-emitter-v6";
 
 pub struct GeneratedFreshness {
     pub workflow_hash: String,
+    pub derivation_hash: String,
 }
 
 #[derive(Debug)]
@@ -61,6 +62,10 @@ pub fn verify_generated_freshness(
     )?;
     Ok(GeneratedFreshness {
         workflow_hash: string_definition(&generated_source, &format!("{lean_name}_workflowHash"))?,
+        derivation_hash: string_definition(
+            &generated_source,
+            &format!("{lean_name}_derivationHash"),
+        )?,
     })
 }
 

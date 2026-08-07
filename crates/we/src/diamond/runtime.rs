@@ -293,7 +293,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diamond::{DiamondArtifactNames, DiamondWeConfig};
+    use crate::diamond::{
+        DiamondArtifactNames, DiamondWeConfig, default_preimage_max_coefficient_bound,
+    };
     use keccak_asm::Keccak256;
     use mxx_gadgets::circuit::{BooleanGateData, BooleanGateKind};
     use mxx_ir_core::{RealExpr, artifact::SpecHash};
@@ -320,6 +322,15 @@ mod tests {
     fn runtime() -> TestRuntime {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let modulus: std::sync::Arc<num_bigint::BigUint> = parameters.modulus();
+        let trapdoor_sigma = RealExpr::from_f64_exact(4.578).unwrap();
+        let gadget_base = BigInt::from(1u64 << parameters.base_bits());
+        let preimage_max_coefficient_bound = default_preimage_max_coefficient_bound(
+            &trapdoor_sigma,
+            parameters.ring_dimension() as usize,
+            parameters.modulus_digits(),
+            &gadget_base,
+        )
+        .unwrap();
         let compiler = DiamondWeCompiler::new(
             DiamondWeConfig {
                 modulus: BigInt::from(modulus.as_ref().clone()),
@@ -327,12 +338,12 @@ mod tests {
                 input_count: 1,
                 digit_base: 2,
                 batch_bits: 1,
-                gadget_base: BigInt::from(1u64 << parameters.base_bits()),
+                gadget_base,
                 digit_count: parameters.modulus_digits(),
-                trapdoor_sigma: RealExpr::from_f64_exact(4.578).unwrap(),
+                trapdoor_sigma,
                 error_sigma: RealExpr::from_integer(0),
                 error_max_coefficient_bound: 0.into(),
-                preimage_max_coefficient_bound: 30.into(),
+                preimage_max_coefficient_bound,
                 bgg_tag: b"diamond-runtime-test".to_vec(),
             },
             BooleanCircuitShape {
@@ -354,6 +365,23 @@ mod tests {
             ]],
             output_source,
         }
+    }
+
+    fn and_circuit() -> BooleanCircuitData {
+        BooleanCircuitData {
+            layers: vec![vec![BooleanGateData { kind: BooleanGateKind::And, left: 0, right: 1 }]],
+            output_source: 0,
+        }
+    }
+
+    #[test]
+    fn small_and_round_trip() {
+        let circuit = and_circuit();
+        let instance = [true];
+        let mut runtime = runtime();
+        let ciphertext =
+            runtime.encrypt_with_hash_key(&circuit, &instance, true, [0x3f; 32]).unwrap();
+        assert_eq!(runtime.decrypt(&circuit, &instance, &[true], &ciphertext).unwrap(), true);
     }
 
     #[test]

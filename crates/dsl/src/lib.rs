@@ -2880,6 +2880,44 @@ pub struct FrozenSemanticAnchors {
     entries: BTreeMap<String, Vec<ScopedWireRef>>,
 }
 
+/// A frozen, owner-crate rule reference retained alongside an executable graph.
+///
+/// This is generator infrastructure: it identifies the exact wires to which an owning crate's
+/// checked operational rule applies.  It contains neither a claimed equation nor a numeric bound.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Deserialize, serde::Serialize)]
+#[doc(hidden)]
+pub struct FrozenDerivationAttachment {
+    pub namespace: String,
+    pub rule: String,
+    pub roles: Vec<(String, ScopedWireRef)>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[doc(hidden)]
+pub struct FrozenDerivationAttachments {
+    entries: Vec<FrozenDerivationAttachment>,
+}
+
+impl FrozenDerivationAttachments {
+    #[doc(hidden)]
+    pub fn iter(&self) -> impl Iterator<Item = &FrozenDerivationAttachment> {
+        self.entries.iter()
+    }
+
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct DerivationAttachment {
+    namespace: String,
+    rule: String,
+    roles: Vec<(String, ValueHandle)>,
+}
+
 impl FrozenSemanticAnchors {
     pub fn get(&self, name: &str) -> Option<&[ScopedWireRef]> {
         self.entries.get(name).map(Vec::as_slice)
@@ -2898,6 +2936,7 @@ impl FrozenSemanticAnchors {
 #[doc(hidden)]
 pub struct Pending {
     semantic_anchors: BTreeMap<String, Vec<ValueHandle>>,
+    derivation_attachments: Vec<DerivationAttachment>,
 }
 
 impl Pending {
@@ -2908,6 +2947,7 @@ impl Pending {
             for (name, wires) in pending.semantic_anchors {
                 merged.semantic_anchors.entry(name).or_default().extend(wires);
             }
+            merged.derivation_attachments.extend(pending.derivation_attachments);
         }
         merged
     }
@@ -2924,11 +2964,31 @@ impl Pending {
                 (name.clone(), wires)
             })
             .collect();
-        Self { semantic_anchors }
+        let derivation_attachments = self
+            .derivation_attachments
+            .iter()
+            .map(|attachment| DerivationAttachment {
+                namespace: attachment.namespace.clone(),
+                rule: attachment.rule.clone(),
+                roles: attachment
+                    .roles
+                    .iter()
+                    .map(|(role, wire)| {
+                        (role.clone(), map.resolve(wire).cloned().unwrap_or_else(|| wire.clone()))
+                    })
+                    .collect(),
+            })
+            .collect();
+        Self { semantic_anchors, derivation_attachments }
     }
 
     fn with_semantic_anchor(mut self, name: String, wires: Vec<ValueHandle>) -> Self {
         self.semantic_anchors.entry(name).or_default().extend(wires);
+        self
+    }
+
+    fn with_derivation_attachment(mut self, attachment: DerivationAttachment) -> Self {
+        self.derivation_attachments.push(attachment);
         self
     }
 }
@@ -2944,6 +3004,31 @@ pub trait SemanticAnchor: GraphValue + Sized {
 }
 
 impl<T: GraphValue> SemanticAnchor for T {}
+
+/// Attaches an owning-crate operational-rule reference without changing the executable graph.
+///
+/// This trait is intentionally hidden from normal DSL documentation.  Reusable gadget and BGG
+/// builders use it mechanically; protocol authors do not supply bounds, identities, or rules.
+#[doc(hidden)]
+pub trait DerivationAttachmentValue: GraphValue + Sized {
+    fn derivation_attachment(
+        self,
+        namespace: impl Into<String>,
+        rule: impl Into<String>,
+        roles: Vec<(String, ValueHandle)>,
+    ) -> Result<Self, DslError> {
+        let schema = self.schema();
+        let wires = self.flatten();
+        let pending = self.pending().with_derivation_attachment(DerivationAttachment {
+            namespace: namespace.into(),
+            rule: rule.into(),
+            roles,
+        });
+        Self::from_values(&schema, &wires, pending)
+    }
+}
+
+impl<T: GraphValue> DerivationAttachmentValue for T {}
 
 pub struct DslContext {
     name: String,
@@ -3190,6 +3275,12 @@ impl DslContext {
             .semantic_anchors
             .values()
             .flat_map(|wires| wires.iter().cloned())
+            .chain(
+                pending
+                    .derivation_attachments
+                    .iter()
+                    .flat_map(|attachment| attachment.roles.iter().map(|(_, wire)| wire.clone())),
+            )
             .filter(|wire| wire.construction_scope() == root_scope)
             .collect();
         let outputs = self
@@ -3222,13 +3313,43 @@ impl DslContext {
             })
             .collect::<Result<BTreeMap<_, _>, mxx_ir_core::FreezeResolveError>>()
             .map_err(|error| DslError::SemanticAnchorResolution(error.to_string()))?;
-        Ok((BuiltGraph { graph, anchors: FrozenSemanticAnchors { entries: anchors } }, freeze_map))
+        let mut attachments = pending
+            .derivation_attachments
+            .into_iter()
+            .map(|attachment| {
+                let roles = attachment
+                    .roles
+                    .into_iter()
+                    .map(|(role, wire)| {
+                        freeze_map.resolve_unique(&wire).cloned().map(|wire| (role, wire))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(FrozenDerivationAttachment {
+                    namespace: attachment.namespace,
+                    rule: attachment.rule,
+                    roles,
+                })
+            })
+            .collect::<Result<Vec<_>, mxx_ir_core::FreezeResolveError>>()
+            .map_err(|error| DslError::SemanticAnchorResolution(error.to_string()))?;
+        attachments.sort();
+        attachments.dedup();
+        Ok((
+            BuiltGraph {
+                graph,
+                anchors: FrozenSemanticAnchors { entries: anchors },
+                derivation_attachments: FrozenDerivationAttachments { entries: attachments },
+            },
+            freeze_map,
+        ))
     }
 }
 
 pub struct BuiltGraph {
     pub graph: Graph,
     pub anchors: FrozenSemanticAnchors,
+    #[doc(hidden)]
+    pub derivation_attachments: FrozenDerivationAttachments,
 }
 
 #[derive(Clone)]

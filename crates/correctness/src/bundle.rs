@@ -623,6 +623,7 @@ mod tests {
                     id: StageId("stage".to_owned()),
                     graph: stage.graph,
                     semantic_anchors: stage.anchors,
+                    derivation_attachments: stage.derivation_attachments,
                     bindings: Vec::new(),
                 }],
                 entrypoint: StageId("stage".to_owned()),

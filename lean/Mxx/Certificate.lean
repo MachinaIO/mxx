@@ -7,6 +7,8 @@ import Mxx.Certificate.Facts
 import Mxx.Certificate.Bounds
 import Mxx.Certificate.BundleSoundness
 import Mxx.Certificate.Checker
+import Mxx.Certificate.Derivation
+import Mxx.Certificate.OperationalBounds
 import Mxx.Certificate.Execution
 import Mxx.Certificate.ExpressionArena
 import Mxx.Certificate.LocalSoundness

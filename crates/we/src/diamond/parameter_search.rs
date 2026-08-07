@@ -364,6 +364,7 @@ impl Drop for LeanCheckerSession {
     }
 }
 
+#[cfg(test)]
 fn lean_checker_accepts(compiler: &DiamondWeCompiler) -> Result<bool, DiamondParameterSearchError> {
     LeanCheckerSession::start()?.accepts(compiler)
 }
@@ -403,13 +404,8 @@ fn discrete_gaussian_distribution_json(sigma: f64) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn exact_cutoffs_and_lean_checker_match_rust() {
-        assert_eq!(
-            default_error_max_coefficient_bound(&RealExpr::from_integer(4)).unwrap(),
-            BigInt::from(26)
-        );
-        let search = DiamondParameterSearch {
+    fn small_search() -> DiamondParameterSearch {
+        DiamondParameterSearch {
             shape: BooleanCircuitShape {
                 instance_width: 0,
                 witness_width: 1,
@@ -419,8 +415,8 @@ mod tests {
             min_crt_depth: 1,
             initial_max_crt_depth: 1,
             max_crt_depth: 1,
-            min_log_ring_dimension: 3,
-            max_log_ring_dimension: 3,
+            min_log_ring_dimension: 5,
+            max_log_ring_dimension: 5,
             crt_modulus_bits: 60,
             gadget_base_bits: 2,
             security_bits: 1,
@@ -430,12 +426,29 @@ mod tests {
             trapdoor_sigma: 4.0,
             error_sigma: 1.0,
             bgg_tag: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn exact_cutoffs_and_lean_checker_match_rust() {
+        assert_eq!(
+            default_error_max_coefficient_bound(&RealExpr::from_integer(4)).unwrap(),
+            BigInt::from(26)
+        );
+        let search = small_search();
         let selected = search.search_with_security_estimator(|_, _| Ok(1)).unwrap();
         assert!(lean_checker_accepts(&selected.compiler).unwrap());
 
-        let mut invalid_shape_relation = selected.compiler.clone();
-        invalid_shape_relation.shape.witness_width += 1;
-        assert!(!lean_checker_accepts(&invalid_shape_relation).unwrap());
+        let mut invalid_hard_bound = selected.compiler.clone();
+        invalid_hard_bound.config.error_max_coefficient_bound =
+            invalid_hard_bound.config.modulus.clone();
+        assert!(!lean_checker_accepts(&invalid_hard_bound).unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires lattice-estimator-cli and Sage on PATH"]
+    fn small_search_with_lattice_estimator() {
+        let selected = small_search().search().unwrap();
+        assert!(selected.achieved_security_bits >= 1);
     }
 }

@@ -595,42 +595,268 @@ private def ParallelTemplateSubstitution.rewriteMatrix
   | .loopResult type recurrence path => pure (.loopResult type recurrence path)
   | .carriedInput type path => pure (.carriedInput type path)
 
+/-- Collect exactly the arena entries reachable from one template fact.  Parallel instantiation
+only needs these entries: rebuilding every older entry makes nested families superlinear in the
+size of an unrelated parent scope.  The arena ordering invariant guarantees that recursive lookup
+always moves to an older entry; fuel is defensive for malformed hand-written fixtures. -/
+private def insertReachableReference (references : List Nat) (reference : Nat) : List Nat :=
+  if references.contains reference then references else reference :: references
+
+mutual
+
+private def collectReachableIntegerReference
+    (arena : ExpressionArena) : Nat → List Nat → RuntimeExprRef .integer → List Nat
+  | 0, references, _ => references
+  | fuel + 1, references, reference =>
+      let references := insertReachableReference references reference.id
+      match arena.lookupInteger reference with
+      | some expression => collectReachableRuntime arena fuel references expression
+      | none => references
+termination_by fuel _ _ => fuel
+
+private def collectReachableBooleanReference
+    (arena : ExpressionArena) : Nat → List Nat → RuntimeExprRef .boolean → List Nat
+  | 0, references, _ => references
+  | fuel + 1, references, reference =>
+      let references := insertReachableReference references reference.id
+      match arena.lookupBoolean reference with
+      | some expression => collectReachableRuntime arena fuel references expression
+      | none => references
+termination_by fuel _ _ => fuel
+
+private def collectReachableMatrixReference
+    (arena : ExpressionArena) : Nat → List Nat → MatrixExprRef → List Nat
+  | 0, references, _ => references
+  | fuel + 1, references, reference =>
+      let references := insertReachableReference references reference.id
+      match arena.lookupMatrix reference with
+      | some expression => collectReachableMatrix arena fuel references expression
+      | none => references
+termination_by fuel _ _ => fuel
+
+private def collectReachablePath
+    (arena : ExpressionArena) : Nat → List Nat → InstancePathExpr → List Nat
+  | _, references, [] => references
+  | 0, references, _ => references
+  | fuel + 1, references, .subgraphCall _ :: tail =>
+      collectReachablePath arena fuel references tail
+  | fuel + 1, references, .parallelLane _ index :: tail
+  | fuel + 1, references, .sequentialIteration _ index :: tail =>
+      collectReachablePath arena fuel
+        (collectReachableIntegerReference arena fuel references index) tail
+termination_by fuel _ _ => fuel
+
+private def collectReachableAggregate
+    (arena : ExpressionArena) : Nat → List Nat → FamilyAggregateRef → List Nat
+  | 0, references, _ => references
+  | fuel + 1, references, .joint _ _ path => collectReachablePath arena fuel references path
+  | fuel + 1, references, .familyElement parent index =>
+      collectReachableAggregate arena fuel
+        (collectReachableIntegerReference arena fuel references index) parent
+  | _, references, .carriedInput _ | _, references, .recurrenceResult _ _ _ => references
+termination_by fuel _ _ => fuel
+
+private def collectReachableValue
+    (arena : ExpressionArena) : Nat → List Nat → ValueInstanceRef → List Nat
+  | _, references, .protocolInput _ | _, references, .concrete _ | _, references, .template _ |
+      _, references, .recurrenceResult _ _ => references
+  | 0, references, _ => references
+  | fuel + 1, references, .instantiatedTemplate _ path =>
+      collectReachablePath arena fuel references path
+  | fuel + 1, references, .familyElement aggregate index =>
+      collectReachableAggregate arena fuel
+        (collectReachableIntegerReference arena fuel references index) aggregate
+termination_by fuel _ _ => fuel
+
+private def collectReachableRuntime
+    (arena : ExpressionArena) : {type : RuntimeScalarType} → Nat → List Nat → RuntimeExpr type → List Nat
+  | _, _, references, .intWire _ | _, _, references, .boolWire _ => references
+  | _, _, references, .intConstant _ | _, _, references, .boolConstant _ |
+      _, _, references, .parameter _ | _, _, references, .loopIndex _ |
+      _, _, references, .carriedInput _ => references
+  | _, 0, references, _ => references
+  | _, fuel + 1, references, .intBinary _ left right | _, fuel + 1, references, .compare _ left right =>
+      collectReachableRuntime arena fuel (collectReachableRuntime arena fuel references left) right
+  | _, fuel + 1, references, .bitExtract value _ | _, fuel + 1, references, .boolToInt value =>
+      collectReachableRuntime arena fuel references value
+  | _, fuel + 1, references, .thresholdDecodeBool matrix _ _ _ =>
+      collectReachableValue arena fuel references matrix
+  | _, fuel + 1, references, .extractCoefficient matrix _ =>
+      collectReachableMatrixReference arena fuel references matrix
+  | _, fuel + 1, references, .familyElement _ aggregate indexRef index =>
+      collectReachableAggregate arena fuel
+        (collectReachableRuntime arena fuel
+          (collectReachableIntegerReference arena fuel references indexRef) index) aggregate
+  | .integer, fuel + 1, references, .select .integer index branches =>
+      branches.foldl (collectReachableIntegerReference arena fuel)
+        (collectReachableRuntime arena fuel references index)
+  | .boolean, fuel + 1, references, .select .boolean index branches =>
+      branches.foldl (collectReachableBooleanReference arena fuel)
+        (collectReachableRuntime arena fuel references index)
+termination_by _ fuel _ _ => fuel
+
+private def collectReachableMatrix
+    (arena : ExpressionArena) : Nat → List Nat → MatrixExpr → List Nat
+  | _, references, .zero _ | _, references, .identity _ | _, references, .gadget _ _ |
+      _, references, .loopResult _ _ _ | _, references, .carriedInput _ _ => references
+  | 0, references, _ => references
+  | fuel + 1, references, .wire reference => collectReachableValue arena fuel references reference.value
+  | fuel + 1, references, .add left right | fuel + 1, references, .multiply left right =>
+      collectReachableMatrix arena fuel (collectReachableMatrix arena fuel references left) right
+  | fuel + 1, references, .negate value | fuel + 1, references, .scalarMultiply _ value |
+      fuel + 1, references, .rowSlice value _ _ | fuel + 1, references, .columnSlice value _ _ |
+      fuel + 1, references, .rowCoefficientEmbed _ _ value |
+      fuel + 1, references, .columnBasisEmbed _ _ value |
+      fuel + 1, references, .diagonalCoefficientEmbed _ _ value |
+      fuel + 1, references, .diagonalBasisEmbed _ _ value =>
+      collectReachableMatrix arena fuel references value
+  | fuel + 1, references, .rowConcat values | fuel + 1, references, .columnConcat values |
+      fuel + 1, references, .diagonalConcat values =>
+      values.foldl (collectReachableMatrix arena fuel) references
+  | fuel + 1, references, .select index branches =>
+      branches.foldl (collectReachableMatrix arena fuel)
+        (collectReachableRuntime arena fuel references index)
+termination_by fuel _ _ => fuel
+
+end
+
+private def collectReachableBoundPath
+    (arena : ExpressionArena) : BoundFactPath → List Nat → List Nat
+  | .affineCoefficientBound _ _, references | .affineNoiseBound _, references |
+      .matrixTotalBound _, references => references
+  | .familyElement _ index nested, references =>
+      collectReachableBoundPath arena nested
+        (collectReachableIntegerReference arena arena.entries.size references index)
+
+private def collectReachableIntBoundPath
+    (arena : ExpressionArena) : IntBoundFactPath → List Nat → List Nat
+  | .lower _, references | .upper _, references => references
+  | .familyElement _ index nested, references =>
+      collectReachableIntBoundPath arena nested
+        (collectReachableIntegerReference arena arena.entries.size references index)
+
+private def collectReachableBound
+    (arena : ExpressionArena) : BoundExpr → List Nat → List Nat
+  | .constant _, references | .parameter _, references | .absolute _, references => references
+  | .add left right, references | .multiply left right, references | .maximum left right, references |
+      .minimum left right, references =>
+      collectReachableBound arena right (collectReachableBound arena left references)
+  | .floorDivide value _, references => collectReachableBound arena value references
+  | .matrixProduct _ _ left right, references =>
+      collectReachableBound arena right (collectReachableBound arena left references)
+  | .recurrenceResult _ path, references | .carriedInput path, references =>
+      collectReachableBoundPath arena path references
+
+private def collectReachableIntBound
+    (arena : ExpressionArena) : IntBoundExpr → List Nat → List Nat
+  | .integer _, references => references
+  | .natural value, references => collectReachableBound arena value references
+  | .negate value, references => collectReachableIntBound arena value references
+  | .add left right, references | .subtract left right, references | .multiply left right, references |
+      .divide left right, references | .minimum left right, references | .maximum left right, references =>
+      collectReachableIntBound arena right (collectReachableIntBound arena left references)
+  | .carriedInput path, references | .recurrenceResult _ path, references =>
+      collectReachableIntBoundPath arena path references
+
+private def collectReachableRelation
+    (arena : ExpressionArena) : MatrixRelation → List Nat → List Nat
+  | .preimage subject source target trapdoor, references =>
+      collectReachableValue arena arena.entries.size
+        (collectReachableValue arena arena.entries.size
+          (collectReachableValue arena arena.entries.size
+            (collectReachableValue arena arena.entries.size references subject) source.value) target.value)
+        trapdoor
+  | .gadgetDecomposition subject target _ _, references =>
+      collectReachableValue arena arena.entries.size
+        (collectReachableValue arena arena.entries.size references subject) target.value
+
+private def collectReachableFact
+    (arena : ExpressionArena) : ValueFact → List Nat → List Nat
+  | .matrix fact, references =>
+      let references := collectReachableValue arena arena.entries.size references fact.subject
+      let references := fact.relations.foldl (fun references relation =>
+        collectReachableRelation arena relation references) references
+      let references := collectReachableBound arena fact.totalNormBound references
+      match fact.primary with
+      | .exact expression => collectReachableMatrix arena arena.entries.size references expression
+      | .affine form =>
+          let references := collectReachableBound arena form.noiseBound references
+          form.terms.foldl (fun references term =>
+            collectReachableMatrix arena arena.entries.size
+              (collectReachableBound arena term.coefficient.normBound
+                (collectReachableMatrix arena arena.entries.size references term.coefficient.expression))
+              term.basis) references
+  | .trapdoor fact, references =>
+      collectReachableMatrix arena arena.entries.size
+        (collectReachableValue arena arena.entries.size
+          (collectReachableValue arena arena.entries.size references fact.privatePort) fact.publicPort)
+        fact.publicMatrix
+  | .integer fact, references =>
+      collectReachableIntBound arena fact.upper
+        (collectReachableIntBound arena fact.lower
+          (collectReachableRuntime arena arena.entries.size references fact.expression))
+  | .boolean fact, references =>
+      collectReachableRuntime arena arena.entries.size references fact.expression
+  | .bytes value, references => collectReachableValue arena arena.entries.size references value
+  | .family fact, references => collectReachableAggregate arena arena.entries.size references fact.aggregate
+
+/-- Relation-origin normalization follows only the exact aliases recorded for the selected body.
+Their expressions are therefore part of the same scope-local dependency closure as the output
+template, even when the selected output does not mention an alias directly. -/
+private def collectReachableAliases
+    (arena : ExpressionArena) (aliases : List MatrixAliasTemplate) (references : List Nat) : List Nat :=
+  aliases.foldl (fun references candidate =>
+    collectReachableMatrix arena arena.entries.size references candidate.exactTarget) references
+
 private def ParallelTemplateSubstitution.rewriteArenaEntries
     (substitution : ParallelTemplateSubstitution)
     (original : List SymbolicExprEntry)
     (entryIndex : Nat)
+    (reachable : List Nat)
     (state : ParallelArenaRewriteState) : Except ParallelTemplateInstantiationError ParallelArenaRewriteState := do
   match original with
   | [] => pure state
   | .integer expression :: tail =>
-      let expression ← substitution.rewriteRuntime state expression
-      let ⟨arena, reference⟩ ← match state.arena.internInteger expression with
-        | some result => pure result
-        | none => throw .invalidExpressionReference
-      substitution.rewriteArenaEntries tail (entryIndex + 1) {
-        state with arena, integerReferences := state.integerReferences ++ [(⟨entryIndex⟩, reference)]
-      }
+      if !reachable.contains entryIndex then
+        substitution.rewriteArenaEntries tail (entryIndex + 1) reachable state
+      else
+        let expression ← substitution.rewriteRuntime state expression
+        let ⟨arena, reference⟩ ← match state.arena.internInteger expression with
+          | some result => pure result
+          | none => throw .invalidExpressionReference
+        substitution.rewriteArenaEntries tail (entryIndex + 1) reachable {
+          state with arena, integerReferences := state.integerReferences ++ [(⟨entryIndex⟩, reference)]
+        }
   | .boolean expression :: tail =>
-      let expression ← substitution.rewriteRuntime state expression
-      let ⟨arena, reference⟩ ← match state.arena.internBoolean expression with
-        | some result => pure result
-        | none => throw .invalidExpressionReference
-      substitution.rewriteArenaEntries tail (entryIndex + 1) {
-        state with arena, booleanReferences := state.booleanReferences ++ [(⟨entryIndex⟩, reference)]
-      }
+      if !reachable.contains entryIndex then
+        substitution.rewriteArenaEntries tail (entryIndex + 1) reachable state
+      else
+        let expression ← substitution.rewriteRuntime state expression
+        let ⟨arena, reference⟩ ← match state.arena.internBoolean expression with
+          | some result => pure result
+          | none => throw .invalidExpressionReference
+        substitution.rewriteArenaEntries tail (entryIndex + 1) reachable {
+          state with arena, booleanReferences := state.booleanReferences ++ [(⟨entryIndex⟩, reference)]
+        }
   | .matrix expression :: tail =>
-      let expression ← substitution.rewriteMatrix state expression
-      let ⟨arena, reference⟩ ← match state.arena.internMatrix expression with
-        | some result => pure result
-        | none => throw .invalidExpressionReference
-      substitution.rewriteArenaEntries tail (entryIndex + 1) {
-        state with arena, matrixReferences := state.matrixReferences ++ [(⟨entryIndex⟩, reference)]
-      }
+      if !reachable.contains entryIndex then
+        substitution.rewriteArenaEntries tail (entryIndex + 1) reachable state
+      else
+        let expression ← substitution.rewriteMatrix state expression
+        let ⟨arena, reference⟩ ← match state.arena.internMatrix expression with
+          | some result => pure result
+          | none => throw .invalidExpressionReference
+        substitution.rewriteArenaEntries tail (entryIndex + 1) reachable {
+          state with arena, matrixReferences := state.matrixReferences ++ [(⟨entryIndex⟩, reference)]
+        }
 
 private def ParallelTemplateSubstitution.rewriteArena
     (substitution : ParallelTemplateSubstitution)
-    (arena : ExpressionArena) : Except ParallelTemplateInstantiationError ParallelArenaRewriteState :=
-  substitution.rewriteArenaEntries arena.entries.toList 0 { arena }
+    (arena : ExpressionArena)
+    (template : ValueFactTemplate) : Except ParallelTemplateInstantiationError ParallelArenaRewriteState :=
+  substitution.rewriteArenaEntries arena.entries.toList 0
+    (collectReachableAliases arena substitution.derivation.matrixAliasTemplates
+      (collectReachableFact arena template.fact [])) { arena }
 
 private def ParallelTemplateSubstitution.aliasesFor
     (substitution : ParallelTemplateSubstitution)
@@ -814,7 +1040,7 @@ def instantiateParallelTemplate
     (output : ValueInstanceRef)
     (template : ValueFactTemplate) :
     Except ParallelTemplateInstantiationError (ExpressionArena × ValueFact) := do
-  let state ← substitution.rewriteArena arena
+  let state ← substitution.rewriteArena arena template
   let substitution := match substitution.originContext with
     | some context => { substitution with originContext := some { context with arena := state.arena } }
     | none => substitution
@@ -873,20 +1099,6 @@ private def familyTestSubstitution : ParallelTemplateSubstitution := {
   actualIndex := ⟨3⟩
   actualIndexExpression := .intConstant 3
 }
-
-/-- A scalar select owns branch references in the expression arena.  Instantiation rewrites both
-branches and allocates fresh references after the immutable source entries. -/
-private def familySelectArena : ExpressionArena := { entries := #[
-  .integer (.intConstant 0),
-  .integer (.intWire (.template familyTestTemplate)),
-  .integer (.select .integer (.intConstant 0) [⟨0⟩, ⟨1⟩])
-] }
-
-example :
-    (familyTestSubstitution.rewriteArena familySelectArena).map
-      (fun state => state.arena.lookupInteger ⟨5⟩) =
-    .ok (some (.select .integer (.intConstant 0) [⟨3⟩, ⟨4⟩])) := by
-  rfl
 
 private def familyTestLocalTemplate : TemplateWireRef where
   definition := { stage := ⟨"family-test"⟩, name := "body" }

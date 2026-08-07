@@ -48,4 +48,5 @@ fn main() {
     build_support::verify_no_proof_holes(workspace, &[&workspace.join("lean/Mxx"), &owner_lean])
         .unwrap_or_else(|error| panic!("{error}"));
     println!("cargo:warning=Toy correctness workflow hash: {}", freshness.workflow_hash);
+    println!("cargo:warning=Toy correctness derivation hash: {}", freshness.derivation_hash);
 }

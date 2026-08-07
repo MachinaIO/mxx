@@ -13,6 +13,15 @@ deriving instance DecidableEq for BoundExpr
 deriving instance DecidableEq for IntBoundExpr
 deriving instance DecidableEq for StaticObligation
 
+example : checkProgramDerivation ToyExample_stage_encrypt ToyExample_stage_encrypt_derivation =
+    .ok () := by decide
+
+example : checkProgramDerivation ToyExample_stage_decrypt ToyExample_stage_decrypt_derivation =
+    .ok () := by decide
+
+example : checkProgramDerivation ToyExample_ideal ToyExample_ideal_derivation = .ok () := by
+  decide
+
 
 def checker (cutoff : Nat) : Bool :=
   match analyzeProtocol ToyExample_protocol { overrides := [] } with

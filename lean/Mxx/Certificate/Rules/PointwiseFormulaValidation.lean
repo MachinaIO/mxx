@@ -4,6 +4,8 @@ namespace Mxx.Certificate
 
 deriving instance ReflBEq for Mxx.Ir.IntExpr
 deriving instance LawfulBEq for Mxx.Ir.IntExpr
+deriving instance ReflBEq for Mxx.Ir.RealExpr
+deriving instance LawfulBEq for Mxx.Ir.RealExpr
 deriving instance ReflBEq for Mxx.Ir.MatrixTypeExpr
 deriving instance LawfulBEq for Mxx.Ir.MatrixTypeExpr
 deriving instance ReflBEq for Mxx.Ir.WireRef
@@ -12,6 +14,8 @@ deriving instance ReflBEq for Mxx.Ir.IntBinaryOp
 deriving instance LawfulBEq for Mxx.Ir.IntBinaryOp
 deriving instance ReflBEq for Mxx.Ir.IntCompareOp
 deriving instance LawfulBEq for Mxx.Ir.IntCompareOp
+deriving instance ReflBEq for Mxx.Ir.RealBinaryOp
+deriving instance LawfulBEq for Mxx.Ir.RealBinaryOp
 deriving instance ReflBEq for Mxx.Ir.ConcatAxis
 deriving instance LawfulBEq for Mxx.Ir.ConcatAxis
 deriving instance ReflBEq for Mxx.Ir.LoopInputMode

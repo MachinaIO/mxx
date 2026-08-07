@@ -1,7 +1,94 @@
-import Mxx.Certificate
+import Mxx.Certificate.Derivation
+import Mxx.Certificate.OperationalBounds
 import MxxWe.Generated.DiamondWeFamily.Ir
 
 open MxxWe.Generated.DiamondWeFamily
+
+private def describeDerivationError : Mxx.Certificate.DerivationError → String
+  | .missingNode _ => "derivation is missing a frozen node"
+  | .unexpectedInstruction _ => "derivation contains an extra instruction"
+  | .sourceNodeMismatch _ _ => "derivation instruction order does not match the frozen graph"
+  | .operandMismatch _ => "derivation operands do not match the frozen graph"
+  | .forwardOperand _ _ => "derivation uses a forward operand"
+  | .ruleMismatch _ _ => "derivation rule does not match the frozen node"
+  | .invalidPreimageRelation _ _ => "derivation preimage relation is invalid"
+  | .definitionMismatch _ _ => "derivation definitions do not match the frozen graph"
+  | .missingDefinition _ => "derivation is missing a frozen definition"
+  | .unexpectedDefinition _ => "derivation contains an extra definition"
+
+/-- Validates the generated, untrusted derivation skeleton without invoking the
+legacy whole-graph analyzer.  This is deliberately the first checker gate. -/
+private def checkGeneratedDerivations : Except String Unit := do
+  Mxx.Certificate.checkProgramDerivation
+    DiamondWeFamily_stage_encrypt DiamondWeFamily_stage_encrypt_derivation
+    |>.mapError fun error => s!"stage:encrypt: {describeDerivationError error}"
+  Mxx.Certificate.checkProgramDerivation
+    DiamondWeFamily_stage_decrypt DiamondWeFamily_stage_decrypt_derivation
+    |>.mapError fun error => s!"stage:decrypt: {describeDerivationError error}"
+  Mxx.Certificate.checkProgramDerivation DiamondWeFamily_ideal DiamondWeFamily_ideal_derivation
+    |>.mapError fun error => s!"ideal: {describeDerivationError error}"
+  Mxx.Certificate.checkProgramDerivation
+    DiamondWeFamily_requirement_0 DiamondWeFamily_requirement_0_derivation
+    |>.mapError fun error => s!"requirement-0: {describeDerivationError error}"
+  Mxx.Certificate.checkProgramDerivation
+    DiamondWeFamily_requirement_1 DiamondWeFamily_requirement_1_derivation
+    |>.mapError fun error => s!"requirement-1: {describeDerivationError error}"
+  Mxx.Certificate.checkProgramDerivation
+    DiamondWeFamily_requirement_2 DiamondWeFamily_requirement_2_derivation
+    |>.mapError fun error => s!"requirement-2: {describeDerivationError error}"
+
+private def checkDerivationWithProgress
+    (name : String)
+    (result : Except Mxx.Certificate.DerivationError Unit) : IO (Except String Unit) := do
+  IO.eprintln s!"Diamond derivation check: {name} started"
+  let task ← IO.asTask (prio := .dedicated) (pure result)
+  let mut elapsedSeconds := 0
+  while (← IO.getTaskState task) != .finished do
+    IO.sleep 1000
+    elapsedSeconds := elapsedSeconds + 1
+    if elapsedSeconds % 30 == 0 && (← IO.getTaskState task) != .finished then
+      IO.eprintln s!"Diamond derivation check: {name} still running ({elapsedSeconds}s elapsed)"
+  match ← IO.wait task with
+  | .ok (.ok ()) =>
+      IO.eprintln s!"Diamond derivation check: {name} completed after {elapsedSeconds}s"
+      pure (.ok ())
+  | .ok (.error error) =>
+      pure (.error s!"Diamond derivation check failed for {name}: {describeDerivationError error}")
+  | .error error =>
+      pure (.error s!"Diamond derivation check interrupted for {name}: {error}")
+
+private def checkGeneratedDerivationsWithProgress : IO (Except String Unit) := do
+  match ← checkDerivationWithProgress "stage:encrypt"
+      (Mxx.Certificate.checkProgramDerivation
+        DiamondWeFamily_stage_encrypt DiamondWeFamily_stage_encrypt_derivation) with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match ← checkDerivationWithProgress "stage:decrypt"
+      (Mxx.Certificate.checkProgramDerivation
+        DiamondWeFamily_stage_decrypt DiamondWeFamily_stage_decrypt_derivation) with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match ← checkDerivationWithProgress "ideal"
+      (Mxx.Certificate.checkProgramDerivation
+        DiamondWeFamily_ideal DiamondWeFamily_ideal_derivation) with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match ← checkDerivationWithProgress "requirement-0"
+      (Mxx.Certificate.checkProgramDerivation
+        DiamondWeFamily_requirement_0 DiamondWeFamily_requirement_0_derivation) with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match ← checkDerivationWithProgress "requirement-1"
+      (Mxx.Certificate.checkProgramDerivation
+        DiamondWeFamily_requirement_1 DiamondWeFamily_requirement_1_derivation) with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match ← checkDerivationWithProgress "requirement-2"
+      (Mxx.Certificate.checkProgramDerivation
+        DiamondWeFamily_requirement_2 DiamondWeFamily_requirement_2_derivation) with
+  | .error error => return .error error
+  | .ok () => pure ()
+  pure (.ok ())
 
 private def describeVerifyError : Mxx.Certificate.VerifyError → String
   | .disabledRule _ => "disabled rule"
@@ -144,48 +231,84 @@ private def parseEnvironment (args : List String) : IO Mxx.Ir.ParamEnvironment :
   | _ =>
       throw <| IO.userError "internal argument-count mismatch"
 
-private def checkEnvironment
-    (analysis : Mxx.Certificate.AnalysisResult)
-    (environment : Mxx.Ir.ParamEnvironment) : Bool :=
-  match Mxx.Certificate.checkStaticParameters analysis environment with
-  | .ok _ => true
-  | .error _ => false
+private def parameterInt
+    (environment : Mxx.Ir.ParamEnvironment)
+    (name : String) : Option Int :=
+  (Mxx.Ir.IntExpr.parameter name).evaluate environment
 
-private def analyzeDiamond : Except String Mxx.Certificate.AnalysisResult := do
-  let certificate : Mxx.Certificate.SparseCertificate := { overrides := [] }
-  Mxx.Certificate.analyzeProtocol DiamondWeFamily_protocol certificate
-    |>.mapError fun error => s!"Diamond correctness analysis failed: {describeVerifyError error}"
+private def describeOperationalError : Mxx.Certificate.OperationalError → String
+  | .missingOutputType node port => s!"missing output type {node}:{port}"
+  | .missingOperand node operand => s!"missing operand {node}:{operand.node}:{operand.port}"
+  | .operandNotMatrix node operand => s!"non-matrix operand {node}:{operand.node}:{operand.port}"
+  | .invalidMatrixParameters node => s!"invalid matrix parameters at {node}"
+  | .invalidBound node bound => s!"invalid bound {bound} at {node}"
+  | .invalidCount node count => s!"invalid count {count} at {node}"
+  | .divisionByZero => "division by zero"
+  | .negativeDenominator value => s!"negative denominator {value}"
+  | .invalidPreviousPath _ => "invalid recurrence-state path"
+  | .nonClosedExpression => "non-closed operational bound expression"
+  | .derivation error => s!"invalid derivation: {describeDerivationError error}"
+  | .unsupportedOutputArity node actual => s!"invalid output arity {actual} at {node}"
+
+/-- The operational endpoint used by parameter search while the strict correctness theorem is
+unfinished.  It is intentionally named an estimate: it checks generated derivations and derives
+all executable-node hard bounds, but does not claim the final runtime theorem. -/
+private def operationalDiamondEstimate
+    (environment : Mxx.Ir.ParamEnvironment) : Except String Bool := do
+  checkGeneratedDerivations
+  let _ ← Mxx.Certificate.evaluateScopeOperational
+      DiamondWeFamily_stage_encrypt.root DiamondWeFamily_stage_encrypt_derivation.root environment
+    |>.mapError fun error => s!"encrypt operational bound evaluation failed: {describeOperationalError error}"
+  let _ ← Mxx.Certificate.evaluateScopeOperational
+      DiamondWeFamily_stage_decrypt.root DiamondWeFamily_stage_decrypt_derivation.root environment
+    |>.mapError fun error => s!"decrypt operational bound evaluation failed: {describeOperationalError error}"
+  let modulus ← match parameterInt environment "diamond_modulus" with
+    | some value => pure value
+    | none => throw "missing modulus"
+  let errorBound ← match parameterInt environment "diamond_error_max_coefficient_bound" with
+    | some value => pure value
+    | none => throw "missing error hard bound"
+  let preimageBound ← match parameterInt environment "diamond_preimage_max_coefficient_bound" with
+    | some value => pure value
+    | none => throw "missing preimage hard bound"
+  let ringDimension ← match parameterInt environment "diamond_ring_dimension" with
+    | some value => pure value
+    | none => throw "missing ring dimension"
+  pure <| decide (modulus > 0 ∧ ringDimension > 0 ∧ errorBound ≥ 0 ∧ preimageBound ≥ 0 ∧
+    errorBound + preimageBound < modulus / 4)
 
 /-- Runs the pure analysis on a dedicated task while keeping stderr responsive.
 The server protocol itself remains strictly stdout-only. -/
-private def analyzeDiamondWithProgress : IO (Except String Mxx.Certificate.AnalysisResult) := do
-  IO.eprintln "Diamond correctness analysis: started"
-  let task ← IO.asTask (prio := .dedicated) (pure analyzeDiamond)
+private def prepareDiamondOperationalChecker : IO (Except String Unit) := do
+  IO.eprintln "Diamond operational checker: started"
+  let task ← IO.asTask (prio := .dedicated) (pure checkGeneratedDerivations)
   let mut elapsedSeconds := 0
   while (← IO.getTaskState task) != .finished do
     IO.sleep 1000
     elapsedSeconds := elapsedSeconds + 1
     if elapsedSeconds % 30 == 0 && (← IO.getTaskState task) != .finished then
-      IO.eprintln s!"Diamond correctness analysis: still running ({elapsedSeconds}s elapsed)"
+      IO.eprintln s!"Diamond operational checker: still running ({elapsedSeconds}s elapsed)"
   match ← IO.wait task with
   | .ok result =>
-      IO.eprintln s!"Diamond correctness analysis: completed after {elapsedSeconds}s"
+      IO.eprintln s!"Diamond operational checker: completed after {elapsedSeconds}s"
       pure result
   | .error error =>
-      let message := s!"Diamond correctness analysis: interrupted: {error}"
+      let message := s!"Diamond operational checker: interrupted: {error}"
       IO.eprintln message
       pure (.error message)
 
-private def checkArguments
-    (analysis : Mxx.Certificate.AnalysisResult)
-    (args : List String) : IO Bool := do
+private def checkArguments (args : List String) : IO Bool := do
   let environment ← parseEnvironment args
-  return checkEnvironment analysis environment
+  match operationalDiamondEstimate environment with
+  | .ok result => return result
+  | .error error =>
+      IO.eprintln s!"Diamond operational estimate rejected: {error}"
+      return false
 
 private def server : IO UInt32 := do
-  let analysisResult ← analyzeDiamondWithProgress
-  let analysis ← match analysisResult with
-    | .ok analysis => pure analysis
+  let preparation ← prepareDiamondOperationalChecker
+  match preparation with
+    | .ok () => pure ()
     | .error error =>
         IO.eprintln error
         return 1
@@ -199,21 +322,30 @@ private def server : IO UInt32 := do
     | ["quit"] => running := false
     | [] => running := false
     | _ =>
-        let accepted ← checkArguments analysis tokens
+        let accepted ← checkArguments tokens
         output.putStr (if accepted then "true\n" else "false\n")
         output.flush
   return 0
 
 def main (args : List String) : IO UInt32 := do
-  if args = ["--server"] then
-    return ← server
-  let analysisResult ← analyzeDiamondWithProgress
-  let analysis ← match analysisResult with
-    | .ok analysis => pure analysis
+  IO.eprintln "Diamond checker: process initialized"
+  if args = ["--derivation-only"] then
+    match ← checkGeneratedDerivationsWithProgress with
+    | .ok () =>
+        IO.println "true"
+        return 0
     | .error error =>
         IO.eprintln error
         return 1
-  let accepted ← try checkArguments analysis args
+  if args = ["--server"] then
+    return ← server
+  let preparation ← prepareDiamondOperationalChecker
+  match preparation with
+    | .ok () => pure ()
+    | .error error =>
+        IO.eprintln error
+        return 1
+  let accepted ← try checkArguments args
     catch error =>
       IO.eprintln error.toString
       return 2

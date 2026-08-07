@@ -24,8 +24,8 @@ INPUTS = (
     ROOT / "crates/we/lean/MxxWe/Generated/DiamondWeFamily/Ir.lean",
 )
 EXPECTED_WORKFLOW_HASHES = {
-    "ToyExample": "50d3fa2842746284fe6afc1d2b1004bec7e32982cdca391b9f6170b57877c374",
-    "DiamondWeFamily": "60b0219e7732db469820f1b3a636c9d04528f62dc47ec09a8dc5cb54820dd01b",
+    "ToyExample": "1cffc358ce796800fad2b9513f767c5df8e2eaf8e62bca1329a8b0012874b0df",
+    "DiamondWeFamily": "ce6395d760eba47744a2e1ee2e692af2a316a95e60d9943589c3d0cef891de27",
 }
 EXPECTED_SOURCE_PATHS = {
     "ToyExample": (
@@ -53,7 +53,7 @@ EXPECTED_SOURCE_PATHS = {
         "crates/we/src",
     ),
 }
-EXPECTED_GENERATOR = "mxx-correctness-emitter-v5"
+EXPECTED_GENERATOR = "mxx-correctness-emitter-v6"
 DEFAULT_ANALYSIS_FACTS = ROOT / "target/correctness/m0-analysis-facts.json"
 
 ALLOWED_KINDS = {
@@ -98,7 +98,7 @@ SPECIAL_KINDS = FORBIDDEN_KINDS | {"matrixMultiply", "matrixScale", "reshape"}
 
 PROGRAM_RE = re.compile(r"^def ([A-Za-z0-9_]+) : Mxx\.Ir\.Prog :=")
 METADATA_STRING_RE = re.compile(
-    r'^def ([A-Za-z0-9_]+)_(generatorVersion|protocolSourceHash|workflowHash|toolkitHash) '
+    r'^def ([A-Za-z0-9_]+)_(generatorVersion|protocolSourceHash|workflowHash|toolkitHash|derivationHash) '
     r': String := "([^"]+)"'
 )
 SOURCE_PATHS_RE = re.compile(
@@ -132,6 +132,7 @@ class Freshness:
     protocol_source_hash: str | None = None
     workflow_hash: str | None = None
     toolkit_hash: str | None = None
+    derivation_hash: str | None = None
 
 
 def parse(
@@ -157,6 +158,7 @@ def parse(
                     "protocolSourceHash": "protocol_source_hash",
                     "workflowHash": "workflow_hash",
                     "toolkitHash": "toolkit_hash",
+                    "derivationHash": "derivation_hash",
                 }[field],
                 value,
             )
@@ -556,6 +558,8 @@ def main() -> int:
             )
         if freshness.toolkit_hash != current_toolkit_hash:
             failures.append(f"{name} toolkit hash is stale")
+        if freshness.derivation_hash is None or not re.fullmatch(r"[0-9a-f]{64}", freshness.derivation_hash):
+            failures.append(f"{name} derivation hash is missing or malformed")
     if analysis_payload is not None and analysis_payload.get("workflowHash") != (
         all_metadata.get("DiamondWeFamily").workflow_hash
         if all_metadata.get("DiamondWeFamily") is not None

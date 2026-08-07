@@ -1,5 +1,5 @@
 use crate::{BundleValidationError, ClosedProtocolBundle};
-use mxx_dsl::FrozenSemanticAnchors;
+use mxx_dsl::{FrozenDerivationAttachments, FrozenSemanticAnchors};
 use mxx_ir_core::{CompileParameter, FrozenGraphScopeId, Graph, NodeId, Port, WireType};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +42,9 @@ pub struct ProtocolStage {
     pub id: StageId,
     pub graph: Graph,
     pub semantic_anchors: FrozenSemanticAnchors,
+    /// Owning-crate operational rule references frozen with the executable graph.
+    /// They carry no asserted bounds or equations.
+    pub derivation_attachments: FrozenDerivationAttachments,
     pub bindings: Vec<ArtifactBinding>,
 }
 
@@ -356,12 +359,14 @@ mod tests {
                             id: StageId("producer".to_owned()),
                             graph: producer.graph,
                             semantic_anchors: producer.anchors,
+                            derivation_attachments: producer.derivation_attachments,
                             bindings: Vec::new(),
                         },
                         ProtocolStage {
                             id: StageId("consumer".to_owned()),
                             graph: consumer.graph,
                             semantic_anchors: consumer.anchors,
+                            derivation_attachments: consumer.derivation_attachments,
                             bindings: vec![ArtifactBinding {
                                 consumer_input: StageInputName("artifact".to_owned()),
                                 producer_stage: StageId("producer".to_owned()),

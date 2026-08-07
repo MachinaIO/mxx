@@ -1,6 +1,9 @@
 //! BGG-independent input-injection preprocessing shared by Diamond applications.
 
-use mxx_dsl::{DslError, Family, Int, Mat, Parallel, Ring, Trapdoor};
+use mxx_dsl::{
+    DslError, Family, Int, Mat, Parallel, Ring, Sequential, TrapdoorFamily,
+    parallel_zip_bundle_result,
+};
 use mxx_ir_core::{IntExpr, RealExpr, node::ConcatAxis};
 use num_bigint::BigInt;
 use thiserror::Error;
@@ -19,6 +22,23 @@ pub struct DiamondInputConfig {
     pub digit_count: usize,
     pub trapdoor_sigma: RealExpr,
     pub error_sigma: RealExpr,
+    pub error_max_coefficient_bound: BigInt,
+    pub preimage_max_coefficient_bound: BigInt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiamondInputParams {
+    pub modulus: IntExpr,
+    pub ring_dimension: IntExpr,
+    pub input_count: IntExpr,
+    pub digit_base: IntExpr,
+    pub batch_bits: IntExpr,
+    pub gadget_base: IntExpr,
+    pub digit_count: IntExpr,
+    pub trapdoor_sigma: RealExpr,
+    pub error_sigma: RealExpr,
+    pub error_max_coefficient_bound: IntExpr,
+    pub preimage_max_coefficient_bound: IntExpr,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -35,6 +55,8 @@ pub enum DiamondInputConfigError {
     InvalidDigitBase,
     #[error("the gadget base must be at least two")]
     InvalidGadgetBase,
+    #[error("sampler coefficient bounds must be nonnegative")]
+    InvalidSamplerBound,
     #[error("a Diamond input-injection layout calculation overflowed")]
     LayoutOverflow,
     #[error("Diamond input-injection transition artifacts do not match the configured layout")]
@@ -52,10 +74,10 @@ pub enum DiamondInputPreprocessError {
 pub struct DiamondInputPreprocessing {
     /// The initial input-injection vector p.
     pub p: Mat,
-    /// Transition preimages indexed by input level, digit, and state.
-    pub transitions: Vec<Vec<Vec<Mat>>>,
+    /// Rectangular transition family indexed by `(level, digit, state)`.
+    pub transitions: Family<Mat>,
     /// Trapdoors for the final state bases, returned for application-specific projections.
-    pub final_trapdoors: Vec<Trapdoor>,
+    pub final_trapdoors: TrapdoorFamily,
 }
 
 /// Online result of applying the input-selected transition matrices.
@@ -64,12 +86,12 @@ pub struct DiamondInputPreprocessing {
 /// bit-specific states in the same order returned by
 /// [`DiamondInputConfig::bit_state_index`].
 pub struct DiamondInputEvaluation {
-    pub states: Vec<Mat>,
+    pub states: Family<Mat>,
 }
 
 #[derive(Clone)]
 pub struct DiamondInputInjector {
-    pub config: DiamondInputConfig,
+    pub params: DiamondInputParams,
 }
 
 impl DiamondInputConfig {
@@ -91,6 +113,11 @@ impl DiamondInputConfig {
         }
         if self.gadget_base < BigInt::from(2) {
             return Err(DiamondInputConfigError::InvalidGadgetBase);
+        }
+        if self.error_max_coefficient_bound < BigInt::from(0) ||
+            self.preimage_max_coefficient_bound < BigInt::from(0)
+        {
+            return Err(DiamondInputConfigError::InvalidSamplerBound);
         }
         self.witness_size()?;
         self.state_columns()?;
@@ -143,104 +170,196 @@ impl DiamondInputConfig {
     pub fn digit_count_expr(&self) -> IntExpr {
         self.digit_count.into()
     }
+
+    pub fn params(&self) -> DiamondInputParams {
+        DiamondInputParams {
+            modulus: self.modulus.clone().into(),
+            ring_dimension: self.ring_dimension.into(),
+            input_count: self.input_count.into(),
+            digit_base: self.digit_base.into(),
+            batch_bits: self.batch_bits.into(),
+            gadget_base: self.gadget_base_expr(),
+            digit_count: self.digit_count_expr(),
+            trapdoor_sigma: self.trapdoor_sigma.clone(),
+            error_sigma: self.error_sigma.clone(),
+            error_max_coefficient_bound: self.error_max_coefficient_bound.clone().into(),
+            preimage_max_coefficient_bound: self.preimage_max_coefficient_bound.clone().into(),
+        }
+    }
+}
+
+impl DiamondInputParams {
+    pub fn ring(&self) -> Ring {
+        Ring::new(self.modulus.clone(), self.ring_dimension.clone())
+    }
+
+    pub fn witness_size(&self) -> IntExpr {
+        IntExpr::Mul(Box::new(self.input_count.clone()), Box::new(self.batch_bits.clone()))
+            .canonicalize()
+    }
+
+    pub fn state_rows(&self) -> IntExpr {
+        IntExpr::constant(DIAMOND_PREFIX_DIMENSION * DIAMOND_SECRET_DIMENSION)
+    }
+
+    pub fn state_columns(&self) -> IntExpr {
+        IntExpr::Mul(
+            Box::new(self.state_rows()),
+            Box::new(IntExpr::Add(
+                Box::new(self.digit_count.clone()),
+                Box::new(IntExpr::constant(2)),
+            )),
+        )
+        .canonicalize()
+    }
+
+    pub fn max_state_count(&self) -> IntExpr {
+        IntExpr::Add(Box::new(IntExpr::constant(1)), Box::new(self.witness_size())).canonicalize()
+    }
 }
 
 impl DiamondInputInjector {
     pub fn new(config: DiamondInputConfig) -> Result<Self, DiamondInputConfigError> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self { params: config.params() })
+    }
+
+    pub fn parameterized(params: DiamondInputParams) -> Self {
+        Self { params }
     }
 
     pub fn preprocess(
         &self,
         message: Mat,
     ) -> Result<DiamondInputPreprocessing, DiamondInputPreprocessError> {
-        let ring = self.config.ring();
-        let state_rows = self.config.state_rows();
-        let state_columns = self.config.state_columns()?;
-        let mut bases = Vec::with_capacity(self.config.input_count + 1);
-        for level in 0..=self.config.input_count {
-            let state_count = self.config.state_count_at_level(level)?;
-            bases.push(
-                (0..state_count)
-                    .map(|_| {
-                        ring.sample_trapdoor(
-                            state_rows,
-                            self.config.trapdoor_sigma.clone(),
-                            self.config.gadget_base_expr(),
-                            self.config.digit_count_expr(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-        }
+        let ring = self.params.ring();
+        let state_rows = self.params.state_rows();
+        let state_columns = self.params.state_columns();
+        let level_count = self.params.input_count.clone();
+        let digit_base = self.params.digit_base.clone();
+        let batch_bits = self.params.batch_bits.clone();
+        let max_state_count = self.params.max_state_count();
+        let digit_state_count =
+            IntExpr::Mul(Box::new(digit_base.clone()), Box::new(max_state_count.clone()))
+                .canonicalize();
+        let base_count = IntExpr::Mul(
+            Box::new(IntExpr::Add(Box::new(level_count.clone()), Box::new(IntExpr::constant(1)))),
+            Box::new(max_state_count.clone()),
+        )
+        .canonicalize();
+        let bases = Parallel::range(base_count).map_values(|_| {
+            ring.sample_trapdoor(
+                state_rows.clone(),
+                self.params.trapdoor_sigma.clone(),
+                self.params.gadget_base.clone(),
+                self.params.digit_count.clone(),
+                self.params.preimage_max_coefficient_bound.clone(),
+            )
+        })?;
 
         let secret_epsilon = ternary_secret(&ring);
         let selector = Mat::concat(ConcatAxis::Columns, vec![secret_epsilon, message]);
-        let p = selector * bases[0][0].public_matrix() +
-            ring.gaussian((1, state_columns), self.config.error_sigma.clone());
+        let base_public = bases.get_static(0).public_matrix();
+        let initial_public_product_value = selector * base_public;
+        let initial_error = ring.gaussian(
+            (1, state_columns.clone()),
+            self.params.error_sigma.clone(),
+            self.params.error_max_coefficient_bound.clone(),
+        );
+        let p = initial_public_product_value + initial_error;
 
-        let mut transitions = Vec::with_capacity(self.config.input_count);
-        for level in 1..=self.config.input_count {
-            let state_count = self.config.state_count_at_level(level)?;
-            let first_new_state = 1 + (level - 1) * self.config.batch_bits;
-            let digit_secrets =
-                Parallel::range(self.config.digit_base).map(|_| ternary_secret(&ring))?;
-            let mut state_transitions = Vec::with_capacity(state_count);
-            for state in 0..state_count {
-                let source_state = if state >= first_new_state { 0 } else { state };
-                let source = bases[level - 1][source_state].clone();
-                let public = bases[level][state].public_matrix();
-                let ring = ring.clone();
-                let sigma = self.config.error_sigma.clone();
-                let new_bit = (state >= first_new_state).then(|| state - first_new_state);
-                let build_transition = move |secret_mask: Mat, bit: Option<Mat>| {
-                    let selector = if let Some(bit) = bit {
-                        special_selector(&ring, secret_mask, bit)
-                    } else if state == 0 {
-                        k_selector(&ring, secret_mask)
-                    } else {
-                        regular_selector(secret_mask)
-                    };
-                    let target = selector * public.clone() +
-                        ring.gaussian((state_rows, state_columns), sigma.clone());
-                    source.sample_preimage(target, (state_columns, state_columns)).as_mat()
-                };
-                let family = if let Some(bit_index) = new_bit {
-                    let bits = mxx_dsl::Family::pack(
-                        (0..self.config.digit_base)
-                            .map(|digit| {
-                                if ((digit >> bit_index) & 1) == 0 {
-                                    self.config.ring().zero((1, 1))
-                                } else {
-                                    self.config.ring().identity(1)
-                                }
-                            })
-                            .collect(),
-                    )?;
-                    digit_secrets
-                        .clone()
-                        .parallel_zip(bits, |_, secret, bit| build_transition(secret, Some(bit)))?
-                } else {
-                    digit_secrets
-                        .clone()
-                        .parallel_map(|_, secret| build_transition(secret, None))?
-                };
-                state_transitions.push(family);
-            }
-            let level_transitions = (0..self.config.digit_base)
-                .map(|digit| {
-                    state_transitions
-                        .iter()
-                        .map(|family| family.get_static(digit))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            transitions.push(level_transitions);
-        }
-
-        let final_trapdoors =
-            bases.pop().expect("Diamond input preprocessing always has a final level");
+        let transition_count =
+            IntExpr::Mul(Box::new(level_count.clone()), Box::new(digit_state_count.clone()))
+                .canonicalize();
+        let transition_indices = Parallel::range(transition_count.clone()).map_values(|slot| {
+            let flat = slot.as_int();
+            let state = flat.clone().rem(Int::evaluate(max_state_count.clone()));
+            let level = flat.clone().div(Int::evaluate(digit_state_count.clone()));
+            let first_new =
+                level.clone().mul(Int::evaluate(batch_bits.clone())).add(Int::constant(1));
+            let source_state = first_new
+                .less_equal(state.clone())
+                .to_int()
+                .select_int(vec![state, Int::constant(0)])
+                .expect("two integer branches");
+            level.mul(Int::evaluate(max_state_count.clone())).add(source_state)
+        })?;
+        let target_indices = Parallel::range(transition_count.clone()).map_values(|slot| {
+            let flat = slot.as_int();
+            let state = flat.clone().rem(Int::evaluate(max_state_count.clone()));
+            let level = flat.div(Int::evaluate(digit_state_count.clone()));
+            level.add(Int::constant(1)).mul(Int::evaluate(max_state_count.clone())).add(state)
+        })?;
+        let digit_secret_indices = Parallel::range(transition_count)
+            .map_values(|slot| slot.as_int().div(Int::evaluate(max_state_count.clone())))?;
+        let digit_secret_samples_family = Parallel::range(IntExpr::Mul(
+            Box::new(level_count.clone()),
+            Box::new(digit_base.clone()),
+        ))
+        .map_values(|_| ternary_secret(&ring))?;
+        let digit_secrets = digit_secret_samples_family.parallel_gather(digit_secret_indices)?;
+        let sources = bases.clone().parallel_gather(transition_indices)?;
+        let target_public = bases.public_matrices().parallel_gather(target_indices)?;
+        let sigma = self.params.error_sigma.clone();
+        let error_bound = self.params.error_max_coefficient_bound.clone();
+        let targets = parallel_zip_bundle_result(
+            (digit_secrets, target_public),
+            |slot, (secret, public)| {
+                let flat = slot.as_int();
+                let state = flat.clone().rem(Int::evaluate(max_state_count.clone()));
+                let digit = flat
+                    .clone()
+                    .div(Int::evaluate(max_state_count.clone()))
+                    .rem(Int::evaluate(digit_base.clone()));
+                let level = flat.div(Int::evaluate(digit_state_count.clone()));
+                let first_new = level.mul(Int::evaluate(batch_bits.clone())).add(Int::constant(1));
+                let regular = regular_selector(secret.clone());
+                let k_identity = ring.identity(1);
+                let k = Mat::concat(ConcatAxis::Diagonal, vec![secret.clone(), k_identity]);
+                let initial_match = state.clone().equal(Int::constant(0)).to_int();
+                let selector = initial_match.select(vec![regular, k])?;
+                let selector = Sequential::range(batch_bits.clone()).scan(
+                    selector,
+                    (digit, (state, (first_new, secret))),
+                    |bit, selector, (digit, (state, (first_new, secret)))| {
+                        let extracted = digit.clone().bit(bit.expression());
+                        let extracted_int = extracted.to_int();
+                        let bit_zero_value = ring.zero((1, 1));
+                        let bit_one_value = ring.identity(1);
+                        let bit_value =
+                            extracted_int.select(vec![bit_zero_value, bit_one_value])?;
+                        let special_product = secret.clone() * bit_value;
+                        let special_top =
+                            Mat::concat(ConcatAxis::Columns, vec![secret, special_product]);
+                        let special_bottom_value = ring.zero((1, 2));
+                        let special =
+                            Mat::concat(ConcatAxis::Rows, vec![special_top, special_bottom_value]);
+                        let expected_state = first_new.add(bit.as_int());
+                        let state_match_value = state.equal(expected_state);
+                        let state_match_int = state_match_value.to_int();
+                        state_match_int.select(vec![selector, special])
+                    },
+                )?;
+                let selector_product_value = selector * public;
+                let error = ring.gaussian(
+                    (state_rows.clone(), state_columns.clone()),
+                    sigma.clone(),
+                    error_bound.clone(),
+                );
+                Ok::<_, DslError>(selector_product_value + error)
+            },
+        )?;
+        let transitions = sources.parallel_zip_mat_values(targets, |_, source, target| {
+            source.sample_preimage(target, (state_columns.clone(), state_columns.clone())).as_mat()
+        })?;
+        let final_indices = Parallel::range(max_state_count.clone()).map_values(|state| {
+            Int::evaluate(IntExpr::Mul(
+                Box::new(level_count.clone()),
+                Box::new(max_state_count.clone()),
+            ))
+            .add(state.as_int())
+        })?;
+        let final_trapdoors = bases.parallel_gather(final_indices)?;
         Ok(DiamondInputPreprocessing { p, transitions, final_trapdoors })
     }
 
@@ -253,51 +372,62 @@ impl DiamondInputInjector {
     pub fn evaluate(
         &self,
         initial_state: Mat,
-        input_digits: &[Int],
-        transitions: &[Vec<Vec<Mat>>],
+        input_digits: Family<Int>,
+        transitions: Family<Mat>,
     ) -> Result<DiamondInputEvaluation, DiamondInputPreprocessError> {
-        self.config.validate()?;
-        if input_digits.len() != self.config.input_count ||
-            transitions.len() != self.config.input_count
+        let level_count = self.params.input_count.clone();
+        let digit_base = self.params.digit_base.clone();
+        let batch_bits = self.params.batch_bits.clone();
+        let max_state_count = self.params.max_state_count();
+        let digit_state_count =
+            IntExpr::Mul(Box::new(digit_base.clone()), Box::new(max_state_count.clone()))
+                .canonicalize();
+        let expected_transitions =
+            IntExpr::Mul(Box::new(level_count.clone()), Box::new(digit_state_count.clone()))
+                .canonicalize();
+        if input_digits.count().canonicalize() != level_count.canonicalize() ||
+            transitions.count().canonicalize() != expected_transitions
         {
             return Err(DiamondInputConfigError::InvalidTransitionLayout.into());
         }
-
-        let mut states = vec![initial_state];
-        for level in 1..=self.config.input_count {
-            let state_count = self.config.state_count_at_level(level)?;
-            let level_transitions = &transitions[level - 1];
-            if level_transitions.len() != self.config.digit_base ||
-                level_transitions.iter().any(|branch| branch.len() != state_count)
-            {
-                return Err(DiamondInputConfigError::InvalidTransitionLayout.into());
-            }
-            let first_new_state = 1 + (level - 1) * self.config.batch_bits;
-            let source_states = Family::pack(
-                (0..state_count)
-                    .map(|state| {
-                        let source = if state >= first_new_state { 0 } else { state };
-                        states[source].clone()
-                    })
-                    .collect(),
-            )?;
-            let selected_transitions = Family::pack(
-                (0..state_count)
-                    .map(|state| {
-                        input_digits[level - 1].clone().select(
-                            (0..self.config.digit_base)
-                                .map(|digit| level_transitions[digit][state].clone())
-                                .collect(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            )?;
-            let next = source_states
-                .parallel_zip(selected_transitions, move |_, state, transition| {
-                    state * transition
-                })?;
-            states = (0..state_count).map(|state| next.get_static(state)).collect();
-        }
+        let initial = Parallel::range(max_state_count.clone()).map_values(|state| {
+            let selector = state.as_int().equal(Int::constant(0)).to_int();
+            let zero = self.params.ring().zero((1, self.params.state_columns()));
+            selector.select(vec![zero, initial_state.clone()]).expect("matching state matrices")
+        })?;
+        let states = Sequential::range(level_count).scan(
+            initial,
+            (input_digits, transitions),
+            |level, states, (input_digits, transitions)| {
+                let level = level.as_int();
+                let digit = input_digits.get(level.clone());
+                let first_new =
+                    level.clone().mul(Int::evaluate(batch_bits.clone())).add(Int::constant(1));
+                let source_indices =
+                    Parallel::range(max_state_count.clone()).map_values(|state| {
+                        let state = state.as_int();
+                        first_new
+                            .clone()
+                            .less_equal(state.clone())
+                            .to_int()
+                            .select_int(vec![state, Int::constant(0)])
+                            .expect("two integer branches")
+                    })?;
+                let source_states = states.parallel_gather(source_indices)?;
+                let transition_indices =
+                    Parallel::range(max_state_count.clone()).map_values(|state| {
+                        level
+                            .clone()
+                            .mul(Int::evaluate(digit_state_count.clone()))
+                            .add(digit.clone().mul(Int::evaluate(max_state_count.clone())))
+                            .add(state.as_int())
+                    })?;
+                let selected = transitions.parallel_gather(transition_indices)?;
+                parallel_zip_bundle_result((source_states, selected), |_, (state, transition)| {
+                    Ok(state * transition)
+                })
+            },
+        )?;
         Ok(DiamondInputEvaluation { states })
     }
 }
@@ -308,16 +438,6 @@ fn ternary_secret(ring: &Ring) -> Mat {
 
 fn regular_selector(secret: Mat) -> Mat {
     Mat::concat(ConcatAxis::Diagonal, vec![secret.clone(), secret])
-}
-
-fn k_selector(ring: &Ring, secret: Mat) -> Mat {
-    Mat::concat(ConcatAxis::Diagonal, vec![secret, ring.identity(1)])
-}
-
-fn special_selector(ring: &Ring, secret: Mat, bit: Mat) -> Mat {
-    let top = Mat::concat(ConcatAxis::Columns, vec![secret.clone(), secret * bit]);
-    let bottom = ring.zero((1, 2));
-    Mat::concat(ConcatAxis::Rows, vec![top, bottom])
 }
 
 #[cfg(test)]
@@ -337,25 +457,25 @@ mod tests {
             digit_count: 2,
             trapdoor_sigma: RealExpr::from_integer(4),
             error_sigma: RealExpr::from_integer(3),
+            error_max_coefficient_bound: BigInt::from(19),
+            preimage_max_coefficient_bound: BigInt::from(64),
         }
     }
 
     #[test]
     fn preprocessing_builds_p_transitions_and_final_trapdoors() {
-        let injector = DiamondInputInjector::new(config()).unwrap();
-        let ring = injector.config.ring();
+        let config = config();
+        let ring = config.ring();
+        let injector = DiamondInputInjector::new(config).unwrap();
         let preprocessing =
             injector.preprocess(ring.input("message", (1, 1))).expect("preprocessing");
-        assert_eq!(preprocessing.transitions.len(), 2);
-        assert_eq!(preprocessing.transitions[0].len(), 2);
-        assert_eq!(preprocessing.transitions[0][0].len(), 2);
-        assert_eq!(preprocessing.transitions[1][0].len(), 3);
-        assert_eq!(preprocessing.final_trapdoors.len(), 3);
+        assert_eq!(preprocessing.transitions.count(), &IntExpr::constant(12));
+        assert_eq!(preprocessing.final_trapdoors.count(), &IntExpr::constant(3));
 
         let built = DslContext::new("diamond-input-preprocessing")
             .output("p", preprocessing.p)
             .unwrap()
-            .output("transition", preprocessing.transitions[1][1][2].clone())
+            .output("transition", preprocessing.transitions.get_static(11))
             .unwrap()
             .build()
             .unwrap();
@@ -368,26 +488,29 @@ mod tests {
                 .flat_map(|scope| scope.nodes())
                 .any(|node| matches!(node.kind(), NodeKind::PreimageSample { .. }))
         );
-        let elaborated = built.elaborate(&ParamEnv::default()).unwrap();
-        assert!(!elaborated.preimage_relations.is_empty());
     }
 
     #[test]
     fn online_evaluation_selects_transitions_and_uses_parallel_state_updates() {
-        let injector = DiamondInputInjector::new(config()).unwrap();
-        let ring = injector.config.ring();
+        let config = config();
+        let input_count = config.input_count;
+        let ring = config.ring();
+        let injector = DiamondInputInjector::new(config).unwrap();
         let preprocessing =
             injector.preprocess(ring.input("message", (1, 1))).expect("preprocessing");
-        let digits = (0..injector.config.input_count)
-            .map(|digit| ring.input(format!("digit-{digit}"), (1, 1)).extract_coefficient(0))
-            .collect::<Vec<_>>();
+        let digits = Family::pack(
+            (0..input_count)
+                .map(|digit| ring.input(format!("digit-{digit}"), (1, 1)).extract_coefficient(0))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let evaluation = injector
-            .evaluate(preprocessing.p, &digits, &preprocessing.transitions)
+            .evaluate(preprocessing.p, digits, preprocessing.transitions)
             .expect("online evaluation");
         let graph = DslContext::new("diamond-input-online")
-            .output("default-state", evaluation.states[0].clone())
+            .output("default-state", evaluation.states.get_static(0))
             .unwrap()
-            .output("last-state", evaluation.states.last().unwrap().clone())
+            .output("last-state", evaluation.states.get_static(2))
             .unwrap()
             .build()
             .unwrap();

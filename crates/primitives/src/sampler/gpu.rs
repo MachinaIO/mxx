@@ -10,6 +10,8 @@ use crate::{
     sampler::{DistType, PolyHashSampler, PolyUniformSampler},
 };
 use digest::OutputSizeUser;
+use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use rand::{Rng, rng};
 use std::marker::PhantomData;
 
@@ -28,7 +30,7 @@ impl PolyUniformSampler for GpuDCRTPolyUniformSampler {
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         dist: &DistType,
     ) -> <Self::M as PolyMatrix>::P {
-        let sampled = self.sample_uniform(params, 1, 1, *dist);
+        let sampled = self.sample_uniform(params, 1, 1, dist.clone());
         sampled.entry(0, 0)
     }
 
@@ -167,22 +169,27 @@ fn sample_gpu_matrix_with_seed(
             ncol,
             GpuMatrixSampleDist::Uniform,
             0.0,
+            u64::MAX,
             seed,
         ),
-        DistType::GaussDist { sigma } => GpuDCRTPolyMatrix::sample_distribution(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Gauss,
-            sigma,
-            seed,
-        ),
+        DistType::GaussDist { sigma, max_coefficient_bound } => {
+            GpuDCRTPolyMatrix::sample_distribution(
+                params,
+                nrow,
+                ncol,
+                GpuMatrixSampleDist::Gauss,
+                sigma,
+                gpu_coefficient_cutoff(max_coefficient_bound.as_ref()),
+                seed,
+            )
+        }
         DistType::BitDist => GpuDCRTPolyMatrix::sample_distribution(
             params,
             nrow,
             ncol,
             GpuMatrixSampleDist::Bit,
             0.0,
+            u64::MAX,
             seed,
         ),
         DistType::TernaryDist => GpuDCRTPolyMatrix::sample_distribution(
@@ -191,6 +198,7 @@ fn sample_gpu_matrix_with_seed(
             ncol,
             GpuMatrixSampleDist::Ternary,
             0.0,
+            u64::MAX,
             seed,
         ),
     }
@@ -217,18 +225,22 @@ fn sample_gpu_matrix_with_seed_columns(
             col_len,
             GpuMatrixSampleDist::Uniform,
             0.0,
+            u64::MAX,
             seed,
         ),
-        DistType::GaussDist { sigma } => GpuDCRTPolyMatrix::sample_distribution_columns(
-            params,
-            nrow,
-            total_ncol,
-            col_start,
-            col_len,
-            GpuMatrixSampleDist::Gauss,
-            sigma,
-            seed,
-        ),
+        DistType::GaussDist { sigma, max_coefficient_bound } => {
+            GpuDCRTPolyMatrix::sample_distribution_columns(
+                params,
+                nrow,
+                total_ncol,
+                col_start,
+                col_len,
+                GpuMatrixSampleDist::Gauss,
+                sigma,
+                gpu_coefficient_cutoff(max_coefficient_bound.as_ref()),
+                seed,
+            )
+        }
         DistType::BitDist => GpuDCRTPolyMatrix::sample_distribution_columns(
             params,
             nrow,
@@ -237,6 +249,7 @@ fn sample_gpu_matrix_with_seed_columns(
             col_len,
             GpuMatrixSampleDist::Bit,
             0.0,
+            u64::MAX,
             seed,
         ),
         DistType::TernaryDist => GpuDCRTPolyMatrix::sample_distribution_columns(
@@ -247,9 +260,14 @@ fn sample_gpu_matrix_with_seed_columns(
             col_len,
             GpuMatrixSampleDist::Ternary,
             0.0,
+            u64::MAX,
             seed,
         ),
     }
+}
+
+fn gpu_coefficient_cutoff(max_coefficient_bound: Option<&BigUint>) -> u64 {
+    max_coefficient_bound.and_then(ToPrimitive::to_u64).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -370,7 +388,7 @@ mod tests {
             &params,
             4,
             5,
-            DistType::GaussDist { sigma },
+            DistType::GaussDist { sigma, max_coefficient_bound: None },
             GpuRngSeed::from_bytes([0x5au8; 32]),
         );
 
@@ -396,5 +414,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_truncated_gaussian_never_exceeds_integer_cutoff() {
+        gpu_device_sync();
+        let cpu_params = gpu_test_params();
+        let params = gpu_params_from_cpu(&cpu_params);
+        let cutoff = BigUint::from(2u8);
+        let sampled = sample_gpu_matrix_with_seed(
+            &params,
+            4,
+            5,
+            DistType::GaussDist { sigma: 4.578, max_coefficient_bound: Some(cutoff.clone()) },
+            GpuRngSeed::from_bytes([0x6bu8; 32]),
+        );
+
+        assert!(crate::sampler::bounds::matrix_within_coefficient_bound(&sampled, &cutoff));
     }
 }

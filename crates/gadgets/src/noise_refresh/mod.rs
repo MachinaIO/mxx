@@ -1,7 +1,7 @@
 //! BGG-independent noise-refresh circuit helpers.
 //!
 //! BGG graph construction belongs to `mxx-bgg`; numerical analysis belongs to
-//! `mxx-noise-simulator`.
+//! application-specific correctness proofs.
 
 pub mod circuit_decrypt;
 pub mod circuit_merge;

@@ -1,0 +1,7 @@
+import MxxGadgets
+
+#print axioms MxxGadgets.InputInjector.transition_affine
+#print axioms MxxGadgets.InputInjector.projection_affine
+#print axioms MxxGadgets.InputInjector.ValidatedInputInjectorFacts.transitionsArtifact_source_value
+#print axioms MxxGadgets.InputInjector.sampled_transition_contract
+#print axioms MxxGadgets.InputInjector.projectInputInjectorFacts_validated

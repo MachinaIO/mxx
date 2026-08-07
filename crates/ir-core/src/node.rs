@@ -65,6 +65,7 @@ pub enum NodeKind {
     GaussianSample {
         matrix_type: crate::types::MatrixType,
         sigma: RealExpr,
+        max_coefficient_bound: IntExpr,
     },
     HashSample {
         matrix_type: crate::types::MatrixType,
@@ -85,9 +86,11 @@ pub enum NodeKind {
         sigma: RealExpr,
         gadget_base: IntExpr,
         digit_count: IntExpr,
+        preimage_max_coefficient_bound: IntExpr,
     },
     PreimageSample {
         matrix_type: crate::types::MatrixType,
+        max_coefficient_bound: IntExpr,
     },
     GadgetDecompose {
         base: IntExpr,
@@ -120,6 +123,7 @@ pub enum NodeKind {
     },
     SubgraphCall(SubgraphCall),
     ParallelLoop(ParallelLoop),
+    SequentialLoop(SequentialLoop),
     FamilyPack {
         count: IntExpr,
     },
@@ -223,6 +227,19 @@ pub struct ParallelLoop {
     pub index_slot: u32,
     pub bindings: Vec<(String, IntExpr)>,
     pub input_modes: Vec<LoopInputMode>,
+}
+
+/// A structural loop whose body consumes and returns a carried state.
+///
+/// Arguments are ordered as the initial carried values followed by loop-invariant values. The
+/// body receives values in the same order and returns exactly `carried_count` values. Iteration
+/// outputs replace the carried inputs for the next iteration; the node exposes the final state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SequentialLoop {
+    pub count: IntExpr,
+    pub index_slot: u32,
+    pub bindings: Vec<(String, IntExpr)>,
+    pub carried_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

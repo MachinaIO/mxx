@@ -1,4 +1,5 @@
 use crate::{matrix::PolyMatrix, poly::Poly};
+use num_bigint::BigUint;
 
 pub mod bounds;
 #[cfg(feature = "gpu")]
@@ -7,7 +8,7 @@ pub mod hash;
 pub mod trapdoor;
 pub mod uniform;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 /// Enum representing different types of distributions for random sampling.
 pub enum DistType {
     /// Distribution over a finite ring, typically samples elements from a ring in a uniform or
@@ -18,7 +19,12 @@ pub enum DistType {
     /// Each sample is drawn proportionally to exp(-π‖x‖² / σ²), restricted to x ∈ Λ.
     ///
     /// * `sigma` - The Gaussian parameter (standard deviation).
-    GaussDist { sigma: f64 },
+    GaussDist {
+        sigma: f64,
+        /// When present, CPU and GPU samplers independently rejection-resample coefficients until
+        /// their centered magnitude is at most this authoritative hard cutoff.
+        max_coefficient_bound: Option<BigUint>,
+    },
     /// Distribution that produces random bits (0 or 1).
     BitDist,
     /// Distribution that produces random bits (-1,0,1).
@@ -184,12 +190,20 @@ pub trait PolyTrapdoorSampler {
         requests
             .into_iter()
             .map(|request| {
-                let out = self.preimage(
-                    request.params,
-                    request.trapdoor,
-                    request.public_matrix,
-                    &request.target,
-                );
+                let out = loop {
+                    let candidate = self.preimage(
+                        request.params,
+                        request.trapdoor,
+                        request.public_matrix,
+                        &request.target,
+                    );
+                    if bounds::matrix_within_coefficient_bound(
+                        &candidate,
+                        &request.max_coefficient_bound,
+                    ) {
+                        break candidate;
+                    }
+                };
                 (request.entry_idx, out)
             })
             .collect()

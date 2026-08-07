@@ -116,6 +116,7 @@ pub fn estimate<B: MeasurementBackend>(
         invocations: BTreeMap::new(),
     };
     let mut report = estimator.estimate_scope(&FrozenGraphScopeId::Root, &validated.bindings)?;
+    estimator.record_child_invocations(&FrozenGraphScopeId::Root, &validated.bindings, 1)?;
     for (key, count) in estimator.invocations {
         if let Some(cached) = estimator.cache.get(&key) {
             report.per_subgraph.insert(
@@ -271,7 +272,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .child_scope_id(node.scope, node.id)
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
                 let child_bindings = child_bindings(bindings, &call.bindings, None)?;
-                self.cached_child(child, child_bindings, 1)
+                self.cached_child(child, child_bindings)
             }
             NodeKind::ParallelLoop(loop_node) => {
                 if !self.backend.loop_index_invariant(self.validated.source.name(), node) {
@@ -298,7 +299,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
                 let child_bindings =
                     child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
-                let (one, peak, parallelism) = self.cached_child(child, child_bindings, count)?;
+                let (one, peak, parallelism) = self.cached_child(child, child_bindings)?;
                 let concurrent = (self.config.device_pool_size.max(1) /
                     self.config.per_instance_occupancy.max(1))
                 .max(1);
@@ -313,6 +314,42 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     parallelism.saturating_mul(active),
                 ))
             }
+            NodeKind::SequentialLoop(loop_node) => {
+                if !self.backend.loop_index_invariant(self.validated.source.name(), node) {
+                    return Err(EstimateError::LoopIndexDependentCost {
+                        scope: node.scope.clone(),
+                        node: node.id,
+                    });
+                }
+                let count = loop_node
+                    .count
+                    .evaluate(bindings)
+                    .map_err(|error| EstimateError::Expression(error.to_string()))?
+                    .to_usize()
+                    .ok_or_else(|| {
+                        EstimateError::Expression("sequential loop count is not usize".to_owned())
+                    })?;
+                if count == 0 {
+                    return Ok((NodeMeasurement::default(), 0, 1));
+                }
+                let child = self
+                    .validated
+                    .source
+                    .child_scope_id(node.scope, node.id)
+                    .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                let child_bindings =
+                    child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
+                let (one, peak, parallelism) = self.cached_child(child, child_bindings)?;
+                Ok((
+                    NodeMeasurement {
+                        work_seconds: one.work_seconds * count as f64,
+                        latency_seconds: one.latency_seconds * count as f64,
+                        workspace_bytes: one.workspace_bytes,
+                    },
+                    peak,
+                    parallelism,
+                ))
+            }
             _ => self
                 .backend
                 .measure(self.validated.source.name(), node, bindings)
@@ -325,10 +362,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         &mut self,
         child: FrozenGraphScopeId,
         bindings: ParamEnv,
-        invocations: usize,
     ) -> Result<(NodeMeasurement, u64, usize), EstimateError> {
         let key = CacheKey::new(child.clone(), &bindings)?;
-        *self.invocations.entry(key.clone()).or_default() += invocations;
         let report = if let Some(report) = self.cache.get(&key) {
             report.clone()
         } else {
@@ -345,6 +380,82 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             report.peak_memory_bytes,
             report.maximum_parallelism,
         ))
+    }
+
+    fn record_child_invocations(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        bindings: &ParamEnv,
+        parent_invocations: usize,
+    ) -> Result<(), EstimateError> {
+        let nodes = self
+            .validated
+            .source
+            .scope(scope_id)
+            .ok_or_else(|| EstimateError::MissingScope(scope_id.clone()))?
+            .nodes()
+            .to_vec();
+        for (position, node) in nodes.iter().enumerate() {
+            let node_id = NodeId(position as u64);
+            let Some(child) = self.validated.source.child_scope_id(scope_id, node_id) else {
+                continue;
+            };
+            let (child_bindings, local_invocations) = match node.kind() {
+                NodeKind::SubgraphCall(call) => {
+                    (child_bindings(bindings, &call.bindings, None)?, 1)
+                }
+                NodeKind::ParallelLoop(loop_node) => {
+                    let count = loop_node
+                        .count
+                        .evaluate(bindings)
+                        .map_err(|error| EstimateError::Expression(error.to_string()))?
+                        .to_usize()
+                        .ok_or_else(|| {
+                            EstimateError::Expression("loop count is not usize".to_owned())
+                        })?;
+                    if count == 0 {
+                        continue;
+                    }
+                    (
+                        child_bindings(
+                            bindings,
+                            &loop_node.bindings,
+                            Some((loop_node.index_slot, 0)),
+                        )?,
+                        count,
+                    )
+                }
+                NodeKind::SequentialLoop(loop_node) => {
+                    let count = loop_node
+                        .count
+                        .evaluate(bindings)
+                        .map_err(|error| EstimateError::Expression(error.to_string()))?
+                        .to_usize()
+                        .ok_or_else(|| {
+                            EstimateError::Expression(
+                                "sequential loop count is not usize".to_owned(),
+                            )
+                        })?;
+                    if count == 0 {
+                        continue;
+                    }
+                    (
+                        child_bindings(
+                            bindings,
+                            &loop_node.bindings,
+                            Some((loop_node.index_slot, 0)),
+                        )?,
+                        count,
+                    )
+                }
+                _ => continue,
+            };
+            let invocations = parent_invocations.saturating_mul(local_invocations);
+            let key = CacheKey::new(child.clone(), &child_bindings)?;
+            *self.invocations.entry(key).or_default() += invocations;
+            self.record_child_invocations(&child, &child_bindings, invocations)?;
+        }
+        Ok(())
     }
 }
 
@@ -370,7 +481,7 @@ fn child_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, Ring};
+    use mxx_dsl::{DslContext, Int, IntType, Parallel, Ring, Sequential, Subgraph};
     use std::convert::Infallible;
 
     struct UnitBackend;
@@ -406,5 +517,61 @@ mod tests {
             estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
         assert_eq!(report.total_work_seconds, 3.0);
         assert_eq!(report.critical_path_seconds, 2.0);
+    }
+
+    #[test]
+    fn sequential_loop_iterations_extend_latency_without_parallel_memory_multiplication() {
+        let total =
+            Sequential::range(3)
+                .scan(Int::constant(0), Int::constant(1), |_, total, increment| {
+                    Ok(total.add(increment))
+                })
+                .expect("sequential scan");
+        let built = DslContext::new("estimate-sequential")
+            .int_output("total", total)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        let report =
+            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+        assert!(report.critical_path_seconds >= 3.0);
+        assert_eq!(report.maximum_parallelism, 1);
+    }
+
+    #[test]
+    fn sequential_loop_multiplies_all_nested_invocation_counts() {
+        let increment =
+            Subgraph::<Int, Int>::define("increment", IntType, |value| value.add(Int::constant(1)))
+                .expect("increment subgraph");
+        let total = Sequential::range(3)
+            .scan(Int::constant(0), Int::constant(0), |_, total, _| {
+                let direct = increment.call(total)?;
+                let parallel = Parallel::range(2).map_values(|_| {
+                    increment.call(direct.clone()).expect("nested subgraph call")
+                })?;
+                Ok(parallel.get_static(0))
+            })
+            .expect("nested sequential scan");
+        let built = DslContext::new("estimate-nested-sequential")
+            .int_output("total", total)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        let report =
+            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+
+        let invocation_count = |needle: &str| {
+            report
+                .per_subgraph
+                .iter()
+                .filter(|(name, _)| name.starts_with(needle))
+                .map(|(_, cost)| cost.invocations)
+                .sum::<usize>()
+        };
+        assert_eq!(invocation_count("SequentialBody"), 3);
+        assert_eq!(invocation_count("ParallelBody"), 6);
+        assert_eq!(invocation_count("Subgraph { canonical_name: \"increment\""), 9);
     }
 }

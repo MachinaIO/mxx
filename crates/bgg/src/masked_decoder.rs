@@ -188,7 +188,7 @@ impl MaskedHighBitDecoderCompiler {
 mod tests {
     use super::*;
     use crate::test_utils::execute_graph;
-    use mxx_ir_core::ParamEnv;
+
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -199,67 +199,6 @@ mod tests {
     use mxx_runtime::{RuntimeValue, backend::poly::CpuDcrtBackend};
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeMap;
-
-    fn compiler() -> MaskedHighBitDecoderCompiler {
-        MaskedHighBitDecoderCompiler {
-            modulus: 65_537.into(),
-            ring_dimension: 8.into(),
-            secret_size: 2,
-            digit_count: 4,
-            gadget_base: 4.into(),
-            trapdoor_sigma: RealExpr::from_integer(5),
-            coefficient_count: 4,
-        }
-    }
-
-    #[test]
-    fn preprocessing_and_online_graphs_validate() {
-        let compiler = compiler();
-        let ring = Ring::new(compiler.modulus.clone(), compiler.ring_dimension.clone());
-        let trapdoor = ring.sample_trapdoor(
-            compiler.decoder_rows(),
-            compiler.trapdoor_sigma.clone(),
-            compiler.gadget_base.clone(),
-            compiler.digit_count,
-        );
-        let public_keys = ring.input_family(
-            "public-keys",
-            3,
-            (compiler.secret_size, compiler.public_key_columns()),
-        );
-        let preprocessing =
-            compiler.build_preprocessing(trapdoor, public_keys, 3).expect("preprocessing");
-        let preprocessing = compiler
-            .export_preprocessing(DslContext::new("decoder-preprocessing"), preprocessing)
-            .expect("export")
-            .build()
-            .expect("build preprocessing");
-        preprocessing.validate(&ParamEnv::default()).expect("validate preprocessing");
-        let symbolic =
-            preprocessing.elaborate(&ParamEnv::default()).expect("elaborate preprocessing");
-        let report = mxx_noise_simulator::simulate(&symbolic).expect("simulate preprocessing");
-        assert!(report.outputs.contains_key(MASKED_DECODER_PREIMAGES));
-
-        let state = ring.input("state", (1, compiler.decoder_columns()));
-        let preimages = ring.input_family("preimages", 3, (compiler.decoder_columns(), 1));
-        let vectors = ring.input_family("vectors", 3, (1, compiler.public_key_columns()));
-        let bottoms = ring.input_family("bottoms", 3, (1, 1));
-        let MaskedHighBitDecoderOutputs::Integers(outputs) = compiler
-            .build_online(state, preimages, vectors, bottoms, 2.into(), false, 3)
-            .expect("online")
-        else {
-            panic!("integer outputs")
-        };
-        let context = outputs
-            .into_iter()
-            .enumerate()
-            .try_fold(DslContext::new("decoder-online"), |context, (index, output)| {
-                context.int_family_output(format!("coefficient-{index}"), output)
-            })
-            .expect("outputs");
-        let online = context.build().expect("build online");
-        online.validate(&ParamEnv::default()).expect("validate online");
-    }
 
     #[test]
     fn online_runtime_matches_explicit_threshold_decode_oracle() {

@@ -1,7 +1,7 @@
 use crate::{
     artifact::ArtifactConfidentiality,
     expr::RealExpr,
-    node::{NodeKind, ParallelLoop, SubgraphCall},
+    node::{NodeKind, ParallelLoop, SequentialLoop, SubgraphCall},
     types::{NodeId, Port, WireRef, WireType},
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -156,6 +156,23 @@ impl NodeHandle {
             output_types,
             Some(SourceLocation::caller()),
             Some(StructuralChild::Parallel(body)),
+        )
+    }
+
+    #[track_caller]
+    pub fn sequential_loop(
+        body: SubgraphHandle,
+        arguments: Vec<ValueHandle>,
+        output_types: Vec<WireType>,
+        loop_spec: SequentialLoop,
+    ) -> Self {
+        Self::new_in_scope(
+            current_construction_scope(),
+            NodeKind::SequentialLoop(loop_spec),
+            arguments,
+            output_types,
+            Some(SourceLocation::caller()),
+            Some(StructuralChild::Sequential(body)),
         )
     }
 
@@ -345,8 +362,8 @@ pub enum CapturePolicy {
     /// Broadcast scalar values and read-only artifact families into a
     /// structural child scope.
     ///
-    /// Arbitrary executable families remain rejected because their symbolic
-    /// member identity cannot be reconstructed from an opaque family input.
+    /// Arbitrary executable families remain rejected because their member
+    /// dataflow cannot be reconstructed from an opaque family input.
     BroadcastScalarsAndArtifactFamilies,
 }
 
@@ -481,6 +498,7 @@ struct GraphNode {
 enum StructuralChild {
     Subgraph(SubgraphHandle),
     Parallel(SubgraphHandle),
+    Sequential(SubgraphHandle),
 }
 
 struct SubgraphDefinition {
@@ -508,6 +526,7 @@ pub enum FrozenGraphScopeId {
     Root,
     Subgraph { canonical_name: String },
     ParallelBody { parent: Box<FrozenGraphScopeId>, owner: NodeId },
+    SequentialBody { parent: Box<FrozenGraphScopeId>, owner: NodeId },
 }
 
 #[derive(Clone)]
@@ -602,7 +621,7 @@ impl Graph {
         register_named_children(&root, &mut named)?;
 
         let mut scopes = BTreeMap::new();
-        freeze_parallel_children(&root, &mut scopes, &mut freeze_map, &mut named)?;
+        freeze_structural_children(&root, &mut scopes, &mut freeze_map, &mut named)?;
         scopes.insert(FrozenGraphScopeId::Root, root);
 
         let mut completed_names = BTreeSet::new();
@@ -620,7 +639,7 @@ impl Graph {
                 &mut freeze_map,
             )?;
             register_named_children(&scope, &mut named)?;
-            freeze_parallel_children(&scope, &mut scopes, &mut freeze_map, &mut named)?;
+            freeze_structural_children(&scope, &mut scopes, &mut freeze_map, &mut named)?;
             scopes.insert(id, scope);
             completed_names.insert(name);
         }
@@ -703,6 +722,10 @@ impl Graph {
                 parent: Box::new(parent.clone()),
                 owner: node,
             }),
+            NodeKind::SequentialLoop(_) => Some(FrozenGraphScopeId::SequentialBody {
+                parent: Box::new(parent.clone()),
+                owner: node,
+            }),
             _ => None,
         }
     }
@@ -753,15 +776,64 @@ impl<'de> Deserialize<'de> for Graph {
     }
 }
 
+#[derive(Clone, Debug)]
+enum FrozenCandidates {
+    Unique(ScopedWireRef),
+    Ambiguous(BTreeSet<ScopedWireRef>),
+}
+
+impl FrozenCandidates {
+    fn insert(&mut self, candidate: ScopedWireRef) {
+        match self {
+            Self::Unique(current) if *current == candidate => {}
+            Self::Unique(current) => {
+                *self = Self::Ambiguous(BTreeSet::from([current.clone(), candidate]));
+            }
+            Self::Ambiguous(candidates) => {
+                candidates.insert(candidate);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct FreezeMap {
-    values: HashMap<(NodeIdentity, Port), ScopedWireRef>,
+    values: HashMap<(NodeIdentity, Port), FrozenCandidates>,
 }
 
 impl FreezeMap {
-    pub fn resolve(&self, value: &ValueHandle) -> Option<&ScopedWireRef> {
-        self.values.get(&(value.node.identity(), value.port))
+    fn insert(&mut self, value: &ValueHandle, candidate: ScopedWireRef) {
+        self.values
+            .entry((value.node.identity(), value.port))
+            .and_modify(|candidates| candidates.insert(candidate.clone()))
+            .or_insert(FrozenCandidates::Unique(candidate));
     }
+
+    /// Resolves a construction-time value to its one exact frozen location.
+    ///
+    /// The same construction handle can be reached from more than one structural
+    /// child path. Such a handle is deliberately rejected instead of selecting a
+    /// path based on traversal order.
+    pub fn resolve_unique(
+        &self,
+        value: &ValueHandle,
+    ) -> Result<&ScopedWireRef, FreezeResolveError> {
+        match self.values.get(&(value.node.identity(), value.port)) {
+            Some(FrozenCandidates::Unique(reference)) => Ok(reference),
+            Some(FrozenCandidates::Ambiguous(candidates)) => Err(FreezeResolveError::Ambiguous {
+                candidates: candidates.iter().cloned().collect(),
+            }),
+            None => Err(FreezeResolveError::Missing),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum FreezeResolveError {
+    #[error("the construction value is not reachable in the frozen graph")]
+    Missing,
+    #[error("the construction value has multiple frozen structural locations: {candidates:?}")]
+    Ambiguous { candidates: Vec<ScopedWireRef> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -831,8 +903,8 @@ fn freeze_scope(
         }
         let node_id = node_ids[&node.identity()];
         for port in 0..node.output_types().len() {
-            freeze_map.values.insert(
-                (node.identity(), Port(port as u32)),
+            freeze_map.insert(
+                &node.output(port as u32).expect("known output port"),
                 ScopedWireRef {
                     scope: id.clone(),
                     wire: WireRef { node: node_id, port: Port(port as u32) },
@@ -904,16 +976,36 @@ fn register_named_children(
     Ok(())
 }
 
-fn freeze_parallel_children(
+fn freeze_structural_children(
     parent: &GraphScope,
     scopes: &mut BTreeMap<FrozenGraphScopeId, GraphScope>,
     freeze_map: &mut FreezeMap,
     named: &mut BTreeMap<String, SubgraphHandle>,
 ) -> Result<(), FreezeError> {
     for node in parent.nodes() {
-        let Some(StructuralChild::Parallel(body)) = node.child() else { continue };
-        let owner = parent.node_id(node).expect("frozen parent node");
-        let id = FrozenGraphScopeId::ParallelBody { parent: Box::new(parent.id().clone()), owner };
+        let (body, id) = match node.child() {
+            Some(StructuralChild::Parallel(body)) => {
+                let owner = parent.node_id(node).expect("frozen parent node");
+                (
+                    body,
+                    FrozenGraphScopeId::ParallelBody {
+                        parent: Box::new(parent.id().clone()),
+                        owner,
+                    },
+                )
+            }
+            Some(StructuralChild::Sequential(body)) => {
+                let owner = parent.node_id(node).expect("frozen parent node");
+                (
+                    body,
+                    FrozenGraphScopeId::SequentialBody {
+                        parent: Box::new(parent.id().clone()),
+                        owner,
+                    },
+                )
+            }
+            _ => continue,
+        };
         let scope = freeze_scope(
             id.clone(),
             body.construction_scope(),
@@ -923,7 +1015,7 @@ fn freeze_parallel_children(
             freeze_map,
         )?;
         register_named_children(&scope, named)?;
-        freeze_parallel_children(&scope, scopes, freeze_map, named)?;
+        freeze_structural_children(&scope, scopes, freeze_map, named)?;
         scopes.insert(id, scope);
     }
     Ok(())
@@ -1101,5 +1193,75 @@ mod tests {
         let encoded = serde_json::to_vec(&graph).unwrap();
         let decoded: Graph = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(graph, decoded);
+    }
+
+    #[test]
+    fn freeze_map_rejects_one_body_handle_reused_under_distinct_loop_owners() {
+        let (body, body_output) = with_new_construction_scope(|scope| {
+            let input = input("item");
+            let output = NodeHandle::new(
+                NodeKind::MatrixScale { scalar: IntExpr::constant(1) },
+                vec![input.clone()],
+                vec![WireType::Matrix(matrix_type())],
+            )
+            .output(0)
+            .unwrap();
+            (
+                SubgraphHandle::new("shared-loop-body", scope, vec![input], vec![output.clone()])
+                    .unwrap(),
+                output,
+            )
+        });
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(matrix_type())),
+            count: IntExpr::constant(1),
+        };
+        let family = NodeHandle::new(
+            NodeKind::Input {
+                name: "family".to_owned(),
+                wire_type: family_type.clone(),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![family_type.clone()],
+        )
+        .output(0)
+        .unwrap();
+        let make_loop = || {
+            NodeHandle::parallel_loop(
+                body.clone(),
+                vec![family.clone()],
+                vec![family_type.clone()],
+                ParallelLoop {
+                    count: IntExpr::constant(1),
+                    minimum_count: 0,
+                    index_slot: 0,
+                    bindings: Vec::new(),
+                    input_modes: vec![crate::node::LoopInputMode::Zip],
+                },
+            )
+            .output(0)
+            .unwrap()
+        };
+        let (_, freeze_map) = Graph::freeze(
+            "ambiguous-body-handle",
+            Vec::new(),
+            BTreeMap::from([
+                ("left".to_owned(), GraphOutput { value: make_loop(), confidentiality: None }),
+                ("right".to_owned(), GraphOutput { value: make_loop(), confidentiality: None }),
+            ]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        let FreezeResolveError::Ambiguous { candidates } =
+            freeze_map.resolve_unique(&body_output).unwrap_err()
+        else {
+            panic!("reused body handle must be ambiguous")
+        };
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }

@@ -16,6 +16,7 @@ pub struct PreimageRequest<M, T> {
     pub sigma: f64,
     pub gadget_base: BigInt,
     pub digit_count: usize,
+    pub max_coefficient_bound: BigInt,
     pub trapdoor: Arc<T>,
     pub public: Arc<M>,
     pub target: Arc<M>,
@@ -196,6 +197,7 @@ pub trait Backend {
         &mut self,
         ty: &ConcreteMatrixType,
         sigma: f64,
+        max_coefficient_bound: &BigInt,
     ) -> Result<Self::Matrix, Self::Error>;
     fn sample_hash(
         &mut self,
@@ -217,6 +219,7 @@ pub trait Backend {
         sigma: f64,
         gadget_base: &BigInt,
         digit_count: usize,
+        max_coefficient_bound: &BigInt,
         trapdoor: &Self::Trapdoor,
         public: &Self::Matrix,
         target: &Self::Matrix,
@@ -233,6 +236,7 @@ pub trait Backend {
                     request.sigma,
                     &request.gadget_base,
                     request.digit_count,
+                    &request.max_coefficient_bound,
                     request.trapdoor.as_ref(),
                     request.public.as_ref(),
                     request.target.as_ref(),

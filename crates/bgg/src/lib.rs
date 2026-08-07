@@ -1,6 +1,7 @@
 //! BGG+ constructions expressed directly with the declarative graph DSL.
 
 pub mod attribute_encoding;
+pub mod boolean;
 pub mod circuit;
 pub mod encoding;
 pub mod lwe_lookup;
@@ -21,6 +22,10 @@ mod test_utils;
 pub use attribute_encoding::{
     AttributeEncodingCompiler, AttributeEncodingWire, AttributeEvaluationError,
     AttributeMatrixEvaluation,
+};
+pub use boolean::{
+    BggEncodingFamily, BggPublicKeyFamily, DynamicBooleanBggError,
+    evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
 };
 pub use circuit::{
     CircuitCompileError, NaiveEncodingSlotOperations, NaivePublicKeySlotOperations, NoPublicLookup,

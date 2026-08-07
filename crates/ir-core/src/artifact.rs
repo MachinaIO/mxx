@@ -44,6 +44,8 @@ pub enum ArtifactType {
         #[serde(with = "serde_support::bigint")]
         gadget_base: BigInt,
         digit_count: usize,
+        #[serde(with = "serde_support::bigint")]
+        preimage_max_coefficient_bound: BigInt,
     },
     TypedBlob {
         type_name: String,
@@ -58,14 +60,19 @@ impl ArtifactType {
                 Some(Self::Matrix(matrix.clone()))
             }
             ConcreteWireType::Bytes { length } => Some(Self::Bytes { length: *length }),
-            ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count } => {
-                Some(Self::Trapdoor {
-                    matrix: matrix.clone(),
-                    sigma: sigma.clone(),
-                    gadget_base: gadget_base.clone(),
-                    digit_count: *digit_count,
-                })
-            }
+            ConcreteWireType::Trapdoor {
+                matrix,
+                sigma,
+                gadget_base,
+                digit_count,
+                preimage_max_coefficient_bound,
+            } => Some(Self::Trapdoor {
+                matrix: matrix.clone(),
+                sigma: sigma.clone(),
+                gadget_base: gadget_base.clone(),
+                digit_count: *digit_count,
+                preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+            }),
             ConcreteWireType::TypedBlob { type_name, schema_hash } => {
                 Some(Self::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash })
             }

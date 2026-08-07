@@ -95,8 +95,8 @@ impl DCRTTrapdoor {
     pub fn new(params: &DCRTPolyParams, size: usize, sigma: f64) -> Self {
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
-        let dist = DistType::GaussDist { sigma };
-        let r_cpu = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
+        let dist = DistType::GaussDist { sigma, max_coefficient_bound: None };
+        let r_cpu = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist.clone());
         let e_cpu = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
         let a_mat_cpu = &r_cpu * &r_cpu.transpose(); // d x d
         let b_mat_cpu = &r_cpu * &e_cpu.transpose(); // d x d

@@ -775,53 +775,6 @@ mod tests {
     }
 
     #[test]
-    fn opening_verifier_and_residual_build_and_elaborate() {
-        let compiler = Wee25CommitmentCompiler {
-            modulus: 257.into(),
-            ring_dimension: 8.into(),
-            secret_size: 1,
-            tree_base: 2,
-            digit_count: 2,
-            gadget_base: 4.into(),
-        };
-        let ring = compiler.ring();
-        let parameters = Wee25PublicParameterWires {
-            b: ring.input("b", (1, compiler.public_columns())),
-            t_top: (0..compiler.public_parameter_top_family_count())
-                .map(|index| {
-                    ring.input_family(
-                        format!("top-{index}"),
-                        compiler.public_parameter_block_count(),
-                        (compiler.public_columns(), compiler.public_columns()),
-                    )
-                })
-                .collect(),
-            t_bottom: ring.input_family(
-                "bottom",
-                compiler.public_parameter_part_count(),
-                (compiler.public_columns(), compiler.public_columns()),
-            ),
-        };
-        let blocks = (0..4)
-            .map(|index| ring.input(format!("block-{index}"), (1, compiler.public_columns())))
-            .collect::<Vec<_>>();
-        let tree = compiler.commitment_tree(ring.bytes_input("key", 32), &blocks).unwrap();
-        let opening = compiler.opening(&blocks, None, &parameters, &tree.cached_nodes).unwrap();
-        let residual = compiler
-            .verification_residual(&blocks, &tree.root, &opening, None, &parameters)
-            .unwrap();
-        let built = DslContext::new("wee25-opening")
-            .output("residual", residual.residual)
-            .unwrap()
-            .build()
-            .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
-        let symbolic = built.elaborate(&ParamEnv::default()).unwrap();
-        let report = mxx_noise_simulator::simulate(&symbolic).unwrap();
-        assert!(report.outputs.contains_key("residual"));
-    }
-
-    #[test]
     #[serial_test::serial]
     fn generated_parameters_opening_and_verifier_have_zero_residual() {
         let parameters = DCRTPolyParams::new(4, 1, 12, 4);
@@ -835,10 +788,14 @@ mod tests {
         };
         let ring = compiler.ring();
         let hash_key = ring.bytes_input("hash-key", 32);
-        let public =
-            Wee25PublicParameterCompiler { layout: compiler.clone(), trapdoor_sigma: 5.into() }
-                .build(hash_key.clone())
-                .unwrap();
+        let public = Wee25PublicParameterCompiler {
+            layout: compiler.clone(),
+            trapdoor_sigma: 5.into(),
+            gaussian_max_coefficient_bound: 32.into(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
+        }
+        .build(hash_key.clone())
+        .unwrap();
         let blocks = (0..2)
             .map(|index| ring.input(format!("block-{index}"), (1, compiler.public_columns())))
             .collect::<Vec<_>>();

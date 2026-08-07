@@ -1,18 +1,70 @@
 use crate::{
+    element::PolyElem,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
-    sampler::{DistType, PolyUniformSampler},
+    sampler::{DistType, PolyUniformSampler, bounds::centered_coefficient_abs},
 };
+use num_bigint::BigUint;
 use openfhe::ffi;
 use rayon::prelude::*;
 
 use crate::poly::dcrt::params::DCRTPolyParams;
 
+fn rejection_resample_coefficients<T>(
+    count: usize,
+    mut candidate: impl FnMut() -> Vec<T>,
+    mut accepts: impl FnMut(&T) -> bool,
+) -> Vec<T> {
+    let mut accepted = (0..count).map(|_| None).collect::<Vec<_>>();
+    while accepted.iter().any(Option::is_none) {
+        for (slot, coefficient) in accepted.iter_mut().zip(candidate()) {
+            if slot.is_none() && accepts(&coefficient) {
+                *slot = Some(coefficient);
+            }
+        }
+    }
+    accepted
+        .into_iter()
+        .map(|coefficient| coefficient.expect("all coefficients accepted"))
+        .collect()
+}
+
 pub struct DCRTPolyUniformSampler {}
 
 impl DCRTPolyUniformSampler {
+    fn sample_gaussian_unchecked(&self, params: &DCRTPolyParams, sigma: f64) -> DCRTPoly {
+        let sampled_poly = ffi::DCRTPolyGenFromDgg(
+            params.ring_dimension(),
+            params.crt_depth(),
+            params.crt_bits(),
+            sigma,
+        );
+        if sampled_poly.is_null() {
+            panic!("Attempted to dereference a null pointer");
+        }
+        DCRTPoly::new(sampled_poly)
+    }
+
+    fn sample_truncated_gaussian_poly(
+        &self,
+        params: &DCRTPolyParams,
+        sigma: f64,
+        max_coefficient_bound: &BigUint,
+    ) -> DCRTPoly {
+        let modulus = params.modulus();
+        let coefficients = rejection_resample_coefficients(
+            params.ring_dimension() as usize,
+            || self.sample_gaussian_unchecked(params, sigma).coeffs(),
+            |coefficient| {
+                centered_coefficient_abs(coefficient.value(), modulus.as_ref()) <=
+                    *max_coefficient_bound
+            },
+        );
+        DCRTPoly::from_coeffs(params, &coefficients)
+    }
+
     fn sample_poly_unchecked(&self, params: &DCRTPolyParams, dist: &DistType) -> DCRTPoly {
         let sampled_poly = match dist {
             DistType::FinRingDist => ffi::DCRTPolyGenFromDug(
@@ -20,12 +72,12 @@ impl DCRTPolyUniformSampler {
                 params.crt_depth(),
                 params.crt_bits(),
             ),
-            DistType::GaussDist { sigma } => ffi::DCRTPolyGenFromDgg(
-                params.ring_dimension(),
-                params.crt_depth(),
-                params.crt_bits(),
-                *sigma,
-            ),
+            DistType::GaussDist { sigma, max_coefficient_bound: Some(bound) } => {
+                return self.sample_truncated_gaussian_poly(params, *sigma, bound);
+            }
+            DistType::GaussDist { sigma, max_coefficient_bound: None } => {
+                return self.sample_gaussian_unchecked(params, *sigma);
+            }
             DistType::BitDist => ffi::DCRTPolyGenFromBug(
                 params.ring_dimension(),
                 params.crt_depth(),
@@ -146,18 +198,56 @@ mod tests {
     }
 
     #[test]
+    fn truncated_gaussian_never_exceeds_the_integer_cutoff() {
+        let params = DCRTPolyParams::new(32, 1, 20, 4);
+        let cutoff = BigUint::from(2u8);
+        let matrix = DCRTPolyUniformSampler::new().sample_uniform(
+            &params,
+            3,
+            2,
+            DistType::GaussDist { sigma: 3.0, max_coefficient_bound: Some(cutoff.clone()) },
+        );
+        assert!(crate::sampler::bounds::matrix_within_coefficient_bound(&matrix, &cutoff));
+    }
+
+    #[test]
+    fn truncated_coefficients_are_resampled_instead_of_clipped() {
+        let candidates = [vec![99, 2, 99], vec![1, 99, 3]];
+        let mut next = 0;
+        let accepted = rejection_resample_coefficients(
+            3,
+            || {
+                let candidate = candidates[next].clone();
+                next += 1;
+                candidate
+            },
+            |coefficient| *coefficient <= 3,
+        );
+        assert_eq!(accepted, vec![1, 2, 3]);
+        assert_eq!(next, 2);
+    }
+
+    #[test]
     fn test_gaussian_dist() {
         let params = DCRTPolyParams::default();
 
         // Test GaussianDist
         let sampler = DCRTPolyUniformSampler::new();
-        let matrix1 =
-            sampler.sample_uniform(&params, 20, 5, DistType::GaussDist { sigma: 4.57825 });
+        let matrix1 = sampler.sample_uniform(
+            &params,
+            20,
+            5,
+            DistType::GaussDist { sigma: 4.57825, max_coefficient_bound: None },
+        );
         assert_eq!(matrix1.row_size(), 20);
         assert_eq!(matrix1.col_size(), 5);
 
-        let matrix2 =
-            sampler.sample_uniform(&params, 20, 5, DistType::GaussDist { sigma: 4.57825 });
+        let matrix2 = sampler.sample_uniform(
+            &params,
+            20,
+            5,
+            DistType::GaussDist { sigma: 4.57825, max_coefficient_bound: None },
+        );
 
         let sampler2 = DCRTPolyUniformSampler::new();
         let matrix3 = sampler2.sample_uniform(&params, 5, 12, DistType::FinRingDist);

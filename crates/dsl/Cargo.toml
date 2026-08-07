@@ -3,15 +3,13 @@ name = "mxx-dsl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Declarative typed DSL for mxx executable and symbolic graphs"
+description = "Declarative typed DSL for mxx executable graphs and pure correctness specs"
 
 [dependencies]
 mxx-ir-core.workspace = true
-mxx-ir-symbolic.workspace = true
 num-bigint.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-mxx-noise-simulator.workspace = true
-bigdecimal.workspace = true
 serde_json.workspace = true

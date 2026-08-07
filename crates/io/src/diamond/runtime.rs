@@ -577,33 +577,6 @@ mod tests {
     }
 
     #[test]
-    fn native_seed_bottom_row_exposes_encryption_noise_to_the_simulator() {
-        let ring = Ring::new(257, 8);
-        let declarations = declare_native_seed_inputs(
-            &ring,
-            "diamond-native-noise",
-            1,
-            4,
-            2,
-            RealExpr::from_integer(7),
-        )
-        .unwrap();
-        let graph = mxx_dsl::DslContext::new("diamond-native-noise-assumption")
-            .public_family_output("bottom", declarations[0].scalar_families[2].clone())
-            .unwrap()
-            .build()
-            .unwrap();
-        let elaborated = graph.elaborate(&ParamEnv::default()).unwrap();
-        let report = mxx_noise_simulator::simulate(&elaborated).unwrap();
-        let output = &report.outputs["bottom"];
-        assert!(output.has_signal);
-        assert_eq!(
-            output.noise.as_ref().expect("bottom-row error must remain visible").bound,
-            bigdecimal::BigDecimal::from(7)
-        );
-    }
-
-    #[test]
     #[ignore = "expands and executes the full nested-RNS Diamond iO graph"]
     fn obfuscation_runtime_matches_the_plaintext_goldreich_path_with_nonzero_noise() {
         let parameters = DCRTPolyParams::new(2, 1, 10, 5);

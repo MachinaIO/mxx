@@ -2,10 +2,9 @@
 resolver = "3"
 members = [
     "crates/ir-core",
-    "crates/ir-symbolic",
     "crates/dsl",
-    "crates/noise-simulator",
     "crates/runtime",
+    "crates/correctness",
     "crates/bench-estimator",
     "crates/bgg",
     "crates/primitives",
@@ -27,10 +26,9 @@ mxx-func-enc = { path = "crates/func-enc" }
 mxx-we = { path = "crates/we" }
 mxx-io = { path = "crates/io" }
 mxx-ir-core = { path = "crates/ir-core" }
-mxx-ir-symbolic = { path = "crates/ir-symbolic" }
 mxx-dsl = { path = "crates/dsl" }
-mxx-noise-simulator = { path = "crates/noise-simulator" }
 mxx-runtime = { path = "crates/runtime" }
+mxx-correctness = { path = "crates/correctness" }
 mxx-bench-estimator = { path = "crates/bench-estimator" }
 mxx-bgg = { path = "crates/bgg" }
 bigdecimal = "0.4"

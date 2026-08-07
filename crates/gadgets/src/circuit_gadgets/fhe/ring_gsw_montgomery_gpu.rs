@@ -40,7 +40,14 @@ pub fn sample_montgomery_public_key<B: AsRef<[u8]>>(
         hash_sampler.sample_hash(params, hash_key, tag, 1, width, DistType::FinRingDist).get_row(0);
     let error = error_sigma.filter(|sigma| *sigma != 0.0).map(|sigma| {
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
-        uniform_sampler.sample_uniform(params, 1, width, DistType::GaussDist { sigma }).get_row(0)
+        uniform_sampler
+            .sample_uniform(
+                params,
+                1,
+                width,
+                DistType::GaussDist { sigma, max_coefficient_bound: None },
+            )
+            .get_row(0)
     });
     let b = a
         .par_iter()

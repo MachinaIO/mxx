@@ -154,7 +154,7 @@ pub trait StructuredCircuitLowering<P: Poly>: GraphCircuitLowering<P> {
     /// Whether lookup/slot gate identities affect values or artifact names
     /// emitted by this lowerer. Such definitions are kept per invocation;
     /// pure executable lowerers can share them because the core subgraph call
-    /// already supplies distinct runtime and symbolic instantiation paths.
+    /// already supplies distinct runtime instantiation paths.
     fn call_site_identity_is_semantic(&self) -> bool {
         true
     }

@@ -86,8 +86,17 @@ impl BggPublicKeyCompiler {
     pub fn mul(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
         let decomposed =
             rhs.matrix.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat();
+        self.mul_with_decomposition(lhs, rhs, decomposed)
+    }
+
+    pub(crate) fn mul_with_decomposition(
+        &self,
+        lhs: &BggPublicKeyWire,
+        rhs: &BggPublicKeyWire,
+        decomposed_rhs: Mat,
+    ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: lhs.matrix.clone() * decomposed,
+            matrix: lhs.matrix.clone() * decomposed_rhs,
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }

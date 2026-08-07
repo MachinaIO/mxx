@@ -122,7 +122,8 @@ where
         request.matrix_type != first.matrix_type ||
             request.sigma != first.sigma ||
             request.gadget_base != first.gadget_base ||
-            request.digit_count != first.digit_count
+            request.digit_count != first.digit_count ||
+            request.max_coefficient_bound != first.max_coefficient_bound
     }) {
         return requests
             .into_iter()
@@ -132,6 +133,7 @@ where
                     request.sigma,
                     &request.gadget_base,
                     request.digit_count,
+                    &request.max_coefficient_bound,
                     request.trapdoor.as_ref(),
                     request.public.as_ref(),
                     request.target.as_ref(),
@@ -140,12 +142,31 @@ where
             .collect();
     }
     let parameters = backend.parameters(&first.matrix_type)?;
+    if parameters.device_ids().is_empty() {
+        return requests
+            .into_iter()
+            .map(|request| {
+                backend.sample_preimage(
+                    &request.matrix_type,
+                    request.sigma,
+                    &request.gadget_base,
+                    request.digit_count,
+                    &request.max_coefficient_bound,
+                    request.trapdoor.as_ref(),
+                    request.public.as_ref(),
+                    request.target.as_ref(),
+                )
+            })
+            .collect();
+    }
     PolyBackend::<M, U, H, T>::validate_regular_gadget_layout(
         parameters,
         &first.gadget_base,
         first.digit_count,
     )?;
     let sampler = T::new(parameters, first.sigma);
+    let max_coefficient_bound =
+        first.max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
     let batched = requests
         .iter()
         .enumerate()
@@ -155,6 +176,7 @@ where
             trapdoor: request.trapdoor.as_ref(),
             public_matrix: request.public.as_ref(),
             target: request.target.as_ref().clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
         })
         .collect();
     let mut results = sampler.preimage_batched_sharded(batched);

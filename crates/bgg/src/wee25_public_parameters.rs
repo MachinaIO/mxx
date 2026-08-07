@@ -16,6 +16,8 @@ pub const WEE25_PUBLIC_B_TRAPDOOR: &str = "wee25_public_b_trapdoor";
 pub struct Wee25PublicParameterCompiler {
     pub layout: Wee25CommitmentCompiler,
     pub trapdoor_sigma: RealExpr,
+    pub gaussian_max_coefficient_bound: IntExpr,
+    pub preimage_max_coefficient_bound: IntExpr,
 }
 
 #[derive(Clone)]
@@ -38,9 +40,13 @@ impl Wee25PublicParameterCompiler {
             self.trapdoor_sigma.clone(),
             self.layout.gadget_base.clone(),
             self.layout.digit_count,
+            self.preimage_max_coefficient_bound.clone(),
         );
-        let t_bottom_full = ring
-            .gaussian((public_columns, part_count * public_columns), self.trapdoor_sigma.clone());
+        let t_bottom_full = ring.gaussian(
+            (public_columns, part_count * public_columns),
+            self.trapdoor_sigma.clone(),
+            self.gaussian_max_coefficient_bound.clone(),
+        );
         let t_bottom_parts = (0..part_count)
             .map(|part| {
                 t_bottom_full.clone().slice(
@@ -183,7 +189,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output};
     use mxx_dsl::DslContext;
-    use mxx_ir_core::ParamEnv;
+
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
@@ -255,6 +261,8 @@ mod tests {
         let compiler = Wee25PublicParameterCompiler {
             layout: layout.clone(),
             trapdoor_sigma: RealExpr::from_f64_exact(4.578).expect("finite sigma"),
+            gaussian_max_coefficient_bound: 30.into(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
         };
         let hash_key = [0x45; 32];
         let wires = compiler.build(layout.ring().bytes_input("hash-key", 32)).unwrap();
@@ -313,30 +321,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn public_parameters_build_and_elaborate() {
-        let layout = Wee25CommitmentCompiler {
-            modulus: 257.into(),
-            ring_dimension: 8.into(),
-            secret_size: 1,
-            tree_base: 2,
-            digit_count: 2,
-            gadget_base: 4.into(),
-        };
-        let compiler =
-            Wee25PublicParameterCompiler { layout: layout.clone(), trapdoor_sigma: 3.into() };
-        let wires = compiler.build(layout.ring().bytes_input("hash-key", 32)).expect("parameters");
-        let built = compiler
-            .export(DslContext::new("wee25-public-parameters"), wires)
-            .expect("outputs")
-            .build()
-            .expect("build");
-        built.validate(&ParamEnv::default()).expect("validate");
-        let symbolic = built.elaborate(&ParamEnv::default()).expect("elaborate");
-        let report = mxx_noise_simulator::simulate(&symbolic).expect("simulate");
-        assert!(!report.outputs.is_empty());
-        assert!(!report.outputs.contains_key(WEE25_PUBLIC_B_TRAPDOOR));
     }
 }

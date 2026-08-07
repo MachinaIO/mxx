@@ -3,7 +3,7 @@ use super::*;
 impl<P: Poly> PolyCircuit<P> {
     pub(crate) fn inherit_shared_registries(
         &mut self,
-        lookup_registry: Arc<LookupRegistry<P>>,
+        lookup_registry: Arc<LookupRegistry>,
         binding_registry: Arc<BindingRegistry>,
         input_set_registry: Arc<InputSetRegistry>,
         sub_circuit_registry: Arc<SubCircuitRegistry<P>>,
@@ -82,7 +82,7 @@ impl<P: Poly> PolyCircuit<P> {
     fn import_sub_circuit_to_registry(
         previous_registry: &Arc<SubCircuitRegistry<P>>,
         previous_registry_key: usize,
-        lookup_registry: &Arc<LookupRegistry<P>>,
+        lookup_registry: &Arc<LookupRegistry>,
         binding_registry: &Arc<BindingRegistry>,
         input_set_registry: &Arc<InputSetRegistry>,
         target_registry: &Arc<SubCircuitRegistry<P>>,
@@ -135,7 +135,7 @@ impl<P: Poly> PolyCircuit<P> {
     }
 
     /// Returns a shared, read-only lookup table for external circuit compilers.
-    pub fn lookup_table(&self, lut_id: usize) -> Arc<PublicLut<P>> {
+    pub fn lookup_table(&self, lut_id: usize) -> Arc<PublicLutProgram> {
         self.lookup_registry.lookups.get(&lut_id).expect("lookup table missing").clone()
     }
 
@@ -337,7 +337,7 @@ impl<P: Poly> PolyCircuit<P> {
         self.sub_circuit_registry.get(circuit_id)
     }
 
-    pub fn register_public_lookup(&mut self, public_lookup: PublicLut<P>) -> usize {
+    pub fn register_public_lookup(&mut self, public_lookup: PublicLutProgram) -> usize {
         if !self.allow_register_lookup {
             panic!("lookup table registration is only allowed on top-level circuits");
         }

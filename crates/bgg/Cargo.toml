@@ -18,7 +18,5 @@ rayon.workspace = true
 mxx-gadgets = { workspace = true, features = ["test-support"] }
 mxx-primitives.workspace = true
 mxx-runtime.workspace = true
-mxx-noise-simulator.workspace = true
-mxx-ir-symbolic.workspace = true
 keccak-asm.workspace = true
 serial_test.workspace = true

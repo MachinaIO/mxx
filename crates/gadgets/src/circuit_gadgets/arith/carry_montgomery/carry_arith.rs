@@ -1,7 +1,6 @@
 use crate::{
-    circuit::{BatchedWire, PolyCircuit, PublicLut, gate::GateId},
-    element::PolyElem,
-    poly::{Poly, PolyParams},
+    circuit::{BatchedWire, LutExpr, PolyCircuit, PublicLutProgram, gate::GateId},
+    poly::Poly,
 };
 use num_bigint::BigUint;
 use num_traits::Zero;
@@ -44,41 +43,14 @@ struct CarryArithLutIds {
     kss_p: usize,
 }
 
-fn constant_elem<P: Poly>(params: &P::Params, value: u64) -> P::Elem {
-    P::Elem::constant(&params.modulus(), value)
+fn register_lookup<P: Poly>(circuit: &mut PolyCircuit<P>, len: u64, value: LutExpr) -> usize {
+    circuit.register_public_lookup(
+        PublicLutProgram::new(len, value).expect("carry-arithmetic LUT program must be valid"),
+    )
 }
 
-fn register_lookup<P, F>(
-    circuit: &mut PolyCircuit<P>,
-    params: &P::Params,
-    len: u64,
-    max_output_row: (u64, u64),
-    output: F,
-) -> usize
-where
-    P: Poly + 'static,
-    F: Fn(u64) -> u64 + Send + Sync + 'static,
-{
-    let max_output_row = (max_output_row.0, constant_elem::<P>(params, max_output_row.1));
-    let lut = PublicLut::<P>::new(
-        params,
-        len,
-        move |params, x| {
-            if x >= len {
-                return None;
-            }
-            Some((x, constant_elem::<P>(params, output(x))))
-        },
-        Some(max_output_row),
-    );
-    circuit.register_public_lookup(lut)
-}
-
-fn register_dummy_lookup<P: Poly + 'static>(
-    circuit: &mut PolyCircuit<P>,
-    params: &P::Params,
-) -> usize {
-    register_lookup::<P, _>(circuit, params, 1, (0, 0), |_| 0)
+fn register_dummy_lookup<P: Poly>(circuit: &mut PolyCircuit<P>) -> usize {
+    register_lookup(circuit, 1, LutExpr::constant(0))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,19 +64,14 @@ pub struct CarryArithPolyContext<P: Poly> {
 }
 
 impl<P: Poly + 'static> CarryArithPolyContext<P> {
-    pub fn setup(
-        circuit: &mut PolyCircuit<P>,
-        params: &P::Params,
-        limb_bit_size: usize,
-        dummy_scalar: bool,
-    ) -> Self {
+    pub fn setup(circuit: &mut PolyCircuit<P>, limb_bit_size: usize, dummy_scalar: bool) -> Self {
         debug_assert!(limb_bit_size < 32);
         let base = 1usize << limb_bit_size;
         let const_zero = single_wire(circuit.const_zero_gate());
         let const_base = single_wire(circuit.const_digits(&[base as u32]));
         let scalar_base = BigUint::from(base);
         let luts = if limb_bit_size > 1 {
-            Some(Self::setup_luts(circuit, params, base, dummy_scalar))
+            Some(Self::setup_luts(circuit, base, dummy_scalar))
         } else {
             None
         };
@@ -113,7 +80,6 @@ impl<P: Poly + 'static> CarryArithPolyContext<P> {
 
     fn setup_luts(
         circuit: &mut PolyCircuit<P>,
-        params: &P::Params,
         base: usize,
         dummy_scalar: bool,
     ) -> CarryArithLutIds {
@@ -123,51 +89,35 @@ impl<P: Poly + 'static> CarryArithPolyContext<P> {
         // - kss_g/kss_p implement the binary combine step of the prefix network.
         if dummy_scalar {
             return CarryArithLutIds {
-                add_mod: register_dummy_lookup(circuit, params),
-                add_floor: register_dummy_lookup(circuit, params),
-                mul_mod: register_dummy_lookup(circuit, params),
-                mul_floor: register_dummy_lookup(circuit, params),
-                kss_g: register_dummy_lookup(circuit, params),
-                kss_p: register_dummy_lookup(circuit, params),
+                add_mod: register_dummy_lookup(circuit),
+                add_floor: register_dummy_lookup(circuit),
+                mul_mod: register_dummy_lookup(circuit),
+                mul_floor: register_dummy_lookup(circuit),
+                kss_g: register_dummy_lookup(circuit),
+                kss_p: register_dummy_lookup(circuit),
             };
         }
 
         let b = u64::try_from(base).expect("base must fit in u64");
         let add_max = (b * b - 1) / 2;
         let add_len = 2 * add_max + 1;
-        let add_mod =
-            register_lookup::<P, _>(circuit, params, add_len, (b - 1, b - 1), move |t| t % b);
-        let add_floor =
-            register_lookup::<P, _>(circuit, params, add_len, (b * (b - 1), b - 1), move |t| t / b);
+        let input = LutExpr::input();
+        let add_mod = register_lookup(circuit, add_len, input.clone().modulo(b));
+        let add_floor = register_lookup(circuit, add_len, input.clone().floor_div(b));
         let mul_len = b * b;
-        let mul_mod =
-            register_lookup::<P, _>(circuit, params, mul_len, ((b - 1) * b + 1, b - 1), move |t| {
-                let x = t % b;
-                let y = t / b;
-                (x * y) % b
-            });
-        let mul_floor = register_lookup::<P, _>(
-            circuit,
-            params,
-            mul_len,
-            (mul_len - 1, b.saturating_sub(2)),
-            move |t| {
-                let x = t % b;
-                let y = t / b;
-                (x * y) / b
-            },
-        );
-        let kss_g = register_lookup::<P, _>(circuit, params, 8, (7, 1), move |t| {
-            let gk = (t & 1) != 0;
-            let gj = (t & 2) != 0;
-            let pk = (t & 4) != 0;
-            u64::from(gk || (pk && gj))
-        });
-        let kss_p = register_lookup::<P, _>(circuit, params, 4, (3, 1), move |t| {
-            let pk = (t & 1) != 0;
-            let pj = (t & 2) != 0;
-            u64::from(pk && pj)
-        });
+        let product = input.clone().modulo(b).mul(input.clone().floor_div(b));
+        let mul_mod = register_lookup(circuit, mul_len, product.clone().modulo(b));
+        let mul_floor = register_lookup(circuit, mul_len, product.floor_div(b));
+
+        let gk = input.clone().modulo(2u8);
+        let gj = input.clone().floor_div(2u8).modulo(2u8);
+        let pk = input.clone().floor_div(4u8).modulo(2u8);
+        let propagated = pk.mul(gj);
+        let kss_g =
+            register_lookup(circuit, 8, gk.clone().add(propagated.clone()).sub(gk.mul(propagated)));
+        let pk = input.clone().modulo(2u8);
+        let pj = input.floor_div(2u8).modulo(2u8);
+        let kss_p = register_lookup(circuit, 4, pk.mul(pj));
 
         CarryArithLutIds { add_mod, add_floor, mul_mod, mul_floor, kss_g, kss_p }
     }
@@ -734,8 +684,7 @@ mod tests {
         let parameters = test_parameters();
         let limb_len = limb_len(&parameters, limb_bit_size);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let context =
-            Arc::new(CarryArithPolyContext::setup(&mut circuit, &parameters, limb_bit_size, false));
+        let context = Arc::new(CarryArithPolyContext::setup(&mut circuit, limb_bit_size, false));
         let input_bits = limb_len * limb_bit_size;
         let left = CarryArithPoly::input(context.clone(), &mut circuit, input_bits);
         let right = CarryArithPoly::input(context, &mut circuit, input_bits);
@@ -759,8 +708,7 @@ mod tests {
         let limb_len = limb_len(&parameters, limb_bit_size);
         let input_bits = limb_len * limb_bit_size;
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let context =
-            Arc::new(CarryArithPolyContext::setup(&mut circuit, &parameters, limb_bit_size, false));
+        let context = Arc::new(CarryArithPolyContext::setup(&mut circuit, limb_bit_size, false));
         let left = CarryArithPoly::input(context.clone(), &mut circuit, input_bits);
         let right = CarryArithPoly::input(context, &mut circuit, input_bits);
         let (is_less, difference) = left.less_than(&right, &mut circuit);
@@ -789,8 +737,7 @@ mod tests {
         let limb_len = limb_len(&parameters, limb_bit_size);
         let input_bits = limb_len * limb_bit_size;
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let context =
-            Arc::new(CarryArithPolyContext::setup(&mut circuit, &parameters, limb_bit_size, false));
+        let context = Arc::new(CarryArithPolyContext::setup(&mut circuit, limb_bit_size, false));
         let left = CarryArithPoly::input(context.clone(), &mut circuit, input_bits);
         let right = CarryArithPoly::input(context, &mut circuit, input_bits);
         let product = left.mul(&right, &mut circuit, None);

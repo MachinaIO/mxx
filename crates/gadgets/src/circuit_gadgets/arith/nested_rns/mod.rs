@@ -20,14 +20,14 @@ mod poly;
 
 use crate::{
     circuit::{
-        BatchedWire, PolyCircuit, PublicLut, SubCircuitParamSpec, SubCircuitParamValue,
-        gate::GateId,
+        BatchedWire, LutExpr, PolyCircuit, PublicLutProgram, SubCircuitParamSpec,
+        SubCircuitParamValue, gate::GateId,
     },
     circuit_gadgets::conv_mul::{
         negacyclic_conv_mul_right_decomposed_term_many_subcircuit, negacyclic_conv_mul_right_sparse,
     },
     poly::{Poly, PolyParams},
-    utils::{mod_inverse, round_div},
+    utils::mod_inverse,
 };
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;

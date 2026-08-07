@@ -20,8 +20,8 @@ use mxx_bgg::{
     PolyCircuitCompiler, bind_naive_lwe_lookup_invocations,
 };
 use mxx_dsl::{
-    BoundedMetadata, BuiltGraph, Bytes, DslContext, DslError, Family, HashTag, Int, Mat, Parallel,
-    Ring, Trapdoor, VirtualMat,
+    BuiltGraph, Bytes, DslContext, DslError, Family, HashTag, Int, Mat, Parallel, Ring, Trapdoor,
+    TrapdoorFamily,
 };
 use mxx_gadgets::{
     Poly,
@@ -197,11 +197,6 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
         let hash_key = ring.bytes_input(HASH_KEY_INPUT, 32);
         let noise_refresh_hash_key = ring.bytes_input(NOISE_REFRESH_HASH_KEY_INPUT, 32);
         let private_k = ring.input(PRIVATE_K_INPUT, (1, 1));
-        let private_k = private_k.clone().assume(VirtualMat::bounded(
-            "diamond-io/private-k",
-            private_k.matrix_type().clone(),
-            BoundedMetadata::conservative(1),
-        ))?;
         let injector = DiamondInputInjector::new(self.config.input_config())?;
         let injection = injector.preprocess(private_k)?;
         let lookup_trapdoor = ring.sample_trapdoor(
@@ -217,7 +212,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             reveal_plaintext: false,
         };
         let lookup_base_projection = self.projection_preimages(
-            injection.final_trapdoors[0].clone(),
+            injection.final_trapdoors.get_static(0),
             &lookup_base_keys,
             false,
             false,
@@ -280,7 +275,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                 &selectors[round_index],
                 &branch_outputs,
                 &decoded,
-                injection.final_trapdoors[0].clone(),
+                injection.final_trapdoors.get_static(0),
             )?;
             seed = preprocessed
                 .refresh
@@ -303,7 +298,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                 )?;
                 Ok(decoder
                     .build_preprocessing(
-                        injection.final_trapdoors[0].clone(),
+                        injection.final_trapdoors.get_static(0),
                         combined.matrices,
                         self.config.ring_dimension,
                     )?
@@ -313,17 +308,11 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
 
         let mut context = DslContext::new("diamond-io-preprocessing")
             .public_output(DiamondIoArtifactNames::INJECTOR_INITIAL_STATE, injection.p)?
-            .public_bytes_output(DiamondIoArtifactNames::HASH_KEY, hash_key)?;
-        for (level, branches) in injection.transitions.into_iter().enumerate() {
-            for (digit, states) in branches.into_iter().enumerate() {
-                for (state, transition) in states.into_iter().enumerate() {
-                    context = context.public_output(
-                        DiamondIoArtifactNames::injector_transition(level + 1, digit, state),
-                        transition,
-                    )?;
-                }
-            }
-        }
+            .public_bytes_output(DiamondIoArtifactNames::HASH_KEY, hash_key)?
+            .public_family_output(
+                DiamondIoArtifactNames::INJECTOR_TRANSITIONS,
+                injection.transitions,
+            )?;
         context = self.export_public_key(
             context,
             DiamondIoArtifactNames::SCALAR_ONE_PUBLIC_KEY,
@@ -443,8 +432,9 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                     .extract_coefficient(0)
             })
             .collect::<Vec<_>>();
+        let digit_family = Family::pack(digits.clone())?;
         let transitions = self.import_transitions(production.clone());
-        let states = injector.evaluate(initial, &digits, &transitions)?.states;
+        let states = injector.evaluate(initial, digit_family, transitions)?.states;
         let lookup_base_preimages = ring.family_artifact_input(
             production.clone(),
             DiamondIoArtifactNames::LOOKUP_BASE_PROJECTION,
@@ -452,7 +442,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             (self.config.input_config().state_columns()?, self.config.digit_count + 2),
             ArtifactConfidentiality::Public,
         );
-        let root_state = states[0].clone();
+        let root_state = states.get_static(0);
         let c_b_by_slot =
             lookup_base_preimages.parallel_map(move |_, preimage| root_state.clone() * preimage)?;
         let mut lookups =
@@ -468,14 +458,14 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             false,
         );
         let one = self.project_encoding(
-            &states[0],
+            &states.get_static(0),
             production.clone(),
             DiamondIoArtifactNames::ONE_PROJECTION,
             one_public,
             Some(ring.identity(1)),
         )?;
         let k = self.project_encoding(
-            &states[0],
+            &states.get_static(0),
             production.clone(),
             DiamondIoArtifactNames::K_PROJECTION,
             k_public,
@@ -492,7 +482,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                 .to_int()
                 .select(vec![ring.zero((1, 1)), ring.identity(1)])?;
             input_bits.push(self.project_encoding(
-                &states[state],
+                &states.get_static(state),
                 production.clone(),
                 DiamondIoArtifactNames::input_projection(bit),
                 self.import_public_key(
@@ -547,7 +537,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                 round,
                 hash_key.clone(),
                 digits[round].clone(),
-                states[0].clone(),
+                states.get_static(0),
                 &one,
                 &selectors[round],
                 &branches,
@@ -582,7 +572,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                 ArtifactConfidentiality::Public,
             );
             let MaskedHighBitDecoderOutputs::Booleans(decoded) = decoder.build_online(
-                states[0].clone(),
+                states.get_static(0),
                 preimages,
                 combined.vectors,
                 bottoms,
@@ -1108,18 +1098,18 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
     fn export_projection_artifacts(
         &self,
         mut context: DslContext,
-        trapdoors: &[Trapdoor],
+        trapdoors: &TrapdoorFamily,
         one: &NaiveBggPublicKeyVecWire,
         k: &NaiveBggPublicKeyVecWire,
         input_bits: &[NaiveBggPublicKeyVecWire],
     ) -> Result<DslContext, DiamondIoCompileError> {
         context = context.public_family_output(
             DiamondIoArtifactNames::ONE_PROJECTION,
-            self.projection_preimages(trapdoors[0].clone(), one, true, false)?,
+            self.projection_preimages(trapdoors.get_static(0), one, true, false)?,
         )?;
         context = context.public_family_output(
             DiamondIoArtifactNames::K_PROJECTION,
-            self.projection_preimages(trapdoors[0].clone(), k, false, true)?,
+            self.projection_preimages(trapdoors.get_static(0), k, false, true)?,
         )?;
         for (bit, key) in input_bits.iter().enumerate() {
             let digit = bit / self.config.batch_bits;
@@ -1127,7 +1117,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             let state = self.config.input_config().bit_state_index(digit, bit_in_digit)?;
             context = context.public_family_output(
                 DiamondIoArtifactNames::input_projection(bit),
-                self.projection_preimages(trapdoors[state].clone(), key, false, true)?,
+                self.projection_preimages(trapdoors.get_static(state), key, false, true)?,
             )?;
         }
         Ok(context)
@@ -1182,35 +1172,20 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
         })
     }
 
-    fn import_transitions(&self, production: ProductionId) -> Vec<Vec<Vec<Mat>>> {
-        (1..=self.config.input_count)
-            .map(|level| {
-                let states = self
-                    .config
-                    .input_config()
-                    .state_count_at_level(level)
-                    .expect("validated layout");
-                (0..self.config.digit_base)
-                    .map(|digit| {
-                        (0..states)
-                            .map(|state| {
-                                self.ring().artifact_input(
-                                    production.clone(),
-                                    DiamondIoArtifactNames::injector_transition(
-                                        level, digit, state,
-                                    ),
-                                    (
-                                        self.config.input_config().state_columns().expect("layout"),
-                                        self.config.input_config().state_columns().expect("layout"),
-                                    ),
-                                    ArtifactConfidentiality::Public,
-                                )
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect()
+    fn import_transitions(&self, production: ProductionId) -> Family<Mat> {
+        let state_columns = self.config.input_config().state_columns().expect("layout");
+        let max_states = self
+            .config
+            .input_config()
+            .state_count_at_level(self.config.input_count)
+            .expect("validated layout");
+        self.ring().family_artifact_input(
+            production,
+            DiamondIoArtifactNames::INJECTOR_TRANSITIONS,
+            self.config.input_count * self.config.digit_base * max_states,
+            (state_columns, state_columns),
+            ArtifactConfidentiality::Public,
+        )
     }
 
     fn import_round_artifacts(
@@ -1852,38 +1827,6 @@ mod tests {
         }
     }
 
-    fn symbolic_manifest(
-        production: ProductionId,
-        elaborated: &mxx_ir_symbolic::ElaboratedGraph,
-    ) -> mxx_ir_symbolic::manifest::Manifest {
-        let artifacts = elaborated
-            .outputs
-            .iter()
-            .map(|(name, reference)| {
-                let wire = elaborated.wire(reference).unwrap();
-                (
-                    name.clone(),
-                    mxx_ir_symbolic::manifest::ExportArtifact {
-                        wire_type: wire.wire_type.clone(),
-                        expression: wire.expression,
-                        family: wire.family.clone(),
-                        content_hash: None,
-                        layout: None,
-                    },
-                )
-            })
-            .collect();
-        mxx_ir_symbolic::manifest::export_manifest(
-            production,
-            &artifacts,
-            &elaborated.atoms,
-            &elaborated.expressions,
-            &elaborated.preimage_relations,
-            elaborated.assumption_digest,
-        )
-        .unwrap()
-    }
-
     #[test]
     #[ignore = "expands the full nested-RNS Diamond iO graph"]
     fn top_level_producer_and_consumer_are_manifest_linked() {
@@ -1910,15 +1853,9 @@ mod tests {
         let production = ProductionId { spec_hash: SpecHash([4; 32]), execution_nonce: [5; 32] };
         let artifact_manifest =
             export_validated_manifest(production.clone(), &validated_producer).unwrap();
-        let elaborated_producer = producer.graph.elaborate(&bindings).unwrap();
-        let symbolic_manifest = symbolic_manifest(production.clone(), &elaborated_producer);
         let consumer = compiler.build_evaluation(&function, production.clone()).unwrap();
         let manifests = BTreeMap::from([(production, artifact_manifest)]);
         consumer.graph.validate_with_manifests(&bindings, &manifests).unwrap();
-        consumer
-            .graph
-            .elaborate_with_manifests(&bindings, &manifests, &[symbolic_manifest])
-            .unwrap();
     }
 
     fn config() -> DiamondIoConfig {
@@ -1952,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn one_full_branch_rebase_and_refresh_round_validates_and_elaborates() {
+    fn one_full_branch_rebase_and_refresh_round_validates() {
         let config = config();
         config.validate(&DiamondIoFunction::GoldreichPrf { output_bits: 1 }).unwrap();
         let compiler = DiamondIoRoundCompiler { config: config.clone() };
@@ -2041,7 +1978,6 @@ mod tests {
             .build()
             .unwrap();
         graph.validate(&ParamEnv::default()).unwrap();
-        graph.elaborate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

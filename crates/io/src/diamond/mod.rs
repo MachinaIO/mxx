@@ -7,7 +7,6 @@ mod final_circuit;
 mod graph;
 #[cfg(feature = "gpu")]
 mod graph_gpu;
-mod noise;
 mod parameter_search;
 mod runtime;
 
@@ -19,7 +18,6 @@ pub use graph::{
     DiamondIoPreprocessingGraph, HASH_KEY_INPUT, NATIVE_SEED_INPUT_PREFIX, OUTPUT_PREFIX,
     PRIVATE_K_INPUT, PUBLIC_INPUT_DIGIT_PREFIX, output_name,
 };
-pub use noise::{DiamondIoNoiseError, DiamondIoNoiseSimulation, simulate_diamond_io_noise};
 pub use parameter_search::{
     DiamondIoParameterSearch, DiamondIoParameterSearchError, DiamondIoSelectedParameters,
 };

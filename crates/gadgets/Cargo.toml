@@ -6,7 +6,7 @@ license.workspace = true
 description = "Reusable lattice-cryptographic gadgets and protocol components for mxx"
 [features]
 default = []
-gpu = ["mxx-primitives/gpu", "mxx-runtime/gpu"]
+gpu = ["mxx-bench-estimator/gpu", "mxx-primitives/gpu", "mxx-runtime/gpu"]
 test-support = ["dep:mxx-runtime"]
 
 [dependencies]
@@ -31,6 +31,8 @@ digest.workspace = true
 keccak-asm.workspace = true
 
 [dev-dependencies]
+mxx-bgg.workspace = true
+mxx-bench-estimator.workspace = true
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
 mxx-runtime.workspace = true
 serial_test.workspace = true

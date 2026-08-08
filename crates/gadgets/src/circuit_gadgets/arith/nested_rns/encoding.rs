@@ -41,8 +41,27 @@ pub(crate) fn sample_crt_primes(
     q_max: u64,
     max_unreduced_muls: usize,
 ) -> Vec<u64> {
+    try_sample_crt_primes(max_bit_width, q_max, max_unreduced_muls).unwrap_or_else(|| {
+        panic!(
+            "failed to find enough pairwise coprime integers with bit width {max_bit_width} to satisfy q_max {q_max} and max_unreduced_muls {max_unreduced_muls}"
+        )
+    })
+}
+
+/// Returns the smallest p-modulus bit width whose deterministic CRT basis supports the requested
+/// q modulus and unreduced multiplication budget.
+pub fn minimum_p_moduli_bits(q_max: u64, max_unreduced_muls: usize) -> Option<usize> {
+    (2..usize::BITS as usize)
+        .find(|&bits| try_sample_crt_primes(bits, q_max, max_unreduced_muls).is_some())
+}
+
+fn try_sample_crt_primes(
+    max_bit_width: usize,
+    q_max: u64,
+    max_unreduced_muls: usize,
+) -> Option<Vec<u64>> {
     let lower = 3u64;
-    let upper = 1u64 << max_bit_width;
+    let upper = 1u64.checked_shl(u32::try_from(max_bit_width).ok()?)?;
     let mut results: Vec<u64> = Vec::new();
     let mut sum = 0u64;
     let mut prod = BigUint::one();
@@ -61,13 +80,7 @@ pub(crate) fn sample_crt_primes(
         }
     }
 
-    if !prod_reached {
-        panic!(
-            "failed to find enough pairwise coprime integers with bit width {max_bit_width} to satisfy q_max {q_max} and max_unreduced_muls {max_unreduced_muls}"
-        );
-    }
-
-    results
+    prod_reached.then_some(results)
 }
 
 /// Resolve the q-window and synthetic p-moduli used by the pure encoding helpers.

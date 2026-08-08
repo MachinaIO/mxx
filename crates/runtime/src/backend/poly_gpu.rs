@@ -67,6 +67,16 @@ pub type GpuDcrtBackend = PolyBackend<
 pub fn gpu_backend(parameters: impl IntoIterator<Item = GpuDCRTPolyParams>) -> GpuDcrtBackend {
     let parameters = parameters.into_iter().collect::<Vec<_>>();
     let device_ids = detected_gpu_device_ids();
+    gpu_backend_on(parameters, device_ids)
+}
+
+/// Builds a GPU backend restricted to the requested detected devices.
+pub fn gpu_backend_on(
+    parameters: impl IntoIterator<Item = GpuDCRTPolyParams>,
+    device_ids: impl IntoIterator<Item = i32>,
+) -> GpuDcrtBackend {
+    let parameters = parameters.into_iter().collect::<Vec<_>>();
+    let device_ids = device_ids.into_iter().collect::<Vec<_>>();
     assert!(!device_ids.is_empty(), "mxx-runtime GPU backend requires at least one detected GPU");
     let placements = device_ids
         .into_iter()

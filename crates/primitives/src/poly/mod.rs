@@ -41,6 +41,12 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
     fn params_for_device(&self, _device_id: i32) -> Self {
         self.clone()
     }
+    /// Releases cached accelerator allocations that are no longer in use.
+    ///
+    /// CPU parameter types leave this as a no-op. GPU parameter types may
+    /// trim an asynchronous allocation pool after the runtime has fenced the
+    /// matrices that remain live.
+    fn trim_unused_memory(&self) {}
     /// Return CRT reconstruction coefficients for each CRT modulus.
     fn reconst_coeffs(&self) -> Vec<BigUint> {
         let (moduli, _, _) = self.to_crt();

@@ -5,7 +5,9 @@ use crate::{
     NaiveBggPublicKeyVecWire,
     tall_encoding::{BggTallEncodingWire, BggTallPlaintext},
 };
-use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Ring, Trapdoor, parallel_zip};
+use mxx_dsl::{
+    Bytes, DslContext, DslError, Family, HashTag, Int, Mat, Ring, Trapdoor, parallel_zip,
+};
 use mxx_gadgets::{
     Poly,
     circuit::{
@@ -268,6 +270,9 @@ fn update_commitment_bytes(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
+// This bounds preprocessing VRAM independently of a public LUT's total size.
+const LOOKUP_ARTIFACT_CHUNK_ROWS: usize = 512;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LweLookupArtifactNames {
     pub output_public_key: String,
@@ -290,6 +295,14 @@ impl LweLookupArtifactNames {
             high_matrices: format!("{prefix}_high_matrices"),
         }
     }
+
+    pub fn low_chunk(&self, index: usize) -> String {
+        format!("{}_chunk_{index}", self.low_matrices)
+    }
+
+    pub fn high_chunk(&self, index: usize) -> String {
+        format!("{}_chunk_{index}", self.high_matrices)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -297,6 +310,7 @@ pub struct LweLookupArtifacts {
     production_id: ProductionId,
     table_length: usize,
     table_commitment: [u8; 32],
+    chunk_count: usize,
 }
 
 impl LweLookupArtifacts {
@@ -305,6 +319,7 @@ impl LweLookupArtifacts {
             production_id,
             table_length: compiler.table.len(),
             table_commitment: compiler.table.commitment(),
+            chunk_count: compiler.table.len().div_ceil(LOOKUP_ARTIFACT_CHUNK_ROWS),
         }
     }
 
@@ -320,15 +335,31 @@ impl LweLookupArtifacts {
 #[derive(Clone)]
 pub struct LweLookupPreprocessingWires {
     pub output_public_key: Mat,
-    pub low_matrices: Family<Mat>,
-    pub high_matrices: Family<Mat>,
+    pub low_chunks: Vec<Family<Mat>>,
+    pub high_chunks: Vec<Family<Mat>>,
 }
 
 #[derive(Clone)]
 pub struct LweLookupArtifactWires {
     pub output_public_key: Mat,
-    pub low_matrices: Family<Mat>,
-    pub high_matrices: Family<Mat>,
+    pub low_chunks: Vec<Family<Mat>>,
+    pub high_chunks: Vec<Family<Mat>>,
+}
+
+#[derive(Clone)]
+pub struct LweLookupPreprocessingEntry {
+    pub compiler: LweLookupCompiler,
+    pub wires: LweLookupPreprocessingWires,
+}
+
+impl LweLookupPreprocessingEntry {
+    pub fn export(&self, context: DslContext) -> Result<DslContext, LweLookupCompileError> {
+        self.compiler.export_preprocessing(
+            context,
+            self.wires.clone(),
+            &LweLookupArtifactNames::for_compiler(&self.compiler),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -348,6 +379,16 @@ impl NaiveLweLookupPreprocessingEntry {
         }
         Ok(context)
     }
+}
+
+pub struct LweLookupPreprocessingLowering<P: Poly> {
+    parameters: P::Params,
+    hash_key: Bytes,
+    trapdoor: Trapdoor,
+    gadget_base: IntExpr,
+    digit_count: IntExpr,
+    call_path_prefix: Vec<usize>,
+    entries: Vec<LweLookupPreprocessingEntry>,
 }
 
 pub struct NaiveLweLookupPreprocessingLowering<P: Poly> {
@@ -478,6 +519,17 @@ impl NaiveLweLookupInvocation {
 }
 
 impl LweLookupCompiler {
+    /// Number of rows in this public LUT, and therefore the number of high preimages required
+    /// when its preprocessing artifacts are generated.
+    pub fn table_length(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Number of preprocessing rows after fixed-size artifact chunk padding.
+    pub fn preprocessing_row_count(&self) -> usize {
+        self.table.len().div_ceil(LOOKUP_ARTIFACT_CHUNK_ROWS) * LOOKUP_ARTIFACT_CHUNK_ROWS
+    }
+
     /// Builds `K_high = Preimage_B(A_lt - yG - (A_z - xG)K_low)`.
     pub fn preprocess(
         &self,
@@ -503,53 +555,63 @@ impl LweLookupCompiler {
             HashTag::from(self.identity.output_public_key_tag()),
             shape(&self.public_key_type),
         );
-        let input_scalars = Family::pack(
-            (0..self.table.len())
-                .map(|input| ring.polynomial([IntExpr::constant(input)]))
-                .collect(),
-        )?;
-        let output_scalars = Family::pack(
-            self.table
-                .entries
-                .iter()
-                .map(|entry| ring.polynomial([IntExpr::constant(entry.output.clone())]))
-                .collect(),
-        )?;
-        let low_inputs = Family::pack(
-            self.table
-                .entries
-                .iter()
-                .map(|entry| {
-                    ring.hash_decomposed(
-                        hash_key.clone(),
-                        HashTag::from(self.identity.low_matrix_tag(entry.row)),
-                        shape(&self.low_matrix_type),
-                        self.gadget_base.clone(),
-                        self.digit_count.clone(),
-                    )
-                })
-                .collect(),
-        )?;
         let gadget = ring.gadget(
             self.public_key_type.rows.clone(),
             self.gadget_base.clone(),
             self.digit_count.clone(),
         );
-        let input_public_key = input_public_key.matrix.clone();
-        let output_for_loop = output_public_key.clone();
-        let trapdoor = trapdoor.clone();
         let high_shape = shape(&self.high_matrix_type);
-        let (low_matrices, high_matrices) = parallel_zip(
-            (input_scalars, output_scalars, low_inputs),
-            move |_, (input_scalar, output_scalar, low)| {
-                let extended_input = input_public_key.clone() - gadget.clone() * input_scalar;
-                let target = output_for_loop.clone() - gadget.clone() * output_scalar;
-                let adjusted_target = target - extended_input * low.clone();
-                let high = trapdoor.sample_preimage(adjusted_target, high_shape.clone()).as_mat();
-                (low, high)
-            },
-        )?;
-        Ok(LweLookupPreprocessingWires { output_public_key, low_matrices, high_matrices })
+        let mut low_chunks = Vec::new();
+        let mut high_chunks = Vec::new();
+        for chunk_start in (0..self.table.len()).step_by(LOOKUP_ARTIFACT_CHUNK_ROWS) {
+            let entries = (0..LOOKUP_ARTIFACT_CHUNK_ROWS)
+                .map(|offset| &self.table.entries[(chunk_start + offset).min(self.table.len() - 1)])
+                .collect::<Vec<_>>();
+            let input_scalars = Family::pack(
+                (0..LOOKUP_ARTIFACT_CHUNK_ROWS)
+                    .map(|offset| ring.polynomial([IntExpr::constant(chunk_start + offset)]))
+                    .collect(),
+            )?;
+            let output_scalars = Family::pack(
+                entries
+                    .iter()
+                    .map(|entry| ring.polynomial([IntExpr::constant(entry.output.clone())]))
+                    .collect(),
+            )?;
+            let low_inputs = Family::pack(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        ring.hash_decomposed(
+                            hash_key.clone(),
+                            HashTag::from(self.identity.low_matrix_tag(entry.row)),
+                            shape(&self.low_matrix_type),
+                            self.gadget_base.clone(),
+                            self.digit_count.clone(),
+                        )
+                    })
+                    .collect(),
+            )?;
+            let input_public_key = input_public_key.matrix.clone();
+            let output_for_loop = output_public_key.clone();
+            let trapdoor = trapdoor.clone();
+            let gadget = gadget.clone();
+            let high_shape = high_shape.clone();
+            let (low, high) = parallel_zip(
+                (input_scalars, output_scalars, low_inputs),
+                move |_, (input_scalar, output_scalar, low)| {
+                    let extended_input = input_public_key.clone() - gadget.clone() * input_scalar;
+                    let target = output_for_loop.clone() - gadget.clone() * output_scalar;
+                    let adjusted_target = target - extended_input * low.clone();
+                    let high =
+                        trapdoor.sample_preimage(adjusted_target, high_shape.clone()).as_mat();
+                    (low, high)
+                },
+            )?;
+            low_chunks.push(low);
+            high_chunks.push(high);
+        }
+        Ok(LweLookupPreprocessingWires { output_public_key, low_chunks, high_chunks })
     }
 
     pub fn export_preprocessing(
@@ -558,10 +620,15 @@ impl LweLookupCompiler {
         wires: LweLookupPreprocessingWires,
         names: &LweLookupArtifactNames,
     ) -> Result<DslContext, LweLookupCompileError> {
-        Ok(context
-            .public_output(names.output_public_key.clone(), wires.output_public_key)?
-            .public_family_output(names.low_matrices.clone(), wires.low_matrices)?
-            .public_family_output(names.high_matrices.clone(), wires.high_matrices)?)
+        let mut context =
+            context.public_output(names.output_public_key.clone(), wires.output_public_key)?;
+        for (index, (low, high)) in wires.low_chunks.into_iter().zip(wires.high_chunks).enumerate()
+        {
+            context = context
+                .public_family_output(names.low_chunk(index), low)?
+                .public_family_output(names.high_chunk(index), high)?;
+        }
+        Ok(context)
     }
 
     pub fn import_artifacts(
@@ -575,24 +642,32 @@ impl LweLookupCompiler {
         Ok(LweLookupArtifactWires {
             output_public_key: ring.artifact_input(
                 artifacts.production_id.clone(),
-                names.output_public_key,
+                names.output_public_key.clone(),
                 shape(&self.public_key_type),
                 ArtifactConfidentiality::Public,
             ),
-            low_matrices: ring.family_artifact_input(
-                artifacts.production_id.clone(),
-                names.low_matrices,
-                self.table.len(),
-                shape(&self.low_matrix_type),
-                ArtifactConfidentiality::Public,
-            ),
-            high_matrices: ring.family_artifact_input(
-                artifacts.production_id.clone(),
-                names.high_matrices,
-                self.table.len(),
-                shape(&self.high_matrix_type),
-                ArtifactConfidentiality::Public,
-            ),
+            low_chunks: (0..artifacts.chunk_count)
+                .map(|index| {
+                    ring.family_artifact_input(
+                        artifacts.production_id.clone(),
+                        names.low_chunk(index),
+                        LOOKUP_ARTIFACT_CHUNK_ROWS,
+                        shape(&self.low_matrix_type),
+                        ArtifactConfidentiality::Public,
+                    )
+                })
+                .collect(),
+            high_chunks: (0..artifacts.chunk_count)
+                .map(|index| {
+                    ring.family_artifact_input(
+                        artifacts.production_id.clone(),
+                        names.high_chunk(index),
+                        LOOKUP_ARTIFACT_CHUNK_ROWS,
+                        shape(&self.high_matrix_type),
+                        ArtifactConfidentiality::Public,
+                    )
+                })
+                .collect(),
         })
     }
 
@@ -610,8 +685,10 @@ impl LweLookupCompiler {
         let plaintext = input.plaintext.clone().ok_or(LweLookupCompileError::MissingPlaintext)?;
         self.validate_artifact_wires(artifacts)?;
         let input_index = plaintext.extract_coefficient(0);
-        let low = artifacts.low_matrices.get(input_index.clone());
-        let high = artifacts.high_matrices.get(input_index.clone());
+        let chunk = input_index.clone().div(Int::constant(LOOKUP_ARTIFACT_CHUNK_ROWS));
+        let offset = input_index.clone().rem(Int::constant(LOOKUP_ARTIFACT_CHUNK_ROWS));
+        let low = Family::select(chunk.clone(), artifacts.low_chunks.clone())?.get(offset.clone());
+        let high = Family::select(chunk, artifacts.high_chunks.clone())?.get(offset);
         let output_plaintext = input_index.select(
             self.table
                 .entries
@@ -660,8 +737,14 @@ impl LweLookupCompiler {
             (input.rows.clone(), input_plaintexts.clone(), c_b_rows.clone()),
             move |_, (input_row, plaintext, c_b)| {
                 let input_index = plaintext.extract_coefficient(0);
-                let low = artifact_rows.low_matrices.get(input_index.clone());
-                let high = artifact_rows.high_matrices.get(input_index.clone());
+                let chunk = input_index.clone().div(Int::constant(LOOKUP_ARTIFACT_CHUNK_ROWS));
+                let offset = input_index.clone().rem(Int::constant(LOOKUP_ARTIFACT_CHUNK_ROWS));
+                let low = Family::select(chunk.clone(), artifact_rows.low_chunks.clone())
+                    .expect("validated lookup low chunks")
+                    .get(offset.clone());
+                let high = Family::select(chunk, artifact_rows.high_chunks.clone())
+                    .expect("validated lookup high chunks")
+                    .get(offset);
                 let output_plaintext = input_index
                     .select(
                         table_outputs
@@ -733,12 +816,19 @@ impl LweLookupCompiler {
         &self,
         artifacts: &LweLookupArtifactWires,
     ) -> Result<(), LweLookupCompileError> {
-        let count = IntExpr::constant(self.table.len());
+        let chunk_count = self.table.len().div_ceil(LOOKUP_ARTIFACT_CHUNK_ROWS);
+        let count = IntExpr::constant(LOOKUP_ARTIFACT_CHUNK_ROWS);
         if !same_matrix_type(artifacts.output_public_key.matrix_type(), &self.public_key_type) ||
-            artifacts.low_matrices.count() != &count ||
-            !same_matrix_type(artifacts.low_matrices.element_type(), &self.low_matrix_type) ||
-            artifacts.high_matrices.count() != &count ||
-            !same_matrix_type(artifacts.high_matrices.element_type(), &self.high_matrix_type)
+            artifacts.low_chunks.len() != chunk_count ||
+            artifacts.high_chunks.len() != chunk_count ||
+            artifacts.low_chunks.iter().any(|chunk| {
+                chunk.count() != &count ||
+                    !same_matrix_type(chunk.element_type(), &self.low_matrix_type)
+            }) ||
+            artifacts.high_chunks.iter().any(|chunk| {
+                chunk.count() != &count ||
+                    !same_matrix_type(chunk.element_type(), &self.high_matrix_type)
+            })
         {
             return Err(LweLookupCompileError::ArtifactFamilyLayout);
         }
@@ -792,6 +882,74 @@ fn lookup_compiler_for_circuit<P: Poly>(
         gadget_base,
         digit_count,
     })
+}
+
+impl<P: Poly> LweLookupPreprocessingLowering<P> {
+    pub fn new(
+        parameters: P::Params,
+        hash_key: Bytes,
+        trapdoor: Trapdoor,
+        gadget_base: IntExpr,
+        digit_count: IntExpr,
+        call_path_prefix: Vec<usize>,
+    ) -> Self {
+        Self {
+            parameters,
+            hash_key,
+            trapdoor,
+            gadget_base,
+            digit_count,
+            call_path_prefix,
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn entries(&self) -> &[LweLookupPreprocessingEntry] {
+        &self.entries
+    }
+
+    pub fn into_entries(self) -> Vec<LweLookupPreprocessingEntry> {
+        self.entries
+    }
+}
+
+impl<P: Poly> CircuitLoweringTypes for LweLookupPreprocessingLowering<P> {
+    type Wire = BggPublicKeyWire;
+    type Error = CircuitCompileError;
+}
+
+impl<P: Poly> PublicLookupLowering<P> for LweLookupPreprocessingLowering<P> {
+    fn public_lookup(
+        &mut self,
+        circuit: &PolyCircuit<P>,
+        lookup_id: usize,
+        input: &Self::Wire,
+        gate: GateInstance<'_>,
+    ) -> Result<Self::Wire, Self::Error> {
+        let mut identity = identity_for_gate(gate, lookup_id);
+        let mut call_path = self.call_path_prefix.clone();
+        call_path.extend(identity.call_path);
+        identity.call_path = call_path;
+        let compiler = lookup_compiler_for_circuit(
+            &self.parameters,
+            circuit,
+            identity,
+            input.matrix.matrix_type().clone(),
+            self.gadget_base.clone(),
+            self.digit_count.clone(),
+        )
+        .map_err(|source| CircuitCompileError::LweLookup {
+            gate: gate.local_gate().index(),
+            source,
+        })?;
+        let wires = compiler.preprocess(self.hash_key.clone(), input, &self.trapdoor).map_err(
+            |source| CircuitCompileError::LweLookup { gate: gate.local_gate().index(), source },
+        )?;
+        let output =
+            BggPublicKeyWire { matrix: wires.output_public_key.clone(), reveal_plaintext: true };
+        self.entries.push(LweLookupPreprocessingEntry { compiler, wires });
+        Ok(output)
+    }
 }
 
 impl<P: Poly> NaiveLweLookupPreprocessingLowering<P> {
@@ -887,6 +1045,25 @@ impl<P: Poly> PublicLookupLowering<P> for NaiveLweLookupPreprocessingLowering<P>
         self.entries.push(NaiveLweLookupPreprocessingEntry { compilers, wires });
         Ok(NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: true })
     }
+}
+
+pub fn bind_lwe_lookup_invocations<P: Poly>(
+    parameters: &P::Params,
+    circuit: &PolyCircuit<P>,
+    production: ProductionId,
+    compilers: impl IntoIterator<Item = LweLookupCompiler>,
+) -> Result<Vec<LweLookupInvocation>, LweLookupCompileError> {
+    compilers
+        .into_iter()
+        .map(|compiler| {
+            LweLookupInvocation::bind(
+                compiler.clone(),
+                LweLookupArtifacts::for_compiler(production.clone(), &compiler),
+                parameters,
+                circuit,
+            )
+        })
+        .collect()
 }
 
 pub fn bind_naive_lwe_lookup_invocations<P: Poly>(
@@ -1268,9 +1445,16 @@ mod tests {
     use mxx_dsl::DslContext;
     use mxx_gadgets::circuit::{LutExpr, PolyCircuit, PublicLutProgram};
     use mxx_ir_core::{ParamEnv, artifact::SpecHash, node::NodeKind};
-    use mxx_primitives::poly::{
-        PolyParams,
-        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    use mxx_primitives::{
+        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+    };
+    use mxx_runtime::{
+        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
+        transcript::SamplingMode,
     };
 
     fn identity_lut(length: u64) -> PublicLutProgram {
@@ -1389,16 +1573,24 @@ mod tests {
         let names = LweLookupArtifactNames::for_compiler(&lookup);
         let producer_wires = LweLookupPreprocessingWires {
             output_public_key: ring.input("output-public", (1, digits)),
-            low_matrices: Family::pack(
-                (0..4).map(|index| ring.input(format!("low-{index}"), (digits, digits))).collect(),
-            )
-            .unwrap(),
-            high_matrices: Family::pack(
-                (0..4)
-                    .map(|index| ring.input(format!("high-{index}"), (digits + 2, digits)))
-                    .collect(),
-            )
-            .unwrap(),
+            low_chunks: vec![
+                Family::pack(
+                    (0..LOOKUP_ARTIFACT_CHUNK_ROWS)
+                        .map(|index| ring.input(format!("low-{}", index.min(3)), (digits, digits)))
+                        .collect(),
+                )
+                .unwrap(),
+            ],
+            high_chunks: vec![
+                Family::pack(
+                    (0..LOOKUP_ARTIFACT_CHUNK_ROWS)
+                        .map(|index| {
+                            ring.input(format!("high-{}", index.min(3)), (digits + 2, digits))
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            ],
         };
         let producer = lookup
             .export_preprocessing(DslContext::new("tall-lookup-helpers"), producer_wires, &names)
@@ -1518,16 +1710,20 @@ mod tests {
         let diagonal = Family::pack(vec![ring.zero((1, 1)), ring.zero((1, 1))]).unwrap();
         let artifacts = LweLookupArtifactWires {
             output_public_key: ring.zero((1, digits)),
-            low_matrices: Family::pack(vec![
-                ring.zero((digits, digits)),
-                ring.zero((digits, digits)),
-            ])
-            .unwrap(),
-            high_matrices: Family::pack(vec![
-                ring.zero((digits + 2, digits)),
-                ring.zero((digits + 2, digits)),
-            ])
-            .unwrap(),
+            low_chunks: vec![
+                Family::pack(
+                    (0..LOOKUP_ARTIFACT_CHUNK_ROWS).map(|_| ring.zero((digits, digits))).collect(),
+                )
+                .unwrap(),
+            ],
+            high_chunks: vec![
+                Family::pack(
+                    (0..LOOKUP_ARTIFACT_CHUNK_ROWS)
+                        .map(|_| ring.zero((digits + 2, digits)))
+                        .collect(),
+                )
+                .unwrap(),
+            ],
         };
         let wire = |plaintext| BggTallEncodingWire {
             rows: rows.clone(),

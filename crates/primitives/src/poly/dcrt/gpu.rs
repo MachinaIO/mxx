@@ -79,6 +79,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn gpu_context_destroy(ctx: *mut GpuContextOpaque);
     fn gpu_context_get_N(ctx: *const GpuContextOpaque, out_n: *mut c_int) -> c_int;
+    fn gpu_context_trim_memory_pool(ctx: *const GpuContextOpaque) -> c_int;
 
     pub(crate) fn gpu_event_set_wait(events: *mut GpuEventSetOpaque) -> c_int;
     pub(crate) fn gpu_event_set_destroy(events: *mut GpuEventSetOpaque);
@@ -92,6 +93,7 @@ unsafe extern "C" {
         out_mat: *mut *mut GpuMatrixOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_destroy(mat: *mut GpuMatrixOpaque);
+    pub(crate) fn gpu_matrix_wait(mat: *const GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_copy(dst: *mut GpuMatrixOpaque, src: *const GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_load_rns_batch(
         mat: *mut GpuMatrixOpaque,
@@ -262,7 +264,7 @@ unsafe extern "C" {
     pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     fn gpu_device_synchronize() -> c_int;
     fn gpu_device_count(out_count: *mut c_int) -> c_int;
-    // fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
+    fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
 
     fn gpu_last_error() -> *const c_char;
 
@@ -299,38 +301,22 @@ pub fn gpu_device_sync() {
     check_status(status, "gpu_device_synchronize");
 }
 
-// #[derive(Clone, Copy, Debug)]
-// pub(crate) struct GpuMemoryInfo {
-//     pub device: c_int,
-//     pub free: usize,
-//     pub total: usize,
-// }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMemoryInfo {
+    pub free: usize,
+    pub total: usize,
+}
 
-// pub(crate) fn gpu_memory_infos() -> Result<Vec<GpuMemoryInfo>, String> {
-//     let mut count: c_int = 0;
-//     let status = unsafe { gpu_device_count(&mut count) };
-//     if status != 0 {
-//         return Err(last_error_string());
-//     }
-//     if count < 0 {
-//         return Err("invalid GPU device count".to_string());
-//     }
-//     if count == 0 {
-//         return Ok(Vec::new());
-//     }
-
-//     let mut infos = Vec::with_capacity(count as usize);
-//     for device in 0..count {
-//         let mut free: usize = 0;
-//         let mut total: usize = 0;
-//         let status = unsafe { gpu_device_mem_info(device, &mut free, &mut total) };
-//         if status != 0 {
-//             return Err(last_error_string());
-//         }
-//         infos.push(GpuMemoryInfo { device, free, total });
-//     }
-//     Ok(infos)
-// }
+/// Returns the CUDA allocator-visible memory counters for one detected device.
+pub fn gpu_memory_info(device: i32) -> Result<GpuMemoryInfo, String> {
+    let mut free = 0;
+    let mut total = 0;
+    let status = unsafe { gpu_device_mem_info(device, &mut free, &mut total) };
+    if status != 0 {
+        return Err(last_error_string());
+    }
+    Ok(GpuMemoryInfo { free, total })
+}
 
 fn available_gpu_ids() -> Vec<i32> {
     let mut count: c_int = 0;
@@ -559,6 +545,10 @@ impl PolyParams for GpuDCRTPolyParams {
             ctx,
         }
     }
+
+    fn trim_unused_memory(&self) {
+        self.ctx.trim_unused_memory();
+    }
 }
 
 impl GpuDCRTPolyParams {
@@ -723,6 +713,13 @@ impl GpuContext {
 
     pub(crate) fn raw_ptr(&self) -> *mut GpuContextOpaque {
         self.raw
+    }
+
+    /// Returns free allocations from this context's asynchronous CUDA memory
+    /// pools to the driver. This never waits for unrelated device work.
+    pub fn trim_unused_memory(&self) {
+        let status = unsafe { gpu_context_trim_memory_pool(self.raw) };
+        check_status(status, "gpu_context_trim_memory_pool");
     }
 }
 

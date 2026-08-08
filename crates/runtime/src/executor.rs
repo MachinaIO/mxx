@@ -20,8 +20,14 @@ use mxx_ir_core::{
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    num::NonZeroUsize,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionConfig {
@@ -31,12 +37,32 @@ pub struct ExecutionConfig {
     /// size. Artifact-compatible family outputs are streamed through the
     /// artifact store; scalar-only families are accumulated in memory.
     pub max_parallel_instances: NonZeroUsize,
+    /// Optional progress reporting for actual preimage sampler invocations.
+    pub preimage_progress: Option<PreimageProgressConfig>,
+    /// Optionally fence all currently live matrices after this many nodes in
+    /// each executed scope. This bounds queued asynchronous backend work
+    /// without imposing a device-wide synchronization.
+    pub live_matrix_fence_interval: Option<NonZeroUsize>,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
-        Self { max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero") }
+        Self {
+            max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero"),
+            preimage_progress: None,
+            live_matrix_fence_interval: None,
+        }
     }
+}
+
+/// Reporting contract for a known number of preimage sampler invocations.
+///
+/// The executor increments this count only after its backend has returned the
+/// sampled preimages. Replayed transcript values are deliberately excluded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreimageProgressConfig {
+    pub total: usize,
+    pub report_interval: NonZeroUsize,
 }
 
 pub struct ExecutionResult<B: Backend> {
@@ -108,6 +134,8 @@ struct ExecutableNode<'a> {
 pub enum ExecutionError {
     #[error("backend operation failed: {0}")]
     Backend(String),
+    #[error("preimage progress expected {expected} generated preimages but observed {actual}")]
+    PreimageProgressMismatch { expected: usize, actual: usize },
     #[error("artifact operation failed: {0}")]
     Artifact(String),
     #[error(transparent)]
@@ -327,6 +355,9 @@ where
         production,
         scratch_production,
         staged_families: BTreeMap::new(),
+        preimage_progress: config.preimage_progress.map(PreimageProgress::new),
+        executed_node_count: 0,
+        last_live_matrix_fence_node_count: 0,
     };
     let inputs = inputs
         .into_iter()
@@ -347,6 +378,12 @@ where
             };
         }
     };
+    if let Err(error) = executor.finish_preimage_progress() {
+        return match executor.cleanup_all_staged_families() {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(cleanup_error),
+        };
+    }
     let mut named_outputs = validated
         .source
         .outputs()
@@ -392,6 +429,68 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     production: ProductionId,
     scratch_production: ProductionId,
     staged_families: BTreeMap<(ProductionId, String), ManifestArtifact>,
+    preimage_progress: Option<PreimageProgress>,
+    executed_node_count: usize,
+    last_live_matrix_fence_node_count: usize,
+}
+
+struct PreimageProgress {
+    config: PreimageProgressConfig,
+    completed: usize,
+    last_reported: usize,
+    started: Instant,
+}
+
+impl PreimageProgress {
+    fn new(config: PreimageProgressConfig) -> Self {
+        info!(
+            total = config.total,
+            report_interval = config.report_interval.get(),
+            "preimage generation progress started"
+        );
+        Self { config, completed: 0, last_reported: 0, started: Instant::now() }
+    }
+
+    fn record(&mut self, count: usize) {
+        self.completed = self.completed.saturating_add(count);
+        let final_report = self.completed >= self.config.total;
+        if !final_report &&
+            self.completed.saturating_sub(self.last_reported) < self.config.report_interval.get()
+        {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        let elapsed_seconds = elapsed.as_secs_f64();
+        let rate_per_second = (self.completed as f64) / elapsed_seconds.max(f64::MIN_POSITIVE);
+        let remaining = self.config.total.saturating_sub(self.completed);
+        let eta = Duration::from_secs_f64((remaining as f64) / rate_per_second);
+        info!(
+            completed = self.completed,
+            total = self.config.total,
+            percent = (self.completed as f64) * 100.0 / (self.config.total.max(1) as f64),
+            rate_per_second,
+            elapsed = ?elapsed,
+            eta = ?eta,
+            "preimage generation progress"
+        );
+        self.last_reported = self.completed;
+    }
+
+    fn finish(&self) -> Result<(), ExecutionError> {
+        if self.completed != self.config.total {
+            return Err(ExecutionError::PreimageProgressMismatch {
+                expected: self.config.total,
+                actual: self.completed,
+            });
+        }
+        info!(
+            completed = self.completed,
+            total = self.config.total,
+            elapsed = ?self.started.elapsed(),
+            "preimage generation completed"
+        );
+        Ok(())
+    }
 }
 
 impl<B, S> Executor<'_, B, S>
@@ -502,6 +601,22 @@ where
                         values[index].remove(argument);
                     }
                 }
+            }
+            self.executed_node_count = self.executed_node_count.saturating_add(envs.len());
+            if self.config.live_matrix_fence_interval.is_some_and(|interval| {
+                self.executed_node_count.saturating_sub(self.last_live_matrix_fence_node_count) >=
+                    interval.get()
+            }) {
+                self.fence_live_matrices(&values)?;
+                self.last_live_matrix_fence_node_count = self.executed_node_count;
+                info!(
+                    scope = ?scope_id,
+                    scope_completed_nodes = position + 1,
+                    scope_total_nodes = validated_scope.execution_order.len(),
+                    total_executed_nodes = self.executed_node_count,
+                    instances = values.len(),
+                    "execution progress checkpoint"
+                );
             }
         }
         let mut instances = Vec::with_capacity(values.len());
@@ -1382,12 +1497,17 @@ where
                 let max_coefficient_bound = max_coefficient_bound
                     .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
-                let value = if let Some(small) = gadget_small {
-                    self.backend.gadget_decompose(&target, small).map_err(Self::backend_error)?
+                let (value, sampled) = if let Some(small) = gadget_small {
+                    (
+                        self.backend
+                            .gadget_decompose(&target, small)
+                            .map_err(Self::backend_error)?,
+                        false,
+                    )
                 } else {
                     let secret =
                         secret.as_ref().expect("sampled trapdoor must carry secret material");
-                    self.sample_matrix(path, wire, &ty, |backend| {
+                    self.sample_matrix_with_status(path, wire, &ty, |backend| {
                         backend.sample_preimage(
                             &ty,
                             sigma,
@@ -1400,6 +1520,9 @@ where
                         )
                     })?
                 };
+                if sampled {
+                    self.record_preimages(1);
+                }
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
             NodeKind::GadgetDecompose { base, small, digit_count } => {
@@ -1976,6 +2099,7 @@ where
                             indices.iter().map(|index| pending[*index].request.clone()).collect(),
                         )
                         .map_err(Self::backend_error)?;
+                    self.record_preimages(sampled.len());
                     for (index, output) in indices.into_iter().zip(sampled) {
                         sampled_by_index[index] = Some(output);
                     }
@@ -2078,6 +2202,7 @@ where
                         indices.iter().map(|index| pending[*index].request.clone()).collect(),
                     )
                     .map_err(Self::backend_error)?;
+                self.record_preimages(sampled.len());
                 for (index, output) in indices.into_iter().zip(sampled) {
                     outputs[index] = Some(output);
                 }
@@ -2150,6 +2275,19 @@ where
     where
         F: FnOnce(&mut B) -> Result<B::Matrix, B::Error>,
     {
+        self.sample_matrix_with_status(path, wire, ty, fresh).map(|(value, _)| value)
+    }
+
+    fn sample_matrix_with_status<F>(
+        &mut self,
+        path: &[InstantiationFrame],
+        wire: WireRef,
+        ty: &ConcreteMatrixType,
+        fresh: F,
+    ) -> Result<(B::Matrix, bool), ExecutionError>
+    where
+        F: FnOnce(&mut B) -> Result<B::Matrix, B::Error>,
+    {
         let site = DrawSite { instantiation_path: path.to_vec(), node: wire.node, port: wire.port };
         if let Some(production) = self.session.clone() {
             if let Some(recorded) = self
@@ -2158,9 +2296,11 @@ where
                 .map_err(Self::artifact_error)?
             {
                 return match recorded {
-                    RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => {
-                        self.backend.matrix_from_bytes(ty, &bytes).map_err(Self::backend_error)
-                    }
+                    RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => self
+                        .backend
+                        .matrix_from_bytes(ty, &bytes)
+                        .map(|value| (value, false))
+                        .map_err(Self::backend_error),
                     RecordedValue::Matrix { .. } | RecordedValue::Trapdoor { .. } => {
                         Err(TranscriptError::KindMismatch(site).into())
                     }
@@ -2179,10 +2319,12 @@ where
                     )],
                 )
                 .map_err(Self::artifact_error)?;
-            return Ok(value);
+            return Ok((value, true));
         }
         match &mut self.sampling_mode {
-            SamplingMode::Fresh => fresh(self.backend).map_err(Self::backend_error),
+            SamplingMode::Fresh => {
+                fresh(self.backend).map(|value| (value, true)).map_err(Self::backend_error)
+            }
             SamplingMode::Record(recorder) => {
                 let value = fresh(self.backend).map_err(Self::backend_error)?;
                 recorder.record(
@@ -2192,15 +2334,27 @@ where
                         bytes: self.backend.matrix_to_bytes(&value),
                     },
                 )?;
-                Ok(value)
+                Ok((value, true))
             }
             SamplingMode::Replay(replayer) => match replayer.get(&site)? {
-                RecordedValue::Matrix { bytes, .. } => {
-                    self.backend.matrix_from_bytes(ty, bytes).map_err(Self::backend_error)
-                }
+                RecordedValue::Matrix { bytes, .. } => self
+                    .backend
+                    .matrix_from_bytes(ty, bytes)
+                    .map(|value| (value, false))
+                    .map_err(Self::backend_error),
                 RecordedValue::Trapdoor { .. } => Err(TranscriptError::KindMismatch(site).into()),
             },
         }
+    }
+
+    fn record_preimages(&mut self, count: usize) {
+        if let Some(progress) = &mut self.preimage_progress {
+            progress.record(count);
+        }
+    }
+
+    fn finish_preimage_progress(&self) -> Result<(), ExecutionError> {
+        self.preimage_progress.as_ref().map_or(Ok(()), PreimageProgress::finish)
     }
 
     fn sample_trapdoor(
@@ -2430,6 +2584,48 @@ where
         match self.materialize(values, wire)? {
             RuntimeValue::Matrix(value) => Ok(value),
             _ => Err(ExecutionError::ValueKind(wire)),
+        }
+    }
+
+    fn fence_live_matrices(
+        &mut self,
+        values: &[BTreeMap<WireRef, RuntimeValue<B>>],
+    ) -> Result<(), ExecutionError> {
+        for instance in values {
+            for value in instance.values() {
+                self.fence_runtime_value(value)?;
+            }
+        }
+        // Matrix-local fences above guarantee that only allocator blocks no
+        // longer referenced by this scope are returned. GPU backends trim
+        // their async pools; CPU backends keep this as a no-op.
+        self.backend.trim_unused_memory().map_err(Self::backend_error)?;
+        Ok(())
+    }
+
+    fn fence_runtime_value(&self, value: &RuntimeValue<B>) -> Result<(), ExecutionError> {
+        match value {
+            RuntimeValue::Matrix(matrix) => {
+                self.backend.wait_for_matrix(matrix.as_ref()).map_err(Self::backend_error)
+            }
+            RuntimeValue::Trapdoor { public, .. } => {
+                self.backend.wait_for_matrix(public.as_ref()).map_err(Self::backend_error)
+            }
+            RuntimeValue::IndexedFamily(values) => {
+                for value in values {
+                    self.fence_runtime_value(value)?;
+                }
+                Ok(())
+            }
+            RuntimeValue::Int(_) |
+            RuntimeValue::Real(_) |
+            RuntimeValue::Bool(_) |
+            RuntimeValue::Bytes(_) |
+            RuntimeValue::TypedBlob(_) |
+            RuntimeValue::LazyArtifact { .. } |
+            RuntimeValue::LazyArtifactFamily { .. } |
+            RuntimeValue::StagedArtifact { .. } |
+            RuntimeValue::StagedArtifactFamily { .. } => Ok(()),
         }
     }
 
@@ -3083,6 +3279,26 @@ mod tests {
     use rand::Rng;
 
     #[test]
+    fn preimage_progress_requires_the_configured_exact_total() {
+        let mut progress = PreimageProgress {
+            config: PreimageProgressConfig {
+                total: 3,
+                report_interval: NonZeroUsize::new(2).expect("nonzero interval"),
+            },
+            completed: 0,
+            last_reported: 0,
+            started: Instant::now(),
+        };
+        progress.record(2);
+        assert!(matches!(
+            progress.finish(),
+            Err(ExecutionError::PreimageProgressMismatch { expected: 3, actual: 2 })
+        ));
+        progress.record(1);
+        assert!(progress.finish().is_ok());
+    }
+
+    #[test]
     fn canonical_polynomial_coefficient_bits_roundtrip_on_cpu() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let modulus = parameters.modulus();
@@ -3146,7 +3362,10 @@ mod tests {
             BTreeMap::new(),
             &mut store,
             SamplingMode::Fresh,
-            ExecutionConfig { max_parallel_instances: NonZeroUsize::new(2).expect("nonzero") },
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(2).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
         )
         .expect("execution");
         match &result.outputs["values"] {
@@ -3251,7 +3470,10 @@ mod tests {
             )]),
             &mut store,
             SamplingMode::Fresh,
-            ExecutionConfig { max_parallel_instances: NonZeroUsize::new(2).expect("nonzero") },
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(2).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
         )
         .expect("execution");
 
@@ -3577,7 +3799,10 @@ mod tests {
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
-            ExecutionConfig { max_parallel_instances: NonZeroUsize::new(2).expect("nonzero") },
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(2).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
         )
         .expect("execution");
         let four = DCRTPolyMatrix::from_poly_vec_row(

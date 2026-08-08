@@ -2047,6 +2047,40 @@ impl Family<Mat> {
         }
     }
 
+    /// Selects one same-shaped matrix family without materializing the other branches.
+    pub fn select(selector: Int, branches: Vec<Self>) -> Result<Self, DslError> {
+        let Some(first) = branches.first() else {
+            return Err(DslError::Schema);
+        };
+        if branches.iter().any(|branch| {
+            branch.count != first.count ||
+                branch.element_schema.matrix_type != first.element_schema.matrix_type
+        }) {
+            return Err(DslError::FamilyCountMismatch);
+        }
+        let pending = Pending::merge(
+            std::iter::once(selector.pending.clone())
+                .chain(branches.iter().map(|branch| branch.pending.clone())),
+        );
+        let mut arguments = vec![selector.value];
+        arguments.extend(branches.iter().map(|branch| branch.value.clone()));
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(first.element_schema.matrix_type.clone())),
+            count: first.count.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::Select { count: IntExpr::constant(branches.len()) },
+            arguments,
+            vec![family_type],
+        );
+        Ok(Self {
+            value: node.output(0).expect("selected matrix family"),
+            element_schema: first.element_schema.clone(),
+            count: first.count.clone(),
+            pending,
+        })
+    }
+
     pub fn parallel_map(self, body: impl FnOnce(LoopIndex, Mat) -> Mat) -> Result<Self, DslError> {
         self.parallel_map_values(body)
     }
@@ -4808,6 +4842,19 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn matrix_family_select_preserves_the_family_wire_type() {
+        let ring = Ring::new(17, 8);
+        let context = DslContext::new("select-matrix-family");
+        let selector = context.int_family_input("selector", 1).get_static(0);
+        let one = ring.polynomial([IntExpr::constant(1)]);
+        let left = Family::pack(vec![ring.zero((1, 1)), one.clone()]).unwrap();
+        let right = Family::pack(vec![one, ring.zero((1, 1))]).unwrap();
+        let selected = Family::select(selector, vec![left, right]).unwrap();
+        let built = context.public_family_output("selected", selected).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
     }
 }

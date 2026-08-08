@@ -349,6 +349,20 @@ where
         self.parameters_for_matrix(value).is_ok_and(|target| value.params() == target)
     }
 
+    fn wait_for_matrix(&self, value: &M) -> Result<(), Self::Error> {
+        value.wait_until_ready();
+        Ok(())
+    }
+
+    fn trim_unused_memory(&mut self) -> Result<(), Self::Error> {
+        for placement in &self.parameters {
+            for parameters in placement.values() {
+                parameters.trim_unused_memory();
+            }
+        }
+        Ok(())
+    }
+
     fn matrix_to_placements(&mut self, value: &M) -> Result<Vec<Option<M>>, Self::Error> {
         let source = value.params();
         let modulus: Arc<BigUint> = source.modulus().into();
@@ -946,5 +960,5 @@ mod tests {
 
 #[cfg(feature = "gpu")]
 pub mod gpu {
-    pub use crate::backend::poly_gpu::{GpuDcrtBackend, gpu_backend};
+    pub use crate::backend::poly_gpu::{GpuDcrtBackend, gpu_backend, gpu_backend_on};
 }

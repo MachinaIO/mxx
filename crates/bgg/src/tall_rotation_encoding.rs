@@ -115,6 +115,8 @@ pub struct TallRotationEncodingCompiler {
     pub digit_count: usize,
     /// Gaussian width for tall rotation encoding errors.
     pub error_sigma: RealExpr,
+    /// Explicit hard coefficient cutoff for tall rotation encoding errors.
+    pub error_max_coefficient_bound: IntExpr,
 }
 
 /// Finds every normalized nonidentity rotation pair required by a circuit.
@@ -238,7 +240,11 @@ impl TallRotationEncodingCompiler {
                 let columns = self.gadget_columns();
                 move |_, current, shifted| {
                     current * a_forward.clone() - shifted * gadget.clone() +
-                        ring.gaussian((1, columns), sigma.clone())
+                        ring.gaussian(
+                            (1, columns),
+                            sigma.clone(),
+                            self.error_max_coefficient_bound.clone(),
+                        )
                 }
             })?;
             let c_backward = transformed.clone().parallel_zip(shifted_backward, {
@@ -249,7 +255,11 @@ impl TallRotationEncodingCompiler {
                 let columns = self.gadget_columns();
                 move |_, current, shifted| {
                     current * a_backward.clone() - shifted * gadget.clone() +
-                        ring.gaussian((1, columns), sigma.clone())
+                        ring.gaussian(
+                            (1, columns),
+                            sigma.clone(),
+                            self.error_max_coefficient_bound.clone(),
+                        )
                 }
             })?;
             rotations.insert(

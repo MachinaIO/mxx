@@ -28,6 +28,7 @@ int gpu_context_create(
     GpuContext **out_ctx);
 
 void gpu_context_destroy(GpuContext *ctx);
+int gpu_context_trim_memory_pool(const GpuContext *ctx);
 int gpu_context_get_N(const GpuContext *ctx, int *out_N);
 
 int gpu_event_set_wait(GpuEventSet *events);

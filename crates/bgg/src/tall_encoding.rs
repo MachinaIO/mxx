@@ -64,6 +64,8 @@ pub struct BggTallEncodingSampler {
     pub layout: BggSamplerLayout,
     /// Optional Gaussian error width; `None` produces exact test encodings.
     pub gaussian_sigma: Option<RealExpr>,
+    /// Explicit hard coefficient cutoff for `gaussian_sigma`.
+    pub gaussian_max_coefficient_bound: Option<IntExpr>,
 }
 
 /// Errors produced by tall BGG+ compilation and artifact wiring.
@@ -72,6 +74,9 @@ pub enum TallCompileError {
     /// Input families or matrix types do not match the tall BGG layout.
     #[error("tall BGG+ inputs have incompatible counts or matrix types")]
     InvalidLayout,
+    /// A Gaussian sampler needs a bound as well as a width.
+    #[error("tall BGG+ Gaussian sampling requires both a sigma and an explicit coefficient cutoff")]
+    MissingGaussianBound,
     /// A rotation has zero slots or mismatched family counts.
     #[error("tall BGG+ rotation has an invalid slot layout")]
     InvalidRotationLayout,
@@ -349,6 +354,9 @@ impl BggTallEncodingSampler {
         if public_keys.len() != plaintexts.len() + 1 {
             return Err(TallCompileError::InvalidLayout);
         }
+        if self.gaussian_sigma.is_some() != self.gaussian_max_coefficient_bound.is_some() {
+            return Err(TallCompileError::MissingGaussianBound);
+        }
         let ring = self.layout.ring();
         let secret_size = self.layout.secret_dimension;
         let columns = self.layout.public_key_columns();
@@ -421,9 +429,12 @@ impl BggTallEncodingSampler {
             move |_, (slot_secret, encoded)| {
                 let packed = slot_secret.clone() * packed_public.clone() -
                     encoded.tensor(slot_secret * gadget.clone()) +
-                    match &sigma {
-                        Some(sigma) => ring.gaussian((1, columns * count), sigma.clone()),
-                        None => ring.zero((1, columns * count)),
+                    match (&sigma, &self.gaussian_max_coefficient_bound) {
+                        (Some(sigma), Some(bound)) => {
+                            ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
+                        }
+                        (None, None) => ring.zero((1, columns * count)),
+                        _ => unreachable!("validated Gaussian sampler configuration"),
                     };
                 (0..count)
                     .map(|index| {
@@ -885,15 +896,19 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let sample = BggTallEncodingSampler { layout: layout.clone(), gaussian_sigma: None }
-            .sample(
-                ring.input("secret", (1, secret_size)),
-                &public_keys,
-                &[plaintexts],
-                slots.into(),
-                Some(transforms),
-            )
-            .unwrap();
+        let sample = BggTallEncodingSampler {
+            layout: layout.clone(),
+            gaussian_sigma: None,
+            gaussian_max_coefficient_bound: None,
+        }
+        .sample(
+            ring.input("secret", (1, secret_size)),
+            &public_keys,
+            &[plaintexts],
+            slots.into(),
+            Some(transforms),
+        )
+        .unwrap();
         let mut context = DslContext::new("tall-sampler-runtime");
         for slot in 0..slots {
             context = context
@@ -977,6 +992,7 @@ mod tests {
             gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
             digit_count: digits,
             error_sigma: RealExpr::from_integer(0),
+            error_max_coefficient_bound: 0.into(),
         };
         let ring = compiler.ring();
         let transforms = Family::pack(
@@ -1159,6 +1175,7 @@ mod tests {
                 hash_key,
                 public_key_type,
                 configured_slot_count: slots,
+                output_public_key_production: None,
                 requests: Vec::new(),
             },
         };
@@ -1230,6 +1247,8 @@ mod tests {
             gadget_base: 4.into(),
             trapdoor_sigma: RealExpr::from_integer(5),
             error_sigma: RealExpr::from_integer(3),
+            preimage_max_coefficient_bound: 32.into(),
+            error_max_coefficient_bound: 19.into(),
         };
         let ring = Ring::new(257, 8);
         let hash_key = ring.bytes_input("hash-key", 32);
@@ -1256,6 +1275,7 @@ mod tests {
             hash_key: hash_key.clone(),
             public_key_type: ring.matrix_type((1, 2)),
             configured_slot_count: 2,
+            output_public_key_production: None,
             requests: Vec::new(),
         };
         let circuit_compiler = crate::PolyCircuitCompiler { public_key: public_compiler.clone() };
@@ -1285,6 +1305,7 @@ mod tests {
             compiler: BggTallEncodingCompiler { public_key: public_compiler },
             artifact,
             hash_key,
+            output_public_key_production: None,
             c_b0: ring.input("c-b0", (1, 4)),
             slots: public_slots,
             gates: gate_wires,
@@ -1308,9 +1329,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let elaborated = built.elaborate(&ParamEnv::default()).unwrap();
-        assert!(elaborated.wire(&elaborated.outputs["rows"]).unwrap().family.is_some());
-        assert!(elaborated.wire(&elaborated.outputs["public"]).unwrap().expression.is_some());
+        built.validate(&ParamEnv::default()).expect("valid executable graph");
     }
 
     #[test]
@@ -1450,11 +1469,9 @@ mod tests {
             .identities
             .into_iter()
             .map(|(identity, lookup_id)| {
-                let table = LweLookupTable::from_public_lut(
-                    parameters,
-                    circuit.lookup_table(lookup_id).as_ref(),
-                )
-                .expect("nested-RNS lookup table");
+                let table =
+                    LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
+                        .expect("nested-RNS lookup table");
                 LweLookupCompiler {
                     identity,
                     table,
@@ -1471,14 +1488,16 @@ mod tests {
         for lookup in &lookup_compilers {
             let wires = LweLookupPreprocessingWires {
                 output_public_key: ring.zero((1, digits)),
-                low_matrices: Family::pack(
-                    (0..lookup.table.len()).map(|_| ring.zero((digits, digits))).collect(),
-                )
-                .expect("lookup low artifact family"),
-                high_matrices: Family::pack(
-                    (0..lookup.table.len()).map(|_| ring.zero((digits + 2, digits))).collect(),
-                )
-                .expect("lookup high artifact family"),
+                low_chunks: (0..lookup.table.len().div_ceil(512))
+                    .map(|_| Family::pack((0..512).map(|_| ring.zero((digits, digits))).collect()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("lookup low artifact chunks"),
+                high_chunks: (0..lookup.table.len().div_ceil(512))
+                    .map(|_| {
+                        Family::pack((0..512).map(|_| ring.zero((digits + 2, digits))).collect())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("lookup high artifact chunks"),
             };
             artifact_context = lookup
                 .export_preprocessing(
@@ -1527,6 +1546,7 @@ mod tests {
                 hash_key: hash_key.clone(),
                 public_key_type: ring.matrix_type((1, digits)),
                 configured_slot_count: physical_slots,
+                output_public_key_production: None,
                 requests: Vec::new(),
             },
         };
@@ -1551,6 +1571,8 @@ mod tests {
             gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
             trapdoor_sigma: RealExpr::from_integer(5),
             error_sigma: RealExpr::from_integer(0),
+            preimage_max_coefficient_bound: 32.into(),
+            error_max_coefficient_bound: 0.into(),
         };
         let base = artifact.build_base().expect("slot base artifacts");
         let slot_wires =
@@ -1618,6 +1640,7 @@ mod tests {
             compiler: BggTallEncodingCompiler { public_key: public_key_compiler },
             artifact: artifact.clone(),
             hash_key,
+            output_public_key_production: None,
             c_b0: ring.zero((1, artifact.b0_public_columns())),
             slots,
             gates: gate_wires,

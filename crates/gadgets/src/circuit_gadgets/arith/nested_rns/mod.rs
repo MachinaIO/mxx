@@ -39,7 +39,7 @@ use encoding::sample_crt_primes;
 pub use encoding::{
     encode_nested_rns_poly, encode_nested_rns_poly_compact_bytes,
     encode_nested_rns_poly_compact_bytes_with_offset, encode_nested_rns_poly_with_offset,
-    nested_rns_gadget_decomposed, nested_rns_gadget_vector,
+    minimum_p_moduli_bits, nested_rns_gadget_decomposed, nested_rns_gadget_vector,
 };
 
 pub const DEFAULT_MAX_UNREDUCED_MULS: usize = 2;

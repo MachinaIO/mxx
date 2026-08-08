@@ -22,6 +22,7 @@ use crate::{
                 gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_columns,
                 gpu_matrix_sample_p1_full_cached, gpu_matrix_store_compact_bytes,
                 gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                gpu_matrix_wait,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -220,6 +221,12 @@ impl PartialEq for GpuDCRTPolyMatrix {
 impl Eq for GpuDCRTPolyMatrix {}
 
 impl GpuDCRTPolyMatrix {
+    /// Waits for writes to this matrix without synchronizing unrelated device work.
+    pub fn wait_until_ready(&self) {
+        let status = unsafe { gpu_matrix_wait(self.raw) };
+        check_status(status, "gpu_matrix_wait");
+    }
+
     pub(crate) fn new_empty_with_state(
         params: &GpuDCRTPolyParams,
         nrow: usize,
@@ -1118,6 +1125,10 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn params(&self) -> &GpuDCRTPolyParams {
         &self.params
+    }
+
+    fn wait_until_ready(&self) {
+        GpuDCRTPolyMatrix::wait_until_ready(self);
     }
 
     fn add_in_place(&mut self, rhs: &Self) {
@@ -2197,6 +2208,22 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_wait_until_ready_fences_the_result_event() {
+        let cpu_params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&cpu_params);
+        let left = gpu_constant_matrix(&gpu_params, 4, 7, 3);
+        let right = gpu_constant_matrix(&gpu_params, 7, 5, 101);
+        let addend = gpu_constant_matrix(&gpu_params, 4, 5, 211);
+        let expected = left.to_cpu_matrix() * right.to_cpu_matrix() + addend.to_cpu_matrix();
+
+        let actual = &left * &right + &addend;
+        actual.wait_until_ready();
+
+        assert_eq!(actual.to_cpu_matrix(), expected);
     }
 
     #[test]

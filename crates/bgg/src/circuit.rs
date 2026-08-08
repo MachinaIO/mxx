@@ -921,6 +921,7 @@ mod tests {
             hash_key: ring.bytes_input("slot-hash-key", 32),
             public_key_type: lookup.public_key_type.clone(),
             configured_slot_count: 1,
+            output_public_key_production: None,
             requests: Vec::new(),
         };
         let public_key = |name: &str| BggPublicKeyWire {

@@ -64,6 +64,12 @@ pub trait PolyMatrix:
 
     fn params(&self) -> &<Self::P as Poly>::Params;
 
+    /// Waits until writes submitted for this matrix have completed.
+    ///
+    /// CPU-backed matrices are ready immediately. GPU implementations override
+    /// this to wait only for this matrix's recorded write events.
+    fn wait_until_ready(&self) {}
+
     fn add_in_place(&mut self, rhs: &Self) {
         *self = self.clone() + rhs;
     }

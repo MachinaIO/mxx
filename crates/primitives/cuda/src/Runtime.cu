@@ -713,6 +713,34 @@ extern "C"
         delete ctx;
     }
 
+    int gpu_context_trim_memory_pool(const GpuContext *ctx)
+    {
+        if (!ctx)
+        {
+            return set_error("invalid gpu_context_trim_memory_pool arguments");
+        }
+        for (int device : ctx->gpu_ids)
+        {
+            cudaError_t err = cudaSetDevice(device);
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
+            }
+            cudaMemPool_t pool = nullptr;
+            err = cudaDeviceGetDefaultMemPool(&pool, device);
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
+            }
+            err = cudaMemPoolTrimTo(pool, 0);
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
+            }
+        }
+        return 0;
+    }
+
     int gpu_context_get_N(const GpuContext *ctx, int *out_N)
     {
         if (!ctx || !out_N)

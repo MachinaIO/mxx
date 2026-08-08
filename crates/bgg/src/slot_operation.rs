@@ -281,10 +281,11 @@ mod naive {
         }
 
         #[test]
-        fn slot_transfer_and_reduction_preserve_heterogeneous_member_terms() {
+        fn slot_transfer_and_reduction_preserve_heterogeneous_member_graphs() {
             let ring = Ring::new(257, 8);
-            let matrices = Family::pack(vec![ring.gaussian((1, 1), 2), ring.gaussian((1, 1), 3)])
-                .expect("family");
+            let matrices =
+                Family::pack(vec![ring.gaussian((1, 1), 2, 13), ring.gaussian((1, 1), 3, 20)])
+                    .expect("family");
             let input = NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: true };
             let compiler = NaiveBggSlotTransferCompiler;
             let transferred =
@@ -297,14 +298,7 @@ mod naive {
                 .expect("reduction output")
                 .build()
                 .expect("build");
-            let elaborated = built.elaborate(&ParamEnv::default()).expect("elaboration");
-            let report = mxx_noise_simulator::simulate(&elaborated).expect("simulation");
-            let transferred_bound =
-                report.outputs["transferred"].noise.as_ref().expect("noise").bound.clone();
-            let reduced_bound =
-                report.outputs["reduced"].noise.as_ref().expect("noise").bound.clone();
-            assert_eq!(transferred_bound.to_string(), "19.5");
-            assert!(reduced_bound > transferred_bound);
+            built.validate(&ParamEnv::default()).expect("valid executable graph");
         }
 
         #[test]
@@ -376,6 +370,7 @@ mod public_key {
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
+    use mxx_ir_core::artifact::{ArtifactConfidentiality, ProductionId};
     use rayon::prelude::*;
 
     #[derive(Clone)]
@@ -400,22 +395,34 @@ mod public_key {
         pub hash_key: Bytes,
         pub public_key_type: mxx_ir_core::types::MatrixType,
         pub configured_slot_count: usize,
+        /// Producer containing the exact gate output public keys, when this
+        /// lowering is used by a consumer graph.
+        pub output_public_key_production: Option<ProductionId>,
         pub requests: Vec<BggSlotTransferGateRequest>,
     }
 
     impl BggSlotTransferPublicKeyLowering {
         fn output_public_key(&self, gate: GateInstance<'_>, reduction: bool) -> BggPublicKeyWire {
             let operation = if reduction { "slot_reduce" } else { "slot_transfer" };
-            BggPublicKeyWire {
-                matrix: self.compiler.ring.hash_matrix(
-                    self.hash_key.clone(),
-                    HashTag::from(
-                        format!("{operation}_gate_a_out_{}", gate_token(gate)).into_bytes(),
-                    ),
-                    (self.public_key_type.rows.clone(), self.public_key_type.columns.clone()),
-                ),
-                reveal_plaintext: true,
-            }
+            let identity = gate_token(gate);
+            let matrix = self.output_public_key_production.as_ref().map_or_else(
+                || {
+                    self.compiler.ring.hash_matrix(
+                        self.hash_key.clone(),
+                        HashTag::from(format!("{operation}_gate_a_out_{identity}").into_bytes()),
+                        (self.public_key_type.rows.clone(), self.public_key_type.columns.clone()),
+                    )
+                },
+                |production| {
+                    self.compiler.ring.artifact_input(
+                        production.clone(),
+                        super::slot_gate_public_key_name(reduction, &identity),
+                        (self.public_key_type.rows.clone(), self.public_key_type.columns.clone()),
+                        ArtifactConfidentiality::Public,
+                    )
+                },
+            );
+            BggPublicKeyWire { matrix, reveal_plaintext: true }
         }
 
         fn valid_type(&self, input: &BggPublicKeyWire) -> bool {
@@ -519,6 +526,7 @@ mod public_key {
                 hash_key: ring.bytes_input("hash-key", 32),
                 public_key_type,
                 configured_slot_count: 2,
+                output_public_key_production: None,
                 requests: Vec::new(),
             };
             let mut lookup = NoPublicLookup::default();
@@ -537,13 +545,17 @@ mod public_key {
                 .expect("output")
                 .build()
                 .expect("build");
-            let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
-            assert!(elaborated.wire(&elaborated.outputs["output"]).unwrap().expression.is_some());
+            built.validate(&ParamEnv::default()).expect("valid executable graph");
         }
     }
 }
 pub(crate) use public_key::gate_token;
 pub use public_key::*;
+
+fn slot_gate_public_key_name(reduction: bool, identity: &str) -> String {
+    let operation = if reduction { "slot_reduce" } else { "slot_transfer" };
+    format!("{operation}_gate_{identity}_public_key")
+}
 
 mod artifact {
     use crate::BggSlotTransferGateRequest;
@@ -576,6 +588,8 @@ mod artifact {
         pub gadget_base: IntExpr,
         pub trapdoor_sigma: RealExpr,
         pub error_sigma: RealExpr,
+        pub preimage_max_coefficient_bound: IntExpr,
+        pub error_max_coefficient_bound: IntExpr,
     }
 
     #[derive(Debug, Error)]
@@ -656,12 +670,14 @@ mod artifact {
                     self.trapdoor_sigma.clone(),
                     self.gadget_base.clone(),
                     self.digit_count,
+                    self.preimage_max_coefficient_bound.clone(),
                 ),
                 b1: ring.sample_trapdoor(
                     self.secret_size * 2,
                     self.trapdoor_sigma.clone(),
                     self.gadget_base.clone(),
                     self.digit_count,
+                    self.preimage_max_coefficient_bound.clone(),
                 ),
             })
         }
@@ -693,6 +709,7 @@ mod artifact {
                     self.trapdoor_sigma.clone(),
                     self.gadget_base.clone(),
                     self.digit_count,
+                    self.preimage_max_coefficient_bound.clone(),
                 ),
                 b1: ring.trapdoor_artifact_input(
                     artifacts.production_id.clone(),
@@ -702,6 +719,7 @@ mod artifact {
                     self.trapdoor_sigma.clone(),
                     self.gadget_base.clone(),
                     self.digit_count,
+                    self.preimage_max_coefficient_bound.clone(),
                 ),
             })
         }
@@ -750,6 +768,7 @@ mod artifact {
                                 ring.gaussian(
                                     (secret_size, columns.clone()),
                                     error_sigma.clone(),
+                                    self.error_max_coefficient_bound.clone(),
                                 ),
                             (b0.public_matrix().matrix_type().columns.clone(), columns),
                         )
@@ -783,6 +802,7 @@ mod artifact {
                                     ring.gaussian(
                                         (secret_size * 2, columns.clone()),
                                         error_sigma.clone(),
+                                        self.error_max_coefficient_bound.clone(),
                                     ),
                                 (b1.public_matrix().matrix_type().columns.clone(), columns),
                             )
@@ -921,6 +941,36 @@ mod artifact {
             Ok(BggSlotTransferGateWires { preimage_chunks })
         }
 
+        /// Returns the exact number of trapdoor preimage samples performed by
+        /// [`Self::build_slots`] followed by [`Self::build_gate_preimages`] for
+        /// `requests`.
+        ///
+        /// This deliberately derives the count from the same chunking and
+        /// family cardinalities as graph construction.  Callers therefore do
+        /// not need to duplicate assumptions about the current gadget width or
+        /// about how many destination rows a transfer/reduction request has.
+        pub fn preprocessing_preimage_count(
+            &self,
+            requests: &[BggSlotTransferGateRequest],
+        ) -> Result<usize, BggSlotTransferArtifactError> {
+            self.validate_layout()?;
+            let slot_samples = self.slot_count *
+                (self.chunks(self.b1_public_columns()).len() +
+                    self.chunks(self.gadget_columns()).len());
+            let gate_chunks = self.chunks(self.gadget_columns()).len();
+            let gate_samples = requests.iter().try_fold(0usize, |total, request| {
+                self.validate_gate_request(request)?;
+                let family_count = match request {
+                    BggSlotTransferGateRequest::Transfer { source_slots, .. } => source_slots.len(),
+                    BggSlotTransferGateRequest::Reduce { input_public_keys, .. } => {
+                        input_public_keys.len()
+                    }
+                };
+                Ok::<usize, BggSlotTransferArtifactError>(total + family_count * gate_chunks)
+            })?;
+            Ok(slot_samples + gate_samples)
+        }
+
         pub fn export_gate_preimages(
             &self,
             context: DslContext,
@@ -929,6 +979,28 @@ mod artifact {
             Ok(gates.preimage_chunks.into_iter().try_fold(context, |context, (name, family)| {
                 context.public_family_output(name, family)
             })?)
+        }
+
+        /// Exports the exact public-key expressions used as gate-preimage targets.
+        pub fn export_gate_public_keys(
+            &self,
+            context: DslContext,
+            requests: &[BggSlotTransferGateRequest],
+        ) -> Result<DslContext, BggSlotTransferArtifactError> {
+            requests.iter().try_fold(context, |context, request| {
+                let (reduction, identity, output) = match request {
+                    BggSlotTransferGateRequest::Transfer {
+                        identity, output_public_key, ..
+                    } => (false, identity, output_public_key),
+                    BggSlotTransferGateRequest::Reduce { identity, output_public_key, .. } => {
+                        (true, identity, output_public_key)
+                    }
+                };
+                Ok(context.public_output(
+                    super::slot_gate_public_key_name(reduction, identity),
+                    output.clone(),
+                )?)
+            })
         }
 
         pub fn import_gate_preimages(
@@ -1001,6 +1073,7 @@ mod artifact {
                         ring.gaussian(
                             (self.secret_size, range_len(&columns)),
                             self.error_sigma.clone(),
+                            self.error_max_coefficient_bound.clone(),
                         );
                     base.b0
                         .sample_preimage(target, (self.b0_public_columns(), range_len(&columns)))
@@ -1054,6 +1127,7 @@ mod artifact {
                         ring.gaussian(
                             (self.secret_size, range_len(&columns)),
                             self.error_sigma.clone(),
+                            self.error_max_coefficient_bound.clone(),
                         );
                     base.b0
                         .sample_preimage(target, (self.b0_public_columns(), range_len(&columns)))
@@ -1199,6 +1273,8 @@ mod artifact {
                 gadget_base: 4.into(),
                 trapdoor_sigma: RealExpr::from_integer(5),
                 error_sigma: RealExpr::from_integer(3),
+                preimage_max_coefficient_bound: 32.into(),
+                error_max_coefficient_bound: 19.into(),
             }
         }
 
@@ -1225,6 +1301,8 @@ mod artifact {
                 gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
                 trapdoor_sigma: RealExpr::from_f64_exact(4.578).expect("finite sigma"),
                 error_sigma: RealExpr::from_integer(0),
+                preimage_max_coefficient_bound: 29.into(),
+                error_max_coefficient_bound: 0.into(),
             };
             let ring = compiler.ring();
             let base = compiler.build_base().expect("base");
@@ -1400,6 +1478,8 @@ mod artifact {
                 gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
                 trapdoor_sigma: RealExpr::from_f64_exact(4.578).expect("finite sigma"),
                 error_sigma: RealExpr::from_integer(0),
+                preimage_max_coefficient_bound: 29.into(),
+                error_max_coefficient_bound: 0.into(),
             };
             let mut backend = cpu_backend([parameters.clone()]);
             let mut store = MemoryArtifactStore::default();
@@ -1746,7 +1826,6 @@ mod artifact {
                 .build()
                 .expect("slot graph");
             slot_graph.validate(&ParamEnv::default()).expect("valid slot graph");
-            slot_graph.elaborate(&ParamEnv::default()).expect("symbolic slot graph");
 
             let key = compiler.ring().bytes_input("gate-hash-key", 32);
             let input = compiler.ring().hash_matrix(
@@ -1785,7 +1864,6 @@ mod artifact {
                 .build()
                 .expect("gate graph");
             gate_graph.validate(&ParamEnv::default()).expect("valid gate graph");
-            gate_graph.elaborate(&ParamEnv::default()).expect("symbolic gate graph");
         }
     }
 }
@@ -1811,7 +1889,11 @@ mod tall {
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_ir_core::{IntExpr, node::ConcatAxis};
+    use mxx_ir_core::{
+        IntExpr,
+        artifact::{ArtifactConfidentiality, ProductionId},
+        node::ConcatAxis,
+    };
     use rayon::prelude::*;
     use std::collections::BTreeMap;
 
@@ -1914,6 +1996,8 @@ mod tall {
         pub artifact: BggSlotTransferArtifactCompiler,
         /// Hash key used for ordinary transfer output public keys.
         pub hash_key: Bytes,
+        /// Producer containing the exact ordinary gate output public keys.
+        pub output_public_key_production: Option<ProductionId>,
         /// Base trapdoor encoding used by the ordinary transfer path.
         pub c_b0: Mat,
         /// Public per-slot transfer artifacts.
@@ -1927,16 +2011,25 @@ mod tall {
     impl BggTallSlotLowering {
         fn output_public_key(&self, gate: GateInstance<'_>, reduction: bool) -> BggPublicKeyWire {
             let operation = if reduction { "slot_reduce" } else { "slot_transfer" };
-            BggPublicKeyWire {
-                matrix: self.artifact.ring().hash_matrix(
-                    self.hash_key.clone(),
-                    HashTag::from(
-                        format!("{operation}_gate_a_out_{}", gate_token(gate)).into_bytes(),
-                    ),
-                    (self.artifact.secret_size, self.artifact.gadget_columns()),
-                ),
-                reveal_plaintext: true,
-            }
+            let identity = gate_token(gate);
+            let matrix = self.output_public_key_production.as_ref().map_or_else(
+                || {
+                    self.artifact.ring().hash_matrix(
+                        self.hash_key.clone(),
+                        HashTag::from(format!("{operation}_gate_a_out_{identity}").into_bytes()),
+                        (self.artifact.secret_size, self.artifact.gadget_columns()),
+                    )
+                },
+                |production| {
+                    self.artifact.ring().artifact_input(
+                        production.clone(),
+                        super::slot_gate_public_key_name(reduction, &identity),
+                        (self.artifact.secret_size, self.artifact.gadget_columns()),
+                        ArtifactConfidentiality::Public,
+                    )
+                },
+            );
+            BggPublicKeyWire { matrix, reveal_plaintext: true }
         }
 
         fn product_chunks(

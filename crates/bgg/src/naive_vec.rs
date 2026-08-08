@@ -848,7 +848,11 @@ mod tests {
         )
         .unwrap();
         let encodings = NaiveBggEncodingVecSampler {
-            scalar: BggEncodingSampler { layout: layout.clone(), gaussian_sigma: None },
+            scalar: BggEncodingSampler {
+                layout: layout.clone(),
+                gaussian_sigma: None,
+                gaussian_max_coefficient_bound: None,
+            },
         }
         .sample(ring.input("secret", (1, layout.secret_dimension)), &public_keys, &[plaintexts])
         .unwrap();

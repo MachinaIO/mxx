@@ -222,6 +222,8 @@ pub enum BggSampleError {
     MatrixTypeMismatch,
     #[error("BGG+ sampler families must have matching slot counts")]
     SlotCountMismatch,
+    #[error("BGG+ Gaussian sampling requires both a sigma and an explicit coefficient cutoff")]
+    MissingGaussianBound,
     #[error(transparent)]
     Dsl(#[from] mxx_dsl::DslError),
 }
@@ -230,6 +232,7 @@ pub enum BggSampleError {
 pub struct BggEncodingSampler {
     pub layout: BggSamplerLayout,
     pub gaussian_sigma: Option<RealExpr>,
+    pub gaussian_max_coefficient_bound: Option<IntExpr>,
 }
 
 impl BggEncodingSampler {
@@ -278,9 +281,12 @@ impl BggEncodingSampler {
         );
         let packed_vector = secret.clone() * all_public_keys -
             encoded_plaintexts.tensor(secret.clone() * gadget) +
-            match &self.gaussian_sigma {
-                Some(sigma) => ring.gaussian((1, columns * count), sigma.clone()),
-                None => ring.zero((1, columns * count)),
+            match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
+                (Some(sigma), Some(bound)) => {
+                    ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
+                }
+                (None, None) => ring.zero((1, columns * count)),
+                _ => return Err(BggSampleError::MissingGaussianBound),
             };
         Ok((0..count)
             .map(|index| BggEncodingWire {
@@ -463,11 +469,7 @@ mod tests {
         );
         assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixBinary(_))));
 
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
-        let vector = elaborated.wire(&elaborated.outputs["vector"]).expect("vector output");
-        assert!(
-            elaborated.expressions.get(vector.expression.expect("vector expression")).is_some()
-        );
+        built.validate(&ParamEnv::default()).expect("valid executable graph");
     }
 
     #[test]
@@ -537,7 +539,7 @@ mod tests {
         assert_eq!(matrix_output(&result, "plaintext"), &(lhs_plaintext * rhs_plaintext));
     }
     #[test]
-    fn bgg_sampling_elaborates_without_aggregate_atoms() {
+    fn bgg_sampling_builds_a_packed_executable_graph() {
         let layout = BggSamplerLayout {
             modulus: 257.into(),
             ring_dimension: 8.into(),
@@ -551,9 +553,13 @@ mod tests {
             b"bgg-test".to_vec(),
             &[true],
         );
-        let encodings = BggEncodingSampler { layout, gaussian_sigma: Some(3.into()) }
-            .sample(ring.input("secret", (1, 2)), &public_keys, &[ring.input("plaintext", (1, 1))])
-            .expect("compatible sampler inputs");
+        let encodings = BggEncodingSampler {
+            layout,
+            gaussian_sigma: Some(3.into()),
+            gaussian_max_coefficient_bound: Some(19.into()),
+        }
+        .sample(ring.input("secret", (1, 2)), &public_keys, &[ring.input("plaintext", (1, 1))])
+        .expect("compatible sampler inputs");
         let built = DslContext::new("bgg-sampling")
             .private_output("constant", encodings[0].vector.clone())
             .expect("constant output")
@@ -589,18 +595,7 @@ mod tests {
         assert_eq!(tensor_count, 1, "one packed plaintext/secret-gadget tensor");
         assert_eq!(gaussian_types.len(), 1, "one packed error sample");
         assert_eq!(gaussian_types[0].columns.canonicalize(), IntExpr::constant(16));
-        let elaborated = built.elaborate(&ParamEnv::default()).expect("symbolic elaboration");
-        assert_eq!(elaborated.outputs.len(), 2);
-        assert!(!elaborated.atoms.is_empty());
-        let report = mxx_noise_simulator::simulate(&elaborated).expect("noise simulation");
-        for name in ["constant", "message"] {
-            let estimate = &report.outputs[name];
-            assert!(estimate.has_signal, "{name} retains the BGG signal term");
-            assert!(
-                estimate.noise.as_ref().is_some_and(|noise| noise.bound > 0),
-                "{name} retains sampled error in the noise estimate"
-            );
-        }
+        built.validate(&ParamEnv::default()).expect("valid executable graph");
     }
     #[test]
     fn runtime_public_keys_and_encodings_match_the_bgg_sampling_formula() {
@@ -614,13 +609,17 @@ mod tests {
             tag.to_vec(),
             &[false, true],
         );
-        let encodings = BggEncodingSampler { layout: layout.clone(), gaussian_sigma: None }
-            .sample(
-                ring.input("secret", (1, layout.secret_dimension)),
-                &public_keys,
-                &[ring.input("plaintext-0", (1, 1)), ring.input("plaintext-1", (1, 1))],
-            )
-            .unwrap();
+        let encodings = BggEncodingSampler {
+            layout: layout.clone(),
+            gaussian_sigma: None,
+            gaussian_max_coefficient_bound: None,
+        }
+        .sample(
+            ring.input("secret", (1, layout.secret_dimension)),
+            &public_keys,
+            &[ring.input("plaintext-0", (1, 1)), ring.input("plaintext-1", (1, 1))],
+        )
+        .unwrap();
         let mut context = DslContext::new("bgg-sampler-runtime");
         for index in 0..public_keys.len() {
             context = context

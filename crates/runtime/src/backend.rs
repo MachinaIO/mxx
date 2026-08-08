@@ -57,6 +57,16 @@ pub trait Backend {
     fn matrix_is_on_active_placement(&self, _value: &Self::Matrix) -> bool {
         true
     }
+    /// Fences work that produces one matrix. The default is a no-op for
+    /// synchronous backends.
+    fn wait_for_matrix(&self, _value: &Self::Matrix) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    /// Releases allocator-cached storage that is no longer referenced by a
+    /// fenced execution scope. Synchronous backends have nothing to release.
+    fn trim_unused_memory(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn matrix_to_placements(
         &mut self,
         value: &Self::Matrix,

@@ -11,6 +11,7 @@ pub mod noise_refresh;
 pub mod public_key;
 pub mod slot_operation;
 pub mod tall_encoding;
+pub mod tall_operational;
 pub mod tall_rotation_encoding;
 pub mod wee25_commitment;
 pub mod wee25_opening;
@@ -38,11 +39,12 @@ pub use encoding::{
 pub use lwe_lookup::{
     LweLookupArtifactNames, LweLookupArtifactWires, LweLookupArtifacts, LweLookupCompileError,
     LweLookupCompiler, LweLookupEncodingLowering, LweLookupIdentity, LweLookupInvocation,
-    LweLookupPreprocessingWires, LweLookupPublicKeyLowering, LweLookupTable,
-    LweLookupTallEncodingLowering, NaiveLweLookupEncodingLowering, NaiveLweLookupInvocation,
-    NaiveLweLookupPreprocessingEntry, NaiveLweLookupPreprocessingLowering,
-    NaiveLweLookupPublicKeyLowering, bind_naive_lwe_lookup_invocations,
-    collect_lwe_lookup_identities, collect_lwe_lookup_identities_with_prefix,
+    LweLookupPreprocessingEntry, LweLookupPreprocessingLowering, LweLookupPreprocessingWires,
+    LweLookupPublicKeyLowering, LweLookupTable, LweLookupTallEncodingLowering,
+    NaiveLweLookupEncodingLowering, NaiveLweLookupInvocation, NaiveLweLookupPreprocessingEntry,
+    NaiveLweLookupPreprocessingLowering, NaiveLweLookupPublicKeyLowering,
+    bind_lwe_lookup_invocations, bind_naive_lwe_lookup_invocations, collect_lwe_lookup_identities,
+    collect_lwe_lookup_identities_with_prefix,
 };
 pub use masked_decoder::{
     MASKED_DECODER_PREIMAGES, MaskedHighBitDecoderArtifacts, MaskedHighBitDecoderCompiler,
@@ -70,6 +72,10 @@ pub use slot_operation::{
 pub use tall_encoding::{
     BggTallEncodingCompiler, BggTallEncodingSample, BggTallEncodingSampler, BggTallEncodingWire,
     BggTallPlaintext, TallCompileError,
+};
+pub use tall_operational::{
+    TallNestedRnsDescriptor, TallOperationalError, TallOperationalEstimate, TallOperationalInputs,
+    estimate_tall_nested_rns,
 };
 pub use tall_rotation_encoding::{
     TallRotationDirection, TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts,

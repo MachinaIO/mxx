@@ -1,5 +1,7 @@
 //! Cost estimation over validated scoped execution plans.
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod harness;
 
 use mxx_ir_core::{
@@ -25,6 +27,10 @@ pub struct MeasurementNode<'a> {
     pub kind: &'a NodeKind,
     pub arguments: &'a [WireRef],
     pub output_types: &'a [WireType],
+    /// Concrete types resolved by graph validation for every input wire.
+    pub concrete_argument_types: Vec<ConcreteWireType>,
+    /// Concrete types resolved by graph validation for every output port.
+    pub concrete_output_types: Vec<ConcreteWireType>,
 }
 
 pub trait MeasurementBackend {
@@ -209,12 +215,31 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         for (position, handle) in plan.execution_order.iter().enumerate() {
             let id = NodeId(position as u64);
             let arguments = scope.arguments(handle).expect("plan node belongs to scope");
+            let concrete_argument_types = arguments
+                .iter()
+                .map(|wire| {
+                    plan.wire_types
+                        .get(wire)
+                        .cloned()
+                        .expect("validated argument has a concrete type")
+                })
+                .collect();
+            let concrete_output_types = (0..handle.output_types().len())
+                .map(|port| {
+                    plan.wire_types
+                        .get(&WireRef { node: id, port: mxx_ir_core::Port(port as u32) })
+                        .cloned()
+                        .expect("validated output has a concrete type")
+                })
+                .collect();
             let node = MeasurementNode {
                 scope: scope_id,
                 id,
                 kind: handle.kind(),
                 arguments: &arguments,
                 output_types: handle.output_types(),
+                concrete_argument_types,
+                concrete_output_types,
             };
             let predecessor = arguments
                 .iter()

@@ -428,11 +428,13 @@ version = "0.1.0"
 dependencies = [
  "mxx-dsl",
  "mxx-ir-core",
+ "mxx-primitives",
  "mxx-runtime",
  "num-bigint",
  "num-traits",
  "serde",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -446,6 +448,7 @@ dependencies = [
  "mxx-primitives",
  "mxx-runtime",
  "num-bigint",
+ "num-traits",
  "rayon",
  "serial_test",
  "sha2",
@@ -505,6 +508,8 @@ dependencies = [
  "digest",
  "itertools",
  "keccak-asm",
+ "mxx-bench-estimator",
+ "mxx-bgg",
  "mxx-dsl",
  "mxx-ir-core",
  "mxx-primitives",
@@ -580,6 +585,7 @@ dependencies = [
  "serial_test",
  "sha2",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

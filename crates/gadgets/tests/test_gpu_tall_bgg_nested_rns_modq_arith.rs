@@ -920,7 +920,7 @@ fn benchmark_estimation(
     selected: &PreparedCandidate,
     config: &TestConfig,
     gpu_parameters: &GpuDCRTPolyParams,
-    device_id: i32,
+    device_ids: &[i32],
 ) -> Result<(CostReport, CostReport), String> {
     info!("stage 2/4: benchmark estimation");
     let bindings = ParamEnv::default();
@@ -945,8 +945,8 @@ fn benchmark_estimation(
     };
     let make_backend = || {
         GpuNodeMeasurementBackend::new(
-            gpu_backend_on([gpu_parameters.clone()], [device_id]),
-            device_id,
+            gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied()),
+            device_ids[0],
             harness.clone(),
             selected.parameters.to_crt().2,
         )
@@ -1167,7 +1167,7 @@ fn end_to_end_processing(
     selected: &PreparedCandidate,
     config: &TestConfig,
     gpu_parameters: &GpuDCRTPolyParams,
-    device_id: i32,
+    device_ids: &[i32],
 ) -> Result<EndToEndOutputs, String> {
     info!("stage 3/4: end-to-end processing");
     info!(
@@ -1197,7 +1197,8 @@ fn end_to_end_processing(
     // dedicated context so the consumer passes start without the producer's
     // allocator pool and transient preimage buffers still resident on the GPU.
     let production = {
-        let mut producer_backend = gpu_backend_on([gpu_parameters.clone()], [device_id]);
+        let mut producer_backend =
+            gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
         let started = Instant::now();
         let producer_result = execute_in_session_with_config(
             &producer,
@@ -1228,7 +1229,7 @@ fn end_to_end_processing(
     let (mut store, manifest) = reload_preprocessing(&checkpoint_path)?;
     info!(elapsed = ?started.elapsed(), path = %checkpoint_path.display(), "timed checkpoint reload");
     let manifests = BTreeMap::from([(production, manifest)]);
-    let mut backend = gpu_backend_on([gpu_parameters.clone()], [device_id]);
+    let mut backend = gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
 
     let started = Instant::now();
     let public_graph_source = build_public_key_graph(
@@ -1422,16 +1423,18 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
         threshold = %selected.threshold,
         "selected Tall nested-RNS parameters"
     );
-    let device_id = *detected_gpu_device_ids().first().expect("at least one CUDA GPU");
+    let device_ids = detected_gpu_device_ids();
+    assert!(!device_ids.is_empty(), "at least one CUDA GPU");
+    info!(?device_ids, gpu_count = device_ids.len(), "using all detected CUDA GPUs");
     let (moduli, _, _) = selected.parameters.to_crt();
     let gpu_parameters = GpuDCRTPolyParams::new(
         selected.parameters.ring_dimension(),
         moduli,
         selected.parameters.base_bits(),
     );
-    let _reports = benchmark_estimation(&selected, &config, &gpu_parameters, device_id)
+    let _reports = benchmark_estimation(&selected, &config, &gpu_parameters, &device_ids)
         .expect("benchmark estimation");
-    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, device_id)
+    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)
         .expect("end-to-end processing");
     runtime_verification(&selected, &gpu_parameters, outputs).expect("runtime verification");
 }

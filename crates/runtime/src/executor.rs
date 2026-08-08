@@ -540,6 +540,12 @@ where
         let mut values = (0..envs.len())
             .map(|_| BTreeMap::<WireRef, RuntimeValue<B>>::new())
             .collect::<Vec<_>>();
+        // Releasing a GPU matrix schedules asynchronous frees on its matrix-local
+        // streams.  Keep retired values until the next configured fence so those
+        // streams have completed before their resources are returned.  This
+        // bounds CUDA stream/event pressure in long, fine-grained graphs without
+        // synchronizing unrelated device work or serializing individual drops.
+        let mut retired_values = Vec::new();
         for (position, handle) in validated_scope.execution_order.iter().enumerate() {
             let node = ExecutableNode {
                 id: NodeId(position as u64),
@@ -598,7 +604,11 @@ where
                     if schedule.last_use.get(argument) == Some(&position) &&
                         !schedule.retained.contains(argument)
                     {
-                        values[index].remove(argument);
+                        if let Some(value) = values[index].remove(argument) {
+                            if self.config.live_matrix_fence_interval.is_some() {
+                                retired_values.push(value);
+                            }
+                        }
                     }
                 }
             }
@@ -607,7 +617,8 @@ where
                 self.executed_node_count.saturating_sub(self.last_live_matrix_fence_node_count) >=
                     interval.get()
             }) {
-                self.fence_live_matrices(&values)?;
+                self.fence_live_matrices(&values, &retired_values)?;
+                retired_values.clear();
                 self.last_live_matrix_fence_node_count = self.executed_node_count;
                 info!(
                     scope = ?scope_id,
@@ -618,6 +629,11 @@ where
                     "execution progress checkpoint"
                 );
             }
+        }
+        if !retired_values.is_empty() {
+            self.fence_runtime_values(&retired_values)?;
+            retired_values.clear();
+            self.backend.trim_unused_memory().map_err(Self::backend_error)?;
         }
         let mut instances = Vec::with_capacity(values.len());
         for (index, mut instance_values) in values.into_iter().enumerate() {
@@ -2590,16 +2606,29 @@ where
     fn fence_live_matrices(
         &mut self,
         values: &[BTreeMap<WireRef, RuntimeValue<B>>],
+        retired_values: &[RuntimeValue<B>],
     ) -> Result<(), ExecutionError> {
         for instance in values {
-            for value in instance.values() {
-                self.fence_runtime_value(value)?;
-            }
+            self.fence_runtime_values(instance.values())?;
         }
+        self.fence_runtime_values(retired_values)?;
         // Matrix-local fences above guarantee that only allocator blocks no
         // longer referenced by this scope are returned. GPU backends trim
         // their async pools; CPU backends keep this as a no-op.
         self.backend.trim_unused_memory().map_err(Self::backend_error)?;
+        Ok(())
+    }
+
+    fn fence_runtime_values<'a>(
+        &self,
+        values: impl IntoIterator<Item = &'a RuntimeValue<B>>,
+    ) -> Result<(), ExecutionError>
+    where
+        B: 'a,
+    {
+        for value in values {
+            self.fence_runtime_value(value)?;
+        }
         Ok(())
     }
 

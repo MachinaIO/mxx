@@ -46,46 +46,49 @@ namespace
             cudaSetDevice(device);
 
             cudaStream_t free_stream = nullptr;
-            cudaError_t err = cudaStreamCreateWithFlags(&free_stream, cudaStreamNonBlocking);
+            if (partition_idx < mat->exec_limb_states.size())
+            {
+                auto &states = mat->exec_limb_states[partition_idx];
+                for (auto &state : states)
+                {
+                    if (state.stream && state.device == device)
+                    {
+                        free_stream = state.stream;
+                        break;
+                    }
+                }
+            }
 
-            if (err == cudaSuccess && free_stream)
+            if (free_stream)
             {
                 bool dependency_ok = true;
                 bool async_free_queued = false;
                 cudaEvent_t free_done = nullptr;
                 bool free_done_registered = false;
-                err = cudaEventCreateWithFlags(&free_done, cudaEventDisableTiming);
+                cudaError_t err = cudaEventCreateWithFlags(&free_done, cudaEventDisableTiming);
                 if (err != cudaSuccess)
                 {
                     dependency_ok = false;
                 }
-                if (partition_idx < mat->exec_limb_states.size())
+                auto &states = mat->exec_limb_states[partition_idx];
+                for (auto &state : states)
                 {
-                    auto &states = mat->exec_limb_states[partition_idx];
-                    for (auto &state : states)
+                    if (!state.stream)
                     {
-                        if (!state.stream)
-                        {
-                            continue;
-                        }
-                        if (state.device != device)
+                        continue;
+                    }
+                    if (state.device != device || !state.write_done)
+                    {
+                        dependency_ok = false;
+                        break;
+                    }
+                    if (state.write_done_valid)
+                    {
+                        err = cudaStreamWaitEvent(free_stream, state.write_done, 0);
+                        if (err != cudaSuccess)
                         {
                             dependency_ok = false;
                             break;
-                        }
-                        if (!state.write_done)
-                        {
-                            dependency_ok = false;
-                            break;
-                        }
-                        if (state.write_done_valid)
-                        {
-                            err = cudaStreamWaitEvent(free_stream, state.write_done, 0);
-                            if (err != cudaSuccess)
-                            {
-                                dependency_ok = false;
-                                break;
-                            }
                         }
                     }
                 }
@@ -125,13 +128,9 @@ namespace
                 {
                     // The event could not be registered with the context. Keep
                     // the fallback local so its asynchronous free cannot leak
-                    // an untracked CUDA stream resource.
+                    // an untracked CUDA event resource.
                     cudaStreamSynchronize(free_stream);
                     cudaEventDestroy(free_done);
-                }
-                if (free_stream)
-                {
-                    cudaStreamDestroy(free_stream);
                 }
             }
             else

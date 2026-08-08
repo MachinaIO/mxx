@@ -871,7 +871,15 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
                 u32::try_from(config.gadget_base_bits)
                     .map_err(|_| "gadget base bits exceed u32".to_owned())?,
             );
-            let achieved_security_bits = lattice_security_bits(&parameters, config.error_sigma)?;
+            // A zero target is the explicitly configured execution-smoke mode for n = 8.
+            // Its security predicate is tautological, so do not require Sage/lattice-estimator
+            // just to establish 0 >= 0. Any positive target retains the existing concrete
+            // estimator check.
+            let achieved_security_bits = if config.security_bits == 0 {
+                0
+            } else {
+                lattice_security_bits(&parameters, config.error_sigma)?
+            };
             info!(
                 crt_depth,
                 ring_dimension,

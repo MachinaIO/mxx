@@ -618,7 +618,12 @@ where
                     interval.get()
             }) {
                 self.fence_live_matrices(&values, &retired_values)?;
+                // Dropping retired GPU matrices enqueues their asynchronous frees.
+                // Reap their completion events only after the drops have been
+                // issued, so this same fence releases the streams and allocator
+                // blocks it was intended to bound.
                 retired_values.clear();
+                self.backend.trim_unused_memory().map_err(Self::backend_error)?;
                 self.last_live_matrix_fence_node_count = self.executed_node_count;
                 info!(
                     scope = ?scope_id,
@@ -2612,10 +2617,6 @@ where
             self.fence_runtime_values(instance.values())?;
         }
         self.fence_runtime_values(retired_values)?;
-        // Matrix-local fences above guarantee that only allocator blocks no
-        // longer referenced by this scope are returned. GPU backends trim
-        // their async pools; CPU backends keep this as a no-op.
-        self.backend.trim_unused_memory().map_err(Self::backend_error)?;
         Ok(())
     }
 

@@ -52,6 +52,13 @@ namespace
             {
                 bool dependency_ok = true;
                 bool async_free_queued = false;
+                cudaEvent_t free_done = nullptr;
+                bool free_done_registered = false;
+                err = cudaEventCreateWithFlags(&free_done, cudaEventDisableTiming);
+                if (err != cudaSuccess)
+                {
+                    dependency_ok = false;
+                }
                 if (partition_idx < mat->exec_limb_states.size())
                 {
                     auto &states = mat->exec_limb_states[partition_idx];
@@ -93,6 +100,13 @@ namespace
                         cudaFreeAsync(aux_ptr, free_stream);
                     }
                     async_free_queued = true;
+                    err = cudaEventRecord(free_done, free_stream);
+                    if (err == cudaSuccess && mat->ctx)
+                    {
+                        std::lock_guard<std::mutex> lock(mat->ctx->released_buffer_events_mutex);
+                        mat->ctx->released_buffer_events.push_back({free_done, device});
+                        free_done_registered = true;
+                    }
                 }
                 if (!dependency_ok && !async_free_queued)
                 {
@@ -106,6 +120,14 @@ namespace
                         cudaFree(aux_ptr);
                         aux_ptr = nullptr;
                     }
+                }
+                if (free_done && !free_done_registered)
+                {
+                    // The event could not be registered with the context. Keep
+                    // the fallback local so its asynchronous free cannot leak
+                    // an untracked CUDA stream resource.
+                    cudaStreamSynchronize(free_stream);
+                    cudaEventDestroy(free_done);
                 }
                 if (free_stream)
                 {

@@ -40,6 +40,33 @@ namespace
         delete events;
     }
 
+    int reap_released_buffer_events(const GpuContext *ctx)
+    {
+        std::vector<GpuReleasedBufferEvent> events;
+        {
+            std::lock_guard<std::mutex> lock(ctx->released_buffer_events_mutex);
+            events.swap(ctx->released_buffer_events);
+        }
+        for (const auto &entry : events)
+        {
+            cudaError_t err = cudaSetDevice(entry.device);
+            if (err == cudaSuccess)
+            {
+                err = cudaEventSynchronize(entry.event);
+            }
+            cudaError_t destroy_err = cudaEventDestroy(entry.event);
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
+            }
+            if (destroy_err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(destroy_err));
+            }
+        }
+        return 0;
+    }
+
     bool mod_inverse_u64(uint64_t a, uint64_t modulus, uint64_t &out_inv)
     {
         if (modulus == 0)
@@ -709,6 +736,9 @@ extern "C"
         {
             return;
         }
+        // Context destruction is already terminal; drain only the free streams
+        // owned by this context before releasing its CUDA resources.
+        reap_released_buffer_events(ctx);
         free_ntt_device_constants(ctx->ntt_device_constants);
         delete ctx;
     }
@@ -718,6 +748,11 @@ extern "C"
         if (!ctx)
         {
             return set_error("invalid gpu_context_trim_memory_pool arguments");
+        }
+        int status = reap_released_buffer_events(ctx);
+        if (status != 0)
+        {
+            return status;
         }
         for (int device : ctx->gpu_ids)
         {

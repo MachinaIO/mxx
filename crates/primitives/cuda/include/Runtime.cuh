@@ -17,6 +17,14 @@ extern "C" {
 typedef struct GpuContext GpuContext;
 typedef struct GpuEventSet GpuEventSet;
 
+#ifdef __cplusplus
+struct GpuReleasedBufferEvent
+{
+    cudaEvent_t event;
+    int device;
+};
+#endif
+
 int gpu_context_create(
     uint32_t logN,
     uint32_t L,
@@ -94,6 +102,11 @@ struct GpuContext
     std::vector<uint8_t> limb_coeff_bytes;
     std::vector<size_t> decomp_counts_by_partition;
     std::mutex transform_mutex;
+    // Matrix destructors enqueue cudaFreeAsync work after the matrix's last
+    // writer. The owning context reaps these events at explicit executor
+    // fences, rather than letting short-lived free streams accumulate.
+    mutable std::mutex released_buffer_events_mutex;
+    mutable std::vector<GpuReleasedBufferEvent> released_buffer_events;
 };
 
 struct GpuEventSet

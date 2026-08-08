@@ -263,7 +263,11 @@ def genericNodeFact
         | none => throw (.invalidBound nodeIndex 0)
       cappedMatrixFact nodeIndex matrixType environment
         (values.foldl (fun maximum value => max maximum (absolute value)) 0)
-  | .uniformSample _ minimum maximum, some matrixType =>
+  | .uniformResidueSample _, some matrixType =>
+      let cap ← match matrixCap matrixType environment with
+        | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
+      cappedMatrixFact nodeIndex matrixType environment cap
+  | .uniformIntervalSample _ minimum maximum, some matrixType =>
       let lower ← match minimum.evaluate environment with
         | some value => pure value | none => throw (.invalidBound nodeIndex 0)
       let upper ← match maximum.evaluate environment with

@@ -3,7 +3,7 @@ import Mxx.Certificate.Derivation
 
 namespace MxxWe.Generated.DiamondWeFamily
 
-def DiamondWeFamily_derivationHash : String := "9314f009be577d1ca0a5993083f6911b00e80420e82536ae47e4fad0a5a8b1c5"
+def DiamondWeFamily_derivationHash : String := "725614abcff36406ac74963f32f148f1a45059050a9da533b4d469de9a141f0d"
 
 def DiamondWeFamily_stage_encrypt : Mxx.Ir.Prog :=
   { root :=
@@ -57,7 +57,7 @@ def DiamondWeFamily_stage_encrypt : Mxx.Ir.Prog :=
         { kind := .concat .rows, arguments := [{ node := 44, port := 0 }, { node := 45, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .add (.constant (1 : Int)) (.constant (1 : Int)), columns := .constant (1 : Int) })] },
         { kind := .preimageSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .add (.constant (4 : Int)) (.multiply (.constant (2 : Int)) (.parameter "diamond_digit_count")), columns := .constant (1 : Int) } (.parameter "diamond_preimage_max_coefficient_bound"), arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }, { node := 46, port := 0 }], outputCount := 1, outputTypes := [.preimage ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .add (.constant (4 : Int)) (.multiply (.constant (2 : Int)) (.parameter "diamond_digit_count")), columns := .constant (1 : Int) })] },
         { kind := .matrixScale (.constant (1 : Int)), arguments := [{ node := 47, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .add (.constant (4 : Int)) (.multiply (.constant (2 : Int)) (.parameter "diamond_digit_count")), columns := .constant (1 : Int) })] },
-        { kind := .uniformSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) } (.constant (-1 : Int)) (.constant (1 : Int)), arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
+        { kind := .uniformIntervalSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) } (.constant (-1 : Int)) (.constant (1 : Int)), arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
         { kind := .input "diamond-message", arguments := [], outputCount := 1, outputTypes := [.boolean] },
         { kind := .boolToInt, arguments := [{ node := 50, port := 0 }], outputCount := 1, outputTypes := [.integer] },
         { kind := .zeroMatrix { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) }, arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
@@ -231,7 +231,7 @@ def DiamondWeFamily_stage_encrypt : Mxx.Ir.Prog :=
         inputNames := [] }),
     ("parallel:__root:73",
       { nodes := [
-        { kind := .uniformSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) } (.constant (-1 : Int)) (.constant (1 : Int)), arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] }
+        { kind := .uniformIntervalSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) } (.constant (-1 : Int)) (.constant (1 : Int)), arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] }
       ]
         outputs := [("output-0", { node := 0, port := 0 })]
         inputNames := [] }),
@@ -2231,7 +2231,7 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 46, rule := .concat, arguments := [{ node := 44, port := 0 }, { node := 45, port := 0 }] },
         { sourceNode := 47, rule := .preimageSample, arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }, { node := 46, port := 0 }] },
         { sourceNode := 48, rule := .matrixScale, arguments := [{ node := 47, port := 0 }] },
-        { sourceNode := 49, rule := .uniformSample, arguments := [] },
+        { sourceNode := 49, rule := .uniformIntervalSample, arguments := [] },
         { sourceNode := 50, rule := .input, arguments := [] },
         { sourceNode := 51, rule := .boolToInt, arguments := [{ node := 50, port := 0 }] },
         { sourceNode := 52, rule := .zeroMatrix, arguments := [] },
@@ -2381,7 +2381,7 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
       ] }),
     ("parallel:__root:73",
       { steps := [
-        { sourceNode := 0, rule := .uniformSample, arguments := [] }
+        { sourceNode := 0, rule := .uniformIntervalSample, arguments := [] }
       ] }),
     ("parallel:__root:74",
       { steps := [

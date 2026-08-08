@@ -229,7 +229,8 @@ inductive NodeKind where
   | extractCoefficient (position : IntExpr)
   | constantCoefficient (position : IntExpr)
   | select
-  | uniformSample (matrixType : MatrixTypeExpr) (minimum maximum : IntExpr)
+  | uniformResidueSample (matrixType : MatrixTypeExpr)
+  | uniformIntervalSample (matrixType : MatrixTypeExpr) (minimum maximum : IntExpr)
   | gaussianSample (matrixType : MatrixTypeExpr) (maxCoefficientBound : IntExpr)
   | hashSample
       (matrixType : MatrixTypeExpr)
@@ -809,7 +810,13 @@ def evaluateNode
       | some (.integer index :: branches) =>
           [[branches[index.toNat]?.getD (.invalid "Select index out of range")]]
       | _ => [[.invalid "Select argument mismatch"]]
-  | .uniformSample matrixType minimum maximum =>
+  | .uniformResidueSample matrixType =>
+      match matrixType.evaluate params with
+      | some matrixParams =>
+          (uniformMatrixSupport matrixParams 0 (matrixParams.modulus - 1)).map
+            (fun sample => [.matrix sample])
+      | none => [[.invalid "uniform-residue-sample parameter evaluation failed"]]
+  | .uniformIntervalSample matrixType minimum maximum =>
       match matrixType.evaluate params, minimum.evaluate params, maximum.evaluate params with
       | some matrixParams, some minimum, some maximum =>
           (uniformMatrixSupport matrixParams minimum maximum).map (fun sample => [.matrix sample])

@@ -30,7 +30,8 @@ inductive DerivationRule where
   | extractCoefficient
   | constantCoefficient
   | select
-  | uniformSample
+  | uniformResidueSample
+  | uniformIntervalSample
   | gaussianSample
   | hashSample
   | gadgetDecompose
@@ -117,7 +118,8 @@ private def matchesNodeKind : DerivationRule → Mxx.Ir.NodeKind → Bool
   | .extractCoefficient, .extractCoefficient _ => true
   | .constantCoefficient, .constantCoefficient _ => true
   | .select, .select => true
-  | .uniformSample, .uniformSample _ _ _ => true
+  | .uniformResidueSample, .uniformResidueSample _ => true
+  | .uniformIntervalSample, .uniformIntervalSample _ _ _ => true
   | .gaussianSample, .gaussianSample _ _ => true
   | .hashSample, .hashSample _ _ _ _ _ _ _ _ => true
   | .gadgetDecompose, .gadgetDecompose _ _ _ => true

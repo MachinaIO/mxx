@@ -645,12 +645,28 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(ConcreteMatrixType { rows, columns, ..input })]
         }
-        NodeKind::UniformSample { matrix_type, range } => {
+        NodeKind::UniformResidueSample { matrix_type } => {
             require_arity(scope, node, 0)?;
-            if range.minimum.evaluate(env)? > range.maximum.evaluate(env)? {
+            vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
+        }
+        NodeKind::UniformIntervalSample { matrix_type, range } => {
+            require_arity(scope, node, 0)?;
+            let minimum = range.minimum.evaluate(env)?;
+            let maximum = range.maximum.evaluate(env)?;
+            if minimum > maximum {
                 return node_error(scope, node.id, "uniform sample range is empty");
             }
-            vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
+            let matrix_type = concrete_matrix(matrix_type, env, scope, node.id)?;
+            let is_ternary = minimum == BigInt::from(-1) && maximum == BigInt::from(1);
+            let is_bit = minimum == BigInt::from(0) && maximum == BigInt::from(1);
+            if !is_ternary && !is_bit {
+                return node_error(
+                    scope,
+                    node.id,
+                    "uniform interval must be [-1, 1] or [0, 1]; use uniform_residue for R_q",
+                );
+            }
+            vec![ConcreteWireType::Matrix(matrix_type)]
         }
         NodeKind::GaussianSample { matrix_type, sigma, max_coefficient_bound } => {
             require_arity(scope, node, 0)?;
@@ -1640,7 +1656,7 @@ mod tests {
 
         let uniform_type = matrix_type(17, 1, 1);
         let uniform = value(
-            NodeKind::UniformSample {
+            NodeKind::UniformIntervalSample {
                 matrix_type: uniform_type.clone(),
                 range: SampleRange { minimum: IntExpr::constant(2), maximum: IntExpr::constant(1) },
             },
@@ -1653,6 +1669,34 @@ mod tests {
             )
             .contains("uniform range")
         );
+
+        let unsupported_interval_type = matrix_type(17, 1, 1);
+        let unsupported_interval = value(
+            NodeKind::UniformIntervalSample {
+                matrix_type: unsupported_interval_type.clone(),
+                range: SampleRange { minimum: IntExpr::constant(2), maximum: IntExpr::constant(3) },
+            },
+            Vec::new(),
+            vec![WireType::Matrix(unsupported_interval_type)],
+        );
+        assert!(
+            node_message(
+                validate(
+                    &graph("unsupported-uniform-interval", unsupported_interval),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            )
+            .contains("uniform interval")
+        );
+
+        let residue_type = matrix_type(17, 1, 1);
+        let residue = value(
+            NodeKind::UniformResidueSample { matrix_type: residue_type.clone() },
+            Vec::new(),
+            vec![WireType::Matrix(residue_type)],
+        );
+        assert!(validate(&graph("uniform-residue", residue), &ParamEnv::default()).is_ok());
 
         let source = input("source", matrix_type(17, 2, 2));
         let reshape = value(

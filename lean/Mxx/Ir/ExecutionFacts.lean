@@ -311,7 +311,24 @@ theorem mem_evaluateNode_familyGetDynamic_of_arguments
     values = [family[index.toNat]?.getD (.invalid "FamilyGetDynamic index out of range")] := by
   simpa [evaluateNode, arguments, argumentsEvaluate] using member
 
-theorem mem_evaluateNode_uniformSample
+theorem mem_evaluateNode_uniformResidueSample
+    (runChild : ChildRunner) (samplers : MxxSamplerFamily)
+    (params : ParamEnvironment) (inputs : Environment) (wires : WireEnvironment)
+    (matrixType : MatrixTypeExpr) (matrixParams : Mxx.SamplerParams) (outputCount : Nat)
+    (matrixTypeEvaluate : matrixType.evaluate params = some matrixParams)
+    {values : List Value}
+    (member : values ∈ evaluateNode runChild samplers params inputs wires {
+      kind := .uniformResidueSample matrixType
+      arguments := []
+      outputCount
+    }) :
+    ∃ sample ∈ uniformMatrixSupport matrixParams 0 (matrixParams.modulus - 1),
+      values = [.matrix sample] := by
+  simp only [evaluateNode, matrixTypeEvaluate, List.mem_map] at member
+  obtain ⟨sample, sampleMember, rfl⟩ := member
+  exact ⟨sample, sampleMember, rfl⟩
+
+theorem mem_evaluateNode_uniformIntervalSample
     (runChild : ChildRunner) (samplers : MxxSamplerFamily)
     (params : ParamEnvironment) (inputs : Environment) (wires : WireEnvironment)
     (matrixType : MatrixTypeExpr) (minimum maximum : IntExpr)
@@ -322,7 +339,7 @@ theorem mem_evaluateNode_uniformSample
     (maximumEvaluate : maximum.evaluate params = some evaluatedMaximum)
     {values : List Value}
     (member : values ∈ evaluateNode runChild samplers params inputs wires {
-      kind := .uniformSample matrixType minimum maximum
+      kind := .uniformIntervalSample matrixType minimum maximum
       arguments := []
       outputCount
     }) :

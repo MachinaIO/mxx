@@ -58,7 +58,15 @@ pub enum NodeKind {
         rows: IntExpr,
         columns: IntExpr,
     },
-    UniformSample {
+    /// Samples every coefficient uniformly from the full residue ring `R_q`.
+    ///
+    /// The modulus belongs to `matrix_type`, so this operation remains meaningful
+    /// before a concrete parameter environment is selected.
+    UniformResidueSample {
+        matrix_type: crate::types::MatrixType,
+    },
+    /// Samples every coefficient from an explicit integer interval.
+    UniformIntervalSample {
         matrix_type: crate::types::MatrixType,
         range: SampleRange,
     },

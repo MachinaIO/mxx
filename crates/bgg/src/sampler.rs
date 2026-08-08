@@ -128,7 +128,7 @@ impl BggPolyEncodingSampler {
                 let ring = ring.clone();
                 let secret = secret.clone();
                 move |_| {
-                    let slot_secret = ring.uniform_in((secret_size, secret_size), -1, 1);
+                    let slot_secret = ring.uniform_interval((secret_size, secret_size), -1, 1);
                     (secret.clone() * slot_secret.clone(), slot_secret)
                 }
             })?;

@@ -46,7 +46,7 @@ theorem matrix_norm_le_centered_radius
   change (Mxx.centeredCoefficient q original).natAbs ≤ q / 2
   exact centeredCoefficient_le_radius q original
 
-private theorem withSamplerParams_zeroOne_norm_le
+theorem withSamplerParams_zeroOne_norm_le
     (params : Mxx.SamplerParams)
     (coefficients : List Int)
     (coefficientsZeroOne : ∀ coefficient ∈ coefficients, coefficient = 0 ∨ coefficient = 1)

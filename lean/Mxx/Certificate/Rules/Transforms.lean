@@ -7,6 +7,7 @@ namespace Mxx.Certificate
 /-- Closed transform subset present in the current Diamond workflow. -/
 inductive TransformRule where
   | uniformMinusOneOne
+  | uniformZeroOne
   | slice
   | reshapeBounded
   | concatRows
@@ -26,7 +27,8 @@ inductive TransformRuleError where
   | emptyConcat
 
 def inferTransformRule : Mxx.Ir.NodeKind → Except TransformRuleError TransformRule
-  | .uniformSample _ (.constant (-1)) (.constant 1) => .ok .uniformMinusOneOne
+  | .uniformIntervalSample _ (.constant (-1)) (.constant 1) => .ok .uniformMinusOneOne
+  | .uniformIntervalSample _ (.constant 0) (.constant 1) => .ok .uniformZeroOne
   | .slice _ _ => .ok .slice
   | .reshape _ _ => .ok .reshapeBounded
   | .concat .rows => .ok .concatRows
@@ -86,7 +88,7 @@ def deriveSliceFact
     coefficientRepresentation := input.coefficientRepresentation
   }
 
-def deriveUniformMinusOneOneFact (output : ValueInstanceRef) : MatrixFact := {
+def deriveUniformBoundOneFact (output : ValueInstanceRef) : MatrixFact := {
   subject := output
   primary := .affine { terms := [], noiseBound := .constant 1 }
   relations := []
@@ -151,17 +153,82 @@ theorem uniformMinusOneOneNode_local_sound
     (modulusGe : 2 ≤ matrixParams.modulus)
     {values : List Mxx.Ir.Value}
     (member : values ∈ Mxx.Ir.evaluateNode runChild samplers params inputs wires {
-      kind := .uniformSample matrixType (.constant (-1)) (.constant 1)
+      kind := .uniformIntervalSample matrixType (.constant (-1)) (.constant 1)
       arguments := []
       outputCount
     }) :
     ∃ matrix,
       values = [.matrix matrix] ∧ Mxx.maxCenteredCoefficientNorm matrix ≤ 1 := by
-  obtain ⟨matrix, matrixMember, rfl⟩ := Mxx.Ir.mem_evaluateNode_uniformSample
+  obtain ⟨matrix, matrixMember, rfl⟩ := Mxx.Ir.mem_evaluateNode_uniformIntervalSample
     runChild samplers params inputs wires matrixType (.constant (-1)) (.constant 1)
     matrixParams (-1) 1 outputCount matrixTypeEvaluate rfl rfl member
   exact ⟨matrix, rfl,
     Mxx.Toolkit.uniformMatrixSupport_minusOneOne_norm_le matrixParams modulusGe matrix matrixMember⟩
+
+/-- A full-residue sample is intentionally not turned into a bounded-noise fact.  This theorem
+records only its universal centered cap; higher-level analysis must retain it as a carrier. -/
+theorem uniformResidueNode_local_sound
+    (runChild : Mxx.Ir.ChildRunner)
+    (samplers : Mxx.MxxSamplerFamily)
+    (params : Mxx.Ir.ParamEnvironment)
+    (inputs : Mxx.Ir.Environment)
+    (wires : Mxx.Ir.WireEnvironment)
+    (matrixType : MatrixTypeExpr)
+    (matrixParams : Mxx.SamplerParams)
+    (outputCount : Nat)
+    (matrixTypeEvaluate : matrixType.evaluate params = some matrixParams)
+    (modulusPositive : 0 < matrixParams.modulus)
+    {values : List Mxx.Ir.Value}
+    (member : values ∈ Mxx.Ir.evaluateNode runChild samplers params inputs wires {
+      kind := .uniformResidueSample matrixType
+      arguments := []
+      outputCount
+    }) :
+    ∃ matrix,
+      values = [.matrix matrix] ∧
+        Mxx.maxCenteredCoefficientNorm matrix ≤ matrixParams.modulus.natAbs / 2 := by
+  obtain ⟨matrix, matrixMember, rfl⟩ := Mxx.Ir.mem_evaluateNode_uniformResidueSample
+    runChild samplers params inputs wires matrixType matrixParams outputCount matrixTypeEvaluate member
+  refine ⟨matrix, rfl, ?_⟩
+  have layout := Mxx.Toolkit.uniformMatrixSupport_layout matrixParams 0
+    (matrixParams.modulus - 1) matrix matrixMember
+  rw [← layout.modulus]
+  exact matrix_norm_le_centered_radius matrix (by simpa [layout.modulus] using modulusPositive)
+
+theorem uniformZeroOneNode_local_sound
+    (runChild : Mxx.Ir.ChildRunner)
+    (samplers : Mxx.MxxSamplerFamily)
+    (params : Mxx.Ir.ParamEnvironment)
+    (inputs : Mxx.Ir.Environment)
+    (wires : Mxx.Ir.WireEnvironment)
+    (matrixType : MatrixTypeExpr)
+    (matrixParams : Mxx.SamplerParams)
+    (outputCount : Nat)
+    (matrixTypeEvaluate : matrixType.evaluate params = some matrixParams)
+    (modulusGe : 2 ≤ matrixParams.modulus)
+    {values : List Mxx.Ir.Value}
+    (member : values ∈ Mxx.Ir.evaluateNode runChild samplers params inputs wires {
+      kind := .uniformIntervalSample matrixType (.constant 0) (.constant 1)
+      arguments := []
+      outputCount
+    }) :
+    ∃ matrix,
+      values = [.matrix matrix] ∧ Mxx.maxCenteredCoefficientNorm matrix ≤ 1 := by
+  obtain ⟨matrix, matrixMember, rfl⟩ := Mxx.Ir.mem_evaluateNode_uniformIntervalSample
+    runChild samplers params inputs wires matrixType (.constant 0) (.constant 1)
+    matrixParams 0 1 outputCount matrixTypeEvaluate rfl rfl member
+  rw [Mxx.Ir.uniformMatrixSupport] at matrixMember
+  obtain ⟨coefficients, coefficientsMember, rfl⟩ := List.mem_map.mp matrixMember
+  refine ⟨_, rfl, ?_⟩
+  apply withSamplerParams_zeroOne_norm_le matrixParams coefficients
+  · intro coefficient coefficientMember
+    have sourceMember : coefficient ∈ coefficients := coefficientMember
+    have coefficientRange := Mxx.Toolkit.coefficientVectors_member
+      coefficientsMember coefficient sourceMember
+    have range : Mxx.Ir.integerRange 0 1 = [0, 1] := by decide
+    rw [range] at coefficientRange
+    simpa using coefficientRange
+  · omega
 
 theorem matrixReshape_norm_eq
     (matrix : Mxx.Matrix) (rows columns : Nat) :
@@ -384,18 +451,12 @@ theorem concatDiagonalTwoNode_local_sound
       (Mxx.Toolkit.matrixConcatDiagonal_two_norm_le q left right leftModulus rightModulus)
       (max_le_max leftNorm rightNorm)
 
-example : inferTransformRule (.uniformSample {
+example : inferTransformRule (.uniformIntervalSample {
     modulus := .constant 17
     ringDimension := .constant 4
     rows := .constant 1
     columns := .constant 1
-  } (.constant 0) (.constant 1)) =
-    .error (.unsupportedNodeKind (.uniformSample {
-      modulus := .constant 17
-      ringDimension := .constant 4
-      rows := .constant 1
-      columns := .constant 1
-    } (.constant 0) (.constant 1))) := rfl
+  } (.constant 0) (.constant 1)) = .ok .uniformZeroOne := rfl
 
 private def fixtureValue : ValueInstanceRef := .protocolInput ⟨"matrix"⟩
 
@@ -483,7 +544,7 @@ example : deriveSliceFact (.protocolInput ⟨"sliced"⟩) none
 example : deriveBoundedConcatFact (.protocolInput ⟨"concatenated"⟩) [] =
     .error .emptyConcat := rfl
 
-example : deriveUniformMinusOneOneFact (.protocolInput ⟨"uniform"⟩) = {
+example : deriveUniformBoundOneFact (.protocolInput ⟨"uniform"⟩) = {
     subject := .protocolInput ⟨"uniform"⟩
     primary := .affine { terms := [], noiseBound := .constant 1 }
     relations := []

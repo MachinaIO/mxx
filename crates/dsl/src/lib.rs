@@ -452,16 +452,15 @@ impl Ring {
     }
 
     #[track_caller]
-    pub fn uniform(&self, shape: impl IntoShape) -> Mat {
-        self.uniform_in(
-            shape,
-            IntExpr::constant(0),
-            IntExpr::Sub(Box::new(self.modulus.clone()), Box::new(IntExpr::constant(1))),
-        )
+    /// Samples a matrix uniformly from the full coefficient residue ring `R_q`.
+    pub fn uniform_residue(&self, shape: impl IntoShape) -> Mat {
+        let ty = self.matrix_type(shape);
+        Mat::from_node(NodeKind::UniformResidueSample { matrix_type: ty.clone() }, Vec::new(), ty)
     }
 
     #[track_caller]
-    pub fn uniform_in(
+    /// Samples from one of the supported small integer intervals: `[-1, 1]` or `[0, 1]`.
+    pub fn uniform_interval(
         &self,
         shape: impl IntoShape,
         minimum: impl Into<IntExpr>,
@@ -469,7 +468,7 @@ impl Ring {
     ) -> Mat {
         let ty = self.matrix_type(shape);
         Mat::from_node(
-            NodeKind::UniformSample {
+            NodeKind::UniformIntervalSample {
                 matrix_type: ty.clone(),
                 range: SampleRange { minimum: minimum.into(), maximum: maximum.into() },
             },
@@ -3367,7 +3366,8 @@ fn require_sampler_free(graph: &Graph) -> Result<(), DslError> {
         scope.nodes().iter().any(|node| {
             matches!(
                 node.kind(),
-                NodeKind::UniformSample { .. } |
+                NodeKind::UniformResidueSample { .. } |
+                    NodeKind::UniformIntervalSample { .. } |
                     NodeKind::GaussianSample { .. } |
                     NodeKind::HashSample { .. } |
                     NodeKind::TrapdoorSample { .. } |

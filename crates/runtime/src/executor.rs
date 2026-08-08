@@ -1253,7 +1253,19 @@ where
                     self.backend.reshape(&input, rows, columns).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
-            NodeKind::UniformSample { range, .. } => {
+            NodeKind::UniformResidueSample { .. } => {
+                let wire = WireRef { node: node.id, port: Port(0) };
+                let ty = self.matrix_type(scope_id, path, wire)?;
+                let range: RuntimeSampleRange = RuntimeSampleRange {
+                    minimum: BigInt::from(0),
+                    maximum: &ty.modulus - BigInt::from(1),
+                };
+                let value = self.sample_matrix(path, wire, &ty, |backend| {
+                    backend.sample_uniform(&ty, &range)
+                })?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(value));
+            }
+            NodeKind::UniformIntervalSample { range, .. } => {
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
                 let range = RuntimeSampleRange {

@@ -447,7 +447,20 @@ impl DiamondGpuMeasurementBackend {
                         .map_err(Self::backend_error)
                 })
             }
-            NodeKind::UniformSample { range, .. } => {
+            NodeKind::UniformResidueSample { .. } => {
+                let output = Self::matrix_output(node)?.clone();
+                let range = SampleRange {
+                    minimum: BigInt::from(0),
+                    maximum: &output.modulus - BigInt::one(),
+                };
+                self.measure_placements(node, bindings, |this| {
+                    this.backend
+                        .sample_uniform(&output, &range)
+                        .map(ReadyOutput::Matrix)
+                        .map_err(Self::backend_error)
+                })
+            }
+            NodeKind::UniformIntervalSample { range, .. } => {
                 let output = Self::matrix_output(node)?.clone();
                 let range = SampleRange {
                     minimum: range.minimum.evaluate(bindings).map_err(|error| {

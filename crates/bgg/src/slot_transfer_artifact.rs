@@ -181,7 +181,7 @@ impl BggSlotTransferArtifactCompiler {
                 let mut tag = HashTag::from(b"slot_transfer_slot_a_".as_slice());
                 tag.push_decimal(index);
                 (
-                    ring.uniform_in((secret_size, secret_size), -1, 1),
+                    ring.uniform_interval((secret_size, secret_size), -1, 1),
                     ring.hash_matrix(hash_key.clone(), tag, (secret_size, public_columns)),
                 )
             }

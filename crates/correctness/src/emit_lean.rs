@@ -385,7 +385,8 @@ fn lean_derivation_rule(
         NodeKind::ExtractCoefficient { .. } => ".extractCoefficient",
         NodeKind::ConstantCoefficient { .. } => ".constantCoefficient",
         NodeKind::Select { .. } => ".select",
-        NodeKind::UniformSample { .. } => ".uniformSample",
+        NodeKind::UniformResidueSample { .. } => ".uniformResidueSample",
+        NodeKind::UniformIntervalSample { .. } => ".uniformIntervalSample",
         NodeKind::GaussianSample { .. } => ".gaussianSample",
         NodeKind::HashSample { .. } => ".hashSample",
         NodeKind::GadgetDecompose { digit_count: Some(_), .. } => ".gadgetDecompose",
@@ -641,8 +642,11 @@ fn lean_node_kind(
             format!(".constantCoefficient ({})", lean_ir_int_expr(position))
         }
         NodeKind::Select { .. } => ".select".to_owned(),
-        NodeKind::UniformSample { matrix_type, range } => format!(
-            ".uniformSample {} ({}) ({})",
+        NodeKind::UniformResidueSample { matrix_type } => {
+            format!(".uniformResidueSample {}", lean_matrix_type(matrix_type))
+        }
+        NodeKind::UniformIntervalSample { matrix_type, range } => format!(
+            ".uniformIntervalSample {} ({}) ({})",
             lean_matrix_type(matrix_type),
             lean_ir_int_expr(&range.minimum),
             lean_ir_int_expr(&range.maximum)
@@ -957,7 +961,8 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::Tensor => "Tensor",
         NodeKind::Concat { .. } => "Concat",
         NodeKind::Reshape { .. } => "Reshape",
-        NodeKind::UniformSample { .. } => "UniformSample",
+        NodeKind::UniformResidueSample { .. } => "UniformResidueSample",
+        NodeKind::UniformIntervalSample { .. } => "UniformIntervalSample",
         NodeKind::GaussianSample { .. } => "GaussianSample",
         NodeKind::HashSample { .. } => "HashSample",
         NodeKind::TrapdoorSample { .. } => "TrapdoorSample",

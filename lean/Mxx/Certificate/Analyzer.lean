@@ -406,7 +406,8 @@ private def nodeIntrinsicOutputTypesMatch (node : Mxx.Ir.Node) : Bool :=
   | .constantMatrix type _, [output]
   | .gadgetMatrix type _, [output]
   | .gaussianSample type _, [output]
-  | .uniformSample type _ _, [output]
+  | .uniformResidueSample type, [output]
+  | .uniformIntervalSample type _ _, [output]
   | .hashSample type _ _ _ _ _ _ _, [output]
   | .gadgetDecompose type _ _, [output]
   | .preimageSample type _, [output] => declaredMatrixTypeMatches type output
@@ -1194,11 +1195,12 @@ def inferNodeFacts
           .bitExtract _ | .thresholdDecodeBool _ _ _ =>
           inferScalarOrSelect stage nodeId node facts scope
       | .extractCoefficient _ => return facts
-      | .uniformSample _ (.constant (-1)) (.constant 1) =>
+      | .uniformIntervalSample _ (.constant (-1)) (.constant 1) |
+        .uniformIntervalSample _ (.constant 0) (.constant 1) =>
           let output := scopedOutputWire stage scope nodeId
           let outputType ← requireDeclaredMatrixType stage nodeId node
           let _ ← inferTransformRule node.kind |>.mapError .transform
-          let result := deriveUniformMinusOneOneFact (.ofCoreWire output)
+          let result := deriveUniformBoundOneFact (.ofCoreWire output)
           return facts ++ [{
             wire := output
             matrixType := some outputType
@@ -3264,7 +3266,8 @@ private def nodeKindParameterReferences : Mxx.Ir.NodeKind → List (String × Bo
   | .gadgetMatrix type base =>
       matrixTypeParameterReferences type ++ intParameterReferences base
   | .bitExtract bit | .matrixScale bit | .familyGetStatic bit => intParameterReferences bit
-  | .uniformSample type minimum maximum =>
+  | .uniformResidueSample type => matrixTypeParameterReferences type
+  | .uniformIntervalSample type minimum maximum =>
       matrixTypeParameterReferences type ++ intParameterReferences minimum ++
         intParameterReferences maximum
   | .gaussianSample type bound | .trapdoorSample type bound | .preimageSample type bound =>

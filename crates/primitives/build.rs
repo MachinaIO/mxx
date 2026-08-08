@@ -20,10 +20,13 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTT.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixData.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixArith.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixArithBatch.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTTBatch.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixDecompose.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSampling.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixTrapdoor.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerde.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerdeBatch.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixCrt.cu");
         println!("cargo::rerun-if-changed=cuda/include/Runtime.cuh");
         println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");

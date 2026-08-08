@@ -92,7 +92,7 @@ struct TestConfig {
     preimage_progress_interval: usize,
     max_parallel_instances: usize,
     preprocessing_parallel_instances: usize,
-    live_matrix_fence_interval: usize,
+    release_fence_interval: usize,
     checkpoint_root: PathBuf,
 }
 
@@ -139,12 +139,9 @@ impl TestConfig {
                 "MXX_TALL_NESTED_RNS_PREPROCESSING_PARALLEL_INSTANCES",
                 2,
             )?,
-            // This fences matrix-local completion events only after substantial graph work.
-            // It bounds queued CUDA allocations without making each short loop body synchronous.
-            live_matrix_fence_interval: env_usize(
-                "MXX_TALL_NESTED_RNS_LIVE_MATRIX_FENCE_INTERVAL",
-                1024,
-            )?,
+            // This fences context-owned release streams only after substantial graph work.
+            // It bounds queued frees without waiting unrelated live matrices.
+            release_fence_interval: env_usize("MXX_TALL_NESTED_RNS_RELEASE_FENCE_INTERVAL", 1024)?,
             checkpoint_root: env::var_os("MXX_TALL_NESTED_RNS_CHECKPOINT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("test_data/tall_nested_rns_gpu")),
@@ -165,7 +162,7 @@ impl TestConfig {
             config.preimage_progress_interval == 0 ||
             config.max_parallel_instances == 0 ||
             config.preprocessing_parallel_instances == 0 ||
-            config.live_matrix_fence_interval == 0
+            config.release_fence_interval == 0
         {
             return Err("invalid Tall nested-RNS GPU test configuration".to_owned());
         }
@@ -983,11 +980,9 @@ fn execution_config(
             report_interval: NonZeroUsize::new(config.preimage_progress_interval)
                 .expect("validated nonzero progress interval"),
         }),
-        // Matrix-local event fences prevent the CPU from submitting an
-        // unbounded number of short CUDA streams during this long graph. They
-        // deliberately do not synchronize unrelated device work.
-        live_matrix_fence_interval: Some(
-            NonZeroUsize::new(config.live_matrix_fence_interval)
+        // Release-stream epochs bound queued frees without synchronizing live values.
+        release_fence_interval: Some(
+            NonZeroUsize::new(config.release_fence_interval)
                 .expect("validated nonzero fence interval"),
         ),
     })

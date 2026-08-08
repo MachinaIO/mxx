@@ -1,9 +1,10 @@
+#[cfg(test)]
+use crate::sampler::bounds::matrix_within_coefficient_bound;
 use crate::{
     matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{Poly, PolyParams, dcrt::gpu::GpuDCRTPolyParams},
     sampler::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler,
-        bounds::matrix_within_coefficient_bound,
         gpu::{GpuDCRTPolyUniformSampler, random_gpu_rng_seed},
     },
 };
@@ -188,21 +189,8 @@ where
     pub params: &'a <<M as PolyMatrix>::P as Poly>::Params,
     pub trapdoor: &'a T,
     pub public_matrix: &'a M,
-    pub target: M,
+    pub target: &'a M,
     pub max_coefficient_bound: BigUint,
-}
-
-fn rejection_resample_preimage<M>(
-    max_coefficient_bound: &BigUint,
-    mut sample: impl FnMut() -> M,
-    mut within_bound: impl FnMut(&M, &BigUint) -> bool,
-) -> M {
-    loop {
-        let candidate = sample();
-        if within_bound(&candidate, max_coefficient_bound) {
-            return candidate;
-        }
-    }
 }
 
 impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
@@ -339,32 +327,48 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
             request_count = requests.len(),
             "gpu preimage: start multi-target sharded dispatch"
         );
-        let results = requests
-            .into_par_iter()
-            .map(|request| {
-                let out = rejection_resample_preimage(
-                    &request.max_coefficient_bound,
-                    || {
-                        self.preimage(
-                            request.params,
-                            request.trapdoor,
-                            request.public_matrix,
-                            &request.target,
-                        )
-                    },
-                    |candidate, max_coefficient_bound| {
-                        // One batched RNS download per whole candidate is required to reconstruct
-                        // centered coefficients modulo the full CRT modulus. Checking limbs
-                        // independently would be unsound. Independent requests remain parallel.
-                        matrix_within_coefficient_bound(
-                            &candidate.to_cpu_matrix(),
-                            max_coefficient_bound,
-                        )
-                    },
-                );
-                (request.entry_idx, out)
-            })
-            .collect::<Vec<_>>();
+        let common_bound = requests
+            .first()
+            .map(|request| request.max_coefficient_bound.clone())
+            .expect("preimage batch must not be empty");
+        assert!(
+            requests.iter().all(|request| request.max_coefficient_bound == common_bound),
+            "GPU preimage batch requires one common coefficient cutoff"
+        );
+        let mut pending = requests;
+        let mut results = Vec::with_capacity(pending.len());
+        while !pending.is_empty() {
+            let sampled = pending
+                .into_par_iter()
+                .map(|request| {
+                    let candidate = self.preimage(
+                        request.params,
+                        request.trapdoor,
+                        request.public_matrix,
+                        request.target,
+                    );
+                    (request, candidate)
+                })
+                .collect::<Vec<_>>();
+            let (requests, mut candidates): (Vec<_>, Vec<_>) = sampled.into_iter().unzip();
+            let accepted =
+                GpuDCRTPolyMatrix::batch_within_coefficient_bound(&mut candidates, &common_bound);
+            pending = Vec::new();
+            let mut accepted_candidates = Vec::new();
+            for ((request, candidate), accepted) in
+                requests.into_iter().zip(candidates).zip(accepted)
+            {
+                if accepted {
+                    accepted_candidates.push((request.entry_idx, candidate));
+                } else {
+                    pending.push(request);
+                }
+            }
+            let (entry_indices, mut matrices): (Vec<_>, Vec<_>) =
+                accepted_candidates.into_iter().unzip();
+            GpuDCRTPolyMatrix::ntt_batch_in_place(&mut matrices);
+            results.extend(entry_indices.into_iter().zip(matrices));
+        }
         tracing::debug!("gpu preimage: finished multi-target sharded dispatch");
         results
     }
@@ -684,24 +688,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_preimage_rejection_resamples_whole_candidate() {
-        let cutoff = BigUint::from(3u8);
-        let mut candidates = [7u8, 9, 2].into_iter();
-        let mut attempts = 0usize;
-        let accepted = rejection_resample_preimage(
-            &cutoff,
-            || {
-                attempts += 1;
-                candidates.next().expect("test supplies an accepted candidate")
-            },
-            |candidate, bound| BigUint::from(*candidate) <= *bound,
-        );
-
-        assert_eq!(accepted, 2);
-        assert_eq!(attempts, 3);
-    }
-
-    #[test]
     #[sequential]
     fn test_gpu_batched_preimages_respect_exact_request_cutoff() {
         gpu_device_sync();
@@ -730,7 +716,6 @@ mod tests {
         let cutoff = hard_cutoff_from_sigma_bound(&preimage_sigma);
         let requests = targets
             .iter()
-            .cloned()
             .enumerate()
             .map(|(entry_idx, target)| GpuPreimageRequest {
                 entry_idx,

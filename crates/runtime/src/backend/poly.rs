@@ -16,7 +16,6 @@ use mxx_primitives::{
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, ToPrimitive, Zero};
-use rayon::prelude::*;
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use thiserror::Error;
 
@@ -252,6 +251,22 @@ where
             .ok_or(PolyBackendError::MissingParameters(key))
     }
 
+    #[cfg(feature = "gpu")]
+    pub(super) fn parameters_at(
+        &self,
+        placement: usize,
+        matrix_type: &ConcreteMatrixType,
+    ) -> Result<&<M::P as Poly>::Params, PolyBackendError> {
+        let key = RingKey {
+            modulus: matrix_type.modulus.clone(),
+            ring_dimension: matrix_type.ring_dimension,
+        };
+        self.parameters
+            .get(placement)
+            .and_then(|parameters| parameters.get(&key))
+            .ok_or(PolyBackendError::MissingParameters(key))
+    }
+
     pub(super) fn validate_regular_gadget_layout(
         parameters: &<M::P as Poly>::Params,
         gadget_base: &BigInt,
@@ -341,6 +356,9 @@ where
         if value.params() == target {
             return Ok(value.clone());
         }
+        if let Some(copied) = value.copy_to_params_direct(target) {
+            return Ok(copied);
+        }
         let bytes = value.to_cpu_staging_bytes();
         Ok(M::from_cpu_staging_bytes(target, &bytes))
     }
@@ -349,15 +367,10 @@ where
         self.parameters_for_matrix(value).is_ok_and(|target| value.params() == target)
     }
 
-    fn wait_for_matrix(&self, value: &M) -> Result<(), Self::Error> {
-        value.wait_until_ready();
-        Ok(())
-    }
-
-    fn trim_unused_memory(&mut self) -> Result<(), Self::Error> {
+    fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
         for placement in &self.parameters {
             for parameters in placement.values() {
-                parameters.trim_unused_memory();
+                parameters.fence_released_memory();
             }
         }
         Ok(())
@@ -377,21 +390,25 @@ where
                 parameters.get(&key).ok_or_else(|| PolyBackendError::MissingParameters(key.clone()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let staging =
-            targets.iter().any(|target| source != *target).then(|| value.to_cpu_staging_bytes());
-        Ok(targets
-            .into_iter()
-            .map(|target| {
-                if source == target {
-                    None
-                } else {
-                    Some(M::from_cpu_staging_bytes(
-                        target,
-                        staging.as_deref().expect("cross-placement staging was prepared"),
-                    ))
-                }
-            })
-            .collect())
+        let mut outputs = (0..targets.len()).map(|_| None).collect::<Vec<_>>();
+        let mut staged_indices = Vec::new();
+        for (index, target) in targets.iter().enumerate() {
+            if source == *target {
+                continue;
+            }
+            if let Some(copied) = value.copy_to_params_direct(target) {
+                outputs[index] = Some(copied);
+            } else {
+                staged_indices.push(index);
+            }
+        }
+        let staged_targets = staged_indices.iter().map(|index| targets[*index]).collect::<Vec<_>>();
+        for (index, copied) in
+            staged_indices.into_iter().zip(value.copy_to_params_fanout(&staged_targets))
+        {
+            outputs[index] = Some(copied);
+        }
+        Ok(outputs)
     }
 
     fn trapdoor_to_active_placement(
@@ -521,64 +538,54 @@ where
     }
 
     fn add(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
-        Ok(left.clone() + right)
+        Ok(left.add_out_of_place(right))
     }
 
-    fn add_batch(&mut self, inputs: Vec<(M, M)>) -> Result<Vec<M>, Self::Error> {
-        Ok(inputs.into_par_iter().map(|(left, right)| left + &right).collect())
+    fn add_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
+        Ok(M::add_batch_out_of_place(inputs))
     }
 
     fn sub(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
-        Ok(left.clone() - right)
+        Ok(left.sub_out_of_place(right))
     }
 
-    fn sub_batch(&mut self, inputs: Vec<(M, M)>) -> Result<Vec<M>, Self::Error> {
-        Ok(inputs.into_par_iter().map(|(left, right)| left - &right).collect())
+    fn sub_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
+        Ok(M::sub_batch_out_of_place(inputs))
     }
 
     fn multiply(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
         let left_size = left.size();
         let right_size = right.size();
         Ok(if left_size == (1, 1) {
-            right.clone() * left.entry(0, 0)
+            right.multiply_poly_out_of_place(&left.entry(0, 0))
         } else if right_size == (1, 1) {
-            left.clone() * right.entry(0, 0)
+            left.multiply_poly_out_of_place(&right.entry(0, 0))
         } else {
-            left.clone() * right
+            left.multiply_out_of_place(right)
         })
     }
 
-    fn multiply_batch(&mut self, inputs: Vec<(M, M)>) -> Result<Vec<M>, Self::Error> {
-        Ok(inputs
-            .into_par_iter()
-            .map(|(left, right)| {
-                let left_size = left.size();
-                let right_size = right.size();
-                if left_size == (1, 1) {
-                    right * left.entry(0, 0)
-                } else if right_size == (1, 1) {
-                    left * right.entry(0, 0)
-                } else {
-                    left * &right
-                }
-            })
-            .collect())
+    fn multiply_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
+        Ok(M::multiply_batch_out_of_place(inputs))
     }
 
     fn negate(&mut self, value: &M) -> Result<M, Self::Error> {
-        Ok(-value.clone())
+        Ok(value.negate_out_of_place())
     }
 
-    fn negate_batch(&mut self, inputs: Vec<M>) -> Result<Vec<M>, Self::Error> {
-        Ok(inputs.into_par_iter().map(|value| -value).collect())
+    fn negate_batch(&mut self, inputs: Vec<Arc<M>>) -> Result<Vec<M>, Self::Error> {
+        Ok(M::negate_batch_out_of_place(inputs))
     }
 
     fn scale_integer(&mut self, value: &M, scalar: &BigInt) -> Result<M, Self::Error> {
         let parameters = self.parameters_for_matrix(value)?;
-        Ok(value.clone() * Self::ring_integer(parameters, scalar)?)
+        Ok(value.multiply_poly_out_of_place(&Self::ring_integer(parameters, scalar)?))
     }
 
-    fn scale_integer_batch(&mut self, inputs: Vec<(M, BigInt)>) -> Result<Vec<M>, Self::Error> {
+    fn scale_integer_batch(
+        &mut self,
+        inputs: Vec<(Arc<M>, BigInt)>,
+    ) -> Result<Vec<M>, Self::Error> {
         let prepared = inputs
             .into_iter()
             .map(|(value, scalar)| {
@@ -586,7 +593,7 @@ where
                 Ok((value, Self::ring_integer(parameters, &scalar)?))
             })
             .collect::<Result<Vec<_>, PolyBackendError>>()?;
-        Ok(prepared.into_par_iter().map(|(value, scalar)| value * scalar).collect())
+        Ok(M::multiply_polys_batch_out_of_place(prepared))
     }
 
     fn transpose(&mut self, value: &M) -> Result<M, Self::Error> {
@@ -804,6 +811,45 @@ where
         }
     }
 
+    fn sample_preimage_batches_by_placement(
+        &mut self,
+        batches: Vec<(usize, Vec<PreimageRequest<M, T::Trapdoor>>)>,
+    ) -> Result<Vec<(usize, Vec<M>)>, Self::Error> {
+        self.preimage_batch_calls += batches.len();
+        #[cfg(feature = "gpu")]
+        {
+            super::poly_gpu::sample_preimage_batches_by_placement(self, batches)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let original = self.active_placement;
+            let result = batches
+                .into_iter()
+                .map(|(placement, requests)| {
+                    self.active_placement = placement;
+                    requests
+                        .into_iter()
+                        .map(|request| {
+                            self.sample_preimage(
+                                &request.matrix_type,
+                                request.sigma,
+                                &request.gadget_base,
+                                request.digit_count,
+                                &request.max_coefficient_bound,
+                                request.trapdoor.as_ref(),
+                                request.public.as_ref(),
+                                request.target.as_ref(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|outputs| (placement, outputs))
+                })
+                .collect();
+            self.active_placement = original;
+            result
+        }
+    }
+
     fn gadget_decompose(&mut self, value: &M, small: bool) -> Result<M, Self::Error> {
         Ok(if small { value.small_decompose() } else { value.decompose() })
     }
@@ -884,6 +930,17 @@ where
 
     fn matrix_to_bytes(&self, value: &M) -> Vec<u8> {
         value.to_compact_bytes()
+    }
+
+    fn matrices_to_bytes(&self, values: &[&M]) -> Vec<Vec<u8>> {
+        #[cfg(feature = "gpu")]
+        {
+            M::compact_bytes_batch(values)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            values.iter().map(|value| value.to_compact_bytes()).collect()
+        }
     }
 
     fn matrix_from_bytes(&self, ty: &ConcreteMatrixType, bytes: &[u8]) -> Result<M, Self::Error> {

@@ -57,14 +57,8 @@ pub trait Backend {
     fn matrix_is_on_active_placement(&self, _value: &Self::Matrix) -> bool {
         true
     }
-    /// Fences work that produces one matrix. The default is a no-op for
-    /// synchronous backends.
-    fn wait_for_matrix(&self, _value: &Self::Matrix) -> Result<(), Self::Error> {
-        Ok(())
-    }
-    /// Releases allocator-cached storage that is no longer referenced by a
-    /// fenced execution scope. Synchronous backends have nothing to release.
-    fn trim_unused_memory(&mut self) -> Result<(), Self::Error> {
+    /// Waits only for releases queued on backend-owned release streams.
+    fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
     fn matrix_to_placements(
@@ -130,7 +124,7 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
     fn add_batch(
         &mut self,
-        inputs: Vec<(Self::Matrix, Self::Matrix)>,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(left, right)| self.add(&left, &right)).collect()
     }
@@ -141,7 +135,7 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
     fn sub_batch(
         &mut self,
-        inputs: Vec<(Self::Matrix, Self::Matrix)>,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(left, right)| self.sub(&left, &right)).collect()
     }
@@ -152,14 +146,14 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
     fn multiply_batch(
         &mut self,
-        inputs: Vec<(Self::Matrix, Self::Matrix)>,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(left, right)| self.multiply(&left, &right)).collect()
     }
     fn negate(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error>;
     fn negate_batch(
         &mut self,
-        inputs: Vec<Self::Matrix>,
+        inputs: Vec<Arc<Self::Matrix>>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|value| self.negate(&value)).collect()
     }
@@ -170,7 +164,7 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
     fn scale_integer_batch(
         &mut self,
-        inputs: Vec<(Self::Matrix, BigInt)>,
+        inputs: Vec<(Arc<Self::Matrix>, BigInt)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(value, scalar)| self.scale_integer(&value, &scalar)).collect()
     }
@@ -254,6 +248,21 @@ pub trait Backend {
             })
             .collect()
     }
+    fn sample_preimage_batches_by_placement(
+        &mut self,
+        batches: Vec<(usize, Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>)>,
+    ) -> Result<Vec<(usize, Vec<Self::Matrix>)>, Self::Error> {
+        let original = self.active_placement();
+        let result = batches
+            .into_iter()
+            .map(|(placement, requests)| {
+                assert!(self.set_active_placement(placement), "backend rejected its own placement");
+                self.sample_preimage_batch(requests).map(|outputs| (placement, outputs))
+            })
+            .collect();
+        assert!(self.set_active_placement(original), "backend rejected its active placement");
+        result
+    }
     fn validate_gadget_layout(
         &self,
         _ty: &ConcreteMatrixType,
@@ -293,6 +302,9 @@ pub trait Backend {
     ) -> Result<Self::Matrix, Self::Error>;
 
     fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8>;
+    fn matrices_to_bytes(&self, values: &[&Self::Matrix]) -> Vec<Vec<u8>> {
+        values.iter().map(|value| self.matrix_to_bytes(value)).collect()
+    }
     fn matrix_from_bytes(
         &self,
         ty: &ConcreteMatrixType,
@@ -398,6 +410,30 @@ impl<B: Backend> Clone for RuntimeValue<B> {
                 }
             }
             Self::IndexedFamily(values) => Self::IndexedFamily(values.clone()),
+        }
+    }
+}
+
+impl<B: Backend> RuntimeValue<B> {
+    pub(crate) fn releases_backend_resources_on_drop(&self) -> bool {
+        match self {
+            Self::Matrix(matrix) => Arc::strong_count(matrix) == 1,
+            Self::Trapdoor { secret, public, .. } => {
+                Arc::strong_count(public) == 1 ||
+                    secret.as_ref().is_some_and(|secret| Arc::strong_count(secret) == 1)
+            }
+            Self::IndexedFamily(values) => {
+                values.iter().any(Self::releases_backend_resources_on_drop)
+            }
+            Self::Int(_) |
+            Self::Real(_) |
+            Self::Bool(_) |
+            Self::Bytes(_) |
+            Self::TypedBlob(_) |
+            Self::LazyArtifact { .. } |
+            Self::LazyArtifactFamily { .. } |
+            Self::StagedArtifact { .. } |
+            Self::StagedArtifactFamily { .. } => false,
         }
     }
 }

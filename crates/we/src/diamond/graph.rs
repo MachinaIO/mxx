@@ -751,7 +751,6 @@ impl DiamondWeProtocolFamily {
             secret_dimension: 1,
             digit_count: 1,
             gadget_base: params.input.gadget_base.clone(),
-            gaussian_max_coefficient_bound: params.input.error_max_coefficient_bound.clone(),
         }
     }
 

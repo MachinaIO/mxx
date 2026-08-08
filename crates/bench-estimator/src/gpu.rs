@@ -52,7 +52,7 @@ impl MemoryProbe for GpuMemoryProbe {
 }
 
 struct PreparedMeasurement {
-    arguments: Vec<Option<GpuDCRTPolyMatrix>>,
+    arguments: Vec<Option<Arc<GpuDCRTPolyMatrix>>>,
     preimage_trapdoor: Option<(GpuDCRTPolyMatrix, GpuDCRTTrapdoor, f64, BigInt, usize, BigInt)>,
 }
 
@@ -86,7 +86,7 @@ impl GpuNodeMeasurementBackend {
                 ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => self
                     .backend
                     .constant_matrix(&matrix, &ConstantMatrix::Zero, bindings)
-                    .map(Some)
+                    .map(|matrix| Some(Arc::new(matrix)))
                     .map_err(|error| GpuMeasurementError(error.to_string())),
                 _ => Ok(None),
             })
@@ -133,10 +133,20 @@ impl GpuNodeMeasurementBackend {
         batch_size: usize,
         prepared: &PreparedMeasurement,
     ) -> Result<Vec<GpuDCRTPolyMatrix>, GpuMeasurementError> {
-        let matrix = |index: usize| {
+        let matrix_arc = |index: usize| {
             prepared.arguments.get(index).and_then(Option::as_ref).cloned().ok_or_else(|| {
                 GpuMeasurementError(format!("node {:?} argument {index} is not a matrix", node.id))
             })
+        };
+        let matrix = |index: usize| {
+            prepared.arguments.get(index).and_then(Option::as_ref).map(Arc::as_ref).ok_or_else(
+                || {
+                    GpuMeasurementError(format!(
+                        "node {:?} argument {index} is not a matrix",
+                        node.id
+                    ))
+                },
+            )
         };
         let output_matrix_type = || {
             node.concrete_output_types
@@ -179,7 +189,7 @@ impl GpuNodeMeasurementBackend {
             }
             NodeKind::MatrixBinary(operation) => {
                 let inputs = (0..batch_size)
-                    .map(|_| Ok((matrix(0)?, matrix(1)?)))
+                    .map(|_| Ok((matrix_arc(0)?, matrix_arc(1)?)))
                     .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
                 match operation {
                     MatrixBinaryOp::Add => backend.add_batch(inputs),
@@ -189,7 +199,9 @@ impl GpuNodeMeasurementBackend {
                 .map_err(backend_error)
             }
             NodeKind::MatrixNegate => backend
-                .negate_batch((0..batch_size).map(|_| matrix(0)).collect::<Result<Vec<_>, _>>()?)
+                .negate_batch(
+                    (0..batch_size).map(|_| matrix_arc(0)).collect::<Result<Vec<_>, _>>()?,
+                )
                 .map_err(backend_error),
             NodeKind::MatrixScale { scalar } => {
                 let scalar = scalar
@@ -198,13 +210,13 @@ impl GpuNodeMeasurementBackend {
                 backend
                     .scale_integer_batch(
                         (0..batch_size)
-                            .map(|_| Ok((matrix(0)?, scalar.clone())))
+                            .map(|_| Ok((matrix_arc(0)?, scalar.clone())))
                             .collect::<Result<Vec<_>, GpuMeasurementError>>()?,
                     )
                     .map_err(backend_error)
             }
             NodeKind::Transpose => (0..batch_size)
-                .map(|_| backend.transpose(&matrix(0)?).map_err(backend_error))
+                .map(|_| backend.transpose(matrix(0)?).map_err(backend_error))
                 .collect(),
             NodeKind::Slice { rows, columns } => {
                 let rows = rows
@@ -228,20 +240,20 @@ impl GpuNodeMeasurementBackend {
                 (0..batch_size)
                     .map(|_| {
                         backend
-                            .slice(&matrix(0)?, rows.as_ref(), columns.as_ref())
+                            .slice(matrix(0)?, rows.as_ref(), columns.as_ref())
                             .map_err(backend_error)
                     })
                     .collect()
             }
             NodeKind::Tensor => (0..batch_size)
-                .map(|_| backend.tensor(&matrix(0)?, &matrix(1)?).map_err(backend_error))
+                .map(|_| backend.tensor(matrix(0)?, matrix(1)?).map_err(backend_error))
                 .collect(),
             NodeKind::Concat { axis } => {
                 let inputs = prepared
                     .arguments
                     .iter()
                     .map(|value| {
-                        value.as_ref().ok_or_else(|| {
+                        value.as_ref().map(Arc::as_ref).ok_or_else(|| {
                             GpuMeasurementError("concat argument is not a matrix".to_owned())
                         })
                     })
@@ -254,7 +266,7 @@ impl GpuNodeMeasurementBackend {
                 let rows = evaluate_usize(rows)?;
                 let columns = evaluate_usize(columns)?;
                 (0..batch_size)
-                    .map(|_| backend.reshape(&matrix(0)?, rows, columns).map_err(backend_error))
+                    .map(|_| backend.reshape(matrix(0)?, rows, columns).map_err(backend_error))
                     .collect()
             }
             NodeKind::UniformSample { range, .. } => {
@@ -323,7 +335,7 @@ impl GpuNodeMeasurementBackend {
                     prepared.preimage_trapdoor.as_ref().ok_or_else(|| {
                         GpuMeasurementError("missing prepared trapdoor".to_owned())
                     })?;
-                let target = matrix(2)?;
+                let target = matrix_arc(2)?;
                 if batch_size == 1 {
                     backend
                         .sample_preimage(
@@ -334,7 +346,7 @@ impl GpuNodeMeasurementBackend {
                             max_coefficient_bound,
                             trapdoor,
                             public,
-                            &target,
+                            target.as_ref(),
                         )
                         .map(|output| vec![output])
                         .map_err(backend_error)
@@ -350,7 +362,7 @@ impl GpuNodeMeasurementBackend {
                                     max_coefficient_bound: max_coefficient_bound.clone(),
                                     trapdoor: Arc::new(trapdoor.clone()),
                                     public: Arc::new(public.clone()),
-                                    target: Arc::new(target.clone()),
+                                    target: target.clone(),
                                 })
                                 .collect(),
                         )
@@ -358,12 +370,12 @@ impl GpuNodeMeasurementBackend {
                 }
             }
             NodeKind::GadgetDecompose { small, .. } => (0..batch_size)
-                .map(|_| backend.gadget_decompose(&matrix(0)?, *small).map_err(backend_error))
+                .map(|_| backend.gadget_decompose(matrix(0)?, *small).map_err(backend_error))
                 .collect(),
             NodeKind::ExtractCoefficient { position } => {
                 let position = evaluate_usize(position)?;
                 for _ in 0..batch_size {
-                    backend.extract_coefficient(&matrix(0)?, position).map_err(backend_error)?;
+                    backend.extract_coefficient(matrix(0)?, position).map_err(backend_error)?;
                 }
                 Ok(Vec::new())
             }
@@ -373,7 +385,7 @@ impl GpuNodeMeasurementBackend {
                 (0..batch_size)
                     .map(|_| {
                         let coefficient = backend
-                            .extract_coefficient(&matrix(0)?, position)
+                            .extract_coefficient(matrix(0)?, position)
                             .map_err(backend_error)?;
                         let identity = backend
                             .constant_matrix(&ty, &ConstantMatrix::Identity, bindings)
@@ -389,7 +401,7 @@ impl GpuNodeMeasurementBackend {
                 let length = evaluate_usize(length)?;
                 for _ in 0..batch_size {
                     backend
-                        .threshold_decode(&matrix(0)?, &modulus, length)
+                        .threshold_decode(matrix(0)?, &modulus, length)
                         .map_err(backend_error)?;
                 }
                 Ok(Vec::new())
@@ -399,7 +411,7 @@ impl GpuNodeMeasurementBackend {
                     .arguments
                     .iter()
                     .map(|value| {
-                        value.clone().ok_or_else(|| {
+                        value.as_ref().map(|value| value.as_ref().clone()).ok_or_else(|| {
                             GpuMeasurementError("CRT argument is not a matrix".to_owned())
                         })
                     })

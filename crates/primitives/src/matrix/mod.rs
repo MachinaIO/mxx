@@ -1,8 +1,10 @@
 use crate::poly::{Poly, PolyParams};
+use rayon::prelude::*;
 use std::{
     fmt::Debug,
     ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
     path::Path,
+    sync::Arc,
 };
 
 pub mod base;
@@ -70,6 +72,44 @@ pub trait PolyMatrix:
     /// this to wait only for this matrix's recorded write events.
     fn wait_until_ready(&self) {}
 
+    fn add_out_of_place(&self, rhs: &Self) -> Self {
+        self.clone() + rhs
+    }
+    fn add_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
+        inputs.into_par_iter().map(|(left, right)| left.add_out_of_place(&right)).collect()
+    }
+
+    fn sub_out_of_place(&self, rhs: &Self) -> Self {
+        self.clone() - rhs
+    }
+    fn sub_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
+        inputs.into_par_iter().map(|(left, right)| left.sub_out_of_place(&right)).collect()
+    }
+
+    fn multiply_out_of_place(&self, rhs: &Self) -> Self {
+        self.clone() * rhs
+    }
+    fn multiply_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
+        inputs.into_par_iter().map(|(left, right)| left.multiply_out_of_place(&right)).collect()
+    }
+
+    fn negate_out_of_place(&self) -> Self {
+        -self.clone()
+    }
+    fn negate_batch_out_of_place(inputs: Vec<Arc<Self>>) -> Vec<Self> {
+        inputs.into_par_iter().map(|value| value.negate_out_of_place()).collect()
+    }
+
+    fn multiply_poly_out_of_place(&self, scalar: &Self::P) -> Self {
+        self.clone() * scalar
+    }
+    fn multiply_polys_batch_out_of_place(inputs: Vec<(Arc<Self>, Self::P)>) -> Vec<Self> {
+        inputs
+            .into_par_iter()
+            .map(|(matrix, scalar)| matrix.multiply_poly_out_of_place(&scalar))
+            .collect()
+    }
+
     fn add_in_place(&mut self, rhs: &Self) {
         *self = self.clone() + rhs;
     }
@@ -101,6 +141,9 @@ pub trait PolyMatrix:
         self.clone().into_compact_bytes()
     }
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self;
+    fn compact_bytes_batch(values: &[&Self]) -> Vec<Vec<u8>> {
+        values.iter().map(|value| value.to_compact_bytes()).collect()
+    }
     fn into_cpu_staging_bytes(self) -> Vec<u8> {
         self.into_compact_bytes()
     }
@@ -109,6 +152,16 @@ pub trait PolyMatrix:
     }
     fn from_cpu_staging_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
         Self::from_compact_bytes(params, bytes)
+    }
+    fn copy_to_params_direct(&self, _params: &<Self::P as Poly>::Params) -> Option<Self> {
+        None
+    }
+    fn copy_to_params_fanout(&self, params: &[&<Self::P as Poly>::Params]) -> Vec<Self> {
+        let bytes = self.to_cpu_staging_bytes();
+        params
+            .par_iter()
+            .map(|parameters| Self::from_cpu_staging_bytes(parameters, &bytes))
+            .collect()
     }
     fn zero_compact_bytes(
         params: &<Self::P as Poly>::Params,

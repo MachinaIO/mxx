@@ -45,32 +45,17 @@ namespace
             }
             cudaSetDevice(device);
 
-            cudaStream_t free_stream = nullptr;
-            if (partition_idx < mat->exec_limb_states.size())
-            {
-                auto &states = mat->exec_limb_states[partition_idx];
-                for (auto &state : states)
-                {
-                    if (state.stream && state.device == device)
-                    {
-                        free_stream = state.stream;
-                        break;
-                    }
-                }
-            }
+            cudaStream_t free_stream =
+                partition_idx < mat->ctx->release_streams_by_partition.size()
+                    ? mat->ctx->release_streams_by_partition[partition_idx]
+                    : nullptr;
 
             if (free_stream)
             {
+                auto &states = mat->exec_limb_states[partition_idx];
                 bool dependency_ok = true;
                 bool async_free_queued = false;
-                cudaEvent_t free_done = nullptr;
-                bool free_done_registered = false;
-                cudaError_t err = cudaEventCreateWithFlags(&free_done, cudaEventDisableTiming);
-                if (err != cudaSuccess)
-                {
-                    dependency_ok = false;
-                }
-                auto &states = mat->exec_limb_states[partition_idx];
+                cudaError_t err = cudaSuccess;
                 for (auto &state : states)
                 {
                     if (!state.stream)
@@ -103,13 +88,6 @@ namespace
                         cudaFreeAsync(aux_ptr, free_stream);
                     }
                     async_free_queued = true;
-                    err = cudaEventRecord(free_done, free_stream);
-                    if (err == cudaSuccess && mat->ctx)
-                    {
-                        std::lock_guard<std::mutex> lock(mat->ctx->released_buffer_events_mutex);
-                        mat->ctx->released_buffer_events.push_back({free_done, device});
-                        free_done_registered = true;
-                    }
                 }
                 if (!dependency_ok && !async_free_queued)
                 {
@@ -123,14 +101,6 @@ namespace
                         cudaFree(aux_ptr);
                         aux_ptr = nullptr;
                     }
-                }
-                if (free_done && !free_done_registered)
-                {
-                    // The event could not be registered with the context. Keep
-                    // the fallback local so its asynchronous free cannot leak
-                    // an untracked CUDA event resource.
-                    cudaStreamSynchronize(free_stream);
-                    cudaEventDestroy(free_done);
                 }
             }
             else
@@ -186,11 +156,7 @@ namespace
                     cudaEventDestroy(state.write_done);
                     state.write_done = nullptr;
                 }
-                if (state.stream)
-                {
-                    cudaStreamDestroy(state.stream);
-                    state.stream = nullptr;
-                }
+                state.stream = nullptr;
                 state.write_done_valid = false;
             }
         }
@@ -357,13 +323,17 @@ extern "C" int gpu_matrix_create(
             state.stream = nullptr;
             state.write_done = nullptr;
             state.write_done_valid = false;
-            err = cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking);
-            if (err != cudaSuccess)
+            auto &stream_pool = ctx->compute_streams_by_partition[partition_idx];
+            if (stream_pool.empty())
             {
                 destroy_matrix_contents(mat);
                 delete mat;
-                return set_error(err);
+                return set_error("empty compute stream pool in gpu_matrix_create");
             }
+            const size_t stream_slot =
+                ctx->next_compute_stream.fetch_add(1, std::memory_order_relaxed) %
+                stream_pool.size();
+            state.stream = stream_pool[stream_slot];
             err = cudaEventCreateWithFlags(&state.write_done, cudaEventDisableTiming);
             if (err != cudaSuccess)
             {
@@ -606,5 +576,170 @@ extern "C" int gpu_matrix_copy_block(
     }
 
     out->format = src->format;
+    return 0;
+}
+
+extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *out_copied)
+{
+    if (!dst || !src || !out_copied || !dst->ctx || !src->ctx)
+    {
+        return set_error("invalid gpu_matrix_copy_peer arguments");
+    }
+    *out_copied = 0;
+    if (dst->rows != src->rows || dst->cols != src->cols || dst->level != src->level ||
+        dst->format != src->format || dst->ctx->N != src->ctx->N)
+    {
+        return set_error("incompatible matrices in gpu_matrix_copy_peer");
+    }
+    const size_t active_limbs = static_cast<size_t>(dst->level + 1);
+    if (dst->ctx->moduli.size() < active_limbs || src->ctx->moduli.size() < active_limbs)
+    {
+        return set_error("missing active CRT moduli in gpu_matrix_copy_peer");
+    }
+    if (!std::equal(
+            dst->ctx->moduli.begin(),
+            dst->ctx->moduli.begin() + active_limbs,
+            src->ctx->moduli.begin()) ||
+        dst->shared_limb_buffers.size() != 1 || src->shared_limb_buffers.size() != 1)
+    {
+        return 0;
+    }
+    auto &destination_buffer = dst->shared_limb_buffers[0];
+    const auto &source_buffer = src->shared_limb_buffers[0];
+    if (!destination_buffer.ptr || !source_buffer.ptr ||
+        destination_buffer.bytes_total != source_buffer.bytes_total ||
+        destination_buffer.limb_count != source_buffer.limb_count ||
+        destination_buffer.bytes_per_poly != source_buffer.bytes_per_poly ||
+        destination_buffer.limb_coeff_bytes != source_buffer.limb_coeff_bytes ||
+        destination_buffer.limb_offsets_bytes != source_buffer.limb_offsets_bytes)
+    {
+        return 0;
+    }
+    const int destination_device = destination_buffer.device;
+    const int source_device = source_buffer.device;
+    cudaError_t error = cudaSetDevice(destination_device);
+    if (error != cudaSuccess)
+    {
+        return set_error(error);
+    }
+    if (destination_device != source_device)
+    {
+        int can_access = 0;
+        error = cudaDeviceCanAccessPeer(&can_access, destination_device, source_device);
+        if (error != cudaSuccess)
+        {
+            return set_error(error);
+        }
+        if (!can_access)
+        {
+            return 0;
+        }
+        error = cudaDeviceEnablePeerAccess(source_device, 0);
+        if (error == cudaErrorPeerAccessAlreadyEnabled)
+        {
+            cudaGetLastError();
+            error = cudaSuccess;
+        }
+        if (error != cudaSuccess)
+        {
+            return set_error(error);
+        }
+    }
+    if (dst->exec_limb_states.empty() || dst->exec_limb_states[0].empty() ||
+        src->exec_limb_states.empty())
+    {
+        return set_error("missing matrix execution state in gpu_matrix_copy_peer");
+    }
+    cudaStream_t destination_stream = dst->exec_limb_states[0][0].stream;
+    if (!destination_stream)
+    {
+        return set_error("missing destination stream in gpu_matrix_copy_peer");
+    }
+    for (const auto &states : src->exec_limb_states)
+    {
+        for (const auto &state : states)
+        {
+            if (state.write_done && state.write_done_valid)
+            {
+                error = cudaStreamWaitEvent(destination_stream, state.write_done, 0);
+                if (error != cudaSuccess)
+                {
+                    return set_error(error);
+                }
+            }
+        }
+    }
+    if (destination_device == source_device)
+    {
+        error = cudaMemcpyAsync(
+            destination_buffer.ptr,
+            source_buffer.ptr,
+            source_buffer.bytes_total,
+            cudaMemcpyDeviceToDevice,
+            destination_stream);
+    }
+    else
+    {
+        error = cudaMemcpyPeerAsync(
+            destination_buffer.ptr,
+            destination_device,
+            source_buffer.ptr,
+            source_device,
+            source_buffer.bytes_total,
+            destination_stream);
+    }
+    if (error != cudaSuccess)
+    {
+        return set_error(error);
+    }
+    cudaEvent_t peer_copy_done = nullptr;
+    error = cudaEventCreateWithFlags(&peer_copy_done, cudaEventDisableTiming);
+    if (error == cudaSuccess)
+    {
+        error = cudaEventRecord(peer_copy_done, destination_stream);
+    }
+    if (error != cudaSuccess)
+    {
+        if (peer_copy_done) cudaEventDestroy(peer_copy_done);
+        return set_error(error);
+    }
+    if (src->ctx->release_streams_by_partition.empty() ||
+        !src->ctx->release_streams_by_partition[0])
+    {
+        cudaEventDestroy(peer_copy_done);
+        return set_error("missing source release stream in gpu_matrix_copy_peer");
+    }
+    error = cudaSetDevice(source_device);
+    if (error == cudaSuccess)
+    {
+        error = cudaStreamWaitEvent(
+            src->ctx->release_streams_by_partition[0], peer_copy_done, 0);
+    }
+    if (error != cudaSuccess)
+    {
+        cudaSetDevice(destination_device);
+        cudaEventDestroy(peer_copy_done);
+        return set_error(error);
+    }
+    error = cudaSetDevice(destination_device);
+    if (error != cudaSuccess)
+    {
+        cudaEventDestroy(peer_copy_done);
+        return set_error(error);
+    }
+    for (size_t limb = 0; limb < active_limbs; ++limb)
+    {
+        const int status = matrix_record_limb_write(
+            dst,
+            dst->ctx->limb_gpu_ids[limb],
+            destination_stream);
+        if (status != 0)
+        {
+            cudaEventDestroy(peer_copy_done);
+            return status;
+        }
+    }
+    cudaEventDestroy(peer_copy_done);
+    *out_copied = 1;
     return 0;
 }

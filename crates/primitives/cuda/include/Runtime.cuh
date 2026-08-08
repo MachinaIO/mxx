@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #ifdef __cplusplus
+#include <atomic>
 #include <mutex>
 #include <vector>
 #endif
@@ -17,14 +18,6 @@ extern "C" {
 typedef struct GpuContext GpuContext;
 typedef struct GpuEventSet GpuEventSet;
 
-#ifdef __cplusplus
-struct GpuReleasedBufferEvent
-{
-    cudaEvent_t event;
-    int device;
-};
-#endif
-
 int gpu_context_create(
     uint32_t logN,
     uint32_t L,
@@ -33,10 +26,11 @@ int gpu_context_create(
     size_t moduli_len,
     const int *gpu_ids,
     size_t gpu_ids_len,
+    size_t stream_pool_size,
     GpuContext **out_ctx);
 
 void gpu_context_destroy(GpuContext *ctx);
-int gpu_context_trim_memory_pool(const GpuContext *ctx);
+int gpu_context_fence_releases(const GpuContext *ctx);
 int gpu_context_get_N(const GpuContext *ctx, int *out_N);
 
 int gpu_event_set_wait(GpuEventSet *events);
@@ -102,11 +96,10 @@ struct GpuContext
     std::vector<uint8_t> limb_coeff_bytes;
     std::vector<size_t> decomp_counts_by_partition;
     std::mutex transform_mutex;
-    // Matrix destructors enqueue cudaFreeAsync work after the matrix's last
-    // writer. The owning context reaps these events at explicit executor
-    // fences, rather than letting short-lived free streams accumulate.
-    mutable std::mutex released_buffer_events_mutex;
-    mutable std::vector<GpuReleasedBufferEvent> released_buffer_events;
+    std::vector<std::vector<cudaStream_t>> compute_streams_by_partition;
+    std::vector<cudaStream_t> release_streams_by_partition;
+    std::vector<cudaEvent_t> release_fence_events_by_partition;
+    std::atomic<size_t> next_compute_stream{0};
 };
 
 struct GpuEventSet

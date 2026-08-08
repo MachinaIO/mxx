@@ -39,10 +39,9 @@ pub struct ExecutionConfig {
     pub max_parallel_instances: NonZeroUsize,
     /// Optional progress reporting for actual preimage sampler invocations.
     pub preimage_progress: Option<PreimageProgressConfig>,
-    /// Optionally fence all currently live matrices after this many nodes in
-    /// each executed scope. This bounds queued asynchronous backend work
-    /// without imposing a device-wide synchronization.
-    pub live_matrix_fence_interval: Option<NonZeroUsize>,
+    /// Optionally fence backend release streams after this many executed nodes.
+    /// This bounds queued releases without waiting unrelated live matrices.
+    pub release_fence_interval: Option<NonZeroUsize>,
 }
 
 impl Default for ExecutionConfig {
@@ -50,7 +49,7 @@ impl Default for ExecutionConfig {
         Self {
             max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero"),
             preimage_progress: None,
-            live_matrix_fence_interval: None,
+            release_fence_interval: None,
         }
     }
 }
@@ -357,7 +356,8 @@ where
         staged_families: BTreeMap::new(),
         preimage_progress: config.preimage_progress.map(PreimageProgress::new),
         executed_node_count: 0,
-        last_live_matrix_fence_node_count: 0,
+        last_release_fence_node_count: 0,
+        has_pending_releases: false,
     };
     let inputs = inputs
         .into_iter()
@@ -409,6 +409,7 @@ where
             });
         }
     }
+    executor.fence_pending_releases()?;
     let result = ExecutionResult {
         outputs: named_outputs,
         production_id,
@@ -431,7 +432,8 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     staged_families: BTreeMap<(ProductionId, String), ManifestArtifact>,
     preimage_progress: Option<PreimageProgress>,
     executed_node_count: usize,
-    last_live_matrix_fence_node_count: usize,
+    last_release_fence_node_count: usize,
+    has_pending_releases: bool,
 }
 
 struct PreimageProgress {
@@ -540,12 +542,6 @@ where
         let mut values = (0..envs.len())
             .map(|_| BTreeMap::<WireRef, RuntimeValue<B>>::new())
             .collect::<Vec<_>>();
-        // Releasing a GPU matrix schedules asynchronous frees on its matrix-local
-        // streams.  Keep retired values until the next configured fence so those
-        // streams have completed before their resources are returned.  This
-        // bounds CUDA stream/event pressure in long, fine-grained graphs without
-        // synchronizing unrelated device work or serializing individual drops.
-        let mut retired_values = Vec::new();
         for (position, handle) in validated_scope.execution_order.iter().enumerate() {
             let node = ExecutableNode {
                 id: NodeId(position as u64),
@@ -562,8 +558,12 @@ where
                     &mut values,
                 )?;
             } else if envs.len() > 1 &&
-                placements.iter().all(|placement| *placement == placements[0]) &&
-                self.execute_parallel_matrix_node(placements[0], &envs, &node, &mut values)?
+                self.execute_parallel_matrix_node_by_placement(
+                    &placements,
+                    &envs,
+                    &node,
+                    &mut values,
+                )?
             {
             } else if matches!(node.kind, NodeKind::Select { .. }) {
                 for index in 0..envs.len() {
@@ -605,26 +605,19 @@ where
                         !schedule.retained.contains(argument)
                     {
                         if let Some(value) = values[index].remove(argument) {
-                            if self.config.live_matrix_fence_interval.is_some() {
-                                retired_values.push(value);
-                            }
+                            self.has_pending_releases |= value.releases_backend_resources_on_drop();
                         }
                     }
                 }
             }
             self.executed_node_count = self.executed_node_count.saturating_add(envs.len());
-            if self.config.live_matrix_fence_interval.is_some_and(|interval| {
-                self.executed_node_count.saturating_sub(self.last_live_matrix_fence_node_count) >=
-                    interval.get()
-            }) {
-                self.fence_live_matrices(&values, &retired_values)?;
-                // Dropping retired GPU matrices enqueues their asynchronous frees.
-                // Reap their completion events only after the drops have been
-                // issued, so this same fence releases the streams and allocator
-                // blocks it was intended to bound.
-                retired_values.clear();
-                self.backend.trim_unused_memory().map_err(Self::backend_error)?;
-                self.last_live_matrix_fence_node_count = self.executed_node_count;
+            if self.has_pending_releases &&
+                self.config.release_fence_interval.is_some_and(|interval| {
+                    self.executed_node_count.saturating_sub(self.last_release_fence_node_count) >=
+                        interval.get()
+                })
+            {
+                self.fence_pending_releases()?;
                 info!(
                     scope = ?scope_id,
                     scope_completed_nodes = position + 1,
@@ -634,11 +627,6 @@ where
                     "execution progress checkpoint"
                 );
             }
-        }
-        if !retired_values.is_empty() {
-            self.fence_runtime_values(&retired_values)?;
-            retired_values.clear();
-            self.backend.trim_unused_memory().map_err(Self::backend_error)?;
         }
         let mut instances = Vec::with_capacity(values.len());
         for (index, mut instance_values) in values.into_iter().enumerate() {
@@ -653,21 +641,49 @@ where
         Ok(instances)
     }
 
+    fn execute_parallel_matrix_node_by_placement(
+        &mut self,
+        placements: &[usize],
+        envs: &[ParamEnv],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+    ) -> Result<bool, ExecutionError> {
+        if !matches!(
+            node.kind,
+            NodeKind::MatrixBinary(_) | NodeKind::MatrixNegate | NodeKind::MatrixScale { .. }
+        ) {
+            return Ok(false);
+        }
+        for placement in 0..self.backend.placement_count() {
+            let indices = placements
+                .iter()
+                .enumerate()
+                .filter_map(|(index, assigned)| (*assigned == placement).then_some(index))
+                .collect::<Vec<_>>();
+            if !indices.is_empty() {
+                self.execute_parallel_matrix_node(placement, envs, node, values, &indices)?;
+            }
+        }
+        Ok(true)
+    }
+
     fn execute_parallel_matrix_node(
         &mut self,
         placement: usize,
         envs: &[ParamEnv],
         node: &ExecutableNode<'_>,
         values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
-    ) -> Result<bool, ExecutionError> {
+        indices: &[usize],
+    ) -> Result<(), ExecutionError> {
         self.set_placement(placement)?;
         let outputs = match node.kind {
             NodeKind::MatrixBinary(operation) => {
-                let mut inputs = Vec::with_capacity(values.len());
-                for instance in values.iter_mut() {
+                let mut inputs = Vec::with_capacity(indices.len());
+                for index in indices {
+                    let instance = &mut values[*index];
                     let left = self.matrix(instance, node.args[0])?;
                     let right = self.matrix(instance, node.args[1])?;
-                    inputs.push((left.as_ref().clone(), right.as_ref().clone()));
+                    inputs.push((left, right));
                 }
                 match operation {
                     MatrixBinaryOp::Add => self.backend.add_batch(inputs),
@@ -677,32 +693,35 @@ where
                 .map_err(Self::backend_error)?
             }
             NodeKind::MatrixNegate => {
-                let mut inputs = Vec::with_capacity(values.len());
-                for instance in values.iter_mut() {
-                    inputs.push(self.matrix(instance, node.args[0])?.as_ref().clone());
+                let mut inputs = Vec::with_capacity(indices.len());
+                for index in indices {
+                    let instance = &mut values[*index];
+                    inputs.push(self.matrix(instance, node.args[0])?);
                 }
                 self.backend.negate_batch(inputs).map_err(Self::backend_error)?
             }
             NodeKind::MatrixScale { scalar } => {
-                let mut inputs = Vec::with_capacity(values.len());
-                for (env, instance) in envs.iter().zip(values.iter_mut()) {
+                let mut inputs = Vec::with_capacity(indices.len());
+                for index in indices {
+                    let env = &envs[*index];
+                    let instance = &mut values[*index];
                     let value = self.matrix(instance, node.args[0])?;
                     let scalar = scalar
                         .evaluate(env)
                         .map_err(|error| self.expression_error(node.id, error))?;
-                    inputs.push((value.as_ref().clone(), scalar));
+                    inputs.push((value, scalar));
                 }
                 self.backend.scale_integer_batch(inputs).map_err(Self::backend_error)?
             }
-            _ => return Ok(false),
+            _ => unreachable!("matrix batch kind checked by caller"),
         };
-        if outputs.len() != values.len() {
+        if outputs.len() != indices.len() {
             return Err(ExecutionError::InvalidBatch(node.id));
         }
-        for (instance, output) in values.iter_mut().zip(outputs) {
-            self.put(instance, node.id, 0, RuntimeValue::matrix(output));
+        for (index, output) in indices.iter().zip(outputs) {
+            self.put(&mut values[*index], node.id, 0, RuntimeValue::matrix(output));
         }
-        Ok(true)
+        Ok(())
     }
 
     fn persist_outputs(
@@ -2104,33 +2123,53 @@ where
             if !missing.is_empty() {
                 let mut sampled_by_index =
                     (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
-                for placement in 0..self.backend.placement_count() {
-                    let indices = missing
-                        .iter()
-                        .copied()
-                        .filter(|index| pending[*index].placement == placement)
-                        .collect::<Vec<_>>();
-                    if indices.is_empty() {
-                        continue;
-                    }
-                    self.set_placement(placement)?;
-                    let sampled = self
-                        .backend
-                        .sample_preimage_batch(
-                            indices.iter().map(|index| pending[*index].request.clone()).collect(),
-                        )
-                        .map_err(Self::backend_error)?;
+                let groups = (0..self.backend.placement_count())
+                    .filter_map(|placement| {
+                        let indices = missing
+                            .iter()
+                            .copied()
+                            .filter(|index| pending[*index].placement == placement)
+                            .collect::<Vec<_>>();
+                        (!indices.is_empty()).then(|| {
+                            let requests: Vec<PreimageRequest<B::Matrix, B::Trapdoor>> = indices
+                                .iter()
+                                .map(|index| pending[*index].request.clone())
+                                .collect();
+                            (placement, indices, requests)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let batches = groups
+                    .iter()
+                    .map(|(placement, _, requests)| (*placement, requests.clone()))
+                    .collect();
+                let sampled_groups = self
+                    .backend
+                    .sample_preimage_batches_by_placement(batches)
+                    .map_err(Self::backend_error)?;
+                for ((expected_placement, indices, _), (placement, sampled)) in
+                    groups.into_iter().zip(sampled_groups)
+                {
+                    debug_assert_eq!(placement, expected_placement);
                     self.record_preimages(sampled.len());
                     for (index, output) in indices.into_iter().zip(sampled) {
                         sampled_by_index[index] = Some(output);
                     }
                 }
+                let serialized = self.backend.matrices_to_bytes(
+                    &missing
+                        .iter()
+                        .map(|index| {
+                            sampled_by_index[*index]
+                                .as_ref()
+                                .expect("every missing preimage was sampled")
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 let entries = missing
                     .iter()
-                    .map(|index| {
-                        let output = sampled_by_index[*index]
-                            .as_ref()
-                            .expect("every missing preimage was sampled");
+                    .zip(serialized)
+                    .map(|(index, bytes)| {
                         let request = &pending[*index];
                         (
                             DrawSite {
@@ -2140,7 +2179,7 @@ where
                             },
                             RecordedValue::Matrix {
                                 matrix_type: request.request.matrix_type.clone(),
-                                bytes: self.backend.matrix_to_bytes(output),
+                                bytes,
                             },
                         )
                     })
@@ -2205,24 +2244,34 @@ where
             outputs
         } else {
             let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
-            for placement in 0..self.backend.placement_count() {
-                let indices = pending
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, request)| {
-                        (request.placement == placement).then_some(index)
+            let groups = (0..self.backend.placement_count())
+                .filter_map(|placement| {
+                    let indices = pending
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, request)| {
+                            (request.placement == placement).then_some(index)
+                        })
+                        .collect::<Vec<_>>();
+                    (!indices.is_empty()).then(|| {
+                        let requests: Vec<PreimageRequest<B::Matrix, B::Trapdoor>> =
+                            indices.iter().map(|index| pending[*index].request.clone()).collect();
+                        (placement, indices, requests)
                     })
-                    .collect::<Vec<_>>();
-                if indices.is_empty() {
-                    continue;
-                }
-                self.set_placement(placement)?;
-                let sampled = self
-                    .backend
-                    .sample_preimage_batch(
-                        indices.iter().map(|index| pending[*index].request.clone()).collect(),
-                    )
-                    .map_err(Self::backend_error)?;
+                })
+                .collect::<Vec<_>>();
+            let batches = groups
+                .iter()
+                .map(|(placement, _, requests)| (*placement, requests.clone()))
+                .collect();
+            let sampled_groups = self
+                .backend
+                .sample_preimage_batches_by_placement(batches)
+                .map_err(Self::backend_error)?;
+            for ((expected_placement, indices, _), (placement, sampled)) in
+                groups.into_iter().zip(sampled_groups)
+            {
+                debug_assert_eq!(placement, expected_placement);
                 self.record_preimages(sampled.len());
                 for (index, output) in indices.into_iter().zip(sampled) {
                     outputs[index] = Some(output);
@@ -2236,7 +2285,8 @@ where
         debug_assert_eq!(outputs.len(), pending.len());
 
         if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
-            for (request, output) in pending.iter().zip(&outputs) {
+            let serialized = self.backend.matrices_to_bytes(&outputs.iter().collect::<Vec<_>>());
+            for ((request, _), bytes) in pending.iter().zip(&outputs).zip(serialized) {
                 recorder.record(
                     DrawSite {
                         instantiation_path: request.path.clone(),
@@ -2245,7 +2295,7 @@ where
                     },
                     RecordedValue::Matrix {
                         matrix_type: request.request.matrix_type.clone(),
-                        bytes: self.backend.matrix_to_bytes(output),
+                        bytes,
                     },
                 )?;
             }
@@ -2608,55 +2658,13 @@ where
         }
     }
 
-    fn fence_live_matrices(
-        &mut self,
-        values: &[BTreeMap<WireRef, RuntimeValue<B>>],
-        retired_values: &[RuntimeValue<B>],
-    ) -> Result<(), ExecutionError> {
-        for instance in values {
-            self.fence_runtime_values(instance.values())?;
-        }
-        self.fence_runtime_values(retired_values)?;
-        Ok(())
-    }
-
-    fn fence_runtime_values<'a>(
-        &self,
-        values: impl IntoIterator<Item = &'a RuntimeValue<B>>,
-    ) -> Result<(), ExecutionError>
-    where
-        B: 'a,
-    {
-        for value in values {
-            self.fence_runtime_value(value)?;
+    fn fence_pending_releases(&mut self) -> Result<(), ExecutionError> {
+        if self.has_pending_releases {
+            self.backend.fence_released_memory().map_err(Self::backend_error)?;
+            self.has_pending_releases = false;
+            self.last_release_fence_node_count = self.executed_node_count;
         }
         Ok(())
-    }
-
-    fn fence_runtime_value(&self, value: &RuntimeValue<B>) -> Result<(), ExecutionError> {
-        match value {
-            RuntimeValue::Matrix(matrix) => {
-                self.backend.wait_for_matrix(matrix.as_ref()).map_err(Self::backend_error)
-            }
-            RuntimeValue::Trapdoor { public, .. } => {
-                self.backend.wait_for_matrix(public.as_ref()).map_err(Self::backend_error)
-            }
-            RuntimeValue::IndexedFamily(values) => {
-                for value in values {
-                    self.fence_runtime_value(value)?;
-                }
-                Ok(())
-            }
-            RuntimeValue::Int(_) |
-            RuntimeValue::Real(_) |
-            RuntimeValue::Bool(_) |
-            RuntimeValue::Bytes(_) |
-            RuntimeValue::TypedBlob(_) |
-            RuntimeValue::LazyArtifact { .. } |
-            RuntimeValue::LazyArtifactFamily { .. } |
-            RuntimeValue::StagedArtifact { .. } |
-            RuntimeValue::StagedArtifactFamily { .. } => Ok(()),
-        }
     }
 
     fn value(

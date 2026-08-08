@@ -40,31 +40,76 @@ namespace
         delete events;
     }
 
-    int reap_released_buffer_events(const GpuContext *ctx)
+    int fence_release_streams(const GpuContext *ctx)
     {
-        std::vector<GpuReleasedBufferEvent> events;
+        if (!ctx)
         {
-            std::lock_guard<std::mutex> lock(ctx->released_buffer_events_mutex);
-            events.swap(ctx->released_buffer_events);
+            return set_error("invalid GPU context");
         }
-        for (const auto &entry : events)
+        for (size_t partition = 0; partition < ctx->release_streams_by_partition.size(); ++partition)
         {
-            cudaError_t err = cudaSetDevice(entry.device);
-            if (err == cudaSuccess)
+            const int device = ctx->gpu_ids[partition];
+            cudaStream_t stream = ctx->release_streams_by_partition[partition];
+            if (!stream)
             {
-                err = cudaEventSynchronize(entry.event);
+                continue;
             }
-            cudaError_t destroy_err = cudaEventDestroy(entry.event);
+            cudaError_t err = cudaSetDevice(device);
             if (err != cudaSuccess)
             {
                 return set_error(cudaGetErrorString(err));
             }
-            if (destroy_err != cudaSuccess)
+            cudaEvent_t epoch = ctx->release_fence_events_by_partition[partition];
+            err = cudaEventRecord(epoch, stream);
+            if (err == cudaSuccess)
             {
-                return set_error(cudaGetErrorString(destroy_err));
+                err = cudaEventSynchronize(epoch);
+            }
+            if (err != cudaSuccess)
+            {
+                return set_error(cudaGetErrorString(err));
             }
         }
         return 0;
+    }
+
+    void destroy_context_streams(GpuContext *ctx)
+    {
+        if (!ctx)
+        {
+            return;
+        }
+        fence_release_streams(ctx);
+        for (size_t partition = 0; partition < ctx->gpu_ids.size(); ++partition)
+        {
+            cudaSetDevice(ctx->gpu_ids[partition]);
+            if (partition < ctx->release_streams_by_partition.size() &&
+                ctx->release_streams_by_partition[partition])
+            {
+                cudaStreamDestroy(ctx->release_streams_by_partition[partition]);
+                ctx->release_streams_by_partition[partition] = nullptr;
+            }
+            if (partition < ctx->release_fence_events_by_partition.size() &&
+                ctx->release_fence_events_by_partition[partition])
+            {
+                cudaEventDestroy(ctx->release_fence_events_by_partition[partition]);
+                ctx->release_fence_events_by_partition[partition] = nullptr;
+            }
+            if (partition < ctx->compute_streams_by_partition.size())
+            {
+                for (cudaStream_t &stream : ctx->compute_streams_by_partition[partition])
+                {
+                    if (stream)
+                    {
+                        cudaStreamDestroy(stream);
+                        stream = nullptr;
+                    }
+                }
+            }
+        }
+        ctx->release_streams_by_partition.clear();
+        ctx->release_fence_events_by_partition.clear();
+        ctx->compute_streams_by_partition.clear();
     }
 
     bool mod_inverse_u64(uint64_t a, uint64_t modulus, uint64_t &out_inv)
@@ -570,12 +615,13 @@ extern "C"
         size_t moduli_len,
         const int *gpu_ids,
         size_t gpu_ids_len,
+        size_t stream_pool_size,
         GpuContext **out_ctx)
     {
         GpuContext *gpu_ctx = nullptr;
         try
         {
-            if (!out_ctx || !moduli || moduli_len == 0)
+            if (!out_ctx || !moduli || moduli_len == 0 || stream_pool_size == 0)
             {
                 return set_error("invalid context arguments");
             }
@@ -693,6 +739,42 @@ extern "C"
             gpu_ctx->limb_types = std::move(limb_types);
             gpu_ctx->limb_coeff_bytes = std::move(limb_coeff_bytes);
             gpu_ctx->decomp_counts_by_partition = std::move(decomp_counts_by_partition);
+            gpu_ctx->compute_streams_by_partition.resize(gpu_ctx->gpu_ids.size());
+            gpu_ctx->release_streams_by_partition.resize(gpu_ctx->gpu_ids.size(), nullptr);
+            gpu_ctx->release_fence_events_by_partition.resize(gpu_ctx->gpu_ids.size(), nullptr);
+            for (size_t partition = 0; partition < gpu_ctx->gpu_ids.size(); ++partition)
+            {
+                const int device = gpu_ctx->gpu_ids[partition];
+                cudaError_t err = cudaSetDevice(device);
+                if (err != cudaSuccess)
+                {
+                    throw std::runtime_error(cudaGetErrorString(err));
+                }
+                err = cudaEventCreateWithFlags(
+                    &gpu_ctx->release_fence_events_by_partition[partition],
+                    cudaEventDisableTiming);
+                if (err != cudaSuccess)
+                {
+                    throw std::runtime_error(cudaGetErrorString(err));
+                }
+                auto &streams = gpu_ctx->compute_streams_by_partition[partition];
+                streams.resize(stream_pool_size, nullptr);
+                for (cudaStream_t &stream : streams)
+                {
+                    err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+                    if (err != cudaSuccess)
+                    {
+                        throw std::runtime_error(cudaGetErrorString(err));
+                    }
+                }
+                err = cudaStreamCreateWithFlags(
+                    &gpu_ctx->release_streams_by_partition[partition],
+                    cudaStreamNonBlocking);
+                if (err != cudaSuccess)
+                {
+                    throw std::runtime_error(cudaGetErrorString(err));
+                }
+            }
             gpu_ctx->ntt_device_constants.reserve(gpu_ctx->gpu_ids.size());
             for (int device : gpu_ctx->gpu_ids)
             {
@@ -714,6 +796,7 @@ extern "C"
         {
             if (gpu_ctx)
             {
+                destroy_context_streams(gpu_ctx);
                 free_ntt_device_constants(gpu_ctx->ntt_device_constants);
                 delete gpu_ctx;
             }
@@ -723,6 +806,7 @@ extern "C"
         {
             if (gpu_ctx)
             {
+                destroy_context_streams(gpu_ctx);
                 free_ntt_device_constants(gpu_ctx->ntt_device_constants);
                 delete gpu_ctx;
             }
@@ -736,44 +820,18 @@ extern "C"
         {
             return;
         }
-        // Context destruction is already terminal; drain only the free streams
-        // owned by this context before releasing its CUDA resources.
-        reap_released_buffer_events(ctx);
+        destroy_context_streams(ctx);
         free_ntt_device_constants(ctx->ntt_device_constants);
         delete ctx;
     }
 
-    int gpu_context_trim_memory_pool(const GpuContext *ctx)
+    int gpu_context_fence_releases(const GpuContext *ctx)
     {
         if (!ctx)
         {
-            return set_error("invalid gpu_context_trim_memory_pool arguments");
+            return set_error("invalid gpu_context_fence_releases arguments");
         }
-        int status = reap_released_buffer_events(ctx);
-        if (status != 0)
-        {
-            return status;
-        }
-        for (int device : ctx->gpu_ids)
-        {
-            cudaError_t err = cudaSetDevice(device);
-            if (err != cudaSuccess)
-            {
-                return set_error(cudaGetErrorString(err));
-            }
-            cudaMemPool_t pool = nullptr;
-            err = cudaDeviceGetDefaultMemPool(&pool, device);
-            if (err != cudaSuccess)
-            {
-                return set_error(cudaGetErrorString(err));
-            }
-            err = cudaMemPoolTrimTo(pool, 0);
-            if (err != cudaSuccess)
-            {
-                return set_error(cudaGetErrorString(err));
-            }
-        }
-        return 0;
+        return fence_release_streams(ctx);
     }
 
     int gpu_context_get_N(const GpuContext *ctx, int *out_N)

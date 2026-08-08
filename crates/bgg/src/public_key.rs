@@ -1,8 +1,8 @@
 //! Declarative BGG+ public-key graph values.
 
-use crate::encoding::BggSamplerLayout;
+use crate::{boolean::BggPublicKeyFamily, encoding::BggSamplerLayout};
 use mxx_dsl::{
-    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Pending, Ring,
+    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel, Pending, Ring,
 };
 use mxx_ir_core::{IntExpr, ValueHandle, node::IndexRange};
 
@@ -146,6 +146,40 @@ pub struct BggPublicKeySampler {
 }
 
 impl BggPublicKeySampler {
+    /// Samples one packed public matrix and exposes a dynamically sized family of slices.
+    ///
+    /// Every member reveals its plaintext relation. Use [`Self::sample`] when the family size and
+    /// reveal policy are both statically known while constructing the graph.
+    pub fn sample_family(
+        &self,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        count: impl Into<IntExpr>,
+        public_key_columns: impl Into<IntExpr>,
+    ) -> Result<BggPublicKeyFamily, DslError> {
+        let count = count.into();
+        let columns = public_key_columns.into();
+        let packed = self.layout.ring().hash_matrix(
+            hash_key,
+            tag,
+            (
+                IntExpr::constant(self.layout.secret_dimension),
+                IntExpr::Mul(Box::new(columns.clone()), Box::new(count.clone())),
+            ),
+        );
+        let matrices = Parallel::range(count).map_values(|index| {
+            let start = IntExpr::Mul(Box::new(columns.clone()), Box::new(index.expression()));
+            packed.clone().slice(
+                None,
+                Some(IndexRange {
+                    start: start.clone(),
+                    end: IntExpr::Add(Box::new(start), Box::new(columns.clone())),
+                }),
+            )
+        })?;
+        Ok(BggPublicKeyFamily { matrices, reveal_plaintext: true })
+    }
+
     /// Samples the packed public matrices once and exposes deterministic slices.
     pub fn sample(
         &self,

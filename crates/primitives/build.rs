@@ -12,6 +12,7 @@ fn main() {
     println!("cargo::rustc-link-lib=dylib=gomp");
 
     if env::var("CARGO_FEATURE_GPU").is_ok() {
+        println!("cargo::rerun-if-env-changed=CUDA_ARCH");
         println!("cargo::rerun-if-changed=cuda/src/Runtime.cu");
         println!("cargo::rerun-if-changed=cuda/src/ChaCha.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");

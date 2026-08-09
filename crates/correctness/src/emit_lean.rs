@@ -732,6 +732,13 @@ fn lean_wire_ref(wire: &mxx_ir_core::WireRef) -> String {
     format!("{{ node := {}, port := {} }}", wire.node.0, wire.port.0)
 }
 
+fn lean_optional_int_expr(value: &Option<IntExpr>) -> String {
+    match value {
+        Some(value) => format!("(some ({}))", lean_ir_int_expr(value)),
+        None => "none".to_owned(),
+    }
+}
+
 fn lean_node_kind(
     stage: &str,
     graph: &Graph,
@@ -896,10 +903,6 @@ fn lean_node_kind(
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            let optional = |value: &Option<IntExpr>| match value {
-                Some(value) => format!("some ({})", lean_ir_int_expr(value)),
-                None => "none".to_owned(),
-            };
             format!(
                 ".hashSample {} .{} [{}] [{}] [{}] [{}] {} {}",
                 lean_matrix_type(matrix_type),
@@ -908,8 +911,8 @@ fn lean_node_kind(
                 expressions(tag_expressions),
                 expressions(tag_decimal_expressions),
                 expressions(tag_u64_le_expressions),
-                optional(base),
-                optional(digit_count),
+                lean_optional_int_expr(base),
+                lean_optional_int_expr(digit_count),
             )
         }
         NodeKind::GadgetDecompose { base, small, digit_count } => {
@@ -1270,6 +1273,34 @@ mod tests {
     use super::*;
     use mxx_dsl::{DslContext, Family, Int, Ring, Sequential};
     use mxx_ir_core::{RealExpr, WireType};
+
+    #[test]
+    fn optional_int_expression_is_one_lean_application_argument() {
+        assert_eq!(
+            lean_optional_int_expr(&Some(IntExpr::constant(32))),
+            "(some (.constant (32 : Int)))"
+        );
+        assert_eq!(lean_optional_int_expr(&None), "none");
+    }
+
+    #[test]
+    fn decomposed_hash_emits_parenthesized_optional_arguments() {
+        let ring = Ring::new(17, 8);
+        let key = ring.bytes_input("key", 32);
+        let hash = ring.hash_decomposed(key, b"tag".as_slice(), (1, 1), 4, 2);
+        let graph = DslContext::new("hash-emission").output("hash", hash).unwrap().build().unwrap();
+        let emitted = lean_scope(
+            "hash-emission",
+            &graph.graph,
+            &FrozenGraphScopeId::Root,
+            graph.graph.root_scope(),
+            0,
+        )
+        .unwrap();
+
+        assert!(emitted.contains("(some (.constant (4 : Int)))"));
+        assert!(emitted.contains("(some (.constant (2 : Int)))"));
+    }
 
     #[test]
     fn operational_inventory_has_every_current_variant_row() {

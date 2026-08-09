@@ -547,6 +547,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the generated Lean checker executable"]
     fn exact_cutoffs_and_lean_checker_match_rust() {
         assert_eq!(
             default_error_max_coefficient_bound(&RealExpr::from_integer(4)).unwrap(),

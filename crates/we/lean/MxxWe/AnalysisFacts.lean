@@ -1,4 +1,4 @@
-import Mxx.Certificate
+import Mxx.Certificate.Analyzer
 import MxxWe.Generated.DiamondWeFamily.Ir
 
 open MxxWe.Generated.DiamondWeFamily

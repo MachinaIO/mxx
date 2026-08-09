@@ -1,5 +1,4 @@
 import Mxx.Toolkit.Norms
-import Mathlib.Tactic
 
 namespace Mxx.Toolkit
 

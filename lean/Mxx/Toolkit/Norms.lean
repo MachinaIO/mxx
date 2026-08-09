@@ -1,7 +1,7 @@
 import Mxx.Ir
 import Mathlib.Data.List.GetD
 import Mathlib.Data.ZMod.ValMinAbs
-import Mathlib.Tactic
+import Mathlib.Data.Matrix.Mul
 
 namespace Mxx.Toolkit
 

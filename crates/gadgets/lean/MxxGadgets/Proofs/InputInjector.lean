@@ -1,7 +1,6 @@
 import MxxGadgets.InputInjector
 import Mxx.Certificate.SymbolicEvaluationSoundness
 import Mxx.Certificate.Rules.TraceBoundRecurrence
-import Mathlib.Tactic
 
 namespace MxxGadgets.InputInjector
 

@@ -1,6 +1,5 @@
 import Mxx.Certificate.Analyzer
 import Mxx.Certificate.AffineNormalize
-import Mxx.Certificate.AffineNormalize
 import Mxx.Certificate.Identity
 import Mxx.Certificate.Syntax
 import Mxx.Certificate.Facts

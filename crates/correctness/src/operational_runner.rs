@@ -140,7 +140,9 @@ fn checker_source(emitted: &EmittedProtocol, request: &OperationalCheckRequest) 
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "import Mxx.Certificate.OperationalBounds\n{}\n\
+        "import Mxx.Certificate.OperationalBounds\n\
+set_option maxHeartbeats 0\n\
+{}\n\
 open {}\n\
 open Mxx.Certificate\n\n\
 private def operationalCheck : Except OperationalError OperationalNoiseCheckReport := do\n\
@@ -270,6 +272,28 @@ mod tests {
             rejection: None,
         };
         assert_ne!(report.schema_version, OPERATIONAL_REPORT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn generated_checker_does_not_timeout_large_workflows() {
+        let protocol = toy_example::protocol();
+        let emitted = emit_protocol_for(
+            "ToyOperationalRunner",
+            &protocol,
+            "MxxCorrectness",
+            toy_example::PROTOCOL_SOURCE_PATHS,
+        )
+        .unwrap();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            residual_stage: "encrypt".to_owned(),
+            residual_output: "operational-residual".to_owned(),
+            plaintext_modulus: BigInt::from(2),
+            ciphertext_modulus: BigInt::from(256),
+        };
+
+        assert!(checker_source(&emitted, &request).contains("set_option maxHeartbeats 0"));
     }
 
     #[test]

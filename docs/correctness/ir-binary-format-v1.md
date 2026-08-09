@@ -94,7 +94,7 @@ indices are decode errors. Existing Graph IR validation remains responsible for 
 
 ## Derivations
 
-`DerivationRule` uses declaration-order tags `0..51`. `matrixMultiplyRelation` is tag `36` and
+`DerivationRule` uses declaration-order tags `0..53`. `matrixMultiplyRelation` is tag `36` and
 carries its `WireRef rightOperand`; all other rule payloads are empty.
 
 - `NodeDerivation`: `u32 sourceNode, DerivationRule, array<WireRef> arguments`.

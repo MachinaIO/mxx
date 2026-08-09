@@ -13,6 +13,7 @@ use thiserror::Error;
 
 pub const IR_BINARY_FORMAT_VERSION: u8 = 1;
 const DOCUMENT_PROG: u8 = 1;
+const DOCUMENT_PROGRAM_DERIVATION: u8 = 2;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum BinaryEncodeError {
@@ -517,6 +518,135 @@ impl Encoder {
         }
         Ok(())
     }
+
+    fn derivation_rule(
+        &mut self,
+        node: &mxx_ir_core::NodeHandle,
+        scope: &GraphScope,
+    ) -> Result<(), BinaryEncodeError> {
+        let (tag, relation) = match node.kind() {
+            NodeKind::Input { .. } => (0, None),
+            NodeKind::ConstantInt(_) => (1, None),
+            NodeKind::EvaluateInt(_) => (2, None),
+            NodeKind::ConstantReal(_) => (3, None),
+            NodeKind::ConstantBool(_) => (4, None),
+            NodeKind::ConstantMatrix { value: ConstantMatrix::Zero, .. } => (5, None),
+            NodeKind::ConstantMatrix { value: ConstantMatrix::Identity, .. } => (6, None),
+            NodeKind::ConstantMatrix { value: ConstantMatrix::Polynomial { .. }, .. } => (7, None),
+            NodeKind::ConstantMatrix { value: ConstantMatrix::UnitRow { .. }, .. } => (8, None),
+            NodeKind::ConstantMatrix { value: ConstantMatrix::UnitColumn { .. }, .. } => (9, None),
+            NodeKind::ConstantMatrix {
+                value: ConstantMatrix::Gadget { small: false, .. }, ..
+            } => (10, None),
+            NodeKind::ConstantMatrix {
+                value: ConstantMatrix::Gadget { small: true, .. }, ..
+            } => (11, None),
+            NodeKind::ConstantMatrix { value: ConstantMatrix::PowerOfBase { .. }, .. } => {
+                (12, None)
+            }
+            NodeKind::ConstantMatrix { value: ConstantMatrix::Rotation { .. }, .. } => (13, None),
+            NodeKind::GadgetTrapdoor { .. } => (14, None),
+            NodeKind::IntToReal => (15, None),
+            NodeKind::BoolToInt => (16, None),
+            NodeKind::IntBinary(_) => (17, None),
+            NodeKind::RealBinary(_) => (18, None),
+            NodeKind::RealSqrt => (19, None),
+            NodeKind::IntCompare(_) => (20, None),
+            NodeKind::BitExtract { .. } => (21, None),
+            NodeKind::ExtractCoefficient { .. } => (22, None),
+            NodeKind::ConstantCoefficient { .. } => (23, None),
+            NodeKind::Select { .. } => (24, None),
+            NodeKind::UniformResidueSample { .. } => (25, None),
+            NodeKind::UniformIntervalSample { .. } => (26, None),
+            NodeKind::GaussianSample { .. } => (27, None),
+            NodeKind::HashSample { .. } => (28, None),
+            NodeKind::GadgetDecompose { .. } => (29, None),
+            NodeKind::TrapdoorSample { .. } => (30, None),
+            NodeKind::TrapdoorPublic => (31, None),
+            NodeKind::PreimageSample { .. } => (32, None),
+            NodeKind::MatrixBinary(MatrixBinaryOp::Add) => (33, None),
+            NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) => (34, None),
+            NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) => {
+                let arguments = scope.arguments(node).expect("validated multiplication arguments");
+                let left = arguments[0];
+                let right = arguments[1];
+                let relation = match scope.node(right.node).map(|producer| producer.kind()) {
+                    Some(NodeKind::GadgetDecompose { .. }) => {
+                        scope.node(left.node).is_some_and(|producer| {
+                            matches!(
+                                producer.kind(),
+                                NodeKind::ConstantMatrix {
+                                    value: ConstantMatrix::Gadget { .. },
+                                    ..
+                                }
+                            )
+                        })
+                    }
+                    Some(NodeKind::PreimageSample { .. }) => {
+                        scope
+                            .node(right.node)
+                            .and_then(|producer| scope.arguments(producer))
+                            .and_then(|arguments| arguments.first().copied()) ==
+                            Some(left)
+                    }
+                    _ => false,
+                };
+                if relation { (36, Some(right)) } else { (35, None) }
+            }
+            NodeKind::MatrixNegate => (37, None),
+            NodeKind::MatrixScale { .. } => (38, None),
+            NodeKind::Transpose => (39, None),
+            NodeKind::Slice { .. } => (40, None),
+            NodeKind::Tensor => (41, None),
+            NodeKind::Reshape { .. } => (42, None),
+            NodeKind::Concat { .. } => (43, None),
+            NodeKind::ThresholdDecode { output_bool: true, .. } => (44, None),
+            NodeKind::ThresholdDecode { output_bool: false, .. } => (45, None),
+            NodeKind::CrtRecompose { .. } => (46, None),
+            NodeKind::PackPolynomialCoefficients { .. } => (47, None),
+            NodeKind::FamilyPack { .. } => (48, None),
+            NodeKind::FamilyGetStatic { .. } => (49, None),
+            NodeKind::FamilyGetDynamic => (50, None),
+            NodeKind::SubgraphCall(_) => (51, None),
+            NodeKind::ParallelLoop(_) => (52, None),
+            NodeKind::SequentialLoop(_) => (53, None),
+        };
+        self.record(tag, |out| if let Some(wire) = relation { out.wire(&wire) } else { Ok(()) })
+    }
+
+    fn scope_derivation(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        scope: &GraphScope,
+        attachments: Option<&mxx_dsl::FrozenDerivationAttachments>,
+    ) -> Result<(), BinaryEncodeError> {
+        self.u32(scope.nodes().len(), "derivation step count")?;
+        for (source_node, node) in scope.nodes().iter().enumerate() {
+            self.u32(source_node, "source node")?;
+            self.derivation_rule(node, scope)?;
+            let arguments = scope.arguments(node).ok_or(BinaryEncodeError::MissingScope)?;
+            self.array(&arguments, |out, wire| out.wire(wire))?;
+        }
+        let entries = attachments
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .filter(|entry| entry.roles.first().is_some_and(|(_, wire)| &wire.scope == scope_id))
+            .collect::<Vec<_>>();
+        self.u32(entries.len(), "attachment count")?;
+        for entry in entries {
+            if entry.roles.iter().any(|(_, wire)| &wire.scope != scope_id) {
+                return Err(BinaryEncodeError::MissingScope);
+            }
+            self.string(&entry.namespace)?;
+            self.string(&entry.rule)?;
+            self.u32(entry.roles.len(), "attachment role count")?;
+            for (role, wire) in &entry.roles {
+                self.string(role)?;
+                self.wire(&wire.wire)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn scope_name(id: &FrozenGraphScopeId) -> String {
@@ -532,21 +662,9 @@ fn scope_name(id: &FrozenGraphScopeId) -> String {
     }
 }
 
-pub fn encode_prog(graph: &Graph) -> Result<Vec<u8>, BinaryEncodeError> {
-    let mut encoder = Encoder::default();
-    encoder.scope(graph, &FrozenGraphScopeId::Root, graph.root_scope())?;
-    let definitions = graph
-        .scopes()
-        .iter()
-        .filter(|(id, _)| !matches!(id, FrozenGraphScopeId::Root))
-        .collect::<Vec<_>>();
-    encoder.u32(definitions.len(), "definition count")?;
-    for (id, scope) in definitions {
-        encoder.string(&scope_name(id))?;
-        encoder.scope(graph, id, scope)?;
-    }
+fn finish_document(encoder: Encoder, kind: u8) -> Result<Vec<u8>, BinaryEncodeError> {
     let payload = encoder.bytes;
-    let mut output = vec![IR_BINARY_FORMAT_VERSION, DOCUMENT_PROG];
+    let mut output = vec![IR_BINARY_FORMAT_VERSION, kind];
     output.extend_from_slice(
         &u32::try_from(payload.len())
             .map_err(|_| BinaryEncodeError::U32Overflow { field: "document payload" })?
@@ -581,6 +699,41 @@ pub fn encode_prog(graph: &Graph) -> Result<Vec<u8>, BinaryEncodeError> {
     Ok(output)
 }
 
+pub fn encode_prog(graph: &Graph) -> Result<Vec<u8>, BinaryEncodeError> {
+    let mut encoder = Encoder::default();
+    encoder.scope(graph, &FrozenGraphScopeId::Root, graph.root_scope())?;
+    let definitions = graph
+        .scopes()
+        .iter()
+        .filter(|(id, _)| !matches!(id, FrozenGraphScopeId::Root))
+        .collect::<Vec<_>>();
+    encoder.u32(definitions.len(), "definition count")?;
+    for (id, scope) in definitions {
+        encoder.string(&scope_name(id))?;
+        encoder.scope(graph, id, scope)?;
+    }
+    finish_document(encoder, DOCUMENT_PROG)
+}
+
+pub fn encode_program_derivation(
+    graph: &Graph,
+    attachments: Option<&mxx_dsl::FrozenDerivationAttachments>,
+) -> Result<Vec<u8>, BinaryEncodeError> {
+    let mut encoder = Encoder::default();
+    encoder.scope_derivation(&FrozenGraphScopeId::Root, graph.root_scope(), attachments)?;
+    let definitions = graph
+        .scopes()
+        .iter()
+        .filter(|(id, _)| !matches!(id, FrozenGraphScopeId::Root))
+        .collect::<Vec<_>>();
+    encoder.u32(definitions.len(), "derivation definition count")?;
+    for (id, scope) in definitions {
+        encoder.string(&scope_name(id))?;
+        encoder.scope_derivation(id, scope, attachments)?;
+    }
+    finish_document(encoder, DOCUMENT_PROGRAM_DERIVATION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +747,16 @@ mod tests {
             assert_eq!(first, second);
             assert_eq!(first[0], IR_BINARY_FORMAT_VERSION);
             assert_eq!(first[1], DOCUMENT_PROG);
+
+            let first =
+                encode_program_derivation(&stage.graph, Some(&stage.derivation_attachments))
+                    .unwrap();
+            let second =
+                encode_program_derivation(&stage.graph, Some(&stage.derivation_attachments))
+                    .unwrap();
+            assert_eq!(first, second);
+            assert_eq!(first[0], IR_BINARY_FORMAT_VERSION);
+            assert_eq!(first[1], DOCUMENT_PROGRAM_DERIVATION);
         }
     }
 }

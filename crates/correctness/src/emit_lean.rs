@@ -1863,6 +1863,27 @@ mod tests {
             .map(|chunk| lean_string(chunk))
             .collect::<Vec<_>>()
             .join(", ");
+        let lean_chunks = |bytes: &[u8]| {
+            crate::ir_binary::hex_chunks(bytes, 1024)
+                .iter()
+                .map(|chunk| lean_string(chunk))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut wrong_version = bytes.clone();
+        wrong_version[0] = 2;
+        let truncated = bytes[..bytes.len() - 1].to_vec();
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        let string_count = u32::from_le_bytes(bytes[6..10].try_into().unwrap()) as usize;
+        let blob_length = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
+        let payload_start = 14 + (string_count + 1) * 4 + blob_length;
+        let mut unknown_tag = bytes.clone();
+        unknown_tag[payload_start + 4] = 255;
+        let mut invalid_wire = bytes.clone();
+        let first_output_node = invalid_wire.len() - 32;
+        invalid_wire[first_output_node..first_output_node + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
         let derivation_bytes = crate::ir_binary::encode_program_derivation(
             &stage.graph,
             Some(&stage.derivation_attachments),
@@ -1884,12 +1905,17 @@ mod tests {
         )
         .unwrap();
         let source = format!(
-            "import Mxx.Ir.BinaryFormat\n{}\ndef expected : Mxx.Ir.Prog :=\n{}\ndef expectedDerivation : Mxx.Certificate.ProgramDerivation :=\n{}\n#guard (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg) = .ok expected\n#guard (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProgramDerivation) = .ok expectedDerivation\n",
+            "import Mxx.Ir.BinaryFormat\n{}\ndef expected : Mxx.Ir.Prog :=\n{}\ndef expectedDerivation : Mxx.Certificate.ProgramDerivation :=\n{}\n#guard (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg) = .ok expected\n#guard (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProgramDerivation) = .ok expectedDerivation\n#guard match (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg) with | .error (.wrongVersion ..) => true | _ => false\n#guard match (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg) with | .error (.truncated ..) => true | _ => false\n#guard match (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg) with | .error (.trailingBytes ..) => true | _ => false\n#guard match (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg) with | .error (.unknownTag ..) => true | _ => false\n#guard match (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg) with | .error (.invalidWire ..) => true | _ => false\n",
             interner.definitions(),
             literal,
             derivation_literal,
             chunks,
             derivation_chunks,
+            lean_chunks(&wrong_version),
+            lean_chunks(&truncated),
+            lean_chunks(&trailing),
+            lean_chunks(&unknown_tag),
+            lean_chunks(&invalid_wire),
         );
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
         let temporary = tempfile::Builder::new().suffix(".lean").tempfile_in(&workspace).unwrap();

@@ -414,8 +414,9 @@ private def readEnvelope {α : Type}
     | none => throw (.invalidUtf8 (blobOffset + startOffset))
   let payloadStart := state.position
   let payloadEnd := payloadStart + payloadLength
-  if payloadEnd < payloadStart ∨ payloadEnd != bytes.size then
-    throw (.trailingBytes payloadEnd)
+  if payloadEnd < payloadStart then throw (.invalidLength payloadStart)
+  if payloadEnd > bytes.size then throw (.truncated bytes.size)
+  if payloadEnd < bytes.size then throw (.trailingBytes payloadEnd)
   let payloadState := { state with limit := payloadEnd, strings := strings.toArray }
   let (value, final) ← (readPayload (payloadLength + 1)).run payloadState
   if final.position != payloadEnd then throw (.trailingBytes final.position)

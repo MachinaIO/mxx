@@ -94,6 +94,7 @@ struct TestConfig {
     preprocessing_parallel_instances: usize,
     release_fence_interval: usize,
     checkpoint_root: PathBuf,
+    reuse_checkpoint: Option<PathBuf>,
 }
 
 impl TestConfig {
@@ -145,6 +146,8 @@ impl TestConfig {
             checkpoint_root: env::var_os("MXX_TALL_NESTED_RNS_CHECKPOINT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("test_data/tall_nested_rns_gpu")),
+            reuse_checkpoint: env::var_os("MXX_TALL_NESTED_RNS_REUSE_CHECKPOINT")
+                .map(PathBuf::from),
         };
         if config.min_crt_depth == 0 ||
             config.min_crt_depth > config.max_crt_depth ||
@@ -198,6 +201,7 @@ struct PreparedCandidate {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PreprocessingCheckpoint {
+    hash_key: [u8; 32],
     manifest: RuntimeManifest,
     payloads: Vec<(ArtifactKey, ArtifactPayload)>,
 }
@@ -1000,10 +1004,14 @@ fn matrix_output(
 }
 
 fn matrix_family_output(
-    result: &ExecutionResult<GpuDcrtBackend>,
+    result: &mut ExecutionResult<GpuDcrtBackend>,
     name: &str,
+    backend: &GpuDcrtBackend,
+    store: &mut MemoryArtifactStore,
 ) -> Result<Vec<GpuDCRTPolyMatrix>, String> {
-    let Some(RuntimeValue::IndexedFamily(values)) = result.outputs.get(name) else {
+    let RuntimeValue::IndexedFamily(values) =
+        result.materialize_output(name, backend, store).map_err(|error| error.to_string())?
+    else {
         return Err(format!("output {name} is not an indexed family"));
     };
     values
@@ -1019,6 +1027,7 @@ fn save_preprocessing(
     config: &TestConfig,
     store: &MemoryArtifactStore,
     manifest: &RuntimeManifest,
+    hash_key: [u8; 32],
 ) -> Result<PathBuf, String> {
     let payloads = store.snapshot_manifest_payloads(manifest).map_err(|error| error.to_string())?;
     let payload_size = |payload: &ArtifactPayload| match payload {
@@ -1057,13 +1066,15 @@ fn save_preprocessing(
         config.checkpoint_root.join(format!("run-{unique}-{:016x}", rand::random::<u64>()));
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let path = directory.join("preprocessing.json");
-    let checkpoint = PreprocessingCheckpoint { manifest: manifest.clone(), payloads };
+    let checkpoint = PreprocessingCheckpoint { hash_key, manifest: manifest.clone(), payloads };
     fs::write(&path, serde_json::to_vec(&checkpoint).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
     Ok(path)
 }
 
-fn reload_preprocessing(path: &PathBuf) -> Result<(MemoryArtifactStore, RuntimeManifest), String> {
+fn reload_preprocessing(
+    path: &PathBuf,
+) -> Result<(MemoryArtifactStore, RuntimeManifest, [u8; 32]), String> {
     let restored: PreprocessingCheckpoint =
         serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
@@ -1085,7 +1096,7 @@ fn reload_preprocessing(path: &PathBuf) -> Result<(MemoryArtifactStore, RuntimeM
             .map_err(|error| error.to_string())?;
     }
     reloaded.store_manifest(restored.manifest.clone()).map_err(|error| error.to_string())?;
-    Ok((reloaded, restored.manifest))
+    Ok((reloaded, restored.manifest, restored.hash_key))
 }
 
 fn random_operands(selected: &PreparedCandidate, config: &TestConfig) -> Vec<Vec<BigUint>> {
@@ -1185,53 +1196,73 @@ fn end_to_end_processing(
         Some(selected.preprocessing_preimage_count),
     )?;
     let runtime_execution_config = execution_config(config, config.max_parallel_instances, None)?;
-    let mut hash_key = [0u8; 32];
-    rand::rng().fill(&mut hash_key);
     info!(
         elapsed = ?selected.preprocessing_graph_construction,
         "timed preprocessing graph construction during selected-candidate preparation"
     );
-    let started = Instant::now();
-    let producer = selected.producer.validate(&bindings).map_err(|error| error.to_string())?;
-    info!(elapsed = ?started.elapsed(), "timed preprocessing graph validation");
-
-    let mut producer_store = MemoryArtifactStore::default();
-    // Preprocessing artifacts are serialized by the store below.  Use a
-    // dedicated context so the consumer passes start without the producer's
-    // allocator pool and transient preimage buffers still resident on the GPU.
-    let production = {
-        let mut producer_backend =
-            gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
+    let (mut store, manifest, hash_key) = if let Some(checkpoint_path) = &config.reuse_checkpoint {
         let started = Instant::now();
-        let producer_result = execute_in_session_with_config(
-            &producer,
-            &mut producer_backend,
-            BTreeMap::from([(HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]),
-            &mut producer_store,
-            [0x71; 32],
-            producer_execution_config,
-        )
-        .map_err(|error| error.to_string())?;
-        info!(elapsed = ?started.elapsed(), "timed preprocessing execution");
-        producer_result
-            .production_id
-            .ok_or_else(|| "preprocessing execution returned no production id".to_owned())?
-    };
-    if production != selected.production {
-        return Err("preprocessing production id differs from the selected manifest".to_owned());
-    }
-    let manifest = producer_store
-        .manifest(&production)
-        .cloned()
-        .ok_or_else(|| "preprocessing manifest was not committed".to_owned())?;
+        let (store, manifest, hash_key) = reload_preprocessing(checkpoint_path)?;
+        if manifest.production_id != selected.production {
+            return Err(
+                "reused checkpoint production id differs from selected parameters".to_owned()
+            );
+        }
+        info!(
+            elapsed = ?started.elapsed(),
+            path = %checkpoint_path.display(),
+            "reused preprocessing checkpoint; skipped preprocessing execution"
+        );
+        (store, manifest, hash_key)
+    } else {
+        let mut hash_key = [0u8; 32];
+        rand::rng().fill(&mut hash_key);
+        let started = Instant::now();
+        let producer = selected.producer.validate(&bindings).map_err(|error| error.to_string())?;
+        info!(elapsed = ?started.elapsed(), "timed preprocessing graph validation");
 
-    let started = Instant::now();
-    let checkpoint_path = save_preprocessing(config, &producer_store, &manifest)?;
-    info!(elapsed = ?started.elapsed(), path = %checkpoint_path.display(), "timed checkpoint serialization");
-    let started = Instant::now();
-    let (mut store, manifest) = reload_preprocessing(&checkpoint_path)?;
-    info!(elapsed = ?started.elapsed(), path = %checkpoint_path.display(), "timed checkpoint reload");
-    let manifests = BTreeMap::from([(production, manifest)]);
+        let mut producer_store = MemoryArtifactStore::default();
+        // Preprocessing artifacts are serialized by the store below. Use a dedicated context so
+        // the consumer passes start without the producer's allocator pool and transient preimage
+        // buffers still resident on the GPU.
+        let production = {
+            let mut producer_backend =
+                gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
+            let started = Instant::now();
+            let producer_result = execute_in_session_with_config(
+                &producer,
+                &mut producer_backend,
+                BTreeMap::from([(
+                    HASH_KEY_INPUT.to_owned(),
+                    RuntimeValue::Bytes(hash_key.to_vec()),
+                )]),
+                &mut producer_store,
+                [0x71; 32],
+                producer_execution_config,
+            )
+            .map_err(|error| error.to_string())?;
+            info!(elapsed = ?started.elapsed(), "timed preprocessing execution");
+            producer_result
+                .production_id
+                .ok_or_else(|| "preprocessing execution returned no production id".to_owned())?
+        };
+        if production != selected.production {
+            return Err("preprocessing production id differs from the selected manifest".to_owned());
+        }
+        let manifest = producer_store
+            .manifest(&production)
+            .cloned()
+            .ok_or_else(|| "preprocessing manifest was not committed".to_owned())?;
+
+        let started = Instant::now();
+        let checkpoint_path = save_preprocessing(config, &producer_store, &manifest, hash_key)?;
+        info!(elapsed = ?started.elapsed(), path = %checkpoint_path.display(), "timed checkpoint serialization");
+        let started = Instant::now();
+        let (store, manifest, hash_key) = reload_preprocessing(&checkpoint_path)?;
+        info!(elapsed = ?started.elapsed(), path = %checkpoint_path.display(), "timed checkpoint reload");
+        (store, manifest, hash_key)
+    };
+    let manifests = BTreeMap::from([(selected.production.clone(), manifest)]);
     let mut backend = gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
 
     let started = Instant::now();
@@ -1291,7 +1322,7 @@ fn end_to_end_processing(
         .map_err(|error| error.to_string())?;
     info!(elapsed = ?started.elapsed(), "timed Tall encoding graph validation");
     let started = Instant::now();
-    let encoding_result = execute_with_config(
+    let mut encoding_result = execute_with_config(
         &encoding_graph,
         &mut backend,
         inputs,
@@ -1301,9 +1332,13 @@ fn end_to_end_processing(
     )
     .map_err(|error| error.to_string())?;
     let encoding_public_key = matrix_output(&encoding_result, "encoding_public_key")?;
-    let encoding_rows = matrix_family_output(&encoding_result, "encoding_rows")?;
-    let output_plaintexts = matrix_family_output(&encoding_result, "output_plaintexts")?;
-    let transformed_secrets = matrix_family_output(&encoding_result, "transformed_secrets")?;
+    let encoding_rows =
+        matrix_family_output(&mut encoding_result, "encoding_rows", &backend, &mut store)?;
+    let output_plaintexts =
+        matrix_family_output(&mut encoding_result, "output_plaintexts", &backend, &mut store)?;
+    let transformed_secrets =
+        matrix_family_output(&mut encoding_result, "transformed_secrets", &backend, &mut store)?;
+    encoding_result.cleanup_staged(&mut store).map_err(|error| error.to_string())?;
     encoding_public_key.wait_until_ready();
     encoding_rows.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
     output_plaintexts.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);

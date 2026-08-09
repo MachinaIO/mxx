@@ -79,6 +79,28 @@ pub struct StagedFamilyLease {
 }
 
 impl<B: Backend> ExecutionResult<B> {
+    /// Materializes a named output that the executor returned as a lazy or streamed artifact.
+    ///
+    /// Parallel-loop families may be streamed through the artifact store so their live backend
+    /// memory stays bounded by the configured wave size. Callers that need the complete output
+    /// value can explicitly load it after execution. The staged payloads remain owned by this
+    /// result and are deleted by [`Self::cleanup_staged`].
+    pub fn materialize_output<S: ArtifactStore>(
+        &mut self,
+        name: &str,
+        backend: &B,
+        store: &mut S,
+    ) -> Result<&RuntimeValue<B>, ExecutionError> {
+        let value = self
+            .outputs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ExecutionError::MissingOutput(name.to_owned()))?;
+        let value = materialize_runtime_value(value, backend, store)?;
+        self.outputs.insert(name.to_owned(), value);
+        Ok(&self.outputs[name])
+    }
+
     /// Deletes ephemeral streamed families returned by this execution.
     ///
     /// A returned staged family remains readable until this method is called.
@@ -141,6 +163,8 @@ pub enum ExecutionError {
     Transcript(#[from] TranscriptError),
     #[error("input {0} was not provided")]
     MissingInput(String),
+    #[error("output {0} does not exist")]
+    MissingOutput(String),
     #[error("wire {0:?} is unavailable")]
     MissingWire(WireRef),
     #[error("wire {0:?} has the wrong runtime value kind")]
@@ -2600,51 +2624,7 @@ where
         artifact_type: ArtifactType,
         payload: ArtifactPayload,
     ) -> Result<RuntimeValue<B>, ExecutionError> {
-        match (artifact_type, payload) {
-            (ArtifactType::Matrix(matrix_type), ArtifactPayload::Matrix(bytes)) => {
-                let matrix = self
-                    .backend
-                    .matrix_from_bytes(&matrix_type, &bytes)
-                    .map_err(Self::backend_error)?;
-                Ok(RuntimeValue::matrix(matrix))
-            }
-            (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes))
-                if bytes.len() == length =>
-            {
-                Ok(RuntimeValue::Bytes(bytes))
-            }
-            (ArtifactType::TypedBlob { .. }, ArtifactPayload::TypedBlob(bytes)) => {
-                Ok(RuntimeValue::TypedBlob(bytes))
-            }
-            (
-                ArtifactType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. },
-                ArtifactPayload::Trapdoor { public_bytes, secret_bytes },
-            ) => {
-                let public = self
-                    .backend
-                    .matrix_from_bytes(&matrix, &public_bytes)
-                    .map_err(Self::backend_error)?;
-                let secret = self
-                    .backend
-                    .trapdoor_from_bytes(&matrix, &secret_bytes)
-                    .map_err(Self::backend_error)?;
-                let sigma = sigma
-                    .evaluate_f64(&ParamEnv::default())
-                    .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
-                Ok(RuntimeValue::Trapdoor {
-                    secret: Some(Arc::new(secret)),
-                    public: Arc::new(public),
-                    matrix_type: matrix,
-                    sigma,
-                    gadget_base,
-                    digit_count,
-                    gadget_small: None,
-                })
-            }
-            _ => Err(ExecutionError::Artifact(
-                "stored payload kind does not match artifact descriptor".to_owned(),
-            )),
-        }
+        decode_artifact(self.backend, artifact_type, payload)
     }
 
     fn matrix(
@@ -3285,6 +3265,117 @@ fn collect_staged_families<B: Backend>(
     }
 }
 
+fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
+    value: RuntimeValue<B>,
+    backend: &B,
+    store: &mut S,
+) -> Result<RuntimeValue<B>, ExecutionError> {
+    match value {
+        RuntimeValue::LazyArtifact { production, name, index, descriptor } => {
+            let artifact_type = descriptor.artifact_type.clone();
+            let payload = store
+                .load(&ArtifactKey { production, name, index }, &descriptor)
+                .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+            decode_artifact(backend, artifact_type, payload)
+        }
+        RuntimeValue::StagedArtifact { production, name, index, descriptor } => {
+            let artifact_type = descriptor.artifact_type.clone();
+            let payload = store
+                .load_staged(&ArtifactKey { production, name, index: Some(index) }, &descriptor)
+                .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+            decode_artifact(backend, artifact_type, payload)
+        }
+        RuntimeValue::LazyArtifactFamily { production, name, descriptor } => {
+            materialize_artifact_family(production, name, descriptor, false, backend, store)
+        }
+        RuntimeValue::StagedArtifactFamily { production, name, descriptor } => {
+            materialize_artifact_family(production, name, descriptor, true, backend, store)
+        }
+        RuntimeValue::IndexedFamily(values) => values
+            .into_iter()
+            .map(|value| materialize_runtime_value(value, backend, store))
+            .collect::<Result<Vec<_>, _>>()
+            .map(RuntimeValue::IndexedFamily),
+        value => Ok(value),
+    }
+}
+
+fn materialize_artifact_family<B: Backend, S: ArtifactStore>(
+    production: ProductionId,
+    name: String,
+    descriptor: ManifestArtifact,
+    staged: bool,
+    backend: &B,
+    store: &mut S,
+) -> Result<RuntimeValue<B>, ExecutionError> {
+    let count = descriptor
+        .family_count
+        .ok_or_else(|| ExecutionError::Manifest("artifact family has no cardinality".to_owned()))?;
+    let artifact_type = descriptor.artifact_type.clone();
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let key =
+            ArtifactKey { production: production.clone(), name: name.clone(), index: Some(index) };
+        let payload = if staged {
+            store.load_staged(&key, &descriptor)
+        } else {
+            store.load(&key, &descriptor)
+        }
+        .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+        values.push(decode_artifact(backend, artifact_type.clone(), payload)?);
+    }
+    Ok(RuntimeValue::IndexedFamily(values))
+}
+
+fn decode_artifact<B: Backend>(
+    backend: &B,
+    artifact_type: ArtifactType,
+    payload: ArtifactPayload,
+) -> Result<RuntimeValue<B>, ExecutionError> {
+    match (artifact_type, payload) {
+        (ArtifactType::Matrix(matrix_type), ArtifactPayload::Matrix(bytes)) => {
+            let matrix = backend
+                .matrix_from_bytes(&matrix_type, &bytes)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            Ok(RuntimeValue::matrix(matrix))
+        }
+        (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes))
+            if bytes.len() == length =>
+        {
+            Ok(RuntimeValue::Bytes(bytes))
+        }
+        (ArtifactType::TypedBlob { .. }, ArtifactPayload::TypedBlob(bytes)) => {
+            Ok(RuntimeValue::TypedBlob(bytes))
+        }
+        (
+            ArtifactType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. },
+            ArtifactPayload::Trapdoor { public_bytes, secret_bytes },
+        ) => {
+            let public = backend
+                .matrix_from_bytes(&matrix, &public_bytes)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            let secret = backend
+                .trapdoor_from_bytes(&matrix, &secret_bytes)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            let sigma = sigma
+                .evaluate_f64(&ParamEnv::default())
+                .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
+            Ok(RuntimeValue::Trapdoor {
+                secret: Some(Arc::new(secret)),
+                public: Arc::new(public),
+                matrix_type: matrix,
+                sigma,
+                gadget_base,
+                digit_count,
+                gadget_small: None,
+            })
+        }
+        _ => Err(ExecutionError::Artifact(
+            "stored payload kind does not match artifact descriptor".to_owned(),
+        )),
+    }
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -3406,13 +3497,18 @@ mod tests {
             },
         )
         .expect("execution");
-        match &result.outputs["values"] {
-            RuntimeValue::IndexedFamily(values) => assert_eq!(values.len(), 3),
-            RuntimeValue::StagedArtifactFamily { descriptor, .. } => {
-                assert_eq!(descriptor.family_count, Some(3));
-            }
-            _ => panic!("range output is not a family"),
-        }
+        let RuntimeValue::StagedArtifactFamily { descriptor, .. } = &result.outputs["values"]
+        else {
+            panic!("matrix range output should be streamed");
+        };
+        assert_eq!(descriptor.family_count, Some(3));
+        let RuntimeValue::IndexedFamily(values) = result
+            .materialize_output("values", &backend, &mut store)
+            .expect("materialize range output")
+        else {
+            panic!("materialized range output is not an indexed family");
+        };
+        assert_eq!(values.len(), 3);
         result.cleanup_staged(&mut store).expect("staged cleanup");
     }
 

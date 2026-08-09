@@ -1683,4 +1683,63 @@ mod tests {
             "1eb7ee1d85bf85dc59fea9e4e198e1cfa94df8fd0bf8168d408a754514520933"
         );
     }
+
+    #[test]
+    #[ignore = "invokes the Lean compiler"]
+    fn binary_prog_decoder_matches_toy_literal() {
+        use std::{fs, process::Command};
+
+        let protocol = crate::toy_example::protocol();
+        let stage = &protocol.bundle.workflow.stages[0];
+        let bytes = crate::ir_binary::encode_prog(&stage.graph).unwrap();
+        let chunks = crate::ir_binary::hex_chunks(&bytes, 1024)
+            .iter()
+            .map(|chunk| lean_string(chunk))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let derivation_bytes = crate::ir_binary::encode_program_derivation(
+            &stage.graph,
+            Some(&stage.derivation_attachments),
+        )
+        .unwrap();
+        let derivation_chunks = crate::ir_binary::hex_chunks(&derivation_bytes, 1024)
+            .iter()
+            .map(|chunk| lean_string(chunk))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut interner = LeanNodeInterner::default();
+        let literal = lean_program(&stage.id.0, &stage.graph, &mut interner, 0).unwrap();
+        let derivation_literal = lean_program_derivation_with_attachments(
+            &stage.id.0,
+            &stage.graph,
+            Some(&stage.derivation_attachments),
+            true,
+            0,
+        )
+        .unwrap();
+        let source = format!(
+            "import Mxx.Ir.BinaryFormat\n{}\ndef expected : Mxx.Ir.Prog :=\n{}\ndef expectedDerivation : Mxx.Certificate.ProgramDerivation :=\n{}\n#guard (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg) = .ok expected\n#guard (Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProgramDerivation) = .ok expectedDerivation\n",
+            interner.definitions(),
+            literal,
+            derivation_literal,
+            chunks,
+            derivation_chunks,
+        );
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        let temporary = tempfile::Builder::new().suffix(".lean").tempfile_in(&workspace).unwrap();
+        fs::write(temporary.path(), &source).unwrap();
+        let output = Command::new("lake")
+            .args(["env", "lean"])
+            .arg(temporary.path())
+            .current_dir(workspace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Lean decoder fixture failed:\n{}\n{}\nsource:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            source,
+        );
+    }
 }

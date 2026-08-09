@@ -734,6 +734,21 @@ pub fn encode_program_derivation(
     finish_document(encoder, DOCUMENT_PROGRAM_DERIVATION)
 }
 
+pub fn hex_chunks(bytes: &[u8], chunk_bytes: usize) -> Vec<String> {
+    assert!(chunk_bytes > 0, "hex chunk size must be positive");
+    bytes
+        .chunks(chunk_bytes)
+        .map(|chunk| {
+            let mut output = String::with_capacity(chunk.len() * 2);
+            for byte in chunk {
+                use std::fmt::Write;
+                write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+            }
+            output
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +773,11 @@ mod tests {
             assert_eq!(first[0], IR_BINARY_FORMAT_VERSION);
             assert_eq!(first[1], DOCUMENT_PROGRAM_DERIVATION);
         }
+    }
+
+    #[test]
+    fn hex_transport_has_bounded_stable_chunks() {
+        let bytes = (0_u8..10).collect::<Vec<_>>();
+        assert_eq!(hex_chunks(&bytes, 4), ["00010203", "04050607", "0809"]);
     }
 }

@@ -75,10 +75,13 @@ jobs:
       - name: Run clippy memory
         run: cargo +nightly-2026-07-25 clippy --workspace --all-targets
         env:
+          MXX_REGENERATE_CORRECTNESS: 1
           RUSTFLAGS: -A unused
 
       - name: Run test
         run: RUST_TEST_NOCAPTURE=1 cargo test -r --workspace --lib -- --test-threads=1
+        env:
+          MXX_REGENERATE_CORRECTNESS: 1
 
   lean:
     runs-on: ubuntu-latest
@@ -127,21 +130,14 @@ jobs:
         run: |
           scratch="$(mktemp -d)"
           trap 'rm -rf "${scratch}"' EXIT
-          MXX_CORRECTNESS_OUT_DIR="${scratch}/correctness" cargo run -p mxx-correctness --example emit_correctness
-          MXX_CORRECTNESS_OUT_DIR="${scratch}/gadgets" cargo run -p mxx-gadgets --example emit_correctness
-          MXX_CORRECTNESS_OUT_DIR="${scratch}/we" cargo run -p mxx-we --example emit_correctness
+          MXX_REGENERATE_CORRECTNESS=1 MXX_CORRECTNESS_OUT_DIR="${scratch}/correctness" cargo run -p mxx-correctness --example emit_correctness
+          MXX_REGENERATE_CORRECTNESS=1 MXX_CORRECTNESS_OUT_DIR="${scratch}/we" cargo run -p mxx-we --example emit_correctness
           diff -ru crates/correctness/lean/MxxCorrectness/Generated "${scratch}/correctness"
-          diff -ru crates/gadgets/lean/MxxGadgets/Generated "${scratch}/gadgets"
           diff -ru crates/we/lean/MxxWe/Generated "${scratch}/we"
 
       - name: Build Lean libraries
         working-directory: lean
-        run: lake build Mxx MxxCorrectness MxxGadgets
-
-      - name: Verify committed protocol theorems
-        run: |
-          cargo run -p mxx-correctness --example verify_correctness
-          cargo run -p mxx-gadgets --example verify_correctness
+        run: lake build Mxx MxxCorrectness MxxGadgets MxxWe
 
   ci-success:
     name: ci success

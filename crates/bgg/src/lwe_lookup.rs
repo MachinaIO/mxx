@@ -640,12 +640,7 @@ impl LweLookupCompiler {
         let ring = self.ring();
         let names = LweLookupArtifactNames::for_compiler(self);
         Ok(LweLookupArtifactWires {
-            output_public_key: ring.artifact_input(
-                artifacts.production_id.clone(),
-                names.output_public_key.clone(),
-                shape(&self.public_key_type),
-                ArtifactConfidentiality::Public,
-            ),
+            output_public_key: self.import_output_public_key(artifacts),
             low_chunks: (0..artifacts.chunk_count)
                 .map(|index| {
                     ring.family_artifact_input(
@@ -671,6 +666,15 @@ impl LweLookupCompiler {
         })
     }
 
+    fn import_output_public_key(&self, artifacts: &LweLookupArtifacts) -> Mat {
+        self.ring().artifact_input(
+            artifacts.production_id.clone(),
+            LweLookupArtifactNames::for_compiler(self).output_public_key,
+            shape(&self.public_key_type),
+            ArtifactConfidentiality::Public,
+        )
+    }
+
     pub fn public_key(&self, artifacts: &LweLookupArtifactWires) -> BggPublicKeyWire {
         BggPublicKeyWire { matrix: artifacts.output_public_key.clone(), reveal_plaintext: true }
     }
@@ -687,8 +691,8 @@ impl LweLookupCompiler {
         let input_index = plaintext.extract_coefficient(0);
         let chunk = input_index.clone().div(Int::constant(LOOKUP_ARTIFACT_CHUNK_ROWS));
         let offset = input_index.clone().rem(Int::constant(LOOKUP_ARTIFACT_CHUNK_ROWS));
-        let low = Family::select(chunk.clone(), artifacts.low_chunks.clone())?.get(offset.clone());
-        let high = Family::select(chunk, artifacts.high_chunks.clone())?.get(offset);
+        let low = select_artifact_row(&artifacts.low_chunks, chunk.clone(), offset.clone())?;
+        let high = select_artifact_row(&artifacts.high_chunks, chunk, offset)?;
         let output_plaintext = input_index.select(
             self.table
                 .entries
@@ -739,12 +743,11 @@ impl LweLookupCompiler {
                 let input_index = plaintext.extract_coefficient(0);
                 let chunk = input_index.clone().div(Int::constant(LOOKUP_ARTIFACT_CHUNK_ROWS));
                 let offset = input_index.clone().rem(Int::constant(LOOKUP_ARTIFACT_CHUNK_ROWS));
-                let low = Family::select(chunk.clone(), artifact_rows.low_chunks.clone())
-                    .expect("validated lookup low chunks")
-                    .get(offset.clone());
-                let high = Family::select(chunk, artifact_rows.high_chunks.clone())
-                    .expect("validated lookup high chunks")
-                    .get(offset);
+                let low =
+                    select_artifact_row(&artifact_rows.low_chunks, chunk.clone(), offset.clone())
+                        .expect("validated lookup low chunks");
+                let high = select_artifact_row(&artifact_rows.high_chunks, chunk, offset)
+                    .expect("validated lookup high chunks");
                 let output_plaintext = input_index
                     .select(
                         table_outputs
@@ -838,6 +841,16 @@ impl LweLookupCompiler {
     fn ring(&self) -> Ring {
         Ring::new(self.public_key_type.modulus.clone(), self.public_key_type.ring_dimension.clone())
     }
+}
+
+fn select_artifact_row(
+    chunks: &[Family<Mat>],
+    chunk: Int,
+    offset: Int,
+) -> Result<Mat, LweLookupCompileError> {
+    let selected =
+        if chunks.len() == 1 { chunks[0].clone() } else { Family::select(chunk, chunks.to_vec())? };
+    Ok(selected.get(offset))
 }
 
 fn shape(matrix_type: &MatrixType) -> (IntExpr, IntExpr) {
@@ -1218,11 +1231,15 @@ impl<P: Poly> PublicLookupLowering<P> for LweLookupPublicKeyLowering {
         gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error> {
         let invocation = invocation_for_gate(&self.invocations, circuit, lookup_id, gate)?;
-        let artifacts = invocation
+        invocation
             .compiler
-            .import_artifacts(&invocation.artifacts)
+            .validate_layout()
+            .and_then(|_| invocation.compiler.validate_artifacts(&invocation.artifacts))
             .map_err(|source| lookup_error(gate, source))?;
-        Ok(invocation.compiler.public_key(&artifacts))
+        Ok(BggPublicKeyWire {
+            matrix: invocation.compiler.import_output_public_key(&invocation.artifacts),
+            reveal_plaintext: true,
+        })
     }
 }
 
@@ -1571,12 +1588,18 @@ mod tests {
             .map(|index| make_matrix(digits + 2, digits, 30 + index * (digits + 2)))
             .collect::<Vec<_>>();
         let names = LweLookupArtifactNames::for_compiler(&lookup);
+        let low_inputs = (0..4)
+            .map(|index| ring.input(format!("low-{index}"), (digits, digits)))
+            .collect::<Vec<_>>();
+        let high_inputs = (0..4)
+            .map(|index| ring.input(format!("high-{index}"), (digits + 2, digits)))
+            .collect::<Vec<_>>();
         let producer_wires = LweLookupPreprocessingWires {
             output_public_key: ring.input("output-public", (1, digits)),
             low_chunks: vec![
                 Family::pack(
                     (0..LOOKUP_ARTIFACT_CHUNK_ROWS)
-                        .map(|index| ring.input(format!("low-{}", index.min(3)), (digits, digits)))
+                        .map(|index| low_inputs[index.min(3)].clone())
                         .collect(),
                 )
                 .unwrap(),
@@ -1584,9 +1607,7 @@ mod tests {
             high_chunks: vec![
                 Family::pack(
                     (0..LOOKUP_ARTIFACT_CHUNK_ROWS)
-                        .map(|index| {
-                            ring.input(format!("high-{}", index.min(3)), (digits + 2, digits))
-                        })
+                        .map(|index| high_inputs[index.min(3)].clone())
                         .collect(),
                 )
                 .unwrap(),
@@ -1616,8 +1637,14 @@ mod tests {
                 .unwrap();
         let production_id = produced.production_id.expect("helper artifact production");
         let manifest = store.manifest(&production_id).unwrap().clone();
-        assert_eq!(manifest.artifacts[&names.low_matrices].family_count, Some(4));
-        assert_eq!(manifest.artifacts[&names.high_matrices].family_count, Some(4));
+        assert_eq!(
+            manifest.artifacts[&names.low_chunk(0)].family_count,
+            Some(LOOKUP_ARTIFACT_CHUNK_ROWS)
+        );
+        assert_eq!(
+            manifest.artifacts[&names.high_chunk(0)].family_count,
+            Some(LOOKUP_ARTIFACT_CHUNK_ROWS)
+        );
         let artifacts = lookup
             .import_artifacts(&LweLookupArtifacts::for_compiler(production_id.clone(), &lookup))
             .unwrap();

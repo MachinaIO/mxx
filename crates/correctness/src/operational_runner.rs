@@ -14,7 +14,7 @@ use tempfile::Builder;
 use thiserror::Error;
 
 pub const OPERATIONAL_REPORT_SCHEMA_VERSION: u32 = 2;
-const OPERATIONAL_PREPARED_CACHE_FORMAT_VERSION: u32 = 3;
+const OPERATIONAL_PREPARED_CACHE_FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationalParameterValue {
@@ -108,18 +108,6 @@ fn lean_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
-fn lean_identifier(value: &str) -> String {
-    let mut output = String::new();
-    for character in value.chars() {
-        if character.is_ascii_alphanumeric() || character == '_' {
-            output.push(character.to_ascii_lowercase());
-        } else {
-            output.push('_');
-        }
-    }
-    output
-}
-
 fn operational_lean_arguments() -> [&'static str; 4] {
     ["env", "lean", "-DmaxHeartbeats=0", "--run"]
 }
@@ -140,34 +128,18 @@ fn lean_version(lean_workspace: &Path) -> Result<String, OperationalRunnerError>
 
 fn prepared_module_source(emitted: &EmittedProtocol, prepared_name: &str) -> String {
     let namespace = format!("{}.Generated.{}", emitted.module_root, emitted.lean_name);
-    let derivations = emitted
-        .stage_ids
-        .iter()
-        .map(|stage| {
-            format!(
-                "({}, {}_stage_{}_derivation)",
-                lean_string(stage),
-                emitted.lean_name,
-                lean_identifier(stage)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
     format!(
         "import Mxx.Certificate.OperationalBounds\n{}\nnamespace {}\n\n\
-def {} : Except Mxx.Certificate.OperationalError \
-Mxx.Certificate.PreparedOperationalWorkflow :=\n  \
+def {} : Except (Sum Mxx.Ir.DecodeError Mxx.Certificate.OperationalError) \
+Mxx.Certificate.PreparedOperationalWorkflow := do\n  \
+let decoded ← {}_decoded |>.mapError Sum.inl\n  \
+let protocol := decoded.1\n  \
+let derivations := decoded.2\n  \
 Mxx.Certificate.prepareWorkflowOperational\n    \
-({{ workflow := {}_protocol.bundle.workflow, inputContract := \
-{}_protocol.bundle.inputContract }} : Mxx.Certificate.OperationalWorkflowSpec)\n    \
-[{}]\n\nend {}\n",
-        emitted.ir,
-        namespace,
-        prepared_name,
-        emitted.lean_name,
-        emitted.lean_name,
-        derivations,
-        namespace,
+({{ workflow := protocol.bundle.workflow, inputContract := protocol.bundle.inputContract }} : \
+Mxx.Certificate.OperationalWorkflowSpec)\n    \
+derivations |>.mapError Sum.inr\n\nend {}\n",
+        emitted.ir, namespace, prepared_name, emitted.lean_name, namespace,
     )
 }
 

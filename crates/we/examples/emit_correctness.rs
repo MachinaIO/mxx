@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lean/MxxWe/Generated"))
         .join("DiamondWeFamily");
     fs::create_dir_all(&generated)?;
-    fs::write(generated.join("Ir.lean"), emitted.ir)?;
+    fs::write(generated.join("Ir.lean"), emitted.proof_ir)?;
     fs::write(generated.join("Derivation.lean"), emitted.derivation_ir)?;
     Ok(())
 }

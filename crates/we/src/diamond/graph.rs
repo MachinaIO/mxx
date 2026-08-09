@@ -1350,13 +1350,13 @@ mod tests {
                 .ir
                 .contains("def DiamondWeFamily_protocol : Mxx.Certificate.ClosedProtocolDecl")
         );
-        assert!(!emitted.ir.contains("SparseCertificate"));
+        assert!(!emitted.proof_ir.contains("SparseCertificate"));
         assert!(
             emitted
                 .ir
                 .contains(".roundDivide (.parameter \"diamond_modulus\") (.constant (2 : Int))")
         );
-        assert!(!emitted.ir.contains(
+        assert!(!emitted.proof_ir.contains(
             ".roundDivide (.subtract (.parameter \"diamond_modulus\") (.constant (1 : Int))) \
              (.constant (2 : Int))"
         ));

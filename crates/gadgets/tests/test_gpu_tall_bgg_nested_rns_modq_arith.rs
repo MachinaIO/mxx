@@ -186,6 +186,8 @@ struct PreparedCandidate {
     artifact_compiler: BggSlotTransferArtifactCompiler,
     producer: BuiltGraph,
     preprocessing_graph_construction: Duration,
+    lookup_preimage_count: usize,
+    slot_preimage_count: usize,
     preprocessing_preimage_count: usize,
     production: ProductionId,
     runtime_manifest: RuntimeManifest,
@@ -560,6 +562,8 @@ fn prepare_candidate(
         artifact_compiler,
         producer,
         preprocessing_graph_construction,
+        lookup_preimage_count,
+        slot_preimage_count,
         preprocessing_preimage_count,
         production,
         runtime_manifest,
@@ -914,6 +918,7 @@ fn log_cost_report(label: &str, report: &CostReport) {
     info!(
         label,
         total_work_seconds = report.total_work_seconds,
+        preimage_sampling_work_seconds = report.preimage_sampling_work_seconds,
         critical_path_seconds = report.critical_path_seconds,
         maximum_parallelism = report.maximum_parallelism,
         workspace_high_water_bytes = report.workspace_high_water_bytes,
@@ -930,11 +935,13 @@ fn benchmark_estimation(
     config: &TestConfig,
     gpu_parameters: &GpuDCRTPolyParams,
     device_ids: &[i32],
-) -> Result<(CostReport, CostReport), String> {
+) -> Result<(CostReport, CostReport, CostReport), String> {
     info!("stage 2/4: benchmark estimation");
     let bindings = ParamEnv::default();
     let manifests =
         BTreeMap::from([(selected.production.clone(), selected.runtime_manifest.clone())]);
+    let preprocessing_graph =
+        selected.producer.validate(&bindings).map_err(|error| error.to_string())?;
     let public_graph = selected
         .public_key_graph
         .validate_with_manifests(&bindings, &manifests)
@@ -960,6 +967,21 @@ fn benchmark_estimation(
             selected.parameters.to_crt().2,
         )
     };
+    let preprocessing_estimator_config = EstimateConfig {
+        device_pool_size: config.preprocessing_parallel_instances,
+        per_instance_occupancy: 1,
+    };
+    let mut preprocessing_backend = make_backend();
+    let preprocessing_report =
+        estimate(&preprocessing_graph, &mut preprocessing_backend, &preprocessing_estimator_config)
+            .map_err(|error| error.to_string())?;
+    info!(
+        lookup_preimage_count = selected.lookup_preimage_count,
+        slot_preimage_count = selected.slot_preimage_count,
+        total_preimage_count = selected.preprocessing_preimage_count,
+        "estimated lookup and slot-operation preimage sampling"
+    );
+    log_cost_report("TallBggPreprocessing", &preprocessing_report);
     let mut public_backend = make_backend();
     let public_report = estimate(&public_graph, &mut public_backend, &estimator_config)
         .map_err(|error| error.to_string())?;
@@ -968,7 +990,7 @@ fn benchmark_estimation(
     let encoding_report = estimate(&encoding_graph, &mut encoding_backend, &estimator_config)
         .map_err(|error| error.to_string())?;
     log_cost_report("TallBggEncoding", &encoding_report);
-    Ok((public_report, encoding_report))
+    Ok((preprocessing_report, public_report, encoding_report))
 }
 
 fn execution_config(

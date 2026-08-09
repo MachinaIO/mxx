@@ -65,6 +65,8 @@ impl Default for EstimateConfig {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostReport {
     pub total_work_seconds: f64,
+    /// Total measured work attributable to preimage sampling nodes, including loop multiplicity.
+    pub preimage_sampling_work_seconds: f64,
     pub critical_path_seconds: f64,
     pub maximum_parallelism: usize,
     pub persistent_bytes_over_time: Vec<u64>,
@@ -79,6 +81,7 @@ pub struct SubgraphCost {
     pub invocations: usize,
     pub measured_once: bool,
     pub work_seconds_per_invocation: f64,
+    pub preimage_sampling_work_seconds_per_invocation: f64,
     pub latency_seconds_per_invocation: f64,
     pub workspace_high_water_bytes: u64,
     pub peak_memory_bytes: u64,
@@ -131,6 +134,8 @@ pub fn estimate<B: MeasurementBackend>(
                     invocations: count,
                     measured_once: true,
                     work_seconds_per_invocation: cached.total_work_seconds,
+                    preimage_sampling_work_seconds_per_invocation: cached
+                        .preimage_sampling_work_seconds,
                     latency_seconds_per_invocation: cached.critical_path_seconds,
                     workspace_high_water_bytes: cached.workspace_high_water_bytes,
                     peak_memory_bytes: cached.peak_memory_bytes,
@@ -246,8 +251,10 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 .filter_map(|wire| completion.get(wire))
                 .copied()
                 .fold(0.0, f64::max);
-            let (measurement, nested_peak, nested_parallelism) = self.node_cost(&node, bindings)?;
+            let (measurement, preimage_sampling_work, nested_peak, nested_parallelism) =
+                self.node_cost(&node, bindings)?;
             report.total_work_seconds += measurement.work_seconds;
+            report.preimage_sampling_work_seconds += preimage_sampling_work;
             let finish = predecessor + measurement.latency_seconds;
             report.critical_path_seconds = report.critical_path_seconds.max(finish);
             report.workspace_high_water_bytes =
@@ -288,7 +295,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         &mut self,
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
-    ) -> Result<(NodeMeasurement, u64, usize), EstimateError> {
+    ) -> Result<(NodeMeasurement, f64, u64, usize), EstimateError> {
         match node.kind {
             NodeKind::SubgraphCall(call) => {
                 let child = self
@@ -315,7 +322,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         EstimateError::Expression("loop count is not usize".to_owned())
                     })?;
                 if count == 0 {
-                    return Ok((NodeMeasurement::default(), 0, 1));
+                    return Ok((NodeMeasurement::default(), 0.0, 0, 1));
                 }
                 let child = self
                     .validated
@@ -324,7 +331,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
                 let child_bindings =
                     child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
-                let (one, peak, parallelism) = self.cached_child(child, child_bindings)?;
+                let (one, preimage_work, peak, parallelism) =
+                    self.cached_child(child, child_bindings)?;
                 let concurrent = (self.config.device_pool_size.max(1) /
                     self.config.per_instance_occupancy.max(1))
                 .max(1);
@@ -335,6 +343,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         latency_seconds: one.latency_seconds * count.div_ceil(concurrent) as f64,
                         workspace_bytes: one.workspace_bytes,
                     },
+                    preimage_work * count as f64,
                     peak.saturating_mul(active as u64),
                     parallelism.saturating_mul(active),
                 ))
@@ -355,7 +364,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         EstimateError::Expression("sequential loop count is not usize".to_owned())
                     })?;
                 if count == 0 {
-                    return Ok((NodeMeasurement::default(), 0, 1));
+                    return Ok((NodeMeasurement::default(), 0.0, 0, 1));
                 }
                 let child = self
                     .validated
@@ -364,13 +373,15 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
                 let child_bindings =
                     child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
-                let (one, peak, parallelism) = self.cached_child(child, child_bindings)?;
+                let (one, preimage_work, peak, parallelism) =
+                    self.cached_child(child, child_bindings)?;
                 Ok((
                     NodeMeasurement {
                         work_seconds: one.work_seconds * count as f64,
                         latency_seconds: one.latency_seconds * count as f64,
                         workspace_bytes: one.workspace_bytes,
                     },
+                    preimage_work * count as f64,
                     peak,
                     parallelism,
                 ))
@@ -378,7 +389,14 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             _ => self
                 .backend
                 .measure(self.validated.source.name(), node, bindings)
-                .map(|measurement| (measurement, 0, 1))
+                .map(|measurement| {
+                    let preimage_work = if matches!(node.kind, NodeKind::PreimageSample { .. }) {
+                        measurement.work_seconds
+                    } else {
+                        0.0
+                    };
+                    (measurement, preimage_work, 0, 1)
+                })
                 .map_err(|error| EstimateError::Backend(error.to_string())),
         }
     }
@@ -387,7 +405,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         &mut self,
         child: FrozenGraphScopeId,
         bindings: ParamEnv,
-    ) -> Result<(NodeMeasurement, u64, usize), EstimateError> {
+    ) -> Result<(NodeMeasurement, f64, u64, usize), EstimateError> {
         let key = CacheKey::new(child.clone(), &bindings)?;
         let report = if let Some(report) = self.cache.get(&key) {
             report.clone()
@@ -402,6 +420,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 latency_seconds: report.critical_path_seconds,
                 workspace_bytes: report.workspace_high_water_bytes,
             },
+            report.preimage_sampling_work_seconds,
             report.peak_memory_bytes,
             report.maximum_parallelism,
         ))

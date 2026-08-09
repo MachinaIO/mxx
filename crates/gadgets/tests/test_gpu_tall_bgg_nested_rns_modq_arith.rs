@@ -16,7 +16,8 @@ use mxx_bgg::{
 };
 use mxx_correctness::{
     OperationalCheckRequest, OperationalCheckerReport, OperationalGadgetLayout, emit_protocol_for,
-    operational_protocol_from_graphs, run_emitted_operational_check,
+    operational_protocol_from_graphs, prepare_emitted_operational_checker,
+    run_prepared_operational_checks,
 };
 use mxx_dsl::{BuiltGraph, DslContext, Family, Ring, SemanticAnchor, parallel_zip};
 use mxx_gadgets::{
@@ -324,9 +325,36 @@ fn run_tall_operational_check(
         ciphertext_modulus: BigInt::from(parameters.modulus().as_ref().clone()),
     };
     let lean_workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lean");
-    let report = run_emitted_operational_check(&lean_workspace, &emitted, &request)
+    let preparation_started = Instant::now();
+    let prepared = prepare_emitted_operational_checker(&lean_workspace, &emitted)
         .map_err(|error| error.to_string())?;
-    Ok(report)
+    info!(
+        elapsed = ?preparation_started.elapsed(),
+        olean = %prepared.olean_path().display(),
+        "prepared and cached Tall operational IR and derivation"
+    );
+
+    // Keep the first request identical to the selection request. The second request exercises
+    // the intended cheap multi-parameter path against the same prepared symbolic graph without
+    // affecting candidate acceptance.
+    let mut diagnostic_request = request.clone();
+    diagnostic_request.ciphertext_modulus += BigInt::from(1u8);
+    let evaluation_started = Instant::now();
+    let mut reports =
+        run_prepared_operational_checks(&lean_workspace, &prepared, &[request, diagnostic_request])
+            .map_err(|error| error.to_string())?;
+    info!(
+        elapsed = ?evaluation_started.elapsed(),
+        request_count = reports.len(),
+        "evaluated Tall parameter requests with one prepared derivation"
+    );
+    if reports.len() != 2 {
+        return Err(format!("expected two Tall operational reports, got {}", reports.len()));
+    }
+    if reports[0].request_digest == reports[1].request_digest {
+        return Err("distinct Tall parameter requests produced the same digest".to_owned());
+    }
+    Ok(reports.remove(0))
 }
 
 fn prepare_candidate(
@@ -1589,6 +1617,24 @@ fn runtime_verification(
         ));
     }
     Ok(())
+}
+
+#[test]
+#[ignore = "runs the Lean-only Tall BGG+ parameter simulation"]
+fn test_tall_bgg_nested_rns_parameter_simulation() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let config = TestConfig::from_env().expect("valid Tall nested-RNS configuration");
+    info!(?config, "effective Tall nested-RNS parameter-simulation configuration");
+    let selected = select_parameters(&config).expect("Lean parameter simulation");
+    info!(
+        crt_depth = selected.parameters.to_crt().2,
+        ring_dimension = selected.parameters.ring_dimension(),
+        lean_operational_bound = %selected.lean_operational_bound,
+        lean_accepted = selected.lean_report.accepted,
+        "completed Lean-only Tall parameter simulation"
+    );
 }
 
 #[test]

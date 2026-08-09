@@ -3589,7 +3589,7 @@ example : (multiplyFact .multiplyAffineRight (matrixRuleTestWire 2) matrixRuleTe
   decide
 
 private def familyRuleTestBody : Mxx.Ir.Scope := {
-  nodes := [{
+  nodes := #[{
     kind := .input "x"
     arguments := []
     outputCount := 1
@@ -3601,7 +3601,7 @@ private def familyRuleTestBody : Mxx.Ir.Scope := {
 
 private def familyRuleTestProgram : Mxx.Ir.Prog := {
   root := {
-    nodes := [
+    nodes := #[
       {
         kind := .input "x"
         arguments := []

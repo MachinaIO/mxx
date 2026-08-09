@@ -1,13 +1,20 @@
 //! Fail-closed execution of generated Lean operational checks.
 
-use crate::EmittedProtocol;
+use crate::{EmittedProtocol, GENERATOR_VERSION};
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
-use std::{path::Path, process::Command};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use tempfile::Builder;
 use thiserror::Error;
 
-pub const OPERATIONAL_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const OPERATIONAL_REPORT_SCHEMA_VERSION: u32 = 2;
+const OPERATIONAL_PREPARED_CACHE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationalParameterValue {
@@ -41,14 +48,34 @@ pub struct OperationalCheckRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationalCheckerReport {
     pub schema_version: u32,
+    pub protocol_source_hash: String,
     pub workflow_hash: String,
     pub derivation_hash: String,
     pub toolkit_hash: String,
+    pub request_digest: String,
     pub noise_bound: String,
     pub plaintext_modulus: String,
     pub ciphertext_modulus: String,
     pub accepted: bool,
     pub rejection: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedOperationalChecker {
+    module_name: String,
+    namespace: String,
+    prepared_name: String,
+    protocol_source_hash: String,
+    workflow_hash: String,
+    derivation_hash: String,
+    toolkit_hash: String,
+    olean_path: PathBuf,
+}
+
+impl PreparedOperationalChecker {
+    pub fn olean_path(&self) -> &Path {
+        &self.olean_path
+    }
 }
 
 #[derive(Debug, Error)]
@@ -59,6 +86,8 @@ pub enum OperationalRunnerError {
     CheckerFailed { stdout: String, stderr: String },
     #[error("Lean operational checker must emit exactly one nonempty JSON line, got {count}")]
     UnexpectedOutput { count: usize },
+    #[error("Lean operational checker emitted {actual} reports, expected {expected}")]
+    UnexpectedReportCount { expected: usize, actual: usize },
     #[error("Lean operational checker emitted malformed JSON: {0}")]
     Malformed(#[from] serde_json::Error),
     #[error("unsupported Lean operational report schema {actual}")]
@@ -67,6 +96,12 @@ pub enum OperationalRunnerError {
     Freshness,
     #[error("Lean operational report modulus fields do not match the request")]
     Modulus,
+    #[error("Lean operational report request digest does not match the request")]
+    RequestDigest,
+    #[error(
+        "could not compile prepared Lean operational module; stdout: {stdout}; stderr: {stderr}"
+    )]
+    PreparationFailed { stdout: String, stderr: String },
 }
 
 fn lean_string(value: &str) -> String {
@@ -89,7 +124,21 @@ fn operational_lean_arguments() -> [&'static str; 4] {
     ["env", "lean", "-DmaxHeartbeats=0", "--run"]
 }
 
-fn checker_source(emitted: &EmittedProtocol, request: &OperationalCheckRequest) -> String {
+fn lean_version(lean_workspace: &Path) -> Result<String, OperationalRunnerError> {
+    let output = Command::new("lake")
+        .args(["env", "lean", "--version"])
+        .current_dir(lean_workspace)
+        .output()?;
+    if !output.status.success() {
+        return Err(OperationalRunnerError::PreparationFailed {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn prepared_module_source(emitted: &EmittedProtocol, prepared_name: &str) -> String {
     let namespace = format!("{}.Generated.{}", emitted.module_root, emitted.lean_name);
     let derivations = emitted
         .stage_ids
@@ -104,6 +153,130 @@ fn checker_source(emitted: &EmittedProtocol, request: &OperationalCheckRequest) 
         })
         .collect::<Vec<_>>()
         .join(", ");
+    format!(
+        "import Mxx.Certificate.OperationalBounds\n{}\nnamespace {}\n\n\
+def {} : Except Mxx.Certificate.OperationalError \
+Mxx.Certificate.PreparedOperationalWorkflow :=\n  \
+Mxx.Certificate.prepareWorkflowOperational\n    \
+({{ workflow := {}_protocol.bundle.workflow, inputContract := \
+{}_protocol.bundle.inputContract }} : Mxx.Certificate.OperationalWorkflowSpec)\n    \
+[{}]\n\nend {}\n",
+        emitted.ir,
+        namespace,
+        prepared_name,
+        emitted.lean_name,
+        emitted.lean_name,
+        derivations,
+        namespace,
+    )
+}
+
+pub fn prepare_emitted_operational_checker(
+    lean_workspace: &Path,
+    emitted: &EmittedProtocol,
+) -> Result<PreparedOperationalChecker, OperationalRunnerError> {
+    let version = lean_version(lean_workspace)?;
+    let key_material = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        OPERATIONAL_PREPARED_CACHE_FORMAT_VERSION,
+        GENERATOR_VERSION,
+        emitted.freshness.protocol_source_hash,
+        emitted.freshness.workflow_hash,
+        emitted.derivation_hash,
+        emitted.freshness.toolkit_hash,
+        version,
+    );
+    let key = format!("{:x}", Sha256::digest(key_material.as_bytes()));
+    let component = format!("C{key}");
+    let module_name = format!("MxxOperationalCache.{component}");
+    let cache_root = lean_workspace.join(".lake/build/mxx-operational-cache/src");
+    let source_dir = cache_root.join("MxxOperationalCache");
+    let source_path = source_dir.join(format!("{component}.lean"));
+    let olean_dir = lean_workspace.join(".lake/build/lib/lean/MxxOperationalCache");
+    let olean_path = olean_dir.join(format!("{component}.olean"));
+    let namespace = format!("{}.Generated.{}", emitted.module_root, emitted.lean_name);
+    let prepared_name = format!("{}_preparedOperational", emitted.lean_name);
+    fs::create_dir_all(&source_dir)?;
+    fs::create_dir_all(&olean_dir)?;
+    if !olean_path.is_file() {
+        fs::write(&source_path, prepared_module_source(emitted, &prepared_name))?;
+        let temporary_olean =
+            olean_dir.join(format!("{component}.{}.tmp.olean", std::process::id()));
+        let output = Command::new("lake")
+            .args(["env", "lean", "-DmaxHeartbeats=0", "-DmaxRecDepth=1000000", "-R"])
+            .arg(&cache_root)
+            .arg("-o")
+            .arg(&temporary_olean)
+            .arg(&source_path)
+            .current_dir(lean_workspace)
+            .output()?;
+        if !output.status.success() {
+            let _ = fs::remove_file(&temporary_olean);
+            return Err(OperationalRunnerError::PreparationFailed {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        fs::rename(temporary_olean, &olean_path)?;
+    }
+    Ok(PreparedOperationalChecker {
+        module_name,
+        namespace,
+        prepared_name,
+        protocol_source_hash: emitted.freshness.protocol_source_hash.clone(),
+        workflow_hash: emitted.freshness.workflow_hash.clone(),
+        derivation_hash: emitted.derivation_hash.clone(),
+        toolkit_hash: emitted.freshness.toolkit_hash.clone(),
+        olean_path,
+    })
+}
+
+fn operational_request_digest(request: &OperationalCheckRequest) -> String {
+    let environment = request
+        .environment
+        .iter()
+        .map(|(name, value)| match value {
+            OperationalParameterValue::Integer(value) => {
+                json!({"name": name, "kind": "integer", "value": value.to_string()})
+            }
+            OperationalParameterValue::Rational { numerator, denominator } => json!({
+                "name": name,
+                "kind": "rational",
+                "numerator": numerator.to_string(),
+                "denominator": denominator.to_string(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    let layouts = request
+        .layouts
+        .iter()
+        .map(|layout| {
+            json!({
+                "params_id": layout.params_id,
+                "ring_dimension": layout.ring_dimension,
+                "crt_moduli": layout.crt_moduli,
+                "crt_bits": layout.crt_bits,
+                "base_bits": layout.base_bits,
+                "base": layout.base.to_string(),
+                "regular_digit_count": layout.regular_digit_count,
+                "small_digit_count": layout.small_digit_count,
+                "smallest_crt_modulus": layout.smallest_crt_modulus,
+            })
+        })
+        .collect::<Vec<_>>();
+    let canonical = serde_json::to_vec(&json!({
+        "environment": environment,
+        "layouts": layouts,
+        "residual_stage": request.residual_stage,
+        "residual_output": request.residual_output,
+        "plaintext_modulus": request.plaintext_modulus.to_string(),
+        "ciphertext_modulus": request.ciphertext_modulus.to_string(),
+    }))
+    .expect("operational request JSON serialization");
+    format!("{:x}", Sha256::digest(canonical))
+}
+
+fn lean_request_values(request: &OperationalCheckRequest) -> (String, String) {
     let environment = request
         .environment
         .iter()
@@ -143,65 +316,86 @@ fn checker_source(emitted: &EmittedProtocol, request: &OperationalCheckRequest) 
         })
         .collect::<Vec<_>>()
         .join(", ");
+    (environment, layouts)
+}
+
+fn prepared_checker_source(
+    prepared: &PreparedOperationalChecker,
+    requests: &[OperationalCheckRequest],
+) -> String {
+    let definitions = requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            let (environment, layouts) = lean_request_values(request);
+            format!(
+                "private def operationalCheck_{index} (prepared : PreparedOperationalWorkflow) : \
+                 Except OperationalError OperationalNoiseCheckReport := do\n\
+                   let outputs <- evaluatePreparedWorkflowOperational prepared [{environment}] \
+                     [{layouts}]\n\
+                   let stage <- match outputs.find? (fun result => result.stage == {}) with\n\
+                     | some stage => pure stage\n\
+                     | none => throw (.missingStageResult {} {})\n\
+                   let residual <- match stage.outputs.find? (fun output => output.1 == {}) with\n\
+                     | some output => pure output.2\n\
+                     | none => throw (.missingStageResult {} {})\n\
+                   decoderNoiseCheckReportForFact outputs residual [{environment}] {} {}",
+                lean_string(&request.residual_stage),
+                lean_string(&request.residual_stage),
+                lean_string(&request.residual_output),
+                lean_string(&request.residual_output),
+                lean_string(&request.residual_stage),
+                lean_string(&request.residual_output),
+                request.plaintext_modulus,
+                request.ciphertext_modulus,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let executions = requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            let digest = operational_request_digest(request);
+            format!(
+                "    match operationalCheck_{index} prepared with\n\
+                 | .error _ => IO.eprintln \"operational graph evaluation failed at request \
+                   {index}\"; return 2\n\
+                 | .ok report =>\n\
+                     match report.obligations with\n\
+                     | [.decoderThreshold plaintextModulus ciphertextModulus noiseBound] =>\n\
+                         let accepted := if report.accepted then \"true\" else \"false\"\n\
+                         let json := \"{{\\\"schema_version\\\":2,\\\"protocol_source_hash\\\":\\\"{}\\\",\\\"workflow_hash\\\":\\\"{}\\\",\\\"derivation_hash\\\":\\\"{}\\\",\\\"toolkit_hash\\\":\\\"{}\\\",\\\"request_digest\\\":\\\"{}\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++ \"\\\",\\\"plaintext_modulus\\\":\\\"\" ++ toString plaintextModulus ++ \"\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++ \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++ rejectionJson report.rejection ++ \"}}\"\n\
+                         IO.println json\n\
+                     | _ => IO.eprintln \"operational checker returned an unexpected obligation \
+                       set\"; return 3",
+                prepared.protocol_source_hash,
+                prepared.workflow_hash,
+                prepared.derivation_hash,
+                prepared.toolkit_hash,
+                digest,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "import Mxx.Certificate.OperationalBounds\n{}\n\
-open {}\n\
-open Mxx.Certificate\n\n\
-private def operationalCheck : Except OperationalError OperationalNoiseCheckReport := do\n\
-  let outputs ← evaluateWorkflowOperational ({{ workflow := {}_protocol.bundle.workflow, inputContract := {}_protocol.bundle.inputContract }} : OperationalWorkflowSpec) [{}] [{}] [{}]\n\
-  let stage ← match outputs.find? (fun result => result.stage == {}) with\n\
-    | some stage => pure stage\n\
-    | none => throw (.missingStageResult {} {})\n\
-  let residual ← match stage.outputs.find? (fun output => output.1 == {}) with\n\
-    | some output => pure output.2\n\
-    | none => throw (.missingStageResult {} {})\n\
-  decoderNoiseCheckReportForFact outputs residual [{}] {} {}\n\n\
-private def rejectionJson : Option OperationalNoiseRejection → String\n\
-  | none => \"null\"\n\
-  | some rejection => \"\\\"\" ++ reprStr rejection ++ \"\\\"\"\n\n\
-def main : IO UInt32 := do\n\
-  match operationalCheck with\n\
-  | .error _ => IO.eprintln \"operational graph evaluation failed\"; return 2\n\
-  | .ok report =>\n\
-      match report.obligations with\n\
-      | [.decoderThreshold plaintextModulus ciphertextModulus noiseBound] =>\n\
-          let accepted := if report.accepted then \"true\" else \"false\"\n\
-          let json := \"{{\\\"schema_version\\\":1,\\\"workflow_hash\\\":\\\"\" ++\n\
-            {}_workflowHash ++ \"\\\",\\\"derivation_hash\\\":\\\"\" ++\n\
-            {}_derivationHash ++ \"\\\",\\\"toolkit_hash\\\":\\\"\" ++\n\
-            {}_toolkitHash ++ \"\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++\n\
-            \"\\\",\\\"plaintext_modulus\\\":\\\"\" ++ toString plaintextModulus ++\n\
-            \"\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++\n\
-            \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++\n\
-            rejectionJson report.rejection ++ \"}}\"\n\
-          IO.println json; return 0\n\
-      | _ => IO.eprintln \"operational checker returned an unexpected obligation set\"; return 3\n",
-        emitted.ir,
-        namespace,
-        emitted.lean_name,
-        emitted.lean_name,
-        derivations,
-        environment,
-        layouts,
-        lean_string(&request.residual_stage),
-        lean_string(&request.residual_stage),
-        lean_string(&request.residual_output),
-        lean_string(&request.residual_output),
-        lean_string(&request.residual_stage),
-        lean_string(&request.residual_output),
-        environment,
-        request.plaintext_modulus,
-        request.ciphertext_modulus,
-        emitted.lean_name,
-        emitted.lean_name,
-        emitted.lean_name,
+        "import {}\nopen {}\nopen Mxx.Certificate\n\n{}\n\n\
+         private def rejectionJson : Option OperationalNoiseRejection -> String\n\
+           | none => \"null\"\n\
+           | some rejection => \"\\\"\" ++ reprStr rejection ++ \"\\\"\"\n\n\
+         def main : IO UInt32 := do\n\
+           match {} with\n\
+           | .error _ => IO.eprintln \"operational graph preparation failed\"; return 2\n\
+           | .ok prepared =>\n{}\n    return 0\n",
+        prepared.module_name, prepared.namespace, definitions, prepared.prepared_name, executions,
     )
 }
 
-pub fn run_operational_checker_source(
+fn run_operational_checker_reports(
     lean_workspace: &Path,
     source: &str,
-) -> Result<OperationalCheckerReport, OperationalRunnerError> {
+    expected: usize,
+) -> Result<Vec<OperationalCheckerReport>, OperationalRunnerError> {
     let file = Builder::new().prefix("mxx-operational-").suffix(".lean").tempfile()?;
     std::fs::write(file.path(), source)?;
     let output = Command::new("lake")
@@ -217,14 +411,66 @@ pub fn run_operational_checker_source(
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines = stdout.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
-    if lines.len() != 1 {
-        return Err(OperationalRunnerError::UnexpectedOutput { count: lines.len() });
+    if lines.len() != expected {
+        return Err(OperationalRunnerError::UnexpectedReportCount { expected, actual: lines.len() });
     }
-    let report: OperationalCheckerReport = serde_json::from_str(lines[0])?;
-    if report.schema_version != OPERATIONAL_REPORT_SCHEMA_VERSION {
-        return Err(OperationalRunnerError::Schema { actual: report.schema_version });
+    let reports = lines
+        .into_iter()
+        .map(serde_json::from_str)
+        .collect::<Result<Vec<OperationalCheckerReport>, _>>()?;
+    for report in &reports {
+        if report.schema_version != OPERATIONAL_REPORT_SCHEMA_VERSION {
+            return Err(OperationalRunnerError::Schema { actual: report.schema_version });
+        }
     }
-    Ok(report)
+    Ok(reports)
+}
+
+pub fn run_operational_checker_source(
+    lean_workspace: &Path,
+    source: &str,
+) -> Result<OperationalCheckerReport, OperationalRunnerError> {
+    let mut reports = run_operational_checker_reports(lean_workspace, source, 1)?;
+    reports.pop().ok_or(OperationalRunnerError::UnexpectedOutput { count: 0 })
+}
+
+fn validate_prepared_report(
+    prepared: &PreparedOperationalChecker,
+    request: &OperationalCheckRequest,
+    report: &OperationalCheckerReport,
+) -> Result<(), OperationalRunnerError> {
+    if report.protocol_source_hash != prepared.protocol_source_hash ||
+        report.workflow_hash != prepared.workflow_hash ||
+        report.derivation_hash != prepared.derivation_hash ||
+        report.toolkit_hash != prepared.toolkit_hash
+    {
+        return Err(OperationalRunnerError::Freshness);
+    }
+    if report.request_digest != operational_request_digest(request) {
+        return Err(OperationalRunnerError::RequestDigest);
+    }
+    if report.plaintext_modulus != request.plaintext_modulus.to_string() ||
+        report.ciphertext_modulus != request.ciphertext_modulus.to_string()
+    {
+        return Err(OperationalRunnerError::Modulus);
+    }
+    Ok(())
+}
+
+pub fn run_prepared_operational_checks(
+    lean_workspace: &Path,
+    prepared: &PreparedOperationalChecker,
+    requests: &[OperationalCheckRequest],
+) -> Result<Vec<OperationalCheckerReport>, OperationalRunnerError> {
+    let reports = run_operational_checker_reports(
+        lean_workspace,
+        &prepared_checker_source(prepared, requests),
+        requests.len(),
+    )?;
+    for (request, report) in requests.iter().zip(&reports) {
+        validate_prepared_report(prepared, request, report)?;
+    }
+    Ok(reports)
 }
 
 pub fn run_emitted_operational_check(
@@ -232,19 +478,10 @@ pub fn run_emitted_operational_check(
     emitted: &EmittedProtocol,
     request: &OperationalCheckRequest,
 ) -> Result<OperationalCheckerReport, OperationalRunnerError> {
-    let report = run_operational_checker_source(lean_workspace, &checker_source(emitted, request))?;
-    if report.workflow_hash != emitted.freshness.workflow_hash ||
-        report.derivation_hash != emitted.derivation_hash ||
-        report.toolkit_hash != emitted.freshness.toolkit_hash
-    {
-        return Err(OperationalRunnerError::Freshness);
-    }
-    if report.plaintext_modulus != request.plaintext_modulus.to_string() ||
-        report.ciphertext_modulus != request.ciphertext_modulus.to_string()
-    {
-        return Err(OperationalRunnerError::Modulus);
-    }
-    Ok(report)
+    let prepared = prepare_emitted_operational_checker(lean_workspace, emitted)?;
+    let mut reports =
+        run_prepared_operational_checks(lean_workspace, &prepared, std::slice::from_ref(request))?;
+    reports.pop().ok_or(OperationalRunnerError::UnexpectedOutput { count: 0 })
 }
 
 #[cfg(test)]
@@ -263,10 +500,12 @@ mod tests {
     #[test]
     fn rejects_unknown_schema() {
         let report = OperationalCheckerReport {
-            schema_version: 2,
+            schema_version: 3,
+            protocol_source_hash: String::new(),
             workflow_hash: String::new(),
             derivation_hash: String::new(),
             toolkit_hash: String::new(),
+            request_digest: String::new(),
             noise_bound: "0".to_owned(),
             plaintext_modulus: "2".to_owned(),
             ciphertext_modulus: "17".to_owned(),
@@ -303,9 +542,23 @@ mod tests {
             plaintext_modulus: BigInt::from(2),
             ciphertext_modulus: BigInt::from(256),
         };
+        let mut rejecting_request = request.clone();
+        rejecting_request.ciphertext_modulus = BigInt::from(8);
         let lean_workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
-        let report = run_emitted_operational_check(&lean_workspace, &emitted, &request).unwrap();
-        assert_eq!(report.noise_bound, "3");
-        assert!(report.accepted);
+        let prepared = prepare_emitted_operational_checker(&lean_workspace, &emitted).unwrap();
+        let modified = fs::metadata(prepared.olean_path()).unwrap().modified().unwrap();
+        let cached = prepare_emitted_operational_checker(&lean_workspace, &emitted).unwrap();
+        assert_eq!(fs::metadata(cached.olean_path()).unwrap().modified().unwrap(), modified);
+        let reports = run_prepared_operational_checks(
+            &lean_workspace,
+            &prepared,
+            &[request, rejecting_request],
+        )
+        .unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].noise_bound, "3");
+        assert!(reports[0].accepted);
+        assert!(!reports[1].accepted);
+        assert_ne!(reports[0].request_digest, reports[1].request_digest);
     }
 }

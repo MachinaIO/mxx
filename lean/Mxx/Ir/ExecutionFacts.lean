@@ -797,7 +797,7 @@ theorem mem_denote_iff_root_path
       ∃ wires,
         EvaluatesNodesPath
           (childRunnerWithFuel samplers program program.definitions.length)
-          samplers params inputs 0 program.root.nodes [] wires ∧
+          samplers params inputs 0 program.root.nodes.toList [] wires ∧
         output = collectOutputs program.root.outputs wires := by
   unfold denote
   rw [denoteScopeWithFuel_succ]
@@ -817,7 +817,7 @@ theorem mem_denote_iff_root_path
 the checked node index; no generated node number is embedded in this theorem. -/
 theorem rootNodeAt_of_mem_denote
     (samplers : MxxSamplerFamily) (program : Prog) (params : ParamEnvironment)
-    (inputs output : Environment) (index : Nat) (inBounds : index < program.root.nodes.length)
+    (inputs output : Environment) (index : Nat) (inBounds : index < program.root.nodes.size)
     (member : output ∈ denote samplers program params inputs) :
     ∃ before values,
       values ∈ evaluateNode
@@ -825,7 +825,8 @@ theorem rootNodeAt_of_mem_denote
         samplers params inputs before program.root.nodes[index] := by
   obtain ⟨wires, path, _⟩ :=
     (mem_denote_iff_root_path samplers program params inputs output).mp member
-  obtain ⟨before, values, _, valuesMember, _⟩ := path.atNodeIndex index inBounds
+  obtain ⟨before, values, _, valuesMember, _⟩ :=
+    path.atNodeIndex index (by simpa using inBounds)
   exact ⟨before, values, valuesMember⟩
 
 /-- Membership in a named child runner is exactly one execution path through the looked-up child
@@ -839,7 +840,7 @@ theorem mem_childRunnerWithFuel_succ_iff_path
     values ∈ childRunnerWithFuel samplers program (fuel + 1) definition params inputs ↔
       ∃ wires,
         EvaluatesNodesPath (childRunnerWithFuel samplers program fuel) samplers params
-          (scope.inputNames.zip inputs) 0 scope.nodes [] wires ∧
+          (scope.inputNames.zip inputs) 0 scope.nodes.toList [] wires ∧
         values = (collectOutputs scope.outputs wires).map Prod.snd := by
   simp only [childRunnerWithFuel, definitionFound, denoteScopeWithFuel_succ, List.mem_map]
   constructor

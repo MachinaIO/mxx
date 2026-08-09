@@ -22,16 +22,25 @@ The active path is:
 ```text
 Rust DSL graph
   -> frozen IR and mechanically generated derivation
-  -> generated Lean IR
-  -> checked node-order traversal in OperationalBounds.lean
+  -> generated Array-backed Lean IR
+  -> one-time derivation validation and prepared node-order metadata
   -> flat operational facts and generic obligations
-  -> exact Lean evaluation for one parameter candidate
+  -> exact Lean evaluation for one or more parameter requests
   -> report consumed by Rust parameter search
 ```
 
 Rust owns graph construction, freezing, hashing, process invocation, candidate parallelism, and
 report parsing. Lean owns all matrix-bound, sampler-bound, recurrence, and decoder-threshold
 arithmetic. Rust does not maintain a second noise formula.
+
+The Rust runner compiles each emitted workflow and derivation into a content-addressed prepared
+module. Its cache key includes the generator, protocol source, workflow, derivation, toolkit, and
+Lean-version hashes. Within one checker process, `prepareWorkflowOperational` validates the
+derivation and resolves input indices, definition indices, and attachment buckets exactly once;
+all parameter requests then call `evaluatePreparedWorkflowOperational` against that prepared
+value. Reusing the module avoids re-elaborating the generated IR, while batching requests avoids
+repeating preparation inside one process. Different candidate graphs still require distinct
+prepared modules.
 
 The active public module is `Mxx.Certificate`, which imports
 `Mxx.Certificate.OperationalBounds`. It does not import the retired whole-graph symbolic analyzer,

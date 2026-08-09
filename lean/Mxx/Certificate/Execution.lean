@@ -382,7 +382,7 @@ structure PureProgramRootExecutionPath
     (Mxx.Ir.childRunnerWithFuel Mxx.Ir.emptySamplerFamily execution.program
       execution.program.definitions.length)
     Mxx.Ir.emptySamplerFamily execution.params execution.inputs 0
-    execution.program.root.nodes [] wires
+    execution.program.root.nodes.toList [] wires
   outputEq : Mxx.Ir.collectOutputs execution.program.root.outputs wires = output
 
 theorem PureProgramRootExecutionPath.exists
@@ -403,14 +403,14 @@ structure PureProgramSelectedNodeExecution
     {execution : PureProgramExecution}
     (root : PureProgramRootExecutionPath execution)
     (nodeIndex : Nat)
-    (nodeInBounds : nodeIndex < execution.program.root.nodes.length) where
+    (nodeInBounds : nodeIndex < execution.program.root.nodes.size) where
   before : Mxx.Ir.WireEnvironment
   nodeValues : List Mxx.Ir.Value
   prefixPath : Mxx.Ir.EvaluatesNodesPath
     (Mxx.Ir.childRunnerWithFuel Mxx.Ir.emptySamplerFamily execution.program
       execution.program.definitions.length)
     Mxx.Ir.emptySamplerFamily execution.params execution.inputs 0
-    (execution.program.root.nodes.take nodeIndex) [] before
+    (execution.program.root.nodes.toList.take nodeIndex) [] before
   nodeMember : nodeValues ∈ Mxx.Ir.evaluateNode
     (Mxx.Ir.childRunnerWithFuel Mxx.Ir.emptySamplerFamily execution.program
       execution.program.definitions.length)
@@ -420,7 +420,7 @@ structure PureProgramSelectedNodeExecution
     (Mxx.Ir.childRunnerWithFuel Mxx.Ir.emptySamplerFamily execution.program
       execution.program.definitions.length)
     Mxx.Ir.emptySamplerFamily execution.params execution.inputs (nodeIndex + 1)
-    (execution.program.root.nodes.drop (nodeIndex + 1))
+    (execution.program.root.nodes.toList.drop (nodeIndex + 1))
     (before ++ Mxx.Ir.bindOutputs nodeIndex nodeValues) root.wires
 
 /-- Mechanically select one root node from the actual pure-program path. -/
@@ -428,7 +428,7 @@ noncomputable def PureProgramRootExecutionPath.nodeExecutionAt
     {execution : PureProgramExecution}
     (root : PureProgramRootExecutionPath execution)
     (nodeIndex : Nat)
-    (nodeInBounds : nodeIndex < execution.program.root.nodes.length) :
+    (nodeInBounds : nodeIndex < execution.program.root.nodes.size) :
     PureProgramSelectedNodeExecution root nodeIndex nodeInBounds := by
   classical
   let selected := root.path.atNodeIndex nodeIndex nodeInBounds
@@ -440,10 +440,10 @@ noncomputable def PureProgramRootExecutionPath.nodeExecutionAt
     before
     nodeValues
     prefixPath := facts.1
-    nodeMember := facts.2.1
+    nodeMember := by
+      simpa [before, nodeValues, afterBefore, selected] using facts.2.1
     suffixPath := by
-      dsimp [before, nodeValues]
-      simpa only [Nat.zero_add] using facts.2.2
+      simpa [before, nodeValues, afterBefore, selected] using facts.2.2
   }
 
 /-- Concrete comparator data, including the output environment of an optional comparator map and

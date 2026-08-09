@@ -5,7 +5,7 @@ use std::{
     process::Command,
 };
 
-pub const GENERATOR_VERSION: &str = "mxx-correctness-emitter-v6";
+pub const GENERATOR_VERSION: &str = "mxx-correctness-emitter-v8";
 
 pub struct GeneratedFreshness {
     pub workflow_hash: String,

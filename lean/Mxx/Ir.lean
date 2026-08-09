@@ -293,8 +293,23 @@ structure Node where
   outputTypes : List WireTypeExpr := []
   deriving BEq, DecidableEq
 
+/-- Compact constructors used by generated protocol modules. They only change the transport
+syntax; `n kind arguments outputCount outputTypes` elaborates to the same `Node` value as the
+corresponding structure literal. -/
+def w (node : Nat) (port : Nat := 0) : WireRef := { node, port }
+
+def n (kind : NodeKind) (arguments : Array WireRef) (outputCount : Nat)
+    (outputTypes : Array WireTypeExpr) : Node :=
+  { kind, arguments := arguments.toList, outputCount, outputTypes := outputTypes.toList }
+
+theorem n_eq_structure_literal (kind : NodeKind) (arguments : Array WireRef) (outputCount : Nat)
+    (outputTypes : Array WireTypeExpr) :
+    n kind arguments outputCount outputTypes =
+      { kind, arguments := arguments.toList, outputCount, outputTypes := outputTypes.toList } :=
+  rfl
+
 structure Scope where
-  nodes : List Node
+  nodes : Array Node
   outputs : List (String × WireRef)
   inputNames : List String
   deriving BEq, DecidableEq
@@ -1328,7 +1343,7 @@ def denoteScopeWithFuel
         | some child =>
             (denoteScopeWithFuel samplers program fuel child childParams
               (child.inputNames.zip childValues)).map (fun environment => environment.map Prod.snd)
-      (evaluateNodes runChild samplers params inputs scope.nodes 0 [[]]).map
+      (evaluateNodes runChild samplers params inputs scope.nodes.toList 0 [[]]).map
         (collectOutputs scope.outputs)
 
 /-- The named form of the recursive child runner used by `denoteScopeWithFuel`.
@@ -1354,7 +1369,7 @@ theorem denoteScopeWithFuel_succ
     (inputs : Environment) :
     denoteScopeWithFuel samplers program (fuel + 1) scope params inputs =
       (evaluateNodes (childRunnerWithFuel samplers program fuel) samplers params inputs
-        scope.nodes 0 [[]]).map (collectOutputs scope.outputs) := by
+        scope.nodes.toList 0 [[]]).map (collectOutputs scope.outputs) := by
   rfl
 
 def denote (samplers : MxxSamplerFamily) (program : Prog)

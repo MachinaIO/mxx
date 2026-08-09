@@ -40,7 +40,7 @@ private def toyTrapdoorType : Mxx.Ir.WireTypeExpr :=
   .trapdoor toyBType (.parameter "toy_sigma") (.constant 2) (.constant 1) (.constant 11)
 
 private def toyStep : Mxx.Ir.Scope := {
-  nodes := [
+  nodes := #[
     {
       kind := .input "c"
       arguments := []
@@ -63,7 +63,7 @@ private def toyStep : Mxx.Ir.Scope := {
 
 private def toyProgram : Mxx.Ir.Prog := {
   root := {
-    nodes := [
+    nodes := #[
       {
         kind := .trapdoorSample toyBType (.constant 11)
         arguments := []
@@ -217,7 +217,7 @@ example : toyResolvedBounds = some (true, 50000, 50000, 50000) := by
 
 private def toySchemaBreakingStep : Mxx.Ir.Scope := {
   toyStep with
-  nodes := toyStep.nodes.take 2 ++ [{
+  nodes := toyStep.nodes.take 2 ++ #[{
     kind := .extractCoefficient (.constant 0)
     arguments := [⟨0, 0⟩]
     outputTypes := [.integer]

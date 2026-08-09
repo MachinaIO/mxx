@@ -27,6 +27,7 @@ pub use operational_protocol::{OperationalProtocolError, operational_protocol_fr
 pub use operational_runner::{
     OPERATIONAL_REPORT_SCHEMA_VERSION, OperationalCheckRequest, OperationalCheckerReport,
     OperationalGadgetLayout, OperationalParameterValue, OperationalRunnerError,
-    run_emitted_operational_check, run_operational_checker_source,
+    PreparedOperationalChecker, prepare_emitted_operational_checker, run_emitted_operational_check,
+    run_operational_checker_source, run_prepared_operational_checks,
 };
 pub use protocol::*;

@@ -1718,7 +1718,7 @@ private def fixtureDecompositionType := fixtureMatrixType 4 4
 
 private def fixtureDecompositionProgram : Mxx.Ir.Prog := {
   root := {
-    nodes := [{
+    nodes := #[{
       kind := .gadgetDecompose fixtureDecompositionType (.constant 2) (.constant 4)
       arguments := [{ node := 0, port := 0 }]
       outputCount := 1

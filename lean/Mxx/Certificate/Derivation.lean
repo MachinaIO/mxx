@@ -79,7 +79,7 @@ structure DerivationAttachment where
   deriving BEq, DecidableEq
 
 structure ScopeDerivation where
-  steps : List NodeDerivation
+  steps : Array NodeDerivation
   attachments : List DerivationAttachment := []
   deriving BEq, DecidableEq
 
@@ -178,16 +178,16 @@ private def checkNodeDerivation
   | _ => pure ()
 
 private def checkScopeSteps
-    (nodes : List Mxx.Ir.Node)
-    (steps : List NodeDerivation)
-    (nodeIndex : Nat := 0) : Except DerivationError Unit :=
-  match nodes, steps with
-  | [], [] => .ok ()
-  | [], extra :: _ => .error (.unexpectedInstruction extra.sourceNode)
-  | _ :: _, [] => .error (.missingNode nodeIndex)
-  | node :: remainingNodes, step :: remainingSteps => do
-      checkNodeDerivation nodeIndex node step
-      checkScopeSteps remainingNodes remainingSteps (nodeIndex + 1)
+    (nodes : Array Mxx.Ir.Node)
+    (steps : Array NodeDerivation) : Except DerivationError Unit := do
+  for nodeIndex in [:min nodes.size steps.size] do
+    match nodes[nodeIndex]?, steps[nodeIndex]? with
+    | some node, some step => checkNodeDerivation nodeIndex node step
+    | _, _ => throw (.missingNode nodeIndex)
+  if let some extra := steps[nodes.size]? then
+    throw (.unexpectedInstruction extra.sourceNode)
+  if steps.size < nodes.size then
+    throw (.missingNode steps.size)
 
 def checkScopeDerivation
     (scope : Mxx.Ir.Scope)
@@ -218,7 +218,7 @@ establish it rather than introducing a second proof-only representation. -/
 def StructuralDerivationSoundnessClaim : Prop :=
   ∀ (program : Mxx.Ir.Prog) (derivation : ProgramDerivation),
     checkProgramDerivation program derivation = .ok () →
-      derivation.root.steps.length = program.root.nodes.length ∧
+      derivation.root.steps.size = program.root.nodes.size ∧
         derivation.definitions.length = program.definitions.length
 
 private def fixtureType : Mxx.Ir.MatrixTypeExpr := {
@@ -229,7 +229,7 @@ private def fixtureType : Mxx.Ir.MatrixTypeExpr := {
 }
 
 private def fixtureScope : Mxx.Ir.Scope := {
-  nodes := [
+  nodes := #[
     { kind := .input "left", arguments := [], outputCount := 1,
       outputTypes := [.matrix fixtureType] },
     { kind := .gaussianSample fixtureType (.constant 2), arguments := [], outputCount := 1,
@@ -242,7 +242,7 @@ private def fixtureScope : Mxx.Ir.Scope := {
 }
 
 private def fixtureDerivation : ScopeDerivation := {
-  steps := [
+  steps := #[
     { sourceNode := 0, rule := .input, arguments := [] },
     { sourceNode := 1, rule := .gaussianSample, arguments := [] },
     { sourceNode := 2, rule := .matrixAdd,
@@ -251,10 +251,10 @@ private def fixtureDerivation : ScopeDerivation := {
 }
 
 example : checkScopeDerivation fixtureScope fixtureDerivation = .ok () := by
-  rfl
+  native_decide
 
 private def operandMismatchFixture : ScopeDerivation := {
-  steps := [
+  steps := #[
     { sourceNode := 0, rule := .input, arguments := [] },
     { sourceNode := 1, rule := .gaussianSample, arguments := [] },
     { sourceNode := 2, rule := .matrixAdd,
@@ -264,15 +264,15 @@ private def operandMismatchFixture : ScopeDerivation := {
 
 example : checkScopeDerivation fixtureScope operandMismatchFixture =
     .error (.operandMismatch 2) := by
-  rfl
+  native_decide
 
 example : checkScopeDerivation fixtureScope {
   fixtureDerivation with steps := fixtureDerivation.steps.take 2
 } = .error (.missingNode 2) := by
-  rfl
+  native_decide
 
 private def reorderedFixture : ScopeDerivation := {
-  steps := [
+  steps := #[
     { sourceNode := 1, rule := .gaussianSample, arguments := [] },
     { sourceNode := 0, rule := .input, arguments := [] },
     { sourceNode := 2, rule := .matrixAdd,
@@ -282,10 +282,10 @@ private def reorderedFixture : ScopeDerivation := {
 
 example : checkScopeDerivation fixtureScope reorderedFixture =
     .error (.sourceNodeMismatch 0 1) := by
-  rfl
+  native_decide
 
 private def preimageFixtureScope : Mxx.Ir.Scope := {
-  nodes := [
+  nodes := #[
     { kind := .input "source", arguments := [], outputCount := 1,
       outputTypes := [.matrix fixtureType] },
     { kind := .preimageSample fixtureType (.constant 2), arguments := [{ node := 0, port := 0 }],
@@ -298,7 +298,7 @@ private def preimageFixtureScope : Mxx.Ir.Scope := {
 }
 
 private def preimageFixtureDerivation : ScopeDerivation := {
-  steps := [
+  steps := #[
     { sourceNode := 0, rule := .input, arguments := [] },
     { sourceNode := 1, rule := .preimageSample, arguments := [{ node := 0, port := 0 }] },
     { sourceNode := 2, rule := .matrixMultiplyRelation { node := 0, port := 0 },
@@ -308,6 +308,6 @@ private def preimageFixtureDerivation : ScopeDerivation := {
 
 example : checkScopeDerivation preimageFixtureScope preimageFixtureDerivation =
     .error (.invalidRelationOperand 2 { node := 0, port := 0 }) := by
-  rfl
+  native_decide
 
 end Mxx.Certificate

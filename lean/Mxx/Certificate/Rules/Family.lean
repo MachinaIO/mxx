@@ -1087,7 +1087,7 @@ private def familyTestSource : ParallelFamilyDerivationSource := {
   argumentRefs := []
   outputCount := 1
   outputTypes := [.matrix familyTestType]
-  body := { nodes := [], outputs := [], inputNames := [] }
+  body := { nodes := #[], outputs := [], inputNames := [] }
   seededFacts := []
   analyzedFacts := []
   outputFacts := []
@@ -1204,7 +1204,7 @@ private def familyTestTrapdoorSource : ParallelFamilyDerivationSource := {
   outputCount := 2
   outputTypes := [.matrix familyTestType, .trapdoor familyTestType (.rational 1) (.constant 2)
     (.constant 1) (.constant 1)]
-  body := { nodes := [], outputs := [], inputNames := [] }
+  body := { nodes := #[], outputs := [], inputNames := [] }
   seededFacts := []
   analyzedFacts := []
   outputFacts := []

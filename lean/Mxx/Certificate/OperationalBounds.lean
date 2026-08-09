@@ -850,6 +850,19 @@ abbrev OperationalState := Array OperationalFact
 /-- Facts for an ordinary frozen scope are indexed by the exact `(node, port)` wire location. -/
 abbrev OperationalScopeFacts := Array (Array OperationalFact)
 
+/-- Structure-only information validated once before numeric operational requests are evaluated. -/
+structure PreparedOperationalScope where
+  scope : Scope
+  derivation : ScopeDerivation
+  inputIndices : Array (Option Nat)
+  definitionIndices : Array (Option Nat)
+  attachmentBuckets : Array (Array DerivationAttachment)
+
+/-- One frozen program with all scope/derivation alignment resolved to array indices. -/
+structure PreparedOperationalProgram where
+  root : PreparedOperationalScope
+  definitions : Array (String × PreparedOperationalScope)
+
 inductive OperationalError where
   | inScope (scope : ScopeTemplateKey) (error : OperationalError)
   | missingOutputType (node : Nat) (port : Nat)
@@ -2557,15 +2570,12 @@ private def applyDerivationAttachment
     let grouped ← groupPublicKeySignalFact value
     replaceOperationalFact node facts valueWire grouped
 
-private def applyReadyDerivationAttachments
+private def applyPreparedDerivationAttachments
     (node : Nat)
-    (attachments : List DerivationAttachment)
+    (attachments : Array DerivationAttachment)
     (facts : OperationalScopeFacts) : Except OperationalError OperationalScopeFacts :=
   attachments.foldlM (init := facts) fun current attachment =>
-    if attachment.roles.any (fun role => role.2.node == node) &&
-        attachment.roles.all (fun role => role.2.node <= node) then
-      applyDerivationAttachment node attachment current
-    else pure current
+    applyDerivationAttachment node attachment current
 
 private def tensorOperationalPolynomials
     (outputType : MatrixTypeExpr)
@@ -3980,6 +3990,68 @@ private def validateScopeInputs (scope : Scope) : Except OperationalError Unit :
   for name in nodeNames do
     if !scope.inputNames.contains name then throw (.unexpectedInputNode name)
 
+private def findDefinitionIndex
+    (name : String) : List (String × Scope) → Nat → Option Nat
+  | [], _ => none
+  | (candidate, _) :: tail, index =>
+      if candidate == name then some index else findDefinitionIndex name tail (index + 1)
+
+private def prepareOperationalScope
+    (definitions : List (String × Scope))
+    (scope : Scope)
+    (derivation : ScopeDerivation) : Except OperationalError PreparedOperationalScope := do
+  validateScopeInputs scope
+  let inputIndices := scope.nodes.map fun node => match node.kind with
+    | .input name => scope.inputNames.idxOf? name
+    | _ => none
+  let definitionIndices := scope.nodes.map fun node => match node.kind with
+    | .subgraphCall name _ => findDefinitionIndex name definitions 0
+    | .parallelLoop name _ _ _ _ => findDefinitionIndex name definitions 0
+    | .sequentialLoop name _ _ _ _ => findDefinitionIndex name definitions 0
+    | _ => none
+  for (node, index) in scope.nodes.zipIdx do
+    match node.kind with
+    | .subgraphCall name _ | .parallelLoop name _ _ _ _ | .sequentialLoop name _ _ _ _ =>
+        match definitionIndices[index]? with
+        | some (some _) => pure ()
+        | _ => throw (OperationalError.missingDefinition name)
+    | _ => pure ()
+  let mut attachmentBuckets := Array.replicate scope.nodes.size #[]
+  for attachment in derivation.attachments do
+    validateDerivationAttachment scope attachment
+    let readyNode := attachment.roles.foldl (fun current role => max current role.2.node) 0
+    match attachmentBuckets[readyNode]? with
+    | some bucket => attachmentBuckets := attachmentBuckets.set! readyNode (bucket.push attachment)
+    | none => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+  pure { scope, derivation, inputIndices, definitionIndices, attachmentBuckets }
+
+/-- Checks a frozen program once and resolves every structure-only lookup used by later requests. -/
+def prepareProgramOperational
+    (program : Prog)
+    (derivation : ProgramDerivation) : Except OperationalError PreparedOperationalProgram := do
+  match checkProgramDerivation program derivation with
+  | .error error => throw (.derivation error)
+  | .ok () => pure ()
+  let root ← prepareOperationalScope program.definitions program.root derivation.root
+  let definitionPairs := program.definitions.zip derivation.definitions
+  let definitions ← definitionPairs.mapM fun pair => do
+    let ((name, scope), (derivationName, scopeDerivation)) := pair
+    if name != derivationName then throw (.missingDefinition name)
+    return (name, ← prepareOperationalScope program.definitions scope scopeDerivation)
+  pure { root, definitions := definitions.toArray }
+
+private def preparedDefinitionAt
+    (node : Nat)
+    (prepared : PreparedOperationalScope)
+    (definitions : Array (String × PreparedOperationalScope)) :
+    Except OperationalError PreparedOperationalScope := do
+  let definitionIndex ← match prepared.definitionIndices[node]? with
+    | some (some index) => pure index
+    | _ => throw (OperationalError.missingDefinition s!"node-{node}")
+  match definitions[definitionIndex]? with
+  | some (_, definition) => pure definition
+  | none => throw (OperationalError.missingDefinition s!"node-{node}")
+
 def deriveOrdinaryOutputs
     (scopeKey : ScopeTemplateKey)
     (nodeIndex : Nat)
@@ -3998,22 +4070,17 @@ def deriveOrdinaryOutputs
       return output :: (← deriveOrdinaryOutputs scopeKey nodeIndex node rule environment
         loopDomains layouts facts (port + 1) tail)
 
-def evaluateCheckedScope
-    (definitions : List (String × Scope))
-    (definitionDerivations : List (String × ScopeDerivation))
+def evaluatePreparedScope
+    (definitions : Array (String × PreparedOperationalScope))
     (layouts : List Mxx.GadgetLayoutDescriptor) :
-    ScopeTemplateKey → Nat → Scope → ScopeDerivation → ParamEnvironment →
+    ScopeTemplateKey → Nat → PreparedOperationalScope → ParamEnvironment →
       List OperationalParameterDomain →
       List OperationalFact →
       Except OperationalError OperationalScopeFacts
-  | _, 0, _, _, _, _, _ => .error .definitionFuelExhausted
-  | scopeKey, fuel + 1, scope, derivation, environment, loopDomains, inputFacts => do
-      match checkScopeDerivation scope derivation with
-      | .error error => throw (.derivation error)
-      | .ok () => pure ()
-      validateScopeInputs scope
-      for attachment in derivation.attachments do
-        validateDerivationAttachment scope attachment
+  | _, 0, _, _, _, _ => .error .definitionFuelExhausted
+  | scopeKey, fuel + 1, prepared, environment, loopDomains, inputFacts => do
+      let scope := prepared.scope
+      let derivation := prepared.derivation
       if !inputFacts.isEmpty && inputFacts.length != scope.inputNames.length then
         throw (.childInputMismatch 0 scope.inputNames.length inputFacts.length)
       let rec collectChildOutputs
@@ -4045,45 +4112,42 @@ def evaluateCheckedScope
             return (← loopArgumentFact nodeIndex argumentIndex index mode input) ::
               (← prepareParallelInputs nodeIndex index (argumentIndex + 1) modeTail inputTail)
         | _, _ => throw (.loopInputModeMismatch nodeIndex argumentIndex)
-      let rec go
-          (index : Nat)
-          (nodes : List Node)
-          (facts : OperationalScopeFacts) : Except OperationalError OperationalScopeFacts := do
-        match nodes with
-        | [] => pure facts
-        | node :: tail =>
+      let mut facts : OperationalScopeFacts := #[]
+      for node in scope.nodes do
+            let index := facts.size
             if node.outputCount != node.outputTypes.length then
               throw (.unsupportedOutputArity index node.outputCount)
             let step ← match derivation.steps[index]? with
               | some step => pure step
               | none => throw (.derivation (.missingNode index))
             let outputs ← match node.kind with
-              | .input name =>
+              | .input _ =>
                   if inputFacts.isEmpty then
                     deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
                       layouts facts 0 node.outputTypes
                   else
-                    match scope.inputNames.idxOf? name with
-                    | some inputIndex =>
+                    match prepared.inputIndices[index]? with
+                    | some (some inputIndex) =>
                         match inputFacts[inputIndex]? with
                         | some input => do
                             let rebound ← rebindSubject { node := index, port := 0 } input
                             pure [rebound]
-                        | none => throw (.childInputMismatch index scope.inputNames.length inputFacts.length)
-                    | none => throw (.childInputMismatch index scope.inputNames.length inputFacts.length)
-              | .subgraphCall definition bindings =>
+                        | none => throw (OperationalError.childInputMismatch index
+                            scope.inputNames.length inputFacts.length)
+                    | _ => throw (OperationalError.childInputMismatch index
+                        scope.inputNames.length inputFacts.length)
+              | .subgraphCall _ bindings =>
                   let actualInputs ← node.arguments.mapM (lookupFact index facts)
                   let boundParams ← match evaluateBindings environment bindings with
                     | some values => pure values
                     | none => throw .nonClosedExpression
                   let childDomains ← extendParameterDomains environment loopDomains bindings
-                  let (childScope, childDerivation) ←
-                    lookupCheckedDefinition definition definitions definitionDerivations
+                  let child ← preparedDefinitionAt index prepared definitions
                   let childKey := .callBody scopeKey index
-                  let childFacts ← (evaluateCheckedScope definitions definitionDerivations layouts
-                    childKey fuel childScope childDerivation (boundParams ++ environment)
+                  let childFacts ← (evaluatePreparedScope definitions layouts
+                    childKey fuel child (boundParams ++ environment)
                     childDomains actualInputs).mapError (.inScope childKey)
-                  collectChildOutputs index 0 childScope.outputs childFacts
+                  collectChildOutputs index 0 child.scope.outputs childFacts
               | .familyPack =>
                   let elements ← node.arguments.mapM (lookupFact index facts)
                   pure [packedFacts elements]
@@ -4142,7 +4206,7 @@ def evaluateCheckedScope
                           else pure [← joinDynamicFacts index { node := index, port := 0 } elements
                               (some selection)]
                       | none => throw (.loopInputModeMismatch index 0)
-              | .parallelLoop definition count indexSlot bindings modes =>
+              | .parallelLoop _ count indexSlot bindings modes =>
                   let evaluatedCount ← match count.evaluate environment with
                     | some value => pure value
                     | none => throw .nonClosedExpression
@@ -4159,21 +4223,20 @@ def evaluateCheckedScope
                     | some values => pure values
                     | none => throw .nonClosedExpression
                   let childDomains ← extendParameterDomains iterationEnvironment parentDomains bindings
-                  let (childScope, childDerivation) ←
-                    lookupCheckedDefinition definition definitions definitionDerivations
+                  let child ← preparedDefinitionAt index prepared definitions
                   let childKey := .parallelBody scopeKey index
-                  let childFacts ← (evaluateCheckedScope definitions definitionDerivations layouts
-                    childKey fuel childScope childDerivation
+                  let childFacts ← (evaluatePreparedScope definitions layouts
+                    childKey fuel child
                     (boundParams ++ iterationEnvironment) childDomains templateInputs).mapError
                       (.inScope childKey)
-                  let childOutputs ← scopeOutputFacts index childScope.outputs childFacts
+                  let childOutputs ← scopeOutputFacts index child.scope.outputs childFacts
                   if childOutputs.length != node.outputCount then
                     throw (.childInputMismatch index node.outputCount childOutputs.length)
                   childOutputs.zipIdx.mapM fun (output, port) =>
                     rebindSubject { node := index, port } (.familyUniform
                       { owner := scopeKey, producerNode := index, binderSlot := indexSlot }
                       (some (.loopBinder scopeKey index indexSlot)) output evaluatedCount)
-              | .sequentialLoop definition count indexSlot bindings carriedCount =>
+              | .sequentialLoop _ count indexSlot bindings carriedCount =>
                   let evaluatedCount ← match count.evaluate environment with
                     | some value => pure value
                     | none => throw .nonClosedExpression
@@ -4198,14 +4261,13 @@ def evaluateCheckedScope
                     | some values => pure values
                     | none => throw .nonClosedExpression
                   let childDomains ← extendParameterDomains iterationEnvironment sequentialDomains bindings
-                  let (childScope, childDerivation) ←
-                    lookupCheckedDefinition definition definitions definitionDerivations
+                  let child ← preparedDefinitionAt index prepared definitions
                   let childKey := .sequentialBody scopeKey index
-                  let childFacts ← (evaluateCheckedScope definitions definitionDerivations layouts
-                    childKey fuel childScope childDerivation
+                  let childFacts ← (evaluatePreparedScope definitions layouts
+                    childKey fuel child
                     (boundParams ++ iterationEnvironment) childDomains
                     (abstractCarried ++ shiftedInvariantFacts)).mapError (.inScope childKey)
-                  let outputTemplates ← scopeOutputFacts index childScope.outputs childFacts
+                  let outputTemplates ← scopeOutputFacts index child.scope.outputs childFacts
                   if outputTemplates.length != carriedCount then
                     throw (.childInputMismatch index carriedCount outputTemplates.length)
                   for slot in List.range carriedCount do
@@ -4236,13 +4298,20 @@ def evaluateCheckedScope
               | _ =>
                   deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
                     layouts facts 0 node.outputTypes
-            let facts := facts.push outputs.toArray
-            let facts ← applyReadyDerivationAttachments index derivation.attachments facts
-            go (index + 1) tail facts
-      termination_by (fuel, nodes.length)
-      go 0 scope.nodes #[]
+            facts := facts.push outputs.toArray
+            let attachments := prepared.attachmentBuckets[index]?.getD #[]
+            facts := ← applyPreparedDerivationAttachments index attachments facts
+      pure facts
 termination_by
-  _ fuel _ _ _ _ _ => (fuel, 0)
+  _ fuel _ _ _ _ => (fuel, 0)
+
+def evaluatePreparedProgramOperationalWithKey
+    (programKey : ProgramInstanceKey)
+    (program : PreparedOperationalProgram)
+    (environment : ParamEnvironment)
+    (layouts : List Mxx.GadgetLayoutDescriptor) : Except OperationalError OperationalScopeFacts :=
+  evaluatePreparedScope program.definitions layouts
+    (.root programKey) (program.definitions.size + 1) program.root environment [] []
 
 def evaluateProgramOperationalWithKey
     (programKey : ProgramInstanceKey)
@@ -4250,12 +4319,8 @@ def evaluateProgramOperationalWithKey
     (derivation : ProgramDerivation)
     (environment : ParamEnvironment)
     (layouts : List Mxx.GadgetLayoutDescriptor) : Except OperationalError OperationalScopeFacts := do
-  match checkProgramDerivation program derivation with
-  | .error error => throw (.derivation error)
-  | .ok () =>
-      evaluateCheckedScope program.definitions derivation.definitions layouts
-        (.root programKey) (program.definitions.length + 1)
-        program.root derivation.root environment [] []
+  let prepared ← prepareProgramOperational program derivation
+  evaluatePreparedProgramOperationalWithKey programKey prepared environment layouts
 
 private def findInputWireType (scope : Scope) (name : String) : Option (WireRef × WireTypeExpr) :=
   scope.nodes.zipIdx.findSome? fun (node, index) =>
@@ -4456,7 +4521,7 @@ def decoderNoiseCheckReportForFact
 private def collectOperationalOutputs
     (scope : Scope)
     (facts : OperationalScopeFacts) : Except OperationalError (List (String × OperationalFact)) :=
-  scope.outputs.mapM fun (name, wire) => return (name, ← lookupFact scope.nodes.length facts wire)
+  scope.outputs.mapM fun (name, wire) => return (name, ← lookupFact scope.nodes.size facts wire)
 
 private def findStageOutput
     (results : List OperationalStageResult)
@@ -4468,6 +4533,63 @@ private def findStageOutput
   | some (_, fact) => pure fact
   | none => throw (.missingStageResult stage output)
 
+structure PreparedOperationalStageInput where
+  subject : WireRef
+  wireType : WireTypeExpr
+  source : InputSource
+
+structure PreparedOperationalStage where
+  id : String
+  program : PreparedOperationalProgram
+  inputs : Array PreparedOperationalStageInput
+
+structure PreparedOperationalWorkflow where
+  stages : Array PreparedOperationalStage
+  inputContract : InputContract
+
+/-- Validates every frozen stage and resolves its structural lookups exactly once. -/
+def prepareWorkflowOperational
+    (bundle : OperationalWorkflowSpec)
+    (stageDerivations : List (String × ProgramDerivation)) :
+    Except OperationalError PreparedOperationalWorkflow := do
+  let mut stages := #[]
+  for stage in bundle.workflow.stages do
+    let derivation ← match stageDerivations.find? fun candidate => candidate.1 == stage.id with
+      | some (_, derivation) => pure derivation
+      | none => throw (.missingStageDerivation stage.id)
+    let program ← prepareProgramOperational stage.program derivation
+    let inputs ← stage.inputs.mapM fun (inputName, source) => do
+      let (subject, wireType) ← match findInputWireType stage.program.root inputName with
+        | some result => pure result
+        | none => throw (.missingInputNode inputName)
+      pure { subject, wireType, source }
+    stages := stages.push { id := stage.id, program, inputs := inputs.toArray }
+  pure { stages, inputContract := bundle.inputContract }
+
+/-- Evaluates request-dependent bounds using a workflow whose structure is already checked. -/
+def evaluatePreparedWorkflowOperational
+    (prepared : PreparedOperationalWorkflow)
+    (environment : ParamEnvironment)
+    (layouts : List Mxx.GadgetLayoutDescriptor) :
+    Except OperationalError (List OperationalStageResult) := do
+  let mut results := []
+  for stage in prepared.stages do
+    let scopeKey := ScopeTemplateKey.root (.workflowStage ⟨stage.id⟩)
+    let inputFacts ← stage.inputs.toList.mapM fun input => match input.source with
+      | .artifact producer output => do
+          rebindSubject input.subject (← findStageOutput results producer output)
+      | .protocol protocolName => do
+          let (protocolInput, contract) ← match prepared.inputContract.inputs.find? fun entry =>
+              entry.1.name == protocolName with
+            | some (protocolInput, _, contract) => pure (protocolInput, contract)
+            | none => throw (.missingProtocolContract protocolName)
+          contractFact scopeKey input.subject protocolInput input.wireType contract environment
+    let facts ← evaluatePreparedScope stage.program.definitions layouts scopeKey
+      (stage.program.definitions.size + 1) stage.program.root environment [] inputFacts
+    let outputs ← collectOperationalOutputs stage.program.root.scope facts
+    results := results ++ [{ stage := stage.id, outputs, facts }]
+  pure results
+
 /-- Evaluates the exact frozen workflow in stage order. Protocol inputs are constructed from the
 reviewed input contract; artifact inputs are the producer's actual operational output facts, so
 relations and identities cross a stage boundary without graph search or user annotations. -/
@@ -4477,36 +4599,8 @@ def evaluateWorkflowOperational
     (environment : ParamEnvironment)
     (layouts : List Mxx.GadgetLayoutDescriptor) :
     Except OperationalError (List OperationalStageResult) := do
-  let rec go (results : List OperationalStageResult) : List Stage →
-      Except OperationalError (List OperationalStageResult)
-    | [] => pure results
-    | stage :: tail => do
-        let derivation ← match stageDerivations.find? fun candidate => candidate.1 == stage.id with
-          | some (_, derivation) => pure derivation
-          | none => throw (.missingStageDerivation stage.id)
-        let scopeKey := ScopeTemplateKey.root (.workflowStage ⟨stage.id⟩)
-        let inputFacts ← stage.inputs.mapM fun (inputName, source) => do
-          let (subject, wireType) ← match findInputWireType stage.program.root inputName with
-            | some result => pure result
-            | none => throw (.missingInputNode inputName)
-          match source with
-          | .artifact producer output =>
-              rebindSubject subject (← findStageOutput results producer output)
-          | .protocol protocolName =>
-              let (protocolInput, contract) ← match bundle.inputContract.inputs.find? fun entry =>
-                  entry.1.name == protocolName with
-                | some (protocolInput, _, contract) => pure (protocolInput, contract)
-                | none => throw (.missingProtocolContract protocolName)
-              contractFact scopeKey subject protocolInput wireType contract environment
-        match checkProgramDerivation stage.program derivation with
-        | .error error => throw (.derivation error)
-        | .ok () => pure ()
-        let facts ← evaluateCheckedScope stage.program.definitions derivation.definitions layouts
-          scopeKey (stage.program.definitions.length + 1) stage.program.root derivation.root
-          environment [] inputFacts
-        let outputs ← collectOperationalOutputs stage.program.root facts
-        go (results ++ [{ stage := stage.id, outputs, facts }]) tail
-  go [] bundle.workflow.stages
+  let prepared ← prepareWorkflowOperational bundle stageDerivations
+  evaluatePreparedWorkflowOperational prepared environment layouts
 
 def evaluateProgramOperationalWithLayouts
     (program : Prog)
@@ -4515,12 +4609,25 @@ def evaluateProgramOperationalWithLayouts
     (layouts : List Mxx.GadgetLayoutDescriptor) : Except OperationalError OperationalScopeFacts :=
   evaluateProgramOperationalWithKey (.standalone 0) program derivation environment layouts
 
+def evaluateScopeOperationalWithKey
+    (scopeKey : ScopeTemplateKey)
+    (scope : Scope)
+    (derivation : ScopeDerivation)
+    (environment : ParamEnvironment)
+    (layouts : List Mxx.GadgetLayoutDescriptor)
+    (inputFacts : List OperationalFact := []) : Except OperationalError OperationalScopeFacts := do
+  let program : Prog := { root := scope }
+  let programDerivation : ProgramDerivation := { root := derivation }
+  let prepared ← prepareProgramOperational program programDerivation
+  evaluatePreparedScope prepared.definitions layouts scopeKey 1 prepared.root environment [] inputFacts
+
 def evaluateScopeOperationalWithLayouts
     (scope : Scope)
     (derivation : ScopeDerivation)
     (environment : ParamEnvironment)
     (layouts : List Mxx.GadgetLayoutDescriptor) : Except OperationalError OperationalScopeFacts :=
-  evaluateCheckedScope [] [] layouts (.root (.standalone 0)) 1 scope derivation environment [] []
+  evaluateScopeOperationalWithKey (.root (.standalone 0))
+    scope derivation environment layouts
 
 /-- Future local proof target for ordinary addition.  It intentionally states the runtime
 connection without presenting the operational estimate as an established theorem. -/
@@ -4636,7 +4743,7 @@ private def fixtureTrapdoorFact : OperationalFact := .trapdoor {
 }
 
 private def sharedPreimageBaseScope : Scope := {
-  nodes := [
+  nodes := #[
     {
       kind := .trapdoorSample fixtureType (.constant 3)
       arguments := []
@@ -4678,7 +4785,7 @@ private def sharedPreimageBaseScope : Scope := {
   inputNames := []
 }
 
-private def sharedPreimageBaseDerivation : ScopeDerivation := { steps := [
+private def sharedPreimageBaseDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .trapdoorSample, arguments := [] },
   { sourceNode := 1, rule := .gaussianSample, arguments := [] },
   { sourceNode := 2, rule := .identityMatrix, arguments := [] },
@@ -4753,7 +4860,7 @@ example : (do
   native_decide
 
 private def fixtureScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
     { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
       outputTypes := [.matrix fixtureType] },
@@ -4763,7 +4870,7 @@ private def fixtureScope : Scope := {
   outputs := [("result", { node := 2, port := 0 })], inputNames := []
 }
 
-private def fixtureDerivation : ScopeDerivation := { steps := [
+private def fixtureDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .zeroMatrix, arguments := [] },
   { sourceNode := 1, rule := .gaussianSample, arguments := [] },
   { sourceNode := 2, rule := .matrixAdd, arguments := [{ node := 0, port := 0 },
@@ -4787,7 +4894,7 @@ example : (do
   native_decide
 
 private def scaledNoiseScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
       outputTypes := [.matrix fixtureType] },
     { kind := .matrixScale (.constant 2), arguments := [{ node := 0, port := 0 }],
@@ -4797,7 +4904,7 @@ private def scaledNoiseScope : Scope := {
   inputNames := []
 }
 
-private def scaledNoiseDerivation : ScopeDerivation := { steps := [
+private def scaledNoiseDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .gaussianSample, arguments := [] },
   { sourceNode := 1, rule := .matrixScale, arguments := [{ node := 0, port := 0 }] }
 ] }
@@ -4810,7 +4917,7 @@ example : (do
   native_decide
 
 private def mixedSignalNoiseScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .uniformResidueSample fixtureType, arguments := [],
       outputTypes := [.matrix fixtureType] },
     { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
@@ -4823,7 +4930,7 @@ private def mixedSignalNoiseScope : Scope := {
   inputNames := []
 }
 
-private def mixedSignalNoiseDerivation : ScopeDerivation := { steps := [
+private def mixedSignalNoiseDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .uniformResidueSample, arguments := [] },
   { sourceNode := 1, rule := .gaussianSample, arguments := [] },
   { sourceNode := 2, rule := .matrixAdd,
@@ -4842,7 +4949,7 @@ example : (do
   native_decide
 
 private def flatCancellationScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
       outputTypes := [.matrix fixtureType] },
     { kind := .matrixSubtract,
@@ -4853,7 +4960,7 @@ private def flatCancellationScope : Scope := {
   inputNames := []
 }
 
-private def flatCancellationDerivation : ScopeDerivation := { steps := [
+private def flatCancellationDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .gaussianSample, arguments := [] },
   { sourceNode := 1, rule := .matrixSubtract,
     arguments := [{ node := 0, port := 0 }, { node := 0, port := 0 }] }
@@ -4868,7 +4975,7 @@ example : (do
   native_decide
 
 private def flatNoiseOrderScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .gaussianSample fixtureType (.constant 2), arguments := [],
       outputTypes := [.matrix fixtureType] },
     { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
@@ -4887,7 +4994,7 @@ private def flatNoiseOrderScope : Scope := {
   inputNames := []
 }
 
-private def flatNoiseOrderDerivation : ScopeDerivation := { steps := [
+private def flatNoiseOrderDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .gaussianSample, arguments := [] },
   { sourceNode := 1, rule := .gaussianSample, arguments := [] },
   { sourceNode := 2, rule := .matrixAdd,
@@ -4907,7 +5014,7 @@ example : (do
   native_decide
 
 private def flatMultiLargeScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .uniformResidueSample fixtureType, arguments := [],
       outputTypes := [.matrix fixtureType] },
     { kind := .uniformResidueSample fixtureType, arguments := [],
@@ -4923,7 +5030,7 @@ private def flatMultiLargeScope : Scope := {
   inputNames := []
 }
 
-private def flatMultiLargeDerivation : ScopeDerivation := { steps := [
+private def flatMultiLargeDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .uniformResidueSample, arguments := [] },
   { sourceNode := 1, rule := .uniformResidueSample, arguments := [] },
   { sourceNode := 2, rule := .matrixAdd,
@@ -4941,13 +5048,13 @@ example : (do
       operationalLargeFactorCount term = 2)) = .ok (4, true) := by
   native_decide
 
-example : checkScopeDerivation fixtureScope { steps := [
+example : checkScopeDerivation fixtureScope { steps := #[
   { sourceNode := 1, rule := .gaussianSample, arguments := [] }
 ] } = .error (.sourceNodeMismatch 0 1) := by
   native_decide
 
 private def gadgetFixtureScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
       outputTypes := [.matrix fixtureType] },
     { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
@@ -4956,7 +5063,7 @@ private def gadgetFixtureScope : Scope := {
   outputs := [("result", { node := 1, port := 0 })], inputNames := []
 }
 
-private def gadgetFixtureDerivation : ScopeDerivation := { steps := [
+private def gadgetFixtureDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .gaussianSample, arguments := [] },
   { sourceNode := 1, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] }
 ] }
@@ -4995,7 +5102,7 @@ private def fixtureSquare2Type : MatrixTypeExpr := {
 }
 
 private def matrixTransformCoverageScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
       outputTypes := [.matrix fixtureType] },
     { kind := .identityMatrix fixtureType, arguments := [],
@@ -5042,7 +5149,7 @@ private def matrixTransformCoverageScope : Scope := {
   inputNames := []
 }
 
-private def matrixTransformCoverageDerivation : ScopeDerivation := { steps := [
+private def matrixTransformCoverageDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .gaussianSample, arguments := [] },
   { sourceNode := 1, rule := .identityMatrix, arguments := [] },
   { sourceNode := 2, rule := .matrixAdd,
@@ -5086,7 +5193,7 @@ example : (do
   native_decide
 
 private def samplerAndDecodeCoverageScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .trapdoorSample fixtureType (.constant 3), arguments := [], outputCount := 2,
       outputTypes := [
         .matrix fixtureType,
@@ -5126,7 +5233,7 @@ private def samplerAndDecodeCoverageScope : Scope := {
   inputNames := []
 }
 
-private def samplerAndDecodeCoverageDerivation : ScopeDerivation := { steps := [
+private def samplerAndDecodeCoverageDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .trapdoorSample, arguments := [] },
   { sourceNode := 1, rule := .gaussianSample, arguments := [] },
   { sourceNode := 2, rule := .preimageSample,
@@ -5170,7 +5277,7 @@ example : (do
   native_decide
 
 private def hashIdentityFixtureScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
     { kind := .hashSample fixtureType .plain [109, 120, 120] [.constant 7] [] [] none none,
       arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] },
@@ -5182,7 +5289,7 @@ private def hashIdentityFixtureScope : Scope := {
   inputNames := ["key"]
 }
 
-private def hashIdentityFixtureDerivation : ScopeDerivation := { steps := [
+private def hashIdentityFixtureDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .input, arguments := [] },
   { sourceNode := 1, rule := .hashSample, arguments := [{ node := 0, port := 0 }] },
   { sourceNode := 2, rule := .hashSample, arguments := [{ node := 0, port := 0 }] }
@@ -5200,7 +5307,7 @@ example : (do
   native_decide
 
 private def trailingHashIdentityFixtureScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
     { kind := .constantInt 9, arguments := [], outputTypes := [.integer] },
     { kind := .hashSample fixtureType .plain [109, 120, 120] [.constant 7] [] [] none none,
@@ -5215,7 +5322,7 @@ private def trailingHashIdentityFixtureScope : Scope := {
   inputNames := ["key"]
 }
 
-private def trailingHashIdentityFixtureDerivation : ScopeDerivation := { steps := [
+private def trailingHashIdentityFixtureDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .input, arguments := [] },
   { sourceNode := 1, rule := .constantInt, arguments := [] },
   { sourceNode := 2, rule := .hashSample,
@@ -5246,17 +5353,17 @@ example : (do
       (.bytes (.constant 32)) (.bytes (.constant 32)) []
     let rightInput ← contractFact rightScope { node := 0, port := 0 } input
       (.bytes (.constant 32)) (.bytes (.constant 32)) []
-    let leftFacts ← evaluateCheckedScope [] [] [fixtureLayout] leftScope 1
-      hashIdentityFixtureScope hashIdentityFixtureDerivation [] [] [leftInput]
-    let rightFacts ← evaluateCheckedScope [] [] [fixtureLayout] rightScope 1
-      hashIdentityFixtureScope hashIdentityFixtureDerivation [] [] [rightInput]
+    let leftFacts ← evaluateScopeOperationalWithKey leftScope hashIdentityFixtureScope
+      hashIdentityFixtureDerivation [] [fixtureLayout] [leftInput]
+    let rightFacts ← evaluateScopeOperationalWithKey rightScope hashIdentityFixtureScope
+      hashIdentityFixtureDerivation [] [fixtureLayout] [rightInput]
     let left ← matrixFactAt 2 leftFacts { node := 1, port := 0 }
     let right ← matrixFactAt 2 rightFacts { node := 1, port := 0 }
     pure (left.origin == right.origin)) = .ok true := by
   native_decide
 
 private def scalarIntervalFixtureScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .constantInt (-2), arguments := [], outputTypes := [.integer] },
     { kind := .constantInt 3, arguments := [], outputTypes := [.integer] },
     { kind := .intBinary .multiply,
@@ -5272,7 +5379,7 @@ private def scalarIntervalFixtureScope : Scope := {
   inputNames := []
 }
 
-private def scalarIntervalFixtureDerivation : ScopeDerivation := { steps := [
+private def scalarIntervalFixtureDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .constantInt, arguments := [] },
   { sourceNode := 1, rule := .constantInt, arguments := [] },
   { sourceNode := 2, rule := .intBinary,
@@ -5292,14 +5399,14 @@ example : (do
   native_decide
 
 private def malformedScalarOutputScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .constantInt 1, arguments := [], outputTypes := [.boolean] }
   ]
   outputs := []
   inputNames := []
 }
 
-private def malformedScalarOutputDerivation : ScopeDerivation := { steps := [
+private def malformedScalarOutputDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .constantInt, arguments := [] }
 ] }
 
@@ -5311,7 +5418,7 @@ example : (match evaluateScopeOperationalWithLayouts malformedScalarOutputScope
   native_decide
 
 private def negativeBitScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
     { kind := .bitExtract (.constant (-1)), arguments := [{ node := 0, port := 0 }],
       outputTypes := [.boolean] }
@@ -5320,7 +5427,7 @@ private def negativeBitScope : Scope := {
   inputNames := []
 }
 
-private def negativeBitDerivation : ScopeDerivation := { steps := [
+private def negativeBitDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .constantInt, arguments := [] },
   { sourceNode := 1, rule := .bitExtract, arguments := [{ node := 0, port := 0 }] }
 ] }
@@ -5332,7 +5439,7 @@ example : (match evaluateScopeOperationalWithLayouts negativeBitScope negativeBi
   native_decide
 
 private def scalarTypeMismatchScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
     { kind := .boolToInt, arguments := [{ node := 0, port := 0 }], outputTypes := [.integer] }
   ]
@@ -5340,7 +5447,7 @@ private def scalarTypeMismatchScope : Scope := {
   inputNames := []
 }
 
-private def scalarTypeMismatchDerivation : ScopeDerivation := { steps := [
+private def scalarTypeMismatchDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .zeroMatrix, arguments := [] },
   { sourceNode := 1, rule := .boolToInt, arguments := [{ node := 0, port := 0 }] }
 ] }
@@ -5353,7 +5460,7 @@ example : (match evaluateScopeOperationalWithLayouts scalarTypeMismatchScope
   native_decide
 
 private def selectRangeMismatchScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .constantInt 2, arguments := [], outputTypes := [.integer] },
     { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
     { kind := .identityMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
@@ -5365,7 +5472,7 @@ private def selectRangeMismatchScope : Scope := {
   inputNames := []
 }
 
-private def selectRangeMismatchDerivation : ScopeDerivation := { steps := [
+private def selectRangeMismatchDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .constantInt, arguments := [] },
   { sourceNode := 1, rule := .zeroMatrix, arguments := [] },
   { sourceNode := 2, rule := .identityMatrix, arguments := [] },
@@ -5382,7 +5489,7 @@ example : (match evaluateScopeOperationalWithLayouts selectRangeMismatchScope
   native_decide
 
 private def crtMetadataMismatchScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
     { kind := .crtRecompose [.constant 2, .constant 3] [.constant 1, .constant 1],
       arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
@@ -5391,7 +5498,7 @@ private def crtMetadataMismatchScope : Scope := {
   inputNames := []
 }
 
-private def crtMetadataMismatchDerivation : ScopeDerivation := { steps := [
+private def crtMetadataMismatchDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .zeroMatrix, arguments := [] },
   { sourceNode := 1, rule := .crtRecompose, arguments := [{ node := 0, port := 0 }] }
 ] }
@@ -5404,7 +5511,7 @@ example : (match evaluateScopeOperationalWithLayouts crtMetadataMismatchScope
   native_decide
 
 private def packedPolynomialInputMismatchScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .constantBool true, arguments := [], outputTypes := [.boolean] },
     { kind := .packPolynomialCoefficients fixtureType (.constant 5),
       arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
@@ -5413,7 +5520,7 @@ private def packedPolynomialInputMismatchScope : Scope := {
   inputNames := []
 }
 
-private def packedPolynomialInputMismatchDerivation : ScopeDerivation := { steps := [
+private def packedPolynomialInputMismatchDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .constantBool, arguments := [] },
   { sourceNode := 1, rule := .packPolynomialCoefficients,
     arguments := [{ node := 0, port := 0 }] }
@@ -5427,7 +5534,7 @@ example : (match evaluateScopeOperationalWithLayouts packedPolynomialInputMismat
   native_decide
 
 private def loopHashBody : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
     { kind := .hashSample fixtureType .plain [109, 120, 120] [.loopIndex 0] [] [] none none,
       arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
@@ -5438,7 +5545,7 @@ private def loopHashBody : Scope := {
 
 private def loopHashProgram : Prog := {
   root := {
-    nodes := [
+    nodes := #[
       { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
       { kind := .parallelLoop "body" (.constant 2) 0 [] [.broadcast],
         arguments := [{ node := 0, port := 0 }],
@@ -5455,13 +5562,13 @@ private def loopHashProgram : Prog := {
 }
 
 private def loopHashDerivation : ProgramDerivation := {
-  root := { steps := [
+  root := { steps := #[
     { sourceNode := 0, rule := .input, arguments := [] },
     { sourceNode := 1, rule := .parallelLoop, arguments := [{ node := 0, port := 0 }] },
     { sourceNode := 2, rule := .familyGetStatic, arguments := [{ node := 1, port := 0 }] },
     { sourceNode := 3, rule := .familyGetStatic, arguments := [{ node := 1, port := 0 }] }
   ] }
-  definitions := [("body", { steps := [
+  definitions := [("body", { steps := #[
     { sourceNode := 0, rule := .input, arguments := [] },
     { sourceNode := 1, rule := .hashSample, arguments := [{ node := 0, port := 0 }] }
   ] })]
@@ -5477,7 +5584,7 @@ example : (do
   native_decide
 
 private def aliasedHashBody : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
     { kind := .hashSample fixtureType .plain [109, 120, 120] [.parameter "tag"] [] [] none none,
       arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
@@ -5487,7 +5594,7 @@ private def aliasedHashBody : Scope := {
 }
 
 private def aliasedLoopBody : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
     { kind := .subgraphCall "hash" [("tag", .loopIndex 0)],
       arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
@@ -5504,11 +5611,11 @@ private def aliasedLoopHashProgram : Prog := {
 private def aliasedLoopHashDerivation : ProgramDerivation := {
   root := loopHashDerivation.root
   definitions := [
-    ("body", { steps := [
+    ("body", { steps := #[
       { sourceNode := 0, rule := .input, arguments := [] },
       { sourceNode := 1, rule := .subgraphCall, arguments := [{ node := 0, port := 0 }] }
     ] }),
-    ("hash", { steps := [
+    ("hash", { steps := #[
       { sourceNode := 0, rule := .input, arguments := [] },
       { sourceNode := 1, rule := .hashSample, arguments := [{ node := 0, port := 0 }] }
     ] })
@@ -5526,7 +5633,7 @@ example : (do
   native_decide
 
 private def relationFixtureScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
       outputTypes := [.matrix fixtureType] },
     { kind := .gadgetMatrix fixtureType (.constant 2), arguments := [],
@@ -5540,7 +5647,7 @@ private def relationFixtureScope : Scope := {
   outputs := [("result", { node := 3, port := 0 })], inputNames := []
 }
 
-private def relationFixtureDerivation : ScopeDerivation := { steps := [
+private def relationFixtureDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .gaussianSample, arguments := [] },
   { sourceNode := 1, rule := .gadgetMatrix, arguments := [] },
   { sourceNode := 2, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] },
@@ -5554,7 +5661,7 @@ example : (do
     matrixMaximum 3 { node := 3, port := 0 } facts) = .ok 3 := by
   native_decide
 
-private def wrongRelationFixtureDerivation : ScopeDerivation := { steps := [
+private def wrongRelationFixtureDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .gaussianSample, arguments := [] },
   { sourceNode := 1, rule := .gadgetMatrix, arguments := [] },
   { sourceNode := 2, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] },
@@ -5564,10 +5671,10 @@ private def wrongRelationFixtureDerivation : ScopeDerivation := { steps := [
 
 example : checkScopeDerivation relationFixtureScope wrongRelationFixtureDerivation =
     .error (.invalidRelationOperand 3 { node := 1, port := 0 }) := by
-  decide
+  native_decide
 
 private def childRelationScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .input "target", arguments := [], outputTypes := [.matrix fixtureType] },
     { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
       arguments := [{ node := 0, port := 0 }], outputTypes := [.preimage fixtureType] }
@@ -5575,14 +5682,14 @@ private def childRelationScope : Scope := {
   outputs := [("preimage", { node := 1, port := 0 })], inputNames := ["target"]
 }
 
-private def childRelationDerivation : ScopeDerivation := { steps := [
+private def childRelationDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .input, arguments := [] },
   { sourceNode := 1, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] }
 ] }
 
 private def subgraphRelationProgram : Prog := {
   root := {
-    nodes := [
+    nodes := #[
       { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
         outputTypes := [.matrix fixtureType] },
       { kind := .gadgetMatrix fixtureType (.constant 2), arguments := [],
@@ -5599,7 +5706,7 @@ private def subgraphRelationProgram : Prog := {
 }
 
 private def subgraphRelationDerivation : ProgramDerivation := {
-  root := { steps := [
+  root := { steps := #[
     { sourceNode := 0, rule := .gaussianSample, arguments := [] },
     { sourceNode := 1, rule := .gadgetMatrix, arguments := [] },
     { sourceNode := 2, rule := .subgraphCall, arguments := [{ node := 0, port := 0 }] },
@@ -5617,7 +5724,7 @@ example : (do
 
 private def distinctCallIdentityProgram : Prog := {
   root := {
-    nodes := [
+    nodes := #[
       { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
         outputTypes := [.matrix fixtureType] },
       { kind := .subgraphCall "decompose" [], arguments := [{ node := 0, port := 0 }],
@@ -5632,7 +5739,7 @@ private def distinctCallIdentityProgram : Prog := {
 }
 
 private def distinctCallIdentityDerivation : ProgramDerivation := {
-  root := { steps := [
+  root := { steps := #[
     { sourceNode := 0, rule := .gaussianSample, arguments := [] },
     { sourceNode := 1, rule := .subgraphCall, arguments := [{ node := 0, port := 0 }] },
     { sourceNode := 2, rule := .subgraphCall, arguments := [{ node := 0, port := 0 }] }
@@ -5650,7 +5757,7 @@ example : (do
   native_decide
 
 private def packedFamilyFixtureScope : Scope := {
-  nodes := relationFixtureScope.nodes ++ [
+  nodes := relationFixtureScope.nodes ++ #[
     { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
     { kind := .familyPack,
       arguments := [{ node := 2, port := 0 }, { node := 4, port := 0 }],
@@ -5667,7 +5774,7 @@ private def packedFamilyFixtureScope : Scope := {
 }
 
 private def packedFamilyFixtureDerivation : ScopeDerivation := {
-  steps := relationFixtureDerivation.steps ++ [
+  steps := relationFixtureDerivation.steps ++ #[
     { sourceNode := 4, rule := .zeroMatrix, arguments := [] },
     { sourceNode := 5, rule := .familyPack,
       arguments := [{ node := 2, port := 0 }, { node := 4, port := 0 }] },
@@ -5690,7 +5797,7 @@ example : (do
   native_decide
 
 private def selectFixtureScope : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
     { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
       outputTypes := [.matrix fixtureType] },
@@ -5702,7 +5809,7 @@ private def selectFixtureScope : Scope := {
   outputs := [("result", { node := 3, port := 0 })], inputNames := []
 }
 
-private def selectFixtureDerivation : ScopeDerivation := { steps := [
+private def selectFixtureDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .constantInt, arguments := [] },
   { sourceNode := 1, rule := .gaussianSample, arguments := [] },
   { sourceNode := 2, rule := .gaussianSample, arguments := [] },
@@ -5716,7 +5823,7 @@ example : (do
   native_decide
 
 private def loopBoundBody : Scope := {
-  nodes := [{
+  nodes := #[{
     kind := .gaussianSample fixtureType (.parameter "lane_bound")
     arguments := []
     outputTypes := [.matrix fixtureType]
@@ -5727,7 +5834,7 @@ private def loopBoundBody : Scope := {
 
 private def loopBoundProgram : Prog := {
   root := {
-    nodes := [{
+    nodes := #[{
       kind := .parallelLoop "body" (.constant 4) 0
         [("lane_bound", .add (.loopIndex 0) (.constant 1))] []
       arguments := []
@@ -5744,11 +5851,11 @@ private def loopBoundProgram : Prog := {
 }
 
 private def loopBoundDerivation : ProgramDerivation := {
-  root := { steps := [
+  root := { steps := #[
     { sourceNode := 0, rule := .parallelLoop, arguments := [] },
     { sourceNode := 1, rule := .familyGetStatic, arguments := [{ node := 0, port := 0 }] }
   ] }
-  definitions := [("body", { steps := [
+  definitions := [("body", { steps := #[
     { sourceNode := 0, rule := .gaussianSample, arguments := [] }
   ] })]
 }
@@ -5768,7 +5875,7 @@ example : (do
   native_decide
 
 private def sequentialRelationBody : Scope := {
-  nodes := [
+  nodes := #[
     { kind := .input "target", arguments := [], outputTypes := [.matrix fixtureType] },
     { kind := .input "public", arguments := [], outputTypes := [.matrix fixtureType] },
     { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
@@ -5783,7 +5890,7 @@ private def sequentialRelationBody : Scope := {
 
 private def sequentialRelationProgram : Prog := {
   root := {
-    nodes := [
+    nodes := #[
       { kind := .gaussianSample fixtureType (.constant 2), arguments := [],
         outputTypes := [.matrix fixtureType] },
       { kind := .gadgetMatrix fixtureType (.constant 2), arguments := [],
@@ -5799,13 +5906,13 @@ private def sequentialRelationProgram : Prog := {
 }
 
 private def sequentialRelationDerivation : ProgramDerivation := {
-  root := { steps := [
+  root := { steps := #[
     { sourceNode := 0, rule := .gaussianSample, arguments := [] },
     { sourceNode := 1, rule := .gadgetMatrix, arguments := [] },
     { sourceNode := 2, rule := .sequentialLoop,
       arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
   ] }
-  definitions := [("body", { steps := [
+  definitions := [("body", { steps := #[
     { sourceNode := 0, rule := .input, arguments := [] },
     { sourceNode := 1, rule := .input, arguments := [] },
     { sourceNode := 2, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] },
@@ -5823,14 +5930,14 @@ example : (do
   native_decide
 
 private def relationCarryBody : Scope := {
-  nodes := [{ kind := .input "carried", arguments := [], outputTypes := [.preimage fixtureType] }]
+  nodes := #[{ kind := .input "carried", arguments := [], outputTypes := [.preimage fixtureType] }]
   outputs := [("result", { node := 0, port := 0 })]
   inputNames := ["carried"]
 }
 
 private def relationCarryProgram : Prog := {
   root := {
-    nodes := relationFixtureScope.nodes.take 3 ++ [{
+    nodes := relationFixtureScope.nodes.take 3 ++ #[{
       kind := .sequentialLoop "body" (.constant 1) 0 [] 1
       arguments := [{ node := 2, port := 0 }]
       outputTypes := [.preimage fixtureType]
@@ -5842,12 +5949,12 @@ private def relationCarryProgram : Prog := {
 }
 
 private def relationCarryDerivation : ProgramDerivation := {
-  root := { steps := relationFixtureDerivation.steps.take 3 ++ [{
+  root := { steps := relationFixtureDerivation.steps.take 3 ++ #[{
     sourceNode := 3
     rule := .sequentialLoop
     arguments := [{ node := 2, port := 0 }]
   }] }
-  definitions := [("body", { steps := [
+  definitions := [("body", { steps := #[
     { sourceNode := 0, rule := .input, arguments := [] }
   ] })]
 }
@@ -5922,7 +6029,7 @@ private def mismatchedFixtureType : MatrixTypeExpr :=
 
 /-- A frozen leaf cannot claim an output matrix type different from the type it executes. -/
 example : (match evaluateScopeOperationalWithLayouts {
-    nodes := [{
+    nodes := #[{
       kind := .zeroMatrix fixtureType
       arguments := []
       outputTypes := [.matrix mismatchedFixtureType]
@@ -5930,7 +6037,7 @@ example : (match evaluateScopeOperationalWithLayouts {
     outputs := [("result", { node := 0, port := 0 })]
     inputNames := []
   } {
-    steps := [{ sourceNode := 0, rule := .zeroMatrix, arguments := [] }]
+    steps := #[{ sourceNode := 0, rule := .zeroMatrix, arguments := [] }]
   } [] [] with
   | .error (.outputTypeMismatch 0) => true
   | _ => false) = true := by
@@ -5938,7 +6045,7 @@ example : (match evaluateScopeOperationalWithLayouts {
 
 /-- Arithmetic operands must have the exact declared output matrix type. -/
 example : (match evaluateScopeOperationalWithLayouts {
-    nodes := [
+    nodes := #[
       { kind := .zeroMatrix fixtureType, arguments := [],
         outputTypes := [.matrix fixtureType] },
       { kind := .zeroMatrix mismatchedFixtureType, arguments := [],
@@ -5950,7 +6057,7 @@ example : (match evaluateScopeOperationalWithLayouts {
     outputs := [("result", { node := 2, port := 0 })]
     inputNames := []
   } {
-    steps := [
+    steps := #[
       { sourceNode := 0, rule := .zeroMatrix, arguments := [] },
       { sourceNode := 1, rule := .zeroMatrix, arguments := [] },
       { sourceNode := 2, rule := .matrixAdd,
@@ -5963,7 +6070,7 @@ example : (match evaluateScopeOperationalWithLayouts {
 
 /-- Output arity is checked before any operational fact is constructed. -/
 example : (match evaluateScopeOperationalWithLayouts {
-    nodes := [{
+    nodes := #[{
       kind := .zeroMatrix fixtureType
       arguments := []
       outputCount := 2
@@ -5972,7 +6079,7 @@ example : (match evaluateScopeOperationalWithLayouts {
     outputs := [("result", { node := 0, port := 0 })]
     inputNames := []
   } {
-    steps := [{ sourceNode := 0, rule := .zeroMatrix, arguments := [] }]
+    steps := #[{ sourceNode := 0, rule := .zeroMatrix, arguments := [] }]
   } [] [] with
   | .error (.unsupportedOutputArity 0 2) => true
   | _ => false) = true := by

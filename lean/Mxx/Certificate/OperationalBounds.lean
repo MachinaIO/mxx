@@ -4417,6 +4417,42 @@ def decoderNoiseCheckReport
     checkDecoderThreshold plaintextModulus ciphertextModulus noiseBound
   pure { outputs, obligations := [obligation], accepted, rejection }
 
+private def collectDecoderResidualBounds
+    (environment : ParamEnvironment) : OperationalFact → Except OperationalError (List Int)
+  | .matrix residual => return [← residual.evaluateNoiseHardBound environment]
+  | .familyUniform _ _ element count => do
+      if count <= 0 then
+        throw (.invalidCount 0 count)
+      collectDecoderResidualBounds environment element
+  | .familyPackedNil => throw (.invalidCount 0 0)
+  | .familyPackedCons head tail => do
+      let headBounds ← collectDecoderResidualBounds environment head
+      let tailBounds ← match tail with
+        | .familyPackedNil => pure []
+        | tail => collectDecoderResidualBounds environment tail
+      pure (headBounds ++ tailBounds)
+  | _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
+
+/-- Builds one decoder obligation for a matrix residual or an entire residual family. Packed
+families are checked member-by-member and use their maximum bound. A uniform family uses the
+element fact whose uniformity was established by operational elaboration; empty and non-matrix
+families fail closed. -/
+def decoderNoiseCheckReportForFact
+    (outputs : List OperationalStageResult)
+    (residual : OperationalFact)
+    (environment : ParamEnvironment)
+    (plaintextModulus ciphertextModulus : Int) :
+    Except OperationalError OperationalNoiseCheckReport := do
+  let bounds ← collectDecoderResidualBounds environment residual
+  let noiseBound ← match bounds with
+    | head :: tail => pure (tail.foldl max head)
+    | [] => throw (OperationalError.invalidCount 0 0)
+  let obligation := OperationalNoiseObligation.decoderThreshold
+    plaintextModulus ciphertextModulus noiseBound
+  let (accepted, rejection) :=
+    checkDecoderThreshold plaintextModulus ciphertextModulus noiseBound
+  pure { outputs, obligations := [obligation], accepted, rejection }
+
 private def collectOperationalOutputs
     (scope : Scope)
     (facts : OperationalScopeFacts) : Except OperationalError (List (String × OperationalFact)) :=
@@ -5961,6 +5997,30 @@ example : (do
     let report ← decoderNoiseCheckReport [] residual [] 1 100
     pure (report.accepted, report.rejection)) =
     .ok (false, some (.invalidPlaintextModulus 1)) := by
+  native_decide
+
+/-- Packed residual families inspect every member rather than using a representative lane. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
+    let first ← lookupFact 2 facts { node := 0, port := 0 }
+    let second ← lookupFact 2 facts { node := 1, port := 0 }
+    let report ← decoderNoiseCheckReportForFact [] (packedFacts [first, second]) [] 2 25
+    pure report.obligations) = .ok [.decoderThreshold 2 25 6] := by
+  native_decide
+
+/-- A checked uniform family evaluates its element template once, independently of its count. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
+    let residual ← lookupFact 2 facts { node := 1, port := 0 }
+    let family := OperationalFact.familyUniform fixtureFamilyBinder none residual 100
+    let report ← decoderNoiseCheckReportForFact [] family [] 2 25
+    pure report.obligations) = .ok [.decoderThreshold 2 25 6] := by
+  native_decide
+
+/-- Empty residual families are rejected instead of being assigned a zero bound. -/
+example : (match decoderNoiseCheckReportForFact [] .familyPackedNil [] 2 25 with
+    | .error (.invalidCount 0 0) => true
+    | _ => false) = true := by
   native_decide
 
 end Mxx.Certificate

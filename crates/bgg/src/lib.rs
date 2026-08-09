@@ -11,7 +11,6 @@ pub mod noise_refresh;
 pub mod public_key;
 pub mod slot_operation;
 pub mod tall_encoding;
-pub mod tall_operational;
 pub mod tall_rotation_encoding;
 pub mod wee25_commitment;
 pub mod wee25_opening;
@@ -72,10 +71,6 @@ pub use slot_operation::{
 pub use tall_encoding::{
     BggTallEncodingCompiler, BggTallEncodingSample, BggTallEncodingSampler, BggTallEncodingWire,
     BggTallPlaintext, TallCompileError,
-};
-pub use tall_operational::{
-    TallNestedRnsDescriptor, TallOperationalError, TallOperationalEstimate, TallOperationalInputs,
-    estimate_tall_nested_rns,
 };
 pub use tall_rotation_encoding::{
     TallRotationDirection, TallRotationEncodingArtifactNames, TallRotationEncodingArtifacts,

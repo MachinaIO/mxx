@@ -87,7 +87,7 @@ impl DiamondGpuMeasurementBackend {
     ) -> Self {
         Self {
             crt_depth: parameters.crt_depth(),
-            backend: gpu_backend_on([parameters], device_ids),
+            backend: gpu_backend_on([parameters], device_ids.iter().copied()),
             harness,
             matrix_cache: BTreeMap::new(),
             trapdoor_cache: BTreeMap::new(),

@@ -11,11 +11,14 @@ use mxx_bgg::{
     BggSlotTransferPublicKeyLowering, BggSlotTransferPublicSlotWires, BggSlotTransferSlotArtifacts,
     BggTallEncodingCompiler, BggTallEncodingSampler, BggTallPlaintext, BggTallSlotLowering,
     BggTallSlotPublicKeyLowering, LweLookupPreprocessingLowering, LweLookupPublicKeyLowering,
-    LweLookupTallEncodingLowering, PolyCircuitCompiler, TallNestedRnsDescriptor,
-    TallOperationalInputs, TallRotationEncodingArtifacts, TallRotationEncodingCompiler,
-    bind_lwe_lookup_invocations, estimate_tall_nested_rns, required_tall_rotation_encodings,
+    LweLookupTallEncodingLowering, PolyCircuitCompiler, TallRotationEncodingArtifacts,
+    TallRotationEncodingCompiler, bind_lwe_lookup_invocations, required_tall_rotation_encodings,
 };
-use mxx_dsl::{BuiltGraph, DslContext, Family, Ring};
+use mxx_correctness::{
+    OperationalCheckRequest, OperationalCheckerReport, OperationalGadgetLayout, emit_protocol_for,
+    operational_protocol_from_graphs, run_emitted_operational_check,
+};
+use mxx_dsl::{BuiltGraph, DslContext, Family, Ring, SemanticAnchor, parallel_zip};
 use mxx_gadgets::{
     circuit::{PolyCircuit, PolyGateKind},
     circuit_gadgets::arith::nested_rns::{
@@ -197,7 +200,7 @@ struct PreparedCandidate {
     public_key_graph: BuiltGraph,
     encoding_graph: BuiltGraph,
     lean_operational_bound: BigUint,
-    threshold: BigUint,
+    lean_report: OperationalCheckerReport,
     achieved_security_bits: u64,
 }
 
@@ -277,6 +280,46 @@ fn gate_kind_counts(circuit: &PolyCircuit<DCRTPoly>) -> HashMap<PolyGateKind, us
     counts
 }
 
+fn run_tall_operational_check(
+    producer: &BuiltGraph,
+    encoding: &BuiltGraph,
+    parameters: &DCRTPolyParams,
+) -> Result<OperationalCheckerReport, String> {
+    let protocol = operational_protocol_from_graphs(
+        vec![("producer".to_owned(), producer), ("encoding".to_owned(), encoding)],
+        "encoding",
+    )
+    .map_err(|error| error.to_string())?;
+    let emitted = emit_protocol_for("TallNestedRnsCandidate", &protocol, "MxxCorrectness", &[])
+        .map_err(|error| error.to_string())?;
+    let (crt_moduli, crt_bits, _) = parameters.to_crt();
+    let q_max = crt_moduli.iter().copied().max().expect("nonempty CRT basis");
+    let base_bits = parameters.base_bits() as usize;
+    let small_digit_count = crt_bits.div_ceil(base_bits);
+    let request = OperationalCheckRequest {
+        environment: Vec::new(),
+        layouts: vec![OperationalGadgetLayout {
+            params_id: "tall-nested-rns".to_owned(),
+            ring_dimension: parameters.ring_dimension() as usize,
+            smallest_crt_modulus: *crt_moduli.iter().min().expect("nonempty CRT basis"),
+            regular_digit_count: small_digit_count * crt_moduli.len(),
+            small_digit_count,
+            base: BigInt::from(1u8) << base_bits,
+            base_bits,
+            crt_bits,
+            crt_moduli,
+        }],
+        residual_stage: "encoding".to_owned(),
+        residual_output: "operational_residual".to_owned(),
+        plaintext_modulus: BigInt::from(q_max),
+        ciphertext_modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+    };
+    let lean_workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+    let report = run_emitted_operational_check(&lean_workspace, &emitted, &request)
+        .map_err(|error| error.to_string())?;
+    Ok(report)
+}
+
 fn prepare_candidate(
     parameters: DCRTPolyParams,
     config: &TestConfig,
@@ -322,7 +365,7 @@ fn prepare_candidate(
     };
     let ring = layout.ring();
     let hash_key = ring.bytes_input(HASH_KEY_INPUT, 32);
-    let secret = ring.uniform_in((1, 1), -1, 1);
+    let secret = ring.uniform_interval((1, 1), -1, 1);
     let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
         hash_key.clone(),
         b"tall-nested-rns-input-public-keys".as_slice(),
@@ -528,7 +571,32 @@ fn prepare_candidate(
         &rotation_offsets,
         physical_slots,
         config.error_sigma,
+        false,
     )?;
+    let operational_encoding_graph = build_encoding_graph(
+        &parameters,
+        &circuit,
+        &layout,
+        &artifact_compiler,
+        production.clone(),
+        &lookup_compilers,
+        &slot_requests,
+        &rotation_offsets,
+        physical_slots,
+        config.error_sigma,
+        true,
+    )?;
+    for output in
+        ["encoding_rows", "encoding_public_key", "output_plaintexts", "transformed_secrets"]
+    {
+        if encoding_graph.graph.outputs().get(output) !=
+            operational_encoding_graph.graph.outputs().get(output)
+        {
+            return Err(format!(
+                "operational residual suffix changed executable output identity {output}"
+            ));
+        }
+    }
     let manifests = BTreeMap::from([(production.clone(), runtime_manifest.clone())]);
     public_key_graph
         .validate_with_manifests(&bindings, &manifests)
@@ -536,24 +604,15 @@ fn prepare_candidate(
     encoding_graph
         .validate_with_manifests(&bindings, &manifests)
         .map_err(|error| error.to_string())?;
-    let (_, q_moduli, _) = parameters_to_threshold_parts(&parameters);
-    let descriptor = TallNestedRnsDescriptor::from_circuit(
-        &circuit,
-        config.mul_count,
-        nested.q_moduli_depth,
-        ring_dimension,
-    );
-    let error_cutoff = hard_cutoff_from_sigma_bound(&error_sigma_decimal);
-    let preimage_cutoff = hard_cutoff_from_sigma_bound(&preimage_sigma);
-    let estimate = estimate_tall_nested_rns(&TallOperationalInputs {
-        descriptor,
-        layout: layout.clone(),
-        ring_dimension,
-        q_moduli,
-        error_cutoff,
-        preimage_cutoff,
-    })
-    .map_err(|error| error.to_string())?;
+    operational_encoding_graph
+        .validate_with_manifests(&bindings, &manifests)
+        .map_err(|error| error.to_string())?;
+    let lean_report =
+        run_tall_operational_check(&producer, &operational_encoding_graph, &parameters)?;
+    let lean_operational_bound = lean_report
+        .noise_bound
+        .parse::<BigUint>()
+        .map_err(|_| "Lean operational checker returned a non-natural noise bound".to_owned())?;
     Ok(PreparedCandidate {
         parameters,
         circuit,
@@ -572,8 +631,8 @@ fn prepare_candidate(
         rotation_offsets,
         public_key_graph,
         encoding_graph,
-        lean_operational_bound: estimate.residual_bound,
-        threshold: estimate.threshold,
+        lean_operational_bound,
+        lean_report,
         achieved_security_bits,
     })
 }
@@ -670,6 +729,7 @@ fn build_encoding_graph(
     rotation_offsets: &[u32],
     physical_slots: usize,
     error_sigma: f64,
+    include_operational_residual: bool,
 ) -> Result<BuiltGraph, String> {
     let ring = layout.ring();
     let hash_key = ring.bytes_input(HASH_KEY_INPUT, 32);
@@ -814,17 +874,37 @@ fn build_encoding_graph(
     let BggTallPlaintext::Diagonal(output_plaintexts) = output.plaintext else {
         return Err("nested-RNS output plaintext is hidden".to_owned());
     };
-    DslContext::new("gpu-tall-nested-rns-encoding")
-        .family_output("encoding_rows", output.rows)
+    let encoding_rows = output.rows;
+    let output_public_key = output.pubkey.matrix;
+    let mut context = DslContext::new("gpu-tall-nested-rns-encoding")
+        .family_output("encoding_rows", encoding_rows.clone())
         .map_err(|error| error.to_string())?
-        .output("encoding_public_key", output.pubkey.matrix)
+        .output("encoding_public_key", output_public_key.clone())
         .map_err(|error| error.to_string())?
-        .family_output("output_plaintexts", output_plaintexts)
+        .family_output("output_plaintexts", output_plaintexts.clone())
         .map_err(|error| error.to_string())?
-        .family_output("transformed_secrets", transformed_secrets)
+        .family_output("transformed_secrets", transformed_secrets.clone())
+        .map_err(|error| error.to_string())?;
+    if include_operational_residual {
+        let gadget =
+            ring.gadget(layout.secret_dimension, layout.gadget_base.clone(), layout.digit_count);
+        let public_key = output_public_key;
+        let residuals = parallel_zip(
+            (encoding_rows, output_plaintexts, transformed_secrets),
+            move |_, (encoding, plaintext, transformed_secret)| {
+                let signal = transformed_secret.clone() * public_key.clone() -
+                    plaintext * (transformed_secret * gadget.clone());
+                encoding - signal
+            },
+        )
         .map_err(|error| error.to_string())?
-        .build()
-        .map_err(|error| error.to_string())
+        .semantic_anchor("tall.decoder.residual")
+        .map_err(|error| error.to_string())?;
+        context = context
+            .family_output("operational_residual", residuals)
+            .map_err(|error| error.to_string())?;
+    }
+    context.build().map_err(|error| error.to_string())
 }
 
 fn lattice_security_bits(parameters: &DCRTPolyParams, sigma: f64) -> Result<u64, String> {
@@ -852,11 +932,6 @@ fn lattice_security_bits(parameters: &DCRTPolyParams, sigma: f64) -> Result<u64,
         .trim()
         .parse()
         .map_err(|_| format!("invalid lattice-estimator-cli output: {stdout}"))
-}
-
-fn parameters_to_threshold_parts(parameters: &DCRTPolyParams) -> (BigUint, Vec<u64>, usize) {
-    let (moduli, _, depth) = parameters.to_crt();
-    (parameters.modulus().as_ref().clone(), moduli, depth)
 }
 
 fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
@@ -896,12 +971,12 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
                 continue;
             }
             let candidate = prepare_candidate(parameters, config, achieved_security_bits)?;
-            let accepted = candidate.lean_operational_bound < candidate.threshold;
+            let accepted = candidate.lean_report.accepted;
             info!(
                 crt_depth,
                 ring_dimension,
                 lean_operational_bound = %candidate.lean_operational_bound,
-                threshold = %candidate.threshold,
+                rejection = ?candidate.lean_report.rejection,
                 accepted,
                 "evaluated Tall BGG+ operational candidate"
             );
@@ -1335,6 +1410,7 @@ fn end_to_end_processing(
         &selected.rotation_offsets,
         selected.parameters.ring_dimension() as usize * selected.nested.q_moduli_depth,
         config.error_sigma,
+        false,
     )?;
     info!(elapsed = ?started.elapsed(), "timed Tall encoding graph construction");
     let encoding_pass_started = Instant::now();
@@ -1425,7 +1501,7 @@ fn runtime_verification(
         if outputs.output_plaintexts[slot] != expected_matrix {
             return Err(format!("runtime plaintext mismatch at physical slot {slot}"));
         }
-        let signal = &outputs.transformed_secrets[slot] * &outputs.public_key -
+        let signal = &outputs.transformed_secrets[slot] * &outputs.encoding_public_key -
             &expected_matrix * (&outputs.transformed_secrets[slot] * &gadget);
         let residual = &outputs.encoding_rows[slot] - &signal;
         residual.wait_until_ready();
@@ -1447,18 +1523,32 @@ fn runtime_verification(
             }
         }
     }
+    let q_max = selected
+        .parameters
+        .to_crt()
+        .0
+        .into_iter()
+        .max()
+        .ok_or_else(|| "runtime verification requires a nonempty CRT basis".to_owned())?;
+    let threshold_lhs = BigUint::from(2u8) * BigUint::from(q_max) * &maximum_noise;
     info!(
         maximum_noise = %maximum_noise,
         ?maximum_location,
         lean_operational_bound = %selected.lean_operational_bound,
         within_operational_envelope = maximum_noise <= selected.lean_operational_bound,
-        threshold = %selected.threshold,
+        threshold_lhs = %threshold_lhs,
+        ciphertext_modulus = %modulus,
         "measured Tall BGG+ residual"
     );
-    if maximum_noise >= selected.threshold {
+    if maximum_noise > selected.lean_operational_bound {
         return Err(format!(
-            "measured residual {maximum_noise} at {maximum_location:?} is not below {}",
-            selected.threshold
+            "measured residual {maximum_noise} at {maximum_location:?} exceeds Lean bound {}",
+            selected.lean_operational_bound
+        ));
+    }
+    if threshold_lhs >= modulus {
+        return Err(format!(
+            "measured residual {maximum_noise} at {maximum_location:?} fails 2*q_max*noise < q"
         ));
     }
     Ok(())
@@ -1480,7 +1570,7 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
             selected.nested.q_moduli_depth,
         achieved_security_bits = selected.achieved_security_bits,
         lean_operational_bound = %selected.lean_operational_bound,
-        threshold = %selected.threshold,
+        lean_accepted = selected.lean_report.accepted,
         "selected Tall nested-RNS parameters"
     );
     let device_ids = detected_gpu_device_ids();

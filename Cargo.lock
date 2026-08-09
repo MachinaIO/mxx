@@ -488,6 +488,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
 ]
 
@@ -532,6 +533,7 @@ dependencies = [
  "keccak-asm",
  "mxx-bench-estimator",
  "mxx-bgg",
+ "mxx-correctness",
  "mxx-dsl",
  "mxx-ir-core",
  "mxx-primitives",

@@ -269,7 +269,17 @@ impl GpuNodeMeasurementBackend {
                     .map(|_| backend.reshape(matrix(0)?, rows, columns).map_err(backend_error))
                     .collect()
             }
-            NodeKind::UniformSample { range, .. } => {
+            NodeKind::UniformResidueSample { .. } => {
+                let ty = output_matrix_type()?;
+                let range = SampleRange {
+                    minimum: BigInt::from(0),
+                    maximum: &ty.modulus - BigInt::from(1),
+                };
+                (0..batch_size)
+                    .map(|_| backend.sample_uniform(&ty, &range).map_err(backend_error))
+                    .collect()
+            }
+            NodeKind::UniformIntervalSample { range, .. } => {
                 let ty = output_matrix_type()?;
                 let range = SampleRange {
                     minimum: range
@@ -301,12 +311,21 @@ impl GpuNodeMeasurementBackend {
                     })
                     .collect()
             }
-            NodeKind::HashSample { variant, tag_prefix, .. } => {
+            NodeKind::HashSample { variant, tag_prefix, base, digit_count, .. } => {
                 let ty = output_matrix_type()?;
+                let gadget_base = base
+                    .as_ref()
+                    .map(|base| {
+                        base.evaluate(bindings)
+                            .map_err(|error| GpuMeasurementError(error.to_string()))
+                    })
+                    .transpose()?;
+                let digit_count = digit_count.as_ref().map(evaluate_usize).transpose()?;
+                let gadget_layout = gadget_base.as_ref().zip(digit_count);
                 (0..batch_size)
                     .map(|_| {
                         backend
-                            .sample_hash(&ty, [0x53; 32], tag_prefix, *variant)
+                            .sample_hash(&ty, [0x53; 32], tag_prefix, *variant, gadget_layout)
                             .map_err(backend_error)
                     })
                     .collect()

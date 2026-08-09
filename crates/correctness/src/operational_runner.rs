@@ -85,6 +85,10 @@ fn lean_identifier(value: &str) -> String {
     output
 }
 
+fn operational_lean_arguments() -> [&'static str; 4] {
+    ["env", "lean", "-DmaxHeartbeats=0", "--run"]
+}
+
 fn checker_source(emitted: &EmittedProtocol, request: &OperationalCheckRequest) -> String {
     let namespace = format!("{}.Generated.{}", emitted.module_root, emitted.lean_name);
     let derivations = emitted
@@ -140,9 +144,7 @@ fn checker_source(emitted: &EmittedProtocol, request: &OperationalCheckRequest) 
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "import Mxx.Certificate.OperationalBounds\n\
-set_option maxHeartbeats 0\n\
-{}\n\
+        "import Mxx.Certificate.OperationalBounds\n{}\n\
 open {}\n\
 open Mxx.Certificate\n\n\
 private def operationalCheck : Except OperationalError OperationalNoiseCheckReport := do\n\
@@ -203,7 +205,7 @@ pub fn run_operational_checker_source(
     let file = Builder::new().prefix("mxx-operational-").suffix(".lean").tempfile()?;
     std::fs::write(file.path(), source)?;
     let output = Command::new("lake")
-        .args(["env", "lean", "--run"])
+        .args(operational_lean_arguments())
         .arg(file.path())
         .current_dir(lean_workspace)
         .output()?;
@@ -275,25 +277,8 @@ mod tests {
     }
 
     #[test]
-    fn generated_checker_does_not_timeout_large_workflows() {
-        let protocol = toy_example::protocol();
-        let emitted = emit_protocol_for(
-            "ToyOperationalRunner",
-            &protocol,
-            "MxxCorrectness",
-            toy_example::PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            residual_stage: "encrypt".to_owned(),
-            residual_output: "operational-residual".to_owned(),
-            plaintext_modulus: BigInt::from(2),
-            ciphertext_modulus: BigInt::from(256),
-        };
-
-        assert!(checker_source(&emitted, &request).contains("set_option maxHeartbeats 0"));
+    fn operational_runner_disables_lean_heartbeat_timeout() {
+        assert!(operational_lean_arguments().contains(&"-DmaxHeartbeats=0"));
     }
 
     #[test]

@@ -311,7 +311,24 @@ theorem mem_evaluateNode_familyGetDynamic_of_arguments
     values = [family[index.toNat]?.getD (.invalid "FamilyGetDynamic index out of range")] := by
   simpa [evaluateNode, arguments, argumentsEvaluate] using member
 
-theorem mem_evaluateNode_uniformSample
+theorem mem_evaluateNode_uniformResidueSample
+    (runChild : ChildRunner) (samplers : MxxSamplerFamily)
+    (params : ParamEnvironment) (inputs : Environment) (wires : WireEnvironment)
+    (matrixType : MatrixTypeExpr) (matrixParams : Mxx.SamplerParams) (outputCount : Nat)
+    (matrixTypeEvaluate : matrixType.evaluate params = some matrixParams)
+    {values : List Value}
+    (member : values ∈ evaluateNode runChild samplers params inputs wires {
+      kind := .uniformResidueSample matrixType
+      arguments := []
+      outputCount
+    }) :
+    ∃ sample ∈ uniformMatrixSupport matrixParams 0 (matrixParams.modulus - 1),
+      values = [.matrix sample] := by
+  simp only [evaluateNode, matrixTypeEvaluate, List.mem_map] at member
+  obtain ⟨sample, sampleMember, rfl⟩ := member
+  exact ⟨sample, sampleMember, rfl⟩
+
+theorem mem_evaluateNode_uniformIntervalSample
     (runChild : ChildRunner) (samplers : MxxSamplerFamily)
     (params : ParamEnvironment) (inputs : Environment) (wires : WireEnvironment)
     (matrixType : MatrixTypeExpr) (minimum maximum : IntExpr)
@@ -322,7 +339,7 @@ theorem mem_evaluateNode_uniformSample
     (maximumEvaluate : maximum.evaluate params = some evaluatedMaximum)
     {values : List Value}
     (member : values ∈ evaluateNode runChild samplers params inputs wires {
-      kind := .uniformSample matrixType minimum maximum
+      kind := .uniformIntervalSample matrixType minimum maximum
       arguments := []
       outputCount
     }) :
@@ -354,13 +371,15 @@ theorem mem_evaluateNode_gaussianSample
 theorem mem_evaluateNode_hashSample_of_arguments
     (runChild : ChildRunner) (samplers : MxxSamplerFamily)
     (params : ParamEnvironment) (inputs : Environment) (wires : WireEnvironment)
-    (keyRef : WireRef) (key : ByteArray) (matrixType : MatrixTypeExpr)
+    (keyRef : WireRef) (trailingRefs : List WireRef) (key : ByteArray)
+    (trailingIntegerValues : List Int) (matrixType : MatrixTypeExpr)
     (variant : Mxx.HashVariant) (tagPrefix : List Nat)
     (tagExpressions tagDecimalExpressions tagU64LeExpressions : List IntExpr)
     (base digitCount : Option IntExpr) (matrixParams : Mxx.SamplerParams)
     (tagValues tagDecimalValues tagU64LeValues : List Int)
     (evaluatedBase evaluatedDigitCount : Option Int) (outputCount : Nat)
-    (argumentsEvaluate : [keyRef].mapM (fun wire => lookupWire wire wires) = some [.bytes key])
+    (argumentsEvaluate : (keyRef :: trailingRefs).mapM (fun wire => lookupWire wire wires) =
+      some (.bytes key :: trailingIntegerValues.map Value.integer))
     (matrixTypeEvaluate : matrixType.evaluate params (.constant 0) = some matrixParams)
     (tagsEvaluate : tagExpressions.mapM (IntExpr.evaluate params) = some tagValues)
     (decimalTagsEvaluate :
@@ -373,7 +392,7 @@ theorem mem_evaluateNode_hashSample_of_arguments
     (member : values ∈ evaluateNode runChild samplers params inputs wires {
       kind := .hashSample matrixType variant tagPrefix tagExpressions tagDecimalExpressions
         tagU64LeExpressions base digitCount
-      arguments := [keyRef]
+      arguments := keyRef :: trailingRefs
       outputCount
     }) :
     values = [.matrix ((samplers.hashSample {
@@ -384,36 +403,65 @@ theorem mem_evaluateNode_hashSample_of_arguments
       tagValues
       tagDecimalValues
       tagU64LeValues
+      trailingIntegerTagValues := trailingIntegerValues
       base := evaluatedBase
       digitCount := evaluatedDigitCount
     }).withSamplerParams matrixParams)] := by
-  simpa [evaluateNode, arguments, argumentsEvaluate, matrixTypeEvaluate, tagsEvaluate,
-    decimalTagsEvaluate, u64TagsEvaluate, baseEvaluate, digitCountEvaluate] using member
+  have mapIntegerValues : ∀ integerValues : List Int,
+      (integerValues.map Value.integer).mapM (fun value => match value with
+        | .integer value => some value
+        | _ => none) = some integerValues := by
+    intro integerValues
+    induction integerValues with
+    | nil => rfl
+    | cons value tail inductionHypothesis => simp [inductionHypothesis]
+  have trailingValuesEvaluate := mapIntegerValues trailingIntegerValues
+  have hashArgumentsEvaluate :
+      hashArguments (.bytes key :: trailingIntegerValues.map Value.integer) =
+        some (key, trailingIntegerValues) := by
+    simp only [hashArguments]
+    change (trailingIntegerValues.map Value.integer |>.mapM (fun value => match value with
+      | Value.integer value => some value
+      | _ => none)).bind (fun values => some (key, values)) = some (key, trailingIntegerValues)
+    rw [trailingValuesEvaluate]
+    rfl
+  simpa [evaluateNode, arguments, argumentsEvaluate, hashArgumentsEvaluate, matrixTypeEvaluate,
+    tagsEvaluate,
+    decimalTagsEvaluate, u64TagsEvaluate, baseEvaluate, digitCountEvaluate,
+    trailingValuesEvaluate] using member
+
+/-- Regression fixture: hash operands after the key are retained in their exact order and value. -/
+theorem hashArguments_nonempty_integer_tail_fixture (key : ByteArray) :
+    hashArguments [.bytes key, .integer 7, .integer (-2)] = some (key, [7, -2]) := by
+  rfl
 
 theorem mem_evaluateNode_gadgetDecompose_of_arguments
     (runChild : ChildRunner) (samplers : MxxSamplerFamily)
     (params : ParamEnvironment) (inputs : Environment) (wires : WireEnvironment)
     (inputRef : WireRef) (input : Mxx.Matrix) (matrixType : MatrixTypeExpr)
-    (base digitCount : IntExpr) (matrixParams : Mxx.SamplerParams)
-    (evaluatedBase evaluatedDigitCount : Int) (outputCount : Nat)
+    (base digitCount : IntExpr) (small : Bool) (matrixParams : Mxx.SamplerParams)
+    (paramsId : Mxx.SamplerParamsId) (evaluatedBase evaluatedDigitCount : Int) (outputCount : Nat)
     (argumentsEvaluate : [inputRef].mapM (fun wire => lookupWire wire wires) =
       some [.matrix input])
     (matrixTypeEvaluate : matrixType.evaluate params (.constant 0) = some matrixParams)
     (baseEvaluate : base.evaluate params = some evaluatedBase)
     (digitCountEvaluate : digitCount.evaluate params = some evaluatedDigitCount)
+    (layoutId : samplers.layoutId matrixParams = some paramsId)
     {values : List Value}
     (member : values ∈ evaluateNode runChild samplers params inputs wires {
-      kind := .gadgetDecompose matrixType base digitCount
+      kind := .gadgetDecompose matrixType base small digitCount
       arguments := [inputRef]
       outputCount
     }) :
-    ∃ output ∈ samplers.gadgetDecompose matrixParams evaluatedBase
-        evaluatedDigitCount.toNat input,
-      values = [.matrix (output.withSamplerParams matrixParams)] := by
-  simp only [evaluateNode, arguments, argumentsEvaluate, matrixTypeEvaluate, baseEvaluate,
-    digitCountEvaluate, List.mem_map] at member
-  obtain ⟨output, outputMember, rfl⟩ := member
-  exact ⟨output, outputMember, rfl⟩
+    values = [.invalid "gadget-decomposition layout is invalid"] ∨
+      ∃ output, samplers.gadgetDecompose paramsId matrixParams evaluatedBase small
+          evaluatedDigitCount.toNat input = some output ∧
+        values = [.matrix (output.withSamplerParams matrixParams)] := by
+  simp [evaluateNode, arguments, argumentsEvaluate, matrixTypeEvaluate, baseEvaluate,
+    digitCountEvaluate, layoutId] at member
+  split at member
+  · simp_all
+  · split at member <;> simp_all
 
 theorem mem_evaluateNode_trapdoorSample
     (runChild : ChildRunner) (samplers : MxxSamplerFamily)
@@ -429,7 +477,7 @@ theorem mem_evaluateNode_trapdoorSample
     }) :
     ∃ publicMatrix ∈ samplers.trapdoorSample matrixParams,
       let normalized := publicMatrix.withSamplerParams matrixParams
-      values = [.matrix normalized, .trapdoor normalized] := by
+      values = [.matrix normalized, .trapdoor normalized .sampled] := by
   simp only [evaluateNode, matrixTypeEvaluate, List.mem_map] at member
   obtain ⟨publicMatrix, publicMatrixMember, rfl⟩ := member
   exact ⟨publicMatrix, publicMatrixMember, rfl⟩
@@ -437,9 +485,10 @@ theorem mem_evaluateNode_trapdoorSample
 theorem mem_evaluateNode_trapdoorPublic_of_arguments
     (runChild : ChildRunner) (samplers : MxxSamplerFamily)
     (params : ParamEnvironment) (inputs : Environment) (wires : WireEnvironment)
-    (trapdoorRef : WireRef) (publicMatrix : Mxx.Matrix) (outputCount : Nat)
+    (trapdoorRef : WireRef) (publicMatrix : Mxx.Matrix) (origin : Mxx.TrapdoorOrigin)
+    (outputCount : Nat)
     (argumentsEvaluate : [trapdoorRef].mapM (fun wire => lookupWire wire wires) =
-      some [.trapdoor publicMatrix])
+      some [.trapdoor publicMatrix origin])
     {values : List Value}
     (member : values ∈ evaluateNode runChild samplers params inputs wires {
       kind := .trapdoorPublic
@@ -457,7 +506,7 @@ theorem mem_evaluateNode_preimageSample_of_arguments
     (outputCount : Nat)
     (argumentsEvaluate :
       [publicRef, trapdoorRef, targetRef].mapM (fun wire => lookupWire wire wires) =
-        some [.matrix publicMatrix, .trapdoor publicMatrix, .matrix target])
+        some [.matrix publicMatrix, .trapdoor publicMatrix .sampled, .matrix target])
     (matrixTypeEvaluate : matrixType.evaluate params cutoff = some matrixParams)
     {values : List Value}
     (member : values ∈ evaluateNode runChild samplers params inputs wires {
@@ -470,57 +519,6 @@ theorem mem_evaluateNode_preimageSample_of_arguments
   simp [evaluateNode, arguments, argumentsEvaluate, matrixTypeEvaluate] at member
   obtain ⟨sample, sampleMember, rfl⟩ := member
   exact ⟨sample, sampleMember, rfl⟩
-
-/-- `gadgetDecompose` canonicalizes coefficients in `R_q` before its deterministic digit
-expansion.  Therefore executions on quotient-equal inputs return the same normalized digit
-matrix, even when their stored representatives or SSA environments differ. -/
-theorem mem_evaluateNode_gadgetDecompose_congruent_of_arguments
-    (leftRunner rightRunner : ChildRunner) (samplers : MxxSamplerFamily)
-    (contract : MxxBoundedSamplerContract samplers)
-    (leftParams rightParams : ParamEnvironment)
-    (leftInputs rightInputs : Environment)
-    (leftWires rightWires : WireEnvironment) (leftRef rightRef : WireRef)
-    (leftInput rightInput : Mxx.Matrix)
-    (leftMatrixType rightMatrixType : MatrixTypeExpr)
-    (leftBase rightBase leftDigitCount rightDigitCount : IntExpr)
-    (matrixParams : Mxx.SamplerParams) (evaluatedBase evaluatedDigitCount : Int)
-    (leftOutputCount rightOutputCount : Nat)
-    (leftArgumentsEvaluate : [leftRef].mapM (fun wire => lookupWire wire leftWires) =
-      some [.matrix leftInput])
-    (rightArgumentsEvaluate : [rightRef].mapM (fun wire => lookupWire wire rightWires) =
-      some [.matrix rightInput])
-    (inputsCongruent : Mxx.MatrixModEq leftInput rightInput)
-    (leftMatrixTypeEvaluate :
-      leftMatrixType.evaluate leftParams (.constant 0) = some matrixParams)
-    (rightMatrixTypeEvaluate :
-      rightMatrixType.evaluate rightParams (.constant 0) = some matrixParams)
-    (leftBaseEvaluate : leftBase.evaluate leftParams = some evaluatedBase)
-    (rightBaseEvaluate : rightBase.evaluate rightParams = some evaluatedBase)
-    (leftDigitCountEvaluate : leftDigitCount.evaluate leftParams = some evaluatedDigitCount)
-    (rightDigitCountEvaluate : rightDigitCount.evaluate rightParams = some evaluatedDigitCount)
-    {leftValues rightValues : List Value}
-    (leftMember : leftValues ∈ evaluateNode leftRunner samplers leftParams leftInputs leftWires {
-      kind := .gadgetDecompose leftMatrixType leftBase leftDigitCount
-      arguments := [leftRef]
-      outputCount := leftOutputCount
-    })
-    (rightMember : rightValues ∈ evaluateNode rightRunner samplers rightParams rightInputs rightWires {
-      kind := .gadgetDecompose rightMatrixType rightBase rightDigitCount
-      arguments := [rightRef]
-      outputCount := rightOutputCount
-    }) :
-    leftValues = rightValues := by
-  obtain ⟨left, leftSupport, rfl⟩ := mem_evaluateNode_gadgetDecompose_of_arguments
-    leftRunner samplers leftParams leftInputs leftWires leftRef leftInput leftMatrixType leftBase
-    leftDigitCount matrixParams evaluatedBase evaluatedDigitCount leftOutputCount
-    leftArgumentsEvaluate leftMatrixTypeEvaluate leftBaseEvaluate leftDigitCountEvaluate leftMember
-  obtain ⟨right, rightSupport, rfl⟩ := mem_evaluateNode_gadgetDecompose_of_arguments
-    rightRunner samplers rightParams rightInputs rightWires rightRef rightInput rightMatrixType
-    rightBase rightDigitCount matrixParams evaluatedBase evaluatedDigitCount rightOutputCount
-    rightArgumentsEvaluate rightMatrixTypeEvaluate rightBaseEvaluate rightDigitCountEvaluate
-    rightMember
-  rw [contract.gadgetDecomposeCongruent matrixParams evaluatedBase evaluatedDigitCount.toNat
-    leftInput rightInput left right inputsCongruent leftSupport rightSupport]
 
 /-- Inverting a sequential-loop node produces the exact inductive trace selected by that
 execution, with no materialization of the other sampler outcomes. -/

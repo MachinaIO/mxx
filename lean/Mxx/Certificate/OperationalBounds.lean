@@ -1,4 +1,5 @@
 import Mxx.Certificate.Derivation
+import Mxx.Certificate.OperationalProtocolSyntax
 
 /-! # Linear operational hard-bound estimator
 
@@ -17,13 +18,33 @@ namespace Mxx.Certificate
 open Mxx.Ir
 
 inductive OperationalBoundPath where
-  | matrixMaximum (slot : Nat)
-  | integerLower (slot : Nat)
-  | integerUpper (slot : Nat)
-  deriving BEq, DecidableEq
+  | matrixMaximum (depth slot : Nat)
+  | integerLower (depth slot : Nat)
+  | integerUpper (depth slot : Nat)
+  deriving BEq, DecidableEq, Repr
+
+inductive OperationalParameterDomain where
+  | loopIndex (slot count : Nat)
+  | parameter
+      (name : String)
+      (environment : ParamEnvironment)
+      (domains : List OperationalParameterDomain)
+      (expression : IntExpr)
+  deriving BEq, Repr
+
+inductive ContextualExtremum where
+  | minimum
+  | maximum
+  | maximumAbsolute
+  deriving BEq, Repr
 
 inductive OperationalBoundExpr where
   | closedInt (value : IntExpr)
+  | contextual
+      (kind : ContextualExtremum)
+      (environment : ParamEnvironment)
+      (domains : List OperationalParameterDomain)
+      (value : IntExpr)
   | previous (path : OperationalBoundPath)
   | negate (value : OperationalBoundExpr)
   | add (left right : OperationalBoundExpr)
@@ -35,19 +56,794 @@ inductive OperationalBoundExpr where
   | centeredCap (modulus value : OperationalBoundExpr)
   | matrixProduct
       (ringDimension innerDimension left right : OperationalBoundExpr)
-  deriving BEq, DecidableEq
+  | recurrence
+      (count : Nat)
+      (initial transition : List OperationalBoundExpr)
+      (slot : Nat)
+  | recurrenceState
+      (count : Nat)
+      (paths : List OperationalBoundPath)
+      (initial transition : List OperationalBoundExpr)
+      (output : OperationalBoundPath)
+  deriving BEq, Repr
+
+inductive CanonicalRange where
+  | unknown
+  | below (upperExclusive : Nat)
+  deriving BEq, DecidableEq, Repr
+
+inductive ProgramInstanceKey where
+  | temporary
+  | workflowStage (stage : StageId)
+  | ideal
+  | requirement (index : Nat)
+  | standalone (checkedProgramOrdinal : Nat)
+  deriving BEq, DecidableEq, Repr
+
+inductive ScopeTemplateKey where
+  | root (program : ProgramInstanceKey)
+  | callBody (parent : ScopeTemplateKey) (callNode : Nat)
+  | parallelBody (parent : ScopeTemplateKey) (loopNode : Nat)
+  | sequentialBody (parent : ScopeTemplateKey) (loopNode : Nat)
+  deriving BEq, DecidableEq, Repr
+
+inductive LoopCoordinate where
+  | loopBinder (owner : ScopeTemplateKey) (loopNode binderSlot : Nat)
+  | loopBinderOffset (owner : ScopeTemplateKey) (loopNode binderSlot offset : Nat)
+  deriving BEq, DecidableEq, Repr
+
+structure FamilyTemplateBinder where
+  owner : ScopeTemplateKey
+  producerNode : Nat
+  binderSlot : Nat
+  deriving BEq, DecidableEq, Repr
+
+inductive OperationalValueOrigin where
+  | local (scope : ScopeTemplateKey) (wire : WireRef)
+  | protocolInput (input : ProtocolInputId)
+  | protocolFamilyElement (input : ProtocolInputId) (index : Nat)
+  | loopInstance (slot index : Nat) (source : OperationalValueOrigin)
+  | selected
+      (binder : FamilyTemplateBinder)
+      (index : OperationalValueOrigin)
+      (source : OperationalValueOrigin)
+  deriving BEq, DecidableEq, Repr
+
+structure DynamicSelectionIdentity where
+  index : OperationalValueOrigin
+  deriving BEq, DecidableEq, Repr
+
+structure DeterministicHashIdentity where
+  keyOrigin : OperationalValueOrigin
+  matrixType : MatrixTypeExpr
+  parameterEnvironment : ParamEnvironment
+  parameterDomains : List OperationalParameterDomain
+  tagPrefix : List Nat
+  tagExpressions : List IntExpr
+  tagDecimalExpressions : List IntExpr
+  tagU64LeExpressions : List IntExpr
+  trailingIntegerOrigins : List OperationalValueOrigin
+  deriving BEq, Repr
+
+inductive MatrixOriginIdentity where
+  | value (scope : ScopeTemplateKey) (wire : WireRef)
+  | protocolInput (input : ProtocolInputId)
+  | protocolFamilyElement (input : ProtocolInputId) (index : Nat)
+  | deterministicHash (query : DeterministicHashIdentity)
+  | loopInstance (slot index : Nat) (source : MatrixOriginIdentity)
+  | selected
+      (binder : FamilyTemplateBinder)
+      (selection : DynamicSelectionIdentity)
+      (source : MatrixOriginIdentity)
+  deriving BEq, Repr
+
+inductive PublicMatrixIdentity where
+  | sampledTrapdoor (scope : ScopeTemplateKey) (wire : WireRef)
+  | gadget
+      (paramsId : Mxx.SamplerParamsId)
+      (params : Mxx.SamplerParams)
+      (inputRows : Nat)
+      (base : Int)
+      (small : Bool)
+      (digitCount : Nat)
+  | selected
+      (binder : FamilyTemplateBinder)
+      (selection : DynamicSelectionIdentity)
+      (source : PublicMatrixIdentity)
+  | loopInstance (slot index : Nat) (source : PublicMatrixIdentity)
+  deriving BEq, DecidableEq, Repr
+
+private def temporaryScope : ScopeTemplateKey := .root .temporary
+
+/-! ## Flat operational polynomial
+
+The parameter-search checker keeps exact sums of ordered products.  This is intentionally flat:
+there is no recursive matrix expression and no stored coefficient/carrier split. -/
+
+inductive OperationalFactorRole where
+  | bounded
+  | large
+  deriving BEq, DecidableEq, Repr
+
+structure OperationalMatrixMetadata where
+  isConstantPolynomial : Bool := false
+  knownZeroRows : Option IntExpr := none
+  deriving BEq, DecidableEq, Repr
+
+inductive OperationalProductMode where
+  | ordinaryMatrixProduct
+  | leftPolynomialScalarBroadcast
+  | rightPolynomialScalarBroadcast
+  | swappedRowVectorScalarProduct
+  deriving BEq, DecidableEq, Repr
+
+inductive OperationalFactorTransform where
+  | negate
+  | transpose
+  | rowSlice (start stop : IntExpr)
+  | columnSlice (start stop : IntExpr)
+  | rowEmbed (axis : ConcatAxis) (part : Nat)
+  | columnEmbed (axis : ConcatAxis) (part : Nat)
+  | reshape (rows columns : IntExpr)
+  | constantCoefficient (index : IntExpr)
+  deriving BEq, Repr
+
+inductive OperationalPrimitiveIdentity where
+  | matrix (identity : MatrixOriginIdentity)
+  | publicMatrix (identity : PublicMatrixIdentity)
+  | value (identity : OperationalValueOrigin)
+  | parameterScalar
+      (environment : ParamEnvironment)
+      (domains : List OperationalParameterDomain)
+      (value : IntExpr)
+  | identityMatrix (type : MatrixTypeExpr)
+  | selectionIndicator
+      (binder : FamilyTemplateBinder)
+      (selection : DynamicSelectionIdentity)
+      (branch : Nat)
+  | indexedArtifact (input : ProtocolInputId) (index : IntExpr)
+  | recurrenceResult (scope : ScopeTemplateKey) (node path : Nat)
+  | carriedInput (path : Nat)
+  deriving BEq, Repr
+
+inductive OperationalCompressionKind where
+  | boundedRun
+  | boundedNoiseSum
+  deriving BEq, DecidableEq, Repr
+
+inductive OperationalProvenanceSegmentKind where
+  | primitiveRun
+  | boundedNoiseSum
+  deriving BEq, DecidableEq, Repr
+
+inductive OperationalCompressionToken where
+  | primitive (identity : OperationalPrimitiveIdentity)
+  | transform (value : OperationalFactorTransform)
+  | productMode (value : OperationalProductMode)
+  | intermediateType (value : MatrixTypeExpr)
+  | productStart
+  | productEnd
+  | groupStart
+  | groupEnd
+  | sumStart
+  | sumEnd
+  | termStart (coefficient : Int)
+  | termEnd
+  | summaryBound (bound : OperationalBoundExpr)
+  | summaryMetadata (metadata : OperationalMatrixMetadata)
+  | segmentStart (kind : OperationalProvenanceSegmentKind) (length : Nat)
+  | segmentEnd
+  deriving BEq, Repr
+
+structure OperationalCompressionOrigin where
+  kind : OperationalCompressionKind
+  tokens : List OperationalCompressionToken
+  deriving BEq, Repr
+
+structure OperationalBoundedFactorSummary where
+  matrixType : MatrixTypeExpr
+  hardBound : OperationalBoundExpr
+  metadata : OperationalMatrixMetadata
+  provenance : List OperationalCompressionToken
+  deriving BEq, Repr
+
+inductive OperationalCompressionProtection where
+  | relationOwner
+  | decompositionOwner
+  | exactOneIndicator
+  | endpointIdentity
+  | originPreservingArtifact
+  deriving BEq, DecidableEq, Repr
+
+/-- A relation owns a relation-free copy of its exact target polynomial. This separate flat type
+breaks the recursive cycle that would arise if a target snapshot could itself own relations. -/
+inductive RelationSnapshotFactorLeaf where
+  | primitive (identity : OperationalPrimitiveIdentity)
+  | boundedSummary
+      (origin : OperationalCompressionOrigin)
+      (summary : OperationalBoundedFactorSummary)
+  | exactTransform (tokens : List OperationalCompressionToken) (type : MatrixTypeExpr)
+  deriving BEq, Repr
+
+structure RelationSnapshotFactor where
+  leaf : RelationSnapshotFactorLeaf
+  transforms : List OperationalFactorTransform := []
+  inputType : MatrixTypeExpr
+  outputType : MatrixTypeExpr
+  role : OperationalFactorRole
+  boundedSummary : Option OperationalBoundedFactorSummary := none
+  protections : List OperationalCompressionProtection := []
+  deriving BEq, Repr
+
+structure RelationSnapshotProduct where
+  factors : List RelationSnapshotFactor
+  modes : List OperationalProductMode
+  outputType : MatrixTypeExpr
+  deriving BEq, Repr
+
+structure RelationSnapshotTerm where
+  coefficient : Int
+  product : RelationSnapshotProduct
+  deriving BEq, Repr
+
+abbrev RelationSnapshotPolynomial := List RelationSnapshotTerm
+
+structure RelationTargetSummary where
+  origin : MatrixOriginIdentity
+  matrixType : MatrixTypeExpr
+  matrixParams : Mxx.SamplerParams
+  totalHardBound : OperationalBoundExpr
+  canonicalRange : CanonicalRange
+  polynomial : RelationSnapshotPolynomial
+  deriving BEq, Repr
+
+inductive ReconstructionStatus where
+  | available
+  | smallRangeMissing (requiredExclusiveUpper : Nat)
+  deriving BEq, DecidableEq, Repr
+
+structure DecompositionRelation where
+  producer : MatrixOriginIdentity
+  publicIdentity : PublicMatrixIdentity
+  inputOrigin : MatrixOriginIdentity
+  inputSummary : RelationTargetSummary
+  base : Int
+  small : Bool
+  digitCount : Nat
+  status : ReconstructionStatus
+  deriving BEq, Repr
+
+structure PreimageRelation where
+  producer : MatrixOriginIdentity
+  publicIdentity : PublicMatrixIdentity
+  targetOrigin : MatrixOriginIdentity
+  targetSummary : RelationTargetSummary
+  deriving BEq, Repr
+
+inductive OperationalMatrixRelation where
+  | decomposition (relation : DecompositionRelation)
+  | preimage (relation : PreimageRelation)
+  deriving BEq, Repr
+
+inductive OperationalFactorLeaf where
+  | primitive (identity : OperationalPrimitiveIdentity)
+  | boundedSummary
+      (origin : OperationalCompressionOrigin)
+      (summary : OperationalBoundedFactorSummary)
+  | exactTransform (tokens : List OperationalCompressionToken) (type : MatrixTypeExpr)
+  deriving BEq, Repr
+
+structure OperationalFactorKey where
+  leaf : OperationalFactorLeaf
+  transforms : List OperationalFactorTransform := []
+  inputType : MatrixTypeExpr
+  outputType : MatrixTypeExpr
+  role : OperationalFactorRole
+  boundedSummary : Option OperationalBoundedFactorSummary := none
+  protections : List OperationalCompressionProtection := []
+  relations : List OperationalMatrixRelation := []
+  deriving BEq, Repr
+
+structure OperationalProductKey where
+  factors : List OperationalFactorKey
+  modes : List OperationalProductMode
+  outputType : MatrixTypeExpr
+  deriving BEq, Repr
+
+structure OperationalTerm where
+  coefficient : Int
+  product : OperationalProductKey
+  deriving BEq, Repr
+
+abbrev OperationalPolynomial := List OperationalTerm
+
+private def relationSnapshotLeaf : OperationalFactorLeaf → RelationSnapshotFactorLeaf
+  | .primitive identity => .primitive identity
+  | .boundedSummary origin summary => .boundedSummary origin summary
+  | .exactTransform tokens type => .exactTransform tokens type
+
+private def relationSnapshotFactor (factor : OperationalFactorKey) : RelationSnapshotFactor := {
+  leaf := relationSnapshotLeaf factor.leaf
+  transforms := factor.transforms
+  inputType := factor.inputType
+  outputType := factor.outputType
+  role := factor.role
+  boundedSummary := factor.boundedSummary
+  protections := factor.protections.filter (· != .relationOwner)
+}
+
+private def relationSnapshotPolynomial
+    (polynomial : OperationalPolynomial) : RelationSnapshotPolynomial :=
+  polynomial.map fun term => {
+    coefficient := term.coefficient
+    product := {
+      factors := term.product.factors.map relationSnapshotFactor
+      modes := term.product.modes
+      outputType := term.product.outputType
+    }
+  }
+
+private def operationalLeafFromSnapshot : RelationSnapshotFactorLeaf → OperationalFactorLeaf
+  | .primitive identity => .primitive identity
+  | .boundedSummary origin summary => .boundedSummary origin summary
+  | .exactTransform tokens type => .exactTransform tokens type
+
+private def operationalPolynomialFromSnapshot
+    (polynomial : RelationSnapshotPolynomial) : OperationalPolynomial :=
+  polynomial.map fun term => {
+    coefficient := term.coefficient
+    product := {
+      factors := term.product.factors.map fun factor => {
+        leaf := operationalLeafFromSnapshot factor.leaf
+        transforms := factor.transforms
+        inputType := factor.inputType
+        outputType := factor.outputType
+        role := factor.role
+        boundedSummary := factor.boundedSummary
+        protections := factor.protections
+        relations := []
+      }
+      modes := term.product.modes
+      outputType := term.product.outputType
+    }
+  }
+
+inductive OperationalFlatError where
+  | incompatibleProduct (left right : MatrixTypeExpr)
+  | malformedProduct
+  | missingBoundedSummary
+  | invalidKnownZeroRows
+  | cannotPreserveNoiseSeparation
+  | analysisLimitExceeded
+  deriving BEq, DecidableEq, Repr
+
+private def operationalAbsoluteCoefficient (value : Int) : Int :=
+  if value < 0 then -value else value
+
+private def operationalCoefficientContent : List OperationalTerm → Nat
+  | [] => 1
+  | head :: tail =>
+      let content := tail.foldl (fun current term => Nat.gcd current term.coefficient.natAbs)
+        head.coefficient.natAbs
+      if content = 0 then 1 else content
+
+private def insertCanonicalOperationalTerm
+    (term : OperationalTerm) : OperationalPolynomial → OperationalPolynomial
+  | [] => [term]
+  | head :: tail =>
+      if reprStr term.product < reprStr head.product then term :: head :: tail
+      else head :: insertCanonicalOperationalTerm term tail
+
+private def sortOperationalTerms (terms : OperationalPolynomial) : OperationalPolynomial :=
+  terms.foldl (fun sorted term => insertCanonicalOperationalTerm term sorted) []
+
+private def normalizeOperationalDimension : IntExpr → IntExpr
+  | .add left right =>
+      let left := normalizeOperationalDimension left
+      let right := normalizeOperationalDimension right
+      match left, right with
+      | .constant 0, value | value, .constant 0 => value
+      | .constant left, .constant right => .constant (left + right)
+      | left, right => .add left right
+  | .subtract left right =>
+      let left := normalizeOperationalDimension left
+      let right := normalizeOperationalDimension right
+      match left, right with
+      | value, .constant 0 => value
+      | .constant left, .constant right => .constant (left - right)
+      | left, right => .subtract left right
+  | .multiply left right =>
+      let left := normalizeOperationalDimension left
+      let right := normalizeOperationalDimension right
+      match left, right with
+      | .constant 0, _ | _, .constant 0 => .constant 0
+      | .constant 1, value | value, .constant 1 => value
+      | .constant left, .constant right => .constant (left * right)
+      | left, right => .multiply left right
+  | .divide left right =>
+      .divide (normalizeOperationalDimension left) (normalizeOperationalDimension right)
+  | .roundDivide left right =>
+      .roundDivide (normalizeOperationalDimension left) (normalizeOperationalDimension right)
+  | .log2Ceil value => .log2Ceil (normalizeOperationalDimension value)
+  | value => value
+
+private def operationalDimensionEqual (left right : IntExpr) : Bool :=
+  normalizeOperationalDimension left == normalizeOperationalDimension right
+
+private def operationalSameRing (left right : MatrixTypeExpr) : Bool :=
+  operationalDimensionEqual left.modulus right.modulus &&
+    operationalDimensionEqual left.ringDimension right.ringDimension
+
+private def operationalIsOne : IntExpr → Bool
+  | value => normalizeOperationalDimension value == .constant 1
+
+def inferOperationalProductMode
+    (left right : MatrixTypeExpr) : Except OperationalFlatError
+      (OperationalProductMode × MatrixTypeExpr) := do
+  if !operationalSameRing left right then throw (.incompatibleProduct left right)
+  if operationalDimensionEqual left.columns right.rows then
+    pure (.ordinaryMatrixProduct, {
+      modulus := left.modulus
+      ringDimension := left.ringDimension
+      rows := left.rows
+      columns := right.columns
+    })
+  else if operationalIsOne left.rows && operationalIsOne left.columns then
+    pure (.leftPolynomialScalarBroadcast, right)
+  else if operationalIsOne right.rows && operationalIsOne right.columns then
+    pure (.rightPolynomialScalarBroadcast, left)
+  else if operationalIsOne left.rows && operationalIsOne right.rows &&
+      operationalDimensionEqual left.columns right.columns then
+    pure (.swappedRowVectorScalarProduct, {
+      modulus := left.modulus
+      ringDimension := left.ringDimension
+      rows := .constant 1
+      columns := left.columns
+    })
+  else throw (.incompatibleProduct left right)
+
+private def operationalInnerDimension
+    (mode : OperationalProductMode)
+    (left : OperationalBoundedFactorSummary)
+    (right : OperationalBoundedFactorSummary) : Except OperationalFlatError IntExpr := do
+  match mode with
+  | .ordinaryMatrixProduct =>
+      match right.metadata.knownZeroRows with
+      | none => pure left.matrixType.columns
+      | some zeroRows => pure (.subtract left.matrixType.columns zeroRows)
+  | .leftPolynomialScalarBroadcast | .rightPolynomialScalarBroadcast |
+      .swappedRowVectorScalarProduct => pure (.constant 1)
+
+def multiplyOperationalBoundedSummaries
+    (mode : OperationalProductMode)
+    (left right : OperationalBoundedFactorSummary) :
+    Except OperationalFlatError OperationalBoundedFactorSummary := do
+  let inner ← operationalInnerDimension mode left right
+  let ringFactor := if left.metadata.isConstantPolynomial ||
+      right.metadata.isConstantPolynomial then .closedInt (.constant 1)
+    else .closedInt left.matrixType.ringDimension
+  let outputType ← (inferOperationalProductMode left.matrixType right.matrixType).map (·.2)
+  pure {
+    matrixType := outputType
+    hardBound := .multiply (.closedInt inner)
+      (.multiply ringFactor (.multiply left.hardBound right.hardBound))
+    metadata := {
+      isConstantPolynomial := left.metadata.isConstantPolynomial &&
+        right.metadata.isConstantPolynomial
+      knownZeroRows := none
+    }
+    provenance := left.provenance ++
+      [.productMode mode, .intermediateType outputType] ++ right.provenance
+  }
+
+def OperationalTerm.negate (term : OperationalTerm) : OperationalTerm :=
+  { term with coefficient := -term.coefficient }
+
+private def insertOperationalTerm
+    (term : OperationalTerm) : OperationalPolynomial → OperationalPolynomial
+  | [] => if term.coefficient = 0 then [] else [term]
+  | head :: tail =>
+      if head.product == term.product then
+        let coefficient := head.coefficient + term.coefficient
+        if coefficient = 0 then tail else { head with coefficient } :: tail
+      else head :: insertOperationalTerm term tail
+
+def normalizeOperationalTerms (terms : OperationalPolynomial) : OperationalPolynomial :=
+  terms.foldl (fun result term ↦ insertOperationalTerm term result) []
+
+def addOperationalPolynomials
+    (left right : OperationalPolynomial) : OperationalPolynomial :=
+  normalizeOperationalTerms (left ++ right)
+
+def subtractOperationalPolynomials
+    (left right : OperationalPolynomial) : OperationalPolynomial :=
+  normalizeOperationalTerms (left ++ right.map OperationalTerm.negate)
+
+def scaleOperationalPolynomial
+    (scalar : Int) (terms : OperationalPolynomial) : OperationalPolynomial :=
+  normalizeOperationalTerms (terms.map fun term ↦ {
+    term with coefficient := scalar * term.coefficient
+  })
+
+private def multiplyOperationalTerms
+    (left right : OperationalTerm) : Except OperationalFlatError OperationalTerm := do
+  let leftLast ← match left.product.factors.getLast? with
+    | some factor => pure factor
+    | none => throw .malformedProduct
+  let rightFirst ← match right.product.factors.head? with
+    | some factor => pure factor
+    | none => throw .malformedProduct
+  let (mode, outputType) ← inferOperationalProductMode leftLast.outputType rightFirst.inputType
+  pure {
+    coefficient := left.coefficient * right.coefficient
+    product := {
+      factors := left.product.factors ++ right.product.factors
+      modes := left.product.modes ++ [mode] ++ right.product.modes
+      outputType
+    }
+  }
+
+def multiplyOperationalPolynomials
+    (left right : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  let rows ← left.mapM fun leftTerm ↦ right.mapM (multiplyOperationalTerms leftTerm)
+  pure (normalizeOperationalTerms rows.flatten)
+
+def operationalLargeFactorCount (term : OperationalTerm) : Nat :=
+  term.product.factors.countP fun factor ↦ factor.role == .large
+
+def operationalTermIsNoise (term : OperationalTerm) : Bool :=
+  operationalLargeFactorCount term = 0
+
+def operationalTermIsSignal (term : OperationalTerm) : Bool :=
+  0 < operationalLargeFactorCount term
+
+private def operationalTermIsCompressionProtected (term : OperationalTerm) : Bool :=
+  term.product.factors.any fun factor => !factor.protections.isEmpty
+
+private def factorBoundedSummary
+    (factor : OperationalFactorKey) : Except OperationalFlatError OperationalBoundedFactorSummary :=
+  match factor.role, factor.boundedSummary with
+  | .bounded, some summary => pure summary
+  | _, _ => throw .missingBoundedSummary
+
+private def boundedRunTokens
+    (factors : List OperationalFactorKey)
+    (modes : List OperationalProductMode)
+    (summary : OperationalBoundedFactorSummary) : List OperationalCompressionToken :=
+  [.productStart] ++
+    (factors.flatMap fun factor ↦ match factor.leaf with
+      | .primitive identity =>
+          [.segmentStart .primitiveRun (1 + factor.transforms.length), .primitive identity] ++
+            factor.transforms.map OperationalCompressionToken.transform ++ [.segmentEnd]
+      | .boundedSummary origin _ =>
+          [.segmentStart (match origin.kind with
+            | .boundedRun => .primitiveRun
+            | .boundedNoiseSum => .boundedNoiseSum) origin.tokens.length] ++
+            origin.tokens ++ [.segmentEnd]
+      | .exactTransform tokens _ =>
+          [.segmentStart .primitiveRun tokens.length] ++ tokens ++ [.segmentEnd]) ++
+    modes.map OperationalCompressionToken.productMode ++
+    [.intermediateType summary.matrixType, .summaryBound summary.hardBound,
+      .summaryMetadata summary.metadata, .productEnd]
+
+private def summarizeEntireBoundedProduct
+    (product : OperationalProductKey) :
+    Except OperationalFlatError OperationalBoundedFactorSummary := do
+  if product.factors.isEmpty || product.factors.any fun factor ↦ factor.role == .large then
+    throw .cannotPreserveNoiseSeparation
+  let summaries ← product.factors.mapM factorBoundedSummary
+  let first ← match summaries.head? with
+    | some summary => pure summary
+    | none => throw .malformedProduct
+  let pairs := product.modes.zip (summaries.drop 1)
+  pairs.foldlM (init := first) fun current pair ↦
+    multiplyOperationalBoundedSummaries pair.1 current pair.2
+
+def compressEntireBoundedProduct
+    (product : OperationalProductKey) : Except OperationalFlatError OperationalFactorKey := do
+  if product.factors.any fun factor ↦ !factor.protections.isEmpty then
+    throw .cannotPreserveNoiseSeparation
+  let summary ← summarizeEntireBoundedProduct product
+  let firstFactor ← match product.factors.head? with
+    | some factor => pure factor
+    | none => throw .malformedProduct
+  if product.factors.length = 1 then
+    pure firstFactor
+  else
+    let tokens := boundedRunTokens product.factors product.modes summary
+    let origin : OperationalCompressionOrigin := { kind := .boundedRun, tokens }
+    pure {
+      leaf := .boundedSummary origin { summary with provenance := tokens }
+      inputType := firstFactor.inputType
+      outputType := product.outputType
+      role := .bounded
+      boundedSummary := some { summary with provenance := tokens }
+    }
+
+private def boundedNoiseTermSummary
+    (term : OperationalTerm) : Except OperationalFlatError OperationalBoundedFactorSummary := do
+  if !operationalTermIsNoise term then throw .cannotPreserveNoiseSeparation
+  summarizeEntireBoundedProduct term.product
+
+private def boundedNoiseTermTokens
+    (term : OperationalTerm)
+    (summary : OperationalBoundedFactorSummary) : List OperationalCompressionToken :=
+  [.termStart term.coefficient, .segmentStart .boundedNoiseSum summary.provenance.length] ++
+    summary.provenance ++ [.segmentEnd, .termEnd]
+
+/-- Replace a sum of bounded-only products by one bounded summary.  The signed content is kept as
+the sole additive coefficient, while the summary bound uses the triangle inequality.  The
+summary is never reopened by multiplication; subsequent products use its stored hard bound. -/
+def compressBoundedNoiseSum
+    (terms : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  let terms := sortOperationalTerms (normalizeOperationalTerms terms)
+  if terms.isEmpty then return []
+  if terms.any operationalTermIsSignal then throw .cannotPreserveNoiseSeparation
+  if terms.any operationalTermIsCompressionProtected then
+    throw .cannotPreserveNoiseSeparation
+  match terms with
+  | [{ product := { factors := [{ leaf := .boundedSummary origin _, .. }], .. }, .. }] =>
+      if origin.kind == OperationalCompressionKind.boundedNoiseSum then return terms
+  | _ => pure ()
+  let summaries ← terms.mapM boundedNoiseTermSummary
+  let firstTerm ← match terms.head? with
+    | some term => pure term
+    | none => throw .malformedProduct
+  let content := operationalCoefficientContent terms
+  let unsignedContent := Int.ofNat content
+  let contentInt := if firstTerm.coefficient < 0 then -unsignedContent else unsignedContent
+  let scaledBounds := (terms.zip summaries).map fun (term, summary) =>
+    OperationalBoundExpr.multiply
+      (.closedInt (.constant (operationalAbsoluteCoefficient (term.coefficient / contentInt))))
+      summary.hardBound
+  let hardBound := scaledBounds.foldl OperationalBoundExpr.add (.closedInt (.constant 0))
+  let tokens := [.sumStart] ++
+    (terms.zip summaries).flatMap fun (term, summary) =>
+      boundedNoiseTermTokens { term with coefficient := term.coefficient / contentInt } summary ++
+    [.summaryBound hardBound, .sumEnd]
+  let metadata : OperationalMatrixMetadata := {
+    isConstantPolynomial := summaries.all (·.metadata.isConstantPolynomial)
+    knownZeroRows := none
+  }
+  let summary : OperationalBoundedFactorSummary := {
+    matrixType := firstTerm.product.outputType
+    hardBound
+    metadata
+    provenance := tokens
+  }
+  let origin : OperationalCompressionOrigin := { kind := .boundedNoiseSum, tokens }
+  let factor : OperationalFactorKey := {
+    leaf := .boundedSummary origin summary
+    inputType := summary.matrixType
+    outputType := summary.matrixType
+    role := .bounded
+    boundedSummary := some summary
+  }
+  pure [{
+    coefficient := contentInt
+    product := { factors := [factor], modes := [], outputType := summary.matrixType }
+  }]
+
+/-- Canonicalize exact products first, then collapse only the bounded-only subset.  Signal terms,
+including terms with multiple Large factors, stay distributed and retain their ordered factors. -/
+def normalizeOperationalPolynomial
+    (terms : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  let merged := normalizeOperationalTerms terms
+  let noise := merged.filter operationalTermIsNoise
+  let signal := merged.filter operationalTermIsSignal
+  let protectedNoise := noise.filter operationalTermIsCompressionProtected
+  let compressibleNoise := noise.filter fun term => !operationalTermIsCompressionProtected term
+  let compressedNoise ← compressBoundedNoiseSum compressibleNoise
+  pure (normalizeOperationalTerms (signal ++ protectedNoise ++ compressedNoise))
+
+structure OperationalMatrixFact where
+  subject : WireRef
+  origin : MatrixOriginIdentity
+  matrixType : MatrixTypeExpr
+  matrixParams : Mxx.SamplerParams
+  totalHardBound : OperationalBoundExpr
+  polynomial : OperationalPolynomial := []
+  metadata : OperationalMatrixMetadata := {}
+  canonicalRange : CanonicalRange := .unknown
+  identity : Option PublicMatrixIdentity := none
+  relations : List OperationalMatrixRelation := []
+  deriving BEq
+
+private def primitiveOperationalPolynomial
+    (origin : MatrixOriginIdentity)
+    (matrixType : MatrixTypeExpr)
+    (totalHardBound : OperationalBoundExpr)
+    (role : OperationalFactorRole)
+    (identity : Option PublicMatrixIdentity)
+    (relations : List OperationalMatrixRelation)
+    (metadata : OperationalMatrixMetadata) : OperationalPolynomial :=
+  let summary := match role with
+    | .bounded => some {
+        matrixType
+        hardBound := totalHardBound
+        metadata
+        provenance := [.primitive (.matrix origin)]
+      }
+    | .large => none
+  let primitive := match identity with
+    | some publicIdentity => OperationalPrimitiveIdentity.publicMatrix publicIdentity
+    | none => .matrix origin
+  let protections := if relations.isEmpty then [] else
+    [OperationalCompressionProtection.relationOwner]
+  [{
+    coefficient := 1
+    product := {
+      factors := [{
+        leaf := .primitive primitive
+        inputType := matrixType
+        outputType := matrixType
+        role
+        boundedSummary := summary
+        protections
+        relations
+      }]
+      modes := []
+      outputType := matrixType
+    }
+  }]
+
+private def OperationalMatrixFact.initializePrimitivePolynomial
+    (fact : OperationalMatrixFact)
+    (role : OperationalFactorRole) : OperationalMatrixFact := {
+  fact with polynomial := (primitiveOperationalPolynomial fact.origin fact.matrixType
+    fact.totalHardBound role fact.identity fact.relations fact.metadata)
+}
+
+private def OperationalMatrixFact.primitiveRole (fact : OperationalMatrixFact) :
+    OperationalFactorRole :=
+  match fact.polynomial.head? >>= fun term => term.product.factors.head? with
+  | some factor => factor.role
+  | none => .bounded
+
+private def OperationalMatrixFact.refreshPrimitivePolynomial
+    (fact : OperationalMatrixFact) : OperationalMatrixFact :=
+  fact.initializePrimitivePolynomial fact.primitiveRole
+
+structure OperationalTrapdoorFact where
+  subject : WireRef
+  matrixType : MatrixTypeExpr
+  matrixParams : Mxx.SamplerParams
+  maximum : OperationalBoundExpr
+  publicIdentity : PublicMatrixIdentity
+  deriving BEq
+
+structure OperationalIntegerFact where
+  subject : WireRef
+  origin : OperationalValueOrigin
+  lower : Int
+  upper : Int
+  lowerExpression : OperationalBoundExpr
+  upperExpression : OperationalBoundExpr
+  deriving BEq
+
+structure OperationalBytesFact where
+  subject : WireRef
+  origin : OperationalValueOrigin
+  length : Int
+  deriving BEq, DecidableEq, Repr
 
 inductive OperationalFact where
-  | matrix (matrixType : MatrixTypeExpr) (maximum : Int)
-  | integer (lower upper : Int)
+  | matrix (fact : OperationalMatrixFact)
+  | integer (fact : OperationalIntegerFact)
   | boolean
   | real
-  | trapdoor (matrixType : MatrixTypeExpr) (maximum : Int)
-  | family (element : OperationalFact) (count : Int)
-  | bytes (length : Int)
+  | trapdoor (fact : OperationalTrapdoorFact)
+  | familyUniform
+      (binder : FamilyTemplateBinder)
+      (binderCoordinate : Option LoopCoordinate)
+      (element : OperationalFact)
+      (count : Int)
+  | familyPackedNil
+  | familyPackedCons (head tail : OperationalFact)
+  | bytes (fact : OperationalBytesFact)
   | typedBlob (typeName : String)
   | unknown (wireType : WireTypeExpr)
-  deriving BEq, DecidableEq
+  deriving BEq
 
 abbrev OperationalState := Array OperationalFact
 
@@ -55,19 +851,155 @@ abbrev OperationalState := Array OperationalFact
 abbrev OperationalScopeFacts := Array (Array OperationalFact)
 
 inductive OperationalError where
+  | inScope (scope : ScopeTemplateKey) (error : OperationalError)
   | missingOutputType (node : Nat) (port : Nat)
   | missingOperand (node : Nat) (operand : WireRef)
   | operandNotMatrix (node : Nat) (operand : WireRef)
+  | operandNotInteger (node : Nat) (operand : WireRef)
+  | operandNotBoolean (node : Nat) (operand : WireRef)
+  | operandNotReal (node : Nat) (operand : WireRef)
   | invalidMatrixParameters (node : Nat)
+  | flat (node : Nat) (error : OperationalFlatError)
   | invalidBound (node : Nat) (bound : Int)
   | invalidCount (node : Nat) (count : Int)
+  | missingGadgetLayout (node : Nat)
+  | ambiguousGadgetLayout (node : Nat)
+  | invalidGadgetLayout (node : Nat)
+  | gadgetLayoutMismatch (node : Nat)
+  | missingPublicIdentity (node : Nat) (wire : WireRef)
+  | publicIdentityMismatch (node : Nat)
+  | missingRelation (node : Nat) (wire : WireRef)
+  | ambiguousRelation (node : Nat) (wire : WireRef)
+  | unavailableRelation (node : Nat) (wire : WireRef)
+  | malformedRelation (node : Nat)
+  | missingDefinition (name : String)
+  | definitionFuelExhausted
+  | childInputMismatch (node expected actual : Nat)
+  | duplicateInputName (name : String)
+  | missingInputNode (name : String)
+  | unexpectedInputNode (name : String)
+  | missingChildOutput (node port : Nat)
+  | loopInputModeMismatch (node argument : Nat)
+  | relationBearingCarriedValue (scope : ScopeTemplateKey) (node slot : Nat)
+  | sequentialSchemaMismatch
+      (scope : ScopeTemplateKey)
+      (node slot : Nat)
+      (initialLargeCounts outputLargeCounts : List Nat)
   | divisionByZero
   | negativeDenominator (value : Int)
   | invalidPreviousPath (path : OperationalBoundPath)
   | nonClosedExpression
   | derivation (error : DerivationError)
   | unsupportedOutputArity (node : Nat) (actual : Nat)
+  | outputTypeMismatch (node : Nat)
+  | missingStageDerivation (stage : String)
+  | missingStageResult (stage output : String)
+  | missingProtocolContract (name : String)
+  | inputContractMismatch (name : String)
+  | unknownDerivationAttachment (ownerNamespace ruleName : String)
+  | missingDerivationAttachmentRole (ownerNamespace ruleName roleName : String)
+  | invalidDerivationAttachment (ownerNamespace ruleName : String)
+  | unsupportedNode (node : Nat)
   deriving BEq, DecidableEq
+
+/-- The operational checker has an explicit transfer category for every executable IR node.
+This definition and the exhaustive classifiers below are deliberately separate from the transfer
+implementation: adding an IR constructor must first make this file fail to compile, rather than
+silently reaching the conservative fallback. -/
+inductive OperationalTransferClass where
+  | input
+  | scalar
+  | matrix
+  | structural
+  deriving BEq, DecidableEq
+
+private def classifyIntBinary : IntBinaryOp → Unit
+  | .add | .subtract | .multiply | .divide | .remainder => ()
+
+private def classifyIntCompare : IntCompareOp → Unit
+  | .equal | .less | .lessEqual => ()
+
+private def classifyRealBinary : RealBinaryOp → Unit
+  | .add | .subtract | .multiply | .divide => ()
+
+private def classifyConcatAxis : ConcatAxis → Unit
+  | .rows | .columns | .diagonal => ()
+
+private def classifyHashVariant : Mxx.HashVariant → Unit
+  | .plain | .decomposed | .smallDecomposed => ()
+
+private def classifyLoopInputMode : LoopInputMode → Unit
+  | .broadcast | .zip | .zipOffset _ => ()
+
+/-- Exhaustive compile-time inventory of the operational transfer surface. Nested operation enums
+are themselves classified exhaustively, so extending (for example) `IntBinaryOp` or `ConcatAxis`
+also requires an explicit operational-checker decision. -/
+def operationalTransferClass : NodeKind → OperationalTransferClass
+  | .input _ => .input
+  | .constantInt _
+  | .evaluateInt _
+  | .constantReal _
+  | .constantBool _
+  | .boolToInt
+  | .intToReal
+  | .realSqrt
+  | .bitExtract _
+  | .extractCoefficient _ => .scalar
+  | .intBinary operation =>
+      let _ := classifyIntBinary operation
+      .scalar
+  | .intCompare operation =>
+      let _ := classifyIntCompare operation
+      .scalar
+  | .realBinary operation =>
+      let _ := classifyRealBinary operation
+      .scalar
+  | .zeroMatrix _
+  | .identityMatrix _
+  | .constantMatrix _ _
+  | .unitRowMatrix _ _
+  | .unitColumnMatrix _ _
+  | .gadgetMatrix _ _
+  | .smallGadgetMatrix _ _
+  | .powerOfBaseMatrix _ _ _
+  | .rotationMatrix _ _
+  | .gadgetTrapdoor _ _
+  | .constantCoefficient _
+  | .uniformResidueSample _
+  | .uniformIntervalSample _ _ _
+  | .gaussianSample _ _
+  | .gadgetDecompose _ _ _ _
+  | .trapdoorSample _ _
+  | .trapdoorPublic
+  | .preimageSample _ _
+  | .matrixAdd
+  | .matrixSubtract
+  | .matrixMultiply
+  | .matrixNegate
+  | .matrixScale _
+  | .transpose
+  | .slice _ _
+  | .tensor
+  | .reshape _ _
+  | .thresholdDecodeBool _ _ _
+  | .thresholdDecodeInt _ _ _
+  | .crtRecompose _ _
+  | .packPolynomialCoefficients _ _ => .matrix
+  | .hashSample _ variant _ _ _ _ _ _ =>
+      let _ := classifyHashVariant variant
+      .matrix
+  | .concat axis =>
+      let _ := classifyConcatAxis axis
+      .matrix
+  | .select
+  | .familyPack
+  | .familyGetStatic _
+  | .familyGetDynamic
+  | .subgraphCall _ _
+  | .sequentialLoop _ _ _ _ _ => .structural
+  | .parallelLoop _ _ _ _ inputModes =>
+      let _ := inputModes.map classifyLoopInputMode
+      .structural
 
 def absolute (value : Int) : Int := if value < 0 then -value else value
 
@@ -82,24 +1014,144 @@ def matrixRingDimension (matrixType : MatrixTypeExpr) (environment : ParamEnviro
   let value ← matrixType.ringDimension.evaluate environment
   if value < 0 then none else some value
 
-def matrixInnerDimension (matrixType : MatrixTypeExpr) (environment : ParamEnvironment) : Option Int := do
-  let value ← matrixType.columns.evaluate environment
-  if value < 0 then none else some value
+def resolveGadgetLayout
+    (node : Nat)
+    (layouts : List Mxx.GadgetLayoutDescriptor)
+    (params : Mxx.SamplerParams) : Except OperationalError Mxx.GadgetLayoutDescriptor := do
+  let candidates := layouts.filter fun descriptor => descriptor.matches params
+  match candidates with
+  | [descriptor] =>
+      if descriptor.valid then pure descriptor else throw (.invalidGadgetLayout node)
+  | [] => throw (.missingGadgetLayout node)
+  | _ => throw (.ambiguousGadgetLayout node)
 
-def lookupPrevious (state : OperationalState) : OperationalBoundPath → Option Int
-  | .matrixMaximum slot =>
-      match state[slot]? with
-      | some (.matrix _ maximum) => some maximum
-      | some (.trapdoor _ maximum) => some maximum
+private def factClosedMaximum : OperationalFact → Option Int
+  | .matrix fact => match fact.totalHardBound with
+      | .closedInt (.constant maximum) => some maximum
       | _ => none
-  | .integerLower slot =>
-      match state[slot]? with
-      | some (.integer lower _) => some lower
+  | .trapdoor fact => match fact.maximum with
+      | .closedInt (.constant maximum) => some maximum
       | _ => none
-  | .integerUpper slot =>
-      match state[slot]? with
-      | some (.integer _ upper) => some upper
-      | _ => none
+  | .familyUniform _ _ element _ => factClosedMaximum element
+  | _ => none
+
+structure OperationalNumericSlot where
+  matrixMaximum : Option Int := none
+  integerLower : Option Int := none
+  integerUpper : Option Int := none
+  deriving Inhabited
+
+abbrev OperationalNumericState := Array OperationalNumericSlot
+
+def factNumericSlot : OperationalFact → OperationalNumericSlot
+  | fact@(.matrix _) | fact@(.trapdoor _) | fact@(.familyUniform _ _ _ _) =>
+      { matrixMaximum := factClosedMaximum fact }
+  | .integer fact => { integerLower := some fact.lower, integerUpper := some fact.upper }
+  | _ => {}
+
+private def lookupPrevious
+    (states : List OperationalNumericState) : OperationalBoundPath → Option Int
+  | .matrixMaximum depth slot => states[depth]? >>= fun state => state[slot]? >>= (·.matrixMaximum)
+  | .integerLower depth slot => states[depth]? >>= fun state => state[slot]? >>= (·.integerLower)
+  | .integerUpper depth slot => states[depth]? >>= fun state => state[slot]? >>= (·.integerUpper)
+
+private def operationalBoundPathSlot : OperationalBoundPath → Nat
+  | .matrixMaximum _ slot | .integerLower _ slot | .integerUpper _ slot => slot
+
+private def operationalBoundPathAtCurrentDepth : OperationalBoundPath → Bool
+  | .matrixMaximum depth _ | .integerLower depth _ | .integerUpper depth _ => depth = 0
+
+private def numericStateFromComponents
+    (paths : List OperationalBoundPath)
+    (values : List Int) : Except OperationalError OperationalNumericState := do
+  if paths.length != values.length then
+    throw (.unsupportedOutputArity values.length paths.length)
+  if paths.any fun path => !operationalBoundPathAtCurrentDepth path then
+    throw (.invalidPreviousPath (paths.find? (fun path =>
+      !operationalBoundPathAtCurrentDepth path) |>.getD (.matrixMaximum 0 0)))
+  let size := paths.foldl (fun current path => max current (operationalBoundPathSlot path + 1)) 0
+  let mut result : OperationalNumericState := Array.replicate size {}
+  for (path, value) in paths.zip values do
+    let slot := operationalBoundPathSlot path
+    let previous := result[slot]!
+    result := result.set! slot <| match path with
+      | .matrixMaximum _ _ => { previous with matrixMaximum := some value }
+      | .integerLower _ _ => { previous with integerLower := some value }
+      | .integerUpper _ _ => { previous with integerUpper := some value }
+  pure result
+
+private def factMaximumExpr : OperationalFact → Option OperationalBoundExpr
+  | .matrix fact => some fact.totalHardBound
+  | .trapdoor fact => some fact.maximum
+  | .familyUniform _ _ element _ => factMaximumExpr element
+  | _ => none
+
+private def factNumericExpressions
+    (slot : Nat) : OperationalFact → List (OperationalBoundPath × OperationalBoundExpr)
+  | .matrix fact => [(.matrixMaximum 0 slot, fact.totalHardBound)]
+  | .trapdoor fact => [(.matrixMaximum 0 slot, fact.maximum)]
+  | .integer fact => [
+      (.integerLower 0 slot, fact.lowerExpression),
+      (.integerUpper 0 slot, fact.upperExpression)
+    ]
+  | .familyUniform _ _ element _ => factNumericExpressions slot element
+  | _ => []
+
+private def abstractCarriedMaximum (slot : Nat) : OperationalFact → OperationalFact
+  | .matrix fact => .matrix {
+      fact with totalHardBound := .previous (.matrixMaximum 0 slot) }
+  | .trapdoor fact => .trapdoor { fact with maximum := .previous (.matrixMaximum 0 slot) }
+  | .integer fact => .integer {
+      fact with
+      lowerExpression := .previous (.integerLower 0 slot)
+      upperExpression := .previous (.integerUpper 0 slot)
+    }
+  | .familyUniform binder coordinate element count =>
+      .familyUniform binder coordinate (abstractCarriedMaximum slot element) count
+  | fact => fact
+
+private def setFactMaximum (maximum : Int) : OperationalFact → OperationalFact
+  | .matrix fact => .matrix {
+      fact with totalHardBound := .closedInt (.constant maximum) }
+  | .trapdoor fact => .trapdoor { fact with maximum := .closedInt (.constant maximum) }
+  | .familyUniform binder coordinate element count =>
+      .familyUniform binder coordinate (setFactMaximum maximum element) count
+  | fact => fact
+
+private def setFactMaximumExpr
+    (maximum : OperationalBoundExpr) : OperationalFact → OperationalFact
+  | .matrix fact => .matrix { fact with totalHardBound := maximum }
+  | .trapdoor fact => .trapdoor { fact with maximum }
+  | .familyUniform binder coordinate element count =>
+      .familyUniform binder coordinate (setFactMaximumExpr maximum element) count
+  | fact => fact
+
+private def sameCarriedSchema : OperationalFact → OperationalFact → Bool
+  | .matrix left, .matrix right =>
+      left.matrixParams.modulus == right.matrixParams.modulus &&
+      left.matrixParams.ringDimension == right.matrixParams.ringDimension &&
+      left.matrixParams.rows == right.matrixParams.rows &&
+      left.matrixParams.columns == right.matrixParams.columns &&
+      left.canonicalRange == right.canonicalRange &&
+      left.identity.isNone && right.identity.isNone &&
+      left.relations.isEmpty && right.relations.isEmpty &&
+      left.polynomial.map operationalLargeFactorCount ==
+        right.polynomial.map operationalLargeFactorCount
+  | .familyUniform _ leftCoordinate left leftCount,
+      .familyUniform _ rightCoordinate right rightCount =>
+      -- Producer/binder identities are values, not schema: each loop body necessarily creates a
+      -- different family producer than the initial carried family.  Uniform-vs-nonuniform shape,
+      -- count, and element schema are the invariant parts.
+      leftCoordinate.isSome == rightCoordinate.isSome &&
+        leftCount == rightCount && sameCarriedSchema left right
+  | .integer _, .integer _ => true
+  | .boolean, .boolean | .real, .real => true
+  | _, _ => false
+
+private def carriedLargeFactorCounts : OperationalFact → List Nat
+  | .matrix fact => fact.polynomial.map operationalLargeFactorCount
+  | .familyUniform _ _ element _ => carriedLargeFactorCounts element
+  | _ => []
 
 def intExprIsClosed : IntExpr → Bool
   | .constant _ => true
@@ -109,48 +1161,336 @@ def intExprIsClosed : IntExpr → Bool
       .roundDivide left right => intExprIsClosed left && intExprIsClosed right
   | .log2Ceil value => intExprIsClosed value
 
-def OperationalBoundExpr.evaluate
+private def intExprUsesLoop (slot : Nat) : IntExpr → Bool
+  | .constant _ | .parameter _ => false
+  | .loopIndex candidate => candidate == slot
+  | .add left right | .subtract left right | .multiply left right | .divide left right |
+      .roundDivide left right => intExprUsesLoop slot left || intExprUsesLoop slot right
+  | .log2Ceil value => intExprUsesLoop slot value
+
+private def intExprUsesParameter (name : String) : IntExpr → Bool
+  | .constant _ | .loopIndex _ => false
+  | .parameter candidate => candidate == name
+  | .add left right | .subtract left right | .multiply left right | .divide left right |
+      .roundDivide left right => intExprUsesParameter name left || intExprUsesParameter name right
+  | .log2Ceil value => intExprUsesParameter name value
+
+def replaceLoopIndex
+    (environment : ParamEnvironment) (slot : Nat) (value : Nat) : ParamEnvironment :=
+  (ParamKey.loopIndex slot, ParamValue.integer (Int.ofNat value)) ::
+    environment.filter fun entry => entry.1 != .loopIndex slot
+
+def replaceParameter
+    (environment : ParamEnvironment) (name : String) (value : Int) : ParamEnvironment :=
+  (ParamKey.parameter name, ParamValue.integer value) ::
+    environment.filter fun entry => entry.1 != .parameter name
+
+/-- Evaluates only the numeric expression over the loop coordinates it actually references.
+This never reevaluates an IR scope and allocates no lane facts. -/
+private def evaluateIntOverLoops
     (environment : ParamEnvironment)
-    (previousState : OperationalState) : OperationalBoundExpr → Except OperationalError Int
+    (domains : List OperationalParameterDomain)
+    (expression : IntExpr) : Except OperationalError (List Int) := do
+  let rec visit (environment : ParamEnvironment) : List OperationalParameterDomain →
+      Except OperationalError (List Int)
+    | [] => match expression.evaluate environment with
+        | some value => pure [value]
+        | none => throw .nonClosedExpression
+    | .loopIndex slot count :: tail =>
+        if !intExprUsesLoop slot expression || count = 0 then visit environment tail else
+          return (← (List.range count).mapM fun index =>
+            visit (replaceLoopIndex environment slot index) tail).flatten
+    | .parameter name sourceEnvironment sourceDomains sourceExpression :: tail =>
+        if !intExprUsesParameter name expression then visit environment tail else do
+          let values ← evaluateIntOverLoops sourceEnvironment sourceDomains sourceExpression
+          return (← values.mapM fun value =>
+            visit (replaceParameter environment name value) tail).flatten
+  visit environment domains
+
+private def evaluateIntMinimum
+    (environment : ParamEnvironment) (domains : List OperationalParameterDomain)
+    (expression : IntExpr) : Except OperationalError Int := do
+  match ← evaluateIntOverLoops environment domains expression with
+  | [] => throw .nonClosedExpression
+  | first :: tail => pure (tail.foldl min first)
+
+private def evaluateIntMaximum
+    (environment : ParamEnvironment) (domains : List OperationalParameterDomain)
+    (expression : IntExpr) : Except OperationalError Int := do
+  match ← evaluateIntOverLoops environment domains expression with
+  | [] => throw .nonClosedExpression
+  | first :: tail => pure (tail.foldl max first)
+
+private def evaluateIntMaximumAbsolute
+    (environment : ParamEnvironment) (domains : List OperationalParameterDomain)
+    (expression : IntExpr) : Except OperationalError Int := do
+  let values ← evaluateIntOverLoops environment domains expression
+  pure (values.foldl (fun maximum value => max maximum (absolute value)) 0)
+
+def evaluateIntInvariant
+    (environment : ParamEnvironment) (domains : List OperationalParameterDomain)
+    (expression : IntExpr) : Except OperationalError Int := do
+  match ← evaluateIntOverLoops environment domains expression with
+  | [] => throw .nonClosedExpression
+  | first :: tail =>
+      if tail.all (· == first) then pure first else throw .nonClosedExpression
+
+private def extendParameterDomains
+    (environment : ParamEnvironment)
+    (domains : List OperationalParameterDomain)
+    (bindings : List (String × IntExpr)) : Except OperationalError (List OperationalParameterDomain) := do
+  let mut result := domains
+  for (name, expression) in bindings do
+    result := .parameter name environment domains expression :: result.filter fun domain => match domain with
+      | .parameter candidate _ _ _ => candidate != name
+      | .loopIndex _ _ => true
+  pure result
+
+def instantiateParameterDomains (slot index : Nat) :
+    List OperationalParameterDomain → List OperationalParameterDomain
+  | [] => []
+  | .loopIndex candidate count :: tail =>
+      if candidate = slot then instantiateParameterDomains slot index tail
+      else .loopIndex candidate count :: instantiateParameterDomains slot index tail
+  | .parameter name environment domains expression :: tail =>
+      .parameter name (replaceLoopIndex environment slot index)
+          (instantiateParameterDomains slot index domains) expression ::
+        instantiateParameterDomains slot index tail
+
+def materializeInvariantParameters
+    (environment : ParamEnvironment)
+    (domains : List OperationalParameterDomain) : Except OperationalError ParamEnvironment := do
+  let mut result := environment
+  for domain in domains do
+    match domain with
+    | .loopIndex _ _ => pure ()
+    | .parameter name sourceEnvironment sourceDomains sourceExpression =>
+        let value ← evaluateIntInvariant sourceEnvironment sourceDomains sourceExpression
+        result := replaceParameter result name value
+  pure result
+
+@[simp] theorem materializeInvariantParameters_nil (environment : ParamEnvironment) :
+    materializeInvariantParameters environment [] = .ok environment := by
+  rfl
+
+private def instantiateBoundLoopIndex (slot index : Nat) : OperationalBoundExpr → OperationalBoundExpr
+  | .closedInt value => .closedInt value
+  | .contextual kind environment domains value =>
+      .contextual kind (replaceLoopIndex environment slot index)
+        (instantiateParameterDomains slot index domains)
+        value
+  | .previous path => .previous path
+  | .negate value => .negate (instantiateBoundLoopIndex slot index value)
+  | .add left right => .add (instantiateBoundLoopIndex slot index left)
+      (instantiateBoundLoopIndex slot index right)
+  | .subtract left right => .subtract (instantiateBoundLoopIndex slot index left)
+      (instantiateBoundLoopIndex slot index right)
+  | .multiply left right => .multiply (instantiateBoundLoopIndex slot index left)
+      (instantiateBoundLoopIndex slot index right)
+  | .divide left right => .divide (instantiateBoundLoopIndex slot index left)
+      (instantiateBoundLoopIndex slot index right)
+  | .minimum left right => .minimum (instantiateBoundLoopIndex slot index left)
+      (instantiateBoundLoopIndex slot index right)
+  | .maximum left right => .maximum (instantiateBoundLoopIndex slot index left)
+      (instantiateBoundLoopIndex slot index right)
+  | .centeredCap modulus value => .centeredCap (instantiateBoundLoopIndex slot index modulus)
+      (instantiateBoundLoopIndex slot index value)
+  | .matrixProduct ringDimension innerDimension left right =>
+      .matrixProduct (instantiateBoundLoopIndex slot index ringDimension)
+        (instantiateBoundLoopIndex slot index innerDimension)
+        (instantiateBoundLoopIndex slot index left) (instantiateBoundLoopIndex slot index right)
+  | .recurrence count initial transition outputSlot =>
+      .recurrence count (initial.map (instantiateBoundLoopIndex slot index))
+        (transition.map (instantiateBoundLoopIndex slot index)) outputSlot
+  | .recurrenceState count paths initial transition output =>
+      .recurrenceState count paths (initial.map (instantiateBoundLoopIndex slot index))
+        (transition.map (instantiateBoundLoopIndex slot index)) output
+
+private def shiftPreviousDepthFrom (cutoff : Nat) : OperationalBoundExpr → OperationalBoundExpr
+  | .closedInt value => .closedInt value
+  | .contextual kind environment domains value => .contextual kind environment domains value
+  | .previous (.matrixMaximum depth slot) =>
+      .previous (.matrixMaximum (if cutoff ≤ depth then depth + 1 else depth) slot)
+  | .previous (.integerLower depth slot) =>
+      .previous (.integerLower (if cutoff ≤ depth then depth + 1 else depth) slot)
+  | .previous (.integerUpper depth slot) =>
+      .previous (.integerUpper (if cutoff ≤ depth then depth + 1 else depth) slot)
+  | .negate value => .negate (shiftPreviousDepthFrom cutoff value)
+  | .add left right => .add (shiftPreviousDepthFrom cutoff left)
+      (shiftPreviousDepthFrom cutoff right)
+  | .subtract left right => .subtract (shiftPreviousDepthFrom cutoff left)
+      (shiftPreviousDepthFrom cutoff right)
+  | .multiply left right => .multiply (shiftPreviousDepthFrom cutoff left)
+      (shiftPreviousDepthFrom cutoff right)
+  | .divide left right => .divide (shiftPreviousDepthFrom cutoff left)
+      (shiftPreviousDepthFrom cutoff right)
+  | .minimum left right => .minimum (shiftPreviousDepthFrom cutoff left)
+      (shiftPreviousDepthFrom cutoff right)
+  | .maximum left right => .maximum (shiftPreviousDepthFrom cutoff left)
+      (shiftPreviousDepthFrom cutoff right)
+  | .centeredCap modulus value => .centeredCap (shiftPreviousDepthFrom cutoff modulus)
+      (shiftPreviousDepthFrom cutoff value)
+  | .matrixProduct ringDimension innerDimension left right =>
+      .matrixProduct (shiftPreviousDepthFrom cutoff ringDimension)
+        (shiftPreviousDepthFrom cutoff innerDimension) (shiftPreviousDepthFrom cutoff left)
+        (shiftPreviousDepthFrom cutoff right)
+  | .recurrence count initial transition slot =>
+      .recurrence count (initial.map (shiftPreviousDepthFrom cutoff))
+        (transition.map (shiftPreviousDepthFrom (cutoff + 1))) slot
+  | .recurrenceState count paths initial transition output =>
+      .recurrenceState count paths (initial.map (shiftPreviousDepthFrom cutoff))
+        (transition.map (shiftPreviousDepthFrom (cutoff + 1))) output
+
+private def shiftPreviousDepth := shiftPreviousDepthFrom 0
+
+private def OperationalBoundExpr.usesPrevious : OperationalBoundExpr → Bool
+  | .closedInt _ | .contextual .. => false
+  | .previous _ => true
+  | .negate value => value.usesPrevious
+  | .add left right | .subtract left right | .multiply left right | .divide left right |
+      .minimum left right | .maximum left right | .centeredCap left right =>
+      left.usesPrevious || right.usesPrevious
+  | .matrixProduct ringDimension innerDimension left right =>
+      ringDimension.usesPrevious || innerDimension.usesPrevious || left.usesPrevious ||
+        right.usesPrevious
+  | .recurrence .. | .recurrenceState .. => true
+
+def OperationalBoundExpr.evaluateWithStates
+    (environment : ParamEnvironment)
+    (previousStates : List OperationalNumericState) : OperationalBoundExpr → Except OperationalError Int
   | .closedInt value => do
       if !intExprIsClosed value then throw .nonClosedExpression
       match value.evaluate environment with
       | some result => pure result
       | none => throw .nonClosedExpression
+  | .contextual kind contextualEnvironment domains value =>
+      match kind with
+      | .minimum => evaluateIntMinimum contextualEnvironment domains value
+      | .maximum => evaluateIntMaximum contextualEnvironment domains value
+      | .maximumAbsolute => evaluateIntMaximumAbsolute contextualEnvironment domains value
   | .previous path =>
-      match lookupPrevious previousState path with
+      match lookupPrevious previousStates path with
       | some result => pure result
       | none => throw (.invalidPreviousPath path)
-  | .negate value => return -(← value.evaluate environment previousState)
-  | .add left right => return (← left.evaluate environment previousState) +
-      (← right.evaluate environment previousState)
-  | .subtract left right => return (← left.evaluate environment previousState) -
-      (← right.evaluate environment previousState)
-  | .multiply left right => return (← left.evaluate environment previousState) *
-      (← right.evaluate environment previousState)
+  | .negate value => return -(← value.evaluateWithStates environment previousStates)
+  | .add left right => return (← left.evaluateWithStates environment previousStates) +
+      (← right.evaluateWithStates environment previousStates)
+  | .subtract left right => return (← left.evaluateWithStates environment previousStates) -
+      (← right.evaluateWithStates environment previousStates)
+  | .multiply left right => return (← left.evaluateWithStates environment previousStates) *
+      (← right.evaluateWithStates environment previousStates)
   | .divide left right => do
-      let denominator ← right.evaluate environment previousState
+      let denominator ← right.evaluateWithStates environment previousStates
       if denominator = 0 then throw .divisionByZero
       if denominator < 0 then throw (.negativeDenominator denominator)
-      return (← left.evaluate environment previousState) / denominator
+      return (← left.evaluateWithStates environment previousStates) / denominator
   | .minimum left right => do
-      let left ← left.evaluate environment previousState
-      let right ← right.evaluate environment previousState
+      let left ← left.evaluateWithStates environment previousStates
+      let right ← right.evaluateWithStates environment previousStates
       return min left right
   | .maximum left right => do
-      let left ← left.evaluate environment previousState
-      let right ← right.evaluate environment previousState
+      let left ← left.evaluateWithStates environment previousStates
+      let right ← right.evaluateWithStates environment previousStates
       return max left right
   | .centeredCap modulus value => do
-      let modulus ← modulus.evaluate environment previousState
-      let value ← value.evaluate environment previousState
+      let modulus ← modulus.evaluateWithStates environment previousStates
+      let value ← value.evaluateWithStates environment previousStates
       return capCentered modulus value
   | .matrixProduct ringDimension innerDimension left right => do
-      let ringDimension ← ringDimension.evaluate environment previousState
-      let innerDimension ← innerDimension.evaluate environment previousState
-      let left ← left.evaluate environment previousState
-      let right ← right.evaluate environment previousState
+      let ringDimension ← ringDimension.evaluateWithStates environment previousStates
+      let innerDimension ← innerDimension.evaluateWithStates environment previousStates
+      let left ← left.evaluateWithStates environment previousStates
+      let right ← right.evaluateWithStates environment previousStates
       return ringDimension * innerDimension * left * right
+  | .recurrence count initial transition slot => do
+      if initial.length != transition.length then
+        throw (.unsupportedOutputArity transition.length initial.length)
+      let initialValues ← initial.mapM (OperationalBoundExpr.evaluateWithStates environment previousStates)
+      let initialState : OperationalNumericState := initialValues.map
+        (fun value => { matrixMaximum := some value }) |>.toArray
+      let rec iterate : Nat → OperationalNumericState → Except OperationalError OperationalNumericState
+        | 0, state => pure state
+        | remaining + 1, state => do
+            let values ← transition.mapM
+              (OperationalBoundExpr.evaluateWithStates environment (state :: previousStates))
+            iterate remaining (values.map (fun value => { matrixMaximum := some value }) |>.toArray)
+      let finalState ← iterate count initialState
+      match finalState[slot]? >>= (·.matrixMaximum) with
+      | some value => pure value
+      | none => throw (.invalidPreviousPath (.matrixMaximum 0 slot))
+  | .recurrenceState count paths initial transition output => do
+      if paths.length != initial.length || initial.length != transition.length then
+        throw (.unsupportedOutputArity transition.length initial.length)
+      let initialValues ← initial.mapM
+        (OperationalBoundExpr.evaluateWithStates environment previousStates)
+      let initialState ← numericStateFromComponents paths initialValues
+      let rec iterateState : Nat → OperationalNumericState →
+          Except OperationalError OperationalNumericState
+        | 0, state => pure state
+        | remaining + 1, state => do
+            let values ← transition.mapM
+              (OperationalBoundExpr.evaluateWithStates environment (state :: previousStates))
+            iterateState remaining (← numericStateFromComponents paths values)
+      let finalState ← iterateState count initialState
+      match lookupPrevious [finalState] output with
+      | some value => pure value
+      | none => throw (.invalidPreviousPath output)
+
+@[simp] theorem OperationalBoundExpr.evaluateWithStates_closedConstant
+    (environment : ParamEnvironment)
+    (previousStates : List OperationalNumericState)
+    (value : Int) :
+    OperationalBoundExpr.evaluateWithStates environment previousStates
+      (.closedInt (.constant value)) = .ok value := by
+  simp [OperationalBoundExpr.evaluateWithStates, intExprIsClosed, IntExpr.evaluate]
+  rfl
+
+@[simp] theorem OperationalBoundExpr.evaluateWithStates_contextualMaximum_nil
+    (environment : ParamEnvironment)
+    (previousStates : List OperationalNumericState)
+    (value : IntExpr)
+    (result : Int)
+    (evaluates : value.evaluate environment = some result) :
+    OperationalBoundExpr.evaluateWithStates environment previousStates
+      (.contextual .maximum environment [] value) = .ok result := by
+  simp [OperationalBoundExpr.evaluateWithStates, evaluateIntMaximum, evaluateIntOverLoops,
+    evaluateIntOverLoops.visit, evaluates]
+  rfl
+
+def OperationalBoundExpr.evaluate
+    (environment : ParamEnvironment)
+    (previousState : OperationalState)
+    (expression : OperationalBoundExpr) : Except OperationalError Int :=
+  expression.evaluateWithStates environment [previousState.map factNumericSlot]
+
+private def setFactRecurrenceState
+    (count : Nat)
+    (paths : List OperationalBoundPath)
+    (initial transition : List OperationalBoundExpr)
+    (slot : Nat)
+    (environment : ParamEnvironment) : OperationalFact → Except OperationalError OperationalFact
+  | .matrix fact =>
+      let maximum := OperationalBoundExpr.recurrenceState
+        count paths initial transition (.matrixMaximum 0 slot)
+      pure (.matrix { fact with totalHardBound := maximum })
+  | .trapdoor fact =>
+      let maximum := OperationalBoundExpr.recurrenceState
+        count paths initial transition (.matrixMaximum 0 slot)
+      pure (.trapdoor { fact with maximum })
+  | .integer fact => do
+      let lowerExpression :=
+        .recurrenceState count paths initial transition (.integerLower 0 slot)
+      let upperExpression :=
+        .recurrenceState count paths initial transition (.integerUpper 0 slot)
+      let lower ← lowerExpression.evaluateWithStates environment []
+      let upper ← upperExpression.evaluateWithStates environment []
+      if lower > upper then throw (.invalidBound slot lower)
+      pure (.integer { fact with lower, upper, lowerExpression, upperExpression })
+  | .familyUniform binder coordinate element familyCount =>
+      return .familyUniform binder coordinate
+        (← setFactRecurrenceState count paths initial transition slot environment element)
+        familyCount
+  | fact => pure fact
 
 def evaluateTransition
     (environment : ParamEnvironment)
@@ -160,11 +1500,7 @@ def evaluateTransition
     throw (.unsupportedOutputArity transition.size previousState.size)
   let values ← transition.toList.mapM (OperationalBoundExpr.evaluate environment previousState)
   let next := values.zip previousState.toList |>.map fun (value, previous) =>
-    match previous with
-    | .matrix matrixType _ => .matrix matrixType value
-    | .trapdoor matrixType _ => .trapdoor matrixType value
-    | .integer lower upper => .integer (min lower value) (max upper value)
-    | other => other
+    setFactMaximum value previous
   pure next.toArray
 
 def repeatTransition
@@ -178,35 +1514,72 @@ def repeatTransition
       let next ← evaluateTransition environment state transition
       repeatTransition count environment transition next
 
+def fallbackMatrixFact
+    (node port : Nat)
+    (matrixType : MatrixTypeExpr)
+    (environment : ParamEnvironment) : Except OperationalError OperationalFact := do
+  let cap ← match matrixCap matrixType environment with
+    | some cap => pure cap
+    | none => throw (.invalidMatrixParameters node)
+  let params ← match matrixType.evaluate environment (.constant cap) with
+    | some params => pure params
+    | none => throw (.invalidMatrixParameters node)
+  let fact : OperationalMatrixFact := {
+    subject := { node, port }
+    origin := .value temporaryScope { node, port }
+    matrixType
+    matrixParams := params
+    totalHardBound := .closedInt (.constant cap)
+  }
+  pure (.matrix (fact.initializePrimitivePolynomial .large))
+
 def defaultFact
     (node : Nat)
+    (port : Nat)
     (wireType : WireTypeExpr)
     (environment : ParamEnvironment) : Except OperationalError OperationalFact :=
   match wireType with
-  | .matrix matrixType =>
-      match matrixCap matrixType environment with
-      | some cap => pure (.matrix matrixType cap)
-      | none => throw (.invalidMatrixParameters node)
+  | .matrix matrixType => fallbackMatrixFact node port matrixType environment
   | .trapdoor matrixType _ _ _ _ =>
       match matrixCap matrixType environment with
-      | some cap => pure (.trapdoor matrixType cap)
+      | some cap => do
+          let params ← match matrixType.evaluate environment (.constant cap) with
+            | some params => pure params
+            | none => throw (.invalidMatrixParameters node)
+          pure (.trapdoor {
+            subject := { node, port }
+            matrixType
+            matrixParams := params
+            maximum := .closedInt (.constant cap)
+            publicIdentity := .sampledTrapdoor temporaryScope { node, port := 0 }
+          })
       | none => throw (.invalidMatrixParameters node)
-  | .integer | .constantInt => pure (.integer 0 0)
+  | .integer | .constantInt => pure (.integer {
+      subject := { node, port }
+      origin := .local temporaryScope { node, port }
+      lower := 0
+      upper := 0
+      lowerExpression := .closedInt (.constant 0)
+      upperExpression := .closedInt (.constant 0)
+    })
   | .boolean | .constantBool => pure .boolean
   | .real | .constantReal => pure .real
   | .bytes length =>
       match length.evaluate environment with
-      | some value => pure (.bytes value)
+      | some value => pure (.bytes {
+          subject := { node, port }
+          origin := .local temporaryScope { node, port }
+          length := value
+        })
       | none => throw (.invalidCount node 0)
   | .typedBlob typeName _ => pure (.typedBlob typeName)
-  | .preimage matrixType =>
-      match matrixCap matrixType environment with
-      | some cap => pure (.matrix matrixType cap)
-      | none => throw (.invalidMatrixParameters node)
+  | .preimage matrixType => fallbackMatrixFact node port matrixType environment
   | .indexedFamily element count => do
-      let element ← defaultFact node element environment
+      let element ← defaultFact node port element environment
       match count.evaluate environment with
-      | some value => pure (.family element value)
+      | some value => pure (.familyUniform
+          { owner := .root (.standalone 0), producerNode := node, binderSlot := port }
+          none element value)
       | none => throw (.invalidCount node 0)
 
 def lookupFact
@@ -217,13 +1590,147 @@ def lookupFact
   | some fact => pure fact
   | none => throw (.missingOperand node wire)
 
+def integerFactAt
+    (node : Nat)
+    (facts : OperationalScopeFacts)
+    (wire : WireRef) : Except OperationalError OperationalIntegerFact := do
+  match ← lookupFact node facts wire with
+  | .integer fact => pure fact
+  | _ => throw (.operandNotInteger node wire)
+
+private def requireBooleanFact
+    (node : Nat)
+    (facts : OperationalScopeFacts)
+    (wire : WireRef) : Except OperationalError Unit := do
+  match ← lookupFact node facts wire with
+  | .boolean => pure ()
+  | _ => throw (.operandNotBoolean node wire)
+
+private def requireRealFact
+    (node : Nat)
+    (facts : OperationalScopeFacts)
+    (wire : WireRef) : Except OperationalError Unit := do
+  match ← lookupFact node facts wire with
+  | .real => pure ()
+  | _ => throw (.operandNotReal node wire)
+
+private def integerFact
+    (node port : Nat)
+    (lower upper : Int) : Except OperationalError OperationalFact := do
+  if lower > upper then throw (.invalidBound node lower)
+  pure (.integer {
+    subject := { node, port }
+    origin := .local temporaryScope { node, port }
+    lower
+    upper
+    lowerExpression := .closedInt (.constant lower)
+    upperExpression := .closedInt (.constant upper)
+  })
+
+private def integerFactWithExpressions
+    (node port : Nat)
+    (lower upper : Int)
+    (lowerExpression upperExpression : OperationalBoundExpr) :
+    Except OperationalError OperationalFact := do
+  if lower > upper then throw (.invalidBound node lower)
+  pure (.integer {
+    subject := { node, port }
+    origin := .local temporaryScope { node, port }
+    lower
+    upper
+    lowerExpression
+    upperExpression
+  })
+
+private structure OperationalIntegerInterval where
+  lower : Int
+  upper : Int
+  lowerExpression : OperationalBoundExpr
+  upperExpression : OperationalBoundExpr
+
+private def integerBinaryInterval
+    (node : Nat)
+    (operation : IntBinaryOp)
+    (left right : OperationalIntegerFact) : Except OperationalError OperationalIntegerInterval := do
+  match operation with
+  | .add => pure {
+      lower := left.lower + right.lower
+      upper := left.upper + right.upper
+      lowerExpression := .add left.lowerExpression right.lowerExpression
+      upperExpression := .add left.upperExpression right.upperExpression
+    }
+  | .subtract => pure {
+      lower := left.lower - right.upper
+      upper := left.upper - right.lower
+      lowerExpression := .subtract left.lowerExpression right.upperExpression
+      upperExpression := .subtract left.upperExpression right.lowerExpression
+    }
+  | .multiply =>
+      let values := [
+        left.lower * right.lower,
+        left.lower * right.upper,
+        left.upper * right.lower,
+        left.upper * right.upper
+      ]
+      match values with
+      | [] => throw (.invalidBound node 0)
+      | first :: tail =>
+          let expressions := [
+            OperationalBoundExpr.multiply left.lowerExpression right.lowerExpression,
+            OperationalBoundExpr.multiply left.lowerExpression right.upperExpression,
+            OperationalBoundExpr.multiply left.upperExpression right.lowerExpression,
+            OperationalBoundExpr.multiply left.upperExpression right.upperExpression
+          ]
+          let firstExpression := expressions.headD (.closedInt (.constant first))
+          pure {
+            lower := tail.foldl min first
+            upper := tail.foldl max first
+            lowerExpression := expressions.drop 1 |>.foldl OperationalBoundExpr.minimum firstExpression
+            upperExpression := expressions.drop 1 |>.foldl OperationalBoundExpr.maximum firstExpression
+          }
+  | .divide =>
+      if left.lower < 0 then throw (.invalidBound node left.lower)
+      if right.lower ≤ 0 then throw .divisionByZero
+      pure {
+        lower := left.lower / right.upper
+        upper := left.upper / right.lower
+        lowerExpression := .divide left.lowerExpression right.upperExpression
+        upperExpression := .divide left.upperExpression right.lowerExpression
+      }
+  | .remainder =>
+      if left.lower < 0 then throw (.invalidBound node left.lower)
+      if right.lower ≤ 0 then throw .divisionByZero
+      pure {
+        lower := 0
+        upper := right.upper - 1
+        lowerExpression := .closedInt (.constant 0)
+        upperExpression := .subtract right.upperExpression (.closedInt (.constant 1))
+      }
+
 def matrixMaximum
     (node : Nat)
     (wire : WireRef)
     (facts : OperationalScopeFacts) : Except OperationalError Int := do
   match ← lookupFact node facts wire with
-  | .matrix _ maximum | .trapdoor _ maximum => pure maximum
+  | .matrix fact => fact.totalHardBound.evaluate [] #[]
+  | .trapdoor fact => fact.maximum.evaluate [] #[]
   | _ => throw (.operandNotMatrix node wire)
+
+def matrixMaximumExpr
+    (node : Nat)
+    (wire : WireRef)
+    (facts : OperationalScopeFacts) : Except OperationalError OperationalBoundExpr := do
+  match ← lookupFact node facts wire with
+  | .matrix fact => pure fact.totalHardBound
+  | .trapdoor fact => pure fact.maximum
+  | _ => throw (.operandNotMatrix node wire)
+
+def maximumArgumentExprs
+    (node : Nat)
+    (arguments : List WireRef)
+    (facts : OperationalScopeFacts) : Except OperationalError OperationalBoundExpr := do
+  let values ← arguments.mapM (matrixMaximumExpr node · facts)
+  pure <| values.foldl OperationalBoundExpr.maximum (.closedInt (.constant 0))
 
 def maximumArguments
     (node : Nat)
@@ -234,6 +1741,7 @@ def maximumArguments
 
 def cappedMatrixFact
     (nodeIndex : Nat)
+    (outputPort : Nat)
     (matrixType : MatrixTypeExpr)
     (environment : ParamEnvironment)
     (bound : Int) : Except OperationalError OperationalFact := do
@@ -241,147 +1749,2972 @@ def cappedMatrixFact
     | some value => pure value
     | none => throw (.invalidMatrixParameters nodeIndex)
   if bound < 0 then throw (.invalidBound nodeIndex bound)
-  pure (.matrix matrixType (min cap bound))
+  let maximum := min cap bound
+  let params ← match matrixType.evaluate environment (.constant maximum) with
+    | some params => pure params
+    | none => throw (.invalidMatrixParameters nodeIndex)
+  let fact : OperationalMatrixFact := {
+    subject := { node := nodeIndex, port := outputPort }
+    origin := .value temporaryScope { node := nodeIndex, port := outputPort }
+    matrixType
+    matrixParams := params
+    totalHardBound := .closedInt (.constant maximum)
+  }
+  pure (.matrix (fact.initializePrimitivePolynomial .bounded))
+
+def cappedMatrixFactExpr
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (environment : ParamEnvironment)
+    (bound : OperationalBoundExpr) : Except OperationalError OperationalFact := do
+  let cap ← match matrixCap matrixType environment with
+    | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
+  let parameterBound ← if bound.usesPrevious then pure cap else do
+    let maximum ← bound.evaluate environment #[]
+    if maximum < 0 then throw (.invalidBound nodeIndex maximum)
+    pure (min cap maximum)
+  let params ← match matrixType.evaluate environment (.constant parameterBound) with
+    | some params => pure params | none => throw (.invalidMatrixParameters nodeIndex)
+  let fact : OperationalMatrixFact := {
+    subject := { node := nodeIndex, port := outputPort }
+    origin := .value temporaryScope { node := nodeIndex, port := outputPort }
+    matrixType
+    matrixParams := params
+    totalHardBound := .minimum (.closedInt (.constant cap)) bound
+  }
+  pure (.matrix (fact.initializePrimitivePolynomial .bounded))
+
+def classifiedMatrixFact
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (environment : ParamEnvironment)
+    (bound : Int)
+    (large : Bool)
+    (canonicalRange : CanonicalRange := .unknown)
+    (metadata : OperationalMatrixMetadata := {}) : Except OperationalError OperationalFact := do
+  let fact ← cappedMatrixFact nodeIndex outputPort matrixType environment bound
+  match fact with
+  | .matrix fact =>
+      let role := if large then OperationalFactorRole.large else .bounded
+      pure (.matrix (({ fact with
+        totalHardBound := .closedInt (.constant bound), canonicalRange, metadata
+      }).initializePrimitivePolynomial role))
+  | _ => throw (.malformedRelation nodeIndex)
+
+def classifiedMatrixFactExpr
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (environment : ParamEnvironment)
+    (bound : OperationalBoundExpr)
+    (large : Bool)
+    (canonicalRange : CanonicalRange := .unknown)
+    (metadata : OperationalMatrixMetadata := {}) : Except OperationalError OperationalFact := do
+  let fact ← cappedMatrixFactExpr nodeIndex outputPort matrixType environment bound
+  match fact with
+  | .matrix fact =>
+      let cap ← match matrixCap matrixType environment with
+        | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
+      let totalHardBound := .minimum (.closedInt (.constant cap)) bound
+      let role := if large then OperationalFactorRole.large else .bounded
+      pure (.matrix (({ fact with totalHardBound, canonicalRange, metadata
+        }).initializePrimitivePolynomial role))
+  | _ => throw (.malformedRelation nodeIndex)
+
+def matrixTargetSummary (fact : OperationalMatrixFact) : RelationTargetSummary := {
+  origin := fact.origin
+  matrixType := fact.matrixType
+  matrixParams := fact.matrixParams
+  totalHardBound := fact.totalHardBound
+  canonicalRange := fact.canonicalRange
+  polynomial := relationSnapshotPolynomial fact.polynomial
+}
+
+def matrixFactAt
+    (node : Nat)
+    (facts : OperationalScopeFacts)
+    (wire : WireRef) : Except OperationalError OperationalMatrixFact := do
+  match ← lookupFact node facts wire with
+  | .matrix fact => pure fact
+  | _ => throw (.operandNotMatrix node wire)
+
+private def operationalProductFromFactors
+    (factors : List OperationalFactorKey) : Except OperationalFlatError OperationalProductKey := do
+  let first ← match factors.head? with
+    | some factor => pure factor
+    | none => throw .malformedProduct
+  let rec visit
+      (previousType : MatrixTypeExpr)
+      (remaining : List OperationalFactorKey)
+      (modes : List OperationalProductMode) :
+      Except OperationalFlatError (List OperationalProductMode × MatrixTypeExpr) := do
+    match remaining with
+    | [] => pure (modes, previousType)
+    | factor :: tail =>
+        let (mode, outputType) ← inferOperationalProductMode previousType factor.inputType
+        visit outputType tail (modes ++ [mode])
+  let (modes, outputType) ← visit first.outputType (factors.drop 1) []
+  pure { factors, modes, outputType }
+
+private def factorPublicIdentity? (factor : OperationalFactorKey) : Option PublicMatrixIdentity :=
+  match factor.leaf with
+  | .primitive (.publicMatrix identity) => some identity
+  | _ => none
+
+private def factorPrimitiveOrigin? (factor : OperationalFactorKey) : Option MatrixOriginIdentity :=
+  match factor.leaf with
+  | .primitive (.matrix origin) => some origin
+  | _ => none
+
+private def matchingFactorRelation?
+    (left right : OperationalFactorKey) : Option OperationalMatrixRelation := do
+  if !left.transforms.isEmpty || !right.transforms.isEmpty then none else pure ()
+  let publicIdentity ← factorPublicIdentity? left
+  let producer ← factorPrimitiveOrigin? right
+  right.relations.find? fun relation =>
+    match relation with
+      | .decomposition value => value.publicIdentity == publicIdentity &&
+          value.producer == producer &&
+            value.status == ReconstructionStatus.available
+      | .preimage value => value.publicIdentity == publicIdentity && value.producer == producer
+
+private def rewriteOperationalTermRelation?
+    (node : Nat)
+    (term : OperationalTerm) : Except OperationalError (Option OperationalPolynomial) := do
+  let rec visit
+      (accumulated : List OperationalFactorKey) :
+      List OperationalFactorKey → Except OperationalError (Option OperationalPolynomial)
+    | left :: right :: tail =>
+        match matchingFactorRelation? left right with
+        | none => visit (accumulated ++ [left]) (right :: tail)
+        | some relation => do
+            let target := match relation with
+              | .decomposition value => value.inputSummary
+              | .preimage value => value.targetSummary
+            let targetPolynomial := operationalPolynomialFromSnapshot target.polynomial
+            if targetPolynomial.isEmpty then
+              throw (.malformedRelation node)
+            let rewritten ← targetPolynomial.mapM fun targetTerm => do
+              let product ← operationalProductFromFactors
+                (accumulated ++ targetTerm.product.factors ++ tail) |>.mapError
+                  (fun _ => OperationalError.invalidMatrixParameters node)
+              pure {
+                coefficient := term.coefficient * targetTerm.coefficient
+                product
+              }
+            pure (some rewritten)
+    | _ => pure none
+  visit [] term.product.factors
+
+private def rewriteOperationalRelations
+    (node : Nat)
+    (polynomial : OperationalPolynomial) : Except OperationalError OperationalPolynomial :=
+  let rec iterate : Nat → OperationalPolynomial → Except OperationalError OperationalPolynomial
+    | 0, _ => throw (.invalidMatrixParameters node)
+    | fuel + 1, current => do
+        let rewrites ← current.mapM (rewriteOperationalTermRelation? node)
+        if rewrites.all Option.isNone then pure current
+        else
+          let next := (current.zip rewrites).flatMap fun (term, rewrite) =>
+            rewrite.getD [term]
+          iterate fuel (normalizeOperationalTerms next)
+  iterate 64 polynomial
+
+private def sameConcreteMatrixShape (left right : Mxx.SamplerParams) : Bool :=
+  left.modulus == right.modulus &&
+    left.ringDimension == right.ringDimension &&
+    left.rows == right.rows &&
+    left.columns == right.columns
+
+private def equivalentRetypeOperationalFactor
+    (outputType : MatrixTypeExpr)
+    (standalone : Bool)
+    (factor : OperationalFactorKey) : OperationalFactorKey :=
+  let updateSummary (summary : OperationalBoundedFactorSummary) := {
+    summary with matrixType := outputType
+  }
+  let leaf := match factor.leaf with
+    | .boundedSummary origin summary => .boundedSummary origin (updateSummary summary)
+    | .exactTransform tokens _ => .exactTransform tokens outputType
+    | primitive => primitive
+  {
+    factor with
+    leaf
+    inputType := if standalone then outputType else factor.inputType
+    outputType
+    boundedSummary := factor.boundedSummary.map updateSummary
+  }
+
+/-- Canonicalize a matrix-type expression after proving that its evaluated shape is unchanged.
+This changes no value and records no transform, so relation-owner identities remain bare. -/
+private def equivalentRetypeOperationalPolynomial
+    (outputType : MatrixTypeExpr)
+    (input : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  input.mapM fun term => do
+    match term.product.factors.reverse with
+    | [] => throw .malformedProduct
+    | last :: reversePrefix =>
+        let replacement := equivalentRetypeOperationalFactor outputType reversePrefix.isEmpty last
+        let factors := (replacement :: reversePrefix).reverse
+        pure { term with product := { term.product with factors, outputType } }
+
+private def requireMatrixType
+    (node : Nat)
+    (wire : WireRef)
+    (expected : MatrixTypeExpr)
+    (facts : OperationalScopeFacts)
+    (environment : ParamEnvironment) : Except OperationalError OperationalMatrixFact := do
+  let fact ← matrixFactAt node facts wire
+  if fact.matrixType == expected then return fact
+  let expectedParams ← match expected.evaluate environment
+      (.constant fact.matrixParams.maxCoefficientBound) with
+    | some params => pure params
+    | none => throw (.invalidMatrixParameters node)
+  if !sameConcreteMatrixShape fact.matrixParams expectedParams then
+    throw (.outputTypeMismatch node)
+  let polynomial ← equivalentRetypeOperationalPolynomial expected fact.polynomial
+    |>.mapError fun error => OperationalError.flat node error
+  pure { fact with matrixType := expected, matrixParams := expectedParams, polynomial }
+
+def valueOriginAt
+    (scope : ScopeTemplateKey)
+    (node : Nat)
+    (facts : OperationalScopeFacts)
+    (wire : WireRef) : Except OperationalError OperationalValueOrigin := do
+  match ← lookupFact node facts wire with
+  | .integer fact => pure fact.origin
+  | .bytes fact => pure fact.origin
+  | .matrix { origin := .value originScope originWire, .. } =>
+      pure (.local originScope originWire)
+  | .matrix { origin := .protocolInput input, .. } => pure (.protocolInput input)
+  | _ => pure (.local scope wire)
+
+def operationalPolynomialNoiseSummary
+    (polynomial : OperationalPolynomial) :
+    Except OperationalFlatError (Option OperationalBoundedFactorSummary) := do
+  let noise := sortOperationalTerms
+    (normalizeOperationalTerms (polynomial.filter operationalTermIsNoise))
+  if noise.isEmpty then return none
+  let summaries ← noise.mapM boundedNoiseTermSummary
+  let firstTerm ← match noise.head? with
+    | some term => pure term
+    | none => throw .malformedProduct
+  let hardBound := (noise.zip summaries).foldl (fun current pair =>
+    .add current (.multiply
+      (.closedInt (.constant (operationalAbsoluteCoefficient pair.1.coefficient)))
+      pair.2.hardBound)) (.closedInt (.constant 0))
+  let tokens := [.sumStart] ++ ((noise.zip summaries).flatMap fun (term, summary) =>
+    boundedNoiseTermTokens term summary) ++ [.summaryBound hardBound, .sumEnd]
+  pure (some {
+    matrixType := firstTerm.product.outputType
+    hardBound
+    metadata := {
+      isConstantPolynomial := summaries.all (·.metadata.isConstantPolynomial)
+      knownZeroRows := none
+    }
+    provenance := tokens
+  })
+
+def OperationalMatrixFact.noiseHardBound
+    (fact : OperationalMatrixFact) : Except OperationalFlatError OperationalBoundExpr := do
+  match ← operationalPolynomialNoiseSummary fact.polynomial with
+  | some summary => pure summary.hardBound
+  | none => pure (.closedInt (.constant 0))
+
+def OperationalMatrixFact.evaluateNoiseHardBound
+    (fact : OperationalMatrixFact)
+    (environment : ParamEnvironment)
+    (states : List OperationalNumericState := []) : Except OperationalError Int := do
+  let expression ← fact.noiseHardBound |>.mapError fun _ =>
+    OperationalError.invalidMatrixParameters fact.subject.node
+  expression.evaluateWithStates environment states
+
+private def flatErrorAt (node : Nat) : OperationalFlatError → OperationalError
+  | error => .flat node error
+
+private def polynomialMatrixFact
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (environment : ParamEnvironment)
+    (polynomial : OperationalPolynomial)
+    (canonicalRange : CanonicalRange := .unknown) : Except OperationalError OperationalFact := do
+  let polynomial ← normalizeOperationalPolynomial polynomial |>.mapError (flatErrorAt nodeIndex)
+  let cap ← match matrixCap matrixType environment with
+    | some value => pure value
+    | none => throw (.invalidMatrixParameters nodeIndex)
+  let noiseSummary ← operationalPolynomialNoiseSummary polynomial |>.mapError (flatErrorAt nodeIndex)
+  let totalHardBound :=
+    if polynomial.any operationalTermIsSignal then
+      .closedInt (.constant cap)
+    else match noiseSummary with
+      | some summary => .minimum (.closedInt (.constant cap)) summary.hardBound
+      | none => .closedInt (.constant 0)
+  let parameterBound :=
+    if totalHardBound.usesPrevious then cap
+    else match totalHardBound.evaluate environment #[] with
+      | .ok value => min cap value
+      | .error _ => cap
+  let params ← match matrixType.evaluate environment (.constant parameterBound) with
+    | some params => pure params
+    | none => throw (.invalidMatrixParameters nodeIndex)
+  let metadata := match noiseSummary with
+    | some summary => summary.metadata
+    | none => {}
+  pure (.matrix {
+    subject := { node := nodeIndex, port := outputPort }
+    origin := .value temporaryScope { node := nodeIndex, port := outputPort }
+    matrixType
+    matrixParams := params
+    totalHardBound
+    polynomial
+    metadata
+    canonicalRange
+  })
+
+private def exactOneIndicatorFactor
+    (scope : ScopeTemplateKey)
+    (node : Nat)
+    (selection : OperationalValueOrigin)
+    (branch : Nat)
+    (matrixType : MatrixTypeExpr) : OperationalFactorKey :=
+  let scalarType : MatrixTypeExpr := {
+    modulus := matrixType.modulus
+    ringDimension := matrixType.ringDimension
+    rows := .constant 1
+    columns := .constant 1
+  }
+  let binder : FamilyTemplateBinder := { owner := scope, producerNode := node, binderSlot := 0 }
+  let metadata : OperationalMatrixMetadata := { isConstantPolynomial := true }
+  let summary : OperationalBoundedFactorSummary := {
+    matrixType := scalarType
+    hardBound := .closedInt (.constant 1)
+    metadata
+    provenance := [.primitive (.selectionIndicator binder { index := selection } branch)]
+  }
+  {
+    leaf := .primitive (.selectionIndicator binder { index := selection } branch)
+    inputType := scalarType
+    outputType := scalarType
+    role := .bounded
+    boundedSummary := some summary
+    protections := [.exactOneIndicator]
+  }
+
+private def parameterScalarPolynomial
+    (environment : ParamEnvironment)
+    (domains : List OperationalParameterDomain)
+    (value : IntExpr)
+    (matrixType : MatrixTypeExpr) : OperationalPolynomial :=
+  let scalarType : MatrixTypeExpr := {
+    modulus := matrixType.modulus
+    ringDimension := matrixType.ringDimension
+    rows := .constant 1
+    columns := .constant 1
+  }
+  let identity := OperationalPrimitiveIdentity.parameterScalar environment domains value
+  let metadata : OperationalMatrixMetadata := { isConstantPolynomial := true }
+  let summary : OperationalBoundedFactorSummary := {
+    matrixType := scalarType
+    hardBound := .contextual .maximumAbsolute environment domains value
+    metadata
+    provenance := [.primitive identity]
+  }
+  [{
+    coefficient := 1
+    product := {
+      factors := [{
+        leaf := .primitive identity
+        inputType := scalarType
+        outputType := scalarType
+        role := .bounded
+        boundedSummary := some summary
+      }]
+      modes := []
+      outputType := scalarType
+    }
+  }]
+
+private def prependOperationalFactor
+    (factor : OperationalFactorKey)
+    (term : OperationalTerm) : Except OperationalFlatError OperationalTerm := do
+  let product ← operationalProductFromFactors (factor :: term.product.factors)
+  pure { term with product }
+
+private def maximumOperationalBounds : List OperationalBoundExpr → OperationalBoundExpr
+  | [] => .closedInt (.constant 0)
+  | head :: tail => tail.foldl OperationalBoundExpr.maximum head
+
+private def discardBranchLocalRelations (term : OperationalTerm) : OperationalTerm := {
+  term with product := {
+    term.product with factors := term.product.factors.map fun factor => {
+      factor with
+      protections := factor.protections.filter fun protection => match protection with
+        | .relationOwner | .decompositionOwner => false
+        | _ => true
+      relations := []
+    }
+  }
+}
+
+/-- Preserve exact-one branch structure for signal terms and use max, not a triangle sum, for the
+bounded noise selected from mutually exclusive branches. -/
+private def selectOperationalPolynomials
+    (scope : ScopeTemplateKey)
+    (node : Nat)
+    (selection : OperationalValueOrigin)
+    (matrixType : MatrixTypeExpr)
+    (branches : List OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  if branches.isEmpty then throw .malformedProduct
+  let indexed := branches.zipIdx
+  let signalRows ← indexed.mapM fun (branchTerms, branch) => do
+    let indicator := exactOneIndicatorFactor scope node selection branch matrixType
+    (branchTerms.filter operationalTermIsSignal).mapM (prependOperationalFactor indicator)
+  let branchNoise ← indexed.mapM fun (branchTerms, _) =>
+    compressBoundedNoiseSum
+      ((branchTerms.filter operationalTermIsNoise).map discardBranchLocalRelations)
+  let noiseSummaries ← branchNoise.mapM fun terms => match terms with
+    | [] => pure none
+    | [term] => match term.product.factors with
+      | [factor] => return some (← factorBoundedSummary factor)
+      | _ => throw .malformedProduct
+    | _ => throw .malformedProduct
+  let presentSummaries := noiseSummaries.filterMap id
+  let selectedNoise ← if presentSummaries.isEmpty then pure [] else do
+    let bound := maximumOperationalBounds (presentSummaries.map (·.hardBound))
+    let metadata : OperationalMatrixMetadata := {
+      isConstantPolynomial := presentSummaries.all (·.metadata.isConstantPolynomial)
+      knownZeroRows := none
+    }
+    let tokens := [.sumStart] ++ presentSummaries.flatMap (·.provenance) ++
+      [.summaryBound bound, .sumEnd]
+    let summary : OperationalBoundedFactorSummary := {
+      matrixType
+      hardBound := bound
+      metadata
+      provenance := tokens
+    }
+    let origin : OperationalCompressionOrigin := { kind := .boundedNoiseSum, tokens }
+    let factor : OperationalFactorKey := {
+      leaf := .boundedSummary origin summary
+      inputType := matrixType
+      outputType := matrixType
+      role := .bounded
+      boundedSummary := some summary
+    }
+    pure [{ coefficient := 1, product := { factors := [factor], modes := [], outputType := matrixType } }]
+  pure (normalizeOperationalTerms (signalRows.flatten ++ selectedNoise))
+
+private def transposeOperationalMatrixType (type : MatrixTypeExpr) : MatrixTypeExpr := {
+  type with rows := type.columns, columns := type.rows
+}
+
+private def transformOperationalFactor
+    (transform : OperationalFactorTransform)
+    (outputType : MatrixTypeExpr)
+    (factor : OperationalFactorKey) : OperationalFactorKey :=
+  let transformSummary (summary : OperationalBoundedFactorSummary) := {
+    summary with
+    matrixType := outputType
+    metadata := { summary.metadata with knownZeroRows := none }
+    provenance := summary.provenance ++ [.transform transform, .intermediateType outputType]
+  }
+  let leaf := match factor.leaf with
+    | .boundedSummary origin summary =>
+        let tokens := origin.tokens ++ [.transform transform, .intermediateType outputType]
+        .boundedSummary { origin with tokens } (transformSummary summary)
+    | .exactTransform tokens _ =>
+        .exactTransform (tokens ++ [.transform transform, .intermediateType outputType]) outputType
+    | primitive => primitive
+  {
+    factor with
+    leaf
+    transforms := factor.transforms ++ [transform]
+    inputType := outputType
+    outputType
+    boundedSummary := factor.boundedSummary.map transformSummary
+    protections := factor.protections.filter fun protection => match protection with
+      | .relationOwner | .decompositionOwner => false
+      | _ => true
+    relations := []
+  }
+
+private def replaceOperationalFactorAt
+    (index : Nat)
+    (replacement : OperationalFactorKey)
+    (factors : List OperationalFactorKey) : List OperationalFactorKey :=
+  let rec visit : Nat → List OperationalFactorKey → List OperationalFactorKey
+    | _, [] => []
+    | 0, _ :: tail => replacement :: tail
+    | remaining + 1, head :: tail => head :: visit remaining tail
+  visit index factors
+
+private def rowBoundaryIndex (product : OperationalProductKey) : Nat :=
+  let rec visit : Nat → List OperationalProductMode → Nat
+    | index, .leftPolynomialScalarBroadcast :: tail => visit (index + 1) tail
+    | index, _ => index
+  visit 0 product.modes
+
+private def columnBoundaryIndex (product : OperationalProductKey) : Nat :=
+  let rec skipRightScalars : Nat → List OperationalProductMode → Nat
+    | index, [] => index
+    | index, .rightPolynomialScalarBroadcast :: tail => skipRightScalars (index - 1) tail
+    | index, _ => index
+  skipRightScalars (product.factors.length - 1) product.modes.reverse
+
+private def transformOperationalBoundary
+    (axis : ConcatAxis)
+    (part : Nat)
+    (outputType : MatrixTypeExpr)
+    (term : OperationalTerm) : Except OperationalFlatError OperationalTerm := do
+  let applyAt (index : Nat) (transform : OperationalFactorTransform)
+      (changeType : MatrixTypeExpr → MatrixTypeExpr) :
+      Except OperationalFlatError OperationalProductKey := do
+    let factor ← match term.product.factors[index]? with
+      | some factor => pure factor
+      | none => throw OperationalFlatError.malformedProduct
+    let replacement := transformOperationalFactor transform (changeType factor.outputType) factor
+    operationalProductFromFactors
+      (replaceOperationalFactorAt index replacement term.product.factors)
+  let product ← match axis with
+    | .rows => applyAt (rowBoundaryIndex term.product) (.rowEmbed .rows part) (fun matrixType =>
+        { matrixType with rows := outputType.rows })
+    | .columns => applyAt (columnBoundaryIndex term.product) (.columnEmbed .columns part) (fun matrixType =>
+        { matrixType with columns := outputType.columns })
+    | .diagonal => do
+        let rowProduct ← applyAt (rowBoundaryIndex term.product) (.rowEmbed .diagonal part)
+          (fun matrixType => { matrixType with rows := outputType.rows })
+        let index := columnBoundaryIndex rowProduct
+        let factor ← match rowProduct.factors[index]? with
+          | some factor => pure factor
+          | none => throw .malformedProduct
+        let replacement := transformOperationalFactor (.columnEmbed .diagonal part)
+          { factor.outputType with columns := outputType.columns } factor
+        operationalProductFromFactors (replaceOperationalFactorAt index replacement rowProduct.factors)
+  pure { term with product }
+
+private def concatOperationalPolynomials
+    (axis : ConcatAxis)
+    (outputType : MatrixTypeExpr)
+    (inputs : List OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  let rows ← inputs.zipIdx.mapM fun (terms, part) =>
+    terms.mapM (transformOperationalBoundary axis part outputType)
+  pure (normalizeOperationalTerms rows.flatten)
+
+private def transposeOperationalPolynomial
+    (terms : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  let terms ← terms.mapM fun term => do
+    let factors := term.product.factors.reverse.map fun factor =>
+      transformOperationalFactor .transpose (transposeOperationalMatrixType factor.outputType) factor
+    let product ← operationalProductFromFactors factors
+    pure { term with product }
+  pure (normalizeOperationalTerms terms)
+
+private def sliceOperationalPolynomial
+    (rows columns : Option (IntExpr × IntExpr))
+    (outputType : MatrixTypeExpr)
+    (terms : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  let terms ← terms.mapM fun term => do
+    let term ← match rows with
+      | none => pure term
+      | some (start, stop) => do
+          let index := rowBoundaryIndex term.product
+          let factor ← match term.product.factors[index]? with
+            | some factor => pure factor
+            | none => throw .malformedProduct
+          let replacement := transformOperationalFactor (.rowSlice start stop)
+            { factor.outputType with rows := outputType.rows } factor
+          let product ← operationalProductFromFactors
+            (replaceOperationalFactorAt index replacement term.product.factors)
+          pure { term with product }
+    match columns with
+    | none => pure term
+    | some (start, stop) => do
+        let index := columnBoundaryIndex term.product
+        let factor ← match term.product.factors[index]? with
+          | some factor => pure factor
+          | none => throw .malformedProduct
+        let replacement := transformOperationalFactor (.columnSlice start stop)
+          { factor.outputType with columns := outputType.columns } factor
+        let product ← operationalProductFromFactors
+          (replaceOperationalFactorAt index replacement term.product.factors)
+        pure { term with product }
+  pure (normalizeOperationalTerms terms)
+
+private def boundedStructuralTransformPolynomial
+    (transform : OperationalFactorTransform)
+    (outputType : MatrixTypeExpr)
+    (input : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  if input.any operationalTermIsSignal then throw .cannotPreserveNoiseSeparation
+  let compressed ← compressBoundedNoiseSum input
+  compressed.mapM fun term => do
+    match term.product.factors with
+    | [factor] =>
+        let transformed := transformOperationalFactor transform outputType factor
+        pure { term with product := {
+          factors := [transformed]
+          modes := []
+          outputType
+        }}
+    | _ => throw .malformedProduct
+
+private def operationalProductTokens
+    (term : OperationalTerm) : List OperationalCompressionToken :=
+  [.productStart, .termStart term.coefficient] ++
+    term.product.factors.flatMap (fun factor => match factor.leaf with
+      | .primitive identity => [.primitive identity] ++
+          factor.transforms.map OperationalCompressionToken.transform
+      | .boundedSummary origin _ => origin.tokens
+      | .exactTransform tokens _ => tokens) ++
+    term.product.modes.map OperationalCompressionToken.productMode ++
+    [.intermediateType term.product.outputType, .termEnd, .productEnd]
+
+/-- Group the already-derived exact signal part of a BGG encoding while retaining its bounded
+noise as a separate top-level term.  The complete pre-grouping signal polynomial is embedded in a
+flat token sequence, so this cannot create a false cancellation or hide bounded noise.  The paired
+public-key/plaintext origins identify the one executable BGG value selected at runtime. -/
+private def groupExactSignal
+    (identityTokens : List OperationalCompressionToken)
+    (vector : OperationalMatrixFact) :
+    Except OperationalFlatError OperationalMatrixFact := do
+  let signal := sortOperationalTerms (vector.polynomial.filter operationalTermIsSignal)
+  let noise := vector.polynomial.filter operationalTermIsNoise
+  if signal.isEmpty then
+    return { vector with polynomial := (← compressBoundedNoiseSum noise) }
+  let tokens := [.groupStart] ++ identityTokens ++ [.sumStart] ++
+    signal.flatMap operationalProductTokens ++
+    [.sumEnd, .intermediateType vector.matrixType, .groupEnd]
+  let factor : OperationalFactorKey := {
+    leaf := .exactTransform tokens vector.matrixType
+    inputType := vector.matrixType
+    outputType := vector.matrixType
+    role := .large
+  }
+  let groupedSignal : OperationalTerm := {
+    coefficient := 1
+    product := { factors := [factor], modes := [], outputType := vector.matrixType }
+  }
+  let compressedNoise ← compressBoundedNoiseSum noise
+  pure { vector with polynomial := groupedSignal :: compressedNoise }
+
+private def groupBggEncodingSignal
+    (vector publicKey plaintext : OperationalMatrixFact) :
+    Except OperationalFlatError OperationalMatrixFact :=
+  groupExactSignal
+    [.primitive (.matrix publicKey.origin), .primitive (.matrix plaintext.origin)] vector
+
+private def groupBggEncodingFact : OperationalFact → OperationalFact → OperationalFact →
+    Except OperationalError OperationalFact
+  | .matrix vector, .matrix publicKey, .matrix plaintext =>
+      return .matrix (← groupBggEncodingSignal vector publicKey plaintext |>.mapError (.flat 0))
+  | .familyUniform vectorBinder vectorCoordinate vector vectorCount,
+      .familyUniform _ _ publicKey publicCount,
+      .familyUniform _ _ plaintext plaintextCount => do
+      if vectorCount != publicCount || vectorCount != plaintextCount then
+        throw (.invalidDerivationAttachment "mxx-bgg" "encoding-family-pairing")
+      return .familyUniform vectorBinder vectorCoordinate
+        (← groupBggEncodingFact vector publicKey plaintext) vectorCount
+  | _, _, _ => throw (.invalidDerivationAttachment "mxx-bgg" "encoding-family-pairing")
+
+private def groupPublicKeySignalFact : OperationalFact → Except OperationalError OperationalFact
+  | .matrix fact =>
+      return .matrix (← groupExactSignal [] fact |>.mapError (.flat 0))
+  | .familyUniform binder coordinate element count =>
+      return .familyUniform binder coordinate (← groupPublicKeySignalFact element) count
+  | _ => throw (.invalidDerivationAttachment "mxx-bgg" "public-key-signal-grouping")
+
+/-- Promote the output of a separately validated exact Boolean carrier selection to one Large
+signal factor. The validator below proves that this value is exactly `select(bit, zero, carrier)`
+with a deterministic constant carrier, so this grouping cannot hide sampler noise. -/
+private def groupProtocolBooleanSignalFact : OperationalFact → Except OperationalError OperationalFact
+  | .matrix fact =>
+      let tokens := [
+        .groupStart,
+        .primitive (.matrix fact.origin),
+        .intermediateType fact.matrixType,
+        .groupEnd
+      ]
+      let factor : OperationalFactorKey := {
+        leaf := .exactTransform tokens fact.matrixType
+        inputType := fact.matrixType
+        outputType := fact.matrixType
+        role := .large
+      }
+      let term : OperationalTerm := {
+        coefficient := 1
+        product := { factors := [factor], modes := [], outputType := fact.matrixType }
+      }
+      pure (.matrix { fact with polynomial := [term], metadata := {} })
+  | _ =>
+      throw (.invalidDerivationAttachment "mxx-correctness"
+        "protocol-boolean-signal-grouping")
+
+private def derivationAttachmentRole
+    (attachment : DerivationAttachment)
+    (role : String) : Except OperationalError WireRef :=
+  match attachment.roles.filter (fun candidate => candidate.1 == role) with
+  | [(_, wire)] => pure wire
+  | _ => throw (.missingDerivationAttachmentRole attachment.ownerNamespace attachment.ruleName role)
+
+private def validateDerivationAttachment
+    (scope : Scope) (attachment : DerivationAttachment) : Except OperationalError Unit := do
+  let isBggEncoding := attachment.ownerNamespace == "mxx-bgg" &&
+    attachment.ruleName == "encoding-family-pairing"
+  let isBggPublicKey := attachment.ownerNamespace == "mxx-bgg" &&
+    attachment.ruleName == "public-key-signal-grouping"
+  let isProtocolBoolean := attachment.ownerNamespace == "mxx-correctness" &&
+    attachment.ruleName == "protocol-boolean-signal-grouping"
+  if !(isBggEncoding || isBggPublicKey || isProtocolBoolean) then
+    throw (.unknownDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+  let required := if isBggEncoding then ["vector", "public-key", "plaintext"]
+    else if isProtocolBoolean then ["value", "selector", "zero", "carrier"]
+    else ["value"]
+  for role in required do
+    let wire ← derivationAttachmentRole attachment role
+    let outputCount ← match scope.nodes[wire.node]? with
+      | some node => pure node.outputCount
+      | none => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    if wire.port >= outputCount then
+      throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+  if attachment.roles.length != required.length then
+    throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+  if isProtocolBoolean then
+    let valueWire ← derivationAttachmentRole attachment "value"
+    let selectorWire ← derivationAttachmentRole attachment "selector"
+    let zeroWire ← derivationAttachmentRole attachment "zero"
+    let carrierWire ← derivationAttachmentRole attachment "carrier"
+    let valueNode ← match scope.nodes[valueWire.node]? with
+      | some value => pure value
+      | none => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    let indexWire ← match valueNode.kind, valueNode.arguments with
+      | .select, [index, zero, carrier] =>
+          if valueWire.port != 0 || zero != zeroWire || carrier != carrierWire then
+            throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+          pure index
+      | _, _ => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    let indexNode ← match scope.nodes[indexWire.node]? with
+      | some value => pure value
+      | none => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    match indexNode.kind, indexNode.arguments with
+    | .boolToInt, [source] =>
+        if indexWire.port != 0 || source != selectorWire then
+          throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    | _, _ => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    let selectorNode ← match scope.nodes[selectorWire.node]? with
+      | some value => pure value
+      | none => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    if selectorWire.port != 0 || selectorNode.outputTypes != [.boolean] then
+      throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    match selectorNode.kind with
+    | .input _ => pure ()
+    | _ => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    let zeroNode ← match scope.nodes[zeroWire.node]? with
+      | some value => pure value
+      | none => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    let carrierNode ← match scope.nodes[carrierWire.node]? with
+      | some value => pure value
+      | none => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    match zeroNode.kind, carrierNode.kind with
+    | .zeroMatrix zeroType, .constantMatrix carrierType coefficients =>
+        if zeroWire.port != 0 || carrierWire.port != 0 || zeroType != carrierType ||
+            coefficients.isEmpty || coefficients.all (· == .constant 0) ||
+            valueNode.outputTypes != [.matrix zeroType] then
+          throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+    | _, _ => throw (.invalidDerivationAttachment attachment.ownerNamespace attachment.ruleName)
+
+private def replaceOperationalFact
+    (node : Nat)
+    (facts : OperationalScopeFacts)
+    (wire : WireRef)
+    (fact : OperationalFact) : Except OperationalError OperationalScopeFacts := do
+  let outputs ← match facts[wire.node]? with
+    | some outputs => pure outputs
+    | none => throw (.missingOperand node wire)
+  if wire.port >= outputs.size then throw (.missingOperand node wire)
+  pure (facts.set! wire.node (outputs.set! wire.port fact))
+
+private def applyDerivationAttachment
+    (node : Nat)
+    (attachment : DerivationAttachment)
+    (facts : OperationalScopeFacts) : Except OperationalError OperationalScopeFacts := do
+  if attachment.ownerNamespace == "mxx-bgg" &&
+      attachment.ruleName == "encoding-family-pairing" then
+    let vectorWire ← derivationAttachmentRole attachment "vector"
+    let publicKeyWire ← derivationAttachmentRole attachment "public-key"
+    let plaintextWire ← derivationAttachmentRole attachment "plaintext"
+    let vector ← lookupFact node facts vectorWire
+    let publicKey ← lookupFact node facts publicKeyWire
+    let plaintext ← lookupFact node facts plaintextWire
+    let grouped ← groupBggEncodingFact vector publicKey plaintext
+    replaceOperationalFact node facts vectorWire grouped
+  else if attachment.ownerNamespace == "mxx-correctness" &&
+      attachment.ruleName == "protocol-boolean-signal-grouping" then
+    let valueWire ← derivationAttachmentRole attachment "value"
+    let value ← lookupFact node facts valueWire
+    let grouped ← groupProtocolBooleanSignalFact value
+    replaceOperationalFact node facts valueWire grouped
+  else
+    let valueWire ← derivationAttachmentRole attachment "value"
+    let value ← lookupFact node facts valueWire
+    let grouped ← groupPublicKeySignalFact value
+    replaceOperationalFact node facts valueWire grouped
+
+private def applyReadyDerivationAttachments
+    (node : Nat)
+    (attachments : List DerivationAttachment)
+    (facts : OperationalScopeFacts) : Except OperationalError OperationalScopeFacts :=
+  attachments.foldlM (init := facts) fun current attachment =>
+    if attachment.roles.any (fun role => role.2.node == node) &&
+        attachment.roles.all (fun role => role.2.node <= node) then
+      applyDerivationAttachment node attachment current
+    else pure current
+
+private def tensorOperationalPolynomials
+    (outputType : MatrixTypeExpr)
+    (left right : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  let rows ← left.mapM fun leftTerm => right.mapM fun rightTerm => do
+    let tokens := [.groupStart] ++ operationalProductTokens leftTerm ++ [.groupEnd,
+      .groupStart] ++ operationalProductTokens rightTerm ++ [.groupEnd,
+      .intermediateType outputType]
+    let role := if operationalTermIsSignal leftTerm || operationalTermIsSignal rightTerm then
+      OperationalFactorRole.large else .bounded
+    let summary ← if role == OperationalFactorRole.bounded then do
+      let leftSummary ← boundedNoiseTermSummary leftTerm
+      let rightSummary ← boundedNoiseTermSummary rightTerm
+      let ringFactor := if leftSummary.metadata.isConstantPolynomial ||
+          rightSummary.metadata.isConstantPolynomial then .closedInt (.constant 1)
+        else .closedInt outputType.ringDimension
+      pure (some {
+        matrixType := outputType
+        hardBound := .multiply ringFactor
+          (.multiply leftSummary.hardBound rightSummary.hardBound)
+        metadata := {
+          isConstantPolynomial := leftSummary.metadata.isConstantPolynomial &&
+            rightSummary.metadata.isConstantPolynomial
+          knownZeroRows := none
+        }
+        provenance := tokens
+      })
+    else pure none
+    let leaf := match summary with
+      | some bounded =>
+          let origin : OperationalCompressionOrigin := { kind := .boundedRun, tokens }
+          OperationalFactorLeaf.boundedSummary origin bounded
+      | none => .exactTransform tokens outputType
+    let factor : OperationalFactorKey := {
+      leaf
+      inputType := outputType
+      outputType
+      role
+      boundedSummary := summary
+    }
+    pure {
+      coefficient := leftTerm.coefficient * rightTerm.coefficient
+      product := { factors := [factor], modes := [], outputType }
+    }
+  pure (normalizeOperationalTerms rows.flatten)
+
+def availableRelation
+    (node : Nat)
+    (wire : WireRef)
+    (fact : OperationalMatrixFact) : Except OperationalError OperationalMatrixRelation := do
+  match fact.relations with
+  | [] => throw (.missingRelation node wire)
+  | [relation] =>
+      let available := match relation with
+        | .decomposition relation => relation.status == ReconstructionStatus.available
+        | .preimage _ => true
+      if available then pure relation else throw (OperationalError.unavailableRelation node wire)
+  | _ => throw (.ambiguousRelation node wire)
+
+def relationPublicIdentity : OperationalMatrixRelation → PublicMatrixIdentity
+  | .decomposition relation => relation.publicIdentity
+  | .preimage relation => relation.publicIdentity
+
+def relationTarget : OperationalMatrixRelation → RelationTargetSummary
+  | .decomposition relation => relation.inputSummary
+  | .preimage relation => relation.targetSummary
+
+private def publicIdentityIsLarge : PublicMatrixIdentity → Bool
+  | .sampledTrapdoor .. | .gadget .. => true
+  | .selected _ _ source => publicIdentityIsLarge source
+  | .loopInstance _ _ source => publicIdentityIsLarge source
+
+private def publicIdentityMaximum
+    (residueCap : Int) : PublicMatrixIdentity → Int
+  | .sampledTrapdoor .. => residueCap
+  | .gadget .. => residueCap
+  | .selected _ _ source => publicIdentityMaximum residueCap source
+  | .loopInstance _ _ source => publicIdentityMaximum residueCap source
+
+def rebindSubject (subject : WireRef) : OperationalFact → Except OperationalError OperationalFact
+  | .matrix fact =>
+      if fact.relations.all fun relation => match relation with
+          | .decomposition relation => relation.producer == fact.origin
+          | .preimage relation => relation.producer == fact.origin then
+        pure (.matrix { fact with subject })
+      else throw (.malformedRelation subject.node)
+  | .trapdoor fact => pure (.trapdoor { fact with subject })
+  | .integer fact => pure (.integer { fact with subject })
+  | .bytes fact => pure (.bytes { fact with subject })
+  | .familyUniform binder coordinate element count =>
+      return .familyUniform binder coordinate (← rebindSubject subject element) count
+  | .familyPackedNil => pure .familyPackedNil
+  | .familyPackedCons head tail =>
+      return .familyPackedCons (← rebindSubject subject head) (← rebindSubject subject tail)
+  | fact => pure fact
+
+private def namespaceFreshOrigin
+    (scope : ScopeTemplateKey)
+    (wire : WireRef) : MatrixOriginIdentity → MatrixOriginIdentity
+  | .value originScope originWire =>
+      if originScope == temporaryScope && originWire == wire then .value scope originWire
+      else .value originScope originWire
+  | origin@(.protocolInput _) => origin
+  | origin@(.protocolFamilyElement _ _) => origin
+  | origin@(.deterministicHash _) => origin
+  | .loopInstance slot index source =>
+      .loopInstance slot index (namespaceFreshOrigin scope wire source)
+  | .selected binder selection source =>
+      .selected binder selection (namespaceFreshOrigin scope wire source)
+
+private def namespaceFreshPublicIdentity
+    (scope : ScopeTemplateKey)
+    (wire : WireRef) : PublicMatrixIdentity → PublicMatrixIdentity
+  | .sampledTrapdoor originScope originWire =>
+      if originScope == temporaryScope && originWire.node == wire.node then
+        .sampledTrapdoor scope originWire
+      else .sampledTrapdoor originScope originWire
+  | identity@(.gadget ..) => identity
+  | .selected binder selection source =>
+      .selected binder selection (namespaceFreshPublicIdentity scope wire source)
+  | .loopInstance slot index source =>
+      .loopInstance slot index (namespaceFreshPublicIdentity scope wire source)
+
+private def mapOperationalPrimitiveIdentity
+    (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
+    (mapPublic : PublicMatrixIdentity → PublicMatrixIdentity)
+    (mapValue : OperationalValueOrigin → OperationalValueOrigin) :
+    OperationalPrimitiveIdentity → OperationalPrimitiveIdentity
+  | .matrix identity => .matrix (mapOrigin identity)
+  | .publicMatrix identity => .publicMatrix (mapPublic identity)
+  | .value identity => .value (mapValue identity)
+  | .parameterScalar environment domains value => .parameterScalar environment domains value
+  | .identityMatrix type => .identityMatrix type
+  | .selectionIndicator binder selection branch =>
+      .selectionIndicator binder { index := mapValue selection.index } branch
+  | .indexedArtifact input index => .indexedArtifact input index
+  | .recurrenceResult scope node path => .recurrenceResult scope node path
+  | .carriedInput path => .carriedInput path
+
+private def mapOperationalCompressionToken
+    (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
+    (mapPublic : PublicMatrixIdentity → PublicMatrixIdentity)
+    (mapValue : OperationalValueOrigin → OperationalValueOrigin)
+    (mapBound : OperationalBoundExpr → OperationalBoundExpr) :
+    OperationalCompressionToken → OperationalCompressionToken
+  | .primitive identity =>
+      .primitive (mapOperationalPrimitiveIdentity mapOrigin mapPublic mapValue identity)
+  | .summaryBound bound => .summaryBound (mapBound bound)
+  | token => token
+
+private def mapOperationalBoundedSummary
+    (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
+    (mapPublic : PublicMatrixIdentity → PublicMatrixIdentity)
+    (mapValue : OperationalValueOrigin → OperationalValueOrigin)
+    (mapBound : OperationalBoundExpr → OperationalBoundExpr)
+    (summary : OperationalBoundedFactorSummary) : OperationalBoundedFactorSummary := {
+  summary with
+  hardBound := mapBound summary.hardBound
+  provenance := summary.provenance.map
+    (mapOperationalCompressionToken mapOrigin mapPublic mapValue mapBound)
+}
+
+private def mapOperationalPolynomial
+    (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
+    (mapPublic : PublicMatrixIdentity → PublicMatrixIdentity)
+    (mapValue : OperationalValueOrigin → OperationalValueOrigin)
+    (mapBound : OperationalBoundExpr → OperationalBoundExpr)
+    (mapRelation : OperationalMatrixRelation → OperationalMatrixRelation)
+    (polynomial : OperationalPolynomial) : OperationalPolynomial :=
+  polynomial.map fun term => { term with product := {
+    term.product with factors := term.product.factors.map fun factor =>
+      let boundedSummary := factor.boundedSummary.map
+        (mapOperationalBoundedSummary mapOrigin mapPublic mapValue mapBound)
+      let leaf := match factor.leaf with
+        | .primitive identity => .primitive
+            (mapOperationalPrimitiveIdentity mapOrigin mapPublic mapValue identity)
+        | .boundedSummary origin summary =>
+            let tokens := origin.tokens.map
+              (mapOperationalCompressionToken mapOrigin mapPublic mapValue mapBound)
+            .boundedSummary { origin with tokens }
+              (mapOperationalBoundedSummary mapOrigin mapPublic mapValue mapBound summary)
+        | .exactTransform tokens type =>
+            let tokens := tokens.map
+              (mapOperationalCompressionToken mapOrigin mapPublic mapValue mapBound)
+            .exactTransform tokens type
+      { factor with
+        leaf
+        boundedSummary
+        relations := factor.relations.map mapRelation
+      }
+  }}
+
+private def mapRelationSnapshotPolynomial
+    (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
+    (mapPublic : PublicMatrixIdentity → PublicMatrixIdentity)
+    (mapValue : OperationalValueOrigin → OperationalValueOrigin)
+    (mapBound : OperationalBoundExpr → OperationalBoundExpr)
+    (polynomial : RelationSnapshotPolynomial) : RelationSnapshotPolynomial :=
+  polynomial.map fun term => { term with product := {
+    term.product with factors := term.product.factors.map fun factor =>
+      let boundedSummary := factor.boundedSummary.map
+        (mapOperationalBoundedSummary mapOrigin mapPublic mapValue mapBound)
+      let leaf := match factor.leaf with
+        | .primitive identity => .primitive
+            (mapOperationalPrimitiveIdentity mapOrigin mapPublic mapValue identity)
+        | .boundedSummary origin summary =>
+            let tokens := origin.tokens.map
+              (mapOperationalCompressionToken mapOrigin mapPublic mapValue mapBound)
+            .boundedSummary { origin with tokens }
+              (mapOperationalBoundedSummary mapOrigin mapPublic mapValue mapBound summary)
+        | .exactTransform tokens type =>
+            let tokens := tokens.map
+              (mapOperationalCompressionToken mapOrigin mapPublic mapValue mapBound)
+            .exactTransform tokens type
+      { factor with leaf, boundedSummary }
+  }}
+
+private def namespaceFreshSummary
+    (scope : ScopeTemplateKey)
+    (wire : WireRef)
+    (summary : RelationTargetSummary) : RelationTargetSummary := {
+  summary with
+  origin := namespaceFreshOrigin scope wire summary.origin
+  polynomial := mapRelationSnapshotPolynomial
+    (namespaceFreshOrigin scope wire)
+    (namespaceFreshPublicIdentity scope wire)
+    id id summary.polynomial
+}
+
+private def namespaceFreshRelation
+    (scope : ScopeTemplateKey)
+    (wire : WireRef) : OperationalMatrixRelation → OperationalMatrixRelation
+  | .decomposition relation => .decomposition {
+      relation with
+      producer := namespaceFreshOrigin scope wire relation.producer
+      inputOrigin := namespaceFreshOrigin scope wire relation.inputOrigin
+      inputSummary := namespaceFreshSummary scope wire relation.inputSummary
+      publicIdentity := namespaceFreshPublicIdentity scope wire relation.publicIdentity
+    }
+  | .preimage relation => .preimage {
+      relation with
+      producer := namespaceFreshOrigin scope wire relation.producer
+      targetOrigin := namespaceFreshOrigin scope wire relation.targetOrigin
+      targetSummary := namespaceFreshSummary scope wire relation.targetSummary
+      publicIdentity := namespaceFreshPublicIdentity scope wire relation.publicIdentity
+    }
+
+private def shiftTargetPreviousDepth
+    (target : RelationTargetSummary) : RelationTargetSummary := {
+  target with
+  totalHardBound := shiftPreviousDepth target.totalHardBound
+  polynomial := mapRelationSnapshotPolynomial id id id shiftPreviousDepth target.polynomial
+}
+
+private def shiftRelationPreviousDepth :
+    OperationalMatrixRelation → OperationalMatrixRelation
+  | .decomposition relation => .decomposition {
+      relation with inputSummary := shiftTargetPreviousDepth relation.inputSummary }
+  | .preimage relation => .preimage {
+      relation with targetSummary := shiftTargetPreviousDepth relation.targetSummary }
+
+/-- Insert a new innermost recurrence state. References already present in invariant facts then
+refer to the enclosing state, while the new carried placeholders continue to use depth zero. -/
+private def shiftFactPreviousDepth : OperationalFact → OperationalFact
+  | .matrix fact => .matrix {
+      fact with
+      totalHardBound := shiftPreviousDepth fact.totalHardBound
+      relations := fact.relations.map shiftRelationPreviousDepth
+      polynomial := mapOperationalPolynomial id id id shiftPreviousDepth
+        shiftRelationPreviousDepth fact.polynomial
+    }
+  | .trapdoor fact => .trapdoor { fact with maximum := shiftPreviousDepth fact.maximum }
+  | .integer fact => .integer {
+      fact with
+      lowerExpression := shiftPreviousDepth fact.lowerExpression
+      upperExpression := shiftPreviousDepth fact.upperExpression
+    }
+  | .familyUniform binder coordinate element count =>
+      .familyUniform binder coordinate (shiftFactPreviousDepth element) count
+  | .familyPackedCons head tail =>
+      .familyPackedCons (shiftFactPreviousDepth head) (shiftFactPreviousDepth tail)
+  | fact => fact
+
+private def namespaceFreshValueOrigin
+    (scope : ScopeTemplateKey)
+    (wire : WireRef) : OperationalValueOrigin → OperationalValueOrigin
+  | .local originScope originWire =>
+      if originScope == temporaryScope && originWire == wire then .local scope originWire
+      else .local originScope originWire
+  | origin@(.protocolInput _) => origin
+  | origin@(.protocolFamilyElement _ _) => origin
+  | .loopInstance slot index source =>
+      .loopInstance slot index (namespaceFreshValueOrigin scope wire source)
+  | .selected binder index source =>
+      .selected binder (namespaceFreshValueOrigin scope wire index)
+        (namespaceFreshValueOrigin scope wire source)
+
+/-- Namespace only identities created by this exact output.  Caller origins transported through
+an input are deliberately left unchanged. -/
+def namespaceFreshOutput
+    (scope : ScopeTemplateKey)
+    (wire : WireRef) : OperationalFact → OperationalFact
+  | .matrix fact => .matrix {
+      fact with
+      origin := namespaceFreshOrigin scope wire fact.origin
+      identity := fact.identity.map (namespaceFreshPublicIdentity scope wire)
+      relations := fact.relations.map (namespaceFreshRelation scope wire)
+      polynomial := mapOperationalPolynomial
+        (namespaceFreshOrigin scope wire)
+        (namespaceFreshPublicIdentity scope wire)
+        (namespaceFreshValueOrigin scope wire)
+        id
+        (namespaceFreshRelation scope wire)
+        fact.polynomial
+    }
+  | .trapdoor fact => .trapdoor {
+      fact with publicIdentity := namespaceFreshPublicIdentity scope wire fact.publicIdentity
+    }
+  | .integer fact => .integer {
+      fact with
+      origin := match fact.origin with
+        | .local originScope originWire =>
+            if originScope == temporaryScope && originWire == wire then .local scope wire
+            else fact.origin
+        | .protocolInput _ => fact.origin
+        | .protocolFamilyElement _ _ => fact.origin
+        | .loopInstance _ _ _ => fact.origin
+        | .selected _ _ _ => fact.origin
+    }
+  | .bytes fact => .bytes {
+      fact with
+      origin := match fact.origin with
+        | .local originScope originWire =>
+            if originScope == temporaryScope && originWire == wire then .local scope wire
+            else fact.origin
+        | .protocolInput _ => fact.origin
+        | .protocolFamilyElement _ _ => fact.origin
+        | .loopInstance _ _ _ => fact.origin
+        | .selected _ _ _ => fact.origin
+    }
+  | fact => fact
+
+def factHasRelation : OperationalFact → Bool
+  | .matrix fact => !fact.relations.isEmpty
+  | .familyUniform _ _ element _ => factHasRelation element
+  | .familyPackedNil => false
+  | .familyPackedCons head tail => factHasRelation head || factHasRelation tail
+  | _ => false
+
+def packedFacts : List OperationalFact → OperationalFact
+  | [] => .familyPackedNil
+  | head :: tail => .familyPackedCons head (packedFacts tail)
+
+def unpackPackedFacts : OperationalFact → Option (List OperationalFact)
+  | .familyPackedNil => some []
+  | .familyPackedCons head tail => return head :: (← unpackPackedFacts tail)
+  | _ => none
+
+private def booleanFamilyCount (fact : OperationalFact) : Option Int :=
+  match fact with
+  | .familyUniform _ _ .boolean count => some count
+  | packed => do
+      let elements ← unpackPackedFacts packed
+      if elements.all (· == .boolean) then some (Int.ofNat elements.length) else none
+
+private def instantiateHashIdentityLoopIndex
+    (slot index : Nat) (identity : DeterministicHashIdentity) : DeterministicHashIdentity :=
+  { identity with
+    parameterEnvironment := replaceLoopIndex identity.parameterEnvironment slot index
+    parameterDomains := instantiateParameterDomains slot index identity.parameterDomains
+  }
+
+private def instantiateOriginLoopIndex
+    (slot index : Nat) : MatrixOriginIdentity → MatrixOriginIdentity
+  | .value scope wire => .loopInstance slot index (.value scope wire)
+  | .protocolInput input => .protocolInput input
+  | .protocolFamilyElement input familyIndex => .protocolFamilyElement input familyIndex
+  | .deterministicHash identity =>
+      .deterministicHash (instantiateHashIdentityLoopIndex slot index identity)
+  | .loopInstance existingSlot existingIndex source =>
+      .loopInstance existingSlot existingIndex (instantiateOriginLoopIndex slot index source)
+  | .selected binder selection source =>
+      .selected binder selection (instantiateOriginLoopIndex slot index source)
+
+private def instantiateValueOriginLoopIndex
+    (slot index : Nat) : OperationalValueOrigin → OperationalValueOrigin
+  | .local scope wire => .loopInstance slot index (.local scope wire)
+  | .protocolInput input => .protocolInput input
+  | .protocolFamilyElement input familyIndex => .protocolFamilyElement input familyIndex
+  | .loopInstance existingSlot existingIndex source =>
+      .loopInstance existingSlot existingIndex
+        (instantiateValueOriginLoopIndex slot index source)
+  | .selected binder selection source =>
+      .selected binder (instantiateValueOriginLoopIndex slot index selection)
+        (instantiateValueOriginLoopIndex slot index source)
+
+private def instantiatePublicIdentityLoopIndex
+    (slot index : Nat) : PublicMatrixIdentity → PublicMatrixIdentity
+  | identity@(.gadget ..) => identity
+  | .sampledTrapdoor scope wire =>
+      .loopInstance slot index (.sampledTrapdoor scope wire)
+  | .selected binder selection source =>
+      .selected binder selection (instantiatePublicIdentityLoopIndex slot index source)
+  | .loopInstance existingSlot existingIndex source =>
+      .loopInstance existingSlot existingIndex
+        (instantiatePublicIdentityLoopIndex slot index source)
+
+private def instantiateTargetLoopIndex
+    (slot index : Nat) (target : RelationTargetSummary) : RelationTargetSummary :=
+  { target with
+    origin := instantiateOriginLoopIndex slot index target.origin
+    totalHardBound := instantiateBoundLoopIndex slot index target.totalHardBound
+    polynomial := mapRelationSnapshotPolynomial
+      (instantiateOriginLoopIndex slot index)
+      (instantiatePublicIdentityLoopIndex slot index)
+      (instantiateValueOriginLoopIndex slot index)
+      (instantiateBoundLoopIndex slot index)
+      target.polynomial
+  }
+
+private def instantiateRelationLoopIndex
+    (slot index : Nat) : OperationalMatrixRelation → OperationalMatrixRelation
+  | .decomposition relation => .decomposition {
+      relation with
+      producer := instantiateOriginLoopIndex slot index relation.producer
+      publicIdentity := instantiatePublicIdentityLoopIndex slot index relation.publicIdentity
+      inputOrigin := instantiateOriginLoopIndex slot index relation.inputOrigin
+      inputSummary := instantiateTargetLoopIndex slot index relation.inputSummary
+    }
+  | .preimage relation => .preimage {
+      relation with
+      producer := instantiateOriginLoopIndex slot index relation.producer
+      publicIdentity := instantiatePublicIdentityLoopIndex slot index relation.publicIdentity
+      targetOrigin := instantiateOriginLoopIndex slot index relation.targetOrigin
+      targetSummary := instantiateTargetLoopIndex slot index relation.targetSummary
+    }
+
+private def instantiateFactLoopIndex (slot index : Nat) : OperationalFact → OperationalFact
+  | .matrix fact => .matrix {
+      fact with
+      origin := instantiateOriginLoopIndex slot index fact.origin
+      totalHardBound := instantiateBoundLoopIndex slot index fact.totalHardBound
+      identity := fact.identity.map (instantiatePublicIdentityLoopIndex slot index)
+      relations := fact.relations.map (instantiateRelationLoopIndex slot index)
+      polynomial := mapOperationalPolynomial
+        (instantiateOriginLoopIndex slot index)
+        (instantiatePublicIdentityLoopIndex slot index)
+        (instantiateValueOriginLoopIndex slot index)
+        (instantiateBoundLoopIndex slot index)
+        (instantiateRelationLoopIndex slot index)
+        fact.polynomial
+    }
+  | .trapdoor fact => .trapdoor {
+      fact with
+      maximum := instantiateBoundLoopIndex slot index fact.maximum
+      publicIdentity := instantiatePublicIdentityLoopIndex slot index fact.publicIdentity }
+  | .integer fact => .integer {
+      fact with
+      origin := instantiateValueOriginLoopIndex slot index fact.origin
+      lowerExpression := instantiateBoundLoopIndex slot index fact.lowerExpression
+      upperExpression := instantiateBoundLoopIndex slot index fact.upperExpression
+    }
+  | .bytes fact => .bytes {
+      fact with origin := instantiateValueOriginLoopIndex slot index fact.origin }
+  | .familyUniform binder coordinate element count =>
+      .familyUniform binder coordinate (instantiateFactLoopIndex slot index element) count
+  | .familyPackedCons head tail =>
+      .familyPackedCons (instantiateFactLoopIndex slot index head)
+        (instantiateFactLoopIndex slot index tail)
+  | fact => fact
+
+private def selectProtocolValueOrigin
+    (index : Nat) : OperationalValueOrigin → OperationalValueOrigin
+  | .protocolInput input => .protocolFamilyElement input index
+  | .loopInstance slot lane source =>
+      .loopInstance slot lane (selectProtocolValueOrigin index source)
+  | .selected binder selection source =>
+      .selected binder (selectProtocolValueOrigin index selection)
+        (selectProtocolValueOrigin index source)
+  | origin => origin
+
+private def selectProtocolHashIdentity
+    (index : Nat) (identity : DeterministicHashIdentity) : DeterministicHashIdentity :=
+  { identity with
+    keyOrigin := selectProtocolValueOrigin index identity.keyOrigin
+    trailingIntegerOrigins := identity.trailingIntegerOrigins.map (selectProtocolValueOrigin index)
+  }
+
+private def selectProtocolMatrixOrigin
+    (index : Nat) : MatrixOriginIdentity → MatrixOriginIdentity
+  | .protocolInput input => .protocolFamilyElement input index
+  | .deterministicHash identity =>
+      .deterministicHash (selectProtocolHashIdentity index identity)
+  | .loopInstance slot lane source =>
+      .loopInstance slot lane (selectProtocolMatrixOrigin index source)
+  | .selected binder selection source =>
+      .selected binder selection (selectProtocolMatrixOrigin index source)
+  | origin => origin
+
+private def selectProtocolTarget
+    (index : Nat) (target : RelationTargetSummary) : RelationTargetSummary :=
+  { target with
+    origin := selectProtocolMatrixOrigin index target.origin
+    polynomial := mapRelationSnapshotPolynomial
+      (selectProtocolMatrixOrigin index) id (selectProtocolValueOrigin index) id
+      target.polynomial
+  }
+
+private def selectProtocolRelation
+    (index : Nat) : OperationalMatrixRelation → OperationalMatrixRelation
+  | .decomposition relation => .decomposition {
+      relation with
+      producer := selectProtocolMatrixOrigin index relation.producer
+      inputOrigin := selectProtocolMatrixOrigin index relation.inputOrigin
+      inputSummary := selectProtocolTarget index relation.inputSummary
+    }
+  | .preimage relation => .preimage {
+      relation with
+      producer := selectProtocolMatrixOrigin index relation.producer
+      targetOrigin := selectProtocolMatrixOrigin index relation.targetOrigin
+      targetSummary := selectProtocolTarget index relation.targetSummary
+    }
+
+private def selectProtocolFamilyElement (index : Nat) : OperationalFact → OperationalFact
+  | .matrix fact => .matrix {
+      fact with
+      origin := selectProtocolMatrixOrigin index fact.origin
+      relations := fact.relations.map (selectProtocolRelation index)
+      polynomial := mapOperationalPolynomial
+        (selectProtocolMatrixOrigin index)
+        id
+        (selectProtocolValueOrigin index)
+        id
+        (selectProtocolRelation index)
+        fact.polynomial
+    }
+  | .integer fact => .integer {
+      fact with origin := selectProtocolValueOrigin index fact.origin }
+  | .bytes fact => .bytes {
+      fact with origin := selectProtocolValueOrigin index fact.origin }
+  | .familyUniform binder coordinate element count =>
+      .familyUniform binder coordinate (selectProtocolFamilyElement index element) count
+  | .familyPackedCons head tail =>
+      .familyPackedCons (selectProtocolFamilyElement index head)
+        (selectProtocolFamilyElement index tail)
+  | fact => fact
+
+private def joinCanonicalRanges : List CanonicalRange → CanonicalRange
+  | [] => .unknown
+  | ranges =>
+      if ranges.all (fun range => match range with | .below _ => true | .unknown => false) then
+        .below (ranges.foldl (fun result range => match range with
+          | .below value => max result value
+          | .unknown => result) 0)
+      else .unknown
+
+/-- A dynamic family lookup may denote any element.  It therefore joins numeric information and
+drops all producer-specific identities and modular relations. -/
+def joinDynamicFacts
+    (node : Nat)
+    (subject : WireRef)
+    (facts : List OperationalFact)
+    (selection : Option OperationalValueOrigin := none) : Except OperationalError OperationalFact := do
+  match facts with
+  | [] => throw (.invalidCount node 0)
+  | .matrix first :: tail =>
+      let matrices ← tail.mapM fun fact => match fact with
+        | .matrix value => pure value
+        | _ => throw (.loopInputModeMismatch node 0)
+      if !(matrices.all fun value =>
+          value.matrixParams.modulus == first.matrixParams.modulus &&
+          value.matrixParams.ringDimension == first.matrixParams.ringDimension &&
+          value.matrixParams.rows == first.matrixParams.rows &&
+          value.matrixParams.columns == first.matrixParams.columns) then
+        throw (.loopInputModeMismatch node 0)
+      let all := first :: matrices
+      let selection ← match selection with
+        | some value => pure value
+        | none => throw (.loopInputModeMismatch node 0)
+      let polynomial ← selectOperationalPolynomials temporaryScope node selection first.matrixType
+        (all.map (·.polynomial)) |>.mapError (flatErrorAt node)
+      let totalHardBound := maximumOperationalBounds (all.map (·.totalHardBound))
+      pure (.matrix {
+        first with
+        subject
+        origin := .value temporaryScope subject
+        totalHardBound
+        polynomial
+        canonicalRange := joinCanonicalRanges (all.map (·.canonicalRange))
+        identity := none
+        relations := []
+      })
+  | .integer first :: tail =>
+      let intervals ← tail.mapM fun fact => match fact with
+        | .integer value => pure value
+        | _ => throw (.loopInputModeMismatch node 0)
+      pure (.integer {
+        subject
+        origin := .local temporaryScope subject
+        lower := intervals.foldl (fun value interval => min value interval.lower) first.lower
+        upper := intervals.foldl (fun value interval => max value interval.upper) first.upper
+        lowerExpression := intervals.foldl
+          (fun value interval => .minimum value interval.lowerExpression) first.lowerExpression
+        upperExpression := intervals.foldl
+          (fun value interval => .maximum value interval.upperExpression) first.upperExpression
+      })
+  | first :: tail =>
+      if tail.all (· == first) then rebindSubject subject first
+      else throw (.loopInputModeMismatch node 0)
+
+/-- Select one element of a uniform family by the exact executable index wire.  The wrapper is
+structural: two selections compare equal only when the family binder and index-wire instance are
+identical.  Arithmetic equivalence of two index computations is never inferred. -/
+private def dynamicSelectionScope : OperationalValueOrigin → ScopeTemplateKey
+  | .local scope _ => scope
+  | .protocolInput _ | .protocolFamilyElement _ _ => temporaryScope
+  | .loopInstance _ _ source => dynamicSelectionScope source
+  | .selected _ index _ => dynamicSelectionScope index
+
+private def selectDynamicValueOrigin
+    (binder : FamilyTemplateBinder)
+    (selection : OperationalValueOrigin)
+    (source : OperationalValueOrigin) : OperationalValueOrigin :=
+  .selected binder selection source
+
+private def selectDynamicMatrixOrigin
+    (binder : FamilyTemplateBinder)
+    (selection : OperationalValueOrigin)
+    (source : MatrixOriginIdentity) : MatrixOriginIdentity :=
+  .selected binder { index := selection } source
+
+private def selectDynamicTarget
+    (binder : FamilyTemplateBinder)
+    (selection : OperationalValueOrigin)
+    (target : RelationTargetSummary) : RelationTargetSummary := {
+  target with
+  origin := selectDynamicMatrixOrigin binder selection target.origin
+  polynomial := mapRelationSnapshotPolynomial
+    (selectDynamicMatrixOrigin binder selection)
+    (fun identity => .selected binder { index := selection } identity)
+    (selectDynamicValueOrigin binder selection) id target.polynomial
+}
+
+private def selectDynamicRelation
+    (binder : FamilyTemplateBinder)
+    (selection : OperationalValueOrigin) :
+    OperationalMatrixRelation → OperationalMatrixRelation
+  | .decomposition relation => .decomposition {
+      relation with
+      producer := selectDynamicMatrixOrigin binder selection relation.producer
+      publicIdentity := .selected binder { index := selection } relation.publicIdentity
+      inputOrigin := selectDynamicMatrixOrigin binder selection relation.inputOrigin
+      inputSummary := selectDynamicTarget binder selection relation.inputSummary
+    }
+  | .preimage relation => .preimage {
+      relation with
+      producer := selectDynamicMatrixOrigin binder selection relation.producer
+      publicIdentity := .selected binder { index := selection } relation.publicIdentity
+      targetOrigin := selectDynamicMatrixOrigin binder selection relation.targetOrigin
+      targetSummary := selectDynamicTarget binder selection relation.targetSummary
+    }
+
+def selectDynamicUniformFact
+    (binder : FamilyTemplateBinder)
+    (selection : OperationalValueOrigin)
+    (subject : WireRef) : OperationalFact → Except OperationalError OperationalFact
+  | .matrix fact => pure (.matrix {
+      fact with
+      subject
+      origin := selectDynamicMatrixOrigin binder selection fact.origin
+      identity := fact.identity.map fun identity =>
+        .selected binder { index := selection } identity
+      relations := fact.relations.map (selectDynamicRelation binder selection)
+      polynomial := mapOperationalPolynomial
+        (selectDynamicMatrixOrigin binder selection)
+        (fun identity => .selected binder { index := selection } identity)
+        (selectDynamicValueOrigin binder selection)
+        id
+        (selectDynamicRelation binder selection)
+        fact.polynomial
+    })
+  | .trapdoor fact => pure (.trapdoor {
+      fact with
+      subject
+      publicIdentity := .selected binder { index := selection } fact.publicIdentity
+    })
+  | .integer fact =>
+      let selected := { fact with
+        origin := selectDynamicValueOrigin binder selection fact.origin }
+      pure (.integer { selected with subject })
+  | .bytes fact =>
+      let selected := { fact with
+        origin := selectDynamicValueOrigin binder selection fact.origin }
+      pure (.bytes { selected with subject })
+  | fact => rebindSubject subject fact
+
+def loopArgumentFact
+    (node argument index : Nat)
+    (mode : LoopInputMode)
+    (fact : OperationalFact) : Except OperationalError OperationalFact :=
+  match mode, fact with
+  | .broadcast, fact => pure fact
+  | .zip, .familyUniform _ _ element count =>
+      if index < count.toNat then pure element else throw (.loopInputModeMismatch node argument)
+  | .zipOffset offset, .familyUniform _ _ element count =>
+      if index + offset < count.toNat then pure element else
+        throw (.loopInputModeMismatch node argument)
+  | .zip, packed =>
+      -- One body template cannot soundly stand for a heterogeneous packed family. Uniform
+      -- families carry an explicit template and are handled above; packed inputs are rejected
+      -- until their lanes are conservatively joined with a checked common loop identity.
+      let _ := packed
+      throw (.loopInputModeMismatch node argument)
+  | .zipOffset offset, packed =>
+      let _ := offset
+      let _ := packed
+      throw (.loopInputModeMismatch node argument)
 
 def genericNodeFact
+    (scopeKey : ScopeTemplateKey)
     (nodeIndex : Nat)
     (node : Node)
+    (rule : DerivationRule)
     (outputPort : Nat)
     (outputType : WireTypeExpr)
     (facts : OperationalScopeFacts)
-    (environment : ParamEnvironment) : Except OperationalError OperationalFact := do
+    (environment : ParamEnvironment)
+    (loopDomains : List OperationalParameterDomain)
+    (layouts : List Mxx.GadgetLayoutDescriptor) : Except OperationalError OperationalFact := do
   let matrixType? := match outputType with
     | .matrix matrixType | .preimage matrixType => some matrixType
     | _ => none
+  let embeddedMatrixType? := match node.kind with
+    | .zeroMatrix matrixType
+    | .identityMatrix matrixType
+    | .constantMatrix matrixType _
+    | .unitRowMatrix matrixType _
+    | .unitColumnMatrix matrixType _
+    | .gadgetMatrix matrixType _
+    | .smallGadgetMatrix matrixType _
+    | .powerOfBaseMatrix matrixType _ _
+    | .rotationMatrix matrixType _
+    | .uniformResidueSample matrixType
+    | .uniformIntervalSample matrixType _ _
+    | .gaussianSample matrixType _
+    | .preimageSample matrixType _
+    | .packPolynomialCoefficients matrixType _ => some matrixType
+    | .trapdoorSample matrixType _ =>
+        if outputPort == 0 then some matrixType else none
+    | .hashSample matrixType .plain _ _ _ _ _ _ => some matrixType
+    | .hashSample _ .decomposed _ _ _ _ _ _
+    | .hashSample _ .smallDecomposed _ _ _ _ _ _ => none
+    | _ => none
+  match embeddedMatrixType?, matrixType? with
+  | some embedded, some output =>
+      if embedded != output then throw (.outputTypeMismatch nodeIndex)
+  | some _, none => throw (.outputTypeMismatch nodeIndex)
+  | none, _ => pure ()
+  let outputIsInteger := match outputType with
+    | .integer | .constantInt => true
+    | _ => false
+  let outputIsBoolean := match outputType with
+    | .boolean | .constantBool => true
+    | _ => false
+  match node.kind with
+  | .constantInt _ | .evaluateInt _ | .boolToInt | .intBinary _ | .extractCoefficient _ =>
+      if !outputIsInteger then throw (.outputTypeMismatch nodeIndex)
+  | .constantBool _ | .intCompare _ | .bitExtract _ | .thresholdDecodeBool _ _ _ =>
+      if !outputIsBoolean then throw (.outputTypeMismatch nodeIndex)
+  | _ => pure ()
+  match matrixType? with
+  | some matrixType =>
+      let _ ← evaluateIntInvariant environment loopDomains matrixType.modulus
+      let _ ← evaluateIntInvariant environment loopDomains matrixType.ringDimension
+      let _ ← evaluateIntInvariant environment loopDomains matrixType.rows
+      let _ ← evaluateIntInvariant environment loopDomains matrixType.columns
+      pure ()
+  | none => pure ()
   match node.kind, matrixType? with
-  | .zeroMatrix _, some matrixType => cappedMatrixFact nodeIndex matrixType environment 0
-  | .identityMatrix _, some matrixType => cappedMatrixFact nodeIndex matrixType environment 1
+  | .input _, _ =>
+      defaultFact nodeIndex outputPort outputType environment
+  | .constantInt value, none =>
+      if node.arguments.isEmpty then integerFact nodeIndex outputPort value value
+      else throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+  | .evaluateInt value, none =>
+      if !node.arguments.isEmpty then
+        throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      integerFactWithExpressions nodeIndex outputPort
+        (← evaluateIntMinimum environment loopDomains value)
+        (← evaluateIntMaximum environment loopDomains value)
+        (.contextual .minimum environment loopDomains value)
+        (.contextual .maximum environment loopDomains value)
+  | .boolToInt, none =>
+      let inputWire ← match node.arguments with
+        | [wire] => pure wire
+        | _ => throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      requireBooleanFact nodeIndex facts inputWire
+      integerFact nodeIndex outputPort 0 1
+  | .intBinary operation, none =>
+      if node.arguments.length != 2 then
+        throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let leftWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let rightWire ← match node.arguments[1]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex leftWire)
+      let left ← integerFactAt nodeIndex facts leftWire
+      let right ← integerFactAt nodeIndex facts rightWire
+      let interval ← integerBinaryInterval nodeIndex operation left right
+      integerFactWithExpressions nodeIndex outputPort interval.lower interval.upper
+        interval.lowerExpression interval.upperExpression
+  | .constantReal _, none =>
+      if node.arguments.isEmpty then pure .real
+      else throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+  | .intToReal, none =>
+      let inputWire ← match node.arguments with
+        | [wire] => pure wire
+        | _ => throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let _ ← integerFactAt nodeIndex facts inputWire
+      pure .real
+  | .realBinary _, none =>
+      let (leftWire, rightWire) ← match node.arguments with
+        | [left, right] => pure (left, right)
+        | _ => throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      requireRealFact nodeIndex facts leftWire
+      requireRealFact nodeIndex facts rightWire
+      pure .real
+  | .realSqrt, none =>
+      let inputWire ← match node.arguments with
+        | [wire] => pure wire
+        | _ => throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      requireRealFact nodeIndex facts inputWire
+      pure .real
+  | .constantBool _, none =>
+      if node.arguments.isEmpty then pure .boolean
+      else throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+  | .intCompare _, none =>
+      let (leftWire, rightWire) ← match node.arguments with
+        | [left, right] => pure (left, right)
+        | _ => throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let _ ← integerFactAt nodeIndex facts leftWire
+      let _ ← integerFactAt nodeIndex facts rightWire
+      pure .boolean
+  | .bitExtract bit, none =>
+      let inputWire ← match node.arguments with
+        | [wire] => pure wire
+        | _ => throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let _ ← integerFactAt nodeIndex facts inputWire
+      let minimum ← evaluateIntMinimum environment loopDomains bit
+      if minimum < 0 then throw (.invalidCount nodeIndex minimum)
+      pure .boolean
+  | .extractCoefficient position, none =>
+      let matrixWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let matrix ← matrixFactAt nodeIndex facts matrixWire
+      if node.arguments.length != 1 then
+        throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let minimum ← evaluateIntMinimum environment loopDomains position
+      let maximum ← evaluateIntMaximum environment loopDomains position
+      if minimum < 0 || maximum >= Int.ofNat matrix.matrixParams.ringDimension then
+        throw (.invalidCount nodeIndex maximum)
+      let exclusiveUpper ← match matrix.canonicalRange with
+        | .below upper => pure (Int.ofNat upper)
+        | .unknown => pure matrix.matrixParams.modulus
+      if exclusiveUpper <= 0 then
+        throw (.invalidMatrixParameters nodeIndex)
+      integerFact nodeIndex outputPort 0 (exclusiveUpper - 1)
+  | .thresholdDecodeBool ciphertextModulus plaintextModulus length, none |
+      .thresholdDecodeInt ciphertextModulus plaintextModulus length, none =>
+      let inputWire ← match node.arguments with
+        | [wire] => pure wire
+        | _ => throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let input ← matrixFactAt nodeIndex facts inputWire
+      let ciphertext ← evaluateIntInvariant environment loopDomains ciphertextModulus
+      let plaintext ← evaluateIntInvariant environment loopDomains plaintextModulus
+      let count ← evaluateIntInvariant environment loopDomains length
+      if input.matrixParams.rows != 1 || input.matrixParams.columns != 1 ||
+          ciphertext != input.matrixParams.modulus || plaintext <= 1 || count <= 0 ||
+          count > Int.ofNat input.matrixParams.ringDimension || node.outputCount != count.toNat then
+        throw (.invalidMatrixParameters nodeIndex)
+      match node.kind with
+      | .thresholdDecodeBool .. => pure .boolean
+      | .thresholdDecodeInt .. => integerFact nodeIndex outputPort 0 (plaintext - 1)
+      | _ => throw (.unsupportedNode nodeIndex)
+  | .select, none =>
+      let indexWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let index ← integerFactAt nodeIndex facts indexWire
+      if node.arguments.length < 2 then
+        throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let branchCount := node.arguments.length - 1
+      if index.lower < 0 || index.upper >= Int.ofNat branchCount then
+        throw (.invalidCount nodeIndex index.upper)
+      let branches ← (node.arguments.drop 1).mapM (lookupFact nodeIndex facts)
+      joinDynamicFacts nodeIndex { node := nodeIndex, port := outputPort } branches
+        (some index.origin)
+  | .zeroMatrix _, some matrixType =>
+      polynomialMatrixFact nodeIndex outputPort matrixType environment [] (.below 1)
+  | .identityMatrix _, some matrixType =>
+      classifiedMatrixFact nodeIndex outputPort matrixType environment 1 false (.below 2)
+        { isConstantPolynomial := true }
   | .constantMatrix _ coefficients, some matrixType =>
-      let values ← coefficients.mapM fun coefficient =>
-        match coefficient.evaluate environment with
+      let values ← coefficients.mapM (evaluateIntInvariant environment loopDomains)
+      let ringDimension ← match matrixType.ringDimension.evaluate environment with
         | some value => pure value
-        | none => throw (.invalidBound nodeIndex 0)
-      cappedMatrixFact nodeIndex matrixType environment
-        (values.foldl (fun maximum value => max maximum (absolute value)) 0)
-  | .uniformSample _ minimum maximum, some matrixType =>
-      let lower ← match minimum.evaluate environment with
-        | some value => pure value | none => throw (.invalidBound nodeIndex 0)
-      let upper ← match maximum.evaluate environment with
-        | some value => pure value | none => throw (.invalidBound nodeIndex 0)
-      cappedMatrixFact nodeIndex matrixType environment (max (absolute lower) (absolute upper))
-  | .gaussianSample _ maximum, some matrixType | .preimageSample _ maximum, some matrixType =>
-      let bound ← match maximum.evaluate environment with
-        | some value => pure value | none => throw (.invalidBound nodeIndex 0)
-      cappedMatrixFact nodeIndex matrixType environment bound
-  | .hashSample _ _ _ _ _ _ _ _, some matrixType =>
+        | none => throw (.invalidMatrixParameters nodeIndex)
+      if ringDimension <= 0 then throw (.invalidMatrixParameters nodeIndex)
+      let modulus ← match matrixType.modulus.evaluate environment with
+        | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
+      let canonicalMaximum := values.foldl (fun maximum value =>
+        max maximum ((if modulus > 0 then value % modulus else value).toNat)) 0
+      classifiedMatrixFact nodeIndex outputPort matrixType environment
+        (values.foldl (fun maximum value => max maximum (absolute value)) 0) false
+        (.below (canonicalMaximum + 1)) {
+          isConstantPolynomial := values.zipIdx.all fun (value, index) =>
+            index % ringDimension.toNat = 0 || value = 0
+        }
+  | .uniformResidueSample _, some matrixType =>
       let cap ← match matrixCap matrixType environment with
         | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
-      cappedMatrixFact nodeIndex matrixType environment cap
-  | .gadgetDecompose _ base _, some matrixType =>
-      let bound ← match base.evaluate environment with
-        | some value => pure value | none => throw (.invalidBound nodeIndex 0)
-      cappedMatrixFact nodeIndex matrixType environment (absolute bound)
+      classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
+  | .uniformIntervalSample _ minimum maximum, some matrixType =>
+      let lower ← evaluateIntMinimum environment loopDomains minimum
+      let upper ← evaluateIntMaximum environment loopDomains maximum
+      let bound := OperationalBoundExpr.maximum
+        (.contextual .maximumAbsolute environment loopDomains minimum)
+        (.contextual .maximumAbsolute environment loopDomains maximum)
+      classifiedMatrixFactExpr nodeIndex outputPort matrixType environment bound false
+        (if lower >= 0 then .below (upper.toNat + 1) else .unknown)
+  | .gaussianSample _ maximum, some matrixType =>
+      cappedMatrixFactExpr nodeIndex outputPort matrixType environment
+        (.contextual .maximum environment loopDomains maximum)
+  | .preimageSample _ maximum, some matrixType =>
+      let bound := OperationalBoundExpr.contextual .maximum environment loopDomains maximum
+      let publicWire ← match node.arguments[0]? with
+        | some wire => pure wire | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let trapdoorWire ← match node.arguments[1]? with
+        | some wire => pure wire | none => throw (.missingOperand nodeIndex publicWire)
+      let targetWire ← match node.arguments[2]? with
+        | some wire => pure wire | none => throw (.missingOperand nodeIndex publicWire)
+      let publicFact ← matrixFactAt nodeIndex facts publicWire
+      let trapdoor ← match ← lookupFact nodeIndex facts trapdoorWire with
+        | .trapdoor fact => pure fact
+        | _ => throw (.missingPublicIdentity nodeIndex trapdoorWire)
+      let target ← matrixFactAt nodeIndex facts targetWire
+      let publicIdentity ← match publicFact.identity with
+        | some identity => pure identity
+        | none => throw (.missingPublicIdentity nodeIndex publicWire)
+      if publicIdentity != trapdoor.publicIdentity then
+        throw (.publicIdentityMismatch nodeIndex)
+      let result ← cappedMatrixFactExpr nodeIndex outputPort matrixType environment bound
+      match result with
+      | .matrix result =>
+          let relation : PreimageRelation := {
+            producer := result.origin
+            publicIdentity
+            targetOrigin := target.origin
+            targetSummary := matrixTargetSummary target
+          }
+          pure (.matrix ({ result with relations := [.preimage relation] }).refreshPrimitivePolynomial)
+      | _ => throw (.malformedRelation nodeIndex)
+  | .hashSample _ variant tagPrefix tagExpressions tagDecimalExpressions tagU64LeExpressions
+      base digitCount, some matrixType =>
+      let cap ← match matrixCap matrixType environment with
+        | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
+      let keyWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let keyOrigin ← valueOriginAt scopeKey nodeIndex facts keyWire
+      let trailingIntegerOrigins ← (node.arguments.drop 1).mapM
+        (valueOriginAt scopeKey nodeIndex facts)
+      let hashIdentity (targetType : MatrixTypeExpr) : DeterministicHashIdentity := {
+        keyOrigin
+        matrixType := targetType
+        parameterEnvironment := environment
+        parameterDomains := loopDomains
+        tagPrefix
+        tagExpressions
+        tagDecimalExpressions
+        tagU64LeExpressions
+        trailingIntegerOrigins
+      }
+      match variant with
+      | .plain =>
+          match ← classifiedMatrixFact nodeIndex outputPort matrixType environment cap true with
+          | .matrix result => pure (.matrix {
+              result with origin := .deterministicHash (hashIdentity matrixType)
+            })
+          | _ => throw (.malformedRelation nodeIndex)
+      | .decomposed | .smallDecomposed =>
+          let base ← match base with
+            | some expression => evaluateIntInvariant environment loopDomains expression
+            | none => throw (.gadgetLayoutMismatch nodeIndex)
+          let digitCount ← match digitCount with
+            | some expression => evaluateIntInvariant environment loopDomains expression
+            | none => throw (.gadgetLayoutMismatch nodeIndex)
+          if base <= 1 || digitCount <= 0 then throw (.gadgetLayoutMismatch nodeIndex)
+          let outputParams ← match matrixType.evaluate environment (.constant 0) with
+            | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
+          if outputParams.rows % digitCount.toNat != 0 then
+            throw (.gadgetLayoutMismatch nodeIndex)
+          let descriptor ← resolveGadgetLayout nodeIndex layouts outputParams
+          let small := variant == Mxx.HashVariant.smallDecomposed
+          let expectedCount := if small then descriptor.smallDigitCount else
+            descriptor.regularDigitCount
+          if descriptor.base != base || expectedCount != digitCount.toNat then
+            throw (.gadgetLayoutMismatch nodeIndex)
+          let targetRows := outputParams.rows / digitCount.toNat
+          let targetType : MatrixTypeExpr := {
+            modulus := .constant outputParams.modulus
+            ringDimension := .constant (Int.ofNat outputParams.ringDimension)
+            rows := .constant (Int.ofNat targetRows)
+            columns := .constant (Int.ofNat outputParams.columns)
+          }
+          let targetParams : Mxx.SamplerParams := {
+            maxCoefficientBound := cap.natAbs
+            modulus := outputParams.modulus
+            ringDimension := outputParams.ringDimension
+            rows := targetRows
+            columns := outputParams.columns
+          }
+          let targetOrigin := MatrixOriginIdentity.deterministicHash (hashIdentity targetType)
+          let targetSummary : RelationTargetSummary := {
+            origin := targetOrigin
+            matrixType := targetType
+            matrixParams := targetParams
+            totalHardBound := .closedInt (.constant cap)
+            canonicalRange := .unknown
+            polynomial := relationSnapshotPolynomial (primitiveOperationalPolynomial targetOrigin
+              targetType (.closedInt (.constant cap)) .large none [] {})
+          }
+          let publicIdentity := PublicMatrixIdentity.gadget descriptor.paramsId
+            outputParams targetRows base small digitCount.toNat
+          let result ← classifiedMatrixFact nodeIndex outputPort matrixType environment
+            (Int.ofNat (Mxx.gadgetDecompositionBound base small)) false
+            (if small then .below base.natAbs else .unknown)
+          match result with
+          | .matrix result =>
+              let relation : DecompositionRelation := {
+                producer := result.origin
+                publicIdentity
+                inputOrigin := targetOrigin
+                inputSummary := targetSummary
+                base
+                small
+                digitCount := digitCount.toNat
+                status := if small then .smallRangeMissing descriptor.smallestCrtModulus else
+                  .available
+              }
+              pure (.matrix ({ result with relations := [.decomposition relation] }).refreshPrimitivePolynomial)
+          | _ => throw (.malformedRelation nodeIndex)
+  | .gadgetDecompose declaredType base small digitCount, some matrixType =>
+      let bound ← evaluateIntInvariant environment loopDomains base
+      let count ← evaluateIntInvariant environment loopDomains digitCount
+      if bound <= 1 || count <= 0 then throw (.gadgetLayoutMismatch nodeIndex)
+      let params ← match declaredType.evaluate environment (.constant 0) with
+        | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
+      let descriptor ← resolveGadgetLayout nodeIndex layouts params
+      let expectedCount := if small then descriptor.smallDigitCount else descriptor.regularDigitCount
+      if count.toNat != expectedCount || bound != descriptor.base then
+        throw (.gadgetLayoutMismatch nodeIndex)
+      let inputWire ← match node.arguments[0]? with
+        | some wire => pure wire | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let input ← matrixFactAt nodeIndex facts inputWire
+      let publicIdentity := PublicMatrixIdentity.gadget descriptor.paramsId params
+        input.matrixParams.rows bound small count.toNat
+      let result ← cappedMatrixFact nodeIndex outputPort matrixType environment
+        (Int.ofNat (Mxx.gadgetDecompositionBound bound small))
+      match result with
+      | .matrix result =>
+          let status := if !small then ReconstructionStatus.available else
+            match input.canonicalRange with
+            | .below upper => if upper <= descriptor.smallestCrtModulus then
+                .available else .smallRangeMissing descriptor.smallestCrtModulus
+            | .unknown => .smallRangeMissing descriptor.smallestCrtModulus
+          let relation : DecompositionRelation := {
+            producer := result.origin
+            publicIdentity
+            inputOrigin := input.origin
+            inputSummary := matrixTargetSummary input
+            base := bound
+            small
+            digitCount := count.toNat
+            status
+          }
+          pure (.matrix ({
+            result with
+            canonicalRange := if small then .below bound.natAbs else .unknown
+            relations := [.decomposition relation]
+          }).refreshPrimitivePolynomial)
+      | _ => throw (.malformedRelation nodeIndex)
   | .matrixAdd, some matrixType | .matrixSubtract, some matrixType =>
-      let bounds ← node.arguments.mapM (matrixMaximum nodeIndex · facts)
-      cappedMatrixFact nodeIndex matrixType environment (bounds.foldl (· + ·) 0)
-  | .concat _, some matrixType =>
-      cappedMatrixFact nodeIndex matrixType environment (← maximumArguments nodeIndex node.arguments facts)
+      if node.arguments.length != 2 then
+        throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let leftWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let rightWire ← match node.arguments[1]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex leftWire)
+      let left ← requireMatrixType nodeIndex leftWire matrixType facts environment
+      let right ← requireMatrixType nodeIndex rightWire matrixType facts environment
+      let polynomial := match node.kind with
+        | .matrixAdd => addOperationalPolynomials left.polynomial right.polynomial
+        | .matrixSubtract => subtractOperationalPolynomials left.polynomial right.polynomial
+        | _ => []
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+  | .concat axis, some matrixType =>
+      let inputs ← node.arguments.mapM fun wire => matrixFactAt nodeIndex facts wire
+      let polynomial ← concatOperationalPolynomials axis matrixType (inputs.map (·.polynomial))
+        |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+        (joinCanonicalRanges (inputs.map (·.canonicalRange)))
   | .select, some matrixType =>
-      -- The first input is the Boolean selector.  The selected matrix is one of the remaining
-      -- branches, so their maximum is a sound branch-independent operational bound.
-      cappedMatrixFact nodeIndex matrixType environment
-        (← maximumArguments nodeIndex (node.arguments.drop 1) facts)
-  | .matrixNegate, some matrixType | .transpose, some matrixType | .slice _ _, some matrixType |
-      .reshape _ _, some matrixType =>
-      cappedMatrixFact nodeIndex matrixType environment (← maximumArguments nodeIndex node.arguments facts)
+      let indexWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let index ← integerFactAt nodeIndex facts indexWire
+      if node.arguments.length < 2 then
+        throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let branchCount := node.arguments.length - 1
+      if index.lower < 0 || index.upper >= Int.ofNat branchCount then
+        throw (.invalidCount nodeIndex index.upper)
+      let branches ← (node.arguments.drop 1).mapM fun wire =>
+        requireMatrixType nodeIndex wire matrixType facts environment
+      let polynomial ← selectOperationalPolynomials scopeKey nodeIndex index.origin matrixType
+        (branches.map (·.polynomial)) |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+        (joinCanonicalRanges (branches.map (·.canonicalRange)))
+  | .transpose, some matrixType =>
+      let inputWire ← match node.arguments[0]? with
+        | some wire => pure wire | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let input ← matrixFactAt nodeIndex facts inputWire
+      let polynomial ← transposeOperationalPolynomial input.polynomial
+        |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+  | .slice rows columns, some matrixType =>
+      let inputWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let input ← matrixFactAt nodeIndex facts inputWire
+      let polynomial ← sliceOperationalPolynomial rows columns matrixType input.polynomial
+        |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+  | .reshape rows columns, some matrixType =>
+      let inputWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let input ← matrixFactAt nodeIndex facts inputWire
+      let outputParams ← match matrixType.evaluate environment
+          (.constant input.matrixParams.maxCoefficientBound) with
+        | some params => pure params
+        | none => throw (.invalidMatrixParameters nodeIndex)
+      let polynomial ←
+        if sameConcreteMatrixShape input.matrixParams outputParams then
+          equivalentRetypeOperationalPolynomial matrixType input.polynomial
+            |>.mapError (flatErrorAt nodeIndex)
+        else
+          boundedStructuralTransformPolynomial (.reshape rows columns) matrixType input.polynomial
+            |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+  | .constantCoefficient index, some matrixType =>
+      let inputWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let input ← matrixFactAt nodeIndex facts inputWire
+      if node.arguments.length != 1 || input.matrixParams.rows != 1 ||
+          input.matrixParams.columns != 1 then
+        throw (.invalidMatrixParameters nodeIndex)
+      let minimum ← evaluateIntMinimum environment loopDomains index
+      let maximum ← evaluateIntMaximum environment loopDomains index
+      if minimum < 0 || maximum >= Int.ofNat input.matrixParams.ringDimension then
+        throw (.invalidCount nodeIndex maximum)
+      let polynomial ← boundedStructuralTransformPolynomial (.constantCoefficient index) matrixType
+        input.polynomial |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+  | .matrixNegate, some matrixType =>
+      let inputWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let input ← requireMatrixType nodeIndex inputWire matrixType facts environment
+      polynomialMatrixFact nodeIndex outputPort matrixType environment
+        (scaleOperationalPolynomial (-1) input.polynomial) input.canonicalRange
   | .matrixScale scalar, some matrixType =>
-      let scalar ← match scalar.evaluate environment with
-        | some value => pure value | none => throw (.invalidBound nodeIndex 0)
-      cappedMatrixFact nodeIndex matrixType environment
-        (absolute scalar * (← maximumArguments nodeIndex node.arguments facts))
-  | .matrixMultiply, some matrixType | .tensor, some matrixType =>
-      let ringDimension ← match matrixRingDimension matrixType environment with
+      let scalarValues ← evaluateIntOverLoops environment loopDomains scalar
+      let inputWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let input ← requireMatrixType nodeIndex inputWire matrixType facts environment
+      match scalarValues with
+      | [] => throw (.invalidMatrixParameters nodeIndex)
+      | first :: tail =>
+          if first == 1 && tail.all (· == 1) then
+            pure (.matrix { input with subject := { node := nodeIndex, port := outputPort } })
+          else
+            let polynomial ←
+              if tail.all (· == first) then
+                pure (scaleOperationalPolynomial first input.polynomial)
+              else
+                multiplyOperationalPolynomials
+                  (parameterScalarPolynomial environment loopDomains scalar matrixType)
+                  input.polynomial |>.mapError (flatErrorAt nodeIndex)
+            polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+              input.canonicalRange
+  | .matrixMultiply, some matrixType =>
+      let leftWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let rightWire ← match node.arguments[1]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex leftWire)
+      let left ← matrixFactAt nodeIndex facts leftWire
+      let right ← matrixFactAt nodeIndex facts rightWire
+      let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial
+        |>.mapError (flatErrorAt nodeIndex)
+      let rewritten ← rewriteOperationalRelations nodeIndex raw
+      let polynomial ← match rule with
+        | .matrixMultiplyRelation declaredRight => do
+            if declaredRight != rightWire then throw (.missingRelation nodeIndex declaredRight)
+            if rewritten == raw then throw (.missingRelation nodeIndex rightWire)
+            pure rewritten
+        | _ => pure rewritten
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+  | .tensor, some matrixType =>
+      let leftWire ← match node.arguments[0]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let rightWire ← match node.arguments[1]? with
+        | some wire => pure wire
+        | none => throw (.missingOperand nodeIndex leftWire)
+      let left ← matrixFactAt nodeIndex facts leftWire
+      let right ← matrixFactAt nodeIndex facts rightWire
+      let polynomial ← tensorOperationalPolynomials matrixType left.polynomial right.polynomial
+        |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+  | .crtRecompose plaintextModuli reconstructionCoefficients, some matrixType =>
+      if node.arguments.isEmpty || node.arguments.length != plaintextModuli.length ||
+          node.arguments.length != reconstructionCoefficients.length then
+        throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let moduli ← plaintextModuli.mapM (evaluateIntInvariant environment loopDomains)
+      let coefficients ← reconstructionCoefficients.mapM
+        (evaluateIntInvariant environment loopDomains)
+      let inputs ← node.arguments.mapM fun wire =>
+        requireMatrixType nodeIndex wire matrixType facts environment
+      let modulus ← evaluateIntInvariant environment loopDomains matrixType.modulus
+      if modulus <= 0 || inputs.any (·.matrixParams.rows != 1) ||
+          moduli.any (fun value => value <= 1 || value >= modulus) ||
+          coefficients.any (fun value => value < 0 || value >= modulus) then
+        throw (.invalidMatrixParameters nodeIndex)
+      let polynomial := (coefficients.zip inputs).foldl
+        (fun result pair ↦ addOperationalPolynomials result
+          (scaleOperationalPolynomial pair.1 pair.2.polynomial)) []
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+  | .packPolynomialCoefficients _ coefficientBits, some matrixType =>
+      let bits ← evaluateIntMaximum environment loopDomains coefficientBits
+      if bits <= 0 then throw (.invalidBound nodeIndex bits)
+      if node.arguments.length != 1 then
+        throw (.unsupportedOutputArity nodeIndex node.arguments.length)
+      let cap ← match matrixCap matrixType environment with
+        | some value => pure value
+        | none => throw (.invalidMatrixParameters nodeIndex)
+      let params ← match matrixType.evaluate environment with
         | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
-      let innerDimension ← match matrixInnerDimension matrixType environment with
-        | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
-      let bounds ← node.arguments.mapM (matrixMaximum nodeIndex · facts)
-      let bound := match bounds with
-        | left :: right :: _ => ringDimension * innerDimension * left * right
-        | _ => 0
-      cappedMatrixFact nodeIndex matrixType environment bound
+      if params.rows != 1 || params.columns != 1 || (2 : Int) ^ bits.toNat < params.modulus then
+        throw (.invalidMatrixParameters nodeIndex)
+      let inputWire := node.arguments.headD { node := 0, port := 0 }
+      let input ← lookupFact nodeIndex facts inputWire
+      let expectedCount := Int.ofNat params.ringDimension * bits
+      if booleanFamilyCount input != some expectedCount then
+        throw (.loopInputModeMismatch nodeIndex 0)
+      classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
+        (if params.modulus > 0 then .below params.modulus.toNat else .unknown)
   | .trapdoorSample _ maximum, some matrixType =>
-      let bound ← match maximum.evaluate environment with
-        | some value => pure value | none => throw (.invalidBound nodeIndex 0)
-      cappedMatrixFact nodeIndex matrixType environment bound
+      let maximum ← evaluateIntMaximum environment loopDomains maximum
+      if maximum < 0 then throw (.invalidBound nodeIndex maximum)
+      let cap ← match matrixCap matrixType environment with
+        | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
+      let result ← classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
+      match result with
+      | .matrix result => pure (.matrix ({
+          result with identity := some (.sampledTrapdoor temporaryScope
+            { node := nodeIndex, port := 0 })
+        }).refreshPrimitivePolynomial)
+      | _ => throw (.malformedRelation nodeIndex)
   | .trapdoorSample _ maximum, none =>
-      let bound ← match maximum.evaluate environment with
-        | some value => pure value | none => throw (.invalidBound nodeIndex 0)
+      let boundExpr := OperationalBoundExpr.contextual .maximum environment loopDomains maximum
+      let bound ← boundExpr.evaluate environment #[]
       match outputType with
       | .trapdoor matrixType _ _ _ _ =>
           let cap ← match matrixCap matrixType environment with
             | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
-          pure (.trapdoor matrixType (min cap bound))
-      | _ => defaultFact nodeIndex outputType environment
+          let maximum := min cap bound
+          let params ← match matrixType.evaluate environment (.constant maximum) with
+            | some params => pure params
+            | none => throw (.invalidMatrixParameters nodeIndex)
+          pure (.trapdoor {
+            subject := { node := nodeIndex, port := outputPort }
+            matrixType
+            matrixParams := params
+            maximum := .minimum (.closedInt (.constant cap)) boundExpr
+            publicIdentity := .sampledTrapdoor temporaryScope { node := nodeIndex, port := 0 }
+          })
+      | _ => defaultFact nodeIndex outputPort outputType environment
   | .trapdoorPublic, some matrixType =>
-      cappedMatrixFact nodeIndex matrixType environment (← maximumArguments nodeIndex node.arguments facts)
+      let trapdoorWire ← match node.arguments[0]? with
+        | some wire => pure wire | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
+      let trapdoor ← match ← lookupFact nodeIndex facts trapdoorWire with
+        | .trapdoor fact => pure fact
+        | _ => throw (.missingPublicIdentity nodeIndex trapdoorWire)
+      let cap ← match matrixCap matrixType environment with
+        | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
+      let bound := publicIdentityMaximum cap trapdoor.publicIdentity
+      let large := publicIdentityIsLarge trapdoor.publicIdentity
+      let result ← classifiedMatrixFact nodeIndex outputPort matrixType environment bound large
+      match result with
+      | .matrix result => pure (.matrix ({
+          result with identity := some trapdoor.publicIdentity
+        }).refreshPrimitivePolynomial)
+      | _ => throw (.malformedRelation nodeIndex)
   | .gadgetTrapdoor _ base, some matrixType =>
-      let bound ← match base.evaluate environment with
-        | some value => pure value | none => throw (.invalidBound nodeIndex 0)
-      cappedMatrixFact nodeIndex matrixType environment (absolute bound)
-  | .unitRowMatrix _ _, some matrixType | .unitColumnMatrix _ _, some matrixType |
-      .rotationMatrix _ _, some matrixType =>
-      cappedMatrixFact nodeIndex matrixType environment 1
-  | .gadgetMatrix _ base, some matrixType | .smallGadgetMatrix _ base, some matrixType |
-      .powerOfBaseMatrix _ base _, some matrixType =>
-      let bound ← match base.evaluate environment with
-        | some value => pure (absolute value)
-        | none => throw (.invalidBound nodeIndex 0)
-      cappedMatrixFact nodeIndex matrixType environment bound
-  | _, _ =>
-      -- A generic operation whose output port is not a matrix-specific case still receives a
-      -- checked type-derived fact.  Owning crate descriptors later refine relation-bearing ports.
-      let _ := outputPort
-      defaultFact nodeIndex outputType environment
+      let bound ← evaluateIntInvariant environment loopDomains base
+      let params ← match matrixType.evaluate environment (.constant 0) with
+        | some params => pure params | none => throw (.invalidMatrixParameters nodeIndex)
+      let descriptor ← resolveGadgetLayout nodeIndex layouts params
+      let count := descriptor.regularDigitCount
+      if bound != descriptor.base then throw (.gadgetLayoutMismatch nodeIndex)
+      let identity := PublicMatrixIdentity.gadget descriptor.paramsId params
+        params.rows bound false count
+      let cap ← match matrixCap matrixType environment with
+        | some value => pure value
+        | none => throw (.invalidMatrixParameters nodeIndex)
+      let result ← classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
+      match result with
+      | .matrix result => pure (.matrix ({
+          result with identity := some identity
+        }).refreshPrimitivePolynomial)
+      | _ => throw (.malformedRelation nodeIndex)
+  | .gadgetTrapdoor _ base, none =>
+      let bound ← evaluateIntInvariant environment loopDomains base
+      match outputType with
+      | .trapdoor matrixType _ _ _ _ =>
+          let params ← match matrixType.evaluate environment (.constant 0) with
+            | some params => pure params | none => throw (.invalidMatrixParameters nodeIndex)
+          let descriptor ← resolveGadgetLayout nodeIndex layouts params
+          if bound != descriptor.base then throw (.gadgetLayoutMismatch nodeIndex)
+          let identity := PublicMatrixIdentity.gadget descriptor.paramsId params
+            params.rows bound false descriptor.regularDigitCount
+          pure (.trapdoor {
+            subject := { node := nodeIndex, port := outputPort }
+            matrixType
+            matrixParams := params
+            maximum := .closedInt (.constant (absolute bound))
+            publicIdentity := identity
+          })
+      | _ => defaultFact nodeIndex outputPort outputType environment
+  | .unitRowMatrix _ _, some matrixType | .unitColumnMatrix _ _, some matrixType =>
+      classifiedMatrixFact nodeIndex outputPort matrixType environment 1 false (.below 2)
+        { isConstantPolynomial := true }
+  | .rotationMatrix _ _, some matrixType =>
+      classifiedMatrixFact nodeIndex outputPort matrixType environment 1 false
+  | .gadgetMatrix _ base, some matrixType | .smallGadgetMatrix _ base, some matrixType =>
+      let bound ← evaluateIntMaximumAbsolute environment loopDomains base
+      let params ← match matrixType.evaluate environment (.constant 0) with
+        | some params => pure params | none => throw (.invalidMatrixParameters nodeIndex)
+      let descriptor ← resolveGadgetLayout nodeIndex layouts params
+      let small := match node.kind with | .smallGadgetMatrix _ _ => true | _ => false
+      let count := if small then descriptor.smallDigitCount else descriptor.regularDigitCount
+      if bound != descriptor.base then throw (.gadgetLayoutMismatch nodeIndex)
+      let cap ← match matrixCap matrixType environment with
+        | some value => pure value
+        | none => throw (.invalidMatrixParameters nodeIndex)
+      let result ← classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
+      match result with
+      | .matrix result => pure (.matrix ({
+          result with identity := some (.gadget descriptor.paramsId params params.rows bound small count)
+        }).refreshPrimitivePolynomial)
+      | _ => throw (.malformedRelation nodeIndex)
+  | .powerOfBaseMatrix _ base _, some matrixType =>
+      let _ ← evaluateIntMaximumAbsolute environment loopDomains base
+      let cap ← match matrixCap matrixType environment with
+        | some value => pure value
+        | none => throw (.invalidMatrixParameters nodeIndex)
+      classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
+  | _, some _ => throw (.unsupportedNode nodeIndex)
+  | _, none => throw (.unsupportedNode nodeIndex)
 
-def evaluateScopeOperational
+def lookupCheckedDefinition
+    (name : String)
+    (definitions : List (String × Scope))
+    (derivations : List (String × ScopeDerivation)) :
+    Except OperationalError (Scope × ScopeDerivation) :=
+  match definitions, derivations with
+  | [], _ => .error (.missingDefinition name)
+  | _, [] => .error (.missingDefinition name)
+  | (definitionName, scope) :: definitionTail,
+      (derivationName, derivation) :: derivationTail =>
+      if definitionName != derivationName then .error (.missingDefinition name)
+      else if definitionName = name then .ok (scope, derivation)
+      else lookupCheckedDefinition name definitionTail derivationTail
+
+private def validateScopeInputs (scope : Scope) : Except OperationalError Unit := do
+  let nodeNames := scope.nodes.filterMap fun node => match node.kind with
+    | .input name => some name
+    | _ => none
+  for name in scope.inputNames do
+    if scope.inputNames.count name != 1 then throw (.duplicateInputName name)
+    if nodeNames.count name = 0 then throw (.missingInputNode name)
+    if nodeNames.count name != 1 then throw (.duplicateInputName name)
+  for name in nodeNames do
+    if !scope.inputNames.contains name then throw (.unexpectedInputNode name)
+
+def deriveOrdinaryOutputs
+    (scopeKey : ScopeTemplateKey)
+    (nodeIndex : Nat)
+    (node : Node)
+    (rule : DerivationRule)
+    (environment : ParamEnvironment)
+    (loopDomains : List OperationalParameterDomain)
+    (layouts : List Mxx.GadgetLayoutDescriptor)
+    (facts : OperationalScopeFacts) :
+    Nat → List WireTypeExpr → Except OperationalError (List OperationalFact)
+  | _, [] => pure []
+  | port, outputType :: tail => do
+      let output ← genericNodeFact scopeKey nodeIndex node rule port outputType facts
+        environment loopDomains layouts
+      let output := namespaceFreshOutput scopeKey { node := nodeIndex, port } output
+      return output :: (← deriveOrdinaryOutputs scopeKey nodeIndex node rule environment
+        loopDomains layouts facts (port + 1) tail)
+
+def evaluateCheckedScope
+    (definitions : List (String × Scope))
+    (definitionDerivations : List (String × ScopeDerivation))
+    (layouts : List Mxx.GadgetLayoutDescriptor) :
+    ScopeTemplateKey → Nat → Scope → ScopeDerivation → ParamEnvironment →
+      List OperationalParameterDomain →
+      List OperationalFact →
+      Except OperationalError OperationalScopeFacts
+  | _, 0, _, _, _, _, _ => .error .definitionFuelExhausted
+  | scopeKey, fuel + 1, scope, derivation, environment, loopDomains, inputFacts => do
+      match checkScopeDerivation scope derivation with
+      | .error error => throw (.derivation error)
+      | .ok () => pure ()
+      validateScopeInputs scope
+      for attachment in derivation.attachments do
+        validateDerivationAttachment scope attachment
+      if !inputFacts.isEmpty && inputFacts.length != scope.inputNames.length then
+        throw (.childInputMismatch 0 scope.inputNames.length inputFacts.length)
+      let rec collectChildOutputs
+          (callerNode port : Nat)
+          (outputs : List (String × WireRef))
+          (facts : OperationalScopeFacts) : Except OperationalError (List OperationalFact) := do
+        match outputs with
+        | [] => pure []
+        | (_, wire) :: tail =>
+            let fact ← lookupFact callerNode facts wire
+            let rebound ← rebindSubject { node := callerNode, port } fact
+            return rebound :: (← collectChildOutputs callerNode (port + 1) tail facts)
+      let rec scopeOutputFacts
+          (callerNode : Nat)
+          (outputs : List (String × WireRef))
+          (facts : OperationalScopeFacts) : Except OperationalError (List OperationalFact) := do
+        match outputs with
+        | [] => pure []
+        | (_, wire) :: tail =>
+            return (← lookupFact callerNode facts wire) ::
+              (← scopeOutputFacts callerNode tail facts)
+      let rec prepareParallelInputs
+          (nodeIndex index argumentIndex : Nat)
+          (modes : List LoopInputMode)
+          (inputs : List OperationalFact) : Except OperationalError (List OperationalFact) := do
+        match modes, inputs with
+        | [], [] => pure []
+        | mode :: modeTail, input :: inputTail =>
+            return (← loopArgumentFact nodeIndex argumentIndex index mode input) ::
+              (← prepareParallelInputs nodeIndex index (argumentIndex + 1) modeTail inputTail)
+        | _, _ => throw (.loopInputModeMismatch nodeIndex argumentIndex)
+      let rec go
+          (index : Nat)
+          (nodes : List Node)
+          (facts : OperationalScopeFacts) : Except OperationalError OperationalScopeFacts := do
+        match nodes with
+        | [] => pure facts
+        | node :: tail =>
+            if node.outputCount != node.outputTypes.length then
+              throw (.unsupportedOutputArity index node.outputCount)
+            let step ← match derivation.steps[index]? with
+              | some step => pure step
+              | none => throw (.derivation (.missingNode index))
+            let outputs ← match node.kind with
+              | .input name =>
+                  if inputFacts.isEmpty then
+                    deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
+                      layouts facts 0 node.outputTypes
+                  else
+                    match scope.inputNames.idxOf? name with
+                    | some inputIndex =>
+                        match inputFacts[inputIndex]? with
+                        | some input => do
+                            let rebound ← rebindSubject { node := index, port := 0 } input
+                            pure [rebound]
+                        | none => throw (.childInputMismatch index scope.inputNames.length inputFacts.length)
+                    | none => throw (.childInputMismatch index scope.inputNames.length inputFacts.length)
+              | .subgraphCall definition bindings =>
+                  let actualInputs ← node.arguments.mapM (lookupFact index facts)
+                  let boundParams ← match evaluateBindings environment bindings with
+                    | some values => pure values
+                    | none => throw .nonClosedExpression
+                  let childDomains ← extendParameterDomains environment loopDomains bindings
+                  let (childScope, childDerivation) ←
+                    lookupCheckedDefinition definition definitions definitionDerivations
+                  let childKey := .callBody scopeKey index
+                  let childFacts ← (evaluateCheckedScope definitions definitionDerivations layouts
+                    childKey fuel childScope childDerivation (boundParams ++ environment)
+                    childDomains actualInputs).mapError (.inScope childKey)
+                  collectChildOutputs index 0 childScope.outputs childFacts
+              | .familyPack =>
+                  let elements ← node.arguments.mapM (lookupFact index facts)
+                  pure [packedFacts elements]
+              | .familyGetStatic familyIndex =>
+                  let familyWire ← match node.arguments[0]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index { node := 0, port := 0 })
+                  let requested ← match familyIndex.evaluate environment with
+                    | some value => pure value
+                    | none => throw .nonClosedExpression
+                  match ← lookupFact index facts familyWire with
+                  | .familyUniform _ coordinate element count =>
+                      if requested < 0 || requested >= count then
+                        throw (.invalidCount index requested)
+                      else
+                        let element := match coordinate with
+                          | some (.loopBinder _ _ slot) =>
+                              instantiateFactLoopIndex slot requested.toNat element
+                          | some (.loopBinderOffset _ _ slot offset) =>
+                              instantiateFactLoopIndex slot (requested.toNat + offset) element
+                          | none => selectProtocolFamilyElement requested.toNat element
+                        pure [← rebindSubject { node := index, port := 0 } element]
+                  | packed =>
+                      if requested < 0 then throw (.invalidCount index requested) else
+                        match (unpackPackedFacts packed).bind fun elements => elements[requested.toNat]? with
+                        | some element => pure [← rebindSubject { node := index, port := 0 } element]
+                        | none => throw (.invalidCount index requested)
+              | .familyGetDynamic =>
+                  let familyWire ← match node.arguments[0]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index { node := 0, port := 0 })
+                  let indexWire ← match node.arguments[1]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index { node := 0, port := 0 })
+                  let selectionFact ← match ← lookupFact index facts indexWire with
+                    | .integer fact => pure fact
+                    | _ => throw (.loopInputModeMismatch index 1)
+                  let selection := selectionFact.origin
+                  match ← lookupFact index facts familyWire with
+                  | .familyUniform binder _ element count =>
+                      -- Operational magnitude analysis is conditional on successful executable
+                      -- evaluation. A dynamic access that succeeds returns one family element, so
+                      -- a correlated interval need only overlap the valid range. Proving that every
+                      -- runtime input stays in range belongs to graph validation/end-to-end
+                      -- correctness, not to the noise transfer. Entirely invalid ranges still fail.
+                      if count <= 0 || selectionFact.upper < 0 || selectionFact.lower >= count then
+                        throw (.invalidCount index selectionFact.upper)
+                      else pure [← selectDynamicUniformFact binder selection
+                        { node := index, port := 0 } element]
+                  | packed =>
+                      match unpackPackedFacts packed with
+                      | some elements =>
+                          if elements.isEmpty || selectionFact.upper < 0 ||
+                              selectionFact.lower >= Int.ofNat elements.length then
+                            throw (.invalidCount index selectionFact.upper)
+                          else pure [← joinDynamicFacts index { node := index, port := 0 } elements
+                              (some selection)]
+                      | none => throw (.loopInputModeMismatch index 0)
+              | .parallelLoop definition count indexSlot bindings modes =>
+                  let evaluatedCount ← match count.evaluate environment with
+                    | some value => pure value
+                    | none => throw .nonClosedExpression
+                  if evaluatedCount < 0 then throw (.invalidCount index evaluatedCount)
+                  let actualInputs ← node.arguments.mapM (lookupFact index facts)
+                  let templateInputs ← prepareParallelInputs index 0 0 modes actualInputs
+                  let iterationEnvironment :=
+                    (ParamKey.loopIndex indexSlot, ParamValue.integer 0) :: environment
+                  let parentDomains := .loopIndex indexSlot evaluatedCount.toNat ::
+                    loopDomains.filter fun domain => match domain with
+                      | .loopIndex candidate _ => candidate != indexSlot
+                      | .parameter _ _ _ _ => true
+                  let boundParams ← match evaluateBindings iterationEnvironment bindings with
+                    | some values => pure values
+                    | none => throw .nonClosedExpression
+                  let childDomains ← extendParameterDomains iterationEnvironment parentDomains bindings
+                  let (childScope, childDerivation) ←
+                    lookupCheckedDefinition definition definitions definitionDerivations
+                  let childKey := .parallelBody scopeKey index
+                  let childFacts ← (evaluateCheckedScope definitions definitionDerivations layouts
+                    childKey fuel childScope childDerivation
+                    (boundParams ++ iterationEnvironment) childDomains templateInputs).mapError
+                      (.inScope childKey)
+                  let childOutputs ← scopeOutputFacts index childScope.outputs childFacts
+                  if childOutputs.length != node.outputCount then
+                    throw (.childInputMismatch index node.outputCount childOutputs.length)
+                  childOutputs.zipIdx.mapM fun (output, port) =>
+                    rebindSubject { node := index, port } (.familyUniform
+                      { owner := scopeKey, producerNode := index, binderSlot := indexSlot }
+                      (some (.loopBinder scopeKey index indexSlot)) output evaluatedCount)
+              | .sequentialLoop definition count indexSlot bindings carriedCount =>
+                  let evaluatedCount ← match count.evaluate environment with
+                    | some value => pure value
+                    | none => throw .nonClosedExpression
+                  if evaluatedCount < 0 then throw (.invalidCount index evaluatedCount)
+                  let actualInputs ← node.arguments.mapM (lookupFact index facts)
+                  let carriedFacts := actualInputs.take carriedCount
+                  let invariantFacts := actualInputs.drop carriedCount
+                  if carriedFacts.length != carriedCount then
+                    throw (.childInputMismatch index carriedCount carriedFacts.length)
+                  for (fact, slot) in carriedFacts.zipIdx do
+                    if factHasRelation fact then
+                      throw (.relationBearingCarriedValue scopeKey index slot)
+                  let abstractCarried := carriedFacts.zipIdx.map fun (fact, slot) =>
+                    abstractCarriedMaximum slot fact
+                  let shiftedInvariantFacts := invariantFacts.map shiftFactPreviousDepth
+                  let iterationEnvironment := replaceLoopIndex environment indexSlot 0
+                  let sequentialDomains := .loopIndex indexSlot evaluatedCount.toNat ::
+                    loopDomains.filter fun domain => match domain with
+                      | .loopIndex candidate _ => candidate != indexSlot
+                      | .parameter _ _ _ _ => true
+                  let boundParams ← match evaluateBindings iterationEnvironment bindings with
+                    | some values => pure values
+                    | none => throw .nonClosedExpression
+                  let childDomains ← extendParameterDomains iterationEnvironment sequentialDomains bindings
+                  let (childScope, childDerivation) ←
+                    lookupCheckedDefinition definition definitions definitionDerivations
+                  let childKey := .sequentialBody scopeKey index
+                  let childFacts ← (evaluateCheckedScope definitions definitionDerivations layouts
+                    childKey fuel childScope childDerivation
+                    (boundParams ++ iterationEnvironment) childDomains
+                    (abstractCarried ++ shiftedInvariantFacts)).mapError (.inScope childKey)
+                  let outputTemplates ← scopeOutputFacts index childScope.outputs childFacts
+                  if outputTemplates.length != carriedCount then
+                    throw (.childInputMismatch index carriedCount outputTemplates.length)
+                  for slot in List.range carriedCount do
+                    match carriedFacts[slot]?, outputTemplates[slot]? with
+                    | some initial, some output =>
+                        if !sameCarriedSchema initial output || factHasRelation output then
+                          if factHasRelation output then
+                            throw (.relationBearingCarriedValue scopeKey index slot)
+                          else throw (.sequentialSchemaMismatch scopeKey index slot
+                            (carriedLargeFactorCounts initial) (carriedLargeFactorCounts output))
+                    | _, _ => throw (.childInputMismatch index carriedCount outputTemplates.length)
+                  let initialComponents := carriedFacts.zipIdx.flatMap fun (carried, slot) =>
+                    factNumericExpressions slot carried
+                  let transitionComponents := outputTemplates.zipIdx.flatMap fun (output, slot) =>
+                    factNumericExpressions slot output
+                  let paths := initialComponents.map (·.1)
+                  if paths != transitionComponents.map (·.1) then
+                    throw (.sequentialSchemaMismatch scopeKey index 0 [] [])
+                  let initialExpressions := initialComponents.map (·.2)
+                  let transitions := transitionComponents.map (·.2)
+                  let outputs ←
+                    if evaluatedCount = 0 then pure carriedFacts
+                    else outputTemplates.zipIdx.mapM (fun pair =>
+                      setFactRecurrenceState evaluatedCount.toNat paths initialExpressions transitions
+                        pair.2 environment pair.1)
+                  outputs.zipIdx.mapM fun (output, port) =>
+                    rebindSubject { node := index, port } output
+              | _ =>
+                  deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
+                    layouts facts 0 node.outputTypes
+            let facts := facts.push outputs.toArray
+            let facts ← applyReadyDerivationAttachments index derivation.attachments facts
+            go (index + 1) tail facts
+      termination_by (fuel, nodes.length)
+      go 0 scope.nodes #[]
+termination_by
+  _ fuel _ _ _ _ _ => (fuel, 0)
+
+def evaluateProgramOperationalWithKey
+    (programKey : ProgramInstanceKey)
+    (program : Prog)
+    (derivation : ProgramDerivation)
+    (environment : ParamEnvironment)
+    (layouts : List Mxx.GadgetLayoutDescriptor) : Except OperationalError OperationalScopeFacts := do
+  match checkProgramDerivation program derivation with
+  | .error error => throw (.derivation error)
+  | .ok () =>
+      evaluateCheckedScope program.definitions derivation.definitions layouts
+        (.root programKey) (program.definitions.length + 1)
+        program.root derivation.root environment [] []
+
+private def findInputWireType (scope : Scope) (name : String) : Option (WireRef × WireTypeExpr) :=
+  scope.nodes.zipIdx.findSome? fun (node, index) =>
+    if node.kind == .input name then
+      node.outputTypes[0]?.map fun wireType => ({ node := index, port := 0 }, wireType)
+    else none
+
+private def evaluateDeclaredBound
+    (environment : ParamEnvironment) : DeclaredBoundExpr → Except OperationalError Int
+  | .constant value => pure (Int.ofNat value)
+  | .parameter value =>
+      match value.evaluate environment with
+      | some result => pure result
+      | none => throw .nonClosedExpression
+  | .absolute value =>
+      match value.evaluate environment with
+      | some result => pure (absolute result)
+      | none => throw .nonClosedExpression
+  | .add left right => return (← evaluateDeclaredBound environment left) +
+      (← evaluateDeclaredBound environment right)
+  | .multiply left right => return (← evaluateDeclaredBound environment left) *
+      (← evaluateDeclaredBound environment right)
+  | .maximum left right => do
+      let left ← evaluateDeclaredBound environment left
+      let right ← evaluateDeclaredBound environment right
+      pure (max left right)
+  | .minimum left right => do
+      let left ← evaluateDeclaredBound environment left
+      let right ← evaluateDeclaredBound environment right
+      pure (min left right)
+  | .floorDivide value divisor => do
+      if divisor = 0 then throw .divisionByZero else
+        return (← evaluateDeclaredBound environment value) / Int.ofNat divisor
+  | .matrixProduct ringDimension innerDimension left right => do
+      let ringDimension ← match ringDimension.evaluate environment with
+        | some value => pure value | none => throw .nonClosedExpression
+      let innerDimension ← match innerDimension.evaluate environment with
+        | some value => pure value | none => throw .nonClosedExpression
+      return ringDimension * innerDimension *
+        (← evaluateDeclaredBound environment left) * (← evaluateDeclaredBound environment right)
+
+private def contractFact
+    (scopeKey : ScopeTemplateKey)
+    (subject : WireRef)
+    (protocolInput : ProtocolInputId)
+    (wireType : WireTypeExpr)
+    (contract : InputValueContract)
+    (environment : ParamEnvironment) : Except OperationalError OperationalFact := do
+  let origin : OperationalValueOrigin := .protocolInput protocolInput
+  let setMatrixOrigin : OperationalFact → OperationalFact
+    | .matrix fact => .matrix { fact with origin := .protocolInput protocolInput }
+    | fact => fact
+  match contract, wireType with
+  | .matrixExact contractType, .matrix wireMatrixType =>
+      if contractType != wireMatrixType then throw (.inputContractMismatch "matrix")
+      let cap ← match matrixCap wireMatrixType environment with
+        | some value => pure value
+        | none => throw (.invalidMatrixParameters subject.node)
+      return setMatrixOrigin (← classifiedMatrixFact subject.node subject.port wireMatrixType
+        environment cap true)
+  | .matrixBounded contractType bound, .matrix wireMatrixType =>
+      if contractType != wireMatrixType then throw (.inputContractMismatch "matrix")
+      let maximum ← evaluateDeclaredBound environment bound
+      return setMatrixOrigin (← cappedMatrixFact subject.node subject.port wireMatrixType
+        environment maximum)
+  | .integerRange lower upper, .integer | .integerRange lower upper, .constantInt =>
+      let evaluatedLower ← match lower.evaluate environment with
+        | some value => pure value | none => throw .nonClosedExpression
+      let evaluatedUpper ← match upper.evaluate environment with
+        | some value => pure value | none => throw .nonClosedExpression
+      if evaluatedLower > evaluatedUpper then throw (.inputContractMismatch "integer range")
+      pure (.integer {
+        subject
+        origin
+        lower := evaluatedLower
+        upper := evaluatedUpper
+        lowerExpression := .closedInt (.constant evaluatedLower)
+        upperExpression := .closedInt (.constant evaluatedUpper)
+      })
+  | .boolean, .boolean | .boolean, .constantBool => pure .boolean
+  | .bytes contractLength, .bytes wireLength =>
+      let contractLength ← match contractLength.evaluate environment with
+        | some value => pure value | none => throw .nonClosedExpression
+      let wireLength ← match wireLength.evaluate environment with
+        | some value => pure value | none => throw .nonClosedExpression
+      if contractLength != wireLength then throw (.inputContractMismatch "bytes")
+      pure (.bytes { subject, origin, length := contractLength })
+  | .family contractCount elementContract, .indexedFamily elementType wireCount =>
+      let contractCount ← match contractCount.evaluate environment with
+        | some value => pure value | none => throw .nonClosedExpression
+      let wireCount ← match wireCount.evaluate environment with
+        | some value => pure value | none => throw .nonClosedExpression
+      if contractCount != wireCount || contractCount < 0 then
+        throw (.inputContractMismatch "family count")
+      let element ← contractFact scopeKey subject protocolInput elementType elementContract environment
+      pure (.familyUniform
+        { owner := scopeKey, producerNode := subject.node, binderSlot := subject.port }
+        none element contractCount)
+  | _, _ => throw (.inputContractMismatch "wire type")
+
+structure OperationalStageResult where
+  stage : String
+  outputs : List (String × OperationalFact)
+  facts : OperationalScopeFacts
+
+/-- A closed, generic parameter obligation derived from operational facts. Applications select
+the relevant output fact, but do not implement their own arithmetic acceptance condition. -/
+inductive OperationalNoiseObligation where
+  | decoderThreshold
+      (plaintextModulus ciphertextModulus noiseBound : Int)
+  deriving BEq, DecidableEq, Repr
+
+/-- Stable, protocol-independent reasons why a closed operational report is rejected. -/
+inductive OperationalNoiseRejection where
+  | invalidPlaintextModulus (value : Int)
+  | invalidCiphertextModulus (value : Int)
+  | invalidNoiseBound (value : Int)
+  | decoderThresholdNotMet
+      (plaintextModulus ciphertextModulus noiseBound : Int)
+  deriving BEq, DecidableEq, Repr
+
+/-- Result consumed by parameter search. The evaluated workflow outputs are retained so callers
+can inspect the facts that produced each obligation; acceptance is only the conjunction of the
+listed closed obligations. Wall-clock timing belongs to the IO caller, not this pure result. -/
+structure OperationalNoiseCheckReport where
+  outputs : List OperationalStageResult
+  obligations : List OperationalNoiseObligation
+  accepted : Bool
+  rejection : Option OperationalNoiseRejection
+
+private def checkDecoderThreshold
+    (plaintextModulus ciphertextModulus noiseBound : Int) :
+    Bool × Option OperationalNoiseRejection :=
+  if plaintextModulus <= 1 then
+    (false, some (.invalidPlaintextModulus plaintextModulus))
+  else if ciphertextModulus <= 0 then
+    (false, some (.invalidCiphertextModulus ciphertextModulus))
+  else if noiseBound < 0 then
+    (false, some (.invalidNoiseBound noiseBound))
+  else if 2 * plaintextModulus * noiseBound < ciphertextModulus then
+    (true, none)
+  else
+    (false, some (.decoderThresholdNotMet
+      plaintextModulus ciphertextModulus noiseBound))
+
+/-- Builds the generic decoder report used by parameter search. This definition intentionally
+uses multiplication rather than an integer division such as `noise < q / 4`, so boundary behavior
+is exactly the stated strict inequality for every plaintext modulus. -/
+def decoderNoiseCheckReport
+    (outputs : List OperationalStageResult)
+    (residual : OperationalMatrixFact)
+    (environment : ParamEnvironment)
+    (plaintextModulus ciphertextModulus : Int) :
+    Except OperationalError OperationalNoiseCheckReport := do
+  let noiseBound ← residual.evaluateNoiseHardBound environment
+  let obligation := OperationalNoiseObligation.decoderThreshold
+    plaintextModulus ciphertextModulus noiseBound
+  let (accepted, rejection) :=
+    checkDecoderThreshold plaintextModulus ciphertextModulus noiseBound
+  pure { outputs, obligations := [obligation], accepted, rejection }
+
+private def collectOperationalOutputs
+    (scope : Scope)
+    (facts : OperationalScopeFacts) : Except OperationalError (List (String × OperationalFact)) :=
+  scope.outputs.mapM fun (name, wire) => return (name, ← lookupFact scope.nodes.length facts wire)
+
+private def findStageOutput
+    (results : List OperationalStageResult)
+    (stage output : String) : Except OperationalError OperationalFact := do
+  let result ← match results.find? fun result => result.stage == stage with
+    | some result => pure result
+    | none => throw (.missingStageResult stage output)
+  match result.outputs.find? fun candidate => candidate.1 == output with
+  | some (_, fact) => pure fact
+  | none => throw (.missingStageResult stage output)
+
+/-- Evaluates the exact frozen workflow in stage order. Protocol inputs are constructed from the
+reviewed input contract; artifact inputs are the producer's actual operational output facts, so
+relations and identities cross a stage boundary without graph search or user annotations. -/
+def evaluateWorkflowOperational
+    (bundle : OperationalWorkflowSpec)
+    (stageDerivations : List (String × ProgramDerivation))
+    (environment : ParamEnvironment)
+    (layouts : List Mxx.GadgetLayoutDescriptor) :
+    Except OperationalError (List OperationalStageResult) := do
+  let rec go (results : List OperationalStageResult) : List Stage →
+      Except OperationalError (List OperationalStageResult)
+    | [] => pure results
+    | stage :: tail => do
+        let derivation ← match stageDerivations.find? fun candidate => candidate.1 == stage.id with
+          | some (_, derivation) => pure derivation
+          | none => throw (.missingStageDerivation stage.id)
+        let scopeKey := ScopeTemplateKey.root (.workflowStage ⟨stage.id⟩)
+        let inputFacts ← stage.inputs.mapM fun (inputName, source) => do
+          let (subject, wireType) ← match findInputWireType stage.program.root inputName with
+            | some result => pure result
+            | none => throw (.missingInputNode inputName)
+          match source with
+          | .artifact producer output =>
+              rebindSubject subject (← findStageOutput results producer output)
+          | .protocol protocolName =>
+              let (protocolInput, contract) ← match bundle.inputContract.inputs.find? fun entry =>
+                  entry.1.name == protocolName with
+                | some (protocolInput, _, contract) => pure (protocolInput, contract)
+                | none => throw (.missingProtocolContract protocolName)
+              contractFact scopeKey subject protocolInput wireType contract environment
+        match checkProgramDerivation stage.program derivation with
+        | .error error => throw (.derivation error)
+        | .ok () => pure ()
+        let facts ← evaluateCheckedScope stage.program.definitions derivation.definitions layouts
+          scopeKey (stage.program.definitions.length + 1) stage.program.root derivation.root
+          environment [] inputFacts
+        let outputs ← collectOperationalOutputs stage.program.root facts
+        go (results ++ [{ stage := stage.id, outputs, facts }]) tail
+  go [] bundle.workflow.stages
+
+def evaluateProgramOperationalWithLayouts
+    (program : Prog)
+    (derivation : ProgramDerivation)
+    (environment : ParamEnvironment)
+    (layouts : List Mxx.GadgetLayoutDescriptor) : Except OperationalError OperationalScopeFacts :=
+  evaluateProgramOperationalWithKey (.standalone 0) program derivation environment layouts
+
+def evaluateScopeOperationalWithLayouts
     (scope : Scope)
     (derivation : ScopeDerivation)
-    (environment : ParamEnvironment) : Except OperationalError OperationalScopeFacts := do
-  match checkScopeDerivation scope derivation with
-  | .error error => throw (.derivation error)
-  | .ok () => pure ()
-  let rec deriveOutputs
-      (nodeIndex : Nat)
-      (node : Node)
-      (port : Nat)
-      (outputTypes : List WireTypeExpr)
-      (facts : OperationalScopeFacts) : Except OperationalError (List OperationalFact) := do
-    match outputTypes with
-    | [] => pure []
-    | outputType :: tail =>
-        let output ← genericNodeFact nodeIndex node port outputType facts environment
-        return output :: (← deriveOutputs nodeIndex node (port + 1) tail facts)
-  let rec go (index : Nat) (nodes : List Node) (facts : OperationalScopeFacts) := do
-    match nodes with
-    | [] => pure facts
-    | node :: tail =>
-        if node.outputCount != node.outputTypes.length then
-          throw (.unsupportedOutputArity index node.outputCount)
-        let outputs ← deriveOutputs index node 0 node.outputTypes facts
-        go (index + 1) tail (facts.push outputs.toArray)
-  go 0 scope.nodes #[]
+    (environment : ParamEnvironment)
+    (layouts : List Mxx.GadgetLayoutDescriptor) : Except OperationalError OperationalScopeFacts :=
+  evaluateCheckedScope [] [] layouts (.root (.standalone 0)) 1 scope derivation environment [] []
 
 /-- Future local proof target for ordinary addition.  It intentionally states the runtime
 connection without presenting the operational estimate as an established theorem. -/
 def MatrixAddOperationalSoundnessClaim : Prop :=
   ∀ (scope : Scope) (derivation : ScopeDerivation) (environment : ParamEnvironment),
     checkScopeDerivation scope derivation = .ok () →
-      ∃ facts, evaluateScopeOperational scope derivation environment = .ok facts
+      ∃ facts, evaluateScopeOperationalWithLayouts scope derivation environment [] = .ok facts
+
+/-- The same protocol input has one root identity across workflow stages even though each stage
+binds it to a different local subject wire. -/
+example : (do
+    let input : ProtocolInputId := ⟨"shared-key"⟩
+    let left ← contractFact (.root (.workflowStage ⟨"left"⟩)) { node := 0, port := 0 }
+      input (.bytes (.constant 32)) (.bytes (.constant 32)) []
+    let right ← contractFact (.root (.workflowStage ⟨"right"⟩)) { node := 7, port := 0 }
+      input (.bytes (.constant 32)) (.bytes (.constant 32)) []
+    match left, right with
+    | .bytes left, .bytes right => pure (left.origin == right.origin)
+    | _, _ => pure false) = .ok true := by
+  native_decide
+
+/-- Equal-looking values from different protocol inputs remain distinct. -/
+example : (do
+    let left ← contractFact (.root (.workflowStage ⟨"left"⟩)) { node := 0, port := 0 }
+      ⟨"left-key"⟩ (.bytes (.constant 32)) (.bytes (.constant 32)) []
+    let right ← contractFact (.root (.workflowStage ⟨"right"⟩)) { node := 0, port := 0 }
+      ⟨"right-key"⟩ (.bytes (.constant 32)) (.bytes (.constant 32)) []
+    match left, right with
+    | .bytes left, .bytes right => pure (left.origin != right.origin)
+    | _, _ => pure false) = .ok true := by
+  native_decide
+
+/-- Static elements of one external family retain the root input identity and the selected index. -/
+example : (do
+    let family ← contractFact (.root (.workflowStage ⟨"stage"⟩)) { node := 0, port := 0 }
+      ⟨"keys"⟩ (.indexedFamily (.bytes (.constant 32)) (.constant 2))
+      (.family (.constant 2) (.bytes (.constant 32))) []
+    match family with
+    | .familyUniform _ _ element _ =>
+        match selectProtocolFamilyElement 0 element, selectProtocolFamilyElement 1 element with
+        | .bytes first, .bytes second => pure (first.origin != second.origin)
+        | _, _ => pure false
+    | _ => pure false) = .ok true := by
+  native_decide
+
+/-- Repeating the same dynamic external-family access preserves the selected value identity. -/
+example : (do
+    let element ← contractFact (.root (.workflowStage ⟨"stage"⟩)) { node := 0, port := 0 }
+      ⟨"keys"⟩ (.bytes (.constant 32)) (.bytes (.constant 32)) []
+    let binder : FamilyTemplateBinder := {
+      owner := .root (.workflowStage ⟨"stage"⟩), producerNode := 0, binderSlot := 0 }
+    let first ← selectDynamicUniformFact binder
+      (.local (.root (.workflowStage ⟨"stage"⟩)) { node := 4, port := 0 })
+      { node := 5, port := 0 } element
+    let second ← selectDynamicUniformFact binder
+      (.local (.root (.workflowStage ⟨"stage"⟩)) { node := 4, port := 0 })
+      { node := 6, port := 0 } element
+    match first, second with
+    | .bytes first, .bytes second => pure (first.origin == second.origin)
+    | _, _ => pure false) = .ok true := by
+  native_decide
 
 private def fixtureType : MatrixTypeExpr := {
   modulus := .constant 17, ringDimension := .constant 1,
   rows := .constant 1, columns := .constant 1
 }
+
+private def fixtureParams : Mxx.SamplerParams := {
+  maxCoefficientBound := 8
+  modulus := 17
+  ringDimension := 1
+  rows := 1
+  columns := 1
+}
+
+/-- An exact external matrix is not a zero matrix. Without an explicit bounded contract it keeps
+the conservative centered-residue cap and a Large primitive factor. -/
+example : (do
+    let fact ← contractFact (.root (.workflowStage ⟨"stage"⟩)) { node := 0, port := 0 }
+      ⟨"matrix"⟩ (.matrix fixtureType) (.matrixExact fixtureType) []
+    match fact with
+    | .matrix matrix =>
+        if matrix.polynomial.any operationalTermIsSignal then
+          matrix.totalHardBound.evaluate [] #[]
+        else pure (-1)
+    | _ => pure (-1)) = .ok 8 := by
+  native_decide
+
+private def fixtureFamilyBinder : FamilyTemplateBinder := {
+  owner := .root (.standalone 7)
+  producerNode := 4
+  binderSlot := 0
+}
+
+private def fixtureSampledIdentity : PublicMatrixIdentity :=
+  .sampledTrapdoor (.parallelBody (.root (.standalone 7)) 4) { node := 0, port := 0 }
+
+private def fixturePublicFact : OperationalFact := OperationalFact.matrix (({
+  subject := { node := 0, port := 0 }
+  origin := .value (.parallelBody (.root (.standalone 7)) 4) { node := 0, port := 0 }
+  matrixType := fixtureType
+  matrixParams := fixtureParams
+  totalHardBound := .closedInt (.constant 8)
+  identity := some fixtureSampledIdentity
+} : OperationalMatrixFact).initializePrimitivePolynomial .large)
+
+private def fixtureTrapdoorFact : OperationalFact := .trapdoor {
+  subject := { node := 0, port := 1 }
+  matrixType := fixtureType
+  matrixParams := fixtureParams
+  maximum := .closedInt (.constant 3)
+  publicIdentity := fixtureSampledIdentity
+}
+
+private def sharedPreimageBaseScope : Scope := {
+  nodes := [
+    {
+      kind := .trapdoorSample fixtureType (.constant 3)
+      arguments := []
+      outputCount := 2
+      outputTypes := [
+        .matrix fixtureType,
+        .trapdoor fixtureType (.rational 1) (.constant 2) (.constant 1) (.constant 3)
+      ]
+    },
+    {
+      kind := .gaussianSample fixtureType (.constant 2)
+      arguments := []
+      outputTypes := [.matrix fixtureType]
+    },
+    {
+      kind := .identityMatrix fixtureType
+      arguments := []
+      outputTypes := [.matrix fixtureType]
+    },
+    {
+      kind := .preimageSample fixtureType (.constant 3)
+      arguments := [
+        { node := 0, port := 0 }, { node := 0, port := 1 }, { node := 1, port := 0 }
+      ]
+      outputTypes := [.preimage fixtureType]
+    },
+    {
+      kind := .preimageSample fixtureType (.constant 3)
+      arguments := [
+        { node := 0, port := 0 }, { node := 0, port := 1 }, { node := 2, port := 0 }
+      ]
+      outputTypes := [.preimage fixtureType]
+    }
+  ]
+  outputs := [
+    ("first", { node := 3, port := 0 }),
+    ("second", { node := 4, port := 0 })
+  ]
+  inputNames := []
+}
+
+private def sharedPreimageBaseDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .trapdoorSample, arguments := [] },
+  { sourceNode := 1, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 2, rule := .identityMatrix, arguments := [] },
+  { sourceNode := 3, rule := .preimageSample,
+    arguments := [
+      { node := 0, port := 0 }, { node := 0, port := 1 }, { node := 1, port := 0 }
+    ] },
+  { sourceNode := 4, rule := .preimageSample,
+    arguments := [
+      { node := 0, port := 0 }, { node := 0, port := 1 }, { node := 2, port := 0 }
+    ] }
+] }
+
+/-- Branch-specific targets create distinct preimages and target snapshots, but both relations
+retain the one source public matrix identity. This is the Diamond transition shape
+`B*K_d = P_d (mod R_q)`: the digit changes `K_d` and `P_d`, never `B`. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts sharedPreimageBaseScope
+      sharedPreimageBaseDerivation [] []
+    let first ← matrixFactAt 4 facts { node := 3, port := 0 }
+    let second ← matrixFactAt 4 facts { node := 4, port := 0 }
+    match first.relations, second.relations with
+    | [.preimage left], [.preimage right] =>
+        pure (left.publicIdentity == right.publicIdentity &&
+          left.targetOrigin != right.targetOrigin && left.producer != right.producer)
+    | _, _ => pure false) = .ok true := by
+  native_decide
+
+/-- The exact same family and exact same executable index wire preserve the public/private pair. -/
+example : (do
+    let selection : OperationalValueOrigin :=
+      .local (.root (.standalone 7)) { node := 3, port := 0 }
+    let publicFact ← selectDynamicUniformFact fixtureFamilyBinder selection
+      { node := 5, port := 0 } fixturePublicFact
+    let trapdoor ← selectDynamicUniformFact fixtureFamilyBinder selection
+      { node := 6, port := 0 } fixtureTrapdoorFact
+    match publicFact, trapdoor with
+    | .matrix publicFact, .trapdoor trapdoor =>
+        pure (publicFact.identity == some trapdoor.publicIdentity)
+    | _, _ => pure false) = .ok true := by
+  native_decide
+
+/-- Merely equal-looking selections from different executable index wires do not compare equal. -/
+example : (do
+    let publicFact ← selectDynamicUniformFact fixtureFamilyBinder
+      (.local (.root (.standalone 7)) { node := 3, port := 0 })
+      { node := 5, port := 0 } fixturePublicFact
+    let trapdoor ← selectDynamicUniformFact fixtureFamilyBinder
+      (.local (.root (.standalone 7)) { node := 4, port := 0 })
+      { node := 6, port := 0 } fixtureTrapdoorFact
+    match publicFact, trapdoor with
+    | .matrix publicFact, .trapdoor trapdoor =>
+        pure (!(publicFact.identity == some trapdoor.publicIdentity))
+    | _, _ => pure false) = .ok true := by
+  native_decide
+
+/-- The flat polynomial, not merely the outer fact, preserves dynamic-selection identity. -/
+example : (do
+    let selection : OperationalValueOrigin :=
+      .local (.root (.standalone 7)) { node := 3, port := 0 }
+    let first ← selectDynamicUniformFact fixtureFamilyBinder selection
+      { node := 5, port := 0 } fixturePublicFact
+    let same ← selectDynamicUniformFact fixtureFamilyBinder selection
+      { node := 6, port := 0 } fixturePublicFact
+    let different ← selectDynamicUniformFact fixtureFamilyBinder
+      (.local (.root (.standalone 7)) { node := 4, port := 0 })
+      { node := 7, port := 0 } fixturePublicFact
+    match first, same, different with
+    | .matrix first, .matrix same, .matrix different =>
+        pure (first.polynomial == same.polynomial && first.polynomial != different.polynomial)
+    | _, _, _ => pure false) = .ok true := by
+  native_decide
 
 private def fixtureScope : Scope := {
   nodes := [
@@ -401,18 +4734,928 @@ private def fixtureDerivation : ScopeDerivation := { steps := [
     { node := 1, port := 0 }] }
 ] }
 
-example : evaluateScopeOperational fixtureScope fixtureDerivation [] =
-    .ok #[#[.matrix fixtureType 0], #[.matrix fixtureType 3], #[.matrix fixtureType 3]] := by
-  rfl
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts fixtureScope fixtureDerivation [] []
+    matrixMaximum 2 { node := 2, port := 0 } facts) = .ok 3 := by
+  native_decide
+
+/-- A fresh sample produced by one parallel-body template denotes a different source in each
+lane, so subtraction across distinct lanes cannot cancel structurally. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts fixtureScope fixtureDerivation [] []
+    let sample ← lookupFact 2 facts { node := 1, port := 0 }
+    match instantiateFactLoopIndex 0 0 sample, instantiateFactLoopIndex 0 1 sample with
+    | .matrix first, .matrix second =>
+        pure (!(subtractOperationalPolynomials first.polynomial second.polynomial).isEmpty)
+    | _, _ => pure false) = .ok true := by
+  native_decide
+
+private def scaledNoiseScope : Scope := {
+  nodes := [
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixScale (.constant 2), arguments := [{ node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 1, port := 0 })]
+  inputNames := []
+}
+
+private def scaledNoiseDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 1, rule := .matrixScale, arguments := [{ node := 0, port := 0 }] }
+] }
+
+/-- The additive coefficient outside a compressed bounded product remains part of its bound. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
+    let fact ← matrixFactAt 1 facts { node := 1, port := 0 }
+    fact.evaluateNoiseHardBound []) = .ok 6 := by
+  native_decide
+
+private def mixedSignalNoiseScope : Scope := {
+  nodes := [
+    { kind := .uniformResidueSample fixtureType, arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixAdd,
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 2, port := 0 })]
+  inputNames := []
+}
+
+private def mixedSignalNoiseDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .uniformResidueSample, arguments := [] },
+  { sourceNode := 1, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 2, rule := .matrixAdd,
+    arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+] }
+
+/-- A mixed signal/noise value keeps an unconditional whole-value cap while exposing noise
+separately for the endpoint inequality. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts mixedSignalNoiseScope
+      mixedSignalNoiseDerivation [] []
+    let fact ← matrixFactAt 2 facts { node := 2, port := 0 }
+    let total ← fact.totalHardBound.evaluate [] #[]
+    let noise ← fact.evaluateNoiseHardBound []
+    pure (total, noise)) = .ok (8, 3) := by
+  native_decide
+
+private def flatCancellationScope : Scope := {
+  nodes := [
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixSubtract,
+      arguments := [{ node := 0, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 1, port := 0 })]
+  inputNames := []
+}
+
+private def flatCancellationDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 1, rule := .matrixSubtract,
+    arguments := [{ node := 0, port := 0 }, { node := 0, port := 0 }] }
+] }
+
+/-- Exact factor-list equality, rather than equality of numeric bounds, eliminates `E-E`. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts flatCancellationScope
+      flatCancellationDerivation [] []
+    let result ← matrixFactAt 1 facts { node := 1, port := 0 }
+    pure result.polynomial.isEmpty) = .ok true := by
+  native_decide
+
+private def flatNoiseOrderScope : Scope := {
+  nodes := [
+    { kind := .gaussianSample fixtureType (.constant 2), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixAdd,
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixAdd,
+      arguments := [{ node := 1, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixSubtract,
+      arguments := [{ node := 2, port := 0 }, { node := 3, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 4, port := 0 })]
+  inputNames := []
+}
+
+private def flatNoiseOrderDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 1, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 2, rule := .matrixAdd,
+    arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+  { sourceNode := 3, rule := .matrixAdd,
+    arguments := [{ node := 1, port := 0 }, { node := 0, port := 0 }] },
+  { sourceNode := 4, rule := .matrixSubtract,
+    arguments := [{ node := 2, port := 0 }, { node := 3, port := 0 }] }
+] }
+
+/-- Canonical bounded-noise provenance is independent of additive construction order. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts flatNoiseOrderScope
+      flatNoiseOrderDerivation [] []
+    let result ← matrixFactAt 4 facts { node := 4, port := 0 }
+    pure result.polynomial.isEmpty) = .ok true := by
+  native_decide
+
+private def flatMultiLargeScope : Scope := {
+  nodes := [
+    { kind := .uniformResidueSample fixtureType, arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .uniformResidueSample fixtureType, arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixAdd,
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixMultiply,
+      arguments := [{ node := 2, port := 0 }, { node := 2, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 3, port := 0 })]
+  inputNames := []
+}
+
+private def flatMultiLargeDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .uniformResidueSample, arguments := [] },
+  { sourceNode := 1, rule := .uniformResidueSample, arguments := [] },
+  { sourceNode := 2, rule := .matrixAdd,
+    arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+  { sourceNode := 3, rule := .matrixMultiplyBound,
+    arguments := [{ node := 2, port := 0 }, { node := 2, port := 0 }] }
+] }
+
+/-- Multiplication distributes over signal sums; two Large factors remain signal, not opaque. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts flatMultiLargeScope
+      flatMultiLargeDerivation [] []
+    let result ← matrixFactAt 3 facts { node := 3, port := 0 }
+    pure (result.polynomial.length, result.polynomial.all fun term =>
+      operationalLargeFactorCount term = 2)) = .ok (4, true) := by
+  native_decide
 
 example : checkScopeDerivation fixtureScope { steps := [
   { sourceNode := 1, rule := .gaussianSample, arguments := [] }
 ] } = .error (.sourceNodeMismatch 0 1) := by
+  native_decide
+
+private def gadgetFixtureScope : Scope := {
+  nodes := [
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.preimage fixtureType] }
+  ],
+  outputs := [("result", { node := 1, port := 0 })], inputNames := []
+}
+
+private def gadgetFixtureDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 1, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] }
+] }
+
+/-- A request cannot silently derive a CRT layout from a graph-visible modulus. -/
+example : (match evaluateScopeOperationalWithLayouts gadgetFixtureScope gadgetFixtureDerivation [] [] with
+    | .error (.missingGadgetLayout 1) => true
+    | _ => false) = true := by
+  native_decide
+
+private def fixtureLayout : Mxx.GadgetLayoutDescriptor := {
+  paramsId := "fixture"
+  ringDimension := 1
+  crtModuli := [17]
+  crtBits := 1
+  baseBits := 1
+  base := 2
+  regularDigitCount := 1
+  smallDigitCount := 1
+  smallestCrtModulus := 17
+}
+
+private def fixtureRows2Type : MatrixTypeExpr := {
+  modulus := .constant 17, ringDimension := .constant 1,
+  rows := .constant 2, columns := .constant 1
+}
+
+private def fixtureColumns2Type : MatrixTypeExpr := {
+  modulus := .constant 17, ringDimension := .constant 1,
+  rows := .constant 1, columns := .constant 2
+}
+
+private def fixtureSquare2Type : MatrixTypeExpr := {
+  modulus := .constant 17, ringDimension := .constant 1,
+  rows := .constant 2, columns := .constant 2
+}
+
+private def matrixTransformCoverageScope : Scope := {
+  nodes := [
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .identityMatrix fixtureType, arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixAdd, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixSubtract,
+      arguments := [{ node := 2, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixMultiply,
+      arguments := [{ node := 1, port := 0 }, { node := 3, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixNegate, arguments := [{ node := 4, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixScale (.constant (-2)), arguments := [{ node := 5, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .transpose, arguments := [{ node := 6, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .slice none none, arguments := [{ node := 7, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .reshape (.constant 1) (.constant 1), arguments := [{ node := 8, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .constantCoefficient (.constant 0), arguments := [{ node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .tensor, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .concat .rows, arguments := [{ node := 0, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureRows2Type] },
+    { kind := .transpose, arguments := [{ node := 12, port := 0 }],
+      outputTypes := [.matrix fixtureColumns2Type] },
+    { kind := .concat .columns,
+      arguments := [{ node := 0, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureColumns2Type] },
+    { kind := .concat .diagonal,
+      arguments := [{ node := 0, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureSquare2Type] },
+    { kind := .slice (some (.constant 0, .constant 1))
+        (some (.constant 0, .constant 1)), arguments := [{ node := 15, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .uniformIntervalSample fixtureType (.constant (-2)) (.constant 4), arguments := [],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 17, port := 0 })]
+  inputNames := []
+}
+
+private def matrixTransformCoverageDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 1, rule := .identityMatrix, arguments := [] },
+  { sourceNode := 2, rule := .matrixAdd,
+    arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+  { sourceNode := 3, rule := .matrixSubtract,
+    arguments := [{ node := 2, port := 0 }, { node := 1, port := 0 }] },
+  { sourceNode := 4, rule := .matrixMultiplyBound,
+    arguments := [{ node := 1, port := 0 }, { node := 3, port := 0 }] },
+  { sourceNode := 5, rule := .matrixNegate, arguments := [{ node := 4, port := 0 }] },
+  { sourceNode := 6, rule := .matrixScale, arguments := [{ node := 5, port := 0 }] },
+  { sourceNode := 7, rule := .transpose, arguments := [{ node := 6, port := 0 }] },
+  { sourceNode := 8, rule := .slice, arguments := [{ node := 7, port := 0 }] },
+  { sourceNode := 9, rule := .reshape, arguments := [{ node := 8, port := 0 }] },
+  { sourceNode := 10, rule := .constantCoefficient, arguments := [{ node := 0, port := 0 }] },
+  { sourceNode := 11, rule := .tensor,
+    arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+  { sourceNode := 12, rule := .concat,
+    arguments := [{ node := 0, port := 0 }, { node := 0, port := 0 }] },
+  { sourceNode := 13, rule := .transpose, arguments := [{ node := 12, port := 0 }] },
+  { sourceNode := 14, rule := .concat,
+    arguments := [{ node := 0, port := 0 }, { node := 0, port := 0 }] },
+  { sourceNode := 15, rule := .concat,
+    arguments := [{ node := 0, port := 0 }, { node := 0, port := 0 }] },
+  { sourceNode := 16, rule := .slice, arguments := [{ node := 15, port := 0 }] },
+  { sourceNode := 17, rule := .uniformIntervalSample, arguments := [] }
+] }
+
+/-- Every non-relation matrix arithmetic/transform variant reaches an explicit operational
+transfer. The equalities below also pin conservative inter-node bounded-summary subtraction,
+centered-cap scaling, coefficient selection, tensor-with-identity, and interval sampling. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts matrixTransformCoverageScope
+      matrixTransformCoverageDerivation [] []
+    let afterCancellation ← matrixMaximum 17 { node := 3, port := 0 } facts
+    let afterScale ← matrixMaximum 17 { node := 6, port := 0 } facts
+    let coefficient ← matrixMaximum 17 { node := 10, port := 0 } facts
+    let tensor ← matrixMaximum 17 { node := 11, port := 0 } facts
+    let interval ← matrixMaximum 17 { node := 17, port := 0 } facts
+    pure (afterCancellation, afterScale, coefficient, tensor, interval)) =
+      .ok (5, 8, 3, 3, 4) := by
+  native_decide
+
+private def samplerAndDecodeCoverageScope : Scope := {
+  nodes := [
+    { kind := .trapdoorSample fixtureType (.constant 3), arguments := [], outputCount := 2,
+      outputTypes := [
+        .matrix fixtureType,
+        .trapdoor fixtureType (.rational 1) (.constant 2) (.constant 1) (.constant 3)
+      ] },
+    { kind := .gaussianSample fixtureType (.constant 2), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .preimageSample fixtureType (.constant 3),
+      arguments := [
+        { node := 0, port := 0 }, { node := 0, port := 1 }, { node := 1, port := 0 }
+      ], outputTypes := [.preimage fixtureType] },
+    { kind := .trapdoorPublic, arguments := [{ node := 0, port := 1 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .thresholdDecodeBool (.constant 17) (.constant 2) (.constant 1),
+      arguments := [{ node := 1, port := 0 }], outputTypes := [.boolean] },
+    { kind := .thresholdDecodeInt (.constant 17) (.constant 3) (.constant 1),
+      arguments := [{ node := 1, port := 0 }], outputTypes := [.integer] },
+    { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .identityMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .crtRecompose [.constant 2, .constant 3] [.constant 9, .constant 6],
+      arguments := [{ node := 6, port := 0 }, { node := 7, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .constantBool false, arguments := [], outputTypes := [.boolean] },
+    { kind := .constantBool true, arguments := [], outputTypes := [.boolean] },
+    { kind := .constantBool false, arguments := [], outputTypes := [.boolean] },
+    { kind := .constantBool true, arguments := [], outputTypes := [.boolean] },
+    { kind := .constantBool false, arguments := [], outputTypes := [.boolean] },
+    { kind := .familyPack,
+      arguments := [
+        { node := 9, port := 0 }, { node := 10, port := 0 }, { node := 11, port := 0 },
+        { node := 12, port := 0 }, { node := 13, port := 0 }
+      ], outputTypes := [.indexedFamily .boolean (.constant 5)] },
+    { kind := .packPolynomialCoefficients fixtureType (.constant 5),
+      arguments := [{ node := 14, port := 0 }], outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("packed", { node := 15, port := 0 })]
+  inputNames := []
+}
+
+private def samplerAndDecodeCoverageDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .trapdoorSample, arguments := [] },
+  { sourceNode := 1, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 2, rule := .preimageSample,
+    arguments := [
+      { node := 0, port := 0 }, { node := 0, port := 1 }, { node := 1, port := 0 }
+    ] },
+  { sourceNode := 3, rule := .trapdoorPublic, arguments := [{ node := 0, port := 1 }] },
+  { sourceNode := 4, rule := .thresholdDecodeBool, arguments := [{ node := 1, port := 0 }] },
+  { sourceNode := 5, rule := .thresholdDecodeInt, arguments := [{ node := 1, port := 0 }] },
+  { sourceNode := 6, rule := .zeroMatrix, arguments := [] },
+  { sourceNode := 7, rule := .identityMatrix, arguments := [] },
+  { sourceNode := 8, rule := .crtRecompose,
+    arguments := [{ node := 6, port := 0 }, { node := 7, port := 0 }] },
+  { sourceNode := 9, rule := .constantBool, arguments := [] },
+  { sourceNode := 10, rule := .constantBool, arguments := [] },
+  { sourceNode := 11, rule := .constantBool, arguments := [] },
+  { sourceNode := 12, rule := .constantBool, arguments := [] },
+  { sourceNode := 13, rule := .constantBool, arguments := [] },
+  { sourceNode := 14, rule := .familyPack,
+    arguments := [
+      { node := 9, port := 0 }, { node := 10, port := 0 }, { node := 11, port := 0 },
+      { node := 12, port := 0 }, { node := 13, port := 0 }
+    ] },
+  { sourceNode := 15, rule := .packPolynomialCoefficients,
+    arguments := [{ node := 14, port := 0 }] }
+] }
+
+/-- Sampler pairing, preimage ownership, threshold outputs, CRT recomposition, Boolean-family
+packing, and residue reconstruction all reach explicit transfers in one closed fixture. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts samplerAndDecodeCoverageScope
+      samplerAndDecodeCoverageDerivation [] []
+    let publicFact ← matrixFactAt 15 facts { node := 0, port := 0 }
+    let recovered ← matrixFactAt 15 facts { node := 3, port := 0 }
+    let preimage ← matrixFactAt 15 facts { node := 2, port := 0 }
+    let decoded ← integerFactAt 15 facts { node := 5, port := 0 }
+    let packed ← matrixFactAt 15 facts { node := 15, port := 0 }
+    pure (publicFact.identity == recovered.identity, preimage.relations.length,
+      decoded.lower, decoded.upper, packed.polynomial.any operationalTermIsSignal)) =
+      .ok (true, 1, 0, 2, true) := by
+  native_decide
+
+private def hashIdentityFixtureScope : Scope := {
+  nodes := [
+    { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
+    { kind := .hashSample fixtureType .plain [109, 120, 120] [.constant 7] [] [] none none,
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] },
+    { kind := .hashSample fixtureType .decomposed [109, 120, 120] [.constant 7] [] []
+        (some (.constant 2)) (some (.constant 1)),
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.preimage fixtureType] }
+  ]
+  outputs := [("plain", { node := 1, port := 0 }), ("decomposed", { node := 2, port := 0 })]
+  inputNames := ["key"]
+}
+
+private def hashIdentityFixtureDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .input, arguments := [] },
+  { sourceNode := 1, rule := .hashSample, arguments := [{ node := 0, port := 0 }] },
+  { sourceNode := 2, rule := .hashSample, arguments := [{ node := 0, port := 0 }] }
+] }
+
+/-- Plain and decomposed modes of the same fully evaluated hash query share the target identity. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts hashIdentityFixtureScope
+      hashIdentityFixtureDerivation [] [fixtureLayout]
+    let plain ← matrixFactAt 2 facts { node := 1, port := 0 }
+    let decomposed ← matrixFactAt 2 facts { node := 2, port := 0 }
+    match decomposed.relations with
+    | [.decomposition relation] => pure (plain.origin == relation.inputOrigin)
+    | _ => pure false) = .ok true := by
+  native_decide
+
+private def trailingHashIdentityFixtureScope : Scope := {
+  nodes := [
+    { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
+    { kind := .constantInt 9, arguments := [], outputTypes := [.integer] },
+    { kind := .hashSample fixtureType .plain [109, 120, 120] [.constant 7] [] [] none none,
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .hashSample fixtureType .decomposed [109, 120, 120] [.constant 7] [] []
+        (some (.constant 2)) (some (.constant 1)),
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.preimage fixtureType] }
+  ]
+  outputs := [("plain", { node := 2, port := 0 }), ("decomposed", { node := 3, port := 0 })]
+  inputNames := ["key"]
+}
+
+private def trailingHashIdentityFixtureDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .input, arguments := [] },
+  { sourceNode := 1, rule := .constantInt, arguments := [] },
+  { sourceNode := 2, rule := .hashSample,
+    arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+  { sourceNode := 3, rule := .hashSample,
+    arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+] }
+
+/-- A trailing integer operand participates in the plain/decomposed query identity in exact
+argument order rather than being silently discarded. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts trailingHashIdentityFixtureScope
+      trailingHashIdentityFixtureDerivation [] [fixtureLayout]
+    let plain ← matrixFactAt 3 facts { node := 2, port := 0 }
+    let decomposed ← matrixFactAt 3 facts { node := 3, port := 0 }
+    match decomposed.relations with
+    | [.decomposition relation] => pure (plain.origin == relation.inputOrigin)
+    | _ => pure false) = .ok true := by
+  native_decide
+
+/-- Two stages hashing the same protocol key with the same complete query receive one semantic
+hash origin even though their formal input and output wires are separately namespaced. -/
+example : (do
+    let input : ProtocolInputId := ⟨"shared-key"⟩
+    let leftScope := ScopeTemplateKey.root (.workflowStage ⟨"left"⟩)
+    let rightScope := ScopeTemplateKey.root (.workflowStage ⟨"right"⟩)
+    let leftInput ← contractFact leftScope { node := 0, port := 0 } input
+      (.bytes (.constant 32)) (.bytes (.constant 32)) []
+    let rightInput ← contractFact rightScope { node := 0, port := 0 } input
+      (.bytes (.constant 32)) (.bytes (.constant 32)) []
+    let leftFacts ← evaluateCheckedScope [] [] [fixtureLayout] leftScope 1
+      hashIdentityFixtureScope hashIdentityFixtureDerivation [] [] [leftInput]
+    let rightFacts ← evaluateCheckedScope [] [] [fixtureLayout] rightScope 1
+      hashIdentityFixtureScope hashIdentityFixtureDerivation [] [] [rightInput]
+    let left ← matrixFactAt 2 leftFacts { node := 1, port := 0 }
+    let right ← matrixFactAt 2 rightFacts { node := 1, port := 0 }
+    pure (left.origin == right.origin)) = .ok true := by
+  native_decide
+
+private def scalarIntervalFixtureScope : Scope := {
+  nodes := [
+    { kind := .constantInt (-2), arguments := [], outputTypes := [.integer] },
+    { kind := .constantInt 3, arguments := [], outputTypes := [.integer] },
+    { kind := .intBinary .multiply,
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.integer] },
+    { kind := .constantBool true, arguments := [], outputTypes := [.boolean] },
+    { kind := .boolToInt, arguments := [{ node := 3, port := 0 }], outputTypes := [.integer] }
+  ]
+  outputs := [
+    ("product", { node := 2, port := 0 }),
+    ("bit", { node := 4, port := 0 })
+  ]
+  inputNames := []
+}
+
+private def scalarIntervalFixtureDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .constantInt, arguments := [] },
+  { sourceNode := 1, rule := .constantInt, arguments := [] },
+  { sourceNode := 2, rule := .intBinary,
+    arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+  { sourceNode := 3, rule := .constantBool, arguments := [] },
+  { sourceNode := 4, rule := .boolToInt, arguments := [{ node := 3, port := 0 }] }
+] }
+
+/-- Scalar facts are derived from executable semantics rather than the former `[0, 0]`
+fallback. Signed multiplication and Boolean conversion retain sound intervals. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts scalarIntervalFixtureScope
+      scalarIntervalFixtureDerivation [] []
+    let product ← integerFactAt 5 facts { node := 2, port := 0 }
+    let bit ← integerFactAt 5 facts { node := 4, port := 0 }
+    pure (product.lower, product.upper, bit.lower, bit.upper)) = .ok (-6, -6, 0, 1) := by
+  native_decide
+
+private def malformedScalarOutputScope : Scope := {
+  nodes := [
+    { kind := .constantInt 1, arguments := [], outputTypes := [.boolean] }
+  ]
+  outputs := []
+  inputNames := []
+}
+
+private def malformedScalarOutputDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .constantInt, arguments := [] }
+] }
+
+/-- A derivation cannot disguise an integer producer as a Boolean output. -/
+example : (match evaluateScopeOperationalWithLayouts malformedScalarOutputScope
+    malformedScalarOutputDerivation [] [] with
+  | .error (.outputTypeMismatch 0) => true
+  | _ => false) = true := by
+  native_decide
+
+private def negativeBitScope : Scope := {
+  nodes := [
+    { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
+    { kind := .bitExtract (.constant (-1)), arguments := [{ node := 0, port := 0 }],
+      outputTypes := [.boolean] }
+  ]
+  outputs := []
+  inputNames := []
+}
+
+private def negativeBitDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .constantInt, arguments := [] },
+  { sourceNode := 1, rule := .bitExtract, arguments := [{ node := 0, port := 0 }] }
+] }
+
+/-- A negative bit position is rejected rather than coerced to a natural number. -/
+example : (match evaluateScopeOperationalWithLayouts negativeBitScope negativeBitDerivation [] [] with
+  | .error (.invalidCount 1 (-1)) => true
+  | _ => false) = true := by
+  native_decide
+
+private def scalarTypeMismatchScope : Scope := {
+  nodes := [
+    { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .boolToInt, arguments := [{ node := 0, port := 0 }], outputTypes := [.integer] }
+  ]
+  outputs := []
+  inputNames := []
+}
+
+private def scalarTypeMismatchDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .zeroMatrix, arguments := [] },
+  { sourceNode := 1, rule := .boolToInt, arguments := [{ node := 0, port := 0 }] }
+] }
+
+/-- Scalar transfer rules reject operands of a different executable wire type. -/
+example : (match evaluateScopeOperationalWithLayouts scalarTypeMismatchScope
+    scalarTypeMismatchDerivation [] [] with
+  | .error (.operandNotBoolean 1 { node := 0, port := 0 }) => true
+  | _ => false) = true := by
+  native_decide
+
+private def selectRangeMismatchScope : Scope := {
+  nodes := [
+    { kind := .constantInt 2, arguments := [], outputTypes := [.integer] },
+    { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .identityMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .select,
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 },
+        { node := 2, port := 0 }], outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := []
+  inputNames := []
+}
+
+private def selectRangeMismatchDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .constantInt, arguments := [] },
+  { sourceNode := 1, rule := .zeroMatrix, arguments := [] },
+  { sourceNode := 2, rule := .identityMatrix, arguments := [] },
+  { sourceNode := 3, rule := .select,
+    arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 },
+      { node := 2, port := 0 }] }
+] }
+
+/-- A dynamic selector must be proved inside the executable branch range. -/
+example : (match evaluateScopeOperationalWithLayouts selectRangeMismatchScope
+    selectRangeMismatchDerivation [] [] with
+  | .error (.invalidCount 3 2) => true
+  | _ => false) = true := by
+  native_decide
+
+private def crtMetadataMismatchScope : Scope := {
+  nodes := [
+    { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .crtRecompose [.constant 2, .constant 3] [.constant 1, .constant 1],
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := []
+  inputNames := []
+}
+
+private def crtMetadataMismatchDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .zeroMatrix, arguments := [] },
+  { sourceNode := 1, rule := .crtRecompose, arguments := [{ node := 0, port := 0 }] }
+] }
+
+/-- CRT metadata is positional and must have exactly one entry for every operand. -/
+example : (match evaluateScopeOperationalWithLayouts crtMetadataMismatchScope
+    crtMetadataMismatchDerivation [] [] with
+  | .error (.unsupportedOutputArity 1 1) => true
+  | _ => false) = true := by
+  native_decide
+
+private def packedPolynomialInputMismatchScope : Scope := {
+  nodes := [
+    { kind := .constantBool true, arguments := [], outputTypes := [.boolean] },
+    { kind := .packPolynomialCoefficients fixtureType (.constant 5),
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := []
+  inputNames := []
+}
+
+private def packedPolynomialInputMismatchDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .constantBool, arguments := [] },
+  { sourceNode := 1, rule := .packPolynomialCoefficients,
+    arguments := [{ node := 0, port := 0 }] }
+] }
+
+/-- Polynomial reconstruction accepts only the exact Boolean family shape required by the IR. -/
+example : (match evaluateScopeOperationalWithLayouts packedPolynomialInputMismatchScope
+    packedPolynomialInputMismatchDerivation [] [] with
+  | .error (.loopInputModeMismatch 1 0) => true
+  | _ => false) = true := by
+  native_decide
+
+private def loopHashBody : Scope := {
+  nodes := [
+    { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
+    { kind := .hashSample fixtureType .plain [109, 120, 120] [.loopIndex 0] [] [] none none,
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 1, port := 0 })]
+  inputNames := ["key"]
+}
+
+private def loopHashProgram : Prog := {
+  root := {
+    nodes := [
+      { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
+      { kind := .parallelLoop "body" (.constant 2) 0 [] [.broadcast],
+        arguments := [{ node := 0, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+      { kind := .familyGetStatic (.constant 0), arguments := [{ node := 1, port := 0 }],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .familyGetStatic (.constant 1), arguments := [{ node := 1, port := 0 }],
+        outputTypes := [.matrix fixtureType] }
+    ]
+    outputs := [("first", { node := 2, port := 0 }), ("second", { node := 3, port := 0 })]
+    inputNames := ["key"]
+  }
+  definitions := [("body", loopHashBody)]
+}
+
+private def loopHashDerivation : ProgramDerivation := {
+  root := { steps := [
+    { sourceNode := 0, rule := .input, arguments := [] },
+    { sourceNode := 1, rule := .parallelLoop, arguments := [{ node := 0, port := 0 }] },
+    { sourceNode := 2, rule := .familyGetStatic, arguments := [{ node := 1, port := 0 }] },
+    { sourceNode := 3, rule := .familyGetStatic, arguments := [{ node := 1, port := 0 }] }
+  ] }
+  definitions := [("body", { steps := [
+    { sourceNode := 0, rule := .input, arguments := [] },
+    { sourceNode := 1, rule := .hashSample, arguments := [{ node := 0, port := 0 }] }
+  ] })]
+}
+
+/-- Static extraction instantiates the loop-dependent hash query, so two lanes cannot acquire the
+same deterministic source identity merely because the body was analyzed once. -/
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts loopHashProgram loopHashDerivation [] []
+    let first ← matrixFactAt 3 facts { node := 2, port := 0 }
+    let second ← matrixFactAt 3 facts { node := 3, port := 0 }
+    pure (first.origin != second.origin)) = .ok true := by
+  native_decide
+
+private def aliasedHashBody : Scope := {
+  nodes := [
+    { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
+    { kind := .hashSample fixtureType .plain [109, 120, 120] [.parameter "tag"] [] [] none none,
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 1, port := 0 })]
+  inputNames := ["key"]
+}
+
+private def aliasedLoopBody : Scope := {
+  nodes := [
+    { kind := .input "key", arguments := [], outputTypes := [.bytes (.constant 32)] },
+    { kind := .subgraphCall "hash" [("tag", .loopIndex 0)],
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 1, port := 0 })]
+  inputNames := ["key"]
+}
+
+private def aliasedLoopHashProgram : Prog := {
+  root := loopHashProgram.root
+  definitions := [("body", aliasedLoopBody), ("hash", aliasedHashBody)]
+}
+
+private def aliasedLoopHashDerivation : ProgramDerivation := {
+  root := loopHashDerivation.root
+  definitions := [
+    ("body", { steps := [
+      { sourceNode := 0, rule := .input, arguments := [] },
+      { sourceNode := 1, rule := .subgraphCall, arguments := [{ node := 0, port := 0 }] }
+    ] }),
+    ("hash", { steps := [
+      { sourceNode := 0, rule := .input, arguments := [] },
+      { sourceNode := 1, rule := .hashSample, arguments := [{ node := 0, port := 0 }] }
+    ] })
+  ]
+}
+
+/-- A child parameter bound to an enclosing loop index retains that binding frame in the hash
+identity. Flattening the child environment at template index zero would make these origins equal. -/
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts aliasedLoopHashProgram
+      aliasedLoopHashDerivation [] []
+    let first ← matrixFactAt 3 facts { node := 2, port := 0 }
+    let second ← matrixFactAt 3 facts { node := 3, port := 0 }
+    pure (first.origin != second.origin)) = .ok true := by
+  native_decide
+
+private def relationFixtureScope : Scope := {
+  nodes := [
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gadgetMatrix fixtureType (.constant 2), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.preimage fixtureType] },
+    { kind := .matrixMultiply,
+      arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ],
+  outputs := [("result", { node := 3, port := 0 })], inputNames := []
+}
+
+private def relationFixtureDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 1, rule := .gadgetMatrix, arguments := [] },
+  { sourceNode := 2, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] },
+  { sourceNode := 3, rule := .matrixMultiplyRelation { node := 2, port := 0 },
+    arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }] }
+] }
+
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
+      relationFixtureDerivation [] [fixtureLayout]
+    matrixMaximum 3 { node := 3, port := 0 } facts) = .ok 3 := by
+  native_decide
+
+private def wrongRelationFixtureDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 1, rule := .gadgetMatrix, arguments := [] },
+  { sourceNode := 2, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] },
+  { sourceNode := 3, rule := .matrixMultiplyRelation { node := 1, port := 0 },
+    arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }] }
+] }
+
+example : checkScopeDerivation relationFixtureScope wrongRelationFixtureDerivation =
+    .error (.invalidRelationOperand 3 { node := 1, port := 0 }) := by
   decide
+
+private def childRelationScope : Scope := {
+  nodes := [
+    { kind := .input "target", arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.preimage fixtureType] }
+  ],
+  outputs := [("preimage", { node := 1, port := 0 })], inputNames := ["target"]
+}
+
+private def childRelationDerivation : ScopeDerivation := { steps := [
+  { sourceNode := 0, rule := .input, arguments := [] },
+  { sourceNode := 1, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] }
+] }
+
+private def subgraphRelationProgram : Prog := {
+  root := {
+    nodes := [
+      { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .gadgetMatrix fixtureType (.constant 2), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .subgraphCall "decompose" [], arguments := [{ node := 0, port := 0 }],
+        outputTypes := [.preimage fixtureType] },
+      { kind := .matrixMultiply,
+        arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }],
+        outputTypes := [.matrix fixtureType] }
+    ],
+    outputs := [("result", { node := 3, port := 0 })], inputNames := []
+  }
+  definitions := [("decompose", childRelationScope)]
+}
+
+private def subgraphRelationDerivation : ProgramDerivation := {
+  root := { steps := [
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 1, rule := .gadgetMatrix, arguments := [] },
+    { sourceNode := 2, rule := .subgraphCall, arguments := [{ node := 0, port := 0 }] },
+    { sourceNode := 3, rule := .matrixMultiplyRelation { node := 2, port := 0 },
+      arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }] }
+  ] }
+  definitions := [("decompose", childRelationDerivation)]
+}
+
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts subgraphRelationProgram
+      subgraphRelationDerivation [] [fixtureLayout]
+    matrixMaximum 3 { node := 3, port := 0 } facts) = .ok 3 := by
+  native_decide
+
+private def distinctCallIdentityProgram : Prog := {
+  root := {
+    nodes := [
+      { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .subgraphCall "decompose" [], arguments := [{ node := 0, port := 0 }],
+        outputTypes := [.preimage fixtureType] },
+      { kind := .subgraphCall "decompose" [], arguments := [{ node := 0, port := 0 }],
+        outputTypes := [.preimage fixtureType] }
+    ]
+    outputs := [("left", { node := 1, port := 0 }), ("right", { node := 2, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("decompose", childRelationScope)]
+}
+
+private def distinctCallIdentityDerivation : ProgramDerivation := {
+  root := { steps := [
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 1, rule := .subgraphCall, arguments := [{ node := 0, port := 0 }] },
+    { sourceNode := 2, rule := .subgraphCall, arguments := [{ node := 0, port := 0 }] }
+  ] }
+  definitions := [("decompose", childRelationDerivation)]
+}
+
+/-- Equal local node/port numbers in two call instances are not the same sampled/derived event. -/
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts distinctCallIdentityProgram
+      distinctCallIdentityDerivation [] [fixtureLayout]
+    let left ← matrixFactAt 2 facts { node := 1, port := 0 }
+    let right ← matrixFactAt 2 facts { node := 2, port := 0 }
+    pure (left.origin != right.origin)) = .ok true := by
+  native_decide
+
+private def packedFamilyFixtureScope : Scope := {
+  nodes := relationFixtureScope.nodes ++ [
+    { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .familyPack,
+      arguments := [{ node := 2, port := 0 }, { node := 4, port := 0 }],
+      outputTypes := [.indexedFamily (.preimage fixtureType) (.constant 2)] },
+    { kind := .familyGetStatic (.constant 0), arguments := [{ node := 5, port := 0 }],
+      outputTypes := [.preimage fixtureType] },
+    { kind := .constantInt 0, arguments := [], outputTypes := [.integer] },
+    { kind := .familyGetDynamic,
+      arguments := [{ node := 5, port := 0 }, { node := 7, port := 0 }],
+      outputTypes := [.preimage fixtureType] }
+  ]
+  outputs := [("static", { node := 6, port := 0 }), ("dynamic", { node := 8, port := 0 })]
+  inputNames := []
+}
+
+private def packedFamilyFixtureDerivation : ScopeDerivation := {
+  steps := relationFixtureDerivation.steps ++ [
+    { sourceNode := 4, rule := .zeroMatrix, arguments := [] },
+    { sourceNode := 5, rule := .familyPack,
+      arguments := [{ node := 2, port := 0 }, { node := 4, port := 0 }] },
+    { sourceNode := 6, rule := .familyGetStatic, arguments := [{ node := 5, port := 0 }] },
+    { sourceNode := 7, rule := .constantInt, arguments := [] },
+    { sourceNode := 8, rule := .familyGetDynamic,
+      arguments := [{ node := 5, port := 0 }, { node := 7, port := 0 }] }
+  ]
+}
+
+/-- Static extraction retains the exact packed relation, while dynamic extraction cannot claim
+that one producer was selected and therefore drops both identity and relations. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts packedFamilyFixtureScope
+      packedFamilyFixtureDerivation [] [fixtureLayout]
+    let staticFact ← matrixFactAt 8 facts { node := 6, port := 0 }
+    let dynamicFact ← matrixFactAt 8 facts { node := 8, port := 0 }
+    pure (!staticFact.relations.isEmpty && dynamicFact.relations.isEmpty &&
+      dynamicFact.identity.isNone)) = .ok true := by
+  native_decide
 
 private def selectFixtureScope : Scope := {
   nodes := [
-    { kind := .constantBool true, arguments := [], outputTypes := [.boolean] },
+    { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
     { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
       outputTypes := [.matrix fixtureType] },
     { kind := .gaussianSample fixtureType (.constant 5), arguments := [],
@@ -424,16 +5667,300 @@ private def selectFixtureScope : Scope := {
 }
 
 private def selectFixtureDerivation : ScopeDerivation := { steps := [
-  { sourceNode := 0, rule := .constantBool, arguments := [] },
+  { sourceNode := 0, rule := .constantInt, arguments := [] },
   { sourceNode := 1, rule := .gaussianSample, arguments := [] },
   { sourceNode := 2, rule := .gaussianSample, arguments := [] },
   { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 },
     { node := 1, port := 0 }, { node := 2, port := 0 }] }
 ] }
 
-example : evaluateScopeOperational selectFixtureScope selectFixtureDerivation [] =
-    .ok #[#[.boolean], #[.matrix fixtureType 3], #[.matrix fixtureType 5],
-      #[.matrix fixtureType 5]] := by
-  rfl
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts selectFixtureScope selectFixtureDerivation [] []
+    matrixMaximum 3 { node := 3, port := 0 } facts) = .ok 5 := by
+  native_decide
+
+private def loopBoundBody : Scope := {
+  nodes := [{
+    kind := .gaussianSample fixtureType (.parameter "lane_bound")
+    arguments := []
+    outputTypes := [.matrix fixtureType]
+  }]
+  outputs := [("result", { node := 0, port := 0 })]
+  inputNames := []
+}
+
+private def loopBoundProgram : Prog := {
+  root := {
+    nodes := [{
+      kind := .parallelLoop "body" (.constant 4) 0
+        [("lane_bound", .add (.loopIndex 0) (.constant 1))] []
+      arguments := []
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 4)]
+    }, {
+      kind := .familyGetStatic (.constant 2)
+      arguments := [{ node := 0, port := 0 }]
+      outputTypes := [.matrix fixtureType]
+    }]
+    outputs := [("results", { node := 0, port := 0 }), ("selected", { node := 1, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("body", loopBoundBody)]
+}
+
+private def loopBoundDerivation : ProgramDerivation := {
+  root := { steps := [
+    { sourceNode := 0, rule := .parallelLoop, arguments := [] },
+    { sourceNode := 1, rule := .familyGetStatic, arguments := [{ node := 0, port := 0 }] }
+  ] }
+  definitions := [("body", { steps := [
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] }
+  ] })]
+}
+
+/-- A loop-dependent child parameter is evaluated numerically over all four indices while the
+body graph itself is evaluated once. The resulting uniform family stores the exact maximum 4. -/
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts loopBoundProgram loopBoundDerivation [] []
+    match ← lookupFact 1 facts { node := 0, port := 0 } with
+    | .familyUniform _ _ (.matrix fact) _ => fact.totalHardBound.evaluate [] #[]
+    | _ => throw (OperationalError.loopInputModeMismatch 0 0)) = .ok 4 := by
+  native_decide
+
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts loopBoundProgram loopBoundDerivation [] []
+    matrixMaximum 2 { node := 1, port := 0 } facts) = .ok 3 := by
+  native_decide
+
+private def sequentialRelationBody : Scope := {
+  nodes := [
+    { kind := .input "target", arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .input "public", arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.preimage fixtureType] },
+    { kind := .matrixMultiply,
+      arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 3, port := 0 })]
+  inputNames := ["target", "public"]
+}
+
+private def sequentialRelationProgram : Prog := {
+  root := {
+    nodes := [
+      { kind := .gaussianSample fixtureType (.constant 2), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .gadgetMatrix fixtureType (.constant 2), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .sequentialLoop "body" (.constant 3) 0 [] 1,
+        arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.matrix fixtureType] }
+    ]
+    outputs := [("result", { node := 2, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("body", sequentialRelationBody)]
+}
+
+private def sequentialRelationDerivation : ProgramDerivation := {
+  root := { steps := [
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 1, rule := .gadgetMatrix, arguments := [] },
+    { sourceNode := 2, rule := .sequentialLoop,
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+  ] }
+  definitions := [("body", { steps := [
+    { sourceNode := 0, rule := .input, arguments := [] },
+    { sourceNode := 1, rule := .input, arguments := [] },
+    { sourceNode := 2, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] },
+    { sourceNode := 3, rule := .matrixMultiplyRelation { node := 2, port := 0 },
+      arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }] }
+  ] })]
+}
+
+/-- A relation may depend on the previous carried bound when it is created and consumed inside
+one body execution. Only the resulting relation-free target fact becomes the next carried state. -/
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts sequentialRelationProgram
+      sequentialRelationDerivation [] [fixtureLayout]
+    matrixMaximum 2 { node := 2, port := 0 } facts) = .ok 2 := by
+  native_decide
+
+private def relationCarryBody : Scope := {
+  nodes := [{ kind := .input "carried", arguments := [], outputTypes := [.preimage fixtureType] }]
+  outputs := [("result", { node := 0, port := 0 })]
+  inputNames := ["carried"]
+}
+
+private def relationCarryProgram : Prog := {
+  root := {
+    nodes := relationFixtureScope.nodes.take 3 ++ [{
+      kind := .sequentialLoop "body" (.constant 1) 0 [] 1
+      arguments := [{ node := 2, port := 0 }]
+      outputTypes := [.preimage fixtureType]
+    }]
+    outputs := [("result", { node := 3, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("body", relationCarryBody)]
+}
+
+private def relationCarryDerivation : ProgramDerivation := {
+  root := { steps := relationFixtureDerivation.steps.take 3 ++ [{
+    sourceNode := 3
+    rule := .sequentialLoop
+    arguments := [{ node := 2, port := 0 }]
+  }] }
+  definitions := [("body", { steps := [
+    { sourceNode := 0, rule := .input, arguments := [] }
+  ] })]
+}
+
+/-- Relations are body-local tokens; carrying one across iterations rejects before abstraction. -/
+example : (match evaluateProgramOperationalWithLayouts relationCarryProgram relationCarryDerivation
+    [] [fixtureLayout] with
+  | .error (.relationBearingCarriedValue (.root (.standalone 0)) 3 0) => true
+  | _ => false) = true := by
+  native_decide
+
+private def simultaneousRecurrence (slot : Nat) : OperationalBoundExpr :=
+  .recurrence 2 [
+      .closedInt (.constant 2),
+      .closedInt (.constant 5)
+    ] [
+      .add (.previous (.matrixMaximum 0 0)) (.closedInt (.constant 3)),
+      .add (.previous (.matrixMaximum 0 1)) (.previous (.matrixMaximum 0 0))
+    ] slot
+
+/-- All carried slots read the previous state. The second slot must not observe the first slot's
+new value from the same iteration. -/
+example : (simultaneousRecurrence 0).evaluate [] #[] = .ok 8 := by
+  native_decide
+
+example : (simultaneousRecurrence 1).evaluate [] #[] = .ok 12 := by
+  native_decide
+
+private def nestedRecurrence : OperationalBoundExpr :=
+  .recurrence 2 [.closedInt (.constant 2)] [
+    .recurrence 2 [.previous (.matrixMaximum 0 0)] [
+      .add (.previous (.matrixMaximum 0 0)) (.previous (.matrixMaximum 1 0))
+    ] 0
+  ] 0
+
+/-- The inner depth zero denotes the inner state and depth one denotes the enclosing state. -/
+example : nestedRecurrence.evaluate [] #[] = .ok 18 := by
+  native_decide
+
+/-- A zero-count recurrence returns the initial slot without evaluating its transition. -/
+example : (.recurrence 0 [.closedInt (.constant 7)]
+    [.previous (.matrixMaximum 0 99)] 0 : OperationalBoundExpr).evaluate [] #[] = .ok 7 := by
+  native_decide
+
+/-- A typed carried placeholder has no meaning outside recurrence evaluation. -/
+example : (.previous (.matrixMaximum 0 0) : OperationalBoundExpr).evaluate [] #[] =
+    .error (.invalidPreviousPath (.matrixMaximum 0 0)) := by
+  native_decide
+
+private def sampledLoopIdentity : PublicMatrixIdentity :=
+  .sampledTrapdoor (.parallelBody (.root (.standalone 0)) 4) { node := 2, port := 0 }
+
+/-- Independent samples produced at one body wire receive distinct concrete loop identities. -/
+example : instantiatePublicIdentityLoopIndex 0 0 sampledLoopIdentity !=
+    instantiatePublicIdentityLoopIndex 0 1 sampledLoopIdentity := by
+  native_decide
+
+/-- Nested loop instantiation retains both concrete selections. -/
+example : instantiatePublicIdentityLoopIndex 1 3
+    (instantiatePublicIdentityLoopIndex 0 2 sampledLoopIdentity) =
+    .loopInstance 0 2 (.loopInstance 1 3 sampledLoopIdentity) := by
+  native_decide
+
+/-- Deterministic gadget matrices are not spuriously made lane-local. -/
+example : instantiatePublicIdentityLoopIndex 0 7
+    (.gadget "fixture" fixtureParams 1 2 false 3) =
+    (.gadget "fixture" fixtureParams 1 2 false 3) := by
+  native_decide
+
+private def mismatchedFixtureType : MatrixTypeExpr :=
+  { fixtureType with rows := .constant 2 }
+
+/-- A frozen leaf cannot claim an output matrix type different from the type it executes. -/
+example : (match evaluateScopeOperationalWithLayouts {
+    nodes := [{
+      kind := .zeroMatrix fixtureType
+      arguments := []
+      outputTypes := [.matrix mismatchedFixtureType]
+    }]
+    outputs := [("result", { node := 0, port := 0 })]
+    inputNames := []
+  } {
+    steps := [{ sourceNode := 0, rule := .zeroMatrix, arguments := [] }]
+  } [] [] with
+  | .error (.outputTypeMismatch 0) => true
+  | _ => false) = true := by
+  native_decide
+
+/-- Arithmetic operands must have the exact declared output matrix type. -/
+example : (match evaluateScopeOperationalWithLayouts {
+    nodes := [
+      { kind := .zeroMatrix fixtureType, arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .zeroMatrix mismatchedFixtureType, arguments := [],
+        outputTypes := [.matrix mismatchedFixtureType] },
+      { kind := .matrixAdd,
+        arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.matrix fixtureType] }
+    ]
+    outputs := [("result", { node := 2, port := 0 })]
+    inputNames := []
+  } {
+    steps := [
+      { sourceNode := 0, rule := .zeroMatrix, arguments := [] },
+      { sourceNode := 1, rule := .zeroMatrix, arguments := [] },
+      { sourceNode := 2, rule := .matrixAdd,
+        arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+    ]
+  } [] [] with
+  | .error (.outputTypeMismatch 2) => true
+  | _ => false) = true := by
+  native_decide
+
+/-- Output arity is checked before any operational fact is constructed. -/
+example : (match evaluateScopeOperationalWithLayouts {
+    nodes := [{
+      kind := .zeroMatrix fixtureType
+      arguments := []
+      outputCount := 2
+      outputTypes := [.matrix fixtureType]
+    }]
+    outputs := [("result", { node := 0, port := 0 })]
+    inputNames := []
+  } {
+    steps := [{ sourceNode := 0, rule := .zeroMatrix, arguments := [] }]
+  } [] [] with
+  | .error (.unsupportedOutputArity 0 2) => true
+  | _ => false) = true := by
+  native_decide
+
+/-- The generic decoder obligation uses the exact strict product inequality. At noise three and
+plaintext modulus two, ciphertext modulus thirteen passes while the boundary value twelve fails. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
+    let residual ← matrixFactAt 1 facts { node := 1, port := 0 }
+    let accepted ← decoderNoiseCheckReport [] residual [] 2 25
+    let rejected ← decoderNoiseCheckReport [] residual [] 2 24
+    pure (accepted.accepted, accepted.rejection, rejected.accepted, rejected.rejection)) =
+    .ok (true, none, false, some (.decoderThresholdNotMet 2 24 6)) := by
+  native_decide
+
+/-- An invalid plaintext modulus is rejected by the generic report rather than interpreted by an
+application-specific checker. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
+    let residual ← matrixFactAt 1 facts { node := 1, port := 0 }
+    let report ← decoderNoiseCheckReport [] residual [] 1 100
+    pure (report.accepted, report.rejection)) =
+    .ok (false, some (.invalidPlaintextModulus 1)) := by
+  native_decide
 
 end Mxx.Certificate

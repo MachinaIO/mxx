@@ -78,7 +78,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
             }
             let prefix = format!("scope {scope:?}, node {node_index}");
             match node.kind() {
-                NodeKind::UniformSample { range, .. } => {
+                NodeKind::UniformIntervalSample { range, .. } => {
                     constraints.push(ParamConstraint::IntLessEqual {
                         left: range.minimum.clone(),
                         right: range.maximum.clone(),
@@ -197,6 +197,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::MatrixScale { .. } |
                 NodeKind::Transpose |
                 NodeKind::Tensor |
+                NodeKind::UniformResidueSample { .. } |
                 NodeKind::HashSample { .. } |
                 NodeKind::CrtRecompose { .. } |
                 NodeKind::PackPolynomialCoefficients { .. } |

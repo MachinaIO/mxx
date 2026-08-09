@@ -88,6 +88,23 @@ pub fn gpu_backend_on(
     GpuDcrtBackend::new_with_placements(placements)
 }
 
+/// Constructs GPU placements for an explicit ordered device list.
+pub fn gpu_backend_on(
+    parameters: impl IntoIterator<Item = GpuDCRTPolyParams>,
+    device_ids: &[i32],
+) -> GpuDcrtBackend {
+    let parameters = parameters.into_iter().collect::<Vec<_>>();
+    assert!(!device_ids.is_empty(), "mxx-runtime GPU backend requires at least one selected GPU");
+    let placements = device_ids
+        .iter()
+        .copied()
+        .map(|device_id| {
+            parameters.iter().map(|parameters| parameters.params_for_device(device_id)).collect()
+        })
+        .collect();
+    GpuDcrtBackend::new_with_placements(placements)
+}
+
 pub(super) fn new_for_execution_on<M, U, H, T>(
     parameters: Vec<<M::P as Poly>::Params>,
     requested_device_ids: &[i32],

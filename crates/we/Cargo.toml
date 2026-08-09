@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Witness encryption constructions for mxx"
 
+[features]
+default = []
+gpu = ["mxx-primitives/gpu", "mxx-gadgets/gpu", "mxx-runtime/gpu"]
+
 [dependencies]
 mxx-primitives.workspace = true
 mxx-gadgets.workspace = true
@@ -21,6 +25,13 @@ rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 keccak-asm.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
+serial_test.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 [build-dependencies]
 sha2.workspace = true

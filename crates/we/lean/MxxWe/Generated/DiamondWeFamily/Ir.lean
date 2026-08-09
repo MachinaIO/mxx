@@ -8,13 +8,13 @@ def DiamondWeFamily_generatorVersion : String := "mxx-correctness-emitter-v6"
 
 def DiamondWeFamily_protocolSourcePaths : List String := ["crates/bgg/Cargo.toml", "crates/bgg/src", "crates/correctness/Cargo.toml", "crates/correctness/src", "crates/dsl/Cargo.toml", "crates/dsl/src", "crates/gadgets/Cargo.toml", "crates/gadgets/src", "crates/ir-core/Cargo.toml", "crates/ir-core/src", "crates/we/Cargo.toml", "crates/we/examples/emit_correctness.rs", "crates/we/src"]
 
-def DiamondWeFamily_protocolSourceHash : String := "42b321afcf6701ce2ca33435cf7bf9e387b681512e72ea47e0e78861347c88f4"
+def DiamondWeFamily_protocolSourceHash : String := "1bd61ebe38d1933aecaef7f40e39b7dc945ffe833fd74438757352a9b1a27360"
 
-def DiamondWeFamily_workflowHash : String := "df98e6fb7b9da2efdecc07137f81b853a0e8dec1d8af1342f4be45a86439fce1"
+def DiamondWeFamily_workflowHash : String := "b0cb1761132a3683375bc77da27bdac62b157142952ecaa1ee7b00c9aaf70c38"
 
-def DiamondWeFamily_toolkitHash : String := "c7f4b668243279ceab0e82073c2922c384e738d7078e317f96bc222e705ceae8"
+def DiamondWeFamily_toolkitHash : String := "3560ef5c7f64486257af2e66234d8e37803de15756dc58cd88172fa5657b8c75"
 
-def DiamondWeFamily_derivationHash : String := "9314f009be577d1ca0a5993083f6911b00e80420e82536ae47e4fad0a5a8b1c5"
+def DiamondWeFamily_derivationHash : String := "9121b6753e53963269c95afdea191a014643ddad27e056fbb57ad63cda19f719"
 
 def DiamondWeFamily_stage_encrypt : Mxx.Ir.Prog :=
   { root :=
@@ -59,7 +59,7 @@ def DiamondWeFamily_stage_encrypt : Mxx.Ir.Prog :=
         { kind := .matrixSubtract, arguments := [{ node := 10, port := 0 }, { node := 36, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .parameter "diamond_digit_count" })] },
         { kind := .hashSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .parameter "diamond_digit_count" } .plain [109, 120, 120, 58, 100, 105, 97, 109, 111, 110, 100, 45, 119, 101, 58, 114] [] [] [] none none, arguments := [{ node := 5, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .parameter "diamond_digit_count" })] },
         { kind := .slice (none) (some ((.constant (0 : Int)), (.constant (1 : Int)))), arguments := [{ node := 38, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
-        { kind := .gadgetDecompose { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .constant (1 : Int) } (.parameter "diamond_gadget_base") (.parameter "diamond_digit_count"), arguments := [{ node := 39, port := 0 }], outputCount := 1, outputTypes := [.preimage ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .constant (1 : Int) })] },
+        { kind := .gadgetDecompose { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .constant (1 : Int) } (.parameter "diamond_gadget_base") false (.parameter "diamond_digit_count"), arguments := [{ node := 39, port := 0 }], outputCount := 1, outputTypes := [.preimage ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .constant (1 : Int) })] },
         { kind := .matrixScale (.constant (1 : Int)), arguments := [{ node := 40, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .constant (1 : Int) })] },
         { kind := .reshape (.parameter "diamond_digit_count") (.constant (1 : Int)), arguments := [{ node := 41, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .parameter "diamond_digit_count", columns := .constant (1 : Int) })] },
         { kind := .matrixMultiply, arguments := [{ node := 37, port := 0 }, { node := 42, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
@@ -68,7 +68,7 @@ def DiamondWeFamily_stage_encrypt : Mxx.Ir.Prog :=
         { kind := .concat .rows, arguments := [{ node := 44, port := 0 }, { node := 45, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .add (.constant (1 : Int)) (.constant (1 : Int)), columns := .constant (1 : Int) })] },
         { kind := .preimageSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .add (.constant (4 : Int)) (.multiply (.constant (2 : Int)) (.parameter "diamond_digit_count")), columns := .constant (1 : Int) } (.parameter "diamond_preimage_max_coefficient_bound"), arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }, { node := 46, port := 0 }], outputCount := 1, outputTypes := [.preimage ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .add (.constant (4 : Int)) (.multiply (.constant (2 : Int)) (.parameter "diamond_digit_count")), columns := .constant (1 : Int) })] },
         { kind := .matrixScale (.constant (1 : Int)), arguments := [{ node := 47, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .add (.constant (4 : Int)) (.multiply (.constant (2 : Int)) (.parameter "diamond_digit_count")), columns := .constant (1 : Int) })] },
-        { kind := .uniformSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) } (.constant (-1 : Int)) (.constant (1 : Int)), arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
+        { kind := .uniformIntervalSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) } (.constant (-1 : Int)) (.constant (1 : Int)), arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
         { kind := .input "diamond-message", arguments := [], outputCount := 1, outputTypes := [.boolean] },
         { kind := .boolToInt, arguments := [{ node := 50, port := 0 }], outputCount := 1, outputTypes := [.integer] },
         { kind := .zeroMatrix { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) }, arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
@@ -242,7 +242,7 @@ def DiamondWeFamily_stage_encrypt : Mxx.Ir.Prog :=
         inputNames := [] }),
     ("parallel:__root:73",
       { nodes := [
-        { kind := .uniformSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) } (.constant (-1 : Int)) (.constant (1 : Int)), arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] }
+        { kind := .uniformIntervalSample { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) } (.constant (-1 : Int)) (.constant (1 : Int)), arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .constant (1 : Int) })] }
       ]
         outputs := [("output-0", { node := 0, port := 0 })]
         inputNames := [] }),
@@ -425,7 +425,7 @@ def DiamondWeFamily_stage_encrypt : Mxx.Ir.Prog :=
         { kind := .input "arg-1-matrix", arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .parameter "diamond_digit_count" })] },
         { kind := .matrixSubtract, arguments := [{ node := 6, port := 0 }, { node := 9, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .parameter "diamond_digit_count" })] },
         { kind := .input "arg-2-matrix", arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .parameter "diamond_digit_count" })] },
-        { kind := .gadgetDecompose { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .parameter "diamond_digit_count" } (.parameter "diamond_gadget_base") (.parameter "diamond_digit_count"), arguments := [{ node := 11, port := 0 }], outputCount := 1, outputTypes := [.preimage ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .parameter "diamond_digit_count" })] },
+        { kind := .gadgetDecompose { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .parameter "diamond_digit_count" } (.parameter "diamond_gadget_base") false (.parameter "diamond_digit_count"), arguments := [{ node := 11, port := 0 }], outputCount := 1, outputTypes := [.preimage ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .parameter "diamond_digit_count" })] },
         { kind := .matrixScale (.constant (1 : Int)), arguments := [{ node := 12, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .parameter "diamond_digit_count" })] },
         { kind := .matrixMultiply, arguments := [{ node := 9, port := 0 }, { node := 13, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .parameter "diamond_digit_count" })] },
         { kind := .matrixAdd, arguments := [{ node := 9, port := 0 }, { node := 11, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .parameter "diamond_digit_count" })] },
@@ -1016,7 +1016,7 @@ def DiamondWeFamily_stage_decrypt : Mxx.Ir.Prog :=
     ("parallel:sequential:__root:67:19",
       { nodes := [
         { kind := .input "item", arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .constant (1 : Int), columns := .parameter "diamond_digit_count" })] },
-        { kind := .gadgetDecompose { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .parameter "diamond_digit_count" } (.parameter "diamond_gadget_base") (.parameter "diamond_digit_count"), arguments := [{ node := 0, port := 0 }], outputCount := 1, outputTypes := [.preimage ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .parameter "diamond_digit_count" })] },
+        { kind := .gadgetDecompose { modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .parameter "diamond_digit_count" } (.parameter "diamond_gadget_base") false (.parameter "diamond_digit_count"), arguments := [{ node := 0, port := 0 }], outputCount := 1, outputTypes := [.preimage ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .parameter "diamond_digit_count" })] },
         { kind := .matrixScale (.constant (1 : Int)), arguments := [{ node := 1, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .parameter "diamond_modulus", ringDimension := .parameter "diamond_ring_dimension", rows := .multiply (.constant (1 : Int)) (.parameter "diamond_digit_count"), columns := .parameter "diamond_digit_count" })] }
       ]
         outputs := [("output-0", { node := 2, port := 0 })]
@@ -2245,7 +2245,7 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 46, rule := .concat, arguments := [{ node := 44, port := 0 }, { node := 45, port := 0 }] },
         { sourceNode := 47, rule := .preimageSample, arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }, { node := 46, port := 0 }] },
         { sourceNode := 48, rule := .matrixScale, arguments := [{ node := 47, port := 0 }] },
-        { sourceNode := 49, rule := .uniformSample, arguments := [] },
+        { sourceNode := 49, rule := .uniformIntervalSample, arguments := [] },
         { sourceNode := 50, rule := .input, arguments := [] },
         { sourceNode := 51, rule := .boolToInt, arguments := [{ node := 50, port := 0 }] },
         { sourceNode := 52, rule := .zeroMatrix, arguments := [] },
@@ -2280,6 +2280,9 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 81, rule := .parallelLoop, arguments := [{ node := 79, port := 0 }, { node := 9, port := 0 }] },
         { sourceNode := 82, rule := .parallelLoop, arguments := [{ node := 81, port := 0 }, { node := 64, port := 0 }] },
         { sourceNode := 83, rule := .parallelLoop, arguments := [{ node := 80, port := 0 }, { node := 80, port := 1 }, { node := 82, port := 0 }] }
+      ]
+        attachments := [
+        { ownerNamespace := "mxx-bgg", ruleName := "public-key-signal-grouping", roles := [("value", { node := 27, port := 0 })] }
       ] }
     definitions := [
     ("parallel:__root:0",
@@ -2287,10 +2290,16 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 0, rule := .evaluateInt, arguments := [] },
         { sourceNode := 1, rule := .evaluateInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:1",
       { steps := [
         { sourceNode := 0, rule := .trapdoorSample, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:2",
       { steps := [
@@ -2299,11 +2308,17 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
         { sourceNode := 3, rule := .input, arguments := [] },
         { sourceNode := 4, rule := .familyGetDynamic, arguments := [{ node := 3, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:9",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .slice, arguments := [{ node := 0, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:19",
       { steps := [
@@ -2322,12 +2337,18 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 12, rule := .constantInt, arguments := [] },
         { sourceNode := 13, rule := .intBinary, arguments := [{ node := 11, port := 0 }, { node := 12, port := 0 }] },
         { sourceNode := 14, rule := .select, arguments := [{ node := 7, port := 0 }, { node := 10, port := 0 }, { node := 13, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:20",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:26",
       { steps := [
@@ -2342,6 +2363,9 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 8, rule := .input, arguments := [] },
         { sourceNode := 9, rule := .select, arguments := [{ node := 7, port := 0 }, { node := 4, port := 0 }, { node := 8, port := 0 }] },
         { sourceNode := 10, rule := .select, arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }, { node := 9, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:27",
       { steps := [
@@ -2357,6 +2381,9 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 9, rule := .input, arguments := [] },
         { sourceNode := 10, rule := .select, arguments := [{ node := 7, port := 0 }, { node := 8, port := 0 }, { node := 9, port := 0 }] },
         { sourceNode := 11, rule := .select, arguments := [{ node := 5, port := 0 }, { node := 6, port := 0 }, { node := 10, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:70",
       { steps := [
@@ -2378,6 +2405,9 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 15, rule := .intBinary, arguments := [{ node := 13, port := 0 }, { node := 14, port := 0 }] },
         { sourceNode := 16, rule := .select, arguments := [{ node := 12, port := 0 }, { node := 10, port := 0 }, { node := 15, port := 0 }] },
         { sourceNode := 17, rule := .intBinary, arguments := [{ node := 4, port := 0 }, { node := 16, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:71",
       { steps := [
@@ -2386,22 +2416,34 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
         { sourceNode := 3, rule := .input, arguments := [] },
         { sourceNode := 4, rule := .familyGetDynamic, arguments := [{ node := 3, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:72",
       { steps := [
         { sourceNode := 0, rule := .evaluateInt, arguments := [] },
         { sourceNode := 1, rule := .evaluateInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:73",
       { steps := [
-        { sourceNode := 0, rule := .uniformSample, arguments := [] }
+        { sourceNode := 0, rule := .uniformIntervalSample, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:74",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:75",
       { steps := [
@@ -2415,12 +2457,18 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 7, rule := .evaluateInt, arguments := [] },
         { sourceNode := 8, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 7, port := 0 }] },
         { sourceNode := 9, rule := .intBinary, arguments := [{ node := 6, port := 0 }, { node := 8, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:76",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:77",
       { steps := [
@@ -2450,6 +2498,9 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 23, rule := .matrixMultiplyBound, arguments := [{ node := 21, port := 0 }, { node := 22, port := 0 }] },
         { sourceNode := 24, rule := .gaussianSample, arguments := [] },
         { sourceNode := 25, rule := .matrixAdd, arguments := [{ node := 23, port := 0 }, { node := 24, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:78",
       { steps := [
@@ -2458,12 +2509,18 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .preimageSample, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] },
         { sourceNode := 4, rule := .matrixScale, arguments := [{ node := 3, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:79",
       { steps := [
         { sourceNode := 0, rule := .evaluateInt, arguments := [] },
         { sourceNode := 1, rule := .constantInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:80",
       { steps := [
@@ -2472,12 +2529,18 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
         { sourceNode := 3, rule := .input, arguments := [] },
         { sourceNode := 4, rule := .familyGetDynamic, arguments := [{ node := 3, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:81",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:82",
       { steps := [
@@ -2485,6 +2548,9 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixNegate, arguments := [{ node := 1, port := 0 }] },
         { sourceNode := 3, rule := .concat, arguments := [{ node := 0, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:83",
       { steps := [
@@ -2493,42 +2559,63 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .preimageSample, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] },
         { sourceNode := 4, rule := .matrixScale, arguments := [{ node := 3, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:32:0",
       { steps := [
         { sourceNode := 0, rule := .evaluateInt, arguments := [] },
         { sourceNode := 1, rule := .constantInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:32:2",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:32:4",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:32:6",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:32:8",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:32:9",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:32:14",
       { steps := [
@@ -2553,6 +2640,9 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 18, rule := .matrixSubtract, arguments := [{ node := 15, port := 0 }, { node := 17, port := 0 }] },
         { sourceNode := 19, rule := .select, arguments := [{ node := 8, port := 0 }, { node := 7, port := 0 }, { node := 6, port := 0 }, { node := 9, port := 0 }, { node := 10, port := 0 }, { node := 14, port := 0 }, { node := 18, port := 0 }] },
         { sourceNode := 20, rule := .select, arguments := [{ node := 5, port := 0 }, { node := 7, port := 0 }, { node := 19, port := 0 }] }
+      ]
+        attachments := [
+        { ownerNamespace := "mxx-bgg", ruleName := "public-key-signal-grouping", roles := [("value", { node := 20, port := 0 })] }
       ] }),
     ("sequential:__root:32",
       { steps := [
@@ -2571,6 +2661,9 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 12, rule := .familyGetDynamic, arguments := [{ node := 10, port := 0 }, { node := 11, port := 0 }] },
         { sourceNode := 13, rule := .input, arguments := [] },
         { sourceNode := 14, rule := .parallelLoop, arguments := [{ node := 2, port := 0 }, { node := 6, port := 0 }, { node := 9, port := 0 }, { node := 12, port := 0 }, { node := 13, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("sequential:parallel:__root:77:21",
       { steps := [
@@ -2593,6 +2686,9 @@ def DiamondWeFamily_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 16, rule := .zeroMatrix, arguments := [] },
         { sourceNode := 17, rule := .concat, arguments := [{ node := 15, port := 0 }, { node := 16, port := 0 }] },
         { sourceNode := 18, rule := .select, arguments := [{ node := 5, port := 0 }, { node := 6, port := 0 }, { node := 17, port := 0 }] }
+      ]
+        attachments := [
+
       ] })
     ]
   }
@@ -2687,6 +2783,10 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 84, rule := .intBinary, arguments := [{ node := 79, port := 0 }, { node := 83, port := 0 }] },
         { sourceNode := 85, rule := .constantInt, arguments := [] },
         { sourceNode := 86, rule := .intCompare, arguments := [{ node := 84, port := 0 }, { node := 85, port := 0 }] }
+      ]
+        attachments := [
+        { ownerNamespace := "mxx-bgg", ruleName := "encoding-family-pairing", roles := [("vector", { node := 38, port := 0 }), ("public-key", { node := 50, port := 0 }), ("plaintext", { node := 62, port := 0 })] },
+        { ownerNamespace := "mxx-bgg", ruleName := "public-key-signal-grouping", roles := [("value", { node := 50, port := 0 })] }
       ] }
     definitions := [
     ("parallel:__root:2",
@@ -2698,18 +2798,27 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 4, rule := .zeroMatrix, arguments := [] },
         { sourceNode := 5, rule := .input, arguments := [] },
         { sourceNode := 6, rule := .select, arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }, { node := 5, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:3",
       { steps := [
         { sourceNode := 0, rule := .evaluateInt, arguments := [] },
         { sourceNode := 1, rule := .constantInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:5",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:6",
       { steps := [
@@ -2719,6 +2828,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 3, rule := .evaluateInt, arguments := [] },
         { sourceNode := 4, rule := .evaluateInt, arguments := [] },
         { sourceNode := 5, rule := .sequentialLoop, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }, { node := 3, port := 0 }, { node := 4, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:19",
       { steps := [
@@ -2728,6 +2840,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 3, rule := .intBinary, arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }] },
         { sourceNode := 4, rule := .intCompare, arguments := [{ node := 0, port := 0 }, { node := 3, port := 0 }] },
         { sourceNode := 5, rule := .boolToInt, arguments := [{ node := 4, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:24",
       { steps := [
@@ -2739,10 +2854,16 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 5, rule := .intCompare, arguments := [{ node := 1, port := 0 }, { node := 4, port := 0 }] },
         { sourceNode := 6, rule := .boolToInt, arguments := [{ node := 5, port := 0 }] },
         { sourceNode := 7, rule := .intBinary, arguments := [{ node := 3, port := 0 }, { node := 6, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:26",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:27",
       { steps := [
@@ -2759,30 +2880,45 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 10, rule := .intBinary, arguments := [{ node := 8, port := 0 }, { node := 9, port := 0 }] },
         { sourceNode := 11, rule := .intBinary, arguments := [{ node := 1, port := 0 }, { node := 0, port := 0 }] },
         { sourceNode := 12, rule := .select, arguments := [{ node := 7, port := 0 }, { node := 10, port := 0 }, { node := 11, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:28",
       { steps := [
         { sourceNode := 0, rule := .evaluateInt, arguments := [] },
         { sourceNode := 1, rule := .constantInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:29",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:31",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixMultiplyBound, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:32",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:33",
       { steps := [
@@ -2790,14 +2926,23 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:35",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:36",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:37",
       { steps := [
@@ -2805,6 +2950,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:38",
       { steps := [
@@ -2812,28 +2960,43 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:42",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:43",
       { steps := [
         { sourceNode := 0, rule := .evaluateInt, arguments := [] },
         { sourceNode := 1, rule := .constantInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:44",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:45",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:46",
       { steps := [
@@ -2841,14 +3004,23 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:47",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:48",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:49",
       { steps := [
@@ -2856,6 +3028,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:50",
       { steps := [
@@ -2863,18 +3038,30 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:53",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:54",
       { steps := [
         { sourceNode := 0, rule := .zeroMatrix, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:55",
       { steps := [
         { sourceNode := 0, rule := .identityMatrix, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:56",
       { steps := [
@@ -2882,12 +3069,18 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:57",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:58",
       { steps := [
@@ -2895,14 +3088,23 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:59",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:60",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:61",
       { steps := [
@@ -2910,6 +3112,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:62",
       { steps := [
@@ -2917,6 +3122,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:8:5",
       { steps := [
@@ -2930,12 +3138,18 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 7, rule := .constantInt, arguments := [] },
         { sourceNode := 8, rule := .intBinary, arguments := [{ node := 6, port := 0 }, { node := 7, port := 0 }] },
         { sourceNode := 9, rule := .select, arguments := [{ node := 3, port := 0 }, { node := 5, port := 0 }, { node := 8, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:8:7",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:8:10",
       { steps := [
@@ -2948,18 +3162,27 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 6, rule := .intBinary, arguments := [{ node := 2, port := 0 }, { node := 5, port := 0 }] },
         { sourceNode := 7, rule := .evaluateInt, arguments := [] },
         { sourceNode := 8, rule := .intBinary, arguments := [{ node := 6, port := 0 }, { node := 7, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:8:12",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:8:13",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixMultiplyBound, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:3",
       { steps := [
@@ -2969,112 +3192,169 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 3, rule := .intBinary, arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }] },
         { sourceNode := 4, rule := .intCompare, arguments := [{ node := 0, port := 0 }, { node := 3, port := 0 }] },
         { sourceNode := 5, rule := .boolToInt, arguments := [{ node := 4, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:5",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:6",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixSubtract, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:7",
       { steps := [
         { sourceNode := 0, rule := .evaluateInt, arguments := [] },
         { sourceNode := 1, rule := .constantInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:9",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:11",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:13",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:14",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixSubtract, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:16",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:18",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:19",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] },
         { sourceNode := 2, rule := .matrixScale, arguments := [{ node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:20",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixMultiplyBound, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:21",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:23",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:24",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixMultiplyBound, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:25",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixAdd, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:26",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixAdd, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:28",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixMultiplyBound, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:29",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixSubtract, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:30",
       { steps := [
@@ -3086,6 +3366,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 5, rule := .input, arguments := [] },
         { sourceNode := 6, rule := .input, arguments := [] },
         { sourceNode := 7, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }, { node := 3, port := 0 }, { node := 4, port := 0 }, { node := 5, port := 0 }, { node := 6, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:31",
       { steps := [
@@ -3093,52 +3376,79 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:33",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:34",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixSubtract, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:35",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:36",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixSubtract, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:37",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixMultiplyBound, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:38",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixAdd, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:39",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixMultiplyBound, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:40",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixSubtract, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:41",
       { steps := [
@@ -3150,6 +3460,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 5, rule := .input, arguments := [] },
         { sourceNode := 6, rule := .input, arguments := [] },
         { sourceNode := 7, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }, { node := 3, port := 0 }, { node := 4, port := 0 }, { node := 5, port := 0 }, { node := 6, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:42",
       { steps := [
@@ -3157,52 +3470,79 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:44",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:45",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixSubtract, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:46",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixSubtract, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:47",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:48",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixMultiplyBound, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:49",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixAdd, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:50",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixMultiplyBound, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:51",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .matrixSubtract, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:52",
       { steps := [
@@ -3214,6 +3554,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 5, rule := .input, arguments := [] },
         { sourceNode := 6, rule := .input, arguments := [] },
         { sourceNode := 7, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }, { node := 3, port := 0 }, { node := 4, port := 0 }, { node := 5, port := 0 }, { node := 6, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:67:53",
       { steps := [
@@ -3221,6 +3564,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .input, arguments := [] },
         { sourceNode := 3, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("sequential:__root:8",
       { steps := [
@@ -3238,6 +3584,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 11, rule := .input, arguments := [] },
         { sourceNode := 12, rule := .parallelLoop, arguments := [{ node := 10, port := 0 }, { node := 11, port := 0 }] },
         { sourceNode := 13, rule := .parallelLoop, arguments := [{ node := 7, port := 0 }, { node := 12, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("sequential:__root:67",
       { steps := [
@@ -3295,6 +3644,10 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 51, rule := .parallelLoop, arguments := [{ node := 49, port := 0 }, { node := 50, port := 0 }] },
         { sourceNode := 52, rule := .parallelLoop, arguments := [{ node := 9, port := 0 }, { node := 45, port := 0 }, { node := 44, port := 0 }, { node := 23, port := 0 }, { node := 46, port := 0 }, { node := 48, port := 0 }, { node := 51, port := 0 }] },
         { sourceNode := 53, rule := .parallelLoop, arguments := [{ node := 3, port := 0 }, { node := 45, port := 0 }, { node := 52, port := 0 }] }
+      ]
+        attachments := [
+        { ownerNamespace := "mxx-bgg", ruleName := "encoding-family-pairing", roles := [("vector", { node := 31, port := 0 }), ("public-key", { node := 42, port := 0 }), ("plaintext", { node := 53, port := 0 })] },
+        { ownerNamespace := "mxx-bgg", ruleName := "public-key-signal-grouping", roles := [("value", { node := 42, port := 0 })] }
       ] }),
     ("sequential:parallel:__root:6:5",
       { steps := [
@@ -3311,6 +3664,9 @@ def DiamondWeFamily_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 10, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 9, port := 0 }] },
         { sourceNode := 11, rule := .constantInt, arguments := [] },
         { sourceNode := 12, rule := .intBinary, arguments := [{ node := 8, port := 0 }, { node := 11, port := 0 }] }
+      ]
+        attachments := [
+
       ] })
     ]
   }
@@ -3319,6 +3675,9 @@ def DiamondWeFamily_ideal_derivation : Mxx.Certificate.ProgramDerivation :=
   { root :=
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }
     definitions := [
 
@@ -3403,6 +3762,9 @@ def DiamondWeFamily_requirement_0_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 72, rule := .intBinary, arguments := [{ node := 65, port := 0 }, { node := 71, port := 0 }] },
         { sourceNode := 73, rule := .constantInt, arguments := [] },
         { sourceNode := 74, rule := .intCompare, arguments := [{ node := 72, port := 0 }, { node := 73, port := 0 }] }
+      ]
+        attachments := [
+
       ] }
     definitions := [
     ("sequential:__root:59",
@@ -3411,6 +3773,9 @@ def DiamondWeFamily_requirement_0_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .constantInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
         { sourceNode := 3, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] })
     ]
   }
@@ -3521,6 +3886,9 @@ def DiamondWeFamily_requirement_1_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 100, rule := .intBinary, arguments := [{ node := 85, port := 0 }, { node := 99, port := 0 }] },
         { sourceNode := 101, rule := .constantInt, arguments := [] },
         { sourceNode := 102, rule := .intCompare, arguments := [{ node := 100, port := 0 }, { node := 101, port := 0 }] }
+      ]
+        attachments := [
+
       ] }
     definitions := [
     ("parallel:__root:74",
@@ -3529,30 +3897,45 @@ def DiamondWeFamily_requirement_1_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 1, rule := .boolToInt, arguments := [{ node := 0, port := 0 }] },
         { sourceNode := 2, rule := .constantInt, arguments := [] },
         { sourceNode := 3, rule := .intCompare, arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:79:1",
       { steps := [
         { sourceNode := 0, rule := .evaluateInt, arguments := [] },
         { sourceNode := 1, rule := .constantInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:79:3",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:79:5",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:79:7",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:79:12",
       { steps := [
@@ -3754,6 +4137,9 @@ def DiamondWeFamily_requirement_1_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 195, rule := .constantInt, arguments := [] },
         { sourceNode := 196, rule := .intCompare, arguments := [{ node := 194, port := 0 }, { node := 195, port := 0 }] },
         { sourceNode := 197, rule := .select, arguments := [{ node := 5, port := 0 }, { node := 33, port := 0 }, { node := 196, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:79:22",
       { steps := [
@@ -3779,6 +4165,9 @@ def DiamondWeFamily_requirement_1_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 19, rule := .intBinary, arguments := [{ node := 16, port := 0 }, { node := 18, port := 0 }] },
         { sourceNode := 20, rule := .constantInt, arguments := [] },
         { sourceNode := 21, rule := .intCompare, arguments := [{ node := 19, port := 0 }, { node := 20, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("sequential:__root:79",
       { steps := [
@@ -3805,6 +4194,9 @@ def DiamondWeFamily_requirement_1_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 20, rule := .constantInt, arguments := [] },
         { sourceNode := 21, rule := .intCompare, arguments := [{ node := 19, port := 0 }, { node := 20, port := 0 }] },
         { sourceNode := 22, rule := .parallelLoop, arguments := [{ node := 0, port := 0 }, { node := 12, port := 0 }, { node := 21, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("sequential:__root:80",
       { steps := [
@@ -3817,6 +4209,9 @@ def DiamondWeFamily_requirement_1_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 6, rule := .intBinary, arguments := [{ node := 1, port := 0 }, { node := 5, port := 0 }] },
         { sourceNode := 7, rule := .constantInt, arguments := [] },
         { sourceNode := 8, rule := .intCompare, arguments := [{ node := 6, port := 0 }, { node := 7, port := 0 }] }
+      ]
+        attachments := [
+
       ] })
     ]
   }
@@ -3860,6 +4255,9 @@ def DiamondWeFamily_requirement_2_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 33, rule := .intBinary, arguments := [{ node := 16, port := 0 }, { node := 32, port := 0 }] },
         { sourceNode := 34, rule := .constantInt, arguments := [] },
         { sourceNode := 35, rule := .intCompare, arguments := [{ node := 33, port := 0 }, { node := 34, port := 0 }] }
+      ]
+        attachments := [
+
       ] }
     definitions := [
     ("parallel:__root:8",
@@ -3884,6 +4282,9 @@ def DiamondWeFamily_requirement_2_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 17, rule := .intCompare, arguments := [{ node := 9, port := 0 }, { node := 16, port := 0 }] },
         { sourceNode := 18, rule := .select, arguments := [{ node := 5, port := 0 }, { node := 8, port := 0 }, { node := 17, port := 0 }] },
         { sourceNode := 19, rule := .boolToInt, arguments := [{ node := 18, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:13",
       { steps := [
@@ -3907,6 +4308,9 @@ def DiamondWeFamily_requirement_2_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 17, rule := .intCompare, arguments := [{ node := 9, port := 0 }, { node := 16, port := 0 }] },
         { sourceNode := 18, rule := .select, arguments := [{ node := 5, port := 0 }, { node := 8, port := 0 }, { node := 17, port := 0 }] },
         { sourceNode := 19, rule := .boolToInt, arguments := [{ node := 18, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:14",
       { steps := [
@@ -3915,6 +4319,9 @@ def DiamondWeFamily_requirement_2_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
         { sourceNode := 3, rule := .constantInt, arguments := [] },
         { sourceNode := 4, rule := .intCompare, arguments := [{ node := 2, port := 0 }, { node := 3, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:20",
       { steps := [
@@ -3936,12 +4343,18 @@ def DiamondWeFamily_requirement_2_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 15, rule := .constantInt, arguments := [] },
         { sourceNode := 16, rule := .intBinary, arguments := [{ node := 14, port := 0 }, { node := 15, port := 0 }] },
         { sourceNode := 17, rule := .intBinary, arguments := [{ node := 13, port := 0 }, { node := 16, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:21",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:__root:22",
       { steps := [
@@ -3965,42 +4378,63 @@ def DiamondWeFamily_requirement_2_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 17, rule := .select, arguments := [{ node := 5, port := 0 }, { node := 15, port := 0 }, { node := 16, port := 0 }] },
         { sourceNode := 18, rule := .constantInt, arguments := [] },
         { sourceNode := 19, rule := .intCompare, arguments := [{ node := 17, port := 0 }, { node := 18, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:27:0",
       { steps := [
         { sourceNode := 0, rule := .evaluateInt, arguments := [] },
         { sourceNode := 1, rule := .constantInt, arguments := [] },
         { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:27:2",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:27:4",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:27:6",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:27:8",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:27:9",
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .input, arguments := [] },
         { sourceNode := 2, rule := .familyGetDynamic, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("parallel:sequential:__root:27:13",
       { steps := [
@@ -4040,6 +4474,9 @@ def DiamondWeFamily_requirement_2_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 33, rule := .intCompare, arguments := [{ node := 31, port := 0 }, { node := 32, port := 0 }] },
         { sourceNode := 34, rule := .select, arguments := [{ node := 10, port := 0 }, { node := 14, port := 0 }, { node := 18, port := 0 }, { node := 19, port := 0 }, { node := 22, port := 0 }, { node := 28, port := 0 }, { node := 33, port := 0 }] },
         { sourceNode := 35, rule := .select, arguments := [{ node := 5, port := 0 }, { node := 9, port := 0 }, { node := 34, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("sequential:__root:15",
       { steps := [
@@ -4052,6 +4489,9 @@ def DiamondWeFamily_requirement_2_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 6, rule := .intBinary, arguments := [{ node := 1, port := 0 }, { node := 5, port := 0 }] },
         { sourceNode := 7, rule := .constantInt, arguments := [] },
         { sourceNode := 8, rule := .intCompare, arguments := [{ node := 6, port := 0 }, { node := 7, port := 0 }] }
+      ]
+        attachments := [
+
       ] }),
     ("sequential:__root:27",
       { steps := [
@@ -4069,6 +4509,9 @@ def DiamondWeFamily_requirement_2_derivation : Mxx.Certificate.ProgramDerivation
         { sourceNode := 11, rule := .evaluateInt, arguments := [] },
         { sourceNode := 12, rule := .familyGetDynamic, arguments := [{ node := 10, port := 0 }, { node := 11, port := 0 }] },
         { sourceNode := 13, rule := .parallelLoop, arguments := [{ node := 2, port := 0 }, { node := 6, port := 0 }, { node := 9, port := 0 }, { node := 12, port := 0 }] }
+      ]
+        attachments := [
+
       ] })
     ]
   }

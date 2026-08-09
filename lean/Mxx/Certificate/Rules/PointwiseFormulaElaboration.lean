@@ -372,6 +372,7 @@ private theorem FrozenPointwiseMatrixProgramFormula.validDecomposeChild
   rcases node with ⟨kind, arguments, outputCount, outputTypes⟩
   cases kind <;> simp_all [pointwiseFormulaArgumentsMatch]
 
+set_option maxHeartbeats 800000 in
 private theorem FrozenPointwiseMatrixProgramFormula.validBinaryChildren
     {program : Mxx.Ir.Prog}
     {substitutions : List FrozenPointwiseMatrixProgramFormula}

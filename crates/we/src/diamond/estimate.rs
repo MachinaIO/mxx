@@ -6,8 +6,9 @@ use mxx_ir_core::{
     artifact::{export_validated_manifest, production_id},
     encoding::spec_hash,
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Instant};
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DiamondCostEstimate {
@@ -35,7 +36,9 @@ pub fn estimate_diamond_cost<B>(
 where
     B: MeasurementBackend,
 {
+    let total_started = Instant::now();
     let bindings = compiler.circuit_bindings()?;
+    let encryption_started = Instant::now();
     let encryption = compiler.build_encryption()?.graph;
     let validated_encryption = encryption
         .validate(&bindings)
@@ -48,12 +51,28 @@ where
     let artifact_manifest = export_validated_manifest(encryption_id.clone(), &validated_encryption)
         .map_err(|error| DiamondEstimateError::Manifest(error.to_string()))?;
     let encryption_report = estimate(&validated_encryption, backend, config)?;
+    info!(
+        elapsed_seconds = encryption_started.elapsed().as_secs_f64(),
+        total_work_seconds = encryption_report.total_work_seconds,
+        critical_path_seconds = encryption_report.critical_path_seconds,
+        maximum_parallelism = encryption_report.maximum_parallelism,
+        "estimated Diamond WE encryption graph"
+    );
 
+    let decryption_started = Instant::now();
     let decryption = compiler.build_decryption(encryption_id.clone())?.graph;
     let validated_decryption = decryption
         .validate_with_manifests(&bindings, &BTreeMap::from([(encryption_id, artifact_manifest)]))
         .map_err(|error| DiamondEstimateError::Validation(error.to_string()))?;
     let decryption_report = estimate(&validated_decryption, backend, config)?;
+    info!(
+        elapsed_seconds = decryption_started.elapsed().as_secs_f64(),
+        total_work_seconds = decryption_report.total_work_seconds,
+        critical_path_seconds = decryption_report.critical_path_seconds,
+        maximum_parallelism = decryption_report.maximum_parallelism,
+        total_elapsed_seconds = total_started.elapsed().as_secs_f64(),
+        "estimated Diamond WE decryption graph"
+    );
     Ok(DiamondCostEstimate { encryption: encryption_report, decryption: decryption_report })
 }
 

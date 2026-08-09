@@ -290,7 +290,7 @@ impl PrivatePrfeLayerWires {
             .ok_or(PrivatePrfeGraphError::AttributeLayout)?;
         debug_assert_eq!(attribute_bits + 1, dimensions.attribute_count);
         let attribute_public = (0..dimensions.attribute_count)
-            .map(|_| ring.uniform((SECRET_ROWS, block_columns)))
+            .map(|_| ring.uniform_residue((SECRET_ROWS, block_columns)))
             .collect();
         let b_trapdoor = ring.sample_trapdoor(
             SECRET_ROWS,
@@ -332,9 +332,9 @@ impl PrivatePrfeLayerWires {
                 s_bar: ring.gaussian((1, SECRET_ROWS - 1), self.config.secret_sigma.clone()),
                 e_b: ring.gaussian((1, SECRET_ROWS * b_columns), self.config.b_error_sigma.clone()),
                 seed,
-                a_bar_fhe: ring.uniform((SECRET_ROWS - 1, gsw_columns)),
+                a_bar_fhe: ring.uniform_residue((SECRET_ROWS - 1, gsw_columns)),
                 e_fhe: ring.gaussian((1, gsw_columns), self.config.fhe_error_sigma.clone()),
-                r: ring.uniform_in((gsw_columns, self.x_columns), 0, 1),
+                r: ring.uniform_interval((gsw_columns, self.x_columns), 0, 1),
                 e_att: (0..self.attribute_public.len())
                     .map(|_| {
                         ring.gaussian(
@@ -1354,7 +1354,7 @@ mod tests {
         let ciphertext = layer
             .encrypt(
                 vec![layer.compiler.ring.identity(1)],
-                vec![layer.compiler.ring.uniform_in((1, 1), 0, 1)],
+                vec![layer.compiler.ring.uniform_interval((1, 1), 0, 1)],
             )
             .unwrap();
         let input_count = layer.attribute_public.len() - 1;
@@ -1404,7 +1404,7 @@ mod tests {
         let ciphertext = layer
             .encrypt(
                 vec![layer.compiler.ring.identity(1)],
-                vec![layer.compiler.ring.uniform_in((1, 1), 0, 1)],
+                vec![layer.compiler.ring.uniform_interval((1, 1), 0, 1)],
             )
             .unwrap();
         let bits = layer.serialize_ciphertext(&ciphertext).unwrap();
@@ -1490,7 +1490,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let ciphertext = layer
-            .encrypt(encoded_message, vec![layer.compiler.ring.uniform_in((1, 1), 0, 1)])
+            .encrypt(encoded_message, vec![layer.compiler.ring.uniform_interval((1, 1), 0, 1)])
             .unwrap();
         let input_count = layer.attribute_public.len() - 1;
         let high = layer

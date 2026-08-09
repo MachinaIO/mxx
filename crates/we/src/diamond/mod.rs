@@ -3,6 +3,8 @@
 mod artifacts;
 mod config;
 mod estimate;
+#[cfg(feature = "gpu")]
+mod estimate_gpu;
 mod graph;
 mod parameter_search;
 mod runtime;
@@ -13,6 +15,8 @@ pub use config::{
     default_error_max_coefficient_bound, default_preimage_max_coefficient_bound,
 };
 pub use estimate::{DiamondCostEstimate, DiamondEstimateError, estimate_diamond_cost};
+#[cfg(feature = "gpu")]
+pub use estimate_gpu::{DiamondGpuMeasurementBackend, DiamondGpuMeasurementError};
 pub use graph::{
     DIAMOND_PROTOCOL_SOURCE_PATHS, DiamondCompileError, DiamondDecryptionGraph,
     DiamondEncryptionGraph, DiamondWeCompiler, DiamondWeProtocolFamily,

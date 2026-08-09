@@ -452,16 +452,15 @@ impl Ring {
     }
 
     #[track_caller]
-    pub fn uniform(&self, shape: impl IntoShape) -> Mat {
-        self.uniform_in(
-            shape,
-            IntExpr::constant(0),
-            IntExpr::Sub(Box::new(self.modulus.clone()), Box::new(IntExpr::constant(1))),
-        )
+    /// Samples a matrix uniformly from the full coefficient residue ring `R_q`.
+    pub fn uniform_residue(&self, shape: impl IntoShape) -> Mat {
+        let ty = self.matrix_type(shape);
+        Mat::from_node(NodeKind::UniformResidueSample { matrix_type: ty.clone() }, Vec::new(), ty)
     }
 
     #[track_caller]
-    pub fn uniform_in(
+    /// Samples from one of the supported small integer intervals: `[-1, 1]` or `[0, 1]`.
+    pub fn uniform_interval(
         &self,
         shape: impl IntoShape,
         minimum: impl Into<IntExpr>,
@@ -469,7 +468,7 @@ impl Ring {
     ) -> Mat {
         let ty = self.matrix_type(shape);
         Mat::from_node(
-            NodeKind::UniformSample {
+            NodeKind::UniformIntervalSample {
                 matrix_type: ty.clone(),
                 range: SampleRange { minimum: minimum.into(), maximum: maximum.into() },
             },
@@ -810,7 +809,19 @@ impl Mat {
 
     #[track_caller]
     pub fn decompose(self, base: impl Into<IntExpr>, digit_count: impl Into<IntExpr>) -> Preimage {
-        let digit_count = digit_count.into();
+        self.decompose_with_mode(base.into(), digit_count.into(), false)
+    }
+
+    #[track_caller]
+    pub fn small_decompose(
+        self,
+        base: impl Into<IntExpr>,
+        digit_count: impl Into<IntExpr>,
+    ) -> Preimage {
+        self.decompose_with_mode(base.into(), digit_count.into(), true)
+    }
+
+    fn decompose_with_mode(self, base: IntExpr, digit_count: IntExpr, small: bool) -> Preimage {
         let ty = MatrixType {
             rows: IntExpr::Mul(
                 Box::new(self.matrix_type.rows.clone()),
@@ -820,11 +831,7 @@ impl Mat {
         };
         let pending = self.pending;
         let node = NodeHandle::new(
-            NodeKind::GadgetDecompose {
-                base: base.into(),
-                small: false,
-                digit_count: Some(digit_count),
-            },
+            NodeKind::GadgetDecompose { base, small, digit_count },
             vec![self.value],
             vec![WireType::Preimage(ty.clone())],
         );
@@ -3401,7 +3408,8 @@ fn require_sampler_free(graph: &Graph) -> Result<(), DslError> {
         scope.nodes().iter().any(|node| {
             matches!(
                 node.kind(),
-                NodeKind::UniformSample { .. } |
+                NodeKind::UniformResidueSample { .. } |
+                    NodeKind::UniformIntervalSample { .. } |
                     NodeKind::GaussianSample { .. } |
                     NodeKind::HashSample { .. } |
                     NodeKind::TrapdoorSample { .. } |
@@ -4535,6 +4543,36 @@ mod tests {
         let constraints = mxx_ir_core::derive_param_constraints(&parameterized.graph).unwrap();
         assert!(constraints.iter().any(|constraint| !constraint.evaluate(&negative).unwrap()));
         assert!(parameterized.validate(&negative).is_err());
+    }
+
+    #[test]
+    fn decomposition_requires_explicit_positive_metadata_and_preserves_mode() {
+        let ring = Ring::new(257, 8);
+        let input = ring.input("input", (1, 1));
+        let regular = DslContext::new("regular-decomposition")
+            .output("value", input.clone().decompose(4, 4).as_mat())
+            .unwrap()
+            .build()
+            .unwrap();
+        regular.validate(&ParamEnv::default()).unwrap();
+        let serialized = serde_json::to_string(&regular.graph).unwrap();
+        assert!(serialized.contains("digit_count"));
+        assert!(serialized.contains("\"small\":false"));
+
+        let small = DslContext::new("small-decomposition")
+            .output("value", input.clone().small_decompose(4, 4).as_mat())
+            .unwrap()
+            .build()
+            .unwrap();
+        small.validate(&ParamEnv::default()).unwrap();
+        assert!(serde_json::to_string(&small.graph).unwrap().contains("\"small\":true"));
+
+        let invalid = DslContext::new("negative-decomposition-base")
+            .output("value", input.decompose(-4, 4).as_mat())
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(invalid.validate(&ParamEnv::default()).is_err());
     }
 
     #[test]

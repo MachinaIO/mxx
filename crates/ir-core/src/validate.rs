@@ -511,8 +511,11 @@ fn validate_node(
         NodeKind::GadgetTrapdoor { matrix_type, base } => {
             require_arity(scope, node, 0)?;
             let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
-            let gadget_base = base.evaluate(env)?.abs();
-            if gadget_base <= BigInt::one() || !matrix.columns.is_multiple_of(matrix.rows) {
+            let gadget_base = base.evaluate(env)?;
+            if gadget_base <= BigInt::one() ||
+                matrix.rows == 0 ||
+                !matrix.columns.is_multiple_of(matrix.rows)
+            {
                 return node_error(scope, node.id, "invalid gadget trapdoor dimensions or base");
             }
             let digit_count = matrix.columns / matrix.rows;
@@ -645,12 +648,28 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(ConcreteMatrixType { rows, columns, ..input })]
         }
-        NodeKind::UniformSample { matrix_type, range } => {
+        NodeKind::UniformResidueSample { matrix_type } => {
             require_arity(scope, node, 0)?;
-            if range.minimum.evaluate(env)? > range.maximum.evaluate(env)? {
+            vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
+        }
+        NodeKind::UniformIntervalSample { matrix_type, range } => {
+            require_arity(scope, node, 0)?;
+            let minimum = range.minimum.evaluate(env)?;
+            let maximum = range.maximum.evaluate(env)?;
+            if minimum > maximum {
                 return node_error(scope, node.id, "uniform sample range is empty");
             }
-            vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
+            let matrix_type = concrete_matrix(matrix_type, env, scope, node.id)?;
+            let is_ternary = minimum == BigInt::from(-1) && maximum == BigInt::from(1);
+            let is_bit = minimum == BigInt::from(0) && maximum == BigInt::from(1);
+            if !is_ternary && !is_bit {
+                return node_error(
+                    scope,
+                    node.id,
+                    "uniform interval must be [-1, 1] or [0, 1]; use uniform_residue for R_q",
+                );
+            }
+            vec![ConcreteWireType::Matrix(matrix_type)]
         }
         NodeKind::GaussianSample { matrix_type, sigma, max_coefficient_bound } => {
             require_arity(scope, node, 0)?;
@@ -769,22 +788,22 @@ fn validate_node(
         NodeKind::GadgetDecompose { base, digit_count, .. } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
-            let base = base.evaluate(env)?.abs();
+            let base = base.evaluate(env)?;
             if base <= BigInt::one() {
                 return node_error(scope, node.id, "gadget base must be greater than one");
             }
-            let digits = decomposition_digits(
-                digit_count.as_ref(),
-                &input.modulus,
-                &base,
-                env,
+            let digits = positive_usize(
+                digit_count.evaluate(env)?,
+                "decomposition digit count",
                 scope,
                 node.id,
             )?;
-            vec![ConcreteWireType::Preimage(ConcreteMatrixType {
-                rows: input.rows.saturating_mul(digits),
-                ..input
-            })]
+            let rows = input.rows.checked_mul(digits).ok_or_else(|| ValidationError::Node {
+                scope: scope.clone(),
+                node: node.id,
+                message: "gadget decomposition row count overflow".to_owned(),
+            })?;
+            vec![ConcreteWireType::Preimage(ConcreteMatrixType { rows, ..input })]
         }
         NodeKind::ExtractCoefficient { position } | NodeKind::ConstantCoefficient { position } => {
             require_arity(scope, node, 1)?;
@@ -1421,26 +1440,6 @@ fn sliced_type(
     })
 }
 
-fn decomposition_digits(
-    explicit: Option<&IntExpr>,
-    modulus: &BigInt,
-    base: &BigInt,
-    env: &ParamEnv,
-    scope: &FrozenGraphScopeId,
-    node: NodeId,
-) -> Result<usize, ValidationError> {
-    if let Some(explicit) = explicit {
-        return positive_usize(explicit.evaluate(env)?, "decomposition digit count", scope, node);
-    }
-    let mut power = BigInt::one();
-    let mut digits = 0usize;
-    while power < *modulus {
-        power *= base;
-        digits = digits.saturating_add(1);
-    }
-    Ok(digits.max(1))
-}
-
 fn check_bindings(graph: &Graph, env: &ParamEnv) -> Result<(), ValidationError> {
     for parameter in graph.parameters() {
         let present = match parameter.kind {
@@ -1640,7 +1639,7 @@ mod tests {
 
         let uniform_type = matrix_type(17, 1, 1);
         let uniform = value(
-            NodeKind::UniformSample {
+            NodeKind::UniformIntervalSample {
                 matrix_type: uniform_type.clone(),
                 range: SampleRange { minimum: IntExpr::constant(2), maximum: IntExpr::constant(1) },
             },
@@ -1653,6 +1652,34 @@ mod tests {
             )
             .contains("uniform range")
         );
+
+        let unsupported_interval_type = matrix_type(17, 1, 1);
+        let unsupported_interval = value(
+            NodeKind::UniformIntervalSample {
+                matrix_type: unsupported_interval_type.clone(),
+                range: SampleRange { minimum: IntExpr::constant(2), maximum: IntExpr::constant(3) },
+            },
+            Vec::new(),
+            vec![WireType::Matrix(unsupported_interval_type)],
+        );
+        assert!(
+            node_message(
+                validate(
+                    &graph("unsupported-uniform-interval", unsupported_interval),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            )
+            .contains("uniform interval")
+        );
+
+        let residue_type = matrix_type(17, 1, 1);
+        let residue = value(
+            NodeKind::UniformResidueSample { matrix_type: residue_type.clone() },
+            Vec::new(),
+            vec![WireType::Matrix(residue_type)],
+        );
+        assert!(validate(&graph("uniform-residue", residue), &ParamEnv::default()).is_ok());
 
         let source = input("source", matrix_type(17, 2, 2));
         let reshape = value(

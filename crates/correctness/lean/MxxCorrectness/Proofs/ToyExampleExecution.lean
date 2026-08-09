@@ -1,5 +1,6 @@
 import MxxCorrectness.Generated.ToyExample.Ir
 import Mxx.Certificate.Execution
+import Mathlib.Tactic
 
 namespace MxxCorrectness.Proofs.ToyExample
 

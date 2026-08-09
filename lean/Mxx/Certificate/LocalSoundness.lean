@@ -1,4 +1,3 @@
-import Mxx.Certificate.Registry
 import Mxx.Ir.ExecutionFacts
 import Mxx.Toolkit.Negacyclic
 import Mxx.Toolkit.Norms
@@ -46,7 +45,7 @@ theorem matrix_norm_le_centered_radius
   change (Mxx.centeredCoefficient q original).natAbs ≤ q / 2
   exact centeredCoefficient_le_radius q original
 
-private theorem withSamplerParams_zeroOne_norm_le
+theorem withSamplerParams_zeroOne_norm_le
     (params : Mxx.SamplerParams)
     (coefficients : List Int)
     (coefficientsZeroOne : ∀ coefficient ∈ coefficients, coefficient = 0 ∨ coefficient = 1)
@@ -343,7 +342,7 @@ theorem preimageNode_local_sound
     (outputCount : Nat)
     (argumentsEvaluate :
       [publicRef, trapdoorRef, targetRef].mapM (fun wire ↦ Mxx.Ir.lookupWire wire wires) =
-        some [.matrix publicMatrix, .trapdoor publicMatrix, .matrix target])
+        some [.matrix publicMatrix, .trapdoor publicMatrix .sampled, .matrix target])
     (matrixTypeEvaluate : matrixType.evaluate params cutoff = some matrixParams)
     {values : List Mxx.Ir.Value}
     (member : values ∈ Mxx.Ir.evaluateNode runChild samplers params inputs wires {
@@ -354,58 +353,98 @@ theorem preimageNode_local_sound
     ∃ output,
       values = [.matrix output] ∧
       Mxx.MatrixModEq (Mxx.matrixMul publicMatrix output) target ∧
-      Mxx.maxCenteredCoefficientNorm output ≤ matrixParams.maxCoefficientBound := by
+      Mxx.maxCenteredCoefficientNorm output ≤ matrixParams.maxCoefficientBound ∧
+      output.WellFormed ∧
+      output.modulus = matrixParams.modulus ∧
+      output.ringDimension = matrixParams.ringDimension ∧
+      output.rows = matrixParams.rows ∧
+      output.columns = matrixParams.columns := by
   obtain ⟨sample, sampleMember, rfl⟩ := Mxx.Ir.mem_evaluateNode_preimageSample_of_arguments
     runChild samplers params inputs wires publicRef trapdoorRef targetRef publicMatrix target
     matrixType cutoff matrixParams outputCount argumentsEvaluate matrixTypeEvaluate member
   obtain ⟨relation, bound⟩ :=
     contract.preimageContract matrixParams publicMatrix target sample sampleMember
-  exact ⟨sample.withSamplerParams matrixParams, rfl, relation, bound⟩
+  exact ⟨sample.withSamplerParams matrixParams, rfl, relation, bound,
+    Mxx.Matrix.withSamplerParams_wellFormed _ _, rfl, rfl, rfl, rfl⟩
 
-/-- Gadget decomposition proves its exact gadget equation and deterministic hard bound. -/
-theorem gadgetDecomposeNode_local_sound
-    (runChild : Mxx.Ir.ChildRunner)
+/-- A successful backend gadget decomposition carries exactly the modular relation and hard
+coefficient bound consumed by the operational relation token. This theorem does not reconstruct
+the gadget matrix or CRT layout in Lean. -/
+theorem gadgetDecompose_local_sound
     (samplers : Mxx.MxxSamplerFamily)
     (contract : Mxx.MxxBoundedSamplerContract samplers)
-    (params : Mxx.Ir.ParamEnvironment)
-    (inputs : Mxx.Ir.Environment)
-    (wires : Mxx.Ir.WireEnvironment)
-    (inputRef : Mxx.Ir.WireRef)
-    (input : Mxx.Matrix)
-    (matrixType : Mxx.Ir.MatrixTypeExpr)
-    (base digitCount : Mxx.Ir.IntExpr)
-    (matrixParams : Mxx.SamplerParams)
-    (evaluatedBase evaluatedDigitCount : Int)
-    (outputCount : Nat)
-    (argumentsEvaluate : [inputRef].mapM (fun wire ↦ Mxx.Ir.lookupWire wire wires) =
-      some [.matrix input])
-    (matrixTypeEvaluate : matrixType.evaluate params (.constant 0) = some matrixParams)
-    (baseEvaluate : base.evaluate params = some evaluatedBase)
-    (digitCountEvaluate : digitCount.evaluate params = some evaluatedDigitCount)
-    {values : List Mxx.Ir.Value}
-    (member : values ∈ Mxx.Ir.evaluateNode runChild samplers params inputs wires {
-      kind := .gadgetDecompose matrixType base digitCount
-      arguments := [inputRef]
-      outputCount
-    }) :
-    ∃ output,
-      values = [.matrix output] ∧
-      Mxx.MatrixModEq (Mxx.matrixMul
-        (Mxx.gadgetMatrix {
-          matrixParams with
-          rows := input.rows
-          columns := input.rows * evaluatedDigitCount.toNat
-        } evaluatedBase evaluatedDigitCount.toNat)
-        output) input ∧
-      Mxx.maxCenteredCoefficientNorm output ≤ max (evaluatedBase.natAbs / 2) 1 := by
-  obtain ⟨sample, sampleMember, rfl⟩ :=
-    Mxx.Ir.mem_evaluateNode_gadgetDecompose_of_arguments
-      runChild samplers params inputs wires inputRef input matrixType base digitCount matrixParams
-      evaluatedBase evaluatedDigitCount outputCount argumentsEvaluate matrixTypeEvaluate
-      baseEvaluate digitCountEvaluate member
-  obtain ⟨relation, bound⟩ := contract.gadgetDecomposeContract matrixParams evaluatedBase
-    evaluatedDigitCount.toNat input sample sampleMember
-  exact ⟨sample.withSamplerParams matrixParams, rfl, relation, bound⟩
+    (paramsId : Mxx.SamplerParamsId)
+    (params : Mxx.SamplerParams)
+    (base : Int)
+    (small : Bool)
+    (digitCount : Nat)
+    (input publicMatrix output : Mxx.Matrix)
+    (publicResult :
+      samplers.gadgetPublicMatrix paramsId params input.rows base small digitCount =
+        some publicMatrix)
+    (decompositionResult :
+      samplers.gadgetDecompose paramsId params base small digitCount input = some output)
+    (reconstructionAvailable :
+      small = false ∨ ∃ limit,
+        samplers.smallDecompositionInputLimit paramsId params = some limit ∧
+        Mxx.maxCanonicalCoefficient input < limit) :
+    Mxx.MatrixModEq (Mxx.matrixMul publicMatrix (output.withSamplerParams params)) input ∧
+      Mxx.maxCenteredCoefficientNorm (output.withSamplerParams params) ≤
+        Mxx.gadgetDecompositionBound base small := by
+  exact ⟨contract.gadgetDecomposeRelation paramsId params base small digitCount input publicMatrix
+      output publicResult decompositionResult reconstructionAvailable,
+    contract.gadgetDecomposeHardBound paramsId params base small digitCount input output
+      decompositionResult⟩
+
+/-- The unsigned small-digit range is independent of the centered hard bound. -/
+theorem gadgetDecomposeSmall_canonical_range
+    (samplers : Mxx.MxxSamplerFamily)
+    (contract : Mxx.MxxBoundedSamplerContract samplers)
+    (paramsId : Mxx.SamplerParamsId)
+    (params : Mxx.SamplerParams)
+    (base : Int)
+    (digitCount : Nat)
+    (input output : Mxx.Matrix)
+    (decompositionResult :
+      samplers.gadgetDecompose paramsId params base true digitCount input = some output) :
+    Mxx.maxCanonicalCoefficient (output.withSamplerParams params) < base.natAbs :=
+  contract.gadgetDecomposeSmallCanonicalRange paramsId params base digitCount input output
+    decompositionResult
+
+/-- A decomposed-hash leaf is the backend decomposition of the exactly matching plain-hash
+query. Consequently it receives the same modular reconstruction relation and hard digit bound as
+a direct decomposition; Lean neither reconstructs hashing nor the backend CRT layout. -/
+theorem decomposedHash_local_sound
+    (samplers : Mxx.MxxSamplerFamily)
+    (contract : Mxx.MxxBoundedSamplerContract samplers)
+    (paramsId : Mxx.SamplerParamsId)
+    (plain decomposed : Mxx.HashQuery)
+    (base : Int)
+    (small : Bool)
+    (digitCount : Nat)
+    (publicMatrix : Mxx.Matrix)
+    (layoutId : samplers.layoutId decomposed.params = some paramsId)
+    (queriesMatch : Mxx.HashQueriesMatchDecomposition plain decomposed base small digitCount)
+    (publicResult :
+      samplers.gadgetPublicMatrix paramsId decomposed.params
+          plain.params.rows base small digitCount = some publicMatrix)
+    (reconstructionAvailable :
+      small = false ∨ ∃ limit,
+        samplers.smallDecompositionInputLimit paramsId decomposed.params = some limit ∧
+        Mxx.maxCanonicalCoefficient
+          ((samplers.hashSample plain).withSamplerParams plain.params) < limit) :
+    Mxx.MatrixModEq
+        (Mxx.matrixMul publicMatrix
+          ((samplers.hashSample decomposed).withSamplerParams decomposed.params))
+        ((samplers.hashSample plain).withSamplerParams plain.params) ∧
+      Mxx.maxCenteredCoefficientNorm
+          ((samplers.hashSample decomposed).withSamplerParams decomposed.params) ≤
+        Mxx.gadgetDecompositionBound base small := by
+  have decompositionResult := contract.decomposedHashConsistency paramsId plain decomposed base
+    small digitCount layoutId queriesMatch
+  exact gadgetDecompose_local_sound samplers contract paramsId decomposed.params base small digitCount
+    ((samplers.hashSample plain).withSamplerParams plain.params) publicMatrix
+    (samplers.hashSample decomposed) publicResult decompositionResult reconstructionAvailable
 
 /-- The executable trapdoor sampler always pairs the public output with the same matrix stored in
 the private trapdoor output. This proves pairing, but not the public matrix's centered-radius
@@ -431,7 +470,7 @@ theorem trapdoorNode_pairs_public_and_private
     ∃ publicMatrix,
       publicMatrix ∈ samplers.trapdoorSample matrixParams ∧
       let normalized := publicMatrix.withSamplerParams matrixParams
-      values = [.matrix normalized, .trapdoor normalized] ∧
+      values = [.matrix normalized, .trapdoor normalized .sampled] ∧
         Mxx.maxCenteredCoefficientNorm normalized ≤ normalized.modulus.natAbs / 2 := by
   obtain ⟨publicMatrix, publicMember, valuesEq⟩ :=
     Mxx.Ir.mem_evaluateNode_trapdoorSample runChild samplers params inputs wires matrixType cutoff

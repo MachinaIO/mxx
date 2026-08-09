@@ -689,20 +689,30 @@ where
         key: [u8; 32],
         tag: &[u8],
         variant: HashVariant,
+        gadget_layout: Option<(&BigInt, usize)>,
     ) -> Result<M, Self::Error> {
         let parameters = self.parameters(ty)?;
         let sampler = H::new();
         Ok(match variant {
-            HashVariant::Plain => sampler.sample_hash(
-                parameters,
-                key,
-                tag,
-                ty.rows,
-                ty.columns,
-                DistType::FinRingDist,
-            ),
+            HashVariant::Plain => {
+                if gadget_layout.is_some() {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
+                sampler.sample_hash(
+                    parameters,
+                    key,
+                    tag,
+                    ty.rows,
+                    ty.columns,
+                    DistType::FinRingDist,
+                )
+            }
             HashVariant::Decomposed => {
-                let digits = parameters.modulus_digits();
+                let (base, digits) = gadget_layout.ok_or(PolyBackendError::InvalidInteger)?;
+                self.validate_gadget_layout(ty, base, digits, false)?;
+                if ty.rows % digits != 0 {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
                 sampler.sample_hash_decomposed(
                     parameters,
                     key,
@@ -713,8 +723,11 @@ where
                 )
             }
             HashVariant::SmallDecomposed => {
-                let (_, crt_bits, _) = parameters.to_crt();
-                let digits = crt_bits.div_ceil(parameters.base_bits() as usize);
+                let (base, digits) = gadget_layout.ok_or(PolyBackendError::InvalidInteger)?;
+                self.validate_gadget_layout(ty, base, digits, true)?;
+                if ty.rows % digits != 0 {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
                 sampler.sample_hash_small_decomposed(
                     parameters,
                     key,
@@ -975,7 +988,7 @@ pub fn cpu_backend(parameters: impl IntoIterator<Item = DCRTPolyParams>) -> CpuD
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_primitives::poly::dcrt::poly::DCRTPoly;
+    use mxx_primitives::poly::{PolyParams, dcrt::poly::DCRTPoly};
 
     #[test]
     fn coefficient_extraction_returns_a_canonical_index_above_half_modulus() {
@@ -1012,6 +1025,40 @@ mod tests {
         });
         assert_eq!(draws, 2);
         assert_eq!(sampled, accepted);
+    }
+
+    #[test]
+    fn decomposed_hash_uses_the_explicit_backend_layout() {
+        let parameters = DCRTPolyParams::new(4, 1, 10, 5);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let digits = parameters.modulus_digits();
+        let base = BigInt::from(1u8) << parameters.base_bits();
+        let plain_type =
+            ConcreteMatrixType { modulus: modulus.clone(), ring_dimension: 4, rows: 2, columns: 3 };
+        let decomposed_type =
+            ConcreteMatrixType { rows: plain_type.rows * digits, ..plain_type.clone() };
+        let key = [7u8; 32];
+        let tag = b"runtime-explicit-layout";
+        let mut backend = cpu_backend([parameters]);
+
+        let plain = backend
+            .sample_hash(&plain_type, key, tag, HashVariant::Plain, None)
+            .expect("plain hash");
+        let decomposed = backend
+            .sample_hash(&decomposed_type, key, tag, HashVariant::Decomposed, Some((&base, digits)))
+            .expect("decomposed hash");
+        let small_decomposed = backend
+            .sample_hash(
+                &decomposed_type,
+                key,
+                tag,
+                HashVariant::SmallDecomposed,
+                Some((&base, digits)),
+            )
+            .expect("small decomposed hash");
+
+        assert_eq!(decomposed, plain.decompose());
+        assert_eq!(small_decomposed, plain.small_decompose());
     }
 }
 

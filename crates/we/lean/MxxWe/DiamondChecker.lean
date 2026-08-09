@@ -11,7 +11,7 @@ private def describeDerivationError : Mxx.Certificate.DerivationError → String
   | .operandMismatch _ => "derivation operands do not match the frozen graph"
   | .forwardOperand _ _ => "derivation uses a forward operand"
   | .ruleMismatch _ _ => "derivation rule does not match the frozen node"
-  | .invalidPreimageRelation _ _ => "derivation preimage relation is invalid"
+  | .invalidRelationOperand _ _ => "derivation relation operand is invalid"
   | .definitionMismatch _ _ => "derivation definitions do not match the frozen graph"
   | .missingDefinition _ => "derivation is missing a frozen definition"
   | .unexpectedDefinition _ => "derivation contains an extra definition"
@@ -90,6 +90,8 @@ private def checkGeneratedDerivationsWithProgress : IO (Except String Unit) := d
   | .ok () => pure ()
   pure (.ok ())
 
+/- Obsolete whole-graph analyzer diagnostics.  The active checker reports derivation and
+operational-bound errors directly, so this former diagnostic mapping is intentionally inactive.
 private def describeVerifyError : Mxx.Certificate.VerifyError → String
   | .disabledRule _ => "disabled rule"
   | .unsupportedNode stage node =>
@@ -180,6 +182,7 @@ private def describeVerifyError : Mxx.Certificate.VerifyError → String
       s!"affine normalization failed at {reprStr wire}"
   | .symbolicEvaluation error => s!"symbolic evaluation construction failed: {repr error}"
   | .symbolicRecurrence error => s!"symbolic recurrence construction failed: {repr error}"
+-/
 
 private def parseNat (value : String) : IO Nat :=
   match value.toNat? with
@@ -201,14 +204,25 @@ private def parseRat (numerator denominator : String) : IO Rat := do
     throw <| IO.userError "a rational denominator must be positive"
   pure ((numerator : Rat) / (denominator : Rat))
 
-private def parseEnvironment (args : List String) : IO Mxx.Ir.ParamEnvironment := do
-  if args.length != 17 then
-    throw <| IO.userError "expected 13 integer arguments and two exact numerator/denominator pairs"
+private structure CheckerRequest where
+  environment : Mxx.Ir.ParamEnvironment
+  layouts : List Mxx.GadgetLayoutDescriptor
+  requestHash : String
+
+private def parseCrtModuli (value : String) : IO (List Nat) :=
+  value.splitOn "," |>.mapM parseNat
+
+private def parseRequest (args : List String) : IO CheckerRequest := do
+  if args.length != 27 then
+    throw <| IO.userError "expected 17 scalar arguments, one 9-field gadget-layout descriptor, and a request hash"
   match args with
   | [instanceWidth, witnessWidth, depth, maxLayerWidth, ringDimension, inputCount, digitBase,
       batchBits, digitCount, modulus, gadgetBase, errorBound, preimageBound,
-      trapdoorNumerator, trapdoorDenominator, errorNumerator, errorDenominator] =>
-      return [
+      trapdoorNumerator, trapdoorDenominator, errorNumerator, errorDenominator,
+      paramsId, layoutRingDimension, crtBits, baseBits, layoutBase, regularDigitCount,
+      smallDigitCount, smallestCrtModulus, crtModuli, requestHash] =>
+      return {
+        environment := [
         (.parameter "instance_width", .integer (← parseDimension instanceWidth)),
         (.parameter "witness_width", .integer (← parseDimension witnessWidth)),
         (.parameter "depth", .integer (← parseDimension depth)),
@@ -225,9 +239,22 @@ private def parseEnvironment (args : List String) : IO Mxx.Ir.ParamEnvironment :
           .integer (← parseInt preimageBound)),
         (.parameter "diamond_trapdoor_sigma",
           .rational (← parseRat trapdoorNumerator trapdoorDenominator)),
-        (.parameter "diamond_error_sigma",
-          .rational (← parseRat errorNumerator errorDenominator))
-      ]
+          (.parameter "diamond_error_sigma",
+            .rational (← parseRat errorNumerator errorDenominator))
+        ]
+        layouts := [{
+          paramsId
+          ringDimension := ← parseNat layoutRingDimension
+          crtModuli := ← parseCrtModuli crtModuli
+          crtBits := ← parseNat crtBits
+          baseBits := ← parseNat baseBits
+          base := ← parseInt layoutBase
+          regularDigitCount := ← parseNat regularDigitCount
+          smallDigitCount := ← parseNat smallDigitCount
+          smallestCrtModulus := ← parseNat smallestCrtModulus
+        }]
+        requestHash
+      }
   | _ =>
       throw <| IO.userError "internal argument-count mismatch"
 
@@ -237,45 +264,128 @@ private def parameterInt
   (Mxx.Ir.IntExpr.parameter name).evaluate environment
 
 private def describeOperationalError : Mxx.Certificate.OperationalError → String
+  | .inScope scope error => s!"in {repr scope}: {describeOperationalError error}"
   | .missingOutputType node port => s!"missing output type {node}:{port}"
   | .missingOperand node operand => s!"missing operand {node}:{operand.node}:{operand.port}"
   | .operandNotMatrix node operand => s!"non-matrix operand {node}:{operand.node}:{operand.port}"
+  | .operandNotInteger node operand =>
+      s!"non-integer operand {node}:{operand.node}:{operand.port}"
+  | .operandNotBoolean node operand =>
+      s!"non-Boolean operand {node}:{operand.node}:{operand.port}"
+  | .operandNotReal node operand =>
+      s!"non-real operand {node}:{operand.node}:{operand.port}"
   | .invalidMatrixParameters node => s!"invalid matrix parameters at {node}"
+  | .flat node error => s!"flat operational error at {node}: {repr error}"
   | .invalidBound node bound => s!"invalid bound {bound} at {node}"
   | .invalidCount node count => s!"invalid count {count} at {node}"
+  | .missingGadgetLayout node => s!"missing gadget layout at {node}"
+  | .ambiguousGadgetLayout node => s!"ambiguous gadget layout at {node}"
+  | .invalidGadgetLayout node => s!"invalid gadget layout at {node}"
+  | .gadgetLayoutMismatch node => s!"gadget layout mismatch at {node}"
+  | .missingPublicIdentity node wire =>
+      s!"missing public identity at {node} for {wire.node}:{wire.port}"
+  | .publicIdentityMismatch node => s!"public identity mismatch at {node}"
+  | .missingRelation node wire => s!"missing relation at {node} for {wire.node}:{wire.port}"
+  | .ambiguousRelation node wire =>
+      s!"ambiguous relation at {node} for {wire.node}:{wire.port}"
+  | .unavailableRelation node wire =>
+      s!"unavailable relation at {node} for {wire.node}:{wire.port}"
+  | .malformedRelation node => s!"malformed relation at {node}"
+  | .missingDefinition name => s!"missing frozen definition {name}"
+  | .definitionFuelExhausted => "frozen definition nesting exceeds the checked program budget"
+  | .childInputMismatch node expected actual =>
+      s!"child input mismatch at {node}: expected {expected}, got {actual}"
+  | .duplicateInputName name => s!"duplicate frozen input name {name}"
+  | .missingInputNode name => s!"missing frozen input node {name}"
+  | .unexpectedInputNode name => s!"unexpected frozen input node {name}"
+  | .missingChildOutput node port => s!"missing child output {node}:{port}"
+  | .loopInputModeMismatch node argument =>
+      s!"loop input mode mismatch at {node}, argument {argument}"
+  | .relationBearingCarriedValue scope node slot =>
+      s!"relation-bearing sequential carry in {repr scope} at {node}, slot {slot}"
+  | .sequentialSchemaMismatch scope node slot initial output =>
+      s!"sequential carry schema changed in {repr scope} at {node}, slot {slot}\n" ++
+        s!"initial large-factor counts: {initial}\noutput large-factor counts: {output}"
   | .divisionByZero => "division by zero"
   | .negativeDenominator value => s!"negative denominator {value}"
-  | .invalidPreviousPath _ => "invalid recurrence-state path"
+  | .invalidPreviousPath path => s!"invalid recurrence-state path: {repr path}"
   | .nonClosedExpression => "non-closed operational bound expression"
   | .derivation error => s!"invalid derivation: {describeDerivationError error}"
   | .unsupportedOutputArity node actual => s!"invalid output arity {actual} at {node}"
+  | .outputTypeMismatch node => s!"output type mismatch at {node}"
+  | .missingStageDerivation stage => s!"missing workflow derivation for {stage}"
+  | .missingStageResult stage output => s!"missing workflow artifact {stage}.{output}"
+  | .missingProtocolContract name => s!"missing protocol input contract for {name}"
+  | .inputContractMismatch detail => s!"protocol input contract mismatch: {detail}"
+  | .unknownDerivationAttachment ownerNamespace ruleName =>
+      s!"unknown derivation attachment {ownerNamespace}.{ruleName}"
+  | .missingDerivationAttachmentRole ownerNamespace ruleName roleName =>
+      s!"derivation attachment {ownerNamespace}.{ruleName} is missing role {roleName}"
+  | .invalidDerivationAttachment ownerNamespace ruleName =>
+      s!"invalid derivation attachment {ownerNamespace}.{ruleName}"
+  | .unsupportedNode node => s!"unsupported IR node at {node}"
+
+private def rootAnchorMatrixFact
+    (results : List Mxx.Certificate.OperationalStageResult)
+    (label : String) : Except String Mxx.Certificate.OperationalMatrixFact := do
+  let binding ← match DiamondWeFamily_protocol.bundle.anchorBindings.find? fun binding =>
+      binding.anchor.label == label with
+    | some value => pure value
+    | none => throw s!"missing semantic anchor {label}"
+  let wire ← match binding.wires with
+    | [wire] => pure wire
+    | _ => throw s!"semantic anchor {label} is not bound to exactly one wire"
+  if !wire.scope.path.isEmpty then
+    throw s!"semantic anchor {label} is not a root-scope wire"
+  let stage ← match results.find? fun result => result.stage == wire.stage.name with
+    | some value => pure value
+    | none => throw s!"missing operational stage result {wire.stage.name}"
+  match ← Mxx.Certificate.lookupFact (wire.node.value + 1) stage.facts
+      { node := wire.node.value, port := wire.port }
+      |>.mapError describeOperationalError with
+  | .matrix fact => pure fact
+  | _ => throw s!"semantic anchor {label} is not a matrix"
 
 /-- The operational endpoint used by parameter search while the strict correctness theorem is
 unfinished.  It is intentionally named an estimate: it checks generated derivations and derives
 all executable-node hard bounds, but does not claim the final runtime theorem. -/
+private structure OperationalDiamondEstimate where
+  accepted : Bool
+  noiseBound : Int
+  modulus : Int
+  rejection : Option Mxx.Certificate.OperationalNoiseRejection
+
 private def operationalDiamondEstimate
-    (environment : Mxx.Ir.ParamEnvironment) : Except String Bool := do
+    (request : CheckerRequest) : Except String OperationalDiamondEstimate := do
+  let environment := request.environment
   checkGeneratedDerivations
-  let _ ← Mxx.Certificate.evaluateScopeOperational
-      DiamondWeFamily_stage_encrypt.root DiamondWeFamily_stage_encrypt_derivation.root environment
-    |>.mapError fun error => s!"encrypt operational bound evaluation failed: {describeOperationalError error}"
-  let _ ← Mxx.Certificate.evaluateScopeOperational
-      DiamondWeFamily_stage_decrypt.root DiamondWeFamily_stage_decrypt_derivation.root environment
-    |>.mapError fun error => s!"decrypt operational bound evaluation failed: {describeOperationalError error}"
+  let operationalWorkflow : Mxx.Certificate.OperationalWorkflowSpec := {
+    workflow := DiamondWeFamily_protocol.bundle.workflow
+    inputContract := DiamondWeFamily_protocol.bundle.inputContract
+  }
+  let workflowResults ← Mxx.Certificate.evaluateWorkflowOperational operationalWorkflow
+      [("encrypt", DiamondWeFamily_stage_encrypt_derivation),
+       ("decrypt", DiamondWeFamily_stage_decrypt_derivation)] environment request.layouts
+    |>.mapError fun error => s!"workflow operational bound evaluation failed: {describeOperationalError error}"
   let modulus ← match parameterInt environment "diamond_modulus" with
     | some value => pure value
     | none => throw "missing modulus"
-  let errorBound ← match parameterInt environment "diamond_error_max_coefficient_bound" with
-    | some value => pure value
-    | none => throw "missing error hard bound"
-  let preimageBound ← match parameterInt environment "diamond_preimage_max_coefficient_bound" with
-    | some value => pure value
-    | none => throw "missing preimage hard bound"
   let ringDimension ← match parameterInt environment "diamond_ring_dimension" with
     | some value => pure value
     | none => throw "missing ring dimension"
-  pure <| decide (modulus > 0 ∧ ringDimension > 0 ∧ errorBound ≥ 0 ∧ preimageBound ≥ 0 ∧
-    errorBound + preimageBound < modulus / 4)
+  if ringDimension <= 0 then throw "ring dimension must be positive"
+  let residual ← rootAnchorMatrixFact workflowResults "diamond.decoder.residual"
+  let report ← Mxx.Certificate.decoderNoiseCheckReport workflowResults residual environment 2 modulus
+    |>.mapError describeOperationalError
+  let noiseBound ← match report.obligations with
+    | [.decoderThreshold _ _ value] => pure value
+    | _ => throw "operational decoder report did not contain exactly one threshold obligation"
+  return {
+    accepted := report.accepted
+    noiseBound
+    modulus
+    rejection := report.rejection
+  }
 
 /-- Runs the pure analysis on a dedicated task while keeping stderr responsive.
 The server protocol itself remains strictly stdout-only. -/
@@ -297,13 +407,20 @@ private def prepareDiamondOperationalChecker : IO (Except String Unit) := do
       IO.eprintln message
       pure (.error message)
 
-private def checkArguments (args : List String) : IO Bool := do
-  let environment ← parseEnvironment args
-  match operationalDiamondEstimate environment with
-  | .ok result => return result
+private def checkArguments (args : List String) : IO (Bool × String) := do
+  let started ← IO.monoMsNow
+  let request ← parseRequest args
+  match operationalDiamondEstimate request with
+  | .ok result =>
+      let elapsed ← IO.monoMsNow
+      IO.eprintln (s!"Diamond operational estimate: accepted={result.accepted}, " ++
+        s!"noise_bound={result.noiseBound}, modulus={result.modulus}, " ++
+        s!"elapsed_ms={elapsed - started}, rejection={repr result.rejection}")
+      return (result.accepted, request.requestHash)
   | .error error =>
-      IO.eprintln s!"Diamond operational estimate rejected: {error}"
-      return false
+      let elapsed ← IO.monoMsNow
+      IO.eprintln s!"Diamond operational estimate rejected after {elapsed - started}ms: {error}"
+      return (false, request.requestHash)
 
 private def server : IO UInt32 := do
   let preparation ← prepareDiamondOperationalChecker
@@ -322,8 +439,8 @@ private def server : IO UInt32 := do
     | ["quit"] => running := false
     | [] => running := false
     | _ =>
-        let accepted ← checkArguments tokens
-        output.putStr (if accepted then "true\n" else "false\n")
+        let (accepted, requestHash) ← checkArguments tokens
+        output.putStr s!"{if accepted then "true" else "false"} {requestHash}\n"
         output.flush
   return 0
 
@@ -345,7 +462,7 @@ def main (args : List String) : IO UInt32 := do
     | .error error =>
         IO.eprintln error
         return 1
-  let accepted ← try checkArguments args
+  let (accepted, _) ← try checkArguments args
     catch error =>
       IO.eprintln error.toString
       return 2

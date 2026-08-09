@@ -1,4 +1,5 @@
 import Mathlib.Data.ENNReal.Basic
+import Mathlib.Data.List.GetD
 
 namespace Mxx
 
@@ -21,6 +22,15 @@ def centeredCoefficient (modulus value : Int) : Int :=
   else
     let residue := reduceCoefficient modulus value
     if 2 * residue > modulus then residue - modulus else residue
+
+/-- The unsigned canonical coefficient used by compact decomposition.  This deliberately differs
+from `centeredCoefficient`: `-1` modulo a positive `q` has canonical value `q - 1`. -/
+def canonicalCoefficient (modulus value : Int) : Nat :=
+  (reduceCoefficient modulus value).toNat
+
+def maxCanonicalCoefficient (matrix : Matrix) : Nat :=
+  matrix.coefficients.foldl (fun maximum coefficient =>
+    max maximum (canonicalCoefficient matrix.modulus coefficient)) 0
 
 def negacyclicCoefficient (ringDimension : Nat)
     (left right : Nat → Int) (coefficient : Nat) : Int :=
@@ -263,7 +273,48 @@ structure SamplerParams where
   ringDimension : Nat := 0
   rows : Nat := 0
   columns : Nat := 0
+  deriving DecidableEq, Repr
+
+abbrev SamplerParamsId := String
+
+inductive TrapdoorOrigin where
+  | sampled
+  | gadget (paramsId : SamplerParamsId) (base : Int) (small : Bool) (digitCount : Nat)
   deriving DecidableEq
+
+structure GadgetLayoutDescriptor where
+  paramsId : SamplerParamsId
+  ringDimension : Nat
+  crtModuli : List Nat
+  crtBits : Nat
+  baseBits : Nat
+  base : Int
+  regularDigitCount : Nat
+  smallDigitCount : Nat
+  smallestCrtModulus : Nat
+  deriving DecidableEq
+
+private def ceilDivide (numerator denominator : Nat) : Option Nat :=
+  if denominator = 0 then none else some ((numerator + denominator - 1) / denominator)
+
+def GadgetLayoutDescriptor.valid (descriptor : GadgetLayoutDescriptor) : Bool :=
+  let modulus := descriptor.crtModuli.foldl (· * ·) 1
+  let smallest := descriptor.crtModuli.foldl min descriptor.crtModuli.head!
+  match ceilDivide descriptor.crtBits descriptor.baseBits with
+  | none => false
+  | some digitsPerTower =>
+      !descriptor.crtModuli.isEmpty && descriptor.baseBits > 0 && descriptor.base > 1 &&
+        descriptor.base = 2 ^ descriptor.baseBits && descriptor.smallestCrtModulus = smallest &&
+        descriptor.smallDigitCount = digitsPerTower &&
+        descriptor.regularDigitCount = digitsPerTower * descriptor.crtModuli.length &&
+        modulus > 0
+
+def GadgetLayoutDescriptor.matches (descriptor : GadgetLayoutDescriptor) (params : SamplerParams) : Bool :=
+  descriptor.valid && descriptor.ringDimension = params.ringDimension &&
+    params.modulus = Int.ofNat (descriptor.crtModuli.foldl (fun product modulus => product * modulus) 1)
+
+def gadgetDecompositionBound (base : Int) (small : Bool) : Nat :=
+  if small then base.natAbs - 1 else max (base.natAbs / 2) 1
 
 inductive HashVariant where
   | plain
@@ -281,6 +332,7 @@ structure HashQuery where
   tagValues : List Int
   tagDecimalValues : List Int
   tagU64LeValues : List Int
+  trailingIntegerTagValues : List Int
   base : Option Int
   digitCount : Option Int
   deriving DecidableEq
@@ -296,6 +348,215 @@ def Matrix.withSamplerParams (matrix : Matrix) (params : SamplerParams) : Matrix
     rows := params.rows
     columns := params.columns }
 
+/-- A matrix stores exactly one coefficient for every typed row, column, and ring position. -/
+def Matrix.WellFormed (matrix : Matrix) : Prop :=
+  matrix.coefficients.length = matrix.rows * matrix.columns * matrix.ringDimension
+
+theorem Matrix.withSamplerParams_wellFormed (matrix : Matrix) (params : SamplerParams) :
+    (matrix.withSamplerParams params).WellFormed := by
+  simp only [Matrix.WellFormed, Matrix.withSamplerParams, List.length_append,
+    List.length_take, List.length_replicate]
+  omega
+
+private theorem addCoefficients_length_of_eq
+    (left right : List Int)
+    (sameLength : left.length = right.length) :
+    (addCoefficients left right).length = left.length := by
+  induction left generalizing right with
+  | nil =>
+      cases right with
+      | nil => rfl
+      | cons head tail => simp at sameLength
+  | cons leftHead leftTail induction =>
+      cases right with
+      | nil => simp at sameLength
+      | cons rightHead rightTail =>
+          simp only [List.length_cons, Nat.succ.injEq] at sameLength
+          simp [addCoefficients, induction rightTail sameLength]
+
+theorem matrixAdd_wellFormed
+    (left right : Matrix)
+    (leftWellFormed : left.WellFormed)
+    (rightWellFormed : right.WellFormed)
+    (sameRows : left.rows = right.rows)
+    (sameColumns : left.columns = right.columns)
+    (sameRingDimension : left.ringDimension = right.ringDimension) :
+    (matrixAdd left right).WellFormed := by
+  have sameLength : left.coefficients.length = right.coefficients.length := by
+    rw [leftWellFormed, rightWellFormed, sameRows, sameColumns, sameRingDimension]
+  simp only [Matrix.WellFormed, matrixAdd, List.length_map]
+  rw [addCoefficients_length_of_eq left.coefficients right.coefficients sameLength]
+  exact leftWellFormed
+
+private theorem subtractCoefficients_length_of_eq
+    (left right : List Int)
+    (sameLength : left.length = right.length) :
+    (subtractCoefficients left right).length = left.length := by
+  induction left generalizing right with
+  | nil =>
+      cases right with
+      | nil => rfl
+      | cons head tail => simp at sameLength
+  | cons leftHead leftTail induction =>
+      cases right with
+      | nil => simp at sameLength
+      | cons rightHead rightTail =>
+          simp only [List.length_cons, Nat.succ.injEq] at sameLength
+          simp [subtractCoefficients, induction rightTail sameLength]
+
+theorem matrixSubtract_wellFormed
+    (left right : Matrix)
+    (leftWellFormed : left.WellFormed)
+    (rightWellFormed : right.WellFormed)
+    (sameRows : left.rows = right.rows)
+    (sameColumns : left.columns = right.columns)
+    (sameRingDimension : left.ringDimension = right.ringDimension) :
+    (matrixSubtract left right).WellFormed := by
+  have sameLength : left.coefficients.length = right.coefficients.length := by
+    rw [leftWellFormed, rightWellFormed, sameRows, sameColumns, sameRingDimension]
+  simp only [Matrix.WellFormed, matrixSubtract, List.length_map]
+  rw [subtractCoefficients_length_of_eq left.coefficients right.coefficients sameLength]
+  exact leftWellFormed
+
+theorem matrixNegate_wellFormed
+    (matrix : Matrix)
+    (wellFormed : matrix.WellFormed) :
+    (matrixNegate matrix).WellFormed := by
+  simpa [Matrix.WellFormed, matrixNegate] using wellFormed
+
+theorem matrixScale_wellFormed
+    (scalar : Int)
+    (matrix : Matrix)
+    (wellFormed : matrix.WellFormed) :
+    (matrixScale scalar matrix).WellFormed := by
+  simpa [Matrix.WellFormed, matrixScale] using wellFormed
+
+theorem reduced_coefficients_eq_of_matrixModEq
+    {left right : Matrix}
+    (relation : MatrixModEq left right)
+    (leftWellFormed : left.WellFormed)
+    (rightWellFormed : right.WellFormed) :
+    left.coefficients.map (reduceCoefficient left.modulus) =
+      right.coefficients.map (reduceCoefficient right.modulus) := by
+  apply List.ext_getElem
+  · simp only [List.length_map]
+    calc
+      left.coefficients.length = left.rows * left.columns * left.ringDimension := leftWellFormed
+      _ = right.rows * right.columns * right.ringDimension := by
+        rw [relation.rows, relation.columns, relation.ringDimension]
+      _ = right.coefficients.length := rightWellFormed.symm
+  · intro index leftLt rightLt
+    have indexLt : index < left.rows * left.columns * left.ringDimension := by
+      have coefficientLt : index < left.coefficients.length := by simpa using leftLt
+      rw [leftWellFormed] at coefficientLt
+      exact coefficientLt
+    have ringPositive : 0 < left.ringDimension := by
+      by_contra nonpositive
+      have : left.ringDimension = 0 := Nat.eq_zero_of_not_pos nonpositive
+      simp [this] at indexLt
+    have columnsPositive : 0 < left.columns := by
+      by_contra nonpositive
+      have : left.columns = 0 := Nat.eq_zero_of_not_pos nonpositive
+      simp [this] at indexLt
+    let coefficient := index % left.ringDimension
+    let entry := index / left.ringDimension
+    let column := entry % left.columns
+    let row := entry / left.columns
+    have coefficientLt : coefficient < left.ringDimension := Nat.mod_lt _ ringPositive
+    have columnLt : column < left.columns := Nat.mod_lt _ columnsPositive
+    have rowLt : row < left.rows := by
+      have entryLt : entry < left.rows * left.columns := by
+        rw [Nat.div_lt_iff_lt_mul ringPositive]
+        simpa [Nat.mul_assoc] using indexLt
+      dsimp [row]
+      rw [Nat.div_lt_iff_lt_mul columnsPositive]
+      simpa [Nat.mul_comm] using entryLt
+    have linearIndex : ((row * left.columns + column) * left.ringDimension) + coefficient =
+        index := by
+      dsimp [row, column, entry, coefficient]
+      rw [Nat.mul_comm (index / left.ringDimension / left.columns) left.columns]
+      rw [Nat.div_add_mod (index / left.ringDimension) left.columns]
+      rw [Nat.mul_comm (index / left.ringDimension) left.ringDimension]
+      rw [Nat.div_add_mod index left.ringDimension]
+    have coefficientRelation :=
+      relation.coefficients row column coefficient rowLt columnLt coefficientLt
+    simp only [List.getElem_map]
+    have leftCoefficientLt : index < left.coefficients.length := by simpa using leftLt
+    have rightCoefficientLt : index < right.coefficients.length := by simpa using rightLt
+    have rightLinearIndex :
+        ((row * right.columns + column) * right.ringDimension) + coefficient = index := by
+      rw [← relation.columns, ← relation.ringDimension]
+      exact linearIndex
+    unfold Matrix.coefficient at coefficientRelation
+    rw [linearIndex, rightLinearIndex] at coefficientRelation
+    rw [List.getD_eq_getElem _ _ leftCoefficientLt,
+      List.getD_eq_getElem _ _ rightCoefficientLt] at coefficientRelation
+    exact coefficientRelation
+
+private def centeredReduced (modulus residue : Int) : Int :=
+  if modulus ≤ 0 then residue
+  else if 2 * residue > modulus then residue - modulus else residue
+
+private theorem centeredCoefficient_eq_centeredReduced (modulus value : Int) :
+    centeredCoefficient modulus value = centeredReduced modulus (reduceCoefficient modulus value) := by
+  by_cases nonpositive : modulus ≤ 0
+  · simp [centeredCoefficient, centeredReduced, reduceCoefficient, nonpositive]
+  · simp [centeredCoefficient, centeredReduced, reduceCoefficient, nonpositive]
+
+theorem centered_coefficients_eq_of_matrixModEq
+    {left right : Matrix}
+    (relation : MatrixModEq left right)
+    (leftWellFormed : left.WellFormed)
+    (rightWellFormed : right.WellFormed) :
+    left.coefficients.map (centeredCoefficient left.modulus) =
+      right.coefficients.map (centeredCoefficient right.modulus) := by
+  have reduced := reduced_coefficients_eq_of_matrixModEq relation leftWellFormed rightWellFormed
+  rw [← relation.modulus] at reduced ⊢
+  have mapped := congrArg (List.map (centeredReduced left.modulus)) reduced
+  simp only [List.map_map] at mapped
+  have functionEq : centeredReduced left.modulus ∘ reduceCoefficient left.modulus =
+      centeredCoefficient left.modulus := by
+    funext value
+    exact (centeredCoefficient_eq_centeredReduced left.modulus value).symm
+  simpa only [functionEq] using mapped
+
+theorem maxCenteredCoefficientNorm_eq_of_matrixModEq
+    {left right : Matrix}
+    (relation : MatrixModEq left right)
+    (leftWellFormed : left.WellFormed)
+    (rightWellFormed : right.WellFormed) :
+    maxCenteredCoefficientNorm left = maxCenteredCoefficientNorm right := by
+  unfold maxCenteredCoefficientNorm
+  rw [centered_coefficients_eq_of_matrixModEq relation leftWellFormed rightWellFormed]
+
+theorem canonical_coefficients_eq_of_matrixModEq
+    {left right : Matrix}
+    (relation : MatrixModEq left right)
+    (leftWellFormed : left.WellFormed)
+    (rightWellFormed : right.WellFormed) :
+    left.coefficients.map (canonicalCoefficient left.modulus) =
+      right.coefficients.map (canonicalCoefficient right.modulus) := by
+  have reduced := reduced_coefficients_eq_of_matrixModEq relation leftWellFormed rightWellFormed
+  rw [← relation.modulus] at reduced ⊢
+  have mapped := congrArg (List.map Int.toNat) reduced
+  simp only [List.map_map] at mapped
+  have functionEq : Int.toNat ∘ reduceCoefficient left.modulus =
+      canonicalCoefficient left.modulus := by
+    funext value
+    rfl
+  simpa only [functionEq] using mapped
+
+theorem maxCanonicalCoefficient_eq_of_matrixModEq
+    {left right : Matrix}
+    (relation : MatrixModEq left right)
+    (leftWellFormed : left.WellFormed)
+    (rightWellFormed : right.WellFormed) :
+    maxCanonicalCoefficient left = maxCanonicalCoefficient right := by
+  unfold maxCanonicalCoefficient
+  rw [← List.foldl_map]
+  rw [canonical_coefficients_eq_of_matrixModEq relation leftWellFormed rightWellFormed]
+  rw [List.foldl_map]
+
 def gadgetMatrix (params : SamplerParams) (base : Int) (digitCount : Nat) : Matrix :=
   let matrixParams := { params with rows := params.rows, columns := params.rows * digitCount }
   let coefficients :=
@@ -310,31 +571,106 @@ def gadgetMatrix (params : SamplerParams) (base : Int) (digitCount : Nat) : Matr
 structure MxxSamplerFamily where
   gaussianSample : SamplerParams → List Matrix
   hashSample : HashQuery → Matrix
-  gadgetDecompose : SamplerParams → Int → Nat → Matrix → List Matrix
+  layoutId : SamplerParams → Option SamplerParamsId
+  gadgetPublicMatrix :
+    SamplerParamsId → SamplerParams → Nat → Int → Bool → Nat → Option Matrix
+  gadgetDecompose :
+    SamplerParamsId → SamplerParams → Int → Bool → Nat → Matrix → Option Matrix
+  smallDecompositionInputLimit : SamplerParamsId → SamplerParams → Option Nat
   trapdoorSample : SamplerParams → List Matrix
   samplePreimage : SamplerParams → Matrix → Matrix → List Matrix
+
+def HashQueriesMatchDecomposition
+    (plain decomposed : HashQuery)
+    (base : Int)
+    (small : Bool)
+    (digitCount : Nat) : Prop :=
+  decomposed.params.rows = plain.params.rows * digitCount ∧
+    decomposed.params.columns = plain.params.columns ∧
+    plain.params.modulus = decomposed.params.modulus ∧
+    plain.params.ringDimension = decomposed.params.ringDimension ∧
+    plain.key = decomposed.key ∧
+    plain.tagPrefix = decomposed.tagPrefix ∧
+    plain.tagValues = decomposed.tagValues ∧
+    plain.tagDecimalValues = decomposed.tagDecimalValues ∧
+    plain.tagU64LeValues = decomposed.tagU64LeValues ∧
+    plain.trailingIntegerTagValues = decomposed.trailingIntegerTagValues ∧
+    plain.variant = .plain ∧
+    plain.base = none ∧
+    plain.digitCount = none ∧
+    decomposed.variant = (if small then .smallDecomposed else .decomposed) ∧
+    decomposed.base = some base ∧
+    decomposed.digitCount = some (Int.ofNat digitCount)
+
+structure GadgetLayoutAgrees
+    (samplers : MxxSamplerFamily)
+    (descriptor : GadgetLayoutDescriptor)
+    (params : SamplerParams) : Prop where
+  layoutId : samplers.layoutId params = some descriptor.paramsId
+  smallInputLimit :
+    samplers.smallDecompositionInputLimit descriptor.paramsId params =
+      some descriptor.smallestCrtModulus
+  publicDefined : ∀ inputRows small,
+    let digits := if small then descriptor.smallDigitCount else descriptor.regularDigitCount
+    ∃ publicMatrix,
+      samplers.gadgetPublicMatrix descriptor.paramsId params inputRows descriptor.base small digits =
+        some publicMatrix ∧
+      publicMatrix.modulus = params.modulus ∧
+      publicMatrix.ringDimension = params.ringDimension ∧
+      publicMatrix.rows = inputRows ∧
+      publicMatrix.columns = inputRows * digits
+  decompositionDefined : ∀ input small,
+    let digits := if small then descriptor.smallDigitCount else descriptor.regularDigitCount
+    input.modulus = params.modulus →
+    input.ringDimension = params.ringDimension →
+    params.rows = input.rows * digits →
+    params.columns = input.columns →
+    ∃ output,
+      samplers.gadgetDecompose descriptor.paramsId params descriptor.base small digits input =
+        some output
 
 structure MxxBoundedSamplerContract (samplers : MxxSamplerFamily) : Prop where
   gaussianHardSupport :
     ∀ params sample, sample ∈ samplers.gaussianSample params →
       maxCenteredCoefficientNorm (sample.withSamplerParams params) ≤ params.maxCoefficientBound
-  gadgetDecomposeContract :
-    ∀ params base digitCount input output,
-      output ∈ samplers.gadgetDecompose params base digitCount input →
-      MatrixModEq (matrixMul
-        (gadgetMatrix { params with rows := input.rows, columns := input.rows * digitCount }
-          base digitCount)
-        (output.withSamplerParams params)) input ∧
+  gadgetDecomposeRelation :
+    ∀ paramsId params base small digitCount input publicMatrix output,
+      samplers.gadgetPublicMatrix paramsId params input.rows base small digitCount = some publicMatrix →
+      samplers.gadgetDecompose paramsId params base small digitCount input = some output →
+      (small = false ∨ ∃ limit,
+        samplers.smallDecompositionInputLimit paramsId params = some limit ∧
+        maxCanonicalCoefficient input < limit) →
+      MatrixModEq (matrixMul publicMatrix (output.withSamplerParams params)) input
+  gadgetDecomposeHardBound :
+    ∀ paramsId params base small digitCount input output,
+      samplers.gadgetDecompose paramsId params base small digitCount input = some output →
       maxCenteredCoefficientNorm (output.withSamplerParams params) ≤
-        max (base.natAbs / 2) 1
+        gadgetDecompositionBound base small
+  gadgetDecomposeSmallCanonicalRange :
+    ∀ paramsId params base digitCount input output,
+      samplers.gadgetDecompose paramsId params base true digitCount input = some output →
+      maxCanonicalCoefficient (output.withSamplerParams params) < base.natAbs
+  decomposedHashConsistency :
+    ∀ paramsId plain decomposed base small digitCount,
+      samplers.layoutId decomposed.params = some paramsId →
+      HashQueriesMatchDecomposition plain decomposed base small digitCount →
+      samplers.gadgetDecompose paramsId decomposed.params base small digitCount
+        ((samplers.hashSample plain).withSamplerParams plain.params) =
+          some (samplers.hashSample decomposed)
+  gadgetLayoutAgreement :
+    ∀ descriptor params,
+      descriptor.valid = true →
+      descriptor.matches params = true →
+      samplers.layoutId params = some descriptor.paramsId →
+      GadgetLayoutAgrees samplers descriptor params
   /-- Gadget decomposition first canonicalizes its input coefficients in `R_q` and is then
   deterministic.  Consequently, quotient-equal inputs produce the same normalized digit
   matrix, even when their stored integer representatives differ. -/
   gadgetDecomposeCongruent :
-    ∀ params base digitCount leftInput rightInput left right,
+    ∀ paramsId params base small digitCount leftInput rightInput left right,
       MatrixModEq leftInput rightInput →
-      left ∈ samplers.gadgetDecompose params base digitCount leftInput →
-      right ∈ samplers.gadgetDecompose params base digitCount rightInput →
+      samplers.gadgetDecompose paramsId params base small digitCount leftInput = some left →
+      samplers.gadgetDecompose paramsId params base small digitCount rightInput = some right →
       left.withSamplerParams params = right.withSamplerParams params
   preimageContract :
     ∀ params b p k, k ∈ samplers.samplePreimage params b p →

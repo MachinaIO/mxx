@@ -26,6 +26,10 @@ pub struct MeasurementNode<'a> {
     pub id: NodeId,
     pub kind: &'a NodeKind,
     pub arguments: &'a [WireRef],
+    /// Kinds of the direct producers of `arguments`, in the same order.
+    pub argument_kinds: &'a [&'a NodeKind],
+    /// Concrete types of `arguments`, exposed by reference for measurement backends.
+    pub argument_types: &'a [ConcreteWireType],
     pub output_types: &'a [WireType],
     /// Concrete types resolved by graph validation for every input wire.
     pub concrete_argument_types: Vec<ConcreteWireType>,
@@ -228,7 +232,14 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         .cloned()
                         .expect("validated argument has a concrete type")
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let argument_types = concrete_argument_types.clone();
+            let argument_kinds = arguments
+                .iter()
+                .map(|wire| {
+                    scope.node(wire.node).expect("validated argument has a source node").kind()
+                })
+                .collect::<Vec<_>>();
             let concrete_output_types = (0..handle.output_types().len())
                 .map(|port| {
                     plan.wire_types
@@ -242,6 +253,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 id,
                 kind: handle.kind(),
                 arguments: &arguments,
+                argument_kinds: &argument_kinds,
+                argument_types: &argument_types,
                 output_types: handle.output_types(),
                 concrete_argument_types,
                 concrete_output_types,

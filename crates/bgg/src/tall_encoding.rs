@@ -394,7 +394,7 @@ impl BggTallEncodingSampler {
                     let ring = ring.clone();
                     let secret = secret.clone();
                     move |_| {
-                        let transform = ring.uniform_in((secret_size, secret_size), -1, 1);
+                        let transform = ring.uniform_interval((secret_size, secret_size), -1, 1);
                         (secret.clone() * transform.clone(), transform)
                     }
                 })?;

@@ -140,12 +140,12 @@ theorem FrozenPointwiseMatrixProgramFormula.validDecomposeNode
     {scopeId : StaticScopeId}
     {wire : Mxx.Ir.WireRef}
     {matrixType : Mxx.Ir.MatrixTypeExpr}
-    {base digitCount : Mxx.Ir.IntExpr}
+    {base digitCount : Mxx.Ir.IntExpr} {small : Bool}
     {input : FrozenPointwiseMatrixProgramFormula}
-    (valid : (FrozenPointwiseMatrixProgramFormula.decompose scopeId wire matrixType base
+    (valid : (FrozenPointwiseMatrixProgramFormula.decompose scopeId wire matrixType base small
       digitCount input).validIn program substitutions = true) :
     ValidatedPointwiseNode program scopeId wire
-      (.gadgetDecompose matrixType base digitCount) [input.source.2] := by
+      (.gadgetDecompose matrixType base small digitCount) [input.source.2] := by
   unfold FrozenPointwiseMatrixProgramFormula.validIn at valid
   apply validatedPointwiseNode_of_check valid
   intro scope node checked

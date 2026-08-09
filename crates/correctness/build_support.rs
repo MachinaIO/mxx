@@ -12,13 +12,6 @@ pub struct GeneratedFreshness {
     pub derivation_hash: String,
 }
 
-#[derive(Debug)]
-pub struct NativeDecideUse {
-    pub source_path: String,
-    pub line: usize,
-    pub declaration: Option<String>,
-}
-
 pub fn emit_rerun_paths(workspace: &Path, source_paths: &[&str], owner_lean: &Path) {
     for source in source_paths {
         println!("cargo:rerun-if-changed={}", workspace.join(source).display());
@@ -111,28 +104,6 @@ pub fn verify_theorem_axioms(
     Ok(combined)
 }
 
-pub fn verify_native_decide(
-    workspace: &Path,
-    source_directories: &[&Path],
-    allowlist: &[(&str, &str)],
-) -> Result<Vec<NativeDecideUse>, String> {
-    let mut uses = Vec::new();
-    for directory in source_directories {
-        collect_native_decide_uses(directory, workspace, &mut uses)?;
-    }
-    for usage in &uses {
-        if !allowlist.iter().any(|(path, declaration)| {
-            usage.source_path == *path && usage.declaration.as_deref() == Some(*declaration)
-        }) {
-            return Err(format!(
-                "native_decide is not allowed at {}:{} in {:?}",
-                usage.source_path, usage.line, usage.declaration
-            ));
-        }
-    }
-    Ok(uses)
-}
-
 pub fn verify_no_proof_holes(workspace: &Path, source_directories: &[&Path]) -> Result<(), String> {
     for directory in source_directories {
         verify_no_proof_holes_in(directory, workspace)?;
@@ -173,50 +144,6 @@ fn hash_protocol_sources(workspace: &Path, source_paths: &[&str]) -> Result<Stri
         }
     }
     hash_sources(workspace, sources)
-}
-
-fn collect_native_decide_uses(
-    directory: &Path,
-    workspace: &Path,
-    output: &mut Vec<NativeDecideUse>,
-) -> Result<(), String> {
-    for entry in fs::read_dir(directory)
-        .map_err(|error| format!("failed to read {}: {error}", directory.display()))?
-    {
-        let path = entry
-            .map_err(|error| format!("failed to read {} entry: {error}", directory.display()))?
-            .path();
-        if path.is_dir() {
-            collect_native_decide_uses(&path, workspace, output)?;
-        } else if path.extension().is_some_and(|extension| extension == "lean") {
-            let source = fs::read_to_string(&path)
-                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-            let source_path = path
-                .strip_prefix(workspace)
-                .map_err(|_| format!("Lean source is outside workspace: {}", path.display()))?
-                .to_string_lossy()
-                .into_owned();
-            let mut comment_depth = 0usize;
-            let mut declaration = None;
-            for (line_index, line) in source.lines().enumerate() {
-                let code = lean_code_without_comments(line, &mut comment_depth);
-                if let Some(name) = declaration_name(&code) {
-                    declaration = Some(name);
-                }
-                if code
-                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-                    .any(|token| token == "native_decide")
-                {
-                    output.push(NativeDecideUse {
-                        source_path: source_path.clone(),
-                        line: line_index + 1,
-                        declaration: declaration.clone(),
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn verify_no_proof_holes_in(directory: &Path, workspace: &Path) -> Result<(), String> {
@@ -295,20 +222,6 @@ fn lean_code_without_comments(line: &str, comment_depth: &mut usize) -> String {
         }
     }
     output
-}
-
-fn declaration_name(code: &str) -> Option<String> {
-    let trimmed = code.trim_start();
-    let trimmed = ["private ", "protected ", "noncomputable "]
-        .iter()
-        .find_map(|prefix| trimmed.strip_prefix(prefix))
-        .unwrap_or(trimmed);
-    let rest =
-        ["theorem ", "lemma ", "def "].iter().find_map(|prefix| trimmed.strip_prefix(prefix))?;
-    let name = rest
-        .split(|character: char| character.is_whitespace() || matches!(character, ':' | '(' | '{'))
-        .next()?;
-    (!name.is_empty()).then(|| name.to_owned())
 }
 
 fn hash_toolkit(workspace: &Path) -> Result<String, String> {

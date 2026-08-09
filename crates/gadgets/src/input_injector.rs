@@ -433,7 +433,7 @@ impl DiamondInputInjector {
 }
 
 fn ternary_secret(ring: &Ring) -> Mat {
-    ring.uniform_in((1, 1), -1, 1)
+    ring.uniform_interval((1, 1), -1, 1)
 }
 
 fn regular_selector(secret: Mat) -> Mat {

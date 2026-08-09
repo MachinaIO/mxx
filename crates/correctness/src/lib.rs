@@ -8,6 +8,7 @@ pub mod check;
 pub mod emit_bundle_lean;
 pub mod emit_lean;
 pub mod freshness;
+pub mod ir_binary;
 pub mod operational_protocol;
 pub mod operational_runner;
 pub mod protocol;

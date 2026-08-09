@@ -458,29 +458,6 @@ fn lean_program_derivation_with_attachments(
     ))
 }
 
-const LEAN_LIST_CHUNK_SIZE: usize = 256;
-
-fn lean_list_literal(items: Vec<String>, element_type: &str, padding: &str) -> String {
-    if items.is_empty() {
-        return "[]".to_owned();
-    }
-    if items.len() <= LEAN_LIST_CHUNK_SIZE {
-        return format!("[\n{}\n{padding}]", items.join(",\n"));
-    }
-    let chunk_padding = format!("{padding}  ");
-    let chunks = items
-        .chunks(LEAN_LIST_CHUNK_SIZE)
-        .map(|chunk| {
-            format!(
-                "{chunk_padding}([\n{}\n{chunk_padding}] : List {element_type})",
-                chunk.join(",\n")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",\n");
-    format!("List.flatten [\n{chunks}\n{padding}]")
-}
-
 fn lean_scope_derivation(
     stage: &str,
     scope_id: &FrozenGraphScopeId,
@@ -490,8 +467,7 @@ fn lean_scope_derivation(
 ) -> Result<String, EmitError> {
     let padding = " ".repeat(indent);
     let child_padding = " ".repeat(indent + 2);
-    let steps = lean_list_literal(
-        scope
+    let steps = scope
         .nodes()
         .iter()
         .enumerate()
@@ -514,10 +490,8 @@ fn lean_scope_derivation(
                 )?,
             ))
         })
-        .collect::<Result<Vec<_>, _>>()?,
-        "Mxx.Certificate.NodeDerivation",
-        &padding,
-    );
+        .collect::<Result<Vec<_>, _>>()?
+        .join(",\n");
     let attachments = attachments
         .into_iter()
         .flat_map(|attachments| attachments.iter())
@@ -549,7 +523,7 @@ fn lean_scope_derivation(
         .collect::<Result<Vec<_>, EmitError>>()?
         .join(",\n");
     Ok(format!(
-        "{padding}{{ steps := {steps}\n{padding}  attachments := [\n{attachments}\n{padding}] }}"
+        "{padding}{{ steps := [\n{steps}\n{padding}]\n{padding}  attachments := [\n{attachments}\n{padding}] }}"
     ))
 }
 
@@ -666,8 +640,7 @@ fn lean_scope(
 ) -> Result<String, EmitError> {
     let padding = " ".repeat(indent);
     let child_padding = " ".repeat(indent + 2);
-    let nodes = lean_list_literal(
-        scope
+    let nodes = scope
         .nodes()
         .iter()
         .enumerate()
@@ -691,10 +664,8 @@ fn lean_scope(
                 node.output_types().len()
             ))
         })
-        .collect::<Result<Vec<_>, _>>()?,
-        "Mxx.Ir.Node",
-        &padding,
-    );
+        .collect::<Result<Vec<_>, _>>()?
+        .join(",\n");
     let outputs = if matches!(scope_id, FrozenGraphScopeId::Root) {
         graph
             .outputs()
@@ -738,7 +709,7 @@ fn lean_scope(
     }
     .join(", ");
     Ok(format!(
-        "{padding}{{ nodes := {nodes}\n{padding}  outputs := [{outputs}]\n{padding}  inputNames := [{input_names}] }}"
+        "{padding}{{ nodes := [\n{nodes}\n{padding}]\n{padding}  outputs := [{outputs}]\n{padding}  inputNames := [{input_names}] }}"
     ))
 }
 
@@ -1299,15 +1270,6 @@ mod tests {
     use super::*;
     use mxx_dsl::{DslContext, Family, Int, Ring, Sequential};
     use mxx_ir_core::{RealExpr, WireType};
-
-    #[test]
-    fn large_lean_lists_are_emitted_as_typed_chunks() {
-        let items = (0..=LEAN_LIST_CHUNK_SIZE).map(|index| index.to_string()).collect();
-        let emitted = lean_list_literal(items, "Nat", "  ");
-
-        assert!(emitted.starts_with("List.flatten ["));
-        assert_eq!(emitted.matches(": List Nat").count(), 2);
-    }
 
     #[test]
     fn operational_inventory_has_every_current_variant_row() {

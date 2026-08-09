@@ -92,6 +92,7 @@ struct TestConfig {
     trapdoor_sigma: f64,
     benchmark_warmups: usize,
     benchmark_iterations: usize,
+    parameter_simulation_parallelism: usize,
     preimage_progress_interval: usize,
     max_parallel_instances: usize,
     preprocessing_parallel_instances: usize,
@@ -126,6 +127,13 @@ impl TestConfig {
             trapdoor_sigma: env_f64("MXX_TALL_NESTED_RNS_TRAPDOOR_SIGMA", 4.578)?,
             benchmark_warmups: env_usize("MXX_TALL_NESTED_RNS_BENCH_WARMUPS", 1)?,
             benchmark_iterations: env_usize("MXX_TALL_NESTED_RNS_BENCH_ITERATIONS", 2)?,
+            // Lean elaboration of the generated workflow is CPU-only and independent across
+            // parameter candidates. Keep the default batch small because each checker can use
+            // tens of GiB for large LUT graphs.
+            parameter_simulation_parallelism: env_usize(
+                "MXX_TALL_NESTED_RNS_PARAMETER_SIMULATION_PARALLELISM",
+                2,
+            )?,
             // Report exact runtime sampler completion frequently enough to make the long
             // preprocessing phase observable without emitting one line per preimage.
             preimage_progress_interval: env_usize(
@@ -165,6 +173,7 @@ impl TestConfig {
             config.trapdoor_sigma <= 0.0 ||
             !config.trapdoor_sigma.is_finite() ||
             config.benchmark_iterations == 0 ||
+            config.parameter_simulation_parallelism == 0 ||
             config.preimage_progress_interval == 0 ||
             config.max_parallel_instances == 0 ||
             config.preprocessing_parallel_instances == 0 ||
@@ -936,45 +945,73 @@ fn lattice_security_bits(parameters: &DCRTPolyParams, sigma: f64) -> Result<u64,
 
 fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
     info!("stage 1/4: parameter simulation");
-    for crt_depth in config.min_crt_depth..=config.max_crt_depth {
-        for log_ring_dimension in config.min_log_ring_dimension..=config.max_log_ring_dimension {
-            let ring_dimension = 1u32
-                .checked_shl(
-                    u32::try_from(log_ring_dimension)
-                        .map_err(|_| "log ring dimension exceeds u32".to_owned())?,
-                )
-                .ok_or_else(|| "ring dimension overflow".to_owned())?;
-            let parameters = DCRTPolyParams::new(
-                ring_dimension,
-                crt_depth,
-                config.crt_modulus_bits,
-                u32::try_from(config.gadget_base_bits)
-                    .map_err(|_| "gadget base bits exceed u32".to_owned())?,
-            );
-            // A zero target is the explicitly configured execution-smoke mode for n = 8.
-            // Its security predicate is tautological, so do not require Sage/lattice-estimator
-            // just to establish 0 >= 0. Any positive target retains the existing concrete
-            // estimator check.
-            let achieved_security_bits = if config.security_bits == 0 {
-                0
-            } else {
-                lattice_security_bits(&parameters, config.error_sigma)?
-            };
-            info!(
-                crt_depth,
-                ring_dimension,
-                achieved_security_bits,
-                required_security_bits = config.security_bits,
-                "evaluated lattice-security candidate"
-            );
-            if achieved_security_bits < config.security_bits {
+    let candidate_dimensions = (config.min_crt_depth..=config.max_crt_depth)
+        .flat_map(|crt_depth| {
+            (config.min_log_ring_dimension..=config.max_log_ring_dimension)
+                .map(move |log_ring_dimension| (crt_depth, log_ring_dimension))
+        })
+        .collect::<Vec<_>>();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.parameter_simulation_parallelism)
+        .thread_name(|index| format!("tall-parameter-simulation-{index}"))
+        .build()
+        .map_err(|error| format!("could not create parameter simulation pool: {error}"))?;
+    info!(
+        candidate_count = candidate_dimensions.len(),
+        parallelism = config.parameter_simulation_parallelism,
+        "configured bounded parallel parameter simulation"
+    );
+    for batch in candidate_dimensions.chunks(config.parameter_simulation_parallelism) {
+        let batch_results = pool.install(|| {
+            batch
+                .par_iter()
+                .map(|&(crt_depth, log_ring_dimension)| -> Result<_, String> {
+                    let ring_dimension = 1u32
+                        .checked_shl(
+                            u32::try_from(log_ring_dimension)
+                                .map_err(|_| "log ring dimension exceeds u32".to_owned())?,
+                        )
+                        .ok_or_else(|| "ring dimension overflow".to_owned())?;
+                    let parameters = DCRTPolyParams::new(
+                        ring_dimension,
+                        crt_depth,
+                        config.crt_modulus_bits,
+                        u32::try_from(config.gadget_base_bits)
+                            .map_err(|_| "gadget base bits exceed u32".to_owned())?,
+                    );
+                    // A zero target is the explicitly configured execution-smoke mode for n = 8.
+                    // Its security predicate is tautological, so do not require
+                    // Sage/lattice-estimator just to establish 0 >= 0. Any
+                    // positive target retains the existing concrete
+                    // estimator check.
+                    let achieved_security_bits = if config.security_bits == 0 {
+                        0
+                    } else {
+                        lattice_security_bits(&parameters, config.error_sigma)?
+                    };
+                    info!(
+                        crt_depth,
+                        ring_dimension,
+                        achieved_security_bits,
+                        required_security_bits = config.security_bits,
+                        "evaluated lattice-security candidate"
+                    );
+                    if achieved_security_bits < config.security_bits {
+                        return Ok(None);
+                    }
+                    let candidate = prepare_candidate(parameters, config, achieved_security_bits)?;
+                    Ok(Some(candidate))
+                })
+                .collect::<Vec<_>>()
+        });
+        for ((crt_depth, log_ring_dimension), result) in batch.iter().zip(batch_results) {
+            let Some(candidate) = result? else {
                 continue;
-            }
-            let candidate = prepare_candidate(parameters, config, achieved_security_bits)?;
+            };
             let accepted = candidate.lean_report.accepted;
             info!(
-                crt_depth,
-                ring_dimension,
+                crt_depth = *crt_depth,
+                ring_dimension = 1usize << *log_ring_dimension,
                 lean_operational_bound = %candidate.lean_operational_bound,
                 rejection = ?candidate.lean_report.rejection,
                 accepted,

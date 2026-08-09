@@ -253,7 +253,7 @@ inductive FrozenPointwiseMatrixFormula where
   | identity (matrixType : MatrixTypeExpr)
   | constant (matrixType : MatrixTypeExpr) (coefficients : List IntExpr)
   | gadget (matrixType : MatrixTypeExpr) (base : IntExpr)
-  | decompose (matrixType : MatrixTypeExpr) (base digitCount : IntExpr)
+  | decompose (matrixType : MatrixTypeExpr) (base : IntExpr) (small : Bool) (digitCount : IntExpr)
       (input : FrozenPointwiseMatrixFormula)
   | add (left right : FrozenPointwiseMatrixFormula)
   | subtract (left right : FrozenPointwiseMatrixFormula)
@@ -276,7 +276,7 @@ inductive FrozenPointwiseMatrixProgramFormula where
   | gadget (scope : StaticScopeId) (wire : Mxx.Ir.WireRef)
       (matrixType : MatrixTypeExpr) (base : IntExpr)
   | decompose (scope : StaticScopeId) (wire : Mxx.Ir.WireRef)
-      (matrixType : MatrixTypeExpr) (base digitCount : IntExpr)
+      (matrixType : MatrixTypeExpr) (base : IntExpr) (small : Bool) (digitCount : IntExpr)
       (input : FrozenPointwiseMatrixProgramFormula)
   | preimage (scope : StaticScopeId) (wire : Mxx.Ir.WireRef)
       (matrixType : MatrixTypeExpr) (cutoff : IntExpr)
@@ -320,8 +320,8 @@ def FrozenPointwiseMatrixProgramFormula.erase :
   | .identity _ _ matrixType => .identity matrixType
   | .constant _ _ matrixType coefficients => .constant matrixType coefficients
   | .gadget _ _ matrixType base => .gadget matrixType base
-  | .decompose _ _ matrixType base digitCount input =>
-      .decompose matrixType base digitCount input.erase
+  | .decompose _ _ matrixType base small digitCount input =>
+      .decompose matrixType base small digitCount input.erase
   | .preimage scope wire _ _ _ _ _ => .atom scope wire
   | .reshape scope wire _ _ _ => .atom scope wire
   | .slice scope wire _ _ _ => .atom scope wire
@@ -344,7 +344,7 @@ def FrozenPointwiseMatrixProgramFormula.source :
   | .identity scope wire _
   | .constant scope wire _ _
   | .gadget scope wire _ _
-  | .decompose scope wire _ _ _ _
+  | .decompose scope wire _ _ _ _ _
   | .preimage scope wire _ _ _ _ _
   | .reshape scope wire _ _ _
   | .slice scope wire _ _ _
@@ -421,12 +421,12 @@ def FrozenPointwiseMatrixProgramFormula.validIn
         | .gadgetMatrix actualType actualBase, [] =>
             wire.port == 0 && matrixType == actualType && base == actualBase
         | _, _ => false
-  | .decompose scopeId wire matrixType base digitCount input =>
+  | .decompose scopeId wire matrixType base small digitCount input =>
       pointwiseFormulaNodeValid program scopeId wire fun _ node =>
         match node.kind with
-        | .gadgetDecompose actualType actualBase actualDigitCount =>
+        | .gadgetDecompose actualType actualBase actualSmall actualDigitCount =>
             wire.port == 0 && matrixType == actualType && base == actualBase &&
-              digitCount == actualDigitCount &&
+              small == actualSmall && digitCount == actualDigitCount &&
               pointwiseFormulaArgumentsMatch scopeId wire node.arguments [input] &&
               input.validIn program substitutions
         | _ => false
@@ -558,8 +558,8 @@ private partial def normalizePointwiseMatrixWire
       | .constantMatrix matrixType coefficients, [] =>
           some (.constant scopeId wire matrixType coefficients)
       | .gadgetMatrix matrixType base, [] => some (.gadget scopeId wire matrixType base)
-      | .gadgetDecompose matrixType base digitCount, [input] =>
-          return .decompose scopeId wire matrixType base digitCount
+      | .gadgetDecompose matrixType base small digitCount, [input] =>
+          return .decompose scopeId wire matrixType base small digitCount
             (← normalizePointwiseMatrixWire program scopeId scope substitutions fuel input)
       | .preimageSample matrixType cutoff, [publicWire, trapdoor, target] =>
           some (.preimage scopeId wire matrixType cutoff publicWire trapdoor target)

@@ -809,7 +809,19 @@ impl Mat {
 
     #[track_caller]
     pub fn decompose(self, base: impl Into<IntExpr>, digit_count: impl Into<IntExpr>) -> Preimage {
-        let digit_count = digit_count.into();
+        self.decompose_with_mode(base.into(), digit_count.into(), false)
+    }
+
+    #[track_caller]
+    pub fn small_decompose(
+        self,
+        base: impl Into<IntExpr>,
+        digit_count: impl Into<IntExpr>,
+    ) -> Preimage {
+        self.decompose_with_mode(base.into(), digit_count.into(), true)
+    }
+
+    fn decompose_with_mode(self, base: IntExpr, digit_count: IntExpr, small: bool) -> Preimage {
         let ty = MatrixType {
             rows: IntExpr::Mul(
                 Box::new(self.matrix_type.rows.clone()),
@@ -819,11 +831,7 @@ impl Mat {
         };
         let pending = self.pending;
         let node = NodeHandle::new(
-            NodeKind::GadgetDecompose {
-                base: base.into(),
-                small: false,
-                digit_count: Some(digit_count),
-            },
+            NodeKind::GadgetDecompose { base, small, digit_count },
             vec![self.value],
             vec![WireType::Preimage(ty.clone())],
         );
@@ -4501,6 +4509,36 @@ mod tests {
         let constraints = mxx_ir_core::derive_param_constraints(&parameterized.graph).unwrap();
         assert!(constraints.iter().any(|constraint| !constraint.evaluate(&negative).unwrap()));
         assert!(parameterized.validate(&negative).is_err());
+    }
+
+    #[test]
+    fn decomposition_requires_explicit_positive_metadata_and_preserves_mode() {
+        let ring = Ring::new(257, 8);
+        let input = ring.input("input", (1, 1));
+        let regular = DslContext::new("regular-decomposition")
+            .output("value", input.clone().decompose(4, 4).as_mat())
+            .unwrap()
+            .build()
+            .unwrap();
+        regular.validate(&ParamEnv::default()).unwrap();
+        let serialized = serde_json::to_string(&regular.graph).unwrap();
+        assert!(serialized.contains("digit_count"));
+        assert!(serialized.contains("\"small\":false"));
+
+        let small = DslContext::new("small-decomposition")
+            .output("value", input.clone().small_decompose(4, 4).as_mat())
+            .unwrap()
+            .build()
+            .unwrap();
+        small.validate(&ParamEnv::default()).unwrap();
+        assert!(serde_json::to_string(&small.graph).unwrap().contains("\"small\":true"));
+
+        let invalid = DslContext::new("negative-decomposition-base")
+            .output("value", input.decompose(-4, 4).as_mat())
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(invalid.validate(&ParamEnv::default()).is_err());
     }
 
     #[test]

@@ -1,4 +1,6 @@
 import MxxCorrectness.Proofs.ToyExampleExecution
+import Mxx.Certificate.Checker
+import Mxx.Certificate.Preconditions
 import Mathlib.Tactic
 
 namespace MxxCorrectness.Proofs.ToyExample

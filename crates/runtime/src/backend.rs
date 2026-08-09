@@ -205,6 +205,7 @@ pub trait Backend {
         key: [u8; 32],
         tag: &[u8],
         variant: HashVariant,
+        gadget_layout: Option<(&BigInt, usize)>,
     ) -> Result<Self::Matrix, Self::Error>;
     fn sample_trapdoor(
         &mut self,

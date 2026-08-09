@@ -1,32 +1,15 @@
-import Mxx.Certificate.Analyzer
-import Mxx.Certificate.AffineNormalize
-import Mxx.Certificate.AffineNormalize
 import Mxx.Certificate.Identity
-import Mxx.Certificate.Syntax
-import Mxx.Certificate.Facts
-import Mxx.Certificate.Bounds
-import Mxx.Certificate.BundleSoundness
-import Mxx.Certificate.Checker
+import Mxx.Certificate.ProtocolSyntax
 import Mxx.Certificate.Derivation
 import Mxx.Certificate.OperationalBounds
-import Mxx.Certificate.Execution
-import Mxx.Certificate.ExpressionArena
-import Mxx.Certificate.LocalSoundness
-import Mxx.Certificate.Normalize
-import Mxx.Certificate.Preconditions
-import Mxx.Certificate.Registry
-import Mxx.Certificate.Rules
-import Mxx.Certificate.Semantics
-import Mxx.Certificate.Soundness
-import Mxx.Certificate.SymbolicForm
-import Mxx.Certificate.SymbolicFormSemantics
-import Mxx.Certificate.SymbolicEvaluation
-import Mxx.Certificate.SymbolicEvaluationConstruction
-import Mxx.Certificate.SymbolicEvaluationSoundness
-import Mxx.Certificate.ProtocolBooleanSelector
-import Mxx.Certificate.SymbolicRecurrence
-import Mxx.Certificate.SymbolicRecurrenceConstruction
-import Mxx.Certificate.RecurrenceSchema
-import Mxx.Certificate.Typing
-import Mxx.Certificate.ValueSemantics
-import Mxx.Certificate.Workflow
+
+/-!
+The proof-oriented analyzer and symbolic-evaluation imports are retained in their owning source
+files but are intentionally not re-exported while gadget decomposition is migrated to explicit,
+partial backend layouts.  Those modules still assume a total, one-layout gadget constructor.
+The active public certificate surface includes generated IR syntax, protocol declaration syntax,
+and the operational derivation and hard-bound checker. `OperationalSemantics` remains in its
+owning source while the flat operational facts are migrated; it is intentionally not re-exported
+until the later end-to-end correctness-proof milestone. The older recursive symbolic analyzer is
+not re-exported.
+-/

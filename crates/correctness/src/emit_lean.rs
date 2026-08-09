@@ -42,6 +42,126 @@ pub enum EmitError {
     UnsupportedNode { stage: String, scope: String, node: u64, kind: &'static str },
     #[error("Lean denotation does not yet support child Graph IR scopes")]
     ChildScope,
+    #[error("derivation attachment {namespace}.{rule} contains roles from different scopes")]
+    DerivationAttachmentScope { namespace: String, rule: String },
+    #[error("operational protocol inventory is missing the emitted variant row `{variant}`")]
+    MissingOperationalInventory { variant: &'static str },
+}
+
+const OPERATIONAL_PROTOCOL_INVENTORY: &str =
+    include_str!("../../../docs/correctness/operational-protocol-inventory.md");
+
+fn operational_inventory_key(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Input { .. } => "Input",
+        NodeKind::ConstantInt(_) => "ConstantInt",
+        NodeKind::EvaluateInt(_) => "EvaluateInt",
+        NodeKind::ConstantReal(_) => "ConstantReal",
+        NodeKind::ConstantBool(_) => "ConstantBool",
+        NodeKind::ConstantMatrix { value: ConstantMatrix::Zero, .. } => "ConstantMatrix.Zero",
+        NodeKind::ConstantMatrix { value: ConstantMatrix::Identity, .. } => {
+            "ConstantMatrix.Identity"
+        }
+        NodeKind::ConstantMatrix { value: ConstantMatrix::UnitRow { .. }, .. } => {
+            "ConstantMatrix.UnitRow"
+        }
+        NodeKind::ConstantMatrix { value: ConstantMatrix::UnitColumn { .. }, .. } => {
+            "ConstantMatrix.UnitColumn"
+        }
+        NodeKind::ConstantMatrix { value: ConstantMatrix::Gadget { small: false, .. }, .. } => {
+            "ConstantMatrix.Gadget"
+        }
+        NodeKind::ConstantMatrix { value: ConstantMatrix::Gadget { small: true, .. }, .. } => {
+            "ConstantMatrix.Gadget(small)"
+        }
+        NodeKind::ConstantMatrix { value: ConstantMatrix::PowerOfBase { .. }, .. } => {
+            "ConstantMatrix.PowerOfBase"
+        }
+        NodeKind::ConstantMatrix { value: ConstantMatrix::Rotation { .. }, .. } => {
+            "ConstantMatrix.Rotation"
+        }
+        NodeKind::ConstantMatrix { value: ConstantMatrix::Polynomial { .. }, .. } => {
+            "ConstantMatrix.Polynomial"
+        }
+        NodeKind::GadgetTrapdoor { .. } => "GadgetTrapdoor",
+        NodeKind::TrapdoorPublic => "TrapdoorPublic",
+        NodeKind::IntBinary(IntBinaryOp::Add) => "IntBinary.Add",
+        NodeKind::IntBinary(IntBinaryOp::Subtract) => "IntBinary.Subtract",
+        NodeKind::IntBinary(IntBinaryOp::Multiply) => "IntBinary.Multiply",
+        NodeKind::IntBinary(IntBinaryOp::Divide) => "IntBinary.Divide",
+        NodeKind::IntBinary(IntBinaryOp::Remainder) => "IntBinary.Remainder",
+        NodeKind::IntCompare(IntCompareOp::Equal) => "IntCompare.Equal",
+        NodeKind::IntCompare(IntCompareOp::Less) => "IntCompare.Less",
+        NodeKind::IntCompare(IntCompareOp::LessEqual) => "IntCompare.LessEqual",
+        NodeKind::BitExtract { .. } => "BitExtract",
+        NodeKind::IntToReal => "IntToReal",
+        NodeKind::BoolToInt => "BoolToInt",
+        NodeKind::RealBinary(RealBinaryOp::Add) => "RealBinary.Add",
+        NodeKind::RealBinary(RealBinaryOp::Subtract) => "RealBinary.Subtract",
+        NodeKind::RealBinary(RealBinaryOp::Multiply) => "RealBinary.Multiply",
+        NodeKind::RealBinary(RealBinaryOp::Divide) => "RealBinary.Divide",
+        NodeKind::RealSqrt => "RealSqrt",
+        NodeKind::MatrixBinary(MatrixBinaryOp::Add) => "MatrixBinary.Add",
+        NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) => "MatrixBinary.Subtract",
+        NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) => "MatrixBinary.Multiply",
+        NodeKind::MatrixNegate => "MatrixNegate",
+        NodeKind::MatrixScale { .. } => "MatrixScale",
+        NodeKind::Transpose => "Transpose",
+        NodeKind::Slice { .. } => "Slice",
+        NodeKind::Tensor => "Tensor",
+        NodeKind::Concat { axis: ConcatAxis::Rows } => "Concat.Rows",
+        NodeKind::Concat { axis: ConcatAxis::Columns } => "Concat.Columns",
+        NodeKind::Concat { axis: ConcatAxis::Diagonal } => "Concat.Diagonal",
+        NodeKind::Reshape { .. } => "Reshape",
+        NodeKind::UniformResidueSample { .. } => "UniformResidueSample",
+        NodeKind::UniformIntervalSample { .. } => "UniformIntervalSample",
+        NodeKind::GaussianSample { .. } => "GaussianSample",
+        NodeKind::HashSample { variant: HashVariant::Plain, .. } => "HashSample.Plain",
+        NodeKind::HashSample { variant: HashVariant::Decomposed, .. } => "HashSample.Decomposed",
+        NodeKind::HashSample { variant: HashVariant::SmallDecomposed, .. } => {
+            "HashSample.SmallDecomposed"
+        }
+        NodeKind::TrapdoorSample { .. } => "TrapdoorSample",
+        NodeKind::PreimageSample { .. } => "PreimageSample",
+        NodeKind::GadgetDecompose { small: false, .. } => "GadgetDecompose(regular)",
+        NodeKind::GadgetDecompose { small: true, .. } => "GadgetDecompose(small)",
+        NodeKind::ExtractCoefficient { .. } => "ExtractCoefficient",
+        NodeKind::ConstantCoefficient { .. } => "ConstantCoefficient",
+        NodeKind::ThresholdDecode { output_bool: true, .. } => "ThresholdDecode(bool)",
+        NodeKind::ThresholdDecode { output_bool: false, .. } => "ThresholdDecode(int)",
+        NodeKind::CrtRecompose { .. } => "CrtRecompose",
+        NodeKind::PackPolynomialCoefficients { .. } => "PackPolynomialCoefficients",
+        NodeKind::SubgraphCall(_) => "SubgraphCall",
+        NodeKind::ParallelLoop(_) => "ParallelLoop",
+        NodeKind::SequentialLoop(_) => "SequentialLoop",
+        NodeKind::FamilyPack { .. } => "FamilyPack",
+        NodeKind::FamilyGetStatic { .. } => "FamilyGetStatic",
+        NodeKind::FamilyGetDynamic => "FamilyGetDynamic",
+        NodeKind::Select { .. } => "Select",
+    }
+}
+
+fn require_operational_inventory_row(key: &'static str) -> Result<(), EmitError> {
+    let row_prefix = format!("| `{key}` |");
+    if OPERATIONAL_PROTOCOL_INVENTORY.contains(&row_prefix) {
+        Ok(())
+    } else {
+        Err(EmitError::MissingOperationalInventory { variant: key })
+    }
+}
+
+fn validate_operational_inventory(kind: &NodeKind) -> Result<(), EmitError> {
+    require_operational_inventory_row(operational_inventory_key(kind))?;
+    if let NodeKind::ParallelLoop(spec) = kind {
+        for mode in &spec.input_modes {
+            require_operational_inventory_row(match mode {
+                LoopInputMode::Broadcast => "ParallelLoop.Broadcast",
+                LoopInputMode::Zip => "ParallelLoop.Zip",
+                LoopInputMode::ZipOffset { .. } => "ParallelLoop.ZipOffset",
+            })?;
+        }
+    }
+    Ok(())
 }
 
 pub fn emit_protocol_for(
@@ -136,7 +256,12 @@ fn lean_protocol_derivations(
         let name = format!("{lean_name}_stage_{stage_name}_derivation");
         definitions.push(format!(
             "def {name} : Mxx.Certificate.ProgramDerivation :=\n{}",
-            lean_program_derivation(&stage.id.0, &stage.graph, 2)?
+            lean_program_derivation_with_attachments(
+                &stage.id.0,
+                &stage.graph,
+                Some(&stage.derivation_attachments),
+                2,
+            )?
         ));
         entries.push(format!("({}, {name})", lean_string(&format!("stage:{}", stage.id.0))));
     }
@@ -283,9 +408,23 @@ fn lean_program(stage: &str, graph: &Graph, indent: usize) -> Result<String, Emi
 }
 
 fn lean_program_derivation(stage: &str, graph: &Graph, indent: usize) -> Result<String, EmitError> {
+    lean_program_derivation_with_attachments(stage, graph, None, indent)
+}
+
+fn lean_program_derivation_with_attachments(
+    stage: &str,
+    graph: &Graph,
+    attachments: Option<&mxx_dsl::FrozenDerivationAttachments>,
+    indent: usize,
+) -> Result<String, EmitError> {
     let padding = " ".repeat(indent);
-    let root =
-        lean_scope_derivation(stage, &FrozenGraphScopeId::Root, graph.root_scope(), indent + 4)?;
+    let root = lean_scope_derivation(
+        stage,
+        &FrozenGraphScopeId::Root,
+        graph.root_scope(),
+        attachments,
+        indent + 4,
+    )?;
     let definitions = graph
         .scopes()
         .iter()
@@ -295,7 +434,7 @@ fn lean_program_derivation(stage: &str, graph: &Graph, indent: usize) -> Result<
                 "{}({},\n{})",
                 " ".repeat(indent + 2),
                 lean_string(&lean_scope_name(id)),
-                lean_scope_derivation(stage, id, scope, indent + 4)?
+                lean_scope_derivation(stage, id, scope, attachments, indent + 4)?
             ))
         })
         .collect::<Result<Vec<_>, EmitError>>()?
@@ -309,6 +448,7 @@ fn lean_scope_derivation(
     stage: &str,
     scope_id: &FrozenGraphScopeId,
     scope: &GraphScope,
+    attachments: Option<&mxx_dsl::FrozenDerivationAttachments>,
     indent: usize,
 ) -> Result<String, EmitError> {
     let padding = " ".repeat(indent);
@@ -327,12 +467,50 @@ fn lean_scope_derivation(
                 .join(", ");
             Ok(format!(
                 "{child_padding}{{ sourceNode := {node_id}, rule := {}, arguments := [{arguments}] }}",
-                lean_derivation_rule(stage, scope_id, mxx_ir_core::NodeId(node_id as u64), node)?,
+                lean_derivation_rule(
+                    stage,
+                    scope_id,
+                    mxx_ir_core::NodeId(node_id as u64),
+                    node,
+                    scope,
+                )?,
             ))
         })
         .collect::<Result<Vec<_>, _>>()?
         .join(",\n");
-    Ok(format!("{padding}{{ steps := [\n{steps}\n{padding}] }}"))
+    let attachments = attachments
+        .into_iter()
+        .flat_map(|attachments| attachments.iter())
+        .filter_map(|attachment| {
+            attachment.roles.first().map(|(_, wire)| (attachment, &wire.scope))
+        })
+        .filter(|(_, attachment_scope)| *attachment_scope == scope_id)
+        .map(|(attachment, attachment_scope)| {
+            if attachment.roles.iter().any(|(_, wire)| &wire.scope != attachment_scope) {
+                return Err(EmitError::DerivationAttachmentScope {
+                    namespace: attachment.namespace.clone(),
+                    rule: attachment.rule.clone(),
+                });
+            }
+            let roles = attachment
+                .roles
+                .iter()
+                .map(|(role, wire)| {
+                    format!("({}, {})", lean_string(role), lean_wire_ref(&wire.wire))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(format!(
+                "{child_padding}{{ ownerNamespace := {}, ruleName := {}, roles := [{roles}] }}",
+                lean_string(&attachment.namespace),
+                lean_string(&attachment.rule),
+            ))
+        })
+        .collect::<Result<Vec<_>, EmitError>>()?
+        .join(",\n");
+    Ok(format!(
+        "{padding}{{ steps := [\n{steps}\n{padding}]\n{padding}  attachments := [\n{attachments}\n{padding}] }}"
+    ))
 }
 
 fn lean_derivation_rule(
@@ -340,14 +518,10 @@ fn lean_derivation_rule(
     scope_id: &FrozenGraphScopeId,
     node_id: mxx_ir_core::NodeId,
     node: &mxx_ir_core::NodeHandle,
-) -> Result<&'static str, EmitError> {
-    let unsupported = |kind| EmitError::UnsupportedNode {
-        stage: stage.to_owned(),
-        scope: lean_scope_name(scope_id),
-        node: node_id.0,
-        kind,
-    };
-    Ok(match node.kind() {
+    scope: &GraphScope,
+) -> Result<String, EmitError> {
+    let _ = (stage, scope_id, node_id);
+    let rule = match node.kind() {
         NodeKind::Input { .. } => ".input",
         NodeKind::ConstantInt(_) => ".constantInt",
         NodeKind::EvaluateInt(_) => ".evaluateInt",
@@ -389,13 +563,39 @@ fn lean_derivation_rule(
         NodeKind::UniformIntervalSample { .. } => ".uniformIntervalSample",
         NodeKind::GaussianSample { .. } => ".gaussianSample",
         NodeKind::HashSample { .. } => ".hashSample",
-        NodeKind::GadgetDecompose { digit_count: Some(_), .. } => ".gadgetDecompose",
+        NodeKind::GadgetDecompose { .. } => ".gadgetDecompose",
         NodeKind::TrapdoorSample { .. } => ".trapdoorSample",
         NodeKind::TrapdoorPublic => ".trapdoorPublic",
         NodeKind::PreimageSample { .. } => ".preimageSample",
         NodeKind::MatrixBinary(MatrixBinaryOp::Add) => ".matrixAdd",
         NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) => ".matrixSubtract",
-        NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) => ".matrixMultiplyBound",
+        NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) => {
+            let arguments = scope.arguments(node).expect("frozen multiplication arguments");
+            let left = arguments.first().expect("validated multiplication has two arguments");
+            let right = arguments.get(1).expect("validated multiplication has two arguments");
+            let relation_available = match scope.node(right.node).map(|producer| producer.kind()) {
+                Some(NodeKind::GadgetDecompose { .. }) => {
+                    scope.node(left.node).is_some_and(|producer| {
+                        matches!(
+                            producer.kind(),
+                            NodeKind::ConstantMatrix { value: ConstantMatrix::Gadget { .. }, .. }
+                        )
+                    })
+                }
+                Some(NodeKind::PreimageSample { .. }) => {
+                    scope
+                        .node(right.node)
+                        .and_then(|producer| scope.arguments(producer))
+                        .and_then(|preimage_arguments| preimage_arguments.first().copied()) ==
+                        Some(*left)
+                }
+                _ => false,
+            };
+            if relation_available {
+                return Ok(format!(".matrixMultiplyRelation {}", lean_wire_ref(right)));
+            }
+            ".matrixMultiplyBound"
+        }
         NodeKind::MatrixNegate => ".matrixNegate",
         NodeKind::MatrixScale { .. } => ".matrixScale",
         NodeKind::Transpose => ".transpose",
@@ -413,8 +613,8 @@ fn lean_derivation_rule(
         NodeKind::SubgraphCall(_) => ".subgraphCall",
         NodeKind::ParallelLoop(_) => ".parallelLoop",
         NodeKind::SequentialLoop(_) => ".sequentialLoop",
-        kind => return Err(unsupported(node_kind_name(kind))),
-    })
+    };
+    Ok(rule.to_owned())
 }
 
 fn lean_scope(
@@ -525,6 +725,7 @@ fn lean_node_kind(
     node_id: mxx_ir_core::NodeId,
     node: &mxx_ir_core::NodeHandle,
 ) -> Result<String, EmitError> {
+    validate_operational_inventory(node.kind())?;
     let unsupported = |kind| EmitError::UnsupportedNode {
         stage: stage.to_owned(),
         scope: lean_scope_name(scope_id),
@@ -697,20 +898,18 @@ fn lean_node_kind(
                 optional(digit_count),
             )
         }
-        NodeKind::GadgetDecompose { base, digit_count, .. } => {
+        NodeKind::GadgetDecompose { base, small, digit_count } => {
             let matrix_type = match node.output_types().first() {
                 Some(WireType::Matrix(matrix_type) | WireType::Preimage(matrix_type)) => {
                     matrix_type
                 }
                 _ => return Err(unsupported("GadgetDecompose")),
             };
-            let Some(digit_count) = digit_count else {
-                return Err(unsupported("implicit-digit GadgetDecompose"));
-            };
             format!(
-                ".gadgetDecompose {} ({}) ({})",
+                ".gadgetDecompose {} ({}) {} ({})",
                 lean_matrix_type(matrix_type),
                 lean_ir_int_expr(base),
+                if *small { "true" } else { "false" },
                 lean_ir_int_expr(digit_count)
             )
         }
@@ -936,53 +1135,6 @@ fn lean_ir_real_expr(expression: &mxx_ir_core::RealExpr) -> String {
     }
 }
 
-fn node_kind_name(kind: &NodeKind) -> &'static str {
-    match kind {
-        NodeKind::Input { .. } => "Input",
-        NodeKind::ConstantInt(_) => "ConstantInt",
-        NodeKind::EvaluateInt(_) => "EvaluateInt",
-        NodeKind::ConstantReal(_) => "ConstantReal",
-        NodeKind::ConstantBool(_) => "ConstantBool",
-        NodeKind::ConstantMatrix { .. } => "ConstantMatrix",
-        NodeKind::GadgetTrapdoor { .. } => "GadgetTrapdoor",
-        NodeKind::TrapdoorPublic => "TrapdoorPublic",
-        NodeKind::IntBinary(_) => "IntBinary",
-        NodeKind::IntCompare(_) => "IntCompare",
-        NodeKind::BitExtract { .. } => "BitExtract",
-        NodeKind::IntToReal => "IntToReal",
-        NodeKind::BoolToInt => "BoolToInt",
-        NodeKind::RealBinary(_) => "RealBinary",
-        NodeKind::RealSqrt => "RealSqrt",
-        NodeKind::MatrixBinary(_) => "MatrixBinary",
-        NodeKind::MatrixNegate => "MatrixNegate",
-        NodeKind::MatrixScale { .. } => "MatrixScale",
-        NodeKind::Transpose => "Transpose",
-        NodeKind::Slice { .. } => "Slice",
-        NodeKind::Tensor => "Tensor",
-        NodeKind::Concat { .. } => "Concat",
-        NodeKind::Reshape { .. } => "Reshape",
-        NodeKind::UniformResidueSample { .. } => "UniformResidueSample",
-        NodeKind::UniformIntervalSample { .. } => "UniformIntervalSample",
-        NodeKind::GaussianSample { .. } => "GaussianSample",
-        NodeKind::HashSample { .. } => "HashSample",
-        NodeKind::TrapdoorSample { .. } => "TrapdoorSample",
-        NodeKind::PreimageSample { .. } => "PreimageSample",
-        NodeKind::GadgetDecompose { .. } => "GadgetDecompose",
-        NodeKind::ExtractCoefficient { .. } => "ExtractCoefficient",
-        NodeKind::ConstantCoefficient { .. } => "ConstantCoefficient",
-        NodeKind::ThresholdDecode { .. } => "ThresholdDecode",
-        NodeKind::CrtRecompose { .. } => "CrtRecompose",
-        NodeKind::PackPolynomialCoefficients { .. } => "PackPolynomialCoefficients",
-        NodeKind::SubgraphCall(_) => "SubgraphCall",
-        NodeKind::ParallelLoop(_) => "ParallelLoop",
-        NodeKind::SequentialLoop(_) => "SequentialLoop",
-        NodeKind::FamilyPack { .. } => "FamilyPack",
-        NodeKind::FamilyGetStatic { .. } => "FamilyGetStatic",
-        NodeKind::FamilyGetDynamic => "FamilyGetDynamic",
-        NodeKind::Select { .. } => "Select",
-    }
-}
-
 fn lean_ir_int_expr(expression: &IntExpr) -> String {
     match expression {
         IntExpr::Const(value) => format!(".constant ({value} : Int)"),
@@ -1104,6 +1256,85 @@ mod tests {
     use super::*;
     use mxx_dsl::{DslContext, Family, Int, Ring, Sequential};
     use mxx_ir_core::{RealExpr, WireType};
+
+    #[test]
+    fn operational_inventory_has_every_current_variant_row() {
+        let keys = [
+            "Input",
+            "ConstantInt",
+            "EvaluateInt",
+            "ConstantReal",
+            "ConstantBool",
+            "ConstantMatrix.Zero",
+            "ConstantMatrix.Identity",
+            "ConstantMatrix.UnitRow",
+            "ConstantMatrix.UnitColumn",
+            "ConstantMatrix.Gadget",
+            "ConstantMatrix.Gadget(small)",
+            "ConstantMatrix.PowerOfBase",
+            "ConstantMatrix.Rotation",
+            "ConstantMatrix.Polynomial",
+            "GadgetTrapdoor",
+            "TrapdoorPublic",
+            "IntBinary.Add",
+            "IntBinary.Subtract",
+            "IntBinary.Multiply",
+            "IntBinary.Divide",
+            "IntBinary.Remainder",
+            "IntCompare.Equal",
+            "IntCompare.Less",
+            "IntCompare.LessEqual",
+            "BitExtract",
+            "IntToReal",
+            "BoolToInt",
+            "RealBinary.Add",
+            "RealBinary.Subtract",
+            "RealBinary.Multiply",
+            "RealBinary.Divide",
+            "RealSqrt",
+            "MatrixBinary.Add",
+            "MatrixBinary.Subtract",
+            "MatrixBinary.Multiply",
+            "MatrixNegate",
+            "MatrixScale",
+            "Transpose",
+            "Slice",
+            "Tensor",
+            "Concat.Rows",
+            "Concat.Columns",
+            "Concat.Diagonal",
+            "Reshape",
+            "UniformResidueSample",
+            "UniformIntervalSample",
+            "GaussianSample",
+            "HashSample.Plain",
+            "HashSample.Decomposed",
+            "HashSample.SmallDecomposed",
+            "TrapdoorSample",
+            "PreimageSample",
+            "GadgetDecompose(regular)",
+            "GadgetDecompose(small)",
+            "ExtractCoefficient",
+            "ConstantCoefficient",
+            "ThresholdDecode(bool)",
+            "ThresholdDecode(int)",
+            "CrtRecompose",
+            "PackPolynomialCoefficients",
+            "SubgraphCall",
+            "ParallelLoop",
+            "ParallelLoop.Broadcast",
+            "ParallelLoop.Zip",
+            "ParallelLoop.ZipOffset",
+            "SequentialLoop",
+            "FamilyPack",
+            "FamilyGetStatic",
+            "FamilyGetDynamic",
+            "Select",
+        ];
+        for key in keys {
+            require_operational_inventory_row(key).unwrap();
+        }
+    }
 
     #[test]
     fn closed_bundle_is_embedded_with_transport_only() {

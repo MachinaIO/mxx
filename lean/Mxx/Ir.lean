@@ -21,11 +21,12 @@ inductive Syntax where
 inductive ParamValue where
   | integer (value : Int)
   | rational (value : Rat)
+  deriving BEq, DecidableEq, Repr
 
 inductive ParamKey where
   | parameter (name : String)
   | loopIndex (slot : Nat)
-  deriving BEq, DecidableEq
+  deriving BEq, DecidableEq, Repr
 
 instance : Coe String ParamKey := ⟨ParamKey.parameter⟩
 
@@ -41,7 +42,7 @@ inductive IntExpr where
   | divide (left right : IntExpr)
   | roundDivide (left right : IntExpr)
   | log2Ceil (value : IntExpr)
-  deriving BEq, DecidableEq
+  deriving BEq, DecidableEq, Repr
 
 /-- Lossless syntax mirror of the compile-time real expressions carried by Graph IR types.
 The correctness analyzer transports this syntax for type identity; hard-bound evaluation uses the
@@ -106,10 +107,18 @@ inductive Value where
   | boolean (value : Bool)
   | bytes (value : ByteArray)
   | matrix (value : Mxx.Matrix)
-  | trapdoor (publicMatrix : Mxx.Matrix)
+  | trapdoor (publicMatrix : Mxx.Matrix) (origin : Mxx.TrapdoorOrigin)
   | family (values : List Value)
   | opaque (description : String)
   | invalid (reason : String)
+
+def hashArguments : List Value → Option (ByteArray × List Int)
+  | .bytes key :: tail => do
+      let values ← tail.mapM fun value => match value with
+        | .integer value => some value
+        | _ => none
+      pure (key, values)
+  | _ => none
 
 abbrev Environment := List (String × Value)
 
@@ -121,7 +130,7 @@ def lookupEnvironment (name : String) : Environment → Option Value
 structure WireRef where
   node : Nat
   port : Nat
-  deriving BEq, DecidableEq
+  deriving BEq, DecidableEq, Repr
 
 inductive IntBinaryOp where
   | add
@@ -154,14 +163,14 @@ inductive ConcatAxis where
   | rows
   | columns
   | diagonal
-  deriving BEq, DecidableEq
+  deriving BEq, DecidableEq, Repr
 
 structure MatrixTypeExpr where
   modulus : IntExpr
   ringDimension : IntExpr
   rows : IntExpr
   columns : IntExpr
-  deriving BEq, DecidableEq
+  deriving BEq, DecidableEq, Repr
 
 /-- Exact transport of the Rust Graph IR wire type. Generated correctness modules populate this
 for every node output. The default exists only so pre-redesign hand-written theorem fixtures keep
@@ -238,7 +247,8 @@ inductive NodeKind where
       (tagPrefix : List Nat)
       (tagExpressions tagDecimalExpressions tagU64LeExpressions : List IntExpr)
       (base digitCount : Option IntExpr)
-  | gadgetDecompose (matrixType : MatrixTypeExpr) (base digitCount : IntExpr)
+  | gadgetDecompose
+      (matrixType : MatrixTypeExpr) (base : IntExpr) (small : Bool) (digitCount : IntExpr)
   | trapdoorSample (matrixType : MatrixTypeExpr) (maxCoefficientBound : IntExpr)
   | trapdoorPublic
   | preimageSample (matrixType : MatrixTypeExpr) (maxCoefficientBound : IntExpr)
@@ -335,10 +345,12 @@ def thresholdDecodeBool (ciphertextModulus plaintextModulus value : Int) : Bool 
 
 def evaluateBindings (params : ParamEnvironment) :
     List (String × IntExpr) → Option ParamEnvironment
-  | [] => some []
-  | (name, expression) :: tail => do
-      let value ← expression.evaluate params
-      return (.parameter name, .integer value) :: (← evaluateBindings params tail)
+  | bindings => do
+      let evaluated ← bindings.mapM fun (name, expression) => do
+        let value ← expression.evaluate params
+        pure (ParamKey.parameter name, ParamValue.integer value)
+      pure <| evaluated.foldl (fun environment binding =>
+        binding :: environment.filter fun candidate => candidate.1 != binding.1) []
 
 def loopArgument (mode : LoopInputMode) (index : Nat) (value : Value) : Value :=
   match mode, value with
@@ -765,15 +777,43 @@ def evaluateNode
             { coefficients := values.map (Mxx.reduceCoefficient matrixParams.modulus) }
             matrixParams)]]
       | _, _ => [[.invalid "constant-matrix evaluation failed"]]
-  | .unitRowMatrix _ _ | .unitColumnMatrix _ _ | .smallGadgetMatrix _ _ |
-      .powerOfBaseMatrix _ _ _ | .rotationMatrix _ _ | .gadgetTrapdoor _ _ =>
+  | .unitRowMatrix _ _ | .unitColumnMatrix _ _ | .powerOfBaseMatrix _ _ _ | .rotationMatrix _ _ =>
       [[.invalid "constant-matrix variant execution is unavailable"]]
   | .gadgetMatrix matrixType base =>
       match matrixType.evaluate params, base.evaluate params with
       | some matrixParams, some base =>
           let digits := if matrixParams.rows = 0 then 0 else matrixParams.columns / matrixParams.rows
-          [[.matrix (Mxx.gadgetMatrix matrixParams base digits)]]
+          match samplers.layoutId matrixParams with
+          | some paramsId =>
+              match samplers.gadgetPublicMatrix paramsId matrixParams matrixParams.rows base false digits with
+              | some matrix => [[.matrix (matrix.withSamplerParams matrixParams)]]
+              | none => [[.invalid "gadget-matrix layout is invalid"]]
+          | none => [[.invalid "gadget-matrix layout is unavailable"]]
       | _, _ => [[.invalid "gadget-matrix evaluation failed"]]
+  | .smallGadgetMatrix matrixType base =>
+      match matrixType.evaluate params, base.evaluate params with
+      | some matrixParams, some base =>
+          let digits := if matrixParams.rows = 0 then 0 else matrixParams.columns / matrixParams.rows
+          match samplers.layoutId matrixParams with
+          | some paramsId =>
+              match samplers.gadgetPublicMatrix paramsId matrixParams matrixParams.rows base true digits with
+              | some matrix => [[.matrix (matrix.withSamplerParams matrixParams)]]
+              | none => [[.invalid "small-gadget-matrix layout is invalid"]]
+          | none => [[.invalid "small-gadget-matrix layout is unavailable"]]
+      | _, _ => [[.invalid "small-gadget-matrix evaluation failed"]]
+  | .gadgetTrapdoor matrixType base =>
+      match matrixType.evaluate params (.constant 0), base.evaluate params with
+      | some matrixParams, some base =>
+          let digits := if matrixParams.rows = 0 then 0 else matrixParams.columns / matrixParams.rows
+          match samplers.layoutId matrixParams with
+          | some paramsId =>
+              match samplers.gadgetPublicMatrix paramsId matrixParams matrixParams.rows base false digits with
+              | some publicMatrix =>
+                  let publicMatrix := publicMatrix.withSamplerParams matrixParams
+                  [[.matrix publicMatrix, .trapdoor publicMatrix (.gadget paramsId base false digits)]]
+              | none => [[.invalid "gadget-trapdoor layout is invalid"]]
+          | none => [[.invalid "gadget-trapdoor layout is unavailable"]]
+      | _, _ => [[.invalid "gadget-trapdoor parameter evaluation failed"]]
   | .boolToInt =>
       match arguments node wires with
       | some [.boolean value] => [[.integer (if value then 1 else 0)]]
@@ -829,12 +869,12 @@ def evaluateNode
       | none => [[.invalid "Gaussian parameter evaluation failed"]]
   | .hashSample matrixType variant tagPrefix tagExpressions tagDecimalExpressions
       tagU64LeExpressions base digitCount =>
-      match arguments node wires, matrixType.evaluate params (.constant 0),
+      match (arguments node wires).bind hashArguments, matrixType.evaluate params (.constant 0),
           tagExpressions.mapM (IntExpr.evaluate params),
           tagDecimalExpressions.mapM (IntExpr.evaluate params),
           tagU64LeExpressions.mapM (IntExpr.evaluate params),
           evaluateOptionalIntExpr params base, evaluateOptionalIntExpr params digitCount with
-      | some [.bytes key], some matrixParams, some tagValues, some tagDecimalValues,
+      | some (key, trailingIntegerTagValues), some matrixParams, some tagValues, some tagDecimalValues,
           some tagU64LeValues, some base, some digitCount =>
           let query : Mxx.HashQuery := {
             params := matrixParams
@@ -844,37 +884,54 @@ def evaluateNode
             tagValues
             tagDecimalValues
             tagU64LeValues
+            trailingIntegerTagValues
             base
             digitCount
           }
           [[.matrix ((samplers.hashSample query).withSamplerParams matrixParams)]]
       | _, _, _, _, _, _, _ => [[.invalid "hash-sample parameter evaluation failed"]]
-  | .gadgetDecompose matrixType base digitCount =>
+  | .gadgetDecompose matrixType base small digitCount =>
       match arguments node wires, matrixType.evaluate params (.constant 0),
           base.evaluate params, digitCount.evaluate params with
       | some [.matrix value], some matrixParams, some base, some digitCount =>
-          (samplers.gadgetDecompose matrixParams base digitCount.toNat value).map (fun output =>
-            [.matrix (output.withSamplerParams matrixParams)])
+          if base <= 1 || digitCount <= 0 then
+            [[.invalid "gadget-decomposition layout is invalid"]]
+          else
+            match samplers.layoutId matrixParams with
+            | some paramsId =>
+                match samplers.gadgetDecompose paramsId matrixParams base small digitCount.toNat value with
+                | some output => [[.matrix (output.withSamplerParams matrixParams)]]
+                | none => [[.invalid "gadget-decomposition layout is invalid"]]
+            | none => [[.invalid "gadget-decomposition layout is unavailable"]]
       | _, _, _, _ => [[.invalid "gadget-decomposition argument mismatch"]]
   | .trapdoorSample matrixType cutoff =>
       match matrixType.evaluate params cutoff with
       | some matrixParams =>
           (samplers.trapdoorSample matrixParams).map fun publicMatrix =>
             let publicMatrix := publicMatrix.withSamplerParams matrixParams
-            [.matrix publicMatrix, .trapdoor publicMatrix]
+            [.matrix publicMatrix, .trapdoor publicMatrix .sampled]
       | none => [[.invalid "trapdoor parameter evaluation failed"]]
   | .trapdoorPublic =>
       match arguments node wires with
-      | some [.trapdoor publicMatrix] => [[.matrix publicMatrix]]
+      | some [.trapdoor publicMatrix _] => [[.matrix publicMatrix]]
       | _ => [[.invalid "TrapdoorPublic argument mismatch"]]
   | .preimageSample matrixType cutoff =>
       match arguments node wires, matrixType.evaluate params cutoff with
-      | some [.matrix publicMatrix, .trapdoor trapdoorPublic, .matrix target], some matrixParams =>
+      | some [.matrix publicMatrix, .trapdoor trapdoorPublic origin, .matrix target], some matrixParams =>
           if publicMatrix != trapdoorPublic then
             [[.invalid "preimage trapdoor/public-matrix mismatch"]]
           else
-            (samplers.samplePreimage matrixParams publicMatrix target).map (fun sample =>
-              [.matrix (sample.withSamplerParams matrixParams)])
+            match origin with
+            | .sampled =>
+                (samplers.samplePreimage matrixParams publicMatrix target).map (fun sample =>
+                  [.matrix (sample.withSamplerParams matrixParams)])
+            | .gadget paramsId base small digitCount =>
+                if base <= 1 || digitCount = 0 then
+                  [[.invalid "gadget preimage decomposition layout is invalid"]]
+                else
+                  match samplers.gadgetDecompose paramsId matrixParams base small digitCount target with
+                  | some output => [[.matrix (output.withSamplerParams matrixParams)]]
+                  | none => [[.invalid "gadget preimage decomposition layout is invalid"]]
       | _, _ => [[.invalid "preimage-sample argument mismatch"]]
   | .matrixAdd =>
       match arguments node wires with
@@ -1308,7 +1365,10 @@ def denote (samplers : MxxSamplerFamily) (program : Prog)
 def emptySamplerFamily : MxxSamplerFamily where
   gaussianSample := fun _ => []
   hashSample := fun _ => { coefficients := [] }
-  gadgetDecompose := fun _ _ _ _ => []
+  layoutId := fun _ => none
+  gadgetPublicMatrix := fun _ _ _ _ _ _ => none
+  gadgetDecompose := fun _ _ _ _ _ _ => none
+  smallDecompositionInputLimit := fun _ _ => none
   trapdoorSample := fun _ => []
   samplePreimage := fun _ _ _ => []
 
@@ -1390,7 +1450,8 @@ def Value.equal : Value → Value → Bool
   | .boolean left, .boolean right => decide (left = right)
   | .bytes left, .bytes right => decide (left = right)
   | .matrix left, .matrix right => decide (left = right)
-  | .trapdoor left, .trapdoor right => decide (left = right)
+  | .trapdoor left leftOrigin, .trapdoor right rightOrigin =>
+      decide (left = right ∧ leftOrigin = rightOrigin)
   | .opaque left, .opaque right => decide (left = right)
   | _, _ => false
 

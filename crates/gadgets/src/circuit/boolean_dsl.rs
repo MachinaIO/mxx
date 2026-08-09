@@ -144,6 +144,21 @@ pub trait BooleanLayerGate<T> {
     fn candidates(&self, slot: GateSlot, left: T, right: T) -> Result<[T; 6], DslError>;
 }
 
+/// Optional owner hooks for matrix-valued Boolean evaluation.
+///
+/// The generic gadget does not assign symbolic meaning.  An owning implementation may retain
+/// frozen derivation references on the initial family and each selected lane value; the Lean
+/// checker remains responsible for validating and applying those references.
+pub trait BooleanMatrixLayerGate: BooleanLayerGate<Mat> {
+    fn retain_initial_family(&self, family: Family<Mat>) -> Result<Family<Mat>, DslError> {
+        Ok(family)
+    }
+
+    fn retain_selected_value(&self, value: Mat) -> Result<Mat, DslError> {
+        Ok(value)
+    }
+}
+
 fn layer_metadata(
     context: &DslContext,
     params: &BooleanCircuitFamilyParams,
@@ -168,12 +183,13 @@ pub fn evaluate_boolean_matrix_family<H>(
     handler: H,
 ) -> Result<Family<Mat>, DslError>
 where
-    H: BooleanLayerGate<Mat> + Clone,
+    H: BooleanMatrixLayerGate + Clone,
 {
     let invariants = (
         circuit.active_gate_counts,
         (circuit.gate_kinds, (circuit.left_sources, circuit.right_sources)),
     );
+    let preceding = handler.retain_initial_family(preceding)?;
     Sequential::range(params.depth.clone()).scan(
         preceding,
         invariants,
@@ -193,7 +209,8 @@ where
                     let selected = kind.select(candidates.into_iter().collect())?;
                     let active =
                         index.as_int().less_equal(active_count.clone().sub(Int::constant(1)));
-                    active.to_int().select(vec![constant_false, selected])
+                    let selected = active.to_int().select(vec![constant_false, selected])?;
+                    layer_handler.retain_selected_value(selected)
                 },
             )
         },

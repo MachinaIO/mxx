@@ -103,8 +103,7 @@ pub enum NodeKind {
     GadgetDecompose {
         base: IntExpr,
         small: bool,
-        #[serde(default)]
-        digit_count: Option<IntExpr>,
+        digit_count: IntExpr,
     },
     ExtractCoefficient {
         position: IntExpr,

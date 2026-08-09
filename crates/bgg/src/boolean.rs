@@ -1,10 +1,13 @@
 //! BGG+ handlers for parameterized dynamic Boolean circuit families.
 
 use crate::{BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire};
-use mxx_dsl::{DslContext, DslError, Family, Int, LoopIndex, Mat, Parallel, Sequential};
+use mxx_dsl::{
+    DerivationAttachmentValue, DslContext, DslError, Family, GraphValue, Int, LoopIndex, Mat,
+    Parallel, Sequential,
+};
 use mxx_gadgets::circuit::{
-    BooleanCircuitFamilyInputs, BooleanCircuitFamilyParams, BooleanLayerGate, GateSlot,
-    evaluate_boolean_matrix_family,
+    BooleanCircuitFamilyInputs, BooleanCircuitFamilyParams, BooleanLayerGate,
+    BooleanMatrixLayerGate, GateSlot, evaluate_boolean_matrix_family,
 };
 use thiserror::Error;
 
@@ -41,6 +44,15 @@ impl BggPublicKeyFamily {
     }
 }
 
+fn attach_public_key_signal_group<T: GraphValue>(value: T) -> Result<T, DslError> {
+    let wire = value.flatten().into_iter().next().ok_or(DslError::Schema)?;
+    value.derivation_attachment(
+        "mxx-bgg",
+        "public-key-signal-grouping",
+        vec![("value".to_owned(), wire)],
+    )
+}
+
 impl BggEncodingFamily {
     pub fn pack(values: Vec<BggEncodingWire>) -> Result<Self, DynamicBooleanBggError> {
         if values.iter().any(|value| !value.pubkey.reveal_plaintext || value.plaintext.is_none()) {
@@ -63,6 +75,28 @@ impl BggEncodingFamily {
             return Err(DynamicBooleanBggError::FamilyLayout);
         }
         Ok(())
+    }
+
+    /// Retains the exact vector/public-key/plaintext pairing for checked operational analysis.
+    ///
+    /// Only frozen wire references are attached.  No equation, role, or numeric bound is supplied
+    /// by Rust; the checker first derives all three ordinary executable facts itself.
+    fn attach_operational_pairing(mut self) -> Result<Self, DslError> {
+        let vector = self.vectors.flatten().into_iter().next().ok_or(DslError::Schema)?;
+        let public_key =
+            self.public_keys.matrices.flatten().into_iter().next().ok_or(DslError::Schema)?;
+        let plaintext = self.plaintexts.flatten().into_iter().next().ok_or(DslError::Schema)?;
+        self.vectors = self.vectors.derivation_attachment(
+            "mxx-bgg",
+            "encoding-family-pairing",
+            vec![
+                ("vector".to_owned(), vector),
+                ("public-key".to_owned(), public_key),
+                ("plaintext".to_owned(), plaintext),
+            ],
+        )?;
+        self.public_keys.matrices = attach_public_key_signal_group(self.public_keys.matrices)?;
+        Ok(self)
     }
 
     fn gather(self, indices: Family<mxx_dsl::Int>) -> Result<Self, DynamicBooleanBggError> {
@@ -111,6 +145,7 @@ pub fn evaluate_boolean_encoding_layers(
     compiler: BggEncodingCompiler,
 ) -> Result<BggEncodingFamily, DynamicBooleanBggError> {
     preceding.validate()?;
+    let preceding = preceding.attach_operational_pairing()?;
     if !one.pubkey.reveal_plaintext || one.plaintext.is_none() {
         return Err(DynamicBooleanBggError::PlaintextRequired);
     }
@@ -189,7 +224,16 @@ pub fn evaluate_boolean_encoding_layers(
             let output_plaintexts = active
                 .clone()
                 .parallel_select_mats(vec![zero.plaintexts.clone(), selected_plaintexts.clone()])?;
-            Ok((output_vectors, output_public_keys, output_plaintexts))
+            let output = BggEncodingFamily {
+                vectors: output_vectors,
+                public_keys: BggPublicKeyFamily {
+                    matrices: output_public_keys,
+                    reveal_plaintext: true,
+                },
+                plaintexts: output_plaintexts,
+            }
+            .attach_operational_pairing()?;
+            Ok((output.vectors, output.public_keys.matrices, output.plaintexts))
         },
     )?;
     Ok(BggEncodingFamily {
@@ -229,6 +273,16 @@ impl BooleanLayerGate<Mat> for PublicKeyBooleanGate {
             product.matrix,
             xor.matrix,
         ])
+    }
+}
+
+impl BooleanMatrixLayerGate for PublicKeyBooleanGate {
+    fn retain_initial_family(&self, family: Family<Mat>) -> Result<Family<Mat>, DslError> {
+        attach_public_key_signal_group(family)
+    }
+
+    fn retain_selected_value(&self, value: Mat) -> Result<Mat, DslError> {
+        attach_public_key_signal_group(value)
     }
 }
 

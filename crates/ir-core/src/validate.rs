@@ -511,8 +511,11 @@ fn validate_node(
         NodeKind::GadgetTrapdoor { matrix_type, base } => {
             require_arity(scope, node, 0)?;
             let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
-            let gadget_base = base.evaluate(env)?.abs();
-            if gadget_base <= BigInt::one() || !matrix.columns.is_multiple_of(matrix.rows) {
+            let gadget_base = base.evaluate(env)?;
+            if gadget_base <= BigInt::one() ||
+                matrix.rows == 0 ||
+                !matrix.columns.is_multiple_of(matrix.rows)
+            {
                 return node_error(scope, node.id, "invalid gadget trapdoor dimensions or base");
             }
             let digit_count = matrix.columns / matrix.rows;
@@ -785,22 +788,22 @@ fn validate_node(
         NodeKind::GadgetDecompose { base, digit_count, .. } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
-            let base = base.evaluate(env)?.abs();
+            let base = base.evaluate(env)?;
             if base <= BigInt::one() {
                 return node_error(scope, node.id, "gadget base must be greater than one");
             }
-            let digits = decomposition_digits(
-                digit_count.as_ref(),
-                &input.modulus,
-                &base,
-                env,
+            let digits = positive_usize(
+                digit_count.evaluate(env)?,
+                "decomposition digit count",
                 scope,
                 node.id,
             )?;
-            vec![ConcreteWireType::Preimage(ConcreteMatrixType {
-                rows: input.rows.saturating_mul(digits),
-                ..input
-            })]
+            let rows = input.rows.checked_mul(digits).ok_or_else(|| ValidationError::Node {
+                scope: scope.clone(),
+                node: node.id,
+                message: "gadget decomposition row count overflow".to_owned(),
+            })?;
+            vec![ConcreteWireType::Preimage(ConcreteMatrixType { rows, ..input })]
         }
         NodeKind::ExtractCoefficient { position } | NodeKind::ConstantCoefficient { position } => {
             require_arity(scope, node, 1)?;
@@ -1435,26 +1438,6 @@ fn sliced_type(
         columns: columns.map_or(input.columns, |(start, end)| end - start),
         ..input.clone()
     })
-}
-
-fn decomposition_digits(
-    explicit: Option<&IntExpr>,
-    modulus: &BigInt,
-    base: &BigInt,
-    env: &ParamEnv,
-    scope: &FrozenGraphScopeId,
-    node: NodeId,
-) -> Result<usize, ValidationError> {
-    if let Some(explicit) = explicit {
-        return positive_usize(explicit.evaluate(env)?, "decomposition digit count", scope, node);
-    }
-    let mut power = BigInt::one();
-    let mut digits = 0usize;
-    while power < *modulus {
-        power *= base;
-        digits = digits.saturating_add(1);
-    }
-    Ok(digits.max(1))
 }
 
 fn check_bindings(graph: &Graph, env: &ParamEnv) -> Result<(), ValidationError> {

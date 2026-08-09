@@ -24,6 +24,12 @@ pub struct MeasurementNode<'a> {
     pub id: NodeId,
     pub kind: &'a NodeKind,
     pub arguments: &'a [WireRef],
+    /// Kinds of the direct producers of `arguments`, in the same order.
+    ///
+    /// Most cost measurements require only concrete argument types.  A few IR operations have
+    /// deliberately distinct runtime branches for values with the same wire type (notably a
+    /// sampled versus gadget trapdoor), so their measurement must retain this frozen provenance.
+    pub argument_kinds: &'a [&'a NodeKind],
     pub argument_types: &'a [ConcreteWireType],
     pub output_types: &'a [WireType],
     pub concrete_output_types: &'a [ConcreteWireType],
@@ -220,6 +226,12 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         .clone()
                 })
                 .collect::<Vec<_>>();
+            let argument_kinds = arguments
+                .iter()
+                .map(|wire| {
+                    scope.node(wire.node).expect("validated plan argument has a source node").kind()
+                })
+                .collect::<Vec<_>>();
             let concrete_output_types = (0..handle.output_types().len())
                 .map(|port| {
                     plan.wire_types
@@ -233,6 +245,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 id,
                 kind: handle.kind(),
                 arguments: &arguments,
+                argument_kinds: &argument_kinds,
                 argument_types: &argument_types,
                 output_types: handle.output_types(),
                 concrete_output_types: &concrete_output_types,

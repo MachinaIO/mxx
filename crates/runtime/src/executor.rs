@@ -12,7 +12,10 @@ use mxx_ir_core::{
     artifact::{ArtifactConfidentiality, ArtifactType, ManifestArtifact, ProductionId},
     expr::euclidean_div_rem,
     graph::{FrozenGraphScopeId, GraphScope},
-    node::{IntBinaryOp, IntCompareOp, LoopInputMode, MatrixBinaryOp, NodeKind, RealBinaryOp},
+    node::{
+        HashVariant, IntBinaryOp, IntCompareOp, LoopInputMode, MatrixBinaryOp, NodeKind,
+        RealBinaryOp,
+    },
     types::{
         ConcreteMatrixType, ConcreteWireType, InstantiationFrame, NodeId, Port, WireId, WireRef,
     },
@@ -1303,6 +1306,8 @@ where
                 tag_expressions,
                 tag_decimal_expressions,
                 tag_u64_le_expressions,
+                base,
+                digit_count,
                 ..
             } => {
                 let key = self.bytes(values, node.args[0])?;
@@ -1337,8 +1342,41 @@ where
                 }
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
+                let gadget_base = base
+                    .as_ref()
+                    .map(|base| {
+                        base.evaluate(env).map_err(|error| self.expression_error(node.id, error))
+                    })
+                    .transpose()?;
+                let digit_count = digit_count
+                    .as_ref()
+                    .map(|count| self.eval_usize(node.id, count, env))
+                    .transpose()?;
+                let gadget_layout = match (variant, gadget_base.as_ref(), digit_count) {
+                    (HashVariant::Plain, None, None) => None,
+                    (
+                        HashVariant::Decomposed | HashVariant::SmallDecomposed,
+                        Some(base),
+                        Some(count),
+                    ) => {
+                        if count == 0 || ty.rows % count != 0 {
+                            return Err(ExecutionError::Expression {
+                                node: node.id,
+                                message: "decomposed hash rows must be divisible by digit count"
+                                    .to_owned(),
+                            });
+                        }
+                        Some((base, count))
+                    }
+                    _ => {
+                        return Err(ExecutionError::Expression {
+                            node: node.id,
+                            message: "hash variant and gadget layout do not match".to_owned(),
+                        });
+                    }
+                };
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
-                    backend.sample_hash(&ty, key, &tag, *variant)
+                    backend.sample_hash(&ty, key, &tag, *variant, gadget_layout)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
@@ -1390,12 +1428,16 @@ where
                     return Err(ExecutionError::PreimagePublicMismatch(node.id));
                 }
                 let target = self.matrix(values, node.args[2])?;
+                let target_type = self.matrix_type(scope_id, path, node.args[2])?;
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
                 let max_coefficient_bound = max_coefficient_bound
                     .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
                 let value = if let Some(small) = gadget_small {
+                    self.backend
+                        .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
+                        .map_err(Self::backend_error)?;
                     self.backend.gadget_decompose(&target, small).map_err(Self::backend_error)?
                 } else {
                     let secret =
@@ -1422,23 +1464,23 @@ where
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 let base =
                     base.evaluate(env).map_err(|error| self.expression_error(node.id, error))?;
-                let digit_count = match digit_count {
-                    Some(count) => self.eval_usize(node.id, count, env)?,
-                    None if output_type.rows.is_multiple_of(input_type.rows) => {
-                        output_type.rows / input_type.rows
-                    }
-                    None => {
-                        return Err(ExecutionError::Expression {
-                            node: node.id,
-                            message:
-                                "gadget decomposition row count is not divisible by input rows"
-                                    .to_owned(),
-                        });
-                    }
-                };
+                let digit_count = self.eval_usize(node.id, digit_count, env)?;
                 self.backend
                     .validate_gadget_layout(&input_type, &base, digit_count, *small)
                     .map_err(Self::backend_error)?;
+                let expected_rows = input_type.rows.checked_mul(digit_count).ok_or_else(|| {
+                    ExecutionError::Expression {
+                        node: node.id,
+                        message: "gadget decomposition output row count overflow".to_owned(),
+                    }
+                })?;
+                if output_type.rows != expected_rows {
+                    return Err(ExecutionError::Expression {
+                        node: node.id,
+                        message: "gadget decomposition output type disagrees with digit count"
+                            .to_owned(),
+                    });
+                }
                 let output =
                     self.backend.gadget_decompose(&input, *small).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
@@ -1925,19 +1967,26 @@ where
             }
             let target = self.matrix(&mut values[instance], node.args[2])?;
             let wire = WireRef { node: node.id, port: Port(0) };
+            let NodeKind::PreimageSample { max_coefficient_bound, .. } = node.kind else {
+                unreachable!("preimage batch only handles preimage nodes")
+            };
+            // Evaluate this before dispatching on trapdoor provenance.  The gadget branch ignores
+            // the cutoff after validation, but must reject the same malformed expression as the
+            // scalar execution path.
+            let max_coefficient_bound = max_coefficient_bound
+                .evaluate(&envs[instance])
+                .map_err(|error| self.expression_error(node.id, error))?;
             if let Some(small) = gadget_small {
+                let target_type = self.matrix_type(scope_id, &paths[instance], node.args[2])?;
+                self.backend
+                    .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
+                    .map_err(Self::backend_error)?;
                 let value =
                     self.backend.gadget_decompose(&target, small).map_err(Self::backend_error)?;
                 self.put(&mut values[instance], node.id, 0, RuntimeValue::matrix(value));
                 continue;
             }
             let matrix_type = self.matrix_type(scope_id, &paths[instance], wire)?;
-            let NodeKind::PreimageSample { max_coefficient_bound, .. } = node.kind else {
-                unreachable!("preimage batch only handles preimage nodes")
-            };
-            let max_coefficient_bound = max_coefficient_bound
-                .evaluate(&envs[instance])
-                .map_err(|error| self.expression_error(node.id, error))?;
             pending.push(Pending {
                 instance,
                 placement: placements[instance],

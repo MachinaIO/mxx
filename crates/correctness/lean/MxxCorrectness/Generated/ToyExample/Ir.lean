@@ -7,13 +7,13 @@ def ToyExample_generatorVersion : String := "mxx-correctness-emitter-v6"
 
 def ToyExample_protocolSourcePaths : List String := ["crates/correctness/Cargo.toml", "crates/correctness/examples/emit_correctness.rs", "crates/correctness/src", "crates/dsl/Cargo.toml", "crates/dsl/src", "crates/ir-core/Cargo.toml", "crates/ir-core/src"]
 
-def ToyExample_protocolSourceHash : String := "9b335cde0d80c6a0dae133423b909757a07c574efddabef2f4676daee9e04426"
+def ToyExample_protocolSourceHash : String := "6c6985a31ef5899c55a2e53d101bca60ce3108d529c6f71ebb38bb24ef6c2db3"
 
-def ToyExample_workflowHash : String := "d2453a64aa0110344b606bc9b011095fe86245c1df189d83c48919ce2bb65f30"
+def ToyExample_workflowHash : String := "eec6cc84a07b935c537fee71c5f133e7e371b21f39e3757def3b287cbf269635"
 
-def ToyExample_toolkitHash : String := "3d7ce14f2018d0c84781b2c20d2110b0841acb7f8c318ade86850456bebf6f4f"
+def ToyExample_toolkitHash : String := "f13f00dfd1cd065e7723704e81f7608db91a4c6418064869d30a1b1c69728abd"
 
-def ToyExample_derivationHash : String := "476c73846858b782d71fde4c6e0acd4a0addf19dbe48858e47e7c2bd411b4947"
+def ToyExample_derivationHash : String := "1eb7ee1d85bf85dc59fea9e4e198e1cfa94df8fd0bf8168d408a754514520933"
 
 def ToyExample_stage_encrypt : Mxx.Ir.Prog :=
   { root :=
@@ -24,9 +24,10 @@ def ToyExample_stage_encrypt : Mxx.Ir.Prog :=
         { kind := .constantMatrix { modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) } [(.constant (128 : Int))], arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
         { kind := .select, arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }, { node := 3, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
         { kind := .gaussianSample { modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) } (.parameter "cutoff"), arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
-        { kind := .matrixAdd, arguments := [{ node := 4, port := 0 }, { node := 5, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] }
+        { kind := .matrixAdd, arguments := [{ node := 4, port := 0 }, { node := 5, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
+        { kind := .matrixSubtract, arguments := [{ node := 6, port := 0 }, { node := 4, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] }
       ]
-        outputs := [("ciphertext", { node := 6, port := 0 })]
+        outputs := [("ciphertext", { node := 6, port := 0 }), ("operational-residual", { node := 7, port := 0 })]
         inputNames := ["message"] }
     definitions := [
 
@@ -59,7 +60,7 @@ def ToyExample_ideal : Mxx.Ir.Prog :=
   }
 
 def ToyExample_protocol : Mxx.Certificate.ClosedProtocolDecl :=
-  { parameters := [{ name := "cutoff", kind := .dimension }], bundle := { workflow := { stages := [{ id := "encrypt", program := ToyExample_stage_encrypt, inputs := [("message", .protocol "message")] }, { id := "decrypt", program := ToyExample_stage_decrypt, inputs := [("ciphertext", .artifact "encrypt" "ciphertext")] }], entrypoint := "decrypt" }, ideal := ToyExample_ideal, requirements := [], comparator := .equality ([{ endpoint := .toyThresholdDecode, actualInput := "decoded", idealInput := "result", resultOutput := "failure", failureValue := true }]), endpoints := { entries := [{ specification := .toyThresholdDecode, stage := { name := "decrypt" }, semanticAnchor := { stage := { name := "decrypt" }, label := "decoded-endpoint" }, semantics := .thresholdDecode, workflowOutput := "decoded", idealOutput := "result" }] }, anchorBindings := [{ anchor := { stage := { name := "decrypt" }, label := "decoded-endpoint" }, wires := [{ stage := { name := "decrypt" }, scope := { path := [] }, node := { value := 1 }, port := 0 }] }], endpointSpecs := [.toyThresholdDecode], inputContract := { inputs := [({ name := "message" }, "message", .boolean)] }, inputBindings := [{ input := { name := "message" }, destinations := [.workflowStage { name := "encrypt" } "message", .ideal "message"] }], preconditionSpec := { requirementOutputs := [] } } }
+  { parameters := [{ name := "cutoff", kind := .dimension }], bundle := { workflow := { stages := [{ id := "encrypt", program := ToyExample_stage_encrypt, inputs := [("message", .protocol "message")] }, { id := "decrypt", program := ToyExample_stage_decrypt, inputs := [("ciphertext", .artifact "encrypt" "ciphertext")] }], entrypoint := "decrypt" }, ideal := ToyExample_ideal, requirements := [], comparator := .equality ([{ endpoint := .toyThresholdDecode, actualInput := "decoded", idealInput := "result", resultOutput := "failure", failureValue := true }]), endpoints := { entries := [{ specification := .toyThresholdDecode, stage := { name := "decrypt" }, semanticAnchor := { stage := { name := "decrypt" }, label := "decoded-endpoint" }, semantics := .thresholdDecode, workflowOutput := "decoded", idealOutput := "result" }] }, anchorBindings := [{ anchor := { stage := { name := "encrypt" }, label := "toy.decoder.residual" }, wires := [{ stage := { name := "encrypt" }, scope := { path := [] }, node := { value := 7 }, port := 0 }] }, { anchor := { stage := { name := "decrypt" }, label := "decoded-endpoint" }, wires := [{ stage := { name := "decrypt" }, scope := { path := [] }, node := { value := 1 }, port := 0 }] }], endpointSpecs := [.toyThresholdDecode], inputContract := { inputs := [({ name := "message" }, "message", .boolean)] }, inputBindings := [{ input := { name := "message" }, destinations := [.workflowStage { name := "encrypt" } "message", .ideal "message"] }], preconditionSpec := { requirementOutputs := [] } } }
 
 def ToyExample_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation :=
   { root :=
@@ -70,7 +71,11 @@ def ToyExample_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation :=
         { sourceNode := 3, rule := .constantMatrix, arguments := [] },
         { sourceNode := 4, rule := .select, arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }, { node := 3, port := 0 }] },
         { sourceNode := 5, rule := .gaussianSample, arguments := [] },
-        { sourceNode := 6, rule := .matrixAdd, arguments := [{ node := 4, port := 0 }, { node := 5, port := 0 }] }
+        { sourceNode := 6, rule := .matrixAdd, arguments := [{ node := 4, port := 0 }, { node := 5, port := 0 }] },
+        { sourceNode := 7, rule := .matrixSubtract, arguments := [{ node := 6, port := 0 }, { node := 4, port := 0 }] }
+      ]
+        attachments := [
+        { ownerNamespace := "mxx-correctness", ruleName := "protocol-boolean-signal-grouping", roles := [("value", { node := 4, port := 0 }), ("selector", { node := 0, port := 0 }), ("zero", { node := 2, port := 0 }), ("carrier", { node := 3, port := 0 })] }
       ] }
     definitions := [
 
@@ -82,6 +87,9 @@ def ToyExample_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation :=
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .thresholdDecodeBool, arguments := [{ node := 0, port := 0 }] }
+      ]
+        attachments := [
+
       ] }
     definitions := [
 
@@ -92,6 +100,9 @@ def ToyExample_ideal_derivation : Mxx.Certificate.ProgramDerivation :=
   { root :=
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }
     definitions := [
 

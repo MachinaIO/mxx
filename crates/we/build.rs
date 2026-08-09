@@ -32,10 +32,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MXX_REGENERATE_CORRECTNESS");
     let checker = workspace.join("lean/.lake/build/bin/mxx_diamond_checker");
     let derivation_checker = workspace.join("lean/.lake/build/bin/mxx_diamond_derivation_checker");
-    let analysis_facts = workspace.join("lean/.lake/build/bin/mxx_analysis_facts");
     println!("cargo:rustc-env=MXX_DIAMOND_CHECKER={}", checker.display());
     println!("cargo:rustc-env=MXX_DIAMOND_DERIVATION_CHECKER={}", derivation_checker.display());
-    println!("cargo:rustc-env=MXX_DIAMOND_ANALYSIS_FACTS_EXPORTER={}", analysis_facts.display());
 
     if env::var_os("MXX_REGENERATE_CORRECTNESS").is_some() {
         return;
@@ -61,7 +59,6 @@ fn main() {
             "MxxWe.Generated.DiamondWeFamily.Derivation",
             "mxx_diamond_checker",
             "mxx_diamond_derivation_checker",
-            "mxx_analysis_facts",
         ],
         "Diamond WE generated protocol and checker build",
     )
@@ -73,11 +70,6 @@ fn main() {
         derivation_checker.is_file(),
         "Diamond WE derivation checker was not produced at {}",
         derivation_checker.display()
-    );
-    assert!(
-        analysis_facts.is_file(),
-        "Diamond WE analysis-fact exporter was not produced at {}",
-        analysis_facts.display()
     );
     println!("cargo:warning=Diamond WE correctness workflow hash: {}", freshness.workflow_hash);
     println!("cargo:warning=Diamond WE correctness derivation hash: {}", freshness.derivation_hash);

@@ -1,4 +1,5 @@
 import Mxx.Certificate.Facts
+import Mxx.Certificate.ProtocolSyntax
 
 namespace Mxx.Certificate
 
@@ -70,12 +71,6 @@ theorem introduceGaussian_enabled :
 example : requireInitialRule .multiplyAffineRight = .ok () := by
   decide
 
-/-- A construction-time DSL label resolved to frozen wires before certificate emission. -/
-structure SemanticAnchorRef where
-  stage : StageId
-  label : String
-  deriving BEq, DecidableEq, Repr
-
 inductive RuleInputRef where
   | value (reference : ValueInstanceRef)
   | matrixFact (reference : ValueInstanceRef)
@@ -94,11 +89,6 @@ structure RuleUse where
 /-- Sparse user guidance. It may choose only a closed rule and existing typed inputs. -/
 structure SparseCertificate where
   overrides : List RuleUse
-
-inductive EndpointSpecId where
-  | toyThresholdDecode
-  | diamondBooleanInterval
-  deriving BEq, DecidableEq, Repr
 
 inductive ValueType where
   | matrix (type : MatrixTypeExpr)

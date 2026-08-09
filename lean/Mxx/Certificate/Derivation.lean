@@ -41,7 +41,7 @@ inductive DerivationRule where
   | matrixAdd
   | matrixSubtract
   | matrixMultiplyBound
-  | matrixMultiplyPreimage (preimage : Mxx.Ir.WireRef)
+  | matrixMultiplyRelation (rightOperand : Mxx.Ir.WireRef)
   | matrixNegate
   | matrixScale
   | transpose
@@ -70,8 +70,17 @@ structure NodeDerivation where
   arguments : List Mxx.Ir.WireRef
   deriving BEq, DecidableEq
 
+/-- An untrusted owner-rule application site.  It names only frozen local wires; the operational
+checker must reject unknown rules and derive every equation and bound from the referenced facts. -/
+structure DerivationAttachment where
+  ownerNamespace : String
+  ruleName : String
+  roles : List (String × Mxx.Ir.WireRef)
+  deriving BEq, DecidableEq
+
 structure ScopeDerivation where
   steps : List NodeDerivation
+  attachments : List DerivationAttachment := []
   deriving BEq, DecidableEq
 
 structure ProgramDerivation where
@@ -86,7 +95,7 @@ inductive DerivationError where
   | operandMismatch (node : Nat)
   | forwardOperand (node : Nat) (operand : Mxx.Ir.WireRef)
   | ruleMismatch (node : Nat) (rule : DerivationRule)
-  | invalidPreimageRelation (node : Nat) (preimage : Mxx.Ir.WireRef)
+  | invalidRelationOperand (node : Nat) (actual : Mxx.Ir.WireRef)
   | definitionMismatch (expected actual : String)
   | missingDefinition (expected : String)
   | unexpectedDefinition (actual : String)
@@ -122,14 +131,14 @@ private def matchesNodeKind : DerivationRule → Mxx.Ir.NodeKind → Bool
   | .uniformIntervalSample, .uniformIntervalSample _ _ _ => true
   | .gaussianSample, .gaussianSample _ _ => true
   | .hashSample, .hashSample _ _ _ _ _ _ _ _ => true
-  | .gadgetDecompose, .gadgetDecompose _ _ _ => true
+  | .gadgetDecompose, .gadgetDecompose _ _ _ _ => true
   | .trapdoorSample, .trapdoorSample _ _ => true
   | .trapdoorPublic, .trapdoorPublic => true
   | .preimageSample, .preimageSample _ _ => true
   | .matrixAdd, .matrixAdd => true
   | .matrixSubtract, .matrixSubtract => true
   | .matrixMultiplyBound, .matrixMultiply => true
-  | .matrixMultiplyPreimage _, .matrixMultiply => true
+  | .matrixMultiplyRelation _, .matrixMultiply => true
   | .matrixNegate, .matrixNegate => true
   | .matrixScale, .matrixScale _ => true
   | .transpose, .transpose => true
@@ -149,20 +158,7 @@ private def matchesNodeKind : DerivationRule → Mxx.Ir.NodeKind → Bool
   | .sequentialLoop, .sequentialLoop _ _ _ _ _ => true
   | _, _ => false
 
-private def validPreimageRelation
-    (previous : Array Mxx.Ir.Node)
-    (node : Mxx.Ir.Node)
-    (preimage : Mxx.Ir.WireRef) : Bool :=
-  match previous[preimage.node]? with
-  | some source =>
-      let sourceIsPreimage := match source.kind with
-        | .preimageSample _ _ => true
-        | _ => false
-      preimage.port < source.outputCount && sourceIsPreimage && node.arguments.contains preimage
-  | none => false
-
 private def checkNodeDerivation
-    (previous : Array Mxx.Ir.Node)
     (nodeIndex : Nat)
     (node : Mxx.Ir.Node)
     (step : NodeDerivation) : Except DerivationError Unit := do
@@ -176,23 +172,22 @@ private def checkNodeDerivation
   if !matchesNodeKind step.rule node.kind then
     throw (.ruleMismatch nodeIndex step.rule)
   match step.rule with
-  | .matrixMultiplyPreimage preimage =>
-      if !validPreimageRelation previous node preimage then
-        throw (.invalidPreimageRelation nodeIndex preimage)
+  | .matrixMultiplyRelation rightOperand =>
+      if node.arguments[1]? != some rightOperand then
+        throw (.invalidRelationOperand nodeIndex rightOperand)
   | _ => pure ()
 
 private def checkScopeSteps
     (nodes : List Mxx.Ir.Node)
     (steps : List NodeDerivation)
-    (nodeIndex : Nat := 0)
-    (previous : Array Mxx.Ir.Node := #[]) : Except DerivationError Unit :=
+    (nodeIndex : Nat := 0) : Except DerivationError Unit :=
   match nodes, steps with
   | [], [] => .ok ()
   | [], extra :: _ => .error (.unexpectedInstruction extra.sourceNode)
   | _ :: _, [] => .error (.missingNode nodeIndex)
   | node :: remainingNodes, step :: remainingSteps => do
-      checkNodeDerivation previous nodeIndex node step
-      checkScopeSteps remainingNodes remainingSteps (nodeIndex + 1) (previous.push node)
+      checkNodeDerivation nodeIndex node step
+      checkScopeSteps remainingNodes remainingSteps (nodeIndex + 1)
 
 def checkScopeDerivation
     (scope : Mxx.Ir.Scope)
@@ -306,13 +301,13 @@ private def preimageFixtureDerivation : ScopeDerivation := {
   steps := [
     { sourceNode := 0, rule := .input, arguments := [] },
     { sourceNode := 1, rule := .preimageSample, arguments := [{ node := 0, port := 0 }] },
-    { sourceNode := 2, rule := .matrixMultiplyPreimage { node := 0, port := 0 },
+    { sourceNode := 2, rule := .matrixMultiplyRelation { node := 0, port := 0 },
       arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
   ]
 }
 
 example : checkScopeDerivation preimageFixtureScope preimageFixtureDerivation =
-    .error (.invalidPreimageRelation 2 { node := 0, port := 0 }) := by
+    .error (.invalidRelationOperand 2 { node := 0, port := 0 }) := by
   rfl
 
 end Mxx.Certificate

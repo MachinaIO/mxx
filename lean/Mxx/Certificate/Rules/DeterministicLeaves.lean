@@ -115,6 +115,7 @@ theorem plainHashNode_local_sound
       tagValues
       tagDecimalValues
       tagU64LeValues
+      trailingIntegerTagValues := []
       base := none
       digitCount := none
     }).withSamplerParams matrixParams
@@ -123,7 +124,7 @@ theorem plainHashNode_local_sound
   dsimp
   constructor
   · exact Mxx.Ir.mem_evaluateNode_hashSample_of_arguments runChild samplers params inputs wires
-      keyRef key matrixType .plain tagPrefix tagExpressions tagDecimalExpressions
+      keyRef [] key [] matrixType .plain tagPrefix tagExpressions tagDecimalExpressions
       tagU64LeExpressions none none matrixParams tagValues tagDecimalValues tagU64LeValues
       none none outputCount argumentsEvaluate typeEvaluates tagsEvaluate decimalTagsEvaluate
       u64TagsEvaluate rfl rfl member

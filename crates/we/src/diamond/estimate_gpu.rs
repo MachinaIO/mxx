@@ -8,7 +8,7 @@ use mxx_bench_estimator::{
 };
 use mxx_ir_core::{
     ParamEnv,
-    node::{ConstantMatrix, MatrixBinaryOp, NodeKind},
+    node::{ConstantMatrix, HashVariant, MatrixBinaryOp, NodeKind},
     types::{ConcreteMatrixType, ConcreteWireType},
 };
 use mxx_primitives::{
@@ -24,7 +24,7 @@ use mxx_runtime::{
     },
 };
 use num_bigint::BigInt;
-use num_traits::{One, Signed};
+use num_traits::One;
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use thiserror::Error;
 use tracing::{debug, info};
@@ -164,7 +164,10 @@ impl DiamondGpuMeasurementBackend {
     }
 
     fn cache_key(node: &MeasurementNode<'_>, bindings: &ParamEnv) -> String {
-        format!("{:?}:{:?}:{:?}:{:?}", node.scope, node.kind, node.argument_types, bindings)
+        format!(
+            "{:?}:{:?}:{:?}:{:?}:{:?}",
+            node.scope, node.kind, node.argument_kinds, node.argument_types, bindings
+        )
     }
 
     fn measure_placements<F>(
@@ -492,12 +495,49 @@ impl DiamondGpuMeasurementBackend {
                         .map_err(Self::backend_error)
                 })
             }
-            NodeKind::HashSample { variant, tag_prefix, .. } => {
+            NodeKind::HashSample { variant, tag_prefix, base, digit_count, .. } => {
                 let output = Self::matrix_output(node)?.clone();
                 let tag = tag_prefix.clone();
+                let gadget_base = base
+                    .as_ref()
+                    .map(|value| {
+                        value.evaluate(bindings).map_err(|error| {
+                            DiamondGpuMeasurementError::Expression(error.to_string())
+                        })
+                    })
+                    .transpose()?;
+                let digit_count = digit_count
+                    .as_ref()
+                    .map(|value| {
+                        value
+                            .evaluate(bindings)
+                            .map_err(|error| {
+                                DiamondGpuMeasurementError::Expression(error.to_string())
+                            })?
+                            .try_into()
+                            .map_err(|_| {
+                                DiamondGpuMeasurementError::Expression(
+                                    "hash digit count is not usize".to_owned(),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                let gadget_layout = match (variant, gadget_base.as_ref(), digit_count) {
+                    (HashVariant::Plain, None, None) => None,
+                    (
+                        HashVariant::Decomposed | HashVariant::SmallDecomposed,
+                        Some(base),
+                        Some(count),
+                    ) if count > 0 && output.rows % count == 0 => Some((base, count)),
+                    _ => {
+                        return Err(DiamondGpuMeasurementError::Expression(
+                            "hash variant and gadget layout do not match".to_owned(),
+                        ));
+                    }
+                };
                 self.measure_placements(node, bindings, |this| {
                     this.backend
-                        .sample_hash(&output, [0x5a; 32], &tag, *variant)
+                        .sample_hash(&output, [0x5a; 32], &tag, *variant, gadget_layout)
                         .map(ReadyOutput::Matrix)
                         .map_err(Self::backend_error)
                 })
@@ -509,8 +549,7 @@ impl DiamondGpuMeasurementBackend {
                     .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
                 let base = gadget_base
                     .evaluate(bindings)
-                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?
-                    .abs();
+                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
                 let digits = digit_count
                     .evaluate(bindings)
                     .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?
@@ -538,7 +577,26 @@ impl DiamondGpuMeasurementBackend {
                 let bound = max_coefficient_bound
                     .evaluate(bindings)
                     .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
+                let gadget_trapdoor =
+                    matches!(node.argument_kinds.get(1), Some(NodeKind::GadgetTrapdoor { .. }));
                 self.measure_placements(node, bindings, |this| {
+                    if gadget_trapdoor {
+                        let target_type = Self::matrix_argument(node, 2)?.clone();
+                        let target = this.matrix(&target_type)?;
+                        let ConcreteWireType::Trapdoor { gadget_base, digit_count, .. } =
+                            &trapdoor_type
+                        else {
+                            return Err(DiamondGpuMeasurementError::TrapdoorArgument);
+                        };
+                        this.backend
+                            .validate_gadget_layout(&target_type, gadget_base, *digit_count, false)
+                            .map_err(Self::backend_error)?;
+                        return this
+                            .backend
+                            .gadget_decompose(&target, false)
+                            .map(ReadyOutput::Matrix)
+                            .map_err(Self::backend_error);
+                    }
                     let (public, secret) = this.trapdoor(&trapdoor_type, bindings)?;
                     let target_ty = ConcreteMatrixType {
                         modulus: output.modulus.clone(),
@@ -570,10 +628,25 @@ impl DiamondGpuMeasurementBackend {
                         .map_err(Self::backend_error)
                 })
             }
-            NodeKind::GadgetDecompose { small, .. } => {
-                let input = Self::matrix_argument(node, 0)?.clone();
+            NodeKind::GadgetDecompose { base, small, digit_count } => {
+                let input_type = Self::matrix_argument(node, 0)?.clone();
+                let base = base
+                    .evaluate(bindings)
+                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
+                let digit_count = digit_count
+                    .evaluate(bindings)
+                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?
+                    .try_into()
+                    .map_err(|_| {
+                        DiamondGpuMeasurementError::Expression(
+                            "gadget decomposition digit count is not usize".to_owned(),
+                        )
+                    })?;
                 self.measure_placements(node, bindings, |this| {
-                    let input = this.matrix(&input)?;
+                    let input = this.matrix(&input_type)?;
+                    this.backend
+                        .validate_gadget_layout(&input_type, &base, digit_count, *small)
+                        .map_err(Self::backend_error)?;
                     this.backend
                         .gadget_decompose(&input, *small)
                         .map(ReadyOutput::Matrix)

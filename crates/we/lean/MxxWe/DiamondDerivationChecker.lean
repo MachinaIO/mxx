@@ -10,7 +10,7 @@ private def describeError : Mxx.Certificate.DerivationError → String
   | .operandMismatch _ => "operand mismatch"
   | .forwardOperand _ _ => "forward operand"
   | .ruleMismatch _ _ => "rule mismatch"
-  | .invalidPreimageRelation _ _ => "invalid preimage relation"
+  | .invalidRelationOperand _ _ => "invalid relation operand"
   | .definitionMismatch _ _ => "definition mismatch"
   | .missingDefinition _ => "missing definition"
   | .unexpectedDefinition _ => "unexpected definition"

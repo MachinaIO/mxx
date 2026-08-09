@@ -3,7 +3,7 @@ import Mxx.Certificate.Derivation
 
 namespace MxxCorrectness.Generated.ToyExample
 
-def ToyExample_derivationHash : String := "476c73846858b782d71fde4c6e0acd4a0addf19dbe48858e47e7c2bd411b4947"
+def ToyExample_derivationHash : String := "1eb7ee1d85bf85dc59fea9e4e198e1cfa94df8fd0bf8168d408a754514520933"
 
 def ToyExample_stage_encrypt : Mxx.Ir.Prog :=
   { root :=
@@ -14,9 +14,10 @@ def ToyExample_stage_encrypt : Mxx.Ir.Prog :=
         { kind := .constantMatrix { modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) } [(.constant (128 : Int))], arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
         { kind := .select, arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }, { node := 3, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
         { kind := .gaussianSample { modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) } (.parameter "cutoff"), arguments := [], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
-        { kind := .matrixAdd, arguments := [{ node := 4, port := 0 }, { node := 5, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] }
+        { kind := .matrixAdd, arguments := [{ node := 4, port := 0 }, { node := 5, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] },
+        { kind := .matrixSubtract, arguments := [{ node := 6, port := 0 }, { node := 4, port := 0 }], outputCount := 1, outputTypes := [.matrix ({ modulus := .constant (256 : Int), ringDimension := .constant (1 : Int), rows := .constant (1 : Int), columns := .constant (1 : Int) })] }
       ]
-        outputs := [("ciphertext", { node := 6, port := 0 })]
+        outputs := [("ciphertext", { node := 6, port := 0 }), ("operational-residual", { node := 7, port := 0 })]
         inputNames := ["message"] }
     definitions := [
 
@@ -57,7 +58,11 @@ def ToyExample_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation :=
         { sourceNode := 3, rule := .constantMatrix, arguments := [] },
         { sourceNode := 4, rule := .select, arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }, { node := 3, port := 0 }] },
         { sourceNode := 5, rule := .gaussianSample, arguments := [] },
-        { sourceNode := 6, rule := .matrixAdd, arguments := [{ node := 4, port := 0 }, { node := 5, port := 0 }] }
+        { sourceNode := 6, rule := .matrixAdd, arguments := [{ node := 4, port := 0 }, { node := 5, port := 0 }] },
+        { sourceNode := 7, rule := .matrixSubtract, arguments := [{ node := 6, port := 0 }, { node := 4, port := 0 }] }
+      ]
+        attachments := [
+        { ownerNamespace := "mxx-correctness", ruleName := "protocol-boolean-signal-grouping", roles := [("value", { node := 4, port := 0 }), ("selector", { node := 0, port := 0 }), ("zero", { node := 2, port := 0 }), ("carrier", { node := 3, port := 0 })] }
       ] }
     definitions := [
 
@@ -69,6 +74,9 @@ def ToyExample_stage_decrypt_derivation : Mxx.Certificate.ProgramDerivation :=
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] },
         { sourceNode := 1, rule := .thresholdDecodeBool, arguments := [{ node := 0, port := 0 }] }
+      ]
+        attachments := [
+
       ] }
     definitions := [
 
@@ -79,6 +87,9 @@ def ToyExample_ideal_derivation : Mxx.Certificate.ProgramDerivation :=
   { root :=
       { steps := [
         { sourceNode := 0, rule := .input, arguments := [] }
+      ]
+        attachments := [
+
       ] }
     definitions := [
 

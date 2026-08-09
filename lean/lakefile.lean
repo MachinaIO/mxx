@@ -31,6 +31,5 @@ lean_exe mxx_diamond_derivation_checker where
   root := `MxxWe.DiamondDerivationChecker
   srcDir := "../crates/we/lean"
 
-lean_exe mxx_analysis_facts where
-  root := `MxxWe.AnalysisFacts
-  srcDir := "../crates/we/lean"
+/- The former `MxxWe.AnalysisFacts` executable rebuilds the superseded whole-graph analyzer.
+It is retained as source for the later proof migration but is not part of the operational checker. -/

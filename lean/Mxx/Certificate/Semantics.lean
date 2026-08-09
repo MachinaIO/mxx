@@ -345,11 +345,11 @@ def MatrixPrimaryForm.Holds
 def MatrixRelation.Holds
     (environment : FactEnvironment) : MatrixRelation → Prop
   | .preimage subject source target trapdoor =>
-      ∃ subjectValue sourceValue targetValue sourceParams targetParams,
+      ∃ subjectValue sourceValue targetValue sourceParams targetParams origin,
         environment.values subject = some (.matrix subjectValue) ∧
         environment.values source.value = some (.matrix sourceValue) ∧
         environment.values target.value = some (.matrix targetValue) ∧
-        environment.values trapdoor = some (.trapdoor sourceValue) ∧
+        environment.values trapdoor = some (.trapdoor sourceValue origin) ∧
         source.type.evaluate environment.parameters (.constant 0) = some sourceParams ∧
         target.type.evaluate environment.parameters (.constant 0) = some targetParams ∧
         Mxx.Toolkit.MatrixLayout sourceValue sourceParams.modulus sourceParams.ringDimension

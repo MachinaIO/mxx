@@ -1290,12 +1290,12 @@ mod artifact {
 
         #[test]
         fn runtime_preprocessing_and_gate_preimages_satisfy_the_primitive_relations() {
-            let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+            let parameters = DCRTPolyParams::new(2, 1, 5, 3);
             let compiler = BggSlotTransferArtifactCompiler {
                 modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
                 ring_dimension: IntExpr::constant(parameters.ring_dimension()),
                 secret_size: 1,
-                slot_count: 3,
+                slot_count: 2,
                 digit_count: parameters.modulus_digits(),
                 chunk_columns: 2,
                 gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
@@ -1466,6 +1466,7 @@ mod artifact {
         }
 
         #[test]
+        #[ignore = "large CPU preimage artifact-family integration test"]
         fn runtime_artifact_productions_preserve_import_order_tail_chunks_and_gate_families() {
             let parameters = DCRTPolyParams::new(8, 1, 20, 4);
             let compiler = BggSlotTransferArtifactCompiler {

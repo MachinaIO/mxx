@@ -90,7 +90,18 @@ pub trait PolyMatrix:
         self.clone() * rhs
     }
     fn multiply_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
-        inputs.into_par_iter().map(|(left, right)| left.multiply_out_of_place(&right)).collect()
+        inputs
+            .into_par_iter()
+            .map(|(left, right)| {
+                if left.size() == (1, 1) {
+                    right.multiply_poly_out_of_place(&left.entry(0, 0))
+                } else if right.size() == (1, 1) {
+                    left.multiply_poly_out_of_place(&right.entry(0, 0))
+                } else {
+                    left.multiply_out_of_place(&right)
+                }
+            })
+            .collect()
     }
 
     fn negate_out_of_place(&self) -> Self {

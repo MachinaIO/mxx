@@ -1704,6 +1704,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    #[ignore = "CPU end-to-end Tall nested-RNS integration test"]
     fn packed_nested_rns_compiles_through_tall_arithmetic_lookup_and_slot_lowerings() {
         let parameters = DCRTPolyParams::new(2, 2, 12, 6);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();

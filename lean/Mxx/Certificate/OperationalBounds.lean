@@ -1300,6 +1300,16 @@ private def OperationalExprArena.pushConcrete
     (fact : OperationalMatrixFact) : OperationalExprArena × OperationalExprId :=
   arena.push { matrixType := fact.matrixType, node := .concrete fact }
 
+private def OperationalExprArena.pushMatrixFact
+    (arena : OperationalExprArena) : OperationalFact →
+    Except OperationalError (OperationalExprArena × OperationalExprId)
+  | .matrix fact => pure (arena.pushConcrete fact)
+  | .matrixExpr root =>
+      match arena.get? root with
+      | some _ => pure (arena, root)
+      | none => throw (.invalidOperationalExprRef root)
+  | _ => throw (.unsupportedOperationalExpr arena.nodes.size)
+
 private def OperationalExprArena.checkedType
     (arena : OperationalExprArena)
     (first : OperationalExprId)
@@ -1334,6 +1344,19 @@ private def OperationalExprArena.pushSelect
       -- then, accepting a caller-provided representative could turn one branch into a false proof
       -- about the whole logical family.
       throw (.unsupportedOperationalExpr representative)
+
+private def OperationalExprArena.pushExactSelection
+    (arena : OperationalExprArena)
+    (selection : DynamicSelectionIdentity)
+    (branches : Array OperationalFact) :
+    Except OperationalError (OperationalExprArena × OperationalExprId) := do
+  let mut arena := arena
+  let mut ids : Array OperationalExprId := #[]
+  for branch in branches do
+    let (nextArena, id) ← arena.pushMatrixFact branch
+    arena := nextArena
+    ids := ids.push id
+  arena.pushSelect selection (.exact ids)
 
 private def OperationalSelectionBranches.staticBranch
     (branches : OperationalSelectionBranches)
@@ -2589,6 +2612,112 @@ private def polynomialMatrixFact
     metadata
     canonicalRange
   })
+
+private def multiplyConcreteMatrixFacts
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (rule : DerivationRule)
+    (rightWire : WireRef)
+    (environment : ParamEnvironment)
+    (left right : OperationalMatrixFact) : Except OperationalError OperationalMatrixFact := do
+  let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial
+    |>.mapError (flatErrorAt nodeIndex)
+  let rewritten ← rewriteOperationalRelations nodeIndex raw
+  let polynomial ← match rule with
+    | .matrixMultiplyRelation declaredRight => do
+        if declaredRight != rightWire then throw (.missingRelation nodeIndex declaredRight)
+        if rewritten == raw then throw (.missingRelation nodeIndex rightWire)
+        pure rewritten
+    | _ => pure rewritten
+  match ← polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial with
+  | .matrix output => pure output
+  | _ => throw (.operandNotMatrix nodeIndex rightWire)
+
+private def multiplyOperationalExprIds
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (rule : DerivationRule)
+    (rightWire : WireRef)
+    (environment : ParamEnvironment) :
+    OperationalExprArena → OperationalExprId → OperationalExprId → Nat →
+    Except OperationalError (OperationalExprArena × OperationalExprId)
+  | _, left, _, 0 => throw (.unsupportedOperationalExpr left)
+  | arena, left, right, fuel + 1 => do
+      let leftExpr ← match arena.get? left with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef left)
+      let rightExpr ← match arena.get? right with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef right)
+      match leftExpr.node, rightExpr.node with
+      | .concrete leftFact, .concrete rightFact =>
+          let output ← multiplyConcreteMatrixFacts nodeIndex outputPort matrixType rule rightWire
+            environment leftFact rightFact
+          pure (arena.pushConcrete output)
+      | .select leftSelection (.exact leftBranches),
+          .select rightSelection (.exact rightBranches) =>
+          if leftSelection == rightSelection then
+            if leftBranches.size != rightBranches.size then
+              throw (.operationalExprTypeMismatch left right)
+            let mut arena := arena
+            let mut outputs : Array OperationalExprId := #[]
+            for branch in [:leftBranches.size] do
+              let leftBranch := leftBranches[branch]!
+              let rightBranch := rightBranches[branch]!
+              let (nextArena, output) ← multiplyOperationalExprIds nodeIndex outputPort matrixType
+                rule rightWire environment arena leftBranch rightBranch fuel
+              arena := nextArena
+              outputs := outputs.push output
+            arena.pushSelect leftSelection (.exact outputs)
+          else
+            let mut arena := arena
+            let mut outputs : Array OperationalExprId := #[]
+            for branch in leftBranches do
+              let (nextArena, output) ← multiplyOperationalExprIds nodeIndex outputPort matrixType
+                rule rightWire environment arena branch right fuel
+              arena := nextArena
+              outputs := outputs.push output
+            arena.pushSelect leftSelection (.exact outputs)
+      | .select selection (.exact branches), _ =>
+          let mut arena := arena
+          let mut outputs : Array OperationalExprId := #[]
+          for branch in branches do
+            let (nextArena, output) ← multiplyOperationalExprIds nodeIndex outputPort matrixType
+              rule rightWire environment arena branch right fuel
+            arena := nextArena
+            outputs := outputs.push output
+          arena.pushSelect selection (.exact outputs)
+      | _, .select selection (.exact branches) =>
+          let mut arena := arena
+          let mut outputs : Array OperationalExprId := #[]
+          for branch in branches do
+            let (nextArena, output) ← multiplyOperationalExprIds nodeIndex outputPort matrixType
+              rule rightWire environment arena left branch fuel
+            arena := nextArena
+            outputs := outputs.push output
+          arena.pushSelect selection (.exact outputs)
+      | .select _ (.schemaEnvelope _ representative _), _
+      | _, .select _ (.schemaEnvelope _ representative _) =>
+          throw (.unsupportedOperationalExpr representative)
+      | _, _ =>
+          if leftExpr.matrixType.columns != rightExpr.matrixType.rows then
+            throw (.operationalExprTypeMismatch left right)
+          pure (arena.push { matrixType, node := .multiply left right })
+
+private def multiplyOperationalExprFacts
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (rule : DerivationRule)
+    (rightWire : WireRef)
+    (environment : ParamEnvironment)
+    (arena : OperationalExprArena)
+    (left right : OperationalFact) :
+    Except OperationalError (OperationalExprArena × OperationalFact) := do
+  let (arena, leftId) ← arena.pushMatrixFact left
+  let (arena, rightId) ← arena.pushMatrixFact right
+  let (arena, result) ← multiplyOperationalExprIds nodeIndex outputPort matrixType rule rightWire
+    environment arena leftId rightId (arena.nodes.size + 1)
+  pure (arena, .matrixExpr result)
 
 private def exactOneIndicatorFactor
     (scope : ScopeTemplateKey)
@@ -5228,24 +5357,22 @@ def evaluatePreparedScope
                       if count == 0 || selectionFact.upper < 0 ||
                           selectionFact.lower >= Int.ofNat count then
                         throw (.invalidCount index selectionFact.upper)
-                      else if summary.isNone && elements.size == count then
-                        let branches := elements.toList
-                        if branches.any factHasRelation then
-                          let binder : FamilyTemplateBinder := {
-                            owner := dynamicSelectionScope selection
-                            producerNode := index
-                            binderSlot := 0
-                          }
-                          let selectedBranches ← elements.mapM fun branch => do
-                            match ← selectDynamicUniformFact binder selection
-                                { node := index, port := 0 } branch with
-                            | .matrix selected => pure selected
-                            | _ => throw (.loopInputModeMismatch index 0)
-                          pure [.selectedMatrices
-                            (selectedMatrixFamily selection selectedBranches)]
-                        else
-                          pure [← joinDynamicFacts index { node := index, port := 0 }
-                            branches (some selection)]
+                      else if elements.size == count then
+                        let binder : FamilyTemplateBinder := {
+                          owner := dynamicSelectionScope selection
+                          producerNode := index
+                          binderSlot := 0
+                        }
+                        let selectedBranches ← elements.mapM fun branch => do
+                          match ← selectDynamicUniformFact binder selection
+                              { node := index, port := 0 } branch with
+                          | .matrix selected => pure selected
+                          | _ => throw (.loopInputModeMismatch index 0)
+                        let (arena, root) ← facts.arena.pushExactSelection
+                          { index := selection }
+                          (selectedBranches.map OperationalFact.matrix)
+                        facts := { facts with arena }
+                        pure [.matrixExpr root]
                       else match elements[0]? with
                       | some element => match element with
                           | .selectedMatrices alternatives =>
@@ -5391,6 +5518,27 @@ def evaluatePreparedScope
                         pair.2 environment pair.1)
                   outputs.zipIdx.mapM fun (output, port) =>
                     rebindSubject { node := index, port } output
+              | .matrixMultiply =>
+                  let leftWire ← match node.arguments[0]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index { node := 0, port := 0 })
+                  let rightWire ← match node.arguments[1]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index leftWire)
+                  let left ← lookupFact index facts leftWire
+                  let right ← lookupFact index facts rightWire
+                  match left, right with
+                  | .matrixExpr _, _ | _, .matrixExpr _ =>
+                      let matrixType ← match node.outputTypes with
+                        | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
+                        | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
+                      let (arena, output) ← multiplyOperationalExprFacts index 0 matrixType
+                        step.rule rightWire environment facts.arena left right
+                      facts := { facts with arena }
+                      pure [output]
+                  | _, _ =>
+                      deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
+                        layouts facts 0 node.outputTypes
               | _ =>
                   deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
                     layouts facts 0 node.outputTypes
@@ -6857,7 +7005,8 @@ example : (do
 
 private def packedFamilyFixtureScope : Scope := {
   nodes := relationFixtureScope.nodes ++ #[
-    { kind := .zeroMatrix fixtureType, arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.preimage fixtureType] },
     { kind := .familyPack,
       arguments := [{ node := 2, port := 0 }, { node := 4, port := 0 }],
       outputTypes := [.indexedFamily (.preimage fixtureType) (.constant 2)] },
@@ -6866,33 +7015,69 @@ private def packedFamilyFixtureScope : Scope := {
     { kind := .constantInt 0, arguments := [], outputTypes := [.integer] },
     { kind := .familyGetDynamic,
       arguments := [{ node := 5, port := 0 }, { node := 7, port := 0 }],
-      outputTypes := [.preimage fixtureType] }
+      outputTypes := [.preimage fixtureType] },
+    { kind := .familyPack,
+      arguments := [{ node := 1, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+    { kind := .familyGetDynamic,
+      arguments := [{ node := 9, port := 0 }, { node := 7, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixMultiply,
+      arguments := [{ node := 10, port := 0 }, { node := 8, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
   ]
-  outputs := [("static", { node := 6, port := 0 }), ("dynamic", { node := 8, port := 0 })]
+  outputs := [("static", { node := 6, port := 0 }), ("dynamic", { node := 8, port := 0 }),
+    ("rewritten", { node := 11, port := 0 })]
   inputNames := []
 }
 
 private def packedFamilyFixtureDerivation : ScopeDerivation := {
   steps := relationFixtureDerivation.steps ++ #[
-    { sourceNode := 4, rule := .zeroMatrix, arguments := [] },
+    { sourceNode := 4, rule := .gadgetDecompose, arguments := [{ node := 0, port := 0 }] },
     { sourceNode := 5, rule := .familyPack,
       arguments := [{ node := 2, port := 0 }, { node := 4, port := 0 }] },
     { sourceNode := 6, rule := .familyGetStatic, arguments := [{ node := 5, port := 0 }] },
     { sourceNode := 7, rule := .constantInt, arguments := [] },
     { sourceNode := 8, rule := .familyGetDynamic,
-      arguments := [{ node := 5, port := 0 }, { node := 7, port := 0 }] }
+      arguments := [{ node := 5, port := 0 }, { node := 7, port := 0 }] },
+    { sourceNode := 9, rule := .familyPack,
+      arguments := [{ node := 1, port := 0 }, { node := 1, port := 0 }] },
+    { sourceNode := 10, rule := .familyGetDynamic,
+      arguments := [{ node := 9, port := 0 }, { node := 7, port := 0 }] },
+    { sourceNode := 11, rule := .matrixMultiplyRelation { node := 8, port := 0 },
+      arguments := [{ node := 10, port := 0 }, { node := 8, port := 0 }] }
   ]
 }
 
-/-- Dynamic extraction keeps relation-bearing branches aligned under one selection identity. -/
-example : (do
+/-- Dynamic extraction keeps relation-bearing branches aligned under one compact expression
+selection. Relation-consuming multiplication then rewrites every branch independently and agrees
+with the explicitly unrolled bound. -/
+private def exactRelationSelectionFixtureResult : Except OperationalError Bool := do
     let facts ← evaluateScopeOperationalWithLayouts packedFamilyFixtureScope
       packedFamilyFixtureDerivation [] [fixtureLayout]
-    match ← lookupFact 8 facts { node := 8, port := 0 } with
-    | .selectedMatrices family => match family.branches[0]? with
-        | some first => pure (family.count == 2 && !first.relations.isEmpty)
-        | none => pure false
-    | _ => pure false) = .ok true := by
+    let dynamicOk ← match ← lookupFact 8 facts { node := 8, port := 0 } with
+    | .matrixExpr root => match facts.arena.get? root with
+        | some { node := .select _ (.exact branches), .. } => match branches[0]? with
+            | some firstId => match facts.arena.get? firstId with
+                | some { node := .concrete first, .. } =>
+                    pure (branches.size == 2 && !first.relations.isEmpty)
+                | _ => pure false
+            | none => pure false
+        | _ => pure false
+    | _ => pure false
+    let rewrittenBounds ← match ← lookupFact 11 facts { node := 11, port := 0 } with
+    | .matrixExpr root => match facts.arena.get? root with
+        | some { node := .select _ (.exact branches), .. } => do
+            let bounds ← branches.toList.mapM fun branch => match facts.arena.get? branch with
+              | some { node := .concrete fact, .. } =>
+                  fact.totalHardBound.evaluateWithStates [] []
+              | _ => throw (OperationalError.unsupportedOperationalExpr branch)
+            pure bounds
+        | _ => throw (OperationalError.unsupportedOperationalExpr root)
+    | _ => throw (OperationalError.operandNotMatrix 11 { node := 11, port := 0 })
+    pure (dynamicOk && rewrittenBounds == [3, 3])
+
+example : exactRelationSelectionFixtureResult = .ok true := by
   native_decide
 
 private def selectFixtureScope : Scope := {

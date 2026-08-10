@@ -75,7 +75,10 @@ private def readString : DecodeM String := do
 
 private def readArray {α : Type} (read : DecodeM α) : DecodeM (List α) := do
   let count ← readU32
-  (List.range count).mapM fun _ => read
+  let mut values := #[]
+  for _ in [:count] do
+    values := values.push (← read)
+  pure values.toList
 
 private def readOption {α : Type} (read : DecodeM α) : DecodeM (Option α) := do
   let offset := (← get).position
@@ -443,7 +446,7 @@ def decodeHexChunks (chunks : Array String) : Except DecodeError ByteArray := do
   for chunk in chunks do
     let bytes := chunk.toUTF8
     if bytes.size % 2 != 0 then throw (.invalidHex sourceOffset)
-    for pairIndex in List.range (bytes.size / 2) do
+    for pairIndex in [:bytes.size / 2] do
       let index := pairIndex * 2
       let high ← match bytes[index]? with
         | some value => hexNibble (sourceOffset + index) value

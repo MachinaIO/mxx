@@ -1279,6 +1279,7 @@ inductive OperationalMatrixExprNode where
   | add (left right : OperationalExprId)
   | subtract (left right : OperationalExprId)
   | multiply (left right : OperationalExprId)
+  | tensor (left right : OperationalExprId)
   | concat (axis : ConcatAxis) (inputs : Array OperationalExprId)
   | transform (operation : OperationalFactorTransform) (value : OperationalExprId)
   | select
@@ -2023,7 +2024,7 @@ private def evaluateOperationalExprBoundWithFuel
               maximum := max maximum bound
               state := nextState
             pure (maximum, state)
-        | .add .. | .subtract .. | .multiply .. | .concat .. | .transform .. =>
+        | .add .. | .subtract .. | .multiply .. | .tensor .. | .concat .. | .transform .. =>
             throw (.unsupportedOperationalExpr id)
       let memo := state.memo.set! id (some value)
       pure (value, { state with memo })
@@ -2942,6 +2943,185 @@ private def multiplyOperationalExprFacts
     environment arena leftId rightId (arena.nodes.size + 1)
   pure (arena, .matrixExpr result)
 
+private def operationalProductTokens
+    (term : OperationalTerm) : List OperationalCompressionToken :=
+  [.productStart, .termStart term.coefficient] ++
+    term.product.factors.flatMap (fun factor => match factor.leaf with
+      | .primitive identity => [.primitive identity] ++
+          factor.transforms.map OperationalCompressionToken.transform
+      | .boundedSummary origin _ => origin.tokens
+      | .exactTransform tokens _ => tokens) ++
+    term.product.modes.map OperationalCompressionToken.productMode ++
+    [.intermediateType term.product.outputType, .termEnd, .productEnd]
+
+private def tensorOperationalPolynomials
+    (outputType : MatrixTypeExpr)
+    (left right : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
+  let rows ← left.mapM fun leftTerm => right.mapM fun rightTerm => do
+    let tokens := [.groupStart] ++ operationalProductTokens leftTerm ++ [.groupEnd,
+      .groupStart] ++ operationalProductTokens rightTerm ++ [.groupEnd,
+      .intermediateType outputType]
+    let role := if operationalTermIsSignal leftTerm || operationalTermIsSignal rightTerm then
+      OperationalFactorRole.large else .bounded
+    let summary ← if role == OperationalFactorRole.bounded then do
+      let leftSummary ← boundedNoiseTermSummary leftTerm
+      let rightSummary ← boundedNoiseTermSummary rightTerm
+      let ringFactor := if leftSummary.metadata.isConstantPolynomial ||
+          rightSummary.metadata.isConstantPolynomial then .closedInt (.constant 1)
+        else .closedInt outputType.ringDimension
+      pure (some {
+        matrixType := outputType
+        hardBound := .multiply ringFactor
+          (.multiply leftSummary.hardBound rightSummary.hardBound)
+        metadata := {
+          isConstantPolynomial := leftSummary.metadata.isConstantPolynomial &&
+            rightSummary.metadata.isConstantPolynomial
+          knownZeroRows := none
+        }
+        provenance := tokens
+      })
+    else pure none
+    let leaf := match summary with
+      | some bounded =>
+          let origin : OperationalCompressionOrigin := { kind := .boundedRun, tokens }
+          OperationalFactorLeaf.boundedSummary origin bounded
+      | none => .exactTransform tokens outputType
+    let factor : OperationalFactorKey := {
+      leaf
+      inputType := outputType
+      outputType
+      role
+      boundedSummary := summary
+    }
+    pure {
+      coefficient := leftTerm.coefficient * rightTerm.coefficient
+      product := { factors := [factor], modes := [], outputType }
+    }
+  pure (normalizeOperationalTerms rows.flatten)
+
+private def tensorConcreteMatrixFacts
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (environment : ParamEnvironment)
+    (left right : OperationalMatrixFact) : Except OperationalError OperationalMatrixFact := do
+  let polynomial ← tensorOperationalPolynomials matrixType left.polynomial right.polynomial
+    |>.mapError (flatErrorAt nodeIndex)
+  match ← polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial with
+  | .matrix output => pure output
+  | _ => throw (.operandNotMatrix nodeIndex right.subject)
+
+private def tensorOperationalExprIds
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (environment : ParamEnvironment) :
+    OperationalExprArena → OperationalExprId → OperationalExprId → Nat →
+    Except OperationalError (OperationalExprArena × OperationalExprId)
+  | _, left, _, 0 => throw (.unsupportedOperationalExpr left)
+  | arena, left, right, fuel + 1 => do
+      let leftExpr ← match arena.get? left with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef left)
+      let rightExpr ← match arena.get? right with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef right)
+      match leftExpr.node, rightExpr.node with
+      | .concrete leftFact, .concrete rightFact =>
+          let output ← tensorConcreteMatrixFacts nodeIndex outputPort matrixType environment
+            leftFact rightFact
+          pure (arena.pushConcrete output)
+      | .select leftSelection (.exact leftBranches),
+          .select rightSelection (.exact rightBranches) =>
+          if leftSelection != rightSelection then
+            pure (arena.push { matrixType, node := .tensor left right })
+          else if leftBranches.size != rightBranches.size then
+            throw (.operationalExprTypeMismatch left right)
+          else
+            let mut arena := arena
+            let mut outputs : Array OperationalExprId := #[]
+            for branch in [:leftBranches.size] do
+              let (nextArena, output) ← tensorOperationalExprIds nodeIndex outputPort matrixType
+                environment arena leftBranches[branch]! rightBranches[branch]! fuel
+              arena := nextArena
+              outputs := outputs.push output
+            arena.pushSelect leftSelection (.exact outputs)
+      | .select selection (.exact branches), _ =>
+          match rightExpr.node with
+          | .select .. => pure (arena.push { matrixType, node := .tensor left right })
+          | _ =>
+              let mut arena := arena
+              let mut outputs : Array OperationalExprId := #[]
+              for branch in branches do
+                let (nextArena, output) ← tensorOperationalExprIds nodeIndex outputPort matrixType
+                  environment arena branch right fuel
+                arena := nextArena
+                outputs := outputs.push output
+              arena.pushSelect selection (.exact outputs)
+      | _, .select selection (.exact branches) =>
+          match leftExpr.node with
+          | .select .. => pure (arena.push { matrixType, node := .tensor left right })
+          | _ =>
+              let mut arena := arena
+              let mut outputs : Array OperationalExprId := #[]
+              for branch in branches do
+                let (nextArena, output) ← tensorOperationalExprIds nodeIndex outputPort matrixType
+                  environment arena left branch fuel
+                arena := nextArena
+                outputs := outputs.push output
+              arena.pushSelect selection (.exact outputs)
+      | .select leftSelection (.schemaEnvelope leftCount leftRepresentative leftSummary),
+          .select rightSelection (.schemaEnvelope rightCount rightRepresentative rightSummary) =>
+          if leftSelection != rightSelection then
+            pure (arena.push { matrixType, node := .tensor left right })
+          else if leftCount != rightCount then
+            throw (.operationalExprTypeMismatch left right)
+          else
+            let _ ← match rightSummary.uniformSchema with
+              | some schema => pure schema
+              | none => throw (.unsupportedOperationalExpr rightRepresentative)
+            let (arena, output) ← tensorOperationalExprIds nodeIndex outputPort matrixType
+              environment arena leftRepresentative rightRepresentative fuel
+            let outputFact ← arena.concreteFact output
+            let outputSummary ← match recomputeSelectedMatrixSummary leftSummary outputFact with
+              | some value => pure value
+              | none => throw (.unsupportedOperationalExpr leftRepresentative)
+            arena.pushSelect leftSelection (.schemaEnvelope leftCount output outputSummary)
+      | .select selection (.schemaEnvelope count representative summary), _ =>
+          match rightExpr.node with
+          | .select .. => pure (arena.push { matrixType, node := .tensor left right })
+          | _ =>
+              let (arena, output) ← tensorOperationalExprIds nodeIndex outputPort matrixType
+                environment arena representative right fuel
+              let outputFact ← arena.concreteFact output
+              let outputSummary ← match recomputeSelectedMatrixSummary summary outputFact with
+                | some value => pure value
+                | none => throw (.unsupportedOperationalExpr representative)
+              arena.pushSelect selection (.schemaEnvelope count output outputSummary)
+      | _, .select selection (.schemaEnvelope count representative summary) =>
+          match leftExpr.node with
+          | .select .. => pure (arena.push { matrixType, node := .tensor left right })
+          | _ =>
+              let (arena, output) ← tensorOperationalExprIds nodeIndex outputPort matrixType
+                environment arena left representative fuel
+              let outputFact ← arena.concreteFact output
+              let outputSummary ← match recomputeSelectedMatrixSummary summary outputFact with
+                | some value => pure value
+                | none => throw (.unsupportedOperationalExpr representative)
+              arena.pushSelect selection (.schemaEnvelope count output outputSummary)
+      | _, _ => pure (arena.push { matrixType, node := .tensor left right })
+
+private def tensorOperationalExprFacts
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (environment : ParamEnvironment)
+    (arena : OperationalExprArena)
+    (left right : OperationalFact) :
+    Except OperationalError (OperationalExprArena × OperationalFact) := do
+  let (arena, leftId) ← arena.pushMatrixFact left
+  let (arena, rightId) ← arena.pushMatrixFact right
+  let (arena, result) ← tensorOperationalExprIds nodeIndex outputPort matrixType environment
+    arena leftId rightId (arena.nodes.size + 1)
+  pure (arena, .matrixExpr result)
+
 private def exactOneIndicatorFactor
     (scope : ScopeTemplateKey)
     (node : Nat)
@@ -3507,17 +3687,6 @@ private def scaleOperationalExprFact
     environment loopDomains arena root (arena.nodes.size + 1)
   pure (arena, .matrixExpr result)
 
-private def operationalProductTokens
-    (term : OperationalTerm) : List OperationalCompressionToken :=
-  [.productStart, .termStart term.coefficient] ++
-    term.product.factors.flatMap (fun factor => match factor.leaf with
-      | .primitive identity => [.primitive identity] ++
-          factor.transforms.map OperationalCompressionToken.transform
-      | .boundedSummary origin _ => origin.tokens
-      | .exactTransform tokens _ => tokens) ++
-    term.product.modes.map OperationalCompressionToken.productMode ++
-    [.intermediateType term.product.outputType, .termEnd, .productEnd]
-
 /-- Group the already-derived exact signal part of a BGG encoding while retaining its bounded
 noise as a separate top-level term.  The complete pre-grouping signal polynomial is embedded in a
 flat token sequence, so this cannot create a false cancellation or hide bounded noise.  The paired
@@ -3714,51 +3883,6 @@ private def applyPreparedDerivationAttachments
     (facts : OperationalScopeFacts) : Except OperationalError OperationalScopeFacts :=
   attachments.foldlM (init := facts) fun current attachment =>
     applyDerivationAttachment node attachment current
-
-private def tensorOperationalPolynomials
-    (outputType : MatrixTypeExpr)
-    (left right : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
-  let rows ← left.mapM fun leftTerm => right.mapM fun rightTerm => do
-    let tokens := [.groupStart] ++ operationalProductTokens leftTerm ++ [.groupEnd,
-      .groupStart] ++ operationalProductTokens rightTerm ++ [.groupEnd,
-      .intermediateType outputType]
-    let role := if operationalTermIsSignal leftTerm || operationalTermIsSignal rightTerm then
-      OperationalFactorRole.large else .bounded
-    let summary ← if role == OperationalFactorRole.bounded then do
-      let leftSummary ← boundedNoiseTermSummary leftTerm
-      let rightSummary ← boundedNoiseTermSummary rightTerm
-      let ringFactor := if leftSummary.metadata.isConstantPolynomial ||
-          rightSummary.metadata.isConstantPolynomial then .closedInt (.constant 1)
-        else .closedInt outputType.ringDimension
-      pure (some {
-        matrixType := outputType
-        hardBound := .multiply ringFactor
-          (.multiply leftSummary.hardBound rightSummary.hardBound)
-        metadata := {
-          isConstantPolynomial := leftSummary.metadata.isConstantPolynomial &&
-            rightSummary.metadata.isConstantPolynomial
-          knownZeroRows := none
-        }
-        provenance := tokens
-      })
-    else pure none
-    let leaf := match summary with
-      | some bounded =>
-          let origin : OperationalCompressionOrigin := { kind := .boundedRun, tokens }
-          OperationalFactorLeaf.boundedSummary origin bounded
-      | none => .exactTransform tokens outputType
-    let factor : OperationalFactorKey := {
-      leaf
-      inputType := outputType
-      outputType
-      role
-      boundedSummary := summary
-    }
-    pure {
-      coefficient := leftTerm.coefficient * rightTerm.coefficient
-      product := { factors := [factor], modes := [], outputType }
-    }
-  pure (normalizeOperationalTerms rows.flatten)
 
 def availableRelation
     (node : Nat)
@@ -6038,6 +6162,102 @@ def evaluatePreparedScope
                   else
                     deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
                       layouts facts 0 node.outputTypes
+              | .crtRecompose plaintextModuli reconstructionCoefficients =>
+                  let inputs ← node.arguments.toArray.mapM (lookupFact index facts)
+                  if inputs.any fun input => match input with
+                      | .matrixExpr _ => true
+                      | _ => false then
+                    if inputs.isEmpty || inputs.size != plaintextModuli.length ||
+                        inputs.size != reconstructionCoefficients.length then
+                      throw (.unsupportedOutputArity index inputs.size)
+                    let matrixType ← match node.outputTypes with
+                      | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
+                      | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
+                    let moduli ← plaintextModuli.mapM
+                      (evaluateIntInvariant environment loopDomains)
+                    let coefficients ← reconstructionCoefficients.mapM
+                      (evaluateIntInvariant environment loopDomains)
+                    let modulus ← evaluateIntInvariant environment loopDomains matrixType.modulus
+                    if modulus <= 0 || moduli.any (fun value => value <= 1 || value >= modulus) ||
+                        coefficients.any (fun value => value < 0 || value >= modulus) then
+                      throw (.invalidMatrixParameters index)
+                    let mut arena := facts.arena
+                    let mut scaled : Array OperationalFact := #[]
+                    for (input, coefficient) in inputs.toList.zip coefficients do
+                      let scalar := IntExpr.constant coefficient
+                      let (nextArena, output) ← scaleOperationalExprFact index 0 matrixType scalar
+                        [coefficient] environment loopDomains arena input
+                      arena := nextArena
+                      scaled := scaled.push output
+                    let mut output ← match scaled[0]? with
+                      | some output => pure output
+                      | none => throw (.invalidCount index 0)
+                    for next in scaled.extract 1 scaled.size do
+                      let (nextArena, sum) ← addOperationalExprFacts index 0 matrixType false
+                        environment arena output next
+                      arena := nextArena
+                      output := sum
+                    facts := { facts with arena }
+                    pure [output]
+                  else
+                    deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
+                      layouts facts 0 node.outputTypes
+              | .gadgetDecompose _ _ _ _ =>
+                  let inputWire ← match node.arguments[0]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index { node := 0, port := 0 })
+                  let input ← lookupFact index facts inputWire
+                  match input with
+                  | .matrixExpr root =>
+                      let matrixType ← match node.outputTypes with
+                        | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
+                        | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
+                      let rec mapExpression : OperationalExprArena → OperationalExprId → Nat →
+                          Except OperationalError (OperationalExprArena × OperationalExprId)
+                        | _, current, 0 => throw (.unsupportedOperationalExpr current)
+                        | arena, current, remaining + 1 => do
+                            let expression ← match arena.get? current with
+                              | some expression => pure expression
+                              | none => throw (.invalidOperationalExprRef current)
+                            match expression.node with
+                            | .concrete branch =>
+                                let branchFacts ← replaceOperationalFact index facts inputWire
+                                  (.matrix branch)
+                                let output ← genericNodeFact scopeKey index node step.rule 0
+                                  (.preimage matrixType) branchFacts environment loopDomains layouts
+                                let output := namespaceFreshOutput scopeKey
+                                  { node := index, port := 0 } output
+                                let output ← match output with
+                                  | .matrix output => pure output
+                                  | _ => throw (.operandNotMatrix index inputWire)
+                                pure (arena.pushConcrete output)
+                            | .select selection (.exact branches) =>
+                                let mut arena := arena
+                                let mut outputs : Array OperationalExprId := #[]
+                                for branch in branches do
+                                  let (nextArena, output) ← mapExpression arena branch remaining
+                                  arena := nextArena
+                                  outputs := outputs.push output
+                                arena.pushSelect selection (.exact outputs)
+                            | .select selection
+                                (.schemaEnvelope count representative summary) =>
+                                let (arena, output) ←
+                                  mapExpression arena representative remaining
+                                let outputFact ← arena.concreteFact output
+                                let outputSummary ← match
+                                    recomputeSelectedMatrixSummary summary outputFact with
+                                  | some value => pure value
+                                  | none => throw (.unsupportedOperationalExpr representative)
+                                arena.pushSelect selection
+                                  (.schemaEnvelope count output outputSummary)
+                            | _ => throw (.unsupportedOperationalExpr current)
+                      let (arena, output) ← mapExpression facts.arena root
+                        (facts.arena.nodes.size + 1)
+                      facts := { facts with arena }
+                      pure [.matrixExpr output]
+                  | _ =>
+                      deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
+                        layouts facts 0 node.outputTypes
               | .matrixScale scalar =>
                   let inputWire ← match node.arguments[0]? with
                     | some wire => pure wire
@@ -6149,6 +6369,27 @@ def evaluatePreparedScope
                         | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
                       let (arena, output) ← multiplyOperationalExprFacts index 0 matrixType
                         step.rule rightWire environment facts.arena left right
+                      facts := { facts with arena }
+                      pure [output]
+                  | _, _ =>
+                      deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
+                        layouts facts 0 node.outputTypes
+              | .tensor =>
+                  let leftWire ← match node.arguments[0]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index { node := 0, port := 0 })
+                  let rightWire ← match node.arguments[1]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index leftWire)
+                  let left ← lookupFact index facts leftWire
+                  let right ← lookupFact index facts rightWire
+                  match left, right with
+                  | .matrixExpr _, _ | _, .matrixExpr _ =>
+                      let matrixType ← match node.outputTypes with
+                        | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
+                        | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
+                      let (arena, output) ← tensorOperationalExprFacts index 0 matrixType
+                        environment facts.arena left right
                       facts := { facts with arena }
                       pure [output]
                   | _, _ =>
@@ -6360,7 +6601,7 @@ private def collectOperationalExprNoiseBoundsWithFuel
       | .select _ (.schemaEnvelope count representative _) =>
           if count = 0 then throw (.invalidCount 0 0)
           collectOperationalExprNoiseBoundsWithFuel arena environment representative fuel
-      | .add .. | .subtract .. | .multiply .. | .concat .. | .transform .. =>
+      | .add .. | .subtract .. | .multiply .. | .tensor .. | .concat .. | .transform .. =>
           throw (.unsupportedOperationalExpr root)
 
 private def collectOperationalExprNoiseBounds

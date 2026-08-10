@@ -3196,6 +3196,39 @@ private def mapOperationalExpr
     Except OperationalError (OperationalExprArena × OperationalExprId) :=
   mapOperationalExprM arena root (fun fact => pure (mapFact fact)) mapSelection
 
+private def isLoopTemplateSelection
+    (binder : FamilyTemplateBinder)
+    (origin : OperationalValueOrigin) : Bool :=
+  let base : OperationalValueOrigin :=
+    .local temporaryScope { node := binder.producerNode, port := 0 }
+  let rec containsBase : OperationalValueOrigin → Bool
+    | candidate@(.local ..) => candidate == base
+    | .loopInstance _ _ source => containsBase source
+    | _ => false
+  containsBase origin
+
+private def loopTemplateStaticRoot
+    (arena : OperationalExprArena)
+    (binder : FamilyTemplateBinder)
+    (root : OperationalExprId)
+    (lane : Nat) : Except OperationalError OperationalExprId := do
+  let expression ← match arena.get? root with
+    | some expression => pure expression
+    | none => throw (.invalidOperationalExprRef root)
+  match expression.node with
+  | .select selection (.exact branches) =>
+      if isLoopTemplateSelection binder selection.index then
+        match branches[lane]? with
+        | some branch => pure branch
+        | none => throw (.invalidCount binder.producerNode lane)
+      else pure root
+  | .select selection (.schemaEnvelope count representative _) =>
+      if isLoopTemplateSelection binder selection.index then
+        if lane < count then pure representative
+        else throw (.invalidCount binder.producerNode lane)
+      else pure root
+  | _ => pure root
+
 private def exactOneIndicatorFactor
     (scope : ScopeTemplateKey)
     (node : Nat)
@@ -4789,6 +4822,63 @@ def loopTemplateArgumentFact
                 joinDynamicFacts node { node, port := argument } branches (some selection)
       | _ => throw (.loopInputModeMismatch node argument)
 
+/-- Arena-backed parallel-loop input preparation.  Matrix families retain their exact selected
+expression (or one checked schema envelope) instead of materializing an indicator polynomial or
+the removed fact-level selected-family representation. -/
+private def loopTemplateArgumentExpr
+    (arena : OperationalExprArena)
+    (node argument count : Nat)
+    (mode : LoopInputMode)
+    (fact : OperationalFact) :
+    Except OperationalError (OperationalExprArena × OperationalFact) := do
+  match mode with
+  | .broadcast => pure (arena, fact)
+  | .zip | .zipOffset _ =>
+      match fact with
+      | .familyUniform _ _ element familyCount =>
+          let offset := match mode with | .zipOffset value => value | _ => 0
+          if count + offset > familyCount.toNat then
+            throw (.loopInputModeMismatch node argument)
+          else pure (arena, element)
+      | .familyPacked elements familyCount matrixSummary =>
+          let offset := match mode with
+            | .zip => 0
+            | .zipOffset value => value
+            | .broadcast => 0
+          if familyCount < count + offset then
+            throw (.loopInputModeMismatch node argument)
+          let baseSelection : OperationalValueOrigin :=
+            .local temporaryScope { node, port := 0 }
+          let selection : DynamicSelectionIdentity := {
+            index := match mode with
+              | .zip => baseSelection
+              | .zipOffset value => .loopInstance argument value baseSelection
+              | .broadcast => baseSelection
+          }
+          match matrixSummary with
+          | some summary =>
+              let representativeIndex := if elements.size == familyCount then offset else 0
+              let representative ← match elements[representativeIndex]? with
+                | some representative => pure representative
+                | none => throw (.loopInputModeMismatch node argument)
+              let (arena, representative) ← arena.pushMatrixFact representative
+              let (arena, root) ← arena.pushSelect selection
+                (.schemaEnvelope count representative summary)
+              pure (arena, .matrixExpr root)
+          | none =>
+              if elements.size < count + offset then
+                throw (.loopInputModeMismatch node argument)
+              let mut arena := arena
+              let mut branches : Array OperationalExprId := #[]
+              for element in elements.extract offset (offset + count) do
+                let (nextArena, branch) ← arena.pushMatrixFact element
+                arena := nextArena
+                branches := branches.push branch
+              let (finalArena, root) ← arena.pushSelect selection (.exact branches)
+              pure (finalArena, .matrixExpr root)
+      | _ =>
+          pure (arena, ← loopTemplateArgumentFact node argument count mode fact)
+
 private def liftSelectedUnaryMatrix
     (node : Nat)
     (wire : WireRef)
@@ -5976,12 +6066,17 @@ def evaluatePreparedScope
       let rec prepareParallelInputs
           (nodeIndex count argumentIndex : Nat)
           (modes : List LoopInputMode)
-          (inputs : List OperationalFact) : Except OperationalError (List OperationalFact) := do
+          (inputs : List OperationalFact)
+          (arena : OperationalExprArena) :
+          Except OperationalError (OperationalExprArena × List OperationalFact) := do
         match modes, inputs with
-        | [], [] => pure []
+        | [], [] => pure (arena, [])
         | mode :: modeTail, input :: inputTail =>
-            return (← loopTemplateArgumentFact nodeIndex argumentIndex count mode input) ::
-              (← prepareParallelInputs nodeIndex count (argumentIndex + 1) modeTail inputTail)
+            let (arena, head) ←
+              loopTemplateArgumentExpr arena nodeIndex argumentIndex count mode input
+            let (arena, tail) ← prepareParallelInputs nodeIndex count (argumentIndex + 1)
+              modeTail inputTail arena
+            pure (arena, head :: tail)
         | _, _ => throw (.loopInputModeMismatch nodeIndex argumentIndex)
       let mut facts : OperationalScopeFacts := { arena := initialArena }
       for node in scope.nodes do
@@ -6031,13 +6126,17 @@ def evaluatePreparedScope
                     | some value => pure value
                     | none => throw .nonClosedExpression
                   match ← lookupFact index facts familyWire with
-                  | .familyUniform _ coordinate element count =>
+                  | .familyUniform binder coordinate element count =>
                       if requested < 0 || requested >= count then
                         throw (.invalidCount index requested)
                       else
                         let subject : WireRef := { node := index, port := 0 }
                         match element with
                         | .matrixExpr root =>
+                            let root ← match coordinate with
+                              | some (.loopBinder ..) | some (.loopBinderOffset ..) =>
+                                  loopTemplateStaticRoot facts.arena binder root requested.toNat
+                              | none => pure root
                             let mapFact (fact : OperationalMatrixFact) :=
                               let mapped := match coordinate with
                                 | some (.loopBinder _ _ slot) =>
@@ -6098,7 +6197,7 @@ def evaluatePreparedScope
                     | _ => throw (.loopInputModeMismatch index 1)
                   let selection := selectionFact.origin
                   match ← lookupFact index facts familyWire with
-                  | .familyUniform binder _ element count =>
+                  | .familyUniform binder coordinate element count =>
                       -- Operational magnitude analysis is conditional on successful executable
                       -- evaluation. A dynamic access that succeeds returns one family element, so
                       -- a correlated interval need only overlap the valid range. Proving that every
@@ -6112,7 +6211,10 @@ def evaluatePreparedScope
                         | .matrixExpr root =>
                             let mapFact := selectDynamicMatrixFact binder selection subject
                             let mapSelection (nested : DynamicSelectionIdentity) := {
-                              index := selectDynamicValueOrigin binder selection nested.index
+                              index := if coordinate.isSome &&
+                                  isLoopTemplateSelection binder nested.index then
+                                selection
+                              else selectDynamicValueOrigin binder selection nested.index
                             }
                             let (arena, mapped) ←
                               mapOperationalExpr facts.arena root mapFact mapSelection
@@ -6130,15 +6232,29 @@ def evaluatePreparedScope
                           producerNode := index
                           binderSlot := 0
                         }
-                        let selectedBranches ← elements.mapM fun branch => do
-                          match ← selectDynamicUniformFact binder selection
-                              { node := index, port := 0 } branch with
-                          | .matrix selected => pure selected
+                        let subject : WireRef := { node := index, port := 0 }
+                        let mut arena := facts.arena
+                        let mut selectedBranches : Array OperationalExprId := #[]
+                        for branch in elements do
+                          match branch with
+                          | .matrix branch =>
+                              let selected := selectDynamicMatrixFact binder selection subject branch
+                              let (nextArena, root) := arena.pushConcrete selected
+                              arena := nextArena
+                              selectedBranches := selectedBranches.push root
+                          | .matrixExpr root =>
+                              let mapFact := selectDynamicMatrixFact binder selection subject
+                              let mapSelection (nested : DynamicSelectionIdentity) := {
+                                index := selectDynamicValueOrigin binder selection nested.index
+                              }
+                              let (nextArena, selected) ←
+                                mapOperationalExpr arena root mapFact mapSelection
+                              arena := nextArena
+                              selectedBranches := selectedBranches.push selected
                           | _ => throw (.loopInputModeMismatch index 0)
-                        let (arena, root) ← facts.arena.pushExactSelection
-                          { index := selection }
-                          (selectedBranches.map OperationalFact.matrix)
-                        facts := { facts with arena }
+                        let (finalArena, root) ← arena.pushSelect { index := selection }
+                          (.exact selectedBranches)
+                        facts := { facts with arena := finalArena }
                         pure [.matrixExpr root]
                       else match elements[0]? with
                       | some element => match element with
@@ -6195,8 +6311,9 @@ def evaluatePreparedScope
                       | .parameter _ _ _ _ => true
                   let child ← preparedDefinitionAt index prepared definitions
                   let childKey := .parallelBody scopeKey index
-                  let templateInputs ←
-                    prepareParallelInputs index evaluatedCount.toNat 0 modes actualInputs
+                  let (arena, templateInputs) ←
+                    prepareParallelInputs index evaluatedCount.toNat 0 modes actualInputs facts.arena
+                  facts := { facts with arena }
                   let iterationEnvironment :=
                     (ParamKey.loopIndex indexSlot, ParamValue.integer 0) :: environment
                   let boundParams ← match evaluateBindings iterationEnvironment bindings with
@@ -6578,11 +6695,8 @@ def evaluatePreparedScope
                     match namespaceFreshOutput scopeKey wire (.matrix fact) with
                     | .matrix mapped => mapped
                     | _ => fact
-                  let mapSelection (selection : DynamicSelectionIdentity) := {
-                    index := namespaceFreshValueOrigin scopeKey wire selection.index
-                  }
                   let (arena, mapped) ←
-                    mapOperationalExpr facts.arena root mapFact mapSelection
+                    mapOperationalExpr facts.arena root mapFact
                   facts := { facts with arena }
                   namespacedOutputs := namespacedOutputs.push (.matrixExpr mapped)
               | output => namespacedOutputs := namespacedOutputs.push output
@@ -8311,6 +8425,78 @@ example : (do
 example : (do
     let facts ← evaluateProgramOperationalWithLayouts loopBoundProgram loopBoundDerivation [] []
     matrixMaximum 2 { node := 1, port := 0 } facts) = .ok 3 := by
+  native_decide
+
+private def packedSelectionLoopBody : Scope := {
+  nodes := #[{
+    kind := .input "value"
+    arguments := []
+    outputTypes := [.matrix fixtureType]
+  }]
+  outputs := [("result", { node := 0, port := 0 })]
+  inputNames := ["value"]
+}
+
+private def packedSelectionLoopProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 5), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .familyPack,
+        arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+      { kind := .parallelLoop "body" (.constant 2) 0 [] [.zip],
+        arguments := [{ node := 2, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+      { kind := .familyGetStatic (.constant 1), arguments := [{ node := 3, port := 0 }],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .constantInt 0, arguments := [], outputTypes := [.integer] },
+      { kind := .familyGetDynamic,
+        arguments := [{ node := 3, port := 0 }, { node := 5, port := 0 }],
+        outputTypes := [.matrix fixtureType] }
+    ]
+    outputs := [("family", { node := 3, port := 0 }),
+      ("static", { node := 4, port := 0 }), ("dynamic", { node := 6, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("body", packedSelectionLoopBody)]
+}
+
+private def packedSelectionLoopDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 1, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 2, rule := .familyPack,
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+    { sourceNode := 3, rule := .parallelLoop, arguments := [{ node := 2, port := 0 }] },
+    { sourceNode := 4, rule := .familyGetStatic, arguments := [{ node := 3, port := 0 }] },
+    { sourceNode := 5, rule := .constantInt, arguments := [] },
+    { sourceNode := 6, rule := .familyGetDynamic,
+      arguments := [{ node := 3, port := 0 }, { node := 5, port := 0 }] }
+  ] }
+  definitions := [("body", { steps := #[
+    { sourceNode := 0, rule := .input, arguments := [] }
+  ] })]
+}
+
+/-- A packed matrix family crosses a one-evaluation parallel body as an arena selection. Static
+extraction reduces the exact lane, while dynamic extraction retains two alternatives and computes
+the maximum complete noise bound without restoring the fact-level selected-family path. -/
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts packedSelectionLoopProgram
+      packedSelectionLoopDerivation [] []
+    let staticMaximum ← matrixMaximum 7 { node := 4, port := 0 } facts
+    let dynamic ← lookupFact 7 facts { node := 6, port := 0 }
+    let report ← decoderNoiseCheckReportForFact [] facts.arena dynamic [] 2 25
+    let familyIsExpression ← match ← lookupFact 7 facts { node := 3, port := 0 } with
+      | .familyUniform _ _ (.matrixExpr root) 2 => match facts.arena.get? root with
+          | some { node := .select _ (.exact branches), .. } => pure (branches.size == 2)
+          | _ => pure false
+      | _ => pure false
+    pure (staticMaximum, report.obligations, familyIsExpression)) =
+    .ok (5, [.decoderThreshold 2 25 5], true) := by
   native_decide
 
 private def sequentialRelationBody : Scope := {

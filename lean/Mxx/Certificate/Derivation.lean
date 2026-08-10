@@ -59,7 +59,7 @@ inductive DerivationRule where
   | subgraphCall
   | parallelLoop
   | sequentialLoop
-  deriving BEq, DecidableEq
+  deriving BEq, DecidableEq, Repr
 
 /-- One untrusted instruction in the canonical node order of a frozen scope.  Only the selected
 rule and operands are repeated.  Output arity and types are read directly from the frozen node,
@@ -99,7 +99,7 @@ inductive DerivationError where
   | definitionMismatch (expected actual : String)
   | missingDefinition (expected : String)
   | unexpectedDefinition (actual : String)
-  deriving BEq, DecidableEq
+  deriving BEq, DecidableEq, Repr
 
 private def matchesNodeKind : DerivationRule → Mxx.Ir.NodeKind → Bool
   | .input, .input _ => true

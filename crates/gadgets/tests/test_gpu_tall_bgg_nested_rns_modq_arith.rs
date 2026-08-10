@@ -302,6 +302,12 @@ fn run_tall_operational_check(
     .map_err(|error| error.to_string())?;
     let emitted = emit_protocol_for("TallNestedRnsCandidate", &protocol, "MxxCorrectness", &[])
         .map_err(|error| error.to_string())?;
+    info!(
+        operational_source_bytes = emitted.ir.len(),
+        proof_source_bytes = emitted.proof_ir.len(),
+        derivation_source_bytes = emitted.derivation_ir.len(),
+        "emitted Tall correctness sources"
+    );
     let (crt_moduli, crt_bits, _) = parameters.to_crt();
     let q_max = crt_moduli.iter().copied().max().expect("nonempty CRT basis");
     let base_bits = parameters.base_bits() as usize;
@@ -333,6 +339,17 @@ fn run_tall_operational_check(
         olean = %prepared.olean_path().display(),
         "prepared and cached Tall operational IR and derivation"
     );
+    let warm_preparation_started = Instant::now();
+    let warm_prepared = prepare_emitted_operational_checker(&lean_workspace, &emitted)
+        .map_err(|error| error.to_string())?;
+    if warm_prepared.olean_path() != prepared.olean_path() {
+        return Err("warm Tall preparation selected a different cache artifact".to_owned());
+    }
+    info!(
+        elapsed = ?warm_preparation_started.elapsed(),
+        olean = %warm_prepared.olean_path().display(),
+        "reused cached Tall operational IR and derivation"
+    );
 
     // Keep the first request identical to the selection request. The second request exercises
     // the intended cheap multi-parameter path against the same prepared symbolic graph without
@@ -348,6 +365,16 @@ fn run_tall_operational_check(
         request_count = reports.len(),
         "evaluated Tall parameter requests with one prepared derivation"
     );
+    for (request_index, report) in reports.iter().enumerate() {
+        info!(
+            request_index,
+            decode_time_ns = report.decode_time_ns,
+            evaluation_time_ns = report.evaluation_time_ns,
+            accepted = report.accepted,
+            noise_bound = %report.noise_bound,
+            "measured Lean Tall operational request"
+        );
+    }
     if reports.len() != 2 {
         return Err(format!("expected two Tall operational reports, got {}", reports.len()));
     }

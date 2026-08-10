@@ -838,8 +838,10 @@ inductive OperationalFact where
       (binderCoordinate : Option LoopCoordinate)
       (element : OperationalFact)
       (count : Int)
-  | familyPackedNil
-  | familyPackedCons (head tail : OperationalFact)
+  | familyPacked (elements : Array OperationalFact)
+  | selectedMatrices
+      (selection : OperationalValueOrigin)
+      (branches : Array OperationalMatrixFact)
   | bytes (fact : OperationalBytesFact)
   | typedBlob (typeName : String)
   | unknown (wireType : WireTypeExpr)
@@ -893,6 +895,7 @@ inductive OperationalError where
   | unexpectedInputNode (name : String)
   | missingChildOutput (node port : Nat)
   | loopInputModeMismatch (node argument : Nat)
+  | selectedFamilyOperationUnsupported (node : Nat)
   | relationBearingCarriedValue (scope : ScopeTemplateKey) (node slot : Nat)
   | sequentialSchemaMismatch
       (scope : ScopeTemplateKey)
@@ -913,7 +916,7 @@ inductive OperationalError where
   | missingDerivationAttachmentRole (ownerNamespace ruleName roleName : String)
   | invalidDerivationAttachment (ownerNamespace ruleName : String)
   | unsupportedNode (node : Nat)
-  deriving BEq, DecidableEq
+  deriving BEq, DecidableEq, Repr
 
 /-- The operational checker has an explicit transfer category for every executable IR node.
 This definition and the exhaustive classifiers below are deliberately separate from the transfer
@@ -1970,13 +1973,11 @@ private def equivalentRetypeOperationalPolynomial
         let factors := (replacement :: reversePrefix).reverse
         pure { term with product := { term.product with factors, outputType } }
 
-private def requireMatrixType
+private def retypeMatrixFact
     (node : Nat)
-    (wire : WireRef)
     (expected : MatrixTypeExpr)
-    (facts : OperationalScopeFacts)
+    (fact : OperationalMatrixFact)
     (environment : ParamEnvironment) : Except OperationalError OperationalMatrixFact := do
-  let fact ← matrixFactAt node facts wire
   if fact.matrixType == expected then return fact
   let expectedParams ← match expected.evaluate environment
       (.constant fact.matrixParams.maxCoefficientBound) with
@@ -1987,6 +1988,14 @@ private def requireMatrixType
   let polynomial ← equivalentRetypeOperationalPolynomial expected fact.polynomial
     |>.mapError fun error => OperationalError.flat node error
   pure { fact with matrixType := expected, matrixParams := expectedParams, polynomial }
+
+private def requireMatrixType
+    (node : Nat)
+    (wire : WireRef)
+    (expected : MatrixTypeExpr)
+    (facts : OperationalScopeFacts)
+    (environment : ParamEnvironment) : Except OperationalError OperationalMatrixFact := do
+  retypeMatrixFact node expected (← matrixFactAt node facts wire) environment
 
 def valueOriginAt
     (scope : ScopeTemplateKey)
@@ -2667,9 +2676,14 @@ def rebindSubject (subject : WireRef) : OperationalFact → Except OperationalEr
   | .bytes fact => pure (.bytes { fact with subject })
   | .familyUniform binder coordinate element count =>
       return .familyUniform binder coordinate (← rebindSubject subject element) count
-  | .familyPackedNil => pure .familyPackedNil
-  | .familyPackedCons head tail =>
-      return .familyPackedCons (← rebindSubject subject head) (← rebindSubject subject tail)
+  | .familyPacked elements =>
+      return .familyPacked (← elements.mapM (rebindSubject subject))
+  | .selectedMatrices selection branches =>
+      if branches.all fun branch => branch.relations.all fun relation => match relation with
+          | .decomposition relation => relation.producer == branch.origin
+          | .preimage relation => relation.producer == branch.origin then
+        pure (.selectedMatrices selection (branches.map fun branch => { branch with subject }))
+      else throw (.malformedRelation subject.node)
   | fact => pure fact
 
 private def namespaceFreshOrigin
@@ -2839,7 +2853,7 @@ private def shiftRelationPreviousDepth :
 
 /-- Insert a new innermost recurrence state. References already present in invariant facts then
 refer to the enclosing state, while the new carried placeholders continue to use depth zero. -/
-private def shiftFactPreviousDepth : OperationalFact → OperationalFact
+private partial def shiftFactPreviousDepth : OperationalFact → OperationalFact
   | .matrix fact => .matrix {
       fact with
       totalHardBound := shiftPreviousDepth fact.totalHardBound
@@ -2855,8 +2869,14 @@ private def shiftFactPreviousDepth : OperationalFact → OperationalFact
     }
   | .familyUniform binder coordinate element count =>
       .familyUniform binder coordinate (shiftFactPreviousDepth element) count
-  | .familyPackedCons head tail =>
-      .familyPackedCons (shiftFactPreviousDepth head) (shiftFactPreviousDepth tail)
+  | .familyPacked elements =>
+      .familyPacked (elements.map shiftFactPreviousDepth)
+  | .selectedMatrices selection branches =>
+      let shiftBranch (branch : OperationalMatrixFact) :=
+        match shiftFactPreviousDepth (.matrix branch) with
+        | .matrix shifted => shifted
+        | _ => branch
+      .selectedMatrices selection (branches.map shiftBranch)
   | fact => fact
 
 private def namespaceFreshValueOrigin
@@ -2875,7 +2895,7 @@ private def namespaceFreshValueOrigin
 
 /-- Namespace only identities created by this exact output.  Caller origins transported through
 an input are deliberately left unchanged. -/
-def namespaceFreshOutput
+partial def namespaceFreshOutput
     (scope : ScopeTemplateKey)
     (wire : WireRef) : OperationalFact → OperationalFact
   | .matrix fact => .matrix {
@@ -2916,22 +2936,28 @@ def namespaceFreshOutput
         | .loopInstance _ _ _ => fact.origin
         | .selected _ _ _ => fact.origin
     }
+  | .selectedMatrices selection branches =>
+      let namespaceBranch (branch : OperationalMatrixFact) :=
+        match namespaceFreshOutput scope wire (.matrix branch) with
+        | .matrix namespaced => namespaced
+        | _ => branch
+      .selectedMatrices (namespaceFreshValueOrigin scope wire selection)
+        (branches.map namespaceBranch)
   | fact => fact
 
-def factHasRelation : OperationalFact → Bool
-  | .matrix fact => !fact.relations.isEmpty
+partial def factHasRelation : OperationalFact → Bool
+  | .matrix fact => !fact.relations.isEmpty || fact.polynomial.any fun term =>
+      term.product.factors.any fun factor => !factor.relations.isEmpty
   | .familyUniform _ _ element _ => factHasRelation element
-  | .familyPackedNil => false
-  | .familyPackedCons head tail => factHasRelation head || factHasRelation tail
+  | .familyPacked elements => elements.any factHasRelation
+  | .selectedMatrices _ branches => branches.any fun branch => factHasRelation (.matrix branch)
   | _ => false
 
 def packedFacts : List OperationalFact → OperationalFact
-  | [] => .familyPackedNil
-  | head :: tail => .familyPackedCons head (packedFacts tail)
+  | elements => .familyPacked elements.toArray
 
-def unpackPackedFacts : OperationalFact → Option (List OperationalFact)
-  | .familyPackedNil => some []
-  | .familyPackedCons head tail => return head :: (← unpackPackedFacts tail)
+def unpackPackedFacts : OperationalFact → Option (Array OperationalFact)
+  | .familyPacked elements => some elements
   | _ => none
 
 private def booleanFamilyCount (fact : OperationalFact) : Option Int :=
@@ -2939,7 +2965,7 @@ private def booleanFamilyCount (fact : OperationalFact) : Option Int :=
   | .familyUniform _ _ .boolean count => some count
   | packed => do
       let elements ← unpackPackedFacts packed
-      if elements.all (· == .boolean) then some (Int.ofNat elements.length) else none
+      if elements.all (· == .boolean) then some (Int.ofNat elements.size) else none
 
 private def instantiateHashIdentityLoopIndex
     (slot index : Nat) (identity : DeterministicHashIdentity) : DeterministicHashIdentity :=
@@ -3013,7 +3039,7 @@ private def instantiateRelationLoopIndex
       targetSummary := instantiateTargetLoopIndex slot index relation.targetSummary
     }
 
-private def instantiateFactLoopIndex (slot index : Nat) : OperationalFact → OperationalFact
+private partial def instantiateFactLoopIndex (slot index : Nat) : OperationalFact → OperationalFact
   | .matrix fact => .matrix {
       fact with
       origin := instantiateOriginLoopIndex slot index fact.origin
@@ -3042,9 +3068,15 @@ private def instantiateFactLoopIndex (slot index : Nat) : OperationalFact → Op
       fact with origin := instantiateValueOriginLoopIndex slot index fact.origin }
   | .familyUniform binder coordinate element count =>
       .familyUniform binder coordinate (instantiateFactLoopIndex slot index element) count
-  | .familyPackedCons head tail =>
-      .familyPackedCons (instantiateFactLoopIndex slot index head)
-        (instantiateFactLoopIndex slot index tail)
+  | .familyPacked elements =>
+      .familyPacked (elements.map (instantiateFactLoopIndex slot index))
+  | .selectedMatrices selection branches =>
+      let instantiateBranch (branch : OperationalMatrixFact) :=
+        match instantiateFactLoopIndex slot index (.matrix branch) with
+        | .matrix instantiated => instantiated
+        | _ => branch
+      .selectedMatrices (instantiateValueOriginLoopIndex slot index selection)
+        (branches.map instantiateBranch)
   | fact => fact
 
 private def selectProtocolValueOrigin
@@ -3099,7 +3131,7 @@ private def selectProtocolRelation
       targetSummary := selectProtocolTarget index relation.targetSummary
     }
 
-private def selectProtocolFamilyElement (index : Nat) : OperationalFact → OperationalFact
+private partial def selectProtocolFamilyElement (index : Nat) : OperationalFact → OperationalFact
   | .matrix fact => .matrix {
       fact with
       origin := selectProtocolMatrixOrigin index fact.origin
@@ -3118,9 +3150,15 @@ private def selectProtocolFamilyElement (index : Nat) : OperationalFact → Oper
       fact with origin := selectProtocolValueOrigin index fact.origin }
   | .familyUniform binder coordinate element count =>
       .familyUniform binder coordinate (selectProtocolFamilyElement index element) count
-  | .familyPackedCons head tail =>
-      .familyPackedCons (selectProtocolFamilyElement index head)
-        (selectProtocolFamilyElement index tail)
+  | .familyPacked elements =>
+      .familyPacked (elements.map (selectProtocolFamilyElement index))
+  | .selectedMatrices selection branches =>
+      let selectBranch (branch : OperationalMatrixFact) :=
+        match selectProtocolFamilyElement index (.matrix branch) with
+        | .matrix selected => selected
+        | _ => branch
+      .selectedMatrices (selectProtocolValueOrigin index selection)
+        (branches.map selectBranch)
   | fact => fact
 
 private def joinCanonicalRanges : List CanonicalRange → CanonicalRange
@@ -3272,27 +3310,115 @@ def selectDynamicUniformFact
       pure (.bytes { selected with subject })
   | fact => rebindSubject subject fact
 
-def loopArgumentFact
-    (node argument index : Nat)
+/-- Build the one-iteration template consumed by a parallel-loop body. Packed executable
+families are joined through the existing exact-one selection representation: signal branches
+retain indicators and bounded branches use their maximum bound. Offset families deliberately use
+a distinct selection origin, which forgets cross-family correlation rather than inventing it. -/
+def loopTemplateArgumentFact
+    (node argument count : Nat)
     (mode : LoopInputMode)
-    (fact : OperationalFact) : Except OperationalError OperationalFact :=
-  match mode, fact with
-  | .broadcast, fact => pure fact
-  | .zip, .familyUniform _ _ element count =>
-      if index < count.toNat then pure element else throw (.loopInputModeMismatch node argument)
-  | .zipOffset offset, .familyUniform _ _ element count =>
-      if index + offset < count.toNat then pure element else
-        throw (.loopInputModeMismatch node argument)
-  | .zip, packed =>
-      -- One body template cannot soundly stand for a heterogeneous packed family. Uniform
-      -- families carry an explicit template and are handled above; packed inputs are rejected
-      -- until their lanes are conservatively joined with a checked common loop identity.
-      let _ := packed
-      throw (.loopInputModeMismatch node argument)
-  | .zipOffset offset, packed =>
-      let _ := offset
-      let _ := packed
-      throw (.loopInputModeMismatch node argument)
+    (fact : OperationalFact) : Except OperationalError OperationalFact := do
+  match mode with
+  | .broadcast => pure fact
+  | .zip | .zipOffset _ =>
+      match unpackPackedFacts fact with
+      | none =>
+          match mode, fact with
+          | .zip, .familyUniform _ _ element familyCount =>
+              if count > familyCount.toNat then
+                throw (.loopInputModeMismatch node argument)
+              else pure element
+          | .zipOffset offset, .familyUniform _ _ element familyCount =>
+              if count + offset > familyCount.toNat then
+                throw (.loopInputModeMismatch node argument)
+              else pure element
+          | _, _ => throw (.loopInputModeMismatch node argument)
+      | some elements =>
+          let offset := match mode with
+            | .zip => 0
+            | .zipOffset value => value
+            | .broadcast => 0
+          if elements.size < count + offset then
+            throw (.loopInputModeMismatch node argument)
+          let branches := ((elements.extract offset (offset + count)).toList)
+          let baseSelection : OperationalValueOrigin :=
+            .local temporaryScope { node, port := 0 }
+          let selection := match mode with
+            | .zip => baseSelection
+            | .zipOffset value => .loopInstance argument value baseSelection
+            | .broadcast => baseSelection
+          if branches.any factHasRelation then do
+            let matrices ← branches.toArray.mapM fun branch =>
+              match branch with
+              | .matrix matrix => pure matrix
+              | _ => throw (.loopInputModeMismatch node argument)
+            pure (.selectedMatrices selection matrices)
+          else
+            joinDynamicFacts node { node, port := argument } branches (some selection)
+
+private def liftSelectedUnaryMatrix
+    (node : Nat)
+    (wire : WireRef)
+    (input : OperationalFact)
+    (operation : OperationalMatrixFact → Except OperationalError OperationalFact) :
+    Except OperationalError OperationalFact := do
+  match input with
+  | .matrix matrix => operation matrix
+  | .selectedMatrices selection branches => do
+      let outputs ← branches.mapM operation
+      let matrices ← outputs.mapM fun output => match output with
+        | .matrix matrix => pure matrix
+        | _ => throw (.operandNotMatrix node wire)
+      pure (.selectedMatrices selection matrices)
+  | _ => throw (.operandNotMatrix node wire)
+
+private structure AlignedMatrixInputs where
+  selection : Option OperationalValueOrigin
+  rows : Array (List OperationalMatrixFact)
+
+private def alignSelectedMatrixInputs
+    (node : Nat)
+    (inputs : List (WireRef × OperationalFact)) :
+    Except OperationalError AlignedMatrixInputs := do
+  let selected := inputs.filterMap fun (_, input) => match input with
+    | .selectedMatrices selection branches => some (selection, branches.size)
+    | _ => none
+  match selected with
+  | [] =>
+      let row ← inputs.mapM fun (wire, input) => match input with
+        | .matrix matrix => pure matrix
+        | _ => throw (.operandNotMatrix node wire)
+      pure { selection := none, rows := #[row] }
+  | (selection, count) :: tail => do
+      if tail.any fun candidate => candidate.1 != selection || candidate.2 != count then
+        throw (.selectedFamilyOperationUnsupported node)
+      let mut rows := #[]
+      for branch in [:count] do
+        let row ← inputs.mapM fun (wire, input) => match input with
+          | .matrix matrix => pure matrix
+          | .selectedMatrices candidate branches => do
+              if candidate != selection then throw (.selectedFamilyOperationUnsupported node)
+              match branches[branch]? with
+              | some matrix => pure matrix
+              | none => throw (.selectedFamilyOperationUnsupported node)
+          | _ => throw (.operandNotMatrix node wire)
+        rows := rows.push row
+      pure { selection := some selection, rows }
+
+private def finishAlignedMatrixOutputs
+    (node : Nat)
+    (wire : WireRef)
+    (selection : Option OperationalValueOrigin)
+    (outputs : Array OperationalFact) : Except OperationalError OperationalFact := do
+  match selection with
+  | none => match outputs[0]? with
+      | some output => pure output
+      | none => throw (.selectedFamilyOperationUnsupported node)
+  | some selection =>
+      let branches ← outputs.mapM fun output => match output with
+        | .matrix matrix => pure matrix
+        | _ => throw (.operandNotMatrix node wire)
+      pure (.selectedMatrices selection branches)
 
 def genericNodeFact
     (scopeKey : ScopeTemplateKey)
@@ -3432,7 +3558,10 @@ def genericNodeFact
       let matrixWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let matrix ← matrixFactAt nodeIndex facts matrixWire
+      let matrix ← match ← lookupFact nodeIndex facts matrixWire with
+        | .matrix matrix => pure matrix
+        | .selectedMatrices .. => throw (.selectedFamilyOperationUnsupported nodeIndex)
+        | _ => throw (.operandNotMatrix nodeIndex matrixWire)
       if node.arguments.length != 1 then
         throw (.unsupportedOutputArity nodeIndex node.arguments.length)
       let minimum ← evaluateIntMinimum environment loopDomains position
@@ -3450,7 +3579,10 @@ def genericNodeFact
       let inputWire ← match node.arguments with
         | [wire] => pure wire
         | _ => throw (.unsupportedOutputArity nodeIndex node.arguments.length)
-      let input ← matrixFactAt nodeIndex facts inputWire
+      let input ← match ← lookupFact nodeIndex facts inputWire with
+        | .matrix matrix => pure matrix
+        | .selectedMatrices .. => throw (.selectedFamilyOperationUnsupported nodeIndex)
+        | _ => throw (.operandNotMatrix nodeIndex inputWire)
       let ciphertext ← evaluateIntInvariant environment loopDomains ciphertextModulus
       let plaintext ← evaluateIntInvariant environment loopDomains plaintextModulus
       let count ← evaluateIntInvariant environment loopDomains length
@@ -3470,7 +3602,10 @@ def genericNodeFact
       if node.arguments.length < 2 then
         throw (.unsupportedOutputArity nodeIndex node.arguments.length)
       let branchCount := node.arguments.length - 1
-      if index.lower < 0 || index.upper >= Int.ofNat branchCount then
+      -- Magnitude analysis is conditional on successful executable evaluation. Reject only an
+      -- interval that cannot select any branch; a partially overlapping interval denotes one of
+      -- the valid branches whenever the runtime Select succeeds.
+      if index.upper < 0 || index.lower >= Int.ofNat branchCount then
         throw (.invalidCount nodeIndex index.upper)
       let branches ← (node.arguments.drop 1).mapM (lookupFact nodeIndex facts)
       joinDynamicFacts nodeIndex { node := nodeIndex, port := outputPort } branches
@@ -3523,7 +3658,7 @@ def genericNodeFact
       let trapdoor ← match ← lookupFact nodeIndex facts trapdoorWire with
         | .trapdoor fact => pure fact
         | _ => throw (.missingPublicIdentity nodeIndex trapdoorWire)
-      let target ← matrixFactAt nodeIndex facts targetWire
+      let targetFact ← lookupFact nodeIndex facts targetWire
       let publicIdentity ← match publicFact.identity with
         | some identity => pure identity
         | none => throw (.missingPublicIdentity nodeIndex publicWire)
@@ -3532,13 +3667,26 @@ def genericNodeFact
       let result ← cappedMatrixFactExpr nodeIndex outputPort matrixType environment bound
       match result with
       | .matrix result =>
-          let relation : PreimageRelation := {
-            producer := result.origin
-            publicIdentity
-            targetOrigin := target.origin
-            targetSummary := matrixTargetSummary target
-          }
-          pure (.matrix ({ result with relations := [.preimage relation] }).refreshPrimitivePolynomial)
+          let attachRelation
+              (branch : Option Nat)
+              (target : OperationalMatrixFact) : OperationalMatrixFact :=
+            let result := match branch with
+              | some index => { result with
+                  origin := .loopInstance nodeIndex index result.origin }
+              | none => result
+            let relation : PreimageRelation := {
+              producer := result.origin
+              publicIdentity
+              targetOrigin := target.origin
+              targetSummary := matrixTargetSummary target
+            }
+            ({ result with relations := [.preimage relation] }).refreshPrimitivePolynomial
+          match targetFact with
+          | .matrix target => pure (.matrix (attachRelation none target))
+          | .selectedMatrices selection targets =>
+              pure (.selectedMatrices selection
+                (targets.mapIdx fun index target => attachRelation (some index) target))
+          | _ => throw (.operandNotMatrix nodeIndex targetWire)
       | _ => throw (.malformedRelation nodeIndex)
   | .hashSample _ variant tagPrefix tagExpressions tagDecimalExpressions tagU64LeExpressions
       base digitCount, some matrixType =>
@@ -3642,33 +3790,51 @@ def genericNodeFact
         throw (.gadgetLayoutMismatch nodeIndex)
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let input ← matrixFactAt nodeIndex facts inputWire
+      let inputFact ← lookupFact nodeIndex facts inputWire
+      let (selection, inputs) ← match inputFact with
+        | .matrix input => pure (none, #[input])
+        | .selectedMatrices selection inputs => pure (some selection, inputs)
+        | _ => throw (.operandNotMatrix nodeIndex inputWire)
+      let input ← match inputs[0]? with
+        | some input => pure input
+        | none => throw (.selectedFamilyOperationUnsupported nodeIndex)
+      if inputs.any fun candidate => candidate.matrixParams != input.matrixParams then
+        throw (.selectedFamilyOperationUnsupported nodeIndex)
       let publicIdentity := PublicMatrixIdentity.gadget descriptor.paramsId params
         input.matrixParams.rows bound small count.toNat
       let result ← cappedMatrixFact nodeIndex outputPort matrixType environment
         (Int.ofNat (Mxx.gadgetDecompositionBound bound small))
       match result with
       | .matrix result =>
-          let status := if !small then ReconstructionStatus.available else
-            match input.canonicalRange with
-            | .below upper => if upper <= descriptor.smallestCrtModulus then
-                .available else .smallRangeMissing descriptor.smallestCrtModulus
-            | .unknown => .smallRangeMissing descriptor.smallestCrtModulus
-          let relation : DecompositionRelation := {
-            producer := result.origin
-            publicIdentity
-            inputOrigin := input.origin
-            inputSummary := matrixTargetSummary input
-            base := bound
-            small
-            digitCount := count.toNat
-            status
-          }
-          pure (.matrix ({
-            result with
-            canonicalRange := if small then .below bound.natAbs else .unknown
-            relations := [.decomposition relation]
-          }).refreshPrimitivePolynomial)
+          let attachRelation (branch : Nat) (input : OperationalMatrixFact) :=
+            let result := match selection with
+              | some _ => { result with origin := .loopInstance nodeIndex branch result.origin }
+              | none => result
+            let status := if !small then ReconstructionStatus.available else
+              match input.canonicalRange with
+              | .below upper => if upper <= descriptor.smallestCrtModulus then
+                  .available else .smallRangeMissing descriptor.smallestCrtModulus
+              | .unknown => .smallRangeMissing descriptor.smallestCrtModulus
+            let relation : DecompositionRelation := {
+              producer := result.origin
+              publicIdentity
+              inputOrigin := input.origin
+              inputSummary := matrixTargetSummary input
+              base := bound
+              small
+              digitCount := count.toNat
+              status
+            }
+            ({ result with
+              canonicalRange := if small then .below bound.natAbs else .unknown
+              relations := [.decomposition relation]
+            }).refreshPrimitivePolynomial
+          let outputs := inputs.mapIdx attachRelation
+          match selection with
+          | none => match outputs[0]? with
+              | some output => pure (.matrix output)
+              | none => throw (.selectedFamilyOperationUnsupported nodeIndex)
+          | some selection => pure (.selectedMatrices selection outputs)
       | _ => throw (.malformedRelation nodeIndex)
   | .matrixAdd, some matrixType | .matrixSubtract, some matrixType =>
       if node.arguments.length != 2 then
@@ -3679,19 +3845,54 @@ def genericNodeFact
       let rightWire ← match node.arguments[1]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex leftWire)
-      let left ← requireMatrixType nodeIndex leftWire matrixType facts environment
-      let right ← requireMatrixType nodeIndex rightWire matrixType facts environment
-      let polynomial := match node.kind with
-        | .matrixAdd => addOperationalPolynomials left.polynomial right.polynomial
-        | .matrixSubtract => subtractOperationalPolynomials left.polynomial right.polynomial
-        | _ => []
-      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+      let leftFact ← lookupFact nodeIndex facts leftWire
+      let rightFact ← lookupFact nodeIndex facts rightWire
+      let combinePair
+          (left right : OperationalMatrixFact) : Except OperationalError OperationalFact := do
+        let left ← retypeMatrixFact nodeIndex matrixType left environment
+        let right ← retypeMatrixFact nodeIndex matrixType right environment
+        let polynomial := match node.kind with
+          | .matrixAdd => addOperationalPolynomials left.polynomial right.polynomial
+          | .matrixSubtract => subtractOperationalPolynomials left.polynomial right.polynomial
+          | _ => []
+        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+      let finishSelected
+          (selection : OperationalValueOrigin)
+          (outputs : Array OperationalFact) : Except OperationalError OperationalFact := do
+        let branches ← outputs.mapM fun output => match output with
+          | .matrix branch => pure branch
+          | _ => throw (.operandNotMatrix nodeIndex leftWire)
+        pure (.selectedMatrices selection branches)
+      match leftFact, rightFact with
+      | .matrix left, .matrix right => combinePair left right
+      | .selectedMatrices selection branches, .matrix right => do
+          let outputs ← branches.mapM fun left => combinePair left right
+          finishSelected selection outputs
+      | .matrix left, .selectedMatrices selection branches => do
+          let outputs ← branches.mapM fun right => combinePair left right
+          finishSelected selection outputs
+      | .selectedMatrices leftSelection leftBranches,
+          .selectedMatrices rightSelection rightBranches => do
+          if leftSelection != rightSelection || leftBranches.size != rightBranches.size then
+            throw (.selectedFamilyOperationUnsupported nodeIndex)
+          let mut outputs : Array OperationalFact := #[]
+          for branch in [:leftBranches.size] do
+            match leftBranches[branch]?, rightBranches[branch]? with
+            | some left, some right => outputs := outputs.push (← combinePair left right)
+            | _, _ => throw (.selectedFamilyOperationUnsupported nodeIndex)
+          finishSelected leftSelection outputs
+      | _, _ => throw (.operandNotMatrix nodeIndex leftWire)
   | .concat axis, some matrixType =>
-      let inputs ← node.arguments.mapM fun wire => matrixFactAt nodeIndex facts wire
-      let polynomial ← concatOperationalPolynomials axis matrixType (inputs.map (·.polynomial))
-        |>.mapError (flatErrorAt nodeIndex)
-      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
-        (joinCanonicalRanges (inputs.map (·.canonicalRange)))
+      let inputs ← node.arguments.mapM fun wire =>
+        return (wire, ← lookupFact nodeIndex facts wire)
+      let aligned ← alignSelectedMatrixInputs nodeIndex inputs
+      let outputs ← aligned.rows.mapM fun row => do
+        let polynomial ← concatOperationalPolynomials axis matrixType (row.map (·.polynomial))
+          |>.mapError (flatErrorAt nodeIndex)
+        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+          (joinCanonicalRanges (row.map (·.canonicalRange)))
+      finishAlignedMatrixOutputs nodeIndex (node.arguments.headD { node := 0, port := 0 })
+        aligned.selection outputs
   | .select, some matrixType =>
       let indexWire ← match node.arguments[0]? with
         | some wire => pure wire
@@ -3700,10 +3901,14 @@ def genericNodeFact
       if node.arguments.length < 2 then
         throw (.unsupportedOutputArity nodeIndex node.arguments.length)
       let branchCount := node.arguments.length - 1
-      if index.lower < 0 || index.upper >= Int.ofNat branchCount then
+      -- Match FamilyGetDynamic's conditional-on-success interpretation above.
+      if index.upper < 0 || index.lower >= Int.ofNat branchCount then
         throw (.invalidCount nodeIndex index.upper)
-      let branches ← (node.arguments.drop 1).mapM fun wire =>
-        requireMatrixType nodeIndex wire matrixType facts environment
+      let branches ← (node.arguments.drop 1).mapM fun wire => do
+        match ← lookupFact nodeIndex facts wire with
+        | .matrix branch => retypeMatrixFact nodeIndex matrixType branch environment
+        | .selectedMatrices .. => throw (.selectedFamilyOperationUnsupported nodeIndex)
+        | _ => throw (.operandNotMatrix nodeIndex wire)
       let polynomial ← selectOperationalPolynomials scopeKey nodeIndex index.origin matrixType
         (branches.map (·.polynomial)) |>.mapError (flatErrorAt nodeIndex)
       polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
@@ -3711,78 +3916,98 @@ def genericNodeFact
   | .transpose, some matrixType =>
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let input ← matrixFactAt nodeIndex facts inputWire
-      let polynomial ← transposeOperationalPolynomial input.polynomial
-        |>.mapError (flatErrorAt nodeIndex)
-      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+      liftSelectedUnaryMatrix nodeIndex inputWire (← lookupFact nodeIndex facts inputWire) fun input => do
+        let polynomial ← transposeOperationalPolynomial input.polynomial
+          |>.mapError (flatErrorAt nodeIndex)
+        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
   | .slice rows columns, some matrixType =>
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let input ← matrixFactAt nodeIndex facts inputWire
-      let polynomial ← sliceOperationalPolynomial rows columns matrixType input.polynomial
-        |>.mapError (flatErrorAt nodeIndex)
-      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+      liftSelectedUnaryMatrix nodeIndex inputWire (← lookupFact nodeIndex facts inputWire) fun input => do
+        let polynomial ← sliceOperationalPolynomial rows columns matrixType input.polynomial
+          |>.mapError (flatErrorAt nodeIndex)
+        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
   | .reshape rows columns, some matrixType =>
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let input ← matrixFactAt nodeIndex facts inputWire
-      let outputParams ← match matrixType.evaluate environment
-          (.constant input.matrixParams.maxCoefficientBound) with
-        | some params => pure params
-        | none => throw (.invalidMatrixParameters nodeIndex)
-      let polynomial ←
-        if sameConcreteMatrixShape input.matrixParams outputParams then
-          equivalentRetypeOperationalPolynomial matrixType input.polynomial
-            |>.mapError (flatErrorAt nodeIndex)
-        else
-          boundedStructuralTransformPolynomial (.reshape rows columns) matrixType input.polynomial
-            |>.mapError (flatErrorAt nodeIndex)
-      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+      liftSelectedUnaryMatrix nodeIndex inputWire (← lookupFact nodeIndex facts inputWire) fun input => do
+        let outputParams ← match matrixType.evaluate environment
+            (.constant input.matrixParams.maxCoefficientBound) with
+          | some params => pure params
+          | none => throw (.invalidMatrixParameters nodeIndex)
+        let polynomial ←
+          if sameConcreteMatrixShape input.matrixParams outputParams then
+            equivalentRetypeOperationalPolynomial matrixType input.polynomial
+              |>.mapError (flatErrorAt nodeIndex)
+          else
+            boundedStructuralTransformPolynomial (.reshape rows columns) matrixType input.polynomial
+              |>.mapError (flatErrorAt nodeIndex)
+        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
   | .constantCoefficient index, some matrixType =>
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let input ← matrixFactAt nodeIndex facts inputWire
-      if node.arguments.length != 1 || input.matrixParams.rows != 1 ||
-          input.matrixParams.columns != 1 then
-        throw (.invalidMatrixParameters nodeIndex)
       let minimum ← evaluateIntMinimum environment loopDomains index
       let maximum ← evaluateIntMaximum environment loopDomains index
-      if minimum < 0 || maximum >= Int.ofNat input.matrixParams.ringDimension then
-        throw (.invalidCount nodeIndex maximum)
-      let polynomial ← boundedStructuralTransformPolynomial (.constantCoefficient index) matrixType
-        input.polynomial |>.mapError (flatErrorAt nodeIndex)
-      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+      liftSelectedUnaryMatrix nodeIndex inputWire (← lookupFact nodeIndex facts inputWire) fun input => do
+        if node.arguments.length != 1 || input.matrixParams.rows != 1 ||
+            input.matrixParams.columns != 1 then
+          throw (.invalidMatrixParameters nodeIndex)
+        if minimum < 0 || maximum >= Int.ofNat input.matrixParams.ringDimension then
+          throw (.invalidCount nodeIndex maximum)
+        let polynomial ← boundedStructuralTransformPolynomial (.constantCoefficient index)
+          matrixType input.polynomial |>.mapError (flatErrorAt nodeIndex)
+        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
   | .matrixNegate, some matrixType =>
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let input ← requireMatrixType nodeIndex inputWire matrixType facts environment
-      polynomialMatrixFact nodeIndex outputPort matrixType environment
-        (scaleOperationalPolynomial (-1) input.polynomial) input.canonicalRange
+      let negate (input : OperationalMatrixFact) := do
+        let input ← retypeMatrixFact nodeIndex matrixType input environment
+        polynomialMatrixFact nodeIndex outputPort matrixType environment
+          (scaleOperationalPolynomial (-1) input.polynomial) input.canonicalRange
+      match ← lookupFact nodeIndex facts inputWire with
+      | .matrix input => negate input
+      | .selectedMatrices selection branches => do
+          let outputs ← branches.mapM negate
+          let branches ← outputs.mapM fun output => match output with
+            | .matrix branch => pure branch
+            | _ => throw (.operandNotMatrix nodeIndex inputWire)
+          pure (.selectedMatrices selection branches)
+      | _ => throw (.operandNotMatrix nodeIndex inputWire)
   | .matrixScale scalar, some matrixType =>
       let scalarValues ← evaluateIntOverLoops environment loopDomains scalar
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let input ← requireMatrixType nodeIndex inputWire matrixType facts environment
-      match scalarValues with
-      | [] => throw (.invalidMatrixParameters nodeIndex)
-      | first :: tail =>
-          if first == 1 && tail.all (· == 1) then
-            pure (.matrix { input with subject := { node := nodeIndex, port := outputPort } })
-          else
-            let polynomial ←
-              if tail.all (· == first) then
-                pure (scaleOperationalPolynomial first input.polynomial)
-              else
-                multiplyOperationalPolynomials
-                  (parameterScalarPolynomial environment loopDomains scalar matrixType)
-                  input.polynomial |>.mapError (flatErrorAt nodeIndex)
-            polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
-              input.canonicalRange
+      let scale (input : OperationalMatrixFact) := do
+        let input ← retypeMatrixFact nodeIndex matrixType input environment
+        match scalarValues with
+        | [] => throw (.invalidMatrixParameters nodeIndex)
+        | first :: tail =>
+            if first == 1 && tail.all (· == 1) then
+              pure (.matrix { input with subject := { node := nodeIndex, port := outputPort } })
+            else
+              let polynomial ←
+                if tail.all (· == first) then
+                  pure (scaleOperationalPolynomial first input.polynomial)
+                else
+                  multiplyOperationalPolynomials
+                    (parameterScalarPolynomial environment loopDomains scalar matrixType)
+                    input.polynomial |>.mapError (flatErrorAt nodeIndex)
+              polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+                input.canonicalRange
+      match ← lookupFact nodeIndex facts inputWire with
+      | .matrix input => scale input
+      | .selectedMatrices selection branches => do
+          let outputs ← branches.mapM scale
+          let branches ← outputs.mapM fun output => match output with
+            | .matrix branch => pure branch
+            | _ => throw (.operandNotMatrix nodeIndex inputWire)
+          pure (.selectedMatrices selection branches)
+      | _ => throw (.operandNotMatrix nodeIndex inputWire)
   | .matrixMultiply, some matrixType =>
       let leftWire ← match node.arguments[0]? with
         | some wire => pure wire
@@ -3790,18 +4015,46 @@ def genericNodeFact
       let rightWire ← match node.arguments[1]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex leftWire)
-      let left ← matrixFactAt nodeIndex facts leftWire
-      let right ← matrixFactAt nodeIndex facts rightWire
-      let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial
-        |>.mapError (flatErrorAt nodeIndex)
-      let rewritten ← rewriteOperationalRelations nodeIndex raw
-      let polynomial ← match rule with
-        | .matrixMultiplyRelation declaredRight => do
-            if declaredRight != rightWire then throw (.missingRelation nodeIndex declaredRight)
-            if rewritten == raw then throw (.missingRelation nodeIndex rightWire)
-            pure rewritten
-        | _ => pure rewritten
-      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+      let leftFact ← lookupFact nodeIndex facts leftWire
+      let rightFact ← lookupFact nodeIndex facts rightWire
+      let multiplyPair
+          (left right : OperationalMatrixFact) : Except OperationalError OperationalFact := do
+        let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial
+          |>.mapError (flatErrorAt nodeIndex)
+        let rewritten ← rewriteOperationalRelations nodeIndex raw
+        let polynomial ← match rule with
+          | .matrixMultiplyRelation declaredRight => do
+              if declaredRight != rightWire then throw (.missingRelation nodeIndex declaredRight)
+              if rewritten == raw then throw (.missingRelation nodeIndex rightWire)
+              pure rewritten
+          | _ => pure rewritten
+        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+      let finishSelected
+          (selection : OperationalValueOrigin)
+          (outputs : Array OperationalFact) : Except OperationalError OperationalFact := do
+        let branches ← outputs.mapM fun output => match output with
+          | .matrix branch => pure branch
+          | _ => throw (.operandNotMatrix nodeIndex leftWire)
+        pure (.selectedMatrices selection branches)
+      match leftFact, rightFact with
+      | .matrix left, .matrix right => multiplyPair left right
+      | .selectedMatrices selection branches, .matrix right => do
+          let outputs ← branches.mapM fun left => multiplyPair left right
+          finishSelected selection outputs
+      | .matrix left, .selectedMatrices selection branches => do
+          let outputs ← branches.mapM fun right => multiplyPair left right
+          finishSelected selection outputs
+      | .selectedMatrices leftSelection leftBranches,
+          .selectedMatrices rightSelection rightBranches => do
+          if leftSelection != rightSelection || leftBranches.size != rightBranches.size then
+            throw (.selectedFamilyOperationUnsupported nodeIndex)
+          let mut outputs : Array OperationalFact := #[]
+          for branch in [:leftBranches.size] do
+            match leftBranches[branch]?, rightBranches[branch]? with
+            | some left, some right => outputs := outputs.push (← multiplyPair left right)
+            | _, _ => throw (.selectedFamilyOperationUnsupported nodeIndex)
+          finishSelected leftSelection outputs
+      | _, _ => throw (.operandNotMatrix nodeIndex leftWire)
   | .tensor, some matrixType =>
       let leftWire ← match node.arguments[0]? with
         | some wire => pure wire
@@ -3809,11 +4062,16 @@ def genericNodeFact
       let rightWire ← match node.arguments[1]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex leftWire)
-      let left ← matrixFactAt nodeIndex facts leftWire
-      let right ← matrixFactAt nodeIndex facts rightWire
-      let polynomial ← tensorOperationalPolynomials matrixType left.polynomial right.polynomial
-        |>.mapError (flatErrorAt nodeIndex)
-      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+      let aligned ← alignSelectedMatrixInputs nodeIndex
+        [(leftWire, ← lookupFact nodeIndex facts leftWire),
+          (rightWire, ← lookupFact nodeIndex facts rightWire)]
+      let outputs ← aligned.rows.mapM fun row => match row with
+        | [left, right] => do
+            let polynomial ← tensorOperationalPolynomials matrixType
+              left.polynomial right.polynomial |>.mapError (flatErrorAt nodeIndex)
+            polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+        | _ => throw (.selectedFamilyOperationUnsupported nodeIndex)
+      finishAlignedMatrixOutputs nodeIndex leftWire aligned.selection outputs
   | .crtRecompose plaintextModuli reconstructionCoefficients, some matrixType =>
       if node.arguments.isEmpty || node.arguments.length != plaintextModuli.length ||
           node.arguments.length != reconstructionCoefficients.length then
@@ -3821,17 +4079,24 @@ def genericNodeFact
       let moduli ← plaintextModuli.mapM (evaluateIntInvariant environment loopDomains)
       let coefficients ← reconstructionCoefficients.mapM
         (evaluateIntInvariant environment loopDomains)
-      let inputs ← node.arguments.mapM fun wire =>
-        requireMatrixType nodeIndex wire matrixType facts environment
+      let inputFacts ← node.arguments.mapM fun wire =>
+        return (wire, ← lookupFact nodeIndex facts wire)
+      let aligned ← alignSelectedMatrixInputs nodeIndex inputFacts
       let modulus ← evaluateIntInvariant environment loopDomains matrixType.modulus
-      if modulus <= 0 || inputs.any (·.matrixParams.rows != 1) ||
-          moduli.any (fun value => value <= 1 || value >= modulus) ||
+      if modulus <= 0 || moduli.any (fun value => value <= 1 || value >= modulus) ||
           coefficients.any (fun value => value < 0 || value >= modulus) then
         throw (.invalidMatrixParameters nodeIndex)
-      let polynomial := (coefficients.zip inputs).foldl
-        (fun result pair ↦ addOperationalPolynomials result
-          (scaleOperationalPolynomial pair.1 pair.2.polynomial)) []
-      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+      let outputs ← aligned.rows.mapM fun inputs => do
+        let inputs ← inputs.mapM fun input =>
+          retypeMatrixFact nodeIndex matrixType input environment
+        if inputs.any (·.matrixParams.rows != 1) then
+          throw (.invalidMatrixParameters nodeIndex)
+        let polynomial := (coefficients.zip inputs).foldl
+          (fun result pair ↦ addOperationalPolynomials result
+            (scaleOperationalPolynomial pair.1 pair.2.polynomial)) []
+        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+      finishAlignedMatrixOutputs nodeIndex
+        (node.arguments.headD { node := 0, port := 0 }) aligned.selection outputs
   | .packPolynomialCoefficients _ coefficientBits, some matrixType =>
       let bits ← evaluateIntMaximum environment loopDomains coefficientBits
       if bits <= 0 then throw (.invalidBound nodeIndex bits)
@@ -4103,14 +4368,14 @@ def evaluatePreparedScope
             return (← lookupFact callerNode facts wire) ::
               (← scopeOutputFacts callerNode tail facts)
       let rec prepareParallelInputs
-          (nodeIndex index argumentIndex : Nat)
+          (nodeIndex count argumentIndex : Nat)
           (modes : List LoopInputMode)
           (inputs : List OperationalFact) : Except OperationalError (List OperationalFact) := do
         match modes, inputs with
         | [], [] => pure []
         | mode :: modeTail, input :: inputTail =>
-            return (← loopArgumentFact nodeIndex argumentIndex index mode input) ::
-              (← prepareParallelInputs nodeIndex index (argumentIndex + 1) modeTail inputTail)
+            return (← loopTemplateArgumentFact nodeIndex argumentIndex count mode input) ::
+              (← prepareParallelInputs nodeIndex count (argumentIndex + 1) modeTail inputTail)
         | _, _ => throw (.loopInputModeMismatch nodeIndex argumentIndex)
       let mut facts : OperationalScopeFacts := #[]
       for node in scope.nodes do
@@ -4201,9 +4466,16 @@ def evaluatePreparedScope
                       match unpackPackedFacts packed with
                       | some elements =>
                           if elements.isEmpty || selectionFact.upper < 0 ||
-                              selectionFact.lower >= Int.ofNat elements.length then
+                              selectionFact.lower >= Int.ofNat elements.size then
                             throw (.invalidCount index selectionFact.upper)
-                          else pure [← joinDynamicFacts index { node := index, port := 0 } elements
+                          else if elements.any factHasRelation then do
+                            let branches ← elements.mapM fun element => do
+                              match ← rebindSubject { node := index, port := 0 } element with
+                              | .matrix branch => pure branch
+                              | _ => throw (.loopInputModeMismatch index 0)
+                            pure [.selectedMatrices selection branches]
+                          else pure [← joinDynamicFacts index { node := index, port := 0 }
+                              elements.toList
                               (some selection)]
                       | none => throw (.loopInputModeMismatch index 0)
               | .parallelLoop _ count indexSlot bindings modes =>
@@ -4212,30 +4484,36 @@ def evaluatePreparedScope
                     | none => throw .nonClosedExpression
                   if evaluatedCount < 0 then throw (.invalidCount index evaluatedCount)
                   let actualInputs ← node.arguments.mapM (lookupFact index facts)
-                  let templateInputs ← prepareParallelInputs index 0 0 modes actualInputs
-                  let iterationEnvironment :=
-                    (ParamKey.loopIndex indexSlot, ParamValue.integer 0) :: environment
                   let parentDomains := .loopIndex indexSlot evaluatedCount.toNat ::
                     loopDomains.filter fun domain => match domain with
                       | .loopIndex candidate _ => candidate != indexSlot
                       | .parameter _ _ _ _ => true
+                  let child ← preparedDefinitionAt index prepared definitions
+                  let childKey := .parallelBody scopeKey index
+                  let templateInputs ←
+                    prepareParallelInputs index evaluatedCount.toNat 0 modes actualInputs
+                  let iterationEnvironment :=
+                    (ParamKey.loopIndex indexSlot, ParamValue.integer 0) :: environment
                   let boundParams ← match evaluateBindings iterationEnvironment bindings with
                     | some values => pure values
                     | none => throw .nonClosedExpression
-                  let childDomains ← extendParameterDomains iterationEnvironment parentDomains bindings
-                  let child ← preparedDefinitionAt index prepared definitions
-                  let childKey := .parallelBody scopeKey index
+                  let childDomains ←
+                    extendParameterDomains iterationEnvironment parentDomains bindings
                   let childFacts ← (evaluatePreparedScope definitions layouts
-                    childKey fuel child
-                    (boundParams ++ iterationEnvironment) childDomains templateInputs).mapError
-                      (.inScope childKey)
+                    childKey fuel child (boundParams ++ iterationEnvironment)
+                    childDomains templateInputs).mapError (.inScope childKey)
                   let childOutputs ← scopeOutputFacts index child.scope.outputs childFacts
                   if childOutputs.length != node.outputCount then
                     throw (.childInputMismatch index node.outputCount childOutputs.length)
                   childOutputs.zipIdx.mapM fun (output, port) =>
-                    rebindSubject { node := index, port } (.familyUniform
-                      { owner := scopeKey, producerNode := index, binderSlot := indexSlot }
-                      (some (.loopBinder scopeKey index indexSlot)) output evaluatedCount)
+                    match output with
+                    | .selectedMatrices _ branches =>
+                        rebindSubject { node := index, port }
+                          (.familyPacked (branches.map OperationalFact.matrix))
+                    | output =>
+                        rebindSubject { node := index, port } (.familyUniform
+                          { owner := scopeKey, producerNode := index, binderSlot := indexSlot }
+                          (some (.loopBinder scopeKey index indexSlot)) output evaluatedCount)
               | .sequentialLoop _ count indexSlot bindings carriedCount =>
                   let evaluatedCount ← match count.evaluate environment with
                     | some value => pure value
@@ -4482,20 +4760,20 @@ def decoderNoiseCheckReport
     checkDecoderThreshold plaintextModulus ciphertextModulus noiseBound
   pure { outputs, obligations := [obligation], accepted, rejection }
 
-private def collectDecoderResidualBounds
+private partial def collectDecoderResidualBounds
     (environment : ParamEnvironment) : OperationalFact → Except OperationalError (List Int)
   | .matrix residual => return [← residual.evaluateNoiseHardBound environment]
   | .familyUniform _ _ element count => do
       if count <= 0 then
         throw (.invalidCount 0 count)
       collectDecoderResidualBounds environment element
-  | .familyPackedNil => throw (.invalidCount 0 0)
-  | .familyPackedCons head tail => do
-      let headBounds ← collectDecoderResidualBounds environment head
-      let tailBounds ← match tail with
-        | .familyPackedNil => pure []
-        | tail => collectDecoderResidualBounds environment tail
-      pure (headBounds ++ tailBounds)
+  | .familyPacked elements => do
+      if elements.isEmpty then throw (.invalidCount 0 0)
+      let rows ← elements.toList.mapM (collectDecoderResidualBounds environment)
+      pure rows.flatten
+  | .selectedMatrices _ branches => do
+      if branches.isEmpty then throw (.invalidCount 0 0)
+      branches.toList.mapM fun branch => branch.evaluateNoiseHardBound environment
   | _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
 
 /-- Builds one decoder obligation for a matrix residual or an entire residual family. Packed
@@ -5785,15 +6063,15 @@ private def packedFamilyFixtureDerivation : ScopeDerivation := {
   ]
 }
 
-/-- Static extraction retains the exact packed relation, while dynamic extraction cannot claim
-that one producer was selected and therefore drops both identity and relations. -/
+/-- Dynamic extraction keeps relation-bearing branches aligned under one selection identity. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts packedFamilyFixtureScope
       packedFamilyFixtureDerivation [] [fixtureLayout]
-    let staticFact ← matrixFactAt 8 facts { node := 6, port := 0 }
-    let dynamicFact ← matrixFactAt 8 facts { node := 8, port := 0 }
-    pure (!staticFact.relations.isEmpty && dynamicFact.relations.isEmpty &&
-      dynamicFact.identity.isNone)) = .ok true := by
+    match ← lookupFact 8 facts { node := 8, port := 0 } with
+    | .selectedMatrices _ branches => match branches[0]? with
+        | some first => pure (branches.size == 2 && !first.relations.isEmpty)
+        | none => pure false
+    | _ => pure false) = .ok true := by
   native_decide
 
 private def selectFixtureScope : Scope := {
@@ -6115,6 +6393,54 @@ example : (do
     pure report.obligations) = .ok [.decoderThreshold 2 25 6] := by
   native_decide
 
+/-- A compact selected residual computes each complete branch bound and then takes the maximum. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
+    let first ← matrixFactAt 2 facts { node := 0, port := 0 }
+    let second ← matrixFactAt 2 facts { node := 1, port := 0 }
+    let selection := OperationalValueOrigin.local temporaryScope { node := 9, port := 0 }
+    let report ← decoderNoiseCheckReportForFact []
+      (.selectedMatrices selection #[first, second]) [] 2 25
+    pure report.obligations) = .ok [.decoderThreshold 2 25 6] := by
+  native_decide
+
+/-- Ordinary inputs broadcast across a selected input, while two different selections never zip. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
+    let first ← matrixFactAt 2 facts { node := 0, port := 0 }
+    let second ← matrixFactAt 2 facts { node := 1, port := 0 }
+    let leftSelection := OperationalValueOrigin.local temporaryScope { node := 9, port := 0 }
+    let rightSelection := OperationalValueOrigin.local temporaryScope { node := 10, port := 0 }
+    let aligned ← alignSelectedMatrixInputs 11 [
+      ({ node := 0, port := 0 }, .selectedMatrices leftSelection #[first, second]),
+      ({ node := 1, port := 0 }, .matrix first)]
+    let mismatch := alignSelectedMatrixInputs 12 [
+      ({ node := 0, port := 0 }, .selectedMatrices leftSelection #[first, second]),
+      ({ node := 1, port := 0 }, .selectedMatrices rightSelection #[first, second])]
+    pure (aligned.selection == some leftSelection && aligned.rows.size == 2 &&
+      aligned.rows.all (·.length == 2) &&
+      (match mismatch with
+        | .error (.selectedFamilyOperationUnsupported 12) => true
+        | _ => false))) = .ok true := by
+  native_decide
+
+/-- ZipOffset selects the exact corresponding relation-bearing packed branch. -/
+example : (do
+    let facts ← evaluateScopeOperationalWithLayouts sharedPreimageBaseScope
+      sharedPreimageBaseDerivation [] [fixtureLayout]
+    let first ← lookupFact 5 facts { node := 3, port := 0 }
+    let second ← lookupFact 5 facts { node := 4, port := 0 }
+    let selected ← loopTemplateArgumentFact 20 0 1 (.zipOffset 1)
+      (packedFacts [first, second])
+    match selected, second with
+    | .selectedMatrices _ branches, .matrix expected => match branches[0]? with
+        | some actual =>
+            let actual : OperationalMatrixFact := actual
+            pure (branches.size == 1 && actual.origin == expected.origin)
+        | none => pure false
+    | _, _ => pure false) = Except.ok true := by
+  native_decide
+
 /-- A checked uniform family evaluates its element template once, independently of its count. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
@@ -6125,7 +6451,7 @@ example : (do
   native_decide
 
 /-- Empty residual families are rejected instead of being assigned a zero bound. -/
-example : (match decoderNoiseCheckReportForFact [] .familyPackedNil [] 2 25 with
+example : (match decoderNoiseCheckReportForFact [] (.familyPacked #[]) [] 2 25 with
     | .error (.invalidCount 0 0) => true
     | _ => false) = true := by
   native_decide

@@ -58,6 +58,8 @@ pub struct OperationalCheckerReport {
     pub ciphertext_modulus: String,
     pub accepted: bool,
     pub rejection: Option<String>,
+    pub decode_time_ns: u64,
+    pub evaluation_time_ns: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -295,16 +297,42 @@ fn prepared_checker_source(
     prepared: &PreparedOperationalChecker,
     requests: &[OperationalCheckRequest],
 ) -> String {
+    let mut group_representatives = Vec::<usize>::new();
+    let request_groups = requests
+        .iter()
+        .enumerate()
+        .map(|(request_index, request)| {
+            if let Some(group) = group_representatives.iter().position(|representative| {
+                requests[*representative].environment == request.environment &&
+                    requests[*representative].layouts == request.layouts
+            }) {
+                group
+            } else {
+                group_representatives.push(request_index);
+                group_representatives.len() - 1
+            }
+        })
+        .collect::<Vec<_>>();
+    let output_definitions = group_representatives
+        .iter()
+        .enumerate()
+        .map(|(group, representative)| {
+            let (environment, layouts) = lean_request_values(&requests[*representative]);
+            format!(
+                "private def operationalOutputs_{group} (prepared : PreparedOperationalWorkflow) :=\n\
+                   evaluatePreparedWorkflowOperational prepared [{environment}] [{layouts}]"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let definitions = requests
         .iter()
         .enumerate()
         .map(|(index, request)| {
-            let (environment, layouts) = lean_request_values(request);
+            let (environment, _) = lean_request_values(request);
             format!(
-                "private def operationalCheck_{index} (prepared : PreparedOperationalWorkflow) : \
+                "private def operationalCheck_{index} (outputs : List OperationalStageResult) : \
                  Except OperationalError OperationalNoiseCheckReport := do\n\
-                   let outputs <- evaluatePreparedWorkflowOperational prepared [{environment}] \
-                     [{layouts}]\n\
                    let stage <- match outputs.find? (fun result => result.stage == {}) with\n\
                      | some stage => pure stage\n\
                      | none => throw (.missingStageResult {} {})\n\
@@ -324,20 +352,37 @@ fn prepared_checker_source(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
+    let output_executions = group_representatives
+        .iter()
+        .enumerate()
+        .map(|(group, _)| {
+            format!(
+                "    let evaluationStarted_{group} ← IO.monoNanosNow\n\
+                 let outputs_{group} ← match operationalOutputs_{group} prepared with\n\
+                 | .error error => IO.eprintln s!\"operational graph evaluation failed for request \
+                   group {group}: {{repr error}}\"; return 2\n\
+                 | .ok outputs => pure outputs\n\
+                 let evaluationFinished_{group} ← IO.monoNanosNow\n\
+                 let evaluationTimeNs_{group} := evaluationFinished_{group} - evaluationStarted_{group}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let executions = requests
         .iter()
         .enumerate()
         .map(|(index, request)| {
             let digest = operational_request_digest(request);
+            let group = request_groups[index];
             format!(
-                "    match operationalCheck_{index} prepared with\n\
-                 | .error _ => IO.eprintln \"operational graph evaluation failed at request \
-                   {index}\"; return 2\n\
+                "    match operationalCheck_{index} outputs_{group} with\n\
+                 | .error error => IO.eprintln s!\"operational graph evaluation failed at request \
+                   {index}: {{repr error}}\"; return 2\n\
                  | .ok report =>\n\
                      match report.obligations with\n\
                      | [.decoderThreshold plaintextModulus ciphertextModulus noiseBound] =>\n\
                          let accepted := if report.accepted then \"true\" else \"false\"\n\
-                         let json := \"{{\\\"schema_version\\\":2,\\\"protocol_source_hash\\\":\\\"{}\\\",\\\"workflow_hash\\\":\\\"{}\\\",\\\"derivation_hash\\\":\\\"{}\\\",\\\"toolkit_hash\\\":\\\"{}\\\",\\\"request_digest\\\":\\\"{}\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++ \"\\\",\\\"plaintext_modulus\\\":\\\"\" ++ toString plaintextModulus ++ \"\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++ \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++ rejectionJson report.rejection ++ \"}}\"\n\
+                         let json := \"{{\\\"schema_version\\\":2,\\\"protocol_source_hash\\\":\\\"{}\\\",\\\"workflow_hash\\\":\\\"{}\\\",\\\"derivation_hash\\\":\\\"{}\\\",\\\"toolkit_hash\\\":\\\"{}\\\",\\\"request_digest\\\":\\\"{}\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++ \"\\\",\\\"plaintext_modulus\\\":\\\"\" ++ toString plaintextModulus ++ \"\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++ \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++ rejectionJson report.rejection ++ \",\\\"decode_time_ns\\\":\" ++ toString decodeTimeNs ++ \",\\\"evaluation_time_ns\\\":\" ++ toString evaluationTimeNs_{group} ++ \"}}\"\n\
                          IO.println json\n\
                      | _ => IO.eprintln \"operational checker returned an unexpected obligation \
                        set\"; return 3",
@@ -351,15 +396,25 @@ fn prepared_checker_source(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "import {}\nopen {}\nopen Mxx.Certificate\n\n{}\n\n\
+        "import {}\nopen {}\nopen Mxx.Certificate\n\n{}\n\n{}\n\n\
          private def rejectionJson : Option OperationalNoiseRejection -> String\n\
            | none => \"null\"\n\
            | some rejection => \"\\\"\" ++ reprStr rejection ++ \"\\\"\"\n\n\
          def main : IO UInt32 := do\n\
+           let decodeStarted ← IO.monoNanosNow\n\
            match {} with\n\
            | .error _ => IO.eprintln \"operational graph preparation failed\"; return 2\n\
-           | .ok prepared =>\n{}\n    return 0\n",
-        prepared.module_name, prepared.namespace, definitions, prepared.prepared_name, executions,
+           | .ok prepared =>\n\
+             let decodeFinished ← IO.monoNanosNow\n\
+             let decodeTimeNs := decodeFinished - decodeStarted\n\
+{}\n{}\n    return 0\n",
+        prepared.module_name,
+        prepared.namespace,
+        output_definitions,
+        definitions,
+        prepared.prepared_name,
+        output_executions,
+        executions,
     )
 }
 
@@ -483,6 +538,8 @@ mod tests {
             ciphertext_modulus: "17".to_owned(),
             accepted: true,
             rejection: None,
+            decode_time_ns: 0,
+            evaluation_time_ns: 0,
         };
         assert_ne!(report.schema_version, OPERATIONAL_REPORT_SCHEMA_VERSION);
     }

@@ -3122,6 +3122,74 @@ private def tensorOperationalExprFacts
     arena leftId rightId (arena.nodes.size + 1)
   pure (arena, .matrixExpr result)
 
+private def mapOperationalExprWithFuel
+    (mapFact : OperationalMatrixFact → OperationalMatrixFact)
+    (mapSelection : DynamicSelectionIdentity → DynamicSelectionIdentity) :
+    OperationalExprArena → OperationalExprId → Nat →
+    Except OperationalError (OperationalExprArena × OperationalExprId)
+  | _, root, 0 => throw (.unsupportedOperationalExpr root)
+  | arena, root, fuel + 1 => do
+      let expression ← match arena.get? root with
+        | some expression => pure expression
+        | none => throw (.invalidOperationalExprRef root)
+      let pushUnary
+          (constructor : OperationalExprId → OperationalMatrixExprNode)
+          (value : OperationalExprId) := do
+        let (arena, mapped) ←
+          mapOperationalExprWithFuel mapFact mapSelection arena value fuel
+        pure (arena.push { expression with node := constructor mapped })
+      let pushBinary
+          (constructor : OperationalExprId → OperationalExprId → OperationalMatrixExprNode)
+          (left right : OperationalExprId) := do
+        let (arena, mappedLeft) ←
+          mapOperationalExprWithFuel mapFact mapSelection arena left fuel
+        let (arena, mappedRight) ←
+          mapOperationalExprWithFuel mapFact mapSelection arena right fuel
+        pure (arena.push { expression with node := constructor mappedLeft mappedRight })
+      match expression.node with
+      | .concrete fact => pure (arena.pushConcrete (mapFact fact))
+      | .add left right => pushBinary OperationalMatrixExprNode.add left right
+      | .subtract left right => pushBinary OperationalMatrixExprNode.subtract left right
+      | .multiply left right => pushBinary OperationalMatrixExprNode.multiply left right
+      | .tensor left right => pushBinary OperationalMatrixExprNode.tensor left right
+      | .concat axis inputs =>
+          let mut arena := arena
+          let mut mappedInputs : Array OperationalExprId := #[]
+          for input in inputs do
+            let (nextArena, mapped) ←
+              mapOperationalExprWithFuel mapFact mapSelection arena input fuel
+            arena := nextArena
+            mappedInputs := mappedInputs.push mapped
+          pure (arena.push { expression with node := .concat axis mappedInputs })
+      | .transform operation value =>
+          pushUnary (OperationalMatrixExprNode.transform operation) value
+      | .select selection (.exact branches) =>
+          let mut arena := arena
+          let mut mappedBranches : Array OperationalExprId := #[]
+          for branch in branches do
+            let (nextArena, mapped) ←
+              mapOperationalExprWithFuel mapFact mapSelection arena branch fuel
+            arena := nextArena
+            mappedBranches := mappedBranches.push mapped
+          arena.pushSelect (mapSelection selection) (.exact mappedBranches)
+      | .select selection (.schemaEnvelope count representative summary) =>
+          let (arena, mapped) ←
+            mapOperationalExprWithFuel mapFact mapSelection arena representative fuel
+          let mappedFact ← arena.concreteFact mapped
+          let mappedSummary ← match recomputeSelectedMatrixSummary summary mappedFact with
+            | some value => pure value
+            | none => throw (.unsupportedOperationalExpr representative)
+          arena.pushSelect (mapSelection selection)
+            (.schemaEnvelope count mapped mappedSummary)
+
+private def mapOperationalExpr
+    (arena : OperationalExprArena)
+    (root : OperationalExprId)
+    (mapFact : OperationalMatrixFact → OperationalMatrixFact)
+    (mapSelection : DynamicSelectionIdentity → DynamicSelectionIdentity := id) :
+    Except OperationalError (OperationalExprArena × OperationalExprId) :=
+  mapOperationalExprWithFuel mapFact mapSelection arena root (arena.nodes.size + 1)
+
 private def exactOneIndicatorFactor
     (scope : ScopeTemplateKey)
     (node : Nat)
@@ -4536,25 +4604,31 @@ private def selectDynamicRelation
       targetSummary := selectDynamicTarget binder selection relation.targetSummary
     }
 
+private def selectDynamicMatrixFact
+    (binder : FamilyTemplateBinder)
+    (selection : OperationalValueOrigin)
+    (subject : WireRef)
+    (fact : OperationalMatrixFact) : OperationalMatrixFact := {
+  fact with
+  subject
+  origin := selectDynamicMatrixOrigin binder selection fact.origin
+  identity := fact.identity.map fun identity =>
+    .selected binder { index := selection } identity
+  relations := fact.relations.map (selectDynamicRelation binder selection)
+  polynomial := mapOperationalPolynomial
+    (selectDynamicMatrixOrigin binder selection)
+    (fun identity => .selected binder { index := selection } identity)
+    (selectDynamicValueOrigin binder selection)
+    id
+    (selectDynamicRelation binder selection)
+    fact.polynomial
+}
+
 def selectDynamicUniformFact
     (binder : FamilyTemplateBinder)
     (selection : OperationalValueOrigin)
     (subject : WireRef) : OperationalFact → Except OperationalError OperationalFact
-  | .matrix fact => pure (.matrix {
-      fact with
-      subject
-      origin := selectDynamicMatrixOrigin binder selection fact.origin
-      identity := fact.identity.map fun identity =>
-        .selected binder { index := selection } identity
-      relations := fact.relations.map (selectDynamicRelation binder selection)
-      polynomial := mapOperationalPolynomial
-        (selectDynamicMatrixOrigin binder selection)
-        (fun identity => .selected binder { index := selection } identity)
-        (selectDynamicValueOrigin binder selection)
-        id
-        (selectDynamicRelation binder selection)
-        fact.polynomial
-    })
+  | .matrix fact => pure (.matrix (selectDynamicMatrixFact binder selection subject fact))
   | .trapdoor fact => pure (.trapdoor {
       fact with
       subject
@@ -5935,13 +6009,42 @@ def evaluatePreparedScope
                       if requested < 0 || requested >= count then
                         throw (.invalidCount index requested)
                       else
-                        let element := match coordinate with
-                          | some (.loopBinder _ _ slot) =>
-                              instantiateFactLoopIndex slot requested.toNat element
-                          | some (.loopBinderOffset _ _ slot offset) =>
-                              instantiateFactLoopIndex slot (requested.toNat + offset) element
-                          | none => selectProtocolFamilyElement requested.toNat element
-                        pure [← rebindSubject { node := index, port := 0 } element]
+                        let subject : WireRef := { node := index, port := 0 }
+                        match element with
+                        | .matrixExpr root =>
+                            let mapFact (fact : OperationalMatrixFact) :=
+                              let mapped := match coordinate with
+                                | some (.loopBinder _ _ slot) =>
+                                    instantiateFactLoopIndex slot requested.toNat (.matrix fact)
+                                | some (.loopBinderOffset _ _ slot offset) =>
+                                    instantiateFactLoopIndex slot (requested.toNat + offset)
+                                      (.matrix fact)
+                                | none => selectProtocolFamilyElement requested.toNat (.matrix fact)
+                              match rebindSubject subject mapped with
+                              | .ok (.matrix result) => result
+                              | _ => fact
+                            let mapSelection (selection : DynamicSelectionIdentity) := {
+                              index := match coordinate with
+                                | some (.loopBinder _ _ slot) =>
+                                    instantiateValueOriginLoopIndex slot requested.toNat
+                                      selection.index
+                                | some (.loopBinderOffset _ _ slot offset) =>
+                                    instantiateValueOriginLoopIndex slot (requested.toNat + offset)
+                                      selection.index
+                                | none => selectProtocolValueOrigin requested.toNat selection.index
+                            }
+                            let (arena, mapped) ←
+                              mapOperationalExpr facts.arena root mapFact mapSelection
+                            facts := { facts with arena }
+                            pure [.matrixExpr mapped]
+                        | element =>
+                            let element := match coordinate with
+                              | some (.loopBinder _ _ slot) =>
+                                  instantiateFactLoopIndex slot requested.toNat element
+                              | some (.loopBinderOffset _ _ slot offset) =>
+                                  instantiateFactLoopIndex slot (requested.toNat + offset) element
+                              | none => selectProtocolFamilyElement requested.toNat element
+                            pure [← rebindSubject subject element]
                   | .familyPacked elements count summary =>
                       if requested < 0 || requested >= count then
                         throw (.invalidCount index requested)
@@ -5977,8 +6080,20 @@ def evaluatePreparedScope
                       -- correctness, not to the noise transfer. Entirely invalid ranges still fail.
                       if count <= 0 || selectionFact.upper < 0 || selectionFact.lower >= count then
                         throw (.invalidCount index selectionFact.upper)
-                      else pure [← selectDynamicUniformFact binder selection
-                        { node := index, port := 0 } element]
+                      else
+                        let subject : WireRef := { node := index, port := 0 }
+                        match element with
+                        | .matrixExpr root =>
+                            let mapFact := selectDynamicMatrixFact binder selection subject
+                            let mapSelection (nested : DynamicSelectionIdentity) := {
+                              index := selectDynamicValueOrigin binder selection nested.index
+                            }
+                            let (arena, mapped) ←
+                              mapOperationalExpr facts.arena root mapFact mapSelection
+                            facts := { facts with arena }
+                            pure [.matrixExpr mapped]
+                        | element =>
+                            pure [← selectDynamicUniformFact binder selection subject element]
                   | .familyPacked elements count summary =>
                       if count == 0 || selectionFact.upper < 0 ||
                           selectionFact.lower >= Int.ofNat count then
@@ -6398,7 +6513,25 @@ def evaluatePreparedScope
               | _ =>
                   deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
                     layouts facts 0 node.outputTypes
-            facts := { facts with values := facts.values.push outputs.toArray }
+            let mut namespacedOutputs : Array OperationalFact := #[]
+            for (output, port) in outputs.toArray.zipIdx do
+              match output with
+              | .matrixExpr root =>
+                  let wire : WireRef := { node := index, port }
+                  let mapFact (fact : OperationalMatrixFact) :=
+                    match namespaceFreshOutput scopeKey wire (.matrix fact) with
+                    | .matrix mapped => mapped
+                    | _ => fact
+                  let mapSelection (selection : DynamicSelectionIdentity) := {
+                    index := namespaceFreshValueOrigin scopeKey wire selection.index
+                  }
+                  let (arena, mapped) ←
+                    mapOperationalExpr facts.arena root mapFact mapSelection
+                  facts := { facts with arena }
+                  namespacedOutputs := namespacedOutputs.push (.matrixExpr mapped)
+              | output => namespacedOutputs := namespacedOutputs.push output
+            let outputs := namespacedOutputs
+            facts := { facts with values := facts.values.push outputs }
             let attachments := prepared.attachmentBuckets[index]?.getD #[]
             facts := ← applyPreparedDerivationAttachments index attachments facts
       pure facts

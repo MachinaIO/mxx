@@ -1229,8 +1229,121 @@ inductive OperationalError where
   | unknownDerivationAttachment (ownerNamespace ruleName : String)
   | missingDerivationAttachmentRole (ownerNamespace ruleName roleName : String)
   | invalidDerivationAttachment (ownerNamespace ruleName : String)
+  | invalidOperationalExprRef (id : Nat)
+  | operationalExprTypeMismatch (left right : Nat)
+  | unsupportedOperationalExpr (id : Nat)
   | unsupportedNode (node : Nat)
   deriving BEq, DecidableEq, Repr
+
+/-! ## Selection-preserving operational expressions
+
+The executable checker still evaluates ordinary operations into the flat facts above.  This
+request-local arena is the compact boundary for unresolved dynamic selections.  Arena indices are
+allocation identities only: they are never matrix, relation, or symbolic-equality evidence. -/
+
+private abbrev OperationalExprId := Nat
+
+private inductive OperationalSelectionBranches where
+  | exact (branches : Array OperationalExprId)
+  | schemaEnvelope
+      (count : Nat)
+      (representative : OperationalExprId)
+      (summary : SelectedMatrixSummary)
+  deriving BEq
+
+private inductive OperationalMatrixExprNode where
+  | concrete (fact : OperationalMatrixFact)
+  | add (left right : OperationalExprId)
+  | subtract (left right : OperationalExprId)
+  | multiply (left right : OperationalExprId)
+  | transform (operation : OperationalFactorTransform) (value : OperationalExprId)
+  | select
+      (selection : DynamicSelectionIdentity)
+      (branches : OperationalSelectionBranches)
+  deriving BEq
+
+private structure OperationalMatrixExpr where
+  matrixType : MatrixTypeExpr
+  node : OperationalMatrixExprNode
+  deriving BEq
+
+private structure OperationalExprArena where
+  nodes : Array OperationalMatrixExpr := #[]
+  deriving BEq
+
+private structure OperationalExprEvaluationStats where
+  evaluations : Nat := 0
+  memoHits : Nat := 0
+  memoMisses : Nat := 0
+  deriving BEq, DecidableEq, Repr
+
+private structure OperationalExprEvaluationState where
+  memo : Array (Option Int)
+  stats : OperationalExprEvaluationStats := {}
+  deriving BEq
+
+private def OperationalExprArena.get?
+    (arena : OperationalExprArena) (id : OperationalExprId) : Option OperationalMatrixExpr :=
+  arena.nodes[id]?
+
+private def OperationalExprArena.push
+    (arena : OperationalExprArena)
+    (expression : OperationalMatrixExpr) : OperationalExprArena × OperationalExprId :=
+  ({ arena with nodes := arena.nodes.push expression }, arena.nodes.size)
+
+private def OperationalExprArena.pushConcrete
+    (arena : OperationalExprArena)
+    (fact : OperationalMatrixFact) : OperationalExprArena × OperationalExprId :=
+  arena.push { matrixType := fact.matrixType, node := .concrete fact }
+
+private def OperationalExprArena.checkedType
+    (arena : OperationalExprArena)
+    (first : OperationalExprId)
+    (remaining : Array OperationalExprId) : Except OperationalError MatrixTypeExpr := do
+  let firstExpr ← match arena.get? first with
+    | some expression => pure expression
+    | none => throw (.invalidOperationalExprRef first)
+  for id in remaining do
+    let expression ← match arena.get? id with
+      | some expression => pure expression
+      | none => throw (.invalidOperationalExprRef id)
+    if expression.matrixType ≠ firstExpr.matrixType then
+      throw (.operationalExprTypeMismatch first id)
+  pure firstExpr.matrixType
+
+private def OperationalExprArena.pushSelect
+    (arena : OperationalExprArena)
+    (selection : DynamicSelectionIdentity)
+    (branches : OperationalSelectionBranches) :
+    Except OperationalError (OperationalExprArena × OperationalExprId) := do
+  match branches with
+  | .exact values =>
+      let first ← match values[0]? with
+        | some first => pure first
+        | none => throw (.invalidCount 0 0)
+      let matrixType ← arena.checkedType first (values.extract 1 values.size)
+      if values.all (· == first) then pure (arena, first)
+      else pure (arena.push { matrixType, node := .select selection branches })
+  | .schemaEnvelope count representative _ =>
+      if count = 0 then throw (.invalidCount 0 0)
+      -- Step 3 enables this constructor only through a complete summary-transfer check.  Until
+      -- then, accepting a caller-provided representative could turn one branch into a false proof
+      -- about the whole logical family.
+      throw (.unsupportedOperationalExpr representative)
+
+private def OperationalSelectionBranches.staticBranch
+    (branches : OperationalSelectionBranches)
+    (index : Nat) : Except OperationalError OperationalExprId :=
+  match branches with
+  | .exact values => match values[index]? with
+      | some value => pure value
+      | none => throw (.invalidCount 0 index)
+  | .schemaEnvelope _ representative _ => throw (.unsupportedOperationalExpr representative)
+
+private def OperationalExprEvaluationState.empty
+    (arena : OperationalExprArena) : OperationalExprEvaluationState := {
+  memo := Array.replicate arena.nodes.size none
+}
 
 /-- The operational checker has an explicit transfer category for every executable IR node.
 This definition and the exhaustive classifiers below are deliberately separate from the transfer
@@ -1792,6 +1905,66 @@ def OperationalBoundExpr.evaluate
     (previousState : OperationalState)
     (expression : OperationalBoundExpr) : Except OperationalError Int :=
   expression.evaluateWithStates environment [previousState.map factNumericSlot]
+
+private def evaluateOperationalExprBoundWithFuel
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (id : OperationalExprId)
+    (state : OperationalExprEvaluationState) : Nat →
+    Except OperationalError (Int × OperationalExprEvaluationState)
+  | 0 => throw (.unsupportedOperationalExpr id)
+  | fuel + 1 => match state.memo[id]? with
+  | none => throw (.invalidOperationalExprRef id)
+  | some (some value) =>
+      pure (value, { state with stats := {
+        state.stats with memoHits := state.stats.memoHits + 1
+      } })
+  | some none => do
+      let expression ← match arena.get? id with
+        | some expression => pure expression
+        | none => throw (.invalidOperationalExprRef id)
+      let state := { state with stats := {
+        state.stats with
+        evaluations := state.stats.evaluations + 1
+        memoMisses := state.stats.memoMisses + 1
+      } }
+      let (value, state) ← match expression.node with
+        | .concrete fact => do
+            let value ← match fact.totalHardBound with
+              | .closedInt (.constant value) => pure value
+              | expression => expression.evaluateWithStates environment []
+            pure (value, state)
+        | .select _ branches =>
+            let branchIds ← match branches with
+              | .exact values => pure values
+              | .schemaEnvelope count representative _ =>
+                  if count = 0 then throw (.invalidCount 0 0)
+                  pure #[representative]
+            let first ← match branchIds[0]? with
+              | some first => pure first
+              | none => throw (.invalidCount 0 0)
+            let (firstBound, state) ←
+              evaluateOperationalExprBoundWithFuel arena environment first state fuel
+            let mut maximum := firstBound
+            let mut state := state
+            for branch in branchIds.extract 1 branchIds.size do
+              let (bound, nextState) ←
+                evaluateOperationalExprBoundWithFuel arena environment branch state fuel
+              maximum := max maximum bound
+              state := nextState
+            pure (maximum, state)
+        | .add .. | .subtract .. | .multiply .. | .transform .. =>
+            throw (.unsupportedOperationalExpr id)
+      let memo := state.memo.set! id (some value)
+      pure (value, { state with memo })
+
+private def evaluateOperationalExprBound
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (id : OperationalExprId)
+    (state : OperationalExprEvaluationState) :
+    Except OperationalError (Int × OperationalExprEvaluationState) :=
+  evaluateOperationalExprBoundWithFuel arena environment id state (arena.nodes.size + 1)
 
 private def setFactRecurrenceState
     (count : Nat)
@@ -7131,5 +7304,60 @@ example : (match decoderNoiseCheckReportForFact [] (.familyPacked #[] 0 none) []
     | .error (.invalidCount 0 0) => true
     | _ => false) = true := by
   native_decide
+
+/-! The expression-arena fixtures use `decide`, not `native_decide`: request-local IDs and memo
+statistics are ordinary checker data and do not enlarge the trusted evaluation base. -/
+
+private def operationalExprFixtureFact (node : Nat) (bound : Int) : OperationalMatrixFact := {
+  subject := { node, port := 0 }
+  origin := .value temporaryScope { node, port := 0 }
+  matrixType := fixtureType
+  matrixParams := fixtureParams
+  totalHardBound := .closedInt (.constant bound)
+}
+
+/-- A selected expression evaluates each complete branch once, takes their maximum, and then hits
+the O(1) ID-keyed memo entry when the same root is requested again. -/
+example : (do
+    let first := operationalExprFixtureFact 0 3
+    let second := operationalExprFixtureFact 1 6
+    let (arena, firstId) := ({} : OperationalExprArena).pushConcrete first
+    let (arena, secondId) := arena.pushConcrete second
+    let selection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 9, port := 0 }
+    }
+    let (arena, selectedId) ← arena.pushSelect selection
+      (.exact #[firstId, secondId])
+    let initial := OperationalExprEvaluationState.empty arena
+    let (firstBound, state) ← evaluateOperationalExprBound arena [] selectedId initial
+    let (secondBound, state) ← evaluateOperationalExprBound arena [] selectedId state
+    pure (arena.nodes.size, firstBound, secondBound, state.stats)) =
+    .ok (3, 6, 6, { evaluations := 3, memoHits := 1, memoMisses := 3 }) := by
+  simp [operationalExprFixtureFact, fixtureType, OperationalExprArena.pushConcrete,
+    OperationalExprArena.push, OperationalExprArena.pushSelect,
+    OperationalExprArena.checkedType, OperationalExprArena.get?,
+    OperationalExprEvaluationState.empty, evaluateOperationalExprBound,
+    evaluateOperationalExprBoundWithFuel]
+  rfl
+
+/-- Exact equal-branch reduction reuses the existing expression ID and allocates no select node. -/
+example : (do
+    let first := operationalExprFixtureFact 0 3
+    let (arena, firstId) := ({} : OperationalExprArena).pushConcrete first
+    let selection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 9, port := 0 }
+    }
+    let (arena, selectedId) ← arena.pushSelect selection (.exact #[firstId, firstId])
+    pure (arena.nodes.size, selectedId == firstId)) = .ok (1, true) := by
+  simp [operationalExprFixtureFact, fixtureType, OperationalExprArena.pushConcrete,
+    OperationalExprArena.push, OperationalExprArena.pushSelect,
+    OperationalExprArena.checkedType, OperationalExprArena.get?]
+  rfl
+
+/-- Static exact selection distinguishes an invalid index from the intentionally unavailable
+schema-envelope lookup. -/
+example : (OperationalSelectionBranches.exact #[4, 7]).staticBranch 2 =
+    .error (.invalidCount 0 2) := by
+  decide
 
 end Mxx.Certificate

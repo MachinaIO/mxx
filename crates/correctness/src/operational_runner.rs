@@ -550,6 +550,36 @@ mod tests {
     }
 
     #[test]
+    fn prepared_checker_passes_the_stage_expression_arena_to_the_decoder() {
+        let prepared = PreparedOperationalChecker {
+            module_name: "Test.Prepared".to_owned(),
+            namespace: "Test.Generated.Protocol".to_owned(),
+            prepared_name: "preparedOperational".to_owned(),
+            protocol_source_hash: "protocol".to_owned(),
+            workflow_hash: "workflow".to_owned(),
+            derivation_hash: "derivation".to_owned(),
+            toolkit_hash: "toolkit".to_owned(),
+            olean_path: PathBuf::from("unused.olean"),
+        };
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            residual_stage: "evaluate".to_owned(),
+            residual_output: "residual".to_owned(),
+            plaintext_modulus: BigInt::from(2),
+            ciphertext_modulus: BigInt::from(17),
+        };
+
+        let source = prepared_checker_source(&prepared, &[request]);
+
+        assert_eq!(source.matches("decoderNoiseCheckReportForFact outputs ").count(), 1);
+        assert!(
+            source.contains("decoderNoiseCheckReportForFact outputs stage.facts.arena residual")
+        );
+        assert!(!source.contains("decoderNoiseCheckReportForFact outputs residual"));
+    }
+
+    #[test]
     #[ignore = "invokes the Lean compiler"]
     fn runs_generated_toy_workflow() {
         let protocol = toy_example::protocol();

@@ -65,6 +65,12 @@ pub enum DeclaredBoundExpr {
 pub enum InputValueContract {
     MatrixExact {
         matrix_type: MatrixType,
+        /// If present, every canonical coefficient of the external matrix is strictly below this
+        /// bound. This is an input contract, not a bound derived by Rust.
+        canonical_coefficient_exclusive_upper_bound: Option<IntExpr>,
+        /// Whether every polynomial entry is constant. This is input metadata used by the
+        /// operational bound rules, not a property inferred by Rust.
+        is_constant_polynomial: bool,
     },
     MatrixBounded {
         matrix_type: MatrixType,
@@ -558,7 +564,7 @@ fn output_type(graph: &Graph, wire: mxx_ir_core::WireRef) -> Option<&WireType> {
 fn contract_matches_wire(contract: &InputValueContract, wire_type: &WireType) -> bool {
     match (contract, wire_type) {
         (
-            InputValueContract::MatrixExact { matrix_type } |
+            InputValueContract::MatrixExact { matrix_type, .. } |
             InputValueContract::MatrixBounded { matrix_type, .. },
             WireType::Matrix(actual),
         ) => matrix_type == actual,

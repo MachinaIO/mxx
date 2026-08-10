@@ -18,7 +18,10 @@ inductive DeclaredBoundExpr where
   | minimum (left right : DeclaredBoundExpr)
 
 inductive InputValueContract where
-  | matrixExact (type : MatrixTypeExpr)
+  | matrixExact
+      (type : MatrixTypeExpr)
+      (canonicalExclusiveUpper : Option IntExpr)
+      (isConstantPolynomial : Bool)
   | matrixBounded (type : MatrixTypeExpr) (bound : DeclaredBoundExpr)
   | integerRange (lower upper : IntExpr)
   | boolean

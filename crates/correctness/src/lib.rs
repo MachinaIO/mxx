@@ -24,7 +24,9 @@ pub use freshness::{
     FreshnessError, FreshnessMetadata, GENERATOR_VERSION, protocol_source_hash, toolkit_hash,
     verify_freshness,
 };
-pub use operational_protocol::{OperationalProtocolError, operational_protocol_from_graphs};
+pub use operational_protocol::{
+    ExactMatrixInputMetadata, OperationalProtocolError, operational_protocol_from_graphs,
+};
 pub use operational_runner::{
     OPERATIONAL_REPORT_SCHEMA_VERSION, OperationalCheckRequest, OperationalCheckerReport,
     OperationalGadgetLayout, OperationalParameterValue, OperationalRunnerError,

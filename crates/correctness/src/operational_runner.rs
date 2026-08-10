@@ -7,13 +7,15 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
 };
 use tempfile::Builder;
 use thiserror::Error;
 
-pub const OPERATIONAL_REPORT_SCHEMA_VERSION: u32 = 2;
+pub const OPERATIONAL_REPORT_SCHEMA_VERSION: u32 = 4;
 const OPERATIONAL_PREPARED_CACHE_FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +62,19 @@ pub struct OperationalCheckerReport {
     pub rejection: Option<String>,
     pub decode_time_ns: u64,
     pub evaluation_time_ns: u64,
+    pub bound_evaluation_time_ns: u64,
+    pub expression_node_count: u64,
+    pub memo_evaluations: u64,
+    pub memo_hits: u64,
+    pub memo_misses: u64,
+    pub peak_memo_entries: u64,
+    pub envelope_logical_branch_count: u64,
+    pub envelope_stored_branch_count: u64,
+    pub relation_rewrite_count: u64,
+    pub transform_cache_hits: u64,
+    pub transform_cache_misses: u64,
+    pub cartesian_pair_visits: u64,
+    pub maximum_polynomial_terms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +127,25 @@ fn lean_string(value: &str) -> String {
 
 fn operational_lean_arguments() -> [&'static str; 4] {
     ["env", "lean", "-DmaxHeartbeats=0", "--run"]
+}
+
+fn stream_and_retain(
+    input: impl Read,
+    mut emit: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut reader = BufReader::new(input);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let count = reader.read_until(b'\n', &mut line)?;
+        if count == 0 {
+            break;
+        }
+        emit(&line)?;
+        bytes.extend_from_slice(&line);
+    }
+    Ok(bytes)
 }
 
 fn lean_version(lean_workspace: &Path) -> Result<String, OperationalRunnerError> {
@@ -313,6 +347,23 @@ fn prepared_checker_source(
             }
         })
         .collect::<Vec<_>>();
+    let mut bound_group_representatives = Vec::<usize>::new();
+    let request_bound_groups = requests
+        .iter()
+        .enumerate()
+        .map(|(request_index, request)| {
+            if let Some(group) = bound_group_representatives.iter().position(|representative| {
+                request_groups[*representative] == request_groups[request_index] &&
+                    requests[*representative].residual_stage == request.residual_stage &&
+                    requests[*representative].residual_output == request.residual_output
+            }) {
+                group
+            } else {
+                bound_group_representatives.push(request_index);
+                bound_group_representatives.len() - 1
+            }
+        })
+        .collect::<Vec<_>>();
     let output_definitions = group_representatives
         .iter()
         .enumerate()
@@ -325,29 +376,28 @@ fn prepared_checker_source(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let definitions = requests
+    let bound_definitions = bound_group_representatives
         .iter()
         .enumerate()
-        .map(|(index, request)| {
+        .map(|(bound_group, representative)| {
+            let request = &requests[*representative];
             let (environment, _) = lean_request_values(request);
             format!(
-                "private def operationalCheck_{index} (outputs : List OperationalStageResult) : \
-                 Except OperationalError OperationalNoiseCheckReport := do\n\
+                "private def operationalBound_{bound_group} (outputs : List OperationalStageResult) : \
+                 Except OperationalError (Int × OperationalAnalysisDiagnostics) := do\n\
                    let stage <- match outputs.find? (fun result => result.stage == {}) with\n\
                      | some stage => pure stage\n\
                      | none => throw (.missingStageResult {} {})\n\
                    let residual <- match stage.outputs.find? (fun output => output.1 == {}) with\n\
                      | some output => pure output.2\n\
                      | none => throw (.missingStageResult {} {})\n\
-                   decoderNoiseCheckReportForFact outputs stage.facts.arena residual [{environment}] {} {}",
+                   operationalNoiseBoundForFact stage.facts.arena residual [{environment}]",
                 lean_string(&request.residual_stage),
                 lean_string(&request.residual_stage),
                 lean_string(&request.residual_output),
                 lean_string(&request.residual_output),
                 lean_string(&request.residual_stage),
                 lean_string(&request.residual_output),
-                request.plaintext_modulus,
-                request.ciphertext_modulus,
             )
         })
         .collect::<Vec<_>>()
@@ -357,13 +407,38 @@ fn prepared_checker_source(
         .enumerate()
         .map(|(group, _)| {
             format!(
-                "    let evaluationStarted_{group} ← IO.monoNanosNow\n\
+                "IO.eprintln \"phase=evaluate_scope group={group} state=start\"\n\
+                 let evaluationStarted_{group} ← IO.monoNanosNow\n\
                  let outputs_{group} ← match operationalOutputs_{group} prepared with\n\
                  | .error error => IO.eprintln s!\"operational graph evaluation failed for request \
                    group {group}: {{repr error}}\"; return 2\n\
                  | .ok outputs => pure outputs\n\
                  let evaluationFinished_{group} ← IO.monoNanosNow\n\
-                 let evaluationTimeNs_{group} := evaluationFinished_{group} - evaluationStarted_{group}"
+                 let evaluationTimeNs_{group} := evaluationFinished_{group} - evaluationStarted_{group}\n\
+                 IO.eprintln s!\"phase=evaluate_scope group={group} state=finish \
+                   elapsed_ns={{evaluationTimeNs_{group}}}\""
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bound_executions = bound_group_representatives
+        .iter()
+        .enumerate()
+        .map(|(bound_group, representative)| {
+            let output_group = request_groups[*representative];
+            format!(
+                "IO.eprintln \"phase=evaluate_decoder_bounds group={bound_group} state=start\"\n\
+                 let boundEvaluationStarted_{bound_group} ← IO.monoNanosNow\n\
+                 let boundResult_{bound_group} ← match \
+                   operationalBound_{bound_group} outputs_{output_group} with\n\
+                   | .error error => IO.eprintln s!\"operational bound evaluation failed for \
+                     bound group {bound_group}: {{repr error}}\"; return 2\n\
+                   | .ok result => pure result\n\
+                 let boundEvaluationFinished_{bound_group} ← IO.monoNanosNow\n\
+                 let boundEvaluationTimeNs_{bound_group} := \
+                   boundEvaluationFinished_{bound_group} - boundEvaluationStarted_{bound_group}\n\
+                 IO.eprintln s!\"phase=evaluate_decoder_bounds group={bound_group} state=finish \
+                   elapsed_ns={{boundEvaluationTimeNs_{bound_group}}}\""
             )
         })
         .collect::<Vec<_>>()
@@ -374,18 +449,31 @@ fn prepared_checker_source(
         .map(|(index, request)| {
             let digest = operational_request_digest(request);
             let group = request_groups[index];
+            let bound_group = request_bound_groups[index];
             format!(
-                "    match operationalCheck_{index} outputs_{group} with\n\
-                 | .error error => IO.eprintln s!\"operational graph evaluation failed at request \
-                   {index}: {{repr error}}\"; return 2\n\
-                 | .ok report =>\n\
-                     match report.obligations with\n\
+                "let (noiseBound_{index}, diagnostics_{index}) := boundResult_{bound_group}\n\
+                 let report := decoderNoiseCheckReportFromBound outputs_{group} noiseBound_{index} \
+                   diagnostics_{index} {} {}\n\
+                 IO.eprintln s!\"operational analysis diagnostics request {index}: \
+                   expression_nodes={{report.diagnostics.expressionNodeCount}} \
+                   memo_hits={{report.diagnostics.memoHits}} \
+                   memo_misses={{report.diagnostics.memoMisses}} \
+                   envelope_logical={{report.diagnostics.envelopeLogicalBranchCount}} \
+                   envelope_stored={{report.diagnostics.envelopeStoredBranchCount}} \
+                   relation_rewrites={{report.diagnostics.relationRewriteCount}} \
+                   transform_cache_hits={{report.diagnostics.transformCacheHits}} \
+                   transform_cache_misses={{report.diagnostics.transformCacheMisses}} \
+                   cartesian_pairs={{report.diagnostics.cartesianPairVisits}} \
+                   maximum_polynomial_terms={{report.diagnostics.maximumPolynomialTerms}}\"\n\
+                 match report.obligations with\n\
                      | [.decoderThreshold plaintextModulus ciphertextModulus noiseBound] =>\n\
                          let accepted := if report.accepted then \"true\" else \"false\"\n\
-                         let json := \"{{\\\"schema_version\\\":2,\\\"protocol_source_hash\\\":\\\"{}\\\",\\\"workflow_hash\\\":\\\"{}\\\",\\\"derivation_hash\\\":\\\"{}\\\",\\\"toolkit_hash\\\":\\\"{}\\\",\\\"request_digest\\\":\\\"{}\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++ \"\\\",\\\"plaintext_modulus\\\":\\\"\" ++ toString plaintextModulus ++ \"\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++ \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++ rejectionJson report.rejection ++ \",\\\"decode_time_ns\\\":\" ++ toString decodeTimeNs ++ \",\\\"evaluation_time_ns\\\":\" ++ toString evaluationTimeNs_{group} ++ \"}}\"\n\
+                         let json := \"{{\\\"schema_version\\\":4,\\\"protocol_source_hash\\\":\\\"{}\\\",\\\"workflow_hash\\\":\\\"{}\\\",\\\"derivation_hash\\\":\\\"{}\\\",\\\"toolkit_hash\\\":\\\"{}\\\",\\\"request_digest\\\":\\\"{}\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++ \"\\\",\\\"plaintext_modulus\\\":\\\"\" ++ toString plaintextModulus ++ \"\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++ \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++ rejectionJson report.rejection ++ \",\\\"decode_time_ns\\\":\" ++ toString decodeTimeNs ++ \",\\\"evaluation_time_ns\\\":\" ++ toString evaluationTimeNs_{group} ++ \",\\\"bound_evaluation_time_ns\\\":\" ++ toString boundEvaluationTimeNs_{bound_group} ++ \",\\\"expression_node_count\\\":\" ++ toString report.diagnostics.expressionNodeCount ++ \",\\\"memo_evaluations\\\":\" ++ toString report.diagnostics.memoEvaluations ++ \",\\\"memo_hits\\\":\" ++ toString report.diagnostics.memoHits ++ \",\\\"memo_misses\\\":\" ++ toString report.diagnostics.memoMisses ++ \",\\\"peak_memo_entries\\\":\" ++ toString report.diagnostics.peakMemoEntries ++ \",\\\"envelope_logical_branch_count\\\":\" ++ toString report.diagnostics.envelopeLogicalBranchCount ++ \",\\\"envelope_stored_branch_count\\\":\" ++ toString report.diagnostics.envelopeStoredBranchCount ++ \",\\\"relation_rewrite_count\\\":\" ++ toString report.diagnostics.relationRewriteCount ++ \",\\\"transform_cache_hits\\\":\" ++ toString report.diagnostics.transformCacheHits ++ \",\\\"transform_cache_misses\\\":\" ++ toString report.diagnostics.transformCacheMisses ++ \",\\\"cartesian_pair_visits\\\":\" ++ toString report.diagnostics.cartesianPairVisits ++ \",\\\"maximum_polynomial_terms\\\":\" ++ toString report.diagnostics.maximumPolynomialTerms ++ \"}}\"\n\
                          IO.println json\n\
                      | _ => IO.eprintln \"operational checker returned an unexpected obligation \
                        set\"; return 3",
+                request.plaintext_modulus,
+                request.ciphertext_modulus,
                 prepared.protocol_source_hash,
                 prepared.workflow_hash,
                 prepared.derivation_hash,
@@ -407,14 +495,14 @@ fn prepared_checker_source(
            | .ok prepared =>\n\
              let decodeFinished ← IO.monoNanosNow\n\
              let decodeTimeNs := decodeFinished - decodeStarted\n\
-{}\n{}\n    return 0\n",
+{}\n{}\nreturn 0\n",
         prepared.module_name,
         prepared.namespace,
         output_definitions,
-        definitions,
+        bound_definitions,
         prepared.prepared_name,
         output_executions,
-        executions,
+        format!("{bound_executions}\n{executions}"),
     )
 }
 
@@ -425,18 +513,37 @@ fn run_operational_checker_reports(
 ) -> Result<Vec<OperationalCheckerReport>, OperationalRunnerError> {
     let file = Builder::new().prefix("mxx-operational-").suffix(".lean").tempfile()?;
     std::fs::write(file.path(), source)?;
-    let output = Command::new("lake")
+    let mut child = Command::new("lake")
         .args(operational_lean_arguments())
         .arg(file.path())
         .current_dir(lean_workspace)
-        .output()?;
-    if !output.status.success() {
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("piped Lean stdout");
+    let stderr = child.stderr.take().expect("piped Lean stderr");
+    let stdout_reader = thread::spawn(move || {
+        stream_and_retain(stdout, |line| {
+            print!("{}", String::from_utf8_lossy(line));
+            std::io::stdout().flush()
+        })
+    });
+    let stderr_reader = thread::spawn(move || {
+        stream_and_retain(stderr, |line| {
+            eprint!("{}", String::from_utf8_lossy(line));
+            Ok(())
+        })
+    });
+    let status = child.wait()?;
+    let stdout = stdout_reader.join().expect("Lean stdout reader panicked")?;
+    let stderr = stderr_reader.join().expect("Lean stderr reader panicked")?;
+    if !status.success() {
         return Err(OperationalRunnerError::CheckerFailed {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         });
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout);
     let lines = stdout.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
     if lines.len() != expected {
         return Err(OperationalRunnerError::UnexpectedReportCount { expected, actual: lines.len() });
@@ -527,7 +634,7 @@ mod tests {
     #[test]
     fn rejects_unknown_schema() {
         let report = OperationalCheckerReport {
-            schema_version: 3,
+            schema_version: 5,
             protocol_source_hash: String::new(),
             workflow_hash: String::new(),
             derivation_hash: String::new(),
@@ -540,6 +647,19 @@ mod tests {
             rejection: None,
             decode_time_ns: 0,
             evaluation_time_ns: 0,
+            bound_evaluation_time_ns: 0,
+            expression_node_count: 0,
+            memo_evaluations: 0,
+            memo_hits: 0,
+            memo_misses: 0,
+            peak_memo_entries: 0,
+            envelope_logical_branch_count: 0,
+            envelope_stored_branch_count: 0,
+            relation_rewrite_count: 0,
+            transform_cache_hits: 0,
+            transform_cache_misses: 0,
+            cartesian_pair_visits: 0,
+            maximum_polynomial_terms: 0,
         };
         assert_ne!(report.schema_version, OPERATIONAL_REPORT_SCHEMA_VERSION);
     }
@@ -550,7 +670,25 @@ mod tests {
     }
 
     #[test]
-    fn prepared_checker_passes_the_stage_expression_arena_to_the_decoder() {
+    fn stream_and_retain_emits_lines_and_preserves_exact_output() {
+        let input = b"first line\nsecond line without newline";
+        let mut emitted = Vec::new();
+
+        let retained = stream_and_retain(input.as_slice(), |line| {
+            emitted.push(line.to_vec());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            emitted,
+            vec![b"first line\n".to_vec(), b"second line without newline".to_vec()]
+        );
+        assert_eq!(retained, input);
+    }
+
+    #[test]
+    fn prepared_checker_reuses_structural_bound_across_threshold_requests() {
         let prepared = PreparedOperationalChecker {
             module_name: "Test.Prepared".to_owned(),
             namespace: "Test.Generated.Protocol".to_owned(),
@@ -570,13 +708,19 @@ mod tests {
             ciphertext_modulus: BigInt::from(17),
         };
 
-        let source = prepared_checker_source(&prepared, &[request]);
+        let mut rejecting_request = request.clone();
+        rejecting_request.ciphertext_modulus = BigInt::from(8);
+        let source = prepared_checker_source(&prepared, &[request, rejecting_request]);
 
-        assert_eq!(source.matches("decoderNoiseCheckReportForFact outputs ").count(), 1);
-        assert!(
-            source.contains("decoderNoiseCheckReportForFact outputs stage.facts.arena residual")
-        );
-        assert!(!source.contains("decoderNoiseCheckReportForFact outputs residual"));
+        assert_eq!(source.matches("operationalBound_0 outputs_0").count(), 1);
+        assert!(!source.contains("operationalBound_1"));
+        assert_eq!(source.matches("boundResult_0").count(), 3);
+        assert!(source.contains("operationalNoiseBoundForFact stage.facts.arena residual"));
+        assert_eq!(source.matches("decoderNoiseCheckReportFromBound").count(), 2);
+        assert!(source.contains("boundEvaluationTimeNs_0"));
+        assert!(!source.contains("boundEvaluationTimeNs_1"));
+        assert!(source.contains("report.diagnostics.expressionNodeCount"));
+        assert!(source.contains("report.diagnostics.relationRewriteCount"));
     }
 
     #[test]

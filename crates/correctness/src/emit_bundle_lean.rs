@@ -234,8 +234,19 @@ pub fn emit_closed_protocol_bundle(
 
 fn input_value_contract(value: &InputValueContract) -> String {
     match value {
-        InputValueContract::MatrixExact { matrix_type: value } => {
-            format!(".matrixExact ({})", matrix_type(value))
+        InputValueContract::MatrixExact {
+            matrix_type: value,
+            canonical_coefficient_exclusive_upper_bound,
+            is_constant_polynomial,
+        } => {
+            let canonical_upper = canonical_coefficient_exclusive_upper_bound
+                .as_ref()
+                .map(|upper| format!("some ({})", int_expr(upper)))
+                .unwrap_or_else(|| "none".to_owned());
+            format!(
+                ".matrixExact ({}) ({canonical_upper}) {is_constant_polynomial}",
+                matrix_type(value)
+            )
         }
         InputValueContract::MatrixBounded { matrix_type: value, max_centered_coefficient } => {
             format!(
@@ -409,6 +420,7 @@ fn record(fields: &[(impl AsRef<str>, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mxx_dsl::Ring;
     use num_bigint::{BigInt, BigUint};
 
     #[test]
@@ -439,6 +451,21 @@ mod tests {
         assert!(emitted.contains("999999999999999999999999999999999"));
         assert!(emitted.starts_with(".minimum (.maximum (.add"));
         assert!(emitted.contains(".matrixProduct (.loopIndex 3) (.log2Ceil"));
+    }
+
+    #[test]
+    fn exact_matrix_contract_emits_canonical_range_and_constant_polynomial_metadata() {
+        let ring = Ring::new(17, 8);
+        let contract = InputValueContract::MatrixExact {
+            matrix_type: ring.matrix_type((2, 3)),
+            canonical_coefficient_exclusive_upper_bound: Some(IntExpr::Var("p".to_owned())),
+            is_constant_polynomial: true,
+        };
+
+        let emitted = input_value_contract(&contract);
+
+        assert!(emitted.starts_with(".matrixExact ("));
+        assert!(emitted.ends_with("(some (.parameter \"p\")) true"));
     }
 
     #[test]

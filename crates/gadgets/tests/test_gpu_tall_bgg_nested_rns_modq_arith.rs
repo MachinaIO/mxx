@@ -15,9 +15,9 @@ use mxx_bgg::{
     TallRotationEncodingCompiler, bind_lwe_lookup_invocations, required_tall_rotation_encodings,
 };
 use mxx_correctness::{
-    OperationalCheckRequest, OperationalCheckerReport, OperationalGadgetLayout, emit_protocol_for,
-    operational_protocol_from_graphs, prepare_emitted_operational_checker,
-    run_prepared_operational_checks,
+    ExactMatrixInputMetadata, OperationalCheckRequest, OperationalCheckerReport,
+    OperationalGadgetLayout, emit_protocol_for, operational_protocol_from_graphs,
+    prepare_emitted_operational_checker, run_prepared_operational_checks,
 };
 use mxx_dsl::{BuiltGraph, DslContext, Family, Ring, SemanticAnchor, parallel_zip};
 use mxx_gadgets::{
@@ -28,12 +28,13 @@ use mxx_gadgets::{
     },
 };
 use mxx_ir_core::{
-    ParamEnv, RealExpr,
+    IntExpr, ParamEnv, RealExpr,
     artifact::{
         ArtifactConfidentiality, Manifest as RuntimeManifest, ProductionId,
         export_validated_manifest, production_id,
     },
     encoding::spec_hash,
+    node::NodeKind,
 };
 use mxx_primitives::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
@@ -294,10 +295,35 @@ fn run_tall_operational_check(
     producer: &BuiltGraph,
     encoding: &BuiltGraph,
     parameters: &DCRTPolyParams,
+    nested: &NestedRnsPolyContext,
 ) -> Result<OperationalCheckerReport, String> {
+    if nested.p_moduli.is_empty() {
+        return Err("nested-RNS plaintext contract requires a nonempty p-basis".to_owned());
+    }
+    let mut exact_input_metadata = BTreeMap::new();
+    for node in encoding.graph.root_scope().nodes() {
+        let NodeKind::Input { name, .. } = node.kind() else { continue };
+        let Some(indices) = name.strip_prefix("plaintext_") else { continue };
+        let Some((input_index, _slot_index)) = indices.split_once('_') else { continue };
+        let input_index = input_index
+            .parse::<usize>()
+            .map_err(|_| format!("invalid nested-RNS plaintext input name {name}"))?;
+        let modulus = nested
+            .p_moduli
+            .get(input_index % nested.p_moduli.len())
+            .ok_or_else(|| "nested-RNS plaintext input has no p-modulus".to_owned())?;
+        exact_input_metadata.insert(
+            name.clone(),
+            ExactMatrixInputMetadata {
+                canonical_coefficient_exclusive_upper_bound: Some(IntExpr::constant(*modulus)),
+                is_constant_polynomial: true,
+            },
+        );
+    }
     let protocol = operational_protocol_from_graphs(
         vec![("producer".to_owned(), producer), ("encoding".to_owned(), encoding)],
         "encoding",
+        &exact_input_metadata,
     )
     .map_err(|error| error.to_string())?;
     let emitted = emit_protocol_for("TallNestedRnsCandidate", &protocol, "MxxCorrectness", &[])
@@ -672,7 +698,7 @@ fn prepare_candidate(
         .validate_with_manifests(&bindings, &manifests)
         .map_err(|error| error.to_string())?;
     let lean_report =
-        run_tall_operational_check(&producer, &operational_encoding_graph, &parameters)?;
+        run_tall_operational_check(&producer, &operational_encoding_graph, &parameters, &nested)?;
     let lean_operational_bound = lean_report
         .noise_bound
         .parse::<BigUint>()

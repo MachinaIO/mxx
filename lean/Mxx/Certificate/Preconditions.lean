@@ -23,11 +23,28 @@ def ClosedProtocolDecl.ParamsWF
     ∃ value, Mxx.Ir.lookupParam declaration.name parameters = some value ∧
       declaration.ValueWF value
 
+/-- Every coefficient above degree zero in every matrix entry is zero in the coefficient ring. -/
+def MatrixIsConstantPolynomial (matrix : Mxx.Matrix) : Prop :=
+  ∀ row column coefficient,
+    row < matrix.rows → column < matrix.columns → coefficient < matrix.ringDimension →
+      coefficient ≠ 0 →
+      Mxx.reduceCoefficient matrix.modulus
+        (matrix.coefficient row column coefficient) = 0
+
 /-- Runtime meaning of an input contract. Every numerical expression is evaluated in the same
 parameter environment used by protocol execution. -/
 def InputValueContract.Holds
     (parameters : Mxx.Ir.ParamEnvironment) : InputValueContract → Mxx.Ir.Value → Prop
-  | .matrixExact matrixType, .matrix matrix => matrixType.Holds parameters matrix
+  | .matrixExact matrixType canonicalExclusiveUpper isConstantPolynomial, .matrix matrix =>
+      matrixType.Holds parameters matrix ∧
+        (match canonicalExclusiveUpper with
+        | none => True
+        | some upper =>
+            ∃ evaluatedUpper,
+              evaluateIntExpr parameters upper = .ok evaluatedUpper ∧
+              0 < evaluatedUpper ∧
+              Mxx.maxCanonicalCoefficient matrix < evaluatedUpper.toNat) ∧
+        (isConstantPolynomial = true → MatrixIsConstantPolynomial matrix)
   | .matrixBounded matrixType declaredBound, .matrix matrix =>
       matrixType.Holds parameters matrix ∧
         ∃ bound, declaredBound.toBoundExpr.evaluate parameters = .ok bound ∧
@@ -48,6 +65,71 @@ def InputValueContract.Holds
         0 ≤ expected ∧ values.length = expected.toNat ∧
         ∀ value ∈ values, element.Holds parameters value
   | _, _ => False
+
+private def constantPolynomialContractFixtureType : MatrixTypeExpr where
+  modulus := .constant 17
+  ringDimension := .constant 2
+  rows := .constant 1
+  columns := .constant 1
+
+private def constantPolynomialContractFixtureMatrix : Mxx.Matrix where
+  coefficients := [3, 0]
+  modulus := 17
+  ringDimension := 2
+  rows := 1
+  columns := 1
+
+private def nonconstantPolynomialContractFixtureMatrix : Mxx.Matrix where
+  coefficients := [3, 1]
+  modulus := 17
+  ringDimension := 2
+  rows := 1
+  columns := 1
+
+example :
+    (InputValueContract.matrixExact constantPolynomialContractFixtureType
+      (some (.constant 4)) true).Holds [] (.matrix constantPolynomialContractFixtureMatrix) := by
+  constructor
+  · refine ⟨{
+      maxCoefficientBound := 0
+      modulus := 17
+      ringDimension := 2
+      rows := 1
+      columns := 1
+    }, ?_⟩
+    norm_num [constantPolynomialContractFixtureType, constantPolynomialContractFixtureMatrix,
+      Mxx.Ir.MatrixTypeExpr.evaluate, Mxx.Ir.IntExpr.evaluate, Mxx.Matrix.WellFormed]
+    decide
+  constructor
+  · norm_num [evaluateIntExpr, Mxx.Ir.IntExpr.evaluate, Mxx.maxCanonicalCoefficient,
+      constantPolynomialContractFixtureMatrix, Mxx.canonicalCoefficient,
+      Mxx.reduceCoefficient]
+  · intro _ row column coefficient rowBound columnBound coefficientBound coefficientNonzero
+    norm_num [constantPolynomialContractFixtureMatrix] at rowBound columnBound coefficientBound
+    have rowZero : row = 0 := by omega
+    have columnZero : column = 0 := by omega
+    have coefficientOne : coefficient = 1 := by omega
+    subst row
+    subst column
+    subst coefficient
+    decide
+
+example :
+    ¬(InputValueContract.matrixExact constantPolynomialContractFixtureType
+      (some (.constant 3)) true).Holds [] (.matrix constantPolynomialContractFixtureMatrix) := by
+  norm_num [InputValueContract.Holds, MatrixTypeExpr.Holds,
+    constantPolynomialContractFixtureType, constantPolynomialContractFixtureMatrix,
+    evaluateIntExpr, Mxx.Ir.IntExpr.evaluate, Mxx.maxCanonicalCoefficient,
+    Mxx.canonicalCoefficient, Mxx.reduceCoefficient, Mxx.Matrix.WellFormed]
+
+example :
+    ¬(InputValueContract.matrixExact constantPolynomialContractFixtureType
+      (some (.constant 4)) true).Holds [] (.matrix nonconstantPolynomialContractFixtureMatrix) := by
+  intro holds
+  have constant := holds.2.2 (by decide)
+  have degreeOneZero := constant 0 0 1 (by decide) (by decide) (by decide) (by decide)
+  norm_num [nonconstantPolynomialContractFixtureMatrix, Mxx.Matrix.coefficient,
+    Mxx.reduceCoefficient] at degreeOneZero
 
 /-- Input well-formedness is the direct interpretation of every named contract entry against the
 concrete protocol input environment. -/

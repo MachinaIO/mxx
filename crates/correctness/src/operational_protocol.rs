@@ -29,18 +29,31 @@ pub enum OperationalProtocolError {
     Protocol(String),
 }
 
+/// Optional semantic metadata for one exact matrix protocol input. Rust attaches these declared
+/// facts by input name and does not attempt to infer them from the executable graph.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExactMatrixInputMetadata {
+    pub canonical_coefficient_exclusive_upper_bound: Option<mxx_ir_core::IntExpr>,
+    pub is_constant_polynomial: bool,
+}
+
 fn exact_input_contract(
     wire_type: &WireType,
+    metadata: Option<&ExactMatrixInputMetadata>,
 ) -> Result<InputValueContract, OperationalProtocolError> {
     match wire_type {
-        WireType::Matrix(matrix_type) => {
-            Ok(InputValueContract::MatrixExact { matrix_type: matrix_type.clone() })
-        }
+        WireType::Matrix(matrix_type) => Ok(InputValueContract::MatrixExact {
+            matrix_type: matrix_type.clone(),
+            canonical_coefficient_exclusive_upper_bound: metadata
+                .and_then(|metadata| metadata.canonical_coefficient_exclusive_upper_bound.clone()),
+            is_constant_polynomial: metadata
+                .is_some_and(|metadata| metadata.is_constant_polynomial),
+        }),
         WireType::Bytes { length } => Ok(InputValueContract::Bytes { length: length.clone() }),
         WireType::Bool | WireType::ConstantBool => Ok(InputValueContract::Boolean),
         WireType::IndexedFamily { element, count } => Ok(InputValueContract::Family {
             count: count.clone(),
-            element: Box::new(exact_input_contract(element)?),
+            element: Box::new(exact_input_contract(element, metadata)?),
         }),
         unsupported => Err(OperationalProtocolError::UnsupportedInput(unsupported.clone())),
     }
@@ -52,6 +65,7 @@ fn exact_input_contract(
 pub fn operational_protocol_from_graphs(
     stages: Vec<(String, &BuiltGraph)>,
     entrypoint: &str,
+    exact_matrix_input_metadata: &BTreeMap<String, ExactMatrixInputMetadata>,
 ) -> Result<ProtocolDecl, OperationalProtocolError> {
     if stages.is_empty() {
         return Err(OperationalProtocolError::EmptyWorkflow);
@@ -120,11 +134,8 @@ pub fn operational_protocol_from_graphs(
     let mut input_bindings = Vec::new();
     for (name, (wire_type, destinations)) in contracts {
         let id = ProtocolInputId(name.clone());
-        input_contract.push(InputContractEntry {
-            id: id.clone(),
-            name,
-            value: exact_input_contract(&wire_type)?,
-        });
+        let value = exact_input_contract(&wire_type, exact_matrix_input_metadata.get(&name))?;
+        input_contract.push(InputContractEntry { id: id.clone(), name, value });
         input_bindings.push(ProtocolInputBinding { input: id, destinations });
     }
     let ideal = IdealSpec::new(
@@ -151,4 +162,55 @@ pub fn operational_protocol_from_graphs(
         },
     })
     .map_err(|error| OperationalProtocolError::Protocol(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mxx_dsl::Ring;
+    use mxx_ir_core::IntExpr;
+
+    #[test]
+    fn exact_matrix_metadata_is_applied_through_an_indexed_family() {
+        let ring = Ring::new(17, 8);
+        let metadata = ExactMatrixInputMetadata {
+            canonical_coefficient_exclusive_upper_bound: Some(IntExpr::constant(13)),
+            is_constant_polynomial: true,
+        };
+        let wire_type = WireType::IndexedFamily {
+            count: IntExpr::constant(4),
+            element: Box::new(WireType::Matrix(ring.matrix_type((2, 3)))),
+        };
+
+        let contract = exact_input_contract(&wire_type, Some(&metadata)).unwrap();
+
+        let InputValueContract::Family { element, .. } = contract else {
+            panic!("indexed family must produce a family contract");
+        };
+        assert!(matches!(
+            element.as_ref(),
+            InputValueContract::MatrixExact {
+                canonical_coefficient_exclusive_upper_bound: Some(upper),
+                is_constant_polynomial: true,
+                ..
+            } if upper == &IntExpr::constant(13)
+        ));
+    }
+
+    #[test]
+    fn exact_matrix_metadata_defaults_are_conservative() {
+        let ring = Ring::new(17, 8);
+
+        let contract =
+            exact_input_contract(&WireType::Matrix(ring.matrix_type((1, 1))), None).unwrap();
+
+        assert!(matches!(
+            contract,
+            InputValueContract::MatrixExact {
+                canonical_coefficient_exclusive_upper_bound: None,
+                is_constant_polynomial: false,
+                ..
+            }
+        ));
+    }
 }

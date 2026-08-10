@@ -387,6 +387,8 @@ mod tests {
                         name: "message".to_owned(),
                         value: InputValueContract::MatrixExact {
                             matrix_type: ring.matrix_type((1, 1)),
+                            canonical_coefficient_exclusive_upper_bound: None,
+                            is_constant_polynomial: false,
                         },
                     }],
                 },

@@ -289,7 +289,7 @@ private def normalizeMatrixFact
       return { fact with primary := .affine normalized.form }
 
 private def InputValueContract.factSchema : InputValueContract → ValueFactSchema
-  | .matrixExact type => .matrix type .exact [] .unknown
+  | .matrixExact type _ _ => .matrix type .exact [] .unknown
   | .matrixBounded type _ => .matrix type (.affine []) [] .unknown
   | .integerRange .. => .integer
   | .boolean => .boolean
@@ -299,7 +299,7 @@ private def InputValueContract.factSchema : InputValueContract → ValueFactSche
 private def protocolInputFact
     (wire : CoreWireRef)
     (id : ProtocolInputId) : InputValueContract → ScopedWireFact
-  | .matrixExact type => exactFact wire type
+  | .matrixExact type _ _ => exactFact wire type
       (.wire { value := .protocolInput id, type }) (centeredBound type)
   | .matrixBounded type bound => boundedFact wire type bound.toBoundExpr
   | .integerRange lower upper => scalarFact wire (.integer {
@@ -380,9 +380,9 @@ private def wireTypeMatchesContract : Mxx.Ir.WireTypeExpr → InputValueContract
   | .constantInt, .integerRange _ _ | .integer, .integerRange _ _ => true
   | .constantBool, .boolean | .boolean, .boolean => true
   | .bytes actualLength, .bytes expectedLength => intExprEqual actualLength expectedLength
-  | .matrix actual, .matrixExact expected
+  | .matrix actual, .matrixExact expected _ _
   | .matrix actual, .matrixBounded expected _
-  | .preimage actual, .matrixExact expected
+  | .preimage actual, .matrixExact expected _ _
   | .preimage actual, .matrixBounded expected _ => matrixTypeEqual actual expected
   | .indexedFamily actualElement actualCount, .family expectedCount expectedElement =>
       intExprEqual actualCount expectedCount &&
@@ -1736,7 +1736,7 @@ private def instantiateProtocolFamilyElement
     (output : CoreWireRef) : ScopedWireFact :=
   let provenance := ValueInstanceRef.familyElement aggregate index
   match contract with
-  | .matrixExact type => {
+  | .matrixExact type _ _ => {
       wire := output
       matrixType := some type
       fact := .matrix {
@@ -3310,7 +3310,9 @@ private def declaredBoundParameterReferences : DeclaredBoundExpr → List (Strin
         declaredBoundParameterReferences left ++ declaredBoundParameterReferences right
 
 private def inputContractParameterReferences : InputValueContract → List (String × Bool)
-  | .matrixExact type => matrixTypeParameterReferences type
+  | .matrixExact type canonicalExclusiveUpper _ =>
+      matrixTypeParameterReferences type ++
+        canonicalExclusiveUpper.toList.flatMap intParameterReferences
   | .matrixBounded type bound =>
       matrixTypeParameterReferences type ++ declaredBoundParameterReferences bound
   | .integerRange lower upper =>

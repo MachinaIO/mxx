@@ -749,6 +749,8 @@ structure OperationalMatrixFact where
   relations : List OperationalMatrixRelation := []
   deriving BEq
 
+abbrev OperationalExprId := Nat
+
 private structure UniformBoundedSchema where
   matrixType : MatrixTypeExpr
   hardBound : OperationalBoundExpr
@@ -962,7 +964,7 @@ private def absorbedSelectionBinder?
   | [] => none
   | first :: rest => if rest.all (· == first) then some first else none
 
-private structure SelectedMatrixSummary where
+structure SelectedMatrixSummary where
   uniformSchema : Option UniformMatrixSchema
   relationFree : Bool
   sharedLastPublicIdentity : Option PublicMatrixIdentity
@@ -1130,6 +1132,7 @@ structure OperationalBytesFact where
 
 inductive OperationalFact where
   | matrix (fact : OperationalMatrixFact)
+  | matrixExpr (root : OperationalExprId)
   | integer (fact : OperationalIntegerFact)
   | boolean
   | real
@@ -1162,9 +1165,6 @@ private def packedOperationalFamily
   .familyPacked elements count (packedMatrixSummary? elements)
 
 abbrev OperationalState := Array OperationalFact
-
-/-- Facts for an ordinary frozen scope are indexed by the exact `(node, port)` wire location. -/
-abbrev OperationalScopeFacts := Array (Array OperationalFact)
 
 /-- Structure-only information validated once before numeric operational requests are evaluated. -/
 structure PreparedOperationalScope where
@@ -1241,9 +1241,7 @@ The executable checker still evaluates ordinary operations into the flat facts a
 request-local arena is the compact boundary for unresolved dynamic selections.  Arena indices are
 allocation identities only: they are never matrix, relation, or symbolic-equality evidence. -/
 
-private abbrev OperationalExprId := Nat
-
-private inductive OperationalSelectionBranches where
+inductive OperationalSelectionBranches where
   | exact (branches : Array OperationalExprId)
   | schemaEnvelope
       (count : Nat)
@@ -1251,7 +1249,7 @@ private inductive OperationalSelectionBranches where
       (summary : SelectedMatrixSummary)
   deriving BEq
 
-private inductive OperationalMatrixExprNode where
+inductive OperationalMatrixExprNode where
   | concrete (fact : OperationalMatrixFact)
   | add (left right : OperationalExprId)
   | subtract (left right : OperationalExprId)
@@ -1262,12 +1260,12 @@ private inductive OperationalMatrixExprNode where
       (branches : OperationalSelectionBranches)
   deriving BEq
 
-private structure OperationalMatrixExpr where
+structure OperationalMatrixExpr where
   matrixType : MatrixTypeExpr
   node : OperationalMatrixExprNode
   deriving BEq
 
-private structure OperationalExprArena where
+structure OperationalExprArena where
   nodes : Array OperationalMatrixExpr := #[]
   deriving BEq
 
@@ -1281,6 +1279,12 @@ private structure OperationalExprEvaluationState where
   memo : Array (Option Int)
   stats : OperationalExprEvaluationStats := {}
   deriving BEq
+
+/-- Facts for one frozen scope and the append-only expression arena shared by its request.  Wire
+facts remain indexed by exact `(node, port)` locations; expression IDs are valid only in `arena`. -/
+structure OperationalScopeFacts where
+  values : Array (Array OperationalFact) := #[]
+  arena : OperationalExprArena := {}
 
 private def OperationalExprArena.get?
     (arena : OperationalExprArena) (id : OperationalExprId) : Option OperationalMatrixExpr :=
@@ -2089,7 +2093,7 @@ def lookupFact
     (node : Nat)
     (facts : OperationalScopeFacts)
     (wire : WireRef) : Except OperationalError OperationalFact :=
-  match facts[wire.node]?.bind fun outputs => outputs[wire.port]? with
+  match facts.values[wire.node]?.bind fun outputs => outputs[wire.port]? with
   | some fact => pure fact
   | none => throw (.missingOperand node wire)
 
@@ -3041,11 +3045,11 @@ private def replaceOperationalFact
     (facts : OperationalScopeFacts)
     (wire : WireRef)
     (fact : OperationalFact) : Except OperationalError OperationalScopeFacts := do
-  let outputs ← match facts[wire.node]? with
+  let outputs ← match facts.values[wire.node]? with
     | some outputs => pure outputs
     | none => throw (.missingOperand node wire)
   if wire.port >= outputs.size then throw (.missingOperand node wire)
-  pure (facts.set! wire.node (outputs.set! wire.port fact))
+  pure { facts with values := facts.values.set! wire.node (outputs.set! wire.port fact) }
 
 private def applyDerivationAttachment
     (node : Nat)
@@ -5086,10 +5090,11 @@ def evaluatePreparedScope
     (layouts : List Mxx.GadgetLayoutDescriptor) :
     ScopeTemplateKey → Nat → PreparedOperationalScope → ParamEnvironment →
       List OperationalParameterDomain →
+      OperationalExprArena →
       List OperationalFact →
       Except OperationalError OperationalScopeFacts
-  | _, 0, _, _, _, _ => .error .definitionFuelExhausted
-  | scopeKey, fuel + 1, prepared, environment, loopDomains, inputFacts => do
+  | _, 0, _, _, _, _, _ => .error .definitionFuelExhausted
+  | scopeKey, fuel + 1, prepared, environment, loopDomains, initialArena, inputFacts => do
       let scope := prepared.scope
       let derivation := prepared.derivation
       if !inputFacts.isEmpty && inputFacts.length != scope.inputNames.length then
@@ -5123,9 +5128,9 @@ def evaluatePreparedScope
             return (← loopTemplateArgumentFact nodeIndex argumentIndex count mode input) ::
               (← prepareParallelInputs nodeIndex count (argumentIndex + 1) modeTail inputTail)
         | _, _ => throw (.loopInputModeMismatch nodeIndex argumentIndex)
-      let mut facts : OperationalScopeFacts := #[]
+      let mut facts : OperationalScopeFacts := { arena := initialArena }
       for node in scope.nodes do
-            let index := facts.size
+            let index := facts.values.size
             if node.outputCount != node.outputTypes.length then
               throw (.unsupportedOutputArity index node.outputCount)
             let step ← match derivation.steps[index]? with
@@ -5157,7 +5162,8 @@ def evaluatePreparedScope
                   let childKey := .callBody scopeKey index
                   let childFacts ← (evaluatePreparedScope definitions layouts
                     childKey fuel child (boundParams ++ environment)
-                    childDomains actualInputs).mapError (.inScope childKey)
+                    childDomains facts.arena actualInputs).mapError (.inScope childKey)
+                  facts := { facts with arena := childFacts.arena }
                   collectChildOutputs index 0 child.scope.outputs childFacts
               | .familyPack =>
                   let elements ← node.arguments.mapM (lookupFact index facts)
@@ -5303,7 +5309,8 @@ def evaluatePreparedScope
                     extendParameterDomains iterationEnvironment parentDomains bindings
                   let childFacts ← (evaluatePreparedScope definitions layouts
                     childKey fuel child (boundParams ++ iterationEnvironment)
-                    childDomains templateInputs).mapError (.inScope childKey)
+                    childDomains facts.arena templateInputs).mapError (.inScope childKey)
+                  facts := { facts with arena := childFacts.arena }
                   let childOutputs ← scopeOutputFacts index child.scope.outputs childFacts
                   if childOutputs.length != node.outputCount then
                     throw (.childInputMismatch index node.outputCount childOutputs.length)
@@ -5354,7 +5361,8 @@ def evaluatePreparedScope
                   let childFacts ← (evaluatePreparedScope definitions layouts
                     childKey fuel child
                     (boundParams ++ iterationEnvironment) childDomains
-                    (abstractCarried ++ shiftedInvariantFacts)).mapError (.inScope childKey)
+                    facts.arena (abstractCarried ++ shiftedInvariantFacts)).mapError (.inScope childKey)
+                  facts := { facts with arena := childFacts.arena }
                   let outputTemplates ← scopeOutputFacts index child.scope.outputs childFacts
                   if outputTemplates.length != carriedCount then
                     throw (.childInputMismatch index carriedCount outputTemplates.length)
@@ -5386,7 +5394,7 @@ def evaluatePreparedScope
               | _ =>
                   deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
                     layouts facts 0 node.outputTypes
-            facts := facts.push outputs.toArray
+            facts := { facts with values := facts.values.push outputs.toArray }
             let attachments := prepared.attachmentBuckets[index]?.getD #[]
             facts := ← applyPreparedDerivationAttachments index attachments facts
       pure facts
@@ -5399,7 +5407,7 @@ def evaluatePreparedProgramOperationalWithKey
     (environment : ParamEnvironment)
     (layouts : List Mxx.GadgetLayoutDescriptor) : Except OperationalError OperationalScopeFacts :=
   evaluatePreparedScope program.definitions layouts
-    (.root programKey) (program.definitions.size + 1) program.root environment [] []
+    (.root programKey) (program.definitions.size + 1) program.root environment [] {} []
 
 def evaluateProgramOperationalWithKey
     (programKey : ProgramInstanceKey)
@@ -5661,6 +5669,7 @@ def evaluatePreparedWorkflowOperational
     (layouts : List Mxx.GadgetLayoutDescriptor) :
     Except OperationalError (List OperationalStageResult) := do
   let mut results := []
+  let mut arena : OperationalExprArena := {}
   for stage in prepared.stages do
     let scopeKey := ScopeTemplateKey.root (.workflowStage ⟨stage.id⟩)
     let inputFacts ← stage.inputs.toList.mapM fun input => match input.source with
@@ -5673,7 +5682,8 @@ def evaluatePreparedWorkflowOperational
             | none => throw (.missingProtocolContract protocolName)
           contractFact scopeKey input.subject protocolInput input.wireType contract environment
     let facts ← evaluatePreparedScope stage.program.definitions layouts scopeKey
-      (stage.program.definitions.size + 1) stage.program.root environment [] inputFacts
+      (stage.program.definitions.size + 1) stage.program.root environment [] arena inputFacts
+    arena := facts.arena
     let outputs ← collectOperationalOutputs stage.program.root.scope facts
     results := results ++ [{ stage := stage.id, outputs, facts }]
   pure results
@@ -5707,7 +5717,8 @@ def evaluateScopeOperationalWithKey
   let program : Prog := { root := scope }
   let programDerivation : ProgramDerivation := { root := derivation }
   let prepared ← prepareProgramOperational program programDerivation
-  evaluatePreparedScope prepared.definitions layouts scopeKey 1 prepared.root environment [] inputFacts
+  evaluatePreparedScope prepared.definitions layouts scopeKey 1 prepared.root environment [] {}
+    inputFacts
 
 def evaluateScopeOperationalWithLayouts
     (scope : Scope)

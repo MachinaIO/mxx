@@ -2633,6 +2633,106 @@ private def multiplyConcreteMatrixFacts
   | .matrix output => pure output
   | _ => throw (.operandNotMatrix nodeIndex rightWire)
 
+private def addConcreteMatrixFacts
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (subtract : Bool)
+    (environment : ParamEnvironment)
+    (left right : OperationalMatrixFact) : Except OperationalError OperationalMatrixFact := do
+  let left ← retypeMatrixFact nodeIndex matrixType left environment
+  let right ← retypeMatrixFact nodeIndex matrixType right environment
+  let polynomial := if subtract then
+    subtractOperationalPolynomials left.polynomial right.polynomial
+  else
+    addOperationalPolynomials left.polynomial right.polynomial
+  match ← polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial with
+  | .matrix output => pure output
+  | _ => throw (.operandNotMatrix nodeIndex { node := nodeIndex, port := outputPort })
+
+private def addOperationalExprIds
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (subtract : Bool)
+    (environment : ParamEnvironment) :
+    OperationalExprArena → OperationalExprId → OperationalExprId → Nat →
+    Except OperationalError (OperationalExprArena × OperationalExprId)
+  | _, left, _, 0 => throw (.unsupportedOperationalExpr left)
+  | arena, left, right, fuel + 1 => do
+      let leftExpr ← match arena.get? left with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef left)
+      let rightExpr ← match arena.get? right with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef right)
+      match leftExpr.node, rightExpr.node with
+      | .concrete leftFact, .concrete rightFact =>
+          let output ← addConcreteMatrixFacts nodeIndex outputPort matrixType subtract environment
+            leftFact rightFact
+          pure (arena.pushConcrete output)
+      | .select leftSelection (.exact leftBranches),
+          .select rightSelection (.exact rightBranches) =>
+          if leftSelection == rightSelection then
+            if leftBranches.size != rightBranches.size then
+              throw (.operationalExprTypeMismatch left right)
+            let mut arena := arena
+            let mut outputs : Array OperationalExprId := #[]
+            for branch in [:leftBranches.size] do
+              let (nextArena, output) ← addOperationalExprIds nodeIndex outputPort matrixType
+                subtract environment arena leftBranches[branch]! rightBranches[branch]! fuel
+              arena := nextArena
+              outputs := outputs.push output
+            arena.pushSelect leftSelection (.exact outputs)
+          else
+            let mut arena := arena
+            let mut outputs : Array OperationalExprId := #[]
+            for branch in leftBranches do
+              let (nextArena, output) ← addOperationalExprIds nodeIndex outputPort matrixType
+                subtract environment arena branch right fuel
+              arena := nextArena
+              outputs := outputs.push output
+            arena.pushSelect leftSelection (.exact outputs)
+      | .select selection (.exact branches), _ =>
+          let mut arena := arena
+          let mut outputs : Array OperationalExprId := #[]
+          for branch in branches do
+            let (nextArena, output) ← addOperationalExprIds nodeIndex outputPort matrixType
+              subtract environment arena branch right fuel
+            arena := nextArena
+            outputs := outputs.push output
+          arena.pushSelect selection (.exact outputs)
+      | _, .select selection (.exact branches) =>
+          let mut arena := arena
+          let mut outputs : Array OperationalExprId := #[]
+          for branch in branches do
+            let (nextArena, output) ← addOperationalExprIds nodeIndex outputPort matrixType
+              subtract environment arena left branch fuel
+            arena := nextArena
+            outputs := outputs.push output
+          arena.pushSelect selection (.exact outputs)
+      | .select _ (.schemaEnvelope _ representative _), _
+      | _, .select _ (.schemaEnvelope _ representative _) =>
+          throw (.unsupportedOperationalExpr representative)
+      | _, _ =>
+          if leftExpr.matrixType != rightExpr.matrixType || leftExpr.matrixType != matrixType then
+            throw (.operationalExprTypeMismatch left right)
+          let operation := if subtract then OperationalMatrixExprNode.subtract left right
+            else .add left right
+          pure (arena.push { matrixType, node := operation })
+
+private def addOperationalExprFacts
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (subtract : Bool)
+    (environment : ParamEnvironment)
+    (arena : OperationalExprArena)
+    (left right : OperationalFact) :
+    Except OperationalError (OperationalExprArena × OperationalFact) := do
+  let (arena, leftId) ← arena.pushMatrixFact left
+  let (arena, rightId) ← arena.pushMatrixFact right
+  let (arena, result) ← addOperationalExprIds nodeIndex outputPort matrixType subtract environment
+    arena leftId rightId (arena.nodes.size + 1)
+  pure (arena, .matrixExpr result)
+
 private def multiplyOperationalExprIds
     (nodeIndex outputPort : Nat)
     (matrixType : MatrixTypeExpr)
@@ -3004,6 +3104,90 @@ private def boundedStructuralTransformPolynomial
           outputType
         }}
     | _ => throw .malformedProduct
+
+private def transformConcreteMatrixFact
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (operation : OperationalFactorTransform)
+    (environment : ParamEnvironment)
+    (input : OperationalMatrixFact) : Except OperationalError OperationalMatrixFact := do
+  let polynomial ← match operation with
+    | .negate =>
+        let input ← retypeMatrixFact nodeIndex matrixType input environment
+        pure (scaleOperationalPolynomial (-1) input.polynomial)
+    | .transpose =>
+        transposeOperationalPolynomial input.polynomial |>.mapError (flatErrorAt nodeIndex)
+    | .rowSlice start stop =>
+        sliceOperationalPolynomial (some (start, stop)) none matrixType input.polynomial
+          |>.mapError (flatErrorAt nodeIndex)
+    | .columnSlice start stop =>
+        sliceOperationalPolynomial none (some (start, stop)) matrixType input.polynomial
+          |>.mapError (flatErrorAt nodeIndex)
+    | .reshape rows columns =>
+        let outputParams ← match matrixType.evaluate environment
+            (.constant input.matrixParams.maxCoefficientBound) with
+          | some params => pure params
+          | none => throw (.invalidMatrixParameters nodeIndex)
+        if sameConcreteMatrixShape input.matrixParams outputParams then
+          equivalentRetypeOperationalPolynomial matrixType input.polynomial
+            |>.mapError (flatErrorAt nodeIndex)
+        else
+          boundedStructuralTransformPolynomial (.reshape rows columns) matrixType input.polynomial
+            |>.mapError (flatErrorAt nodeIndex)
+    | .constantCoefficient index =>
+        boundedStructuralTransformPolynomial (.constantCoefficient index) matrixType input.polynomial
+          |>.mapError (flatErrorAt nodeIndex)
+    | .rowEmbed axis part | .columnEmbed axis part =>
+        input.polynomial.mapM (transformOperationalBoundary axis part matrixType)
+          |>.mapError (flatErrorAt nodeIndex)
+  match ← polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+      input.canonicalRange with
+  | .matrix output => pure output
+  | _ => throw (.operandNotMatrix nodeIndex input.subject)
+
+private def transformOperationalExprId
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (operation : OperationalFactorTransform)
+    (environment : ParamEnvironment) :
+    OperationalExprArena → OperationalExprId → Nat →
+    Except OperationalError (OperationalExprArena × OperationalExprId)
+  | _, root, 0 => throw (.unsupportedOperationalExpr root)
+  | arena, root, fuel + 1 => do
+      let expression ← match arena.get? root with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef root)
+      match expression.node with
+      | .concrete input =>
+          let output ← transformConcreteMatrixFact nodeIndex outputPort matrixType operation
+            environment input
+          pure (arena.pushConcrete output)
+      | .select selection (.exact branches) =>
+          let mut arena := arena
+          let mut outputs : Array OperationalExprId := #[]
+          for branch in branches do
+            let (nextArena, output) ← transformOperationalExprId nodeIndex outputPort matrixType
+              operation environment arena branch fuel
+            arena := nextArena
+            outputs := outputs.push output
+          arena.pushSelect selection (.exact outputs)
+      | .select _ (.schemaEnvelope _ representative _) =>
+          throw (.unsupportedOperationalExpr representative)
+      | _ =>
+          pure (arena.push { matrixType, node := .transform operation root })
+
+private def transformOperationalExprFact
+    (nodeIndex outputPort : Nat)
+    (matrixType : MatrixTypeExpr)
+    (operation : OperationalFactorTransform)
+    (environment : ParamEnvironment)
+    (arena : OperationalExprArena)
+    (input : OperationalFact) :
+    Except OperationalError (OperationalExprArena × OperationalFact) := do
+  let (arena, root) ← arena.pushMatrixFact input
+  let (arena, result) ← transformOperationalExprId nodeIndex outputPort matrixType operation
+    environment arena root (arena.nodes.size + 1)
+  pure (arena, .matrixExpr result)
 
 private def operationalProductTokens
     (term : OperationalTerm) : List OperationalCompressionToken :=
@@ -5518,6 +5702,63 @@ def evaluatePreparedScope
                         pair.2 environment pair.1)
                   outputs.zipIdx.mapM fun (output, port) =>
                     rebindSubject { node := index, port } output
+              | .transpose | .matrixNegate | .slice _ _ | .reshape _ _ =>
+                  let inputWire ← match node.arguments[0]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index { node := 0, port := 0 })
+                  let input ← lookupFact index facts inputWire
+                  match input with
+                  | .matrixExpr _ =>
+                      let matrixType ← match node.outputTypes with
+                        | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
+                        | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
+                      let operations : List OperationalFactorTransform := match node.kind with
+                        | .transpose => [OperationalFactorTransform.transpose]
+                        | .matrixNegate => [OperationalFactorTransform.negate]
+                        | .slice rows columns =>
+                            rows.toList.map (fun (start, stop) =>
+                              OperationalFactorTransform.rowSlice start stop) ++
+                            columns.toList.map (fun (start, stop) =>
+                              OperationalFactorTransform.columnSlice start stop)
+                        | .reshape rows columns =>
+                            [OperationalFactorTransform.reshape rows columns]
+                        | _ => []
+                      let mut arena := facts.arena
+                      let mut output := input
+                      for operation in operations do
+                        let (nextArena, nextOutput) ← transformOperationalExprFact index 0
+                          matrixType operation environment arena output
+                        arena := nextArena
+                        output := nextOutput
+                      facts := { facts with arena }
+                      pure [output]
+                  | _ =>
+                      deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
+                        layouts facts 0 node.outputTypes
+              | .matrixAdd | .matrixSubtract =>
+                  let leftWire ← match node.arguments[0]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index { node := 0, port := 0 })
+                  let rightWire ← match node.arguments[1]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index leftWire)
+                  let left ← lookupFact index facts leftWire
+                  let right ← lookupFact index facts rightWire
+                  match left, right with
+                  | .matrixExpr _, _ | _, .matrixExpr _ =>
+                      let matrixType ← match node.outputTypes with
+                        | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
+                        | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
+                      let subtract := match node.kind with
+                        | .matrixSubtract => true
+                        | _ => false
+                      let (arena, output) ← addOperationalExprFacts index 0 matrixType subtract
+                        environment facts.arena left right
+                      facts := { facts with arena }
+                      pure [output]
+                  | _, _ =>
+                      deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
+                        layouts facts 0 node.outputTypes
               | .matrixMultiply =>
                   let leftWire ← match node.arguments[0]? with
                     | some wire => pure wire

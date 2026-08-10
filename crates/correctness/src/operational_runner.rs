@@ -339,7 +339,7 @@ fn prepared_checker_source(
                    let residual <- match stage.outputs.find? (fun output => output.1 == {}) with\n\
                      | some output => pure output.2\n\
                      | none => throw (.missingStageResult {} {})\n\
-                   decoderNoiseCheckReportForFact outputs residual [{environment}] {} {}",
+                   decoderNoiseCheckReportForFact outputs stage.facts.arena residual [{environment}] {} {}",
                 lean_string(&request.residual_stage),
                 lean_string(&request.residual_stage),
                 lean_string(&request.residual_output),

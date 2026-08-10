@@ -971,14 +971,6 @@ structure SelectedMatrixSummary where
   sharedFirstRelationPublicIdentity : Option PublicMatrixIdentity
   deriving BEq
 
-private structure SelectedMatrixFamily where
-  selection : OperationalValueOrigin
-  branches : Array OperationalMatrixFact
-  count : Nat
-  representsLoopLanes : Bool
-  summary : SelectedMatrixSummary
-  deriving BEq
-
 private def selectedMatrixSummary
     (branches : Array OperationalMatrixFact) : SelectedMatrixSummary :=
   match branches[0]? with
@@ -1035,47 +1027,6 @@ private def recomputeSelectedMatrixSummary
     (representative : OperationalMatrixFact) : Option SelectedMatrixSummary := do
   let _ ← source.uniformSchema
   pure (selectedMatrixSummary #[representative])
-
-private def selectedMatrixFamily
-    (selection : OperationalValueOrigin)
-    (branches : Array OperationalMatrixFact) : SelectedMatrixFamily := {
-  selection
-  branches
-  count := branches.size
-  representsLoopLanes := false
-  summary := selectedMatrixSummary branches
-}
-
-private def selectedMatrixEnvelope
-    (selection : OperationalValueOrigin)
-    (count : Nat)
-    (representative : OperationalMatrixFact)
-    (summary : SelectedMatrixSummary := selectedMatrixSummary #[representative])
-    (representsLoopLanes : Bool := false) :
-    SelectedMatrixFamily := {
-  selection
-  branches := #[representative]
-  count
-  representsLoopLanes
-  summary
-}
-
-private def SelectedMatrixFamily.isEnvelope (family : SelectedMatrixFamily) : Bool :=
-  family.count != family.branches.size
-
-private def SelectedMatrixFamily.map
-    (family : SelectedMatrixFamily)
-    (selection : OperationalValueOrigin)
-    (transform : OperationalMatrixFact → OperationalMatrixFact) : SelectedMatrixFamily :=
-  let branches := family.branches.map transform
-  if family.isEnvelope then
-    match branches[0]? with
-    | some representative => selectedMatrixEnvelope selection family.count representative
-        (representsLoopLanes := family.representsLoopLanes)
-    | none => selectedMatrixFamily selection branches
-  else
-    { selectedMatrixFamily selection branches with
-      representsLoopLanes := family.representsLoopLanes }
 
 private def primitiveOperationalPolynomial
     (origin : MatrixOriginIdentity)
@@ -1171,7 +1122,6 @@ inductive OperationalFact where
       (elements : Array OperationalFact)
       (count : Nat)
       (matrixSummary : Option SelectedMatrixSummary)
-  | selectedMatrices (family : SelectedMatrixFamily)
   | bytes (fact : OperationalBytesFact)
   | typedBlob (typeName : String)
   | unknown (wireType : WireTypeExpr)
@@ -1374,7 +1324,7 @@ private def OperationalExprArena.pushSelect
         | some first => pure first
         | none => throw (.invalidCount 0 0)
       let matrixType ← arena.checkedType first (values.extract 1 values.size)
-      if values.all (· == first) then pure (arena, first)
+      if values.size > 1 && values.all (· == first) then pure (arena, first)
       else pure (arena.push { matrixType, node := .select selection branches })
   | .schemaEnvelope count representative summary =>
       if count = 0 then throw (.invalidCount 0 0)
@@ -1614,9 +1564,28 @@ private def factNumericExpressions
   | .familyUniform _ _ element _ => factNumericExpressions slot element
   | _ => []
 
+private def replaceOperationalFactorHardBound
+    (bound : OperationalBoundExpr)
+    (factor : OperationalFactorKey) : OperationalFactorKey :=
+  let update (summary : OperationalBoundedFactorSummary) := { summary with hardBound := bound }
+  { factor with
+    leaf := match factor.leaf with
+      | .boundedSummary origin summary => .boundedSummary origin (update summary)
+      | leaf => leaf
+    boundedSummary := factor.boundedSummary.map update
+  }
+
 private def abstractCarriedMaximum (slot : Nat) : OperationalFact → OperationalFact
-  | .matrix fact => .matrix {
-      fact with totalHardBound := .previous (.matrixMaximum 0 slot) }
+  | .matrix fact =>
+      let maximum := OperationalBoundExpr.previous (.matrixMaximum 0 slot)
+      .matrix {
+        fact with
+        totalHardBound := maximum
+        polynomial := fact.polynomial.map fun term => { term with product := {
+          term.product with
+          factors := term.product.factors.map (replaceOperationalFactorHardBound maximum)
+        }}
+      }
   | .trapdoor fact => .trapdoor { fact with maximum := .previous (.matrixMaximum 0 slot) }
   | .integer fact => .integer {
       fact with
@@ -3874,6 +3843,111 @@ private def groupProtocolBooleanSignalFact : OperationalFact → Except Operatio
       throw (.invalidDerivationAttachment "mxx-correctness"
         "protocol-boolean-signal-grouping")
 
+private def groupBggEncodingExprIds
+    (environment : ParamEnvironment) :
+    OperationalExprArena → OperationalExprId → OperationalExprId → OperationalExprId → Nat →
+    Except OperationalError (OperationalExprArena × OperationalExprId)
+  | _, vector, _, _, 0 => throw (.unsupportedOperationalExpr vector)
+  | arena, vector, publicKey, plaintext, fuel + 1 => do
+      let vectorExpr ← match arena.get? vector with
+        | some expression => pure expression
+        | none => throw (.invalidOperationalExprRef vector)
+      let publicKeyExpr ← match arena.get? publicKey with
+        | some expression => pure expression
+        | none => throw (.invalidOperationalExprRef publicKey)
+      let plaintextExpr ← match arena.get? plaintext with
+        | some expression => pure expression
+        | none => throw (.invalidOperationalExprRef plaintext)
+      match vectorExpr.node, publicKeyExpr.node, plaintextExpr.node with
+      | .concrete vectorFact, .concrete publicKeyFact, .concrete plaintextFact =>
+          let grouped ← groupBggEncodingSignal vectorFact publicKeyFact plaintextFact
+            |>.mapError (.flat vectorFact.subject.node)
+          pure (arena.pushConcrete grouped)
+      | _, _, _ =>
+          let selected := [vectorExpr.node, publicKeyExpr.node, plaintextExpr.node].filterMap
+            fun node => match node with
+              | .select selection branches => some (selection, branches)
+              | _ => none
+          let (selection, branches) ← match selected.head? with
+            | some selected => pure selected
+            | none => throw (.unsupportedOperationalExpr vector)
+          if selected.any fun candidate => candidate.1 != selection then
+            throw (.operationalExprTypeMismatch vector publicKey)
+          let branchFor
+              (node : OperationalMatrixExprNode)
+              (ordinary : OperationalExprId)
+              (index : Nat) : Except OperationalError OperationalExprId :=
+            match node with
+            | .concrete _ => pure ordinary
+            | .select candidate (.exact values) =>
+                if candidate != selection then
+                  throw (.operationalExprTypeMismatch ordinary vector)
+                else match values[index]? with
+                  | some value => pure value
+                  | none => throw (.operationalExprTypeMismatch ordinary vector)
+            | _ => throw (.unsupportedOperationalExpr ordinary)
+          match branches with
+          | .exact values =>
+              if values.isEmpty then throw (.invalidCount 0 0)
+              let selectedCountsAgree := selected.all fun candidate => match candidate.2 with
+                | .exact candidates => candidates.size == values.size
+                | .schemaEnvelope .. => false
+              if !selectedCountsAgree then throw (.operationalExprTypeMismatch vector publicKey)
+              let mut arena := arena
+              let mut outputs : Array OperationalExprId := #[]
+              for branch in [:values.size] do
+                let vectorBranch ← branchFor vectorExpr.node vector branch
+                let publicKeyBranch ← branchFor publicKeyExpr.node publicKey branch
+                let plaintextBranch ← branchFor plaintextExpr.node plaintext branch
+                let (nextArena, output) ← groupBggEncodingExprIds environment arena vectorBranch
+                  publicKeyBranch plaintextBranch fuel
+                arena := nextArena
+                outputs := outputs.push output
+              arena.pushSelect selection (.exact outputs)
+          | .schemaEnvelope count representative summary =>
+              let representativeFor
+                  (node : OperationalMatrixExprNode)
+                  (ordinary : OperationalExprId) : Except OperationalError OperationalExprId :=
+                match node with
+                | .concrete _ => pure ordinary
+                | .select candidateSelection
+                    (.schemaEnvelope candidateCount candidateRepresentative _) =>
+                    if candidateSelection != selection || candidateCount != count then
+                      throw (.operationalExprTypeMismatch ordinary vector)
+                    else pure candidateRepresentative
+                | _ => throw (.unsupportedOperationalExpr ordinary)
+              let vectorRepresentative ← representativeFor vectorExpr.node vector
+              let publicKeyRepresentative ← representativeFor publicKeyExpr.node publicKey
+              let plaintextRepresentative ← representativeFor plaintextExpr.node plaintext
+              let (arena, output) ← groupBggEncodingExprIds environment arena vectorRepresentative
+                publicKeyRepresentative plaintextRepresentative fuel
+              let outputFact ← arena.concreteFact output
+              let outputSummary ← match recomputeSelectedMatrixSummary summary outputFact with
+                | some outputSummary => pure outputSummary
+                | none => throw (.unsupportedOperationalExpr representative)
+              arena.pushSelect selection (.schemaEnvelope count output outputSummary)
+
+private partial def groupBggEncodingOperationalFacts
+    (environment : ParamEnvironment)
+    (arena : OperationalExprArena) :
+    OperationalFact → OperationalFact → OperationalFact →
+    Except OperationalError (OperationalExprArena × OperationalFact)
+  | .familyUniform binder coordinate vector vectorCount,
+      .familyUniform _ _ publicKey publicCount,
+      .familyUniform _ _ plaintext plaintextCount => do
+      if vectorCount != publicCount || vectorCount != plaintextCount then
+        throw (.invalidDerivationAttachment "mxx-bgg" "encoding-family-pairing")
+      let (arena, grouped) ← groupBggEncodingOperationalFacts environment arena
+        vector publicKey plaintext
+      pure (arena, .familyUniform binder coordinate grouped vectorCount)
+  | vector, publicKey, plaintext => do
+      let (arena, vector) ← arena.pushMatrixFact vector
+      let (arena, publicKey) ← arena.pushMatrixFact publicKey
+      let (arena, plaintext) ← arena.pushMatrixFact plaintext
+      let (arena, grouped) ← groupBggEncodingExprIds environment arena vector publicKey plaintext
+        (arena.nodes.size + 1)
+      pure (arena, .matrixExpr grouped)
+
 private def derivationAttachmentRole
     (attachment : DerivationAttachment)
     (role : String) : Except OperationalError WireRef :=
@@ -3961,6 +4035,7 @@ private def replaceOperationalFact
 private def applyDerivationAttachment
     (node : Nat)
     (attachment : DerivationAttachment)
+    (environment : ParamEnvironment)
     (facts : OperationalScopeFacts) : Except OperationalError OperationalScopeFacts := do
   if attachment.ownerNamespace == "mxx-bgg" &&
       attachment.ruleName == "encoding-family-pairing" then
@@ -3970,8 +4045,9 @@ private def applyDerivationAttachment
     let vector ← lookupFact node facts vectorWire
     let publicKey ← lookupFact node facts publicKeyWire
     let plaintext ← lookupFact node facts plaintextWire
-    let grouped ← groupBggEncodingFact vector publicKey plaintext
-    replaceOperationalFact node facts vectorWire grouped
+    let (arena, grouped) ← groupBggEncodingOperationalFacts environment facts.arena
+      vector publicKey plaintext
+    replaceOperationalFact node { facts with arena } vectorWire grouped
   else if attachment.ownerNamespace == "mxx-correctness" &&
       attachment.ruleName == "protocol-boolean-signal-grouping" then
     let valueWire ← derivationAttachmentRole attachment "value"
@@ -4007,9 +4083,10 @@ private def applyDerivationAttachment
 private def applyPreparedDerivationAttachments
     (node : Nat)
     (attachments : Array DerivationAttachment)
+    (environment : ParamEnvironment)
     (facts : OperationalScopeFacts) : Except OperationalError OperationalScopeFacts :=
   attachments.foldlM (init := facts) fun current attachment =>
-    applyDerivationAttachment node attachment current
+    applyDerivationAttachment node attachment environment current
 
 def availableRelation
     (node : Nat)
@@ -4059,14 +4136,6 @@ def rebindSubject (subject : WireRef) : OperationalFact → Except OperationalEr
   | .familyPacked elements count _ => do
       let elements ← elements.mapM (rebindSubject subject)
       return packedOperationalFamily elements count
-  | .selectedMatrices family =>
-      let selection := family.selection
-      let branches := family.branches
-      if branches.all fun branch => branch.relations.all fun relation => match relation with
-          | .decomposition relation => relation.producer == branch.origin
-          | .preimage relation => relation.producer == branch.origin then
-        pure (.selectedMatrices (family.map selection fun branch => { branch with subject }))
-      else throw (.malformedRelation subject.node)
   | fact => pure fact
 
 private def namespaceFreshOrigin
@@ -4254,13 +4323,6 @@ private partial def shiftFactPreviousDepth : OperationalFact → OperationalFact
       .familyUniform binder coordinate (shiftFactPreviousDepth element) count
   | .familyPacked elements count _ =>
       packedOperationalFamily (elements.map shiftFactPreviousDepth) count
-  | .selectedMatrices family =>
-      let selection := family.selection
-      let shiftBranch (branch : OperationalMatrixFact) :=
-        match shiftFactPreviousDepth (.matrix branch) with
-        | .matrix shifted => shifted
-        | _ => branch
-      .selectedMatrices (family.map selection shiftBranch)
   | fact => fact
 
 private def namespaceFreshValueOrigin
@@ -4320,14 +4382,6 @@ partial def namespaceFreshOutput
         | .loopInstance _ _ _ => fact.origin
         | .selected _ _ _ => fact.origin
     }
-  | .selectedMatrices family =>
-      let selection := family.selection
-      let namespaceBranch (branch : OperationalMatrixFact) :=
-        match namespaceFreshOutput scope wire (.matrix branch) with
-        | .matrix namespaced => namespaced
-        | _ => branch
-      .selectedMatrices (family.map (namespaceFreshValueOrigin scope wire selection)
-        namespaceBranch)
   | fact => fact
 
 partial def factHasRelation : OperationalFact → Bool
@@ -4335,8 +4389,6 @@ partial def factHasRelation : OperationalFact → Bool
       term.product.factors.any fun factor => !factor.relations.isEmpty
   | .familyUniform _ _ element _ => factHasRelation element
   | .familyPacked elements _ _ => elements.any factHasRelation
-  | .selectedMatrices family =>
-      family.branches.any fun branch => factHasRelation (.matrix branch)
   | _ => false
 
 def packedFacts : List OperationalFact → OperationalFact
@@ -4456,14 +4508,6 @@ private partial def instantiateFactLoopIndex (slot index : Nat) : OperationalFac
       .familyUniform binder coordinate (instantiateFactLoopIndex slot index element) count
   | .familyPacked elements count _ =>
       packedOperationalFamily (elements.map (instantiateFactLoopIndex slot index)) count
-  | .selectedMatrices family =>
-      let selection := family.selection
-      let instantiateBranch (branch : OperationalMatrixFact) :=
-        match instantiateFactLoopIndex slot index (.matrix branch) with
-        | .matrix instantiated => instantiated
-        | _ => branch
-      .selectedMatrices (family.map (instantiateValueOriginLoopIndex slot index selection)
-        instantiateBranch)
   | fact => fact
 
 private def selectProtocolValueOrigin
@@ -4539,13 +4583,6 @@ private partial def selectProtocolFamilyElement (index : Nat) : OperationalFact 
       .familyUniform binder coordinate (selectProtocolFamilyElement index element) count
   | .familyPacked elements count _ =>
       packedOperationalFamily (elements.map (selectProtocolFamilyElement index)) count
-  | .selectedMatrices family =>
-      let selection := family.selection
-      let selectBranch (branch : OperationalMatrixFact) :=
-        match selectProtocolFamilyElement index (.matrix branch) with
-        | .matrix selected => selected
-        | _ => branch
-      .selectedMatrices (family.map (selectProtocolValueOrigin index selection) selectBranch)
   | fact => fact
 
 private def joinCanonicalRanges : List CanonicalRange → CanonicalRange
@@ -4703,125 +4740,6 @@ def selectDynamicUniformFact
       pure (.bytes { selected with subject })
   | fact => rebindSubject subject fact
 
-/-- Remove only producer identities from a relation-free branch.  The remaining value is the
-complete operational schema used by every later bound rule: ordered products, transforms, roles,
-matrix types, bound expressions, and metadata all remain exact. -/
-private def relationFreeUniformSchema?
-    (fact : OperationalMatrixFact) : Option UniformMatrixSchema := do
-  if factHasRelation (.matrix fact) then none else
-    some (operationalUniformSchema fact)
-
-private def uniformBoundaryRelationPair
-    (left right : OperationalMatrixFact) : Bool :=
-  match left.polynomial, right.polynomial with
-  | [{ product := { factors := leftFactors, .. }, .. }],
-      [{ product := { factors := rightFactors, .. }, .. }] =>
-      match leftFactors.getLast?, rightFactors.head? with
-      | some leftFactor, some rightFactor =>
-          (matchingFactorRelation? leftFactor rightFactor).isSome
-      | _, _ => false
-  | _, _ => false
-
-private def uniformBoundaryRelationPairs
-    (left right : SelectedMatrixFamily) : Bool :=
-  left.count == right.count &&
-    left.summary.uniformSchema.isSome && right.summary.uniformSchema.isSome &&
-    left.summary.sharedLastPublicIdentity.isSome &&
-    left.summary.sharedLastPublicIdentity == right.summary.sharedFirstRelationPublicIdentity
-
-private def uniformBoundaryRelationsWithSharedLeft
-    (left : OperationalMatrixFact)
-    (right : SelectedMatrixFamily) : Bool :=
-  let identity := boundaryLastPublicIdentity? left
-  right.summary.uniformSchema.isSome && identity.isSome &&
-    identity == right.summary.sharedFirstRelationPublicIdentity
-
-/-- Collapse a selected family only after every branch-local relation has been consumed and every
-complete branch has the same operational schema modulo producer identity.  The representative is
-wrapped in the executable selection identity, so it cannot spuriously match an ordinary branch's
-identity in a later relation rewrite. -/
-private def compressUniformSelectedMatrices
-    (node : Nat)
-    (subject : WireRef)
-    (selection : OperationalValueOrigin)
-    (branches : Array OperationalMatrixFact)
-    (count : Nat := branches.size)
-    (representsLoopLanes : Bool := false) : Except OperationalError OperationalFact := do
-  let first ← match branches[0]? with
-    | some first => pure first
-    | none => throw (.invalidCount node 0)
-  let family := if count == branches.size then
-      { selectedMatrixFamily selection branches with representsLoopLanes }
-    else selectedMatrixEnvelope selection count first (representsLoopLanes := representsLoopLanes)
-  match family.summary.uniformSchema with
-  | some _ =>
-      if family.summary.relationFree then
-        let binder : FamilyTemplateBinder := {
-          owner := dynamicSelectionScope selection
-          producerNode := node
-          binderSlot := 0
-        }
-        selectDynamicUniformFact binder selection subject (.matrix first)
-      else
-        pure (.selectedMatrices family)
-  | none => pure (.selectedMatrices family)
-
-/-- Build the one-iteration template consumed by a parallel-loop body. Packed executable
-families are joined through the existing exact-one selection representation: signal branches
-retain indicators and bounded branches use their maximum bound. Offset families deliberately use
-a distinct selection origin, which forgets cross-family correlation rather than inventing it. -/
-def loopTemplateArgumentFact
-    (node argument count : Nat)
-    (mode : LoopInputMode)
-    (fact : OperationalFact) : Except OperationalError OperationalFact := do
-  match mode with
-  | .broadcast => pure fact
-  | .zip | .zipOffset _ =>
-      match fact with
-      | .familyUniform _ _ element familyCount =>
-          let offset := match mode with | .zipOffset value => value | _ => 0
-          if count + offset > familyCount.toNat then
-            throw (.loopInputModeMismatch node argument)
-          else pure element
-      | .familyPacked elements familyCount matrixSummary =>
-          let offset := match mode with
-            | .zip => 0
-            | .zipOffset value => value
-            | .broadcast => 0
-          if familyCount < count + offset then
-            throw (.loopInputModeMismatch node argument)
-          let baseSelection : OperationalValueOrigin :=
-            .local temporaryScope { node, port := 0 }
-          let selection := match mode with
-            | .zip => baseSelection
-            | .zipOffset value => .loopInstance argument value baseSelection
-            | .broadcast => baseSelection
-          match matrixSummary with
-          | some summary =>
-              let representativeIndex := if elements.size == familyCount then offset else 0
-              let representative ← match elements[representativeIndex]? with
-                | some (.matrix matrix) => pure matrix
-                | _ => throw (.loopInputModeMismatch node argument)
-              if summary.relationFree then
-                compressUniformSelectedMatrices node { node, port := argument } selection
-                  #[representative] count true
-              else pure (.selectedMatrices
-                (selectedMatrixEnvelope selection count representative summary true))
-          | none =>
-              if elements.size < count + offset then
-                throw (.loopInputModeMismatch node argument)
-              let branches := ((elements.extract offset (offset + count)).toList)
-              if branches.any factHasRelation then do
-                let matrices ← branches.toArray.mapM fun branch =>
-                  match branch with
-                  | .matrix matrix => pure matrix
-                  | _ => throw (.loopInputModeMismatch node argument)
-                pure (.selectedMatrices
-                  { selectedMatrixFamily selection matrices with representsLoopLanes := true })
-              else
-                joinDynamicFacts node { node, port := argument } branches (some selection)
-      | _ => throw (.loopInputModeMismatch node argument)
-
 /-- Arena-backed parallel-loop input preparation.  Matrix families retain their exact selected
 expression (or one checked schema envelope) instead of materializing an indicator polynomial or
 the removed fact-level selected-family representation. -/
@@ -4876,76 +4794,7 @@ private def loopTemplateArgumentExpr
                 branches := branches.push branch
               let (finalArena, root) ← arena.pushSelect selection (.exact branches)
               pure (finalArena, .matrixExpr root)
-      | _ =>
-          pure (arena, ← loopTemplateArgumentFact node argument count mode fact)
-
-private def liftSelectedUnaryMatrix
-    (node : Nat)
-    (wire : WireRef)
-    (input : OperationalFact)
-    (operation : OperationalMatrixFact → Except OperationalError OperationalFact) :
-    Except OperationalError OperationalFact := do
-  match input with
-  | .matrix matrix => operation matrix
-  | .selectedMatrices family => do
-      let selection := family.selection
-      let branches := family.branches
-      let outputs ← branches.mapM operation
-      let matrices ← outputs.mapM fun output => match output with
-        | .matrix matrix => pure matrix
-        | _ => throw (.operandNotMatrix node wire)
-      compressUniformSelectedMatrices node wire selection matrices family.count
-        family.representsLoopLanes
-  | _ => throw (.operandNotMatrix node wire)
-
-private structure AlignedMatrixInputs where
-  selection : Option OperationalValueOrigin
-  rows : Array (List OperationalMatrixFact)
-
-private def alignSelectedMatrixInputs
-    (node : Nat)
-    (inputs : List (WireRef × OperationalFact)) :
-    Except OperationalError AlignedMatrixInputs := do
-  let selected := inputs.filterMap fun (_, input) => match input with
-    | .selectedMatrices family => some (family.selection, family.branches.size)
-    | _ => none
-  match selected with
-  | [] =>
-      let row ← inputs.mapM fun (wire, input) => match input with
-        | .matrix matrix => pure matrix
-        | _ => throw (.operandNotMatrix node wire)
-      pure { selection := none, rows := #[row] }
-  | (selection, count) :: tail => do
-      if tail.any fun candidate => candidate.1 != selection || candidate.2 != count then
-        throw (.selectedFamilyOperationUnsupported node)
-      let mut rows := #[]
-      for branch in [:count] do
-        let row ← inputs.mapM fun (wire, input) => match input with
-          | .matrix matrix => pure matrix
-          | .selectedMatrices family => do
-              if family.selection != selection then
-                throw (.selectedFamilyOperationUnsupported node)
-              match family.branches[branch]? with
-              | some matrix => pure matrix
-              | none => throw (.selectedFamilyOperationUnsupported node)
-          | _ => throw (.operandNotMatrix node wire)
-        rows := rows.push row
-      pure { selection := some selection, rows }
-
-private def finishAlignedMatrixOutputs
-    (node : Nat)
-    (wire : WireRef)
-    (selection : Option OperationalValueOrigin)
-    (outputs : Array OperationalFact) : Except OperationalError OperationalFact := do
-  match selection with
-  | none => match outputs[0]? with
-      | some output => pure output
-      | none => throw (.selectedFamilyOperationUnsupported node)
-  | some selection =>
-      let branches ← outputs.mapM fun output => match output with
-        | .matrix matrix => pure matrix
-        | _ => throw (.operandNotMatrix node wire)
-      compressUniformSelectedMatrices node wire selection branches
+      | _ => throw (.loopInputModeMismatch node argument)
 
 def genericNodeFact
     (scopeKey : ScopeTemplateKey)
@@ -5087,7 +4936,6 @@ def genericNodeFact
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
       let matrix ← match ← lookupFact nodeIndex facts matrixWire with
         | .matrix matrix => pure matrix
-        | .selectedMatrices .. => throw (.selectedFamilyOperationUnsupported nodeIndex)
         | _ => throw (.operandNotMatrix nodeIndex matrixWire)
       if node.arguments.length != 1 then
         throw (.unsupportedOutputArity nodeIndex node.arguments.length)
@@ -5108,7 +4956,6 @@ def genericNodeFact
         | _ => throw (.unsupportedOutputArity nodeIndex node.arguments.length)
       let input ← match ← lookupFact nodeIndex facts inputWire with
         | .matrix matrix => pure matrix
-        | .selectedMatrices .. => throw (.selectedFamilyOperationUnsupported nodeIndex)
         | _ => throw (.operandNotMatrix nodeIndex inputWire)
       let ciphertext ← evaluateIntInvariant environment loopDomains ciphertextModulus
       let plaintext ← evaluateIntInvariant environment loopDomains plaintextModulus
@@ -5135,26 +4982,8 @@ def genericNodeFact
       if index.upper < 0 || index.lower >= Int.ofNat branchCount then
         throw (.invalidCount nodeIndex index.upper)
       let branches ← (node.arguments.drop 1).mapM (lookupFact nodeIndex facts)
-      let packedBranches? := branches.mapM fun branch => match branch with
-        | .familyPacked elements count (some _) => match elements[0]? with
-            | some element => match element with
-                | OperationalFact.matrix representative => some (count, representative)
-                | _ => none
-            | none => none
-        | _ => none
-      match packedBranches? with
-      | some packedBranches =>
-          let first ← match packedBranches.head? with
-            | some first => pure first
-            | none => throw (OperationalError.invalidCount nodeIndex 0)
-          if packedBranches.any fun branch => branch.1 != first.1 then
-            throw (.loopInputModeMismatch nodeIndex 0)
-          let alternatives := packedBranches.map (·.2) |>.toArray
-          let selected := selectedMatrixFamily index.origin alternatives
-          pure (.familyPacked #[.selectedMatrices selected] first.1 none)
-      | none =>
-          joinDynamicFacts nodeIndex { node := nodeIndex, port := outputPort } branches
-            (some index.origin)
+      joinDynamicFacts nodeIndex { node := nodeIndex, port := outputPort } branches
+        (some index.origin)
   | .zeroMatrix _, some matrixType =>
       polynomialMatrixFact nodeIndex outputPort matrixType environment [] (.below 1)
   | .identityMatrix _, some matrixType =>
@@ -5228,24 +5057,6 @@ def genericNodeFact
             ({ result with relations := [.preimage relation] }).refreshPrimitivePolynomial
           match targetFact with
           | .matrix target => pure (.matrix (attachRelation none target))
-          | .selectedMatrices family =>
-              match family.summary.uniformSchema, family.branches[0]? with
-              | some _, some target =>
-                  let representative := attachRelation (some 0) target
-                  let summary : SelectedMatrixSummary := {
-                    uniformSchema := some (operationalUniformSchema representative)
-                    relationFree := false
-                    sharedLastPublicIdentity := none
-                    sharedFirstRelationPublicIdentity := some publicIdentity
-                  }
-                  pure (.selectedMatrices (selectedMatrixEnvelope family.selection family.count
-                    representative summary family.representsLoopLanes))
-              | _, _ =>
-                  pure (.selectedMatrices {
-                    selectedMatrixFamily family.selection
-                      (family.branches.mapIdx fun index target => attachRelation (some index) target)
-                    with representsLoopLanes := family.representsLoopLanes
-                  })
           | _ => throw (.operandNotMatrix nodeIndex targetWire)
       | _ => throw (.malformedRelation nodeIndex)
   | .hashSample _ variant tagPrefix tagExpressions tagDecimalExpressions tagU64LeExpressions
@@ -5350,26 +5161,14 @@ def genericNodeFact
         throw (.gadgetLayoutMismatch nodeIndex)
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let inputFact ← lookupFact nodeIndex facts inputWire
-      let (selection, inputs) ← match inputFact with
-        | .matrix input => pure (none, #[input])
-        | .selectedMatrices family => pure (some family.selection, family.branches)
-        | _ => throw (.operandNotMatrix nodeIndex inputWire)
-      let input ← match inputs[0]? with
-        | some input => pure input
-        | none => throw (.selectedFamilyOperationUnsupported nodeIndex)
-      if inputs.any fun candidate => candidate.matrixParams != input.matrixParams then
-        throw (.selectedFamilyOperationUnsupported nodeIndex)
+      let input ← matrixFactAt nodeIndex facts inputWire
       let publicIdentity := PublicMatrixIdentity.gadget descriptor.paramsId params
         input.matrixParams.rows bound small count.toNat
       let result ← cappedMatrixFact nodeIndex outputPort matrixType environment
         (Int.ofNat (Mxx.gadgetDecompositionBound bound small))
       match result with
       | .matrix result =>
-          let attachRelation (branch : Nat) (input : OperationalMatrixFact) :=
-            let result := match selection with
-              | some _ => { result with origin := .loopInstance nodeIndex branch result.origin }
-              | none => result
+          let attachRelation (_branch : Nat) (input : OperationalMatrixFact) :=
             let status := if !small then ReconstructionStatus.available else
               match input.canonicalRange with
               | .below upper => if upper <= descriptor.smallestCrtModulus then
@@ -5389,13 +5188,7 @@ def genericNodeFact
               canonicalRange := if small then .below bound.natAbs else .unknown
               relations := [.decomposition relation]
             }).refreshPrimitivePolynomial
-          let outputs := inputs.mapIdx attachRelation
-          match selection with
-          | none => match outputs[0]? with
-              | some output => pure (.matrix output)
-              | none => throw (.selectedFamilyOperationUnsupported nodeIndex)
-          | some selection =>
-              pure (.selectedMatrices (selectedMatrixFamily selection outputs))
+          pure (.matrix (attachRelation 0 input))
       | _ => throw (.malformedRelation nodeIndex)
   | .matrixAdd, some matrixType | .matrixSubtract, some matrixType =>
       if node.arguments.length != 2 then
@@ -5417,101 +5210,15 @@ def genericNodeFact
           | .matrixSubtract => subtractOperationalPolynomials left.polynomial right.polynomial
           | _ => []
         polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
-      let finishSelected
-          (selection : OperationalValueOrigin)
-          (count : Nat)
-          (representsLoopLanes : Bool)
-          (outputs : Array OperationalFact) : Except OperationalError OperationalFact := do
-        let branches ← outputs.mapM fun output => match output with
-          | .matrix branch => pure branch
-          | _ => throw (.operandNotMatrix nodeIndex leftWire)
-        compressUniformSelectedMatrices nodeIndex { node := nodeIndex, port := outputPort }
-          selection branches count representsLoopLanes
       match leftFact, rightFact with
       | .matrix left, .matrix right => combinePair left right
-      | .selectedMatrices family, .matrix right => do
-          let outputs ← family.branches.mapM fun left => combinePair left right
-          finishSelected family.selection family.count family.representsLoopLanes outputs
-      | .matrix left, .selectedMatrices family => do
-          let outputs ← family.branches.mapM fun right => combinePair left right
-          finishSelected family.selection family.count family.representsLoopLanes outputs
-      | .selectedMatrices leftFamily, .selectedMatrices rightFamily => do
-          if leftFamily.selection != rightFamily.selection ||
-              leftFamily.branches.size != rightFamily.branches.size then do
-            if leftFamily.selection == rightFamily.selection ||
-                leftFamily.representsLoopLanes != rightFamily.representsLoopLanes ||
-                (leftFamily.isEnvelope && leftFamily.summary.uniformSchema.isNone) ||
-                (rightFamily.isEnvelope && rightFamily.summary.uniformSchema.isNone) then
-              throw (.selectedFamilyOperationUnsupported nodeIndex)
-            match leftFamily.summary.uniformSchema, leftFamily.branches[0]?,
-                rightFamily.branches[0]? with
-            | some _, some leftRepresentative, some rightRepresentative =>
-                match absorbedSelectionBinder? rightRepresentative leftFamily.selection with
-                | some binder =>
-                    if rightFamily.branches.all fun branch =>
-                        absorbedSelectionBinder? branch leftFamily.selection == some binder then
-                      let selectedLeft ← match ← selectDynamicUniformFact binder
-                          leftFamily.selection { node := nodeIndex, port := outputPort }
-                          (.matrix leftRepresentative) with
-                        | .matrix selected => pure selected
-                        | _ => throw (.operandNotMatrix nodeIndex leftWire)
-                      let outputs ← rightFamily.branches.mapM fun right =>
-                        combinePair selectedLeft right
-                      let branches ← outputs.mapM fun output => match output with
-                        | .matrix branch => pure branch
-                        | _ => throw (.operandNotMatrix nodeIndex leftWire)
-                      let summary := selectedMatrixSummary branches
-                      if rightFamily.isEnvelope && summary.uniformSchema.isNone then
-                        throw (.selectedFamilyOperationUnsupported nodeIndex)
-                      let representative ← match branches[0]? with
-                        | some branch => pure branch
-                        | none => throw (.selectedFamilyOperationUnsupported nodeIndex)
-                      if rightFamily.isEnvelope then
-                        return .selectedMatrices (selectedMatrixEnvelope rightFamily.selection
-                          rightFamily.count representative summary
-                          rightFamily.representsLoopLanes)
-                      else
-                        return .selectedMatrices {
-                          selectedMatrixFamily rightFamily.selection branches with
-                          representsLoopLanes := rightFamily.representsLoopLanes
-                        }
-                | none => pure ()
-            | _, _, _ => pure ()
-            if leftFamily.isEnvelope || rightFamily.isEnvelope then
-              throw (.selectedFamilyOperationUnsupported nodeIndex)
-            let left ← match ← joinDynamicFacts nodeIndex
-                { node := nodeIndex, port := outputPort }
-                (leftFamily.branches.map OperationalFact.matrix).toList
-                (some leftFamily.selection) with
-              | .matrix matrix => pure matrix
-              | _ => throw (.operandNotMatrix nodeIndex leftWire)
-            let right ← match ← joinDynamicFacts nodeIndex
-                { node := nodeIndex, port := outputPort }
-                (rightFamily.branches.map OperationalFact.matrix).toList
-                (some rightFamily.selection) with
-              | .matrix matrix => pure matrix
-              | _ => throw (.operandNotMatrix nodeIndex rightWire)
-            combinePair left right
-          else
-            let mut outputs : Array OperationalFact := #[]
-            for branch in [:leftFamily.branches.size] do
-              match leftFamily.branches[branch]?, rightFamily.branches[branch]? with
-              | some left, some right => outputs := outputs.push (← combinePair left right)
-              | _, _ => throw (.selectedFamilyOperationUnsupported nodeIndex)
-            finishSelected leftFamily.selection leftFamily.count
-              leftFamily.representsLoopLanes outputs
       | _, _ => throw (.operandNotMatrix nodeIndex leftWire)
   | .concat axis, some matrixType =>
-      let inputs ← node.arguments.mapM fun wire =>
-        return (wire, ← lookupFact nodeIndex facts wire)
-      let aligned ← alignSelectedMatrixInputs nodeIndex inputs
-      let outputs ← aligned.rows.mapM fun row => do
-        let polynomial ← concatOperationalPolynomials axis matrixType (row.map (·.polynomial))
-          |>.mapError (flatErrorAt nodeIndex)
-        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
-          (joinCanonicalRanges (row.map (·.canonicalRange)))
-      finishAlignedMatrixOutputs nodeIndex (node.arguments.headD { node := 0, port := 0 })
-        aligned.selection outputs
+      let inputs ← node.arguments.mapM fun wire => matrixFactAt nodeIndex facts wire
+      let polynomial ← concatOperationalPolynomials axis matrixType (inputs.map (·.polynomial))
+        |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+        (joinCanonicalRanges (inputs.map (·.canonicalRange)))
   | .select, some matrixType =>
       let indexWire ← match node.arguments[0]? with
         | some wire => pure wire
@@ -5526,7 +5233,6 @@ def genericNodeFact
       let branches ← (node.arguments.drop 1).mapM fun wire => do
         match ← lookupFact nodeIndex facts wire with
         | .matrix branch => retypeMatrixFact nodeIndex matrixType branch environment
-        | .selectedMatrices .. => throw (.selectedFamilyOperationUnsupported nodeIndex)
         | _ => throw (.operandNotMatrix nodeIndex wire)
       let polynomial ← selectOperationalPolynomials scopeKey nodeIndex index.origin matrixType
         (branches.map (·.polynomial)) |>.mapError (flatErrorAt nodeIndex)
@@ -5535,100 +5241,80 @@ def genericNodeFact
   | .transpose, some matrixType =>
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      liftSelectedUnaryMatrix nodeIndex inputWire (← lookupFact nodeIndex facts inputWire) fun input => do
-        let polynomial ← transposeOperationalPolynomial input.polynomial
-          |>.mapError (flatErrorAt nodeIndex)
-        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+      let input ← matrixFactAt nodeIndex facts inputWire
+      let polynomial ← transposeOperationalPolynomial input.polynomial
+        |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
   | .slice rows columns, some matrixType =>
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      liftSelectedUnaryMatrix nodeIndex inputWire (← lookupFact nodeIndex facts inputWire) fun input => do
-        let polynomial ← sliceOperationalPolynomial rows columns matrixType input.polynomial
-          |>.mapError (flatErrorAt nodeIndex)
-        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+      let input ← matrixFactAt nodeIndex facts inputWire
+      let polynomial ← sliceOperationalPolynomial rows columns matrixType input.polynomial
+        |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
   | .reshape rows columns, some matrixType =>
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      liftSelectedUnaryMatrix nodeIndex inputWire (← lookupFact nodeIndex facts inputWire) fun input => do
-        let outputParams ← match matrixType.evaluate environment
-            (.constant input.matrixParams.maxCoefficientBound) with
-          | some params => pure params
-          | none => throw (.invalidMatrixParameters nodeIndex)
-        let polynomial ←
-          if sameConcreteMatrixShape input.matrixParams outputParams then
-            equivalentRetypeOperationalPolynomial matrixType input.polynomial
-              |>.mapError (flatErrorAt nodeIndex)
-          else
-            boundedStructuralTransformPolynomial (.reshape rows columns) matrixType input.polynomial
-              |>.mapError (flatErrorAt nodeIndex)
-        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+      let input ← matrixFactAt nodeIndex facts inputWire
+      let outputParams ← match matrixType.evaluate environment
+          (.constant input.matrixParams.maxCoefficientBound) with
+        | some params => pure params
+        | none => throw (.invalidMatrixParameters nodeIndex)
+      let polynomial ←
+        if sameConcreteMatrixShape input.matrixParams outputParams then
+          equivalentRetypeOperationalPolynomial matrixType input.polynomial
+            |>.mapError (flatErrorAt nodeIndex)
+        else
+          boundedStructuralTransformPolynomial (.reshape rows columns) matrixType input.polynomial
+            |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
   | .constantCoefficient index, some matrixType =>
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
       let minimum ← evaluateIntMinimum environment loopDomains index
       let maximum ← evaluateIntMaximum environment loopDomains index
-      liftSelectedUnaryMatrix nodeIndex inputWire (← lookupFact nodeIndex facts inputWire) fun input => do
-        if node.arguments.length != 1 || input.matrixParams.rows != 1 ||
-            input.matrixParams.columns != 1 then
-          throw (.invalidMatrixParameters nodeIndex)
-        if minimum < 0 || maximum >= Int.ofNat input.matrixParams.ringDimension then
-          throw (.invalidCount nodeIndex maximum)
-        let polynomial ← boundedStructuralTransformPolynomial (.constantCoefficient index)
-          matrixType input.polynomial |>.mapError (flatErrorAt nodeIndex)
-        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+      let input ← matrixFactAt nodeIndex facts inputWire
+      if node.arguments.length != 1 || input.matrixParams.rows != 1 ||
+          input.matrixParams.columns != 1 then
+        throw (.invalidMatrixParameters nodeIndex)
+      if minimum < 0 || maximum >= Int.ofNat input.matrixParams.ringDimension then
+        throw (.invalidCount nodeIndex maximum)
+      let polynomial ← boundedStructuralTransformPolynomial (.constantCoefficient index)
+        matrixType input.polynomial |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
   | .matrixNegate, some matrixType =>
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let negate (input : OperationalMatrixFact) := do
-        let input ← retypeMatrixFact nodeIndex matrixType input environment
-        polynomialMatrixFact nodeIndex outputPort matrixType environment
-          (scaleOperationalPolynomial (-1) input.polynomial) input.canonicalRange
-      match ← lookupFact nodeIndex facts inputWire with
-      | .matrix input => negate input
-      | .selectedMatrices family => do
-          let outputs ← family.branches.mapM negate
-          let branches ← outputs.mapM fun output => match output with
-            | .matrix branch => pure branch
-            | _ => throw (.operandNotMatrix nodeIndex inputWire)
-          compressUniformSelectedMatrices nodeIndex { node := nodeIndex, port := outputPort }
-            family.selection branches family.count family.representsLoopLanes
-      | _ => throw (.operandNotMatrix nodeIndex inputWire)
+      let input ← matrixFactAt nodeIndex facts inputWire
+      let input ← retypeMatrixFact nodeIndex matrixType input environment
+      polynomialMatrixFact nodeIndex outputPort matrixType environment
+        (scaleOperationalPolynomial (-1) input.polynomial) input.canonicalRange
   | .matrixScale scalar, some matrixType =>
       let scalarValues ← evaluateIntOverLoops environment loopDomains scalar
       let inputWire ← match node.arguments[0]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
-      let scale (input : OperationalMatrixFact) := do
-        let input ← retypeMatrixFact nodeIndex matrixType input environment
-        match scalarValues with
-        | [] => throw (.invalidMatrixParameters nodeIndex)
-        | first :: tail =>
-            if first == 1 && tail.all (· == 1) then
-              pure (.matrix { input with subject := { node := nodeIndex, port := outputPort } })
-            else
-              let polynomial ←
-                if tail.all (· == first) then
-                  pure (scaleOperationalPolynomial first input.polynomial)
-                else
-                  multiplyOperationalPolynomials
-                    (parameterScalarPolynomial environment loopDomains scalar matrixType)
-                    input.polynomial |>.mapError (flatErrorAt nodeIndex)
-              polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
-                input.canonicalRange
-      match ← lookupFact nodeIndex facts inputWire with
-      | .matrix input => scale input
-      | .selectedMatrices family => do
-          let outputs ← family.branches.mapM scale
-          let branches ← outputs.mapM fun output => match output with
-            | .matrix branch => pure branch
-            | _ => throw (.operandNotMatrix nodeIndex inputWire)
-          compressUniformSelectedMatrices nodeIndex { node := nodeIndex, port := outputPort }
-            family.selection branches family.count family.representsLoopLanes
-      | _ => throw (.operandNotMatrix nodeIndex inputWire)
+      let input ← matrixFactAt nodeIndex facts inputWire
+      let input ← retypeMatrixFact nodeIndex matrixType input environment
+      match scalarValues with
+      | [] => throw (.invalidMatrixParameters nodeIndex)
+      | first :: tail =>
+          if first == 1 && tail.all (· == 1) then
+            pure (.matrix { input with subject := { node := nodeIndex, port := outputPort } })
+          else
+            let polynomial ←
+              if tail.all (· == first) then
+                pure (scaleOperationalPolynomial first input.polynomial)
+              else
+                multiplyOperationalPolynomials
+                  (parameterScalarPolynomial environment loopDomains scalar matrixType)
+                  input.polynomial |>.mapError (flatErrorAt nodeIndex)
+            polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+              input.canonicalRange
   | .matrixMultiply, some matrixType =>
       let leftWire ← match node.arguments[0]? with
         | some wire => pure wire
@@ -5650,105 +5336,8 @@ def genericNodeFact
               pure rewritten
           | _ => pure rewritten
         polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
-      let finishSelected
-          (selection : OperationalValueOrigin)
-          (count : Nat)
-          (representsLoopLanes : Bool)
-          (outputs : Array OperationalFact) : Except OperationalError OperationalFact := do
-        let branches ← outputs.mapM fun output => match output with
-          | .matrix branch => pure branch
-          | _ => throw (.operandNotMatrix nodeIndex leftWire)
-        compressUniformSelectedMatrices nodeIndex { node := nodeIndex, port := outputPort }
-          selection branches count representsLoopLanes
       match leftFact, rightFact with
       | .matrix left, .matrix right => multiplyPair left right
-      | .selectedMatrices family, .matrix right => do
-          let outputs ← family.branches.mapM fun left => multiplyPair left right
-          finishSelected family.selection family.count family.representsLoopLanes outputs
-      | .matrix left, .selectedMatrices family => do
-          if uniformBoundaryRelationsWithSharedLeft left family then
-            match family.branches[0]? with
-            | some right => do
-                let output ← multiplyPair left right
-                finishSelected family.selection family.count family.representsLoopLanes #[output]
-            | none => throw (.selectedFamilyOperationUnsupported nodeIndex)
-          else
-            if family.isEnvelope && (family.summary.uniformSchema.isSome &&
-                (family.summary.relationFree ||
-                  family.summary.sharedFirstRelationPublicIdentity.isSome)) then
-              match family.branches[0]? with
-              | some right => do
-                  let output ← multiplyPair left right
-                  finishSelected family.selection family.count family.representsLoopLanes #[output]
-              | none => throw (.selectedFamilyOperationUnsupported nodeIndex)
-            else if family.isEnvelope then do
-              throw (.selectedFamilyOperationUnsupported nodeIndex)
-            else
-              let outputs ← family.branches.mapM fun right => multiplyPair left right
-              finishSelected family.selection family.count family.representsLoopLanes outputs
-      | .selectedMatrices leftFamily, .selectedMatrices rightFamily => do
-          if leftFamily.selection != rightFamily.selection ||
-              leftFamily.count != rightFamily.count ||
-              leftFamily.representsLoopLanes != rightFamily.representsLoopLanes then do
-            if leftFamily.selection == rightFamily.selection ||
-                leftFamily.representsLoopLanes != rightFamily.representsLoopLanes ||
-                (leftFamily.isEnvelope && leftFamily.summary.uniformSchema.isNone) ||
-                (rightFamily.isEnvelope && rightFamily.summary.uniformSchema.isNone) then
-              throw (.selectedFamilyOperationUnsupported nodeIndex)
-            let binder : FamilyTemplateBinder := {
-              owner := dynamicSelectionScope rightFamily.selection
-              producerNode := nodeIndex
-              binderSlot := 0
-            }
-            let mut selectedBranches : Array OperationalMatrixFact := #[]
-            for left in leftFamily.branches do
-              let mut outputs : Array OperationalFact := #[]
-              for right in rightFamily.branches do
-                outputs := outputs.push (← multiplyPair left right)
-              let branches ← outputs.mapM fun output => match output with
-                | .matrix branch => pure branch
-                | _ => throw (.operandNotMatrix nodeIndex leftWire)
-              let summary := selectedMatrixSummary branches
-              if summary.uniformSchema.isNone then
-                throw (.selectedFamilyOperationUnsupported nodeIndex)
-              let representative ← match branches[0]? with
-                | some branch => pure branch
-                | none => throw (.selectedFamilyOperationUnsupported nodeIndex)
-              match ← selectDynamicUniformFact binder rightFamily.selection
-                  { node := nodeIndex, port := outputPort } (.matrix representative) with
-              | .matrix selected => selectedBranches := selectedBranches.push selected
-              | _ => throw (.operandNotMatrix nodeIndex leftWire)
-            let summary := selectedMatrixSummary selectedBranches
-            if leftFamily.isEnvelope && summary.uniformSchema.isNone then
-              throw (.selectedFamilyOperationUnsupported nodeIndex)
-            let representative ← match selectedBranches[0]? with
-              | some branch => pure branch
-              | none => throw (.selectedFamilyOperationUnsupported nodeIndex)
-            if leftFamily.isEnvelope then
-              pure (.selectedMatrices (selectedMatrixEnvelope leftFamily.selection
-                leftFamily.count representative summary leftFamily.representsLoopLanes))
-            else
-              pure (.selectedMatrices {
-                selectedMatrixFamily leftFamily.selection selectedBranches with
-                representsLoopLanes := leftFamily.representsLoopLanes
-              })
-          else if uniformBoundaryRelationPairs leftFamily rightFamily then
-            match leftFamily.branches[0]?, rightFamily.branches[0]? with
-            | some left, some right => do
-                let output ← multiplyPair left right
-                finishSelected leftFamily.selection leftFamily.count
-                  leftFamily.representsLoopLanes #[output]
-            | _, _ => throw (.selectedFamilyOperationUnsupported nodeIndex)
-          else
-            if leftFamily.isEnvelope || rightFamily.isEnvelope then do
-              throw (.selectedFamilyOperationUnsupported nodeIndex)
-            let mut outputs : Array OperationalFact := #[]
-            for branch in [:leftFamily.branches.size] do
-              match leftFamily.branches[branch]?, rightFamily.branches[branch]? with
-              | some left, some right => outputs := outputs.push (← multiplyPair left right)
-              | _, _ => throw (.selectedFamilyOperationUnsupported nodeIndex)
-            finishSelected leftFamily.selection leftFamily.count
-              leftFamily.representsLoopLanes outputs
       | _, _ => throw (.operandNotMatrix nodeIndex leftWire)
   | .tensor, some matrixType =>
       let leftWire ← match node.arguments[0]? with
@@ -5757,16 +5346,11 @@ def genericNodeFact
       let rightWire ← match node.arguments[1]? with
         | some wire => pure wire
         | none => throw (.missingOperand nodeIndex leftWire)
-      let aligned ← alignSelectedMatrixInputs nodeIndex
-        [(leftWire, ← lookupFact nodeIndex facts leftWire),
-          (rightWire, ← lookupFact nodeIndex facts rightWire)]
-      let outputs ← aligned.rows.mapM fun row => match row with
-        | [left, right] => do
-            let polynomial ← tensorOperationalPolynomials matrixType
-              left.polynomial right.polynomial |>.mapError (flatErrorAt nodeIndex)
-            polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
-        | _ => throw (.selectedFamilyOperationUnsupported nodeIndex)
-      finishAlignedMatrixOutputs nodeIndex leftWire aligned.selection outputs
+      let left ← matrixFactAt nodeIndex facts leftWire
+      let right ← matrixFactAt nodeIndex facts rightWire
+      let polynomial ← tensorOperationalPolynomials matrixType
+        left.polynomial right.polynomial |>.mapError (flatErrorAt nodeIndex)
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
   | .crtRecompose plaintextModuli reconstructionCoefficients, some matrixType =>
       if node.arguments.isEmpty || node.arguments.length != plaintextModuli.length ||
           node.arguments.length != reconstructionCoefficients.length then
@@ -5774,24 +5358,18 @@ def genericNodeFact
       let moduli ← plaintextModuli.mapM (evaluateIntInvariant environment loopDomains)
       let coefficients ← reconstructionCoefficients.mapM
         (evaluateIntInvariant environment loopDomains)
-      let inputFacts ← node.arguments.mapM fun wire =>
-        return (wire, ← lookupFact nodeIndex facts wire)
-      let aligned ← alignSelectedMatrixInputs nodeIndex inputFacts
+      let inputs ← node.arguments.mapM fun wire => matrixFactAt nodeIndex facts wire
       let modulus ← evaluateIntInvariant environment loopDomains matrixType.modulus
       if modulus <= 0 || moduli.any (fun value => value <= 1 || value >= modulus) ||
           coefficients.any (fun value => value < 0 || value >= modulus) then
         throw (.invalidMatrixParameters nodeIndex)
-      let outputs ← aligned.rows.mapM fun inputs => do
-        let inputs ← inputs.mapM fun input =>
-          retypeMatrixFact nodeIndex matrixType input environment
-        if inputs.any (·.matrixParams.rows != 1) then
-          throw (.invalidMatrixParameters nodeIndex)
-        let polynomial := (coefficients.zip inputs).foldl
-          (fun result pair ↦ addOperationalPolynomials result
-            (scaleOperationalPolynomial pair.1 pair.2.polynomial)) []
-        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
-      finishAlignedMatrixOutputs nodeIndex
-        (node.arguments.headD { node := 0, port := 0 }) aligned.selection outputs
+      let inputs ← inputs.mapM fun input => retypeMatrixFact nodeIndex matrixType input environment
+      if inputs.any (·.matrixParams.rows != 1) then
+        throw (.invalidMatrixParameters nodeIndex)
+      let polynomial := (coefficients.zip inputs).foldl
+        (fun result pair ↦ addOperationalPolynomials result
+          (scaleOperationalPolynomial pair.1 pair.2.polynomial)) []
+      polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
   | .packPolynomialCoefficients _ coefficientBits, some matrixType =>
       let bits ← evaluateIntMaximum environment loopDomains coefficientBits
       if bits <= 0 then throw (.invalidBound nodeIndex bits)
@@ -6030,6 +5608,100 @@ def deriveOrdinaryOutputs
       return output :: (← deriveOrdinaryOutputs scopeKey nodeIndex node rule environment
         loopDomains layouts facts (port + 1) tail)
 
+/-! Evaluate unresolved selections by streaming complete concrete alternatives into a consumer.
+Independent selections are nested control flow here; they are never materialized as a Cartesian
+array of facts or expression nodes.  Every concrete combination still goes through the existing
+primitive polynomial and relation-rewrite implementations. -/
+private partial def foldOperationalExprConcreteFacts
+    {α : Type}
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (root : OperationalExprId)
+    (state : α)
+    (visit : α → OperationalMatrixFact → Except OperationalError α) :
+    Except OperationalError α := do
+  let expression ← match arena.get? root with
+    | some expression => pure expression
+    | none => throw (.invalidOperationalExprRef root)
+  let foldBinary
+      (left right : OperationalExprId)
+      (combine : OperationalMatrixFact → OperationalMatrixFact →
+        Except OperationalError OperationalMatrixFact) :=
+    foldOperationalExprConcreteFacts arena environment left state fun state leftFact =>
+      foldOperationalExprConcreteFacts arena environment right state fun state rightFact => do
+        visit state (← combine leftFact rightFact)
+  match expression.node with
+  | .concrete fact => visit state fact
+  | .select _ (.exact branches) =>
+      if branches.isEmpty then throw (.invalidCount 0 0)
+      else
+        let mut state := state
+        for branch in branches do
+          state ← foldOperationalExprConcreteFacts arena environment branch state visit
+        pure state
+  | .select _ (.schemaEnvelope count representative _) =>
+      if count = 0 then throw (.invalidCount 0 0)
+      else foldOperationalExprConcreteFacts arena environment representative state visit
+  | .add left right =>
+      foldBinary left right fun leftFact rightFact =>
+        addConcreteMatrixFacts 0 0 expression.matrixType false environment leftFact rightFact
+  | .subtract left right =>
+      foldBinary left right fun leftFact rightFact =>
+        addConcreteMatrixFacts 0 0 expression.matrixType true environment leftFact rightFact
+  | .multiply rule rightWire left right =>
+      foldBinary left right fun leftFact rightFact =>
+        multiplyConcreteMatrixFacts 0 0 expression.matrixType rule rightWire environment
+          leftFact rightFact
+  | .tensor left right =>
+      foldBinary left right fun leftFact rightFact =>
+        tensorConcreteMatrixFacts 0 0 expression.matrixType environment leftFact rightFact
+  | .concat axis inputs =>
+      if inputs.isEmpty then throw (.invalidCount 0 0)
+      else
+        let rec foldInputs
+            (remaining : List OperationalExprId)
+            (state : α)
+            (reverseInputs : List OperationalMatrixFact) : Except OperationalError α := do
+          match remaining with
+          | [] =>
+              let inputs := reverseInputs.reverse.toArray
+              visit state (← concatConcreteMatrixFacts 0 0 axis expression.matrixType
+                environment inputs)
+          | input :: tail =>
+              foldOperationalExprConcreteFacts arena environment input state fun state fact =>
+                foldInputs tail state (fact :: reverseInputs)
+        foldInputs inputs.toList state []
+  | .transform operation value =>
+      foldOperationalExprConcreteFacts arena environment value state fun state fact => do
+        visit state (← transformConcreteMatrixFact 0 0 expression.matrixType operation
+          environment fact)
+
+private def operationalExprHasRelation
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (root : OperationalExprId) : Except OperationalError Bool :=
+  foldOperationalExprConcreteFacts arena environment root false fun found fact =>
+    pure (found || matrixFactHasRelation fact)
+
+private def summarizeSequentialOperationalExpr
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (root : OperationalExprId) : Except OperationalError OperationalMatrixFact := do
+  let summary ← foldOperationalExprConcreteFacts arena environment root none fun summary fact => do
+    if matrixFactHasRelation fact then throw (.relationBearingCarriedValue temporaryScope 0 0)
+    match summary with
+    | none => pure (some fact)
+    | some first =>
+        if !sameCarriedSchema (.matrix first) (.matrix fact) then
+          throw (.sequentialSchemaMismatch temporaryScope 0 0
+            (first.polynomial.map operationalLargeFactorCount)
+            (fact.polynomial.map operationalLargeFactorCount))
+        pure (some { first with
+          totalHardBound := .maximum first.totalHardBound fact.totalHardBound })
+  match summary with
+  | some fact => pure fact
+  | none => throw (.invalidCount 0 0)
+
 def evaluatePreparedScope
     (definitions : Array (String × PreparedOperationalScope))
     (layouts : List Mxx.GadgetLayoutDescriptor) :
@@ -6257,23 +5929,7 @@ def evaluatePreparedScope
                         facts := { facts with arena := finalArena }
                         pure [.matrixExpr root]
                       else match elements[0]? with
-                      | some element => match element with
-                          | .selectedMatrices alternatives =>
-                              if elements.size != 1 then
-                                throw (.selectedFamilyOperationUnsupported index)
-                              let binder : FamilyTemplateBinder := {
-                                owner := dynamicSelectionScope selection
-                                producerNode := index
-                                binderSlot := 0
-                              }
-                              let selectedBranches ← alternatives.branches.mapM fun branch => do
-                                match ← selectDynamicUniformFact binder selection
-                                    { node := index, port := 0 } (.matrix branch) with
-                                | .matrix selected => pure selected
-                                | _ => throw (.loopInputModeMismatch index 0)
-                              pure [.selectedMatrices
-                                (selectedMatrixFamily alternatives.selection selectedBranches)]
-                          | _ => match summary, elements[0]? with
+                      | some element => match summary, elements[0]? with
                               | some summary, some element => match element with
                                   | .matrix representative =>
                                       let binder : FamilyTemplateBinder := {
@@ -6329,22 +5985,9 @@ def evaluatePreparedScope
                   if childOutputs.length != node.outputCount then
                     throw (.childInputMismatch index node.outputCount childOutputs.length)
                   childOutputs.zipIdx.mapM fun (output, port) =>
-                    match output with
-                    | .selectedMatrices family =>
-                        if family.representsLoopLanes then
-                          let summary := if family.summary.uniformSchema.isSome then
-                            some family.summary else none
-                          rebindSubject { node := index, port }
-                            (.familyPacked (family.branches.map OperationalFact.matrix)
-                              family.count summary)
-                        else
-                          rebindSubject { node := index, port } (.familyUniform
-                            { owner := scopeKey, producerNode := index, binderSlot := indexSlot }
-                            (some (.loopBinder scopeKey index indexSlot)) output evaluatedCount)
-                    | output =>
-                        rebindSubject { node := index, port } (.familyUniform
-                          { owner := scopeKey, producerNode := index, binderSlot := indexSlot }
-                          (some (.loopBinder scopeKey index indexSlot)) output evaluatedCount)
+                    rebindSubject { node := index, port } (.familyUniform
+                      { owner := scopeKey, producerNode := index, binderSlot := indexSlot }
+                      (some (.loopBinder scopeKey index indexSlot)) output evaluatedCount)
               | .sequentialLoop _ count indexSlot bindings carriedCount =>
                   let evaluatedCount ← match count.evaluate environment with
                     | some value => pure value
@@ -6356,11 +5999,40 @@ def evaluatePreparedScope
                   if carriedFacts.length != carriedCount then
                     throw (.childInputMismatch index carriedCount carriedFacts.length)
                   for (fact, slot) in carriedFacts.zipIdx do
-                    if factHasRelation fact then
+                    let relationBearing ← match fact with
+                      | .matrixExpr root => operationalExprHasRelation facts.arena environment root
+                      | fact => pure (factHasRelation fact)
+                    if relationBearing then
                       throw (.relationBearingCarriedValue scopeKey index slot)
-                  let abstractCarried := carriedFacts.zipIdx.map fun (fact, slot) =>
-                    abstractCarriedMaximum slot fact
-                  let shiftedInvariantFacts := invariantFacts.map shiftFactPreviousDepth
+                  let mut abstractCarried : List OperationalFact := []
+                  for (fact, slot) in carriedFacts.zipIdx do
+                    match fact with
+                    | .matrixExpr root =>
+                        let mapFact (fact : OperationalMatrixFact) :=
+                          match abstractCarriedMaximum slot (.matrix fact) with
+                          | .matrix mapped => mapped
+                          | _ => fact
+                        let (arena, mapped) ←
+                          mapOperationalExpr facts.arena root mapFact
+                        facts := { facts with arena }
+                        abstractCarried := abstractCarried ++ [.matrixExpr mapped]
+                    | fact =>
+                        abstractCarried := abstractCarried ++ [abstractCarriedMaximum slot fact]
+                  let mut shiftedInvariantFacts : List OperationalFact := []
+                  for fact in invariantFacts do
+                    match fact with
+                    | .matrixExpr root =>
+                        let mapFact (fact : OperationalMatrixFact) :=
+                          match shiftFactPreviousDepth (.matrix fact) with
+                          | .matrix mapped => mapped
+                          | _ => fact
+                        let (arena, mapped) ←
+                          mapOperationalExpr facts.arena root mapFact
+                        facts := { facts with arena }
+                        shiftedInvariantFacts := shiftedInvariantFacts ++ [.matrixExpr mapped]
+                    | fact =>
+                        shiftedInvariantFacts := shiftedInvariantFacts ++
+                          [shiftFactPreviousDepth fact]
                   let iterationEnvironment := replaceLoopIndex environment indexSlot 0
                   let sequentialDomains := .loopIndex indexSlot evaluatedCount.toNat ::
                     loopDomains.filter fun domain => match domain with
@@ -6377,11 +6049,25 @@ def evaluatePreparedScope
                     (boundParams ++ iterationEnvironment) childDomains
                     facts.arena (abstractCarried ++ shiftedInvariantFacts)).mapError (.inScope childKey)
                   facts := { facts with arena := childFacts.arena }
-                  let outputTemplates ← scopeOutputFacts index child.scope.outputs childFacts
-                  if outputTemplates.length != carriedCount then
-                    throw (.childInputMismatch index carriedCount outputTemplates.length)
+                  let rawOutputTemplates ← scopeOutputFacts index child.scope.outputs childFacts
+                  if rawOutputTemplates.length != carriedCount then
+                    throw (.childInputMismatch index carriedCount rawOutputTemplates.length)
+                  let mut initialTemplates : List OperationalFact := []
+                  for carried in carriedFacts do
+                    match carried with
+                    | .matrixExpr root =>
+                        initialTemplates := initialTemplates ++
+                          [.matrix (← summarizeSequentialOperationalExpr facts.arena environment root)]
+                    | carried => initialTemplates := initialTemplates ++ [carried]
+                  let mut outputTemplates : List OperationalFact := []
+                  for output in rawOutputTemplates do
+                    match output with
+                    | .matrixExpr root =>
+                        outputTemplates := outputTemplates ++
+                          [.matrix (← summarizeSequentialOperationalExpr facts.arena environment root)]
+                    | output => outputTemplates := outputTemplates ++ [output]
                   for slot in List.range carriedCount do
-                    match carriedFacts[slot]?, outputTemplates[slot]? with
+                    match initialTemplates[slot]?, outputTemplates[slot]? with
                     | some initial, some output =>
                         if !sameCarriedSchema initial output || factHasRelation output then
                           if factHasRelation output then
@@ -6389,7 +6075,7 @@ def evaluatePreparedScope
                           else throw (.sequentialSchemaMismatch scopeKey index slot
                             (carriedLargeFactorCounts initial) (carriedLargeFactorCounts output))
                     | _, _ => throw (.childInputMismatch index carriedCount outputTemplates.length)
-                  let initialComponents := carriedFacts.zipIdx.flatMap fun (carried, slot) =>
+                  let initialComponents := initialTemplates.zipIdx.flatMap fun (carried, slot) =>
                     factNumericExpressions slot carried
                   let transitionComponents := outputTemplates.zipIdx.flatMap fun (output, slot) =>
                     factNumericExpressions slot output
@@ -6490,6 +6176,63 @@ def evaluatePreparedScope
                   else
                     deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
                       layouts facts 0 node.outputTypes
+              | .preimageSample .. =>
+                  let targetWire ← match node.arguments[2]? with
+                    | some wire => pure wire
+                    | none => throw (.missingOperand index { node := 0, port := 0 })
+                  let target ← lookupFact index facts targetWire
+                  match target with
+                  | .matrixExpr root =>
+                      let matrixType ← match node.outputTypes with
+                        | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
+                        | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
+                      let rec mapPreimageExpression : OperationalExprArena → OperationalExprId → Nat →
+                          Except OperationalError (OperationalExprArena × OperationalExprId)
+                        | _, current, 0 => throw (.unsupportedOperationalExpr current)
+                        | arena, current, remaining + 1 => do
+                            let expression ← match arena.get? current with
+                              | some expression => pure expression
+                              | none => throw (.invalidOperationalExprRef current)
+                            match expression.node with
+                            | .concrete branch =>
+                                let branchFacts ← replaceOperationalFact index facts targetWire
+                                  (.matrix branch)
+                                let output ← genericNodeFact scopeKey index node step.rule 0
+                                  (.preimage matrixType) branchFacts environment loopDomains layouts
+                                let output := namespaceFreshOutput scopeKey
+                                  { node := index, port := 0 } output
+                                let output ← match output with
+                                  | .matrix output => pure output
+                                  | _ => throw (.operandNotMatrix index targetWire)
+                                pure (arena.pushConcrete output)
+                            | .select selection (.exact branches) =>
+                                let mut arena := arena
+                                let mut outputs : Array OperationalExprId := #[]
+                                for branch in branches do
+                                  let (nextArena, output) ←
+                                    mapPreimageExpression arena branch remaining
+                                  arena := nextArena
+                                  outputs := outputs.push output
+                                arena.pushSelect selection (.exact outputs)
+                            | .select selection
+                                (.schemaEnvelope count representative summary) =>
+                                let (arena, output) ←
+                                  mapPreimageExpression arena representative remaining
+                                let outputFact ← arena.concreteFact output
+                                let outputSummary ← match
+                                    recomputeSelectedMatrixSummary summary outputFact with
+                                  | some value => pure value
+                                  | none => throw (.unsupportedOperationalExpr representative)
+                                arena.pushSelect selection
+                                  (.schemaEnvelope count output outputSummary)
+                            | _ => throw (.unsupportedOperationalExpr current)
+                      let (arena, output) ← mapPreimageExpression facts.arena root
+                        (facts.arena.nodes.size + 1)
+                      facts := { facts with arena }
+                      pure [.matrixExpr output]
+                  | _ =>
+                      deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
+                        layouts facts 0 node.outputTypes
               | .gadgetDecompose _ _ _ _ =>
                   let inputWire ← match node.arguments[0]? with
                     | some wire => pure wire
@@ -6703,7 +6446,7 @@ def evaluatePreparedScope
             let outputs := namespacedOutputs
             facts := { facts with values := facts.values.push outputs }
             let attachments := prepared.attachmentBuckets[index]?.getD #[]
-            facts := ← applyPreparedDerivationAttachments index attachments facts
+            facts := ← applyPreparedDerivationAttachments index attachments environment facts
       pure facts
 termination_by
   _ fuel _ _ _ _ => (fuel, 0)
@@ -6885,74 +6628,6 @@ def decoderNoiseCheckReport
     checkDecoderThreshold plaintextModulus ciphertextModulus noiseBound
   pure { outputs, obligations := [obligation], accepted, rejection }
 
-/-! Evaluate unresolved selections by streaming complete concrete alternatives into a consumer.
-Independent selections are nested control flow here; they are never materialized as a Cartesian
-array of facts or expression nodes.  Every concrete combination still goes through the existing
-primitive polynomial and relation-rewrite implementations. -/
-private partial def foldOperationalExprConcreteFacts
-    {α : Type}
-    (arena : OperationalExprArena)
-    (environment : ParamEnvironment)
-    (root : OperationalExprId)
-    (state : α)
-    (visit : α → OperationalMatrixFact → Except OperationalError α) :
-    Except OperationalError α := do
-  let expression ← match arena.get? root with
-    | some expression => pure expression
-    | none => throw (.invalidOperationalExprRef root)
-  let foldBinary
-      (left right : OperationalExprId)
-      (combine : OperationalMatrixFact → OperationalMatrixFact →
-        Except OperationalError OperationalMatrixFact) :=
-    foldOperationalExprConcreteFacts arena environment left state fun state leftFact =>
-      foldOperationalExprConcreteFacts arena environment right state fun state rightFact => do
-        visit state (← combine leftFact rightFact)
-  match expression.node with
-  | .concrete fact => visit state fact
-  | .select _ (.exact branches) =>
-      if branches.isEmpty then throw (.invalidCount 0 0)
-      else
-        let mut state := state
-        for branch in branches do
-          state ← foldOperationalExprConcreteFacts arena environment branch state visit
-        pure state
-  | .select _ (.schemaEnvelope count representative _) =>
-      if count = 0 then throw (.invalidCount 0 0)
-      else foldOperationalExprConcreteFacts arena environment representative state visit
-  | .add left right =>
-      foldBinary left right fun leftFact rightFact =>
-        addConcreteMatrixFacts 0 0 expression.matrixType false environment leftFact rightFact
-  | .subtract left right =>
-      foldBinary left right fun leftFact rightFact =>
-        addConcreteMatrixFacts 0 0 expression.matrixType true environment leftFact rightFact
-  | .multiply rule rightWire left right =>
-      foldBinary left right fun leftFact rightFact =>
-        multiplyConcreteMatrixFacts 0 0 expression.matrixType rule rightWire environment
-          leftFact rightFact
-  | .tensor left right =>
-      foldBinary left right fun leftFact rightFact =>
-        tensorConcreteMatrixFacts 0 0 expression.matrixType environment leftFact rightFact
-  | .concat axis inputs =>
-      if inputs.isEmpty then throw (.invalidCount 0 0)
-      else
-        let rec foldInputs
-            (remaining : List OperationalExprId)
-            (state : α)
-            (reverseInputs : List OperationalMatrixFact) : Except OperationalError α := do
-          match remaining with
-          | [] =>
-              let inputs := reverseInputs.reverse.toArray
-              visit state (← concatConcreteMatrixFacts 0 0 axis expression.matrixType
-                environment inputs)
-          | input :: tail =>
-              foldOperationalExprConcreteFacts arena environment input state fun state fact =>
-                foldInputs tail state (fact :: reverseInputs)
-        foldInputs inputs.toList state []
-  | .transform operation value =>
-      foldOperationalExprConcreteFacts arena environment value state fun state fact => do
-        visit state (← transformConcreteMatrixFact 0 0 expression.matrixType operation
-          environment fact)
-
 private def evaluateOperationalExprNoiseBound
     (arena : OperationalExprArena)
     (environment : ParamEnvironment)
@@ -6977,9 +6652,6 @@ private partial def collectDecoderResidualBounds
       if elements.isEmpty then throw (.invalidCount 0 0)
       let rows ← elements.toList.mapM (collectDecoderResidualBounds arena environment)
       pure rows.flatten
-  | .selectedMatrices family => do
-      if family.branches.isEmpty then throw (.invalidCount 0 0)
-      family.branches.toList.mapM fun branch => branch.evaluateNoiseHardBound environment
   | _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
 
 /-- Builds one decoder obligation for a matrix residual or an entire residual family. Packed
@@ -8499,6 +8171,70 @@ example : (do
     .ok (5, [.decoderThreshold 2 25 5], true) := by
   native_decide
 
+private def selectedSequentialBody : Scope := {
+  nodes := #[
+    { kind := .input "state", arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .input "selector", arguments := [], outputTypes := [.integer] },
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gaussianSample fixtureType (.constant 5), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .select,
+      arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 },
+        { node := 3, port := 0 }], outputTypes := [.matrix fixtureType] },
+    { kind := .matrixAdd,
+      arguments := [{ node := 0, port := 0 }, { node := 4, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("state", { node := 5, port := 0 })]
+  inputNames := ["state", "selector"]
+}
+
+private def selectedSequentialProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .gaussianSample fixtureType (.constant 1), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .constantInt 0, arguments := [], outputTypes := [.integer] },
+      { kind := .sequentialLoop "body" (.constant 2) 0 [] 1,
+        arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.matrix fixtureType] }
+    ]
+    outputs := [("result", { node := 2, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("body", selectedSequentialBody)]
+}
+
+private def selectedSequentialDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 1, rule := .constantInt, arguments := [] },
+    { sourceNode := 2, rule := .sequentialLoop,
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+  ] }
+  definitions := [("body", { steps := #[
+    { sourceNode := 0, rule := .input, arguments := [] },
+    { sourceNode := 1, rule := .input, arguments := [] },
+    { sourceNode := 2, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 3, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 4, rule := .select,
+      arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 },
+        { node := 3, port := 0 }] },
+    { sourceNode := 5, rule := .matrixAdd,
+      arguments := [{ node := 0, port := 0 }, { node := 4, port := 0 }] }
+  ] })]
+}
+
+/-- A sequential body may contain a selection, but its complete one-step alternatives are joined
+before constructing the numeric recurrence. Two iterations therefore reuse the existing capped
+transition `min(q/2, previous + max(3, 5))` instead of adding one nested select per iteration. -/
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts selectedSequentialProgram
+      selectedSequentialDerivation [] []
+    matrixMaximum 3 { node := 2, port := 0 } facts) = .ok 8 := by
+  native_decide
+
 private def sequentialRelationBody : Scope := {
   nodes := #[
     { kind := .input "target", arguments := [], outputTypes := [.matrix fixtureType] },
@@ -8740,90 +8476,27 @@ example : (do
     pure report.obligations) = .ok [.decoderThreshold 2 25 6] := by
   native_decide
 
-/-- A compact selected residual computes each complete branch bound and then takes the maximum. -/
-example : (do
-    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
-    let first ← matrixFactAt 2 facts { node := 0, port := 0 }
-    let second ← matrixFactAt 2 facts { node := 1, port := 0 }
-    let selection := OperationalValueOrigin.local temporaryScope { node := 9, port := 0 }
-    let report ← decoderNoiseCheckReportForFact [] {}
-      (.selectedMatrices (selectedMatrixFamily selection #[first, second])) [] 2 25
-    pure report.obligations) = .ok [.decoderThreshold 2 25 6] := by
-  native_decide
-
-/-- Relation-free branches whose complete operational schemas differ only in producer identity
-collapse to one selection-namespaced envelope.  The decoder consumes the same complete bound. -/
-example : (do
-    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
-    let first ← matrixFactAt 2 facts { node := 0, port := 0 }
-    let branch (index : Nat) : OperationalMatrixFact := {
-      first with
-      origin := .loopInstance 0 index first.origin
-      polynomial := mapOperationalPolynomial
-        (fun origin => .loopInstance 0 index origin)
-        (fun identity => .loopInstance 0 index identity)
-        (fun origin => .loopInstance 0 index origin)
-        id id first.polynomial
-    }
-    let selection := OperationalValueOrigin.local temporaryScope { node := 9, port := 0 }
-    let compressed ← compressUniformSelectedMatrices 10 { node := 10, port := 0 }
-      selection #[branch 0, branch 1]
-    let report ← decoderNoiseCheckReportForFact [] {} compressed [] 2 25
-    pure (match compressed with | .matrix _ => true | _ => false, report.obligations)) =
-    .ok (true, [.decoderThreshold 2 25 3]) := by
-  native_decide
-
-/-- Equal shapes are insufficient for uniform collapse: differing complete branch bounds retain the
-explicit selected family so the decoder still takes the branch-wise maximum. -/
-example : (do
-    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
-    let first ← matrixFactAt 2 facts { node := 0, port := 0 }
-    let second ← matrixFactAt 2 facts { node := 1, port := 0 }
-    let selection := OperationalValueOrigin.local temporaryScope { node := 9, port := 0 }
-    let retained ← compressUniformSelectedMatrices 10 { node := 10, port := 0 }
-      selection #[first, second]
-    let report ← decoderNoiseCheckReportForFact [] {} retained [] 2 25
-    pure (match retained with | .selectedMatrices _ => true | _ => false,
-      report.obligations)) = .ok (true, [.decoderThreshold 2 25 6]) := by
-  native_decide
-
-/-- Ordinary inputs broadcast across a selected input, while two different selections never zip. -/
-example : (do
-    let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
-    let first ← matrixFactAt 2 facts { node := 0, port := 0 }
-    let second ← matrixFactAt 2 facts { node := 1, port := 0 }
-    let leftSelection := OperationalValueOrigin.local temporaryScope { node := 9, port := 0 }
-    let rightSelection := OperationalValueOrigin.local temporaryScope { node := 10, port := 0 }
-    let aligned ← alignSelectedMatrixInputs 11 [
-      ({ node := 0, port := 0 },
-        .selectedMatrices (selectedMatrixFamily leftSelection #[first, second])),
-      ({ node := 1, port := 0 }, .matrix first)]
-    let mismatch := alignSelectedMatrixInputs 12 [
-      ({ node := 0, port := 0 },
-        .selectedMatrices (selectedMatrixFamily leftSelection #[first, second])),
-      ({ node := 1, port := 0 },
-        .selectedMatrices (selectedMatrixFamily rightSelection #[first, second]))]
-    pure (aligned.selection == some leftSelection && aligned.rows.size == 2 &&
-      aligned.rows.all (·.length == 2) &&
-      (match mismatch with
-        | .error (.selectedFamilyOperationUnsupported 12) => true
-        | _ => false))) = .ok true := by
-  native_decide
-
 /-- ZipOffset selects the exact corresponding relation-bearing packed branch. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts sharedPreimageBaseScope
       sharedPreimageBaseDerivation [] [fixtureLayout]
     let first ← lookupFact 5 facts { node := 3, port := 0 }
     let second ← lookupFact 5 facts { node := 4, port := 0 }
-    let selected ← loopTemplateArgumentFact 20 0 1 (.zipOffset 1)
+    let (arena, selected) ← loopTemplateArgumentExpr {} 20 0 1 (.zipOffset 1)
       (packedFacts [first, second])
     match selected, second with
-    | .selectedMatrices family, .matrix expected => match family.branches[0]? with
-        | some actual =>
-            let actual : OperationalMatrixFact := actual
-            pure (family.branches.size == 1 && actual.origin == expected.origin)
-        | none => pure false
+    | .matrixExpr root, .matrix expected => match arena.get? root with
+        | some { node := .select selection (.exact branches), .. } =>
+            match branches[0]? with
+            | some branch => match arena.get? branch with
+                | some { node := .concrete actual, .. } =>
+                    pure (branches.size == 1 &&
+                      selection.index == .loopInstance 0 1
+                        (.local temporaryScope { node := 20, port := 0 }) &&
+                      actual.origin == expected.origin)
+                | _ => pure false
+            | none => pure false
+        | _ => pure false
     | _, _ => pure false) = Except.ok true := by
   native_decide
 

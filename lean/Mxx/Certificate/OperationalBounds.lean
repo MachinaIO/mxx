@@ -1770,6 +1770,7 @@ private structure OperationalExprEvaluationState where
   relationMemo : Array (Option RelationRequirement)
   totalStats : OperationalExprEvaluationStats := {}
   noiseStats : OperationalExprEvaluationStats := {}
+  schemaStats : OperationalExprEvaluationStats := {}
   relationStats : OperationalExprEvaluationStats := {}
   deriving BEq
 
@@ -6945,8 +6946,14 @@ private def deriveOperationalSchemaFactWithFuel
   | 0 => throw (.unsupportedOperationalExpr id)
   | fuel + 1 => match state.schemaFactMemo[id]? with
     | none => throw (.invalidOperationalExprRef id)
-    | some (some fact) => pure (fact, state)
+    | some (some fact) => pure (fact, { state with schemaStats := {
+        state.schemaStats with memoHits := state.schemaStats.memoHits + 1 } })
     | some none => do
+        let state := { state with schemaStats := {
+          evaluations := state.schemaStats.evaluations + 1
+          memoHits := state.schemaStats.memoHits
+          memoMisses := state.schemaStats.memoMisses + 1
+        }}
         let expression ← match arena.get? id with
           | some expression => pure expression
           | none => throw (.invalidOperationalExprRef id)
@@ -11082,6 +11089,159 @@ private def largeUniformFamilyExactRelationFixture : Bool :=
   | .ok true => true
   | _ => false
 
+/-- Every primitive transfer class has exactly one closed-registry row. This inventory is
+exhaustive, so adding a constructor requires an explicit decision here and in the registry. -/
+private def primitiveTransferRegistryCoverageFixture : Bool :=
+  let classes := #[
+    PrimitiveTransferClass.addSubtract,
+    .multiplyOrdinary, .multiplyRelation, .tensor, .concat, .transform]
+  classes.size == 6 && classes.all fun transferClass =>
+    match compositionalTransferRegistry transferClass with
+    | .supported _ | .requiresConcreteStructure => true
+
+/-- Relation-consuming Shared operands require the same domain and matching public/relation
+boundary templates. A matching pair rewrites once without visiting logical branches; changing the
+preimage domain is rejected before representative evaluation. -/
+private def sharedRelationCorrelationFixture : Bool :=
+  match (do
+    let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
+      relationFixtureDerivation [] [fixtureLayout]
+    let publicMatrix ← matrixFactAt 3 facts { node := 1, port := 0 }
+    let preimage ← matrixFactAt 3 facts { node := 2, port := 0 }
+    let binder : FamilyTemplateBinder := {
+      owner := temporaryScope, producerNode := 150, binderSlot := 0
+    }
+    let selection : OperationalValueOrigin := .local temporaryScope { node := 151, port := 0 }
+    let otherSelection : OperationalValueOrigin :=
+      .local temporaryScope { node := 152, port := 0 }
+    let selectedPublic := selectDynamicMatrixFact binder selection { node := 153, port := 0 }
+      publicMatrix
+    let selectedPreimage := selectDynamicMatrixFact binder selection { node := 154, port := 0 }
+      preimage
+    let otherPreimage := selectDynamicMatrixFact binder otherSelection { node := 155, port := 0 }
+      preimage
+    let publicSummary := selectedMatrixSummary #[selectedPublic]
+    let preimageSummary := selectedMatrixSummary #[selectedPreimage]
+    let otherSummary := selectedMatrixSummary #[otherPreimage]
+    let (arena, publicRepresentative) := ({} : OperationalExprArena).pushConcrete selectedPublic
+    let (arena, preimageRepresentative) := arena.pushConcrete selectedPreimage
+    let (arena, otherRepresentative) := arena.pushConcrete otherPreimage
+    let (arena, selectedPublicRoot) ← arena.pushSharedSelection
+      { index := selection } 30720 publicRepresentative publicSummary
+    let (arena, selectedPreimageRoot) ← arena.pushSharedSelection
+      { index := selection } 30720 preimageRepresentative preimageSummary
+    let (arena, otherPreimageRoot) ← arena.pushSharedSelection
+      { index := otherSelection } 30720 otherRepresentative otherSummary
+    let (arena, output) ← multiplyOperationalExprIds 156 0 fixtureType
+      (.matrixMultiplyRelation selectedPreimage.subject) selectedPreimage.subject []
+      deriveOperationalSchemaFact arena selectedPublicRoot selectedPreimageRoot
+      (arena.nodes.size + 1)
+    let accepted := match arena.get? output with
+      | some { node := .select domain (.shared _ _), .. } =>
+          domain.count == 30720 && arena.relationRewriteCount == 1
+      | _ => false
+    let rejected := match multiplyOperationalExprIds 157 0 fixtureType
+        (.matrixMultiplyRelation otherPreimage.subject) otherPreimage.subject []
+        deriveOperationalSchemaFact arena selectedPublicRoot otherPreimageRoot
+        (arena.nodes.size + 1) with
+      | .error (.incompatibleRelationDomains 157 _ _) => true
+      | _ => false
+    pure (accepted && rejected)) with
+  | .ok true => true
+  | _ => false
+
+/-- Supported independent addition composes complete child maxima without a Cartesian product.
+An ordinary multiplication that requires concrete structure remains delayed and then fails with
+the dedicated endpoint error. -/
+private def concreteStructureLifecycleFixture : Bool :=
+  match (do
+    let facts := Array.range 4 |>.map fun index =>
+      boundedOperationalExprFixtureFact (160 + index) (Int.ofNat (index + 1))
+    let mut arena : OperationalExprArena := {}
+    let mut ids : Array OperationalExprId := #[]
+    for fact in facts do
+      let (nextArena, id) := arena.pushConcrete fact
+      arena := nextArena
+      ids := ids.push id
+    let leftSelection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 164, port := 0 }
+    }
+    let rightSelection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 165, port := 0 }
+    }
+    let (nextArena, left) ← arena.pushSelect leftSelection (.exact (ids.extract 0 2))
+    arena := nextArena
+    let (nextArena, right) ← arena.pushSelect rightSelection (.exact (ids.extract 2 4))
+    arena := nextArena
+    let (nextArena, sum) ← addOperationalExprIds 166 0 fixtureType false []
+      deriveOperationalSchemaFact arena left right (arena.nodes.size + 1)
+    arena := nextArena
+    let sumBound ← evaluateOperationalExprNoiseBound arena [] sum
+    let (nextArena, product) ← multiplyOperationalExprIds 167 0 fixtureType .matrixMultiplyBound
+      { node := 165, port := 0 } [] deriveOperationalSchemaFact arena left right
+      (arena.nodes.size + 1)
+    arena := nextArena
+    let productRejected := match evaluateOperationalExprNoiseBound arena [] product with
+      | .error (.unresolvedConcreteStructure 167 _) => true
+      | _ => false
+    let diagnostics := operationalAnalysisDiagnostics arena
+    pure (sumBound == 6 && productRejected && diagnostics.cartesianPairVisits == 0)) with
+  | .ok true => true
+  | _ => false
+
+private def selectionTraversalComplexityFixture : Bool :=
+  let uniformCase (count : Nat) := do
+    let fact := boundedOperationalExprFixtureFact (200 + count % 17) 3
+    let summary := selectedMatrixSummary #[fact]
+    let (arena, representative) := ({} : OperationalExprArena).pushConcrete fact
+    let selection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 201 + count % 17, port := 0 }
+    }
+    let (arena, root) ← arena.pushSharedSelection selection count representative summary
+    let (bound, state) ← evaluateOperationalExprNoiseBoundWithState arena [] root
+      (OperationalExprEvaluationState.empty arena)
+    pure (bound == 3 && arena.nodes.size == 2 && state.noiseStats.evaluations == 2)
+  let exactCase (count : Nat) := do
+    let mut arena : OperationalExprArena := {}
+    let mut branches : Array OperationalExprId := #[]
+    for index in [:count] do
+      let fact := boundedOperationalExprFixtureFact (300 + index) 1
+      let (nextArena, branch) := arena.pushConcrete fact
+      arena := nextArena
+      branches := branches.push branch
+    let selection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 400 + count, port := 0 }
+    }
+    let (nextArena, root) ← arena.pushSelect selection (.exact branches)
+    arena := nextArena
+    let (bound, state) ← evaluateOperationalExprNoiseBoundWithState arena [] root
+      (OperationalExprEvaluationState.empty arena)
+    pure (bound == 1 && state.noiseStats.evaluations == count + 1)
+  match (do
+    let uniform ← #[2, 1024, 30720].mapM uniformCase
+    let exact ← #[8, 32, 65].mapM exactCase
+    pure (uniform.all id && exact.all id)) with
+  | .ok true => true
+  | _ => false
+
+/-- Relation, schema, and complete-bound queries all use request-local array memo entries keyed by
+expression ID. Repeating a query changes only its hit counter. -/
+private def operationalQueryMemoFixture : Bool :=
+  match (do
+    let fact := boundedOperationalExprFixtureFact 500 3
+    let (arena, root) := ({} : OperationalExprArena).pushConcrete fact
+    let state := OperationalExprEvaluationState.empty arena
+    let (_, state) ← relationRequirement arena root state
+    let (_, state) ← relationRequirement arena root state
+    let (_, state) ← deriveOperationalSchemaFact arena [] root state
+    let (_, state) ← deriveOperationalSchemaFact arena [] root state
+    let (_, state) ← evaluateCompleteBound arena [] root state
+    let (_, state) ← evaluateCompleteBound arena [] root state
+    pure (state.relationStats.memoHits == 1 && state.schemaStats.memoHits == 1 &&
+      state.totalStats.memoHits == 1)) with
+  | .ok true => true
+  | _ => false
+
 /-! Reuse one pre-existing native fixture gate for the computationally heavy operational
 fixtures.  This keeps the trusted-evaluation surface unchanged while checking the production
 functions rather than duplicating their behavior in proof-only reference code. -/
@@ -11105,7 +11265,12 @@ example : exactRelationSelectionFixtureResult = .ok true ∧
     transformMemoInvocationIsolationFixture = true ∧
     envelopePlusNestedSelectionFixture = true ∧
     independentSelectionCartesianRejectsFixture = true ∧
-    largeUniformFamilyExactRelationFixture = true := by
+    largeUniformFamilyExactRelationFixture = true ∧
+    primitiveTransferRegistryCoverageFixture = true ∧
+    sharedRelationCorrelationFixture = true ∧
+    concreteStructureLifecycleFixture = true ∧
+    selectionTraversalComplexityFixture = true ∧
+    operationalQueryMemoFixture = true := by
   native_decide
 
 end Mxx.Certificate

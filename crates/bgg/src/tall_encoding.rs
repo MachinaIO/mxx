@@ -545,7 +545,7 @@ mod tests {
             SlotOperationLowering, SlotTransferSpec, SubCircuitParamSpec, SubCircuitParamValue,
         },
         circuit_gadgets::{
-            arith::{NestedRnsPoly, NestedRnsPolyContext},
+            arith::{CrtWindow, NestedRnsPoly, NestedRnsPolyContext},
             conv_mul::negacyclic_conv_mul,
         },
         test_utils::{PolyVec, execute_polyvec_circuit},
@@ -1711,10 +1711,9 @@ mod tests {
         let nested =
             Arc::new(NestedRnsPolyContext::setup(&mut circuit, &parameters, 6, 2, 16, false, None));
         let coefficient_slots = 2;
-        let left =
-            NestedRnsPoly::input(nested.clone(), coefficient_slots, Some(2), None, &mut circuit);
-        let right =
-            NestedRnsPoly::input(nested.clone(), coefficient_slots, Some(2), None, &mut circuit);
+        let window = CrtWindow::full(nested.q_moduli_depth);
+        let left = NestedRnsPoly::input(nested.clone(), coefficient_slots, window, &mut circuit);
+        let right = NestedRnsPoly::input(nested.clone(), coefficient_slots, window, &mut circuit);
         let ordinary = left.mul(&right, &mut circuit).full_reduce(&mut circuit);
         let convolution =
             negacyclic_conv_mul(&parameters, &mut circuit, &left, &right, coefficient_slots)

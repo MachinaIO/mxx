@@ -156,6 +156,7 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
             .with_execution_config(ExecutionConfig {
                 max_parallel_instances: NonZeroUsize::new(effective_parallel_width)
                     .expect("effective parallel width is nonzero"),
+                ..ExecutionConfig::default()
             });
     let circuit = and_circuit();
     let instance = [true];

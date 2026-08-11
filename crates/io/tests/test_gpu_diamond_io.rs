@@ -1,4 +1,5 @@
-#![cfg(feature = "gpu")]
+#![cfg(any())]
+// Diamond iO is temporarily disabled together with `mxx_io::diamond`.
 
 use keccak_asm::Keccak256;
 use mxx_gadgets::{

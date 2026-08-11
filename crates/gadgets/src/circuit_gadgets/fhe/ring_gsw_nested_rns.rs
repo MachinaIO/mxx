@@ -1,14 +1,14 @@
 use crate::{
     circuit_gadgets::{
         arith::{
-            NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_with_offset,
+            CrtWindow, NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly,
             nested_rns_gadget_decomposed, nested_rns_gadget_vector,
         },
         fhe::ring_gsw::{RingGswCiphertext, RingGswContext},
     },
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
-        Poly,
+        Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     sampler::{
@@ -77,7 +77,7 @@ where
     P: Poly,
     M: PolyMatrix<P = P>,
 {
-    nested_rns_gadget_vector::<P, M>(params, ctx, None, None)
+    nested_rns_gadget_vector::<P, M>(params, ctx, CrtWindow::full(ctx.q_moduli_depth))
         .get_row(0)
         .into_par_iter()
         .map(|poly| {
@@ -96,8 +96,7 @@ fn native_gadget_decompose_window<P, M>(
     params: &P::Params,
     ctx: &NestedRnsPolyContext,
     input_poly: &P,
-    enable_levels: Option<usize>,
-    level_offset: Option<usize>,
+    window: CrtWindow,
 ) -> Vec<P>
 where
     P: Poly + 'static,
@@ -107,8 +106,7 @@ where
         params,
         ctx,
         &M::from_poly_vec(params, vec![vec![input_poly.clone()]]),
-        enable_levels,
-        level_offset,
+        window,
     );
     assert_eq!(
         decomposed.col_size(),
@@ -130,7 +128,12 @@ where
     P: Poly + 'static,
     M: PolyMatrix<P = P>,
 {
-    native_gadget_decompose_window::<P, M>(params, ctx, input_poly, None, None)
+    native_gadget_decompose_window::<P, M>(
+        params,
+        ctx,
+        input_poly,
+        CrtWindow::full(ctx.q_moduli_depth),
+    )
 }
 
 pub fn sample_secret_key(params: &DCRTPolyParams) -> DCRTPoly {
@@ -418,40 +421,90 @@ where
     (top, bottom)
 }
 
+/// Encodes a Ring-GSW ciphertext created in the genuine native ring
+/// `R_Q[X]/(X^N + 1)` into compact scalar lanes of an ambient circuit.
+///
+/// The native CRT basis must equal the selected ambient q-window exactly. OpenFHE's native
+/// parameter object therefore remains the authority for the `2N`-th-root convention used while
+/// creating and multiplying the ciphertext; the ambient polynomial type is used only as a carrier
+/// for constant scalar lanes and does not reinterpret the ciphertext with an ambient-ring NTT.
+/// Every entry is checked against `native_params` before encoding, so an ambient-dimension
+/// ciphertext cannot be silently truncated to `N` coefficients.
 pub fn ciphertext_inputs_from_native<P, M>(
-    params: &P::Params,
+    native_params: &P::Params,
+    ambient_params: &P::Params,
     ctx: &NestedRnsPolyContext,
     ciphertext: &NativeRingGswCiphertext<P>,
-    level_offset: usize,
-    enable_levels: Option<usize>,
+    window: CrtWindow,
 ) -> Vec<M>
 where
     P: Poly + 'static,
     M: PolyMatrix<P = P>,
 {
+    let native_dimension = native_params.ring_dimension() as usize;
+    let ambient_dimension = ambient_params.ring_dimension() as usize;
+    assert!(native_dimension.is_power_of_two(), "native Ring-GSW dimension must be a power of two");
+    assert!(
+        native_dimension <= ambient_dimension,
+        "native Ring-GSW dimension {native_dimension} exceeds ambient circuit dimension {ambient_dimension}"
+    );
+    let (native_moduli, _, native_depth) = native_params.to_crt();
+    let (ambient_moduli, _, ambient_depth) = ambient_params.to_crt();
+    let window = CrtWindow::new(window.offset, window.depth, ambient_depth);
+    assert_eq!(
+        ctx.q_moduli(),
+        ambient_moduli,
+        "nested-RNS context and ambient polynomial parameters must use the same CRT basis"
+    );
+    assert_eq!(
+        native_depth, window.depth,
+        "native Ring-GSW CRT depth must equal the active ambient CRT depth"
+    );
+    assert_eq!(
+        native_moduli,
+        ambient_moduli[window.offset..window.end()],
+        "native Ring-GSW CRT moduli must exactly equal the active ambient CRT window"
+    );
+    for &q_i in &native_moduli {
+        assert_eq!(
+            (q_i - 1) % (2 * native_dimension) as u64,
+            0,
+            "native CRT modulus {q_i} does not admit the primitive 2N-th root required by OpenFHE for N={native_dimension}"
+        );
+    }
+
     ciphertext
         .par_iter()
         .map(|row| {
             row.par_iter()
                 .map(|poly| {
                     let coefficients = poly.coeffs_biguints();
-                    encode_nested_rns_poly_with_offset::<P>(
+                    assert_eq!(
+                        coefficients.len(),
+                        native_dimension,
+                        "every Ring-GSW ciphertext entry must have exactly the native ring dimension"
+                    );
+                    assert_eq!(
+                        P::from_biguints(native_params, &coefficients),
+                        *poly,
+                        "Ring-GSW ciphertext entry is not represented by the declared native parameters"
+                    );
+                    encode_nested_rns_poly::<P>(
                         ctx.p_moduli_bits,
                         ctx.max_unreduced_muls,
-                        params,
+                        ambient_params,
                         &coefficients,
-                        level_offset,
-                        enable_levels,
+                        window,
                     )
                     .into_par_iter()
                     .map(|diagonal| {
                         let diagonal = diagonal
                             .into_iter()
-                            .map(|value| P::from_biguint_to_constant(params, value))
+                            .map(|value| P::from_biguint_to_constant(ambient_params, value))
                             .collect::<Vec<_>>();
-                        let zero = P::const_zero(params);
+                        let zero = P::const_zero(ambient_params);
                         M::from_poly_vec(
-                            params,
+                            ambient_params,
                             (0..diagonal.len())
                                 .map(|row_idx| {
                                     (0..diagonal.len())
@@ -488,17 +541,17 @@ where
 /// graph and therefore cannot be accidentally interpreted as additional
 /// slots.
 pub fn native_ring_gsw_scalar_bindings<P, M>(
-    params: &P::Params,
+    native_params: &P::Params,
+    ambient_params: &P::Params,
     ctx: &NestedRnsPolyContext,
     ciphertext: &NativeRingGswCiphertext<P>,
-    level_offset: usize,
-    enable_levels: Option<usize>,
+    window: CrtWindow,
 ) -> Vec<Vec<M>>
 where
     P: Poly + 'static,
     M: PolyMatrix<P = P>,
 {
-    ciphertext_inputs_from_native::<P, M>(params, ctx, ciphertext, level_offset, enable_levels)
+    ciphertext_inputs_from_native::<P, M>(native_params, ambient_params, ctx, ciphertext, window)
         .into_par_iter()
         .map(|encoded| {
             assert_eq!(
@@ -508,7 +561,7 @@ where
             );
             (0..encoded.row_size())
                 .into_par_iter()
-                .map(|slot| M::from_poly_vec(params, vec![vec![encoded.entry(slot, slot)]]))
+                .map(|slot| M::from_poly_vec(ambient_params, vec![vec![encoded.entry(slot, slot)]]))
                 .collect()
         })
         .collect()
@@ -592,6 +645,256 @@ where
 }
 
 #[cfg(test)]
+mod compact_layout_tests {
+    use super::*;
+    use crate::{
+        circuit::PolyCircuit,
+        circuit_gadgets::arith::{CrtWindow, DEFAULT_MAX_UNREDUCED_MULS},
+        poly::{Poly, PolyParams},
+        test_utils::execute_circuit_with_shape,
+    };
+    use num_traits::ToPrimitive;
+
+    fn matching_native_and_ambient_params() -> (DCRTPolyParams, DCRTPolyParams, CrtWindow) {
+        for crt_bits in 17..=30 {
+            let native = DCRTPolyParams::new(4, 1, crt_bits, 6);
+            let ambient = DCRTPolyParams::new(8, 3, crt_bits, 6);
+            for offset in 0..3 {
+                if native.to_crt().0 == ambient.to_crt().0[offset..offset + 1] {
+                    return (native, ambient, CrtWindow::new(offset, 1, 3));
+                }
+            }
+        }
+        panic!("no shared OpenFHE CRT basis found for native N=4 and ambient n=8");
+    }
+
+    #[test]
+    fn genuine_native_ciphertext_uses_exact_compact_width() {
+        let (native_params, ambient_params, window) = matching_native_and_ambient_params();
+        let mut native_circuit = PolyCircuit::<DCRTPoly>::new();
+        let native_ctx = NestedRnsPolyContext::setup(
+            &mut native_circuit,
+            &native_params,
+            10,
+            DEFAULT_MAX_UNREDUCED_MULS,
+            1 << 8,
+            false,
+            None,
+        );
+        let native_ring_gsw = NestedRnsRingGswContext::from_arith_context(
+            &mut native_circuit,
+            &native_params,
+            native_params.ring_dimension() as usize,
+            std::sync::Arc::new(native_ctx.clone()),
+            CrtWindow::full(1),
+        );
+        let secret_key = sample_secret_key(&native_params);
+        let public_key = sample_public_key(
+            &native_params,
+            native_ring_gsw.width(),
+            &secret_key,
+            rand::random(),
+            b"native-ring-gsw-compact-boundary",
+            Some(0.0),
+        );
+        let ciphertext = encrypt_plaintext_bit(&native_params, &native_ctx, &public_key, true);
+        let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
+            &native_params,
+            &native_ctx,
+            &ciphertext,
+            &secret_key,
+            2,
+        );
+        let native_modulus = native_params
+            .to_crt()
+            .0
+            .iter()
+            .fold(BigUint::from(1u8), |acc, &q_i| acc * BigUint::from(q_i));
+        let half_native_modulus = &native_modulus / BigUint::from(2u8);
+        let decrypted_bits = decrypted
+            .coeffs_biguints()
+            .into_iter()
+            .map(|coefficient| {
+                ((BigUint::from(2u8) * coefficient + &half_native_modulus) / &native_modulus)
+                    .to_u64()
+                    .expect("decrypted bit must fit in u64") %
+                    2
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decrypted_bits, vec![1, 0, 0, 0]);
+
+        let mut ambient_circuit = PolyCircuit::<DCRTPoly>::new();
+        let ambient_ctx = NestedRnsPolyContext::setup(
+            &mut ambient_circuit,
+            &ambient_params,
+            10,
+            DEFAULT_MAX_UNREDUCED_MULS,
+            1 << 8,
+            false,
+            None,
+        );
+        let inputs = ciphertext_inputs_from_native::<DCRTPoly, DCRTPolyMatrix>(
+            &native_params,
+            &ambient_params,
+            &ambient_ctx,
+            &ciphertext,
+            window,
+        );
+        assert_eq!(inputs.len(), 2 * native_ring_gsw.width() * ambient_ctx.p_moduli.len());
+        assert!(inputs.iter().all(|input| input.size() == (4, 4)));
+        let scalar_bindings = native_ring_gsw_scalar_bindings::<DCRTPoly, DCRTPolyMatrix>(
+            &native_params,
+            &ambient_params,
+            &ambient_ctx,
+            &ciphertext,
+            window,
+        );
+        assert_eq!(scalar_bindings.len(), inputs.len());
+        assert!(scalar_bindings.iter().all(|family| family.len() == 4));
+    }
+
+    #[test]
+    fn genuine_native_ciphertexts_add_and_subtract_in_ambient_circuit() {
+        let (native_params, ambient_params, window) = matching_native_and_ambient_params();
+        let mut native_circuit = PolyCircuit::<DCRTPoly>::new();
+        let native_ctx = NestedRnsPolyContext::setup(
+            &mut native_circuit,
+            &native_params,
+            10,
+            DEFAULT_MAX_UNREDUCED_MULS,
+            1 << 8,
+            false,
+            None,
+        );
+
+        let mut ambient_circuit = PolyCircuit::<DCRTPoly>::new();
+        let ambient_ctx = std::sync::Arc::new(NestedRnsPolyContext::setup(
+            &mut ambient_circuit,
+            &ambient_params,
+            10,
+            DEFAULT_MAX_UNREDUCED_MULS,
+            1 << 8,
+            false,
+            None,
+        ));
+        let ambient_ring_gsw = std::sync::Arc::new(NestedRnsRingGswContext::from_arith_context(
+            &mut ambient_circuit,
+            &ambient_params,
+            native_params.ring_dimension() as usize,
+            ambient_ctx.clone(),
+            window,
+        ));
+        let left =
+            NestedRnsRingGswCiphertext::input(ambient_ring_gsw.clone(), None, &mut ambient_circuit);
+        let right =
+            NestedRnsRingGswCiphertext::input(ambient_ring_gsw.clone(), None, &mut ambient_circuit);
+        let results =
+            [left.add(&right, &mut ambient_circuit), left.sub(&right, &mut ambient_circuit)];
+        let mut output_wires = Vec::new();
+        for result in &results {
+            output_wires.extend(result.reconstruct(&mut ambient_circuit));
+        }
+        ambient_circuit.output(output_wires);
+
+        let secret_key = sample_secret_key(&native_params);
+        let public_key = sample_public_key(
+            &native_params,
+            ambient_ring_gsw.width(),
+            &secret_key,
+            rand::random(),
+            b"native-ring-gsw-ambient-add-sub",
+            Some(0.0),
+        );
+        let native_inputs = [true, true].map(|plaintext| {
+            encrypt_plaintext_bit(&native_params, &native_ctx, &public_key, plaintext)
+        });
+        let runtime_inputs = native_inputs
+            .iter()
+            .flat_map(|ciphertext| {
+                ciphertext_inputs_from_native::<DCRTPoly, DCRTPolyMatrix>(
+                    &native_params,
+                    &ambient_params,
+                    &ambient_ctx,
+                    ciphertext,
+                    window,
+                )
+            })
+            .collect::<Vec<_>>();
+        let runtime_outputs = execute_circuit_with_shape(
+            "native-ring-gsw-ambient-add-sub",
+            &ambient_params,
+            &ambient_circuit,
+            &runtime_inputs,
+            (native_params.ring_dimension() as usize, native_params.ring_dimension() as usize),
+        );
+        let output_width = 2 * ambient_ring_gsw.width();
+        assert_eq!(runtime_outputs.len(), results.len() * output_width);
+        let native_outputs = runtime_outputs
+            .chunks(output_width)
+            .map(|outputs| {
+                ciphertext_from_outputs(&native_params, outputs, ambient_ring_gsw.width())
+            })
+            .collect::<Vec<_>>();
+        let native_modulus = native_params
+            .to_crt()
+            .0
+            .iter()
+            .fold(BigUint::from(1u8), |acc, &q_i| acc * BigUint::from(q_i));
+        let half_native_modulus = &native_modulus / BigUint::from(2u8);
+        for (ciphertext, expected) in native_outputs.iter().zip([2u64, 0]) {
+            let decrypted = decrypt_ciphertext::<DCRTPoly, DCRTPolyMatrix>(
+                &native_params,
+                &native_ctx,
+                ciphertext,
+                &secret_key,
+                3,
+            );
+            let plaintext = decrypted
+                .coeffs_biguints()
+                .into_iter()
+                .map(|coefficient| {
+                    ((BigUint::from(3u8) * coefficient + &half_native_modulus) / &native_modulus)
+                        .to_u64()
+                        .expect("decrypted ternary coefficient must fit in u64") %
+                        3
+                })
+                .collect::<Vec<_>>();
+            let mut expected_coefficients = vec![0; native_params.ring_dimension() as usize];
+            expected_coefficients[0] = expected;
+            assert_eq!(plaintext, expected_coefficients);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must have exactly the native ring dimension")]
+    fn ambient_ciphertext_cannot_be_truncated_at_native_boundary() {
+        let (native_params, ambient_params, window) = matching_native_and_ambient_params();
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ambient_ctx = NestedRnsPolyContext::setup(
+            &mut circuit,
+            &ambient_params,
+            10,
+            DEFAULT_MAX_UNREDUCED_MULS,
+            1 << 8,
+            false,
+            None,
+        );
+        let ambient_poly = DCRTPoly::from_biguints(
+            &ambient_params,
+            &(0u8..8).map(BigUint::from).collect::<Vec<_>>(),
+        );
+        let ciphertext = [vec![ambient_poly.clone()], vec![ambient_poly]];
+        let _ = ciphertext_inputs_from_native::<DCRTPoly, DCRTPolyMatrix>(
+            &native_params,
+            &ambient_params,
+            &ambient_ctx,
+            &ciphertext,
+            window,
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -641,8 +944,7 @@ mod tests {
             &params,
             RING_DIMENSION as usize,
             nested_rns,
-            Some(ACTIVE_LEVELS),
-            Some(0),
+            CrtWindow::full(ACTIVE_LEVELS),
         ));
         (params, context)
     }
@@ -678,53 +980,6 @@ mod tests {
     }
 
     #[test]
-    fn native_ciphertext_inputs_preserve_every_ring_coefficient_when_slots_are_fewer() {
-        let ring_dimension = 4u32;
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let params = DCRTPolyParams::new(ring_dimension, ACTIVE_LEVELS, CRT_BITS, BASE_BITS);
-        let nested_rns = Arc::new(NestedRnsPolyContext::setup(
-            &mut circuit,
-            &params,
-            P_MODULI_BITS,
-            MAX_UNREDUCED_MULS,
-            SCALE,
-            false,
-            Some(ACTIVE_LEVELS),
-        ));
-        let context = Arc::new(NestedRnsRingGswContext::from_arith_context(
-            &mut circuit,
-            &params,
-            2,
-            nested_rns,
-            Some(ACTIVE_LEVELS),
-            Some(0),
-        ));
-        let secret_key = sample_secret_key(&params);
-        let public_key = sample_public_key(
-            &params,
-            context.width(),
-            &secret_key,
-            sample_hash_key(),
-            b"ring-gsw-preserve-all-coefficients",
-            None,
-        );
-        let ciphertext =
-            encrypt_plaintext_bit(&params, context.nested_rns.as_ref(), &public_key, true);
-        let inputs = ciphertext_inputs_from_native::<DCRTPoly, DCRTPolyMatrix>(
-            &params,
-            context.nested_rns.as_ref(),
-            &ciphertext,
-            context.level_offset,
-            Some(context.active_levels),
-        );
-        assert!(!inputs.is_empty());
-        assert!(inputs.iter().all(|input| {
-            input.row_size() == ring_dimension as usize &&
-                input.col_size() == ring_dimension as usize
-        }));
-    }
-
-    #[test]
     fn native_scalar_binding_layout_matches_every_simd_diagonal_entry() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, context) = test_context(&mut circuit);
@@ -741,17 +996,17 @@ mod tests {
             encrypt_plaintext_bit(&params, context.nested_rns.as_ref(), &public_key, true);
         let matrix_inputs = ciphertext_inputs_from_native::<DCRTPoly, DCRTPolyMatrix>(
             &params,
-            context.nested_rns.as_ref(),
-            &ciphertext,
-            context.level_offset,
-            Some(context.active_levels),
-        );
-        let scalar_inputs = native_ring_gsw_scalar_bindings::<DCRTPoly, DCRTPolyMatrix>(
             &params,
             context.nested_rns.as_ref(),
             &ciphertext,
-            context.level_offset,
-            Some(context.active_levels),
+            CrtWindow::full(context.active_levels),
+        );
+        let scalar_inputs = native_ring_gsw_scalar_bindings::<DCRTPoly, DCRTPolyMatrix>(
+            &params,
+            &params,
+            context.nested_rns.as_ref(),
+            &ciphertext,
+            CrtWindow::full(context.active_levels),
         );
         assert_eq!(scalar_inputs.len(), context.flattened_ciphertext_input_count());
         assert_eq!(scalar_inputs.len(), matrix_inputs.len());
@@ -843,10 +1098,10 @@ mod tests {
             .flat_map(|ciphertext| {
                 ciphertext_inputs_from_native(
                     &params,
+                    &params,
                     context.nested_rns.as_ref(),
                     ciphertext,
-                    context.level_offset,
-                    Some(context.active_levels),
+                    CrtWindow::full(context.active_levels),
                 )
             })
             .collect::<Vec<_>>();
@@ -918,10 +1173,10 @@ mod tests {
             .flat_map(|ciphertext| {
                 ciphertext_inputs_from_native(
                     &params,
+                    &params,
                     context.nested_rns.as_ref(),
                     ciphertext,
-                    context.level_offset,
-                    Some(context.active_levels),
+                    CrtWindow::full(context.active_levels),
                 )
             })
             .collect::<Vec<_>>();
@@ -988,10 +1243,10 @@ mod tests {
             .flat_map(|ciphertext| {
                 ciphertext_inputs_from_native(
                     &params,
+                    &params,
                     context.nested_rns.as_ref(),
                     ciphertext,
-                    context.level_offset,
-                    Some(context.active_levels),
+                    CrtWindow::full(context.active_levels),
                 )
             })
             .collect::<Vec<_>>();
@@ -1054,8 +1309,7 @@ mod tests {
             &params,
             ring_dimension as usize,
             nested_rns,
-            Some(ACTIVE_LEVELS),
-            Some(0),
+            CrtWindow::full(ACTIVE_LEVELS),
         ));
         let inputs = (0..3)
             .map(|_| NestedRnsRingGswCiphertext::input(context.clone(), None, &mut circuit))
@@ -1103,8 +1357,7 @@ mod tests {
             &params,
             2,
             nested_rns,
-            Some(active_levels),
-            Some(0),
+            CrtWindow::full(active_levels),
         );
         assert_ne!(
             context.width() % (MUL_COLUMN_SUBCIRCUIT_BATCH * MUL_COLUMN_SUBCIRCUIT_BATCH),

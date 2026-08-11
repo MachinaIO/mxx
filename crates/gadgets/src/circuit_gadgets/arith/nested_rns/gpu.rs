@@ -38,7 +38,7 @@ where
 mod tests {
     use super::super::{encode_nested_rns_poly, encode_nested_rns_poly_compact_bytes};
     use crate::{
-        circuit_gadgets::arith::DEFAULT_MAX_UNREDUCED_MULS,
+        circuit_gadgets::arith::{CrtWindow, DEFAULT_MAX_UNREDUCED_MULS},
         poly::{
             Poly, PolyParams,
             dcrt::{
@@ -74,7 +74,7 @@ mod tests {
             gpu_ids.clone(),
             Some(gpu_ids.len() as u32),
         );
-        let q_level = Some(2);
+        let window = CrtWindow::new(0, 2, cpu_params.to_crt().2);
 
         for input in [12345u64, 23456u64, 34567u64] {
             let values = [BigUint::from(input), BigUint::from(input + 7)];
@@ -83,14 +83,14 @@ mod tests {
                 MAX_UNREDUCED_MULS,
                 &cpu_params,
                 &values,
-                q_level,
+                window,
             );
             let actual_bytes = encode_nested_rns_poly_compact_bytes::<GpuDCRTPoly>(
                 P_MODULI_BITS,
                 MAX_UNREDUCED_MULS,
                 &gpu_params,
                 &values,
-                q_level,
+                window,
             );
 
             assert_eq!(actual_bytes.len(), expected.len());

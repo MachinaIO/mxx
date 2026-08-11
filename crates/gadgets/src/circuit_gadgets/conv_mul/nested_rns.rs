@@ -29,7 +29,22 @@ impl<P: Poly + 'static> NegacyclicConvolutionContext<P> for NestedRnsPolyContext
         diagonal: usize,
         num_slots: usize,
     ) -> Vec<SubCircuitParamValue> {
-        let lanes = self.q_moduli_depth;
+        <Self as NegacyclicConvolutionContext<P>>::q_level_diagonal_product_param_bindings_for_lanes(
+            self,
+            diagonal,
+            num_slots,
+            self.q_moduli_depth,
+        )
+    }
+
+    fn q_level_diagonal_product_param_bindings_for_lanes(
+        &self,
+        diagonal: usize,
+        num_slots: usize,
+        lanes: usize,
+    ) -> Vec<SubCircuitParamValue> {
+        assert!(lanes > 0, "nested-RNS convolution requires at least one active CRT lane");
+        assert!(lanes <= self.q_moduli_depth, "active CRT lanes exceed the context depth");
         let rhs_binding = SubCircuitParamValue::SlotTransfer(SlotTransferSpec::rotation(
             diagonal * lanes,
             num_slots * lanes,
@@ -85,8 +100,7 @@ impl<P: Poly + 'static> RingGswConvolution<P> for NestedRnsPoly<P> {
             template.ctx.clone(),
             BatchedWire::from_batches(q_level_outputs.into_iter().next().unwrap()),
             template.num_coefficient_slots,
-            Some(template.level_offset),
-            template.enable_levels,
+            template.window,
             max_plaintexts,
         )
         .with_p_max_traces(p_max_traces)
@@ -106,8 +120,7 @@ impl<P: Poly + 'static> RingGswConvolution<P> for NestedRnsPoly<P> {
             template.ctx.clone(),
             BatchedWire::from_batches(q_level_output),
             template.num_coefficient_slots,
-            Some(template.level_offset),
-            template.enable_levels,
+            template.window,
             (0..active_levels)
                 .map(|q_idx| {
                     if q_idx == target_q_idx { max_plaintext.clone() } else { BigUint::from(0u64) }

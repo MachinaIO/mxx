@@ -14,6 +14,41 @@ use std::{fmt::Debug, hash::Hash, sync::Arc};
 pub use carry_montgomery::*;
 pub use nested_rns::*;
 
+/// A nonempty contiguous window in the context's q-CRT basis.
+///
+/// Arithmetic gadgets use only the towers in `[offset, offset + depth)`. Packed
+/// representations allocate lanes for exactly these towers; towers outside the window do not
+/// occupy physical slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CrtWindow {
+    pub offset: usize,
+    pub depth: usize,
+}
+
+impl CrtWindow {
+    pub fn new(offset: usize, depth: usize, total_depth: usize) -> Self {
+        assert!(depth > 0, "CRT window depth must be positive");
+        let end = offset.checked_add(depth).expect("CRT window end overflow");
+        assert!(
+            end <= total_depth,
+            "CRT window [{offset}, {end}) exceeds total depth {total_depth}"
+        );
+        Self { offset, depth }
+    }
+
+    pub fn full(total_depth: usize) -> Self {
+        Self::new(0, total_depth, total_depth)
+    }
+
+    pub fn end(self) -> usize {
+        self.offset + self.depth
+    }
+
+    pub fn physical_slots(self, coefficient_slots: usize) -> usize {
+        coefficient_slots.checked_mul(self.depth).expect("packed CRT slot count overflow")
+    }
+}
+
 pub trait ModularArithmeticContext<P: Poly>: Clone + Debug + Send + Sync + 'static {
     fn q_moduli_depth(&self) -> usize;
 
@@ -27,19 +62,12 @@ pub trait ModularArithmeticContext<P: Poly>: Clone + Debug + Send + Sync + 'stat
 
     fn plaintext_capacity_bound(&self) -> BigUint;
 
-    fn active_levels(&self, enable_levels: Option<usize>, level_offset: Option<usize>) -> usize {
-        let level_offset = level_offset.unwrap_or(0);
-        let levels = enable_levels.unwrap_or(self.q_moduli_depth().saturating_sub(level_offset));
-        assert!(
-            level_offset + levels <= self.q_moduli_depth(),
-            "active range exceeds q_moduli_depth: level_offset={level_offset}, enable_levels={levels}, q_moduli_depth={}",
-            self.q_moduli_depth()
-        );
-        levels
+    fn validate_window(&self, window: CrtWindow) -> CrtWindow {
+        CrtWindow::new(window.offset, window.depth, self.q_moduli_depth())
     }
 
-    fn gadget_len(&self, enable_levels: Option<usize>, level_offset: Option<usize>) -> usize {
-        self.active_levels(enable_levels, level_offset) * self.decomposition_len()
+    fn gadget_len(&self, window: CrtWindow) -> usize {
+        self.validate_window(window).depth * self.decomposition_len()
     }
 }
 
@@ -48,9 +76,7 @@ pub trait ModularArithmeticGadget<P: Poly>: Clone + Debug + Send + Sync + 'stati
 
     fn context(&self) -> &Arc<Self::Context>;
 
-    fn level_offset(&self) -> usize;
-
-    fn enable_levels(&self) -> Option<usize>;
+    fn crt_window(&self) -> CrtWindow;
 
     fn max_plaintexts(&self) -> &[BigUint];
 
@@ -63,16 +89,14 @@ pub trait ModularArithmeticGadget<P: Poly>: Clone + Debug + Send + Sync + 'stati
     fn input(
         ctx: Arc<Self::Context>,
         num_coefficient_slots: usize,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
         circuit: &mut PolyCircuit<P>,
     ) -> Self;
 
     fn input_with_metadata(
         ctx: Arc<Self::Context>,
         num_coefficient_slots: usize,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
         max_plaintexts: Vec<BigUint>,
         p_max_traces: Vec<BigUint>,
         circuit: &mut PolyCircuit<P>,
@@ -94,9 +118,7 @@ pub trait ModularArithmeticGadget<P: Poly>: Clone + Debug + Send + Sync + 'stati
     fn sparse_level_poly_with_metadata(
         ctx: Arc<Self::Context>,
         num_coefficient_slots: usize,
-        active_levels: usize,
-        enable_levels: Option<usize>,
-        level_offset: usize,
+        window: CrtWindow,
         target_q_idx: usize,
         target_row: BatchedWire,
         max_plaintext: BigUint,
@@ -151,17 +173,12 @@ pub trait ModularArithmeticPlanner<P: Poly>: ModularArithmeticGadget<P> {
 
     fn metadata(entry: &Self) -> Self::Metadata;
 
-    fn normalized_metadata(
-        ctx: &Self::Context,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
-    ) -> Self::Metadata;
+    fn normalized_metadata(ctx: &Self::Context, window: CrtWindow) -> Self::Metadata;
 
     fn input_with_planner_metadata(
         ctx: Arc<Self::Context>,
         num_coefficient_slots: usize,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
         metadata: &Self::Metadata,
         circuit: &mut PolyCircuit<P>,
     ) -> Self;
@@ -189,25 +206,22 @@ pub trait DecomposeArithmeticGadget<P: Poly>: ModularArithmeticGadget<P> {
     fn gadget_matrix<M: PolyMatrix<P = P>>(
         params: &P::Params,
         ctx: &Self::Context,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
     ) -> M;
 
     fn gadget_decomposed<M: PolyMatrix<P = P>>(
         params: &P::Params,
         ctx: &Self::Context,
         target: &M,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
     ) -> M;
 
     fn gadget_constant_coeffs<M: PolyMatrix<P = P>>(
         params: &P::Params,
         ctx: &Self::Context,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
     ) -> Vec<BigUint> {
-        Self::gadget_matrix::<M>(params, ctx, enable_levels, level_offset)
+        Self::gadget_matrix::<M>(params, ctx, window)
             .get_row(0)
             .into_par_iter()
             .map(|entry| entry.coeffs_biguints()[0].clone())
@@ -218,16 +232,15 @@ pub trait DecomposeArithmeticGadget<P: Poly>: ModularArithmeticGadget<P> {
         params: &P::Params,
         ctx: &Self::Context,
         constant: BigUint,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
     ) -> Vec<Vec<u64>> {
-        let level_offset = level_offset.unwrap_or(0);
-        let active_levels = ctx.active_levels(enable_levels, Some(level_offset));
+        let window = ctx.validate_window(window);
+        let active_levels = window.depth;
         let active_q_moduli = params
             .to_crt()
             .0
             .into_iter()
-            .skip(level_offset)
+            .skip(window.offset)
             .take(active_levels)
             .collect::<Vec<_>>();
         let scaled_poly = P::from_biguint_to_constant(params, constant);
@@ -235,8 +248,7 @@ pub trait DecomposeArithmeticGadget<P: Poly>: ModularArithmeticGadget<P> {
             params,
             ctx,
             &M::from_poly_vec_column(params, vec![scaled_poly]),
-            enable_levels,
-            Some(level_offset),
+            window,
         );
         let (rows, cols) = decomposed.size();
         assert_eq!(cols, 1, "gadget decomposition of a constant must have one column");
@@ -263,25 +275,16 @@ pub trait DecomposeArithmeticGadget<P: Poly>: ModularArithmeticGadget<P> {
             .collect()
     }
 
-    fn gadget_decomposition_norm_bound(
-        ctx: &Self::Context,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
-    ) -> BigUint;
+    fn gadget_decomposition_norm_bound(ctx: &Self::Context, window: CrtWindow) -> BigUint;
 
-    fn randomizer_decomposition_norm_bound(
-        ctx: &Self::Context,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
-    ) -> BigUint {
-        Self::gadget_decomposition_norm_bound(ctx, enable_levels, level_offset)
+    fn randomizer_decomposition_norm_bound(ctx: &Self::Context, window: CrtWindow) -> BigUint {
+        Self::gadget_decomposition_norm_bound(ctx, window)
     }
 
     fn gadget_vector(
         ctx: Arc<Self::Context>,
         num_coefficient_slots: usize,
-        enable_levels: Option<usize>,
-        level_offset: Option<usize>,
+        window: CrtWindow,
         circuit: &mut PolyCircuit<P>,
     ) -> Vec<Self>;
 

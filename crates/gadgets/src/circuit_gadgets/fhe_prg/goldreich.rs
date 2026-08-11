@@ -1566,13 +1566,13 @@ mod graph_tests {
             false,
             Some(1),
         ));
+        let window = crate::circuit_gadgets::arith::CrtWindow::full(1);
         let context = Arc::new(NestedRnsRingGswContext::from_arith_context(
             &mut circuit,
             &parameters,
             RING_DIMENSION as usize,
             nested_rns,
-            Some(1),
-            Some(0),
+            window,
         ));
         let graph = GoldreichGraph::from_edges(
             5,
@@ -1620,10 +1620,10 @@ mod graph_tests {
             .flat_map(|ciphertext| {
                 ciphertext_inputs_from_native(
                     &parameters,
+                    &parameters,
                     context.nested_rns.as_ref(),
                     ciphertext,
-                    context.level_offset,
-                    Some(context.active_levels),
+                    window,
                 )
             })
             .collect::<Vec<_>>();

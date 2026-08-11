@@ -92,13 +92,11 @@ fn resolve_nested_rns_encoding_layout<P: Poly>(
     p_moduli_bits: usize,
     max_unreduced_muls: usize,
     params: &P::Params,
-    q_level: Option<usize>,
-) -> (Vec<u64>, usize, Vec<u64>) {
-    let (q_moduli, _, q_moduli_depth) = params.to_crt();
-    let active_q_level = q_level.unwrap_or(q_moduli_depth);
+) -> (Vec<u64>, Vec<u64>) {
+    let (q_moduli, _, _) = params.to_crt();
     let q_moduli_max = q_moduli.iter().max().expect("there should be at least one q modulus");
     let p_moduli = sample_crt_primes(p_moduli_bits, *q_moduli_max, max_unreduced_muls);
-    (q_moduli, active_q_level, p_moduli)
+    (q_moduli, p_moduli)
 }
 
 /// Parallel map helper for producing `output_count` nested-RNS outputs with access to `params`.
@@ -158,18 +156,10 @@ where
 ///izing the validation here guarantees every helper encodes the same window shape.
 pub(crate) fn resolve_nested_rns_active_window(
     ctx: &NestedRnsPolyContext,
-    enable_levels: Option<usize>,
-    level_offset: Option<usize>,
-) -> (usize, Vec<u64>) {
-    let level_offset = level_offset.unwrap_or(0);
-    let active_levels = enable_levels.unwrap_or_else(|| {
-        ctx.q_moduli_depth
-            .checked_sub(level_offset)
-            .expect("level_offset must not exceed q_moduli_depth")
-    });
-    let active_q_moduli =
-        ctx.q_moduli.iter().skip(level_offset).take(active_levels).copied().collect::<Vec<_>>();
-    (level_offset, active_q_moduli)
+    window: CrtWindow,
+) -> Vec<u64> {
+    let window = CrtWindow::new(window.offset, window.depth, ctx.q_moduli_depth);
+    ctx.q_moduli[window.offset..window.end()].to_vec()
 }
 
 /// Compute the CRT reconstruction coefficients for the currently active q-level window.
@@ -253,22 +243,18 @@ pub(crate) fn nested_rns_sparse_level_slot_value<P: Poly>(
 pub fn nested_rns_gadget_vector<P, M>(
     params: &P::Params,
     ctx: &NestedRnsPolyContext,
-    enable_levels: Option<usize>,
-    level_offset: Option<usize>,
+    window: CrtWindow,
 ) -> M
 where
     P: Poly,
     M: PolyMatrix<P = P>,
 {
-    let (level_offset, active_q_moduli) =
-        resolve_nested_rns_active_window(ctx, enable_levels, level_offset);
+    let active_q_moduli = resolve_nested_rns_active_window(ctx, window);
     let chunk_width = ctx.p_moduli.len() + 1;
     let reconst_coeffs = nested_rns_level_reconstruction_coeffs(&active_q_moduli);
     let coeff_count = params.ring_dimension() as usize;
     let mut gadget_row = Vec::with_capacity(active_q_moduli.len() * chunk_width);
-    for (q_idx, level_values) in
-        ctx.gadget_values[level_offset..level_offset + active_q_moduli.len()].iter().enumerate()
-    {
+    for (q_idx, level_values) in ctx.gadget_values[window.offset..window.end()].iter().enumerate() {
         for residue in level_values {
             let row = ctx
                 .p_moduli
@@ -287,14 +273,13 @@ pub fn nested_rns_gadget_decomposed<P, M>(
     params: &P::Params,
     ctx: &NestedRnsPolyContext,
     value: &M,
-    enable_levels: Option<usize>,
-    level_offset: Option<usize>,
+    window: CrtWindow,
 ) -> M
 where
     P: Poly,
     M: PolyMatrix<P = P>,
 {
-    let (_, active_q_moduli) = resolve_nested_rns_active_window(ctx, enable_levels, level_offset);
+    let active_q_moduli = resolve_nested_rns_active_window(ctx, window);
     let chunk_width = ctx.p_moduli.len() + 1;
     let gadget_len = active_q_moduli.len() * chunk_width;
     let (row_size, col_size) = value.size();
@@ -355,50 +340,22 @@ pub fn encode_nested_rns_poly_compact_bytes<P: Poly>(
     max_unreduced_muls: usize,
     params: &P::Params,
     values: &[BigUint],
-    q_level: Option<usize>,
+    window: CrtWindow,
 ) -> Vec<Vec<Vec<u8>>> {
-    encode_nested_rns_poly_compact_bytes_with_offset::<P>(
-        p_moduli_bits,
-        max_unreduced_muls,
-        params,
-        values,
-        0,
-        q_level,
-    )
-}
-
-pub fn encode_nested_rns_poly_compact_bytes_with_offset<P: Poly>(
-    p_moduli_bits: usize,
-    max_unreduced_muls: usize,
-    params: &P::Params,
-    values: &[BigUint],
-    q_level_offset: usize,
-    q_level: Option<usize>,
-) -> Vec<Vec<Vec<u8>>> {
-    let (q_moduli, _, p_moduli) =
-        resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, max_unreduced_muls, params, q_level);
-    let active_q_level = q_level.unwrap_or_else(|| {
-        q_moduli
-            .len()
-            .checked_sub(q_level_offset)
-            .expect("q_level_offset must not exceed q modulus depth")
-    });
-    assert!(q_level_offset + active_q_level <= q_moduli.len());
+    let (q_moduli, p_moduli) =
+        resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, max_unreduced_muls, params);
+    let window = CrtWindow::new(window.offset, window.depth, q_moduli.len());
     assert!(!values.is_empty(), "nested-RNS encoding requires coefficient values");
     let p_moduli_depth = p_moduli.len();
-    let lanes = q_moduli.len();
+    let lanes = window.depth;
     map_nested_rns_outputs_with_params::<P, _, _>(params, p_moduli_depth, |p_idx, local_params| {
         values
             .iter()
             .flat_map(|value| {
                 let q_moduli = &q_moduli;
                 let p_i = p_moduli[p_idx];
-                (0..lanes).map(move |g| {
-                    let residue = if g < q_level_offset || g >= q_level_offset + active_q_level {
-                        BigUint::ZERO
-                    } else {
-                        (value % BigUint::from(q_moduli[g])) % p_i
-                    };
+                (0..lanes).map(move |k| {
+                    let residue = (value % BigUint::from(q_moduli[window.offset + k])) % p_i;
                     P::from_biguint_to_constant(local_params, residue).to_compact_bytes()
                 })
             })
@@ -411,37 +368,13 @@ pub fn encode_nested_rns_poly<P: Poly>(
     max_unreduced_muls: usize,
     params: &P::Params,
     values: &[BigUint],
-    q_level: Option<usize>,
+    window: CrtWindow,
 ) -> Vec<Vec<BigUint>> {
-    encode_nested_rns_poly_with_offset::<P>(
-        p_moduli_bits,
-        max_unreduced_muls,
-        params,
-        values,
-        0,
-        q_level,
-    )
-}
-
-pub fn encode_nested_rns_poly_with_offset<P: Poly>(
-    p_moduli_bits: usize,
-    max_unreduced_muls: usize,
-    params: &P::Params,
-    values: &[BigUint],
-    q_level_offset: usize,
-    q_level: Option<usize>,
-) -> Vec<Vec<BigUint>> {
-    let (q_moduli, _, p_moduli) =
-        resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, max_unreduced_muls, params, q_level);
-    let active_q_level = q_level.unwrap_or_else(|| {
-        q_moduli
-            .len()
-            .checked_sub(q_level_offset)
-            .expect("q_level_offset must not exceed q modulus depth")
-    });
-    assert!(q_level_offset + active_q_level <= q_moduli.len());
+    let (q_moduli, p_moduli) =
+        resolve_nested_rns_encoding_layout::<P>(p_moduli_bits, max_unreduced_muls, params);
+    let window = CrtWindow::new(window.offset, window.depth, q_moduli.len());
     assert!(!values.is_empty(), "nested-RNS encoding requires coefficient values");
-    let lanes = q_moduli.len();
+    let lanes = window.depth;
     p_moduli
         .into_par_iter()
         .map(|p_i| {
@@ -449,13 +382,8 @@ pub fn encode_nested_rns_poly_with_offset<P: Poly>(
                 .iter()
                 .flat_map(|value| {
                     let q_moduli = &q_moduli;
-                    (0..lanes).map(move |g| {
-                        if g < q_level_offset || g >= q_level_offset + active_q_level {
-                            BigUint::ZERO
-                        } else {
-                            (value % BigUint::from(q_moduli[g])) % p_i
-                        }
-                    })
+                    (0..lanes)
+                        .map(move |k| (value % BigUint::from(q_moduli[window.offset + k])) % p_i)
                 })
                 .collect()
         })

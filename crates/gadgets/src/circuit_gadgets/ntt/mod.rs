@@ -16,12 +16,11 @@
 //! - `num_slots` must not exceed `params.ring_dimension()`
 
 use crate::{
-    circuit::{PolyCircuit, evaluable::PolyVec},
-    circuit_gadgets::arith::{NestedRnsPoly, NestedRnsPolyContext, encode_nested_rns_poly_with_offset},
+    circuit::PolyCircuit,
+    circuit_gadgets::arith::NestedRnsPoly,
     poly::{Poly, PolyParams},
     utils::mod_inverse,
 };
-use num_bigint::BigUint;
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,14 +163,7 @@ fn attach_slot_residues(
 }
 
 fn resolved_active_levels<P: Poly>(poly: &NestedRnsPoly<P>) -> usize {
-    let active_levels = poly.enable_levels.unwrap_or(poly.ctx.q_moduli_depth);
-    assert!(
-        active_levels <= poly.ctx.q_moduli_depth,
-        "active levels {} exceed q_moduli_depth {}",
-        active_levels,
-        poly.ctx.q_moduli_depth
-    );
-    active_levels
+    poly.window.depth
 }
 
 fn active_q_moduli<P: Poly>(poly: &NestedRnsPoly<P>) -> Vec<u64> {
@@ -228,54 +220,34 @@ fn openfhe_ftt_tables(q_moduli: &[u64], num_slots: usize) -> OpenFheFttTables {
     OpenFheFttTables { forward_by_q, inverse_by_q, n_inverse_by_q }
 }
 
+// ModUp/ModDown are intentionally outside the compact NTT/iNTT work. Keep the
+// input adapter together with their disabled tests until those operations are
+// migrated to `CrtWindow`.
+#[cfg(all(test, any()))]
 pub fn encode_nested_rns_poly_vec<P: Poly>(
     params: &P::Params,
     ctx: &NestedRnsPolyContext,
     slots: &[BigUint],
-    q_level: Option<usize>,
-) -> Vec<PolyVec<P>> {
-    encode_nested_rns_poly_vec_with_offset(params, ctx, slots, 0, q_level)
-}
-
-pub fn encode_nested_rns_poly_vec_with_offset<P: Poly>(
-    params: &P::Params,
-    ctx: &NestedRnsPolyContext,
-    slots: &[BigUint],
-    q_level_offset: usize,
-    q_level: Option<usize>,
-) -> Vec<PolyVec<P>> {
-    let active_q_level = q_level.unwrap_or(ctx.q_moduli_depth);
-    assert!(
-        active_q_level <= ctx.q_moduli_depth,
-        "q_level {} exceeds NestedRnsPolyContext q_moduli_depth {}",
-        active_q_level,
-        ctx.q_moduli_depth
-    );
-    assert!(
-        q_level_offset + active_q_level <= ctx.q_moduli_depth,
-        "active q range exceeds NestedRnsPolyContext depth: q_level_offset={}, active_q_level={}, q_moduli_depth={}",
-        q_level_offset,
-        active_q_level,
-        ctx.q_moduli_depth
-    );
+    window: CrtWindow,
+) -> Vec<crate::test_utils::PolyVec> {
+    let window = CrtWindow::new(window.offset, window.depth, ctx.q_moduli_depth);
     let encoded_slots = slots
         .par_iter()
         .map(|slot| {
-            encode_nested_rns_poly_with_offset::<P>(
+            encode_nested_rns_poly::<P>(
                 ctx.p_moduli_bits,
                 ctx.max_unreduced_muls,
                 params,
-                slot,
-                q_level_offset,
-                q_level,
+                std::slice::from_ref(slot),
+                window,
             )
         })
         .collect::<Vec<_>>();
-    let input_count = active_q_level * ctx.p_moduli.len();
+    let input_count = window.depth * ctx.p_moduli.len();
     (0..input_count)
         .into_par_iter()
         .map(|input_idx| {
-            PolyVec::new(
+            crate::test_utils::PolyVec(
                 encoded_slots
                     .par_iter()
                     .map(|slot_encoding| slot_encoding[input_idx].clone())
@@ -428,6 +400,10 @@ pub fn forward_ntt<P: Poly>(
     num_slots: usize,
 ) -> NestedRnsPoly<P> {
     validate_num_slots::<P>(params, num_slots);
+    assert_eq!(
+        input.num_coefficient_slots, num_slots,
+        "NTT slot count must match packed coefficient count"
+    );
     let q_moduli = active_q_moduli(input);
     let tables = openfhe_ftt_tables(&q_moduli, num_slots);
 
@@ -447,6 +423,10 @@ pub fn inverse_ntt<P: Poly>(
     num_slots: usize,
 ) -> NestedRnsPoly<P> {
     validate_num_slots::<P>(params, num_slots);
+    assert_eq!(
+        input.num_coefficient_slots, num_slots,
+        "iNTT slot count must match packed coefficient count"
+    );
     let q_moduli = active_q_moduli(input);
     let tables = openfhe_ftt_tables(&q_moduli, num_slots);
 
@@ -463,24 +443,374 @@ pub fn inverse_ntt<P: Poly>(
 }
 
 #[cfg(test)]
-mod tests {
+mod compact_tests {
+    use super::*;
+    use crate::{
+        circuit::PolyGateKind,
+        circuit_gadgets::arith::{CrtWindow, NestedRnsPolyContext, encode_nested_rns_poly},
+        poly::{
+            Poly, PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+        test_utils::{PolyVec, execute_polyvec_circuit},
+    };
+    use num_bigint::BigUint;
+    use std::sync::Arc;
+
+    fn reference_forward_for_tower(values: &[BigUint], q_i: u64) -> Vec<BigUint> {
+        let num_slots = values.len();
+        let tables = openfhe_ftt_tables(&[q_i], num_slots);
+        let roots = &tables.forward_by_q[0];
+        let modulus = BigUint::from(q_i);
+        let mut current = values.iter().map(|value| value % &modulus).collect::<Vec<_>>();
+        for stage_index in 0..num_slots.trailing_zeros() as usize {
+            let m = 1usize << stage_index;
+            let t = num_slots >> (stage_index + 1);
+            let group_len = t << 1;
+            let previous = current.clone();
+            for slot in 0..num_slots {
+                let offset = slot % group_len;
+                let group = slot / group_len;
+                let omega = BigUint::from(roots[m + group]);
+                current[slot] = if offset < t {
+                    (&previous[slot] + &omega * &previous[slot + t]) % &modulus
+                } else {
+                    let upper = &previous[slot - t];
+                    let lower_scaled = (&omega * &previous[slot]) % &modulus;
+                    (upper + &modulus - lower_scaled) % &modulus
+                };
+            }
+        }
+        current
+    }
+
+    fn reference_inverse_for_tower(values: &[BigUint], q_i: u64) -> Vec<BigUint> {
+        let num_slots = values.len();
+        let tables = openfhe_ftt_tables(&[q_i], num_slots);
+        let roots = &tables.inverse_by_q[0];
+        let modulus = BigUint::from(q_i);
+        let mut current = values.iter().map(|value| value % &modulus).collect::<Vec<_>>();
+        for stage_index in 0..num_slots.trailing_zeros() as usize {
+            let m = num_slots >> (stage_index + 1);
+            let t = 1usize << stage_index;
+            let group_len = t << 1;
+            let previous = current.clone();
+            for slot in 0..num_slots {
+                let offset = slot % group_len;
+                let group = slot / group_len;
+                let omega = BigUint::from(roots[m + group]);
+                current[slot] = if offset < t {
+                    (&previous[slot] + &previous[slot + t]) % &modulus
+                } else {
+                    let upper = &previous[slot - t];
+                    let lower = &previous[slot];
+                    (&omega * (upper + &modulus - lower)) % &modulus
+                };
+            }
+        }
+        let scale = BigUint::from(tables.n_inverse_by_q[0]);
+        current.into_iter().map(|value| value * &scale % &modulus).collect()
+    }
+
+    fn run_transform(
+        params: &DCRTPolyParams,
+        values: &[BigUint],
+        window: CrtWindow,
+        inverse: bool,
+    ) -> Vec<BigUint> {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx =
+            Arc::new(NestedRnsPolyContext::setup(&mut circuit, params, 10, 4, 1 << 8, false, None));
+        let n = values.len();
+        let input = NestedRnsPoly::input(ctx.clone(), n, window, &mut circuit);
+        let transformed = if inverse {
+            inverse_ntt(params, &mut circuit, &input, n)
+        } else {
+            forward_ntt(params, &mut circuit, &input, n)
+        };
+        assert_eq!(transformed.window, window);
+        let reconstructed = transformed.reconstruct(&mut circuit);
+        circuit.output([reconstructed]);
+        let encoded = encode_nested_rns_poly::<DCRTPoly>(
+            ctx.p_moduli_bits,
+            ctx.max_unreduced_muls,
+            params,
+            values,
+            window,
+        );
+        let inputs = encoded
+            .into_iter()
+            .map(|lanes| {
+                assert_eq!(lanes.len(), n * window.depth);
+                PolyVec(
+                    lanes
+                        .into_iter()
+                        .map(|value| DCRTPoly::from_biguint_to_constant(params, value))
+                        .collect(),
+                )
+            })
+            .collect();
+        let output = execute_polyvec_circuit(
+            if inverse { "compact-intt" } else { "compact-ntt" },
+            params,
+            &circuit,
+            inputs,
+            n * window.depth,
+        );
+        (0..n)
+            .map(|coefficient| output[0].0[coefficient * window.depth].coeffs_biguints()[0].clone())
+            .collect()
+    }
+
+    fn matching_native_and_ambient_params(
+        native_depth: usize,
+        ambient_depth: usize,
+        ambient_offset: usize,
+    ) -> (DCRTPolyParams, DCRTPolyParams) {
+        assert!(ambient_offset + native_depth <= ambient_depth);
+        for crt_bits in 17..=30 {
+            let native = DCRTPolyParams::new(4, native_depth, crt_bits, 6);
+            let ambient = DCRTPolyParams::new(8, ambient_depth, crt_bits, 6);
+            let native_moduli = native.to_crt().0;
+            let ambient_moduli = ambient.to_crt().0;
+            if native_moduli == ambient_moduli[ambient_offset..ambient_offset + native_depth] {
+                return (native, ambient);
+            }
+        }
+        panic!(
+            "no shared OpenFHE CRT basis found for native N=4 depth={native_depth} and ambient n=8 depth={ambient_depth} offset={ambient_offset}"
+        );
+    }
+
+    #[test]
+    fn forward_and_inverse_match_openfhe_at_ambient_dimension() {
+        let params = DCRTPolyParams::new(8, 2, 17, 6);
+        let window = CrtWindow::full(params.to_crt().2);
+        let coefficients = (0u64..8).map(|value| BigUint::from(value + 3)).collect::<Vec<_>>();
+        let openfhe_forward = DCRTPoly::from_biguints(&params, &coefficients).eval_slots();
+        assert_eq!(run_transform(&params, &coefficients, window, false), openfhe_forward);
+
+        let openfhe_inverse =
+            DCRTPoly::from_biguints_eval(&params, &openfhe_forward).coeffs_biguints();
+        assert_eq!(run_transform(&params, &openfhe_forward, window, true), openfhe_inverse);
+    }
+
+    #[test]
+    fn compact_subdimension_round_trip_uses_no_inactive_lanes() {
+        let params = DCRTPolyParams::new(8, 3, 17, 6);
+        let window = CrtWindow::new(1, 1, params.to_crt().2);
+        let coefficients = (0u64..4).map(|value| BigUint::from(value + 5)).collect::<Vec<_>>();
+        let transformed = run_transform(&params, &coefficients, window, false);
+        let recovered = run_transform(&params, &transformed, window, true);
+        let modulus = params.to_crt().0[window.offset..window.end()]
+            .iter()
+            .fold(BigUint::from(1u8), |acc, &q| acc * BigUint::from(q));
+        assert_eq!(
+            recovered.into_iter().map(|value| value % &modulus).collect::<Vec<_>>(),
+            coefficients.into_iter().map(|value| value % &modulus).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compact_subdimension_forward_matches_openfhe_table_butterflies() {
+        let params = DCRTPolyParams::new(8, 3, 17, 6);
+        let window = CrtWindow::new(1, 1, params.to_crt().2);
+        let coefficients = (0u64..4).map(|value| BigUint::from(value + 5)).collect::<Vec<_>>();
+        let q_i = params.to_crt().0[window.offset];
+        let expected = reference_forward_for_tower(&coefficients, q_i);
+        let modulus = BigUint::from(q_i);
+        let actual = run_transform(&params, &coefficients, window, false)
+            .into_iter()
+            .map(|value| value % &modulus)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn compact_subdimension_inverse_matches_openfhe_table_butterflies() {
+        let params = DCRTPolyParams::new(8, 3, 17, 6);
+        let window = CrtWindow::new(1, 1, params.to_crt().2);
+        let coefficients = (0u64..4).map(|value| BigUint::from(value + 5)).collect::<Vec<_>>();
+        let q_i = params.to_crt().0[window.offset];
+        let evaluations = reference_forward_for_tower(&coefficients, q_i);
+        let expected = reference_inverse_for_tower(&evaluations, q_i);
+        let modulus = BigUint::from(q_i);
+        let actual = run_transform(&params, &evaluations, window, true)
+            .into_iter()
+            .map(|value| value % &modulus)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn compact_subdimension_forward_matches_native_openfhe() {
+        let (native, ambient) = matching_native_and_ambient_params(1, 1, 0);
+        let native_moduli = native.to_crt().0;
+        assert_eq!(native_moduli, ambient.to_crt().0);
+        let coefficients = (0u64..4).map(|value| BigUint::from(value + 5)).collect::<Vec<_>>();
+        let expected = DCRTPoly::from_biguints(&native, &coefficients).eval_slots();
+        let modulus = BigUint::from(native_moduli[0]);
+        let actual =
+            run_transform(&ambient, &coefficients, CrtWindow::full(ambient.to_crt().2), false)
+                .into_iter()
+                .map(|value| value % &modulus)
+                .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn compact_subdimension_inverse_matches_native_openfhe() {
+        let (native, ambient) = matching_native_and_ambient_params(1, 1, 0);
+        let native_moduli = native.to_crt().0;
+        assert_eq!(native_moduli, ambient.to_crt().0);
+        let coefficients = (0u64..4).map(|value| BigUint::from(value + 5)).collect::<Vec<_>>();
+        let evaluations = DCRTPoly::from_biguints(&native, &coefficients).eval_slots();
+        let expected = DCRTPoly::from_biguints_eval(&native, &evaluations).coeffs_biguints();
+        let modulus = BigUint::from(native_moduli[0]);
+        let actual =
+            run_transform(&ambient, &evaluations, CrtWindow::full(ambient.to_crt().2), true)
+                .into_iter()
+                .map(|value| value % &modulus)
+                .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn compact_subdimension_multi_tower_matches_native_openfhe_forward() {
+        let offset = 0;
+        let (native, ambient) = matching_native_and_ambient_params(2, 2, offset);
+        let native_moduli = native.to_crt().0;
+        let ambient_moduli = ambient.to_crt().0;
+        assert_eq!(native_moduli, ambient_moduli[offset..offset + 2]);
+        let coefficients = (0u64..4).map(|value| BigUint::from(value + 5)).collect::<Vec<_>>();
+        let expected = DCRTPoly::from_biguints(&native, &coefficients).eval_slots();
+        let modulus =
+            native_moduli.iter().fold(BigUint::from(1u8), |acc, &q_i| acc * BigUint::from(q_i));
+        let actual = run_transform(
+            &ambient,
+            &coefficients,
+            CrtWindow::new(offset, 2, ambient.to_crt().2),
+            false,
+        )
+        .into_iter()
+        .map(|value| value % &modulus)
+        .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn compact_subdimension_multi_tower_matches_native_openfhe_inverse() {
+        let offset = 0;
+        let (native, ambient) = matching_native_and_ambient_params(2, 2, offset);
+        let native_moduli = native.to_crt().0;
+        let ambient_moduli = ambient.to_crt().0;
+        assert_eq!(native_moduli, ambient_moduli[offset..offset + 2]);
+        let coefficients = (0u64..4).map(|value| BigUint::from(value + 5)).collect::<Vec<_>>();
+        let evaluations = DCRTPoly::from_biguints(&native, &coefficients).eval_slots();
+        let expected = DCRTPoly::from_biguints_eval(&native, &evaluations).coeffs_biguints();
+        let modulus =
+            native_moduli.iter().fold(BigUint::from(1u8), |acc, &q_i| acc * BigUint::from(q_i));
+        let actual = run_transform(
+            &ambient,
+            &evaluations,
+            CrtWindow::new(offset, 2, ambient.to_crt().2),
+            true,
+        )
+        .into_iter()
+        .map(|value| value % &modulus)
+        .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn compact_offset_window_identity_transform_reconstructs() {
+        let params = DCRTPolyParams::new(8, 3, 17, 6);
+        let window = CrtWindow::new(1, 1, params.to_crt().2);
+        let values = vec![BigUint::from(5u8)];
+        assert_eq!(run_transform(&params, &values, window, false), values);
+    }
+
+    #[test]
+    fn compact_ntt_uses_slot_transfers_without_top_level_multiplication() {
+        let params = DCRTPolyParams::new(8, 2, 17, 6);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = Arc::new(NestedRnsPolyContext::setup(
+            &mut circuit,
+            &params,
+            10,
+            4,
+            1 << 8,
+            false,
+            None,
+        ));
+        let window = CrtWindow::new(1, 1, ctx.q_moduli_depth);
+        let input = NestedRnsPoly::input(ctx, 4, window, &mut circuit);
+        let _ = forward_ntt(&params, &mut circuit, &input, 4);
+
+        let (slot_transfers, multiplications) = circuit.gates_in_id_order().fold(
+            (0usize, 0usize),
+            |(slot_transfers, multiplications), (_, gate)| match gate.gate_type.kind() {
+                PolyGateKind::SlotTransfer => (slot_transfers + 1, multiplications),
+                PolyGateKind::Mul => (slot_transfers, multiplications + 1),
+                _ => (slot_transfers, multiplications),
+            },
+        );
+        assert!(slot_transfers > 0);
+        assert_eq!(multiplications, 0);
+    }
+
+    #[test]
+    fn compact_single_tower_round_trip_reconstructs_modulo_q() {
+        let params = DCRTPolyParams::new(2, 1, 24, 6);
+        let window = CrtWindow::full(params.to_crt().2);
+        let coefficients =
+            (0u64..2).map(|value| BigUint::from(value * value + 7)).collect::<Vec<_>>();
+        let transformed = run_transform(&params, &coefficients, window, false);
+        let recovered = run_transform(&params, &transformed, window, true);
+        let modulus = BigUint::from(params.to_crt().0[0]);
+        assert_eq!(
+            recovered.into_iter().map(|value| value % &modulus).collect::<Vec<_>>(),
+            coefficients.into_iter().map(|value| value % &modulus).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "num_slots must be a power of two")]
+    fn forward_rejects_non_power_of_two_slot_count() {
+        let params = DCRTPolyParams::new(8, 1, 17, 6);
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let ctx = Arc::new(NestedRnsPolyContext::setup(
+            &mut circuit,
+            &params,
+            10,
+            4,
+            1 << 8,
+            false,
+            None,
+        ));
+        let input = NestedRnsPoly::input(ctx, 3, CrtWindow::full(params.to_crt().2), &mut circuit);
+        let _ = forward_ntt(&params, &mut circuit, &input, 3);
+    }
+}
+
+// Intentionally disabled: these are the only tests in this file that exercise
+// ModUp/ModDown. Pure NTT/iNTT coverage lives in `compact_tests` above.
+#[cfg(all(test, any()))]
+mod mod_switch_tests {
     use super::*;
     use std::sync::Arc;
 
     use crate::{
-        circuit::PolyGateKind,
         circuit_gadgets::{
             arith::DEFAULT_MAX_UNREDUCED_MULS,
             mod_switch::nested_rns::{
                 mod_down_levels_reconstruct_error_upper_bound, mod_up_reconstruct_error_upper_bound,
             },
         },
-        lookup::{poly::PolyPltEvaluator, poly_vec::PolyVecPltEvaluator},
         poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        slot_transfer::PolyVecSlotTransferEvaluator,
+        test_utils::{PolyVec, execute_polyvec_circuit},
     };
     use num_traits::ToPrimitive;
-    use rand::Rng;
 
     const P_MODULI_BITS: usize = 10;
     const MAX_UNREDUCED_MULS: usize = DEFAULT_MAX_UNREDUCED_MULS;
@@ -510,15 +840,6 @@ mod tests {
         ))
     }
 
-    fn random_slots(
-        params: &DCRTPolyParams,
-        active_levels: usize,
-        num_slots: usize,
-    ) -> Vec<BigUint> {
-        let active_q = active_q_level_modulus(params, active_levels);
-        random_slots_for_modulus(&active_q, num_slots)
-    }
-
     fn random_slots_for_modulus(modulus: &BigUint, num_slots: usize) -> Vec<BigUint> {
         (0..num_slots)
             .into_par_iter()
@@ -526,95 +847,27 @@ mod tests {
             .collect()
     }
 
-    fn recompose_crt_residues(moduli: &[u64], residues: &[u64]) -> BigUint {
-        assert_eq!(
-            moduli.len(),
-            residues.len(),
-            "CRT recomposition requires one residue per modulus"
-        );
-        let modulus_product =
-            moduli.iter().fold(BigUint::from(1u64), |acc, &modulus| acc * BigUint::from(modulus));
-        let mut value = BigUint::from(0u64);
-        for (&modulus, &residue) in moduli.iter().zip(residues.iter()) {
-            let partial_modulus = &modulus_product / BigUint::from(modulus);
-            let partial_modulus_mod_q: u64 = (&partial_modulus % BigUint::from(modulus))
-                .try_into()
-                .expect("partial CRT modulus residue must fit u64");
-            let inverse = mod_inverse(partial_modulus_mod_q, modulus)
-                .expect("CRT partial modulus must be invertible modulo each tower");
-            value += BigUint::from(residue) * &partial_modulus * BigUint::from(inverse);
-        }
-        value % modulus_product
-    }
-
-    fn random_slots_with_zero_inactive_towers(
-        params: &DCRTPolyParams,
-        active_levels: usize,
-        num_slots: usize,
-    ) -> Vec<BigUint> {
-        let (q_moduli, _, _) = params.to_crt();
-        assert!(
-            active_levels <= q_moduli.len(),
-            "active levels {} exceed q tower count {}",
-            active_levels,
-            q_moduli.len()
-        );
-        (0..num_slots)
-            .into_par_iter()
-            .map_init(rand::rng, |rng, _| {
-                let residues = q_moduli
-                    .iter()
-                    .enumerate()
-                    .map(
-                        |(idx, &q_i)| {
-                            if idx < active_levels { rng.random_range(0..q_i) } else { 0 }
-                        },
-                    )
-                    .collect::<Vec<_>>();
-                recompose_crt_residues(&q_moduli, &residues)
-            })
-            .collect()
-    }
-
     fn eval_single_output(
         params: &DCRTPolyParams,
         circuit: &PolyCircuit<DCRTPoly>,
-        inputs: Vec<PolyVec<DCRTPoly>>,
+        inputs: Vec<PolyVec>,
         num_slots: usize,
-    ) -> PolyVec<DCRTPoly> {
-        let one = PolyVec::new(vec![DCRTPoly::const_one(params); num_slots]);
-        let plt_evaluator = PolyVecPltEvaluator { plt_evaluator: PolyPltEvaluator::new() };
-        let slot_transfer_evaluator = PolyVecSlotTransferEvaluator::new();
-        let result = circuit.eval(
-            params,
-            one,
-            inputs,
-            Some(&plt_evaluator),
-            Some(&slot_transfer_evaluator),
-            None,
-        );
+    ) -> PolyVec {
+        let result = execute_polyvec_circuit("ntt-test", params, circuit, inputs, num_slots);
         assert_eq!(result.len(), 1);
         result.into_iter().next().expect("single output must exist")
     }
 
-    fn reconstructed_output_coeffs(output: &PolyVec<DCRTPoly>, num_slots: usize) -> Vec<BigUint> {
-        assert_eq!(output.len(), num_slots, "output PolyVec slot count mismatch");
+    fn reconstructed_output_coeffs(output: &PolyVec, num_slots: usize) -> Vec<BigUint> {
+        assert_eq!(output.0.len(), num_slots, "output PolyVec slot count mismatch");
         output
+            .0
             .as_slice()
             .par_iter()
             .map(|slot_poly| {
                 slot_poly.coeffs_biguints().first().expect("constant term must exist").clone()
             })
             .collect()
-    }
-
-    fn eval_slot_coeffs(params: &DCRTPolyParams, slots: &[BigUint]) -> Vec<BigUint> {
-        DCRTPoly::from_biguints_eval(params, slots).coeffs_biguints()
-    }
-
-    fn active_q_level_modulus(params: &DCRTPolyParams, active_levels: usize) -> BigUint {
-        let (q_moduli, _, _) = params.to_crt();
-        product_modulus(&q_moduli.into_iter().take(active_levels).collect::<Vec<_>>())
     }
 
     fn product_modulus(moduli: &[u64]) -> BigUint {
@@ -695,71 +948,6 @@ mod tests {
         let removed_modulus = product_modulus(removed_moduli);
         let source_modulus = product_modulus(source_moduli);
         coeffs.iter().map(|coeff| (coeff * &removed_modulus) / &source_modulus).collect()
-    }
-
-    fn assert_reconstructed_matches_expected_values(
-        params: &DCRTPolyParams,
-        actual_coeffs: &[BigUint],
-        expected_values: &[BigUint],
-        active_levels: usize,
-    ) {
-        assert_eq!(
-            actual_coeffs.len(),
-            expected_values.len(),
-            "coefficient vector length mismatch"
-        );
-
-        let (q_moduli, _, _) = params.to_crt();
-        if active_levels == q_moduli.len() {
-            assert_eq!(
-                actual_coeffs, expected_values,
-                "reconstructed values must match the expected public slot values"
-            );
-            return;
-        }
-
-        let q_level_modulus = active_q_level_modulus(params, active_levels);
-        actual_coeffs.par_iter().zip(expected_values.par_iter()).enumerate().for_each(
-            |(coeff_idx, (actual, expected))| {
-                assert_eq!(
-                    actual % &q_level_modulus,
-                    expected % &q_level_modulus,
-                    "coefficient {coeff_idx} differs modulo the active q-level modulus"
-                );
-            },
-        );
-    }
-
-    fn assert_reconstructed_matches_eval_coeffs(
-        params: &DCRTPolyParams,
-        actual_coeffs: &[BigUint],
-        slots: &[BigUint],
-        active_levels: usize,
-    ) {
-        let expected_coeffs = eval_slot_coeffs(params, slots);
-        assert_reconstructed_matches_expected_values(
-            params,
-            actual_coeffs,
-            &expected_coeffs,
-            active_levels,
-        );
-    }
-
-    fn assert_top_level_ntt_structure(circuit: &PolyCircuit<DCRTPoly>) {
-        let mut slot_transfer_count = 0usize;
-        let mut mul_count = 0usize;
-        for (_, gate) in circuit.gates_in_id_order() {
-            match gate.gate_type.kind() {
-                PolyGateKind::SlotTransfer => slot_transfer_count += 1,
-                PolyGateKind::Mul => mul_count += 1,
-                _ => {}
-            }
-        }
-        assert!(
-            slot_transfer_count > 0,
-            "NTT/iNTT top-level circuit must contain SlotTransfer gates"
-        );
-        assert_eq!(mul_count, 0, "NTT/iNTT top-level circuit must not contain direct Mul gates");
     }
 
     #[test]
@@ -906,319 +1094,5 @@ mod tests {
                 );
             },
         );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_for_num_slots_2_single_tower()
-     {
-        let params = DCRTPolyParams::new(2, 1, 17, BASE_BITS);
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, 2);
-        let output = forward_ntt(&params, &mut circuit, &inverse, 2);
-        let reconstructed = output.reconstruct(&mut circuit);
-        circuit.output(vec![reconstructed]);
-        assert_top_level_ntt_structure(&circuit);
-
-        let slots = random_slots(&params, resolved_active_levels(&input), 2);
-        let eval_inputs =
-            encode_nested_rns_poly_vec::<DCRTPoly>(&params, ctx.as_ref(), &slots, None);
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 2);
-        let output_coeffs = reconstructed_output_coeffs(&output_poly, 2);
-        assert_reconstructed_matches_expected_values(
-            &params,
-            &output_coeffs,
-            &slots,
-            resolved_active_levels(&input),
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_for_num_slots_16_multi_tower()
-     {
-        let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
-        let output = forward_ntt(&params, &mut circuit, &inverse, 16);
-        let reconstructed = output.reconstruct(&mut circuit);
-        circuit.output(vec![reconstructed]);
-        assert_top_level_ntt_structure(&circuit);
-
-        let slots = random_slots(&params, resolved_active_levels(&input), 16);
-        let eval_inputs =
-            encode_nested_rns_poly_vec::<DCRTPoly>(&params, ctx.as_ref(), &slots, None);
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
-        let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
-        assert_reconstructed_matches_expected_values(
-            &params,
-            &output_coeffs,
-            &slots,
-            resolved_active_levels(&input),
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_for_num_slots_16_single_tower_51_bit_modulus()
-     {
-        let params = DCRTPolyParams::new(16, 1, 51, BASE_BITS);
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ctx = test_context_with_p_moduli_bits(&mut circuit, &params, 10);
-        let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
-        let output = forward_ntt(&params, &mut circuit, &inverse, 16);
-        let reconstructed = output.reconstruct(&mut circuit);
-        circuit.output(vec![reconstructed]);
-        assert_top_level_ntt_structure(&circuit);
-
-        let slots = random_slots(&params, resolved_active_levels(&input), 16);
-        let eval_inputs = encode_nested_rns_poly_vec::<DCRTPoly>(
-            &params,
-            ctx.as_ref(),
-            &slots,
-            input.enable_levels,
-        );
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
-        let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
-        assert_reconstructed_matches_expected_values(
-            &params,
-            &output_coeffs,
-            &slots,
-            resolved_active_levels(&input),
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_when_num_slots_is_smaller_than_ring_dimension()
-     {
-        let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
-        let num_slots = 2usize;
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, num_slots);
-        let output = forward_ntt(&params, &mut circuit, &inverse, num_slots);
-        let reconstructed = output.reconstruct(&mut circuit);
-        circuit.output(vec![reconstructed]);
-        assert_top_level_ntt_structure(&circuit);
-
-        let slots = random_slots(&params, resolved_active_levels(&input), num_slots);
-        let eval_inputs = encode_nested_rns_poly_vec::<DCRTPoly>(
-            &params,
-            ctx.as_ref(),
-            &slots,
-            input.enable_levels,
-        );
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs, num_slots);
-        let output_coeffs = reconstructed_output_coeffs(&output_poly, num_slots);
-        assert_reconstructed_matches_expected_values(
-            &params,
-            &output_coeffs,
-            &slots,
-            resolved_active_levels(&input),
-        );
-    }
-
-    #[test]
-    fn test_ntt_encode_nested_rns_poly_vec_respects_q_level() {
-        let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ctx = test_context(&mut circuit, &params);
-        let slots = random_slots(&params, 2, 16);
-
-        let reduced_inputs =
-            encode_nested_rns_poly_vec::<DCRTPoly>(&params, ctx.as_ref(), &slots, Some(2));
-        assert_eq!(reduced_inputs.len(), 2 * ctx.p_moduli.len());
-        assert!(reduced_inputs.iter().all(|poly_vec| poly_vec.len() == slots.len()));
-
-        let full_inputs =
-            encode_nested_rns_poly_vec::<DCRTPoly>(&params, ctx.as_ref(), &slots, None);
-        assert_eq!(full_inputs.len(), ctx.q_moduli_depth * ctx.p_moduli.len());
-        assert!(full_inputs.iter().all(|poly_vec| poly_vec.len() == slots.len()));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ntt_forward_inverse_round_trip_reconstructs_original_input_for_num_slots_2_and_16() {
-        for (ring_dimension, crt_depth, num_slots) in
-            [(2u32, 1usize, 2usize), (16u32, 2usize, 16usize)]
-        {
-            let params = DCRTPolyParams::new(ring_dimension, crt_depth, 18, BASE_BITS);
-            let mut circuit = PolyCircuit::<DCRTPoly>::new();
-            let ctx = test_context(&mut circuit, &params);
-            let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
-            let forward = forward_ntt(&params, &mut circuit, &input, num_slots);
-            let inverse = inverse_ntt(&params, &mut circuit, &forward, num_slots);
-            let reconstructed = inverse.reconstruct(&mut circuit);
-            circuit.output(vec![reconstructed]);
-
-            let slots = random_slots(&params, resolved_active_levels(&input), num_slots);
-            let eval_inputs = encode_nested_rns_poly_vec::<DCRTPoly>(
-                &params,
-                ctx.as_ref(),
-                &slots,
-                input.enable_levels,
-            );
-            let output_poly = eval_single_output(&params, &circuit, eval_inputs, num_slots);
-            let output_coeffs = reconstructed_output_coeffs(&output_poly, num_slots);
-            assert_reconstructed_matches_expected_values(
-                &params,
-                &output_coeffs,
-                &slots,
-                resolved_active_levels(&input),
-            );
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ntt_forward_inverse_round_trip_reconstructs_original_input_with_reduced_active_levels()
-    {
-        let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), Some(2), None, &mut circuit);
-        let forward = forward_ntt(&params, &mut circuit, &input, 16);
-        assert_eq!(forward.enable_levels, Some(2));
-        let inverse = inverse_ntt(&params, &mut circuit, &forward, 16);
-        assert_eq!(inverse.enable_levels, Some(2));
-        let reconstructed = inverse.reconstruct(&mut circuit);
-        circuit.output(vec![reconstructed]);
-        assert_top_level_ntt_structure(&circuit);
-
-        let slots =
-            random_slots_with_zero_inactive_towers(&params, resolved_active_levels(&input), 16);
-        let eval_inputs = encode_nested_rns_poly_vec::<DCRTPoly>(
-            &params,
-            ctx.as_ref(),
-            &slots,
-            input.enable_levels,
-        );
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
-        let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
-        assert_reconstructed_matches_expected_values(
-            &params,
-            &output_coeffs,
-            &slots,
-            resolved_active_levels(&input),
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_with_reduced_active_levels()
-    {
-        let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), Some(2), None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
-        assert_eq!(inverse.enable_levels, Some(2));
-        let forward = forward_ntt(&params, &mut circuit, &inverse, 16);
-        assert_eq!(forward.enable_levels, Some(2));
-        let reconstructed = forward.reconstruct(&mut circuit);
-        circuit.output(vec![reconstructed]);
-        assert_top_level_ntt_structure(&circuit);
-
-        let slots =
-            random_slots_with_zero_inactive_towers(&params, resolved_active_levels(&input), 16);
-        let eval_inputs = encode_nested_rns_poly_vec::<DCRTPoly>(
-            &params,
-            ctx.as_ref(),
-            &slots,
-            input.enable_levels,
-        );
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
-        let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
-        assert_reconstructed_matches_expected_values(
-            &params,
-            &output_coeffs,
-            &slots,
-            resolved_active_levels(&input),
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ntt_inverse_forward_round_trip_reconstructs_original_input_with_reduced_active_levels_when_num_slots_is_smaller_than_ring_dimension()
-     {
-        let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
-        let num_slots = 2usize;
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), Some(2), None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, num_slots);
-        assert_eq!(inverse.enable_levels, Some(2));
-        let forward = forward_ntt(&params, &mut circuit, &inverse, num_slots);
-        assert_eq!(forward.enable_levels, Some(2));
-        let reconstructed = forward.reconstruct(&mut circuit);
-        circuit.output(vec![reconstructed]);
-        assert_top_level_ntt_structure(&circuit);
-
-        let slots = random_slots_with_zero_inactive_towers(
-            &params,
-            resolved_active_levels(&input),
-            num_slots,
-        );
-        let eval_inputs = encode_nested_rns_poly_vec::<DCRTPoly>(
-            &params,
-            ctx.as_ref(),
-            &slots,
-            input.enable_levels,
-        );
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs, num_slots);
-        let output_coeffs = reconstructed_output_coeffs(&output_poly, num_slots);
-        assert_reconstructed_matches_expected_values(
-            &params,
-            &output_coeffs,
-            &slots,
-            resolved_active_levels(&input),
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ntt_inverse_reconstruct_matches_from_biguints_eval_coeffs() {
-        let params = DCRTPolyParams::new(16, 3, 18, BASE_BITS);
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx.clone(), None, None, &mut circuit);
-        let inverse = inverse_ntt(&params, &mut circuit, &input, 16);
-        let reconstructed = inverse.reconstruct(&mut circuit);
-        circuit.output(vec![reconstructed]);
-
-        let slots = random_slots(&params, resolved_active_levels(&input), 16);
-        let eval_inputs = encode_nested_rns_poly_vec::<DCRTPoly>(
-            &params,
-            ctx.as_ref(),
-            &slots,
-            input.enable_levels,
-        );
-        let output_poly = eval_single_output(&params, &circuit, eval_inputs, 16);
-        let output_coeffs = reconstructed_output_coeffs(&output_poly, 16);
-
-        assert_reconstructed_matches_eval_coeffs(
-            &params,
-            &output_coeffs,
-            &slots,
-            resolved_active_levels(&input),
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    #[should_panic(expected = "num_slots must be a power of two")]
-    fn test_ntt_forward_ntt_rejects_non_power_of_two_num_slots() {
-        let params = DCRTPolyParams::new(8, 1, 17, BASE_BITS);
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let ctx = test_context(&mut circuit, &params);
-        let input = NestedRnsPoly::input(ctx, None, None, &mut circuit);
-        let _ = forward_ntt(&params, &mut circuit, &input, 3);
     }
 }

@@ -301,6 +301,8 @@ private def describeOperationalError : Mxx.Certificate.OperationalError → Stri
   | .missingChildOutput node port => s!"missing child output {node}:{port}"
   | .loopInputModeMismatch node argument =>
       s!"loop input mode mismatch at {node}, argument {argument}"
+  | .selectedFamilyOperationUnsupported node =>
+      s!"selected-family operation unsupported at {node}"
   | .relationBearingCarriedValue scope node slot =>
       s!"relation-bearing sequential carry in {repr scope} at {node}, slot {slot}"
   | .sequentialSchemaMismatch scope node slot initial output =>
@@ -323,6 +325,16 @@ private def describeOperationalError : Mxx.Certificate.OperationalError → Stri
       s!"derivation attachment {ownerNamespace}.{ruleName} is missing role {roleName}"
   | .invalidDerivationAttachment ownerNamespace ruleName =>
       s!"invalid derivation attachment {ownerNamespace}.{ruleName}"
+  | .invalidOperationalExprRef id => s!"invalid operational expression reference {id}"
+  | .operationalExprTypeMismatch left right =>
+      s!"operational expression type mismatch between {left} and {right}"
+  | .incompatibleRelationDomains node leftDomain rightDomain =>
+      s!"incompatible relation domains {leftDomain} and {rightDomain} at {node}"
+  | .unknownRelationRequirement node expression =>
+      s!"unknown relation requirement for expression {expression} at {node}"
+  | .unresolvedConcreteStructure node expression =>
+      s!"unresolved concrete structure for expression {expression} at {node}"
+  | .unsupportedOperationalExpr id => s!"unsupported operational expression {id}"
   | .unsupportedNode node => s!"unsupported IR node at {node}"
 
 private def rootAnchorMatrixFact

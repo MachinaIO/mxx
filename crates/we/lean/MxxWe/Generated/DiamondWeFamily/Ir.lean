@@ -8,11 +8,11 @@ def DiamondWeFamily_generatorVersion : String := "mxx-correctness-emitter-v9"
 
 def DiamondWeFamily_protocolSourcePaths : List String := ["crates/bgg/Cargo.toml", "crates/bgg/src", "crates/correctness/Cargo.toml", "crates/correctness/src", "crates/dsl/Cargo.toml", "crates/dsl/src", "crates/gadgets/Cargo.toml", "crates/gadgets/src", "crates/ir-core/Cargo.toml", "crates/ir-core/src", "crates/we/Cargo.toml", "crates/we/examples/emit_correctness.rs", "crates/we/src"]
 
-def DiamondWeFamily_protocolSourceHash : String := "78c7a0dd747d8c3534ab239101b72a095d51f7dfa7a1d903b657de039e00197c"
+def DiamondWeFamily_protocolSourceHash : String := "31416c644dc13bbdfb80718e197280e7b18adf5a5093c9d2407604f486a57aa5"
 
 def DiamondWeFamily_workflowHash : String := "b0cb1761132a3683375bc77da27bdac62b157142952ecaa1ee7b00c9aaf70c38"
 
-def DiamondWeFamily_toolkitHash : String := "6cc0ac8a8fde258276356918581e7c33d163b6852ce426f4f298bda191672487"
+def DiamondWeFamily_toolkitHash : String := "dc20c115fdf9c19ed384cd59f66670bae9b3bf5dbd2b6acabfca718bb8e89edf"
 
 def DiamondWeFamily_derivationHash : String := "9121b6753e53963269c95afdea191a014643ddad27e056fbb57ad63cda19f719"
 

@@ -3637,10 +3637,8 @@ private def multiplyOperationalExprIds
               outputs := outputs.push output
             arena.pushPrimitiveSelection leftSelection matrixType environment outputs
           else
-            pure (arena.push {
-              matrixType := matrixType
-              node := .multiply rule rightWire left right
-              ownerNode := some nodeIndex })
+            pure (arena.pushPrimitive nodeIndex outputPort matrixType environment
+              (.multiply rule rightWire) #[left, right])
       | .select selection (.exact branches), _ =>
           let mut arena := arena
           let mut outputs : Array OperationalExprId := #[]
@@ -3664,10 +3662,8 @@ private def multiplyOperationalExprIds
           let leftSummary ← arena.validatedSchema leftSummary
           let rightSummary ← arena.validatedSchema rightSummary
           if leftSelection != rightSelection then
-            pure (arena.push {
-              matrixType := matrixType
-              node := .multiply rule rightWire left right
-              ownerNode := some nodeIndex })
+            pure (arena.pushPrimitive nodeIndex outputPort matrixType environment
+              (.multiply rule rightWire) #[left, right])
           else if leftSelection.count != rightSelection.count then
             throw (.operationalExprTypeMismatch left right)
           else
@@ -3689,10 +3685,8 @@ private def multiplyOperationalExprIds
           let summary ← arena.validatedSchema summary
           match rightExpr.node with
           | .select .. =>
-              pure (arena.push {
-                matrixType := matrixType
-                node := .multiply rule rightWire left right
-                ownerNode := some nodeIndex })
+              pure (arena.pushPrimitive nodeIndex outputPort matrixType environment
+                (.multiply rule rightWire) #[left, right])
           | _ =>
               let (arena, output) ← multiplyOperationalExprIds nodeIndex outputPort matrixType rule
                 rightWire environment evaluateRepresentative arena representative right fuel
@@ -3707,10 +3701,8 @@ private def multiplyOperationalExprIds
           let summary ← arena.validatedSchema summary
           match leftExpr.node with
           | .select .. =>
-              pure (arena.push {
-                matrixType := matrixType
-                node := .multiply rule rightWire left right
-                ownerNode := some nodeIndex })
+              pure (arena.pushPrimitive nodeIndex outputPort matrixType environment
+                (.multiply rule rightWire) #[left, right])
           | _ =>
               let (arena, output) ← multiplyOperationalExprIds nodeIndex outputPort matrixType rule
                 rightWire environment evaluateRepresentative arena left representative fuel
@@ -3725,10 +3717,8 @@ private def multiplyOperationalExprIds
           if !concreteMatrixProductMatches leftExpr.matrixType rightExpr.matrixType matrixType
               environment then
             throw (.operationalExprTypeMismatch left right)
-          pure (arena.push {
-            matrixType := matrixType
-            node := .multiply rule rightWire left right
-            ownerNode := some nodeIndex })
+          pure (arena.pushPrimitive nodeIndex outputPort matrixType environment
+            (.multiply rule rightWire) #[left, right])
 
 private def multiplyOperationalExprFacts
     (nodeIndex outputPort : Nat)
@@ -3840,10 +3830,8 @@ private def tensorOperationalExprIds
       | .select leftSelection (.exact leftBranches),
           .select rightSelection (.exact rightBranches) =>
           if leftSelection != rightSelection then
-            pure (arena.push {
-              matrixType := matrixType
-              node := .tensor left right
-              ownerNode := some nodeIndex })
+            pure (arena.pushPrimitive nodeIndex outputPort matrixType environment .tensor
+              #[left, right])
           else if leftBranches.size != rightBranches.size then
             throw (.operationalExprTypeMismatch left right)
           else
@@ -3858,10 +3846,8 @@ private def tensorOperationalExprIds
             arena.pushSelect leftSelection (.exact outputs)
       | .select selection (.exact branches), _ =>
           match rightExpr.node with
-          | .select .. => pure (arena.push {
-              matrixType := matrixType
-              node := .tensor left right
-              ownerNode := some nodeIndex })
+          | .select .. => pure (arena.pushPrimitive nodeIndex outputPort matrixType environment
+              .tensor #[left, right])
           | _ =>
               let mut arena := arena
               let mut outputs : Array OperationalExprId := #[]
@@ -3873,10 +3859,8 @@ private def tensorOperationalExprIds
               arena.pushSelect selection (.exact outputs)
       | _, .select selection (.exact branches) =>
           match leftExpr.node with
-          | .select .. => pure (arena.push {
-              matrixType := matrixType
-              node := .tensor left right
-              ownerNode := some nodeIndex })
+          | .select .. => pure (arena.pushPrimitive nodeIndex outputPort matrixType environment
+              .tensor #[left, right])
           | _ =>
               let mut arena := arena
               let mut outputs : Array OperationalExprId := #[]
@@ -3891,10 +3875,8 @@ private def tensorOperationalExprIds
           let leftSummary ← arena.validatedSchema leftSummary
           let rightSummary ← arena.validatedSchema rightSummary
           if leftSelection != rightSelection then
-            pure (arena.push {
-              matrixType := matrixType
-              node := .tensor left right
-              ownerNode := some nodeIndex })
+            pure (arena.pushPrimitive nodeIndex outputPort matrixType environment .tensor
+              #[left, right])
           else if leftSelection.count != rightSelection.count then
             throw (.operationalExprTypeMismatch left right)
           else
@@ -3914,10 +3896,8 @@ private def tensorOperationalExprIds
       | .select selection (.shared representative summary), _ =>
           let summary ← arena.validatedSchema summary
           match rightExpr.node with
-          | .select .. => pure (arena.push {
-              matrixType := matrixType
-              node := .tensor left right
-              ownerNode := some nodeIndex })
+          | .select .. => pure (arena.pushPrimitive nodeIndex outputPort matrixType environment
+              .tensor #[left, right])
           | _ =>
               let (arena, output) ← tensorOperationalExprIds nodeIndex outputPort matrixType
                 environment evaluateRepresentative arena representative right fuel
@@ -3931,10 +3911,8 @@ private def tensorOperationalExprIds
       | _, .select selection (.shared representative summary) =>
           let summary ← arena.validatedSchema summary
           match leftExpr.node with
-          | .select .. => pure (arena.push {
-              matrixType := matrixType
-              node := .tensor left right
-              ownerNode := some nodeIndex })
+          | .select .. => pure (arena.pushPrimitive nodeIndex outputPort matrixType environment
+              .tensor #[left, right])
           | _ =>
               let (arena, output) ← tensorOperationalExprIds nodeIndex outputPort matrixType
                 environment evaluateRepresentative arena left representative fuel
@@ -3945,10 +3923,8 @@ private def tensorOperationalExprIds
                 | some value => pure value
                 | none => throw (.unsupportedOperationalExpr representative)
               arena.pushCheckedSchemaEnvelope selection selection.count output outputSummary outputFact
-      | _, _ => pure (arena.push {
-          matrixType := matrixType
-          node := .tensor left right
-          ownerNode := some nodeIndex })
+      | _, _ => pure (arena.pushPrimitive nodeIndex outputPort matrixType environment .tensor
+          #[left, right])
 
 private def tensorOperationalExprFacts
     (nodeIndex outputPort : Nat)
@@ -4476,10 +4452,8 @@ private def transformOperationalExprId
             | none => throw (.unsupportedOperationalExpr representative)
           arena.pushCheckedSchemaEnvelope selection selection.count output outputSummary outputFact
       | _ =>
-          pure (arena.push {
-            matrixType := matrixType
-            node := .transform operation root
-            ownerNode := some nodeIndex })
+          pure (arena.pushPrimitive nodeIndex outputPort matrixType environment
+            (.transform operation) #[root])
 
 private def transformOperationalExprFact
     (nodeIndex outputPort : Nat)
@@ -7192,20 +7166,18 @@ private def concatOperationalExprIds
         match expression.node with
         | .select selection branches => some (position, selection, branches)
         | _ => none
+      if selected?.isNone then
+        return arena.pushPrimitive nodeIndex outputPort matrixType environment
+          (PrimitiveOperationKind.concat axis) roots
       let (position, selection, branches) ← match selected? with
         | some selected => pure selected
-        | none => return arena.push {
-            matrixType := matrixType
-            node := .concat axis roots
-            ownerNode := some nodeIndex }
+        | none => throw (.unsupportedOperationalExpr roots[0]!)
       let hasDifferentSelection := expressions.any fun expression => match expression.node with
         | .select candidate _ => candidate != selection
         | _ => false
       if hasDifferentSelection then
-        return arena.push {
-          matrixType := matrixType
-          node := .concat axis roots
-          ownerNode := some nodeIndex }
+        return arena.pushPrimitive nodeIndex outputPort matrixType environment
+          (PrimitiveOperationKind.concat axis) roots
       match branches with
       | .exact selectedBranches =>
           let aligned := expressions.all fun expression => match expression.node with
@@ -10879,7 +10851,9 @@ private def tensorSchemaEnvelopeRepresentativeFixture : Bool :=
         let state := OperationalExprEvaluationState.empty arena
         let (outputFact, _) ← evaluateOperationalExprRepresentative arena [] output state
         pure (actualSelection.identity == selection && actualSelection.count == 2 &&
-          (match outputExpression.node with | .tensor .. => true | _ => false) &&
+          (match outputExpression.node with
+            | .primitive operation _ => operation.kind == PrimitiveOperationKind.tensor
+            | _ => false) &&
           outputSummary.uniformSchema == some (operationalUniformSchema outputFact) &&
           outputSummary.relationFree == !matrixFactHasRelation outputFact &&
           outputSummary.selectionOrigin == some (selectionDomainKind selection.index))

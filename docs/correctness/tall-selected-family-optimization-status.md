@@ -262,7 +262,7 @@ until its implementation and focused validation are both present.
 | Interned selection-domain identity | Implemented with collision-safe full-key comparison; focused cardinality fixtures remain pending |
 | `Exact` and `Shared` storage names | Implemented; Shared carries only a representative and request-local `ValidatedSchemaId` |
 | One canonical domain-owned count | Implemented; `SelectionDomainId` is the sole owner |
-| One lossless n-ary `PrimitiveOperation` node | In progress; descriptor, evaluator, and add/subtract delayed paths are present, while older operation constructors remain |
+| One lossless n-ary `PrimitiveOperation` node | In progress; all production delayed matrix paths now emit the descriptor, while older constructors remain only in migration support and fixtures |
 | Schema-owned outer envelope through `ValidatedSchemaId` | Implemented at the storage boundary; lazy schema-query memoization remains pending |
 | Construction-time Exact-to-Shared join | Not yet complete |
 | Generic lifting rules for all matrix primitives | Not yet implemented; operation-specific branches remain |

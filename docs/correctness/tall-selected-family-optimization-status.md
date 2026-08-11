@@ -260,10 +260,10 @@ until its implementation and focused validation are both present.
 | --- | --- |
 | Request-local expression arena and concrete/expression values | Present from the earlier implementation |
 | Interned selection-domain identity | Implemented with collision-safe full-key comparison; focused cardinality fixtures remain pending |
-| `Exact` and `Shared` storage names | Partially implemented; Shared still carries the older `SelectedMatrixSummary` representation |
+| `Exact` and `Shared` storage names | Implemented; Shared carries only a representative and request-local `ValidatedSchemaId` |
 | One canonical domain-owned count | Implemented; `SelectionDomainId` is the sole owner |
 | One lossless n-ary `PrimitiveOperation` node | Not yet implemented; operation-specific expression constructors remain |
-| Schema-owned outer envelope through `ValidatedSchemaId` | Not yet implemented; the older summary object remains |
+| Schema-owned outer envelope through `ValidatedSchemaId` | Implemented at the storage boundary; lazy schema-query memoization remains pending |
 | Construction-time Exact-to-Shared join | Not yet complete |
 | Generic lifting rules for all matrix primitives | Not yet implemented; operation-specific branches remain |
 | Closed transfer-class registry and completeness inventory | Not yet implemented |

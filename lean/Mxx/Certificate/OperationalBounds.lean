@@ -1249,6 +1249,19 @@ private def matrixFactHasRelation (fact : OperationalMatrixFact) : Bool :=
   !fact.relations.isEmpty || fact.polynomial.any fun term =>
     term.product.factors.any fun factor => !factor.relations.isEmpty
 
+/-- Exact relations carried by a fact. Polynomial distribution may duplicate one relation onto
+multiple terms, so preservation compares membership in both directions rather than multiplicity.
+Identity, producer, target, and relation parameters remain part of the comparison. -/
+private def operationalRelationInventory
+    (fact : OperationalMatrixFact) : List OperationalMatrixRelation :=
+  fact.relations ++ fact.polynomial.flatMap fun term =>
+    term.product.factors.flatMap (·.relations)
+
+private def sameOperationalRelationInventory
+    (left right : List OperationalMatrixRelation) : Bool :=
+  left.all (fun relation => right.any (· == relation)) &&
+    right.all (fun relation => left.any (· == relation))
+
 private def boundaryLastPublicIdentity?
     (fact : OperationalMatrixFact) : Option PublicMatrixIdentity := do
   let term ← match fact.polynomial with | [term] => some term | _ => none
@@ -1285,8 +1298,10 @@ private def publicIdentityTemplateEqual : PublicMatrixIdentity → PublicMatrixI
         leftBase == rightBase && leftSmall == rightSmall && leftDigits == rightDigits
   | .loopInstance leftSlot _ leftSource, .loopInstance rightSlot _ rightSource =>
       leftSlot == rightSlot && publicIdentityTemplateEqual leftSource rightSource
-  | .selected _ leftSelection leftSource, .selected _ rightSelection rightSource =>
-      leftSelection == rightSelection && publicIdentityTemplateEqual leftSource rightSource
+  | .selected leftBinder leftSelection leftSource,
+      .selected rightBinder rightSelection rightSource =>
+      leftBinder == rightBinder && leftSelection == rightSelection &&
+        publicIdentityTemplateEqual leftSource rightSource
   | _, _ => false
 
 private def selectionBinderInPublicIdentity?
@@ -1320,6 +1335,10 @@ private def absorbedSelectionBinder?
 
 structure SelectedMatrixSummary where
   uniformSchema : Option UniformMatrixSchema
+  /-- Complete conservative value for the selected outer domain.  The structural representative
+  retains branch-local identities and nested choices; this fact owns the joined bounds, metadata,
+  canonical range, and relation schema used by transfer and endpoint evaluation. -/
+  conservativeFact : Option OperationalMatrixFact
   relationFree : Bool
   sharedLastPublicIdentity : Option PublicMatrixIdentity
   sharedFirstRelationPublicIdentity : Option PublicMatrixIdentity
@@ -1340,7 +1359,34 @@ inductive RelationRequirement where
   | none
   | uniform (schema : UniformMatrixSchema)
   | branchLocal (domain : SelectionDomainId)
+  | incompatible (left right : SelectionDomainId)
   | unknown
+  deriving BEq
+
+private def relationRequirementDiagnostic : RelationRequirement → String
+  | .none => "none"
+  | .uniform _ => "uniform"
+  | .branchLocal domain => s!"branch-local({domain.ordinal})"
+  | .incompatible left right => s!"incompatible({left.ordinal},{right.ordinal})"
+  | .unknown => "unknown"
+
+structure OperationalExprEvaluationStats where
+  evaluations : Nat := 0
+  memoHits : Nat := 0
+  memoMisses : Nat := 0
+  deriving BEq, DecidableEq, Inhabited, Repr
+
+private structure OperationalExprEvaluationState where
+  environment : Option ParamEnvironment := none
+  totalMemo : Array (Option Int) := #[]
+  noiseMemo : Array (Option Int) := #[]
+  schemaFactMemo : Array (Option OperationalMatrixFact) := #[]
+  schemaMemo : Array (Option ValidatedSchemaId) := #[]
+  relationMemo : Array (Option RelationRequirement) := #[]
+  totalStats : OperationalExprEvaluationStats := {}
+  noiseStats : OperationalExprEvaluationStats := {}
+  schemaStats : OperationalExprEvaluationStats := {}
+  relationStats : OperationalExprEvaluationStats := {}
   deriving BEq
 
 private def selectedMatrixSummary
@@ -1348,6 +1394,7 @@ private def selectedMatrixSummary
   match branches[0]? with
   | none => {
       uniformSchema := none
+      conservativeFact := none
       relationFree := false
       sharedLastPublicIdentity := none
       sharedFirstRelationPublicIdentity := none
@@ -1370,6 +1417,7 @@ private def selectedMatrixSummary
         relationIdentity else none
       {
         uniformSchema := if uniform then some schema else none
+        conservativeFact := if uniform then some first else none
         relationFree
         sharedLastPublicIdentity := sharedLast
         sharedFirstRelationPublicIdentity := sharedRelation
@@ -1379,6 +1427,7 @@ private inductive EnvelopeSummaryTransferOperation where
   | instantiationMap
   | recurrenceBoundShift
   | addSubtract
+  | multiplyOrdinary
   | multiplyRelation
   | tensor
   | concat
@@ -1396,17 +1445,26 @@ field from the post-operation representative; no pre-operation boundary template
 private def transferSelectedMatrixSummary
     (operation : EnvelopeSummaryTransferOperation)
     (sources : Array SelectedMatrixSummary)
-    (representative : OperationalMatrixFact) : Option SelectedMatrixSummary := do
-  if sources.isEmpty || sources.any (fun source => source.uniformSchema.isNone) then none
+    (conservativeOutput : OperationalMatrixFact) : Option SelectedMatrixSummary := do
+  if sources.isEmpty || sources.any (fun source =>
+      source.uniformSchema.isNone || source.conservativeFact.isNone) then
+    dbg_trace s!"selection-summary-invalid-source transfer={reprStr operation} source_count={sources.size}"
+    none
   let first ← sources[0]?
   let alignedOrigin := sources.all (·.selectionOrigin == first.selectionOrigin)
   let recomputed := {
-    selectedMatrixSummary #[representative] with selectionOrigin := first.selectionOrigin }
-  if recomputed.uniformSchema.isNone then none
+    selectedMatrixSummary #[conservativeOutput] with selectionOrigin := first.selectionOrigin }
+  if recomputed.uniformSchema.isNone || recomputed.conservativeFact.isNone then
+    dbg_trace s!"selection-summary-invalid-output transfer={reprStr operation}"
+    none
   match operation with
   | .instantiationMap | .recurrenceBoundShift | .transform | .scale |
       .preimage | .decomposition =>
       if sources.size == 1 then some recomputed else none
+  | .multiplyOrdinary =>
+      if sources.size <= 2 && alignedOrigin then
+        some recomputed
+      else none
   | .addSubtract | .multiplyRelation | .tensor =>
       if sources.size <= 2 && alignedOrigin then some recomputed else none
   | .concat | .bggGrouping =>
@@ -1506,55 +1564,15 @@ inductive OperationalFact where
   | familyPacked
       (elements : Array OperationalFact)
       (count : Nat)
-      (matrixSummary : Option SelectedMatrixSummary)
   | bytes (fact : OperationalBytesFact)
   | typedBlob (typeName : String)
   | unknown (wireType : WireTypeExpr)
   deriving BEq
 
-private def packedMatrixSummary? (elements : Array OperationalFact) : Option SelectedMatrixSummary := do
-  let matrices ← elements.mapM fun element => match element with
-    | .matrix matrix => some matrix
-    | _ => none
-  let summary := selectedMatrixSummary matrices
-  if summary.uniformSchema.isSome then some summary else none
-
 private def packedOperationalFamily
     (elements : Array OperationalFact)
     (count : Nat := elements.size) : OperationalFact :=
-  .familyPacked elements count (packedMatrixSummary? elements)
-
-private def packedMatrixEnvelopeIsComplete
-    (elements : Array OperationalFact)
-    (count : Nat)
-    (summary : Option SelectedMatrixSummary) : Bool :=
-  if elements.size == count then true
-  else if elements.size != 1 || count <= elements.size then false
-  else match summary, elements[0]? with
-    | some claimed, some element => match element with
-        | OperationalFact.matrix representative =>
-            claimed.uniformSchema.isSome && claimed == selectedMatrixSummary #[representative]
-        | _ => false
-    | _, _ => false
-
-/-- Rebuild a validated family after a registered deterministic map.  A full exact family is
-validated only when it is first packed.  Registered maps transfer the checked schema through the
-post-map representative; unregistered or incomplete transfers discard the summary fail-closed
-instead of rescanning every branch or retaining stale metadata. -/
-private def transferPackedOperationalFamily
-    (operation : EnvelopeSummaryTransferOperation)
-    (elements : Array OperationalFact)
-    (count : Nat)
-    (sourceSummary : Option SelectedMatrixSummary) : OperationalFact :=
-  match sourceSummary, elements[0]? with
-  | some source, some element =>
-      match element with
-      | OperationalFact.matrix representative =>
-          match transferSelectedMatrixSummary operation #[source] representative with
-          | some summary => .familyPacked elements count (some summary)
-          | none => .familyPacked elements count none
-      | _ => .familyPacked elements count none
-  | _, _ => .familyPacked elements count none
+  .familyPacked elements count
 
 abbrev OperationalState := Array OperationalFact
 
@@ -1644,6 +1662,11 @@ inductive PrimitiveOperationKind where
   | tensor
   | concat (axis : ConcatAxis)
   | transform (operation : OperationalFactorTransform)
+  | scale (scalar : IntExpr) (values : List Int)
+      (loopDomains : List OperationalParameterDomain)
+  | bggGrouping
+  | preimage
+  | decomposition
   deriving BEq
 
 structure PrimitiveOperation where
@@ -1680,6 +1703,21 @@ inductive OperationalMatrixExprNode where
       (branches : ChoiceStorage)
   deriving BEq
 
+private def primitiveOperationDiagnosticName : PrimitiveOperationKind → String
+  | .add false => "add"
+  | .add true => "subtract"
+  | .multiply (.matrixMultiplyRelation _) _ => "multiply-relation"
+  | .multiply _ _ => "multiply-ordinary"
+  | .tensor => "tensor"
+  | .concat .rows => "concat-rows"
+  | .concat .columns => "concat-columns"
+  | .concat .diagonal => "concat-diagonal"
+  | .transform _ => "transform"
+  | .scale .. => "scale"
+  | .bggGrouping => "bgg-grouping"
+  | .preimage => "preimage"
+  | .decomposition => "decomposition"
+
 structure OperationalMatrixExpr where
   matrixType : MatrixTypeExpr
   node : OperationalMatrixExprNode
@@ -1695,8 +1733,17 @@ structure OperationalExprArena where
   activeScope : Option ScopeTemplateKey := none
   activeNode : Option Nat := none
   relationRewriteCount : Nat := 0
+  choiceJoinCount : Nat := 0
+  domainComparisonCount : Nat := 0
+  exactBranchVisitCount : Nat := 0
+  /-- Shared alternatives are represented by one representative/schema pair.  This counter is
+  intentionally never incremented; exposing it makes accidental logical-domain traversal visible
+  in diagnostics and acceptance fixtures. -/
+  sharedLogicalBranchVisitCount : Nat := 0
+  cartesianPairVisitCount : Nat := 0
   transformCacheHits : Nat := 0
   transformCacheMisses : Nat := 0
+  evaluationState : OperationalExprEvaluationState := {}
   deriving BEq
 
 private def selectionDomainFingerprint (key : SelectionDomainKey) : UInt64 :=
@@ -1724,6 +1771,7 @@ private def OperationalExprArena.internSelectionDomain
 private def validatedSchemaFingerprint (schema : SelectedMatrixSummary) : UInt64 :=
   let seed := mixOperationalFingerprint 127 (if schema.relationFree then 1 else 0)
   let seed := mixOperationalFingerprint seed (if schema.uniformSchema.isSome then 1 else 0)
+  let seed := mixOperationalFingerprint seed (if schema.conservativeFact.isSome then 1 else 0)
   let seed := match schema.sharedLastPublicIdentity with
     | some identity => mixOperationalFingerprint seed (operationalPublicMatrixFingerprint identity)
     | none => mixOperationalFingerprint seed 131
@@ -1756,24 +1804,6 @@ private def OperationalExprArena.validatedSchema
   | some schema => pure schema
   | none => throw (.unsupportedOperationalExpr id.ordinal)
 
-structure OperationalExprEvaluationStats where
-  evaluations : Nat := 0
-  memoHits : Nat := 0
-  memoMisses : Nat := 0
-  deriving BEq, DecidableEq, Inhabited, Repr
-
-private structure OperationalExprEvaluationState where
-  totalMemo : Array (Option Int)
-  noiseMemo : Array (Option Int)
-  representativeMemo : Array (Option OperationalMatrixFact)
-  schemaFactMemo : Array (Option OperationalMatrixFact)
-  relationMemo : Array (Option RelationRequirement)
-  totalStats : OperationalExprEvaluationStats := {}
-  noiseStats : OperationalExprEvaluationStats := {}
-  schemaStats : OperationalExprEvaluationStats := {}
-  relationStats : OperationalExprEvaluationStats := {}
-  deriving BEq
-
 /-- Facts for one frozen scope and the append-only expression arena shared by its request.  Wire
 facts remain indexed by exact `(node, port)` locations; expression IDs are valid only in `arena`. -/
 structure OperationalScopeFacts where
@@ -1783,6 +1813,61 @@ structure OperationalScopeFacts where
 private def OperationalExprArena.get?
     (arena : OperationalExprArena) (id : OperationalExprId) : Option OperationalMatrixExpr :=
   arena.nodes[id]?
+
+private def operationalExprDiagnosticShape
+    (arena : OperationalExprArena)
+    (id : OperationalExprId) : String :=
+  match arena.get? id with
+  | none => s!"{id}:missing"
+  | some expression => match expression.node with
+      | .concrete fact =>
+          s!"{id}:concrete(relation={matrixFactHasRelation fact})"
+      | .primitive operation arguments =>
+          s!"{id}:primitive({primitiveOperationDiagnosticName operation.kind},arity={arguments.size},choice={expression.containsSelection})"
+      | .select domain (.exact branches) =>
+          s!"{id}:exact(domain={domain.ordinal},count={domain.count},stored={branches.size})"
+      | .select domain (.shared _ _) =>
+          s!"{id}:shared(domain={domain.ordinal},count={domain.count})"
+
+private def operationalExprDiagnosticNeighborhood
+    (arena : OperationalExprArena)
+    (id : OperationalExprId) : String :=
+  match arena.get? id with
+  | some { node := .primitive _ arguments, .. } =>
+      s!"root={operationalExprDiagnosticShape arena id}, arguments={reprStr (arguments.map
+        (operationalExprDiagnosticShape arena))}"
+  | _ => s!"root={operationalExprDiagnosticShape arena id}"
+
+private def operationalFactDiagnosticShape
+    (arena : OperationalExprArena) : OperationalFact → String
+  | .matrix fact => s!"matrix(relation={matrixFactHasRelation fact},first_relation={
+      (boundaryFirstRelationPublicIdentity? fact).isSome},last_public={
+      (boundaryLastPublicIdentity? fact).isSome})"
+  | .matrixExpr root => operationalExprDiagnosticNeighborhood arena root
+  | .familyUniform _ coordinate element count =>
+      s!"uniform(count={count},coordinate={reprStr coordinate},element={
+        operationalFactDiagnosticShape arena element})"
+  | .familyPacked elements count => s!"packed(count={count},stored={elements.size})"
+  | .integer _ => "integer"
+  | .boolean => "boolean"
+  | .real => "real"
+  | .trapdoor _ => "trapdoor"
+  | .bytes _ => "bytes"
+  | .typedBlob _ => "typed-blob"
+  | .unknown _ => "unknown"
+
+private def OperationalExprArena.invalidateEvaluationMemo
+    (arena : OperationalExprArena)
+    (id : OperationalExprId) : OperationalExprArena := {
+  arena with evaluationState := {
+    arena.evaluationState with
+    totalMemo := arena.evaluationState.totalMemo.set! id none
+    noiseMemo := arena.evaluationState.noiseMemo.set! id none
+    schemaFactMemo := arena.evaluationState.schemaFactMemo.set! id none
+    schemaMemo := arena.evaluationState.schemaMemo.set! id none
+    relationMemo := arena.evaluationState.relationMemo.set! id none
+  }
+}
 
 private def OperationalExprArena.push
     (arena : OperationalExprArena)
@@ -1798,9 +1883,18 @@ private def OperationalExprArena.push
     | .concrete _ => false
     | .primitive _ arguments => arguments.any childContainsSelection
     | .select .. => true
-  ({ arena with nodes := arena.nodes.push {
-      expression with containsSelection, ownerScope := arena.activeScope, ownerNode
-    } },
+  ({ arena with
+      nodes := arena.nodes.push {
+        expression with containsSelection, ownerScope := arena.activeScope, ownerNode }
+      evaluationState := {
+        arena.evaluationState with
+        totalMemo := arena.evaluationState.totalMemo.push none
+        noiseMemo := arena.evaluationState.noiseMemo.push none
+        schemaFactMemo := arena.evaluationState.schemaFactMemo.push none
+        schemaMemo := arena.evaluationState.schemaMemo.push none
+        relationMemo := arena.evaluationState.relationMemo.push none
+      }
+    },
     arena.nodes.size)
 
 private def OperationalExprArena.pushConcrete
@@ -1864,6 +1958,28 @@ private def OperationalExprArena.checkedType
       throw (.operationalExprTypeMismatch first id)
   pure firstExpr.matrixType
 
+private def validateSelectedMatrixSummary
+    (representative : OperationalExprId)
+    (summary : SelectedMatrixSummary) : Except OperationalError OperationalMatrixFact := do
+  let fact ← match summary.conservativeFact with
+    | some fact => pure fact
+    | none => throw (.unsupportedOperationalExpr representative)
+  if summary.uniformSchema != some (operationalUniformSchema fact) ||
+      summary.relationFree != !matrixFactHasRelation fact ||
+      summary.sharedLastPublicIdentity != boundaryLastPublicIdentity? fact ||
+      summary.sharedFirstRelationPublicIdentity !=
+        boundaryFirstRelationPublicIdentity? fact then
+    throw (.unsupportedOperationalExpr representative)
+  pure fact
+
+private def concreteRepresentativeFitsEnvelope
+    (representative envelope : OperationalMatrixFact) : Bool :=
+  if representative.matrixType != envelope.matrixType then false
+  else match representative.totalHardBound, envelope.totalHardBound with
+    | .closedInt (.constant representativeBound), .closedInt (.constant envelopeBound) =>
+        representativeBound <= envelopeBound
+    | representativeBound, envelopeBound => representativeBound == envelopeBound
+
 private def OperationalExprArena.pushCheckedSchemaEnvelope
     {α : Type} [SelectionIdentityLike α]
     (arena : OperationalExprArena)
@@ -1882,11 +1998,8 @@ private def OperationalExprArena.pushCheckedSchemaEnvelope
   let expression ← match arena.get? representative with
     | some expression => pure expression
     | none => throw (.invalidOperationalExprRef representative)
-  if summary.uniformSchema != some (operationalUniformSchema fact) ||
-      summary.relationFree != !matrixFactHasRelation fact ||
-      summary.sharedLastPublicIdentity != boundaryLastPublicIdentity? fact ||
-      summary.sharedFirstRelationPublicIdentity !=
-        boundaryFirstRelationPublicIdentity? fact then
+  let conservativeFact ← validateSelectedMatrixSummary representative summary
+  if conservativeFact != fact || expression.matrixType != fact.matrixType then
     throw (.unsupportedOperationalExpr representative)
   let (arena, domain) := arena.internSelectionDomain selection count
   let (arena, schema) := arena.internValidatedSchema summary
@@ -1905,6 +2018,10 @@ private def OperationalExprArena.pushSelect
   let selection := SelectionIdentityLike.identity selection
   match branches with
   | .exact values =>
+      match domainCount? with
+      | some count =>
+          if values.size != count then throw (.invalidCount 0 (Int.ofNat values.size))
+      | none => pure ()
       let first ← match values[0]? with
         | some first => pure first
         | none => throw (.invalidCount 0 0)
@@ -1924,15 +2041,14 @@ private def OperationalExprArena.pushSelect
       let summary := {
         summary with selectionOrigin := some (selectionDomainKind selection.index)
       }
-      if count = 0 || summary.uniformSchema.isNone then
+      if count = 0 then
         throw (.unsupportedOperationalExpr representative)
+      let conservativeFact ← validateSelectedMatrixSummary representative summary
+      if expression.matrixType != conservativeFact.matrixType then
+        throw (.operationalExprTypeMismatch representative representative)
       match expression.node with
-      | .concrete fact =>
-          if summary.uniformSchema != some (operationalUniformSchema fact) ||
-              summary.relationFree != !matrixFactHasRelation fact ||
-              summary.sharedLastPublicIdentity != boundaryLastPublicIdentity? fact ||
-              summary.sharedFirstRelationPublicIdentity !=
-                boundaryFirstRelationPublicIdentity? fact then
+      | .concrete representativeFact =>
+          if !concreteRepresentativeFitsEnvelope representativeFact conservativeFact then
             throw (.unsupportedOperationalExpr representative)
       | _ => pure ()
       let (arena, domain) := arena.internSelectionDomain selection count
@@ -1989,23 +2105,30 @@ private def OperationalExprArena.containsSelection
   | some expression => pure expression.containsSelection
   | none => throw (.invalidOperationalExprRef root)
 
-private def ChoiceStorage.staticBranch
-    (branches : ChoiceStorage)
-    (index : Nat) : Except OperationalError OperationalExprId :=
-  match branches with
-  | .exact values => match values[index]? with
-      | some value => pure value
-      | none => throw (.invalidCount 0 index)
-  | .shared representative _ => throw (.unsupportedOperationalExpr representative)
-
 private def OperationalExprEvaluationState.empty
     (arena : OperationalExprArena) : OperationalExprEvaluationState := {
   totalMemo := Array.replicate arena.nodes.size none
   noiseMemo := Array.replicate arena.nodes.size none
-  representativeMemo := Array.replicate arena.nodes.size none
   schemaFactMemo := Array.replicate arena.nodes.size none
+  schemaMemo := Array.replicate arena.nodes.size none
   relationMemo := Array.replicate arena.nodes.size none
 }
+
+private def OperationalExprEvaluationState.forEnvironment
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (state : OperationalExprEvaluationState) : OperationalExprEvaluationState :=
+  if state.environment == some environment then state else {
+    state with
+    environment := some environment
+    totalMemo := Array.replicate arena.nodes.size none
+    noiseMemo := Array.replicate arena.nodes.size none
+    schemaFactMemo := Array.replicate arena.nodes.size none
+    schemaMemo := Array.replicate arena.nodes.size none
+    totalStats := {}
+    noiseStats := {}
+    schemaStats := {}
+  }
 
 private def mergeRelationRequirements
     (left right : RelationRequirement) : RelationRequirement :=
@@ -2014,7 +2137,9 @@ private def mergeRelationRequirements
   | .uniform leftSchema, .uniform rightSchema =>
       if leftSchema == rightSchema then .uniform leftSchema else .unknown
   | .branchLocal leftDomain, .branchLocal rightDomain =>
-      if leftDomain == rightDomain then .branchLocal leftDomain else .unknown
+      if leftDomain == rightDomain then .branchLocal leftDomain
+      else .incompatible leftDomain rightDomain
+  | .incompatible left right, _ | _, .incompatible left right => .incompatible left right
   | .unknown, _ | _, .unknown | .uniform _, .branchLocal _ | .branchLocal _, .uniform _ => .unknown
 
 private def mergeRelationRequirementArray
@@ -2035,29 +2160,75 @@ private def validateSharedRelationCorrelation
       let rightExpression ← match expressions[1]? with
         | some expression => pure expression
         | none => throw (.unsupportedOutputArity operation.ownerNode expressions.size)
-      match leftExpression.node, rightExpression.node with
-      | .select leftDomain (.shared _ leftSchemaId),
-          .select rightDomain (.shared _ rightSchemaId) => do
-          if leftDomain != domain || rightDomain != domain then
-            throw (.incompatibleRelationDomains operation.ownerNode
-              leftDomain.ordinal rightDomain.ordinal)
-          let leftSchema ← arena.validatedSchema leftSchemaId
-          let rightSchema ← arena.validatedSchema rightSchemaId
-          let expectedOrigin := some domain.kind
-          if leftSchema.selectionOrigin != expectedOrigin ||
-              rightSchema.selectionOrigin != expectedOrigin then
-            throw (.incompatibleRelationDomains operation.ownerNode
-              leftDomain.ordinal rightDomain.ordinal)
-          let leftPublic ← match leftSchema.sharedLastPublicIdentity with
+      let expectedOrigin := some domain.kind
+      let leftPublic ← match leftExpression.node with
+        | .concrete fact => match boundaryLastPublicIdentity? fact with
             | some identity => pure identity
             | none => throw (.unknownRelationRequirement operation.ownerNode arguments[0]!)
-          let rightRelation ← match rightSchema.sharedFirstRelationPublicIdentity with
+        | .select leftDomain (.shared representative schemaId) => do
+            if leftDomain != domain then
+              throw (.incompatibleRelationDomains operation.ownerNode
+                leftDomain.ordinal domain.ordinal)
+            let schema ← arena.validatedSchema schemaId
+            if schema.selectionOrigin != expectedOrigin then
+              throw (.incompatibleRelationDomains operation.ownerNode
+                leftDomain.ordinal domain.ordinal)
+            let _ ← validateSelectedMatrixSummary representative schema
+            match schema.sharedLastPublicIdentity with
+            | some identity => pure identity
+            | none => throw (.unknownRelationRequirement operation.ownerNode arguments[0]!)
+        | _ => throw (.unknownRelationRequirement operation.ownerNode arguments[0]!)
+      let rightRelation ← match rightExpression.node with
+        | .concrete fact => match boundaryFirstRelationPublicIdentity? fact with
             | some identity => pure identity
             | none => throw (.unknownRelationRequirement operation.ownerNode arguments[1]!)
-          if !publicIdentityTemplateEqual leftPublic rightRelation then
-            throw (.incompatibleRelationDomains operation.ownerNode
-              leftDomain.ordinal rightDomain.ordinal)
-      | _, _ => pure ()
+        | .select rightDomain (.shared representative schemaId) => do
+            if rightDomain != domain then
+              throw (.incompatibleRelationDomains operation.ownerNode
+                domain.ordinal rightDomain.ordinal)
+            let schema ← arena.validatedSchema schemaId
+            if schema.selectionOrigin != expectedOrigin then
+              throw (.incompatibleRelationDomains operation.ownerNode
+                domain.ordinal rightDomain.ordinal)
+            let _ ← validateSelectedMatrixSummary representative schema
+            match schema.sharedFirstRelationPublicIdentity with
+            | some identity => pure identity
+            | none => throw (.unknownRelationRequirement operation.ownerNode arguments[1]!)
+        | _ => throw (.unknownRelationRequirement operation.ownerNode arguments[1]!)
+      if !publicIdentityTemplateEqual leftPublic rightRelation then
+        throw (.incompatibleRelationDomains operation.ownerNode domain.ordinal domain.ordinal)
+  | _ => pure ()
+
+/-- Before an Exact×Shared relation-consuming lift substitutes the Shared representative into
+each Exact lane, validate that every matching Shared operand is a checked parameterization of the
+same domain and exposes the boundary required at its operand position.  The subsequent per-lane
+check compares the representative boundary with the concrete Exact branch, so neither half alone
+is accepted as correlation evidence. -/
+private def validateMixedSharedRelationSchemas
+    (arena : OperationalExprArena)
+    (operation : PrimitiveOperation)
+    (domain : SelectionDomainId)
+    (arguments : Array OperationalExprId)
+    (expressions : Array OperationalMatrixExpr) : Except OperationalError Unit := do
+  match operation.kind with
+  | .multiply (.matrixMultiplyRelation _) _ =>
+      for (expression, index) in expressions.zipIdx do
+        match expression.node with
+        | .select candidate (.shared representative schemaId) =>
+            if candidate == domain then
+              let schema ← arena.validatedSchema schemaId
+              if schema.selectionOrigin != some domain.kind then
+                throw (.incompatibleRelationDomains operation.ownerNode
+                  candidate.ordinal domain.ordinal)
+              let _ ← validateSelectedMatrixSummary representative schema
+              if index == 0 then
+                if schema.sharedLastPublicIdentity.isNone then
+                  throw (.unknownRelationRequirement operation.ownerNode arguments[index]!)
+              else if index == 1 then
+                if schema.sharedFirstRelationPublicIdentity.isNone then
+                  throw (.unknownRelationRequirement operation.ownerNode arguments[index]!)
+            else pure ()
+        | _ => pure ()
   | _ => pure ()
 
 /-- Memoized structural query for the one selection domain required by a relation-bearing value.
@@ -2096,31 +2267,39 @@ private def relationRequirementWithFuel
           pure (requirements, state)
         let requirement ← match expression.node with
           | .concrete fact =>
-              if matrixFactHasRelation fact then
+              if (boundaryFirstRelationPublicIdentity? fact).isSome then
                 pure (.uniform (operationalUniformSchema fact))
               else pure .none
           | .select domain (.shared _ schemaId) => do
               let schema ← arena.validatedSchema schemaId
-              pure (if schema.relationFree then .none else .branchLocal domain)
+              pure (if schema.sharedFirstRelationPublicIdentity.isSome then
+                .branchLocal domain else .none)
           | .select domain (.exact branches) => do
               let (requirements, nextState) ← queryChildren state branches
               state := nextState
               if requirements.all (· == .none) then pure .none
-              else if requirements.any (· == .unknown) then pure .unknown
-              else pure (.branchLocal domain)
+              else match requirements.find? fun requirement => match requirement with
+                | .incompatible .. => true
+                | _ => false with
+              | some requirement => pure requirement
+              | none =>
+                if requirements.any (· == .unknown) then pure .unknown
+                else pure (.branchLocal domain)
           | .primitive operation arguments => do
               let (requirements, nextState) ← queryChildren state arguments
               state := nextState
               match operation.kind with
-              | .transform _ => pure (requirements[0]?.getD .unknown)
-              | .add _ | .tensor | .concat _ =>
+              | .transform _ | .scale .. | .preimage | .decomposition =>
+                  pure (requirements[0]?.getD .unknown)
+              | .add _ | .tensor | .concat _ | .bggGrouping =>
                   pure (mergeRelationRequirementArray requirements)
-              | .multiply (.matrixMultiplyRelation _) _ =>
-                  let left := requirements[0]?.getD .unknown
-                  let right := requirements[1]?.getD .unknown
-                  pure (if right == .none || right == .unknown then .unknown else left)
               | .multiply _ _ =>
-                  pure (if requirements.all (· == .none) then .none else .unknown)
+                  -- `relationRequirement` describes only a relation exposed at the first factor
+                  -- boundary, because that is the relation a later left multiplication can
+                  -- consume. Relations carried by later factors remain in the polynomial but do
+                  -- not make the complete product relation-consuming. After a concrete rewrite,
+                  -- the result therefore inherits only the left operand's exposed boundary.
+                  pure (requirements[0]?.getD .unknown)
         let relationMemo := state.relationMemo.set! id (some requirement)
         pure (requirement, { state with relationMemo })
 
@@ -2129,6 +2308,14 @@ private def relationRequirement
     (id : OperationalExprId)
     (state : OperationalExprEvaluationState) :=
   relationRequirementWithFuel arena id state (arena.nodes.size + 1)
+
+private def OperationalExprArena.relationRequirementCached
+    (arena : OperationalExprArena)
+    (id : OperationalExprId) :
+    Except OperationalError (RelationRequirement × OperationalExprArena) := do
+  let (requirement, evaluationState) ←
+    relationRequirement arena id arena.evaluationState
+  pure (requirement, { arena with evaluationState })
 
 /-- Transfer classes, rather than broad operation names, are the closed registry keys.  In
 particular relation-consuming multiplication cannot inherit the ordinary multiplication row. -/
@@ -2139,6 +2326,10 @@ inductive PrimitiveTransferClass where
   | tensor
   | concat
   | transform
+  | scale
+  | bggGrouping
+  | preimage
+  | decomposition
   deriving BEq, DecidableEq
 
 inductive CompositionalTransfer where
@@ -2154,6 +2345,10 @@ private def primitiveTransferClass (operation : PrimitiveOperation) : PrimitiveT
   | .tensor => .tensor
   | .concat _ => .concat
   | .transform _ => .transform
+  | .scale .. => .scale
+  | .bggGrouping => .bggGrouping
+  | .preimage => .preimage
+  | .decomposition => .decomposition
 
 /-- Closed registry used by generic choice lifting.  Every transfer-class constructor has exactly
 one equation, so adding a class makes this definition and its inventory fixture non-exhaustive. -/
@@ -2164,6 +2359,10 @@ private def compositionalTransferRegistry : PrimitiveTransferClass → Compositi
   | .tensor => .requiresConcreteStructure
   | .concat => .requiresConcreteStructure
   | .transform => .supported .transform
+  | .scale => .supported .scale
+  | .bggGrouping => .requiresConcreteStructure
+  | .preimage => .requiresConcreteStructure
+  | .decomposition => .requiresConcreteStructure
 
 /-- The operational checker has an explicit transfer category for every executable IR node.
 This definition and the exhaustive classifiers below are deliberately separate from the transfer
@@ -3200,11 +3399,22 @@ private def concreteMatrixProductMatches
       rightType.evaluate environment (.constant 0),
       outputType.evaluate environment (.constant 0) with
   | some left, some right, some output =>
-      left.modulus == right.modulus && left.modulus == output.modulus &&
-        left.ringDimension == right.ringDimension &&
-        left.ringDimension == output.ringDimension &&
-        left.columns == right.rows && output.rows == left.rows &&
-        output.columns == right.columns
+      let sameRing :=
+        left.modulus == right.modulus && left.modulus == output.modulus &&
+          left.ringDimension == right.ringDimension &&
+          left.ringDimension == output.ringDimension
+      let outputShapeMatches (rows columns : Nat) :=
+        output.rows == rows && output.columns == columns
+      sameRing &&
+        if left.columns == right.rows then
+          outputShapeMatches left.rows right.columns
+        else if left.rows == 1 && left.columns == 1 then
+          outputShapeMatches right.rows right.columns
+        else if right.rows == 1 && right.columns == 1 then
+          outputShapeMatches left.rows left.columns
+        else if left.rows == 1 && right.rows == 1 && left.columns == right.columns then
+          outputShapeMatches 1 left.columns
+        else false
   | _, _, _ => false
 
 private def equivalentRetypeOperationalFactor
@@ -3472,6 +3682,9 @@ private def OperationalExprArena.pushPrimitiveSelection
     (selection : α)
     (matrixType : MatrixTypeExpr)
     (environment : ParamEnvironment)
+    (deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
+      OperationalExprEvaluationState →
+      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
     (branches : Array OperationalExprId) :
     Except OperationalError (OperationalExprArena × OperationalExprId) := do
   let expectedParams ← match matrixType.evaluate environment (.constant 0) with
@@ -3495,22 +3708,42 @@ private def OperationalExprArena.pushPrimitiveSelection
   if branches.all (· == first) && firstExpression.matrixType == matrixType then
     pure (arena, first)
   else do
-    let concreteFacts? := branches.mapM fun branch => do
-      let expression ← arena.get? branch
-      match expression.node with
-      | .concrete fact => some fact
-      | _ => none
-    match concreteFacts? with
-    | some concreteFacts =>
-        match summarizePrimitiveSelectionFacts environment concreteFacts with
-        | .ok representativeFact =>
-            let summary := selectedMatrixSummary #[representativeFact]
-            let (arena, representative) := arena.pushConcrete representativeFact
-            arena.pushCheckedSchemaEnvelope selection branches.size representative summary
-              representativeFact
-        | .error _ =>
-            arena.pushSelect selection (.exact branches)
-    | none =>
+    let mut state := OperationalExprEvaluationState.forEnvironment
+      arena environment arena.evaluationState
+    let mut branchFacts : Array OperationalMatrixFact := #[]
+    let mut derivationFailed := false
+    for branch in branches do
+      if !derivationFailed then
+        match deriveSchema arena environment branch state with
+        | .ok (fact, nextState) =>
+            branchFacts := branchFacts.push fact
+            state := nextState
+        | .error _ => derivationFailed := true
+    let arena := { arena with evaluationState := state }
+    if derivationFailed then
+      arena.pushSelect selection (.exact branches)
+    else
+      let allBranchSummary := selectedMatrixSummary branchFacts
+      if !allBranchSummary.relationFree &&
+          allBranchSummary.sharedFirstRelationPublicIdentity.isNone then
+        -- Relation-bearing alternatives cannot be represented by one parameterized branch when
+        -- their rewrite boundary is branch-local. Keep the Exact alternatives until the generic
+        -- lifting engine consumes the relation on the matching domain.
+        arena.pushSelect selection (.exact branches)
+      else match summarizePrimitiveSelectionFacts environment branchFacts with
+      | .ok conservativeFact =>
+        -- The representative keeps the first branch's structure and identities.  Only the
+        -- validated schema owns the conservative all-branch join; replacing the representative
+        -- with that join would discard the relation structure later consumers must correlate.
+        let summary := {
+          selectedMatrixSummary #[conservativeFact] with
+          relationFree := allBranchSummary.relationFree
+          sharedLastPublicIdentity := allBranchSummary.sharedLastPublicIdentity
+          sharedFirstRelationPublicIdentity := allBranchSummary.sharedFirstRelationPublicIdentity
+        }
+        let arena := { arena with choiceJoinCount := arena.choiceJoinCount + 1 }
+        arena.pushCheckedSchemaEnvelope selection branches.size first summary conservativeFact
+      | .error _ =>
         arena.pushSelect selection (.exact branches)
 
 /-- Preserve a strict canonical coefficient range through ordinary matrix multiplication when
@@ -3627,35 +3860,42 @@ private partial def liftPrimitiveOperation
         | some choice => pure choice
         | none => return ← pushImmediate arena arguments
       let (_, firstDomain, _) := firstChoice
-      let relationDomain? ← match operation.kind with
+      let (relationDomain?, arena) ← match operation.kind with
         | .multiply (.matrixMultiplyRelation _) _ => do
             let right ← match arguments[1]? with
               | some right => pure right
               | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
-            let (requirement, _) ← relationRequirement arena right
-              (OperationalExprEvaluationState.empty arena)
+            let (requirement, arena) ← arena.relationRequirementCached right
             match requirement with
-            | .branchLocal domain => pure (some domain)
-            | .uniform _ | .none => pure none
+            | .branchLocal domain => pure (some domain, arena)
+            | .uniform _ | .none => pure (none, arena)
+            | .incompatible left right =>
+                throw (.incompatibleRelationDomains operation.ownerNode left.ordinal right.ordinal)
             | .unknown => throw (.unknownRelationRequirement operation.ownerNode right)
-        | _ => pure none
+        | _ => pure (none, arena)
       let domain := relationDomain?.getD firstDomain
+      let arena := { arena with
+        domainComparisonCount := arena.domainComparisonCount + choices.size }
       if relationDomain?.isSome && !choices.any (fun (_, candidate, _) => candidate == domain) then
-        return ← pushImmediate arena arguments
+        throw (.incompatibleRelationDomains operation.ownerNode domain.ordinal firstDomain.ordinal)
+      let matching := choices.filter fun (_, candidate, _) => candidate == domain
+      let hasExact := matching.any fun (_, _, storage) => match storage with
+        | .exact _ => true
+        | .shared .. => false
       let hasIndependentDomain := choices.any fun (_, candidate, _) => candidate != domain
       if hasIndependentDomain then
         match compositionalTransferRegistry (primitiveTransferClass operation) with
         | .supported _ => return ← pushImmediate arena arguments
         | .requiresConcreteStructure =>
-            match operation.kind, relationDomain? with
-            | .multiply (.matrixMultiplyRelation _) _, some _ => pure ()
-            | _, _ => return ← pushImmediate arena arguments
-      let matching := choices.filter fun (_, candidate, _) => candidate == domain
-      let hasExact := matching.any fun (_, _, storage) => match storage with
-        | .exact _ => true
-        | .shared .. => false
+            let liftsOneExactDomain := match operation.kind with
+              | .concat _ | .bggGrouping => hasExact
+              | _ => false
+            if !liftsOneExactDomain && relationDomain?.isNone then
+              return ← pushImmediate arena arguments
       if hasExact then
-        let mut arena := arena
+        validateMixedSharedRelationSchemas arena operation domain arguments expressions
+        let mut arena := { arena with
+          exactBranchVisitCount := arena.exactBranchVisitCount + domain.count }
         let mut outputs : Array OperationalExprId := #[]
         for branch in [:domain.count] do
           let branchArguments ← arguments.zip expressions |>.mapM fun (argument, expression) =>
@@ -3668,10 +3908,31 @@ private partial def liftPrimitiveOperation
             | .select candidate (.shared representative _) =>
                 if candidate == domain then pure representative else pure argument
             | _ => pure argument
-          let (nextArena, output) ← pushImmediate arena branchArguments
+          let branchExpressions ← branchArguments.mapM fun argument => match arena.get? argument with
+            | some expression => pure expression
+            | none => throw (.invalidOperationalExprRef argument)
+          validateSharedRelationCorrelation arena operation domain branchArguments branchExpressions
+          let (nextArena, output) ← liftPrimitiveOperation operation summaryOperation
+            concreteTransfer evaluateRepresentative arena branchArguments _fuel
           arena := nextArena
+          match operation.kind with
+          | .multiply (.matrixMultiplyRelation _) _ =>
+              let leftBranch ← match branchArguments[0]? with
+                | some value => pure value
+                | none => throw (.unsupportedOutputArity operation.ownerNode branchArguments.size)
+              let (leftRequirement, nextArena) ← arena.relationRequirementCached leftBranch
+              arena := nextArena
+              let (outputRequirement, nextArena) ← arena.relationRequirementCached output
+              arena := nextArena
+              if leftRequirement == .unknown ||
+                  (match leftRequirement with | .incompatible .. => true | _ => false) ||
+                  outputRequirement != leftRequirement then
+                dbg_trace s!"relation-consumption-postcondition node={operation.ownerNode} branch={branch} left={relationRequirementDiagnostic leftRequirement} output={relationRequirementDiagnostic outputRequirement} output_expr={output}"
+                throw (.unknownRelationRequirement operation.ownerNode output)
+          | _ => pure ()
           outputs := outputs.push output
-        arena.pushPrimitiveSelection domain operation.outputType operation.parameterEnvironment outputs
+        arena.pushPrimitiveSelection domain operation.outputType operation.parameterEnvironment
+          evaluateRepresentative outputs
       else
         validateSharedRelationCorrelation arena operation domain arguments expressions
         let representativeArguments := arguments.zip expressions |>.map fun (argument, expression) =>
@@ -3679,17 +3940,54 @@ private partial def liftPrimitiveOperation
           | .select candidate (.shared representative _) =>
               if candidate == domain then representative else argument
           | _ => argument
-        let (arena, output) ← pushImmediate arena representativeArguments
-        let state := OperationalExprEvaluationState.empty arena
-        let (outputFact, _) ← evaluateRepresentative arena operation.parameterEnvironment output state
+        let (arena, output) ← liftPrimitiveOperation operation summaryOperation concreteTransfer
+          evaluateRepresentative arena representativeArguments _fuel
+        let arena ← match operation.kind with
+        | .multiply (.matrixMultiplyRelation _) _ =>
+            let leftRepresentative ← match representativeArguments[0]? with
+              | some value => pure value
+              | none => throw (.unsupportedOutputArity operation.ownerNode representativeArguments.size)
+            let (leftRequirement, arena) ← arena.relationRequirementCached leftRepresentative
+            let (outputRequirement, arena) ← arena.relationRequirementCached output
+            if leftRequirement == .unknown ||
+                (match leftRequirement with | .incompatible .. => true | _ => false) ||
+                outputRequirement != leftRequirement then
+              throw (.unknownRelationRequirement operation.ownerNode output)
+            pure arena
+        | _ => pure arena
         let schemaIds := matching.filterMap fun (_, _, storage) => match storage with
           | .shared _ schema => some schema
           | .exact _ => none
         let summaries ← schemaIds.mapM arena.validatedSchema
-        let outputSummary ← match transferSelectedMatrixSummary summaryOperation summaries outputFact with
+        let mut state := OperationalExprEvaluationState.forEnvironment
+          arena operation.parameterEnvironment arena.evaluationState
+        let mut conservativeArguments : Array OperationalMatrixFact := #[]
+        for (argument, expression) in arguments.zip expressions do
+          let (fact, nextState) ← match expression.node with
+            | .select candidate (.shared _ schemaId) =>
+                if candidate == domain then do
+                  let summary ← arena.validatedSchema schemaId
+                  pure (← validateSelectedMatrixSummary argument summary, state)
+                else evaluateRepresentative arena operation.parameterEnvironment argument state
+            | _ =>
+                evaluateRepresentative arena operation.parameterEnvironment argument state
+          conservativeArguments := conservativeArguments.push fact
+          state := nextState
+        let arena := { arena with evaluationState := state }
+        let conservativeOutput ← concreteTransfer conservativeArguments
+        if summaryOperation == .multiplyOrdinary then
+          let inputRelations := conservativeArguments.toList.flatMap operationalRelationInventory
+          let outputRelations := operationalRelationInventory conservativeOutput
+          if !sameOperationalRelationInventory inputRelations outputRelations then
+            dbg_trace s!"ordinary-shared-relation-change node={operation.ownerNode} input_relations={inputRelations.length} output_relations={outputRelations.length}"
+            throw (.unknownRelationRequirement operation.ownerNode output)
+        let outputSummary ← match transferSelectedMatrixSummary
+            summaryOperation summaries conservativeOutput with
           | some summary => pure summary
-          | none => throw (.unsupportedOperationalExpr output)
-        arena.pushCheckedSchemaEnvelope domain domain.count output outputSummary outputFact
+          | none =>
+              dbg_trace s!"selection-summary-transfer-failure node={operation.ownerNode} transfer={reprStr summaryOperation} output={output} source_count={summaries.size}"
+              throw (.unsupportedOperationalExpr output)
+        arena.pushCheckedSchemaEnvelope domain domain.count output outputSummary conservativeOutput
 
 private def addOperationalExprIds
     (nodeIndex outputPort : Nat)
@@ -3751,8 +4049,32 @@ private def multiplyOperationalExprIds
     (arena : OperationalExprArena)
     (left right : OperationalExprId)
     (fuel : Nat) : Except OperationalError (OperationalExprArena × OperationalExprId) := do
+  let (rightRequirement, arena) ← arena.relationRequirementCached right
+  let effectiveRule ← match rule, rightRequirement with
+    | .matrixMultiplyRelation declaredRight, _ =>
+        pure (.matrixMultiplyRelation declaredRight)
+    | _, .none => pure rule
+    | _, .uniform _ | _, .branchLocal _ =>
+        -- The concrete multiply transfer always consumes a matching relation on its right
+        -- operand. Classify that behavior from the structural relation query as required by D4,
+        -- rather than relying on the derivation rule to duplicate the same information.
+        pure (.matrixMultiplyRelation rightWire)
+    | _, .incompatible leftDomain rightDomain =>
+        throw (.incompatibleRelationDomains nodeIndex leftDomain.ordinal rightDomain.ordinal)
+    | _, .unknown =>
+        let fresh := relationRequirement arena right (OperationalExprEvaluationState.empty arena)
+        let freshResult := match fresh with
+          | .ok (.none, _) => "none"
+          | .ok (.uniform _, _) => "uniform"
+          | .ok (.branchLocal domain, _) => s!"branch-local({domain.ordinal})"
+          | .ok (.incompatible leftDomain rightDomain, _) =>
+              s!"incompatible({leftDomain.ordinal},{rightDomain.ordinal})"
+          | .ok (.unknown, _) => "unknown"
+          | .error error => s!"error({reprStr error})"
+        dbg_trace s!"unknown-relation-fresh-check node={nodeIndex} expression={right} result={freshResult}"
+        throw (.unknownRelationRequirement nodeIndex right)
   let operation : PrimitiveOperation := {
-    kind := .multiply rule rightWire
+    kind := .multiply effectiveRule rightWire
     outputType := matrixType
     ownerScope := arena.activeScope
     ownerNode := nodeIndex
@@ -3767,11 +4089,11 @@ private def multiplyOperationalExprIds
       | some fact => pure fact
       | none => throw (.unsupportedOutputArity nodeIndex arguments.size)
     if arguments.size != 2 then throw (.unsupportedOutputArity nodeIndex arguments.size)
-    multiplyConcreteMatrixFacts nodeIndex outputPort matrixType rule rightWire environment
+    multiplyConcreteMatrixFacts nodeIndex outputPort matrixType effectiveRule rightWire environment
       leftFact rightFact
-  let summaryOperation := match rule with
+  let summaryOperation := match effectiveRule with
     | .matrixMultiplyRelation _ => EnvelopeSummaryTransferOperation.multiplyRelation
-    | _ => .unregistered
+    | _ => .multiplyOrdinary
   liftPrimitiveOperation operation summaryOperation concreteTransfer evaluateRepresentative arena
     #[left, right] fuel
 
@@ -3981,15 +4303,13 @@ private def mapOperationalExprWithFuelCached
           let (arena, memo, mapped) ← mapOperationalExprWithFuelCached
             summaryOperation mapFact mapSelection ownerFilter structuralSummaryMap
               arena memo representative fuel
-          let mappedSummary ← match arena.get? mapped with
-            | some { node := .concrete mappedFact, .. } =>
-                match transferSelectedMatrixSummary summaryOperation #[summary] mappedFact with
-                | some value => pure value
-                | none => throw (.unsupportedOperationalExpr representative)
-            | some _ => match structuralSummaryMap with
-                | some mapSummary => pure (mapSummary summary)
-                | none => throw (.unsupportedOperationalExpr representative)
-            | none => throw (.invalidOperationalExprRef mapped)
+          let conservativeFact ← validateSelectedMatrixSummary representative summary
+          let mappedConservativeFact ← mapFact conservativeFact
+          let mappedSummary ← match transferSelectedMatrixSummary
+              summaryOperation #[summary] mappedConservativeFact with
+            | some value =>
+                pure (structuralSummaryMap.map (fun mapSummary => mapSummary value) |>.getD value)
+            | none => throw (.unsupportedOperationalExpr representative)
           let mappedSelection := mapSelection selection.identity
           if mapped == representative && mappedSelection == selection.identity &&
               mappedSummary == summary then
@@ -4057,27 +4377,41 @@ private def isLoopTemplateSelection
     | _ => false
   containsBase origin
 
-private def loopTemplateStaticRoot
-    (arena : OperationalExprArena)
+private partial def loopTemplateStaticRoot
     (binder : FamilyTemplateBinder)
-    (root : OperationalExprId)
-    (lane : Nat) : Except OperationalError OperationalExprId := do
-  let expression ← match arena.get? root with
-    | some expression => pure expression
-    | none => throw (.invalidOperationalExprRef root)
-  match expression.node with
-  | .select selection (.exact branches) =>
-      if isLoopTemplateSelection binder selection.index then
-        match branches[lane]? with
-        | some branch => pure branch
-        | none => throw (.invalidCount binder.producerNode lane)
-      else pure root
-  | .select selection (.shared representative _) =>
-      if isLoopTemplateSelection binder selection.index then
-        if lane < selection.count then pure representative
-        else throw (.invalidCount binder.producerNode lane)
-      else pure root
-  | _ => pure root
+    (lane : Nat) : OperationalExprArena → OperationalExprId → Nat →
+    Except OperationalError (OperationalExprArena × OperationalExprId)
+  | _, root, 0 => throw (.unsupportedOperationalExpr root)
+  | arena, root, fuel + 1 => do
+      let expression ← match arena.get? root with
+        | some expression => pure expression
+        | none => throw (.invalidOperationalExprRef root)
+      match expression.node with
+      | .select selection (.exact branches) =>
+          if isLoopTemplateSelection binder selection.index then
+            match branches[lane]? with
+            | some branch => pure (arena, branch)
+            | none => throw (.invalidCount binder.producerNode lane)
+          else pure (arena, root)
+      | .select selection (.shared _ _) =>
+          if isLoopTemplateSelection binder selection.index && lane >= selection.count then
+            throw (.invalidCount binder.producerNode lane)
+          else
+            -- Shared deliberately has no recoverable lane array. Keep the validated pair intact;
+            -- the following instantiation map specializes its representative and schema together.
+            pure (arena, root)
+      | .primitive operation arguments =>
+          let mut arena := arena
+          let mut mapped : Array OperationalExprId := #[]
+          for argument in arguments do
+            let (nextArena, nextArgument) ←
+              loopTemplateStaticRoot binder lane arena argument fuel
+            arena := nextArena
+            mapped := mapped.push nextArgument
+          if mapped == arguments then pure (arena, root)
+          else pure (arena.pushPrimitive operation.ownerNode operation.outputPort
+            operation.outputType operation.parameterEnvironment operation.kind mapped)
+      | .concrete _ => pure (arena, root)
 
 private def parameterScalarPolynomial
     (environment : ParamEnvironment)
@@ -4404,40 +4738,27 @@ private def scaleOperationalExprId
     (loopDomains : List OperationalParameterDomain)
     (evaluateRepresentative : OperationalExprArena → ParamEnvironment → OperationalExprId →
       OperationalExprEvaluationState →
-      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState)) :
-    OperationalExprArena → OperationalExprId → Nat →
-    Except OperationalError (OperationalExprArena × OperationalExprId)
-  | _, root, 0 => throw (.unsupportedOperationalExpr root)
-  | arena, root, fuel + 1 => do
-      if !scalarValues.isEmpty && scalarValues.all (· == 1) then return (arena, root)
-      let expression ← match arena.get? root with
-        | some value => pure value
-        | none => throw (.invalidOperationalExprRef root)
-      match expression.node with
-      | .concrete input =>
-          let output ← scaleConcreteMatrixFact nodeIndex outputPort matrixType scalar scalarValues
-            environment loopDomains input
-          pure (arena.pushConcrete output)
-      | .select selection (.exact branches) =>
-          let mut arena := arena
-          let mut outputs : Array OperationalExprId := #[]
-          for branch in branches do
-            let (nextArena, output) ← scaleOperationalExprId nodeIndex outputPort matrixType scalar
-              scalarValues environment loopDomains evaluateRepresentative arena branch fuel
-            arena := nextArena
-            outputs := outputs.push output
-          arena.pushPrimitiveSelection selection matrixType environment outputs
-      | .select selection (.shared representative summary) =>
-          let summary ← arena.validatedSchema summary
-          let (arena, output) ← scaleOperationalExprId nodeIndex outputPort matrixType scalar
-            scalarValues environment loopDomains evaluateRepresentative arena representative fuel
-          let state := OperationalExprEvaluationState.empty arena
-          let (outputFact, _) ← evaluateRepresentative arena environment output state
-          let outputSummary ← match transferSelectedMatrixSummary .scale #[summary] outputFact with
-            | some value => pure value
-            | none => throw (.unsupportedOperationalExpr representative)
-          arena.pushCheckedSchemaEnvelope selection selection.count output outputSummary outputFact
-      | _ => throw (.unsupportedOperationalExpr root)
+      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
+    (arena : OperationalExprArena)
+    (root : OperationalExprId)
+    (fuel : Nat) : Except OperationalError (OperationalExprArena × OperationalExprId) := do
+  if !scalarValues.isEmpty && scalarValues.all (· == 1) then return (arena, root)
+  let operation : PrimitiveOperation := {
+    kind := .scale scalar scalarValues loopDomains
+    outputType := matrixType
+    ownerScope := arena.activeScope
+    ownerNode := nodeIndex
+    outputPort
+    parameterEnvironment := environment
+  }
+  let concreteTransfer (arguments : Array OperationalMatrixFact) := do
+    let input ← match arguments[0]? with
+      | some fact => pure fact
+      | none => throw (.unsupportedOutputArity nodeIndex arguments.size)
+    if arguments.size != 1 then throw (.unsupportedOutputArity nodeIndex arguments.size)
+    scaleConcreteMatrixFact nodeIndex outputPort matrixType scalar scalarValues environment
+      loopDomains input
+  liftPrimitiveOperation operation .scale concreteTransfer evaluateRepresentative arena #[root] fuel
 
 private def scaleOperationalExprFact
     (nodeIndex outputPort : Nat)
@@ -4538,99 +4859,43 @@ private def groupProtocolBooleanSignalFact : OperationalFact → Except Operatio
         "protocol-boolean-signal-grouping")
 
 private def groupBggEncodingExprIds
-    (environment : ParamEnvironment) :
-    OperationalExprArena → OperationalExprId → OperationalExprId → OperationalExprId → Nat →
-    Except OperationalError (OperationalExprArena × OperationalExprId)
-  | _, vector, _, _, 0 => throw (.unsupportedOperationalExpr vector)
-  | arena, vector, publicKey, plaintext, fuel + 1 => do
-      let vectorExpr ← match arena.get? vector with
-        | some expression => pure expression
-        | none => throw (.invalidOperationalExprRef vector)
-      let publicKeyExpr ← match arena.get? publicKey with
-        | some expression => pure expression
-        | none => throw (.invalidOperationalExprRef publicKey)
-      let plaintextExpr ← match arena.get? plaintext with
-        | some expression => pure expression
-        | none => throw (.invalidOperationalExprRef plaintext)
-      match vectorExpr.node, publicKeyExpr.node, plaintextExpr.node with
-      | .concrete vectorFact, .concrete publicKeyFact, .concrete plaintextFact =>
-          let grouped ← groupBggEncodingSignal vectorFact publicKeyFact plaintextFact
-            |>.mapError (.flat vectorFact.subject.node)
-          pure (arena.pushConcrete grouped)
-      | _, _, _ =>
-          let selected := [vectorExpr.node, publicKeyExpr.node, plaintextExpr.node].filterMap
-            fun node => match node with
-              | .select selection branches => some (selection, branches)
-              | _ => none
-          let (selection, branches) ← match selected.head? with
-            | some selected => pure selected
-            | none => throw (.unsupportedOperationalExpr vector)
-          if selected.any fun candidate => candidate.1 != selection then
-            throw (.operationalExprTypeMismatch vector publicKey)
-          let branchFor
-              (node : OperationalMatrixExprNode)
-              (ordinary : OperationalExprId)
-              (index : Nat) : Except OperationalError OperationalExprId :=
-            match node with
-            | .concrete _ => pure ordinary
-            | .select candidate (.exact values) =>
-                if candidate != selection then
-                  throw (.operationalExprTypeMismatch ordinary vector)
-                else match values[index]? with
-                  | some value => pure value
-                  | none => throw (.operationalExprTypeMismatch ordinary vector)
-            | _ => throw (.unsupportedOperationalExpr ordinary)
-          match branches with
-          | .exact values =>
-              if values.isEmpty then throw (.invalidCount 0 0)
-              let selectedCountsAgree := selected.all fun candidate => match candidate.2 with
-                | .exact candidates => candidates.size == values.size
-                | .shared .. => false
-              if !selectedCountsAgree then
-                throw (.operationalExprTypeMismatch vector publicKey)
-              let mut arena := arena
-              let mut outputs : Array OperationalExprId := #[]
-              for branch in [:values.size] do
-                let vectorBranch ← branchFor vectorExpr.node vector branch
-                let publicKeyBranch ← branchFor publicKeyExpr.node publicKey branch
-                let plaintextBranch ← branchFor plaintextExpr.node plaintext branch
-                let (nextArena, output) ← groupBggEncodingExprIds environment arena vectorBranch
-                  publicKeyBranch plaintextBranch fuel
-                arena := nextArena
-                outputs := outputs.push output
-              arena.pushSelect selection (.exact outputs)
-          | .shared representative _ =>
-              let sourceSummaryIds := selected.filterMap fun candidate => match candidate.2 with
-                | .shared _ candidateSummary => some candidateSummary
-                | .exact _ => none
-              let sourceSummaries ← sourceSummaryIds.mapM arena.validatedSchema
-              if sourceSummaries.length != selected.length then
-                throw (.unsupportedOperationalExpr representative)
-              let representativeFor
-                  (node : OperationalMatrixExprNode)
-                  (ordinary : OperationalExprId) : Except OperationalError OperationalExprId :=
-                match node with
-                | .concrete _ => pure ordinary
-                | .select candidateSelection
-                    (.shared candidateRepresentative _) =>
-                    if candidateSelection != selection then
-                      throw (.operationalExprTypeMismatch ordinary vector)
-                    else pure candidateRepresentative
-                | _ => throw (.unsupportedOperationalExpr ordinary)
-              let vectorRepresentative ← representativeFor vectorExpr.node vector
-              let publicKeyRepresentative ← representativeFor publicKeyExpr.node publicKey
-              let plaintextRepresentative ← representativeFor plaintextExpr.node plaintext
-              let (arena, output) ← groupBggEncodingExprIds environment arena vectorRepresentative
-                publicKeyRepresentative plaintextRepresentative fuel
-              let outputFact ← arena.concreteFact output
-              let outputSummary ← match transferSelectedMatrixSummary .bggGrouping
-                  sourceSummaries.toArray outputFact with
-                | some outputSummary => pure outputSummary
-                | none => throw (.unsupportedOperationalExpr representative)
-              arena.pushCheckedSchemaEnvelope selection selection.count output outputSummary outputFact
+    (environment : ParamEnvironment)
+    (deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
+      OperationalExprEvaluationState →
+      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
+    (arena : OperationalExprArena)
+    (vector publicKey plaintext : OperationalExprId)
+    (fuel : Nat) : Except OperationalError (OperationalExprArena × OperationalExprId) := do
+  let vectorType ← arena.checkedType vector #[]
+  let operation : PrimitiveOperation := {
+    kind := .bggGrouping
+    outputType := vectorType
+    ownerScope := arena.activeScope
+    ownerNode := (arena.get? vector).bind (·.ownerNode) |>.getD 0
+    outputPort := 0
+    parameterEnvironment := environment
+  }
+  let concreteTransfer (arguments : Array OperationalMatrixFact) := do
+    if arguments.size != 3 then
+      throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+    let vector ← match arguments[0]? with
+      | some value => pure value
+      | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+    let publicKey ← match arguments[1]? with
+      | some value => pure value
+      | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+    let plaintext ← match arguments[2]? with
+      | some value => pure value
+      | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+    groupBggEncodingSignal vector publicKey plaintext |>.mapError (.flat operation.ownerNode)
+  liftPrimitiveOperation operation .bggGrouping concreteTransfer deriveSchema arena
+    #[vector, publicKey, plaintext] fuel
 
 private partial def groupBggEncodingOperationalFacts
     (environment : ParamEnvironment)
+    (deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
+      OperationalExprEvaluationState →
+      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
     (arena : OperationalExprArena) :
     OperationalFact → OperationalFact → OperationalFact →
     Except OperationalError (OperationalExprArena × OperationalFact)
@@ -4639,15 +4904,15 @@ private partial def groupBggEncodingOperationalFacts
       .familyUniform _ _ plaintext plaintextCount => do
       if vectorCount != publicCount || vectorCount != plaintextCount then
         throw (.invalidDerivationAttachment "mxx-bgg" "encoding-family-pairing")
-      let (arena, grouped) ← groupBggEncodingOperationalFacts environment arena
+      let (arena, grouped) ← groupBggEncodingOperationalFacts environment deriveSchema arena
         vector publicKey plaintext
       pure (arena, .familyUniform binder coordinate grouped vectorCount)
   | vector, publicKey, plaintext => do
       let (arena, vector) ← arena.pushMatrixFact vector
       let (arena, publicKey) ← arena.pushMatrixFact publicKey
       let (arena, plaintext) ← arena.pushMatrixFact plaintext
-      let (arena, grouped) ← groupBggEncodingExprIds environment arena vector publicKey plaintext
-        (arena.nodes.size + 1)
+      let (arena, grouped) ← groupBggEncodingExprIds environment deriveSchema arena vector
+        publicKey plaintext (arena.nodes.size + 1)
       pure (arena, .matrixExpr grouped)
 
 private def derivationAttachmentRole
@@ -4738,6 +5003,9 @@ private def applyDerivationAttachment
     (node : Nat)
     (attachment : DerivationAttachment)
     (environment : ParamEnvironment)
+    (deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
+      OperationalExprEvaluationState →
+      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
     (facts : OperationalScopeFacts) : Except OperationalError OperationalScopeFacts := do
   if attachment.ownerNamespace == "mxx-bgg" &&
       attachment.ruleName == "encoding-family-pairing" then
@@ -4747,7 +5015,7 @@ private def applyDerivationAttachment
     let vector ← lookupFact node facts vectorWire
     let publicKey ← lookupFact node facts publicKeyWire
     let plaintext ← lookupFact node facts plaintextWire
-    let (arena, grouped) ← groupBggEncodingOperationalFacts environment facts.arena
+    let (arena, grouped) ← groupBggEncodingOperationalFacts environment deriveSchema facts.arena
       vector publicKey plaintext
     replaceOperationalFact node { facts with arena } vectorWire grouped
   else if attachment.ownerNamespace == "mxx-correctness" &&
@@ -4790,9 +5058,12 @@ private def applyPreparedDerivationAttachments
     (node : Nat)
     (attachments : Array DerivationAttachment)
     (environment : ParamEnvironment)
+    (deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
+      OperationalExprEvaluationState →
+      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
     (facts : OperationalScopeFacts) : Except OperationalError OperationalScopeFacts :=
   attachments.foldlM (init := facts) fun current attachment =>
-    applyDerivationAttachment node attachment environment current
+    applyDerivationAttachment node attachment environment deriveSchema current
 
 def availableRelation
     (node : Nat)
@@ -4839,9 +5110,9 @@ def rebindSubject (subject : WireRef) : OperationalFact → Except OperationalEr
   | .bytes fact => pure (.bytes { fact with subject })
   | .familyUniform binder coordinate element count =>
       return .familyUniform binder coordinate (← rebindSubject subject element) count
-  | .familyPacked elements count summary => do
+  | .familyPacked elements count => do
       let elements ← elements.mapM (rebindSubject subject)
-      return transferPackedOperationalFamily .instantiationMap elements count summary
+      pure (.familyPacked elements count)
   | fact => pure fact
 
 private def namespaceFreshOrigin
@@ -4870,17 +5141,6 @@ private def namespaceFreshPublicIdentity
       .selected binder selection (namespaceFreshPublicIdentity scope wire source)
   | .loopInstance slot index source =>
       .loopInstance slot index (namespaceFreshPublicIdentity scope wire source)
-
-private def namespaceFreshSelectedMatrixSummary
-    (scope : ScopeTemplateKey)
-    (wire : WireRef)
-    (summary : SelectedMatrixSummary) : SelectedMatrixSummary := {
-  summary with
-  sharedLastPublicIdentity := summary.sharedLastPublicIdentity.map
-    (namespaceFreshPublicIdentity scope wire)
-  sharedFirstRelationPublicIdentity := summary.sharedFirstRelationPublicIdentity.map
-    (namespaceFreshPublicIdentity scope wire)
-}
 
 private def mapOperationalPrimitiveIdentity
     (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
@@ -5036,9 +5296,8 @@ private partial def shiftFactPreviousDepth : OperationalFact → OperationalFact
     }
   | .familyUniform binder coordinate element count =>
       .familyUniform binder coordinate (shiftFactPreviousDepth element) count
-  | .familyPacked elements count summary =>
-      transferPackedOperationalFamily .recurrenceBoundShift
-        (elements.map shiftFactPreviousDepth) count summary
+  | .familyPacked elements count =>
+      .familyPacked (elements.map shiftFactPreviousDepth) count
   | fact => fact
 
 private def namespaceFreshValueOrigin
@@ -5100,6 +5359,16 @@ partial def namespaceFreshOutput
     }
   | fact => fact
 
+private def namespaceFreshSelectedMatrixSummary
+    (scope : ScopeTemplateKey)
+    (wire : WireRef)
+    (summary : SelectedMatrixSummary) : Option SelectedMatrixSummary := do
+  let conservative ← summary.conservativeFact
+  let mapped ← match namespaceFreshOutput scope wire (.matrix conservative) with
+    | .matrix mapped => some mapped
+    | _ => none
+  transferSelectedMatrixSummary .instantiationMap #[summary] mapped
+
 /-- Namespace the concrete leaves created by one output without rebuilding its expression DAG.
 The expression arena is analysis-local and the selected owner has not yet been published in
 `OperationalScopeFacts`, so updating those exact owner nodes in place preserves sharing while
@@ -5123,9 +5392,9 @@ private def namespaceOperationalExprInPlace
           let mapped ← match namespaceFreshOutput scope wire (.matrix fact) with
             | .matrix mapped => pure mapped
             | _ => throw (.unsupportedOperationalExpr root)
-          pure ({ arena with nodes := arena.nodes.set! root {
+          pure (({ arena with nodes := arena.nodes.set! root {
             expression with node := .concrete mapped
-          } }, visited)
+          } }).invalidateEvaluationMemo root, visited)
       | .primitive operation arguments =>
           let mut arena := arena
           let mut visited := visited
@@ -5134,9 +5403,9 @@ private def namespaceOperationalExprInPlace
               namespaceOperationalExprInPlace scope wire arena visited argument fuel
             arena := nextArena
             visited := nextVisited
-          pure ({ arena with nodes := arena.nodes.set! root {
+          pure (({ arena with nodes := arena.nodes.set! root {
             expression with node := .primitive { operation with ownerScope := some scope } arguments
-          } }, visited)
+          } }).invalidateEvaluationMemo root, visited)
       | .select selection (.exact branches) =>
           let mut arena := arena
           let mut visited := visited
@@ -5150,9 +5419,9 @@ private def namespaceOperationalExprInPlace
           }
           let (domainArena, mappedDomain) :=
             arena.internSelectionDomain mappedSelection branches.size
-          pure ({ domainArena with nodes := domainArena.nodes.set! root {
+          pure (({ domainArena with nodes := domainArena.nodes.set! root {
             expression with node := .select mappedDomain (.exact branches)
-          } }, visited)
+          } }).invalidateEvaluationMemo root, visited)
       | .select selection (.shared representative summary) =>
           let summary ← arena.validatedSchema summary
           let (arena, visited) ← namespaceOperationalExprInPlace scope wire arena visited
@@ -5160,29 +5429,29 @@ private def namespaceOperationalExprInPlace
           let mappedSelection : DynamicSelectionIdentity := {
             index := namespaceFreshValueOrigin scope wire selection.index
           }
-          let mappedSummary := {
-            namespaceFreshSelectedMatrixSummary scope wire summary with
-            selectionOrigin := some (selectionDomainKind mappedSelection.index)
-          }
+          let mappedSummary ← match namespaceFreshSelectedMatrixSummary scope wire summary with
+            | some mapped => pure {
+                mapped with selectionOrigin := some (selectionDomainKind mappedSelection.index) }
+            | none => throw (.unsupportedOperationalExpr root)
           let (arena, mappedDomain) := arena.internSelectionDomain mappedSelection selection.count
           let (arena, mappedSchema) := arena.internValidatedSchema mappedSummary
-          pure ({ arena with nodes := arena.nodes.set! root {
+          pure (({ arena with nodes := arena.nodes.set! root {
             expression with node := (.select mappedDomain
               (.shared representative mappedSchema))
-          } }, visited)
+          } }).invalidateEvaluationMemo root, visited)
 
 partial def factHasRelation : OperationalFact → Bool
   | .matrix fact => !fact.relations.isEmpty || fact.polynomial.any fun term =>
       term.product.factors.any fun factor => !factor.relations.isEmpty
   | .familyUniform _ _ element _ => factHasRelation element
-  | .familyPacked elements _ _ => elements.any factHasRelation
+  | .familyPacked elements _ => elements.any factHasRelation
   | _ => false
 
 def packedFacts : List OperationalFact → OperationalFact
   | elements => packedOperationalFamily elements.toArray
 
 def unpackPackedFacts : OperationalFact → Option (Array OperationalFact)
-  | .familyPacked elements _ _ => some elements
+  | .familyPacked elements _ => some elements
   | _ => none
 
 private def booleanFamilyCount (fact : OperationalFact) : Option Int :=
@@ -5293,9 +5562,8 @@ private partial def instantiateFactLoopIndex (slot index : Nat) : OperationalFac
       fact with origin := instantiateValueOriginLoopIndex slot index fact.origin }
   | .familyUniform binder coordinate element count =>
       .familyUniform binder coordinate (instantiateFactLoopIndex slot index element) count
-  | .familyPacked elements count summary =>
-      transferPackedOperationalFamily .instantiationMap
-        (elements.map (instantiateFactLoopIndex slot index)) count summary
+  | .familyPacked elements count =>
+      .familyPacked (elements.map (instantiateFactLoopIndex slot index)) count
   | fact => fact
 
 private def selectProtocolValueOrigin
@@ -5369,9 +5637,8 @@ private partial def selectProtocolFamilyElement (index : Nat) : OperationalFact 
       fact with origin := selectProtocolValueOrigin index fact.origin }
   | .familyUniform binder coordinate element count =>
       .familyUniform binder coordinate (selectProtocolFamilyElement index element) count
-  | .familyPacked elements count summary =>
-      transferPackedOperationalFamily .instantiationMap
-        (elements.map (selectProtocolFamilyElement index)) count summary
+  | .familyPacked elements count =>
+      .familyPacked (elements.map (selectProtocolFamilyElement index)) count
   | fact => fact
 
 private def joinCanonicalRanges : List CanonicalRange → CanonicalRange
@@ -5383,9 +5650,9 @@ private def joinCanonicalRanges : List CanonicalRange → CanonicalRange
           | .unknown => result) 0)
       else .unknown
 
-/-- A dynamic family lookup may denote any element.  It therefore joins numeric information and
-drops all producer-specific identities and modular relations. -/
-def joinDynamicFacts
+/-- Non-matrix dynamic choices retain their existing interval/equality join. Matrix choices are
+represented exclusively by `OperationalMatrixExprNode.select` before this fallback is reached. -/
+def joinDynamicNonMatrixFacts
     (node : Nat)
     (subject : WireRef)
     (facts : List OperationalFact) : Except OperationalError OperationalFact := do
@@ -5644,6 +5911,10 @@ private def loopTemplateArgumentExpr
     (arena : OperationalExprArena)
     (node argument count : Nat)
     (mode : LoopInputMode)
+    (_environment : ParamEnvironment)
+    (_deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
+      OperationalExprEvaluationState →
+      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
     (fact : OperationalFact) :
     Except OperationalError (OperationalExprArena × OperationalFact) := do
   match mode with
@@ -5691,7 +5962,7 @@ private def loopTemplateArgumentExpr
               publicIdentity := substituteLoopTemplatePublicIdentity binder replacement
                 trapdoor.publicIdentity })
           | _, element => pure (arena, element)
-      | .familyPacked elements familyCount matrixSummary =>
+      | .familyPacked elements familyCount =>
           let offset := match mode with
             | .zip => 0
             | .zipOffset value => value
@@ -5712,26 +5983,21 @@ private def loopTemplateArgumentExpr
                 let (arena, root) ← arena.pushMatrixFact element
                 pure (arena, .matrixExpr root)
             | none => throw (.loopInputModeMismatch node argument)
-          else match matrixSummary with
-          | some summary =>
-              let representativeIndex := if elements.size == familyCount then offset else 0
-              let representative ← match elements[representativeIndex]? with
-                | some representative => pure representative
-                | none => throw (.loopInputModeMismatch node argument)
-              let (arena, representative) ← arena.pushMatrixFact representative
-              let (arena, root) ← arena.pushSharedSelection selection count representative summary
-              pure (arena, .matrixExpr root)
-          | none =>
-              if elements.size < count + offset then
-                throw (.loopInputModeMismatch node argument)
-              let mut arena := arena
-              let mut branches : Array OperationalExprId := #[]
-              for element in elements.extract offset (offset + count) do
-                let (nextArena, branch) ← arena.pushMatrixFact element
-                arena := nextArena
-                branches := branches.push branch
-              let (finalArena, root) ← arena.pushSelect selection (.exact branches)
-              pure (finalArena, .matrixExpr root)
+          else
+            if elements.size < count + offset then
+              throw (.loopInputModeMismatch node argument)
+            let mut arena := arena
+            let mut branches : Array OperationalExprId := #[]
+            for element in elements.extract offset (offset + count) do
+              let (nextArena, branch) ← arena.pushMatrixFact element
+              arena := nextArena
+              branches := branches.push branch
+            -- This is the lane-addressable input family itself, not the result of a primitive.
+            -- Preserve its genuinely nonuniform alternatives so a later static lane lookup can
+            -- still recover the corresponding value.  The first consuming primitive performs
+            -- the canonical D2 join on its complete outputs.
+            let (finalArena, root) ← arena.pushSelect selection (.exact branches)
+            pure (finalArena, .matrixExpr root)
       | _ => throw (.loopInputModeMismatch node argument)
 
 /-- Re-express one construction-uniform family element in the template coordinate of a newly
@@ -5782,6 +6048,10 @@ private def selectUniformMatrixFamilies
     (matrixType : MatrixTypeExpr)
     (expectedCount : Nat)
     (branches : List OperationalFact)
+    (_environment : ParamEnvironment)
+    (_deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
+      OperationalExprEvaluationState →
+      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
     (arena : OperationalExprArena) :
     Except OperationalError (OperationalExprArena × OperationalFact) := do
   if expectedCount = 0 || branches.isEmpty then
@@ -5825,6 +6095,9 @@ private def selectUniformMatrixFamilies
     else
       arena := nextArena
       roots := roots.push root
+  -- This node selects one source family; it has not yet applied a primitive whose complete
+  -- branch outputs could be joined. Keep the alternatives exact so later static and
+  -- relation-consuming users can recover the selected source identity.
   let (finalArena, root) ← arena.pushSelect
     ({ index := selection.origin } : DynamicSelectionIdentity) (.exact roots)
   let expression ← match finalArena.get? root with
@@ -6017,7 +6290,7 @@ def genericNodeFact
       if index.lower < 0 || index.upper >= Int.ofNat branchCount then
         throw (.invalidCount nodeIndex index.upper)
       let branches ← (node.arguments.drop 1).mapM (lookupFact nodeIndex facts)
-      joinDynamicFacts nodeIndex { node := nodeIndex, port := outputPort } branches
+      joinDynamicNonMatrixFacts nodeIndex { node := nodeIndex, port := outputPort } branches
   | .zeroMatrix _, some matrixType =>
       polynomialMatrixFact nodeIndex outputPort matrixType environment [] (.below 1)
   | .identityMatrix _, some matrixType =>
@@ -6624,14 +6897,10 @@ def deriveOrdinaryOutputs
       return output :: (← deriveOrdinaryOutputs scopeKey nodeIndex node rule environment
         loopDomains layouts facts (port + 1) tail)
 
-private def operationalExprContainsSelection
-    (arena : OperationalExprArena) (root : OperationalExprId) : Except OperationalError Bool :=
-  arena.containsSelection root
-
 /-! Evaluate a single unresolved selection by streaming complete concrete alternatives into a
 consumer.  A consumer that would combine two selected subexpressions rejects instead of silently
-performing Cartesian-time traversal.  Selection-aware bound evaluation uses the compositional
-representative evaluator below and does not call this endpoint helper. -/
+performing Cartesian-time traversal. Selection-aware bound evaluation uses `evaluateCompleteBound`
+and does not call this endpoint helper. -/
 private def evaluatePrimitiveConcrete
     (operation : PrimitiveOperation)
     (arguments : Array OperationalMatrixFact) : Except OperationalError OperationalMatrixFact := do
@@ -6669,6 +6938,30 @@ private def evaluatePrimitiveConcrete
         | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
       return ← transformConcreteMatrixFact operation.ownerNode operation.outputPort
         operation.outputType transform operation.parameterEnvironment value
+  | .scale scalar values loopDomains =>
+      if arguments.size != 1 then
+        throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+      let value ← match arguments[0]? with
+        | some value => pure value
+        | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+      return ← scaleConcreteMatrixFact operation.ownerNode operation.outputPort
+        operation.outputType scalar values operation.parameterEnvironment loopDomains value
+  | .bggGrouping =>
+      if arguments.size != 3 then
+        throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+      let vector ← match arguments[0]? with
+        | some value => pure value
+        | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+      let publicKey ← match arguments[1]? with
+        | some value => pure value
+        | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+      let plaintext ← match arguments[2]? with
+        | some value => pure value
+        | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+      return ← groupBggEncodingSignal vector publicKey plaintext
+        |>.mapError (.flat operation.ownerNode)
+  | .preimage | .decomposition =>
+      throw (.unresolvedConcreteStructure operation.ownerNode operation.ownerNode)
 
 private partial def foldOperationalExprConcreteFacts
     {α : Type}
@@ -6686,6 +6979,7 @@ private partial def foldOperationalExprConcreteFacts
   | .primitive operation arguments => do
       if arguments.countP (fun argument =>
           (arena.get? argument).any (·.containsSelection)) > 1 then
+        dbg_trace s!"multi-selection-fold-failure root={root} owner_node={operation.ownerNode}"
         throw (.unsupportedOperationalExpr root)
       let rec visitArguments
           (remaining : List OperationalExprId)
@@ -6708,14 +7002,11 @@ private partial def foldOperationalExprConcreteFacts
       if selection.count = 0 then throw (.invalidCount 0 0)
       else do
         let summary ← arena.validatedSchema summary
-        let fact ← arena.concreteFact representative
-        if summary.uniformSchema != some (operationalUniformSchema fact) ||
-            summary.relationFree != !matrixFactHasRelation fact ||
-            summary.sharedLastPublicIdentity != boundaryLastPublicIdentity? fact ||
-            summary.sharedFirstRelationPublicIdentity !=
-              boundaryFirstRelationPublicIdentity? fact || summary.selectionOrigin.isNone then
+        let fact ← validateSelectedMatrixSummary representative summary
+        if summary.selectionOrigin.isNone then
+          dbg_trace s!"shared-fold-origin-failure representative={representative}"
           throw (.unsupportedOperationalExpr representative)
-        foldOperationalExprConcreteFacts arena environment representative state visit
+        visit state fact
 
 private inductive OperationalExprBoundKind where
   | total
@@ -6764,11 +7055,9 @@ private def validateOperationalEnvelope
     (representative : OperationalExprId)
     (summary : SelectedMatrixSummary)
     (fact : OperationalMatrixFact) : Except OperationalError Unit := do
-  if summary.uniformSchema != some (operationalUniformSchema fact) ||
-      summary.relationFree != !matrixFactHasRelation fact ||
-      summary.sharedLastPublicIdentity != boundaryLastPublicIdentity? fact ||
-      summary.sharedFirstRelationPublicIdentity != boundaryFirstRelationPublicIdentity? fact ||
-      summary.selectionOrigin.isNone then
+  let conservativeFact ← validateSelectedMatrixSummary representative summary
+  if conservativeFact.matrixType != fact.matrixType || summary.selectionOrigin.isNone then
+    dbg_trace s!"envelope-validation-failure representative={representative} conservative_type={reprStr conservativeFact.matrixType} fact_type={reprStr fact.matrixType} has_origin={summary.selectionOrigin.isSome}"
     throw (.unsupportedOperationalExpr representative)
 
 private def evaluateOperationalConcreteBound
@@ -6884,55 +7173,20 @@ private def summarizeOperationalSelectionFacts
         identity := if facts.all (·.identity == first.identity) then first.identity else none }
     | _ => throw (.operandNotMatrix first.subject.node first.subject)
 
-/-- Return the one representative only when every unresolved choice has already been validated as
-Shared. Exact alternatives have no representative: callers needing a bound must use
-`evaluateCompleteBound`, which closes every branch before taking its maximum. -/
-private def tryUniformRepresentativeWithFuel
-    (arena : OperationalExprArena)
-    (environment : ParamEnvironment)
-    (id : OperationalExprId)
-    (state : OperationalExprEvaluationState) : Nat →
-    Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState)
-  | 0 => throw (.unsupportedOperationalExpr id)
-  | fuel + 1 => match state.representativeMemo[id]? with
-  | none => throw (.invalidOperationalExprRef id)
-  | some (some fact) => pure (fact, state)
-  | some none => do
-      let expression ← match arena.get? id with
-        | some expression => pure expression
-        | none => throw (.invalidOperationalExprRef id)
-      let (fact, state) ← match expression.node with
-        | .concrete fact => pure (fact, state)
-        | .primitive operation arguments => do
-            let mut state := state
-            let mut facts : Array OperationalMatrixFact := #[]
-            for argument in arguments do
-              let (fact, nextState) ← tryUniformRepresentativeWithFuel
-                arena environment argument state fuel
-              facts := facts.push fact
-              state := nextState
-            pure (← evaluatePrimitiveConcrete operation facts, state)
-        | .select _ (.exact branches) =>
-            if branches.isEmpty then throw (.invalidCount 0 0)
-            else throw (.unsupportedOperationalExpr id)
-        | .select selection (.shared representative summary) => do
-            if selection.count = 0 then throw (.invalidCount 0 0)
-            let summary ← arena.validatedSchema summary
-            let (fact, state) ← tryUniformRepresentativeWithFuel
-              arena environment representative state fuel
-            validateOperationalEnvelope representative summary fact
-            pure (fact, state)
-      pure (fact, { state with representativeMemo :=
-        state.representativeMemo.set! id (some fact) })
-
+/-! Return a Shared value's semantic pair without evaluating, flattening, or re-joining its
+representative DAG. Exact alternatives deliberately have no representative. -/
 private def tryUniformRepresentative
     (arena : OperationalExprArena)
-    (environment : ParamEnvironment)
-    (id : OperationalExprId)
-    (state : OperationalExprEvaluationState) :
-    Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState) :=
-  tryUniformRepresentativeWithFuel
-    arena environment id state (arena.nodes.size + 1)
+    (id : OperationalExprId) :
+    Except OperationalError (Option (OperationalExprId × ValidatedSchemaId)) := do
+  let expression ← match arena.get? id with
+    | some expression => pure expression
+    | none => throw (.invalidOperationalExprRef id)
+  match expression.node with
+  | .select selection (.shared representative schema) =>
+      if selection.count = 0 then throw (.invalidCount 0 0)
+      else pure (some (representative, schema))
+  | .select _ (.exact _) | .concrete _ | .primitive _ _ => pure none
 
 /-- Derive the one fact needed only to validate or transfer a uniform schema. Unlike a value
 representative, this operation may close a relation-free Exact choice by summarizing all complete
@@ -6974,22 +7228,31 @@ private def deriveOperationalSchemaFactWithFuel
           | .select selection (.shared representative summaryId) => do
               if selection.count = 0 then throw (.invalidCount 0 0)
               let summary ← arena.validatedSchema summaryId
-              let (fact, state) ← deriveOperationalSchemaFactWithFuel
-                arena environment representative state fuel
-              validateOperationalEnvelope representative summary fact
-              pure (fact, state)
+              pure (← validateSelectedMatrixSummary representative summary, state)
           | .primitive operation arguments =>
               match compositionalTransferRegistry (primitiveTransferClass operation) with
-              | .requiresConcreteStructure =>
-                  tryUniformRepresentativeWithFuel arena environment id state (fuel + 1)
+              | .requiresConcreteStructure => do
+                  let unresolved := arguments.any fun argument =>
+                    match arena.get? argument with
+                    | some expression => expression.containsSelection
+                    | none => true
+                  if unresolved then
+                    dbg_trace s!"unresolved-concrete-structure node={operation.ownerNode} operation={primitiveOperationDiagnosticName operation.kind} expression={id} arguments={reprStr (arguments.map (operationalExprDiagnosticShape arena))}"
+                    throw (.unresolvedConcreteStructure operation.ownerNode id)
+                  let mut state := state
+                  let mut facts : Array OperationalMatrixFact := #[]
+                  for argument in arguments do
+                    let (fact, nextState) ← deriveOperationalSchemaFactWithFuel
+                      arena environment argument state fuel
+                    facts := facts.push fact
+                    state := nextState
+                  pure (← evaluatePrimitiveConcrete operation facts, state)
               | .supported _ => do
                   let mut state := state
                   let mut facts : Array OperationalMatrixFact := #[]
                   for argument in arguments do
                     let (fact, nextState) ← deriveOperationalSchemaFactWithFuel
                       arena environment argument state fuel
-                    if matrixFactHasRelation fact then
-                      throw (.unknownRelationRequirement operation.ownerNode argument)
                     facts := facts.push fact
                     state := nextState
                   pure (← evaluatePrimitiveConcrete operation facts, state)
@@ -7002,6 +7265,38 @@ private def deriveOperationalSchemaFact
     (id : OperationalExprId)
     (state : OperationalExprEvaluationState) :=
   deriveOperationalSchemaFactWithFuel arena environment id state (arena.nodes.size + 1)
+
+private def OperationalExprArena.deriveOperationalSchemaFactCached
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (id : OperationalExprId) :
+    Except OperationalError (OperationalMatrixFact × OperationalExprArena) := do
+  let evaluationState := OperationalExprEvaluationState.forEnvironment
+    arena environment arena.evaluationState
+  match evaluationState.schemaMemo[id]? with
+  | none => throw (.invalidOperationalExprRef id)
+  | some (some schemaId) => do
+      let schema ← arena.validatedSchema schemaId
+      let fact ← validateSelectedMatrixSummary id schema
+      pure (fact, { arena with evaluationState := {
+        evaluationState with schemaStats := {
+          evaluationState.schemaStats with
+          memoHits := evaluationState.schemaStats.memoHits + 1 }
+      } })
+  | some none => do
+      let (fact, evaluationState) ←
+        deriveOperationalSchemaFact arena environment id evaluationState
+      let (arena, schemaId) ← match ← tryUniformRepresentative arena id with
+        | some (_, schemaId) => pure (arena, schemaId)
+        | none =>
+            let summary := selectedMatrixSummary #[fact]
+            if summary.uniformSchema.isNone || summary.conservativeFact.isNone then
+              dbg_trace s!"schema-intern-failure id={id}"
+              throw (.unsupportedOperationalExpr id)
+            pure (arena.internValidatedSchema summary)
+      let evaluationState := { evaluationState with
+        schemaMemo := evaluationState.schemaMemo.set! id (some schemaId) }
+      pure (fact, { arena with evaluationState })
 
 private def concatOperationalExprIds
     (nodeIndex outputPort : Nat)
@@ -7088,10 +7383,11 @@ private def evaluateCompleteBoundWithFuel
                 pure (leftBound + rightBound, state)
             | .supported _ | .requiresConcreteStructure =>
                 let state := ← evaluateChildren arguments state
-                match tryUniformRepresentative arena environment id state with
+                match deriveOperationalSchemaFact arena environment id state with
                 | .ok (fact, state) =>
                     pure (← evaluateOperationalConcreteBound kind environment fact, state)
-                | .error (.unsupportedOperationalExpr _) =>
+                | .error (.unsupportedOperationalExpr _) |
+                  .error (.unresolvedConcreteStructure _ _) =>
                     throw (.unresolvedConcreteStructure operation.ownerNode id)
                 | .error error => throw error
         | .select _ (.exact branches) => do
@@ -7111,10 +7407,15 @@ private def evaluateCompleteBoundWithFuel
         | .select selection (.shared representative summary) => do
             if selection.count = 0 then throw (.invalidCount 0 0)
             let summary ← arena.validatedSchema summary
-            let (fact, state) ← deriveOperationalSchemaFact
-              arena environment representative state
-            validateOperationalEnvelope representative summary fact
-            evaluateCompleteBoundWithFuel kind arena environment representative state fuel
+            let conservativeFact ← validateSelectedMatrixSummary representative summary
+            let (representativeBound, state) ← evaluateCompleteBoundWithFuel
+              kind arena environment representative state fuel
+            let envelopeBound ← evaluateOperationalConcreteBound
+              kind environment conservativeFact
+            if representativeBound > envelopeBound then
+              dbg_trace s!"shared-envelope-bound-failure representative={representative} representative_bound={representativeBound} envelope_bound={envelopeBound}"
+              throw (.unsupportedOperationalExpr representative)
+            pure (envelopeBound, state)
       pure (value, state.store kind id value)
 
 private def evaluateCompleteBound
@@ -7124,6 +7425,16 @@ private def evaluateCompleteBound
     (state : OperationalExprEvaluationState) :
     Except OperationalError (Int × OperationalExprEvaluationState) :=
   evaluateCompleteBoundWithFuel .total arena environment id state (arena.nodes.size + 1)
+
+private def OperationalExprArena.evaluateCompleteBoundCached
+    (arena : OperationalExprArena)
+    (kind : OperationalExprBoundKind)
+    (environment : ParamEnvironment)
+    (id : OperationalExprId) : Except OperationalError (Int × OperationalExprArena) := do
+  let (bound, evaluationState) ← evaluateCompleteBoundWithFuel kind arena environment id
+    (OperationalExprEvaluationState.forEnvironment arena environment arena.evaluationState)
+    (arena.nodes.size + 1)
+  pure (bound, { arena with evaluationState })
 
 private def evaluateOperationalExprNoiseBoundWithState
     (arena : OperationalExprArena)
@@ -7202,15 +7513,9 @@ partial def requireOperationalBoundaryPublicIdentity
   | .familyUniform _ _ element count =>
       if count <= 0 then throw (.invalidCount node count)
       else requireOperationalBoundaryPublicIdentity arena environment node expected element
-  | .familyPacked elements count summary => do
-      if elements.isEmpty || !packedMatrixEnvelopeIsComplete elements count summary then
+  | .familyPacked elements count => do
+      if elements.isEmpty || elements.size != count then
         throw (.invalidCount node (Int.ofNat count))
-      if elements.size != count then
-        match summary >>= (·.sharedLastPublicIdentity) with
-        | some identity =>
-            if !(identity == expected || publicIdentityTemplateEqual identity expected) then
-              throw (.publicIdentityMismatch node)
-        | none => throw (.publicIdentityMismatch node)
       for element in elements do
         requireOperationalBoundaryPublicIdentity arena environment node expected element
   | _ => throw (.operandNotMatrix node { node, port := 0 })
@@ -7277,7 +7582,8 @@ def evaluatePreparedScope
         | [], [] => pure (arena, [])
         | mode :: modeTail, input :: inputTail =>
             let (arena, head) ←
-              loopTemplateArgumentExpr arena nodeIndex argumentIndex count mode input
+              loopTemplateArgumentExpr arena nodeIndex argumentIndex count mode environment
+                deriveOperationalSchemaFact input
             let (arena, tail) ← prepareParallelInputs nodeIndex count (argumentIndex + 1)
               modeTail inputTail arena
             pure (arena, head :: tail)
@@ -7297,7 +7603,8 @@ def evaluatePreparedScope
             let step ← match derivation.steps[index]? with
               | some step => pure step
               | none => throw (.derivation (.missingNode index))
-            let outputs ← match node.kind with
+            let outputs ← try
+              match node.kind with
               | .input _ =>
                   if inputFacts.isEmpty then
                     deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
@@ -7344,10 +7651,11 @@ def evaluatePreparedScope
                         let subject : WireRef := { node := index, port := 0 }
                         match element with
                         | .matrixExpr root =>
-                            let root ← match coordinate with
+                            let (arena, root) ← match coordinate with
                               | some (.loopBinder ..) | some (.loopBinderOffset ..) =>
-                                  loopTemplateStaticRoot facts.arena binder root requested.toNat
-                              | none => pure root
+                                  loopTemplateStaticRoot binder requested.toNat facts.arena root
+                                    (facts.arena.nodes.size + 1)
+                              | none => pure (facts.arena, root)
                             let mapFact (fact : OperationalMatrixFact) :=
                               let mapped := match coordinate with
                                 | some (.loopBinder _ _ slot) =>
@@ -7372,7 +7680,7 @@ def evaluatePreparedScope
                             let cacheNamespace :=
                               s!"family-static:{index}:{requested}:{reprStr coordinate}"
                             let (arena, mapped) ← mapOperationalExpr cacheNamespace
-                              .instantiationMap facts.arena root mapFact mapSelection
+                              .instantiationMap arena root mapFact mapSelection
                             facts := { facts with arena }
                             pure [.matrixExpr mapped]
                         | element =>
@@ -7383,21 +7691,15 @@ def evaluatePreparedScope
                                   instantiateFactLoopIndex slot (requested.toNat + offset) element
                               | none => selectProtocolFamilyElement requested.toNat element
                             pure [← rebindSubject subject element]
-                  | .familyPacked elements count summary =>
+                  | .familyPacked elements count =>
                       if requested < 0 || requested >= count then
                         throw (.invalidCount index requested)
-                      else if elements.size == count then
+                      else if elements.size != count then
+                        throw (.invalidCount index requested)
+                      else
                         match elements[requested.toNat]? with
                         | some element => pure [← rebindSubject { node := index, port := 0 } element]
                         | none => throw (.invalidCount index requested)
-                      else match summary, elements[0]? with
-                        | some summary, some element =>
-                            let _ ← match summary.uniformSchema with
-                              | some schema => pure schema
-                              | none => throw (.selectedFamilyOperationUnsupported index)
-                            pure [← rebindSubject { node := index, port := 0 }
-                              (selectProtocolFamilyElement requested.toNat element)]
-                        | _, _ => throw (.invalidCount index requested)
                   | _ => throw (.loopInputModeMismatch index 0)
               | .familyGetDynamic =>
                   let familyWire ← match node.arguments[0]? with
@@ -7420,10 +7722,11 @@ def evaluatePreparedScope
                         let subject : WireRef := { node := index, port := 0 }
                         match element with
                         | .matrixExpr root =>
-                            let root ← match coordinate with
+                            let (arena, root) ← match coordinate with
                               | some (.loopBinder ..) | some (.loopBinderOffset ..) =>
-                                  loopTemplateStaticRoot facts.arena binder root requested.toNat
-                              | none => pure root
+                                  loopTemplateStaticRoot binder requested.toNat facts.arena root
+                                    (facts.arena.nodes.size + 1)
+                              | none => pure (facts.arena, root)
                             let mapFact (fact : OperationalMatrixFact) :=
                               let mapped := match coordinate with
                                 | some (.loopBinder _ _ slot) =>
@@ -7447,7 +7750,7 @@ def evaluatePreparedScope
                             let cacheNamespace :=
                               s!"family-dynamic-exact:{index}:{requested}:{reprStr coordinate}"
                             let (arena, mapped) ← mapOperationalExpr cacheNamespace
-                              .instantiationMap facts.arena root mapFact mapSelection
+                              .instantiationMap arena root mapFact mapSelection
                             facts := { facts with arena }
                             pure [.matrixExpr mapped]
                         | element =>
@@ -7458,22 +7761,16 @@ def evaluatePreparedScope
                                   instantiateFactLoopIndex slot (requested.toNat + offset) element
                               | none => selectProtocolFamilyElement requested.toNat element
                             pure [← rebindSubject subject element]
-                  | true, .familyPacked elements count summary =>
+                  | true, .familyPacked elements count =>
                       let requested := selectionFact.lower
                       if requested < 0 || requested >= Int.ofNat count then
                         throw (.invalidCount index requested)
-                      else if elements.size == count then
+                      else if elements.size != count then
+                        throw (.selectedFamilyOperationUnsupported index)
+                      else
                         match elements[requested.toNat]? with
                         | some element => pure [← rebindSubject { node := index, port := 0 } element]
                         | none => throw (.invalidCount index requested)
-                      else match summary, elements[0]? with
-                        | some summary, some element =>
-                            let _ ← match summary.uniformSchema with
-                              | some schema => pure schema
-                              | none => throw (.selectedFamilyOperationUnsupported index)
-                            pure [← rebindSubject { node := index, port := 0 }
-                              (selectProtocolFamilyElement requested.toNat element)]
-                        | _, _ => throw (.selectedFamilyOperationUnsupported index)
                   | true, _ => throw (.loopInputModeMismatch index 0)
                   | false, .familyUniform binder coordinate element count =>
                       if count <= 0 || selectionFact.lower < 0 || selectionFact.upper >= count then
@@ -7501,34 +7798,11 @@ def evaluatePreparedScope
                             facts := { facts with arena }
                             pure [selected]
                         | element => pure [← selectDynamicUniformFact binder selection subject element]
-                  | false, .familyPacked elements count summary =>
+                  | false, .familyPacked elements count =>
                       if count == 0 || selectionFact.lower < 0 ||
                           selectionFact.upper >= Int.ofNat count then
                         throw (.invalidCount index selectionFact.upper)
-                      else match summary, elements[0]? with
-                      | some summary, some element => match element with
-                        | .matrix representative =>
-                          let binder : FamilyTemplateBinder := {
-                            owner := dynamicSelectionScope selection
-                            producerNode := index
-                            binderSlot := 0
-                          }
-                          let selected ← match ← selectDynamicUniformFact binder selection
-                              { node := index, port := 0 } (.matrix representative) with
-                            | .matrix selected => pure selected
-                            | _ => throw (.loopInputModeMismatch index 0)
-                          let transferred ← match transferSelectedMatrixSummary
-                              .instantiationMap #[summary] selected with
-                            | some transferred => pure transferred
-                            | none => throw (.selectedFamilyOperationUnsupported index)
-                          let (arena, representativeId) := facts.arena.pushConcrete selected
-                          let (arena, root) ← arena.pushSharedSelection
-                            ({ index := selection } : DynamicSelectionIdentity) count representativeId
-                              transferred
-                          facts := { facts with arena }
-                          pure [.matrixExpr root]
-                        | _ => throw (.loopInputModeMismatch index 0)
-                      | _, _ =>
+                      else
                         if elements.size == count then
                           let binder : FamilyTemplateBinder := {
                             owner := dynamicSelectionScope selection
@@ -7558,9 +7832,12 @@ def evaluatePreparedScope
                                 arena := nextArena
                                 selectedBranches := selectedBranches.push selected
                             | _ => throw (.loopInputModeMismatch index 0)
-                          let (finalArena, root) ← arena.pushSelect
+                          let matrixType ← match node.outputTypes with
+                            | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
+                            | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
+                          let (finalArena, root) ← arena.pushPrimitiveSelection
                             ({ index := selection } : DynamicSelectionIdentity)
-                            (.exact selectedBranches)
+                            matrixType environment deriveOperationalSchemaFact selectedBranches
                           facts := { facts with arena := finalArena }
                           pure [.matrixExpr root]
                         else throw (.selectedFamilyOperationUnsupported index)
@@ -7786,10 +8063,11 @@ def evaluatePreparedScope
                           | none => throw (.invalidCount index selection.lower)
                         else pure branches
                       let (arena, output) ← selectUniformMatrixFamilies scopeKey index selection
-                        matrixType expectedCount.toNat selectedBranches facts.arena
+                        matrixType expectedCount.toNat selectedBranches environment
+                        deriveOperationalSchemaFact facts.arena
                       facts := { facts with arena }
                       pure [output]
-                  | [.matrix _] | [.preimage _] =>
+                  | [.matrix matrixType] | [.preimage matrixType] =>
                       if selection.lower == selection.upper then
                         let selected ← match branches[selection.lower.toNat]? with
                           | some selected => pure selected
@@ -7802,9 +8080,9 @@ def evaluatePreparedScope
                           let (nextArena, root) ← arena.pushMatrixFact branch
                           arena := nextArena
                           roots := roots.push root
-                        let (finalArena, root) ← arena.pushSelect
+                        let (finalArena, root) ← arena.pushPrimitiveSelection
                           ({ index := selection.origin } : DynamicSelectionIdentity)
-                          (.exact roots)
+                          matrixType environment deriveOperationalSchemaFact roots
                         facts := { facts with arena := finalArena }
                         pure [.matrixExpr root]
                   | _ =>
@@ -7876,51 +8154,23 @@ def evaluatePreparedScope
                       let matrixType ← match node.outputTypes with
                         | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
                         | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
-                      let rec mapPreimageExpression : OperationalExprArena → OperationalExprId → Nat →
-                          Except OperationalError (OperationalExprArena × OperationalExprId)
-                        | _, current, 0 => throw (.unsupportedOperationalExpr current)
-                        | arena, current, remaining + 1 => do
-                            let expression ← match arena.get? current with
-                              | some expression => pure expression
-                              | none => throw (.invalidOperationalExprRef current)
-                            match expression.node with
-                            | .concrete branch =>
-                                let branchFacts ← replaceOperationalFact index facts targetWire
-                                  (.matrix branch)
-                                let output ← genericNodeFact scopeKey index node step.rule 0
-                                  (.preimage matrixType) branchFacts environment loopDomains layouts
-                                let output := namespaceFreshOutput scopeKey
-                                  { node := index, port := 0 } output
-                                let output ← match output with
-                                  | .matrix output => pure output
-                                  | _ => throw (.operandNotMatrix index targetWire)
-                                pure (arena.pushConcrete output)
-                            | .select selection (.exact branches) =>
-                                let mut arena := arena
-                                let mut outputs : Array OperationalExprId := #[]
-                                for branch in branches do
-                                  let (nextArena, output) ←
-                                    mapPreimageExpression arena branch remaining
-                                  arena := nextArena
-                                  outputs := outputs.push output
-                                arena.pushPrimitiveSelection selection matrixType environment outputs
-                            | .select selection
-                                (.shared representative summary) =>
-                                let summary ← arena.validatedSchema summary
-                                let (arena, output) ←
-                                  mapPreimageExpression arena representative remaining
-                                let state := OperationalExprEvaluationState.empty arena
-                                let (outputFact, _) ← tryUniformRepresentative
-                                  arena environment output state
-                                let outputSummary ← match transferSelectedMatrixSummary
-                                    .preimage #[summary] outputFact with
-                                  | some value => pure value
-                                  | none => throw (.unsupportedOperationalExpr representative)
-                                arena.pushCheckedSchemaEnvelope selection selection.count output
-                                  outputSummary outputFact
-                            | _ => throw (.unsupportedOperationalExpr current)
-                      let (arena, output) ← mapPreimageExpression facts.arena root
-                        (facts.arena.nodes.size + 1)
+                      let operation : PrimitiveOperation := {
+                        kind := .preimage, outputType := matrixType, ownerScope := some scopeKey
+                        ownerNode := index, outputPort := 0, parameterEnvironment := environment }
+                      let concreteTransfer (arguments : Array OperationalMatrixFact) := do
+                        let branch ← match arguments[0]? with
+                          | some value => pure value
+                          | none => throw (.unsupportedOutputArity index arguments.size)
+                        if arguments.size != 1 then
+                          throw (.unsupportedOutputArity index arguments.size)
+                        let branchFacts ← replaceOperationalFact index facts targetWire (.matrix branch)
+                        let output ← genericNodeFact scopeKey index node step.rule 0
+                          (.preimage matrixType) branchFacts environment loopDomains layouts
+                        match namespaceFreshOutput scopeKey { node := index, port := 0 } output with
+                        | .matrix output => pure output
+                        | _ => throw (.operandNotMatrix index targetWire)
+                      let (arena, output) ← liftPrimitiveOperation operation .preimage concreteTransfer
+                        deriveOperationalSchemaFact facts.arena #[root] (facts.arena.nodes.size + 1)
                       facts := { facts with arena }
                       pure [.matrixExpr output]
                   | _ =>
@@ -7936,50 +8186,24 @@ def evaluatePreparedScope
                       let matrixType ← match node.outputTypes with
                         | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
                         | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
-                      let rec mapExpression : OperationalExprArena → OperationalExprId → Nat →
-                          Except OperationalError (OperationalExprArena × OperationalExprId)
-                        | _, current, 0 => throw (.unsupportedOperationalExpr current)
-                        | arena, current, remaining + 1 => do
-                            let expression ← match arena.get? current with
-                              | some expression => pure expression
-                              | none => throw (.invalidOperationalExprRef current)
-                            match expression.node with
-                            | .concrete branch =>
-                                let branchFacts ← replaceOperationalFact index facts inputWire
-                                  (.matrix branch)
-                                let output ← genericNodeFact scopeKey index node step.rule 0
-                                  (.preimage matrixType) branchFacts environment loopDomains layouts
-                                let output := namespaceFreshOutput scopeKey
-                                  { node := index, port := 0 } output
-                                let output ← match output with
-                                  | .matrix output => pure output
-                                  | _ => throw (.operandNotMatrix index inputWire)
-                                pure (arena.pushConcrete output)
-                            | .select selection (.exact branches) =>
-                                let mut arena := arena
-                                let mut outputs : Array OperationalExprId := #[]
-                                for branch in branches do
-                                  let (nextArena, output) ← mapExpression arena branch remaining
-                                  arena := nextArena
-                                  outputs := outputs.push output
-                                arena.pushPrimitiveSelection selection matrixType environment outputs
-                            | .select selection
-                                (.shared representative summary) =>
-                                let summary ← arena.validatedSchema summary
-                                let (arena, output) ←
-                                  mapExpression arena representative remaining
-                                let state := OperationalExprEvaluationState.empty arena
-                                let (outputFact, _) ← tryUniformRepresentative
-                                  arena environment output state
-                                let outputSummary ← match transferSelectedMatrixSummary
-                                    .decomposition #[summary] outputFact with
-                                  | some value => pure value
-                                  | none => throw (.unsupportedOperationalExpr representative)
-                                arena.pushCheckedSchemaEnvelope selection selection.count output
-                                  outputSummary outputFact
-                            | _ => throw (.unsupportedOperationalExpr current)
-                      let (arena, output) ← mapExpression facts.arena root
-                        (facts.arena.nodes.size + 1)
+                      let operation : PrimitiveOperation := {
+                        kind := .decomposition, outputType := matrixType, ownerScope := some scopeKey
+                        ownerNode := index, outputPort := 0, parameterEnvironment := environment }
+                      let concreteTransfer (arguments : Array OperationalMatrixFact) := do
+                        let branch ← match arguments[0]? with
+                          | some value => pure value
+                          | none => throw (.unsupportedOutputArity index arguments.size)
+                        if arguments.size != 1 then
+                          throw (.unsupportedOutputArity index arguments.size)
+                        let branchFacts ← replaceOperationalFact index facts inputWire (.matrix branch)
+                        let output ← genericNodeFact scopeKey index node step.rule 0
+                          (.preimage matrixType) branchFacts environment loopDomains layouts
+                        match namespaceFreshOutput scopeKey { node := index, port := 0 } output with
+                        | .matrix output => pure output
+                        | _ => throw (.operandNotMatrix index inputWire)
+                      let (arena, output) ← liftPrimitiveOperation operation .decomposition
+                        concreteTransfer deriveOperationalSchemaFact facts.arena #[root]
+                          (facts.arena.nodes.size + 1)
                       facts := { facts with arena }
                       pure [.matrixExpr output]
                   | _ =>
@@ -8128,6 +8352,18 @@ def evaluatePreparedScope
               | _ =>
                   deriveOrdinaryOutputs scopeKey index node step.rule environment loopDomains
                     layouts facts 0 node.outputTypes
+            catch error =>
+              let argumentDiagnostics := node.arguments.map fun wire =>
+                match lookupFact index facts wire with
+                | .ok fact => operationalFactDiagnosticShape facts.arena fact
+                | .error _ => "lookup-error"
+              dbg_trace s!"operational-node-arguments scope={reprStr scopeKey} node={index} arguments={reprStr argumentDiagnostics}"
+              match error with
+              | .unknownRelationRequirement _ expression =>
+                  dbg_trace s!"unknown-relation-neighborhood {operationalExprDiagnosticNeighborhood facts.arena expression}"
+              | _ => pure ()
+              dbg_trace s!"operational-node-failure scope={reprStr scopeKey} node={index} error={reprStr error} expr_count={facts.arena.nodes.size} relation_rewrites={facts.arena.relationRewriteCount} choice_joins={facts.arena.choiceJoinCount} domain_comparisons={facts.arena.domainComparisonCount} exact_branch_visits={facts.arena.exactBranchVisitCount} shared_logical_branch_visits={facts.arena.sharedLogicalBranchVisitCount} cartesian_pair_visits={facts.arena.cartesianPairVisitCount}"
+              throw error
             let mut namespacedOutputs : Array OperationalFact := #[]
             for (output, port) in outputs.toArray.zipIdx do
               match output with
@@ -8141,7 +8377,8 @@ def evaluatePreparedScope
             let outputs := namespacedOutputs
             facts := { facts with values := facts.values.push outputs }
             let attachments := prepared.attachmentBuckets[index]?.getD #[]
-            facts := ← applyPreparedDerivationAttachments index attachments environment facts
+            facts := ← applyPreparedDerivationAttachments index attachments environment
+              deriveOperationalSchemaFact facts
       pure facts
 termination_by
   _ fuel _ _ _ _ => (fuel, 0)
@@ -8284,6 +8521,10 @@ structure OperationalAnalysisDiagnostics where
   envelopeLogicalBranchCount : Nat := 0
   envelopeStoredBranchCount : Nat := 0
   relationRewriteCount : Nat := 0
+  choiceJoinCount : Nat := 0
+  domainComparisonCount : Nat := 0
+  exactBranchVisitCount : Nat := 0
+  sharedLogicalBranchVisitCount : Nat := 0
   transformCacheHits : Nat := 0
   transformCacheMisses : Nat := 0
   cartesianPairVisits : Nat := 0
@@ -8316,11 +8557,13 @@ private def operationalAnalysisDiagnostics
     envelopeLogicalBranchCount := logicalBranches
     envelopeStoredBranchCount := storedBranches
     relationRewriteCount := arena.relationRewriteCount
+    choiceJoinCount := arena.choiceJoinCount
+    domainComparisonCount := arena.domainComparisonCount
+    exactBranchVisitCount := arena.exactBranchVisitCount
+    sharedLogicalBranchVisitCount := arena.sharedLogicalBranchVisitCount
     transformCacheHits := arena.transformCacheHits
     transformCacheMisses := arena.transformCacheMisses
-    -- Independent selections are summarized compositionally. There is deliberately no Cartesian
-    -- traversal or fallback whose visits could increment this counter.
-    cartesianPairVisits := 0
+    cartesianPairVisits := arena.cartesianPairVisitCount
     maximumPolynomialTerms
   }
 
@@ -8387,7 +8630,7 @@ private def evaluateOperationalExprNoiseBoundWithStats
     (root : OperationalExprId) :
     Except OperationalError (Int × OperationalExprEvaluationStats) := do
   let (maximum, state) ← evaluateOperationalExprNoiseBoundWithState arena environment root
-    (OperationalExprEvaluationState.empty arena)
+    (OperationalExprEvaluationState.forEnvironment arena environment arena.evaluationState)
   pure (maximum, state.noiseStats)
 
 private def evaluateOperationalExprNoiseBound
@@ -8397,32 +8640,31 @@ private def evaluateOperationalExprNoiseBound
   let (maximum, _) ← evaluateOperationalExprNoiseBoundWithStats arena environment root
   pure maximum
 
-private def addOperationalExprEvaluationStats
-    (left right : OperationalExprEvaluationStats) : OperationalExprEvaluationStats := {
-  evaluations := left.evaluations + right.evaluations
-  memoHits := left.memoHits + right.memoHits
-  memoMisses := left.memoMisses + right.memoMisses
-}
-
 private partial def collectDecoderResidualBounds
     (arena : OperationalExprArena)
-    (environment : ParamEnvironment) : OperationalFact →
-    Except OperationalError (List Int × OperationalExprEvaluationStats)
-  | .matrix residual => return ([← residual.evaluateNoiseHardBound environment], {})
-  | .matrixExpr root => do
-      let (bound, stats) ← evaluateOperationalExprNoiseBoundWithStats arena environment root
-      pure ([bound], stats)
-  | .familyUniform _ _ element count => do
+    (environment : ParamEnvironment) : OperationalExprEvaluationState → OperationalFact →
+    Except OperationalError (List Int × OperationalExprEvaluationState)
+  | state, .matrix residual =>
+      return ([← residual.evaluateNoiseHardBound environment], state)
+  | state, .matrixExpr root => do
+      let (bound, state) ← evaluateOperationalExprNoiseBoundWithState arena environment root state
+      pure ([bound], state)
+  | state, .familyUniform _ _ element count => do
       if count <= 0 then
         throw (.invalidCount 0 count)
-      collectDecoderResidualBounds arena environment element
-  | .familyPacked elements count summary => do
-      if elements.isEmpty || !packedMatrixEnvelopeIsComplete elements count summary then
+      collectDecoderResidualBounds arena environment state element
+  | state, .familyPacked elements count => do
+      if elements.isEmpty || elements.size != count then
         throw (.invalidCount 0 (Int.ofNat count))
-      let rows ← elements.toList.mapM (collectDecoderResidualBounds arena environment)
-      pure (rows.flatMap (fun row => row.1), rows.foldl
-        (fun stats row => addOperationalExprEvaluationStats stats row.2) {})
-  | _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
+      let mut state := state
+      let mut bounds : List Int := []
+      for element in elements do
+        let (elementBounds, nextState) ←
+          collectDecoderResidualBounds arena environment state element
+        bounds := bounds ++ elementBounds
+        state := nextState
+      pure (bounds, state)
+  | _, _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
 
 /-- Evaluate every matrix-like port produced at `node` across all workflow stages.  This helper is
 used only by the external performance harness to time former hot nodes; it does not affect the
@@ -8434,15 +8676,18 @@ def operationalNodeNoiseBounds
     (environment : ParamEnvironment) : Except OperationalError (List Int) := do
   let mut result : List Int := []
   for stage in outputs do
+    let mut evaluationState := OperationalExprEvaluationState.forEnvironment
+      stage.facts.arena environment stage.facts.arena.evaluationState
     match stage.facts.values[node]? with
     | none => pure ()
     | some ports =>
         for fact in ports do
           match fact with
           | .matrix _ | .matrixExpr _ | .familyUniform .. | .familyPacked .. =>
-              let (bounds, _) ←
-                collectDecoderResidualBounds stage.facts.arena environment fact
+              let (bounds, nextState) ← collectDecoderResidualBounds stage.facts.arena
+                environment evaluationState fact
               result := result ++ bounds
+              evaluationState := nextState
           | _ => pure ()
   pure result
 
@@ -8454,11 +8699,14 @@ def operationalNoiseBoundForFact
     (residual : OperationalFact)
     (environment : ParamEnvironment) :
     Except OperationalError (Int × OperationalAnalysisDiagnostics) := do
-  let (bounds, evaluationStats) ← collectDecoderResidualBounds arena environment residual
+  let initialState := OperationalExprEvaluationState.forEnvironment
+    arena environment arena.evaluationState
+  let (bounds, evaluationState) ←
+    collectDecoderResidualBounds arena environment initialState residual
   let noiseBound ← match bounds with
     | head :: tail => pure (tail.foldl max head)
     | [] => throw (OperationalError.invalidCount 0 0)
-  pure (noiseBound, operationalAnalysisDiagnostics arena evaluationStats)
+  pure (noiseBound, operationalAnalysisDiagnostics arena evaluationState.noiseStats)
 
 /-- Applies a cheap decoder threshold to an already evaluated structural bound. -/
 def decoderNoiseCheckReportFromBound
@@ -10355,8 +10603,8 @@ example : (do
       sharedPreimageBaseDerivation [] [fixtureLayout]
     let first ← lookupFact 5 facts { node := 3, port := 0 }
     let second ← lookupFact 5 facts { node := 4, port := 0 }
-    let (arena, selected) ← loopTemplateArgumentExpr {} 20 0 1 (.zipOffset 1)
-      (packedFacts [first, second])
+    let (arena, selected) ← loopTemplateArgumentExpr {} 20 0 1 (.zipOffset 1) []
+      deriveOperationalSchemaFact (packedFacts [first, second])
     match selected, second with
     | .matrixExpr root, .matrix expected => match arena.get? root with
         | some { node := .concrete actual, .. } => pure (actual.origin == expected.origin)
@@ -10374,7 +10622,7 @@ example : (do
   native_decide
 
 /-- Empty residual families are rejected instead of being assigned a zero bound. -/
-example : (match decoderNoiseCheckReportForFact [] {} (.familyPacked #[] 0 none) [] 2 25 with
+example : (match decoderNoiseCheckReportForFact [] {} (.familyPacked #[] 0) [] 2 25 with
     | .error (.invalidCount 0 0) => true
     | _ => false) = true := by
   native_decide
@@ -10461,12 +10709,6 @@ example : (do
     OperationalExprArena.checkedType, OperationalExprArena.get?]
   rfl
 
-/-- Static exact selection distinguishes an invalid index from the intentionally unavailable
-schema-envelope lookup. -/
-example : (ChoiceStorage.exact #[4, 7]).staticBranch 2 =
-    .error (.invalidCount 0 2) := by
-  decide
-
 private def boundedOperationalExprFixtureFact
     (node : Nat)
     (bound : Int) : OperationalMatrixFact :=
@@ -10517,6 +10759,33 @@ private def envelopePlusNestedSelectionFixture : Bool :=
   | .ok value => value
   | .error _ => false
 
+/-- A Shared value applies its outer-domain envelope after closing only the physically stored
+nested Exact alternatives.  The 30,720 logical outer branches are never materialized or visited:
+the representative closes to five, while the validated outer envelope raises the result to nine. -/
+private def outerEnvelopeDominatesNestedRepresentativeFixture : Bool :=
+  match (do
+    let first := boundedOperationalExprFixtureFact 180 3
+    let second := boundedOperationalExprFixtureFact 181 5
+    let envelope := boundedOperationalExprFixtureFact 182 9
+    let (arena, firstId) := ({} : OperationalExprArena).pushConcrete first
+    let (arena, secondId) := arena.pushConcrete second
+    let nestedSelection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 183, port := 0 }
+    }
+    let (arena, nested) ← arena.pushSelect nestedSelection (.exact #[firstId, secondId])
+    let outerSelection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 184, port := 0 }
+    }
+    let summary := selectedMatrixSummary #[envelope]
+    let (arena, root) ← arena.pushCheckedSchemaEnvelope outerSelection 30720 nested summary envelope
+    let shallow ← tryUniformRepresentative arena root
+    let (bound, state) ← evaluateOperationalExprNoiseBoundWithState arena [] root
+      (OperationalExprEvaluationState.empty arena)
+    pure (shallow.isSome && bound == 9 && arena.nodes.size == 4 &&
+      state.noiseStats.evaluations == 4)) with
+  | .ok true => true
+  | _ => false
+
 /-- Constant-polynomial matrix multiplication preserves the strict nonnegative range needed by a
 following coefficient extraction and LUT selection. General polynomial inputs remain unknown
 because negacyclic reduction can map a negative coefficient close to the modulus. -/
@@ -10530,8 +10799,9 @@ private def constantPolynomialProductCanonicalRangeFixture : Bool :=
     constantPolynomialProductCanonicalRange
       { constant 20 4 with metadata := {} } (constant 21 5) == .unknown
 
-/-- Matrix-product compatibility uses evaluated dimensions, accepts equivalent symbolic syntax,
-retains the declared canonical output type, and still rejects a genuinely incompatible product. -/
+/-- Matrix-product compatibility uses evaluated dimensions, accepts equivalent symbolic syntax
+and every product mode supported by `inferOperationalProductMode`, retains the declared canonical
+output type, and still rejects a genuinely incompatible product. -/
 private def equivalentProductDimensionFixture : Bool :=
   let leftType : MatrixTypeExpr := {
     modulus := .constant 17, ringDimension := .constant 1,
@@ -10547,6 +10817,10 @@ private def equivalentProductDimensionFixture : Bool :=
   let outputType : MatrixTypeExpr := {
     modulus := .constant 17, ringDimension := .constant 1,
     rows := .constant 1, columns := .constant 3
+  }
+  let scalarType : MatrixTypeExpr := {
+    modulus := .constant 17, ringDimension := .constant 1,
+    rows := .constant 1, columns := .constant 1
   }
   match (do
     let base := boundedOperationalExprFixtureFact 22 2
@@ -10566,7 +10840,10 @@ private def equivalentProductDimensionFixture : Bool :=
         (arena.nodes.size + 1) with
       | .error (.operationalExprTypeMismatch _ _) => true
       | _ => false
-    pure (acceptedType == outputType && rejected)) with
+    pure (acceptedType == outputType && rejected &&
+      concreteMatrixProductMatches scalarType leftType leftType [] &&
+      concreteMatrixProductMatches leftType scalarType leftType [] &&
+      concreteMatrixProductMatches leftType leftType leftType [])) with
   | .ok value => value
   | .error _ => false
 
@@ -10591,16 +10868,15 @@ private def exactSelectionRecoveredFromEnvelopeFixture : Bool :=
     match arena.get? output with
     | some { node := .select actual (.shared representative summary), .. } =>
         let summary ← arena.validatedSchema summary
-        let state := OperationalExprEvaluationState.empty arena
-        let (fact, _) ← tryUniformRepresentative arena [] representative state
+        let conservativeFact ← validateSelectedMatrixSummary representative summary
         pure (actual.identity == selection && actual.count == 2 && summary.relationFree &&
-          summary.uniformSchema == some (operationalUniformSchema fact))
+          summary.uniformSchema == some (operationalUniformSchema conservativeFact))
     | _ => pure false) with
   | .ok value => value
   | .error _ => false
 
-/-- Tensor accepts a checked schema envelope whose representative is an expression DAG, evaluates
-that representative before transferring metadata, and preserves the exact selection identity. -/
+/-- Tensor accepts a checked schema envelope whose representative is an expression DAG, transfers
+the conservative schema fact independently, and preserves the exact selection identity. -/
 private def tensorSchemaEnvelopeRepresentativeFixture : Bool :=
   match (do
     let first := boundedOperationalExprFixtureFact 24 2
@@ -10612,7 +10888,7 @@ private def tensorSchemaEnvelopeRepresentativeFixture : Bool :=
       #[firstId, secondId]
     let state := OperationalExprEvaluationState.empty arena
     let (representativeFact, _) ←
-      tryUniformRepresentative arena [] representative state
+      deriveOperationalSchemaFact arena [] representative state
     let selection : DynamicSelectionIdentity := {
       index := .local temporaryScope { node := 28, port := 0 }
     }
@@ -10631,8 +10907,7 @@ private def tensorSchemaEnvelopeRepresentativeFixture : Bool :=
         let outputExpression ← match arena.get? output with
           | some expression => pure expression
           | none => throw (OperationalError.invalidOperationalExprRef output)
-        let state := OperationalExprEvaluationState.empty arena
-        let (outputFact, _) ← tryUniformRepresentative arena [] output state
+        let outputFact ← validateSelectedMatrixSummary output outputSummary
         pure (actualSelection.identity == selection && actualSelection.count == 2 &&
           (match outputExpression.node with
             | .primitive operation _ => operation.kind == PrimitiveOperationKind.tensor
@@ -10673,11 +10948,12 @@ private def sameSelectionZipMatchesUnrolledFixture : Bool :=
       | some expression => pure expression
       | none => throw (OperationalError.invalidOperationalExprRef result)
     let selectedMaximum ← match expression.node with
-      | .select actualSelection (.shared representative _) => do
+      | .select actualSelection (.shared representative summaryId) => do
           if actualSelection.identity != selection || actualSelection.count != 2 then
             throw (OperationalError.unsupportedOperationalExpr result)
-          let fact ← arena.concreteFact representative
-          fact.evaluateNoiseHardBound []
+          let summary ← arena.validatedSchema summaryId
+          let conservativeFact ← validateSelectedMatrixSummary representative summary
+          conservativeFact.evaluateNoiseHardBound []
       | _ => throw (OperationalError.unsupportedOperationalExpr result)
     pure (selectedMaximum, explicitBounds)) with
   | .ok (selected, explicit) => explicit == [3, 5] && selected == 5
@@ -10694,8 +10970,10 @@ private def mixedPackedUniformZipFixture : Bool :=
     let uniform : OperationalFact := .familyUniform fixtureFamilyBinder
       (some (.loopBinder temporaryScope 46 1))
       (.matrix (boundedOperationalExprFixtureFact 46 2)) 2
-    let (arena, packedInput) ← loopTemplateArgumentExpr {} 47 0 2 .zip packed
-    let (arena, uniformInput) ← loopTemplateArgumentExpr arena 47 1 2 .zip uniform
+    let (arena, packedInput) ← loopTemplateArgumentExpr {} 47 0 2 .zip []
+      deriveOperationalSchemaFact packed
+    let (arena, uniformInput) ← loopTemplateArgumentExpr arena 47 1 2 .zip []
+      deriveOperationalSchemaFact uniform
     let (arena, result) ← addOperationalExprFacts 48 0 fixtureType false []
       deriveOperationalSchemaFact arena packedInput uniformInput
     let root ← match result with
@@ -10751,7 +11029,7 @@ private def uniformMatrixFamilySelectFixture : Bool :=
       (some (.loopBinder temporaryScope 72 4))
       (.matrix (boundedOperationalExprFixtureFact 72 5)) 4
     let (arena, output) ← selectUniformMatrixFamilies temporaryScope 73 selection
-      fixtureType 4 [left, right] {}
+      fixtureType 4 [left, right] [] deriveOperationalSchemaFact {}
     let (binder, coordinate, root, count) ← match output with
       | .familyUniform binder coordinate (.matrixExpr root) count =>
           pure (binder, coordinate, root, count)
@@ -10802,7 +11080,8 @@ private def distinctPublicBoundariesRemainExactFixture : Bool :=
     let selection : DynamicSelectionIdentity := {
       index := .local temporaryScope { node := 70, port := 0 }
     }
-    let (arena, root) ← arena.pushPrimitiveSelection selection fixtureType [] #[firstId, secondId]
+    let (arena, root) ← arena.pushPrimitiveSelection selection fixtureType []
+      deriveOperationalSchemaFact #[firstId, secondId]
     match arena.get? root with
     | some { node := .select actual (.exact branches), .. } =>
         pure (actual == selection && branches == #[firstId, secondId])
@@ -10971,7 +11250,8 @@ private def summaryTransferRegistryCoverageFixture : Bool :=
   let source := selectedMatrixSummary #[representative]
   let registered := #[
     EnvelopeSummaryTransferOperation.instantiationMap,
-    .recurrenceBoundShift, .addSubtract, .multiplyRelation, .tensor, .concat, .transform,
+    .recurrenceBoundShift, .addSubtract, .multiplyOrdinary, .multiplyRelation, .tensor,
+    .concat, .transform,
     .scale, .bggGrouping, .preimage, .decomposition]
   registered.all (fun operation =>
     (transferSelectedMatrixSummary operation #[source] representative).isSome) &&
@@ -11065,12 +11345,12 @@ private def largeUniformFamilyExactRelationFixture : Bool :=
         preimage)
     let publicFamily := packedOperationalFamily publicBranches
     let preimageFamily := packedOperationalFamily preimageBranches
-    let (arena, selectedPublic) ← loopTemplateArgumentExpr {} 340 0 1 (.zipOffset 64)
-      publicFamily
-    let (arena, selectedPreimage) ← loopTemplateArgumentExpr arena 341 0 1 (.zipOffset 64)
-      preimageFamily
-    let (arena, wrongPreimage) ← loopTemplateArgumentExpr arena 342 0 1 (.zipOffset 63)
-      preimageFamily
+    let (arena, selectedPublic) ← loopTemplateArgumentExpr {} 340 0 1 (.zipOffset 64) []
+      deriveOperationalSchemaFact publicFamily
+    let (arena, selectedPreimage) ← loopTemplateArgumentExpr arena 341 0 1 (.zipOffset 64) []
+      deriveOperationalSchemaFact preimageFamily
+    let (arena, wrongPreimage) ← loopTemplateArgumentExpr arena 342 0 1 (.zipOffset 63) []
+      deriveOperationalSchemaFact preimageFamily
     let concrete (fact : OperationalFact) := match fact with
       | .matrixExpr root => arena.concreteFact root
       | _ => throw (OperationalError.operandNotMatrix 0 { node := 0, port := 0 })
@@ -11094,8 +11374,9 @@ exhaustive, so adding a constructor requires an explicit decision here and in th
 private def primitiveTransferRegistryCoverageFixture : Bool :=
   let classes := #[
     PrimitiveTransferClass.addSubtract,
-    .multiplyOrdinary, .multiplyRelation, .tensor, .concat, .transform]
-  classes.size == 6 && classes.all fun transferClass =>
+    .multiplyOrdinary, .multiplyRelation, .tensor, .concat, .transform,
+    .scale, .bggGrouping, .preimage, .decomposition]
+  classes.size == 10 && classes.all fun transferClass =>
     match compositionalTransferRegistry transferClass with
     | .supported _ | .requiresConcreteStructure => true
 
@@ -11114,24 +11395,70 @@ private def sharedRelationCorrelationFixture : Bool :=
     let selection : OperationalValueOrigin := .local temporaryScope { node := 151, port := 0 }
     let otherSelection : OperationalValueOrigin :=
       .local temporaryScope { node := 152, port := 0 }
+    let otherBinder : FamilyTemplateBinder := {
+      owner := temporaryScope, producerNode := 150, binderSlot := 1
+    }
+    let differentPublicIdentity : PublicMatrixIdentity :=
+      .sampledTrapdoor (.root (.standalone 151)) { node := 0, port := 0 }
+    let mapMatrixRelation
+        (map : OperationalMatrixRelation → OperationalMatrixRelation)
+        (fact : OperationalMatrixFact) : OperationalMatrixFact :=
+      { fact with
+        relations := fact.relations.map map
+        polynomial := mapOperationalPolynomial id id id id map fact.polynomial }
+    let wrongBoundaryPreimage := mapMatrixRelation
+      (fun relation => match relation with
+        | .decomposition value => .decomposition {
+            value with publicIdentity := differentPublicIdentity }
+        | .preimage value => .preimage {
+            value with publicIdentity := differentPublicIdentity }) preimage
+    let wrongProducerPreimage := mapMatrixRelation
+      (fun relation => match relation with
+        | .decomposition value => .decomposition { value with
+            producer := .value temporaryScope { node := 999, port := 0 } }
+        | .preimage value => .preimage { value with
+            producer := .value temporaryScope { node := 999, port := 0 } }) preimage
     let selectedPublic := selectDynamicMatrixFact binder selection { node := 153, port := 0 }
       publicMatrix
     let selectedPreimage := selectDynamicMatrixFact binder selection { node := 154, port := 0 }
       preimage
     let otherPreimage := selectDynamicMatrixFact binder otherSelection { node := 155, port := 0 }
       preimage
+    let selectedWrongBoundary := selectDynamicMatrixFact binder selection
+      { node := 158, port := 0 } wrongBoundaryPreimage
+    let selectedWrongProducer := selectDynamicMatrixFact binder selection
+      { node := 159, port := 0 } wrongProducerPreimage
+    let selectedOtherBinder := selectDynamicMatrixFact otherBinder selection
+      { node := 160, port := 0 } preimage
     let publicSummary := selectedMatrixSummary #[selectedPublic]
     let preimageSummary := selectedMatrixSummary #[selectedPreimage]
     let otherSummary := selectedMatrixSummary #[otherPreimage]
+    let wrongBoundarySummary := selectedMatrixSummary #[selectedWrongBoundary]
+    let wrongProducerSummary := selectedMatrixSummary #[selectedWrongProducer]
+    let otherBinderSummary := selectedMatrixSummary #[selectedOtherBinder]
     let (arena, publicRepresentative) := ({} : OperationalExprArena).pushConcrete selectedPublic
     let (arena, preimageRepresentative) := arena.pushConcrete selectedPreimage
     let (arena, otherRepresentative) := arena.pushConcrete otherPreimage
+    let (arena, wrongBoundaryRepresentative) := arena.pushConcrete selectedWrongBoundary
+    let (arena, wrongProducerRepresentative) := arena.pushConcrete selectedWrongProducer
+    let (arena, otherBinderRepresentative) := arena.pushConcrete selectedOtherBinder
     let (arena, selectedPublicRoot) ← arena.pushSharedSelection
       { index := selection } 30720 publicRepresentative publicSummary
     let (arena, selectedPreimageRoot) ← arena.pushSharedSelection
       { index := selection } 30720 preimageRepresentative preimageSummary
     let (arena, otherPreimageRoot) ← arena.pushSharedSelection
       { index := otherSelection } 30720 otherRepresentative otherSummary
+    let (arena, wrongBoundaryRoot) ← arena.pushSharedSelection
+      { index := selection } 30720 wrongBoundaryRepresentative wrongBoundarySummary
+    let (arena, wrongProducerRoot) ← arena.pushSharedSelection
+      { index := selection } 30720 wrongProducerRepresentative wrongProducerSummary
+    let (arena, otherBinderRoot) ← arena.pushSharedSelection
+      { index := selection } 30720 otherBinderRepresentative otherBinderSummary
+    -- A stale pair whose schema claims the good relation but whose representative carries a
+    -- different relation identity must survive construction only to be rejected by the concrete
+    -- representative rewrite below.
+    let (arena, staleRepresentativeRoot) ← arena.pushSharedSelection
+      { index := selection } 30720 wrongBoundaryRepresentative preimageSummary
     let (arena, output) ← multiplyOperationalExprIds 156 0 fixtureType
       (.matrixMultiplyRelation selectedPreimage.subject) selectedPreimage.subject []
       deriveOperationalSchemaFact arena selectedPublicRoot selectedPreimageRoot
@@ -11140,19 +11467,39 @@ private def sharedRelationCorrelationFixture : Bool :=
       | some { node := .select domain (.shared _ _), .. } =>
           domain.count == 30720 && arena.relationRewriteCount == 1
       | _ => false
+    let selectedPublicDomain ← match arena.get? selectedPublicRoot with
+      | some { node := .select domain _, .. } => pure domain
+      | _ => throw (OperationalError.unsupportedOperationalExpr selectedPublicRoot)
+    let otherPreimageDomain ← match arena.get? otherPreimageRoot with
+      | some { node := .select domain _, .. } => pure domain
+      | _ => throw (OperationalError.unsupportedOperationalExpr otherPreimageRoot)
     let rejected := match multiplyOperationalExprIds 157 0 fixtureType
         (.matrixMultiplyRelation otherPreimage.subject) otherPreimage.subject []
         deriveOperationalSchemaFact arena selectedPublicRoot otherPreimageRoot
         (arena.nodes.size + 1) with
-      | .error (.incompatibleRelationDomains 157 _ _) => true
+      | .error (.incompatibleRelationDomains 157 left right) =>
+          left == selectedPublicDomain.ordinal && right == otherPreimageDomain.ordinal &&
+            left != right
       | _ => false
-    pure (accepted && rejected)) with
+    let rejectsSameDomain (node : Nat) (right : OperationalExprId) :=
+      match multiplyOperationalExprIds node 0 fixtureType
+          (.matrixMultiplyRelation selectedPreimage.subject) selectedPreimage.subject []
+          deriveOperationalSchemaFact arena selectedPublicRoot right (arena.nodes.size + 1) with
+      | .error _ => true
+      | .ok _ => false
+    let boundaryRejected := rejectsSameDomain 158 wrongBoundaryRoot
+    let producerRejected := rejectsSameDomain 159 wrongProducerRoot
+    let parameterizationRejected := rejectsSameDomain 160 otherBinderRoot
+    let representativeRejected := rejectsSameDomain 161 staleRepresentativeRoot
+    pure (accepted && rejected && boundaryRejected && producerRejected &&
+      parameterizationRejected && representativeRejected)) with
   | .ok true => true
   | _ => false
 
 /-- Supported independent addition composes complete child maxima without a Cartesian product.
-An ordinary multiplication that requires concrete structure remains delayed and then fails with
-the dedicated endpoint error. -/
+An ordinary multiplication requiring concrete structure remains delayed while both domains are
+unresolved, succeeds after each exact lane is selected, and still fails closed at an unresolved
+endpoint. -/
 private def concreteStructureLifecycleFixture : Bool :=
   match (do
     let facts := Array.range 4 |>.map fun index =>
@@ -11181,11 +11528,81 @@ private def concreteStructureLifecycleFixture : Bool :=
       { node := 165, port := 0 } [] deriveOperationalSchemaFact arena left right
       (arena.nodes.size + 1)
     arena := nextArena
+    let leftBinder : FamilyTemplateBinder := {
+      owner := temporaryScope, producerNode := 164, binderSlot := 0 }
+    let rightBinder : FamilyTemplateBinder := {
+      owner := temporaryScope, producerNode := 165, binderSlot := 0 }
+    let (nextArena, leftResolved) ← loopTemplateStaticRoot leftBinder 0 arena product
+      (arena.nodes.size + 1)
+    arena := nextArena
+    let (nextArena, fullyResolved) ← loopTemplateStaticRoot rightBinder 1 arena leftResolved
+      (arena.nodes.size + 1)
+    arena := nextArena
+    let resolvedWorked := match deriveOperationalSchemaFact arena [] fullyResolved
+        (OperationalExprEvaluationState.empty arena) with
+      | .ok _ => true
+      | .error _ => false
     let productRejected := match evaluateOperationalExprNoiseBound arena [] product with
       | .error (.unresolvedConcreteStructure 167 _) => true
       | _ => false
     let diagnostics := operationalAnalysisDiagnostics arena
-    pure (sumBound == 6 && productRejected && diagnostics.cartesianPairVisits == 0)) with
+    pure (sumBound == 6 && resolvedWorked && productRejected &&
+      diagnostics.cartesianPairVisits == 0)) with
+  | .ok true => true
+  | _ => false
+
+/-- N-ary lifting chooses the first immediate domain, visits only its stored Exact alternatives,
+and leaves an independent Shared domain nested in each representative.  No A×B product is built
+or visited; the complete outer bound is the maximum of the two fully concatenated A branches. -/
+private def naryMixedSelectionFixture : Bool :=
+  match (do
+    let sharedAFact := boundedOperationalExprFixtureFact 180 1
+    let exactAFirst := boundedOperationalExprFixtureFact 181 2
+    let exactASecond := boundedOperationalExprFixtureFact 182 3
+    let concreteFact := boundedOperationalExprFixtureFact 183 4
+    let sharedBFact := boundedOperationalExprFixtureFact 184 5
+    let mut arena : OperationalExprArena := {}
+    let (nextArena, sharedARepresentative) := arena.pushConcrete sharedAFact
+    arena := nextArena
+    let (nextArena, exactAFirstId) := arena.pushConcrete exactAFirst
+    arena := nextArena
+    let (nextArena, exactASecondId) := arena.pushConcrete exactASecond
+    arena := nextArena
+    let (nextArena, concreteId) := arena.pushConcrete concreteFact
+    arena := nextArena
+    let (nextArena, sharedBRepresentative) := arena.pushConcrete sharedBFact
+    arena := nextArena
+    let selectionA : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 185, port := 0 }
+    }
+    let selectionB : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 186, port := 0 }
+    }
+    let (nextArena, sharedA) ← arena.pushSharedSelection selectionA 2 sharedARepresentative
+      (selectedMatrixSummary #[sharedAFact])
+    arena := nextArena
+    let (nextArena, exactA) ← arena.pushSelect selectionA
+      (.exact #[exactAFirstId, exactASecondId])
+    arena := nextArena
+    let (nextArena, sharedB) ← arena.pushSharedSelection selectionB 30720 sharedBRepresentative
+      (selectedMatrixSummary #[sharedBFact])
+    arena := nextArena
+    let outputType : MatrixTypeExpr := { fixtureType with rows := .constant 4 }
+    let (finalArena, output) ← concatOperationalExprIds 187 0 .rows outputType [] arena
+      #[sharedA, exactA, concreteId, sharedB] (arena.nodes.size + 1)
+    let bound ← evaluateOperationalExprNoiseBound finalArena [] output
+    let outerRepresentative ← match finalArena.get? output with
+      | some { node := .select domain (.shared representative _), .. } =>
+          if domain.identity == SelectionIdentityLike.identity selectionA then pure representative
+          else throw (OperationalError.unsupportedOperationalExpr output)
+      | _ => throw (OperationalError.unsupportedOperationalExpr output)
+    let nestedB := match finalArena.get? outerRepresentative with
+      | some expression => expression.containsSelection
+      | none => false
+    let diagnostics := operationalAnalysisDiagnostics finalArena
+    pure (bound == 13 && nestedB && diagnostics.exactBranchVisitCount == 2 &&
+      diagnostics.sharedLogicalBranchVisitCount == 0 &&
+      diagnostics.cartesianPairVisits == 0)) with
   | .ok true => true
   | _ => false
 
@@ -11217,10 +11634,61 @@ private def selectionTraversalComplexityFixture : Bool :=
     let (bound, state) ← evaluateOperationalExprNoiseBoundWithState arena [] root
       (OperationalExprEvaluationState.empty arena)
     pure (bound == 1 && state.noiseStats.evaluations == count + 1)
+  let sharedSharedCase (count : Nat) := do
+    let leftFact := boundedOperationalExprFixtureFact 500 1
+    let rightFact := boundedOperationalExprFixtureFact 501 2
+    let leftSummary := selectedMatrixSummary #[leftFact]
+    let rightSummary := selectedMatrixSummary #[rightFact]
+    let (arena, leftRepresentative) := ({} : OperationalExprArena).pushConcrete leftFact
+    let (arena, rightRepresentative) := arena.pushConcrete rightFact
+    let selection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 502, port := 0 }
+    }
+    let (arena, left) ← arena.pushSharedSelection selection count leftRepresentative leftSummary
+    let (arena, right) ← arena.pushSharedSelection selection count rightRepresentative rightSummary
+    let (arena, output) ← addOperationalExprIds 503 0 fixtureType false []
+      deriveOperationalSchemaFact arena left right (arena.nodes.size + 1)
+    let bound ← evaluateOperationalExprNoiseBound arena [] output
+    let diagnostics := operationalAnalysisDiagnostics arena
+    pure (bound == 3 && diagnostics.sharedLogicalBranchVisitCount == 0 &&
+      diagnostics.exactBranchVisitCount == 0 && diagnostics.domainComparisonCount == 2)
+  let exactSharedCase (count : Nat) := do
+    let mut arena : OperationalExprArena := {}
+    let mut branches : Array OperationalExprId := #[]
+    for index in [:count] do
+      let fact := boundedOperationalExprFixtureFact (600 + index) 1
+      let (nextArena, branch) := arena.pushConcrete fact
+      arena := nextArena
+      branches := branches.push branch
+    let sharedFact := boundedOperationalExprFixtureFact 700 2
+    let sharedSummary := selectedMatrixSummary #[sharedFact]
+    let (nextArena, sharedRepresentative) := arena.pushConcrete sharedFact
+    arena := nextArena
+    let selection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 701 + count, port := 0 }
+    }
+    let (nextArena, exact) ← arena.pushSelect selection (.exact branches)
+    arena := nextArena
+    let (nextArena, shared) ← arena.pushSharedSelection selection count
+      sharedRepresentative sharedSummary
+    arena := nextArena
+    let (finalArena, output) ← addOperationalExprIds 702 0 fixtureType false []
+      deriveOperationalSchemaFact arena exact shared (arena.nodes.size + 1)
+    let nextFact := boundedOperationalExprFixtureFact 703 1
+    let (finalArena, nextId) := finalArena.pushConcrete nextFact
+    let (finalArena, subsequent) ← addOperationalExprIds 704 0 fixtureType false []
+      deriveOperationalSchemaFact finalArena output nextId (finalArena.nodes.size + 1)
+    let bound ← evaluateOperationalExprNoiseBound finalArena [] subsequent
+    let diagnostics := operationalAnalysisDiagnostics finalArena
+    pure (bound == 4 && diagnostics.sharedLogicalBranchVisitCount == 0 &&
+      diagnostics.exactBranchVisitCount == count && diagnostics.domainComparisonCount == 3 &&
+      diagnostics.choiceJoinCount == 1)
   match (do
     let uniform ← #[2, 1024, 30720].mapM uniformCase
     let exact ← #[8, 32, 65].mapM exactCase
-    pure (uniform.all id && exact.all id)) with
+    let sharedShared ← #[2, 1024, 30720].mapM sharedSharedCase
+    let exactShared ← #[8, 32, 65].mapM exactSharedCase
+    pure (uniform.all id && exact.all id && sharedShared.all id && exactShared.all id)) with
   | .ok true => true
   | _ => false
 
@@ -11228,17 +11696,28 @@ private def selectionTraversalComplexityFixture : Bool :=
 expression ID. Repeating a query changes only its hit counter. -/
 private def operationalQueryMemoFixture : Bool :=
   match (do
-    let fact := boundedOperationalExprFixtureFact 500 3
-    let (arena, root) := ({} : OperationalExprArena).pushConcrete fact
-    let state := OperationalExprEvaluationState.empty arena
-    let (_, state) ← relationRequirement arena root state
-    let (_, state) ← relationRequirement arena root state
-    let (_, state) ← deriveOperationalSchemaFact arena [] root state
-    let (_, state) ← deriveOperationalSchemaFact arena [] root state
-    let (_, state) ← evaluateCompleteBound arena [] root state
-    let (_, state) ← evaluateCompleteBound arena [] root state
-    pure (state.relationStats.memoHits == 1 && state.schemaStats.memoHits == 1 &&
-      state.totalStats.memoHits == 1)) with
+    let left := boundedOperationalExprFixtureFact 500 1
+    let right := boundedOperationalExprFixtureFact 501 2
+    let (arena, leftId) := ({} : OperationalExprArena).pushConcrete left
+    let (arena, rightId) := arena.pushConcrete right
+    let (arena, root) := arena.pushPrimitive 502 0 fixtureType [] (.add false)
+      #[leftId, rightId]
+    let (_, arena) ← arena.relationRequirementCached root
+    let (_, arena) ← arena.relationRequirementCached root
+    let (_, arena) ← arena.deriveOperationalSchemaFactCached [] root
+    let (_, arena) ← arena.deriveOperationalSchemaFactCached [] root
+    let (_, arena) ← arena.evaluateCompleteBoundCached .total [] root
+    let (_, arena) ← arena.evaluateCompleteBoundCached .total [] root
+    let (_, arena) ← arena.evaluateCompleteBoundCached .noise [] root
+    let (_, arena) ← arena.evaluateCompleteBoundCached .noise [] root
+    pure (arena.evaluationState.relationStats.memoHits == 1 &&
+      arena.evaluationState.relationStats.evaluations == 3 &&
+      arena.evaluationState.schemaStats.memoHits == 1 &&
+      arena.evaluationState.schemaStats.evaluations == 3 &&
+      arena.evaluationState.totalStats.memoHits == 1 &&
+      arena.evaluationState.totalStats.evaluations == 3 &&
+      arena.evaluationState.noiseStats.memoHits == 1 &&
+      arena.evaluationState.noiseStats.evaluations == 3)) with
   | .ok true => true
   | _ => false
 
@@ -11264,11 +11743,13 @@ example : exactRelationSelectionFixtureResult = .ok true ∧
     summaryTransferRegistryCoverageFixture = true ∧
     transformMemoInvocationIsolationFixture = true ∧
     envelopePlusNestedSelectionFixture = true ∧
+    outerEnvelopeDominatesNestedRepresentativeFixture = true ∧
     independentSelectionCartesianRejectsFixture = true ∧
     largeUniformFamilyExactRelationFixture = true ∧
     primitiveTransferRegistryCoverageFixture = true ∧
     sharedRelationCorrelationFixture = true ∧
     concreteStructureLifecycleFixture = true ∧
+    naryMixedSelectionFixture = true ∧
     selectionTraversalComplexityFixture = true ∧
     operationalQueryMemoFixture = true := by
   native_decide

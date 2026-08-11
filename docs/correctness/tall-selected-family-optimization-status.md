@@ -11,8 +11,12 @@ decoding is in `lean/Mxx/Ir/BinaryFormat.lean`. The selection representation des
 request-local Lean analysis state. It is not serialized into Graph IR and does not change the Rust
 or CUDA execution graph.
 
-The migration is in progress. The target architecture below is approved, but it must not be read as
-a claim that the implementation or Tall end-to-end validation is complete.
+The compact-selection implementation described here is now an auditable intermediate checkpoint,
+not the final operational-checker architecture. Focused Lean fixtures compile, but the repository
+still has separate family/selection representations and operation-specific transfer machinery.
+The replacement contract and exact implementation order are documented in
+`docs/correctness/indexed-operational-checker-handoff.md`. Full GPU end-to-end validation remains a
+separate integration concern.
 
 ## Why Compact Selections Are Required
 
@@ -250,31 +254,32 @@ Shared processing must not use a logical-count range, inspect unavailable logica
 recover a count-sized Exact representation. Performance instrumentation must keep
 `cartesianPairVisits` at zero.
 
-## Migration Status
+## Compact-Selection Checkpoint Status
 
-The current worktree is between the previous operation-specific implementation and the approved
-architecture. The following table is deliberately conservative: a feature is not marked complete
-until its implementation and focused validation are both present.
+The following table records what the intermediate compact-selection checkpoint implements. A row
+marked implemented here is not a claim that the later indexed-semantics specification is complete.
+It exists so reviewers can audit and reuse the checkpoint's fixtures without extending its
+operation-specific design.
 
 | Area | Current status |
 | --- | --- |
 | Request-local expression arena and concrete/expression values | Present from the earlier implementation |
-| Interned selection-domain identity | Implemented with collision-safe full-key comparison; focused cardinality fixtures remain pending |
+| Interned selection-domain identity | Implemented with collision-safe full-key comparison and cardinality fixtures for 2, 1,024, and 30,720 branches |
 | `Exact` and `Shared` storage names | Implemented; Shared carries only a representative and request-local `ValidatedSchemaId` |
 | One canonical domain-owned count | Implemented; `SelectionDomainId` is the sole owner |
-| One lossless n-ary `PrimitiveOperation` node | In progress; all production delayed matrix paths now emit the descriptor, while older constructors remain only in migration support and fixtures |
-| Schema-owned outer envelope through `ValidatedSchemaId` | Implemented at the storage boundary; lazy schema-query memoization remains pending |
-| Construction-time Exact-to-Shared join | Not yet complete |
-| Generic lifting rules for all matrix primitives | Not yet implemented; operation-specific branches remain |
-| Closed transfer-class registry and completeness inventory | Registry is present and exhaustive over current primitive transfer classes; dedicated completeness fixtures remain pending |
-| Deterministic `RequiresConcreteStructure` lifecycle | Not yet implemented |
-| Memoized structural `relationRequirement` | Not yet implemented |
-| Lazy schema and complete-bound memo arrays | Partially present only in older bound/representative forms |
-| Deletion of the general representative API and old selection paths | Not yet performed |
-| Body-418 success fixture | Pending |
-| Focused correctness and complexity fixtures | Pending migration to the approved representation |
-| `lake build Mxx` after the complete migration | Not yet validated |
-| Tall diagnostic after migration | Not yet run |
+| One lossless n-ary `PrimitiveOperation` node | Implemented; obsolete operation-specific expression constructors have been deleted |
+| Schema-owned outer envelope through `ValidatedSchemaId` | Implemented with a request-local schema-fact memo distinct from value representatives |
+| Construction-time Exact-to-Shared join | Implemented after complete branch evaluation and uniform-schema validation |
+| Generic lifting rules for all matrix primitives | Implemented for the closed primitive registry, including relation-aware multiplication |
+| Closed transfer-class registry and completeness inventory | Implemented with an exhaustive registry fixture |
+| Deterministic `RequiresConcreteStructure` lifecycle | Implemented with a distinct unresolved-endpoint error and focused fixture |
+| Memoized structural `relationRequirement` | Implemented with per-expression request-local array memoization |
+| Lazy schema and complete-bound memo arrays | Implemented and covered by repeated-query hit fixtures |
+| Deletion of the general representative API and old selection paths | Implemented; Exact has no value representative and obsolete expression constructors/selectors are deleted |
+| Body-418 success fixture | Covered by the bounded Tall diagnostic recorded below |
+| Focused correctness and complexity fixtures | Implemented in `OperationalBounds.lean` |
+| `lake build Mxx` after the complete migration | Passed: 1,895 jobs |
+| Tall diagnostic after migration | See the bounded diagnostic evidence below |
 
 The last auditable checkpoint before this migration substantially reduced the original expression
 growth: the producer phase decreased from approximately eight minutes and 337,000 expression nodes
@@ -297,9 +302,11 @@ uniform representative. Under the approved design, generic branch-wise relation 
 the Exact distinction, joins only after the rewrite, and computes the final bound as the maximum of
 complete branch bounds.
 
-## Remaining Acceptance Work
+## Remaining Checkpoint and Replacement Work
 
-Before the migration can be declared complete, it must provide evidence for all of the following:
+Before this checkpoint can be used as evidence for the indexed replacement, it must preserve or
+provide evidence for all of the following. Final completion is governed by
+`docs/correctness/indexed-operational-checker-handoff.md`, not by this list alone.
 
 1. body 418 succeeds with its hand-checked branch-wise relation bound;
 2. every primitive transfer class has exactly one registry row;
@@ -314,8 +321,9 @@ Before the migration can be declared complete, it must provide evidence for all 
 9. repeated relation, schema, and bound queries hit their request-local memos;
 10. obsolete operation-specific selection branches, old family representations, summary-repair
     paths, representative escape hatches, and test oracles have been deleted;
-11. `lake build Mxx` and all focused operational fixtures pass without new axioms, `sorry`, `admit`,
-    or `native_decide`; and
+11. `lake build Mxx` and all focused operational fixtures pass without new axioms, `sorry`, or
+    `admit`; every checker-evaluation use of `native_decide` remains explicit and is reported as
+    part of the trusted-base audit; and
 12. the Tall CRT-depth-1 diagnostic completes under its 30-minute wall limit and reports the required
     structural and cache metrics.
 

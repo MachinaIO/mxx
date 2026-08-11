@@ -1,287 +1,289 @@
-# Tall Operational Selection Checker Status
+# Tall Operational Selection Checker Migration Status
 
 ## Purpose
 
-This document describes the operational checker used to estimate noise for the Tall BGG+
-nested-RNS graph. It is written for readers who are new to the checker and describes only the
-current design.
+This document explains the approved architecture for compact dynamic selections in the Tall BGG+
+operational noise checker and records the current implementation status. It is intended for readers
+who are new to the checker.
 
-The checker is implemented primarily in `lean/Mxx/Certificate/OperationalBounds.lean`. Binary
-Graph IR decoding is implemented in `lean/Mxx/Ir/BinaryFormat.lean`.
+The implementation is primarily in `lean/Mxx/Certificate/OperationalBounds.lean`. Binary Graph IR
+decoding is in `lean/Mxx/Ir/BinaryFormat.lean`. The selection representation described here is
+request-local Lean analysis state. It is not serialized into Graph IR and does not change the Rust
+or CUDA execution graph.
 
-The executable Rust and CUDA graph does not contain the operational expression representation
-described below. The representation is private to Lean analysis and does not change protocol
-execution.
+The migration is in progress. The target architecture below is approved, but it must not be read as
+a claim that the implementation or Tall end-to-end validation is complete.
 
-## Tall Workload
+## Why Compact Selections Are Required
 
-The small diagnostic configuration currently used for Tall parameter analysis has:
+The small Tall diagnostic configuration uses ring dimension 8, CRT depth 1, 10-bit CRT moduli,
+5-bit gadget base, scale 1024, and one nested-RNS multiplication. Its generated protocol contains
+31 lookup tables, 30,720 lookup preimages, and 48 slot-operation preimages.
 
-- ring dimension 8;
-- CRT depth 1;
-- CRT modulus width 10 bits;
-- gadget base width 5 bits;
-- scale 1024;
-- one nested-RNS multiplication;
-- parameter-simulation parallelism 1;
-- required security level 0 bits.
+Materializing every logical branch at every downstream operation is therefore too expensive.
+Flattening independent selections into Cartesian alternatives is even worse. At the same time, the
+checker must preserve the branch identities required by decomposition and preimage relations. A
+single scalar maximum is not a sufficient replacement for symbolic structure while relations remain
+to be consumed.
 
-The generated protocol contains 31 lookup tables, 30,720 lookup preimages, and 48 slot-operation
-preimages. The checker must therefore represent large families compactly while retaining the
-identity information required by decomposition and preimage relations.
+The approved design represents a selection either exactly or by a validated shared envelope, and
+uses one generic lifting engine for all matrix primitives.
 
-## Operational Facts and Expressions
+## Approved Analysis Value
 
-An ordinary matrix operation is evaluated to an `OperationalMatrixFact`. Such a fact stores the
-matrix type and parameters, a flat sum of ordered products, the hard-bound expression, metadata,
-canonical-range information, public identity, and relation snapshots.
+Every matrix value is an ID in one request-local append-only arena:
 
-An unresolved dynamic choice is stored in a request-local `OperationalExprArena`. Each node has a
-monotonically allocated `OperationalExprId` and one checked matrix type. The arena supports:
+```text
+MatrixValue := OperationalExprId
 
-- concrete matrix facts;
-- addition and subtraction;
-- matrix multiplication together with its derivation rule and right-hand wire;
-- tensor products;
-- concatenation;
-- structural transforms;
-- dynamic selection.
+OperationalExprNode :=
+  | Concrete  OperationalMatrixFact
+  | Primitive PrimitiveOperation (Array OperationalExprId)
+  | Choice    SelectionDomainId ChoiceStorage
 
-`OperationalExprId` is only an array index for local sharing and memoization. It is not serialized,
-does not become part of matrix or relation identity, and is not evidence that two expressions are
-symbolically equal.
+ChoiceStorage :=
+  | Exact  (Array OperationalExprId)
+  | Shared OperationalExprId ValidatedSchemaId
+```
 
-Concrete arithmetic continues to use the flat-polynomial semantics. Expressions are kept
-unresolved only when a dynamic selection prevents immediate evaluation without expanding a large
-or independent branch domain.
+Each arena node has one checked matrix type and an analysis-only `containsChoice` bit. An
+`OperationalExprId` is only an array index for sharing and memoization. It is not serialized, is not
+part of matrix or relation identity, and is not evidence of symbolic equality.
 
-### Analysis-local polynomial interning
+Ordinary operations whose inputs are concrete continue to use the existing flat-polynomial
+operational formulas. `Primitive` nodes delay an existing concrete transfer when unresolved choices
+prevent immediate evaluation. They do not introduce protocol-specific bound formulas.
 
-Polynomial normalization uses request-local `OperationalFactorId` and `OperationalMonomialId`
-values. Canonical factors are interned first, and an ordered product is then interned from its factor
-IDs, product modes, and output type. Coefficients are accumulated through a monomial-ID index rather
-than by repeatedly scanning all previously normalized products.
+## Interned Selection Domains
 
-The compact fingerprints used by the interners are only bucket selectors. A bucket hit is accepted
-only after comparing the complete canonical factor or monomial key, so hash collisions do not alter
-symbolic equality. The IDs remain private to one operational evaluation and are neither serialized
-nor used as protocol identities. Matrix facts are normalized into the shared request-local interning
-arena before entering expression or scope state, which lets later normalization reuse the same IDs.
+One `Choice` represents exactly one mutually exclusive domain. Independent domains remain nested.
+The request-local `SelectionDomainId` interner uses the full key:
 
-## Dynamic Selection
+```text
+(selection kind, selection identity, canonical branch count)
+```
 
-A selection is identified by the executable index value and stores its alternatives in one of two
-forms.
+Fingerprints select candidate buckets only; full keys are compared before an interned ID is reused.
+After interning, domain comparison is constant time. Loop-lane and protocol-selection domains are
+different kinds and are never positionally zipped.
 
-### Exact alternatives
+The domain owns the only canonical branch count. `Exact` construction checks once that the stored
+array length equals that count. `Shared` construction checks that its representative and schema
+describe the same domain. Downstream code must not maintain or revalidate a second count.
 
-An exact selection stores an array of expression IDs. It preserves each branch's value identity,
-public identity, polynomial, and relations. The arena checks that all alternatives have the same
-matrix type. Empty selections and invalid expression references are rejected.
+## Exact and Shared Choices
 
-If every exact alternative is the same expression ID, the selection is reduced to that ID without
-allocating a selection node. This reduction requires complete expression identity; equal bounds or
-equal schemas are not sufficient.
+### Exact
 
-### Schema envelopes
+`Exact` stores every distinct branch expression. It preserves branch-local value identities,
+public identities, polynomials, and relations. It is used when branches are genuinely nonuniform or
+when branch-local relations still need to be consumed.
 
-A schema envelope stores:
+Operations over an Exact domain may visit its stored branches once. If every branch is the same
+expression ID, construction reduces the choice to that expression. Equal bounds or equal schemas
+are not enough for this identity reduction.
 
-- the logical alternative count;
-- one representative expression;
-- a complete uniform operational schema;
-- whether the alternatives are relation-free;
-- the common public-matrix boundary template, when one exists;
-- the common relation boundary template, when one exists.
+After a producing operation and its relation rewrites finish, the checker performs one canonical
+all-branch join. A successful join immediately converts the value to `Shared` and discards the Exact
+array. A failed join retains `Exact`; it does not create a misleading representative.
 
-The representative does not claim that the alternative matrix values are equal. For example, the
-30,720 lookup preimages are distinct matrices with distinct identities even when their operational
-schemas have the same shape and bound behavior.
+### Shared
 
-Envelope construction checks the summary against the representative before accepting it. A stale
-summary whose bound, relation status, or boundary template no longer describes the representative
-is rejected. A transformation may retain an envelope only when an explicit transfer rule can
-derive a complete output summary from the previously established all-alternative schema. It may
-not infer uniformity from the transformed representative alone.
+`Shared` stores one representative expression and one validated schema. The representative need not
+be concrete and may contain a nested independent choice. It describes the structure common across
+the outer domain, but it does not assert that all logical matrices have the same value or identity.
 
-Packed matrix families perform their full all-element schema check when they are first packed.
-Subsequent registered deterministic maps transfer that validated summary through the transformed
-representative instead of rebuilding every branch schema. Rebinding, loop-index instantiation,
-protocol-family selection, and recurrence-bound shifting use this path. An absent source summary,
-an unsupported operation, or an incomplete transfer discards the summary and fails closed at any
-later operation that requires an envelope; it does not manufacture uniformity from one branch.
+The `ValidatedSchema` owns the conservative join over the complete outer domain. It records all
+bounds and metadata later consumers require, including branch-maximum total and noise bounds,
+signal structure, constant-polynomial and zero-row metadata, canonical range, public and relation
+boundaries, and selection provenance.
 
-## Arithmetic over Selections
+The meaning of a Shared value is always the pair `(representative, schema)`. No consumer may treat
+the representative alone as the complete value. In particular, complete-bound evaluation:
 
-Operations on concrete operands are evaluated immediately with the existing operational formulas.
-This includes relation rewriting and bounded-noise compression.
+1. evaluates any nested choices inside the representative once; and
+2. applies the outer-domain envelope stored in the schema.
 
-For one selected operand, an operation is applied within that selection. Exact alternatives are
-processed branch by branch. An envelope is processed through its representative only when the
-operation has a valid summary-transfer rule; otherwise evaluation fails closed.
+This preserves the outer maximum without traversing the outer logical branch count. There is no
+separate mutable summary node and no fallback that reconstructs Exact branches from Shared.
 
-Two selections with the same identity and domain are evaluated branch-wise. Two independent
-selection identities remain nested expression nodes. The checker does not positionally zip them and
-does not allocate their Cartesian product.
+A direct uniform family template must construct Shared in time proportional to the template and
+schema sizes, independently of the logical branch count. It must not allocate a count-sized array or
+instantiate each lane.
 
-This is important for Tall evaluation. A value chosen by one loop can be multiplied by a preimage
-chosen by another loop, and the result can then be added to a term controlled by only one of those
-loops. The expression arena preserves both choices without flattening all branch combinations into
-one array.
+## Generic Primitive Lifting
 
-## Relation Rewriting
+All matrix operations use one storage-aware lifting engine. Primitives contribute their existing
+concrete transfer behavior and a transfer-class declaration; they do not implement separate
+selection strategies.
 
-Decomposition and preimage rewrites remain noncommutative and identity-sensitive. A rewrite is
-accepted only when the concrete multiplication boundary satisfies the existing checks for:
+The lifting rules are:
 
-- compatible matrix types and moduli;
-- exact factor order;
-- matching relation producer;
-- matching public-matrix identity;
-- matching selection identity and branch domain;
-- an exact target snapshot or a complete envelope schema that justifies representative evaluation.
+1. All concrete operands invoke the existing concrete transfer.
+2. Same-domain Exact operands are zipped branch-wise and joined once after the operation.
+3. Same-domain Shared operands transform their representatives and schemas without logical branch
+   traversal when the transfer supports it.
+4. Same-domain Exact and Shared operands visit only the stored Exact branches. Operand order is
+   preserved.
+5. An ordinary primitive over one Shared argument creates one delayed Primitive over the
+   representative and transfers the schema.
+6. A relation-free operation over independent domains remains a nested delayed Primitive only when
+   its registered transfer class supports composition.
+7. Relation-consuming multiplication zips the domain named by the relation requirement. Other
+   independent domains remain nested in coefficients.
+8. Incompatible relation domains fail closed with an error that names both domains and the scope.
 
-A shared boundary template may justify checking an envelope representative, but it is not copied
-blindly to the result. Operations that consume relations or change factor boundaries recompute the
-output summary. An operation without a reviewed summary-transfer rule rejects an envelope instead
-of dropping relation or identity information.
+N-ary operations follow the same rules. The engine chooses the first immediate domain in argument
+order, aligns operands belonging to that domain, and leaves other domains nested. It never creates
+or visits a Cartesian product.
 
-The operational derivation attachments used by BGG grouping are also preserved. The checker
-recognizes the BGG encoding family pairing, BGG public-key signal grouping, and protocol Boolean
-signal grouping attachments by their owner and rule names.
+For relation-consuming Shared operands, matching domain IDs alone are insufficient. The checker
+must also prove that:
 
-Relation rewriting processes only terms produced by a successful rewrite. Each input term is
-rewritten to completion independently, and unchanged terms are not rescanned merely because
-another term changed. The existing 64-step fail-closed limit remains attached to each rewrite chain,
-and the completed terms are normalized together once at the boundary. This changed-term work queue
-preserves the existing noncommutative matching rules while avoiding repeated full-polynomial passes.
+- the public operand and preimage-relation boundaries correspond;
+- relation producer and target identities match;
+- both schemas use the same branch parameterization; and
+- the representative rewrite is valid for every logical branch.
 
-## Loop Handling
+Failure of any condition rejects the operation.
 
-Parallel loops are evaluated from one abstract loop body. Packed inputs can retain a compact
-selection expression rather than expanding every lane before the body is analyzed. Loop-index,
-namespace, protocol-family, and dynamic-selection instantiation map origins, public identities,
-relations, and bound expressions consistently through the expression tree.
+## Closed Transfer Registry
 
-Expression transformations use a request-local cache keyed by an explicit transformation namespace
-and source expression ID. A repeated transformation in the same namespace reuses its prior output,
-including the no-op case in which the mapped root is already available. Namespaces include the
-relevant node, lane, selection, or coordinate information at their call sites, so results from
-different instantiation environments are not conflated. A per-traversal array additionally prevents
-revisiting shared children while a new transformation result is being constructed.
+Every `PrimitiveOperation` transfer class has exactly one row in a closed registry:
 
-Sequential loops summarize their carried values through the existing recurrence analysis.
-Relation-bearing carried values remain fail-closed where the checker cannot prove a valid recurrence
-schema.
+```text
+CompositionalTransfer :=
+  | Supported existingReviewedTransfer
+  | RequiresConcreteStructure
+```
 
-## Noise-Bound Evaluation
+A constructor with semantically different variants, such as ordinary and relation-consuming matrix
+multiplication, contributes one row per transfer class. A build-time inventory must reject missing
+or duplicate rows.
 
-For a mutually exclusive dynamic selection, the checker evaluates the complete bound of each exact
-alternative and takes their maximum. It does not maximize partial terms independently and combine
-pieces that belong to different alternatives.
+`Supported` reuses only an existing reviewed concrete/compositional transfer. The registry must not
+derive a new bound formula from an operation name or a broad classification such as monotonicity.
 
-A validated schema envelope evaluates its representative schema once. Nested independent
-selections apply a maximum at each selection node without allocating all branch combinations.
+`RequiresConcreteStructure` has one deterministic lifecycle:
 
-Expression-bound evaluation memoizes results in an array indexed by `OperationalExprId`. The
-current fixtures verify that evaluating the same root a second time produces a memo hit. General
-structural interning is not part of the design.
+1. while unresolved choices remain, construction stores a delayed Primitive;
+2. when matching-domain lifting makes the required structure concrete, it invokes the existing
+   concrete transfer; and
+3. if an endpoint bound is requested while independent unresolved domains remain, evaluation fails
+   closed with a distinct error.
 
-Decoder checking traverses concrete facts and operational expressions, obtains the maximum complete
-noise bound, and checks the strict inequality
+It never substitutes a scalar child-bound approximation.
+
+## Relation and Provenance Handling
+
+`relationRequirement` classifies each value as having no relation, one uniform validated relation
+schema, one branch-local relation domain, or an unknown relation. Unknown requirements fail closed.
+The result is memoized per expression ID and parameter environment.
+
+Decomposition and preimage rewrites remain noncommutative and identity-sensitive. Existing checks
+for matrix types, moduli, factor order, producer identity, public-matrix identity, relation target,
+selection domain, and branch parameterization remain mandatory.
+
+One central provenance transformation maps every identity-bearing field for loop instantiation,
+binder rebinding, protocol-family selection, and dynamic selection. The existing namespaced
+transformation cache remains request-local and must not conflate different instantiation
+environments.
+
+Relation rewriting retains the changed-term work queue and its 64-step per-chain fail-closed limit.
+Only terms changed by a successful rewrite are processed again, and completed terms are normalized
+together at the boundary.
+
+## Bound Evaluation and Memoization
+
+`evaluateCompleteBound` takes the maximum of complete Exact branch bounds. It never maximizes
+partial terms from different branches and then combines those unrelated maxima.
+
+Request-local arrays indexed by `OperationalExprId` memoize relation requirements, schemas, total
+bounds, and noise bounds. Schema derivation is lazy and occurs only when a join, Shared construction,
+or representative query requires it. The first query may visit each reachable expression once;
+repeated queries are constant time.
+
+Decoder validation uses the strict inequality:
 
 ```text
 2 * plaintext_modulus * noise_bound < ciphertext_modulus
 ```
 
-The multiplication form is used directly so integer division cannot change threshold behavior.
+The multiplication form avoids integer-division boundary changes.
 
-The Rust runner groups requests that have the same environment, layout, residual stage, and residual
-output. Lean computes the structural residual bound once for that group, after which each compatible
-request applies only its own numeric decoder threshold. This separates graph-derived bound work from
-cheap threshold checks, including normal and diagnostic requests for the same candidate.
+## Fail-Closed Contract
 
-The generated runner emits start and finish records for graph evaluation and decoder-bound
-evaluation, including elapsed nanoseconds. Rust forwards Lean stdout and stderr line by line while
-retaining the exact byte streams for report parsing and errors. Long evaluations therefore expose
-their current phase without waiting for the child process to exit. The final JSON diagnostics also
-include expression and memo counts, envelope logical and stored counts, relation rewrites, transform
-cache hits and misses, and maximum stored polynomial size.
+Unsupported semantics are analysis errors, not invitations to guess a bound. The checker rejects:
 
-## Fail-Closed Boundaries
+- invalid expression references, matrix-type mismatches, and invalid choice cardinalities;
+- missing or ambiguous relations and public-identity mismatches;
+- unsupported schema transfers;
+- relation-consuming operations whose correlation conditions cannot be proved;
+- incompatible or unknown selection domains;
+- concrete-structure-dependent primitives that still have unresolved independent domains at an
+  endpoint; and
+- selection-dependent endpoint operations whose complete branch conditions cannot be established.
 
-The checker rejects a graph when it cannot preserve the information required for a sound bound.
-Current explicit rejection boundaries include:
+No failure path may discard identity or relation metadata, invent branch uniformity from one
+representative, synthesize Exact alternatives from Shared, or introduce a handwritten
+protocol-specific noise formula.
 
-- an invalid expression ID or expression type mismatch;
-- an empty or out-of-range selection;
-- an unsupported operation on a schema envelope;
-- a missing, ambiguous, malformed, or unavailable matrix relation;
-- a public-identity mismatch;
-- selection-dependent coefficient extraction or threshold decoding where complete branch conditions
-  cannot be established;
-- a nested executable `Select` whose alternatives already contain unresolved selections and cannot
-  be represented by the supported expression rules;
-- structural operations whose selection domains cannot be aligned safely;
-- relation-bearing sequential-loop state without a validated recurrence schema.
+## Performance Contract
 
-These errors are analysis failures. They must not be replaced with a guessed bound or by discarding
-identity and relation metadata.
+The migration must preserve the following asymptotic behavior:
 
-## Focused Fixtures
+| Operation | Required cost |
+| --- | --- |
+| Uniform template to Shared | Independent of logical branch count |
+| Packed Exact join | Linear once in stored branches |
+| Same-domain Exact lifting | Linear in stored branches |
+| Shared with Shared | Independent of logical branch count |
+| Exact with Shared | Linear only in stored Exact branches |
+| Single-Shared primitive lift | Linear in arity and schema transfer size |
+| N-ary lift with at least one matching Exact operand | Linear in branch count times arity |
+| Shared outer domain with nested Exact inner domain | Linear only in stored inner branches |
+| Interned domain comparison and `containsChoice` | Constant time |
+| Repeated memoized query | Constant time after first evaluation |
+| Independent-domain Cartesian arrays or visits | Never performed |
 
-`lean/Mxx/Certificate/OperationalBounds.lean` contains focused fixtures for:
+Shared processing must not use a logical-count range, inspect unavailable logical alternatives, or
+recover a count-sized Exact representation. Performance instrumentation must keep
+`cartesianPairVisits` at zero.
 
-- relation-bearing dynamic extraction followed by relation-consuming multiplication;
-- agreement with an explicitly unrolled relation rewrite;
-- a 30,720-alternative schema-envelope bound;
-- rejection of stale envelope summaries;
-- branch-wise decoder maximums;
-- request-local expression memoization statistics;
-- independent selections without a Cartesian arena allocation;
-- exact equal-alternative reduction;
-- static selection range errors;
-- packed-family and loop identity preservation;
-- decomposition, preimage, subgraph, and recurrence relation transport.
+## Migration Status
 
-The independent-selection fixture verifies an expression arena with two two-way choices without
-allocating four Cartesian alternatives. Its endpoint bound is computed from complete branch sums.
+The current worktree is between the previous operation-specific implementation and the approved
+architecture. The following table is deliberately conservative: a feature is not marked complete
+until its implementation and focused validation are both present.
 
-## Current Verification Status
+| Area | Current status |
+| --- | --- |
+| Request-local expression arena and concrete/expression values | Present from the earlier implementation |
+| Interned selection-domain identity | Partially implemented in the current uncommitted migration |
+| `Exact` and `Shared` storage names | Partially implemented, but Shared still carries the older count and `SelectedMatrixSummary` representation |
+| One canonical domain-owned count | In progress; the older Shared count remains |
+| One lossless n-ary `PrimitiveOperation` node | Not yet implemented; operation-specific expression constructors remain |
+| Schema-owned outer envelope through `ValidatedSchemaId` | Not yet implemented; the older summary object remains |
+| Construction-time Exact-to-Shared join | Not yet complete |
+| Generic lifting rules for all matrix primitives | Not yet implemented; operation-specific branches remain |
+| Closed transfer-class registry and completeness inventory | Not yet implemented |
+| Deterministic `RequiresConcreteStructure` lifecycle | Not yet implemented |
+| Memoized structural `relationRequirement` | Not yet implemented |
+| Lazy schema and complete-bound memo arrays | Partially present only in older bound/representative forms |
+| Deletion of the general representative API and old selection paths | Not yet performed |
+| Body-418 success fixture | Pending |
+| Focused correctness and complexity fixtures | Pending migration to the approved representation |
+| `lake build Mxx` after the complete migration | Not yet validated |
+| Tall diagnostic after migration | Not yet run |
 
-This commit is an auditable development checkpoint, not a completed Tall checker. `lake build Mxx`
-passes, including the native operational fixtures. The current Tall diagnostic command is:
+The last auditable checkpoint before this migration substantially reduced the original expression
+growth: the producer phase decreased from approximately eight minutes and 337,000 expression nodes
+to an encoding-stage checkpoint with 102,717 nodes, with the first later failure reached in about
+143 seconds. These observations are development measurements, not controlled benchmarks. The
+approved migration must keep the equivalent-phase expression count at or below 113,000 and must
+perform zero logical traversal of the 30,720-branch uniform family.
 
-```sh
-RUST_LOG=info \
-MXX_TALL_NESTED_RNS_MIN_CRT_DEPTH=1 \
-MXX_TALL_NESTED_RNS_MAX_CRT_DEPTH=1 \
-MXX_TALL_NESTED_RNS_PARAMETER_SIMULATION_PARALLELISM=1 \
-cargo test -p mxx-gadgets \
-  --test test_gpu_tall_bgg_nested_rns_modq_arith \
-  --features gpu \
-  test_tall_bgg_nested_rns_parameter_simulation \
-  -- --ignored --exact --nocapture
-```
-
-The latest run used ring dimension 8, CRT depth 1, 10-bit CRT moduli, 5-bit gadget base, scale
-1024, and one nested-RNS multiplication. It generated 31 lookup tables, 30,720 lookup preimages,
-48 slot-operation preimages, and a producer scope with 92,758 nodes.
-
-The main expression-growth problem is substantially reduced. Before primitive-selection
-summarization, the observed producer evaluation took approximately eight minutes and left roughly
-337,000 expression nodes. At this checkpoint it reaches the encoding stage with 102,717 expression
-nodes; the complete diagnostic run reaches its current failure in 142.93 seconds, including Rust
-graph construction, source emission, Lean module preparation, and operational evaluation. These are
-development observations rather than controlled benchmark results, but they establish that the
-original producer blow-up is no longer the immediate blocker.
-
-The previously failing family choice in encoding parallel body 371 now succeeds. That node selects
-one LUT chunk family and then dynamically extracts a row. It is represented pointwise as one
-`familyUniform` template containing an exact choice expression, so the family length is not
-materialized.
-
-The current first failure is:
+At that checkpoint the first failure was:
 
 ```text
 OperationalError.inScope
@@ -289,186 +291,48 @@ OperationalError.inScope
   (unsupportedOperationalExpr 0)
 ```
 
-Within that body, node 17 is a matrix multiplication whose operands contain unresolved selection
-expressions. Evaluating one two-way exact selection as a single representative finds that one branch
-has a different identity-erased polynomial schema. The checker correctly fails closed instead of
-discarding the distinction. The unresolved design issue is not another missing primitive formula;
-it is that operation lifting and representative construction are separate, partially overlapping
-mechanisms. A nested choice can reach a caller that requests one representative even when no valid
-uniform representative exists.
+The failure is the migration's primary frozen acceptance case. It arises when relation-sensitive
+matrix multiplication receives a valid nonuniform nested choice but a later path requests a single
+uniform representative. Under the approved design, generic branch-wise relation consumption keeps
+the Exact distinction, joins only after the rewrite, and computes the final bound as the maximum of
+complete branch bounds.
 
-The following completion claims therefore remain pending:
+## Remaining Acceptance Work
 
-- successful traversal of the complete Tall preprocessing, public-key, encoding, and residual
-  graphs;
-- completion within the 30-minute checker target;
-- a successful parameter-search verdict;
-- agreement between the resulting simulated threshold and the GPU runtime residual;
-- end-to-end Tall runtime correctness and performance.
+Before the migration can be declared complete, it must provide evidence for all of the following:
 
-These checks are required before the operational selection work can be declared complete.
+1. body 418 succeeds with its hand-checked branch-wise relation bound;
+2. every primitive transfer class has exactly one registry row;
+3. positive and negative Shared relation-correlation fixtures behave as specified;
+4. nested Shared/Exact representatives preserve the schema-owned outer maximum without traversing
+   the outer logical domain;
+5. `RequiresConcreteStructure` succeeds after matching-domain resolution and fails distinctly at an
+   unresolved endpoint;
+6. uniform counts 2, 1,024, and 30,720 have zero logical branch visits;
+7. Exact counts 8, 32, and 65 exhibit linear stored-branch work;
+8. independent selections never allocate or visit Cartesian alternatives;
+9. repeated relation, schema, and bound queries hit their request-local memos;
+10. obsolete operation-specific selection branches, old family representations, summary-repair
+    paths, representative escape hatches, and test oracles have been deleted;
+11. `lake build Mxx` and all focused operational fixtures pass without new axioms, `sorry`, `admit`,
+    or `native_decide`; and
+12. the Tall CRT-depth-1 diagnostic completes under its 30-minute wall limit and reports the required
+    structural and cache metrics.
 
-## Complexity Added After the Main Performance Fix
+Successful parameter search, agreement between the simulated threshold and GPU residual, and Tall
+end-to-end runtime correctness and performance remain later end-to-end requirements. None is
+currently claimed by this document.
 
-The following mechanisms were introduced to retain the performance improvement while repairing
-later semantic failures. They are listed separately because some are essential representation
-choices, while others are symptoms of duplicated control flow.
+## Audit Surface
 
-| Mechanism | Why it was introduced | Optimization or correctness property it protects | Current complexity cost |
-| --- | --- | --- | --- |
-| `OperationalMatrixExpr` arena | Keep unresolved choices as shared expression nodes | Avoids expanding 30,720 LUT alternatives and avoids Cartesian products of independent selections | Every matrix operation now has concrete and expression paths |
-| Exact selections and schema envelopes | Preserve distinct branch identities when needed, but store one representative for proven-uniform families | Exact relations remain available; uniform families become O(1) downstream | Two representations require conversion, validation, and fallback rules |
-| Cached `containsSelection` | Detect nested choices without recursively rescanning a growing arena | Makes the shape test O(1) per expression node | Correctness now depends on every arena constructor maintaining the cache |
-| Operation-specific push-through functions | Apply add, multiply, tensor, concat, transform, scale, and BGG grouping within a choice when safe | Consumes preimage/decomposition relations before joining and avoids premature maxima | Similar alignment and fallback logic is repeated across operations |
-| `SelectedMatrixSummary` and transfer registry | Prove that a compact representative still describes every logical branch after an operation | Allows deterministic maps over huge families without rescanning all branches | Summary fields can become stale; every operation must classify each field as recomputed or invalidated |
-| Family binders, loop coordinates, and selected identity wrappers | Preserve the distinction between a family lane, a chunk selector, and an outer loop instance | Prevents a preimage relation from matching the wrong lane or branch | Substitution is spread over value, matrix, public, hash, relation, polynomial, and summary structures |
-| Namespaced expression-map cache | Reuse binder substitution and structural maps over shared DAGs | Avoids repeated whole-expression traversal for the same instantiation | Cache namespaces are manually assembled at call sites |
-| Factor and monomial interning | Replace repeated product rendering and linear product comparison | Makes polynomial normalization close to linear in the number of terms | Adds fingerprints, collision buckets, canonical-key arrays, and request-local ID threading |
-| Changed-term relation work queue | Rewrite only terms changed by a successful relation rule | Avoids repeatedly scanning a full polynomial after every local rewrite | Adds another normalization boundary and relation-processing state machine |
-| Representative and bound memo arrays | Evaluate shared expression subtrees once | Keeps repeated endpoint and threshold evaluation linear in arena size | A representative is not defined for every valid nonuniform choice, which is the current failure class |
-| Pointwise `IndexedFamily` selection | Select a LUT chunk without materializing all rows | Complexity is proportional to chunk alternatives, not chunk length times alternatives | It requires alpha-renaming lane binders and separately preserving the chunk-selection identity |
+The primary review surface is:
 
-The arena, compact choice representation, arrays, memoization, and interning are directly required by
-the measured performance problem. The large bug surface comes mainly from operation-specific choice
-lifting, summary lifecycle management, and provenance substitution being implemented as separate
-features rather than as one abstraction.
+- `lean/Mxx/Certificate/OperationalBounds.lean` for operational facts, arena values, lifting,
+  relations, loops, bounds, and fixtures;
+- `lean/Mxx/Ir/BinaryFormat.lean` for Graph IR decoding;
+- generated correctness modules whose source hashes depend on these Lean sources; and
+- `crates/gadgets/tests/test_gpu_tall_bgg_nested_rns_modq_arith.rs` for the eventual Tall parameter
+  simulation and GPU runtime validation.
 
-## Why the Current Design Produces Late Bugs
-
-The checker currently has three partially overlapping representations of the same semantic value:
-
-1. a concrete flat `OperationalMatrixFact`;
-2. an exact or compact `OperationalMatrixExpr` choice;
-3. a `SelectedMatrixSummary` attached beside a representative fact.
-
-Each operation decides independently whether to:
-
-- evaluate concrete facts immediately;
-- distribute over exact alternatives;
-- transform an envelope representative and transfer its summary;
-- retain a delayed expression node;
-- request a single conservative representative;
-- or reject.
-
-These decisions are individually reasonable, but they are distributed through separate add,
-multiply, tensor, concat, transform, scale, grouping, family, loop, and endpoint implementations.
-Consequently, a new nested shape can be accepted by one layer and rejected much later by another.
-The body-418 failure is the clearest example: pointwise family selection correctly preserves two
-branches, matrix multiplication correctly keeps the choice unresolved, but a later representative
-request assumes those branches have one uniform schema.
-
-The same duplication affects provenance. A family operation must update matrix origins, value
-origins, public identities, deterministic-hash identities, relation targets, complete relations,
-polynomial factors, selection identities, and summary boundary templates. Missing one map produces
-a late relation mismatch rather than an error near the operation that lost the information.
-
-## Recommended Unified Replacement
-
-A simpler replacement should retain the flat-polynomial evaluator and all measured compactness, but
-make choice lifting one generic mechanism.
-
-### One typed abstract value
-
-Use one analysis value with the following conceptual shape:
-
-```text
-MatrixValue =
-  | Concrete(OperationalMatrixFact)
-  | Choice(domain, alternatives)
-
-alternatives =
-  | Exact(Array<MatrixValue>)
-  | Uniform(logical_count, representative, validated_schema)
-```
-
-`FamilyValue` should contain a lane binder and one `MatrixValue` template. Selecting a family then
-only alpha-renames each branch template to the output lane and creates one ordinary `Choice`.
-There should not be a separate fact-level selected-family representation.
-
-### One generic choice-lifting algorithm
-
-Every primitive operation should provide only its concrete transfer function and a declaration of
-whether it is relation-sensitive. A single generic lifting algorithm should then enforce:
-
-1. all-concrete inputs: call the existing concrete transfer;
-2. choices with the same domain: zip alternatives branch-wise;
-3. independent domains: retain a nested choice without Cartesian expansion;
-4. a uniform alternative: map the representative only through a registered summary transfer;
-5. a relation-sensitive operation: keep exact alternatives until the concrete relation rewrite has
-   run, then attempt one uniform join;
-6. no valid uniform join: keep the exact choice, never call a general representative function.
-
-Add, multiply, tensor, concat, transform, scale, and grouping should use this same algorithm rather
-than each implementing their own selection cases.
-
-### Make summaries derived caches
-
-`SelectedMatrixSummary` should be a cache derived from an alternative set, not an independently
-mutable semantic object. A transformed summary should be produced only by one central operation
-registry. Any unregistered operation invalidates the cache and retains the exact choice. This makes
-stale-summary acceptance impossible by construction and removes scattered summary repair code.
-
-### Eliminate the general representative escape hatch
-
-Replace `evaluateOperationalExprRepresentative` with two explicit APIs:
-
-```text
-tryUniformRepresentative(choice) -> Option<(fact, validated_schema)>
-evaluateCompleteBound(value) -> bound
-```
-
-The first must return `none` for nonuniform exact choices. The second can recurse through choices and
-take complete branch maxima without inventing a representative. A primitive that needs polynomial
-structure must use generic choice lifting, not the bound-only API. This separation would have made
-the body-418 path impossible.
-
-### Centralize provenance mapping
-
-Define one structural provenance map that traverses every identity-bearing field. Binder
-substitution, loop instantiation, protocol-family selection, and dynamic selection should be four
-instances of that map. Summary boundary metadata should be derived after the map rather than mapped
-independently. This removes the current family of near-duplicate substitution functions.
-
-### Preserve the performance-critical pieces
-
-The replacement should retain:
-
-- request-local append-only expression IDs;
-- array-indexed memoization;
-- exact selections without Cartesian expansion;
-- validated uniform envelopes for large LUT families;
-- factor and monomial interning with full equality after fingerprint lookup;
-- changed-term relation rewriting;
-- one abstract parallel-loop body rather than lane materialization.
-
-The goal is not to return to eager SOP expansion. It is to make all compact selection behavior pass
-through one typed lifting engine, so the optimization does not require a new hand-written case for
-every later protocol shape.
-
-## Suggested Handoff Order
-
-1. Freeze the current body-418 failure as a small fixture that reproduces a nested nonuniform choice
-   under relation-sensitive multiplication.
-2. Introduce generic choice lifting beside the current paths and compare it against existing focused
-   fixtures; do not add another protocol-specific rewrite.
-3. Route multiplication first, because it consumes decomposition and preimage relations.
-4. Route add/subtract and structural transforms next.
-5. Replace general representative calls with `tryUniformRepresentative` and complete-bound folding.
-6. Remove the superseded operation-specific selection branches in the same change; do not retain a
-   permanent dual path.
-7. Rerun the Tall diagnostic after each migrated operation and record arena size, evaluation time,
-   relation rewrite count, and first unsupported scope.
-
-## Audit Scope
-
-The relevant review surface is:
-
-- `lean/Mxx/Certificate/OperationalBounds.lean` for operational facts, the expression arena,
-  selection evaluation, relation rewriting, loops, endpoint bounds, and fixtures;
-- `lean/Mxx/Ir/BinaryFormat.lean` for array-based Graph IR decoding;
-- generated correctness modules whose source hashes depend on these Lean files;
-- `crates/gadgets/tests/test_gpu_tall_bgg_nested_rns_modq_arith.rs` for the eventual Tall
-  parameter-simulation and GPU runtime validation.
-
-The Rust/CUDA runtime protocol and proof-side symbolic derivation are outside the expression arena's
-implementation boundary.
+The Rust/CUDA protocol executor and proof-side symbolic derivation remain outside the operational
+selection arena's implementation boundary.

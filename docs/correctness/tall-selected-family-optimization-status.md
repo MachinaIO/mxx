@@ -262,11 +262,11 @@ until its implementation and focused validation are both present.
 | Interned selection-domain identity | Implemented with collision-safe full-key comparison; focused cardinality fixtures remain pending |
 | `Exact` and `Shared` storage names | Implemented; Shared carries only a representative and request-local `ValidatedSchemaId` |
 | One canonical domain-owned count | Implemented; `SelectionDomainId` is the sole owner |
-| One lossless n-ary `PrimitiveOperation` node | Not yet implemented; operation-specific expression constructors remain |
+| One lossless n-ary `PrimitiveOperation` node | In progress; descriptor, evaluator, and add/subtract delayed paths are present, while older operation constructors remain |
 | Schema-owned outer envelope through `ValidatedSchemaId` | Implemented at the storage boundary; lazy schema-query memoization remains pending |
 | Construction-time Exact-to-Shared join | Not yet complete |
 | Generic lifting rules for all matrix primitives | Not yet implemented; operation-specific branches remain |
-| Closed transfer-class registry and completeness inventory | Not yet implemented |
+| Closed transfer-class registry and completeness inventory | Registry is present and exhaustive over current primitive transfer classes; dedicated completeness fixtures remain pending |
 | Deterministic `RequiresConcreteStructure` lifecycle | Not yet implemented |
 | Memoized structural `relationRequirement` | Not yet implemented |
 | Lazy schema and complete-bound memo arrays | Partially present only in older bound/representative forms |

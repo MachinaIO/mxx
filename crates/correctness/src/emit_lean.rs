@@ -1,7 +1,7 @@
 use crate::{
     BundleLeanEmitError, BundleProgramNames, FreshnessError, FreshnessMetadata, GENERATOR_VERSION,
-    ProtocolDecl, ProtocolError, ProtocolStage, StageId, emit_closed_protocol_bundle,
-    protocol_source_hash, toolkit_hash,
+    OperationalDecoderKind, ProtocolDecl, ProtocolError, ProtocolStage, StageId,
+    emit_closed_protocol_bundle, protocol_source_hash, toolkit_hash,
 };
 use mxx_ir_core::{
     FrozenGraphScopeId, Graph, GraphScope, IntExpr, WireType,
@@ -30,6 +30,30 @@ pub struct EmittedProtocol {
     pub ir: String,
     pub proof_ir: String,
     pub derivation_ir: String,
+    pub(crate) operational_decoder_targets: Vec<EmittedOperationalDecoderTarget>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EmittedOperationalDecoderKind {
+    ThresholdDecode,
+    BooleanInterval,
+}
+
+impl EmittedOperationalDecoderKind {
+    pub(crate) fn report_name(&self) -> &'static str {
+        match self {
+            Self::ThresholdDecode => "threshold_decode",
+            Self::BooleanInterval => "boolean_interval",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EmittedOperationalDecoderTarget {
+    pub(crate) target_id: String,
+    pub(crate) decoder_kind: EmittedOperationalDecoderKind,
+    pub(crate) plaintext_modulus: IntExpr,
+    pub(crate) ciphertext_modulus: IntExpr,
 }
 
 #[derive(Debug, Error)]
@@ -120,7 +144,6 @@ fn operational_inventory_key(kind: &NodeKind) -> &'static str {
         NodeKind::Concat { axis: ConcatAxis::Rows } => "Concat.Rows",
         NodeKind::Concat { axis: ConcatAxis::Columns } => "Concat.Columns",
         NodeKind::Concat { axis: ConcatAxis::Diagonal } => "Concat.Diagonal",
-        NodeKind::Reshape { .. } => "Reshape",
         NodeKind::UniformResidueSample { .. } => "UniformResidueSample",
         NodeKind::UniformIntervalSample { .. } => "UniformIntervalSample",
         NodeKind::GaussianSample { .. } => "GaussianSample",
@@ -134,7 +157,7 @@ fn operational_inventory_key(kind: &NodeKind) -> &'static str {
         NodeKind::GadgetDecompose { small: false, .. } => "GadgetDecompose(regular)",
         NodeKind::GadgetDecompose { small: true, .. } => "GadgetDecompose(small)",
         NodeKind::ExtractCoefficient { .. } => "ExtractCoefficient",
-        NodeKind::ConstantCoefficient { .. } => "ConstantCoefficient",
+        NodeKind::LiftIntegerToConstantPolynomial { .. } => "LiftIntegerToConstantPolynomial",
         NodeKind::ThresholdDecode { output_bool: true, .. } => "ThresholdDecode(bool)",
         NodeKind::ThresholdDecode { output_bool: false, .. } => "ThresholdDecode(int)",
         NodeKind::CrtRecompose { .. } => "CrtRecompose",
@@ -229,6 +252,49 @@ pub fn emit_protocol_for(
     );
     let stage_ids =
         topological_stages(protocol).into_iter().map(|stage| stage.id.0.clone()).collect();
+    let operational_decoder_targets = protocol
+        .bundle
+        .operational_decoder_targets
+        .iter()
+        .map(|target| {
+            let residual_stage = protocol
+                .bundle
+                .workflow
+                .stages
+                .iter()
+                .find(|stage| stage.id == target.residual_stage)
+                .expect("validated operational target residual stage");
+            let residual = residual_stage
+                .graph
+                .outputs()
+                .get(&target.residual_output)
+                .expect("validated operational target residual output");
+            let residual_node = residual_stage
+                .graph
+                .root_scope()
+                .node(residual.value.node)
+                .expect("validated operational target residual node");
+            let WireType::Matrix(residual_type) =
+                &residual_node.output_types()[residual.value.port.0 as usize]
+            else {
+                unreachable!("validated operational target residual matrix type")
+            };
+            let (decoder_kind, plaintext_modulus) = match &target.kind {
+                OperationalDecoderKind::ThresholdDecode { plaintext_modulus } => {
+                    (EmittedOperationalDecoderKind::ThresholdDecode, plaintext_modulus.clone())
+                }
+                OperationalDecoderKind::BooleanInterval => {
+                    (EmittedOperationalDecoderKind::BooleanInterval, IntExpr::constant(2))
+                }
+            };
+            EmittedOperationalDecoderTarget {
+                target_id: target.target_id.clone(),
+                decoder_kind,
+                plaintext_modulus,
+                ciphertext_modulus: residual_type.modulus.clone(),
+            }
+        })
+        .collect();
     Ok(EmittedProtocol {
         freshness,
         derivation_hash,
@@ -238,6 +304,7 @@ pub fn emit_protocol_for(
         ir,
         proof_ir,
         derivation_ir,
+        operational_decoder_targets,
     })
 }
 
@@ -861,7 +928,7 @@ fn lean_derivation_rule(
         NodeKind::IntCompare(_) => ".intCompare",
         NodeKind::BitExtract { .. } => ".bitExtract",
         NodeKind::ExtractCoefficient { .. } => ".extractCoefficient",
-        NodeKind::ConstantCoefficient { .. } => ".constantCoefficient",
+        NodeKind::LiftIntegerToConstantPolynomial { .. } => ".liftIntegerToConstantPolynomial",
         NodeKind::Select { .. } => ".select",
         NodeKind::UniformResidueSample { .. } => ".uniformResidueSample",
         NodeKind::UniformIntervalSample { .. } => ".uniformIntervalSample",
@@ -905,7 +972,6 @@ fn lean_derivation_rule(
         NodeKind::Transpose => ".transpose",
         NodeKind::Slice { .. } => ".slice",
         NodeKind::Tensor => ".tensor",
-        NodeKind::Reshape { .. } => ".reshape",
         NodeKind::Concat { .. } => ".concat",
         NodeKind::ThresholdDecode { output_bool: true, .. } => ".thresholdDecodeBool",
         NodeKind::ThresholdDecode { output_bool: false, .. } => ".thresholdDecodeInt",
@@ -1163,8 +1229,8 @@ fn lean_node_kind(
         NodeKind::ExtractCoefficient { position } => {
             format!(".extractCoefficient ({})", lean_ir_int_expr(position))
         }
-        NodeKind::ConstantCoefficient { position } => {
-            format!(".constantCoefficient ({})", lean_ir_int_expr(position))
+        NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
+            format!(".liftIntegerToConstantPolynomial {}", lean_matrix_type(matrix_type))
         }
         NodeKind::Select { .. } => ".select".to_owned(),
         NodeKind::UniformResidueSample { matrix_type } => {
@@ -1264,9 +1330,6 @@ fn lean_node_kind(
             format!(".slice ({}) ({})", range(rows), range(columns))
         }
         NodeKind::Tensor => ".tensor".to_owned(),
-        NodeKind::Reshape { rows, columns } => {
-            format!(".reshape ({}) ({})", lean_ir_int_expr(rows), lean_ir_int_expr(columns))
-        }
         NodeKind::Concat { axis } => format!(
             ".concat .{}",
             match axis {
@@ -1521,6 +1584,7 @@ fn normalized_protocol(protocol: &ProtocolDecl) -> Result<Value, serde_json::Err
             "requirements": requirements,
             "comparator": comparator,
             "endpoints": protocol.bundle.endpoints,
+            "operational_decoder_targets": protocol.bundle.operational_decoder_targets,
             "endpoint_specs": protocol.bundle.endpoint_specs,
             "input_contract": protocol.bundle.input_contract,
             "input_bindings": protocol.bundle.input_bindings,
@@ -1654,7 +1718,6 @@ mod tests {
             "Concat.Rows",
             "Concat.Columns",
             "Concat.Diagonal",
-            "Reshape",
             "UniformResidueSample",
             "UniformIntervalSample",
             "GaussianSample",
@@ -1666,7 +1729,7 @@ mod tests {
             "GadgetDecompose(regular)",
             "GadgetDecompose(small)",
             "ExtractCoefficient",
-            "ConstantCoefficient",
+            "LiftIntegerToConstantPolynomial",
             "ThresholdDecode(bool)",
             "ThresholdDecode(int)",
             "CrtRecompose",
@@ -1817,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_transport_is_byte_stable_and_keeps_v7_logical_hashes() {
+    fn v11_transport_is_byte_stable_and_hashes_closed_decoder_targets() {
         let first = emit_protocol_for(
             "toy-example",
             &crate::toy_example::protocol(),
@@ -1842,7 +1905,7 @@ mod tests {
         assert!(!first.ir.contains("{ kind :="));
         assert_eq!(
             first.freshness.workflow_hash,
-            "eec6cc84a07b935c537fee71c5f133e7e371b21f39e3757def3b287cbf269635"
+            "f0727b300c312d49e01c5cba55cf8d11de69de7efa5d17b68a4133c5a6a15c6b"
         );
         assert_eq!(
             first.derivation_hash,

@@ -101,15 +101,6 @@ inductive SymbolicMatrixForm.Denotes
         (SymbolicMatrixFormArena.Denotes environment arena) parts.toList values) :
       SymbolicMatrixForm.Denotes environment arena (.diagonalConcat parts)
         (Mxx.matrixConcatDiagonal values)
-  | reshape {expression outputType value evaluatedRows evaluatedColumns}
-      (denotes : SymbolicMatrixFormArena.Denotes environment arena expression value)
-      (rowsEvaluate : evaluateIntExpr environment.parameters outputType.rows = .ok evaluatedRows)
-      (columnsEvaluate :
-        evaluateIntExpr environment.parameters outputType.columns = .ok evaluatedColumns)
-      (rowsNonnegative : 0 ≤ evaluatedRows)
-      (columnsNonnegative : 0 ≤ evaluatedColumns) :
-      SymbolicMatrixForm.Denotes environment arena (.reshape expression outputType)
-        (Mxx.matrixReshape value evaluatedRows.toNat evaluatedColumns.toNat)
   | preimageRewrite {relation input value}
       (inputDenotes : SymbolicMatrixFormArena.Denotes environment arena input value) :
       SymbolicMatrixForm.Denotes environment arena (.preimageRewrite relation input) value

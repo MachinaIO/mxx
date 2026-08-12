@@ -69,6 +69,7 @@ structure ClosedProtocolBundle where
   requirements : List Mxx.Ir.Prog
   comparator : ComparatorSpec
   endpoints : EndpointAnchors
+  operationalDecoderTargets : List OperationalDecoderTarget
   anchorBindings : List SemanticAnchorBinding
   endpointSpecs : List EndpointSpecId
   inputContract : InputContract

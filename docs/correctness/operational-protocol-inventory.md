@@ -50,6 +50,7 @@ the shared source public matrix in a preimage relation: branch-specific targets 
 | `RealBinary.Divide` | two reals | Exact real expression | Real fact | No matrix identity | Wrong type/arity | Current IR evaluator |
 | `RealSqrt` | real | Exact real expression | Real fact | No matrix identity | Wrong type/arity | Current IR evaluator |
 | `ExtractCoefficient` | scalar matrix | Exact canonical coefficient | `[0, canonical_upper-1]` | Scalar result does not inherit matrix relation | Invalid position/type/arity | Current IR evaluator |
+| `LiftIntegerToConstantPolynomial` | integer and scalar matrix type | Bounded constant-polynomial factor | Maximum absolute integer bound; constant-polynomial metadata | Fresh output identity; no matrix relation is inferred | Non-scalar type, nonpositive modulus/ring dimension, or wrong arity | Explicit fail-closed transform rule |
 
 ## Deterministic matrix leaves and samplers
 
@@ -92,8 +93,6 @@ the shared source public matrix in a preimage relation: branch-specific targets 
 | `Concat.Rows` | one or more matrices | Embed each term's left boundary and combine | Bounded contributions use triangle inequality | Factor order and signal identities retained | Empty/type/shape mismatch or unsupported embedding | Historical transform rule |
 | `Concat.Columns` | one or more matrices | Embed each term's right boundary and combine | Bounded contributions use triangle inequality | Factor order and signal identities retained | Empty/type/shape mismatch or unsupported embedding | Historical transform rule |
 | `Concat.Diagonal` | one or more matrices | Embed both boundaries and combine | Bounded contributions use triangle inequality | Factor order and signal identities retained | Empty/type/shape mismatch or unsupported embedding | Historical transform rule |
-| `Reshape` | matrix | Exact retype for identical concrete shape; bounded whole-transform otherwise | Bounded transform keeps deterministic bound | No relation transport through a shape-changing transform | Mixed signal/noise shape change or invalid dimensions | Historical transform rule |
-| `ConstantCoefficient` | scalar matrix | Linear coefficient-selection transform for supported bounded input | Input deterministic bound; constant-polynomial metadata | No relation transport through extraction | Signal-bearing input, invalid position/type/arity | Explicit fail-closed transform rule |
 | `ThresholdDecode(bool)` | scalar matrix | Boolean outputs from canonical coefficients | Output facts are Boolean; decoder obligation uses input noise | Does not transport matrix identity | Invalid p/q/count/type/output count | Current evaluator and generic threshold obligation |
 | `ThresholdDecode(int)` | scalar matrix | Integer outputs from canonical coefficients | Each result in `[0,p-1]`; decoder obligation uses input noise | Does not transport matrix identity | Invalid p/q/count/type/output count | Current evaluator and generic threshold obligation |
 | `CrtRecompose` | equal one-row matrices and positional CRT metadata | Weighted sum of input polynomials | Deterministic scaled-sum hard bound | Preserves exact factor provenance in each summand | Empty/mismatched metadata/type/modulus/coefficient | Current IR semantics |

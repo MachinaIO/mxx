@@ -155,6 +155,7 @@ pub fn operational_protocol_from_graphs(
             requirements: Vec::new(),
             comparator: ComparatorSpec::Equality { endpoints: Vec::new() },
             endpoints: EndpointAnchors::default(),
+            operational_decoder_targets: Vec::new(),
             endpoint_specs: Vec::new(),
             input_contract: InputContract { inputs: input_contract },
             input_bindings,

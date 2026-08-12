@@ -2134,7 +2134,11 @@ mod tall {
                 .map(|(destination, (source, scalar))| {
                     let source = usize::try_from(*source).expect("u32 fits usize");
                     let input_row = input.rows.get_static(source);
-                    let plaintext = plaintexts.get_static(source).constant_coefficient(0);
+                    let plaintext_matrix = plaintexts.get_static(source);
+                    let plaintext = plaintext_matrix
+                        .clone()
+                        .extract_coefficient(0)
+                        .lift_to_constant_polynomial(plaintext_matrix.matrix_type().clone());
                     let decomposed = self
                         .slots
                         .public_keys
@@ -2200,8 +2204,13 @@ mod tall {
                         .as_mat();
                     let source_terms = (0..source_slot_count)
                         .map(|source| {
-                            let plaintext =
-                                input_plaintexts.get_static(source).constant_coefficient(0);
+                            let plaintext_matrix = input_plaintexts.get_static(source);
+                            let plaintext = plaintext_matrix
+                                .clone()
+                                .extract_coefficient(0)
+                                .lift_to_constant_polynomial(
+                                    plaintext_matrix.matrix_type().clone(),
+                                );
                             let c_b1 = self.product_chunks(
                                 self.c_b0.clone(),
                                 &self.slots.b0_preimage_chunks,

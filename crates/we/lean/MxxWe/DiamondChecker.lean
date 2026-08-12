@@ -207,20 +207,21 @@ private def parseRat (numerator denominator : String) : IO Rat := do
 private structure CheckerRequest where
   environment : Mxx.Ir.ParamEnvironment
   layouts : List Mxx.GadgetLayoutDescriptor
+  targetId : String
   requestHash : String
 
 private def parseCrtModuli (value : String) : IO (List Nat) :=
   value.splitOn "," |>.mapM parseNat
 
 private def parseRequest (args : List String) : IO CheckerRequest := do
-  if args.length != 27 then
-    throw <| IO.userError "expected 17 scalar arguments, one 9-field gadget-layout descriptor, and a request hash"
+  if args.length != 28 then
+    throw <| IO.userError "expected 17 scalar arguments, one 9-field gadget-layout descriptor, a target id, and a request hash"
   match args with
   | [instanceWidth, witnessWidth, depth, maxLayerWidth, ringDimension, inputCount, digitBase,
       batchBits, digitCount, modulus, gadgetBase, errorBound, preimageBound,
       trapdoorNumerator, trapdoorDenominator, errorNumerator, errorDenominator,
       paramsId, layoutRingDimension, crtBits, baseBits, layoutBase, regularDigitCount,
-      smallDigitCount, smallestCrtModulus, crtModuli, requestHash] =>
+      smallDigitCount, smallestCrtModulus, crtModuli, targetId, requestHash] =>
       return {
         environment := [
         (.parameter "instance_width", .integer (← parseDimension instanceWidth)),
@@ -253,15 +254,11 @@ private def parseRequest (args : List String) : IO CheckerRequest := do
           smallDigitCount := ← parseNat smallDigitCount
           smallestCrtModulus := ← parseNat smallestCrtModulus
         }]
+        targetId
         requestHash
       }
   | _ =>
       throw <| IO.userError "internal argument-count mismatch"
-
-private def parameterInt
-    (environment : Mxx.Ir.ParamEnvironment)
-    (name : String) : Option Int :=
-  (Mxx.Ir.IntExpr.parameter name).evaluate environment
 
 private def describeOperationalError : Mxx.Certificate.OperationalError → String
   | .inScope scope error => s!"in {repr scope}: {describeOperationalError error}"
@@ -317,6 +314,12 @@ private def describeOperationalError : Mxx.Certificate.OperationalError → Stri
   | .outputTypeMismatch node => s!"output type mismatch at {node}"
   | .missingStageDerivation stage => s!"missing workflow derivation for {stage}"
   | .missingStageResult stage output => s!"missing workflow artifact {stage}.{output}"
+  | .invalidOperationalDecoderTarget targetId =>
+      s!"invalid operational decoder target {targetId}"
+  | .unknownOperationalDecoderTarget targetId =>
+      s!"unknown operational decoder target {targetId}"
+  | .duplicateOperationalDecoderTarget targetId =>
+      s!"duplicate operational decoder target {targetId}"
   | .missingProtocolContract name => s!"missing protocol input contract for {name}"
   | .inputContractMismatch detail => s!"protocol input contract mismatch: {detail}"
   | .unknownDerivationAttachment ownerNamespace ruleName =>
@@ -337,27 +340,6 @@ private def describeOperationalError : Mxx.Certificate.OperationalError → Stri
   | .unsupportedOperationalExpr id => s!"unsupported operational expression {id}"
   | .unsupportedNode node => s!"unsupported IR node at {node}"
 
-private def rootAnchorMatrixFact
-    (results : List Mxx.Certificate.OperationalStageResult)
-    (label : String) : Except String Mxx.Certificate.OperationalMatrixFact := do
-  let binding ← match DiamondWeFamily_protocol.bundle.anchorBindings.find? fun binding =>
-      binding.anchor.label == label with
-    | some value => pure value
-    | none => throw s!"missing semantic anchor {label}"
-  let wire ← match binding.wires with
-    | [wire] => pure wire
-    | _ => throw s!"semantic anchor {label} is not bound to exactly one wire"
-  if !wire.scope.path.isEmpty then
-    throw s!"semantic anchor {label} is not a root-scope wire"
-  let stage ← match results.find? fun result => result.stage == wire.stage.name with
-    | some value => pure value
-    | none => throw s!"missing operational stage result {wire.stage.name}"
-  match ← Mxx.Certificate.lookupFact (wire.node.value + 1) stage.facts
-      { node := wire.node.value, port := wire.port }
-      |>.mapError describeOperationalError with
-  | .matrix fact => pure fact
-  | _ => throw s!"semantic anchor {label} is not a matrix"
-
 /-- The operational endpoint used by parameter search while the strict correctness theorem is
 unfinished.  It is intentionally named an estimate: it checks generated derivations and derives
 all executable-node hard bounds, but does not claim the final runtime theorem. -/
@@ -374,24 +356,22 @@ private def operationalDiamondEstimate
   let operationalWorkflow : Mxx.Certificate.OperationalWorkflowSpec := {
     workflow := DiamondWeFamily_protocol.bundle.workflow
     inputContract := DiamondWeFamily_protocol.bundle.inputContract
+    operationalDecoderTargets := DiamondWeFamily_protocol.bundle.operationalDecoderTargets
   }
-  let workflowResults ← Mxx.Certificate.evaluateWorkflowOperational operationalWorkflow
+  let prepared ← Mxx.Certificate.prepareWorkflowOperational operationalWorkflow
       [("encrypt", DiamondWeFamily_stage_encrypt_derivation),
-       ("decrypt", DiamondWeFamily_stage_decrypt_derivation)] environment request.layouts
+       ("decrypt", DiamondWeFamily_stage_decrypt_derivation)]
+    |>.mapError fun error => s!"workflow operational preparation failed: {describeOperationalError error}"
+  let workflowResults ← Mxx.Certificate.evaluatePreparedWorkflowOperational prepared environment request.layouts
     |>.mapError fun error => s!"workflow operational bound evaluation failed: {describeOperationalError error}"
-  let modulus ← match parameterInt environment "diamond_modulus" with
-    | some value => pure value
-    | none => throw "missing modulus"
-  let ringDimension ← match parameterInt environment "diamond_ring_dimension" with
-    | some value => pure value
-    | none => throw "missing ring dimension"
-  if ringDimension <= 0 then throw "ring dimension must be positive"
-  let residual ← rootAnchorMatrixFact workflowResults "diamond.decoder.residual"
-  let report ← Mxx.Certificate.decoderNoiseCheckReport workflowResults residual environment 2 modulus
-    |>.mapError describeOperationalError
+  let (target, modulus, noiseBound, diagnostics) ←
+    Mxx.Certificate.operationalTargetNoiseBound prepared workflowResults request.targetId environment
+      |>.mapError describeOperationalError
+  let report ← Mxx.Certificate.operationalTargetNoiseCheckReportFromBound workflowResults
+      target modulus noiseBound diagnostics environment |>.mapError describeOperationalError
   let noiseBound ← match report.obligations with
-    | [.decoderThreshold _ _ value] => pure value
-    | _ => throw "operational decoder report did not contain exactly one threshold obligation"
+    | [.booleanInterval _ noiseBound] => pure noiseBound
+    | _ => throw "operational decoder report did not contain exactly one interval obligation"
   return {
     accepted := report.accepted
     noiseBound

@@ -141,16 +141,6 @@ inductive FrozenPointwiseMatrixProgramFormula.DenotesAt
       (bound : Mxx.maxCenteredCoefficientNorm output ≤ matrixParams.maxCoefficientBound) :
       DenotesAt frame (.preimage scope wire matrixType cutoff publicWire trapdoor targetWire)
         output
-  | reshape
-      {current : ExecutedScope samplers program}
-      {frame : FormulaExecutionFrame samplers program current}
-      (scope : StaticScopeId) (wire : Mxx.Ir.WireRef)
-      (rows columns : Mxx.Ir.IntExpr) (inputFormula : FrozenPointwiseMatrixProgramFormula)
-      (input : Mxx.Matrix) (rowValue columnValue : Int)
-      (rowsEvaluate : rows.evaluate current.params = some rowValue)
-      (columnsEvaluate : columns.evaluate current.params = some columnValue) :
-      DenotesAt frame (.reshape scope wire rows columns inputFormula)
-        (Mxx.matrixReshape input rowValue.toNat columnValue.toNat)
   | slice
       {current : ExecutedScope samplers program}
       {frame : FormulaExecutionFrame samplers program current}

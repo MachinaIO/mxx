@@ -369,10 +369,11 @@ theorem applyPreimageRelation_local_sound
     (trapdoorRef : ValueInstanceRef)
     (source subject target : Mxx.Matrix)
     (sourceParams targetParams : Mxx.SamplerParams)
+    (trapdoorOrigin : Mxx.TrapdoorOrigin)
     (subjectLookup : environment.values subjectRef = some (.matrix subject))
     (sourceLookup : environment.values sourceRef.value = some (.matrix source))
     (targetLookup : environment.values targetRef.value = some (.matrix target))
-    (trapdoorLookup : environment.values trapdoorRef = some (.trapdoor source))
+    (trapdoorLookup : environment.values trapdoorRef = some (.trapdoor source trapdoorOrigin))
     (sourceTypeEvaluate :
       sourceRef.type.evaluate environment.parameters (.constant 0) = some sourceParams)
     (targetTypeEvaluate :
@@ -405,7 +406,7 @@ theorem applyPreimageRelation_local_sound
     rw [← sameModulus, ← sameRingDimension, ← sameRows] at targetLayout
     simpa [modulusEq] using targetLayout
   have productLayout := Mxx.Toolkit.matrixMul_layout source subject sourceLayoutQ subjectLayoutQ
-  exact ⟨subject, source, target, sourceParams, targetParams, subjectLookup, sourceLookup,
+  exact ⟨subject, source, target, sourceParams, targetParams, trapdoorOrigin, subjectLookup, sourceLookup,
     targetLookup, trapdoorLookup, sourceTypeEvaluate, targetTypeEvaluate, sourceLayout,
     subjectLayout, targetLayout, sameModulus, sameRingDimension, sameRows,
     Mxx.Toolkit.matrixValue_eq_of_modEq q sourceParams.ringDimension sourceParams.rows

@@ -236,7 +236,7 @@ inductive NodeKind where
   | intCompare (operation : IntCompareOp)
   | bitExtract (bit : IntExpr)
   | extractCoefficient (position : IntExpr)
-  | constantCoefficient (position : IntExpr)
+  | liftIntegerToConstantPolynomial (matrixType : MatrixTypeExpr)
   | select
   | uniformResidueSample (matrixType : MatrixTypeExpr)
   | uniformIntervalSample (matrixType : MatrixTypeExpr) (minimum maximum : IntExpr)
@@ -260,7 +260,6 @@ inductive NodeKind where
   | transpose
   | slice (rows columns : Option (IntExpr × IntExpr))
   | tensor
-  | reshape (rows columns : IntExpr)
   | concat (axis : ConcatAxis)
   | thresholdDecodeBool
       (ciphertextModulus plaintextModulus length : IntExpr)
@@ -859,7 +858,12 @@ def evaluateNode
           [[.integer (Mxx.reduceCoefficient matrix.modulus
             (matrix.coefficients.getD position.toNat 0))]]
       | _, _ => [[.invalid "coefficient-extraction argument mismatch"]]
-  | .constantCoefficient _ => [[.invalid "constant-coefficient execution is unavailable"]]
+  | .liftIntegerToConstantPolynomial matrixType =>
+      match arguments node wires, matrixType.evaluate params with
+      | some [.integer value], some matrixParams =>
+          [[.matrix (Mxx.Matrix.withSamplerParams
+            ({ coefficients := [value % matrixParams.modulus] } : Mxx.Matrix) matrixParams)]]
+      | _, _ => [[.invalid "constant-polynomial lift argument mismatch"]]
   | .select =>
       match arguments node wires with
       | some (.integer index :: branches) =>
@@ -984,12 +988,6 @@ def evaluateNode
               [[.matrix (Mxx.matrixSlice value rowStart rowEnd columnStart columnEnd)]]
           | _, _ => [[.invalid "Slice range evaluation failed"]]
       | _ => [[.invalid "Slice argument mismatch"]]
-  | .reshape rows columns =>
-      match arguments node wires, rows.evaluate params, columns.evaluate params with
-      | some [.matrix value], some rows, some columns =>
-          if rows < 0 ∨ columns < 0 then [[.invalid "negative reshape dimension"]]
-          else [[.matrix (Mxx.matrixReshape value rows.toNat columns.toNat)]]
-      | _, _, _ => [[.invalid "Reshape argument mismatch"]]
   | .concat axis =>
       match arguments node wires with
       | some values =>

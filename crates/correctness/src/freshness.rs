@@ -10,7 +10,7 @@ use std::{
 };
 use thiserror::Error;
 
-pub const GENERATOR_VERSION: &str = "mxx-correctness-emitter-v9";
+pub const GENERATOR_VERSION: &str = "mxx-correctness-emitter-v11";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FreshnessMetadata {

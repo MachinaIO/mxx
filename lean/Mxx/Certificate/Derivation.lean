@@ -28,7 +28,7 @@ inductive DerivationRule where
   | intCompare
   | bitExtract
   | extractCoefficient
-  | constantCoefficient
+  | liftIntegerToConstantPolynomial
   | select
   | uniformResidueSample
   | uniformIntervalSample
@@ -47,7 +47,6 @@ inductive DerivationRule where
   | transpose
   | slice
   | tensor
-  | reshape
   | concat
   | thresholdDecodeBool
   | thresholdDecodeInt
@@ -125,7 +124,7 @@ private def matchesNodeKind : DerivationRule → Mxx.Ir.NodeKind → Bool
   | .intCompare, .intCompare _ => true
   | .bitExtract, .bitExtract _ => true
   | .extractCoefficient, .extractCoefficient _ => true
-  | .constantCoefficient, .constantCoefficient _ => true
+  | .liftIntegerToConstantPolynomial, .liftIntegerToConstantPolynomial _ => true
   | .select, .select => true
   | .uniformResidueSample, .uniformResidueSample _ => true
   | .uniformIntervalSample, .uniformIntervalSample _ _ _ => true
@@ -144,7 +143,6 @@ private def matchesNodeKind : DerivationRule → Mxx.Ir.NodeKind → Bool
   | .transpose, .transpose => true
   | .slice, .slice _ _ => true
   | .tensor, .tensor => true
-  | .reshape, .reshape _ _ => true
   | .concat, .concat _ => true
   | .thresholdDecodeBool, .thresholdDecodeBool _ _ _ => true
   | .thresholdDecodeInt, .thresholdDecodeInt _ _ _ => true

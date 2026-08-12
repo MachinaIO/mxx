@@ -93,7 +93,7 @@ partial def buildFrozenDependencySlice
     (output : Mxx.Ir.WireRef)
     (fuel : Nat := program.definitions.length + 1) : Option FrozenDependencySlice := do
   guard (validWire scope output)
-  let wires := dependencyClosure scope scope.nodes.length [output]
+  let wires := dependencyClosure scope scope.nodes.size [output]
   guard (wires.all (validWire scope))
   let children ← match fuel with
     | 0 =>
@@ -210,7 +210,7 @@ partial def FrozenDependencySlice.projectInputToOuterScope?
   let .scope stage scopeId _ _ children := slice
   let scope ← scopeAtStaticPath? program scopeId
   if targetSite.stage = stage && targetSite.scope = scopeId then
-    return scopeMatrixInputDependencies scope (scope.nodes.length + 1) targetInput
+    return scopeMatrixInputDependencies scope (scope.nodes.size + 1) targetInput
   let matching := children.filter fun child => child.2.containsSite targetSite
   let (call, childSlice) ← match matching with
     | [child] => some child
@@ -220,7 +220,7 @@ partial def FrozenDependencySlice.projectInputToOuterScope?
   let actualInputs := childInputs.filterMap fun slot => callNode.arguments[slot]?
   guard (actualInputs.length = childInputs.length)
   return (actualInputs.filter (wireCarriesMatrixData scope)
-    |>.flatMap (scopeMatrixInputDependencies scope (scope.nodes.length + 1))).eraseDups
+    |>.flatMap (scopeMatrixInputDependencies scope (scope.nodes.size + 1))).eraseDups
 
 /-- Project any scalar, Boolean, or matrix dependency through the exact frozen child-call chain.
 This is the control/binder counterpart of `projectInputToOuterScope?`; it does not discard
@@ -233,7 +233,7 @@ partial def FrozenDependencySlice.projectInputToOuterScopeAny?
   let .scope stage scopeId _ _ children := slice
   let scope ← scopeAtStaticPath? program scopeId
   if targetSite.stage = stage && targetSite.scope = scopeId then
-    return scopeInputDependencies scope (scope.nodes.length + 1) targetInput
+    return scopeInputDependencies scope (scope.nodes.size + 1) targetInput
   let matching := children.filter fun child => child.2.containsSite targetSite
   let (call, childSlice) ← match matching with
     | [child] => some child
@@ -242,7 +242,7 @@ partial def FrozenDependencySlice.projectInputToOuterScopeAny?
   let callNode ← scope.nodes[call.site.node.value]?
   let actualInputs := childInputs.filterMap fun slot => callNode.arguments[slot]?
   guard (actualInputs.length = childInputs.length)
-  return (actualInputs.flatMap (scopeInputDependencies scope (scope.nodes.length + 1))).eraseDups
+  return (actualInputs.flatMap (scopeInputDependencies scope (scope.nodes.size + 1))).eraseDups
 
 /-- Analyzer-owned pointwise matrix syntax obtained by expanding frozen subgraph and parallel-loop
 bodies.  Leaves retain their exact outer-scope wire identity.  This is not a second executable DAG:
@@ -281,8 +281,6 @@ inductive FrozenPointwiseMatrixProgramFormula where
   | preimage (scope : StaticScopeId) (wire : Mxx.Ir.WireRef)
       (matrixType : MatrixTypeExpr) (cutoff : IntExpr)
       (publicWire trapdoor target : Mxx.Ir.WireRef)
-  | reshape (scope : StaticScopeId) (wire : Mxx.Ir.WireRef)
-      (rows columns : IntExpr) (input : FrozenPointwiseMatrixProgramFormula)
   | slice (scope : StaticScopeId) (wire : Mxx.Ir.WireRef)
       (rows columns : Option (IntExpr × IntExpr))
       (input : FrozenPointwiseMatrixProgramFormula)
@@ -323,7 +321,6 @@ def FrozenPointwiseMatrixProgramFormula.erase :
   | .decompose _ _ matrixType base small digitCount input =>
       .decompose matrixType base small digitCount input.erase
   | .preimage scope wire _ _ _ _ _ => .atom scope wire
-  | .reshape scope wire _ _ _ => .atom scope wire
   | .slice scope wire _ _ _ => .atom scope wire
   | .concatRows scope wire _ _ => .atom scope wire
   | .add _ _ left right => .add left.erase right.erase
@@ -346,7 +343,6 @@ def FrozenPointwiseMatrixProgramFormula.source :
   | .gadget scope wire _ _
   | .decompose scope wire _ _ _ _ _
   | .preimage scope wire _ _ _ _ _
-  | .reshape scope wire _ _ _
   | .slice scope wire _ _ _
   | .concatRows scope wire _ _
   | .add scope wire _ _
@@ -455,11 +451,6 @@ def FrozenPointwiseMatrixProgramFormula.validIn
         node.kind == .preimageSample matrixType cutoff && wire.port == 0 &&
           node.arguments == [publicWire, trapdoor, target] &&
           node.arguments.all (fun argument => argument.node < wire.node)
-  | .reshape scopeId wire rows columns input =>
-      pointwiseFormulaNodeValid program scopeId wire fun _ node =>
-        node.kind == .reshape rows columns && wire.port == 0 &&
-          pointwiseFormulaArgumentsMatch scopeId wire node.arguments [input] &&
-          input.validIn program substitutions
   | .slice scopeId wire rows columns input =>
       pointwiseFormulaNodeValid program scopeId wire fun _ node =>
         node.kind == .slice rows columns && wire.port == 0 &&
@@ -563,9 +554,6 @@ private partial def normalizePointwiseMatrixWire
             (← normalizePointwiseMatrixWire program scopeId scope substitutions fuel input)
       | .preimageSample matrixType cutoff, [publicWire, trapdoor, target] =>
           some (.preimage scopeId wire matrixType cutoff publicWire trapdoor target)
-      | .reshape rows columns, [input] =>
-          return .reshape scopeId wire rows columns
-            (← normalizePointwiseMatrixWire program scopeId scope substitutions fuel input)
       | .slice rows columns, [input] =>
           return .slice scopeId wire rows columns
             (← normalizePointwiseMatrixWire program scopeId scope substitutions fuel input)
@@ -646,7 +634,7 @@ partial def FrozenDependencySlice.normalizePointwiseMatrixProgramAt?
   let .scope stage scopeId _ _ children := slice
   let scope ← scopeAtStaticPath? program scopeId
   if targetSite.stage = stage && targetSite.scope = scopeId then
-    normalizePointwiseMatrixTargetWire program scopeId scope [] (scope.nodes.length + fuel)
+    normalizePointwiseMatrixTargetWire program scopeId scope [] (scope.nodes.size + fuel)
       targetWire
   else
     let matching := children.filter fun child => child.2.containsSite targetSite
@@ -655,14 +643,14 @@ partial def FrozenDependencySlice.normalizePointwiseMatrixProgramAt?
       | _ => none
     let callNode ← scope.nodes[call.site.node.value]?
     let substitutions ← callNode.arguments.mapM fun argument =>
-      normalizePointwiseMatrixTargetWire program scopeId scope [] (scope.nodes.length + fuel)
+      normalizePointwiseMatrixTargetWire program scopeId scope [] (scope.nodes.size + fuel)
         argument
     let .scope childStage childScopeId _ _ _ := childSlice
     let childScope ← scopeAtStaticPath? program childScopeId
     guard (childStage = stage)
     if targetSite.scope = childScopeId then
       normalizePointwiseMatrixTargetWire program childScopeId childScope substitutions
-        (childScope.nodes.length + fuel) targetWire
+        (childScope.nodes.size + fuel) targetWire
     else
       -- Deeper descent must retain the substitutions already induced by this call.  Rebuild a
       -- rooted view at the child and normalize its target after substituting the child's inputs.
@@ -676,7 +664,7 @@ partial def FrozenDependencySlice.normalizePointwiseMatrixProgramAt?
         if targetSite.scope = currentScopeId then
           normalizePointwiseMatrixTargetWire program currentScopeId currentScope
             currentSubstitutions
-            (currentScope.nodes.length + fuel) targetWire
+            (currentScope.nodes.size + fuel) targetWire
         else
           let nestedMatching := currentChildren.filter fun child =>
             child.2.containsSite targetSite
@@ -686,7 +674,7 @@ partial def FrozenDependencySlice.normalizePointwiseMatrixProgramAt?
           let nestedNode ← currentScope.nodes[nestedCall.site.node.value]?
           let nestedSubstitutions ← nestedNode.arguments.mapM fun argument =>
             normalizePointwiseMatrixTargetWire program currentScopeId currentScope
-              currentSubstitutions (currentScope.nodes.length + fuel) argument
+              currentSubstitutions (currentScope.nodes.size + fuel) argument
           descend nestedSlice nestedSubstitutions
       descend childSlice substitutions
 

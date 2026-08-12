@@ -422,34 +422,6 @@ impl DiamondGpuMeasurementBackend {
                         .map_err(Self::backend_error)
                 })
             }
-            NodeKind::Reshape { rows, columns } => {
-                let input = Self::matrix_argument(node, 0)?.clone();
-                let rows = rows
-                    .evaluate(bindings)
-                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?
-                    .try_into()
-                    .map_err(|_| {
-                        DiamondGpuMeasurementError::Expression(
-                            "reshape rows is not usize".to_owned(),
-                        )
-                    })?;
-                let columns = columns
-                    .evaluate(bindings)
-                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?
-                    .try_into()
-                    .map_err(|_| {
-                        DiamondGpuMeasurementError::Expression(
-                            "reshape columns is not usize".to_owned(),
-                        )
-                    })?;
-                self.measure_placements(node, bindings, |this| {
-                    let input = this.matrix(&input)?;
-                    this.backend
-                        .reshape(&input, rows, columns)
-                        .map(ReadyOutput::Matrix)
-                        .map_err(Self::backend_error)
-                })
-            }
             NodeKind::UniformResidueSample { .. } => {
                 let output = Self::matrix_output(node)?.clone();
                 let range = SampleRange {
@@ -672,30 +644,23 @@ impl DiamondGpuMeasurementBackend {
                     Ok(ReadyOutput::Host)
                 })
             }
-            NodeKind::ConstantCoefficient { position } => {
-                let input = Self::matrix_argument(node, 0)?.clone();
-                let output = Self::matrix_output(node)?.clone();
-                let position = position
-                    .evaluate(bindings)
-                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?
-                    .try_into()
-                    .map_err(|_| {
-                        DiamondGpuMeasurementError::Expression(
-                            "coefficient position is not usize".to_owned(),
-                        )
-                    })?;
+            NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
+                let output = matrix_type.evaluate(bindings).ok_or_else(|| {
+                    DiamondGpuMeasurementError::Expression(
+                        "constant-polynomial lift matrix type is unavailable".to_owned(),
+                    )
+                })?;
                 self.measure_placements(node, bindings, |this| {
-                    let input = this.matrix(&input)?;
-                    let coefficient = this
-                        .backend
-                        .extract_coefficient(&input, position)
-                        .map_err(Self::backend_error)?;
                     let identity = this
                         .backend
-                        .constant_matrix(&output, &ConstantMatrix::Identity, bindings)
+                        .constant_matrix(
+                            &output,
+                            &mxx_ir_core::node::ConstantMatrix::Identity,
+                            bindings,
+                        )
                         .map_err(Self::backend_error)?;
                     this.backend
-                        .scale_integer(&identity, &coefficient)
+                        .scale_integer(&identity, &BigInt::from(0))
                         .map(ReadyOutput::Matrix)
                         .map_err(Self::backend_error)
                 })

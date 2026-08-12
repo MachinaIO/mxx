@@ -3,7 +3,7 @@ import Mxx.Certificate.Derivation
 
 namespace Mxx.Ir
 
-def binaryFormatVersion : UInt8 := 1
+def binaryFormatVersion : UInt8 := 3
 
 inductive DecodeError where
   | truncated (offset : Nat)
@@ -276,7 +276,7 @@ private def readNodeKind (fuel : Nat) : DecodeM NodeKind :=
     | 20 => .intCompare <$> readIntCompareOp
     | 21 => .bitExtract <$> readIntExpr fuel
     | 22 => .extractCoefficient <$> readIntExpr fuel
-    | 23 => .constantCoefficient <$> readIntExpr fuel
+    | 23 => .liftIntegerToConstantPolynomial <$> readMatrixType fuel
     | 24 => pure .select
     | 25 => .uniformResidueSample <$> readMatrixType fuel
     | 26 => .uniformIntervalSample <$> readMatrixType fuel <*> readIntExpr fuel <*> readIntExpr fuel
@@ -293,19 +293,18 @@ private def readNodeKind (fuel : Nat) : DecodeM NodeKind :=
     | 38 => pure .transpose
     | 39 => .slice <$> readRange fuel <*> readRange fuel
     | 40 => pure .tensor
-    | 41 => .reshape <$> readIntExpr fuel <*> readIntExpr fuel
-    | 42 => .concat <$> readConcatAxis
-    | 43 => .thresholdDecodeBool <$> readIntExpr fuel <*> readIntExpr fuel <*> readIntExpr fuel
-    | 44 => .thresholdDecodeInt <$> readIntExpr fuel <*> readIntExpr fuel <*> readIntExpr fuel
-    | 45 => .crtRecompose <$> readArray (readIntExpr fuel) <*> readArray (readIntExpr fuel)
-    | 46 => .packPolynomialCoefficients <$> readMatrixType fuel <*> readIntExpr fuel
-    | 47 => pure .familyPack
-    | 48 => .familyGetStatic <$> readIntExpr fuel
-    | 49 => pure .familyGetDynamic
-    | 50 => .subgraphCall <$> readString <*> readBindings fuel
-    | 51 => .parallelLoop <$> readString <*> readIntExpr fuel <*> readU32 <*>
+    | 41 => .concat <$> readConcatAxis
+    | 42 => .thresholdDecodeBool <$> readIntExpr fuel <*> readIntExpr fuel <*> readIntExpr fuel
+    | 43 => .thresholdDecodeInt <$> readIntExpr fuel <*> readIntExpr fuel <*> readIntExpr fuel
+    | 44 => .crtRecompose <$> readArray (readIntExpr fuel) <*> readArray (readIntExpr fuel)
+    | 45 => .packPolynomialCoefficients <$> readMatrixType fuel <*> readIntExpr fuel
+    | 46 => pure .familyPack
+    | 47 => .familyGetStatic <$> readIntExpr fuel
+    | 48 => pure .familyGetDynamic
+    | 49 => .subgraphCall <$> readString <*> readBindings fuel
+    | 50 => .parallelLoop <$> readString <*> readIntExpr fuel <*> readU32 <*>
         readBindings fuel <*> readArray readLoopInputMode
-    | 52 => .sequentialLoop <$> readString <*> readIntExpr fuel <*> readU32 <*>
+    | 51 => .sequentialLoop <$> readString <*> readIntExpr fuel <*> readU32 <*>
         readBindings fuel <*> readU32
     | _ => do failAt (.unknownTag ((← get).position - 5) "NodeKind" tag)
 
@@ -352,18 +351,18 @@ private def readDerivationRule : DecodeM Mxx.Certificate.DerivationRule :=
     | 12 => pure .powerOfBaseMatrix | 13 => pure .rotationMatrix | 14 => pure .gadgetTrapdoor
     | 15 => pure .intToReal | 16 => pure .boolToInt | 17 => pure .intBinary
     | 18 => pure .realBinary | 19 => pure .realSqrt | 20 => pure .intCompare
-    | 21 => pure .bitExtract | 22 => pure .extractCoefficient | 23 => pure .constantCoefficient
+    | 21 => pure .bitExtract | 22 => pure .extractCoefficient | 23 => pure .liftIntegerToConstantPolynomial
     | 24 => pure .select | 25 => pure .uniformResidueSample | 26 => pure .uniformIntervalSample
     | 27 => pure .gaussianSample | 28 => pure .hashSample | 29 => pure .gadgetDecompose
     | 30 => pure .trapdoorSample | 31 => pure .trapdoorPublic | 32 => pure .preimageSample
     | 33 => pure .matrixAdd | 34 => pure .matrixSubtract | 35 => pure .matrixMultiplyBound
     | 36 => .matrixMultiplyRelation <$> readWireRef
     | 37 => pure .matrixNegate | 38 => pure .matrixScale | 39 => pure .transpose
-    | 40 => pure .slice | 41 => pure .tensor | 42 => pure .reshape | 43 => pure .concat
-    | 44 => pure .thresholdDecodeBool | 45 => pure .thresholdDecodeInt
-    | 46 => pure .crtRecompose | 47 => pure .packPolynomialCoefficients
-    | 48 => pure .familyPack | 49 => pure .familyGetStatic | 50 => pure .familyGetDynamic
-    | 51 => pure .subgraphCall | 52 => pure .parallelLoop | 53 => pure .sequentialLoop
+    | 40 => pure .slice | 41 => pure .tensor | 42 => pure .concat
+    | 43 => pure .thresholdDecodeBool | 44 => pure .thresholdDecodeInt
+    | 45 => pure .crtRecompose | 46 => pure .packPolynomialCoefficients
+    | 47 => pure .familyPack | 48 => pure .familyGetStatic | 49 => pure .familyGetDynamic
+    | 50 => pure .subgraphCall | 51 => pure .parallelLoop | 52 => pure .sequentialLoop
     | _ => do failAt (.unknownTag ((← get).position - 5) "DerivationRule" tag)
 
 private def readNodeDerivation : DecodeM Mxx.Certificate.NodeDerivation := do

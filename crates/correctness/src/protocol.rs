@@ -380,6 +380,7 @@ mod tests {
                 requirements: Vec::new(),
                 comparator: ComparatorSpec::Equality { endpoints: Vec::new() },
                 endpoints: Default::default(),
+                operational_decoder_targets: Vec::new(),
                 endpoint_specs: Vec::new(),
                 input_contract: InputContract {
                     inputs: vec![InputContractEntry {

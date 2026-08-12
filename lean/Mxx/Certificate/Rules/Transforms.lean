@@ -1,4 +1,5 @@
 import Mxx.Certificate.LocalSoundness
+import Mxx.Certificate.Facts
 import Mxx.Certificate.Rules.CanonicalResidues
 import Mxx.Ir.ExecutionFacts
 
@@ -9,14 +10,13 @@ inductive TransformRule where
   | uniformMinusOneOne
   | uniformZeroOne
   | slice
-  | reshapeBounded
   | concatRows
   | concatColumns
   | concatDiagonal
   deriving BEq, DecidableEq, Repr
 
 /- Norm derivation in this module is intentionally independent from coefficient representation.
-Once `MatrixFact` obtains the accepted provenance field, reshape/slice/concat may preserve
+Once `MatrixFact` obtains the accepted provenance field, slice and concat may preserve
 `canonicalResidues(q)` only by applying the executable lemmas from `CanonicalResidues`; they must
 never infer it merely from a centered bound. -/
 
@@ -30,7 +30,6 @@ def inferTransformRule : Mxx.Ir.NodeKind → Except TransformRuleError Transform
   | .uniformIntervalSample _ (.constant (-1)) (.constant 1) => .ok .uniformMinusOneOne
   | .uniformIntervalSample _ (.constant 0) (.constant 1) => .ok .uniformZeroOne
   | .slice _ _ => .ok .slice
-  | .reshape _ _ => .ok .reshapeBounded
   | .concat .rows => .ok .concatRows
   | .concat .columns => .ok .concatColumns
   | .concat .diagonal => .ok .concatDiagonal
@@ -43,20 +42,6 @@ private def boundedOnly (fact : MatrixFact) : Except TransformRuleError BoundExp
       if form.terms.isEmpty then return fact.totalNormBound
       throw .affineSignalInput
   | .exact _ => throw .affineSignalInput
-
-def deriveReshapeBoundedFact
-    (output : ValueInstanceRef) (input : MatrixFact) : Except TransformRuleError MatrixFact := do
-  /- Reshape cannot transport a preimage or gadget-decomposition equation: matrix reshaping is
-  not an algebra homomorphism.  It can nevertheless materialize the complete input as one bounded
-  value because reshaping preserves the coefficient sequence.  In that case the already-proved
-  total bound, rather than any internal affine decomposition, is the sound bound to retain. -/
-  let bound := input.totalNormBound
-  return {
-    subject := output
-    primary := .affine { terms := [], noiseBound := bound }
-    relations := []
-    totalNormBound := bound
-  }
 
 private def sliceExpression
     (expression : MatrixExpr)
@@ -229,44 +214,6 @@ theorem uniformZeroOneNode_local_sound
     rw [range] at coefficientRange
     simpa using coefficientRange
   · omega
-
-theorem matrixReshape_norm_eq
-    (matrix : Mxx.Matrix) (rows columns : Nat) :
-    Mxx.maxCenteredCoefficientNorm (Mxx.matrixReshape matrix rows columns) =
-      Mxx.maxCenteredCoefficientNorm matrix := by
-  rfl
-
-theorem reshapeNode_local_sound
-    (runChild : Mxx.Ir.ChildRunner)
-    (samplers : Mxx.MxxSamplerFamily)
-    (params : Mxx.Ir.ParamEnvironment)
-    (inputs : Mxx.Ir.Environment)
-    (wires : Mxx.Ir.WireEnvironment)
-    (inputRef : Mxx.Ir.WireRef)
-    (rows columns : IntExpr)
-    (matrix : Mxx.Matrix)
-    (evaluatedRows evaluatedColumns : Int)
-    (outputCount bound : Nat)
-    (argumentsEvaluate : [inputRef].mapM (fun wire => Mxx.Ir.lookupWire wire wires) =
-      some [.matrix matrix])
-    (rowsEvaluate : rows.evaluate params = some evaluatedRows)
-    (columnsEvaluate : columns.evaluate params = some evaluatedColumns)
-    (rowsNonnegative : 0 ≤ evaluatedRows)
-    (columnsNonnegative : 0 ≤ evaluatedColumns)
-    (inputNorm : Mxx.maxCenteredCoefficientNorm matrix ≤ bound)
-    {values : List Mxx.Ir.Value}
-    (member : values ∈ Mxx.Ir.evaluateNode runChild samplers params inputs wires {
-      kind := .reshape rows columns
-      arguments := [inputRef]
-      outputCount
-    }) :
-    values = [.matrix (Mxx.matrixReshape matrix evaluatedRows.toNat evaluatedColumns.toNat)] ∧
-      Mxx.maxCenteredCoefficientNorm
-        (Mxx.matrixReshape matrix evaluatedRows.toNat evaluatedColumns.toNat) ≤ bound := by
-  constructor
-  · simpa [Mxx.Ir.evaluateNode, Mxx.Ir.arguments, argumentsEvaluate, rowsEvaluate,
-      columnsEvaluate, not_lt.mpr rowsNonnegative, not_lt.mpr columnsNonnegative] using member
-  · simpa [matrixReshape_norm_eq] using inputNorm
 
 theorem sliceNode_local_sound
     (runChild : Mxx.Ir.ChildRunner)
@@ -493,20 +440,6 @@ private def fixtureSignalMatrix : MatrixFact := {
   relations := []
   totalNormBound := .constant 1
 }
-
-example : deriveReshapeBoundedFact (.protocolInput ⟨"reshaped"⟩) fixtureBoundedMatrix = .ok {
-    subject := .protocolInput ⟨"reshaped"⟩
-    primary := .affine { terms := [], noiseBound := .constant 7 }
-    relations := []
-    totalNormBound := .constant 7
-  } := rfl
-
-example : deriveReshapeBoundedFact (.protocolInput ⟨"reshaped"⟩) fixtureSignalMatrix = .ok {
-    subject := .protocolInput ⟨"reshaped"⟩
-    primary := .affine { terms := [], noiseBound := .constant 1 }
-    relations := []
-    totalNormBound := .constant 1
-  } := rfl
 
 private def fixtureExactMatrix : MatrixFact := {
   subject := fixtureValue

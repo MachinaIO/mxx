@@ -144,23 +144,6 @@ inductive FrozenPointwiseMatrixProgramFormula.LocalElaborationInputs
       (columnsEq : matrixParams.columns = columns) :
       LocalElaborationInputs frame q ringDimension
         (.preimage scope wire matrixType cutoff publicWire trapdoor targetWire) rows columns
-  | reshape
-      (scope : StaticScopeId) (wire : Mxx.Ir.WireRef)
-      (rowsExpr columnsExpr : Mxx.Ir.IntExpr)
-      (inputFormula : FrozenPointwiseMatrixProgramFormula)
-      (input : Mxx.Matrix) (rowValue columnValue : Int) (rows columns : Nat)
-      (scopeEq : scope = current.scopeId)
-      (inputEarlier : inputFormula.source.2.node < wire.node)
-      (inputFound : Mxx.Ir.lookupWire inputFormula.source.2 current.execution.wires =
-        some (.matrix input))
-      (rowsEvaluate : rowsExpr.evaluate current.params = some rowValue)
-      (columnsEvaluate : columnsExpr.evaluate current.params = some columnValue)
-      (rowsNonnegative : 0 ≤ rowValue) (columnsNonnegative : 0 ≤ columnValue)
-      (layout : Mxx.Toolkit.MatrixLayout
-        (Mxx.matrixReshape input rowValue.toNat columnValue.toNat)
-        q ringDimension rows columns) :
-      LocalElaborationInputs frame q ringDimension
-        (.reshape scope wire rowsExpr columnsExpr inputFormula) rows columns
   | slice
       (scope : StaticScopeId) (wire : Mxx.Ir.WireRef)
       (rowStart rowEnd columnStart columnEnd : Mxx.Ir.IntExpr)
@@ -570,20 +553,6 @@ theorem FrozenPointwiseMatrixProgramFormula.LocalElaborationInputs.elaborate
         runtimeFound := by rw [wire_eq_zero_port wire validated.outputPortZero]; exact found
         semanticResult := .preimage typeEvaluates relation bound modulusEq ringDimensionEq rowsEq
           columnsEq
-      }⟩
-  | reshape scope wire rowsExpr columnsExpr inputFormula input rowValue columnValue rows columns
-      scopeEq inputEarlier inputFound rowsEvaluate columnsEvaluate rowsNonnegative
-      columnsNonnegative layout =>
-      have validated := FrozenPointwiseMatrixProgramFormula.validReshapeNode valid
-      obtain ⟨nodeInBounds, nodeEq⟩ := validated.atCurrentScope frameValid scopeEq
-      have found := current.execution.matrixReshapeLookup wire.node nodeInBounds
-        inputFormula.source.2 input rowsExpr columnsExpr rowValue columnValue inputEarlier nodeEq
-        inputFound rowsEvaluate columnsEvaluate rowsNonnegative columnsNonnegative
-      exact ⟨{
-        runtimeValue := Mxx.matrixReshape input rowValue.toNat columnValue.toNat
-        runtimeFound := by rw [wire_eq_zero_port wire validated.outputPortZero]; exact found
-        semanticResult := .refl (.reshape scope wire rowsExpr columnsExpr inputFormula input
-          rowValue columnValue rowsEvaluate columnsEvaluate) layout
       }⟩
   | slice scope wire rowStart rowEnd columnStart columnEnd inputFormula input rowStartValue
       rowEndValue columnStartValue columnEndValue rows columns scopeEq inputEarlier inputFound

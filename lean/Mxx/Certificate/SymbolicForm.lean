@@ -329,7 +329,6 @@ inductive SymbolicMatrixForm where
   | rowConcat (parts : NonemptyRefs SymbolicMatrixFormRef)
   | columnConcat (parts : NonemptyRefs SymbolicMatrixFormRef)
   | diagonalConcat (parts : NonemptyRefs SymbolicMatrixFormRef)
-  | reshape (value : SymbolicMatrixFormRef) (outputType : MatrixTypeExpr)
   | preimageRewrite
       (relation : PreimageRelationRef)
       (input : SymbolicMatrixFormRef)
@@ -437,7 +436,7 @@ def SymbolicMatrixFormEntry.refsBefore
       | none => false
   /- These constructors remain unavailable until their closed layout/relation tables are threaded
   through the WF context. Existence or an in-range relation ID alone is not semantic evidence. -/
-  | .rowConcat _ | .columnConcat _ | .diagonalConcat _ | .reshape .. => false
+  | .rowConcat _ | .columnConcat _ | .diagonalConcat _ => false
   | .preimageRewrite .. | .gadgetRewrite .. => false
   | .carriedInput matrixType slot =>
       context.allowCarriedInputs && matrixType == entry.matrixType && slot < context.carriedArity

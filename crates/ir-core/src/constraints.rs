@@ -141,10 +141,6 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         }
                     }
                 }
-                NodeKind::Reshape { rows, columns } => {
-                    positive(&mut constraints, rows, format!("{prefix}: reshape rows"));
-                    positive(&mut constraints, columns, format!("{prefix}: reshape columns"));
-                }
                 NodeKind::ThresholdDecode { plaintext_modulus, length, .. } => {
                     constraints.push(ParamConstraint::IntGreaterThan {
                         left: plaintext_modulus.clone(),
@@ -158,7 +154,6 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 }
                 NodeKind::FamilyGetStatic { index } |
                 NodeKind::ExtractCoefficient { position: index } |
-                NodeKind::ConstantCoefficient { position: index } |
                 NodeKind::BitExtract { bit: index } => {
                     nonnegative(&mut constraints, index, format!("{prefix}: index"));
                 }
@@ -179,6 +174,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::Concat {
                     axis: ConcatAxis::Rows | ConcatAxis::Columns | ConcatAxis::Diagonal,
                 } |
+                NodeKind::LiftIntegerToConstantPolynomial { .. } |
                 NodeKind::Input { .. } |
                 NodeKind::ConstantInt(_) |
                 NodeKind::EvaluateInt(_) |

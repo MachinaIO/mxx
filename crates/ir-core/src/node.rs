@@ -54,10 +54,6 @@ pub enum NodeKind {
     Concat {
         axis: ConcatAxis,
     },
-    Reshape {
-        rows: IntExpr,
-        columns: IntExpr,
-    },
     /// Samples every coefficient uniformly from the full residue ring `R_q`.
     ///
     /// The modulus belongs to `matrix_type`, so this operation remains meaningful
@@ -108,8 +104,9 @@ pub enum NodeKind {
     ExtractCoefficient {
         position: IntExpr,
     },
-    ConstantCoefficient {
-        position: IntExpr,
+    /// Lifts an integer into the constant coefficient of a scalar polynomial.
+    LiftIntegerToConstantPolynomial {
+        matrix_type: crate::types::MatrixType,
     },
     ThresholdDecode {
         plaintext_modulus: IntExpr,

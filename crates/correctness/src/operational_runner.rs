@@ -1,11 +1,13 @@
 //! Fail-closed execution of generated Lean operational checks.
 
-use crate::{EmittedProtocol, GENERATOR_VERSION};
+use crate::{EmittedProtocol, GENERATOR_VERSION, emit_lean::EmittedOperationalDecoderTarget};
+use mxx_ir_core::{ParamEnv, expr::ExprError};
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -15,8 +17,8 @@ use std::{
 use tempfile::Builder;
 use thiserror::Error;
 
-pub const OPERATIONAL_REPORT_SCHEMA_VERSION: u32 = 4;
-const OPERATIONAL_PREPARED_CACHE_FORMAT_VERSION: u32 = 4;
+pub const OPERATIONAL_REPORT_SCHEMA_VERSION: u32 = 5;
+const OPERATIONAL_PREPARED_CACHE_FORMAT_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationalParameterValue {
@@ -41,10 +43,9 @@ pub struct OperationalGadgetLayout {
 pub struct OperationalCheckRequest {
     pub environment: Vec<(String, OperationalParameterValue)>,
     pub layouts: Vec<OperationalGadgetLayout>,
-    pub residual_stage: String,
-    pub residual_output: String,
-    pub plaintext_modulus: BigInt,
-    pub ciphertext_modulus: BigInt,
+    /// Identifies one closed decoder target emitted with the protocol.  The target, rather than
+    /// the caller, supplies the residual, decoder kind, and modulus expressions.
+    pub target_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -55,6 +56,8 @@ pub struct OperationalCheckerReport {
     pub derivation_hash: String,
     pub toolkit_hash: String,
     pub request_digest: String,
+    pub target_id: String,
+    pub decoder_kind: String,
     pub noise_bound: String,
     pub plaintext_modulus: String,
     pub ciphertext_modulus: String,
@@ -86,6 +89,7 @@ pub struct PreparedOperationalChecker {
     workflow_hash: String,
     derivation_hash: String,
     toolkit_hash: String,
+    operational_decoder_targets: Vec<EmittedOperationalDecoderTarget>,
     olean_path: PathBuf,
 }
 
@@ -111,8 +115,17 @@ pub enum OperationalRunnerError {
     Schema { actual: u32 },
     #[error("Lean operational report freshness hashes do not match the emitted protocol")]
     Freshness,
-    #[error("Lean operational report modulus fields do not match the request")]
-    Modulus,
+    #[error("Lean operational report target id does not match the request")]
+    Target,
+    #[error("could not evaluate closed operational target {target_id} {field}: {source}")]
+    TargetEvaluation {
+        target_id: String,
+        field: &'static str,
+        #[source]
+        source: ExprError,
+    },
+    #[error("Lean operational report decoder or modulus fields do not match the closed target")]
+    TargetEcho,
     #[error("Lean operational report request digest does not match the request")]
     RequestDigest,
     #[error(
@@ -172,7 +185,8 @@ let decoded ← {}_decoded |>.mapError Sum.inl\n  \
 let protocol := decoded.1\n  \
 let derivations := decoded.2\n  \
 Mxx.Certificate.prepareWorkflowOperational\n    \
-({{ workflow := protocol.bundle.workflow, inputContract := protocol.bundle.inputContract }} : \
+({{ workflow := protocol.bundle.workflow, inputContract := protocol.bundle.inputContract, \
+operationalDecoderTargets := protocol.bundle.operationalDecoderTargets }} : \
 Mxx.Certificate.OperationalWorkflowSpec)\n    \
 derivations |>.mapError Sum.inr\n\nend {}\n",
         emitted.ir, namespace, prepared_name, emitted.lean_name, namespace,
@@ -235,6 +249,7 @@ pub fn prepare_emitted_operational_checker(
         workflow_hash: emitted.freshness.workflow_hash.clone(),
         derivation_hash: emitted.derivation_hash.clone(),
         toolkit_hash: emitted.freshness.toolkit_hash.clone(),
+        operational_decoder_targets: emitted.operational_decoder_targets.clone(),
         olean_path,
     })
 }
@@ -275,10 +290,7 @@ fn operational_request_digest(request: &OperationalCheckRequest) -> String {
     let canonical = serde_json::to_vec(&json!({
         "environment": environment,
         "layouts": layouts,
-        "residual_stage": request.residual_stage,
-        "residual_output": request.residual_output,
-        "plaintext_modulus": request.plaintext_modulus.to_string(),
-        "ciphertext_modulus": request.ciphertext_modulus.to_string(),
+        "target_id": request.target_id,
     }))
     .expect("operational request JSON serialization");
     format!("{:x}", Sha256::digest(canonical))
@@ -354,8 +366,7 @@ fn prepared_checker_source(
         .map(|(request_index, request)| {
             if let Some(group) = bound_group_representatives.iter().position(|representative| {
                 request_groups[*representative] == request_groups[request_index] &&
-                    requests[*representative].residual_stage == request.residual_stage &&
-                    requests[*representative].residual_output == request.residual_output
+                    requests[*representative].target_id == request.target_id
             }) {
                 group
             } else {
@@ -383,21 +394,10 @@ fn prepared_checker_source(
             let request = &requests[*representative];
             let (environment, _) = lean_request_values(request);
             format!(
-                "private def operationalBound_{bound_group} (outputs : List OperationalStageResult) : \
-                 Except OperationalError (Int × OperationalAnalysisDiagnostics) := do\n\
-                   let stage <- match outputs.find? (fun result => result.stage == {}) with\n\
-                     | some stage => pure stage\n\
-                     | none => throw (.missingStageResult {} {})\n\
-                   let residual <- match stage.outputs.find? (fun output => output.1 == {}) with\n\
-                     | some output => pure output.2\n\
-                     | none => throw (.missingStageResult {} {})\n\
-                   operationalNoiseBoundForFact stage.facts.arena residual [{environment}]",
-                lean_string(&request.residual_stage),
-                lean_string(&request.residual_stage),
-                lean_string(&request.residual_output),
-                lean_string(&request.residual_output),
-                lean_string(&request.residual_stage),
-                lean_string(&request.residual_output),
+                "private def operationalBound_{bound_group} (prepared : PreparedOperationalWorkflow) \
+                 (outputs : List OperationalStageResult) :=\n\
+                   operationalTargetNoiseBound prepared outputs {} [{environment}]",
+                lean_string(&request.target_id),
             )
         })
         .collect::<Vec<_>>()
@@ -430,7 +430,7 @@ fn prepared_checker_source(
                 "IO.eprintln \"phase=evaluate_decoder_bounds group={bound_group} state=start\"\n\
                  let boundEvaluationStarted_{bound_group} ← IO.monoNanosNow\n\
                  let boundResult_{bound_group} ← match \
-                   operationalBound_{bound_group} outputs_{output_group} with\n\
+                   operationalBound_{bound_group} prepared outputs_{output_group} with\n\
                    | .error error => IO.eprintln s!\"operational bound evaluation failed for \
                      bound group {bound_group}: {{repr error}}\"; return 2\n\
                    | .ok result => pure result\n\
@@ -451,9 +451,13 @@ fn prepared_checker_source(
             let group = request_groups[index];
             let bound_group = request_bound_groups[index];
             format!(
-                "let (noiseBound_{index}, diagnostics_{index}) := boundResult_{bound_group}\n\
-                 let report := decoderNoiseCheckReportFromBound outputs_{group} noiseBound_{index} \
-                   diagnostics_{index} {} {}\n\
+                "let (target_{index}, ciphertextModulus_{index}, noiseBound_{index}, diagnostics_{index}) := \
+                   boundResult_{bound_group}\n\
+                 let report ← match operationalTargetNoiseCheckReportFromBound outputs_{group} \
+                   target_{index} ciphertextModulus_{index} noiseBound_{index} diagnostics_{index} [{}] with\n\
+                   | .ok report => pure report\n\
+                   | .error error => IO.eprintln s!\"operational target check failed for request {index}: \
+                     {{repr error}}\"; return 2\n\
                  IO.eprintln s!\"operational analysis diagnostics request {index}: \
                    expression_nodes={{report.diagnostics.expressionNodeCount}} \
                    memo_hits={{report.diagnostics.memoHits}} \
@@ -465,20 +469,31 @@ fn prepared_checker_source(
                    transform_cache_misses={{report.diagnostics.transformCacheMisses}} \
                    cartesian_pairs={{report.diagnostics.cartesianPairVisits}} \
                    maximum_polynomial_terms={{report.diagnostics.maximumPolynomialTerms}}\"\n\
-                 match report.obligations with\n\
-                     | [.decoderThreshold plaintextModulus ciphertextModulus noiseBound] =>\n\
+                 match report.obligations, target_{index}.kind with\n\
+                     | [.decoderThreshold plaintextModulus ciphertextModulus noiseBound], \
+                       .thresholdDecode _ =>\n\
                          let accepted := if report.accepted then \"true\" else \"false\"\n\
-                         let json := \"{{\\\"schema_version\\\":4,\\\"protocol_source_hash\\\":\\\"{}\\\",\\\"workflow_hash\\\":\\\"{}\\\",\\\"derivation_hash\\\":\\\"{}\\\",\\\"toolkit_hash\\\":\\\"{}\\\",\\\"request_digest\\\":\\\"{}\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++ \"\\\",\\\"plaintext_modulus\\\":\\\"\" ++ toString plaintextModulus ++ \"\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++ \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++ rejectionJson report.rejection ++ \",\\\"decode_time_ns\\\":\" ++ toString decodeTimeNs ++ \",\\\"evaluation_time_ns\\\":\" ++ toString evaluationTimeNs_{group} ++ \",\\\"bound_evaluation_time_ns\\\":\" ++ toString boundEvaluationTimeNs_{bound_group} ++ \",\\\"expression_node_count\\\":\" ++ toString report.diagnostics.expressionNodeCount ++ \",\\\"memo_evaluations\\\":\" ++ toString report.diagnostics.memoEvaluations ++ \",\\\"memo_hits\\\":\" ++ toString report.diagnostics.memoHits ++ \",\\\"memo_misses\\\":\" ++ toString report.diagnostics.memoMisses ++ \",\\\"peak_memo_entries\\\":\" ++ toString report.diagnostics.peakMemoEntries ++ \",\\\"envelope_logical_branch_count\\\":\" ++ toString report.diagnostics.envelopeLogicalBranchCount ++ \",\\\"envelope_stored_branch_count\\\":\" ++ toString report.diagnostics.envelopeStoredBranchCount ++ \",\\\"relation_rewrite_count\\\":\" ++ toString report.diagnostics.relationRewriteCount ++ \",\\\"transform_cache_hits\\\":\" ++ toString report.diagnostics.transformCacheHits ++ \",\\\"transform_cache_misses\\\":\" ++ toString report.diagnostics.transformCacheMisses ++ \",\\\"cartesian_pair_visits\\\":\" ++ toString report.diagnostics.cartesianPairVisits ++ \",\\\"maximum_polynomial_terms\\\":\" ++ toString report.diagnostics.maximumPolynomialTerms ++ \"}}\"\n\
+                         let json := \"{{\\\"schema_version\\\":5,\\\"protocol_source_hash\\\":\\\"{}\\\",\\\"workflow_hash\\\":\\\"{}\\\",\\\"derivation_hash\\\":\\\"{}\\\",\\\"toolkit_hash\\\":\\\"{}\\\",\\\"request_digest\\\":\\\"{}\\\",\\\"target_id\\\":\\\"{}\\\",\\\"decoder_kind\\\":\\\"threshold_decode\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++ \"\\\",\\\"plaintext_modulus\\\":\\\"\" ++ toString plaintextModulus ++ \"\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++ \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++ rejectionJson report.rejection ++ \",\\\"decode_time_ns\\\":\" ++ toString decodeTimeNs ++ \",\\\"evaluation_time_ns\\\":\" ++ toString evaluationTimeNs_{group} ++ \",\\\"bound_evaluation_time_ns\\\":\" ++ toString boundEvaluationTimeNs_{bound_group} ++ \",\\\"expression_node_count\\\":\" ++ toString report.diagnostics.expressionNodeCount ++ \",\\\"memo_evaluations\\\":\" ++ toString report.diagnostics.memoEvaluations ++ \",\\\"memo_hits\\\":\" ++ toString report.diagnostics.memoHits ++ \",\\\"memo_misses\\\":\" ++ toString report.diagnostics.memoMisses ++ \",\\\"peak_memo_entries\\\":\" ++ toString report.diagnostics.peakMemoEntries ++ \",\\\"envelope_logical_branch_count\\\":\" ++ toString report.diagnostics.envelopeLogicalBranchCount ++ \",\\\"envelope_stored_branch_count\\\":\" ++ toString report.diagnostics.envelopeStoredBranchCount ++ \",\\\"relation_rewrite_count\\\":\" ++ toString report.diagnostics.relationRewriteCount ++ \",\\\"transform_cache_hits\\\":\" ++ toString report.diagnostics.transformCacheHits ++ \",\\\"transform_cache_misses\\\":\" ++ toString report.diagnostics.transformCacheMisses ++ \",\\\"cartesian_pair_visits\\\":\" ++ toString report.diagnostics.cartesianPairVisits ++ \",\\\"maximum_polynomial_terms\\\":\" ++ toString report.diagnostics.maximumPolynomialTerms ++ \"}}\"\n\
                          IO.println json\n\
-                     | _ => IO.eprintln \"operational checker returned an unexpected obligation \
+                     | [.booleanInterval ciphertextModulus noiseBound], .booleanInterval =>\n\
+                         let accepted := if report.accepted then \"true\" else \"false\"\n\
+                         let json := \"{{\\\"schema_version\\\":5,\\\"protocol_source_hash\\\":\\\"{}\\\",\\\"workflow_hash\\\":\\\"{}\\\",\\\"derivation_hash\\\":\\\"{}\\\",\\\"toolkit_hash\\\":\\\"{}\\\",\\\"request_digest\\\":\\\"{}\\\",\\\"target_id\\\":\\\"{}\\\",\\\"decoder_kind\\\":\\\"boolean_interval\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++ \"\\\",\\\"plaintext_modulus\\\":\\\"2\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++ \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++ rejectionJson report.rejection ++ \",\\\"decode_time_ns\\\":\" ++ toString decodeTimeNs ++ \",\\\"evaluation_time_ns\\\":\" ++ toString evaluationTimeNs_{group} ++ \",\\\"bound_evaluation_time_ns\\\":\" ++ toString boundEvaluationTimeNs_{bound_group} ++ \",\\\"expression_node_count\\\":\" ++ toString report.diagnostics.expressionNodeCount ++ \",\\\"memo_evaluations\\\":\" ++ toString report.diagnostics.memoEvaluations ++ \",\\\"memo_hits\\\":\" ++ toString report.diagnostics.memoHits ++ \",\\\"memo_misses\\\":\" ++ toString report.diagnostics.memoMisses ++ \",\\\"peak_memo_entries\\\":\" ++ toString report.diagnostics.peakMemoEntries ++ \",\\\"envelope_logical_branch_count\\\":\" ++ toString report.diagnostics.envelopeLogicalBranchCount ++ \",\\\"envelope_stored_branch_count\\\":\" ++ toString report.diagnostics.envelopeStoredBranchCount ++ \",\\\"relation_rewrite_count\\\":\" ++ toString report.diagnostics.relationRewriteCount ++ \",\\\"transform_cache_hits\\\":\" ++ toString report.diagnostics.transformCacheHits ++ \",\\\"transform_cache_misses\\\":\" ++ toString report.diagnostics.transformCacheMisses ++ \",\\\"cartesian_pair_visits\\\":\" ++ toString report.diagnostics.cartesianPairVisits ++ \",\\\"maximum_polynomial_terms\\\":\" ++ toString report.diagnostics.maximumPolynomialTerms ++ \"}}\"\n\
+                         IO.println json\n\
+                     | _, _ => IO.eprintln \"operational checker returned an unexpected obligation \
                        set\"; return 3",
-                request.plaintext_modulus,
-                request.ciphertext_modulus,
+                lean_request_values(request).0,
                 prepared.protocol_source_hash,
                 prepared.workflow_hash,
                 prepared.derivation_hash,
                 prepared.toolkit_hash,
                 digest,
+                request.target_id,
+                prepared.protocol_source_hash,
+                prepared.workflow_hash,
+                prepared.derivation_hash,
+                prepared.toolkit_hash,
+                digest,
+                request.target_id,
             )
         })
         .collect::<Vec<_>>()
@@ -491,7 +506,7 @@ fn prepared_checker_source(
          def main : IO UInt32 := do\n\
            let decodeStarted ← IO.monoNanosNow\n\
            match {} with\n\
-           | .error _ => IO.eprintln \"operational graph preparation failed\"; return 2\n\
+           | .error error => IO.eprintln s!\"operational graph preparation failed: {{repr error}}\"; return 2\n\
            | .ok prepared =>\n\
              let decodeFinished ← IO.monoNanosNow\n\
              let decodeTimeNs := decodeFinished - decodeStarted\n\
@@ -583,10 +598,43 @@ fn validate_prepared_report(
     if report.request_digest != operational_request_digest(request) {
         return Err(OperationalRunnerError::RequestDigest);
     }
-    if report.plaintext_modulus != request.plaintext_modulus.to_string() ||
-        report.ciphertext_modulus != request.ciphertext_modulus.to_string()
+    if report.target_id != request.target_id {
+        return Err(OperationalRunnerError::Target);
+    }
+    let target = prepared
+        .operational_decoder_targets
+        .iter()
+        .find(|target| target.target_id == request.target_id)
+        .ok_or(OperationalRunnerError::Target)?;
+    let mut environment = ParamEnv::default();
+    let mut bound_names = BTreeSet::new();
+    for (name, value) in &request.environment {
+        if bound_names.insert(name.as_str()) {
+            if let OperationalParameterValue::Integer(value) = value {
+                environment.integers.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    let plaintext_modulus = target.plaintext_modulus.evaluate(&environment).map_err(|source| {
+        OperationalRunnerError::TargetEvaluation {
+            target_id: target.target_id.clone(),
+            field: "plaintext modulus",
+            source,
+        }
+    })?;
+    let ciphertext_modulus =
+        target.ciphertext_modulus.evaluate(&environment).map_err(|source| {
+            OperationalRunnerError::TargetEvaluation {
+                target_id: target.target_id.clone(),
+                field: "ciphertext modulus",
+                source,
+            }
+        })?;
+    if report.decoder_kind != target.decoder_kind.report_name() ||
+        report.plaintext_modulus != plaintext_modulus.to_string() ||
+        report.ciphertext_modulus != ciphertext_modulus.to_string()
     {
-        return Err(OperationalRunnerError::Modulus);
+        return Err(OperationalRunnerError::TargetEcho);
     }
     Ok(())
 }
@@ -634,12 +682,14 @@ mod tests {
     #[test]
     fn rejects_unknown_schema() {
         let report = OperationalCheckerReport {
-            schema_version: 5,
+            schema_version: 6,
             protocol_source_hash: String::new(),
             workflow_hash: String::new(),
             derivation_hash: String::new(),
             toolkit_hash: String::new(),
             request_digest: String::new(),
+            target_id: String::new(),
+            decoder_kind: String::new(),
             noise_bound: "0".to_owned(),
             plaintext_modulus: "2".to_owned(),
             ciphertext_modulus: "17".to_owned(),
@@ -697,30 +747,136 @@ mod tests {
             workflow_hash: "workflow".to_owned(),
             derivation_hash: "derivation".to_owned(),
             toolkit_hash: "toolkit".to_owned(),
+            operational_decoder_targets: vec![EmittedOperationalDecoderTarget {
+                target_id: "target".to_owned(),
+                decoder_kind: crate::emit_lean::EmittedOperationalDecoderKind::ThresholdDecode,
+                plaintext_modulus: mxx_ir_core::IntExpr::constant(2),
+                ciphertext_modulus: mxx_ir_core::IntExpr::constant(17),
+            }],
             olean_path: PathBuf::from("unused.olean"),
         };
         let request = OperationalCheckRequest {
             environment: Vec::new(),
             layouts: Vec::new(),
-            residual_stage: "evaluate".to_owned(),
-            residual_output: "residual".to_owned(),
-            plaintext_modulus: BigInt::from(2),
-            ciphertext_modulus: BigInt::from(17),
+            target_id: "target".to_owned(),
         };
 
-        let mut rejecting_request = request.clone();
-        rejecting_request.ciphertext_modulus = BigInt::from(8);
-        let source = prepared_checker_source(&prepared, &[request, rejecting_request]);
+        let source = prepared_checker_source(&prepared, &[request.clone(), request]);
 
-        assert_eq!(source.matches("operationalBound_0 outputs_0").count(), 1);
+        assert_eq!(source.matches("operationalBound_0 prepared outputs_0").count(), 1);
         assert!(!source.contains("operationalBound_1"));
         assert_eq!(source.matches("boundResult_0").count(), 3);
-        assert!(source.contains("operationalNoiseBoundForFact stage.facts.arena residual"));
-        assert_eq!(source.matches("decoderNoiseCheckReportFromBound").count(), 2);
+        assert!(source.contains("operationalTargetNoiseBound prepared outputs"));
+        assert_eq!(source.matches("operationalTargetNoiseCheckReportFromBound").count(), 2);
         assert!(source.contains("boundEvaluationTimeNs_0"));
         assert!(!source.contains("boundEvaluationTimeNs_1"));
         assert!(source.contains("report.diagnostics.expressionNodeCount"));
         assert!(source.contains("report.diagnostics.relationRewriteCount"));
+    }
+
+    #[test]
+    fn prepared_report_must_echo_the_closed_decoder_kind_and_moduli() {
+        let prepared = PreparedOperationalChecker {
+            module_name: "Test.Prepared".to_owned(),
+            namespace: "Test.Generated.Protocol".to_owned(),
+            prepared_name: "preparedOperational".to_owned(),
+            protocol_source_hash: "protocol".to_owned(),
+            workflow_hash: "workflow".to_owned(),
+            derivation_hash: "derivation".to_owned(),
+            toolkit_hash: "toolkit".to_owned(),
+            operational_decoder_targets: vec![EmittedOperationalDecoderTarget {
+                target_id: "target".to_owned(),
+                decoder_kind: crate::emit_lean::EmittedOperationalDecoderKind::ThresholdDecode,
+                plaintext_modulus: mxx_ir_core::IntExpr::Var("p".to_owned()),
+                ciphertext_modulus: mxx_ir_core::IntExpr::Var("q".to_owned()),
+            }],
+            olean_path: PathBuf::from("unused.olean"),
+        };
+        let request = OperationalCheckRequest {
+            environment: vec![
+                ("p".to_owned(), OperationalParameterValue::Integer(BigInt::from(3))),
+                ("q".to_owned(), OperationalParameterValue::Integer(BigInt::from(257))),
+            ],
+            layouts: Vec::new(),
+            target_id: "target".to_owned(),
+        };
+        let report = OperationalCheckerReport {
+            schema_version: OPERATIONAL_REPORT_SCHEMA_VERSION,
+            protocol_source_hash: "protocol".to_owned(),
+            workflow_hash: "workflow".to_owned(),
+            derivation_hash: "derivation".to_owned(),
+            toolkit_hash: "toolkit".to_owned(),
+            request_digest: operational_request_digest(&request),
+            target_id: "target".to_owned(),
+            decoder_kind: "threshold_decode".to_owned(),
+            noise_bound: "4".to_owned(),
+            plaintext_modulus: "3".to_owned(),
+            ciphertext_modulus: "257".to_owned(),
+            accepted: true,
+            rejection: None,
+            decode_time_ns: 0,
+            evaluation_time_ns: 0,
+            bound_evaluation_time_ns: 0,
+            expression_node_count: 0,
+            memo_evaluations: 0,
+            memo_hits: 0,
+            memo_misses: 0,
+            peak_memo_entries: 0,
+            envelope_logical_branch_count: 0,
+            envelope_stored_branch_count: 0,
+            relation_rewrite_count: 0,
+            transform_cache_hits: 0,
+            transform_cache_misses: 0,
+            cartesian_pair_visits: 0,
+            maximum_polynomial_terms: 0,
+        };
+
+        validate_prepared_report(&prepared, &request, &report).unwrap();
+        for corrupt in [
+            |report: &mut OperationalCheckerReport| {
+                report.decoder_kind = "boolean_interval".to_owned();
+            },
+            |report: &mut OperationalCheckerReport| {
+                report.plaintext_modulus = "2".to_owned();
+            },
+            |report: &mut OperationalCheckerReport| {
+                report.ciphertext_modulus = "256".to_owned();
+            },
+        ] {
+            let mut corrupted = report.clone();
+            corrupt(&mut corrupted);
+            assert!(matches!(
+                validate_prepared_report(&prepared, &request, &corrupted),
+                Err(OperationalRunnerError::TargetEcho)
+            ));
+        }
+    }
+
+    #[test]
+    fn emitted_protocol_retains_closed_decoder_echo_metadata() {
+        let protocol = toy_example::protocol();
+        let emitted = emit_protocol_for(
+            "ToyOperationalEchoMetadata",
+            &protocol,
+            "MxxCorrectness",
+            toy_example::PROTOCOL_SOURCE_PATHS,
+        )
+        .unwrap();
+        let target = emitted
+            .operational_decoder_targets
+            .iter()
+            .find(|target| target.target_id == "toy-threshold")
+            .expect("Toy threshold target");
+
+        assert_eq!(target.decoder_kind.report_name(), "threshold_decode");
+        assert_eq!(
+            target.plaintext_modulus.evaluate(&ParamEnv::default()).unwrap(),
+            BigInt::from(2)
+        );
+        assert_eq!(
+            target.ciphertext_modulus.evaluate(&ParamEnv::default()).unwrap(),
+            BigInt::from(256)
+        );
     }
 
     #[test]
@@ -740,13 +896,8 @@ mod tests {
                 OperationalParameterValue::Integer(BigInt::from(3)),
             )],
             layouts: Vec::new(),
-            residual_stage: "encrypt".to_owned(),
-            residual_output: "operational-residual".to_owned(),
-            plaintext_modulus: BigInt::from(2),
-            ciphertext_modulus: BigInt::from(256),
+            target_id: "toy-threshold".to_owned(),
         };
-        let mut rejecting_request = request.clone();
-        rejecting_request.ciphertext_modulus = BigInt::from(8);
         let lean_workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
         let prepared = prepare_emitted_operational_checker(&lean_workspace, &emitted).unwrap();
         let modified = fs::metadata(prepared.olean_path()).unwrap().modified().unwrap();
@@ -755,13 +906,13 @@ mod tests {
         let reports = run_prepared_operational_checks(
             &lean_workspace,
             &prepared,
-            &[request, rejecting_request],
+            &[request.clone(), request],
         )
         .unwrap();
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].noise_bound, "3");
         assert!(reports[0].accepted);
-        assert!(!reports[1].accepted);
-        assert_ne!(reports[0].request_digest, reports[1].request_digest);
+        assert!(reports[1].accepted);
+        assert_eq!(reports[0].request_digest, reports[1].request_digest);
     }
 }

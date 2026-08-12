@@ -8,9 +8,10 @@ use mxx_bgg::{
 use mxx_correctness::{
     ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec,
     EndpointAnchor, EndpointAnchors, EndpointSemanticBinding, EndpointSpecId, InputContract,
-    InputContractEntry, InputValueContract, OutputRef, ParameterDecl, ParameterKind, ProtocolDecl,
-    ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
-    ProtocolStage, StageId, StageInputName, Workflow,
+    InputContractEntry, InputValueContract, OperationalDecoderKind, OperationalDecoderTarget,
+    OutputRef, ParameterDecl, ParameterKind, ProtocolDecl, ProtocolInputBinding,
+    ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage, StageId,
+    StageInputName, Workflow,
 };
 use mxx_dsl::{
     Bool, BuiltGraph, DslContext, DslError, Int, Mat, Parallel, PurePredicateSpec, SemanticAnchor,
@@ -472,7 +473,7 @@ impl DiamondWeProtocolFamily {
             graph_params.input.digit_count.clone(),
         );
         let r_materialized = r_decomposition.as_mat();
-        let r_decomposed = r_materialized.reshape(public_columns, 1);
+        let r_decomposed = r_materialized;
         let difference = public_key_compiler.sub(&one_public_key, &circuit_output);
         let projected_difference = difference.matrix * r_decomposed.clone();
         let decoder_public_key = k_public_key_first + projected_difference;
@@ -964,6 +965,7 @@ impl DiamondWeProtocolFamily {
             },
         ]);
         let endpoint = EndpointSpecId::DiamondBooleanInterval;
+        let decoder_node = decryption.graph.outputs()[DECODED_OUTPUT].value.node;
         let declaration = ProtocolDecl {
             params: [
                 (
@@ -1051,6 +1053,14 @@ impl DiamondWeProtocolFamily {
                         ideal_output: IDEAL_MESSAGE_OUTPUT.to_owned(),
                     }],
                 },
+                operational_decoder_targets: vec![OperationalDecoderTarget {
+                    target_id: "diamond-boolean-interval".to_owned(),
+                    residual_stage: decrypt_id.clone(),
+                    residual_output: NOISY_PLAINTEXT_OUTPUT.to_owned(),
+                    decoder_stage: decrypt_id.clone(),
+                    decoder_node,
+                    kind: OperationalDecoderKind::BooleanInterval,
+                }],
                 endpoint_specs: vec![endpoint],
                 input_contract: InputContract { inputs: input_contracts },
                 input_bindings,

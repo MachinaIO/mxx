@@ -11,7 +11,7 @@ use num_bigint::BigInt;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-pub const IR_BINARY_FORMAT_VERSION: u8 = 1;
+pub const IR_BINARY_FORMAT_VERSION: u8 = 3;
 const DOCUMENT_PROG: u8 = 1;
 const DOCUMENT_PROGRAM_DERIVATION: u8 = 2;
 
@@ -289,8 +289,8 @@ impl Encoder {
             NodeKind::ExtractCoefficient { position } => {
                 self.record(22, |out| out.int_expr(position))
             }
-            NodeKind::ConstantCoefficient { position } => {
-                self.record(23, |out| out.int_expr(position))
+            NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
+                self.record(23, |out| out.matrix_type(matrix_type))
             }
             NodeKind::Select { .. } => self.record(24, |_| Ok(())),
             NodeKind::UniformResidueSample { matrix_type } => {
@@ -379,11 +379,7 @@ impl Encoder {
                 Ok(())
             }),
             NodeKind::Tensor => self.record(40, |_| Ok(())),
-            NodeKind::Reshape { rows, columns } => self.record(41, |out| {
-                out.int_expr(rows)?;
-                out.int_expr(columns)
-            }),
-            NodeKind::Concat { axis } => self.record(42, |out| {
+            NodeKind::Concat { axis } => self.record(41, |out| {
                 out.bytes.push(*axis as u8);
                 Ok(())
             }),
@@ -400,31 +396,31 @@ impl Encoder {
                         _ => None,
                     })
                     .ok_or(BinaryEncodeError::MissingMatrixType)?;
-                self.record(if *output_bool { 43 } else { 44 }, |out| {
+                self.record(if *output_bool { 42 } else { 43 }, |out| {
                     out.int_expr(modulus)?;
                     out.int_expr(plaintext_modulus)?;
                     out.int_expr(length)
                 })
             }
             NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => self
-                .record(45, |out| {
+                .record(44, |out| {
                     out.array(plaintext_moduli, |o, v| o.int_expr(v))?;
                     out.array(reconstruction_coefficients, |o, v| o.int_expr(v))
                 }),
             NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
-                self.record(46, |out| {
+                self.record(45, |out| {
                     out.matrix_type(matrix_type)?;
                     out.int_expr(coefficient_bits)
                 })
             }
-            NodeKind::FamilyPack { .. } => self.record(47, |_| Ok(())),
-            NodeKind::FamilyGetStatic { index } => self.record(48, |out| out.int_expr(index)),
-            NodeKind::FamilyGetDynamic => self.record(49, |_| Ok(())),
+            NodeKind::FamilyPack { .. } => self.record(46, |_| Ok(())),
+            NodeKind::FamilyGetStatic { index } => self.record(47, |out| out.int_expr(index)),
+            NodeKind::FamilyGetDynamic => self.record(48, |_| Ok(())),
             NodeKind::SubgraphCall(call) => {
                 let child = graph
                     .child_scope_id(scope_id, node_id)
                     .ok_or(BinaryEncodeError::MissingScope)?;
-                self.record(50, |out| {
+                self.record(49, |out| {
                     out.string(&scope_name(&child))?;
                     out.bindings(&call.bindings)
                 })
@@ -433,7 +429,7 @@ impl Encoder {
                 let child = graph
                     .child_scope_id(scope_id, node_id)
                     .ok_or(BinaryEncodeError::MissingScope)?;
-                self.record(51, |out| {
+                self.record(50, |out| {
                     out.string(&scope_name(&child))?;
                     out.int_expr(&spec.count)?;
                     out.raw_u32(spec.index_slot);
@@ -455,7 +451,7 @@ impl Encoder {
                 let child = graph
                     .child_scope_id(scope_id, node_id)
                     .ok_or(BinaryEncodeError::MissingScope)?;
-                self.record(52, |out| {
+                self.record(51, |out| {
                     out.string(&scope_name(&child))?;
                     out.int_expr(&spec.count)?;
                     out.raw_u32(spec.index_slot);
@@ -554,7 +550,7 @@ impl Encoder {
             NodeKind::IntCompare(_) => (20, None),
             NodeKind::BitExtract { .. } => (21, None),
             NodeKind::ExtractCoefficient { .. } => (22, None),
-            NodeKind::ConstantCoefficient { .. } => (23, None),
+            NodeKind::LiftIntegerToConstantPolynomial { .. } => (23, None),
             NodeKind::Select { .. } => (24, None),
             NodeKind::UniformResidueSample { .. } => (25, None),
             NodeKind::UniformIntervalSample { .. } => (26, None),
@@ -598,18 +594,17 @@ impl Encoder {
             NodeKind::Transpose => (39, None),
             NodeKind::Slice { .. } => (40, None),
             NodeKind::Tensor => (41, None),
-            NodeKind::Reshape { .. } => (42, None),
-            NodeKind::Concat { .. } => (43, None),
-            NodeKind::ThresholdDecode { output_bool: true, .. } => (44, None),
-            NodeKind::ThresholdDecode { output_bool: false, .. } => (45, None),
-            NodeKind::CrtRecompose { .. } => (46, None),
-            NodeKind::PackPolynomialCoefficients { .. } => (47, None),
-            NodeKind::FamilyPack { .. } => (48, None),
-            NodeKind::FamilyGetStatic { .. } => (49, None),
-            NodeKind::FamilyGetDynamic => (50, None),
-            NodeKind::SubgraphCall(_) => (51, None),
-            NodeKind::ParallelLoop(_) => (52, None),
-            NodeKind::SequentialLoop(_) => (53, None),
+            NodeKind::Concat { .. } => (42, None),
+            NodeKind::ThresholdDecode { output_bool: true, .. } => (43, None),
+            NodeKind::ThresholdDecode { output_bool: false, .. } => (44, None),
+            NodeKind::CrtRecompose { .. } => (45, None),
+            NodeKind::PackPolynomialCoefficients { .. } => (46, None),
+            NodeKind::FamilyPack { .. } => (47, None),
+            NodeKind::FamilyGetStatic { .. } => (48, None),
+            NodeKind::FamilyGetDynamic => (49, None),
+            NodeKind::SubgraphCall(_) => (50, None),
+            NodeKind::ParallelLoop(_) => (51, None),
+            NodeKind::SequentialLoop(_) => (52, None),
         };
         self.record(tag, |out| if let Some(wire) = relation { out.wire(&wire) } else { Ok(()) })
     }
@@ -753,6 +748,58 @@ pub fn hex_chunks(bytes: &[u8], chunk_bytes: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn read_test_u32(bytes: &[u8], cursor: &mut usize) -> usize {
+        let end = cursor.checked_add(4).expect("test cursor overflow");
+        let value = u32::from_le_bytes(
+            bytes
+                .get(*cursor..end)
+                .expect("complete test u32")
+                .try_into()
+                .expect("four test bytes"),
+        ) as usize;
+        *cursor = end;
+        value
+    }
+
+    fn skip_test_record(bytes: &[u8], cursor: &mut usize) -> usize {
+        let tag_offset = *cursor;
+        *cursor = cursor.checked_add(1).expect("test cursor overflow");
+        let payload_length = read_test_u32(bytes, cursor);
+        *cursor = cursor.checked_add(payload_length).expect("test cursor overflow");
+        assert!(*cursor <= bytes.len(), "complete test TLV record");
+        tag_offset
+    }
+
+    fn node_kind_offsets(bytes: &[u8]) -> Vec<usize> {
+        let string_count =
+            u32::from_le_bytes(bytes[6..10].try_into().expect("string count")) as usize;
+        let string_blob_length =
+            u32::from_le_bytes(bytes[10..14].try_into().expect("string blob length")) as usize;
+        let mut cursor = 14 + (string_count + 1) * 4 + string_blob_length;
+        let node_count = read_test_u32(bytes, &mut cursor);
+        let mut offsets = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            offsets.push(skip_test_record(bytes, &mut cursor));
+
+            let argument_count = read_test_u32(bytes, &mut cursor);
+            cursor = cursor.checked_add(argument_count * 8).expect("argument bytes");
+            let _output_count = read_test_u32(bytes, &mut cursor);
+            let output_type_count = read_test_u32(bytes, &mut cursor);
+            for _ in 0..output_type_count {
+                skip_test_record(bytes, &mut cursor);
+            }
+        }
+        offsets
+    }
+
+    fn lean_hex_array(bytes: &[u8]) -> String {
+        hex_chunks(bytes, 1024)
+            .into_iter()
+            .map(|chunk| format!("\"{chunk}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     #[test]
     fn toy_program_encoding_is_deterministic_and_versioned() {
         let protocol = crate::toy_example::protocol();
@@ -779,5 +826,118 @@ mod tests {
     fn hex_transport_has_bounded_stable_chunks() {
         let bytes = (0_u8..10).collect::<Vec<_>>();
         assert_eq!(hex_chunks(&bytes, 4), ["00010203", "04050607", "0809"]);
+    }
+
+    #[test]
+    fn lift_integer_binary_round_trips_exact_type_and_rejects_stale_inputs() {
+        use mxx_dsl::{DslContext, Ring};
+        use std::{fs, path::Path, process::Command};
+
+        let source_ring = Ring::new(257, 8);
+        let integer = source_ring.input("source", (1, 1)).extract_coefficient(3);
+        let matrix_type = MatrixType {
+            modulus: IntExpr::Add(
+                Box::new(IntExpr::Var("q".to_owned())),
+                Box::new(IntExpr::constant(1)),
+            ),
+            ring_dimension: IntExpr::Mul(
+                Box::new(IntExpr::Var("n".to_owned())),
+                Box::new(IntExpr::constant(2)),
+            ),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let lifted = integer.lift_to_constant_polynomial(matrix_type.clone());
+        let graph = DslContext::new("lift-binary-round-trip")
+            .int_parameter("q")
+            .int_parameter("n")
+            .output("lifted", lifted)
+            .unwrap()
+            .build()
+            .unwrap()
+            .graph;
+        let lift_node = &graph.root_scope().nodes()[2];
+        assert_eq!(
+            lift_node.kind(),
+            &NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix_type.clone() }
+        );
+
+        let bytes = encode_prog(&graph).unwrap();
+        let derivation_bytes = encode_program_derivation(&graph, None).unwrap();
+        let offsets = node_kind_offsets(&bytes);
+        let lift_tag_offset = offsets[2];
+        assert_eq!(bytes[lift_tag_offset], 23);
+
+        let mut old_version = bytes.clone();
+        old_version[0] = IR_BINARY_FORMAT_VERSION - 1;
+        let mut stale_node_tag = bytes.clone();
+        // Before the v3 node-surface change, tag 52 denoted SequentialLoop. It is not a v3
+        // NodeKind tag and must not be interpreted through a compatibility reader.
+        stale_node_tag[lift_tag_offset] = 52;
+        let truncated = bytes[..bytes.len() - 1].to_vec();
+
+        let source = format!(
+            r#"import Mxx.Ir.BinaryFormat
+
+private def expectedType : Mxx.Ir.MatrixTypeExpr := {{
+  modulus := .add (.parameter "q") (.constant 1)
+  ringDimension := .multiply (.parameter "n") (.constant 2)
+  rows := .constant 1
+  columns := .constant 1
+}}
+
+#guard match Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg with
+  | .ok program =>
+      match program.root.nodes[2]? with
+      | some node =>
+          node.kind == .liftIntegerToConstantPolynomial expectedType &&
+          node.arguments == [{{ node := 1, port := 0 }}] &&
+          node.outputTypes == [.matrix expectedType]
+      | none => false
+  | .error _ => false
+
+#guard match Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProgramDerivation with
+  | .ok derivation =>
+      match derivation.root.steps[2]? with
+      | some step =>
+          step.rule == .liftIntegerToConstantPolynomial &&
+          step.arguments == [{{ node := 1, port := 0 }}]
+      | none => false
+  | .error _ => false
+
+#guard match Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg with
+  | .error (.wrongVersion ..) => true
+  | _ => false
+
+#guard match Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg with
+  | .error (.unknownTag _ "NodeKind" 52) => true
+  | _ => false
+
+#guard match Mxx.Ir.decodeHexChunks #[{}] >>= Mxx.Ir.decodeProg with
+  | .error (.truncated ..) => true
+  | _ => false
+"#,
+            lean_hex_array(&bytes),
+            lean_hex_array(&derivation_bytes),
+            lean_hex_array(&old_version),
+            lean_hex_array(&stale_node_tag),
+            lean_hex_array(&truncated),
+        );
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        let temporary = tempfile::Builder::new().suffix(".lean").tempfile_in(&workspace).unwrap();
+        fs::write(temporary.path(), &source).unwrap();
+        let output = Command::new("lake")
+            .args(["env", "lean"])
+            .arg(temporary.path())
+            .current_dir(workspace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Lean lift decoder fixture failed:\n{}\n{}\nsource:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            source,
+        );
     }
 }

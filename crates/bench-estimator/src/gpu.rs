@@ -262,13 +262,6 @@ impl GpuNodeMeasurementBackend {
                     .map(|_| backend.concat(&inputs, *axis).map_err(backend_error))
                     .collect()
             }
-            NodeKind::Reshape { rows, columns } => {
-                let rows = evaluate_usize(rows)?;
-                let columns = evaluate_usize(columns)?;
-                (0..batch_size)
-                    .map(|_| backend.reshape(matrix(0)?, rows, columns).map_err(backend_error))
-                    .collect()
-            }
             NodeKind::UniformResidueSample { .. } => {
                 let ty = output_matrix_type()?;
                 let range = SampleRange {
@@ -398,18 +391,22 @@ impl GpuNodeMeasurementBackend {
                 }
                 Ok(Vec::new())
             }
-            NodeKind::ConstantCoefficient { position } => {
-                let ty = output_matrix_type()?;
-                let position = evaluate_usize(position)?;
+            NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
+                let ty = matrix_type.evaluate(bindings).ok_or_else(|| {
+                    GpuMeasurementError(
+                        "constant-polynomial lift matrix type is unavailable".to_owned(),
+                    )
+                })?;
                 (0..batch_size)
                     .map(|_| {
-                        let coefficient = backend
-                            .extract_coefficient(matrix(0)?, position)
-                            .map_err(backend_error)?;
                         let identity = backend
-                            .constant_matrix(&ty, &ConstantMatrix::Identity, bindings)
+                            .constant_matrix(
+                                &ty,
+                                &mxx_ir_core::node::ConstantMatrix::Identity,
+                                bindings,
+                            )
                             .map_err(backend_error)?;
-                        backend.scale_integer(&identity, &coefficient).map_err(backend_error)
+                        backend.scale_integer(&identity, &BigInt::from(0)).map_err(backend_error)
                     })
                     .collect()
             }

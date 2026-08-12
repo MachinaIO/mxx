@@ -169,19 +169,6 @@ theorem FrozenPointwiseMatrixProgramFormula.validPreimageNode
   rcases node with ⟨kind, arguments, outputCount, outputTypes⟩
   cases kind <;> simp_all
 
-theorem FrozenPointwiseMatrixProgramFormula.validReshapeNode
-    {program : Mxx.Ir.Prog} {substitutions : List FrozenPointwiseMatrixProgramFormula}
-    {scopeId : StaticScopeId} {wire : Mxx.Ir.WireRef}
-    {rows columns : Mxx.Ir.IntExpr} {input : FrozenPointwiseMatrixProgramFormula}
-    (valid : (FrozenPointwiseMatrixProgramFormula.reshape scopeId wire rows columns input).validIn
-      program substitutions = true) :
-    ValidatedPointwiseNode program scopeId wire (.reshape rows columns) [input.source.2] := by
-  unfold FrozenPointwiseMatrixProgramFormula.validIn at valid
-  apply validatedPointwiseNode_of_check valid
-  intro scope node checked
-  rcases node with ⟨kind, arguments, outputCount, outputTypes⟩
-  cases kind <;> simp_all [pointwiseFormulaArgumentsMatch]
-
 theorem FrozenPointwiseMatrixProgramFormula.validSliceNode
     {program : Mxx.Ir.Prog} {substitutions : List FrozenPointwiseMatrixProgramFormula}
     {scopeId : StaticScopeId} {wire : Mxx.Ir.WireRef}

@@ -625,19 +625,6 @@ where
         })
     }
 
-    fn reshape(&mut self, value: &M, rows: usize, columns: usize) -> Result<M, Self::Error> {
-        let parameters = self.parameters_for_matrix(value)?;
-        let (old_rows, old_columns) = value.size();
-        if old_rows.saturating_mul(old_columns) != rows.saturating_mul(columns) {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        let entries = (0..old_rows)
-            .flat_map(|row| (0..old_columns).map(move |column| value.entry(row, column)))
-            .collect::<Vec<_>>();
-        let entries = entries.chunks(columns).map(|row| row.to_vec()).collect::<Vec<_>>();
-        Ok(M::from_poly_vec(parameters, entries))
-    }
-
     fn sample_uniform(
         &mut self,
         ty: &ConcreteMatrixType,

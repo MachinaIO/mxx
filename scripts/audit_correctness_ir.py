@@ -76,6 +76,7 @@ ALLOWED_KINDS = {
     "input",
     "intBinary",
     "intCompare",
+    "liftIntegerToConstantPolynomial",
     "matrixAdd",
     "matrixMultiply",
     "matrixNegate",
@@ -83,7 +84,6 @@ ALLOWED_KINDS = {
     "matrixSubtract",
     "parallelLoop",
     "preimageSample",
-    "reshape",
     "select",
     "sequentialLoop",
     "slice",
@@ -93,8 +93,8 @@ ALLOWED_KINDS = {
     "zeroMatrix",
 }
 
-FORBIDDEN_KINDS = {"familyPack", "subgraphCall", "trapdoorPublic"}
-SPECIAL_KINDS = FORBIDDEN_KINDS | {"matrixMultiply", "matrixScale", "reshape"}
+FORBIDDEN_KINDS = {"familyPack", "reshape", "subgraphCall", "trapdoorPublic"}
+SPECIAL_KINDS = FORBIDDEN_KINDS | {"matrixMultiply", "matrixScale"}
 
 PROGRAM_RE = re.compile(r"^def ([A-Za-z0-9_]+) : Mxx\.Ir\.Prog :=")
 METADATA_STRING_RE = re.compile(
@@ -579,14 +579,6 @@ def main() -> int:
         failures.append(
             "non-identity MatrixScale at " + ", ".join(location(node) for node in invalid_scales)
         )
-
-    reshapes = [node for node in all_nodes if node.kind == "reshape"]
-    expected_reshape = (
-        "DiamondWeFamily_stage_encrypt/__root/42",
-        '.reshape (.parameter "diamond_digit_count") (.constant (1 : Int))',
-    )
-    if len(reshapes) != 1 or location(reshapes[0]) != expected_reshape[0] or expected_reshape[1] not in reshapes[0].text:
-        failures.append("the single expected bounded decomposition reshape changed")
 
     if unresolved_multiplications:
         failures.append(

@@ -479,40 +479,6 @@ theorem ChildScopeExecutionPath.matrixScaleLookup
   change Mxx.Ir.evaluateNode _ _ _ _ selected.before _ = _
   simp [Mxx.Ir.evaluateNode, Mxx.Ir.arguments, inputBefore, scalarEvaluates]
 
-theorem ChildScopeExecutionPath.matrixReshapeLookup
-    {samplers : Mxx.MxxSamplerFamily} {program : Mxx.Ir.Prog} {fuel : Nat}
-    {parentDefinition : String} {params : Mxx.Ir.ParamEnvironment}
-    {arguments parentValues : List Mxx.Ir.Value}
-    (scopeExecution : ChildScopeExecutionPath samplers program fuel parentDefinition params
-      arguments parentValues)
-    (nodeIndex : Nat) (nodeInBounds : nodeIndex < scopeExecution.scope.nodes.length)
-    (inputRef : Mxx.Ir.WireRef) (input : Mxx.Matrix) (rows columns : Mxx.Ir.IntExpr)
-    (rowValue columnValue : Int) (inputEarlier : inputRef.node < nodeIndex)
-    (nodeEq : scopeExecution.scope.nodes[nodeIndex] = {
-      kind := .reshape rows columns
-      arguments := [inputRef]
-      outputCount := scopeExecution.scope.nodes[nodeIndex].outputCount
-      outputTypes := scopeExecution.scope.nodes[nodeIndex].outputTypes })
-    (inputFound : Mxx.Ir.lookupWire inputRef scopeExecution.wires = some (.matrix input))
-    (rowsEvaluate : rows.evaluate params = some rowValue)
-    (columnsEvaluate : columns.evaluate params = some columnValue)
-    (rowsNonnegative : 0 ≤ rowValue) (columnsNonnegative : 0 ≤ columnValue) :
-    Mxx.Ir.lookupWire ⟨nodeIndex, 0⟩ scopeExecution.wires = some (.matrix
-      (Mxx.matrixReshape input rowValue.toNat columnValue.toNat)) := by
-  let selected := scopeExecution.nodeExecutionAt nodeIndex nodeInBounds
-  have inputBefore := selected.argumentLookup_of_final inputRef (.matrix input) inputEarlier
-    inputFound
-  have inputBefore' : Mxx.Ir.lookupWire inputRef
-      (scopeExecution.nodeExecutionAt nodeIndex nodeInBounds).before = some (.matrix input) := by
-    simpa only [selected] using inputBefore
-  apply scopeExecution.deterministicMatrixOutputLookup nodeIndex nodeInBounds {
-    kind := .reshape rows columns
-    arguments := [inputRef]
-    outputCount := scopeExecution.scope.nodes[nodeIndex].outputCount
-  } (Mxx.matrixReshape input rowValue.toNat columnValue.toNat) nodeEq
-  simp [Mxx.Ir.evaluateNode, Mxx.Ir.arguments, inputBefore', rowsEvaluate, columnsEvaluate,
-    not_lt.mpr rowsNonnegative, not_lt.mpr columnsNonnegative]
-
 theorem ChildScopeExecutionPath.matrixSliceLookup
     {samplers : Mxx.MxxSamplerFamily} {program : Mxx.Ir.Prog} {fuel : Nat}
     {parentDefinition : String} {params : Mxx.Ir.ParamEnvironment}

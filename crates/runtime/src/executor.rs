@@ -1426,14 +1426,6 @@ where
                 let output = self.backend.concat(&inputs, *axis).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
-            NodeKind::Reshape { rows, columns } => {
-                let input = self.matrix(values, node.args[0])?;
-                let rows = self.eval_usize(node.id, rows, env)?;
-                let columns = self.eval_usize(node.id, columns, env)?;
-                let output =
-                    self.backend.reshape(&input, rows, columns).map_err(Self::backend_error)?;
-                self.put(values, node.id, 0, RuntimeValue::matrix(output));
-            }
             NodeKind::UniformResidueSample { .. } => {
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
@@ -1680,13 +1672,8 @@ where
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::Int(output));
             }
-            NodeKind::ConstantCoefficient { position } => {
-                let input = self.matrix(values, node.args[0])?;
-                let position = self.eval_usize(node.id, position, env)?;
-                let coefficient = self
-                    .backend
-                    .extract_coefficient(&input, position)
-                    .map_err(Self::backend_error)?;
+            NodeKind::LiftIntegerToConstantPolynomial { .. } => {
+                let coefficient = self.int(values, node.args[0])?;
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 let identity = self
@@ -3521,6 +3508,38 @@ mod tests {
         )
         .expect("execution");
         assert_eq!(matrix_output(&result, "reconstructed"), &input_matrix);
+    }
+
+    #[test]
+    fn integer_lift_writes_only_the_constant_polynomial_coefficient() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let context = DslContext::new("integer-lift-constant-polynomial");
+        let coefficient = context.int_family_input("coefficient", 1).get_static(0);
+        let lifted = coefficient.lift_to_constant_polynomial(ring.matrix_type((1, 1)));
+        let expected = ring.polynomial([IntExpr::constant(-3)]);
+        let graph = context
+            .output("lifted", lifted)
+            .expect("lifted output")
+            .output("expected", expected)
+            .expect("expected output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let result = execute(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::from([(
+                "coefficient".to_owned(),
+                RuntimeValue::IndexedFamily(vec![RuntimeValue::Int(BigInt::from(-3))]),
+            )]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        assert_eq!(matrix_output(&result, "lifted"), matrix_output(&result, "expected"));
     }
 
     #[test]

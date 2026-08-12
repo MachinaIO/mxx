@@ -783,15 +783,6 @@ impl Mat {
     }
 
     #[track_caller]
-    pub fn reshape(self, rows: impl Into<IntExpr>, columns: impl Into<IntExpr>) -> Self {
-        let rows = rows.into();
-        let columns = columns.into();
-        let ty =
-            MatrixType { rows: rows.clone(), columns: columns.clone(), ..self.matrix_type.clone() };
-        Self::from_node(NodeKind::Reshape { rows, columns }, vec![self], ty)
-    }
-
-    #[track_caller]
     pub fn tensor(self, rhs: Mat) -> Self {
         let ty = MatrixType {
             rows: IntExpr::Mul(
@@ -826,7 +817,8 @@ impl Mat {
             rows: IntExpr::Mul(
                 Box::new(self.matrix_type.rows.clone()),
                 Box::new(digit_count.clone()),
-            ),
+            )
+            .canonicalize(),
             ..self.matrix_type.clone()
         };
         let pending = self.pending;
@@ -866,12 +858,6 @@ impl Mat {
             bits.extend((0..coefficient_bits).map(|bit| value.clone().bit(bit)));
         }
         Family::<Bool>::pack_bools(bits)
-    }
-
-    #[track_caller]
-    pub fn constant_coefficient(self, position: impl Into<IntExpr>) -> Mat {
-        let ty = self.matrix_type.clone();
-        Self::from_node(NodeKind::ConstantCoefficient { position: position.into() }, vec![self], ty)
     }
 
     #[track_caller]
@@ -1388,6 +1374,19 @@ impl Int {
             vec![WireType::Bool],
         );
         Bool { value: node.output(0).expect("integer bit"), pending: self.pending }
+    }
+
+    #[track_caller]
+    pub fn lift_to_constant_polynomial(self, matrix_type: MatrixType) -> Mat {
+        assert_eq!(matrix_type.rows, IntExpr::constant(1), "constant-polynomial lift is scalar");
+        assert_eq!(matrix_type.columns, IntExpr::constant(1), "constant-polynomial lift is scalar");
+        let pending = self.pending;
+        let node = NodeHandle::new(
+            NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix_type.clone() },
+            vec![self.value],
+            vec![WireType::Matrix(matrix_type.clone())],
+        );
+        Mat { value: node.output(0).expect("constant-polynomial lift"), matrix_type, pending }
     }
 
     fn compare(self, rhs: Self, operation: mxx_ir_core::node::IntCompareOp) -> Bool {

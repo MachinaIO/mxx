@@ -1206,22 +1206,6 @@ def inferNodeFacts
             matrixType := some outputType
             fact := .matrix result
           }]
-      | .reshape _ _ =>
-          match node.arguments with
-          | [inputRef] =>
-              let output := scopedOutputWire stage scope nodeId
-              let ⟨input, _inputType⟩ ← requireMatrix facts
-                (scopedWire stage scope inputRef)
-              let outputType ← requireDeclaredMatrixType stage nodeId node
-              let _ ← inferTransformRule node.kind |>.mapError .transform
-              let result ← deriveReshapeBoundedFact (.ofCoreWire output) input
-                |>.mapError .transform
-              return facts ++ [{
-                wire := output
-                matrixType := some outputType
-                fact := .matrix result
-              }]
-          | _ => throw (.unsupportedNode stage ⟨nodeId⟩)
       | .concat axis =>
           let output := scopedOutputWire stage scope nodeId
           let inputsAndTypes ← node.arguments.mapM fun inputRef ↦
@@ -3280,7 +3264,6 @@ private def nodeKindParameterReferences : Mxx.Ir.NodeKind → List (String × Bo
       matrixTypeParameterReferences type ++ intParameterReferences base ++
         intParameterReferences digits
   | .slice rows columns => optionalRangeReferences rows ++ optionalRangeReferences columns
-  | .reshape rows columns => intParameterReferences rows ++ intParameterReferences columns
   | .thresholdDecodeBool ciphertext plaintext length =>
       intParameterReferences ciphertext ++ intParameterReferences plaintext ++
         intParameterReferences length

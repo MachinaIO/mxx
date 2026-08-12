@@ -6,7 +6,11 @@
 
 use crate::{OutputRef, ProtocolStage, StageId, StageInputName};
 use mxx_dsl::{IdealSpec, PurePredicateSpec};
-use mxx_ir_core::{Graph, IntExpr, WireType, node::NodeKind, types::MatrixType};
+use mxx_ir_core::{
+    Graph, IntExpr, Port, WireRef, WireType,
+    node::{IntBinaryOp, IntCompareOp, NodeKind},
+    types::{MatrixType, NodeId},
+};
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -165,6 +169,27 @@ pub enum EndpointSemanticBinding {
     },
 }
 
+/// The executable decoder family selected by an operational target.  This is
+/// closed protocol data: requests may name a target but cannot supply a
+/// decoder threshold or interval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OperationalDecoderKind {
+    ThresholdDecode { plaintext_modulus: IntExpr },
+    BooleanInterval,
+}
+
+/// Names the residual and executable decoder whose acceptance margin is checked
+/// by the Lean operational checker.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperationalDecoderTarget {
+    pub target_id: String,
+    pub residual_stage: StageId,
+    pub residual_output: String,
+    pub decoder_stage: StageId,
+    pub decoder_node: NodeId,
+    pub kind: OperationalDecoderKind,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EndpointAnchor {
     pub spec: EndpointSpecId,
@@ -193,6 +218,7 @@ pub struct ClosedProtocolBundle {
     pub requirements: Vec<PurePredicateSpec>,
     pub comparator: ComparatorSpec,
     pub endpoints: EndpointAnchors,
+    pub operational_decoder_targets: Vec<OperationalDecoderTarget>,
     pub endpoint_specs: Vec<EndpointSpecId>,
     pub input_contract: InputContract,
     pub input_bindings: Vec<ProtocolInputBinding>,
@@ -239,6 +265,14 @@ pub enum BundleValidationError {
     EndpointAnchorMismatch,
     #[error("an endpoint has semantic identities that do not match its closed endpoint spec")]
     InvalidEndpointSemantics,
+    #[error("the operational decoder target registry must be nonempty")]
+    EmptyOperationalDecoderTargetRegistry,
+    #[error("operational decoder target ids must be nonempty and unique")]
+    DuplicateOperationalDecoderTarget,
+    #[error("an operational decoder target does not name a closed residual output or decoder node")]
+    InvalidOperationalDecoderTarget,
+    #[error("an operational decoder target kind does not match its closed endpoint")]
+    OperationalDecoderTargetKindMismatch,
     #[error("a comparator endpoint references a missing input or result output")]
     MissingComparatorConnection,
     #[error("a comparator result output must be boolean")]
@@ -275,6 +309,7 @@ impl ClosedProtocolBundle {
 
         self.validate_inputs(&stages)?;
         self.validate_endpoints(&stages)?;
+        self.validate_operational_decoder_targets(&stages)?;
         self.validate_preconditions()?;
         Ok(())
     }
@@ -504,6 +539,122 @@ impl ClosedProtocolBundle {
         Ok(())
     }
 
+    fn validate_operational_decoder_targets(
+        &self,
+        stages: &BTreeMap<StageId, &ProtocolStage>,
+    ) -> Result<(), BundleValidationError> {
+        if self.operational_decoder_targets.is_empty() {
+            return Err(BundleValidationError::EmptyOperationalDecoderTargetRegistry);
+        }
+        let target_ids = self
+            .operational_decoder_targets
+            .iter()
+            .map(|target| target.target_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if target_ids.len() != self.operational_decoder_targets.len() ||
+            self.operational_decoder_targets.iter().any(|target| target.target_id.is_empty())
+        {
+            return Err(BundleValidationError::DuplicateOperationalDecoderTarget);
+        }
+        for target in &self.operational_decoder_targets {
+            let residual_stage = stages
+                .get(&target.residual_stage)
+                .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+            let residual = residual_stage
+                .graph
+                .outputs()
+                .get(&target.residual_output)
+                .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+            if !matches!(
+                output_type(&residual_stage.graph, residual.value),
+                Some(WireType::Matrix(_))
+            ) {
+                return Err(BundleValidationError::InvalidOperationalDecoderTarget);
+            }
+            let decoder_stage = stages
+                .get(&target.decoder_stage)
+                .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+            let decoder_is_anchored =
+                decoder_stage.semantic_anchors.iter().flat_map(|(_, wires)| wires).any(|wire| {
+                    wire.scope == mxx_ir_core::FrozenGraphScopeId::Root &&
+                        wire.wire.node == target.decoder_node
+                });
+            if !decoder_is_anchored {
+                return Err(BundleValidationError::InvalidOperationalDecoderTarget);
+            }
+            let endpoint = self
+                .endpoints
+                .entries
+                .iter()
+                .find(|endpoint| {
+                    endpoint.stage == target.decoder_stage &&
+                        decoder_stage
+                            .semantic_anchors
+                            .get(&endpoint.semantic_anchor)
+                            .is_some_and(|wires| {
+                                wires.len() == 1 && wires[0].wire.node == target.decoder_node
+                            })
+                })
+                .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+            let decoder = decoder_stage
+                .graph
+                .root_scope()
+                .node(target.decoder_node)
+                .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+            match (&target.kind, endpoint.spec, decoder.kind()) {
+                (
+                    OperationalDecoderKind::ThresholdDecode { plaintext_modulus },
+                    EndpointSpecId::ToyThresholdDecode,
+                    NodeKind::ThresholdDecode {
+                        plaintext_modulus: decoder_plaintext_modulus,
+                        output_bool: true,
+                        ..
+                    },
+                ) if plaintext_modulus == decoder_plaintext_modulus &&
+                    decoder_stage.graph.root_scope().arguments(decoder)
+                        .and_then(|arguments| arguments.first().copied())
+                        .and_then(|wire| output_type(&decoder_stage.graph, wire))
+                        .is_some_and(|decoder_input| matches!(
+                            (decoder_input, output_type(&residual_stage.graph, residual.value)),
+                            (WireType::Matrix(decoder_type), Some(WireType::Matrix(residual_type)))
+                                if decoder_type.modulus == residual_type.modulus
+                        )) => {}
+                (
+                    OperationalDecoderKind::BooleanInterval,
+                    EndpointSpecId::DiamondBooleanInterval,
+                    NodeKind::IntCompare(IntCompareOp::Equal),
+                ) => {
+                    let EndpointSemanticBinding::DiamondBoolean {
+                        residual_stage,
+                        residual_anchor,
+                        ..
+                    } = &endpoint.semantics else {
+                        return Err(BundleValidationError::OperationalDecoderTargetKindMismatch);
+                    };
+                    let residual_anchor = stages
+                        .get(residual_stage)
+                        .and_then(|stage| stage.semantic_anchors.get(residual_anchor))
+                        .filter(|wires| wires.len() == 1)
+                        .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+                    if residual_stage != &target.residual_stage ||
+                        target.decoder_stage != target.residual_stage ||
+                        residual_anchor[0].scope != mxx_ir_core::FrozenGraphScopeId::Root ||
+                        residual_anchor[0].wire != residual.value ||
+                        !boolean_interval_decoder_matches(
+                            &decoder_stage.graph,
+                            target.decoder_node,
+                            residual.value,
+                        )
+                    {
+                        return Err(BundleValidationError::InvalidOperationalDecoderTarget);
+                    }
+                }
+                _ => return Err(BundleValidationError::OperationalDecoderTargetKindMismatch),
+            }
+        }
+        Ok(())
+    }
+
     fn validate_preconditions(&self) -> Result<(), BundleValidationError> {
         if self.precondition_spec.requirement_outputs.len() != self.requirements.len() {
             return Err(BundleValidationError::PreconditionCardinalityMismatch);
@@ -524,6 +675,99 @@ impl ClosedProtocolBundle {
         }
         Ok(())
     }
+}
+
+fn node_kind_and_arguments<const N: usize>(
+    graph: &Graph,
+    wire: WireRef,
+) -> Option<(&NodeKind, [WireRef; N])> {
+    if wire.port != Port(0) {
+        return None;
+    }
+    let scope = graph.root_scope();
+    let node = scope.node(wire.node)?;
+    let arguments = scope.arguments(node)?.try_into().ok()?;
+    Some((node.kind(), arguments))
+}
+
+/// Checks the complete executable Boolean interval decoder rooted at `decoder_node`.
+///
+/// The endpoint anchor alone identifies only the final equality.  Closing the operational target
+/// additionally fixes every interior edge and requires the modulus used to construct the interval
+/// to be exactly the residual matrix modulus expression.
+fn boolean_interval_decoder_matches(
+    graph: &Graph,
+    decoder_node: NodeId,
+    residual: WireRef,
+) -> bool {
+    let Some(WireType::Matrix(residual_type)) = output_type(graph, residual) else {
+        return false;
+    };
+    let decoder = WireRef { node: decoder_node, port: Port(0) };
+    let Some((NodeKind::IntCompare(IntCompareOp::Equal), [sum, two])) =
+        node_kind_and_arguments(graph, decoder)
+    else {
+        return false;
+    };
+    let Some((NodeKind::IntBinary(IntBinaryOp::Add), [lower_int, upper_int])) =
+        node_kind_and_arguments(graph, sum)
+    else {
+        return false;
+    };
+    let Some((NodeKind::BoolToInt, [lower_ok])) = node_kind_and_arguments(graph, lower_int) else {
+        return false;
+    };
+    let Some((NodeKind::BoolToInt, [upper_ok])) = node_kind_and_arguments(graph, upper_int) else {
+        return false;
+    };
+    let Some((NodeKind::IntCompare(IntCompareOp::LessEqual), [quarter, coefficient])) =
+        node_kind_and_arguments(graph, lower_ok)
+    else {
+        return false;
+    };
+    let Some((NodeKind::IntCompare(IntCompareOp::LessEqual), [upper_coefficient, upper])) =
+        node_kind_and_arguments(graph, upper_ok)
+    else {
+        return false;
+    };
+    let Some((NodeKind::IntBinary(IntBinaryOp::Multiply), [upper_quarter, three])) =
+        node_kind_and_arguments(graph, upper)
+    else {
+        return false;
+    };
+    let Some((NodeKind::EvaluateInt(quarter_expression), [])) =
+        node_kind_and_arguments(graph, quarter)
+    else {
+        return false;
+    };
+    let Some((NodeKind::ExtractCoefficient { position }, [coefficient_input])) =
+        node_kind_and_arguments(graph, coefficient)
+    else {
+        return false;
+    };
+
+    let expected_quarter = IntExpr::RoundDiv(
+        Box::new(IntExpr::Sub(
+            Box::new(residual_type.modulus.clone()),
+            Box::new(IntExpr::constant(2)),
+        )),
+        Box::new(IntExpr::constant(4)),
+    );
+    coefficient_input == residual &&
+        upper_coefficient == coefficient &&
+        upper_quarter == quarter &&
+        position == &IntExpr::constant(0) &&
+        quarter_expression == &expected_quarter &&
+        matches!(
+            node_kind_and_arguments::<0>(graph, two),
+            Some((NodeKind::ConstantInt(value), []))
+                if value == &num_bigint::BigInt::from(2)
+        ) &&
+        matches!(
+            node_kind_and_arguments::<0>(graph, three),
+            Some((NodeKind::ConstantInt(value), []))
+                if value == &num_bigint::BigInt::from(3)
+        )
 }
 
 fn root_inputs(
@@ -584,7 +828,7 @@ fn contract_matches_wire(contract: &InputValueContract, wire_type: &WireType) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, IdealSpec, PurePredicateSpec, Ring, SemanticAnchor};
+    use mxx_dsl::{DslContext, IdealSpec, Int, PurePredicateSpec, Ring, SemanticAnchor};
 
     fn valid_bundle() -> ClosedProtocolBundle {
         let ring = Ring::new(17, 1);
@@ -595,6 +839,33 @@ mod tests {
             .expect("stage output")
             .build()
             .expect("stage graph");
+        let residual = ring
+            .input("residual", (1, 1))
+            .semantic_anchor("interval.residual")
+            .expect("residual anchor")
+            .semantic_anchor("interval.carrier")
+            .expect("carrier anchor");
+        let coefficient = residual.clone().extract_coefficient(0);
+        let quarter = Int::evaluate(IntExpr::RoundDiv(
+            Box::new(IntExpr::Sub(Box::new(IntExpr::constant(17)), Box::new(IntExpr::constant(2)))),
+            Box::new(IntExpr::constant(4)),
+        ));
+        let decoded = quarter
+            .clone()
+            .less_equal(coefficient.clone())
+            .to_int()
+            .add(coefficient.less_equal(quarter.mul(Int::constant(3))).to_int())
+            .equal(Int::constant(2))
+            .semantic_anchor("interval.result")
+            .expect("decoder anchor");
+        let decoder_stage = DslContext::new("decoder-stage")
+            .output("residual", residual)
+            .expect("residual output")
+            .bool_output("decoded", decoded)
+            .expect("decoded output")
+            .build()
+            .expect("decoder graph");
+        let decoder_node = decoder_stage.graph.outputs()["decoded"].value.node;
         let ideal = IdealSpec::new(
             DslContext::new("ideal")
                 .bool_output("result", ring.bool_input("message"))
@@ -622,56 +893,269 @@ mod tests {
         )
         .expect("pure comparator");
         let input = ProtocolInputId::from("message");
+        let residual_input = ProtocolInputId::from("residual");
+        let decoder_stage_id = StageId("decoder-stage".to_owned());
+        let interval_endpoint = EndpointSpecId::DiamondBooleanInterval;
 
         ClosedProtocolBundle {
             workflow: Workflow {
-                stages: vec![ProtocolStage {
-                    id: StageId("stage".to_owned()),
-                    graph: stage.graph,
-                    semantic_anchors: stage.anchors,
-                    derivation_attachments: stage.derivation_attachments,
-                    bindings: Vec::new(),
-                }],
+                stages: vec![
+                    ProtocolStage {
+                        id: StageId("stage".to_owned()),
+                        graph: stage.graph,
+                        semantic_anchors: stage.anchors,
+                        derivation_attachments: stage.derivation_attachments,
+                        bindings: Vec::new(),
+                    },
+                    ProtocolStage {
+                        id: decoder_stage_id.clone(),
+                        graph: decoder_stage.graph,
+                        semantic_anchors: decoder_stage.anchors,
+                        derivation_attachments: decoder_stage.derivation_attachments,
+                        bindings: Vec::new(),
+                    },
+                ],
                 entrypoint: StageId("stage".to_owned()),
             },
             ideal,
             requirements: vec![requirement],
             comparator: ComparatorSpec::EqualityAfterMap {
                 program: comparator,
-                endpoints: Vec::new(),
-            },
-            endpoints: EndpointAnchors::default(),
-            endpoint_specs: Vec::new(),
-            input_contract: InputContract {
-                inputs: vec![InputContractEntry {
-                    id: input.clone(),
-                    name: "message".to_owned(),
-                    value: InputValueContract::Boolean,
+                endpoints: vec![ComparatorEndpointBinding {
+                    endpoint: interval_endpoint,
+                    actual_input: "actual".to_owned(),
+                    ideal_input: "ideal".to_owned(),
+                    result_output: "failure".to_owned(),
+                    failure_value: false,
                 }],
             },
-            input_bindings: vec![ProtocolInputBinding {
-                input,
-                destinations: vec![
-                    ProtocolInputDestination::WorkflowStage {
-                        stage: StageId("stage".to_owned()),
-                        input: StageInputName("message".to_owned()),
+            endpoints: EndpointAnchors {
+                entries: vec![EndpointAnchor {
+                    spec: interval_endpoint,
+                    stage: decoder_stage_id.clone(),
+                    semantic_anchor: "interval.result".to_owned(),
+                    semantics: EndpointSemanticBinding::DiamondBoolean {
+                        residual_stage: decoder_stage_id.clone(),
+                        residual_anchor: "interval.residual".to_owned(),
+                        carrier_stage: decoder_stage_id.clone(),
+                        carrier_anchor: "interval.carrier".to_owned(),
+                        message: input.clone(),
                     },
-                    ProtocolInputDestination::Requirement {
-                        requirement: 0,
-                        input: "message".to_owned(),
+                    workflow_output: OutputRef {
+                        stage: decoder_stage_id.clone(),
+                        output: "decoded".to_owned(),
                     },
-                    ProtocolInputDestination::Ideal { input: "message".to_owned() },
-                ],
+                    ideal_output: "result".to_owned(),
+                }],
+            },
+            operational_decoder_targets: vec![OperationalDecoderTarget {
+                target_id: "interval".to_owned(),
+                residual_stage: decoder_stage_id.clone(),
+                residual_output: "residual".to_owned(),
+                decoder_stage: decoder_stage_id.clone(),
+                decoder_node,
+                kind: OperationalDecoderKind::BooleanInterval,
             }],
+            endpoint_specs: vec![interval_endpoint],
+            input_contract: InputContract {
+                inputs: vec![
+                    InputContractEntry {
+                        id: input.clone(),
+                        name: "message".to_owned(),
+                        value: InputValueContract::Boolean,
+                    },
+                    InputContractEntry {
+                        id: residual_input.clone(),
+                        name: "residual".to_owned(),
+                        value: InputValueContract::MatrixExact {
+                            matrix_type: ring.matrix_type((1, 1)),
+                            canonical_coefficient_exclusive_upper_bound: None,
+                            is_constant_polynomial: false,
+                        },
+                    },
+                ],
+            },
+            input_bindings: vec![
+                ProtocolInputBinding {
+                    input,
+                    destinations: vec![
+                        ProtocolInputDestination::WorkflowStage {
+                            stage: StageId("stage".to_owned()),
+                            input: StageInputName("message".to_owned()),
+                        },
+                        ProtocolInputDestination::Requirement {
+                            requirement: 0,
+                            input: "message".to_owned(),
+                        },
+                        ProtocolInputDestination::Ideal { input: "message".to_owned() },
+                    ],
+                },
+                ProtocolInputBinding {
+                    input: residual_input,
+                    destinations: vec![ProtocolInputDestination::WorkflowStage {
+                        stage: decoder_stage_id,
+                        input: StageInputName("residual".to_owned()),
+                    }],
+                },
+            ],
             precondition_spec: ProtocolPreconditionSpec {
                 requirement_outputs: vec!["valid".to_owned()],
             },
         }
     }
 
+    fn boolean_interval_bundle(decoder_modulus: IntExpr) -> ClosedProtocolBundle {
+        let stage_id = StageId("interval-stage".to_owned());
+        let ring = Ring::new(17, 1);
+        let matrix_type = ring.matrix_type((1, 1));
+        let residual = ring
+            .input("residual", (1, 1))
+            .semantic_anchor("interval.residual")
+            .expect("residual anchor")
+            .semantic_anchor("interval.carrier")
+            .expect("carrier anchor");
+        let coefficient = residual.clone().extract_coefficient(0);
+        let quarter = Int::evaluate(IntExpr::RoundDiv(
+            Box::new(IntExpr::Sub(Box::new(decoder_modulus), Box::new(IntExpr::constant(2)))),
+            Box::new(IntExpr::constant(4)),
+        ));
+        let decoded = quarter
+            .clone()
+            .less_equal(coefficient.clone())
+            .to_int()
+            .add(coefficient.less_equal(quarter.mul(Int::constant(3))).to_int())
+            .equal(Int::constant(2))
+            .semantic_anchor("interval.result")
+            .expect("decoder anchor");
+        let stage = DslContext::new("interval-stage")
+            .output("residual", residual)
+            .expect("residual output")
+            .bool_output("decoded", decoded)
+            .expect("decoded output")
+            .build()
+            .expect("interval graph");
+        let decoder_node = stage.graph.outputs()["decoded"].value.node;
+        let ideal = IdealSpec::new(
+            DslContext::new("interval-ideal")
+                .bool_output("result", ring.bool_input("message"))
+                .expect("ideal output")
+                .build()
+                .expect("ideal graph"),
+        )
+        .expect("pure ideal");
+        let residual_input = ProtocolInputId::from("residual");
+        let message_input = ProtocolInputId::from("message");
+        let endpoint = EndpointSpecId::DiamondBooleanInterval;
+
+        ClosedProtocolBundle {
+            workflow: Workflow {
+                stages: vec![ProtocolStage {
+                    id: stage_id.clone(),
+                    graph: stage.graph,
+                    semantic_anchors: stage.anchors,
+                    derivation_attachments: stage.derivation_attachments,
+                    bindings: Vec::new(),
+                }],
+                entrypoint: stage_id.clone(),
+            },
+            ideal,
+            requirements: Vec::new(),
+            comparator: ComparatorSpec::Equality {
+                endpoints: vec![ComparatorEndpointBinding {
+                    endpoint,
+                    actual_input: "decoded".to_owned(),
+                    ideal_input: "result".to_owned(),
+                    result_output: "failure".to_owned(),
+                    failure_value: true,
+                }],
+            },
+            endpoints: EndpointAnchors {
+                entries: vec![EndpointAnchor {
+                    spec: endpoint,
+                    stage: stage_id.clone(),
+                    semantic_anchor: "interval.result".to_owned(),
+                    semantics: EndpointSemanticBinding::DiamondBoolean {
+                        residual_stage: stage_id.clone(),
+                        residual_anchor: "interval.residual".to_owned(),
+                        carrier_stage: stage_id.clone(),
+                        carrier_anchor: "interval.carrier".to_owned(),
+                        message: message_input.clone(),
+                    },
+                    workflow_output: OutputRef {
+                        stage: stage_id.clone(),
+                        output: "decoded".to_owned(),
+                    },
+                    ideal_output: "result".to_owned(),
+                }],
+            },
+            operational_decoder_targets: vec![OperationalDecoderTarget {
+                target_id: "boolean-interval".to_owned(),
+                residual_stage: stage_id.clone(),
+                residual_output: "residual".to_owned(),
+                decoder_stage: stage_id.clone(),
+                decoder_node,
+                kind: OperationalDecoderKind::BooleanInterval,
+            }],
+            endpoint_specs: vec![endpoint],
+            input_contract: InputContract {
+                inputs: vec![
+                    InputContractEntry {
+                        id: residual_input.clone(),
+                        name: "residual".to_owned(),
+                        value: InputValueContract::MatrixExact {
+                            matrix_type,
+                            canonical_coefficient_exclusive_upper_bound: None,
+                            is_constant_polynomial: false,
+                        },
+                    },
+                    InputContractEntry {
+                        id: message_input.clone(),
+                        name: "message".to_owned(),
+                        value: InputValueContract::Boolean,
+                    },
+                ],
+            },
+            input_bindings: vec![
+                ProtocolInputBinding {
+                    input: residual_input,
+                    destinations: vec![ProtocolInputDestination::WorkflowStage {
+                        stage: stage_id,
+                        input: StageInputName("residual".to_owned()),
+                    }],
+                },
+                ProtocolInputBinding {
+                    input: message_input,
+                    destinations: vec![ProtocolInputDestination::Ideal {
+                        input: "message".to_owned(),
+                    }],
+                },
+            ],
+            precondition_spec: ProtocolPreconditionSpec::default(),
+        }
+    }
+
     #[test]
     fn valid_closed_bundle_has_total_input_and_endpoint_wiring() {
         assert_eq!(valid_bundle().validate(), Ok(()));
+    }
+
+    #[test]
+    fn empty_operational_decoder_target_registry_is_rejected() {
+        let mut bundle = valid_bundle();
+        bundle.operational_decoder_targets.clear();
+        assert_eq!(
+            bundle.validate(),
+            Err(BundleValidationError::EmptyOperationalDecoderTargetRegistry)
+        );
+    }
+
+    #[test]
+    fn boolean_interval_target_rejects_a_forged_interior_modulus() {
+        assert_eq!(boolean_interval_bundle(IntExpr::constant(17)).validate(), Ok(()));
+        assert_eq!(
+            boolean_interval_bundle(IntExpr::constant(19)).validate(),
+            Err(BundleValidationError::InvalidOperationalDecoderTarget)
+        );
     }
 
     #[test]

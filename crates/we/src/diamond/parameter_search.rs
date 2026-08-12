@@ -390,6 +390,7 @@ fn checker_arguments(
         small_digit_count.to_string(),
         smallest_crt_modulus.to_string(),
         crt_moduli.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
+        "diamond-boolean-interval".to_owned(),
     ];
     // The checker echoes this value.  It binds an acceptance response to the complete candidate
     // request, including the ordered CRT layout metadata, without affecting generated Lean code.

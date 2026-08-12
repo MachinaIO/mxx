@@ -1865,30 +1865,10 @@ def evaluatePreparedScope
                     | some value => pure value
                     | none => throw .nonClosedExpression
                   match ← lookupFact index facts familyWire with
-                  | family@{ payload := .matrix _, .. } =>
-                      let (selector, count) ← match facts.arena.get? family.payload with
-                        | some { node := .select domain (.exact branches), .. } =>
-                            if branches.size != domain.count then
-                              throw (.loopInputModeMismatch index 0)
-                            match domain.identity.expression.freeVariables with
-                            | [selector] => pure (selector, domain.count)
-                            | _ => throw (.loopInputModeMismatch index 0)
-                        | some { node := .select domain (.shared _ _), .. } =>
-                            match domain.identity.expression.freeVariables with
-                            | [selector] => pure (selector, domain.count)
-                            | _ => throw (.loopInputModeMismatch index 0)
-                        | _ => throw (.loopInputModeMismatch index 0)
-                      if requested < 0 || requested >= Int.ofNat count then
-                        throw (.invalidCount index requested)
-                      let staticMap ← match staticIndexMap family.context selector requested.toNat with
-                        | some map => pure map
-                        | none => throw (.loopInputModeMismatch index 0)
-                      let (arena, expression) ← reindexIndexedOperationalFact staticMap
-                        facts.arena family
-                      let (arena, rebound) ← rebindOperationalFact { node := index, port := 0 }
-                        arena expression
-                      facts := { facts with arena }
-                      pure [rebound]
+                  /- Matrix families must have crossed the direct carrier.  Legacy matrix
+                  selection, including preimage/decomposition transport, is deliberately deferred
+                  to Stage 8 rather than falling back to ChoiceStorage here. -/
+                  | { payload := .matrix root, .. } => throw (.unsupportedOperationalExpr root)
                   | family@{ payload := .scalar _, .. } =>
                       if requested < 0 then throw (.invalidCount index requested)
                       let (arena, selected) ← selectIndexedScalarStatic facts.arena family
@@ -1917,36 +1897,10 @@ def evaluatePreparedScope
                   let selection := selectionFact.origin
                   let family ← lookupFact index facts familyWire
                   match selectionFact.lower == selectionFact.upper, family with
-                  | true, family@{ payload := .matrix _, .. } =>
-                      let (domain, exactBranches) ← match facts.arena.get? family.payload with
-                        | some { node := .select domain (.exact branches), .. } =>
-                            if branches.size == domain.count then pure (domain, some branches)
-                            else throw (.loopInputModeMismatch index 0)
-                        | some { node := .select domain (.shared _ _), .. } => pure (domain, none)
-                        | _ => throw (.loopInputModeMismatch index 0)
-                      let requested := selectionFact.lower
-                      if requested < 0 || requested >= Int.ofNat domain.count then
-                        throw (.invalidCount index requested)
-                      let (arena, selected) ← match exactBranches with
-                        | some branches => match branches[requested.toNat]? with
-                            | some branch => pure (facts.arena,
-                                ← facts.arena.indexedExpr branch)
-                            | none => throw (.invalidCount index requested)
-                        | none => do
-                            let sourceBinder ← match domain.identity.expression with
-                              | .variable binder => pure binder
-                              | _ => throw (.loopInputModeMismatch index 0)
-                            let staticMap ← match staticIndexMap family.context sourceBinder
-                                requested.toNat with
-                              | some map => pure map
-                              | none => throw (.loopInputModeMismatch index 0)
-                            let (arena, selected) ← reindexIndexedOperationalFact staticMap
-                              facts.arena family
-                            pure (arena, selected)
-                      let (arena, rebound) ← rebindOperationalFact { node := index, port := 0 }
-                        arena selected
-                      facts := { facts with arena }
-                      pure [rebound]
+                  /- Matrix families must have crossed the direct carrier.  Legacy matrix
+                  selection, including preimage/decomposition transport, is deliberately deferred
+                  to Stage 8 rather than falling back to ChoiceStorage here. -/
+                  | _, { payload := .matrix root, .. } => throw (.unsupportedOperationalExpr root)
                   | true, family@{ payload := .scalar _, .. } =>
                       let requested := selectionFact.lower
                       if requested < 0 then throw (.invalidCount index requested)
@@ -1954,31 +1908,6 @@ def evaluatePreparedScope
                         requested.toNat { node := index, port := 0 }
                       facts := { facts with arena }
                       pure [selected]
-                  | false, family@{ payload := .matrix _, .. } =>
-                      let domain ← match facts.arena.get? family.payload with
-                        | some { node := .select domain (.exact branches), .. } =>
-                            if branches.size == domain.count then pure domain
-                            else throw (.loopInputModeMismatch index 0)
-                        | some { node := .select domain (.shared _ _), .. } => pure domain
-                        | _ => throw (.loopInputModeMismatch index 0)
-                      if domain.count == 0 || selectionFact.lower < 0 ||
-                          selectionFact.upper >= Int.ofNat domain.count then
-                        throw (.invalidCount index selectionFact.upper)
-                      let sourceBinder ← match domain.identity.expression with
-                        | .variable binder => pure binder
-                        | _ => throw (.loopInputModeMismatch index 0)
-                      let selector := DynamicSelectionIdentity.fromOrigin selection domain.count
-                      let dynamicMap ← match dynamicIndexMap family.context sourceBinder
-                          selector.expression with
-                        | some map => pure map
-                        | none => throw (.loopInputModeMismatch index 0)
-                      let (arena, selected) ← reindexIndexedOperationalFact dynamicMap facts.arena family
-                        fun mapped =>
-                          if mapped.expression == selector.expression then selector else mapped
-                      let (arena, rebound) ← rebindOperationalFact { node := index, port := 0 }
-                        arena selected
-                      facts := { facts with arena }
-                      pure [rebound]
                   | false, family@{ payload := .scalar _, .. } =>
                       let (domain, _) ← facts.arena.scalarSelectionDomain family
                       if domain.count == 0 || selectionFact.lower < 0 ||
@@ -2049,11 +1978,9 @@ def evaluatePreparedScope
                   let (nextFacts, outputs) ← childOutputs.zipIdx.foldlM
                     (fun (currentFacts, accumulated) (output, port) => do
                       match output with
-                      | { payload := .matrix _, .. } =>
-                          let (arena, family) ← parallelLoopIndexedMatrixOutput scopeKey index indexSlot port
-                            evaluatedCount.toNat environment deriveOperationalSchemaFact
-                              currentFacts.arena output
-                          pure ({ currentFacts with arena }, accumulated.push family)
+                      /- Parallel matrix results are direct indexed values.  Legacy matrix
+                      preimage/decomposition output transport remains a Stage 8 migration. -/
+                      | { payload := .matrix root, .. } => throw (.unsupportedOperationalExpr root)
                       | scalar@{ payload := .scalar _, .. } =>
                           let subject : WireRef := { node := index, port }
                           let binder : FamilyTemplateBinder := {

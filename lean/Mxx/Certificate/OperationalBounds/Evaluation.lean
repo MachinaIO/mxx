@@ -1293,23 +1293,6 @@ def matrixFactAt
       return ← facts.arena.directValueRepresentativeFactAt environment expression
   | _ => throw (.operandNotMatrix node wire)
 
-/-- Inspect one matrix wire through the same arena schema derivation used by operational
-transfers.  This is intentionally separate from `matrixFactAt`: production callers of that
-helper require a concrete fact, while fixtures that assert normalized polynomial structure must
-also accept the canonical indexed expression representation. -/
-def derivedMatrixFactAt
-    (node : Nat)
-    (facts : OperationalScopeFacts)
-    (wire : WireRef)
-    (environment : ParamEnvironment := []) : Except OperationalError OperationalMatrixFact := do
-  match ← lookupFact node facts wire with
-  | expression@{ payload := .matrix _, .. } =>
-      return (← deriveOperationalSchemaFact facts.arena environment expression.payload
-        (OperationalExprEvaluationState.empty facts.arena)).1
-  | expression@{ payload := .directValue _, .. } =>
-      return ← facts.arena.directValueRepresentativeFactAt environment expression
-  | _ => throw (.operandNotMatrix node wire)
-
 def OperationalExprArena.deriveOperationalSchemaFactCached
     (arena : OperationalExprArena)
     (environment : ParamEnvironment)

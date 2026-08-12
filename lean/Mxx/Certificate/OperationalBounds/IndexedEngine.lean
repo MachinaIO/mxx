@@ -6947,24 +6947,6 @@ def indexScalarFact
       fact with subject, origin := indexValueOrigin binder selection fact.origin }
   | fact => fact
 
-partial def selectDynamicUniformFact
-    (binder : FamilyTemplateBinder)
-    (selection : DynamicSelectionIdentity)
-    (subject : WireRef)
-    (arena : OperationalExprArena) : OperationalFact →
-    Except OperationalError (OperationalExprArena × OperationalFact)
-  | expression@{ payload := .scalar _, .. } => do
-      let (arena, mapped) ← mapIndexedScalarLeaves arena expression
-        (indexScalarFact binder selection subject)
-      pure (arena, mapped)
-  | expression@{ payload := .matrix _, .. } => do
-      let (arena, root) ← mapOperationalExpr "select-dynamic-uniform" .instantiationMap arena
-        expression.payload (indexMatrixFact binder selection subject)
-      let mapped : IndexedOperationalFact := { expression with payload := .matrix root }
-      pure (← arena.rememberIndexedExpr mapped, mapped)
-  | { payload := .directValue root, .. } =>
-      throw (.unsupportedOperationalExpr root)
-
 /-- A scalar Shared node is legal only when every stored result is the symbolic template for the
 same outer family selector.  Boolean/real/blob atoms have no provenance fields; indexed integer,
 trapdoor, and byte atoms must carry the exact binder and selector installed by the family

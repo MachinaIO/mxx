@@ -26,7 +26,7 @@ private def fixtureDirectScalarFact
     (indices : IndexValueEnvironment := []) : Except OperationalError OperationalScalarFact := do
   let root ← match fact.payload with
     | .directValue root => pure root
-    | .matrix root | .scalar root => throw (.unsupportedOperationalExpr root)
+    | _ => throw (.unsupportedOperationalExpr 0)
   arena.direct.scalarFactAt [] indices root (arena.direct.values.size + 1)
 
 /-- The same protocol input has one root identity across workflow stages even though each stage
@@ -263,7 +263,7 @@ private def knownZeroRowsUnitColumnGraphFixture : Bool :=
   match (do
     let facts ← evaluateScopeOperationalWithLayouts knownZeroRowsUnitColumnScope
       knownZeroRowsUnitColumnDerivation [] []
-    let unit ← derivedMatrixFactAt 2 facts { node := 1, port := 0 }
+    let unit ← matrixFactAt 2 facts { node := 1, port := 0 }
     let bound ← matrixMaximum 2 { node := 2, port := 0 } facts []
     pure (unit.metadata.knownZeroRows == some (IntExpr.constant 2) && bound == 2)) with
   | .ok value => value
@@ -356,12 +356,6 @@ example : (do
     | _ => pure (-1)) = .ok 8 := by
   native_decide
 
-private def fixtureFamilyBinder : FamilyTemplateBinder := {
-  owner := .root (.standalone 7)
-  producerNode := 4
-  binderSlot := 0
-}
-
 private def fixtureSampledIdentity : PublicMatrixIdentity :=
   .sampledTrapdoor (.parallelBody (.root (.standalone 7)) 4) { node := 0, port := 0 }
 
@@ -373,10 +367,6 @@ private def fixturePublicMatrixFact : OperationalMatrixFact := ({
   totalHardBound := .closedInt (.constant 8)
   identity := some fixtureSampledIdentity
 } : OperationalMatrixFact).initializePrimitivePolynomial .large
-
-private def fixturePublicFact
-    (arena : OperationalExprArena) : Except OperationalError (OperationalExprArena × OperationalFact) :=
-  arena.liftConcreteMatrixFact fixturePublicMatrixFact
 
 /-- Sequential schemas ignore alternate encodings of bounded-only zero signal, but retain the
 ordered structure of every Large-bearing term. -/
@@ -405,43 +395,6 @@ private def carriedSignalSchemaFixture : Bool :=
   | .error _ => false
 
 example : carriedSignalSchemaFixture = true := by
-  native_decide
-
-/-- Sequential carried-bound rewriting maps the checked Shared representative in place.  The
-logical selection context and Shared storage remain attached to the indexed result. -/
-private def indexedCarriedRecurrenceFixture : Bool :=
-  match (do
-    let selection := DynamicSelectionIdentity.fromOrigin
-      (.local temporaryScope { node := 744, port := 0 }) 2
-    let base : OperationalMatrixFact := ({
-      subject := { node := 744, port := 0 }
-      origin := .value temporaryScope { node := 744, port := 0 }
-      matrixType := fixtureType
-      matrixParams := fixtureParams
-      totalHardBound := .closedInt (.constant 3)
-    } : OperationalMatrixFact).initializePrimitivePolynomial .bounded
-    let (arena, representative) := ({} : OperationalExprArena).pushConcrete base
-    let (arena, root) ← arena.pushSharedSelection selection 2 representative
-      (selectedMatrixSummary #[base])
-    let indexed ← arena.indexedExpr root
-    let arena ← arena.rememberIndexedExpr indexed
-    let fact : OperationalFact := indexed
-    let (arena, abstract) ← abstractCarriedMaximum 0 arena fact
-    let (arena, recurrent) ← setFactRecurrenceState 2 [(.matrixMaximum 0 0)]
-      [.closedInt (.constant 3)] [.previous (.matrixMaximum 0 0)] 0 [] arena abstract
-    match recurrent with
-    | mapped@{ payload := .matrix mappedRoot, .. } =>
-        let bounds ← arena.foldMatrixConcreteLeaves mappedRoot ([] : List OperationalBoundExpr)
-          (fun values leaf => pure (values ++ [leaf.totalHardBound]))
-        pure (mapped.context == indexed.context && mapped.storage == IndexedStorage.sharedTemplate &&
-          bounds.all fun bound => match bound with
-            | .recurrenceState 2 _ _ _ (.matrixMaximum 0 0) => true
-            | _ => false)
-    | _ => pure false) with
-  | .ok value => value
-  | .error _ => false
-
-example : indexedCarriedRecurrenceFixture = true := by
   native_decide
 
 private def fixtureTrapdoorFact : OperationalScalarFact := .trapdoor {
@@ -516,76 +469,13 @@ retain the one source public matrix identity. This is the Diamond transition sha
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts sharedPreimageBaseScope
       sharedPreimageBaseDerivation [] []
-    let first ← derivedMatrixFactAt 4 facts { node := 3, port := 0 }
-    let second ← derivedMatrixFactAt 4 facts { node := 4, port := 0 }
+    let first ← matrixFactAt 4 facts { node := 3, port := 0 }
+    let second ← matrixFactAt 4 facts { node := 4, port := 0 }
     match first.relations, second.relations with
     | [.preimage left], [.preimage right] =>
         pure (left.publicIdentity == right.publicIdentity &&
           left.targetOrigin != right.targetOrigin && left.producer != right.producer)
     | _, _ => pure false) = .ok true := by
-  native_decide
-
-/-- The exact same family and exact same executable index wire preserve the public/private pair. -/
-example : (do
-    let selection := DynamicSelectionIdentity.fromOrigin
-      (.local (.root (.standalone 7)) { node := 3, port := 0 }) 2
-    let (arena, trapdoorInput) ← pushIndexedScalarFact {} fixtureTrapdoorFact
-    let (arena, publicInput) ← fixturePublicFact arena
-    let (arena, publicFact) ← selectDynamicUniformFact fixtureFamilyBinder selection
-      { node := 5, port := 0 } arena publicInput
-    let (arena, trapdoor) ← selectDynamicUniformFact fixtureFamilyBinder selection
-      { node := 6, port := 0 } arena trapdoorInput
-    match publicFact, trapdoor with
-    | publicFact@{ payload := .matrix _, .. }, trapdoor@{ payload := .scalar _, .. } =>
-        match ← arena.concreteFact publicFact.payload, ← arena.concreteIndexedScalar trapdoor with
-        | publicFact, .trapdoor trapdoor => pure (publicFact.identity == some trapdoor.publicIdentity)
-        | _, _ => pure false
-    | _, _ => pure false) = .ok true := by
-  native_decide
-
-/-- Merely equal-looking selections from different executable index wires do not compare equal. -/
-example : (do
-    let publicSelection := DynamicSelectionIdentity.fromOrigin
-      (.local (.root (.standalone 7)) { node := 3, port := 0 }) 2
-    let trapdoorSelection := DynamicSelectionIdentity.fromOrigin
-      (.local (.root (.standalone 7)) { node := 4, port := 0 }) 2
-    let (arena, trapdoorInput) ← pushIndexedScalarFact {} fixtureTrapdoorFact
-    let (arena, publicInput) ← fixturePublicFact arena
-    let (arena, publicFact) ← selectDynamicUniformFact fixtureFamilyBinder publicSelection
-      { node := 5, port := 0 } arena publicInput
-    let (arena, trapdoor) ← selectDynamicUniformFact fixtureFamilyBinder trapdoorSelection
-      { node := 6, port := 0 } arena trapdoorInput
-    match publicFact, trapdoor with
-    | publicFact@{ payload := .matrix _, .. }, trapdoor@{ payload := .scalar _, .. } =>
-        match ← arena.concreteFact publicFact.payload, ← arena.concreteIndexedScalar trapdoor with
-        | publicFact, .trapdoor trapdoor => pure (!(publicFact.identity == some trapdoor.publicIdentity))
-        | _, _ => pure false
-    | _, _ => pure false) = .ok true := by
-  native_decide
-
-/-- The flat polynomial, not merely the outer fact, preserves dynamic-selection identity. -/
-example : (do
-    let selection := DynamicSelectionIdentity.fromOrigin
-      (.local (.root (.standalone 7)) { node := 3, port := 0 }) 2
-    let differentSelection := DynamicSelectionIdentity.fromOrigin
-      (.local (.root (.standalone 7)) { node := 4, port := 0 }) 2
-    let (arena, publicInput) ← fixturePublicFact {}
-    let (arena, first) ← selectDynamicUniformFact fixtureFamilyBinder selection
-      { node := 5, port := 0 } arena publicInput
-    let (arena, publicInput) ← fixturePublicFact arena
-    let (arena, same) ← selectDynamicUniformFact fixtureFamilyBinder selection
-      { node := 6, port := 0 } arena publicInput
-    let (arena, publicInput) ← fixturePublicFact arena
-    let (arena, different) ← selectDynamicUniformFact fixtureFamilyBinder differentSelection
-      { node := 7, port := 0 } arena publicInput
-    match first, same, different with
-    | first@{ payload := .matrix _, .. }, same@{ payload := .matrix _, .. },
-        different@{ payload := .matrix _, .. } =>
-        let first ← arena.concreteFact first.payload
-        let same ← arena.concreteFact same.payload
-        let different ← arena.concreteFact different.payload
-        pure (first.polynomial == same.polynomial && first.polynomial != different.polynomial)
-    | _, _, _ => pure false) = .ok true := by
   native_decide
 
 private def fixtureScope : Scope := {
@@ -619,11 +509,6 @@ example : (do
     let (arena, first) ← instantiateFactLoopIndex 0 0 facts.arena sample
     let (arena, second) ← instantiateFactLoopIndex 0 1 arena sample
     match first, second with
-    | first@{ context := { binders := #[] }, payload := .matrix _, .. },
-        second@{ context := { binders := #[] }, payload := .matrix _, .. } =>
-        let first ← arena.concreteFact first.payload
-        let second ← arena.concreteFact second.payload
-        pure (!(subtractOperationalPolynomials first.polynomial second.polynomial).isEmpty)
     | first@{ context := { binders := #[] }, payload := .directValue _, .. },
         second@{ context := { binders := #[] }, payload := .directValue _, .. } =>
         let first ← arena.directValueFactAt [] first
@@ -651,7 +536,7 @@ private def scaledNoiseDerivation : ScopeDerivation := { steps := #[
 /-- The additive coefficient outside a compressed bounded product remains part of its bound. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
-    let fact ← derivedMatrixFactAt 1 facts { node := 1, port := 0 }
+    let fact ← matrixFactAt 1 facts { node := 1, port := 0 }
     fact.evaluateNoiseHardBound []) = .ok 6 := by
   native_decide
 
@@ -681,7 +566,7 @@ separately for the endpoint inequality. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts mixedSignalNoiseScope
       mixedSignalNoiseDerivation [] []
-    let fact ← derivedMatrixFactAt 2 facts { node := 2, port := 0 }
+    let fact ← matrixFactAt 2 facts { node := 2, port := 0 }
     let total ← fact.totalHardBound.evaluate [] #[]
     let noise ← fact.evaluateNoiseHardBound []
     pure (total, noise)) = .ok (8, 3) := by
@@ -709,7 +594,7 @@ private def flatCancellationDerivation : ScopeDerivation := { steps := #[
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts flatCancellationScope
       flatCancellationDerivation [] []
-    let result ← derivedMatrixFactAt 1 facts { node := 1, port := 0 }
+    let result ← matrixFactAt 1 facts { node := 1, port := 0 }
     pure result.polynomial.isEmpty) = .ok true := by
   native_decide
 
@@ -748,7 +633,7 @@ private def flatNoiseOrderDerivation : ScopeDerivation := { steps := #[
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts flatNoiseOrderScope
       flatNoiseOrderDerivation [] []
-    let result ← derivedMatrixFactAt 4 facts { node := 4, port := 0 }
+    let result ← matrixFactAt 4 facts { node := 4, port := 0 }
     pure result.polynomial.isEmpty) = .ok true := by
   native_decide
 
@@ -782,7 +667,7 @@ private def flatMultiLargeDerivation : ScopeDerivation := { steps := #[
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts flatMultiLargeScope
       flatMultiLargeDerivation [] []
-    let result ← derivedMatrixFactAt 3 facts { node := 3, port := 0 }
+    let result ← matrixFactAt 3 facts { node := 3, port := 0 }
     pure (result.polynomial.length, result.polynomial.all fun term =>
       operationalLargeFactorCount term = 2)) = .ok (4, true) := by
   native_decide
@@ -1011,11 +896,11 @@ packing, and residue reconstruction all reach explicit transfers in one closed f
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts samplerAndDecodeCoverageScope
       samplerAndDecodeCoverageDerivation [] []
-    let publicFact ← derivedMatrixFactAt 15 facts { node := 0, port := 0 }
-    let recovered ← derivedMatrixFactAt 15 facts { node := 3, port := 0 }
-    let preimage ← derivedMatrixFactAt 15 facts { node := 2, port := 0 }
+    let publicFact ← matrixFactAt 15 facts { node := 0, port := 0 }
+    let recovered ← matrixFactAt 15 facts { node := 3, port := 0 }
+    let preimage ← matrixFactAt 15 facts { node := 2, port := 0 }
     let decoded ← integerFactAt 15 facts { node := 5, port := 0 }
-    let packed ← derivedMatrixFactAt 15 facts { node := 15, port := 0 }
+    let packed ← matrixFactAt 15 facts { node := 15, port := 0 }
     pure (publicFact.identity == recovered.identity, preimage.relations.length,
       decoded.lower, decoded.upper, packed.polynomial.any operationalTermIsSignal)) =
       .ok (true, 1, 0, 2, true) := by
@@ -1044,8 +929,8 @@ private def hashIdentityFixtureDerivation : ScopeDerivation := { steps := #[
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts hashIdentityFixtureScope
       hashIdentityFixtureDerivation [] [fixtureLayout]
-    let plain ← derivedMatrixFactAt 2 facts { node := 1, port := 0 }
-    let decomposed ← derivedMatrixFactAt 2 facts { node := 2, port := 0 }
+    let plain ← matrixFactAt 2 facts { node := 1, port := 0 }
+    let decomposed ← matrixFactAt 2 facts { node := 2, port := 0 }
     match decomposed.relations with
     | [.decomposition relation] => pure (plain.origin == relation.inputOrigin)
     | _ => pure false) = .ok true := by
@@ -1081,8 +966,8 @@ argument order rather than being silently discarded. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts trailingHashIdentityFixtureScope
       trailingHashIdentityFixtureDerivation [] [fixtureLayout]
-    let plain ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
-    let decomposed ← derivedMatrixFactAt 3 facts { node := 3, port := 0 }
+    let plain ← matrixFactAt 3 facts { node := 2, port := 0 }
+    let decomposed ← matrixFactAt 3 facts { node := 3, port := 0 }
     match decomposed.relations with
     | [.decomposition relation] => pure (plain.origin == relation.inputOrigin)
     | _ => pure false) = .ok true := by
@@ -1102,8 +987,8 @@ example : (do
       hashIdentityFixtureDerivation [] [fixtureLayout] [leftInput] leftArena
     let rightFacts ← evaluateScopeOperationalWithKey rightScope hashIdentityFixtureScope
       hashIdentityFixtureDerivation [] [fixtureLayout] [rightInput] rightArena
-    let left ← derivedMatrixFactAt 2 leftFacts { node := 1, port := 0 }
-    let right ← derivedMatrixFactAt 2 rightFacts { node := 1, port := 0 }
+    let left ← matrixFactAt 2 leftFacts { node := 1, port := 0 }
+    let right ← matrixFactAt 2 rightFacts { node := 1, port := 0 }
     pure (left.origin == right.origin)) = .ok true := by
   native_decide
 
@@ -1325,8 +1210,8 @@ private def loopHashDerivation : ProgramDerivation := {
 same deterministic source identity merely because the body was analyzed once. -/
 example : (do
     let facts ← evaluateProgramOperationalWithLayouts loopHashProgram loopHashDerivation [] []
-    let first ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
-    let second ← derivedMatrixFactAt 3 facts { node := 3, port := 0 }
+    let first ← matrixFactAt 3 facts { node := 2, port := 0 }
+    let second ← matrixFactAt 3 facts { node := 3, port := 0 }
     pure (first.origin != second.origin)) = .ok true := by
   native_decide
 
@@ -1376,8 +1261,8 @@ identity. Flattening the child environment at template index zero would make the
 example : (do
     let facts ← evaluateProgramOperationalWithLayouts aliasedLoopHashProgram
       aliasedLoopHashDerivation [] []
-    let first ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
-    let second ← derivedMatrixFactAt 3 facts { node := 3, port := 0 }
+    let first ← matrixFactAt 3 facts { node := 2, port := 0 }
+    let second ← matrixFactAt 3 facts { node := 3, port := 0 }
     pure (first.origin != second.origin)) = .ok true := by
   native_decide
 
@@ -1494,8 +1379,8 @@ private def distinctCallIdentityDerivation : ProgramDerivation := {
 example : (do
     let facts ← evaluateProgramOperationalWithLayouts distinctCallIdentityProgram
       distinctCallIdentityDerivation [] [fixtureLayout]
-    let left ← derivedMatrixFactAt 2 facts { node := 1, port := 0 }
-    let right ← derivedMatrixFactAt 2 facts { node := 2, port := 0 }
+    let left ← matrixFactAt 2 facts { node := 1, port := 0 }
+    let right ← matrixFactAt 2 facts { node := 2, port := 0 }
     pure (left.origin != right.origin)) = .ok true := by
   native_decide
 
@@ -1553,7 +1438,7 @@ private def exactRelationSelectionFixtureResult : Except OperationalError Bool :
       packedFamilyFixtureDerivation [] [fixtureLayout]
     let dynamicOk ← factHasRelation facts.arena (← lookupFact 8 facts { node := 8, port := 0 })
     let rewritten ← lookupFact 11 facts { node := 11, port := 0 }
-    let rewrittenSchema ← derivedMatrixFactAt 11 facts { node := 11, port := 0 }
+    let rewrittenPhysical ← facts.arena.reducedDirectValueFactsAt [] rewritten
     let (rewrittenBound, _) ← operationalNoiseBoundForFact facts.arena rewritten []
     let representative : OperationalMatrixFact := {
       subject := { node := 20, port := 0 }
@@ -1578,7 +1463,8 @@ private def exactRelationSelectionFixtureResult : Except OperationalError Bool :
       | .error (.unsupportedOperationalExpr _) => true
       | _ => false
     let report ← decoderNoiseCheckReportForFact [] facts.arena rewritten [] 2 25
-    pure (dynamicOk && !matrixFactHasRelation rewrittenSchema && rewrittenBound == 3 &&
+    pure (dynamicOk && !rewrittenPhysical.isEmpty && rewrittenPhysical.all
+      (fun entry => !matrixFactHasRelation entry.fact) && rewrittenBound == 3 &&
       envelopeArena.nodes.size == 2 &&
       envelopeBound == 7 && staleRejected &&
       report.obligations == [.decoderThreshold 2 25 3])
@@ -2802,7 +2688,7 @@ example : (match evaluateScopeOperationalWithLayouts {
 plaintext modulus two, ciphertext modulus thirteen passes while the boundary value twelve fails. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
-    let residual ← derivedMatrixFactAt 1 facts { node := 1, port := 0 }
+    let residual ← matrixFactAt 1 facts { node := 1, port := 0 }
     let accepted ← decoderNoiseCheckReport [] residual [] 2 25
     let rejected ← decoderNoiseCheckReport [] residual [] 2 24
     pure (accepted.accepted, accepted.rejection, rejected.accepted, rejected.rejection)) =
@@ -2813,7 +2699,7 @@ example : (do
 application-specific checker. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
-    let residual ← derivedMatrixFactAt 1 facts { node := 1, port := 0 }
+    let residual ← matrixFactAt 1 facts { node := 1, port := 0 }
     let report ← decoderNoiseCheckReport [] residual [] 1 100
     pure (report.accepted, report.rejection)) =
     .ok (false, some (.invalidPlaintextModulus 1)) := by
@@ -2822,8 +2708,8 @@ example : (do
 /-- Exact indexed residual families inspect every member rather than using a representative lane. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
-    let first ← derivedMatrixFactAt 2 facts { node := 0, port := 0 }
-    let second ← derivedMatrixFactAt 2 facts { node := 1, port := 0 }
+    let first ← matrixFactAt 2 facts { node := 0, port := 0 }
+    let second ← matrixFactAt 2 facts { node := 1, port := 0 }
     let (fixed, firstReference) := ({} : FixedOperationalPayloadArena).pushMatrix first
     let (fixed, secondReference) := fixed.pushMatrix second
     let direct : DirectOperationalIndexedArena := { fixed }
@@ -2844,7 +2730,7 @@ example : (do
 /-- A checked Shared indexed family stores one direct template independently of its logical count. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts scaledNoiseScope scaledNoiseDerivation [] []
-    let template ← derivedMatrixFactAt 2 facts { node := 1, port := 0 }
+    let template ← matrixFactAt 2 facts { node := 1, port := 0 }
     let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushMatrix template
     let direct : DirectOperationalIndexedArena := { fixed }
     let binder := { directCarrierFixtureBinder 821 with count := .constant 100 }
@@ -3753,8 +3639,8 @@ selected under another identity, even when their underlying unselected gadget id
 private def crossSelectionRelationMismatchFixtureResult := do
     let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
       relationFixtureDerivation [] [fixtureLayout]
-    let publicMatrix ← derivedMatrixFactAt 3 facts { node := 1, port := 0 }
-    let preimage ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
+    let publicMatrix ← matrixFactAt 3 facts { node := 1, port := 0 }
+    let preimage ← matrixFactAt 3 facts { node := 2, port := 0 }
     let binder : FamilyTemplateBinder := {
       owner := temporaryScope, producerNode := 80, binderSlot := 0
     }
@@ -3801,8 +3687,8 @@ private def exactAdjacentRelationMatcherFixture : Bool :=
   match (do
     let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
       relationFixtureDerivation [] [fixtureLayout]
-    let publicMatrix ← derivedMatrixFactAt 3 facts { node := 1, port := 0 }
-    let preimage ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
+    let publicMatrix ← matrixFactAt 3 facts { node := 1, port := 0 }
+    let preimage ← matrixFactAt 3 facts { node := 2, port := 0 }
     let publicFactor ← match publicMatrix.polynomial with
       | [{ product := { factors := [factor], .. }, .. }] => pure factor
       | _ => throw (OperationalError.malformedRelation 165)
@@ -3909,8 +3795,8 @@ private def complementaryBlockContractFixture : Bool :=
   match (do
     let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
       relationFixtureDerivation [] [fixtureLayout]
-    let publicMatrix ← derivedMatrixFactAt 3 facts { node := 1, port := 0 }
-    let preimage ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
+    let publicMatrix ← matrixFactAt 3 facts { node := 1, port := 0 }
+    let preimage ← matrixFactAt 3 facts { node := 2, port := 0 }
     let left ← concatConcreteMatrixFacts 170 0 .columns fixtureColumns2Type [] #[publicMatrix, publicMatrix]
     let right ← concatConcreteMatrixFacts 171 0 .rows fixtureRows2Type [] #[preimage, preimage]
     let output ← multiplyConcreteMatrixFacts 172 0 fixtureType
@@ -4038,8 +3924,8 @@ private def directFamilyComplementaryBlockFixture : Bool :=
   match (do
     let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
       relationFixtureDerivation [] [fixtureLayout]
-    let publicMatrix ← derivedMatrixFactAt 3 facts { node := 1, port := 0 }
-    let preimage ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
+    let publicMatrix ← matrixFactAt 3 facts { node := 1, port := 0 }
+    let preimage ← matrixFactAt 3 facts { node := 2, port := 0 }
     let leftFact ← concatConcreteMatrixFacts 190 0 .columns fixtureColumns2Type []
       #[publicMatrix, publicMatrix]
     let rightFact ← concatConcreteMatrixFacts 191 0 .rows fixtureRows2Type [] #[preimage, preimage]

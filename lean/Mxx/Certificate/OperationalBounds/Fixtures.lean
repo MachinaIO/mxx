@@ -626,6 +626,11 @@ private def fixtureRows2Type : MatrixTypeExpr := {
   rows := .constant 2, columns := .constant 1
 }
 
+private def fixtureRows4Type : MatrixTypeExpr := {
+  modulus := .constant 17, ringDimension := .constant 1,
+  rows := .constant 4, columns := .constant 1
+}
+
 private def fixtureColumns2Type : MatrixTypeExpr := {
   modulus := .constant 17, ringDimension := .constant 1,
   rows := .constant 1, columns := .constant 2
@@ -2955,6 +2960,223 @@ private def crossSelectionRelationMismatchFixture : Bool :=
   match crossSelectionRelationMismatchFixtureResult with
   | .ok (positive, rejected) => positive && rejected
   | .error _ => false
+
+/-- Complementary column/row concat layouts retain every physical partition snapshot and expose
+the relation-bearing pairwise products before the ordinary relation rewrite. -/
+private def complementaryBlockContractFixture : Bool :=
+  match (do
+    let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
+      relationFixtureDerivation [] [fixtureLayout]
+    let publicMatrix ← derivedMatrixFactAt 3 facts { node := 1, port := 0 }
+    let preimage ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
+    let left ← concatConcreteMatrixFacts 170 0 .columns fixtureColumns2Type [] #[publicMatrix, publicMatrix]
+    let right ← concatConcreteMatrixFacts 171 0 .rows fixtureRows2Type [] #[preimage, preimage]
+    let output ← multiplyConcreteMatrixFacts 172 0 fixtureType
+      (.matrixMultiplyRelation { node := 2, port := 0 }) { node := 2, port := 0 } [] left right
+    let leftLayoutOk := left.blockLayout.any fun (layout : OperationalBlockLayout) =>
+      layout.axis == ConcatAxis.columns && layout.partitions.size == 2
+    let rightLayoutOk := right.blockLayout.any fun (layout : OperationalBlockLayout) =>
+      layout.axis == ConcatAxis.rows && layout.partitions.size == 2
+    let embedsRemoved := output.polynomial.all fun term => term.product.factors.all fun factor =>
+      !factor.transforms.any fun transform => match transform with
+        | .columnEmbed .columns _ | .rowEmbed .rows _ => true
+        | _ => false
+    pure (leftLayoutOk && rightLayoutOk && !matrixFactHasRelation output && embedsRemoved)) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Non-complementary concat axes remain on the compact ordinary product path; they are never
+mistaken for a blockwise sum. -/
+private def reverseBlockLayoutPreservedFixture : Bool :=
+  match (do
+    let fact := boundedOperationalExprFixtureFact 173 2
+    let left ← concatConcreteMatrixFacts 174 0 .rows fixtureRows2Type [] #[fact, fact]
+    let right ← concatConcreteMatrixFacts 175 0 .columns fixtureColumns2Type [] #[fact, fact]
+    let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial |>.mapError (flatErrorAt 176)
+    let preserved ← contractComplementaryBlocks 176 fixtureSquare2Type left right raw
+    pure (!raw.isEmpty && preserved == raw)) with
+  | .ok true => true
+  | _ => false
+
+/-- Reverse and diagonal concat layouts carry nonempty raw products unchanged; neither is a
+complementary column/row contraction. -/
+private def diagonalBlockLayoutPreservedFixture : Bool :=
+  match (do
+    let fact := boundedOperationalExprFixtureFact 176 2
+    let left ← concatConcreteMatrixFacts 177 0 .diagonal fixtureSquare2Type [] #[fact, fact]
+    let right ← concatConcreteMatrixFacts 178 0 .diagonal fixtureSquare2Type [] #[fact, fact]
+    let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial |>.mapError (flatErrorAt 179)
+    let preserved ← contractComplementaryBlocks 179 fixtureSquare2Type left right raw
+    pure (!raw.isEmpty && preserved == raw)) with
+  | .ok true => true
+  | _ => false
+
+/-- A syntactically forged layout owner or output shape is rejected before any snapshot product
+is considered. -/
+private def forgedComplementaryBlockLayoutRejectedFixture : Bool :=
+  match (do
+    let fact := boundedOperationalExprFixtureFact 180 2
+    let left ← concatConcreteMatrixFacts 181 0 .columns fixtureColumns2Type [] #[fact, fact]
+    let right ← concatConcreteMatrixFacts 182 0 .rows fixtureRows2Type [] #[fact, fact]
+    let forgedOwner := { left with matrixType := fixtureType }
+    let ownerRejected := match contractComplementaryBlocks 183 fixtureType forgedOwner right [] with
+      | .error (.malformedRelation 183) => true
+      | _ => false
+    let outputRejected := match contractComplementaryBlocks 184 fixtureColumns2Type left right [] with
+      | .error (.malformedRelation 184) => true
+      | _ => false
+    pure (ownerRejected && outputRejected)) with
+  | .ok value => value
+  | .error _ => false
+
+/-- An actual zero block has no polynomial terms but remains the second ordered physical layout
+partition, so contraction does not infer count or ordering from visible terms. -/
+private def zeroComplementaryBlockPartitionFixture : Bool :=
+  match (do
+    let fact := boundedOperationalExprFixtureFact 185 2
+    let zero := { fact with polynomial := [] }
+    let left ← concatConcreteMatrixFacts 186 0 .columns fixtureColumns2Type [] #[fact, zero]
+    let right ← concatConcreteMatrixFacts 187 0 .rows fixtureRows2Type [] #[fact, zero]
+    let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial |>.mapError (flatErrorAt 188)
+    let contracted ← contractComplementaryBlocks 188 fixtureType left right raw
+    let leftLayout ← match left.blockLayout with
+      | some layout => pure layout
+      | none => throw (OperationalError.malformedRelation 188)
+    let rightLayout ← match right.blockLayout with
+      | some layout => pure layout
+      | none => throw (OperationalError.malformedRelation 188)
+    pure (leftLayout.partitions.size == 2 && rightLayout.partitions.size == 2 &&
+      leftLayout.partitions[1]?.any fun (partition : OperationalBlockPartition) =>
+        partition.polynomial.isEmpty &&
+      rightLayout.partitions[1]?.any fun (partition : OperationalBlockPartition) =>
+        partition.polynomial.isEmpty && !contracted.isEmpty)) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Complementary layouts must have exactly the same ordered physical partition count. -/
+private def complementaryBlockCountMismatchFixture : Bool :=
+  match (do
+    let fact := boundedOperationalExprFixtureFact 177 2
+    let left ← concatConcreteMatrixFacts 178 0 .columns fixtureColumns2Type [] #[fact, fact]
+    let right ← concatConcreteMatrixFacts 179 0 .rows fixtureType [] #[fact]
+    contractComplementaryBlocks 180 fixtureType left right []) with
+  | .error (.malformedRelation 180) => true
+  | _ => false
+
+/-- Complementary layouts also validate the inner type at every partition boundary. -/
+private def complementaryBlockBoundaryMismatchFixture : Bool :=
+  match (do
+    let fact := boundedOperationalExprFixtureFact 181 2
+    let rows2 := { fact with matrixType := fixtureRows2Type, matrixParams :=
+      { fact.matrixParams with rows := 2 } }.refreshPrimitivePolynomial
+    let left ← concatConcreteMatrixFacts 182 0 .columns fixtureColumns2Type [] #[fact, fact]
+    let right ← concatConcreteMatrixFacts 183 0 .rows fixtureRows4Type [] #[rows2, rows2]
+    contractComplementaryBlocks 184 fixtureType left right []) with
+  | .error (.malformedRelation 184) => true
+  | _ => false
+
+/-- A singleton complementary layout is still contracted through its authoritative snapshot. -/
+private def singletonComplementaryBlockFixture : Bool :=
+  match (do
+    let left := boundedOperationalExprFixtureFact 185 2
+    let right := boundedOperationalExprFixtureFact 186 3
+    let leftLayout ← concatConcreteMatrixFacts 187 0 .columns fixtureType [] #[left]
+    let rightLayout ← concatConcreteMatrixFacts 188 0 .rows fixtureType [] #[right]
+    let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial |>.mapError (flatErrorAt 189)
+    let contracted ← contractComplementaryBlocks 189 fixtureType leftLayout rightLayout raw
+    pure (!contracted.isEmpty && leftLayout.blockLayout.any fun (layout : OperationalBlockLayout) =>
+      layout.partitions.size == 1 && rightLayout.blockLayout.any fun (rightLayout : OperationalBlockLayout) =>
+        rightLayout.partitions.size == 1)) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Direct family reduction contracts the matching column/row layouts lane-by-lane when both
+explicit tables carry the same selector. A different selector is rejected before any pairing. -/
+private def directFamilyComplementaryBlockFixture : Bool :=
+  match (do
+    let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
+      relationFixtureDerivation [] [fixtureLayout]
+    let publicMatrix ← derivedMatrixFactAt 3 facts { node := 1, port := 0 }
+    let preimage ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
+    let leftFact ← concatConcreteMatrixFacts 190 0 .columns fixtureColumns2Type []
+      #[publicMatrix, publicMatrix]
+    let rightFact ← concatConcreteMatrixFacts 191 0 .rows fixtureRows2Type [] #[preimage, preimage]
+    let binder := { directCarrierFixtureBinder 192 with count := .constant 2 }
+    let otherBinder := { directCarrierFixtureBinder 193 with count := .constant 2 }
+    let (fixed, leftReference) := ({} : FixedOperationalPayloadArena).pushMatrix leftFact
+    let (fixed, rightReference) := fixed.pushMatrix rightFact
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, leftRoot) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureColumns2Type) #[leftReference, leftReference] with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr direct.values.size)
+    let (direct, rightRoot) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureRows2Type) #[rightReference, rightReference] with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr direct.values.size)
+    let (direct, otherRoot) ← match direct.pushExplicit [] { binders := #[otherBinder] } otherBinder
+        (.matrix fixtureRows2Type) #[rightReference, rightReference] with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr direct.values.size)
+    let arena : OperationalExprArena := { direct }
+    let left : IndexedOperationalFact := {
+      context := { binders := #[binder] }
+      payload := .directValue leftRoot
+      storage := .explicitTable
+    }
+    let right : IndexedOperationalFact := {
+      context := { binders := #[binder] }
+      payload := .directValue rightRoot
+      storage := .explicitTable
+    }
+    let other : IndexedOperationalFact := {
+      context := { binders := #[otherBinder] }
+      payload := .directValue otherRoot
+      storage := .explicitTable
+    }
+    let relationWire : WireRef := { node := 2, port := 0 }
+    let relationRule : DerivationRule := .matrixMultiplyRelation relationWire
+    let operation : PrimitiveOperation := {
+      kind := .multiply relationRule relationWire
+      outputType := fixtureType
+      ownerScope := none
+      ownerNode := 194
+      outputPort := 0
+      parameterEnvironment := []
+    }
+    let (arena, accepted) ← arena.pushDirectMatrixPointwise operation left right
+    let accepted ← arena.reducedDirectValueFactsAt [] accepted
+    let (arena, rejected) ← arena.pushDirectMatrixPointwise operation left other
+    let rejected := arena.reducedDirectValueFactsAt [] rejected
+    let acceptedOk := accepted.length == 2 && accepted.all fun (entry : ReducedDirectMatrixFact) =>
+      entry.key == some (IndexExpr.variable binder) && !matrixFactHasRelation entry.fact
+    let selector := { directCarrierFixtureBinder 195 with count := .constant 2 }
+    let map ← match dynamicIndexMap left.context binder (IndexExpr.variable selector) with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 195)
+    let (arena, reindexedLeft) ← arena.reindexDirectMatrixFact map left
+    let (arena, reindexedRight) ← arena.reindexDirectMatrixFact map right
+    let (arena, reindexedAccepted) ← arena.pushDirectMatrixPointwise operation reindexedLeft reindexedRight
+    let reindexedAccepted ← arena.reducedDirectValueFactsAt [] reindexedAccepted
+    let reindexedOk := reindexedAccepted.length == 2 &&
+      reindexedAccepted.all fun (entry : ReducedDirectMatrixFact) =>
+        entry.key == some (IndexExpr.variable selector) && !matrixFactHasRelation entry.fact
+    let rejectedOk := match rejected with
+      | .error (.unsupportedOperationalExpr _) => true
+      | _ => false
+    pure (acceptedOk && reindexedOk && rejectedOk)) with
+  | .ok value => value
+  | .error _ => false
+
+example : complementaryBlockContractFixture = true := by native_decide
+example : reverseBlockLayoutPreservedFixture = true := by native_decide
+example : diagonalBlockLayoutPreservedFixture = true := by native_decide
+example : forgedComplementaryBlockLayoutRejectedFixture = true := by native_decide
+example : zeroComplementaryBlockPartitionFixture = true := by native_decide
+example : complementaryBlockCountMismatchFixture = true := by native_decide
+example : complementaryBlockBoundaryMismatchFixture = true := by native_decide
+example : singletonComplementaryBlockFixture = true := by native_decide
+example : directFamilyComplementaryBlockFixture = true := by native_decide
 
 /-- The Tall-size LUT family is checked once, remains logically 30,720 distinct relation-bearing
 lane instances, and stores only one representative after uniform-schema validation. -/

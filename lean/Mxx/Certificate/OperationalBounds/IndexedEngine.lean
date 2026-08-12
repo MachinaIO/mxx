@@ -2704,6 +2704,66 @@ def constantPolynomialProductCanonicalRange
       else .unknown
   | _, _ => .unknown
 
+/-- Contract only the matching block boundaries of a column-concatenated left operand and a
+row-concatenated right operand.  The ordered concat snapshots, rather than the visible embedded
+terms, are authoritative: an all-zero block therefore remains a required physical lane. -/
+def contractComplementaryBlocks
+    (node : Nat)
+    (expectedOutput : MatrixTypeExpr)
+    (left right : OperationalMatrixFact)
+    (raw : OperationalPolynomial) : Except OperationalError OperationalPolynomial := do
+  let layoutMatchesOwner (axis : ConcatAxis) (owner : MatrixTypeExpr)
+      (partitions : Array OperationalBlockPartition) : Bool :=
+    if partitions.isEmpty then false else
+    match partitions[0]? with
+    | none => false
+    | some first =>
+        let sameRing := partitions.all fun partition => operationalSameRing partition.matrixType owner
+        match axis with
+        | .columns => sameRing &&
+            partitions.all (fun partition => operationalDimensionEqual partition.matrixType.rows first.matrixType.rows) &&
+            operationalDimensionEqual first.matrixType.rows owner.rows &&
+            operationalDimensionEqual
+              (partitions.foldl (fun total partition => .add total partition.matrixType.columns)
+                (.constant 0)) owner.columns
+        | .rows => sameRing &&
+            partitions.all (fun partition => operationalDimensionEqual partition.matrixType.columns
+              first.matrixType.columns) &&
+            operationalDimensionEqual first.matrixType.columns owner.columns &&
+            operationalDimensionEqual
+              (partitions.foldl (fun total partition => .add total partition.matrixType.rows)
+                (.constant 0)) owner.rows
+        | .diagonal => false
+  match left.blockLayout, right.blockLayout with
+  | some leftLayout, some rightLayout =>
+      if leftLayout.axis != .columns || rightLayout.axis != .rows then pure raw
+      else if !layoutMatchesOwner .columns left.matrixType leftLayout.partitions ||
+          !layoutMatchesOwner .rows right.matrixType rightLayout.partitions ||
+          !operationalSameRing left.matrixType right.matrixType ||
+          !operationalSameRing left.matrixType expectedOutput ||
+          !operationalDimensionEqual left.matrixType.rows expectedOutput.rows ||
+          !operationalDimensionEqual right.matrixType.columns expectedOutput.columns then
+        throw (.malformedRelation node)
+      else if leftLayout.partitions.size != rightLayout.partitions.size then
+        throw (.malformedRelation node)
+      else do
+        let mut contracted : OperationalPolynomial := []
+        for index in [:leftLayout.partitions.size] do
+          let leftPart ← match leftLayout.partitions[index]? with
+            | some partition => pure partition
+            | none => throw (.malformedRelation node)
+          let rightPart ← match rightLayout.partitions[index]? with
+            | some partition => pure partition
+            | none => throw (.malformedRelation node)
+          if !operationalSameRing leftPart.matrixType rightPart.matrixType ||
+              !operationalDimensionEqual leftPart.matrixType.columns rightPart.matrixType.rows then
+            throw (.malformedRelation node)
+          let product ← multiplyOperationalPolynomials leftPart.polynomial rightPart.polynomial
+            |>.mapError (flatErrorAt node)
+          contracted := contracted ++ product
+        normalizeOperationalPolynomial contracted |>.mapError (flatErrorAt node)
+  | _, _ => pure raw
+
 def multiplyConcreteMatrixFacts
     (nodeIndex outputPort : Nat)
     (matrixType : MatrixTypeExpr)
@@ -2713,11 +2773,12 @@ def multiplyConcreteMatrixFacts
     (left right : OperationalMatrixFact) : Except OperationalError OperationalMatrixFact := do
   let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial
     |>.mapError (flatErrorAt nodeIndex)
-  let rewritten ← rewriteOperationalRelations nodeIndex raw
+  let contracted ← contractComplementaryBlocks nodeIndex matrixType left right raw
+  let rewritten ← rewriteOperationalRelations nodeIndex contracted
   let polynomial ← match rule with
     | .matrixMultiplyRelation declaredRight => do
         if declaredRight != rightWire then throw (.missingRelation nodeIndex declaredRight)
-        if rewritten == raw then throw (.missingRelation nodeIndex rightWire)
+        if rewritten == contracted then throw (.missingRelation nodeIndex rightWire)
         pure rewritten
     | _ => pure rewritten
   polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
@@ -3595,7 +3656,8 @@ def transformOperationalBoundary
     | .columns => applyAt (columnBoundaryIndex term.product) (.columnEmbed .columns part) (fun matrixType =>
         { matrixType with columns := outputType.columns })
     | .diagonal => do
-        let rowProduct ← applyAt (rowBoundaryIndex term.product) (.rowEmbed .diagonal part)
+        let rowProduct ← applyAt (rowBoundaryIndex term.product)
+          (.rowEmbed .diagonal part)
           (fun matrixType => { matrixType with rows := outputType.rows })
         let index := columnBoundaryIndex rowProduct
         let factor ← match rowProduct.factors[index]? with
@@ -3631,8 +3693,10 @@ def concatConcreteMatrixFacts
     (inputs : Array OperationalMatrixFact) : Except OperationalError OperationalMatrixFact := do
   let polynomial ← concatOperationalPolynomials axis matrixType
     (inputs.toList.map (·.polynomial)) |>.mapError (flatErrorAt nodeIndex)
-  polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+  let result ← polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
     (concatCanonicalRange inputs)
+  pure { result with blockLayout := some { axis, partitions := inputs.map fun input => {
+    matrixType := input.matrixType, polynomial := input.polynomial } } }
 
 def transposeOperationalPolynomial
     (terms : OperationalPolynomial) : Except OperationalFlatError OperationalPolynomial := do
@@ -5322,6 +5386,19 @@ def reindexOperationalPolynomial
       outputType := ← reindexMatrixTypeExpr map term.product.outputType
     } }
 
+def reindexOperationalBlockPartition
+    (map : IndexMap)
+    (partition : OperationalBlockPartition) : Option OperationalBlockPartition := do
+  pure {
+    matrixType := ← reindexMatrixTypeExpr map partition.matrixType
+    polynomial := ← reindexOperationalPolynomial map partition.polynomial
+  }
+
+def reindexOperationalBlockLayout
+    (map : IndexMap)
+    (layout : OperationalBlockLayout) : Option OperationalBlockLayout := do
+  pure { layout with partitions := ← layout.partitions.mapM (reindexOperationalBlockPartition map) }
+
 /-- Exhaustive transport for a matrix payload.  Old selected identities return `none` above, so
 callers cannot accidentally retain a pre-indexed selector in an otherwise reindexed fact. -/
 def reindexOperationalMatrixFact
@@ -5334,6 +5411,7 @@ def reindexOperationalMatrixFact
     identity := ← fact.identity.mapM (reindexPublicMatrixIdentity map)
     relations := ← fact.relations.mapM (reindexOperationalMatrixRelation map)
     polynomial := ← reindexOperationalPolynomial map fact.polynomial
+    blockLayout := ← fact.blockLayout.mapM (reindexOperationalBlockLayout map)
   }
 
 /-- Reindex one direct matrix carrier value.  The storage map retains the indexed shape and

@@ -1090,6 +1090,16 @@ def normalizeOperationalPolynomial
   let compressedNoise ← compressBoundedNoiseSum compressibleNoise
   pure (normalizeOperationalTerms (signal ++ protectedNoise ++ compressedNoise))
 
+structure OperationalBlockPartition where
+  matrixType : MatrixTypeExpr
+  polynomial : OperationalPolynomial
+  deriving BEq
+
+structure OperationalBlockLayout where
+  axis : ConcatAxis
+  partitions : Array OperationalBlockPartition
+  deriving BEq
+
 structure OperationalMatrixFact where
   subject : WireRef
   origin : MatrixOriginIdentity
@@ -1101,6 +1111,7 @@ structure OperationalMatrixFact where
   canonicalRange : CanonicalRange := .unknown
   identity : Option PublicMatrixIdentity := none
   relations : List OperationalMatrixRelation := []
+  blockLayout : Option OperationalBlockLayout := none
   deriving BEq
 
 abbrev OperationalExprId := Nat

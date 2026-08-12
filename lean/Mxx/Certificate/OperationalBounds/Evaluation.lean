@@ -352,19 +352,8 @@ def genericNodeMatrixFactConcrete
         | none => throw (.missingOperand nodeIndex leftWire)
       let leftFact ← fixedMatrixFactAt leftWire
       let rightFact ← fixedMatrixFactAt rightWire
-      let multiplyPair
-          (left right : OperationalMatrixFact) : Except OperationalError OperationalMatrixFact := do
-        let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial
-          |>.mapError (flatErrorAt nodeIndex)
-        let rewritten ← rewriteOperationalRelations nodeIndex raw
-        let polynomial ← match rule with
-          | .matrixMultiplyRelation declaredRight => do
-              if declaredRight != rightWire then throw (.missingRelation nodeIndex declaredRight)
-              if rewritten == raw then throw (.missingRelation nodeIndex rightWire)
-              pure rewritten
-          | _ => pure rewritten
-        polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
-      multiplyPair leftFact rightFact
+      multiplyConcreteMatrixFacts nodeIndex outputPort matrixType rule rightWire environment
+        leftFact rightFact
   | .tensor, some matrixType =>
       let leftWire ← match node.arguments[0]? with
         | some wire => pure wire

@@ -321,7 +321,7 @@ def genericNodeMatrixFactConcrete
       let input ← fixedMatrixFactAt inputWire
       let input ← retypeMatrixFact nodeIndex matrixType input environment
       polynomialMatrixFact nodeIndex outputPort matrixType environment
-        (scaleOperationalPolynomial (-1) input.polynomial) input.canonicalRange
+        (scaleOperationalPolynomial (-1) input.polynomial) (negateCanonicalRange input.canonicalRange)
   | .matrixScale scalar, some matrixType =>
       let scalarValues ← evaluateIntOverLoops environment loopDomains scalar
       let inputWire ← match node.arguments[0]? with
@@ -342,7 +342,8 @@ def genericNodeMatrixFactConcrete
                 multiplyOperationalPolynomials
                   (parameterScalarPolynomial environment loopDomains scalar matrixType)
                   input.polynomial |>.mapError (flatErrorAt nodeIndex)
-            polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+            polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+              (scaleCanonicalRange scalarValues input.canonicalRange)
   | .matrixMultiply, some matrixType =>
       let leftWire ← match node.arguments[0]? with
         | some wire => pure wire

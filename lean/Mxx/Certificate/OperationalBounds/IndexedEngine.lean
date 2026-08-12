@@ -3568,6 +3568,21 @@ def concatCanonicalRange (inputs : Array OperationalMatrixFact) : CanonicalRange
       | .unknown => result) 0)
   else .unknown
 
+/-- Negation preserves a canonical coefficient interval only for the exact-zero interval.
+Ordinary canonical representatives are not closed under additive inversion: for example, the
+negation of a coefficient in `[0, 2)` modulo `17` can be `16`. -/
+def negateCanonicalRange : CanonicalRange → CanonicalRange
+  | .below upper => if upper <= 1 then .below upper else .unknown
+  | .unknown => .unknown
+
+/-- Scaling preserves a canonical coefficient interval only for a provably identity scalar, or
+for the exact-zero interval.  Other scalars require a separately proved modular range transfer. -/
+def scaleCanonicalRange (scalarValues : List Int) : CanonicalRange → CanonicalRange
+  | .below upper =>
+      if upper <= 1 || (!scalarValues.isEmpty && scalarValues.all (· == 1)) then .below upper
+      else .unknown
+  | .unknown => .unknown
+
 def concatConcreteMatrixFacts
     (nodeIndex outputPort : Nat)
     (axis : ConcatAxis)
@@ -3659,7 +3674,11 @@ def transformConcreteMatrixFact
     | .rowEmbed axis part | .columnEmbed axis part =>
         input.polynomial.mapM (transformOperationalBoundary axis part matrixType)
           |>.mapError (flatErrorAt nodeIndex)
-  polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+  let canonicalRange := match operation with
+    | .negate => negateCanonicalRange input.canonicalRange
+    | .transpose | .rowSlice _ _ | .columnSlice _ _ | .rowEmbed _ _ | .columnEmbed _ _ =>
+        input.canonicalRange
+  polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial canonicalRange
 
 def transformOperationalExprId
     (nodeIndex outputPort : Nat)
@@ -3738,7 +3757,8 @@ def scaleConcreteMatrixFact
       multiplyOperationalPolynomials
         (parameterScalarPolynomial environment loopDomains scalar matrixType)
         input.polynomial |>.mapError (flatErrorAt nodeIndex)
-  polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial input.canonicalRange
+  polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
+    (scaleCanonicalRange scalarValues input.canonicalRange)
 
 def scaleOperationalExprId
     (nodeIndex outputPort : Nat)

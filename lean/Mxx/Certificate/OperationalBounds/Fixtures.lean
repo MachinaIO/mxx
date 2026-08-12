@@ -2756,6 +2756,55 @@ private def directRelationClosedSchemaFixture : Bool :=
 
 example : directRelationClosedSchemaFixture = true := by native_decide
 
+/-- Canonical coefficient representatives are not stable under negation or nonidentity scaling.
+For modulus 17, a fact in `[0, 2)` may become 16 after negation, so a subsequent small
+decomposition must not receive the original range authorization.  The direct pointwise kernel is
+also the fixed-assignment production path for delayed indexed values. -/
+private def canonicalRangeTransformFixture : Bool :=
+  match (do
+    let input := { boundedOperationalExprFixtureFact 845 2 with canonicalRange := .below 2 }
+    let negate : PrimitiveOperation := {
+      kind := .transform .negate, outputType := fixtureType, ownerScope := none, ownerNode := 846,
+      outputPort := 0, parameterEnvironment := [] }
+    let scale (node : Nat) (scalar : Int) : PrimitiveOperation := {
+      kind := .scale (.constant scalar) [scalar] [], outputType := fixtureType, ownerScope := none,
+      ownerNode := node, outputPort := 0, parameterEnvironment := [] }
+    let negated ← applyDirectMatrixPointwiseOperation negate fixtureType #[input]
+    let scaled ← applyDirectMatrixPointwiseOperation (scale 847 2) fixtureType #[input]
+    let identity ← applyDirectMatrixPointwiseOperation (scale 848 1) fixtureType #[input]
+    let concreteNegated ← transformConcreteMatrixFact 852 0 fixtureType .negate [] input
+    let concreteScaled ← scaleConcreteMatrixFact 853 0 fixtureType (.constant 2) [2] [] [] input
+    let zero := { input with canonicalRange := .below 1 }
+    let zeroNegated ← applyDirectMatrixPointwiseOperation negate fixtureType #[zero]
+    let zeroScaled ← applyDirectMatrixPointwiseOperation (scale 854 2) fixtureType #[zero]
+    let decompose (node : Nat) (fact : OperationalMatrixFact) :
+        Except OperationalError ReconstructionStatus := do
+      let operation : DirectRelationOperation := {
+        kind := .decomposition fixtureType (.constant 2) true (.constant 1) [] [fixtureLayout]
+        outputType := fixtureType, ownerScope := none, ownerNode := node, outputPort := 0,
+        parameterEnvironment := [] }
+      let output ← applyDirectRelationProducer operation fixtureType #[.matrix fact]
+      match output.relations with
+      | [.decomposition relation] => pure relation.status
+      | _ => throw (OperationalError.unsupportedOperationalExpr node)
+    let negatedStatus ← decompose 849 negated
+    let scaledStatus ← decompose 850 scaled
+    let identityStatus ← decompose 851 identity
+    pure (negated.canonicalRange == CanonicalRange.unknown &&
+      scaled.canonicalRange == CanonicalRange.unknown &&
+      identity.canonicalRange == CanonicalRange.below 2 &&
+      concreteNegated.canonicalRange == CanonicalRange.unknown &&
+      concreteScaled.canonicalRange == CanonicalRange.unknown &&
+      zeroNegated.canonicalRange == CanonicalRange.below 1 &&
+      zeroScaled.canonicalRange == CanonicalRange.below 1 &&
+      negatedStatus == ReconstructionStatus.smallRangeMissing 17 &&
+      scaledStatus == ReconstructionStatus.smallRangeMissing 17 &&
+      identityStatus == ReconstructionStatus.available)) with
+  | .ok value => value
+  | .error _ => false
+
+example : canonicalRangeTransformFixture = true := by native_decide
+
 /-- Direct decomposition retains the selected source lane as its relation input, rather than
 collapsing a delayed family to a representative matrix fact. -/
 private def directDecompositionFamilyFixture : Bool :=
@@ -5106,6 +5155,7 @@ example : exactRelationSelectionFixtureResult = .ok true ∧
     directValueContextCorrelationFixture = true ∧
     directValueScalarContextFixture = true ∧
     directValueScalarKernelFixture = true ∧
+    canonicalRangeTransformFixture = true ∧
     directFamilySelectFixture = .ok true ∧
     outOfRangeDirectFamilyGetFixture = true ∧
     symbolicFamilySelectFixture = .ok true ∧

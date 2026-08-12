@@ -498,6 +498,69 @@ partial def DirectOperationalIndexedArena.mapMatrixValue
   let (arena, _, mapped) ← visit (arena.values.size + 1) arena {} root
   pure (arena, mapped)
 
+/-- Scalar analogue of `mapMatrixValue`.  Graph-boundary rebinding must transport integer
+producer subjects through direct scalar families without treating them as matrix leaves. -/
+partial def DirectOperationalIndexedArena.mapScalarValue
+    (arena : DirectOperationalIndexedArena)
+    (root : OperationalIndexedValueId)
+    (mapFact : OperationalScalarFact → Except OperationalError OperationalScalarFact) :
+    Except OperationalError (DirectOperationalIndexedArena × OperationalIndexedValueId) := do
+  let rec visit : Nat → DirectOperationalIndexedArena →
+      Std.HashMap OperationalIndexedValueId OperationalIndexedValueId → OperationalIndexedValueId →
+      Except OperationalError (DirectOperationalIndexedArena ×
+        Std.HashMap OperationalIndexedValueId OperationalIndexedValueId × OperationalIndexedValueId)
+    | 0, _, _, id => throw (.unsupportedOperationalExpr id)
+    | fuel + 1, arena, memo, id => match memo[id]? with
+      | some mapped => pure (arena, memo, mapped)
+      | none => do
+          let value ← match arena.valueAt? id with
+            | some value => pure value | none => throw (.invalidOperationalExprRef id)
+          if !validateContext value.context then throw (.unsupportedOperationalExpr id)
+          let (arena, memo, mapped) ← match value.payload with
+            | .shared (.scalar scalarType) (.scalar reference) => do
+                let fact ← match arena.fixed.scalars[reference]? with
+                  | some fact => pure fact | none => throw (.invalidOperationalExprRef reference)
+                let (fixed, replacement) := arena.fixed.pushScalar (← mapFact fact)
+                let direct := { arena with fixed }
+                let (direct, mapped) ← match direct.pushShared value.context (.scalar scalarType) replacement with
+                  | some result => pure result | none => throw (.unsupportedOperationalExpr id)
+                pure (direct, memo, mapped)
+            | .explicit (.scalar scalarType) binder references => do
+                let (arena, references) ← references.foldlM (fun (arena, mapped) reference => do
+                  let reference ← match reference with
+                    | .scalar reference => pure reference | .matrix _ => throw (.unsupportedOperationalExpr id)
+                  let fact ← match arena.fixed.scalars[reference]? with
+                    | some fact => pure fact | none => throw (.invalidOperationalExprRef reference)
+                  let (fixed, replacement) := arena.fixed.pushScalar (← mapFact fact)
+                  pure ({ arena with fixed }, mapped.push replacement)) (arena, #[])
+                let (arena, mapped) := arena.pushValue value.context (.explicit (.scalar scalarType) binder references)
+                pure (arena, memo, mapped)
+            | .explicitValues (.scalar scalarType) binder values => do
+                let (arena, memo, values) ← values.foldlM (fun (arena, memo, mapped) value => do
+                  let (arena, memo, value) ← visit fuel arena memo value
+                  pure (arena, memo, mapped.push value)) (arena, memo, #[])
+                let (arena, mapped) := arena.pushValue value.context (.explicitValues (.scalar scalarType) binder values)
+                pure (arena, memo, mapped)
+            | .mapped (.scalar scalarType) source map => do
+                let (arena, memo, source) ← visit fuel arena memo source
+                let (arena, mapped) := arena.pushValue value.context (.mapped (.scalar scalarType) source map)
+                pure (arena, memo, mapped)
+            | .pointwise (.scalar scalarType) operation inputs => do
+                let (arena, memo, inputs) ← inputs.foldlM (fun (arena, memo, mapped) input => do
+                  let inputValue ← match arena.valueAt? input with
+                    | some value => pure value | none => throw (.invalidOperationalExprRef input)
+                  match inputValue.payload.schema with
+                  | .scalar _ =>
+                      let (arena, memo, input) ← visit fuel arena memo input
+                      pure (arena, memo, mapped.push input)
+                  | .matrix _ => pure (arena, memo, mapped.push input)) (arena, memo, #[])
+                let (arena, mapped) := arena.pushValue value.context (.pointwise (.scalar scalarType) operation inputs)
+                pure (arena, memo, mapped)
+            | _ => throw (.unsupportedOperationalExpr id)
+          pure (arena, memo.insert id mapped, mapped)
+  let (arena, _, mapped) ← visit (arena.values.size + 1) arena {} root
+  pure (arena, mapped)
+
 def directCarrierFixtureBinder (node : Nat) : IndexVariable := {
   owner := { stage := ⟨"direct-indexed-carrier-fixture"⟩, scope := ⟨[]⟩, node := ⟨node⟩ }
   slot := 0

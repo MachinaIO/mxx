@@ -4499,6 +4499,52 @@ def integerFactAt
       | _ => throw (.operandNotInteger node wire)
   | _ => throw (.operandNotInteger node wire)
 
+/-- Read the complete interval of an ordered direct integer family without choosing one lane.
+Only fixed scalar tables and mapped views thereof are accepted here; arithmetic/opaque scalar
+nodes remain fail-closed until their indexed interval transfer is implemented. -/
+partial def DirectOperationalIndexedArena.integerInterval
+    (arena : DirectOperationalIndexedArena)
+    (id : OperationalIndexedValueId) : Nat → Except OperationalError (Int × Int)
+  | 0 => throw (.unsupportedOperationalExpr id)
+  | fuel + 1 => do
+      let value ← match arena.valueAt? id with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef id)
+      let intervals ← match value.payload with
+        | .shared (.scalar .integer) (.scalar reference) =>
+            match arena.fixed.scalars[reference]? with
+            | some (.integer fact) => pure [(fact.lower, fact.upper)]
+            | _ => throw (.operandNotInteger 0 { node := 0, port := 0 })
+        | .explicit (.scalar .integer) _ references => references.toList.mapM fun reference =>
+            match reference with
+            | .scalar scalar => match arena.fixed.scalars[scalar]? with
+              | some (.integer fact) => pure (fact.lower, fact.upper)
+              | _ => throw (.operandNotInteger 0 { node := 0, port := 0 })
+            | .matrix _ => throw (.operandNotInteger 0 { node := 0, port := 0 })
+        | .explicitValues (.scalar .integer) _ values =>
+            values.toList.mapM fun child => arena.integerInterval child fuel
+        | .mapped (.scalar .integer) source _ => return ← arena.integerInterval source fuel
+        | _ => throw (.operandNotInteger 0 { node := 0, port := 0 })
+      match intervals with
+      | [] => throw (.invalidCount 0 0)
+      | first :: rest => pure <| rest.foldl (fun (lower, upper) (nextLower, nextUpper) =>
+          (min lower nextLower, max upper nextUpper)) first
+
+def directSingleIndexBinder
+    (node : Nat)
+    (expression : IndexedOperationalFact) : Except OperationalError IndexVariable :=
+  match expression.context.binders.toList with
+  | [binder] => pure binder
+  | _ => throw (.loopInputModeMismatch node 0)
+
+/-- Materialize the exact prepared-scope path and integer-family producer wire for a gather
+owner.  Source-family identity is retained by the gathered matrix provenance instead. -/
+def operationalGatherIndicesWire (scope : ScopeTemplateKey) (wire : WireRef) : GatherLookupWire := {
+  scope := scope.toGatherScopeTemplateKey
+  node := wire.node
+  port := wire.port
+}
+
 /-- Read a deterministic representative of a direct indexed matrix value for structural bound
 queries.  Each free binder is assigned its first valid lane; the direct carrier retains the
 complete context for identity-sensitive rewrites, while the fixed transfer supplies its
@@ -4608,7 +4654,13 @@ private def transportDirectCorrelation
     match key with
     | none => pure ()
     | some source => do
-        if source.freeVariables.any map.source.binders.contains then
+        /- A gather's codomain is an `IntExpr` domain witness, so its free index atoms contain
+        only the runtime position.  It nevertheless substitutes the mapped source family lane;
+        always transport the complete gather key through that map. -/
+        let transports := match source with
+          | .gather _ _ _ => true
+          | _ => source.freeVariables.any map.source.binders.contains
+        if transports then
           let translated ← match reindex map source with
             | some translated => pure translated
             | none => throw (.unsupportedOperationalExpr id)
@@ -4631,7 +4683,16 @@ private def transportDirectCorrelation
               if destinationOrdinal < 0 || destinationOrdinal >= count then return none
               key := some (.variable destination)
               ordinal := destinationOrdinal.toNat
-          | .offset _ _ | .gather _ _ => throw (.unsupportedOperationalExpr id)
+          /- A gather is a dependent function application.  `ordinal` remains the physical
+          source-table lane, while the complete owner-bearing gather expression names the
+          (possibly repeated) runtime lookup.  This represents every source lane once and never
+          expands it for each output position.  Two gathered operands can therefore zip only
+          when both the source-index value and lookup-position identities are structurally exact.
+          The fixed leaves have already been reindexed through this same map by
+          `reindexDirectMatrixFact`, so relation owners, targets, and provenance carry this
+          exact gather identity as well. -/
+          | gathered@(.gather _ _ _) => key := some gathered
+          | .offset _ _ => throw (.unsupportedOperationalExpr id)
   pure (some (key, ordinal))
 
 mutual
@@ -5315,7 +5376,9 @@ partial def rebindOperationalFact
         | some value => pure value
         | none => throw (.invalidOperationalExprRef root)
       if value.context != expression.context then throw (.unsupportedOperationalExpr root)
-      let (direct, rebound) ← arena.direct.mapMatrixValue root (rebindMatrixSubject subject)
+      let (direct, rebound) ← match value.payload.schema with
+        | .matrix _ => arena.direct.mapMatrixValue root (rebindMatrixSubject subject)
+        | .scalar _ => arena.direct.mapScalarValue root (pure ∘ rebindOperationalScalarFact subject)
       let value ← match direct.valueAt? rebound with
         | some value => pure value
         | none => throw (.invalidOperationalExprRef rebound)
@@ -5342,9 +5405,8 @@ def selectionExpressionForOrigin
   | .constant value => .constant value
   | .variable binder => canonicalSelectionExpression origin binder.count
   | .offset base amount => .offset (selectionExpressionForOrigin origin base) amount
-  | .gather source position =>
-      .gather (selectionExpressionForOrigin origin source)
-        (selectionExpressionForOrigin origin position)
+  | .gather owner sourceCount position =>
+      .gather owner sourceCount (selectionExpressionForOrigin origin position)
 
 def DynamicSelectionIdentity.withOrigin
     (selection : DynamicSelectionIdentity)
@@ -5440,7 +5502,7 @@ def indexExprAsIntExpr : IndexExpr → Option IntExpr
       let base ← indexExprAsIntExpr base
       if amount < 0 then some (.subtract base (.constant (-amount)))
       else some (.add base (.constant amount))
-  | .gather _ _ => none
+  | .gather _ _ _ => none
 
 /-- Transport loop-index arithmetic through the same capture-free map as identities.  Gather is
 not representable by legacy `IntExpr` and therefore remains fail-closed until bounds use
@@ -5736,15 +5798,23 @@ def OperationalExprArena.reindexDirectMatrixFact
     | .directValue root => pure root
     | .matrix root | .scalar root => throw (.unsupportedOperationalExpr root)
   if !map.transportValid || map.source != expression.context then throw (.unsupportedOperationalExpr root)
+  let rootValue ← match arena.direct.valueAt? root with
+    | some value => pure value
+    | none => throw (.invalidOperationalExprRef root)
   /- A map from the empty context substitutes no source binder.  Parallel-family closing has
   already introduced its destination selector in fixed metadata before it attaches this carrier
   map, so traversing that metadata with an empty-domain substitution would incorrectly reject the
   selector as foreign. -/
   let (direct, reindexed) ← if map.source.binders.isEmpty then pure (arena.direct, root) else
-    arena.direct.mapMatrixValue root fun fact =>
-      match reindexOperationalMatrixFact map fact with
-      | some fact => pure fact
-      | none => throw (.unsupportedOperationalExpr root)
+    match rootValue.payload.schema with
+    | .matrix _ => arena.direct.mapMatrixValue root fun fact =>
+        match reindexOperationalMatrixFact map fact with
+        | some fact => pure fact
+        | none => throw (.unsupportedOperationalExpr root)
+    /- Direct scalar values carry no matrix/provenance relation fields.  Their indexed context is
+    still transported by the enclosing mapped carrier; scalar semantic kernels consume that same
+    context and never select a representative. -/
+    | .scalar _ => pure (arena.direct, root)
   let (direct, mapped) ← match direct.pushMapped reindexed map with
     | some result => pure result
     | none => throw (.unsupportedOperationalExpr root)
@@ -7055,6 +7125,50 @@ def packDirectMatrixFamily
     storage := value.storage
   })
 
+/-- Pack scalar family lanes in the same direct carrier used by matrix families.  In particular,
+integer index families stay ordered direct tables instead of becoming legacy scalar selections. -/
+def packDirectScalarFamily
+    (scope : ScopeTemplateKey)
+    (node : Nat)
+    (environment : ParamEnvironment)
+    (count : IntExpr)
+    (arena : OperationalExprArena)
+    (elements : Array OperationalFact) : Except OperationalError
+      (OperationalExprArena × OperationalFact) := do
+  let binder := packedDirectFamilyBinder scope node count
+  let ids ← elements.mapM fun element => match element.payload with
+    | .directValue id => pure id
+    | .matrix _ | .scalar _ => throw (.operandNotInteger node { node, port := 0 })
+  let values ← ids.mapM fun id => match arena.direct.valueAt? id with
+    | some value => pure value
+    | none => throw (.invalidOperationalExprRef id)
+  let first ← match values[0]? with
+    | some value => pure value
+    | none => throw (.invalidCount node 0)
+  let schema ← match first.payload.schema with
+      | .scalar schema => pure (.scalar schema)
+      | .matrix _ => throw (.operandNotInteger node { node, port := 0 })
+  if values.any (fun value => value.payload.schema != schema) then throw (.outputTypeMismatch node)
+  let explicitReferences := values.mapM fun value => match value with
+    | { context, payload := .shared (.scalar _) reference, .. } =>
+        if context.binders.isEmpty then some reference else none
+    | _ => none
+  let (direct, result) ← match explicitReferences with
+    | some references => match arena.direct.pushExplicit environment { binders := #[binder] } binder schema references with
+      | some result => pure result
+      | none => throw (.unsupportedOperationalExpr arena.direct.values.size)
+    | none => match arena.direct.pushExplicitValues environment binder ids with
+      | some result => pure result
+      | none => throw (.unsupportedOperationalExpr arena.direct.values.size)
+  let value ← match direct.valueAt? result with
+    | some value => pure value
+    | none => throw (.invalidOperationalExprRef result)
+  pure ({ arena with direct }, {
+    context := value.context
+    payload := .directValue result
+    storage := value.storage
+  })
+
 /-- Evaluate an executable matrix `select` as application of one ordered direct family table.
 The fresh table binder is substituted by the selector variable through an `IndexMap`; this keeps
 two uses of the same executable selector correlated without expanding alternatives into indicator
@@ -7199,13 +7313,17 @@ def loopTemplateArgumentExprWithDirectLaneBinder
   | .broadcast =>
       match fact with
       | expression@{ payload := .directValue root, .. } =>
-          if !expression.context.binders.isEmpty then
-            throw (.loopInputModeMismatch node argument)
-          let consumer := DynamicSelectionIdentity.fromDeclaredCount
-            (.local temporaryScope { node, port := argument }) declaredCount
-          let destination ← selectionIndexedContext consumer root
-          let map : IndexMap := { source := emptyContext, destination, assignments := #[] }
-          arena.reindexDirectMatrixFact map expression
+          if expression.context.binders.isEmpty then
+            let consumer := DynamicSelectionIdentity.fromDeclaredCount
+              (.local temporaryScope { node, port := argument }) declaredCount
+            let destination ← selectionIndexedContext consumer root
+            let map : IndexMap := { source := emptyContext, destination, assignments := #[] }
+            arena.reindexDirectMatrixFact map expression
+          else
+            /- A broadcast aggregate is constant in the loop coordinate, not scalar-valued.
+            Keep its source family binder so a body `FamilyGetDynamic` can apply its exact gather
+            map instead of silently replacing the aggregate by one loop-lane template. -/
+            pure (arena, expression)
       | { payload := .matrix _, .. } =>
           throw (.loopInputModeMismatch node argument)
       | expression@{ payload := .scalar _, .. } => pure (arena, expression)

@@ -12,22 +12,45 @@ structure IndexVariable where
 
 /-- Immutable identity of a gather lookup.  `indices` is the exact executable integer-family
 producer occurrence, so two consumers of that one producer share the identity, while equal
-values emitted by different producer wires do not.  `source` is the exact family being gathered.
-The checker never treats a numeric slot or caller-supplied environment entry as this identity. -/
+values emitted by different producer wires do not.  Selected source families remain in matrix
+origins and provenance, not lookup correlation identity. -/
+inductive GatherProgramInstanceKey where
+  | temporary
+  | workflowStage (stage : StageId)
+  | ideal
+  | requirement (index : Nat)
+  | standalone (checkedProgramOrdinal : Nat)
+  deriving BEq, DecidableEq, Repr
+
+/-- Structural scope path for a runtime gather producer.  This deliberately lives below the
+operational checker layer so an index expression can retain an exact producer identity without
+serializing a scope into a stage name or relying on a hash. -/
+inductive GatherScopeTemplateKey where
+  | root (program : GatherProgramInstanceKey)
+  | callBody (parent : GatherScopeTemplateKey) (callNode : Nat)
+  | parallelBody (parent : GatherScopeTemplateKey) (loopNode : Nat)
+  | sequentialBody (parent : GatherScopeTemplateKey) (loopNode : Nat)
+  deriving BEq, DecidableEq, Repr
+
+structure GatherLookupWire where
+  scope : GatherScopeTemplateKey
+  node : Nat
+  port : Nat
+  deriving BEq, DecidableEq, Repr
+
 structure GatherLookupOwner where
-  source : CoreWireRef
-  indices : CoreWireRef
+  indices : GatherLookupWire
   deriving BEq, DecidableEq, Repr
 
 /-- Symbolic selection indices.  Dynamic selection is function application, never an indicator
 sum over every lane.  A gather retains its immutable lookup-producer identity in the correlation
-key itself: `source` carries the gathered result's codomain, while `position` carries the
+key itself: `sourceCount` carries the gathered result's codomain, while `position` carries the
 lookup-lane domain independently. -/
 inductive IndexExpr where
   | constant (value : Nat)
   | variable (value : IndexVariable)
   | offset (base : IndexExpr) (amount : Int)
-  | gather (owner : GatherLookupOwner) (source position : IndexExpr)
+  | gather (owner : GatherLookupOwner) (sourceCount : IntExpr) (position : IndexExpr)
   deriving BEq, DecidableEq, Repr
 
 /-- Optional request-local cache of a *closed* gather lookup.  This is deliberately separate
@@ -101,7 +124,10 @@ def IndexExpr.freeVariables : IndexExpr → List IndexVariable
   | .constant _ => []
   | .variable value => [value]
   | .offset base _ => base.freeVariables
-  | .gather _ source position => source.freeVariables ++ position.freeVariables
+  /- `sourceCount` is the result-domain witness of the exact gathered family, not an independently
+  supplied runtime selector.  The owner carries its producer identity; only `position` must be
+  available in the destination context. -/
+  | .gather _ _ position => position.freeVariables
 
 def indexExpressionInBounds (context : IndexContext) (expression : IndexExpr) : Bool :=
   expression.freeVariables.all context.contains
@@ -116,7 +142,9 @@ private def staticIndexRange : IndexExpr → Option (Int × Int)
   | .offset base amount => do
       let (lower, upper) ← staticIndexRange base
       some (lower + amount, upper + amount)
-  | .gather _ source _ => staticIndexRange source
+  | .gather _ sourceCount _ => match sourceCount with
+      | .constant count => if 0 < count then some (0, count) else none
+      | _ => none
 
 /-- The exact result domain retained by an index expression without evaluating parameters.
 Offsets other than zero do not preserve a complete source domain.  Gather results retain the
@@ -125,7 +153,7 @@ private def exactIndexDomain : IndexExpr → Option IntExpr
   | .constant _ => none
   | .variable binder => some binder.count
   | .offset base amount => if amount == 0 then exactIndexDomain base else none
-  | .gather _ source _ => exactIndexDomain source
+  | .gather _ sourceCount _ => some sourceCount
 
 /-- Split an additive integer expression into its non-constant structural part and its accumulated
 constant.  This is deliberately not an arithmetic normalizer: it proves only offsets visible in
@@ -170,7 +198,7 @@ private def staticallyWithin (limit : IntExpr) (expression : IndexExpr) : Bool :
       | .offset _ _ => match variableOffset expression with
           | some (binder, offset) => symbolicOffsetWithin limit binder.count offset
           | none => false
-      | .gather _ source _ => exactIndexDomain source == some limit
+      | .gather _ sourceCount _ => sourceCount == limit
       | .constant _ => false
 
 private structure ClosedIndexWitness where
@@ -251,8 +279,8 @@ private def reindexUnchecked (map : IndexMap) : IndexExpr → Option IndexExpr
   | .constant value => some (.constant value)
   | .variable binder => map.lookup? binder
   | .offset base amount => return .offset (← reindexUnchecked map base) amount
-  | .gather owner source position =>
-      return .gather owner (← reindexUnchecked map source) (← reindexUnchecked map position)
+  | .gather owner sourceCount position =>
+      return .gather owner sourceCount (← reindexUnchecked map position)
 
 def reindex (map : IndexMap) (expression : IndexExpr) : Option IndexExpr :=
   if map.transportValid then reindexUnchecked map expression else none
@@ -285,7 +313,9 @@ private def evaluatedIndexRange
   | .offset base amount => do
       let (lower, upper) ← evaluatedIndexRange parameters base
       some (lower + amount, upper + amount)
-  | .gather _ source _ => evaluatedIndexRange parameters source
+  | .gather _ sourceCount _ => do
+      let count ← sourceCount.evaluate parameters
+      if count <= 0 then none else some (0, count)
 
 private def valueInRange (value lower upper : Int) : Bool :=
   lower <= value && value < upper
@@ -302,7 +332,7 @@ private def evaluateIndexExprUnchecked
   | .gather _ _ _ => none
 
 /-- Evaluate an index expression only in a context that owns every free index atom.  A gather is
-looked up by its full structural identity after both source and position have been evaluated; it is
+looked up by its full structural identity and position; it is
 never lowered to an `IntExpr` or identified with a similarly numbered foreign selector. -/
 def evaluateIndexExpr
     (parameters : Mxx.Ir.ParamEnvironment)
@@ -549,13 +579,21 @@ private def fixtureWire (node port : Nat := 0) : CoreWireRef := {
   port
 }
 
+private def fixtureGatherWire (node port : Nat := 0) : GatherLookupWire := {
+  scope := .root (.standalone 0)
+  node
+  port
+}
+
 private def fixtureGatherOwner : GatherLookupOwner := {
-  source := fixtureWire 400
-  indices := fixtureWire 401
+  indices := fixtureGatherWire 401
 }
 
 private def fixtureGather (source position : IndexExpr) : IndexExpr :=
-  .gather fixtureGatherOwner source position
+  let sourceCount := match source with
+    | .variable binder => binder.count
+    | _ => .constant 1
+  .gather fixtureGatherOwner sourceCount position
 
 private def fixtureVariable (node slot count : Nat) : IndexVariable := {
   owner := fixtureOwner node
@@ -749,8 +787,7 @@ and the owner remains part of the symbolic correlation key. -/
 example :
     let position := fixtureVariable 2 0 3
     let owner : GatherLookupOwner := {
-      source := fixtureWire 10
-      indices := fixtureWire 11
+      indices := fixtureGatherWire 11
     }
     let table : GatherLookupTable := {
       owner
@@ -762,17 +799,16 @@ example :
     table.cacheShapeValid && !stale.cacheShapeValid &&
       (GatherLookupRegistry.lookupExact #[table] owner == some table) &&
       (GatherLookupRegistry.lookupExact #[table, stale] owner).isNone &&
-      (IndexExpr.gather owner (IndexExpr.variable position) (IndexExpr.variable position) !=
-        IndexExpr.gather { owner with indices := fixtureWire 12 }
-          (IndexExpr.variable position) (IndexExpr.variable position)) := by
+      (IndexExpr.gather owner (.constant 3) (IndexExpr.variable position) !=
+        IndexExpr.gather { owner with indices := fixtureGatherWire 12 }
+          (.constant 3) (IndexExpr.variable position)) := by
   native_decide
 
 example :
     let owner : GatherLookupOwner := {
-      source := fixtureWire 10
-      indices := fixtureWire 11
+      indices := fixtureGatherWire 11
     }
-    let foreign : GatherLookupOwner := { owner with indices := fixtureWire 12 }
+    let foreign : GatherLookupOwner := { owner with indices := fixtureGatherWire 12 }
     let table : GatherLookupTable := {
       owner
       sourceCount := .constant 2

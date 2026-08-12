@@ -4,6 +4,22 @@ namespace Mxx.Certificate
 
 open Mxx.Ir
 
+private def operationalGatherFixtureWire (node : Nat) : GatherLookupWire := {
+  scope := .root (.standalone 0)
+  node
+  port := 0
+}
+
+private def operationalGatherFixtureOwner (node : Nat) : GatherLookupOwner := {
+  indices := operationalGatherFixtureWire (node + 1)
+}
+
+private def operationalFixtureGather (node : Nat) (source position : IndexExpr) : IndexExpr :=
+  let sourceCount := match source with
+    | .variable binder => binder.count
+    | _ => .constant 1
+  .gather (operationalGatherFixtureOwner node) sourceCount position
+
 /-- The same protocol input has one root identity across workflow stages even though each stage
 binds it to a different local subject wire. -/
 example : (show Except OperationalError Bool from do
@@ -1699,6 +1715,221 @@ private def packedSelectionLoopBody : Scope := {
   inputNames := ["value"]
 }
 
+/-- Production gather path: a two-lane integer family is zipped into a parallel body while a
+three-lane matrix family is broadcast intact.  The body dynamically gathers from the latter, so
+the gather codomain and lookup-position domains are deliberately unequal. -/
+private def productionGatherLoopBody : Scope := {
+  nodes := #[
+    { kind := .input "indices", arguments := [], outputTypes := [.integer] },
+    { kind := .input "b", arguments := [], outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 3)] },
+    { kind := .input "k", arguments := [], outputTypes := [.indexedFamily (.preimage fixtureType) (.constant 3)] },
+    { kind := .familyGetDynamic, arguments := [{ node := 1, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .familyGetDynamic, arguments := [{ node := 2, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.preimage fixtureType] },
+    { kind := .matrixMultiply, arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 5, port := 0 })]
+  inputNames := ["indices", "b", "k"]
+}
+
+private def productionGatherLoopProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .constantInt 0, arguments := [], outputTypes := [.integer] },
+      { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
+      { kind := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.indexedFamily .integer (.constant 2)] },
+      { kind := .gadgetMatrix fixtureType (.constant 2), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .familyPack, arguments := [{ node := 3, port := 0 }, { node := 3, port := 0 }, { node := 3, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 3)] },
+      { kind := .gaussianSample fixtureType (.constant 3), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 5), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 7), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
+        arguments := [{ node := 5, port := 0 }], outputTypes := [.preimage fixtureType] },
+      { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
+        arguments := [{ node := 6, port := 0 }], outputTypes := [.preimage fixtureType] },
+      { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
+        arguments := [{ node := 7, port := 0 }], outputTypes := [.preimage fixtureType] },
+      { kind := .familyPack, arguments := [{ node := 8, port := 0 }, { node := 9, port := 0 }, { node := 10, port := 0 }],
+        outputTypes := [.indexedFamily (.preimage fixtureType) (.constant 3)] },
+      { kind := .parallelLoop "gather" (.constant 2) 0 [] [.zip, .broadcast, .broadcast],
+        arguments := [{ node := 2, port := 0 }, { node := 4, port := 0 }, { node := 11, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] }
+    ]
+    outputs := [("result", { node := 12, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("gather", productionGatherLoopBody)]
+}
+
+private def productionGatherLoopDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .constantInt, arguments := [] },
+    { sourceNode := 1, rule := .constantInt, arguments := [] },
+    { sourceNode := 2, rule := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+    { sourceNode := 3, rule := .gadgetMatrix, arguments := [] },
+    { sourceNode := 4, rule := .familyPack, arguments := [{ node := 3, port := 0 }, { node := 3, port := 0 }, { node := 3, port := 0 }] },
+    { sourceNode := 5, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 6, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 7, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 8, rule := .gadgetDecompose, arguments := [{ node := 5, port := 0 }] },
+    { sourceNode := 9, rule := .gadgetDecompose, arguments := [{ node := 6, port := 0 }] },
+    { sourceNode := 10, rule := .gadgetDecompose, arguments := [{ node := 7, port := 0 }] },
+    { sourceNode := 11, rule := .familyPack, arguments := [{ node := 8, port := 0 }, { node := 9, port := 0 }, { node := 10, port := 0 }] },
+    { sourceNode := 12, rule := .parallelLoop, arguments := [{ node := 2, port := 0 }, { node := 4, port := 0 }, { node := 11, port := 0 }] }
+  ] }
+  definitions := [("gather", { steps := #[
+    { sourceNode := 0, rule := .input, arguments := [] },
+    { sourceNode := 1, rule := .input, arguments := [] },
+    { sourceNode := 2, rule := .input, arguments := [] },
+    { sourceNode := 3, rule := .familyGetDynamic, arguments := [{ node := 1, port := 0 }, { node := 0, port := 0 }] },
+    { sourceNode := 4, rule := .familyGetDynamic, arguments := [{ node := 2, port := 0 }, { node := 0, port := 0 }] },
+    { sourceNode := 5, rule := .matrixMultiplyRelation { node := 4, port := 0 },
+      arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }] }
+  ] })]
+}
+
+private def productionGatherLoopFixture : Except OperationalError Bool := do
+  let facts ← evaluateProgramOperationalWithLayouts productionGatherLoopProgram productionGatherLoopDerivation [] [fixtureLayout]
+  let output ← lookupFact 13 facts { node := 12, port := 0 }
+  let entries ← facts.arena.reducedDirectValueFactsAt [] output
+  let maximum ← matrixMaximum 13 { node := 12, port := 0 } facts []
+  let operationalScope : ScopeTemplateKey := .parallelBody (.root (.standalone 0)) 12
+  let scope : GatherScopeTemplateKey := operationalScope.toGatherScopeTemplateKey
+  let owner : GatherLookupOwner := {
+    indices := { scope, node := 0, port := 0 }
+  }
+  pure (maximum == 7 && entries.length == 3 && entries.all fun entry =>
+    (match entry.key with
+    | some (.gather actualOwner (.constant 3) (.variable position)) =>
+        actualOwner == owner && position.count == .constant 2
+    | _ => false) && entry.ordinal < 3 && !matrixFactHasRelation entry.fact)
+
+example : productionGatherLoopFixture = .ok true := by native_decide
+
+/-- The interval of a zipped executable integer family is validated against the gathered source
+family before lowering.  A lane value equal to the source count is rejected, never truncated. -/
+private def productionGatherOutOfRangeProgram : Prog := {
+  productionGatherLoopProgram with
+  root := {
+    productionGatherLoopProgram.root with
+    nodes := productionGatherLoopProgram.root.nodes.set! 1 {
+      kind := .constantInt 3
+      arguments := []
+      outputTypes := [.integer]
+    }
+  }
+}
+
+private def productionGatherOutOfRangeFixture : Bool :=
+  match evaluateProgramOperationalWithLayouts productionGatherOutOfRangeProgram
+      productionGatherLoopDerivation [] [fixtureLayout] with
+  | .error (.inScope (.parallelBody (.root (.standalone 0)) 12) (.invalidCount 3 3)) => true
+  | _ => false
+
+example : productionGatherOutOfRangeFixture = true := by native_decide
+
+/-- Two different executable index-family producers may have the same lane values, but their
+gathers are not correlated.  The Graph IR lowering must therefore reject the relation rewrite
+instead of pairing B and K by ordinal alone. -/
+private def productionDistinctIndexLoopBody : Scope := {
+  nodes := #[
+    { kind := .input "bIndices", arguments := [], outputTypes := [.integer] },
+    { kind := .input "kIndices", arguments := [], outputTypes := [.integer] },
+    { kind := .input "b", arguments := [], outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 3)] },
+    { kind := .input "k", arguments := [], outputTypes := [.indexedFamily (.preimage fixtureType) (.constant 3)] },
+    { kind := .familyGetDynamic, arguments := [{ node := 2, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .familyGetDynamic, arguments := [{ node := 3, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.preimage fixtureType] },
+    { kind := .matrixMultiply, arguments := [{ node := 4, port := 0 }, { node := 5, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  /- Export the two gathered operands separately.  The root relation below is then reduced only
+  by this fixture, so a rejection cannot be mistaken for an unrelated loop-closing failure. -/
+  outputs := [("b", { node := 4, port := 0 }), ("k", { node := 5, port := 0 })]
+  inputNames := ["bIndices", "kIndices", "b", "k"]
+}
+
+private def productionDistinctIndexProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .constantInt 0, arguments := [], outputTypes := [.integer] },
+      { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
+      { kind := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.indexedFamily .integer (.constant 2)] },
+      { kind := .constantInt 0, arguments := [], outputTypes := [.integer] },
+      { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
+      { kind := .familyPack, arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }],
+        outputTypes := [.indexedFamily .integer (.constant 2)] },
+      { kind := .gadgetMatrix fixtureType (.constant 2), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .familyPack, arguments := [{ node := 6, port := 0 }, { node := 6, port := 0 }, { node := 6, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 3)] },
+      { kind := .gaussianSample fixtureType (.constant 3), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 5), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 7), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1), arguments := [{ node := 8, port := 0 }], outputTypes := [.preimage fixtureType] },
+      { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1), arguments := [{ node := 9, port := 0 }], outputTypes := [.preimage fixtureType] },
+      { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1), arguments := [{ node := 10, port := 0 }], outputTypes := [.preimage fixtureType] },
+      { kind := .familyPack, arguments := [{ node := 11, port := 0 }, { node := 12, port := 0 }, { node := 13, port := 0 }], outputTypes := [.indexedFamily (.preimage fixtureType) (.constant 3)] },
+      { kind := .parallelLoop "distinct" (.constant 2) 0 [] [.zip, .zip, .broadcast, .broadcast], arguments := [{ node := 2, port := 0 }, { node := 5, port := 0 }, { node := 7, port := 0 }, { node := 14, port := 0 }], outputCount := 2, outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2), .indexedFamily (.preimage fixtureType) (.constant 2)] },
+      { kind := .matrixMultiply, arguments := [{ node := 15, port := 0 }, { node := 15, port := 1 }], outputTypes := [.matrix fixtureType] }
+    ]
+    outputs := [("result", { node := 16, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("distinct", productionDistinctIndexLoopBody)]
+}
+
+private def productionDistinctIndexDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .constantInt, arguments := [] }, { sourceNode := 1, rule := .constantInt, arguments := [] },
+    { sourceNode := 2, rule := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+    { sourceNode := 3, rule := .constantInt, arguments := [] }, { sourceNode := 4, rule := .constantInt, arguments := [] },
+    { sourceNode := 5, rule := .familyPack, arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }] },
+    { sourceNode := 6, rule := .gadgetMatrix, arguments := [] },
+    { sourceNode := 7, rule := .familyPack, arguments := [{ node := 6, port := 0 }, { node := 6, port := 0 }, { node := 6, port := 0 }] },
+    { sourceNode := 8, rule := .gaussianSample, arguments := [] }, { sourceNode := 9, rule := .gaussianSample, arguments := [] }, { sourceNode := 10, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 11, rule := .gadgetDecompose, arguments := [{ node := 8, port := 0 }] }, { sourceNode := 12, rule := .gadgetDecompose, arguments := [{ node := 9, port := 0 }] }, { sourceNode := 13, rule := .gadgetDecompose, arguments := [{ node := 10, port := 0 }] },
+    { sourceNode := 14, rule := .familyPack, arguments := [{ node := 11, port := 0 }, { node := 12, port := 0 }, { node := 13, port := 0 }] },
+    { sourceNode := 15, rule := .parallelLoop, arguments := [{ node := 2, port := 0 }, { node := 5, port := 0 }, { node := 7, port := 0 }, { node := 14, port := 0 }] },
+    { sourceNode := 16, rule := .matrixMultiplyRelation { node := 15, port := 1 }, arguments := [{ node := 15, port := 0 }, { node := 15, port := 1 }] }
+  ] }
+  definitions := [("distinct", { steps := #[
+    { sourceNode := 0, rule := .input, arguments := [] }, { sourceNode := 1, rule := .input, arguments := [] }, { sourceNode := 2, rule := .input, arguments := [] }, { sourceNode := 3, rule := .input, arguments := [] },
+    { sourceNode := 4, rule := .familyGetDynamic, arguments := [{ node := 2, port := 0 }, { node := 0, port := 0 }] }, { sourceNode := 5, rule := .familyGetDynamic, arguments := [{ node := 3, port := 0 }, { node := 1, port := 0 }] },
+    { sourceNode := 6, rule := .matrixMultiplyRelation { node := 5, port := 0 }, arguments := [{ node := 4, port := 0 }, { node := 5, port := 0 }] }
+  ] })]
+}
+
+private def productionDistinctIndexFixtureResult : Except OperationalError
+    (Bool × Except OperationalError (List ReducedDirectMatrixFact)) := do
+    let facts ← evaluateProgramOperationalWithLayouts productionDistinctIndexProgram
+      productionDistinctIndexDerivation [] [fixtureLayout]
+    let relation ← lookupFact 17 facts { node := 16, port := 0 }
+    let relationRoot ← match relation.payload with
+      | .directValue root => pure root
+      | .matrix root | .scalar root => throw (OperationalError.unsupportedOperationalExpr root)
+    let relationLowered := match facts.arena.direct.valueAt? relationRoot with
+      | some { payload := .pointwise (.matrix _) (.matrix operation) inputs, .. } =>
+          match operation.kind with
+          | .multiply (.matrixMultiplyRelation rightWire) _ =>
+              operation.ownerNode == 16 && rightWire == { node := 15, port := 1 } && inputs.size == 2
+          | _ => false
+      | _ => false
+    let reduction := facts.arena.reducedDirectValueFactsAt [] relation
+    pure (relationLowered, reduction)
+
+private def productionDistinctIndexFixture : Bool :=
+  match productionDistinctIndexFixtureResult with
+  | .ok (true, .error (.unsupportedOperationalExpr _)) => true
+  | _ => false
+
+example : productionDistinctIndexFixture = true := by native_decide
+
 private def packedSelectionLoopProgram : Prog := {
   root := {
     nodes := #[
@@ -2550,8 +2781,16 @@ collapsing a delayed family to a representative matrix fact. -/
 private def directDecompositionFamilyFixture : Bool :=
   match (do
     let binder := { directCarrierFixtureBinder 830 with count := .constant 2 }
-    let input0 := { boundedOperationalExprFixtureFact 831 2 with canonicalRange := .below 17 }
-    let input1 := { boundedOperationalExprFixtureFact 832 3 with canonicalRange := .below 17 }
+    let sourceFamily : FamilyTemplateBinder := {
+      owner := temporaryScope, producerNode := 830, binderSlot := 0 }
+    let sourceSelection : DynamicSelectionIdentity := {
+      index := .local temporaryScope { node := 830, port := 0 }
+      expression := .variable binder
+    }
+    let input0 := indexMatrixFact sourceFamily sourceSelection { node := 831, port := 0 }
+      { boundedOperationalExprFixtureFact 831 2 with canonicalRange := .below 17 }
+    let input1 := indexMatrixFact sourceFamily sourceSelection { node := 832, port := 0 }
+      { boundedOperationalExprFixtureFact 832 3 with canonicalRange := .below 17 }
     let (fixed, input0Ref) := ({} : FixedOperationalPayloadArena).pushMatrix input0
     let (fixed, input1Ref) := fixed.pushMatrix input1
     let direct : DirectOperationalIndexedArena := { fixed }
@@ -2581,6 +2820,14 @@ private def directDecompositionFamilyFixture : Bool :=
       | none => throw (OperationalError.unsupportedOperationalExpr 834)
     let (arena, mappedOutput) ← arena.reindexDirectMatrixFact map output
     let mappedEntries ← arena.reducedDirectValueFactsAt [] mappedOutput
+    let gatherPosition := { directCarrierFixtureBinder 835 with count := .constant 3 }
+    let gathered := operationalFixtureGather 835 (IndexExpr.variable selector)
+      (IndexExpr.variable gatherPosition)
+    let gatherMap ← match dynamicIndexMap output.context binder gathered with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 835)
+    let (arena, gatheredOutput) ← arena.reindexDirectMatrixFact gatherMap output
+    let gatheredEntries ← arena.reducedDirectValueFactsAt [] gatheredOutput
     let sourceOk := entries.length == 2 && entries.all fun entry =>
       entry.key == some (IndexExpr.variable binder) && entry.fact.relations.any fun relation =>
         match relation with
@@ -2593,7 +2840,18 @@ private def directDecompositionFamilyFixture : Bool :=
         | .decomposition value => value.producer == entry.fact.origin &&
             value.inputOrigin != entry.fact.origin
         | _ => false
-    pure (sourceOk && mappedOk)) with
+    let gatheredOk := gatheredEntries.length == 2 && gatheredEntries.all fun entry =>
+      entry.key == some gathered && entry.fact.relations.any fun relation =>
+        match relation with
+        | .decomposition value =>
+            value.producer == entry.fact.origin &&
+            value.inputOrigin == MatrixOriginIdentity.indexed sourceFamily gathered
+              (match entry.ordinal with
+              | 0 => (boundedOperationalExprFixtureFact 831 2).origin
+              | _ => (boundedOperationalExprFixtureFact 832 3).origin) &&
+            value.inputSummary.origin == value.inputOrigin
+        | _ => false
+    pure (sourceOk && mappedOk && gatheredOk)) with
   | .ok value => value
   | .error _ => false
 
@@ -3638,10 +3896,36 @@ private def directFamilyComplementaryBlockFixture : Bool :=
     let reindexedOk := reindexedAccepted.length == 2 &&
       reindexedAccepted.all fun (entry : ReducedDirectMatrixFact) =>
         entry.key == some (IndexExpr.variable selector) && !matrixFactHasRelation entry.fact
+    let gatherPosition := { directCarrierFixtureBinder 196 with count := .constant 3 }
+    let gathered := operationalFixtureGather 196 (IndexExpr.variable selector)
+      (IndexExpr.variable gatherPosition)
+    let gatherMap ← match dynamicIndexMap left.context binder gathered with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 196)
+    let (arena, gatheredLeft) ← arena.reindexDirectMatrixFact gatherMap left
+    let (arena, gatheredRight) ← arena.reindexDirectMatrixFact gatherMap right
+    let (arena, gatheredAccepted) ← arena.pushDirectMatrixPointwise operation gatheredLeft gatheredRight
+    let gatheredAccepted ← arena.reducedDirectValueFactsAt [] gatheredAccepted
+    let distinctPosition := { directCarrierFixtureBinder 197 with count := .constant 3 }
+    let distinctGathered :=
+      operationalFixtureGather 197 (IndexExpr.variable selector) (IndexExpr.variable distinctPosition)
+    let distinctGatherMap ← match dynamicIndexMap right.context binder distinctGathered with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 197)
+    let (arena, distinctGatheredRight) ← arena.reindexDirectMatrixFact distinctGatherMap right
+    let (arena, gatheredRejected) ←
+      arena.pushDirectMatrixPointwise operation gatheredLeft distinctGatheredRight
+    let gatheredRejected := arena.reducedDirectValueFactsAt [] gatheredRejected
+    let gatheredOk := gatheredAccepted.length == 2 &&
+      gatheredAccepted.all fun (entry : ReducedDirectMatrixFact) =>
+        entry.key == some gathered && !matrixFactHasRelation entry.fact
+    let gatheredRejectedOk := match gatheredRejected with
+      | .error (.unsupportedOperationalExpr _) => true
+      | _ => false
     let rejectedOk := match rejected with
       | .error (.unsupportedOperationalExpr _) => true
       | _ => false
-    pure (acceptedOk && reindexedOk && rejectedOk)) with
+    pure (acceptedOk && reindexedOk && gatheredOk && gatheredRejectedOk && rejectedOk)) with
   | .ok value => value
   | .error _ => false
 
@@ -4829,8 +5113,9 @@ private def reducedPointwiseCorrelationFixture : Bool :=
   | .ok value => value
   | .error _ => false
 
-/-- Static access consumes the selected lane. Dynamic and offset maps preserve the exact key and
-physical ordinal, while gather remains unsupported. -/
+/-- Static access consumes the selected lane. Dynamic, offset, and dependent gather maps retain
+the exact owner-bearing key and source physical ordinal.  Gather keeps one source-table entry per
+source lane rather than expanding it once per lookup position. -/
 private def reducedMappedDirectFixture : Bool :=
   match (do
     let (arena, expression, binder) ← reducerExactTable 1600 3 4
@@ -4850,11 +5135,27 @@ private def reducedMappedDirectFixture : Bool :=
       | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1602)
     let (arena, offsetOutput) ← arena.reindexDirectMatrixFact offsetMap expression
     let offsetEntries ← arena.reducedDirectValueFactsAt [] offsetOutput
-    let gatherMap ← match dynamicIndexMap expression.context binder
-        (IndexExpr.gather (IndexExpr.variable selector) (IndexExpr.constant 0)) with
+    let gatherPosition := { directCarrierFixtureBinder 1702 with count := .constant 4 }
+    let gathered := operationalFixtureGather 1702 (IndexExpr.variable selector)
+      (IndexExpr.variable gatherPosition)
+    let gatherMap ← match dynamicIndexMap expression.context binder gathered with
       | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1603)
     let (arena, gatherOutput) ← arena.reindexDirectMatrixFact gatherMap expression
-    let gatherResult := arena.reducedDirectValueFactsAt [] gatherOutput
+    let gatherEntries ← arena.reducedDirectValueFactsAt [] gatherOutput
+    let (arena, gatherPointwise) ← arena.pushDirectMatrixPointwise {
+      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1604,
+      outputPort := 0, parameterEnvironment := [] } gatherOutput gatherOutput
+    let gatherPointwiseEntries ← arena.reducedDirectValueFactsAt [] gatherPointwise
+    let distinctPosition := { directCarrierFixtureBinder 1703 with count := .constant 4 }
+    let distinctGathered :=
+      operationalFixtureGather 1703 (IndexExpr.variable selector) (IndexExpr.variable distinctPosition)
+    let distinctGatherMap ← match dynamicIndexMap expression.context binder distinctGathered with
+      | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1605)
+    let (arena, distinctGatherOutput) ← arena.reindexDirectMatrixFact distinctGatherMap expression
+    let (arena, rejectedGatherPointwise) ← arena.pushDirectMatrixPointwise {
+      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1606,
+      outputPort := 0, parameterEnvironment := [] } gatherOutput distinctGatherOutput
+    let rejectedGatherResult := arena.reducedDirectValueFactsAt [] rejectedGatherPointwise
     pure (staticEntries.map (fun (entry : ReducedDirectMatrixFact) =>
         (entry.key, entry.ordinal, entry.fact.subject.node)) ==
         [(none, 0, 1602)] &&
@@ -4862,9 +5163,12 @@ private def reducedMappedDirectFixture : Bool :=
         (some (IndexExpr.variable selector), 0), (some (IndexExpr.variable selector), 1),
         (some (IndexExpr.variable selector), 2)] &&
       offsetEntries.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
-        (some (IndexExpr.variable offsetSelector), 0),
-        (some (IndexExpr.variable offsetSelector), 1)] &&
-      match gatherResult with
+        (some (IndexExpr.variable offsetSelector), 0), (some (IndexExpr.variable offsetSelector), 1)] &&
+      gatherEntries.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
+        (some gathered, 0), (some gathered, 1), (some gathered, 2)] &&
+      gatherPointwiseEntries.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
+        (some gathered, 0), (some gathered, 1), (some gathered, 2)] &&
+      match rejectedGatherResult with
       | .error (.unsupportedOperationalExpr _) => true
       | _ => false)) with
   | .ok value => value

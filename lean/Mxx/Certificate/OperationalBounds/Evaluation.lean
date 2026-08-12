@@ -914,10 +914,25 @@ def directFamilyLaneBinderAt
     | some value => pure value
     | none => throw .nonClosedExpression
   if count <= 0 then throw (.invalidCount familyWire.node count)
-  let binder ← directFamilyLaneBinder scopeKey familyWire.node producer familyWire countExpression count.toNat
-  if !family.context.binders.contains binder then
-    throw (.loopInputModeMismatch familyWire.node familyWire.port)
-  pure binder
+  match producer.kind with
+  | .input _ =>
+      /- A broadcast direct family enters a loop body through an input node, so the child IR does
+      not repeat the parent's `familyPack` producer.  This is the only input-shaped case accepted
+      here: recover the already-carried lane binder only when the declared count identifies it
+      uniquely.  In particular, do not turn a malformed or independently selected input into a
+      single-binder family. -/
+      let root ← match family.payload with
+        | .directValue root => pure root
+        | .matrix root | .scalar root => throw (.unsupportedOperationalExpr root)
+      if !validateContext family.context then throw (.unsupportedOperationalExpr root)
+      match family.context.binders.toList.filter (fun candidate => candidate.count == countExpression) with
+      | [binder] => pure binder
+      | _ => throw (.loopInputModeMismatch familyWire.node familyWire.port)
+  | _ =>
+      let binder ← directFamilyLaneBinder scopeKey familyWire.node producer familyWire countExpression count.toNat
+      if !family.context.binders.contains binder then
+        throw (.loopInputModeMismatch familyWire.node familyWire.port)
+      pure binder
 
 def deriveOrdinaryOutputs
     (scopeKey : ScopeTemplateKey)
@@ -1873,6 +1888,21 @@ def evaluatePreparedScope
                         facts.arena elements.toArray
                       facts := { facts with arena }
                       pure [family]
+                  | [.indexedFamily (.integer) count] =>
+                      let count ← match count.evaluate environment with
+                        | some value => pure value
+                        | none => throw .nonClosedExpression
+                      if count <= 0 || elements.length != count.toNat then
+                        throw (.invalidCount index count)
+                      let (arena, directElements) ← elements.foldlM (fun (arena, packed) element => do
+                        let (arena, direct) ← arena.promoteDirectRelationOperand element
+                        pure (arena, packed.push direct)) (facts.arena, #[])
+                      let (arena, family) ← packDirectScalarFamily scopeKey index environment
+                        (match node.outputTypes with
+                        | [.indexedFamily _ declaredCount] => declaredCount
+                        | _ => .constant count) arena directElements
+                      facts := { facts with arena }
+                      pure [family]
                   | [.indexedFamily _ count] =>
                       let count ← match count.evaluate environment with
                         | some value => pure value
@@ -1921,7 +1951,20 @@ def evaluatePreparedScope
                   let indexWire ← match node.arguments[1]? with
                     | some wire => pure wire
                     | none => throw (.missingOperand index { node := 0, port := 0 })
-                  let selectionFact ← integerFactAt index facts indexWire
+                  let selectionInput ← lookupFact index facts indexWire
+                  let selectionFact ← match selectionInput with
+                    | { payload := .directValue root, .. } => do
+                        let (lower, upper) ← facts.arena.direct.integerInterval root
+                          (facts.arena.direct.values.size + 1)
+                        pure {
+                          subject := indexWire
+                          origin := .local scopeKey indexWire
+                          lower
+                          upper
+                          lowerExpression := .closedInt (.constant lower)
+                          upperExpression := .closedInt (.constant upper)
+                        }
+                    | _ => integerFactAt index facts indexWire
                   let selection := selectionFact.origin
                   let family ← lookupFact index facts familyWire
                   match selectionFact.lower == selectionFact.upper, family with
@@ -1965,16 +2008,23 @@ def evaluatePreparedScope
                       if selectorCount == 0 || selectionFact.lower < 0 ||
                           selectionFact.upper >= Int.ofNat selectorCount then
                         throw (.invalidCount index selectionFact.upper)
-                      let freshSelector := DynamicSelectionIdentity.fromDeclaredCount selection binder.count
-                      let freshBinder ← match freshSelector.expression with
-                        | .variable value => pure value
-                        | _ => throw (.loopInputModeMismatch index 0)
-                      let selector := match family.context.binders.toList.find? (fun candidate =>
-                          candidate.owner == freshBinder.owner && candidate.slot == freshBinder.slot) with
-                        | some candidate => .variable candidate
-                        | none => freshSelector.expression
-                      if selector.freeVariables.length != 1 then
-                        throw (.loopInputModeMismatch index 0)
+                      let selector ← match selectionInput with
+                        | direct@{ payload := .directValue _, .. } => do
+                            let position ← directSingleIndexBinder index direct
+                            let owner : GatherLookupOwner := {
+                              indices := operationalGatherIndicesWire scopeKey indexWire
+                            }
+                            pure (.gather owner binder.count (.variable position))
+                        | _ => do
+                            let freshSelector := DynamicSelectionIdentity.fromDeclaredCount selection binder.count
+                            let freshBinder ← match freshSelector.expression with
+                              | .variable value => pure value
+                              | _ => throw (.loopInputModeMismatch index 0)
+                            pure <| match family.context.binders.toList.find? (fun candidate =>
+                                candidate.owner == freshBinder.owner && candidate.slot == freshBinder.slot) with
+                              | some candidate => .variable candidate
+                              | none => freshSelector.expression
+                      if selector.freeVariables.isEmpty then throw (.loopInputModeMismatch index 0)
                       let dynamicMap ← match dynamicIndexMap family.context binder selector with
                         | some map => pure map
                         | none => match closedDynamicIndexMap environment family.context binder selector with

@@ -88,6 +88,19 @@ inductive ScopeTemplateKey where
   | sequentialBody (parent : ScopeTemplateKey) (loopNode : Nat)
   deriving BEq, DecidableEq, Repr
 
+def ProgramInstanceKey.toGatherProgramInstanceKey : ProgramInstanceKey → GatherProgramInstanceKey
+  | .temporary => .temporary
+  | .workflowStage stage => .workflowStage stage
+  | .ideal => .ideal
+  | .requirement index => .requirement index
+  | .standalone ordinal => .standalone ordinal
+
+def ScopeTemplateKey.toGatherScopeTemplateKey : ScopeTemplateKey → GatherScopeTemplateKey
+  | .root program => .root program.toGatherProgramInstanceKey
+  | .callBody parent node => .callBody parent.toGatherScopeTemplateKey node
+  | .parallelBody parent node => .parallelBody parent.toGatherScopeTemplateKey node
+  | .sequentialBody parent node => .sequentialBody parent.toGatherScopeTemplateKey node
+
 inductive LoopCoordinate where
   | loopBinder (owner : ScopeTemplateKey) (loopNode binderSlot : Nat)
   | loopBinderOffset (owner : ScopeTemplateKey) (loopNode binderSlot offset : Nat)

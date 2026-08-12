@@ -131,8 +131,8 @@ def selectionDomainFingerprint (key : SelectionDomainKey) : UInt64 :=
     (mixOperationalFingerprint kind (operationalSelectionFingerprint key.identity))
     (UInt64.ofNat key.count)
 
-def DynamicSelectionIdentity.fromOrigin
-    (origin : OperationalValueOrigin) (count : Nat) : DynamicSelectionIdentity := {
+def DynamicSelectionIdentity.fromDeclaredCount
+    (origin : OperationalValueOrigin) (count : IntExpr) : DynamicSelectionIdentity := {
   index := origin
   expression := .variable {
     owner := {
@@ -141,9 +141,13 @@ def DynamicSelectionIdentity.fromOrigin
       node := ⟨0⟩
     }
     slot := 0
-    count := .constant count
+    count
   }
 }
+
+def DynamicSelectionIdentity.fromOrigin
+    (origin : OperationalValueOrigin) (count : Nat) : DynamicSelectionIdentity :=
+  .fromDeclaredCount origin (.constant count)
 
 def OperationalExprArena.internSelectionDomain
     (arena : OperationalExprArena)
@@ -3927,7 +3931,7 @@ def DirectOperationalIndexedArena.matrixFactAt
             | none => throw (.invalidOperationalExprRef lane.toNat)
           arena.matrixFactAt parameters indices branch fuel
       | .mapped (.matrix _) source map => do
-          if !map.validate || map.destination != value.context then
+          if !map.transportValid || map.destination != value.context then
             throw (.unsupportedOperationalExpr id)
           let sourceIndices ← map.source.binders.toList.mapM fun binder => do
             let expression ← match map.assignmentFor binder with
@@ -4061,7 +4065,7 @@ def DirectOperationalIndexedArena.scalarFactAt
             | none => throw (.invalidOperationalExprRef lane.toNat)
           arena.scalarFactAt parameters indices branch fuel
       | .mapped (.scalar _) source map => do
-          if !map.validate || map.destination != value.context then
+          if !map.transportValid || map.destination != value.context then
             throw (.unsupportedOperationalExpr id)
           let sourceIndices ← map.source.binders.toList.mapM fun binder => do
             let expression ← match map.assignmentFor binder with
@@ -5036,7 +5040,7 @@ def OperationalExprArena.reindexDirectMatrixFact
   let root ← match expression.payload with
     | .directValue root => pure root
     | .matrix root | .scalar root => throw (.unsupportedOperationalExpr root)
-  if !map.validate || map.source != expression.context then throw (.unsupportedOperationalExpr root)
+  if !map.transportValid || map.source != expression.context then throw (.unsupportedOperationalExpr root)
   /- A map from the empty context substitutes no source binder.  Parallel-family closing has
   already introduced its destination selector in fixed metadata before it attaches this carrier
   map, so traversing that metadata with an empty-domain substitution would incorrectly reject the
@@ -5092,7 +5096,7 @@ def reindexIndexedScalarFact
     (expression : IndexedOperationalFact)
     (selectionOverride : DynamicSelectionIdentity → DynamicSelectionIdentity := id) :
     Except OperationalError (OperationalExprArena × IndexedOperationalFact) := do
-  if expression.context != map.source || !map.validate then
+  if expression.context != map.source || !map.transportValid then
     throw (.unsupportedOperationalExpr expression.payload)
   let rec visit : Nat → OperationalExprArena → Nat →
       Except OperationalError (OperationalExprArena × Nat)
@@ -5169,7 +5173,7 @@ def selectIndexedScalarStatic
   let sourceBinder ← match domain.identity.expression with
     | .variable binder => pure binder
     | _ => throw (.unsupportedOperationalExpr expression.payload)
-  let map ← match staticIndexMap expression.context sourceBinder requested with
+  let map ← match closedStaticIndexMap [] expression.context sourceBinder requested with
     | some map => pure map
     | none => throw (.unsupportedOperationalExpr expression.payload)
   let (arena, mapped) ← reindexIndexedScalarFact map arena expression
@@ -5235,7 +5239,7 @@ def reindexIndexedOperationalFact
     (expression : IndexedOperationalFact)
     (selectionOverride : DynamicSelectionIdentity → DynamicSelectionIdentity := id) :
     Except OperationalError (OperationalExprArena × IndexedOperationalFact) := do
-  if expression.context != map.source || !map.validate then
+  if expression.context != map.source || !map.transportValid then
     throw (.unsupportedOperationalExpr expression.payload)
   validateOperationalExprReindexSelections map arena expression.payload (arena.nodes.size + 1)
   let mapFact (fact : OperationalMatrixFact) := match reindexOperationalMatrixFact map fact with
@@ -6266,14 +6270,6 @@ def exactlyOneIndexedBinder
   | some binder => pure binder
   | none => throw (.unsupportedOperationalExpr root)
 
-def directFamilyBinder
-    (node argument : Nat)
-    (context : IndexContext) : Except OperationalError IndexVariable := do
-  if context.binders.size != 1 then throw (.loopInputModeMismatch node argument)
-  match context.binders[0]? with
-  | some binder => pure binder
-  | none => throw (.loopInputModeMismatch node argument)
-
 /-- Exact owner-bearing binder for a matrix `familyPack`.  This is distinct from a dynamic
 selection identity: packing constructs a finite function, while later static/dynamic gets are
 only capture-free substitutions into this binder. -/
@@ -6289,6 +6285,33 @@ def packedDirectFamilyBinder
   slot := 0
   count
 }
+
+/-- Resolve the lane binder introduced by a direct matrix-family producer.  A selected family
+retains its independent branch-choice binder, so callers must substitute this exact lane binder
+rather than assuming that the carrier context has a single dimension. -/
+def directFamilyLaneBinder
+    (scope : ScopeTemplateKey)
+    (producerNode : Nat)
+    (producer : Node)
+    (familyWire : WireRef)
+    (countExpression : IntExpr)
+    (count : Nat) : Except OperationalError IndexVariable := do
+  if familyWire.node != producerNode || count == 0 then
+    throw (.loopInputModeMismatch producerNode familyWire.port)
+  match producer.kind with
+  | .familyPack => pure (packedDirectFamilyBinder scope producerNode countExpression)
+  | .parallelLoop _ _ indexSlot _ _ =>
+      let selection := DynamicSelectionIdentity.fromDeclaredCount
+        (.loopInstance indexSlot (.constant 0) (.local scope familyWire)) countExpression
+      match selection.expression with
+      | .variable binder => pure binder
+      | _ => throw (.loopInputModeMismatch producerNode familyWire.port)
+  | .select =>
+      let selection := DynamicSelectionIdentity.fromDeclaredCount (.local scope familyWire) countExpression
+      match selection.expression with
+      | .variable binder => pure binder
+      | _ => throw (.loopInputModeMismatch producerNode familyWire.port)
+  | _ => throw (.loopInputModeMismatch producerNode familyWire.port)
 
 /-- Pack matrix lanes entirely inside the authoritative direct indexed carrier.  Closed fixed
 lanes take the compact fixed-reference table; delayed/mapped lanes retain their exact direct IDs
@@ -6369,7 +6392,7 @@ def selectDirectMatrixBranches
     throw (.unsupportedOperationalExpr node)
   let map ←
     if selection.lower == selection.upper then
-      match staticIndexMap family.context binder selection.lower.toNat with
+      match closedStaticIndexMap environment family.context binder selection.lower.toNat with
       | some map => pure map
       | none => throw (.unsupportedOperationalExpr node)
     else
@@ -6389,7 +6412,8 @@ def selectionIndexedContext
 
 def closeParallelDirectMatrixOutput
     (scope : ScopeTemplateKey)
-    (node indexSlot port count : Nat)
+    (node indexSlot port : Nat)
+    (declaredCount : IntExpr)
     (arena : OperationalExprArena)
     (output : OperationalFact) : Except OperationalError (OperationalExprArena × OperationalFact) := do
   let root ← match output.payload with
@@ -6397,8 +6421,8 @@ def closeParallelDirectMatrixOutput
     | .matrix root | .scalar root => throw (.unsupportedOperationalExpr root)
   let subject : WireRef := { node, port }
   let binder : FamilyTemplateBinder := { owner := scope, producerNode := node, binderSlot := indexSlot }
-  let selection := DynamicSelectionIdentity.fromOrigin
-    (.loopInstance indexSlot (.constant 0) (.local scope subject)) count
+  let selection := DynamicSelectionIdentity.fromDeclaredCount
+    (.loopInstance indexSlot (.constant 0) (.local scope subject)) declaredCount
   if output.context.binders.isEmpty then
     let (direct, indexed) ← arena.direct.mapMatrixValue root
       (fun fact => pure (indexMatrixFact binder selection subject fact))
@@ -6421,7 +6445,9 @@ def closeParallelDirectMatrixOutput
 
 def parallelLoopIndexedMatrixOutput
     (scope : ScopeTemplateKey)
-    (node indexSlot port count : Nat)
+    (node indexSlot port : Nat)
+    (declaredCount : IntExpr)
+    (count : Nat)
     (environment : ParamEnvironment)
     (deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
       OperationalExprEvaluationState →
@@ -6431,10 +6457,10 @@ def parallelLoopIndexedMatrixOutput
   if count = 0 then throw (.invalidCount node 0)
   let subject : WireRef := { node, port }
   let binder : FamilyTemplateBinder := { owner := scope, producerNode := node, binderSlot := indexSlot }
-  let selection := DynamicSelectionIdentity.fromOrigin
-    (.loopInstance indexSlot (.constant 0) (.local scope subject)) count
+  let selection := DynamicSelectionIdentity.fromDeclaredCount
+    (.loopInstance indexSlot (.constant 0) (.local scope subject)) declaredCount
   match output.payload with
-  | .directValue _ => closeParallelDirectMatrixOutput scope node indexSlot port count arena output
+  | .directValue _ => closeParallelDirectMatrixOutput scope node indexSlot port declaredCount arena output
   | .scalar root => throw (.unsupportedOperationalExpr root)
   | .matrix _ =>
     match arena.get? output.payload with
@@ -6461,10 +6487,13 @@ def parallelLoopIndexedMatrixOutput
 /-- Arena-backed parallel-loop input preparation.  Matrix families retain their exact selected
 expression (or one checked schema envelope) instead of materializing an indicator polynomial or
 the removed fact-level selected-family representation. -/
-def loopTemplateArgumentExpr
+def loopTemplateArgumentExprWithDirectLaneBinder
     (arena : OperationalExprArena)
-    (node argument count : Nat)
+    (node argument : Nat)
+    (declaredCount : IntExpr)
+    (count : Nat)
     (mode : LoopInputMode)
+    (directLaneBinder : Option IndexVariable)
     (_environment : ParamEnvironment)
     (_deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
       OperationalExprEvaluationState →
@@ -6472,43 +6501,41 @@ def loopTemplateArgumentExpr
     (fact : OperationalFact) :
     Except OperationalError (OperationalExprArena × OperationalFact) := do
   match mode with
-  | .broadcast => pure (arena, fact)
+  | .broadcast =>
+      match fact with
+      | expression@{ payload := .directValue root, .. } =>
+          if !expression.context.binders.isEmpty then
+            throw (.loopInputModeMismatch node argument)
+          let consumer := DynamicSelectionIdentity.fromDeclaredCount
+            (.local temporaryScope { node, port := argument }) declaredCount
+          let destination ← selectionIndexedContext consumer root
+          let map : IndexMap := { source := emptyContext, destination, assignments := #[] }
+          arena.reindexDirectMatrixFact map expression
+      | { payload := .matrix _, .. } =>
+          throw (.loopInputModeMismatch node argument)
+      | expression@{ payload := .scalar _, .. } => pure (arena, expression)
   | .zip | .zipOffset _ =>
       match fact with
-      | expression@{ payload := .matrix _, .. } =>
-          let domain ← match arena.get? expression.payload with
-            | some { node := .select domain (.exact branches), .. } =>
-                if branches.size == domain.count then pure domain
-                else throw (.loopInputModeMismatch node argument)
-            | some { node := .select domain (.shared _ _), .. } => pure domain
-            | _ => throw (.loopInputModeMismatch node argument)
-          let offset := match mode with | .zipOffset value => value | _ => 0
-          if count + offset > domain.count then throw (.loopInputModeMismatch node argument)
-          let sourceBinder ← match domain.identity.expression with
-            | .variable binder => pure binder
-            | _ => throw (.loopInputModeMismatch node argument)
-          let consumer := DynamicSelectionIdentity.fromOrigin
-            (.local temporaryScope { node, port := argument }) count
-          let assignment := .offset consumer.expression (Int.ofNat offset)
-          let map ← match dynamicIndexMap expression.context sourceBinder assignment with
-            | some map => pure map
-            | none => throw (.loopInputModeMismatch node argument)
-          let (arena, mapped) ← reindexIndexedOperationalFact map arena expression
-          pure (arena, mapped)
       | expression@{ payload := .directValue _, .. } =>
-          let sourceBinder ← directFamilyBinder node argument expression.context
+          let sourceBinder ← match directLaneBinder with
+            | some binder => pure binder
+            | none => throw (.loopInputModeMismatch node argument)
+          if !expression.context.binders.contains sourceBinder then
+            throw (.loopInputModeMismatch node argument)
           let offset := match mode with | .zipOffset value => value | _ => 0
           let sourceCount ← match sourceBinder.count.evaluate _environment with
             | some value => if value > 0 then pure value.toNat else throw (.loopInputModeMismatch node argument)
             | none => throw (.loopInputModeMismatch node argument)
           if count + offset > sourceCount then throw (.loopInputModeMismatch node argument)
-          let consumer := DynamicSelectionIdentity.fromOrigin
-            (.local temporaryScope { node, port := argument }) count
+          let consumer := DynamicSelectionIdentity.fromDeclaredCount
+            (.local temporaryScope { node, port := argument }) declaredCount
           let assignment := .offset consumer.expression (Int.ofNat offset)
           let map ← match dynamicIndexMap expression.context sourceBinder assignment with
             | some map => pure map
             | none => throw (.loopInputModeMismatch node argument)
           arena.reindexDirectMatrixFact map expression
+      | { payload := .matrix _, .. } =>
+          throw (.loopInputModeMismatch node argument)
       | expression@{ payload := .scalar _, .. } =>
           let (domain, _) ← arena.scalarSelectionDomain expression
           let offset := match mode with | .zipOffset value => value | _ => 0
@@ -6628,79 +6655,68 @@ def selectIndexedMatrixFamilyDynamic
       let finalArena ← finalArena.rememberIndexedExpr expression
       pure (finalArena, expression)
 
-/-- Select one matrix family pointwise without materializing its lanes.  Every branch template is
-first alpha-renamed to the output-family binder; the ordinary expression selection then preserves
-the executable selector identity and all branch-local decomposition/preimage relations. -/
-def selectUniformMatrixFamilies
+/-- Select one matrix family as application of an ordered direct family table.  Each branch family
+is first reindexed onto the output lane selector; the branch-table binder is then substituted by
+the executable selector, preserving both dimensions without a legacy choice node. -/
+def selectUniformMatrixFamiliesWithLaneBinders
     (scopeKey : ScopeTemplateKey)
     (node : Nat)
     (selection : OperationalIntegerFact)
     (matrixType : MatrixTypeExpr)
+    (declaredCount : IntExpr)
     (expectedCount : Nat)
     (branches : List OperationalFact)
-    (_environment : ParamEnvironment)
+    (branchLaneBinders : List IndexVariable)
+    (environment : ParamEnvironment)
     (_deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
       OperationalExprEvaluationState →
       Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
     (arena : OperationalExprArena) :
     Except OperationalError (OperationalExprArena × OperationalFact) := do
-  if expectedCount = 0 || branches.isEmpty then
+  if expectedCount = 0 || branches.isEmpty || branches.length != branchLaneBinders.length then
     throw (.invalidCount node expectedCount)
   let outputLane : OperationalValueOrigin := .local scopeKey { node, port := 0 }
-  let outputSelection := DynamicSelectionIdentity.fromOrigin outputLane expectedCount
-  let outputExpression := outputSelection.expression
-  let choiceBinder : FamilyTemplateBinder := {
-    owner := scopeKey
-    producerNode := node
-    binderSlot := 1
-  }
-  let dynamicChoice := branches.length > 1
-  let choiceSelection := DynamicSelectionIdentity.fromOrigin selection.origin branches.length
+  let outputSelection := DynamicSelectionIdentity.fromDeclaredCount outputLane declaredCount
   let mut arena := arena
-  let mut roots : Array OperationalExprId := #[]
-  for branch in branches do
-    let (nextArena, root) ← match branch with
-      | expression@{ payload := .matrix _, .. } => do
-          let domain ← match arena.get? expression.payload with
-            | some { node := .select domain (.exact stored), .. } =>
-                if stored.size == domain.count then pure domain
-                else throw (.loopInputModeMismatch node 1)
-            | some { node := .select domain (.shared _ _), .. } => pure domain
-            | _ => throw (.loopInputModeMismatch node 1)
-          if domain.count != expectedCount then throw (.loopInputModeMismatch node 1)
-          let sourceBinder ← match domain.identity.expression with
-            | .variable binder => pure binder
-            | _ => throw (.loopInputModeMismatch node 1)
-          let map ← match dynamicIndexMap expression.context sourceBinder outputExpression with
-            | some map => pure map
-            | none => throw (.loopInputModeMismatch node 1)
-          let (nextArena, normalized) ← reindexIndexedOperationalFact map arena expression
-          pure (nextArena, normalized.payload.root)
-      | _ => throw (.loopInputModeMismatch node 1)
-    if dynamicChoice then
-      let mapFact := indexMatrixFact choiceBinder choiceSelection { node, port := 0 }
-      let mapSelection (nested : DynamicSelectionIdentity) := nested.withOrigin
-        (indexValueOrigin choiceBinder choiceSelection nested.index)
-      let cacheNamespace := s!"family-select-choice:{node}:{reprStr selection.origin}"
-      let (nextArena, selected) ← mapOperationalExpr cacheNamespace .instantiationMap
-        nextArena root mapFact mapSelection
-      arena := nextArena
-      roots := roots.push selected
+  let mut normalizedBranches : Array OperationalFact := #[]
+  for (branch, sourceBinder) in branches.zip branchLaneBinders do
+    let expression ← match branch with
+      | expression@{ payload := .directValue _, .. } => pure expression
+      | { payload := .matrix root, .. } => throw (.unsupportedOperationalExpr root)
+      | { payload := .scalar _, .. } => throw (.operandNotMatrix node { node, port := 0 })
+    let value ← match arena.direct.valueAt? expression.payload.root with
+      | some value => pure value
+      | none => throw (.invalidOperationalExprRef expression.payload.root)
+    if value.context != expression.context || value.payload.schema != .matrix matrixType then
+      throw (.outputTypeMismatch node)
+    if !expression.context.binders.contains sourceBinder then
+      throw (.loopInputModeMismatch node 1)
+    let map ← match dynamicIndexMap expression.context sourceBinder outputSelection.expression with
+      | some map => pure map
+      | none => throw (.loopInputModeMismatch node 1)
+    let (nextArena, normalized) ← arena.reindexDirectMatrixFact map expression
+    arena := nextArena
+    normalizedBranches := normalizedBranches.push normalized
+  let choiceCount := normalizedBranches.size
+  let choiceCountExpression := IntExpr.constant (Int.ofNat choiceCount)
+  let choiceBinder := packedDirectFamilyBinder scopeKey node choiceCountExpression
+  let (nextArena, table) ← packDirectMatrixFamily scopeKey node environment choiceCountExpression arena
+    normalizedBranches
+  arena := nextArena
+  if !table.context.binders.contains choiceBinder then
+    throw (.unsupportedOperationalExpr node)
+  let choiceMap ←
+    if selection.lower == selection.upper then
+      match closedStaticIndexMap environment table.context choiceBinder selection.lower.toNat with
+      | some map => pure map
+      | none => throw (.unsupportedOperationalExpr node)
     else
-      arena := nextArena
-      roots := roots.push root
-  let (finalArena, root) ← if dynamicChoice then
-      arena.pushSelect choiceSelection (.exact roots)
-    else match roots[0]? with
-      | some root => pure (arena, root)
-      | none => throw (.invalidCount node 0)
-  let expression ← match finalArena.get? root with
-    | some expression => pure expression
-    | none => throw (.invalidOperationalExprRef root)
-  if expression.matrixType != matrixType then throw (.outputTypeMismatch node)
-  let indexed ← finalArena.indexedExpr root
-  let finalArena ← finalArena.rememberIndexedExpr indexed
-  pure (finalArena, indexed)
+      let choiceSelection := DynamicSelectionIdentity.fromOrigin selection.origin choiceCount
+      match dynamicIndexMap table.context choiceBinder choiceSelection.expression with
+      | some map => pure map
+      | none => throw (.unsupportedOperationalExpr node)
+  let (finalArena, selected) ← arena.reindexDirectMatrixFact choiceMap table
+  rebindOperationalFact { node, port := 0 } finalArena selected
 
 def joinOperationalScalarFacts
     (node : Nat) : OperationalScalarFact → OperationalScalarFact →

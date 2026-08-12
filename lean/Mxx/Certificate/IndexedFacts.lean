@@ -132,11 +132,20 @@ private def staticallyWithin (limit : IntExpr) (expression : IndexExpr) : Bool :
       | .gather source _ => exactIndexDomain source == some limit
       | .constant _ => false
 
+private structure ClosedIndexWitness where
+  binder : IndexVariable
+  assignment : IndexExpr
+  bound : Nat
+  deriving BEq, DecidableEq, Repr
+
 /-- Capture-free substitution from source-context binders to target-context expressions. -/
 structure IndexMap where
   source : IndexContext
   destination : IndexContext
   assignments : Array IndexExpr
+  /-- A fixed lane admitted only after its symbolic binder count was closed in a concrete
+  parameter environment.  Ordinary maps leave this absent and remain subject to `validate`. -/
+  closedIndex : Option ClosedIndexWitness := none
   deriving BEq, DecidableEq, Repr
 
 private def lookupAssignment : List IndexVariable → List IndexExpr → IndexVariable → Option IndexExpr
@@ -166,6 +175,37 @@ def IndexMap.validate (map : IndexMap) : Bool :=
     map.assignments.size == map.source.binders.size &&
     assignmentsInBounds map.source.binders.toList map.assignments.toList map.destination
 
+private def closedIndexAssignmentsInBounds
+    (closedBinder : IndexVariable)
+    (closedAssignment : IndexExpr)
+    (closedBound : Nat) : List IndexVariable → List IndexExpr → IndexContext → Bool
+  | [], [], _ => true
+  | binder :: binders, expression :: expressions, destination =>
+      (if binder == closedBinder then
+        expression == closedAssignment &&
+          match expression with
+          | .constant lane => lane < closedBound
+          | .variable _ => true
+          | _ => false
+      else indexExpressionInBounds destination expression && staticallyWithin binder.count expression) &&
+        closedIndexAssignmentsInBounds closedBinder closedAssignment closedBound binders expressions destination
+  | _, _, _ => false
+
+/-- Validate one explicitly environment-closed substitution.  This does not relax
+`IndexMap.validate`: the private witness fixes its exact source binder and assignment, while every
+other assignment remains subject to the ordinary static source-domain proof. -/
+private def closedIndexTransportValid (map : IndexMap) : Bool :=
+  match map.closedIndex with
+  | some { binder, assignment, bound } =>
+      validateContext map.source && validateContext map.destination && 0 < bound &&
+        map.source.binders.contains binder &&
+        map.assignments.size == map.source.binders.size &&
+        closedIndexAssignmentsInBounds binder assignment bound map.source.binders.toList
+          map.assignments.toList map.destination
+  | none => false
+
+def IndexMap.transportValid (map : IndexMap) : Bool := map.validate || closedIndexTransportValid map
+
 private def reindexUnchecked (map : IndexMap) : IndexExpr → Option IndexExpr
   | .constant value => some (.constant value)
   | .variable binder => map.lookup? binder
@@ -174,7 +214,7 @@ private def reindexUnchecked (map : IndexMap) : IndexExpr → Option IndexExpr
       return .gather (← reindexUnchecked map source) (← reindexUnchecked map position)
 
 def reindex (map : IndexMap) (expression : IndexExpr) : Option IndexExpr :=
-  if map.validate then reindexUnchecked map expression else none
+  if map.transportValid then reindexUnchecked map expression else none
 
 def composeIndexMap (first second : IndexMap) : Option IndexMap := do
   if !first.validate || !second.validate || first.destination != second.source then none
@@ -280,7 +320,7 @@ both source and position of gathers, and accepts only a validated source-to-dest
 def IndexedParameterExpr.reindex
     (map : IndexMap)
     (expression : IndexedParameterExpr) : Option IndexedParameterExpr :=
-  if map.validate then reindexIndexedParameterExprUnchecked map expression else none
+  if map.transportValid then reindexIndexedParameterExprUnchecked map expression else none
 
 def IndexedParameterExpr.evaluate
     (parameters : Mxx.Ir.ParamEnvironment)
@@ -305,15 +345,26 @@ def IndexedParameterExpr.evaluate
 
 /-- Substitute one source binder by a fixed lane and retain every other binder unchanged.  Static
 family access uses this map instead of erasing a context position by convention. -/
-def staticIndexMap (source : IndexContext) (binder : IndexVariable) (lane : Nat) : Option IndexMap := do
+def closedStaticIndexMap
+    (environment : Mxx.Ir.ParamEnvironment)
+    (source : IndexContext)
+    (binder : IndexVariable)
+    (lane : Nat) : Option IndexMap := do
   if !validateContext source || !source.binders.contains binder then none
+  let bound ← binder.count.evaluate environment
+  if bound <= 0 || lane >= bound.toNat then none
   let destination : IndexContext := {
     binders := source.binders.filter (· != binder)
   }
   let assignments := source.binders.map fun candidate =>
     if candidate == binder then .constant lane else .variable candidate
-  let map : IndexMap := { source, destination, assignments }
-  if map.validate then some map else none
+  let map : IndexMap := {
+    source
+    destination
+    assignments
+    closedIndex := some { binder, assignment := .constant lane, bound := bound.toNat }
+  }
+  if map.transportValid then some map else none
 
 def sameIndexExpression (left right : IndexExpr) : Bool := left == right
 
@@ -338,6 +389,31 @@ def dynamicIndexMap
     if candidate == binder then selector else .variable candidate
   let map : IndexMap := { source, destination, assignments }
   if map.validate then some map else none
+
+/-- Substitute a symbolic family lane by a canonical variable selector only after both domains
+close to the same positive size in the caller's parameter environment. -/
+def closedDynamicIndexMap
+    (environment : Mxx.Ir.ParamEnvironment)
+    (source : IndexContext)
+    (binder : IndexVariable)
+    (selector : IndexExpr) : Option IndexMap := do
+  if !validateContext source || !source.binders.contains binder then none
+  let selectorBinder ← match selector with
+    | .variable value => some value
+    | _ => none
+  let bound ← binder.count.evaluate environment
+  let selectorBound ← selectorBinder.count.evaluate environment
+  if bound <= 0 || selectorBound != bound then none
+  let destination ← extendAll { binders := source.binders.filter (· != binder) } selector.freeVariables
+  let assignments := source.binders.map fun candidate =>
+    if candidate == binder then selector else .variable candidate
+  let map : IndexMap := {
+    source
+    destination
+    assignments
+    closedIndex := some { binder, assignment := selector, bound := bound.toNat }
+  }
+  if map.transportValid then some map else none
 
 /-- The pointwise context of two operands.  Binders retain first-occurrence order, so equal
 selector variables remain correlated rather than being renamed into independent dimensions. -/
@@ -397,7 +473,7 @@ def IndexedFact.reindex {α : Type}
     (map : IndexMap)
     (mapPayload : IndexMap → α → Option α)
     (fact : IndexedFact α) : Option (IndexedFact α) := do
-  if !map.validate || fact.context != map.source then none
+  if !map.transportValid || fact.context != map.source then none
   let storage := if fact.storage == .explicitTable && map.source != map.destination then
     .mappedTemplate
   else
@@ -696,10 +772,46 @@ example :
     let lane := fixtureVariable 0 0 4
     let other := fixtureVariable 1 0 8
     let source := fixtureContext [lane, other]
-    (staticIndexMap source lane 3).map (fun map =>
+    (closedStaticIndexMap [] source lane 3).map (fun map =>
       map.destination == fixtureContext [other] &&
         reindex map (.variable lane) == some (.constant 3) &&
         reindex map (.variable other) == some (.variable other)) = some true := by
+  native_decide
+
+example :
+    let lane : IndexVariable := {
+      owner := fixtureOwner 20
+      slot := 0
+      count := .parameter "lane_count"
+    }
+    let selector : IndexVariable := {
+      owner := fixtureOwner 21
+      slot := 0
+      count := .parameter "selector_count"
+    }
+    let environment : Mxx.Ir.ParamEnvironment := [
+      ("lane_count", .integer 2), ("selector_count", .integer 2)
+    ]
+    (closedDynamicIndexMap environment (fixtureContext [lane]) lane (.variable selector)).map (fun map =>
+      map.validate == false && map.transportValid &&
+        reindex map (.variable lane) == some (.variable selector)) = some true := by
+  native_decide
+
+example :
+    let lane : IndexVariable := {
+      owner := fixtureOwner 22
+      slot := 0
+      count := .parameter "lane_count"
+    }
+    let outer : IndexVariable := {
+      owner := fixtureOwner 23
+      slot := 0
+      count := .parameter "lane_count"
+    }
+    let environment : Mxx.Ir.ParamEnvironment := [("lane_count", .integer 2)]
+    let first := fixtureMap (fixtureContext [outer]) (fixtureContext [lane]) [.variable lane]
+    (closedStaticIndexMap environment (fixtureContext [lane]) lane 1).map (fun second =>
+      match composeIndexMap first second with | none => true | some _ => false) = some true := by
   native_decide
 
 example :

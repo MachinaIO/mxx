@@ -404,7 +404,7 @@ private def fixtureDerivation : ScopeDerivation := { steps := #[
 
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts fixtureScope fixtureDerivation [] []
-    matrixMaximum 2 { node := 2, port := 0 } facts) = .ok 3 := by
+    matrixMaximum 2 { node := 2, port := 0 } facts []) = .ok 3 := by
   native_decide
 
 /-- A fresh sample produced by one parallel-body template denotes a different source in each
@@ -718,11 +718,11 @@ centered-cap scaling, coefficient selection, tensor-with-identity, and interval 
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts matrixTransformCoverageScope
       matrixTransformCoverageDerivation [] []
-    let afterCancellation ← matrixMaximum 17 { node := 3, port := 0 } facts
-    let afterScale ← matrixMaximum 17 { node := 6, port := 0 } facts
-    let coefficient ← matrixMaximum 17 { node := 10, port := 0 } facts
-    let tensor ← matrixMaximum 17 { node := 11, port := 0 } facts
-    let interval ← matrixMaximum 17 { node := 17, port := 0 } facts
+    let afterCancellation ← matrixMaximum 17 { node := 3, port := 0 } facts []
+    let afterScale ← matrixMaximum 17 { node := 6, port := 0 } facts []
+    let coefficient ← matrixMaximum 17 { node := 10, port := 0 } facts []
+    let tensor ← matrixMaximum 17 { node := 11, port := 0 } facts []
+    let interval ← matrixMaximum 17 { node := 17, port := 0 } facts []
     pure (afterCancellation, afterScale, coefficient, tensor, interval)) =
       .ok (5, 8, 8, 3, 4) := by
   native_decide
@@ -1196,7 +1196,7 @@ absent from the transfer registry has no permissive fallback. -/
 example : (show Except OperationalError (Int × Bool × Bool) from do
     let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
       relationFixtureDerivation [] [fixtureLayout]
-    let maximum ← matrixMaximum 3 { node := 3, port := 0 } facts
+    let maximum ← matrixMaximum 3 { node := 3, port := 0 } facts []
     let relationBearing ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
     let rewritten ← derivedMatrixFactAt 3 facts { node := 3, port := 0 }
     let source := selectedMatrixSummary #[relationBearing]
@@ -1268,7 +1268,7 @@ private def subgraphRelationDerivation : ProgramDerivation := {
 example : (do
     let facts ← evaluateProgramOperationalWithLayouts subgraphRelationProgram
       subgraphRelationDerivation [] [fixtureLayout]
-    matrixMaximum 3 { node := 3, port := 0 } facts) = .ok 3 := by
+    matrixMaximum 3 { node := 3, port := 0 } facts []) = .ok 3 := by
   native_decide
 
 private def distinctCallIdentityProgram : Prog := {
@@ -1396,8 +1396,8 @@ private def familyPackPreservesDomainFixtureResult : Except OperationalError Boo
     packedFamilyFixtureDerivation [] [fixtureLayout]
   let family ← lookupFact 10 facts { node := 9, port := 0 }
   let dynamic ← lookupFact 10 facts { node := 10, port := 0 }
-  let expectedMaximum ← matrixMaximum 10 { node := 1, port := 0 } facts
-  let dynamicMaximum ← matrixMaximum 10 { node := 10, port := 0 } facts
+  let expectedMaximum ← matrixMaximum 10 { node := 1, port := 0 } facts []
+  let dynamicMaximum ← matrixMaximum 10 { node := 10, port := 0 } facts []
   match family, dynamic with
   | { context := familyContext, payload := .directValue _, .. },
       { context := dynamicContext, payload := .directValue _, .. } =>
@@ -1428,7 +1428,7 @@ private def selectFixtureDerivation : ScopeDerivation := { steps := #[
 
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts selectFixtureScope selectFixtureDerivation [] []
-    matrixMaximum 3 { node := 3, port := 0 } facts) = .ok 5 := by
+    matrixMaximum 3 { node := 3, port := 0 } facts []) = .ok 5 := by
   native_decide
 
 /-- Executable matrix `select` is represented as one direct ordered family table followed by an
@@ -1454,6 +1454,183 @@ private def directMatrixSelectFixtureResult : Except OperationalError Bool := do
   | _ => pure false
 
 example : directMatrixSelectFixtureResult = .ok true := by
+  native_decide
+
+/-- Selecting two direct matrix families stays entirely in the direct carrier.  The static
+selection substitutes both the branch and lane binders, while the bounded input selector retains
+the selected branch dimension and the output family lane dimension. -/
+private def directFamilySelectScope : Scope := {
+  nodes := #[
+    { kind := .input "selector", arguments := [], outputTypes := [.integer] },
+    { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
+    { kind := .gaussianSample fixtureType (.constant 2), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .familyPack, arguments := [{ node := 2, port := 0 }, { node := 3, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+    { kind := .gaussianSample fixtureType (.constant 5), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gaussianSample fixtureType (.constant 7), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .familyPack, arguments := [{ node := 5, port := 0 }, { node := 6, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+    { kind := .select, arguments := [{ node := 1, port := 0 }, { node := 4, port := 0 },
+        { node := 7, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+    { kind := .select, arguments := [{ node := 0, port := 0 }, { node := 4, port := 0 },
+        { node := 7, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+    { kind := .familyGetStatic (.constant 1), arguments := [{ node := 8, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .familyGetDynamic, arguments := [{ node := 9, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("static", { node := 10, port := 0 }), ("dynamic", { node := 11, port := 0 })]
+  inputNames := ["selector"]
+}
+
+private def directFamilySelectDerivation : ScopeDerivation := { steps := #[
+  { sourceNode := 0, rule := .input, arguments := [] },
+  { sourceNode := 1, rule := .constantInt, arguments := [] },
+  { sourceNode := 2, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 3, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 4, rule := .familyPack, arguments := [{ node := 2, port := 0 },
+    { node := 3, port := 0 }] },
+  { sourceNode := 5, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 6, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 7, rule := .familyPack, arguments := [{ node := 5, port := 0 },
+    { node := 6, port := 0 }] },
+  { sourceNode := 8, rule := .select, arguments := [{ node := 1, port := 0 },
+    { node := 4, port := 0 }, { node := 7, port := 0 }] },
+  { sourceNode := 9, rule := .select, arguments := [{ node := 0, port := 0 },
+    { node := 4, port := 0 }, { node := 7, port := 0 }] },
+  { sourceNode := 10, rule := .familyGetStatic, arguments := [{ node := 8, port := 0 }] },
+  { sourceNode := 11, rule := .familyGetDynamic, arguments := [{ node := 9, port := 0 },
+    { node := 0, port := 0 }] }
+] }
+
+private def directFamilySelectFixture : Except OperationalError Bool := do
+  let scopeKey : ScopeTemplateKey := .root (.standalone 801)
+  let (arena, selector) ← contractFact {} scopeKey { node := 0, port := 0 } ⟨"selector"⟩
+    .integer (.integerRange (.constant 0) (.constant 1)) []
+  let facts ← evaluateScopeOperationalWithKey scopeKey directFamilySelectScope directFamilySelectDerivation
+    [] [] [selector] arena
+  let staticFamily ← lookupFact 11 facts { node := 8, port := 0 }
+  let dynamicFamily ← lookupFact 11 facts { node := 9, port := 0 }
+  let staticOutput ← lookupFact 11 facts { node := 10, port := 0 }
+  let dynamicOutput ← lookupFact 11 facts { node := 11, port := 0 }
+  let staticBound ← matrixMaximum 11 { node := 10, port := 0 } facts []
+  let dynamicBound ← matrixMaximum 11 { node := 11, port := 0 } facts []
+  let noLegacySelect := facts.arena.nodes.all fun expression => match expression.node with
+    | .select .. => false
+    | _ => true
+  pure (match staticFamily, dynamicFamily, staticOutput, dynamicOutput with
+    | { context := staticContext, payload := .directValue _, .. },
+        { context := dynamicContext, payload := .directValue _, .. },
+        { context := staticOutputContext, payload := .directValue _, .. },
+        { context := dynamicOutputContext, payload := .directValue _, .. } =>
+          !staticContext.binders.isEmpty && dynamicContext.binders.size == 2 &&
+            staticOutputContext == emptyContext && dynamicOutputContext.binders.size == 1 &&
+            staticBound == 7 && dynamicBound == 7 && noLegacySelect
+    | _, _, _, _ => false)
+
+example : directFamilySelectFixture = .ok true := by
+  native_decide
+
+/-- A dynamic selector whose declared range exceeds a two-lane direct matrix family is rejected
+at `familyGetDynamic`; the evaluator must not truncate or canonicalize the selector range. -/
+private def outOfRangeDirectFamilyGetScope : Scope := {
+  nodes := #[
+    { kind := .input "selector", arguments := [], outputTypes := [.integer] },
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gaussianSample fixtureType (.constant 5), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .familyPack, arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+    { kind := .familyGetDynamic, arguments := [{ node := 3, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 4, port := 0 })]
+  inputNames := ["selector"]
+}
+
+private def outOfRangeDirectFamilyGetDerivation : ScopeDerivation := { steps := #[
+  { sourceNode := 0, rule := .input, arguments := [] },
+  { sourceNode := 1, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 2, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 3, rule := .familyPack, arguments := [{ node := 1, port := 0 },
+    { node := 2, port := 0 }] },
+  { sourceNode := 4, rule := .familyGetDynamic, arguments := [{ node := 3, port := 0 },
+    { node := 0, port := 0 }] }
+] }
+
+private def outOfRangeDirectFamilyGetFixture : Bool :=
+  match (do
+    let scopeKey : ScopeTemplateKey := .root (.standalone 803)
+    let (arena, selector) ← contractFact {} scopeKey { node := 0, port := 0 } ⟨"selector"⟩
+      .integer (.integerRange (.constant 0) (.constant 3)) []
+    evaluateScopeOperationalWithKey scopeKey outOfRangeDirectFamilyGetScope
+      outOfRangeDirectFamilyGetDerivation [] [] [selector] arena) with
+  | .error (.invalidCount 4 3) => true
+  | _ => false
+
+/-- A symbolic family count survives direct Select and subsequent static and dynamic extraction
+without allocating a legacy selection node. -/
+private def symbolicFamilySelectScope : Scope := {
+  nodes := #[
+    { kind := .input "selector", arguments := [], outputTypes := [.integer] },
+    { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
+    { kind := .gaussianSample fixtureType (.constant 2), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .familyPack, arguments := [{ node := 2, port := 0 }, { node := 3, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.parameter "lane_count")] },
+    { kind := .gaussianSample fixtureType (.constant 5), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .gaussianSample fixtureType (.constant 7), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .familyPack, arguments := [{ node := 5, port := 0 }, { node := 6, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.parameter "lane_count")] },
+    { kind := .select, arguments := [{ node := 1, port := 0 }, { node := 4, port := 0 },
+        { node := 7, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.parameter "lane_count")] },
+    { kind := .select, arguments := [{ node := 0, port := 0 }, { node := 4, port := 0 },
+        { node := 7, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.parameter "lane_count")] },
+    { kind := .familyGetStatic (.constant 1), arguments := [{ node := 8, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .familyGetDynamic, arguments := [{ node := 9, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("static", { node := 10, port := 0 }), ("dynamic", { node := 11, port := 0 })]
+  inputNames := ["selector"]
+}
+
+private def symbolicFamilySelectFixture : Except OperationalError Bool := do
+  let environment : ParamEnvironment := [("lane_count", .integer 2)]
+  let scopeKey : ScopeTemplateKey := .root (.standalone 802)
+  let (arena, selector) ← contractFact {} scopeKey { node := 0, port := 0 } ⟨"selector"⟩
+    .integer (.integerRange (.constant 0) (.constant 1)) environment
+  let facts ← evaluateScopeOperationalWithKey scopeKey symbolicFamilySelectScope directFamilySelectDerivation
+    environment [] [selector] arena
+  let staticOutput ← lookupFact 11 facts { node := 10, port := 0 }
+  let dynamicOutput ← lookupFact 11 facts { node := 11, port := 0 }
+  let staticBound ← matrixMaximum 11 { node := 10, port := 0 } facts environment
+  let dynamicBound ← matrixMaximum 11 { node := 11, port := 0 } facts environment
+  let noLegacySelect := facts.arena.nodes.all fun expression => match expression.node with
+    | .select .. => false
+    | _ => true
+  pure (match staticOutput, dynamicOutput with
+    | { context := staticContext, payload := .directValue _, .. },
+        { context := dynamicContext, payload := .directValue _, .. } =>
+          staticContext == emptyContext && dynamicContext.binders.size == 1 &&
+            staticBound == 7 && dynamicBound == 7 && noLegacySelect
+    | _, _ => false)
+
+example : symbolicFamilySelectFixture = .ok true := by
   native_decide
 
 private def loopBoundBody : Scope := {
@@ -1498,12 +1675,12 @@ private def loopBoundDerivation : ProgramDerivation := {
 body graph itself is evaluated once. The resulting indexed expression stores the exact maximum 4. -/
 example : (do
     let facts ← evaluateProgramOperationalWithLayouts loopBoundProgram loopBoundDerivation [] []
-    matrixMaximum 1 { node := 0, port := 0 } facts) = .ok 4 := by
+    matrixMaximum 1 { node := 0, port := 0 } facts []) = .ok 4 := by
   native_decide
 
 example : (do
     let facts ← evaluateProgramOperationalWithLayouts loopBoundProgram loopBoundDerivation [] []
-    matrixMaximum 2 { node := 1, port := 0 } facts) = .ok 3 := by
+    matrixMaximum 2 { node := 1, port := 0 } facts []) = .ok 3 := by
   native_decide
 
 private def packedSelectionLoopBody : Scope := {
@@ -1564,7 +1741,7 @@ private def packedSelectionLoopDerivation : ProgramDerivation := {
 example : (do
     let facts ← evaluateProgramOperationalWithLayouts packedSelectionLoopProgram
       packedSelectionLoopDerivation [] []
-    let staticMaximum ← matrixMaximum 7 { node := 4, port := 0 } facts
+    let staticMaximum ← matrixMaximum 7 { node := 4, port := 0 } facts []
     let dynamic ← lookupFact 7 facts { node := 6, port := 0 }
     let report ← decoderNoiseCheckReportForFact [] facts.arena dynamic [] 2 25
     let familyIsDirectIndexed ← match ← lookupFact 7 facts { node := 3, port := 0 } with
@@ -1573,6 +1750,120 @@ example : (do
     pure (staticMaximum, report.obligations, familyIsDirectIndexed)) =
     .ok (5, [.decoderThreshold 2 25 3], true) := by
   native_decide
+
+/-- Parallel-loop input modes keep direct matrix values in the direct carrier: Broadcast lifts a
+constant value over the loop binder, while Zip and ZipOffset reindex a packed direct family. -/
+private def directLoopInputProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 5), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+      { kind := .gaussianSample fixtureType (.constant 7), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .parallelLoop "body" (.constant 2) 0 [] [.broadcast],
+        arguments := [{ node := 3, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+      { kind := .parallelLoop "body" (.constant 2) 0 [] [.zip],
+        arguments := [{ node := 2, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+      { kind := .parallelLoop "body" (.constant 1) 0 [] [.zipOffset 1],
+        arguments := [{ node := 2, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 1)] }
+    ]
+    outputs := [("broadcast", { node := 4, port := 0 }), ("zip", { node := 5, port := 0 }),
+      ("zipOffset", { node := 6, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("body", packedSelectionLoopBody)]
+}
+
+private def directLoopInputDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 1, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 2, rule := .familyPack, arguments := [{ node := 0, port := 0 },
+      { node := 1, port := 0 }] },
+    { sourceNode := 3, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 4, rule := .parallelLoop, arguments := [{ node := 3, port := 0 }] },
+    { sourceNode := 5, rule := .parallelLoop, arguments := [{ node := 2, port := 0 }] },
+    { sourceNode := 6, rule := .parallelLoop, arguments := [{ node := 2, port := 0 }] }
+  ] }
+  definitions := [("body", { steps := #[
+    { sourceNode := 0, rule := .input, arguments := [] }
+  ] })]
+}
+
+private def directLoopInputFixture : Except OperationalError Bool := do
+  let facts ← evaluateProgramOperationalWithLayouts directLoopInputProgram directLoopInputDerivation [] []
+  let broadcast ← lookupFact 7 facts { node := 4, port := 0 }
+  let zipped ← lookupFact 7 facts { node := 5, port := 0 }
+  let offset ← lookupFact 7 facts { node := 6, port := 0 }
+  let broadcastBound ← matrixMaximum 7 { node := 4, port := 0 } facts []
+  let zipBound ← matrixMaximum 7 { node := 5, port := 0 } facts []
+  let offsetBound ← matrixMaximum 7 { node := 6, port := 0 } facts []
+  let noLegacySelect := facts.arena.nodes.all fun expression => match expression.node with
+    | .select .. => false
+    | _ => true
+  pure (match broadcast, zipped, offset with
+    | { context := broadcastContext, payload := .directValue _, .. },
+        { context := zipContext, payload := .directValue _, .. },
+        { context := offsetContext, payload := .directValue _, .. } =>
+          broadcastContext.binders.size == 1 && zipContext.binders.size == 1 &&
+            offsetContext.binders.size == 1 && broadcastBound == 7 && zipBound == 5 &&
+            offsetBound == 5 && noLegacySelect
+    | _, _, _ => false)
+
+/-- A parameter-valued `familyPack` count is resolved from the production environment before a
+zipped loop reindexes its exact direct lane binder. -/
+private def symbolicCountDirectZipProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 5), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.parameter "lane_count")] },
+      { kind := .parallelLoop "body" (.parameter "lane_count") 0 [] [.zip],
+        arguments := [{ node := 2, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.parameter "lane_count")] }
+    ]
+    outputs := [("result", { node := 3, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("body", packedSelectionLoopBody)]
+}
+
+private def symbolicCountDirectZipDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 1, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 2, rule := .familyPack, arguments := [{ node := 0, port := 0 },
+      { node := 1, port := 0 }] },
+    { sourceNode := 3, rule := .parallelLoop, arguments := [{ node := 2, port := 0 }] }
+  ] }
+  definitions := [("body", { steps := #[
+    { sourceNode := 0, rule := .input, arguments := [] }
+  ] })]
+}
+
+private def symbolicCountDirectZipFixture : Except OperationalError Bool := do
+  let environment : ParamEnvironment := [("lane_count", .integer 2)]
+  let facts ← evaluateProgramOperationalWithLayouts symbolicCountDirectZipProgram
+    symbolicCountDirectZipDerivation environment []
+  let output ← lookupFact 4 facts { node := 3, port := 0 }
+  let bound ← matrixMaximum 4 { node := 3, port := 0 } facts environment
+  let noLegacySelect := facts.arena.nodes.all fun expression => match expression.node with
+    | .select .. => false
+    | _ => true
+  pure (match output with
+    | { context, payload := .directValue _, .. } =>
+        context.binders.size == 1 && bound == 5 && noLegacySelect
+    | _ => false)
 
 private def selectedSequentialBody : Scope := {
   nodes := #[
@@ -1636,7 +1927,7 @@ spurious dynamic alternative. -/
 example : (do
     let facts ← evaluateProgramOperationalWithLayouts selectedSequentialProgram
       selectedSequentialDerivation [] []
-    matrixMaximum 3 { node := 2, port := 0 } facts) = .ok 7 := by
+    matrixMaximum 3 { node := 2, port := 0 } facts []) = .ok 7 := by
   native_decide
 
 private def sequentialRelationBody : Scope := {
@@ -1691,7 +1982,7 @@ one body execution. Only the resulting relation-free target fact becomes the nex
 example : (do
     let facts ← evaluateProgramOperationalWithLayouts sequentialRelationProgram
       sequentialRelationDerivation [] [fixtureLayout]
-    matrixMaximum 2 { node := 2, port := 0 } facts) = .ok 2 := by
+    matrixMaximum 2 { node := 2, port := 0 } facts []) = .ok 2 := by
   native_decide
 
 private def relationCarryBody : Scope := {
@@ -2489,9 +2780,11 @@ private def mixedExactSharedZipFixture : Bool :=
     let (arena, sharedRoot) ← arena.pushSharedSelection uniformSelection 2 uniformRoot uniformSummary
     let packed ← arena.indexedExpr packedRoot
     let shared ← arena.indexedExpr sharedRoot
-    let (arena, packedInput) ← loopTemplateArgumentExpr arena 47 0 2 .zip []
+    let (arena, packedInput) ← loopTemplateArgumentExprWithDirectLaneBinder arena 47 0
+      (.constant 2) 2 .zip none []
       deriveOperationalSchemaFact packed
-    let (arena, uniformInput) ← loopTemplateArgumentExpr arena 47 1 2 .zip []
+    let (arena, uniformInput) ← loopTemplateArgumentExprWithDirectLaneBinder arena 47 1
+      (.constant 2) 2 .zip none []
       deriveOperationalSchemaFact shared
     let (arena, result) ← addOperationalExprFacts 48 0 fixtureType false []
       deriveOperationalSchemaFact arena packedInput uniformInput
@@ -2520,50 +2813,6 @@ private def equalBoundDistinctBranchesRemainSelectedFixture : Bool :=
     pure (arena.nodes.size, root, arena.get? root)) with
   | .ok (3, 2, some { node := .select _ (.exact branches), .. }) => branches.size == 2
   | _ => false
-
-/-- Selecting a family constructs one pointwise expression template.  The four logical lanes are
-not materialized, the two family alternatives remain exact, and their complete noise bound is the
-branch maximum.  The output-lane binder and the family-choice binder are deliberately disjoint. -/
-private def indexedMatrixFamilySelectFixture : Bool :=
-  match (do
-    let selection : OperationalIntegerFact := {
-      subject := { node := 70, port := 0 }
-      origin := .local temporaryScope { node := 70, port := 0 }
-      lower := 0
-      upper := 1
-      lowerExpression := .closedInt (.constant 0)
-      upperExpression := .closedInt (.constant 1)
-    }
-    let leftFact := boundedOperationalExprFixtureFact 71 3
-    let rightFact := boundedOperationalExprFixtureFact 72 5
-    let (arena, leftRepresentative) := ({} : OperationalExprArena).pushConcrete leftFact
-    let (arena, rightRepresentative) := arena.pushConcrete rightFact
-    let (arena, leftRoot) ← arena.pushSharedSelection
-      (DynamicSelectionIdentity.fromOrigin
-        (.local temporaryScope { node := 71, port := 3 }) 4)
-      4 leftRepresentative (selectedMatrixSummary #[leftFact])
-    let (arena, rightRoot) ← arena.pushSharedSelection
-      (DynamicSelectionIdentity.fromOrigin
-        (.local temporaryScope { node := 72, port := 4 }) 4)
-      4 rightRepresentative (selectedMatrixSummary #[rightFact])
-    let left : OperationalFact ← arena.indexedExpr leftRoot
-    let right : OperationalFact ← arena.indexedExpr rightRoot
-    let (arena, output) ← selectUniformMatrixFamilies temporaryScope 73 selection
-      fixtureType 4 [left, right] [] deriveOperationalSchemaFact arena
-    let (context, root) ← match output with
-      | { context, payload := .matrix root, .. } =>
-          pure (context, root)
-      | _ => throw (OperationalError.loopInputModeMismatch 73 0)
-    let alternatives ← match arena.get? root with
-      | some { node := .select actual (.exact branches), .. } =>
-          if actual.index == selection.origin then pure branches.size
-          else throw (OperationalError.unsupportedOperationalExpr root)
-      | _ => throw (OperationalError.unsupportedOperationalExpr root)
-    let bound ← evaluateOperationalExprNoiseBound arena [] root
-    pure (context.binders.size == 2 && alternatives == 2 && bound == 5 &&
-      arena.nodes.size <= 5)) with
-  | .ok value => value
-  | .error _ => false
 
 /-- An incomplete envelope summary cannot be promoted from one representative. -/
 private def incompleteEnvelopeRejectedFixture : Bool :=
@@ -2835,66 +3084,6 @@ private def independentSelectionCartesianRejectsFixture : Bool :=
     let (arena, root) := arena.pushPrimitive 125 0 fixtureType [] (.add false) #[left, right]
     foldOperationalExprConcreteFacts arena [] root 0 fun count _ => pure (count + 1)) with
   | .error (.unsupportedOperationalExpr _) => true
-  | _ => false
-
-/-- Schema-uniform families retain exact branch identities beyond the envelope threshold. A
-statically exact lane can consume its matching preimage relation, while a neighboring lane cannot
-be substituted merely because the schemas and bounds are equal. -/
-private def largeUniformFamilyExactRelationFixture : Bool :=
-  match (do
-    let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
-      relationFixtureDerivation [] [fixtureLayout]
-    let publicMatrix ← derivedMatrixFactAt 3 facts { node := 1, port := 0 }
-    let preimage ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
-    let binder : FamilyTemplateBinder := {
-      owner := temporaryScope, producerNode := 130, binderSlot := 0
-    }
-    let lanes := Array.range 65
-    let (arena, publicBranches) ← lanes.foldlM (fun state lane => do
-      let (arena, branches) : OperationalExprArena × Array OperationalFact := state
-      let selection : OperationalValueOrigin :=
-        .protocolFamilyElement { name := "fixture-lane" } (.constant lane)
-      let (arena, branch) ← (arena : OperationalExprArena).liftConcreteMatrixFact (indexMatrixFact binder
-        (DynamicSelectionIdentity.fromOrigin selection 65) { node := 140 + lane, port := 0 }
-        publicMatrix)
-      pure (arena, branches.push branch)) (({} : OperationalExprArena), #[])
-    let (arena, preimageBranches) ← lanes.foldlM (fun state lane => do
-      let (arena, branches) : OperationalExprArena × Array OperationalFact := state
-      let selection : OperationalValueOrigin :=
-        .protocolFamilyElement { name := "fixture-lane" } (.constant lane)
-      let (arena, branch) ← (arena : OperationalExprArena).liftConcreteMatrixFact (indexMatrixFact binder
-        (DynamicSelectionIdentity.fromOrigin selection 65) { node := 240 + lane, port := 0 }
-        preimage)
-      pure (arena, branches.push branch)) (arena, #[])
-    let familySelection := DynamicSelectionIdentity.fromOrigin
-      (.local temporaryScope { node := 339, port := 0 }) 65
-    let (arena, publicRoot) ← arena.pushExactSelection
-      familySelection publicBranches
-    let (arena, preimageRoot) ← arena.pushExactSelection familySelection preimageBranches
-    let publicFamily : OperationalFact ← arena.indexedExpr publicRoot
-    let preimageFamily : OperationalFact ← arena.indexedExpr preimageRoot
-    let (arena, selectedPublic) ← loopTemplateArgumentExpr arena 340 0 1 (.zipOffset 64) []
-      deriveOperationalSchemaFact publicFamily
-    let (arena, selectedPreimage) ← loopTemplateArgumentExpr arena 341 0 1 (.zipOffset 64) []
-      deriveOperationalSchemaFact preimageFamily
-    let (arena, wrongPreimage) ← loopTemplateArgumentExpr arena 342 0 1 (.zipOffset 63) []
-      deriveOperationalSchemaFact preimageFamily
-    let concrete (fact : OperationalFact) := match fact with
-      | { payload := .matrix root, .. } => arena.concreteFact root
-      | _ => throw (OperationalError.operandNotMatrix 0 { node := 0, port := 0 })
-    let selectedPublic ← concrete selectedPublic
-    let selectedPreimage ← concrete selectedPreimage
-    let wrongPreimage ← concrete wrongPreimage
-    let _ ← multiplyConcreteMatrixFacts 343 0 fixtureType
-      (.matrixMultiplyRelation selectedPreimage.subject) selectedPreimage.subject []
-      selectedPublic selectedPreimage
-    let rejected := match multiplyConcreteMatrixFacts 344 0 fixtureType
-        (.matrixMultiplyRelation wrongPreimage.subject) wrongPreimage.subject []
-        selectedPublic wrongPreimage with
-      | .error (.missingRelation 344 _) => true
-      | _ => false
-    pure (publicBranches.size == 65 && preimageBranches.size == 65 && rejected)) with
-  | .ok true => true
   | _ => false
 
 /-- Every primitive transfer class has exactly one closed-registry row. This inventory is
@@ -3383,7 +3572,7 @@ private def indexedDagReindexFixture : Bool :=
     let binder ← match expression.context.binders[0]? with
       | some (binder : IndexVariable) => pure binder
       | none => throw (OperationalError.unsupportedOperationalExpr root)
-    let map ← match staticIndexMap expression.context binder 1 with
+    let map ← match closedStaticIndexMap [] expression.context binder 1 with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr root)
     let (arena, reindexed) ← reindexIndexedOperationalFact map arena expression
@@ -3520,7 +3709,8 @@ private def indexedScalarZipOffsetFixture : Bool :=
     let family ← match familyFact with
       | expression@{ payload := .scalar _, .. } => pure expression
       | _ => throw (OperationalError.unsupportedOperationalExpr arena.scalarNodes.size)
-    let (arena, mapped) ← loopTemplateArgumentExpr arena 766 2 2 (.zipOffset 1) []
+    let (arena, mapped) ← loopTemplateArgumentExprWithDirectLaneBinder arena 766 2 (.constant 2) 2
+      (.zipOffset 1) none []
       deriveOperationalSchemaFact family
     let mappedExpression ← match mapped with
       | expression@{ payload := .scalar _, .. } => pure expression
@@ -3528,7 +3718,8 @@ private def indexedScalarZipOffsetFixture : Bool :=
     let mappedDomain ← match arena.scalarNodes[mappedExpression.payload.root]? with
       | some (.selectShared domain _ _ _) => pure domain
       | _ => throw (OperationalError.unsupportedOperationalExpr mappedExpression.payload.root)
-    let rejected := match loopTemplateArgumentExpr arena 767 2 4 (.zipOffset 1) []
+    let rejected := match loopTemplateArgumentExprWithDirectLaneBinder arena 767 2 (.constant 4) 4
+        (.zipOffset 1) none []
         deriveOperationalSchemaFact family with
       | .error (.loopInputModeMismatch 767 2) => true
       | _ => false
@@ -3795,6 +3986,11 @@ example : exactRelationSelectionFixtureResult = .ok true ∧
     directValueContextCorrelationFixture = true ∧
     directValueScalarContextFixture = true ∧
     directValueScalarKernelFixture = true ∧
+    directFamilySelectFixture = .ok true ∧
+    outOfRangeDirectFamilyGetFixture = true ∧
+    symbolicFamilySelectFixture = .ok true ∧
+    directLoopInputFixture = .ok true ∧
+    symbolicCountDirectZipFixture = .ok true ∧
     familyPackPreservesDomainFixtureResult = .ok true ∧
     constantPolynomialProductCanonicalRangeFixture = true ∧
     equivalentProductDimensionFixture = true ∧

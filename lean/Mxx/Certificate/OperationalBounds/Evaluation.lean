@@ -903,6 +903,33 @@ def preparedDefinitionAt
   | some (_, definition) => pure definition
   | none => throw (OperationalError.missingDefinition s!"node-{node}")
 
+/-- Resolve the direct family lane binder from the producer's IR shape and declared family count.
+The direct carrier may also contain an independent select-choice binder, which is deliberately
+left in its context when a get substitutes only the family lane. -/
+def directFamilyLaneBinderAt
+    (scopeKey : ScopeTemplateKey)
+    (scope : Scope)
+    (environment : ParamEnvironment)
+    (familyWire : WireRef)
+    (family : OperationalFact) : Except OperationalError IndexVariable := do
+  let producer ← match scope.nodes[familyWire.node]? with
+    | some node => pure node
+    | none => throw (.missingOperand familyWire.node familyWire)
+  let outputType ← match producer.outputTypes[familyWire.port]? with
+    | some outputType => pure outputType
+    | none => throw (.missingOperand familyWire.node familyWire)
+  let countExpression ← match outputType with
+    | .indexedFamily _ count => pure count
+    | _ => throw (.loopInputModeMismatch familyWire.node familyWire.port)
+  let count ← match countExpression.evaluate environment with
+    | some value => pure value
+    | none => throw .nonClosedExpression
+  if count <= 0 then throw (.invalidCount familyWire.node count)
+  let binder ← directFamilyLaneBinder scopeKey familyWire.node producer familyWire countExpression count.toNat
+  if !family.context.binders.contains binder then
+    throw (.loopInputModeMismatch familyWire.node familyWire.port)
+  pure binder
+
 def deriveOrdinaryOutputs
     (scopeKey : ScopeTemplateKey)
     (nodeIndex : Nat)
@@ -1526,19 +1553,20 @@ def evaluateOperationalExprNoiseBoundWithState
 def matrixMaximum
     (node : Nat)
     (wire : WireRef)
-    (facts : OperationalScopeFacts) : Except OperationalError Int := do
+    (facts : OperationalScopeFacts)
+    (environment : ParamEnvironment) : Except OperationalError Int := do
   match ← lookupFact node facts wire with
   | expression@{ payload := .matrix _, .. } => do
-      let (maximum, _) ← evaluateCompleteBound facts.arena [] expression.payload
+      let (maximum, _) ← evaluateCompleteBound facts.arena environment expression.payload
         (OperationalExprEvaluationState.empty facts.arena)
       pure maximum
   | expression@{ payload := .scalar _, .. } =>
       match ← facts.arena.concreteIndexedScalar expression with
-      | .trapdoor fact => fact.maximum.evaluate [] #[]
+      | .trapdoor fact => fact.maximum.evaluate environment #[]
       | _ => throw (.operandNotMatrix node wire)
   | expression@{ payload := .directValue _, .. } =>
-      let bounds ← (← facts.arena.directValueFactsAt [] expression).mapM
-        (evaluateOperationalConcreteBound .total [])
+      let bounds ← (← facts.arena.directValueFactsAt environment expression).mapM
+        (evaluateOperationalConcreteBound .total environment)
       match bounds with
       | head :: tail => pure (tail.foldl max head)
       | [] => throw (.invalidCount node 0)
@@ -1546,17 +1574,18 @@ def matrixMaximum
 def matrixMaximumExpr
     (node : Nat)
     (wire : WireRef)
-    (facts : OperationalScopeFacts) : Except OperationalError OperationalBoundExpr := do
+    (facts : OperationalScopeFacts)
+    (environment : ParamEnvironment) : Except OperationalError OperationalBoundExpr := do
   match ← lookupFact node facts wire with
   | expression@{ payload := .matrix _, .. } =>
-      return (← deriveOperationalSchemaFact facts.arena [] expression.payload
+      return (← deriveOperationalSchemaFact facts.arena environment expression.payload
         (OperationalExprEvaluationState.empty facts.arena)).1.totalHardBound
   | expression@{ payload := .scalar _, .. } =>
       match ← facts.arena.concreteIndexedScalar expression with
       | .trapdoor fact => pure fact.maximum
       | _ => throw (.operandNotMatrix node wire)
   | expression@{ payload := .directValue _, .. } =>
-      let facts ← facts.arena.directValueFactsAt [] expression
+      let facts ← facts.arena.directValueFactsAt environment expression
       match facts with
       | head :: tail => pure (tail.foldl (fun bound fact =>
           .maximum bound fact.totalHardBound) head.totalHardBound)
@@ -1565,15 +1594,17 @@ def matrixMaximumExpr
 def maximumArgumentExprs
     (node : Nat)
     (arguments : List WireRef)
-    (facts : OperationalScopeFacts) : Except OperationalError OperationalBoundExpr := do
-  let values ← arguments.mapM (matrixMaximumExpr node · facts)
+    (facts : OperationalScopeFacts)
+    (environment : ParamEnvironment) : Except OperationalError OperationalBoundExpr := do
+  let values ← arguments.mapM (fun wire => matrixMaximumExpr node wire facts environment)
   pure <| values.foldl OperationalBoundExpr.maximum (.closedInt (.constant 0))
 
 def maximumArguments
     (node : Nat)
     (arguments : List WireRef)
-    (facts : OperationalScopeFacts) : Except OperationalError Int := do
-  let values ← arguments.mapM (matrixMaximum node · facts)
+    (facts : OperationalScopeFacts)
+    (environment : ParamEnvironment) : Except OperationalError Int := do
+  let values ← arguments.mapM (fun wire => matrixMaximum node wire facts environment)
   pure <| values.foldl max 0
 
 def operationalExprHasRelation
@@ -1766,21 +1797,28 @@ def evaluatePreparedScope
             return (← lookupFact callerNode facts wire) ::
               (← scopeOutputFacts callerNode tail facts)
       let rec prepareParallelInputs
-          (nodeIndex count argumentIndex : Nat)
+          (nodeIndex argumentIndex : Nat)
+          (declaredCount : IntExpr)
+          (count : Nat)
           (modes : List LoopInputMode)
+          (wires : List WireRef)
           (inputs : List OperationalFact)
           (arena : OperationalExprArena) :
           Except OperationalError (OperationalExprArena × List OperationalFact) := do
-        match modes, inputs with
-        | [], [] => pure (arena, [])
-        | mode :: modeTail, input :: inputTail =>
+        match modes, wires, inputs with
+        | [], [], [] => pure (arena, [])
+        | mode :: modeTail, wire :: wireTail, input :: inputTail =>
+            let directLaneBinder ← match mode, input.payload with
+              | .zip, .directValue _ | .zipOffset _, .directValue _ =>
+                  some <$> directFamilyLaneBinderAt scopeKey scope environment wire input
+              | _, _ => pure none
             let (arena, head) ←
-              loopTemplateArgumentExpr arena nodeIndex argumentIndex count mode environment
-                deriveOperationalSchemaFact input
-            let (arena, tail) ← prepareParallelInputs nodeIndex count (argumentIndex + 1)
-              modeTail inputTail arena
+              loopTemplateArgumentExprWithDirectLaneBinder arena nodeIndex argumentIndex declaredCount count mode
+                directLaneBinder environment deriveOperationalSchemaFact input
+            let (arena, tail) ← prepareParallelInputs nodeIndex (argumentIndex + 1) declaredCount count
+              modeTail wireTail inputTail arena
             pure (arena, head :: tail)
-        | _, _ => throw (.loopInputModeMismatch nodeIndex argumentIndex)
+        | _, _, _ => throw (.loopInputModeMismatch nodeIndex argumentIndex)
       let mut facts : OperationalScopeFacts := {
         arena := { initialArena with activeScope := some scopeKey, activeNode := none }
       }
@@ -1876,9 +1914,9 @@ def evaluatePreparedScope
                       facts := { facts with arena }
                       pure [selected]
                   | family@{ payload := .directValue _, .. } =>
-                      let binder ← directFamilyBinder index 0 family.context
+                      let binder ← directFamilyLaneBinderAt scopeKey scope environment familyWire family
                       if requested < 0 then throw (.invalidCount index requested)
-                      let staticMap ← match staticIndexMap family.context binder requested.toNat with
+                      let staticMap ← match closedStaticIndexMap environment family.context binder requested.toNat with
                         | some map => pure map
                         | none => throw (.loopInputModeMismatch index 0)
                       let (arena, selected) ← facts.arena.reindexDirectMatrixFact staticMap family
@@ -1918,10 +1956,10 @@ def evaluatePreparedScope
                       facts := { facts with arena }
                       pure [selected]
                   | true, family@{ payload := .directValue _, .. } =>
-                      let binder ← directFamilyBinder index 0 family.context
+                      let binder ← directFamilyLaneBinderAt scopeKey scope environment familyWire family
                       let requested := selectionFact.lower
                       if requested < 0 then throw (.invalidCount index requested)
-                      let staticMap ← match staticIndexMap family.context binder requested.toNat with
+                      let staticMap ← match closedStaticIndexMap environment family.context binder requested.toNat with
                         | some map => pure map
                         | none => throw (.loopInputModeMismatch index 0)
                       let (arena, selected) ← facts.arena.reindexDirectMatrixFact staticMap family
@@ -1930,17 +1968,28 @@ def evaluatePreparedScope
                       facts := { facts with arena }
                       pure [rebound]
                   | false, family@{ payload := .directValue _, .. } =>
-                      let binder ← directFamilyBinder index 0 family.context
-                      if selectionFact.lower < 0 then throw (.invalidCount index selectionFact.lower)
+                      let binder ← directFamilyLaneBinderAt scopeKey scope environment familyWire family
                       let selectorCount := match binder.count.evaluate environment with
                         | some count => if count > 0 then count.toNat else 0
                         | none => 0
-                      let selector := DynamicSelectionIdentity.fromOrigin selection selectorCount
-                      if selector.expression.freeVariables.length != 1 then
+                      if selectorCount == 0 || selectionFact.lower < 0 ||
+                          selectionFact.upper >= Int.ofNat selectorCount then
+                        throw (.invalidCount index selectionFact.upper)
+                      let freshSelector := DynamicSelectionIdentity.fromDeclaredCount selection binder.count
+                      let freshBinder ← match freshSelector.expression with
+                        | .variable value => pure value
+                        | _ => throw (.loopInputModeMismatch index 0)
+                      let selector := match family.context.binders.toList.find? (fun candidate =>
+                          candidate.owner == freshBinder.owner && candidate.slot == freshBinder.slot) with
+                        | some candidate => .variable candidate
+                        | none => freshSelector.expression
+                      if selector.freeVariables.length != 1 then
                         throw (.loopInputModeMismatch index 0)
-                      let dynamicMap ← match dynamicIndexMap family.context binder selector.expression with
+                      let dynamicMap ← match dynamicIndexMap family.context binder selector with
                         | some map => pure map
-                        | none => throw (.loopInputModeMismatch index 0)
+                        | none => match closedDynamicIndexMap environment family.context binder selector with
+                          | some map => pure map
+                          | none => throw (.loopInputModeMismatch index 0)
                       let (arena, selected) ← facts.arena.reindexDirectMatrixFact dynamicMap family
                       let (arena, rebound) ← rebindOperationalFact { node := index, port := 0 }
                         arena selected
@@ -1959,7 +2008,7 @@ def evaluatePreparedScope
                   let child ← preparedDefinitionAt index prepared definitions
                   let childKey := .parallelBody scopeKey index
                   let (arena, templateInputs) ←
-                    prepareParallelInputs index evaluatedCount.toNat 0 modes actualInputs facts.arena
+                    prepareParallelInputs index 0 count evaluatedCount.toNat modes node.arguments actualInputs facts.arena
                   facts := { facts with arena }
                   let iterationEnvironment :=
                     (ParamKey.loopIndex indexSlot, ParamValue.integer 0) :: environment
@@ -1993,7 +2042,7 @@ def evaluatePreparedScope
                             selection subject evaluatedCount.toNat scalar
                           pure ({ currentFacts with arena }, accumulated.push family)
                       | direct@{ payload := .directValue _, .. } =>
-                          let (arena, family) ← parallelLoopIndexedMatrixOutput scopeKey index indexSlot port
+                          let (arena, family) ← parallelLoopIndexedMatrixOutput scopeKey index indexSlot port count
                             evaluatedCount.toNat environment deriveOperationalSchemaFact currentFacts.arena direct
                           pure ({ currentFacts with arena }, accumulated.push family)
                       )
@@ -2223,14 +2272,10 @@ def evaluatePreparedScope
                         | some value => pure value
                         | none => throw .nonClosedExpression
                       if expectedCount <= 0 then throw (.invalidCount index expectedCount)
-                      let selectedBranches ←
-                        if selection.lower == selection.upper then
-                          match branches[selection.lower.toNat]? with
-                          | some selected => pure [selected]
-                          | none => throw (.invalidCount index selection.lower)
-                        else pure branches
-                      let (arena, output) ← selectUniformMatrixFamilies scopeKey index selection
-                        matrixType expectedCount.toNat selectedBranches environment
+                      let branchLaneBinders ← branchWires.zip branches |>.mapM fun (wire, branch) =>
+                        directFamilyLaneBinderAt scopeKey scope environment wire branch
+                      let (arena, output) ← selectUniformMatrixFamiliesWithLaneBinders scopeKey index selection
+                        matrixType count expectedCount.toNat branches branchLaneBinders environment
                         deriveOperationalSchemaFact facts.arena
                       facts := { facts with arena }
                       pure [output]

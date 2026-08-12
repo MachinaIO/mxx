@@ -324,11 +324,15 @@ def DirectOperationalIndexedArena.pushMapped
     (source : OperationalIndexedValueId)
     (map : IndexMap) : Option (DirectOperationalIndexedArena × OperationalIndexedValueId) := do
   let sourceValue ← arena.valueAt? source
-  if !map.validate || map.source != sourceValue.context then none else
+  if !map.transportValid || map.source != sourceValue.context then none else
   match sourceValue.payload with
   | .mapped schema base prior => do
-      let composed ← composeIndexMap prior map
-      some (arena.pushValue map.destination (.mapped schema base composed))
+      if prior.validate && map.validate then
+        match composeIndexMap prior map with
+        | some composed => some (arena.pushValue map.destination (.mapped schema base composed))
+        | none => none
+      else
+        some (arena.pushValue map.destination (.mapped schema source map))
   | payload => some (arena.pushValue map.destination (.mapped payload.schema source map))
 
 /-- Annotate a direct matrix root after its fixed-assignment computation.  The source ID remains

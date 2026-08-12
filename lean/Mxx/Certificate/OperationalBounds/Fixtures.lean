@@ -4255,7 +4255,6 @@ private def nestedDirectPackContextFixture : Bool :=
     let facts : OperationalScopeFacts := { values := #[#[outer]], arena }
     let (arena, output) ← genericNodeFact temporaryScope 1 node
       .packPolynomialCoefficients 0 (.matrix fixtureType) facts [] [] []
-      deriveOperationalSchemaFact
     let expression ← match output with
       | expression@{ payload := .directValue _, .. } => pure expression
       | _ => throw (OperationalError.outputTypeMismatch 1)

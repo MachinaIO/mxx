@@ -473,10 +473,7 @@ def genericNodeFact
     (facts : OperationalScopeFacts)
     (environment : ParamEnvironment)
     (loopDomains : List OperationalParameterDomain)
-    (layouts : List Mxx.GadgetLayoutDescriptor)
-    (deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
-      OperationalExprEvaluationState →
-      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState)) :
+    (layouts : List Mxx.GadgetLayoutDescriptor) :
     Except OperationalError (OperationalExprArena × OperationalFact) := do
   let arguments ← node.arguments.mapM (lookupFact nodeIndex facts)
   if let .input _ := node.kind then
@@ -696,12 +693,6 @@ def genericNodeFact
       environment loopDomains layouts
     facts.arena.promoteConcreteMatrixFact output
   else
-    let unaryRoot : Except OperationalError (OperationalExprArena × Nat) := do
-      let input ← match arguments[0]? with
-        | some input => pure input
-        | none => throw (.unsupportedOutputArity nodeIndex arguments.length)
-      if arguments.length != 1 then throw (.unsupportedOutputArity nodeIndex arguments.length)
-      scalarFactRoot facts.arena input
     let subject : WireRef := { node := nodeIndex, port := outputPort }
     match node.kind with
     | .input _ =>
@@ -774,47 +765,6 @@ def genericNodeFact
         facts.arena.promoteConcreteScalarFact scalar
     | .packPolynomialCoefficients _ _ =>
         throw (.loopInputModeMismatch nodeIndex 0)
-    | .liftIntegerToConstantPolynomial matrixType => do
-        let (arena, input) ← unaryRoot
-        let rec visit : Nat → OperationalExprArena → Nat →
-            Except OperationalError (OperationalExprArena × OperationalExprId)
-          | 0, _, root => throw (.unsupportedOperationalExpr root)
-          | fuel + 1, arena, root => do
-              match arena.scalarNodes[root]? with
-              | none => throw (.invalidOperationalExprRef root)
-              | some (.concrete (.integer input))
-              | some (.primitive _ _ (.integer input)) => do
-                  let params ← match matrixType.evaluate environment (.constant 0) with
-                    | some params => pure params
-                    | none => throw (.invalidMatrixParameters nodeIndex)
-                  if params.rows != 1 || params.columns != 1 || params.modulus <= 0 ||
-                      params.ringDimension == 0 then
-                    throw (.invalidMatrixParameters nodeIndex)
-                  let bound := OperationalBoundExpr.maximum
-                    (.negate input.lowerExpression) input.upperExpression
-                  let output ← classifiedMatrixFactExpr nodeIndex outputPort matrixType environment
-                    bound false (.below params.modulus.toNat) { isConstantPolynomial := true }
-                  pure (arena.pushConcrete output)
-              | some (.concrete _)
-              | some (.primitive ..) =>
-                  throw (.operandNotInteger nodeIndex (node.arguments.headD subject))
-              | some (.selectExact domain branches) => do
-                  let (arena, branches) ← branches.foldlM (fun (arena, mapped) branch => do
-                    let (arena, branch) ← visit fuel arena branch
-                    pure (arena, mapped.push branch)) (arena, #[])
-                  arena.pushSelect domain.identity (.exact branches)
-              | some (.selectShared domain _ _ representative) => do
-                  let (arena, representative) ← visit fuel arena representative
-                  let state := OperationalExprEvaluationState.empty arena
-                  let (representativeFact, _) ←
-                    deriveSchema arena environment representative state
-                  let summary := selectedMatrixSummary #[representativeFact]
-                  arena.pushCheckedSchemaEnvelope domain.identity domain.count representative summary
-                    representativeFact
-        let (arena, root) ← visit (arena.scalarNodes.size + 1) arena input
-        let expression ← arena.indexedExpr root
-        let arena ← arena.rememberIndexedExpr expression
-        pure (arena, expression)
     | _ => throw (.unsupportedNode nodeIndex)
 
 def lookupCheckedDefinition
@@ -954,19 +904,16 @@ def deriveOrdinaryOutputs
     (environment : ParamEnvironment)
     (loopDomains : List OperationalParameterDomain)
     (layouts : List Mxx.GadgetLayoutDescriptor)
-    (deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
-      OperationalExprEvaluationState →
-      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
     (facts : OperationalScopeFacts) :
     Nat → List WireTypeExpr →
     Except OperationalError (OperationalExprArena × List OperationalFact)
   | _, [] => pure (facts.arena, [])
   | port, outputType :: tail => do
       let (arena, output) ← genericNodeFact scopeKey nodeIndex node rule port outputType facts
-        environment loopDomains layouts deriveSchema
+        environment loopDomains layouts
       let (arena, output) ← namespaceFreshOutput scopeKey { node := nodeIndex, port } arena output
       let (arena, tail) ← deriveOrdinaryOutputs scopeKey nodeIndex node rule environment
-        loopDomains layouts deriveSchema { facts with arena } (port + 1) tail
+        loopDomains layouts { facts with arena } (port + 1) tail
       pure (arena, output :: tail)
 
 /-! Evaluate a single unresolved selection by streaming complete concrete alternatives into a
@@ -1820,7 +1767,7 @@ def evaluatePreparedScope
               | .input _ =>
                   if inputFacts.isEmpty then
                     let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
-                      environment loopDomains layouts deriveOperationalSchemaFact facts 0
+                      environment loopDomains layouts facts 0
                         node.outputTypes
                     facts := { facts with arena }
                     pure outputs
@@ -2243,7 +2190,7 @@ def evaluatePreparedScope
                       pure outputs
                   | _ =>
                       let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
-                        environment loopDomains layouts deriveOperationalSchemaFact facts 0
+                        environment loopDomains layouts facts 0
                           node.outputTypes
                       facts := { facts with arena }
                       pure outputs
@@ -2287,7 +2234,7 @@ def evaluatePreparedScope
                       pure [output]
                   | _ =>
                       let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
-                        environment loopDomains layouts deriveOperationalSchemaFact facts 0
+                        environment loopDomains layouts facts 0
                           node.outputTypes
                       facts := { facts with arena }
                       pure outputs
@@ -2322,7 +2269,7 @@ def evaluatePreparedScope
                       pure [output]
                   | _ =>
                       let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
-                        environment loopDomains layouts deriveOperationalSchemaFact facts 0
+                        environment loopDomains layouts facts 0
                           node.outputTypes
                       facts := { facts with arena }
                       pure outputs
@@ -2346,7 +2293,7 @@ def evaluatePreparedScope
                     pure [output]
                   else
                     let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                      (.matrix matrixType) facts environment loopDomains layouts deriveOperationalSchemaFact
+                      (.matrix matrixType) facts environment loopDomains layouts
                     facts := { facts with arena }
                     pure [output]
               | .crtRecompose plaintextModuli reconstructionCoefficients =>
@@ -2389,7 +2336,7 @@ def evaluatePreparedScope
                     pure [output]
                   else
                     let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
-                      environment loopDomains layouts deriveOperationalSchemaFact facts 0
+                      environment loopDomains layouts facts 0
                         node.outputTypes
                     facts := { facts with arena }
                     pure outputs
@@ -2418,7 +2365,7 @@ def evaluatePreparedScope
                       pure [output]
                   | _ =>
                       let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
-                        environment loopDomains layouts deriveOperationalSchemaFact facts 0
+                        environment loopDomains layouts facts 0
                           node.outputTypes
                       facts := { facts with arena }
                       pure outputs
@@ -2450,7 +2397,7 @@ def evaluatePreparedScope
                       pure [output]
                   | _ =>
                       let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
-                        environment loopDomains layouts deriveOperationalSchemaFact facts 0
+                        environment loopDomains layouts facts 0
                           node.outputTypes
                       facts := { facts with arena }
                       pure outputs
@@ -2479,7 +2426,7 @@ def evaluatePreparedScope
                       pure [output]
                   | _ =>
                       let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                        (.matrix matrixType) facts environment loopDomains layouts deriveOperationalSchemaFact
+                        (.matrix matrixType) facts environment loopDomains layouts
                       facts := { facts with arena }
                       pure [output]
               | .liftIntegerToConstantPolynomial matrixType =>
@@ -2506,7 +2453,7 @@ def evaluatePreparedScope
                       pure [output]
                   | _ =>
                       let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                        (.matrix matrixType) facts environment loopDomains layouts deriveOperationalSchemaFact
+                        (.matrix matrixType) facts environment loopDomains layouts
                       facts := { facts with arena }
                       pure [output]
               | .trapdoorPublic =>
@@ -2559,7 +2506,7 @@ def evaluatePreparedScope
                       pure [output]
                   | _ =>
                       let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                        (.matrix matrixType) facts environment loopDomains layouts deriveOperationalSchemaFact
+                        (.matrix matrixType) facts environment loopDomains layouts
                       facts := { facts with arena }
                       pure [output]
               | .matrixAdd | .matrixSubtract =>
@@ -2633,12 +2580,12 @@ def evaluatePreparedScope
                     pure [output]
                   else
                     let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                      (.matrix matrixType) facts environment loopDomains layouts deriveOperationalSchemaFact
+                      (.matrix matrixType) facts environment loopDomains layouts
                     facts := { facts with arena }
                     pure [output]
               | _ =>
                   let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
-                    environment loopDomains layouts deriveOperationalSchemaFact facts 0
+                    environment loopDomains layouts facts 0
                       node.outputTypes
                   facts := { facts with arena }
                   pure outputs

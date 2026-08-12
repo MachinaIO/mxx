@@ -7658,11 +7658,6 @@ def OperationalExprArena.scalarAbstract
             let next ← arena.scalarAbstract branch fuel
             joinOperationalScalarFacts root accumulated next) first
 
-def scalarFactRoot
-    (arena : OperationalExprArena)
-    (fact : OperationalFact) : Except OperationalError (OperationalExprArena × Nat) :=
-  arena.pushOperationalScalarFact fact
-
 partial def installSharedScalarProvenance
     (arena : OperationalExprArena)
     (binder : FamilyTemplateBinder)

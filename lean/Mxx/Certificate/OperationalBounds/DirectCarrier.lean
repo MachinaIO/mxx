@@ -91,8 +91,28 @@ def FixedOperationalPayloadArena.pushScalar
     (fact : OperationalScalarFact) : FixedOperationalPayloadArena × FixedOperationalPayloadRef :=
   ({ arena with scalars := arena.scalars.push fact }, .scalar arena.scalars.size)
 
+inductive DirectRelationOperationKind where
+  | preimage (maximum : IntExpr) (loopDomains : List OperationalParameterDomain)
+  | decomposition (declaredType : MatrixTypeExpr) (base : IntExpr) (small : Bool)
+      (digitCount : IntExpr) (loopDomains : List OperationalParameterDomain)
+      (layouts : List Mxx.GadgetLayoutDescriptor)
+  deriving BEq
+
+structure DirectRelationOperation where
+  kind : DirectRelationOperationKind
+  outputType : MatrixTypeExpr
+  ownerScope : Option ScopeTemplateKey
+  ownerNode : Nat
+  outputPort : Nat
+  parameterEnvironment : ParamEnvironment
+  deriving BEq
+
 inductive OperationalIndexedPointwiseOperation where
   | matrix (operation : PrimitiveOperation)
+  /-- Relation-producing matrix kernels retain every graph operand as a direct carrier input.
+  This is distinct from ordinary matrix-only pointwise operations because preimage sampling also
+  consumes a trapdoor scalar at the same indexed assignment. -/
+  | relation (operation : DirectRelationOperation)
   | scalar (kind : OperationalScalarPrimitiveKind)
   | matrixToScalar (operation : DirectValueScalarOperation)
   | matrixFromScalar (operation : DirectValueMatrixOperation)
@@ -238,6 +258,23 @@ def matrixOperationSchemasValid
   | .scale _ _ _, #[.matrix input] => operationalMatrixTypeEqual input output
   | _, _ => false
 
+/-- Closed schemas for direct relation producers.  The concrete kernel performs the remaining
+parameter, identity, and relation-inventory checks after correlated lane alignment. -/
+def relationOperationSchemasValid
+    (operation : DirectRelationOperation)
+    (inputs : Array OperationalIndexedPayloadSchema)
+    (output : MatrixTypeExpr) : Bool :=
+  if !operationalMatrixTypeEqual operation.outputType output then false else
+  match operation.kind, inputs with
+  | .preimage .., #[.matrix publicType, .scalar (.trapdoor trapdoorType), .matrix targetType] =>
+      operationalMatrixTypeEqual publicType trapdoorType &&
+        match inferOperationalProductMode publicType output with
+        | .ok (_, productType) => operationalMatrixTypeEqual productType targetType
+        | .error _ => false
+  | .decomposition declaredType .., #[.matrix _] =>
+      operationalMatrixTypeEqual declaredType output
+  | _, _ => false
+
 def scalarOperationSchemasValid
     (kind : OperationalScalarPrimitiveKind)
     (inputs : Array OperationalIndexedPayloadSchema)
@@ -257,6 +294,8 @@ def pointwiseSchemasValid
   match operation, output with
   | .matrix operation, .matrix matrixType =>
       matrixOperationSchemasValid operation inputs matrixType
+  | .relation operation, .matrix matrixType =>
+      relationOperationSchemasValid operation inputs matrixType
   | .scalar kind, _ => scalarOperationSchemasValid kind inputs output
   | .matrixToScalar operation, .scalar output =>
       let oneMatrix := inputs.size == 1 && inputs.all (fun schema => match schema with
@@ -358,6 +397,7 @@ def DirectOperationalIndexedArena.pushPointwise
   let schemas := values.toArray.map fun value => value.payload.schema
   let output ← match operation with
     | .matrix descriptor => some (.matrix descriptor.outputType)
+    | .relation descriptor => some (.matrix descriptor.outputType)
     | .scalar .boolToInt | .scalar (.intBinary _) => some (.scalar .integer)
     | .scalar (.intCompare _) => some (.scalar .boolean)
     | .scalar .intToReal | .scalar (.realBinary _) | .scalar .realSqrt => some (.scalar .real)
@@ -440,6 +480,18 @@ partial def DirectOperationalIndexedArena.mapMatrixValue
                   pure (arena, memo, mapped.push input)) (arena, memo, #[])
                 let (arena, mapped) := arena.pushValue value.context
                   (.pointwise (.matrix matrixType) (.matrix operation) inputs)
+                pure (arena, memo, mapped)
+            | .pointwise (.matrix matrixType) (.relation operation) inputs => do
+                let (arena, memo, inputs) ← inputs.foldlM (fun (arena, memo, mapped) input => do
+                  let inputValue ← match arena.valueAt? input with
+                    | some value => pure value | none => throw (.invalidOperationalExprRef input)
+                  match inputValue.payload.schema with
+                  | .matrix _ =>
+                      let (arena, memo, input) ← visit fuel arena memo input
+                      pure (arena, memo, mapped.push input)
+                  | .scalar _ => pure (arena, memo, mapped.push input)) (arena, memo, #[])
+                let (arena, mapped) := arena.pushValue value.context
+                  (.pointwise (.matrix matrixType) (.relation operation) inputs)
                 pure (arena, memo, mapped)
             | _ => throw (.unsupportedOperationalExpr id)
           pure (arena, memo.insert id mapped, mapped)

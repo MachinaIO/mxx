@@ -2390,6 +2390,363 @@ private def directValueScalarContextFixture : Bool :=
               | .error _ => true
               | .ok _ => false)
 
+/-- Direct preimage producers preserve a common public/trapdoor as shared storage, pair explicit
+targets only with the same selector, and retain the exact target relation per physical lane. -/
+private def directRelationProducerFixture : Bool :=
+  match (do
+    let target0 := boundedOperationalExprFixtureFact 820 2
+    let target1 := boundedOperationalExprFixtureFact 821 3
+    let binder := { directCarrierFixtureBinder 822 with count := .constant 2 }
+    let other := { directCarrierFixtureBinder 823 with count := .constant 2 }
+    let (fixed, publicRef) := ({} : FixedOperationalPayloadArena).pushMatrix fixturePublicMatrixFact
+    let (fixed, target0Ref) := fixed.pushMatrix target0
+    let (fixed, target1Ref) := fixed.pushMatrix target1
+    let (fixed, trapdoorRef) := fixed.pushScalar fixtureTrapdoorFact
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, publicValue) ← match direct.pushShared { binders := #[binder] }
+        (.matrix fixtureType) publicRef with | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 820)
+    let (direct, trapdoor) ← match direct.pushShared { binders := #[binder] }
+        (.scalar (.trapdoor fixtureType)) trapdoorRef with | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 821)
+    let (direct, target) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) #[target0Ref, target1Ref] with | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 822)
+    let (direct, wrongTarget) ← match direct.pushExplicit [] { binders := #[other] } other
+        (.matrix fixtureType) #[target0Ref, target1Ref] with | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 823)
+    let arena : OperationalExprArena := { direct }
+    let wrap (context : IndexContext) (root : OperationalIndexedValueId) : OperationalFact :=
+      { context, payload := .directValue root, storage := .explicitTable }
+    let operation : DirectRelationOperation := {
+      kind := .preimage (.constant 3) [], outputType := fixtureType, ownerScope := none,
+      ownerNode := 824, outputPort := 0, parameterEnvironment := [] }
+    let (arena, accepted) ← arena.pushDirectRelationPointwise operation
+      #[wrap { binders := #[binder] } publicValue, wrap { binders := #[binder] } trapdoor,
+        wrap { binders := #[binder] } target]
+    let acceptedEntries ← arena.reducedDirectValueFactsAt [] accepted
+    let (arena, independentlySelected) ← arena.pushDirectRelationPointwise operation
+      #[wrap { binders := #[binder] } publicValue, wrap { binders := #[binder] } trapdoor,
+        wrap { binders := #[other] } wrongTarget]
+    let independentlySelected ← arena.reducedDirectValueFactsAt [] independentlySelected
+    let acceptedOk := acceptedEntries.length == 2 && acceptedEntries.all fun entry =>
+      entry.key == some (IndexExpr.variable binder) && entry.fact.relations.any fun relation =>
+        match relation with | .preimage value => value.producer == entry.fact.origin | _ => false
+    let independentlySelectedOk := independentlySelected.length == 2 && independentlySelected.all fun entry =>
+      entry.key == some (IndexExpr.variable other)
+    pure (acceptedOk && independentlySelectedOk)) with
+  | .ok value => value
+  | .error _ => false
+
+example : directRelationProducerFixture = true := by native_decide
+
+/-- When two or more relation operands are lane-dependent, the direct zipper accepts only an
+identical selector/ordinal and rejects a Cartesian pairing with another selector. -/
+private def directRelationLaneAlignmentFixture : Bool :=
+  match (do
+    let binder := { directCarrierFixtureBinder 825 with count := .constant 2 }
+    let other := { directCarrierFixtureBinder 826 with count := .constant 2 }
+    let target := boundedOperationalExprFixtureFact 827 2
+    let (fixed, publicRef) := ({} : FixedOperationalPayloadArena).pushMatrix fixturePublicMatrixFact
+    let (fixed, targetRef) := fixed.pushMatrix target
+    let (fixed, trapdoorRef) := fixed.pushScalar fixtureTrapdoorFact
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let table schema refs b := direct.pushExplicit [] { binders := #[b] } b schema refs
+    let (direct, publicValue) ← match table (.matrix fixtureType) #[publicRef, publicRef] binder with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 825)
+    let (direct, trapdoor) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.scalar (.trapdoor fixtureType)) #[trapdoorRef, trapdoorRef] with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 826)
+    let (direct, target) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) #[targetRef, targetRef] with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 827)
+    let (direct, wrong) ← match direct.pushExplicit [] { binders := #[other] } other
+        (.matrix fixtureType) #[targetRef, targetRef] with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 828)
+    let arena : OperationalExprArena := { direct }
+    let fact (binderValue : IndexVariable) (valueId : OperationalIndexedValueId) : OperationalFact := {
+      context := { binders := #[binderValue] }
+      payload := .directValue valueId
+      storage := .explicitTable
+    }
+    let op : DirectRelationOperation := {
+      kind := .preimage (.constant 3) []
+      outputType := fixtureType
+      ownerScope := none
+      ownerNode := 829
+      outputPort := 0
+      parameterEnvironment := []
+    }
+    let (arena, same) ← arena.pushDirectRelationPointwise op #[fact binder publicValue, fact binder trapdoor, fact binder target]
+    let same ← arena.reducedDirectValueFactsAt [] same
+    let (arena, different) ← arena.pushDirectRelationPointwise op #[fact binder publicValue, fact binder trapdoor, fact other wrong]
+    let different := arena.reducedDirectValueFactsAt [] different
+    pure (same.length == 2 && match different with | .error (.unsupportedOperationalExpr _) => true | _ => false)) with
+  | .ok value => value | .error _ => false
+
+example : directRelationLaneAlignmentFixture = true := by native_decide
+
+/-- Forged direct relation descriptors fail at construction: no lane reduction may repair a
+public/trapdoor mismatch, target-product mismatch, digit-expansion mismatch, or negative bound. -/
+private def directRelationClosedSchemaFixture : Bool :=
+  let result : Except OperationalError Bool := do
+    let fact := boundedOperationalExprFixtureFact 829 2
+    let rows2Fact := { fact with matrixType := fixtureRows2Type, matrixParams :=
+      { fact.matrixParams with rows := 2 } }.refreshPrimitivePolynomial
+    let wrongTrapdoorFact := match fixtureTrapdoorFact with
+      | .trapdoor value => .trapdoor {
+          value with
+          matrixType := fixtureRows2Type
+          matrixParams := { value.matrixParams with rows := 2 }
+        }
+      | _ => .trapdoor {
+          subject := { node := 0, port := 1 }
+          matrixType := fixtureRows2Type
+          matrixParams := { fixtureParams with rows := 2 }
+          maximum := .closedInt (.constant 3)
+          publicIdentity := fixtureSampledIdentity
+        }
+    let (fixed, publicRef) := ({} : FixedOperationalPayloadArena).pushMatrix fixturePublicMatrixFact
+    let (fixed, targetRef) := fixed.pushMatrix fact
+    let (fixed, wrongTargetRef) := fixed.pushMatrix rows2Fact
+    let (fixed, trapdoorRef) := fixed.pushScalar fixtureTrapdoorFact
+    let (fixed, wrongTrapdoorRef) := fixed.pushScalar wrongTrapdoorFact
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, publicValue) ← match direct.pushShared emptyContext (.matrix fixtureType) publicRef with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 829)
+    let (direct, trapdoor) ← match direct.pushShared emptyContext (.scalar (.trapdoor fixtureType)) trapdoorRef with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 830)
+    let (direct, wrongTrapdoor) ← match direct.pushShared emptyContext
+        (.scalar (.trapdoor fixtureRows2Type)) wrongTrapdoorRef with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 831)
+    let (direct, target) ← match direct.pushShared emptyContext (.matrix fixtureType) targetRef with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 832)
+    let (direct, wrongTarget) ← match direct.pushShared emptyContext (.matrix fixtureRows2Type) wrongTargetRef with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 833)
+    let arena : OperationalExprArena := { direct }
+    let wrap (value : OperationalIndexedValueId) : OperationalFact :=
+      { context := emptyContext, payload := .directValue value, storage := .sharedTemplate }
+    let preimage (maximum : IntExpr) (outputType : MatrixTypeExpr) : DirectRelationOperation := {
+      kind := .preimage maximum [], outputType, ownerScope := none, ownerNode := 834,
+      outputPort := 0, parameterEnvironment := [] }
+    let decomposition : DirectRelationOperation := {
+      kind := .decomposition fixtureType (.constant 2) false (.constant 1) [] [fixtureLayout]
+      outputType := fixtureRows2Type, ownerScope := none, ownerNode := 835,
+      outputPort := 0, parameterEnvironment := [] }
+    let rejected (result : Except OperationalError (OperationalExprArena × OperationalFact)) :=
+      match result with | .error _ => true | .ok _ => false
+    let trapdoorRejected := rejected (arena.pushDirectRelationPointwise (preimage (.constant 3) fixtureType)
+      #[wrap publicValue, wrap wrongTrapdoor, wrap target])
+    let targetRejected := rejected (arena.pushDirectRelationPointwise (preimage (.constant 3) fixtureType)
+      #[wrap publicValue, wrap trapdoor, wrap wrongTarget])
+    let negativeRejected := rejected (arena.pushDirectRelationPointwise (preimage (.constant (-1)) fixtureType)
+      #[wrap publicValue, wrap trapdoor, wrap target])
+    let decompositionRejected := rejected (arena.pushDirectRelationPointwise decomposition #[wrap target])
+    pure (trapdoorRejected && targetRejected && negativeRejected && decompositionRejected)
+  match result with
+  | Except.ok value => value
+  | Except.error _ => false
+
+example : directRelationClosedSchemaFixture = true := by native_decide
+
+/-- Direct decomposition retains the selected source lane as its relation input, rather than
+collapsing a delayed family to a representative matrix fact. -/
+private def directDecompositionFamilyFixture : Bool :=
+  match (do
+    let binder := { directCarrierFixtureBinder 830 with count := .constant 2 }
+    let input0 := { boundedOperationalExprFixtureFact 831 2 with canonicalRange := .below 17 }
+    let input1 := { boundedOperationalExprFixtureFact 832 3 with canonicalRange := .below 17 }
+    let (fixed, input0Ref) := ({} : FixedOperationalPayloadArena).pushMatrix input0
+    let (fixed, input1Ref) := fixed.pushMatrix input1
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, input) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) #[input0Ref, input1Ref] with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 830)
+    let arena : OperationalExprArena := { direct }
+    let operation : DirectRelationOperation := {
+      kind := .decomposition fixtureType (.constant 2) false (.constant 1) [] [fixtureLayout]
+      outputType := fixtureType
+      ownerScope := none
+      ownerNode := 833
+      outputPort := 0
+      parameterEnvironment := []
+    }
+    let inputFact : OperationalFact := {
+      context := { binders := #[binder] }
+      payload := .directValue input
+      storage := .explicitTable
+    }
+    let (arena, output) ← arena.pushDirectRelationPointwise operation #[inputFact]
+    let entries ← arena.reducedDirectValueFactsAt [] output
+    let selector := { directCarrierFixtureBinder 834 with count := .constant 2 }
+    let map ← match dynamicIndexMap output.context binder (IndexExpr.variable selector) with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 834)
+    let (arena, mappedOutput) ← arena.reindexDirectMatrixFact map output
+    let mappedEntries ← arena.reducedDirectValueFactsAt [] mappedOutput
+    let sourceOk := entries.length == 2 && entries.all fun entry =>
+      entry.key == some (IndexExpr.variable binder) && entry.fact.relations.any fun relation =>
+        match relation with
+        | .decomposition value => value.producer == entry.fact.origin &&
+            value.inputOrigin != entry.fact.origin && value.status == ReconstructionStatus.available
+        | _ => false
+    let mappedOk := mappedEntries.length == 2 && mappedEntries.all fun entry =>
+      entry.key == some (IndexExpr.variable selector) && entry.fact.relations.any fun relation =>
+        match relation with
+        | .decomposition value => value.producer == entry.fact.origin &&
+            value.inputOrigin != entry.fact.origin
+        | _ => false
+    pure (sourceOk && mappedOk)) with
+  | .ok value => value
+  | .error _ => false
+
+example : directDecompositionFamilyFixture = true := by native_decide
+
+/-- A regular two-digit layout expands one input row into the declared two-row output.  The
+declared decomposition type is the output type, not the input type. -/
+private def directDecompositionDigitExpansionFixture : Bool :=
+  match (do
+    let layout := { fixtureLayout with crtBits := 2, regularDigitCount := 2, smallDigitCount := 2 }
+    let input := { boundedOperationalExprFixtureFact 836 2 with canonicalRange := .below 17 }
+    let (fixed, inputRef) := ({} : FixedOperationalPayloadArena).pushMatrix input
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, inputValue) ← match direct.pushShared emptyContext (.matrix fixtureType) inputRef with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 836)
+    let arena : OperationalExprArena := { direct }
+    let operation : DirectRelationOperation := {
+      kind := .decomposition fixtureRows2Type (.constant 2) false (.constant 2) [] [layout]
+      outputType := fixtureRows2Type
+      ownerScope := none
+      ownerNode := 837
+      outputPort := 0
+      parameterEnvironment := []
+    }
+    let inputFact : OperationalFact := {
+      context := emptyContext
+      payload := .directValue inputValue
+      storage := .sharedTemplate
+    }
+    let (arena, output) ← arena.pushDirectRelationPointwise operation #[inputFact]
+    let entries ← arena.reducedDirectValueFactsAt [] output
+    pure (entries.length == 1 && entries[0]?.any fun (entry : ReducedDirectMatrixFact) =>
+      entry.fact.matrixParams.rows == 2 && entry.fact.matrixParams.columns == 1 &&
+        entry.fact.relations.any fun relation => match relation with
+          | .decomposition value => value.digitCount == 2 && value.inputSummary.matrixParams.rows == 1
+          | _ => false)) with
+  | .ok value => value
+  | .error _ => false
+
+example : directDecompositionDigitExpansionFixture = true := by native_decide
+
+/-- A shared 30,720-lane relation has one physical producer invocation, whereas explicit
+relation tables retain one reduced producer result per physical lane. -/
+private def directRelationPhysicalCardinalityFixture : Bool :=
+  let operation : DirectRelationOperation := {
+    kind := .preimage (.constant 3) []
+    outputType := fixtureType
+    ownerScope := none
+    ownerNode := 835
+    outputPort := 0
+    parameterEnvironment := []
+  }
+  let sharedCase : Except OperationalError (Nat × Nat) := do
+    let binder := { directCarrierFixtureBinder 836 with count := .constant 30720 }
+    let target := boundedOperationalExprFixtureFact 837 2
+    let (fixed, publicRef) := ({} : FixedOperationalPayloadArena).pushMatrix fixturePublicMatrixFact
+    let (fixed, targetRef) := fixed.pushMatrix target
+    let (fixed, trapdoorRef) := fixed.pushScalar fixtureTrapdoorFact
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, publicValue) ← match direct.pushShared { binders := #[binder] }
+        (.matrix fixtureType) publicRef with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 836)
+    let (direct, trapdoor) ← match direct.pushShared { binders := #[binder] }
+        (.scalar (.trapdoor fixtureType)) trapdoorRef with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 837)
+    let (direct, targetValue) ← match direct.pushShared { binders := #[binder] }
+        (.matrix fixtureType) targetRef with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 838)
+    let arena : OperationalExprArena := { direct }
+    let wrap (value : OperationalIndexedValueId) : OperationalFact := {
+      context := { binders := #[binder] }
+      payload := .directValue value
+      storage := .sharedTemplate
+    }
+    let (arena, output) ← arena.pushDirectRelationPointwise operation
+      #[wrap publicValue, wrap trapdoor, wrap targetValue]
+    let entries ← arena.reducedDirectValueFactsAt [] output
+    pure (arena.direct.values.size, entries.length)
+  let explicitCase (count : Nat) : Except OperationalError (Nat × Nat) := do
+    let binder := { directCarrierFixtureBinder (840 + count) with count := .constant count }
+    let target := boundedOperationalExprFixtureFact (850 + count) 2
+    let (fixed, publicRef) := ({} : FixedOperationalPayloadArena).pushMatrix fixturePublicMatrixFact
+    let (fixed, targetRef) := fixed.pushMatrix target
+    let (fixed, trapdoorRef) := fixed.pushScalar fixtureTrapdoorFact
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, publicValue) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) (Array.replicate count publicRef) with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 839)
+    let (direct, trapdoor) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.scalar (.trapdoor fixtureType)) (Array.replicate count trapdoorRef) with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 840)
+    let (direct, targetValue) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) (Array.replicate count targetRef) with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 841)
+    let arena : OperationalExprArena := { direct }
+    let wrap (value : OperationalIndexedValueId) : OperationalFact := {
+      context := { binders := #[binder] }
+      payload := .directValue value
+      storage := .explicitTable
+    }
+    let (arena, output) ← arena.pushDirectRelationPointwise operation
+      #[wrap publicValue, wrap trapdoor, wrap targetValue]
+    let entries ← arena.reducedDirectValueFactsAt [] output
+    pure (arena.direct.values.size, entries.length)
+  match sharedCase, explicitCase 2, explicitCase 3 with
+  | .ok (4, 1), .ok (4, 2), .ok (4, 3) => true
+  | _, _, _ => false
+
+example : directRelationPhysicalCardinalityFixture = true := by native_decide
+
+/-- A family-packed direct operand stays in Graph IR through decomposition: the relation root
+retains its lane context and scope evaluation does not reintroduce legacy expression nodes. -/
+private def directScopeRelationGraphIRFixture : Bool :=
+  let scope : Scope := {
+    nodes := #[
+      { kind := .gaussianSample fixtureType (.constant 2), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+      { kind := .gadgetDecompose fixtureType (.constant 2) false (.constant 1),
+        arguments := [{ node := 2, port := 0 }], outputTypes := [.preimage fixtureType] }
+    ]
+    outputs := [("result", { node := 3, port := 0 })]
+    inputNames := []
+  }
+  let derivation : ScopeDerivation := { steps := #[
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 1, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 2, rule := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+    { sourceNode := 3, rule := .gadgetDecompose, arguments := [{ node := 2, port := 0 }] }
+  ] }
+  match evaluateScopeOperationalWithLayouts scope derivation [] [fixtureLayout] with
+  | .error _ => false
+  | .ok facts => match lookupFact 4 facts { node := 3, port := 0 } with
+    | .error _ => false
+    | .ok { context, payload := .directValue root, .. } =>
+        !context.binders.isEmpty && facts.arena.nodes.isEmpty && (facts.arena.direct.valueAt? root).any fun value =>
+          match value.payload with
+          | .pointwise (.matrix _) (.relation { kind := .decomposition .., .. }) _ => true
+          | _ => false
+    | .ok _ => false
+
+example : directScopeRelationGraphIRFixture = true := by native_decide
+
 /-- Direct threshold kernels use the same fixed-assignment validation and exact output intervals
 as their executable node handlers. The closed schema registry rejects a scalar input. -/
 private def directValueScalarKernelFixture : Bool :=

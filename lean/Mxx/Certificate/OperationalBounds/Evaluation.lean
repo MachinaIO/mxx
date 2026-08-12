@@ -2384,8 +2384,15 @@ def evaluatePreparedScope
                       let matrixType ← match node.outputTypes with
                         | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
                         | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
-                      let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                        (.preimage matrixType) facts environment loopDomains layouts deriveOperationalSchemaFact
+                      let inputs ← node.arguments.toArray.mapM (lookupFact index facts)
+                      let (arena, inputs) ← inputs.foldlM (fun (arena, promoted) input => do
+                        let (arena, input) ← arena.promoteDirectRelationOperand input
+                        pure (arena, promoted.push input)) (facts.arena, #[])
+                      let operation : DirectRelationOperation := {
+                        kind := .preimage (match node.kind with | .preimageSample _ maximum => maximum | _ => .constant 0)
+                          loopDomains, outputType := matrixType, ownerScope := some scopeKey,
+                        ownerNode := index, outputPort := 0, parameterEnvironment := environment }
+                      let (arena, output) ← arena.pushDirectRelationPointwise operation inputs
                       facts := { facts with arena }
                       pure [output]
                   | _ =>
@@ -2430,8 +2437,18 @@ def evaluatePreparedScope
                       let matrixType ← match node.outputTypes with
                         | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
                         | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
-                      let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                        (.preimage matrixType) facts environment loopDomains layouts deriveOperationalSchemaFact
+                      let inputs ← node.arguments.toArray.mapM (lookupFact index facts)
+                      let (arena, inputs) ← inputs.foldlM (fun (arena, promoted) input => do
+                        let (arena, input) ← arena.promoteDirectRelationOperand input
+                        pure (arena, promoted.push input)) (facts.arena, #[])
+                      let operation : DirectRelationOperation := {
+                        kind := .decomposition (match node.kind with | .gadgetDecompose declaredType _ _ _ => declaredType | _ => matrixType)
+                          (match node.kind with | .gadgetDecompose _ base _ _ => base | _ => .constant 0)
+                          (match node.kind with | .gadgetDecompose _ _ small _ => small | _ => false)
+                          (match node.kind with | .gadgetDecompose _ _ _ digitCount => digitCount | _ => .constant 0)
+                          loopDomains layouts, outputType := matrixType, ownerScope := some scopeKey
+                        ownerNode := index, outputPort := 0, parameterEnvironment := environment }
+                      let (arena, output) ← arena.pushDirectRelationPointwise operation inputs
                       facts := { facts with arena }
                       pure [output]
                   | _ =>

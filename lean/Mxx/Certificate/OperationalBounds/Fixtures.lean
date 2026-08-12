@@ -6097,6 +6097,201 @@ private def directScalarParallelFixture : Except OperationalError Bool := do
 
 example : directScalarParallelFixture = .ok true := by native_decide
 
+/-- A complete direct endpoint table is reduced only after every physical lane has formed its
+full sum.  The maximum is therefore twelve, not either input-table maximum. -/
+private def directEndpointNoiseMaximumFixture : Bool :=
+  match (do
+    let binder := { directCarrierFixtureBinder 6200 with count := .constant 2 }
+    let (fixed, left0) := ({} : FixedOperationalPayloadArena).pushMatrix
+      (boundedOperationalExprFixtureFact 6201 2)
+    let (fixed, left1) := fixed.pushMatrix (boundedOperationalExprFixtureFact 6202 11)
+    let (fixed, right0) := fixed.pushMatrix (boundedOperationalExprFixtureFact 6203 5)
+    let (fixed, right1) := fixed.pushMatrix (boundedOperationalExprFixtureFact 6204 1)
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, leftRoot) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) #[left0, left1] with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 6200)
+    let (direct, rightRoot) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) #[right0, right1] with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 6200)
+    let arena : OperationalExprArena := { direct }
+    let wrap root : OperationalFact := {
+      context := { binders := #[binder] }, payload := .directValue root, storage := .explicitTable }
+    let operation : PrimitiveOperation := {
+      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 6205,
+      outputPort := 0, parameterEnvironment := [] }
+    let (arena, summed) ← arena.pushDirectMatrixPointwise operation (wrap leftRoot) (wrap rightRoot)
+    let lanes ← arena.reducedDirectValueFactsAt [] summed
+    let (maximum, _) ← operationalNoiseBoundForFact arena summed []
+    pure (lanes.map (fun (entry : ReducedDirectMatrixFact) => entry.fact.evaluateNoiseHardBound []) ==
+      [Except.ok 7, Except.ok 12] &&
+      maximum == 12)) with
+  | .ok value => value
+  | .error _ => false
+
+private def directScalarTable
+    (node : Nat) (bounds : Array Nat) : Except OperationalError
+    (OperationalExprArena × OperationalFact × IndexVariable) := do
+  let binder := { directCarrierFixtureBinder node with count := .constant bounds.size }
+  let mut fixed : FixedOperationalPayloadArena := {}
+  let mut references : Array FixedOperationalPayloadRef := #[]
+  for lane in [:bounds.size] do
+    let (nextFixed, reference) := fixed.pushScalar
+      (indexedScalarFixtureInteger (node + lane + 1) bounds[lane]! bounds[lane]!)
+    fixed := nextFixed
+    references := references.push reference
+  let direct : DirectOperationalIndexedArena := { fixed }
+  let (direct, root) ← match direct.pushExplicit [] { binders := #[binder] } binder
+      (.scalar .integer) references with
+    | some value => pure value
+    | none => throw (.unsupportedOperationalExpr node)
+  pure ({ direct }, {
+    context := { binders := #[binder] }, payload := .directValue root, storage := .explicitTable }, binder)
+
+/-- Direct scalar ZipOffset uses the same checked map and consumes the requested half-open range
+without falling back to the legacy scalar selection graph. -/
+private def directScalarZipOffsetFixture : Bool :=
+  match (do
+    let (arena, source, binder) ← directScalarTable 6210 #[3, 5, 7]
+    let selector := { directCarrierFixtureBinder 6211 with count := .constant 2 }
+    let map ← match dynamicIndexMap source.context binder
+        (.offset (.variable selector) 1) with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 6210)
+    let (arena, mapped) ← arena.reindexDirectMatrixFact map source
+    let root ← match mapped.payload with
+      | .directValue root => pure root
+      | _ => throw (OperationalError.unsupportedOperationalExpr 6210)
+    let first ← arena.direct.scalarFactAt [] [(.variable selector, 0)] root
+      (arena.direct.values.size + 1)
+    let second ← arena.direct.scalarFactAt [] [(.variable selector, 1)] root
+      (arena.direct.values.size + 1)
+    pure (mapped.context.binders == #[selector] && (match first, second with
+      | .integer first, .integer second => first.lower == 5 && second.lower == 7
+      | _, _ => false))) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Nested direct scalar tables retain both physical coordinates and zip only matching composite
+assignments. -/
+private def nestedDirectScalarContextFixture : Bool :=
+  match (do
+    let (arena, child, inner) ← directScalarTable 6220 #[2, 4]
+    let outer := { directCarrierFixtureBinder 6221 with count := .constant 2 }
+    let childRoot ← match child.payload with
+      | .directValue root => pure root
+      | _ => throw (OperationalError.unsupportedOperationalExpr 6220)
+    let (direct, root) ← match arena.direct.pushExplicitValues [] outer #[childRoot, childRoot] with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 6221)
+    let arena : OperationalExprArena := { arena with direct }
+    let nested : OperationalFact := {
+      context := { binders := #[inner, outer] }, payload := .directValue root, storage := .explicitTable }
+    let entries ← arena.reducedDirectScalarValueFactsAt [] nested
+    pure (entries.map (fun (entry : ReducedDirectScalarFact) => entry.correlation) == [
+      [(IndexExpr.variable outer, 0), (IndexExpr.variable inner, 0)],
+      [(IndexExpr.variable outer, 0), (IndexExpr.variable inner, 1)],
+      [(IndexExpr.variable outer, 1), (IndexExpr.variable inner, 0)],
+      [(IndexExpr.variable outer, 1), (IndexExpr.variable inner, 1)]])) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Explicit and Shared direct scalar carriers zip once per explicit lane in either operand
+order, never through a Cartesian product. -/
+private def directMixedScalarPointwiseFixture : Bool :=
+  match (do
+    let (arena, explicit, binder) ← directScalarTable 6230 #[1, 2]
+    let (fixed, reference) := arena.direct.fixed.pushScalar (indexedScalarFixtureInteger 6233 10 10)
+    let direct := { arena.direct with fixed }
+    let (direct, root) ← match direct.pushShared emptyContext (.scalar .integer) reference with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 6233)
+    let arena : OperationalExprArena := { arena with direct }
+    let sharedFact : OperationalFact := { context := emptyContext, payload := .directValue root, storage := .sharedTemplate }
+    let operation : DirectScalarOperation := {
+      kind := .intBinary .add, ownerScope := none, ownerNode := 6234, outputPort := 0 }
+    let (arena, first) ← arena.pushDirectScalarPointwiseN operation #[explicit, sharedFact]
+    let (arena, second) ← arena.pushDirectScalarPointwiseN operation #[sharedFact, explicit]
+    let lowers (value : OperationalFact) : Except OperationalError (List Int) := do
+      let entries ← arena.reducedDirectScalarValueFactsAt [] value
+      pure (entries.map fun (entry : ReducedDirectScalarFact) =>
+        match entry.fact with | .integer fact => fact.lower | _ => -1)
+    pure (first.context.binders == #[binder] && second.context.binders == #[binder] &&
+      (← lowers first) == [11, 12] && (← lowers second) == [11, 12])) with
+  | .ok value => value
+  | .error _ => false
+
+/-- A direct Boolean family remains indexed through `BoolToInt`; static access specializes its
+selected lane and retains the result's direct producer provenance. -/
+private def directBooleanToIntStaticFixture : Bool :=
+  match (do
+    let binder := { directCarrierFixtureBinder 6240 with count := .constant 2 }
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushScalar .boolean
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, root) ← match direct.pushShared { binders := #[binder] } (.scalar .boolean) reference with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 6240)
+    let arena : OperationalExprArena := { direct }
+    let family : OperationalFact := { context := { binders := #[binder] }, payload := .directValue root, storage := .sharedTemplate }
+    let operation : DirectScalarOperation := {
+      kind := .boolToInt, ownerScope := some temporaryScope, ownerNode := 6241, outputPort := 0 }
+    let (arena, mapped) ← arena.pushDirectScalarPointwiseN operation #[family]
+    let map ← match closedStaticIndexMap [] mapped.context binder 1 with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 6241)
+    let (arena, selected) ← arena.reindexDirectMatrixFact map mapped
+    let root ← match selected.payload with
+      | .directValue root => pure root
+      | _ => throw (OperationalError.unsupportedOperationalExpr 6241)
+    let fact ← arena.direct.scalarFactAt [] [] root (arena.direct.values.size + 1)
+    pure (selected.context == emptyContext && (match fact with
+      | .integer value => value.subject == ({ node := 6241, port := 0 } : WireRef) && value.lower == 0 &&
+          value.upper == 1 && value.origin == (OperationalValueOrigin.local temporaryScope { node := 6241, port := 0 })
+      | _ => false))) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Static direct scalar reindexing substitutes loop-index bound expressions in every fixed
+lane rather than retaining the removed family coordinate. -/
+private def directScalarLoopIndexStaticFixture : Bool :=
+  match (do
+    let binder := { directCarrierFixtureBinder 6250 with count := .constant 2 }
+    let scalar : OperationalScalarFact := .integer {
+      subject := { node := 6251, port := 0 }, origin := .local temporaryScope { node := 6251, port := 0 },
+      lower := 0, upper := 1, lowerExpression := .closedInt (.loopIndex binder.slot),
+      upperExpression := .closedInt (.loopIndex binder.slot) }
+    let (fixed, first) := ({} : FixedOperationalPayloadArena).pushScalar scalar
+    let (fixed, second) := fixed.pushScalar scalar
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, root) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.scalar .integer) #[first, second] with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 6250)
+    let arena : OperationalExprArena := { direct }
+    let source : OperationalFact := { context := { binders := #[binder] }, payload := .directValue root, storage := .explicitTable }
+    let map ← match closedStaticIndexMap [] source.context binder 1 with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 6250)
+    let (arena, selected) ← arena.reindexDirectMatrixFact map source
+    let root ← match selected.payload with
+      | .directValue root => pure root
+      | _ => throw (OperationalError.unsupportedOperationalExpr 6250)
+    match ← arena.direct.scalarFactAt [] [] root (arena.direct.values.size + 1) with
+    | .integer fact => pure (fact.lowerExpression == OperationalBoundExpr.closedInt (.constant 1) &&
+        fact.upperExpression == OperationalBoundExpr.closedInt (.constant 1))
+    | _ => pure false) with
+  | .ok value => value
+  | .error _ => false
+
+example : directEndpointNoiseMaximumFixture = true := by native_decide
+example : directScalarZipOffsetFixture = true := by native_decide
+example : nestedDirectScalarContextFixture = true := by native_decide
+example : directMixedScalarPointwiseFixture = true := by native_decide
+example : directBooleanToIntStaticFixture = true := by native_decide
+example : directScalarLoopIndexStaticFixture = true := by native_decide
+
 /-- Hash provenance follows a direct transport chain only when each map owns its immediate
 source and destination context.  A manually forged mapped carrier cannot substitute a key
 origin across an unrelated lane binder. -/

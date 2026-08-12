@@ -7083,9 +7083,6 @@ def selectUniformMatrixFamiliesWithLaneBinders
     (branches : List OperationalFact)
     (branchLaneBinders : List IndexVariable)
     (environment : ParamEnvironment)
-    (_deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
-      OperationalExprEvaluationState →
-      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
     (arena : OperationalExprArena) :
     Except OperationalError (OperationalExprArena × OperationalFact) := do
   if expectedCount = 0 || branches.isEmpty || branches.length != branchLaneBinders.length then

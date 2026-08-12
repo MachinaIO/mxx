@@ -2187,7 +2187,7 @@ def evaluatePreparedScope
                         directFamilyLaneBinderAt scopeKey scope environment wire branch
                       let (arena, output) ← selectUniformMatrixFamiliesWithLaneBinders scopeKey index selection
                         matrixType count expectedCount.toNat branches branchLaneBinders environment
-                        deriveOperationalSchemaFact facts.arena
+                        facts.arena
                       facts := { facts with arena }
                       pure [output]
                   | [.matrix matrixType] | [.preimage matrixType] =>
@@ -2224,54 +2224,12 @@ def evaluatePreparedScope
                     facts := { facts with arena }
                     pure [output]
                   else
-                    let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                      (.matrix matrixType) facts environment loopDomains layouts
-                    facts := { facts with arena }
-                    pure [output]
-              | .crtRecompose plaintextModuli reconstructionCoefficients =>
-                  let inputs ← node.arguments.toArray.mapM (lookupFact index facts)
-                  if inputs.any fun input => match input with
-                      | { payload := .matrix _, .. } => true
-                      | _ => false then
-                    if inputs.isEmpty || inputs.size != plaintextModuli.length ||
-                        inputs.size != reconstructionCoefficients.length then
-                      throw (.unsupportedOutputArity index inputs.size)
-                    let matrixType ← match node.outputTypes with
-                      | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
-                      | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
-                    let moduli ← plaintextModuli.mapM
-                      (evaluateIntInvariant environment loopDomains)
-                    let coefficients ← reconstructionCoefficients.mapM
-                      (evaluateIntInvariant environment loopDomains)
-                    let modulus ← evaluateIntInvariant environment loopDomains matrixType.modulus
-                    if modulus <= 0 || moduli.any (fun value => value <= 1 || value >= modulus) ||
-                        coefficients.any (fun value => value < 0 || value >= modulus) then
-                      throw (.invalidMatrixParameters index)
-                    let mut arena := facts.arena
-                    let mut scaled : Array OperationalFact := #[]
-                    for (input, coefficient) in inputs.toList.zip coefficients do
-                      let scalar := IntExpr.constant coefficient
-                      let (nextArena, output) ← scaleOperationalExprFact index 0 matrixType scalar
-                        [coefficient] environment loopDomains
-                          deriveOperationalSchemaFact arena input
-                      arena := nextArena
-                      scaled := scaled.push output
-                    let mut output ← match scaled[0]? with
-                      | some output => pure output
-                      | none => throw (.invalidCount index 0)
-                    for next in scaled.extract 1 scaled.size do
-                      let (nextArena, sum) ← addOperationalExprFacts index 0 matrixType false
-                        environment deriveOperationalSchemaFact arena output next
-                      arena := nextArena
-                      output := sum
-                    facts := { facts with arena }
-                    pure [output]
-                  else
-                    let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
-                      environment loopDomains layouts facts 0
-                        node.outputTypes
-                    facts := { facts with arena }
-                    pure outputs
+                    throw (.unsupportedOperationalExpr index)
+              | .crtRecompose _ _ =>
+                  let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
+                    environment loopDomains layouts facts 0 node.outputTypes
+                  facts := { facts with arena }
+                  pure outputs
               | .preimageSample .. =>
                   let targetWire ← match node.arguments[2]? with
                     | some wire => pure wire
@@ -2345,10 +2303,7 @@ def evaluatePreparedScope
                       facts := { facts with arena }
                       pure [output]
                   | _ =>
-                      let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                        (.matrix matrixType) facts environment loopDomains layouts
-                      facts := { facts with arena }
-                      pure [output]
+                      throw (.unsupportedOperationalExpr index)
               | .liftIntegerToConstantPolynomial matrixType =>
                   let inputWire ← match node.arguments with
                     | [wire] => pure wire
@@ -2372,10 +2327,7 @@ def evaluatePreparedScope
                       facts := { facts with arena }
                       pure [output]
                   | _ =>
-                      let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                        (.matrix matrixType) facts environment loopDomains layouts
-                      facts := { facts with arena }
-                      pure [output]
+                      throw (.unsupportedOperationalExpr index)
               | .trapdoorPublic =>
                   let inputWire ← match node.arguments with
                     | [wire] => pure wire
@@ -2425,10 +2377,7 @@ def evaluatePreparedScope
                       facts := { facts with arena }
                       pure [output]
                   | _ =>
-                      let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                        (.matrix matrixType) facts environment loopDomains layouts
-                      facts := { facts with arena }
-                      pure [output]
+                      throw (.unsupportedOperationalExpr index)
               | .matrixAdd | .matrixSubtract =>
                   if node.arguments.length != 2 then
                     throw (.unsupportedOutputArity index node.arguments.length)
@@ -2499,10 +2448,7 @@ def evaluatePreparedScope
                     facts := { facts with arena }
                     pure [output]
                   else
-                    let (arena, output) ← genericNodeFact scopeKey index node step.rule 0
-                      (.matrix matrixType) facts environment loopDomains layouts
-                    facts := { facts with arena }
-                    pure [output]
+                    throw (.unsupportedOperationalExpr index)
               | _ =>
                   let (arena, outputs) ← deriveOrdinaryOutputs scopeKey index node step.rule
                     environment loopDomains layouts facts 0
@@ -2923,17 +2869,13 @@ partial def collectDecoderResidualBounds
     (arena : OperationalExprArena)
     (environment : ParamEnvironment) : OperationalExprEvaluationState → OperationalFact →
     Except OperationalError (List Int × OperationalExprEvaluationState)
-  | state, expression@{ payload := .matrix _, .. } => do
-      let _ ← validateResidualExpressionNoLargeTerms arena environment expression.payload
-      let (bound, state) ← evaluateOperationalExprNoiseBoundWithState arena environment
-        expression.payload state
-      pure ([bound], state)
   | state, expression@{ payload := .directValue _, .. } => do
       let entries ← arena.reducedDirectValueFactsAt environment expression
       let bounds ← entries.mapM fun entry => do
         let _ ← entry.fact.rejectResidualLargeTerms
         entry.fact.evaluateNoiseHardBound environment
       pure (bounds, state)
+  | _, _ => throw (.unsupportedOperationalExpr 0)
 
 /-- Evaluate every matrix-like port produced at `node` across all workflow stages.  This helper is
 used only by the external performance harness to time former hot nodes; it does not affect the
@@ -2952,11 +2894,6 @@ def operationalNodeNoiseBounds
     | some ports =>
         for fact in ports do
           match fact with
-          | { payload := .matrix _, .. } =>
-              let (bounds, nextState) ← collectDecoderResidualBounds stage.facts.arena
-                environment evaluationState fact
-              result := result ++ bounds
-              evaluationState := nextState
           | { payload := .directValue root, .. } =>
               let value ← match stage.facts.arena.direct.valueAt? root with
                 | some value => pure value
@@ -2968,6 +2905,7 @@ def operationalNodeNoiseBounds
                   result := result ++ bounds
                   evaluationState := nextState
               | .scalar _ => pure ()
+          | _ => throw (.unsupportedOperationalExpr node)
   pure result
 
 /-- Evaluates the graph-derived structural bound for a matrix residual or residual family once.

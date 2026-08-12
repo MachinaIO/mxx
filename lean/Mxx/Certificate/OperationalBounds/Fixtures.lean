@@ -1022,7 +1022,7 @@ private def samplerAndDecodeCoverageDerivation : ScopeDerivation := { steps := #
 ] }
 
 /-- Sampler pairing, preimage ownership, threshold outputs, CRT recomposition, Boolean-family
-packing, and residue reconstruction all reach explicit transfers in one closed fixture. -/
+packing, and residue reconstruction all reach direct transfers in one closed fixture. -/
 example : (do
     let facts ← evaluateScopeOperationalWithLayouts samplerAndDecodeCoverageScope
       samplerAndDecodeCoverageDerivation [] []
@@ -1570,33 +1570,9 @@ private def exactRelationSelectionFixtureResult : Except OperationalError Bool :
     let rewritten ← lookupFact 11 facts { node := 11, port := 0 }
     let rewrittenPhysical ← facts.arena.reducedDirectValueFactsAt [] rewritten
     let (rewrittenBound, _) ← operationalNoiseBoundForFact facts.arena rewritten []
-    let representative : OperationalMatrixFact := {
-      subject := { node := 20, port := 0 }
-      origin := .value temporaryScope { node := 20, port := 0 }
-      matrixType := fixtureType
-      matrixParams := fixtureParams
-      totalHardBound := .closedInt (.constant 7)
-    }
-    let summary := selectedMatrixSummary #[representative]
-    let (envelopeArena, representativeId) :=
-      ({} : OperationalExprArena).pushConcrete representative
-    let envelopeSelection := DynamicSelectionIdentity.fromOrigin
-      (.local temporaryScope { node := 21, port := 0 }) 30720
-    let (envelopeArena, envelopeRoot) ← envelopeArena.pushSharedSelection envelopeSelection
-      30720 representativeId summary
-    let (envelopeBound, _) ← evaluateCompleteBound envelopeArena [] envelopeRoot
-      (OperationalExprEvaluationState.empty envelopeArena)
-    let staleRepresentative := { representative with
-      totalHardBound := OperationalBoundExpr.closedInt (.constant 8) }
-    let (staleArena, staleId) := ({} : OperationalExprArena).pushConcrete staleRepresentative
-    let staleRejected := match staleArena.pushSharedSelection envelopeSelection 2 staleId summary with
-      | .error (.unsupportedOperationalExpr _) => true
-      | _ => false
     let report ← decoderNoiseCheckReportForFact [] facts.arena rewritten [] 2 25
     pure (dynamicOk && !rewrittenPhysical.isEmpty && rewrittenPhysical.all
       (fun entry => !matrixFactHasRelation entry.fact) && rewrittenBound == 3 &&
-      envelopeArena.nodes.size == 2 &&
-      envelopeBound == 7 && staleRejected &&
       report.obligations == [.decoderThreshold 2 25 3])
 
 /-- Matrix family packing retains its lane context in the direct carrier; static and known dynamic
@@ -2248,7 +2224,7 @@ private def productionDistinctIndexFixtureResult : Except OperationalError
     let relation ← lookupFact 17 facts { node := 16, port := 0 }
     let relationRoot ← match relation.payload with
       | .directValue root => pure root
-      | .matrix root => throw (OperationalError.unsupportedOperationalExpr root)
+      | _ => throw (OperationalError.unsupportedOperationalExpr 16)
     let relationLowered := match facts.arena.direct.valueAt? relationRoot with
       | some { payload := .pointwise (.matrix _) (.matrix operation) inputs, .. } =>
           match operation.kind with
@@ -4414,20 +4390,6 @@ example : complementaryBlockBoundaryMismatchFixture = true := by native_decide
 example : singletonComplementaryBlockFixture = true := by native_decide
 example : directFamilyComplementaryBlockFixture = true := by native_decide
 
-/-- The summary-transfer registry has an explicit fail-closed row for every operation category
-used by the Tall inventory; no registered category falls through to the unregistered behavior. -/
-private def summaryTransferRegistryCoverageFixture : Bool :=
-  let representative := boundedOperationalExprFixtureFact 96 3
-  let source := selectedMatrixSummary #[representative]
-  let registered := #[
-    EnvelopeSummaryTransferOperation.instantiationMap,
-    .recurrenceBoundShift, .addSubtract, .multiplyOrdinary, .tensor,
-    .concat, .transform,
-    .scale, .bggGrouping]
-  registered.all (fun operation =>
-    (transferSelectedMatrixSummary operation #[source] representative).isSome) &&
-    (transferSelectedMatrixSummary .unregistered #[source] representative).isNone
-
 private def indexedScalarFixtureInteger (node lower upper : Nat) : OperationalScalarFact :=
   .integer {
     subject := { node, port := 0 }
@@ -4878,13 +4840,24 @@ Large-plus-bounded residual before looking at their bounded-only summaries. -/
 private def residualLargeSingleAndMixedFixture : Bool :=
   let large := (operationalExprFixtureFact 5001 8).initializePrimitivePolynomial .large
   let bounded := boundedOperationalExprFixtureFact 5002 3
-  match (do
-    let (arena, largeRoot) := ({} : OperationalExprArena).pushConcrete large
-    let largeResidual ← arena.indexedExpr largeRoot
-    let (arena, boundedRoot) := arena.pushConcrete bounded
-    let (arena, mixedRoot) ← addOperationalExprIds 5003 0 fixtureType false []
-      deriveOperationalSchemaFact arena largeRoot boundedRoot (arena.nodes.size + 1)
-    let mixedResidual ← arena.indexedExpr mixedRoot
+  match (show Except OperationalError
+      (Except OperationalError (Int × OperationalAnalysisDiagnostics) ×
+        Except OperationalError (Int × OperationalAnalysisDiagnostics)) from do
+    let (fixed, largeReference) := ({} : FixedOperationalPayloadArena).pushMatrix large
+    let (fixed, boundedReference) := fixed.pushMatrix bounded
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, largeRoot) ← match direct.pushShared emptyContext (.matrix fixtureType) largeReference with
+      | some value => pure value | none => throw (.unsupportedOperationalExpr 5001)
+    let (direct, boundedRoot) ← match direct.pushShared emptyContext (.matrix fixtureType) boundedReference with
+      | some value => pure value | none => throw (.unsupportedOperationalExpr 5002)
+    let arena : OperationalExprArena := { direct }
+    let largeResidual : OperationalFact := {
+      context := emptyContext, payload := .directValue largeRoot, storage := .sharedTemplate }
+    let operation : PrimitiveOperation := {
+      kind := .add false, outputType := fixtureType, ownerScope := none,
+      ownerNode := 5003, outputPort := 0, parameterEnvironment := [] }
+    let (arena, mixedResidual) ← arena.pushDirectMatrixPointwise operation largeResidual {
+      context := emptyContext, payload := .directValue boundedRoot, storage := .sharedTemplate }
     pure (operationalNoiseBoundForFact arena largeResidual [],
       operationalNoiseBoundForFact arena mixedResidual [])) with
   | .ok (.error (.residualContainsLargeTerm 5001), .error (.residualContainsLargeTerm 5003)) => true
@@ -4916,12 +4889,18 @@ private def residualLargeDirectFamilyFixture : Bool :=
 signal leaves the zero noise residual rather than being rejected from one of its inputs. -/
 private def residualLargeCancellationFixture : Bool :=
   let large := (operationalExprFixtureFact 5040 8).initializePrimitivePolynomial .large
-  match (do
-    let (arena, left) := ({} : OperationalExprArena).pushConcrete large
-    let (arena, right) := arena.pushConcrete large
-    let (arena, root) ← addOperationalExprIds 5042 0 fixtureType true []
-      deriveOperationalSchemaFact arena left right (arena.nodes.size + 1)
-    let residual ← arena.indexedExpr root
+  match (show Except OperationalError (Except OperationalError (Int × OperationalAnalysisDiagnostics)) from do
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushMatrix large
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, root) ← match direct.pushShared emptyContext (.matrix fixtureType) reference with
+      | some value => pure value | none => throw (.unsupportedOperationalExpr 5040)
+    let arena : OperationalExprArena := { direct }
+    let input : OperationalFact := {
+      context := emptyContext, payload := .directValue root, storage := .sharedTemplate }
+    let operation : PrimitiveOperation := {
+      kind := .add true, outputType := fixtureType, ownerScope := none,
+      ownerNode := 5042, outputPort := 0, parameterEnvironment := [] }
+    let (arena, residual) ← arena.pushDirectMatrixPointwise operation input input
     pure (operationalNoiseBoundForFact arena residual [])) with
   | .ok (.ok (0, _)) => true
   | _ => false
@@ -5405,7 +5384,6 @@ example : exactRelationSelectionFixtureResult = .ok true ∧
     equivalentProductDimensionFixture = true ∧
     oneBadEndpointIdentityRejectsFixture = true ∧
     crossSelectionRelationMismatchFixture = true ∧
-    summaryTransferRegistryCoverageFixture = true ∧
     nestedDirectPackContextFixture = true ∧
     reducedSharedLogicalCountsFixture = true ∧
     reducedExplicitTableFixture = true ∧

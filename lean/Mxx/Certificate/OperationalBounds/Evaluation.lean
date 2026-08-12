@@ -3305,13 +3305,22 @@ def PreparedOperationalWorkflow.decoderTarget
 def operationalFactModulus
     (arena : OperationalExprArena)
     (fact : OperationalFact)
-    (environment : ParamEnvironment) : Except OperationalError Int :=
+    (environment : ParamEnvironment) : Except OperationalError Int := do
   match fact with
-  | expression@{ payload := .matrix root, .. } => match arena.nodes[root]? with
-    | some node => match node.matrixType.modulus.evaluate environment with
+  | expression@{ payload := .directValue root, .. } => do
+      let value ← match arena.direct.valueAt? root with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef root)
+      let declaredType ← match value.payload.schema with
+        | .matrix matrixType => pure matrixType
+        | .scalar _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
+      let physicalFacts ← arena.reducedDirectValueFactsAt environment expression
+      if physicalFacts.isEmpty || !physicalFacts.all
+          (fun entry => entry.fact.matrixType == declaredType) then
+        throw (.operandNotMatrix 0 { node := 0, port := 0 })
+      match declaredType.modulus.evaluate environment with
       | some modulus => pure modulus
       | none => throw .nonClosedExpression
-    | none => throw (.invalidOperationalExprRef expression.payload)
   | _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
 
 /-- Resolves the closed target before selecting any residual fact.  The request supplies only the

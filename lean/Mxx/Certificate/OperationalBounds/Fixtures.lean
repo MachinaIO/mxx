@@ -2953,6 +2953,68 @@ private def directOrdinaryMatrixPipelineFixture : Bool :=
   | Except.ok value => value
   | Except.error _ => false
 
+/-- Decoder-target modulus resolution reads direct matrix storage, verifies exact declared and
+physical types, and rejects scalar, dangling, and publicly forged direct roots. -/
+private def directTargetModulusFixture : Bool :=
+  match (show Except OperationalError Bool from do
+    let (arena, matrix) ← ({} : OperationalExprArena).promoteConcreteMatrixFact
+      (boundedOperationalExprFixtureFact 804 2)
+    let modulus ← operationalFactModulus arena matrix []
+    let parameters : ParamEnvironment := [("target_modulus", .integer 19)]
+    let parameterizedType : MatrixTypeExpr := { fixtureType with modulus := .parameter "target_modulus" }
+    let parameterizedFact ← classifiedMatrixFact 805 0 parameterizedType parameters 2 false
+    let (parameterizedArena, parameterizedMatrix) ←
+      ({} : OperationalExprArena).promoteConcreteMatrixFact parameterizedFact
+    let parameterizedModulus ← operationalFactModulus parameterizedArena parameterizedMatrix parameters
+    let (arena, scalar) ← arena.promoteConcreteScalarFact .boolean
+    let invalid : OperationalFact := {
+      context := emptyContext
+      payload := .directValue arena.direct.values.size
+      storage := .sharedTemplate
+    }
+    let binder := directCarrierFixtureBinder 805
+    let emptyDirect : DirectOperationalIndexedArena := { values := #[{
+      context := { binders := #[binder] }
+      payload := .explicit (.matrix fixtureType) binder #[]
+      storage := .explicitTable
+    }] }
+    let emptyFact : OperationalFact := {
+      context := { binders := #[binder] }
+      payload := .directValue 0
+      storage := .explicitTable
+    }
+    let physical := boundedOperationalExprFixtureFact 806 2
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushMatrix physical
+    let mismatchedDirect : DirectOperationalIndexedArena := { fixed, values := #[{
+      context := emptyContext
+      payload := .shared (.matrix knownZeroOutputType) reference
+      storage := .sharedTemplate
+    }] }
+    let mismatchedFact : OperationalFact := {
+      context := emptyContext
+      payload := .directValue 0
+      storage := .sharedTemplate
+    }
+    let scalarRejected := match operationalFactModulus arena scalar [] with
+      | .error (.operandNotMatrix ..) => true
+      | _ => false
+    let invalidRejected := match operationalFactModulus arena invalid [] with
+      | .error (.invalidOperationalExprRef _) => true
+      | _ => false
+    let emptyRejected := match operationalFactModulus { direct := emptyDirect } emptyFact [] with
+      | .error (.operandNotMatrix ..) => true
+      | _ => false
+    let mismatchRejected := match operationalFactModulus { direct := mismatchedDirect }
+        mismatchedFact [] with
+      | .error (.operandNotMatrix ..) => true
+      | _ => false
+    pure (modulus == fixtureParams.modulus && parameterizedModulus == 19 && scalarRejected &&
+      invalidRejected && emptyRejected && mismatchRejected)) with
+  | .ok value => value
+  | .error _ => false
+
+example : directTargetModulusFixture = true := by native_decide
+
 /-- Shared selector binders remain one dimension, while independent binders remain two dimensions
 inside one delayed direct operation.  Neither case allocates an exact-choice Cartesian table. -/
 private def directValueContextCorrelationFixture : Bool :=

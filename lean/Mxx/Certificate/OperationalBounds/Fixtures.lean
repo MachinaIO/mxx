@@ -1304,6 +1304,8 @@ private def loopHashDerivation : ProgramDerivation := {
   ] })]
 }
 
+
+
 /-- Static extraction instantiates the loop-dependent hash query, so two lanes cannot acquire the
 same deterministic source identity merely because the body was analyzed once. -/
 example : (do
@@ -1351,6 +1353,8 @@ private def aliasedLoopHashDerivation : ProgramDerivation := {
     ] })
   ]
 }
+
+
 
 /-- A child parameter bound to an enclosing loop index retains that binding frame in the hash
 identity. Flattening the child environment at template index zero would make these origins equal. -/
@@ -2412,6 +2416,241 @@ example : (match evaluateProgramOperationalWithLayouts relationCarryProgram rela
   | _ => false) = true := by
   native_decide
 
+/-- A production sequential body updates two carried matrix slots from the same previous-state
+vector.  Slot one reads slot zero's previous value, not the already-updated slot-zero result.
+This exercises direct-carrier abstraction, schema closure, and recurrence-state installation
+through the actual Graph IR evaluator. -/
+private def directSimultaneousSequentialBody : Scope := {
+  nodes := #[
+    { kind := .input "left", arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .input "right", arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .gaussianSample fixtureType (.constant 1), arguments := [],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixAdd, arguments := [{ node := 0, port := 0 }, { node := 2, port := 0 }],
+      outputTypes := [.matrix fixtureType] },
+    { kind := .matrixAdd, arguments := [{ node := 1, port := 0 }, { node := 0, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("left", { node := 3, port := 0 }), ("right", { node := 4, port := 0 })]
+  inputNames := ["left", "right"]
+}
+
+private def directSimultaneousSequentialProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .gaussianSample fixtureType (.constant 1), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 2), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .sequentialLoop "body" (.constant 2) 0 [] 2,
+        arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputCount := 2,
+        outputTypes := [.matrix fixtureType, .matrix fixtureType] }
+    ]
+    outputs := [("left", { node := 2, port := 0 }), ("right", { node := 2, port := 1 })]
+    inputNames := []
+  }
+  definitions := [("body", directSimultaneousSequentialBody)]
+}
+
+private def directSimultaneousSequentialDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 1, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 2, rule := .sequentialLoop,
+      arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+  ] }
+  definitions := [("body", { steps := #[
+    { sourceNode := 0, rule := .input, arguments := [] },
+    { sourceNode := 1, rule := .input, arguments := [] },
+    { sourceNode := 2, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 3, rule := .matrixAdd,
+      arguments := [{ node := 0, port := 0 }, { node := 2, port := 0 }] },
+    { sourceNode := 4, rule := .matrixAdd,
+      arguments := [{ node := 1, port := 0 }, { node := 0, port := 0 }] }
+  ] })]
+}
+
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts directSimultaneousSequentialProgram
+      directSimultaneousSequentialDerivation [] []
+    let left ← matrixMaximum 3 { node := 2, port := 0 } facts []
+    let right ← matrixMaximum 3 { node := 2, port := 1 } facts []
+    pure (left == 3 && right == 5)) = .ok true := by
+  native_decide
+
+/-- A direct integer carrier crosses a parallel family boundary, is selected concretely, and then
+is carried through a sequential loop.  Its lower and upper interval components are independently
+installed as recurrence-state paths; this guards against treating an integer carrier as a matrix
+maximum or silently dropping either endpoint. -/
+private def directIntegerParallelBody : Scope := {
+  nodes := #[{ kind := .input "value", arguments := [], outputTypes := [.integer] }]
+  outputs := [("value", { node := 0, port := 0 })]
+  inputNames := ["value"]
+}
+
+private def directIntegerSequentialBody : Scope := {
+  nodes := #[{ kind := .input "value", arguments := [], outputTypes := [.integer] }]
+  outputs := [("value", { node := 0, port := 0 })]
+  inputNames := ["value"]
+}
+
+private def directIntegerSequentialProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .constantInt 4, arguments := [], outputTypes := [.integer] },
+      { kind := .parallelLoop "parallel" (.constant 2) 0 [] [.broadcast],
+        arguments := [{ node := 0, port := 0 }],
+        outputTypes := [.indexedFamily .integer (.constant 2)] },
+      { kind := .familyGetStatic (.constant 1), arguments := [{ node := 1, port := 0 }],
+        outputTypes := [.integer] },
+      { kind := .sequentialLoop "sequential" (.constant 2) 0 [] 1,
+        arguments := [{ node := 2, port := 0 }], outputTypes := [.integer] }
+    ]
+    outputs := [("value", { node := 3, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("parallel", directIntegerParallelBody),
+    ("sequential", directIntegerSequentialBody)]
+}
+
+private def directIntegerSequentialDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .constantInt, arguments := [] },
+    { sourceNode := 1, rule := .parallelLoop, arguments := [{ node := 0, port := 0 }] },
+    { sourceNode := 2, rule := .familyGetStatic, arguments := [{ node := 1, port := 0 }] },
+    { sourceNode := 3, rule := .sequentialLoop, arguments := [{ node := 2, port := 0 }] }
+  ] }
+  definitions := [
+    ("parallel", { steps := #[{ sourceNode := 0, rule := .input, arguments := [] }] }),
+    ("sequential", { steps := #[{ sourceNode := 0, rule := .input, arguments := [] }] })
+  ]
+}
+
+example : (do
+    let facts ← evaluateProgramOperationalWithLayouts directIntegerSequentialProgram
+      directIntegerSequentialDerivation [] []
+    let result ← lookupFact 4 facts { node := 3, port := 0 }
+    let integer ← facts.arena.directValueScalarFactAt [] result
+    pure (match result, integer with
+      | { payload := .directValue _, .. }, .integer value =>
+          value.lower == 4 && value.upper == 4 &&
+            match value.lowerExpression, value.upperExpression with
+            | .recurrenceState 2 paths _ _ (OperationalBoundPath.integerLower 0 0),
+                .recurrenceState 2 upperPaths _ _ (OperationalBoundPath.integerUpper 0 0) =>
+                paths == [(OperationalBoundPath.integerLower 0 0),
+                  (OperationalBoundPath.integerUpper 0 0)] && upperPaths == paths
+            | _, _ => false
+      | _, _ => false)) = .ok true := by
+  native_decide
+
+/-- The exact lower/upper recurrence payload is checked with an asymmetric direct input interval.
+This uses the ordinary Graph IR sequential node and a direct-carrier input, rather than a
+hand-written recurrence expression: swapping or dropping one endpoint changes the result. -/
+private def directIntegerIntervalSequentialScope : Scope := {
+  nodes := #[
+    { kind := .input "value", arguments := [], outputTypes := [.integer] },
+    { kind := .sequentialLoop "sequential" (.constant 2) 0 [] 1,
+      arguments := [{ node := 0, port := 0 }], outputTypes := [.integer] }
+  ]
+  outputs := [("value", { node := 1, port := 0 })]
+  inputNames := ["value"]
+}
+
+private def directIntegerIntervalSequentialDerivation : ScopeDerivation := { steps := #[
+  { sourceNode := 0, rule := .input, arguments := [] },
+  { sourceNode := 1, rule := .sequentialLoop, arguments := [{ node := 0, port := 0 }] }
+] }
+
+private def directIntegerIntervalSequentialProgram : Prog := {
+  root := directIntegerIntervalSequentialScope
+  definitions := [("sequential", directIntegerSequentialBody)]
+}
+
+private def directIntegerIntervalSequentialProgramDerivation : ProgramDerivation := {
+  root := directIntegerIntervalSequentialDerivation
+  definitions := [("sequential", { steps := #[{ sourceNode := 0, rule := .input, arguments := [] }] })]
+}
+
+private def directIntegerIntervalSequentialFixture : Except OperationalError Bool := do
+  let initial ← integerFactWithExpressions 0 0 2 5
+    (.closedInt (.constant 2)) (.closedInt (.constant 5))
+  let (arena, input) ← ({} : OperationalExprArena).promoteConcreteScalarFact initial
+  let prepared ← prepareProgramOperational directIntegerIntervalSequentialProgram
+    directIntegerIntervalSequentialProgramDerivation
+  let facts ← evaluatePreparedScope prepared.definitions [] (.root (.standalone 61))
+    (prepared.definitions.size + 1) prepared.root [] [] arena [input]
+  let result ← lookupFact 2 facts { node := 1, port := 0 }
+  match result, ← facts.arena.directValueScalarFactAt [] result with
+  | { payload := .directValue _, .. }, .integer value =>
+      pure <| value.lower == 2 && value.upper == 5 &&
+        value.lowerExpression == .recurrenceState 2
+          [(.integerLower 0 0), (.integerUpper 0 0)]
+          [.closedInt (.constant 2), .closedInt (.constant 5)]
+          [.previous (.integerLower 0 0), .previous (.integerUpper 0 0)]
+          (.integerLower 0 0) &&
+        value.upperExpression == .recurrenceState 2
+          [(.integerLower 0 0), (.integerUpper 0 0)]
+          [.closedInt (.constant 2), .closedInt (.constant 5)]
+          [.previous (.integerLower 0 0), .previous (.integerUpper 0 0)]
+          (.integerUpper 0 0)
+  | _, _ => pure false
+
+example : directIntegerIntervalSequentialFixture = .ok true := by
+  native_decide
+
+/-- An inner parallel loop is evaluated under a sequential body that reuses index slot zero.
+The result is selected back to one carried matrix value.  The two loop coordinates must remain
+scope-owned and distinct, while the selected inner lane remains a valid direct carried result. -/
+private def nestedParallelSequentialInnerBody : Scope := {
+  nodes := #[{ kind := .input "state", arguments := [], outputTypes := [.matrix fixtureType] }]
+  outputs := [("state", { node := 0, port := 0 })]
+  inputNames := ["state"]
+}
+
+private def nestedParallelSequentialOuterBody : Scope := {
+  nodes := #[
+    { kind := .input "state", arguments := [], outputTypes := [.matrix fixtureType] },
+    { kind := .parallelLoop "inner" (.constant 2) 0 [] [.broadcast],
+      arguments := [{ node := 0, port := 0 }],
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+    { kind := .familyGetStatic (.constant 1), arguments := [{ node := 1, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("state", { node := 2, port := 0 })]
+  inputNames := ["state"]
+}
+
+private def nestedParallelSequentialProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .gaussianSample fixtureType (.constant 3), arguments := [],
+        outputTypes := [.matrix fixtureType] },
+      { kind := .sequentialLoop "outer" (.constant 2) 0 [] 1,
+        arguments := [{ node := 0, port := 0 }], outputTypes := [.matrix fixtureType] }
+    ]
+    outputs := [("state", { node := 1, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("outer", nestedParallelSequentialOuterBody),
+    ("inner", nestedParallelSequentialInnerBody)]
+}
+
+private def nestedParallelSequentialDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 1, rule := .sequentialLoop, arguments := [{ node := 0, port := 0 }] }
+  ] }
+  definitions := [
+    ("outer", { steps := #[
+      { sourceNode := 0, rule := .input, arguments := [] },
+      { sourceNode := 1, rule := .parallelLoop, arguments := [{ node := 0, port := 0 }] },
+      { sourceNode := 2, rule := .familyGetStatic, arguments := [{ node := 1, port := 0 }] }
+    ] }),
+    ("inner", { steps := #[{ sourceNode := 0, rule := .input, arguments := [] }] })
+  ]
+}
+
 private def simultaneousRecurrence (slot : Nat) : OperationalBoundExpr :=
   .recurrence 2 [
       .closedInt (.constant 2),
@@ -2689,6 +2928,36 @@ private def boundedOperationalExprFixtureFact
     (node : Nat)
     (bound : Int) : OperationalMatrixFact :=
   (operationalExprFixtureFact node bound).initializePrimitivePolynomial .bounded
+
+/-- Evaluate the sequential body itself, then inspect its inner parallel carrier before the
+outer recurrence abstracts it.  Reusing index slot zero is safe only when the inner binder and
+selection retain the nested scope identity. -/
+example : (do
+    let prepared ← prepareProgramOperational nestedParallelSequentialProgram
+      nestedParallelSequentialDerivation
+    let outer ← match prepared.definitions.find?
+        (fun entry : String × PreparedOperationalScope => entry.1 == "outer") with
+      | some (_, scope) => pure scope
+      | none => throw (OperationalError.unsupportedOperationalExpr 0)
+    let (arena, input) ← ({} : OperationalExprArena).promoteConcreteMatrixFact
+      (boundedOperationalExprFixtureFact 961 3)
+    let outerScope : ScopeTemplateKey := .sequentialBody (.root (.standalone 0)) 1
+    /- The parallel loop is owned by this sequential body, rather than by the root scope. -/
+    let expectedScope : ScopeTemplateKey := outerScope
+    let expectedBinder := parallelLoopFamilyBinder expectedScope 1 0
+    let expectedBinderVariable ← parallelLoopLaneBinder expectedScope 1 0 (IntExpr.constant 2)
+    let outerBinderVariable ← parallelLoopLaneBinder (.root (.standalone 0)) 1 0 (IntExpr.constant 2)
+    let expectedContext : IndexContext := { binders := #[expectedBinderVariable] }
+    let outerContext : IndexContext := { binders := #[outerBinderVariable] }
+    let facts ← evaluatePreparedScope prepared.definitions [] outerScope
+      (prepared.definitions.size + 1) outer [] [] arena [input]
+    let innerFamily ← lookupFact 2 facts { node := 1, port := 0 }
+    pure (match innerFamily.payload with
+      | .directValue _ =>
+          innerFamily.context == expectedContext && expectedContext != outerContext &&
+            expectedBinder.owner == expectedScope
+      | _ => false)) = .ok true := by
+  native_decide
 
 /-- Direct ordinary matrix operations are request-owned values: concrete leaves are promoted once,
 then add and multiply allocate only delayed direct nodes and execute the fixed-assignment kernels.
@@ -3604,10 +3873,10 @@ private def mixedExactSharedZipFixture : Bool :=
     let (arena, sharedRoot) ← arena.pushSharedSelection uniformSelection 2 uniformRoot uniformSummary
     let packed ← arena.indexedExpr packedRoot
     let shared ← arena.indexedExpr sharedRoot
-    let (arena, packedInput) ← loopTemplateArgumentExprWithDirectLaneBinder arena 47 0
+    let (arena, packedInput) ← loopTemplateArgumentExprWithDirectLaneBinder arena temporaryScope 47 0 0
       (.constant 2) 2 .zip none []
       deriveOperationalSchemaFact packed
-    let (arena, uniformInput) ← loopTemplateArgumentExprWithDirectLaneBinder arena 47 1
+    let (arena, uniformInput) ← loopTemplateArgumentExprWithDirectLaneBinder arena temporaryScope 47 0 1
       (.constant 2) 2 .zip none []
       deriveOperationalSchemaFact shared
     let (arena, result) ← addOperationalExprFacts 48 0 fixtureType false []
@@ -4786,8 +5055,8 @@ private def indexedScalarZipOffsetFixture : Bool :=
     let family ← match familyFact with
       | expression@{ payload := .scalar _, .. } => pure expression
       | _ => throw (OperationalError.unsupportedOperationalExpr arena.scalarNodes.size)
-    let (arena, mapped) ← loopTemplateArgumentExprWithDirectLaneBinder arena 766 2 (.constant 2) 2
-      (.zipOffset 1) none []
+    let (arena, mapped) ← loopTemplateArgumentExprWithDirectLaneBinder arena temporaryScope 766 0 2
+      (.constant 2) 2 (.zipOffset 1) none []
       deriveOperationalSchemaFact family
     let mappedExpression ← match mapped with
       | expression@{ payload := .scalar _, .. } => pure expression
@@ -4795,8 +5064,8 @@ private def indexedScalarZipOffsetFixture : Bool :=
     let mappedDomain ← match arena.scalarNodes[mappedExpression.payload.root]? with
       | some (.selectShared domain _ _ _) => pure domain
       | _ => throw (OperationalError.unsupportedOperationalExpr mappedExpression.payload.root)
-    let rejected := match loopTemplateArgumentExprWithDirectLaneBinder arena 767 2 (.constant 4) 4
-        (.zipOffset 1) none []
+    let rejected := match loopTemplateArgumentExprWithDirectLaneBinder arena temporaryScope 767 0 2
+        (.constant 4) 4 (.zipOffset 1) none []
         deriveOperationalSchemaFact family with
       | .error (.loopInputModeMismatch 767 2) => true
       | _ => false
@@ -5493,6 +5762,128 @@ example : contextualCutoffFixture = true := by native_decide
 example : directContextualCutoffFixture = true := by native_decide
 example : cutoffMetadataClosureFixture = true := by native_decide
 example : directIndexedTrapdoorCutoffFixture = true := by native_decide
+
+/-- Inputs and outputs of one parallel loop share one exact lane coordinate.  A nested body or
+a sibling loop remains distinct even when it reuses the same numeric index slot. -/
+private def parallelLoopScopeOwnedIdentityFixture : Bool :=
+  let root : ScopeTemplateKey := .root (.standalone 91)
+  let sameInput := parallelLoopLaneSelection root 40 0 (.constant 3)
+  let sameOutput := parallelLoopLaneSelection root 40 0 (.constant 3)
+  let nested := parallelLoopLaneSelection (.parallelBody root 40) 40 0 (.constant 3)
+  let sibling := parallelLoopLaneSelection root 41 0 (.constant 3)
+  match parallelLoopLaneBinder root 40 0 (.constant 3),
+      parallelLoopLaneBinder (.parallelBody root 40) 40 0 (.constant 3) with
+  | .ok sameBinder, .ok nestedBinder =>
+      sameInput.expression == sameOutput.expression && sameInput.expression != nested.expression &&
+        sameInput.expression != sibling.expression && sameBinder != nestedBinder
+  | _, _ => false
+
+example : parallelLoopScopeOwnedIdentityFixture = true := by native_decide
+
+/-- Actual scalar `ParallelLoop` lowering: an integer family is zipped, one integer is
+broadcast, and the body adds them through `DirectScalarOperation`.  The output remains a direct
+explicit family, proving that neither loop input nor scalar primitive re-enters the legacy scalar
+selection arena. -/
+private def directScalarParallelBody : Scope := {
+  nodes := #[
+    { kind := .input "zipped", arguments := [], outputTypes := [.integer] },
+    { kind := .input "broadcast", arguments := [], outputTypes := [.integer] },
+    { kind := .intBinary .add, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.integer] }
+  ]
+  outputs := [("result", { node := 2, port := 0 })]
+  inputNames := ["zipped", "broadcast"]
+}
+
+private def directScalarParallelProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
+      { kind := .constantInt 2, arguments := [], outputTypes := [.integer] },
+      { kind := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.indexedFamily .integer (.constant 2)] },
+      { kind := .constantInt 5, arguments := [], outputTypes := [.integer] },
+      { kind := .parallelLoop "scalar" (.constant 2) 0 [] [.zip, .broadcast],
+        arguments := [{ node := 2, port := 0 }, { node := 3, port := 0 }],
+        outputTypes := [.indexedFamily .integer (.constant 2)] },
+      { kind := .familyGetStatic (.constant 1), arguments := [{ node := 4, port := 0 }],
+        outputTypes := [.integer] }
+    ]
+    outputs := [("family", { node := 4, port := 0 }), ("selected", { node := 5, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("scalar", directScalarParallelBody)]
+}
+
+private def directScalarParallelDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .constantInt, arguments := [] },
+    { sourceNode := 1, rule := .constantInt, arguments := [] },
+    { sourceNode := 2, rule := .familyPack, arguments := [{ node := 0, port := 0 },
+      { node := 1, port := 0 }] },
+    { sourceNode := 3, rule := .constantInt, arguments := [] },
+    { sourceNode := 4, rule := .parallelLoop, arguments := [{ node := 2, port := 0 },
+      { node := 3, port := 0 }] },
+    { sourceNode := 5, rule := .familyGetStatic, arguments := [{ node := 4, port := 0 }] }
+  ] }
+  definitions := [("scalar", { steps := #[
+    { sourceNode := 0, rule := .input, arguments := [] },
+    { sourceNode := 1, rule := .input, arguments := [] },
+    { sourceNode := 2, rule := .intBinary, arguments := [{ node := 0, port := 0 },
+      { node := 1, port := 0 }] }
+  ] })]
+}
+
+private def directScalarParallelFixture : Except OperationalError Bool := do
+  let facts ← evaluateProgramOperationalWithLayouts directScalarParallelProgram
+    directScalarParallelDerivation [] []
+  let family ← lookupFact 6 facts { node := 4, port := 0 }
+  let selected ← integerFactAt 6 facts { node := 5, port := 0 }
+  let entries ← facts.arena.reducedDirectScalarValueFactsAt [] family
+  pure (match family.payload with
+    | .directValue _ => entries.length == 2 && entries.map (fun entry =>
+        match entry.fact with | .integer fact => (fact.lower, fact.upper) | _ => (0, -1)) ==
+          [(6, 6), (7, 7)] && selected.lower == 7 && selected.upper == 7
+    | _ => false)
+
+example : directScalarParallelFixture = .ok true := by native_decide
+
+/-- Hash provenance follows a direct transport chain only when each map owns its immediate
+source and destination context.  A manually forged mapped carrier cannot substitute a key
+origin across an unrelated lane binder. -/
+private def malformedDirectMapProvenanceFixture : Bool :=
+  match (do
+    let bytes : OperationalScalarFact := .bytes {
+      subject := { node := 6100, port := 0 }
+      origin := .local temporaryScope { node := 6100, port := 0 }
+      length := 8
+    }
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushScalar bytes
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, source) ← match direct.pushShared emptyContext (.scalar (.bytes 8)) reference with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 6100)
+    let binder := directCarrierFixtureBinder 6101
+    let forgedMap : IndexMap := {
+      source := emptyContext
+      destination := emptyContext
+      assignments := #[]
+    }
+    let (direct, mapped) := direct.pushValue { binders := #[binder] }
+      (.mapped (.scalar (.bytes 8)) source forgedMap)
+    let facts : OperationalScopeFacts := {
+      values := #[#[{
+        context := { binders := #[binder] }
+        payload := .directValue mapped
+        storage := .mappedTemplate
+      }]]
+      arena := { direct }
+    }
+    valueOriginAt temporaryScope 6102 facts { node := 0, port := 0}) with
+  | .error (.unsupportedOperationalExpr 1) => true
+  | _ => false
+
+example : malformedDirectMapProvenanceFixture = true := by native_decide
 
 /-! Reuse one pre-existing native fixture gate for the computationally heavy operational
 fixtures.  This keeps the trusted-evaluation surface unchanged while checking the production

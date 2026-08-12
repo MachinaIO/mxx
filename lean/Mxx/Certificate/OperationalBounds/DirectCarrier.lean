@@ -105,13 +105,23 @@ structure DirectRelationOperation where
   parameterEnvironment : ParamEnvironment
   deriving BEq
 
+/-- Scalar primitive metadata belongs to the executable producer just like matrix primitives.
+The direct scalar evaluator must not manufacture a temporary subject when a loop body produces
+an integer used by a later indexed lookup. -/
+structure DirectScalarOperation where
+  kind : OperationalScalarPrimitiveKind
+  ownerScope : Option ScopeTemplateKey
+  ownerNode : Nat
+  outputPort : Nat
+  deriving BEq
+
 inductive OperationalIndexedPointwiseOperation where
   | matrix (operation : PrimitiveOperation)
   /-- Relation-producing matrix kernels retain every graph operand as a direct carrier input.
   This is distinct from ordinary matrix-only pointwise operations because preimage sampling also
   consumes a trapdoor scalar at the same indexed assignment. -/
   | relation (operation : DirectRelationOperation)
-  | scalar (kind : OperationalScalarPrimitiveKind)
+  | scalar (operation : DirectScalarOperation)
   | matrixToScalar (operation : DirectValueScalarOperation)
   | matrixFromScalar (operation : DirectValueMatrixOperation)
   deriving BEq
@@ -294,7 +304,7 @@ def pointwiseSchemasValid
       matrixOperationSchemasValid operation inputs matrixType
   | .relation operation, .matrix matrixType =>
       relationOperationSchemasValid operation inputs matrixType
-  | .scalar kind, _ => scalarOperationSchemasValid kind inputs output
+  | .scalar operation, _ => scalarOperationSchemasValid operation.kind inputs output
   | .matrixToScalar operation, .scalar output =>
       let oneMatrix := inputs.size == 1 && inputs.all (fun schema => match schema with
         | .matrix _ => true
@@ -396,9 +406,11 @@ def DirectOperationalIndexedArena.pushPointwise
   let output ← match operation with
     | .matrix descriptor => some (.matrix descriptor.outputType)
     | .relation descriptor => some (.matrix descriptor.outputType)
-    | .scalar .boolToInt | .scalar (.intBinary _) => some (.scalar .integer)
-    | .scalar (.intCompare _) => some (.scalar .boolean)
-    | .scalar .intToReal | .scalar (.realBinary _) | .scalar .realSqrt => some (.scalar .real)
+    | .scalar { kind := .boolToInt, .. } | .scalar { kind := .intBinary _, .. } =>
+        some (.scalar .integer)
+    | .scalar { kind := .intCompare _, .. } => some (.scalar .boolean)
+    | .scalar { kind := .intToReal, .. } | .scalar { kind := .realBinary _, .. } |
+        .scalar { kind := .realSqrt, .. } => some (.scalar .real)
     | .matrixToScalar { kind := .extractCoefficient _, .. }
     | .matrixToScalar { kind := .thresholdDecodeInt .., .. } => some (.scalar .integer)
     | .matrixToScalar { kind := .thresholdDecodeBool .., .. } => some (.scalar .boolean)
@@ -686,6 +698,11 @@ two correlated dimensions in one delayed operation; no Cartesian branch table is
 example : (
     let leftBinder := directCarrierFixtureBinder 4
     let rightBinder := directCarrierFixtureBinder 5
+    let realAdd : DirectScalarOperation := {
+      kind := (OperationalScalarPrimitiveKind.realBinary Mxx.Ir.RealBinaryOp.add)
+      ownerScope := none
+      ownerNode := 0
+      outputPort := 0 }
     match directCarrierFixtureArena.pushShared { binders := #[leftBinder] }
         (.scalar .real) (.scalar 0) with
     | none => false
@@ -693,26 +710,36 @@ example : (
         match arena.pushShared { binders := #[rightBinder] } (.scalar .real) (.scalar 1) with
         | none => false
         | some (arena, right) =>
-            match arena.pushPointwise (.scalar (.realBinary .add)) #[left, right] with
+            match arena.pushPointwise (.scalar realAdd) #[left, right] with
             | none => false
             | some (arena, result) =>
                 arena.values.size == 3 && arena.values[result]?.any fun value =>
                   value.context == { binders := #[leftBinder, rightBinder] } &&
                     value.payload == .pointwise (.scalar .real)
-                      (.scalar (.realBinary .add)) #[left, right]
+                      (.scalar realAdd) #[left, right]
     ) = true := by
   native_decide
 
 /-- Pointwise arity and schemas are checked by the closed operation registry. -/
 example : (
+    let realAdd : DirectScalarOperation := {
+      kind := (OperationalScalarPrimitiveKind.realBinary Mxx.Ir.RealBinaryOp.add)
+      ownerScope := none
+      ownerNode := 0
+      outputPort := 0 }
+    let realSqrt : DirectScalarOperation := {
+      kind := OperationalScalarPrimitiveKind.realSqrt
+      ownerScope := none
+      ownerNode := 0
+      outputPort := 0 }
     match directCarrierFixtureArena.pushShared emptyContext (.scalar .real) (.scalar 0) with
     | none => false
     | some (arena, realValue) =>
-        (arena.pushPointwise (.scalar (.realBinary .add)) #[realValue]).isNone &&
+        (arena.pushPointwise (.scalar realAdd) #[realValue]).isNone &&
           match arena.pushShared emptyContext (.scalar .boolean) (.scalar 2) with
           | none => false
           | some (arena, booleanValue) =>
-              (arena.pushPointwise (.scalar .realSqrt) #[booleanValue]).isNone
+              (arena.pushPointwise (.scalar realSqrt) #[booleanValue]).isNone
     ) = true := by
   native_decide
 

@@ -546,6 +546,41 @@ def genericNodeFact
   let indexedPackOutput := match node.kind with
     | .packPolynomialCoefficients _ _ => true
     | _ => false
+  /- Once a scalar crosses the direct carrier (notably at a parallel-loop boundary), every
+  ordinary scalar primitive remains there.  This is deliberately before the legacy scalar-DAG
+  endpoint below: mixing direct and legacy operands would otherwise select a representative or
+  reintroduce old selection transport. -/
+  if scalarOutput && arguments.all fun argument => match argument.payload with
+      | .directValue _ => true
+      | _ => false then
+    let directOperation (kind : OperationalScalarPrimitiveKind) : DirectScalarOperation := {
+      kind, ownerScope := some scopeKey, ownerNode := nodeIndex, outputPort }
+    match node.kind with
+    | .boolToInt =>
+        let argument ← match arguments[0]? with
+          | some argument => pure argument
+          | none => throw (.unsupportedOutputArity nodeIndex arguments.length)
+        let schema ← match argument.payload with
+          | .directValue root => match facts.arena.direct.valueAt? root with
+            | some value => pure value.payload.schema
+            | none => throw (.invalidOperationalExprRef root)
+          | .matrix root | .scalar root => throw (.invalidOperationalExprRef root)
+        match schema with
+        | .scalar .boolean => return (← facts.arena.pushDirectScalarPointwiseN
+            (directOperation .boolToInt) arguments.toArray)
+        | _ => throw (.operandNotBoolean nodeIndex
+            (node.arguments.headD { node := nodeIndex, port := outputPort }))
+    | .intBinary kind => return (← facts.arena.pushDirectScalarPointwiseN
+        (directOperation (.intBinary kind)) arguments.toArray)
+    | .intCompare kind => return (← facts.arena.pushDirectScalarPointwiseN
+        (directOperation (.intCompare kind)) arguments.toArray)
+    | .intToReal => return (← facts.arena.pushDirectScalarPointwiseN
+        (directOperation .intToReal) arguments.toArray)
+    | .realBinary kind => return (← facts.arena.pushDirectScalarPointwiseN
+        (directOperation (.realBinary kind)) arguments.toArray)
+    | .realSqrt => return (← facts.arena.pushDirectScalarPointwiseN
+        (directOperation .realSqrt) arguments.toArray)
+    | _ => pure ()
   if !scalarOutput && !indexedPackOutput then
     let output ← genericNodeMatrixFactConcrete scopeKey nodeIndex node rule outputPort outputType facts
       environment loopDomains layouts
@@ -1689,8 +1724,14 @@ def sequentialFactHasRelation
       operationalExprHasRelation arena environment expression.payload
   | expression@{ payload := .scalar _, .. } => factHasRelation arena expression
   | expression@{ payload := .directValue _, .. } => do
-      pure <| (← arena.reducedDirectValueFactsAt environment expression).any
-        (matrixFactHasRelation ·.fact)
+      let value ← match arena.direct.valueAt? expression.payload.root with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef expression.payload.root)
+      match value.payload.schema with
+      | OperationalIndexedPayloadSchema.matrix _ =>
+          pure ((← arena.reducedDirectValueFactsAt environment expression).any
+            (fun entry => matrixFactHasRelation entry.fact))
+      | OperationalIndexedPayloadSchema.scalar _ => pure false
 
 def summarizeSequentialFact
     (arena : OperationalExprArena)
@@ -1700,8 +1741,7 @@ def summarizeSequentialFact
       pure expression
   | expression@{ payload := .scalar _, .. } => pure expression
   | expression@{ payload := .directValue _, .. } => do
-      let entries ← arena.reducedDirectValueFactsAt environment expression
-      if entries.any (matrixFactHasRelation ·.fact) then
+      if ← sequentialFactHasRelation arena environment expression then
         throw (.relationBearingCarriedValue temporaryScope 0 0)
       pure expression
 
@@ -1729,12 +1769,19 @@ def abstractSequentialFact
   | expression@{ payload := .scalar _, .. } =>
       abstractCarriedMaximum slot arena expression
   | { payload := .directValue root, .. } => do
-      let (direct, mapped) ← arena.direct.mapMatrixValue root fun fact =>
-        let maximum := OperationalBoundExpr.previous (.matrixMaximum 0 slot)
-        let polynomial := fact.polynomial.map fun term => { term with product := {
-          term.product with
-          factors := term.product.factors.map (replaceOperationalFactorHardBound maximum) }}
-        pure { fact with totalHardBound := maximum, polynomial }
+      let value ← match arena.direct.valueAt? root with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef root)
+      let (direct, mapped) ← match value.payload.schema with
+        | OperationalIndexedPayloadSchema.matrix _ =>
+            arena.direct.mapMatrixValue root (fun fact => do
+              let maximum := OperationalBoundExpr.previous (.matrixMaximum 0 slot)
+              let polynomial := fact.polynomial.map fun term => { term with product := {
+                term.product with
+                factors := term.product.factors.map (replaceOperationalFactorHardBound maximum) }}
+              pure { fact with totalHardBound := maximum, polynomial })
+        | OperationalIndexedPayloadSchema.scalar _ =>
+            arena.direct.mapScalarValue root (fun fact => pure (abstractCarriedScalarMaximum slot fact))
       let value ← match direct.valueAt? mapped with
         | some value => pure value
         | none => throw (.invalidOperationalExprRef mapped)
@@ -1765,18 +1812,46 @@ def setSequentialFactRecurrenceState
   | expression@{ payload := .scalar _, .. } =>
       setFactRecurrenceState count paths initial transition slot environment arena expression
   | { payload := .directValue root, .. } => do
-      let maximum := OperationalBoundExpr.recurrenceState
-        count paths initial transition (.matrixMaximum 0 slot)
-      let (direct, mapped) ← match arena.direct.pushMatrixResultBound root maximum with
-        | some result => pure result
-        | none => throw (.unsupportedOperationalExpr root)
-      let value ← match direct.valueAt? mapped with
+      let value ← match arena.direct.valueAt? root with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef root)
+      let (direct, mapped) ← match value.payload.schema with
+        | OperationalIndexedPayloadSchema.matrix _ =>
+            let maximum := OperationalBoundExpr.recurrenceState
+              count paths initial transition (.matrixMaximum 0 slot)
+            match arena.direct.pushMatrixResultBound root maximum with
+            | some result => pure result
+            | none => throw (.unsupportedOperationalExpr root)
+        | OperationalIndexedPayloadSchema.scalar _ =>
+            arena.direct.mapScalarValue root (fun fact => match fact with
+              | .trapdoor fact =>
+                  let maximum := OperationalBoundExpr.recurrenceState count paths initial transition
+                    (.matrixMaximum 0 slot)
+                  pure (.trapdoor { fact with maximum })
+              | .integer fact =>
+                  let lowerExpression := OperationalBoundExpr.recurrenceState count paths
+                    initial transition (.integerLower 0 slot)
+                  let upperExpression := OperationalBoundExpr.recurrenceState count paths
+                    initial transition (.integerUpper 0 slot)
+                  pure (.integer { fact with lowerExpression, upperExpression })
+              | fact => pure fact)
+      let (direct, mapped) ← match value.payload.schema with
+        | OperationalIndexedPayloadSchema.scalar .integer =>
+            direct.mapScalarValue mapped (fun fact => match fact with
+              | .integer integer => do
+                  let lower ← integer.lowerExpression.evaluateWithStates environment []
+                  let upper ← integer.upperExpression.evaluateWithStates environment []
+                  if lower > upper then throw (.invalidBound slot lower)
+                  pure (.integer { integer with lower, upper })
+              | _ => throw (.unsupportedOperationalExpr mapped))
+        | _ => pure (direct, mapped)
+      let mappedValue ← match direct.valueAt? mapped with
         | some value => pure value
         | none => throw (.invalidOperationalExprRef mapped)
       let rebound : OperationalFact := {
-        context := value.context
+        context := mappedValue.context
         payload := .directValue mapped
-        storage := value.storage
+        storage := mappedValue.storage
       }
       pure ({ arena with direct }, rebound)
 
@@ -1817,7 +1892,7 @@ def evaluatePreparedScope
             return (← lookupFact callerNode facts wire) ::
               (← scopeOutputFacts callerNode tail facts)
       let rec prepareParallelInputs
-          (nodeIndex argumentIndex : Nat)
+          (nodeIndex indexSlot argumentIndex : Nat)
           (declaredCount : IntExpr)
           (count : Nat)
           (modes : List LoopInputMode)
@@ -1828,15 +1903,21 @@ def evaluatePreparedScope
         match modes, wires, inputs with
         | [], [], [] => pure (arena, [])
         | mode :: modeTail, wire :: wireTail, input :: inputTail =>
+            /- Scalar loop arguments use the direct carrier too.  This admits only concrete
+            scalar leaves for promotion; an unresolved legacy scalar family is rejected rather
+            than being reindexed through the deprecated scalar selection DAG. -/
+            let (arena, input) ← match input.payload with
+              | .scalar _ => arena.promoteDirectRelationOperand input
+              | .matrix _ | .directValue _ => pure (arena, input)
             let directLaneBinder ← match mode, input.payload with
               | .zip, .directValue _ | .zipOffset _, .directValue _ =>
                   some <$> directFamilyLaneBinderAt scopeKey scope environment wire input
               | _, _ => pure none
             let (arena, head) ←
-              loopTemplateArgumentExprWithDirectLaneBinder arena nodeIndex argumentIndex declaredCount count mode
-                directLaneBinder environment deriveOperationalSchemaFact input
-            let (arena, tail) ← prepareParallelInputs nodeIndex (argumentIndex + 1) declaredCount count
-              modeTail wireTail inputTail arena
+              loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey nodeIndex indexSlot argumentIndex
+                declaredCount count mode directLaneBinder environment deriveOperationalSchemaFact input
+            let (arena, tail) ← prepareParallelInputs nodeIndex indexSlot (argumentIndex + 1)
+              declaredCount count modeTail wireTail inputTail arena
             pure (arena, head :: tail)
         | _, _, _ => throw (.loopInputModeMismatch nodeIndex argumentIndex)
       let mut facts : OperationalScopeFacts := {
@@ -2063,7 +2144,8 @@ def evaluatePreparedScope
                   let child ← preparedDefinitionAt index prepared definitions
                   let childKey := .parallelBody scopeKey index
                   let (arena, templateInputs) ←
-                    prepareParallelInputs index 0 count evaluatedCount.toNat modes node.arguments actualInputs facts.arena
+                    prepareParallelInputs index indexSlot 0 count evaluatedCount.toNat modes node.arguments
+                      actualInputs facts.arena
                   facts := { facts with arena }
                   let iterationEnvironment :=
                     (ParamKey.loopIndex indexSlot, ParamValue.integer 0) :: environment
@@ -2082,23 +2164,28 @@ def evaluatePreparedScope
                   let (nextFacts, outputs) ← childOutputs.zipIdx.foldlM
                     (fun (currentFacts, accumulated) (output, port) => do
                       match output with
-                      /- Parallel matrix results are direct indexed values.  Legacy matrix
-                      preimage/decomposition output transport remains a Stage 8 migration. -/
+                      /- Parallel results are direct indexed values.  Closing installs the one
+                      exact loop coordinate shared by every argument and output of this node. -/
                       | { payload := .matrix root, .. } => throw (.unsupportedOperationalExpr root)
                       | scalar@{ payload := .scalar _, .. } =>
-                          let subject : WireRef := { node := index, port }
-                          let binder : FamilyTemplateBinder := {
-                            owner := scopeKey, producerNode := index, binderSlot := indexSlot
-                          }
-                          let selection := DynamicSelectionIdentity.fromOrigin
-                            (.loopInstance indexSlot (.constant 0) (.local scopeKey subject))
-                            evaluatedCount.toNat
-                          let (arena, family) ← sharedIndexedScalarFact currentFacts.arena binder
-                            selection subject evaluatedCount.toNat scalar
+                          let (arena, direct) ← currentFacts.arena.promoteDirectRelationOperand scalar
+                          let closed ← closeParallelDirectScalarOutput scopeKey index indexSlot port count arena
+                            direct
+                          let (arena, family) := closed
                           pure ({ currentFacts with arena }, accumulated.push family)
                       | direct@{ payload := .directValue _, .. } =>
-                          let (arena, family) ← parallelLoopIndexedMatrixOutput scopeKey index indexSlot port count
-                            evaluatedCount.toNat environment deriveOperationalSchemaFact currentFacts.arena direct
+                          let root := direct.payload.root
+                          let value ← match currentFacts.arena.direct.valueAt? root with
+                            | some value => pure value
+                            | none => throw (.invalidOperationalExprRef root)
+                          let closed ← match value.payload.schema with
+                            | .matrix _ =>
+                                parallelLoopIndexedMatrixOutput scopeKey index indexSlot port count
+                                  evaluatedCount.toNat environment deriveOperationalSchemaFact currentFacts.arena direct
+                            | .scalar _ =>
+                                closeParallelDirectScalarOutput scopeKey index indexSlot port count
+                                  currentFacts.arena direct
+                          let (arena, family) := closed
                           pure ({ currentFacts with arena }, accumulated.push family)
                       )
                     (facts, #[])
@@ -2159,8 +2246,8 @@ def evaluatePreparedScope
                     match initialTemplates[slot]?, outputTemplates[slot]? with
                     | some initial, some output =>
                         if !sameSequentialCarriedSchema facts.arena initial output ||
-                            (← factHasRelation facts.arena output) then
-                          if ← factHasRelation facts.arena output then
+                            (← sequentialFactHasRelation facts.arena environment output) then
+                          if ← sequentialFactHasRelation facts.arena environment output then
                             throw (.relationBearingCarriedValue scopeKey index slot)
                           else do
                             let initialCounts ← sequentialCarriedLargeFactorCounts facts.arena initial
@@ -2178,7 +2265,12 @@ def evaluatePreparedScope
                     transitionComponents := transitionComponents ++
                       (← sequentialFactNumericExpressions facts.arena slot output)
                   let paths := initialComponents.map (·.1)
-                  if paths != transitionComponents.map (·.1) then
+                  /- Every carried component has one unique current-depth state address.  This
+                  rejects an unsupported fixed carried schema rather than allowing two scalar
+                  bounds to overwrite one another in `numericStateFromComponents`. -/
+                  if (!paths.isEmpty && (paths.eraseDups.length != paths.length ||
+                      paths.any (fun path => !operationalBoundPathAtCurrentDepth path))) ||
+                      paths != transitionComponents.map (·.1) then
                     throw (.sequentialSchemaMismatch scopeKey index 0 [] [])
                   let initialExpressions := initialComponents.map (·.2)
                   let transitions := transitionComponents.map (·.2)

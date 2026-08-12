@@ -702,19 +702,7 @@ def genericNodeFact
         | none => throw (.unsupportedOutputArity nodeIndex arguments.length)
       if arguments.length != 1 then throw (.unsupportedOutputArity nodeIndex arguments.length)
       scalarFactRoot facts.arena input
-    let binaryRoots : Except OperationalError (OperationalExprArena × Nat × Nat) := do
-      let left ← match arguments[0]? with
-        | some input => pure input
-        | none => throw (.unsupportedOutputArity nodeIndex arguments.length)
-      let right ← match arguments[1]? with
-        | some input => pure input
-        | none => throw (.unsupportedOutputArity nodeIndex arguments.length)
-      if arguments.length != 2 then throw (.unsupportedOutputArity nodeIndex arguments.length)
-      let (arena, left) ← scalarFactRoot facts.arena left
-      let (arena, right) ← scalarFactRoot arena right
-      pure (arena, left, right)
     let subject : WireRef := { node := nodeIndex, port := outputPort }
-    let origin : OperationalValueOrigin := .local scopeKey subject
     match node.kind with
     | .input _ =>
         let scalar ← defaultScalarFact nodeIndex outputPort outputType environment loopDomains
@@ -784,81 +772,6 @@ def genericNodeFact
             descriptor.regularDigitCount
         }
         facts.arena.promoteConcreteScalarFact scalar
-    | .boolToInt => do
-        match arguments[0]? with
-        | some ({ payload := .scalar _, .. }) => pure ()
-        | _ => throw (.operandNotBoolean nodeIndex (node.arguments.headD subject))
-        let (arena, input) ← unaryRoot
-        let transfer : OperationalScalarFact → Except OperationalError OperationalScalarFact
-          | .boolean => pure (.integer {
-              subject, origin, lower := 0, upper := 1
-              lowerExpression := .closedInt (.constant 0)
-              upperExpression := .closedInt (.constant 1)
-            })
-          | _ => throw (.operandNotBoolean nodeIndex (node.arguments.headD subject))
-        let (arena, root) ← mapScalarExprPointwise .boolToInt transfer arena input
-          (arena.scalarNodes.size + 1)
-        finishIndexedScalar arena root
-    | .bitExtract position => do
-        let evaluatedPosition ← evaluateIntInvariant environment loopDomains position
-        if evaluatedPosition < 0 then throw (.invalidCount nodeIndex evaluatedPosition)
-        let (arena, input) ← unaryRoot
-        let transfer : OperationalScalarFact → Except OperationalError OperationalScalarFact
-          | .integer _ => pure .boolean
-          | _ => throw (.operandNotInteger nodeIndex (node.arguments.headD subject))
-        let (arena, root) ← mapScalarExprPointwise (.intCompare .equal) transfer arena input
-          (arena.scalarNodes.size + 1)
-        finishIndexedScalar arena root
-    | .intBinary operation => do
-        let (arena, left, right) ← binaryRoots
-        let transfer : OperationalScalarFact → OperationalScalarFact →
-            Except OperationalError OperationalScalarFact
-          | .integer left, .integer right => do
-              let interval ← integerBinaryInterval nodeIndex operation left right
-              pure (.integer {
-                subject, origin
-                lower := interval.lower, upper := interval.upper
-                lowerExpression := interval.lowerExpression
-                upperExpression := interval.upperExpression
-              })
-          | _, _ => throw (.operandNotInteger nodeIndex (node.arguments.headD subject))
-        let (arena, root) ← zipScalarExprPointwise (.intBinary operation) transfer arena left right
-          (arena.scalarNodes.size + 1)
-        finishIndexedScalar arena root
-    | .intCompare operation => do
-        let (arena, left, right) ← binaryRoots
-        let transfer : OperationalScalarFact → OperationalScalarFact →
-            Except OperationalError OperationalScalarFact
-          | .integer _, .integer _ => pure .boolean
-          | _, _ => throw (.operandNotInteger nodeIndex (node.arguments.headD subject))
-        let (arena, root) ← zipScalarExprPointwise (.intCompare operation) transfer arena left right
-          (arena.scalarNodes.size + 1)
-        finishIndexedScalar arena root
-    | .intToReal => do
-        let (arena, input) ← unaryRoot
-        let transfer : OperationalScalarFact → Except OperationalError OperationalScalarFact
-          | .integer _ => pure .real
-          | _ => throw (.operandNotInteger nodeIndex (node.arguments.headD subject))
-        let (arena, root) ← mapScalarExprPointwise .intToReal transfer arena input
-          (arena.scalarNodes.size + 1)
-        finishIndexedScalar arena root
-    | .realBinary operation => do
-        let (arena, left, right) ← binaryRoots
-        let transfer : OperationalScalarFact → OperationalScalarFact →
-            Except OperationalError OperationalScalarFact
-          | .real, .real => pure .real
-          | _, _ => throw (.operandNotReal nodeIndex (node.arguments.headD subject))
-        let (arena, root) ← zipScalarExprPointwise (.realBinary operation) transfer arena left right
-          (arena.scalarNodes.size + 1)
-        finishIndexedScalar arena root
-    | .realSqrt => do
-        let (arena, input) ← unaryRoot
-        let transfer : OperationalScalarFact → Except OperationalError OperationalScalarFact
-          | .real => pure .real
-          | _ => throw (.operandNotReal nodeIndex (node.arguments.headD subject))
-        let (arena, root) ← mapScalarExprPointwise .realSqrt transfer arena input
-          (arena.scalarNodes.size + 1)
-        finishIndexedScalar arena root
     | .packPolynomialCoefficients _ _ =>
         throw (.loopInputModeMismatch nodeIndex 0)
     | .liftIntegerToConstantPolynomial matrixType => do

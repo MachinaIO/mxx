@@ -112,9 +112,11 @@ def genericNodeMatrixFactConcrete
       classifiedMatrixFactExpr nodeIndex outputPort matrixType environment bound
         false (if lower >= 0 then .below (upper.toNat + 1) else .unknown)
   | .gaussianSample _ maximum, some matrixType =>
+      let _ ← validateContextualCutoffNonnegative nodeIndex environment loopDomains maximum
       cappedMatrixFactExpr nodeIndex outputPort matrixType environment
         (.contextual .maximum environment loopDomains maximum)
   | .preimageSample _ maximum, some matrixType =>
+      let _ ← validateContextualCutoffNonnegative nodeIndex environment loopDomains maximum
       let bound := OperationalBoundExpr.contextual .maximum environment loopDomains maximum
       let publicWire ← match node.arguments[0]? with
         | some wire => pure wire | none => throw (.missingOperand nodeIndex { node := 0, port := 0 })
@@ -130,6 +132,8 @@ def genericNodeMatrixFactConcrete
         | none => throw (.missingPublicIdentity nodeIndex publicWire)
       if publicIdentity != trapdoor.publicIdentity then
         throw (.publicIdentityMismatch nodeIndex)
+      let _ ← validatePreimageCutoffAgreement nodeIndex environment loopDomains maximum
+        trapdoor.publicIdentity trapdoor.preimageCutoff
       let result ← cappedMatrixFactExpr nodeIndex outputPort matrixType environment bound
       let relation : PreimageRelation := {
         producer := result.origin
@@ -406,8 +410,7 @@ def genericNodeMatrixFactConcrete
       classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
         (if params.modulus > 0 then .below params.modulus.toNat else .unknown)
   | .trapdoorSample _ maximum, some matrixType =>
-      let maximum ← evaluateIntMaximum environment loopDomains maximum
-      if maximum < 0 then throw (.invalidBound nodeIndex maximum)
+      let _ ← validateContextualCutoffNonnegative nodeIndex environment loopDomains maximum
       let cap ← match matrixCap matrixType environment with
         | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
       let result ← classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
@@ -512,7 +515,7 @@ def genericNodeFact
           return ({ facts.arena with direct }, {
             context := value.context, payload := .directValue root, storage := value.storage })
       | _ =>
-          let scalar ← defaultScalarFact nodeIndex outputPort element environment
+          let scalar ← defaultScalarFact nodeIndex outputPort element environment loopDomains
           let (arena, root) := facts.arena.pushScalarConcrete scalar
           let (arena, element) ← finishIndexedScalar arena root
           return ← sharedIndexedScalarFact arena binder selection subject count.toNat element
@@ -556,7 +559,7 @@ def genericNodeFact
     let origin : OperationalValueOrigin := .local scopeKey subject
     match node.kind with
     | .input _ =>
-        let scalar ← defaultScalarFact nodeIndex outputPort outputType environment
+        let scalar ← defaultScalarFact nodeIndex outputPort outputType environment loopDomains
         let (arena, root) := facts.arena.pushScalarConcrete scalar
         finishIndexedScalar arena root
     | .constantInt value => do
@@ -598,9 +601,15 @@ def genericNodeFact
         let params ← match matrixType.evaluate environment (.constant maximum) with
           | some params => pure params
           | none => throw (.invalidMatrixParameters nodeIndex)
+        let preimageCutoff ← match outputType with
+          | .trapdoor _ _ _ _ cutoff => do
+              let cutoff ← validateContextualCutoffNonnegative nodeIndex environment loopDomains cutoff
+              pure (some cutoff)
+          | _ => pure none
         let scalar : OperationalScalarFact := .trapdoor {
           subject, matrixType, matrixParams := params
           maximum := .minimum (.closedInt (.constant cap)) boundExpr
+          preimageCutoff
           publicIdentity := .sampledTrapdoor temporaryScope { node := nodeIndex, port := 0 }
         }
         let (arena, root) := facts.arena.pushScalarConcrete scalar
@@ -618,6 +627,7 @@ def genericNodeFact
         let scalar : OperationalScalarFact := .trapdoor {
           subject, matrixType, matrixParams := params
           maximum := .closedInt (.constant (absolute bound))
+          preimageCutoff := none
           publicIdentity := .gadget descriptor.paramsId params params.rows bound false
             descriptor.regularDigitCount
         }

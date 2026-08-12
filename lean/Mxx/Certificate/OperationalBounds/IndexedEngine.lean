@@ -1454,6 +1454,61 @@ def evaluateIntMaximumAbsolute
   let values ← evaluateIntOverLoops environment domains expression
   pure (values.foldl (fun maximum value => max maximum (absolute value)) 0)
 
+/-- Check every contextual assignment, rather than only the cutoff maximum. -/
+def validateContextualCutoffNonnegative
+    (node : Nat)
+    (environment : ParamEnvironment)
+    (domains : List OperationalParameterDomain)
+    (cutoff : IntExpr) : Except OperationalError OperationalBoundExpr := do
+  let minimum ← evaluateIntMinimum environment domains cutoff
+  if minimum < 0 then throw (.invalidBound node minimum)
+  pure (.contextual .maximum environment domains cutoff)
+
+/-- A gadget has no preimage-sampler cutoff contract; indexed and loop identities preserve this
+distinction from sampled trapdoors. -/
+def publicIdentityIsGadget : PublicMatrixIdentity → Bool
+  | .gadget .. => true
+  | .sampledTrapdoor .. => false
+  | .indexed _ _ source | .loopInstance _ _ source => publicIdentityIsGadget source
+
+def sameContextualDomainKey : OperationalParameterDomain → OperationalParameterDomain → Bool
+  | .loopIndex left _, .loopIndex right _ => left == right
+  | .parameter left _ _ _, .parameter right _ _ _ => left == right
+  | _, _ => false
+
+/-- Merge cutoff assignment domains without allowing an equal key to overwrite a different
+definition.  The resulting enumeration visits each logical assignment exactly once. -/
+def mergeContextualCutoffDomains
+    (node : Nat)
+    (left right : List OperationalParameterDomain) : Except OperationalError
+    (List OperationalParameterDomain) := do
+  let rec insert : List OperationalParameterDomain → OperationalParameterDomain →
+      Except OperationalError (List OperationalParameterDomain)
+    | [], candidate => pure [candidate]
+    | head :: tail, candidate =>
+        if sameContextualDomainKey head candidate then
+          if head == candidate then pure (head :: tail) else throw (.preimageCutoffMismatch node)
+        else return head :: (← insert tail candidate)
+  right.foldlM insert left
+
+/-- Preimage and trapdoor cutoffs must agree per merged assignment, not merely at extrema. -/
+def validatePreimageCutoffAgreement
+    (node : Nat)
+    (environment : ParamEnvironment)
+    (domains : List OperationalParameterDomain)
+    (preimageCutoff : IntExpr)
+    (publicIdentity : PublicMatrixIdentity)
+    (trapdoorCutoff : Option OperationalBoundExpr) : Except OperationalError Unit := do
+  match trapdoorCutoff with
+  | none =>
+      if publicIdentityIsGadget publicIdentity then pure () else throw (.missingPreimageCutoff node)
+  | some (.contextual _ trapdoorEnvironment trapdoorDomains trapdoorExpression) =>
+      let mergedDomains ← mergeContextualCutoffDomains node trapdoorDomains domains
+      let trapdoorValues ← evaluateIntOverLoops trapdoorEnvironment mergedDomains trapdoorExpression
+      let preimageValues ← evaluateIntOverLoops environment mergedDomains preimageCutoff
+      if trapdoorValues != preimageValues then throw (.preimageCutoffMismatch node)
+  | some _ => throw (.preimageCutoffMismatch node)
+
 def evaluateIntInvariant
     (environment : ParamEnvironment) (domains : List OperationalParameterDomain)
     (expression : IntExpr) : Except OperationalError Int := do
@@ -1801,9 +1856,10 @@ def defaultFact
 def defaultScalarFact
     (node port : Nat)
     (wireType : WireTypeExpr)
-    (environment : ParamEnvironment) : Except OperationalError OperationalScalarFact :=
+    (environment : ParamEnvironment)
+    (domains : List OperationalParameterDomain := []) : Except OperationalError OperationalScalarFact :=
   match wireType with
-  | .trapdoor matrixType _ _ _ _ => do
+  | .trapdoor matrixType _ _ _ cutoff => do
       let cap ← match matrixCap matrixType environment with
         | some cap => pure cap
         | none => throw (.invalidMatrixParameters node)
@@ -1815,6 +1871,7 @@ def defaultScalarFact
         matrixType
         matrixParams := params
         maximum := .closedInt (.constant cap)
+        preimageCutoff := some (← validateContextualCutoffNonnegative node environment domains cutoff)
         publicIdentity := .sampledTrapdoor temporaryScope { node, port := 0 }
       })
   | .integer | .constantInt => pure (.integer {
@@ -2716,8 +2773,8 @@ legacy representative. -/
 def validateDirectRelationDescriptor (operation : DirectRelationOperation) : Except OperationalError Unit := do
   match operation.kind with
   | .preimage maximum loopDomains =>
-      let maximum ← evaluateIntInvariant operation.parameterEnvironment loopDomains maximum
-      if maximum < 0 then throw (.invalidCount operation.ownerNode maximum)
+      let _ ← validateContextualCutoffNonnegative operation.ownerNode
+        operation.parameterEnvironment loopDomains maximum
       pure ()
   | .decomposition declaredType base small digitCount loopDomains layouts =>
       let bound ← evaluateIntInvariant operation.parameterEnvironment loopDomains base
@@ -3893,6 +3950,8 @@ def applyDirectRelationProducer
         | some identity => pure identity
         | none => throw (.missingPublicIdentity operation.ownerNode { node := 0, port := 0 })
       if publicIdentity != trapdoor.publicIdentity then throw (.publicIdentityMismatch operation.ownerNode)
+      let _ ← validatePreimageCutoffAgreement operation.ownerNode operation.parameterEnvironment loopDomains
+        maximum trapdoor.publicIdentity trapdoor.preimageCutoff
       let bound := OperationalBoundExpr.contextual .maximum operation.parameterEnvironment loopDomains maximum
       let result ← cappedMatrixFactExpr operation.ownerNode operation.outputPort matrixType
         operation.parameterEnvironment bound
@@ -5594,10 +5653,14 @@ def reindexOperationalScalarFact
         lowerExpression := ← reindexOperationalBoundExpr map fact.lowerExpression
         upperExpression := ← reindexOperationalBoundExpr map fact.upperExpression })
   | .trapdoor fact => do
+      let preimageCutoff ← match fact.preimageCutoff with
+        | none => pure none
+        | some cutoff => reindexOperationalBoundExpr map cutoff
       pure (.trapdoor {
         fact with
         matrixType := ← reindexMatrixTypeExpr map fact.matrixType
         maximum := ← reindexOperationalBoundExpr map fact.maximum
+        preimageCutoff
         publicIdentity := ← reindexPublicMatrixIdentity map fact.publicIdentity })
   | .bytes fact => do
       pure (.bytes { fact with origin := ← reindexOperationalValueOrigin map fact.origin })
@@ -6317,6 +6380,7 @@ partial def instantiateFactLoopIndex
         | .trapdoor fact => .trapdoor {
             fact with
             maximum := instantiateBoundLoopIndex slot index fact.maximum
+            preimageCutoff := fact.preimageCutoff.map (instantiateBoundLoopIndex slot index)
             publicIdentity := instantiatePublicIdentityLoopIndex slot index fact.publicIdentity }
         | .integer fact => .integer {
             fact with

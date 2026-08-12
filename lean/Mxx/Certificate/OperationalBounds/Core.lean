@@ -1490,6 +1490,8 @@ structure OperationalTrapdoorFact where
   matrixType : MatrixTypeExpr
   matrixParams : Mxx.SamplerParams
   maximum : OperationalBoundExpr
+  /-- The uncapped preimage sampler cutoff from the trapdoor wire contract. -/
+  preimageCutoff : Option OperationalBoundExpr := none
   publicIdentity : PublicMatrixIdentity
   deriving BEq
 
@@ -1622,6 +1624,8 @@ inductive OperationalError where
   | invalidMatrixParameters (node : Nat)
   | flat (node : Nat) (error : OperationalFlatError)
   | invalidBound (node : Nat) (bound : Int)
+  | missingPreimageCutoff (node : Nat)
+  | preimageCutoffMismatch (node : Nat)
   | invalidCount (node : Nat) (count : Int)
   | missingGadgetLayout (node : Nat)
   | ambiguousGadgetLayout (node : Nat)

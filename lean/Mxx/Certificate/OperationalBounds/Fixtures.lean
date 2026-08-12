@@ -262,6 +262,7 @@ private def fixtureTrapdoorFact : OperationalScalarFact := .trapdoor {
   matrixType := fixtureType
   matrixParams := fixtureParams
   maximum := .closedInt (.constant 3)
+  preimageCutoff := some (.contextual .maximum [] [] (.constant 3))
   publicIdentity := fixtureSampledIdentity
 }
 
@@ -5146,6 +5147,124 @@ example : residualLargeSharedSelectionFixture = true := by native_decide
 example : residualLargeDirectFamilyFixture = true := by native_decide
 example : residualLargeCancellationFixture = true := by native_decide
 example : residualLargeRelationConsumptionFixture = true := by native_decide
+
+/-- Cutoff agreement is pointwise in its contextual domain.  In particular, equal extrema do
+not permit `i` to agree with `1 - i`. -/
+private def contextualCutoffFixture : Bool :=
+  let domains := [OperationalParameterDomain.loopIndex 0 2]
+  let nonnegative := validateContextualCutoffNonnegative 5100 [] domains (.loopIndex 0)
+  let negative := validateContextualCutoffNonnegative 5101 [] domains
+    (.subtract (.loopIndex 0) (.constant 1))
+  let equalSyntax := validatePreimageCutoffAgreement 5102 [] domains
+    (.add (.loopIndex 0) (.constant 0))
+    fixtureSampledIdentity
+    (some (.contextual .maximum [] domains (.loopIndex 0)))
+  let equalExtrema := validatePreimageCutoffAgreement 5103 [] domains (.loopIndex 0)
+    fixtureSampledIdentity
+    (some (.contextual .maximum [] domains (.subtract (.constant 1) (.loopIndex 0))))
+  let forwardMismatch := validatePreimageCutoffAgreement 5104 [] [] (.constant 2)
+    fixtureSampledIdentity
+    (some (.contextual .maximum [] [] (.constant 3)))
+  let reverseMismatch := validatePreimageCutoffAgreement 5105 [] [] (.constant 3)
+    fixtureSampledIdentity
+    (some (.contextual .maximum [] [] (.constant 2)))
+  let parameterDomain := validateContextualCutoffNonnegative 5106
+    [("cutoff", .integer 3)] [] (.parameter "cutoff")
+  match nonnegative, negative, equalSyntax, equalExtrema, forwardMismatch, reverseMismatch,
+      parameterDomain with
+  | .ok _, .error (.invalidBound 5101 (-1)), .ok (), .error (.preimageCutoffMismatch 5103),
+      .error (.preimageCutoffMismatch 5104), .error (.preimageCutoffMismatch 5105), .ok _ => true
+  | _, _, _, _, _, _, _ => false
+
+/-- The direct relation reducer checks the retained trapdoor cutoff for every physical lane. -/
+private def directContextualCutoffFixture : Bool :=
+  let trapdoor : OperationalTrapdoorFact := match fixtureTrapdoorFact with
+    | .trapdoor fact => { fact with
+        preimageCutoff := some (.contextual .maximum [] [] (.constant 3)) }
+    | _ => {
+        subject := { node := 0, port := 1 }, matrixType := fixtureType, matrixParams := fixtureParams,
+        maximum := .closedInt (.constant 3),
+        preimageCutoff := some (.contextual .maximum [] [] (.constant 3)),
+        publicIdentity := fixtureSampledIdentity }
+  let operation (cutoff : IntExpr) : DirectRelationOperation := {
+    kind := .preimage cutoff [], outputType := fixtureType, ownerScope := none,
+    ownerNode := 5110, outputPort := 0, parameterEnvironment := [] }
+  let target := boundedOperationalExprFixtureFact 5111 2
+  match applyDirectRelationProducer (operation (.constant 3)) fixtureType
+      #[.matrix fixturePublicMatrixFact, .trapdoor trapdoor, .matrix target],
+      applyDirectRelationProducer (operation (.constant 2)) fixtureType
+      #[.matrix fixturePublicMatrixFact, .trapdoor trapdoor, .matrix target] with
+  | .ok _, .error (.preimageCutoffMismatch 5110) => true
+  | _, _ => false
+
+/-- Missing sampled-trapdoor metadata and conflicting assignment domains are rejected before a
+relation can be formed; a parameterized cutoff remains comparable pointwise. -/
+private def cutoffMetadataClosureFixture : Bool :=
+  let loop2 := [OperationalParameterDomain.loopIndex 0 2]
+  let loop3 := [OperationalParameterDomain.loopIndex 0 3]
+  let parameters : ParamEnvironment := [("cutoff", .integer 3)]
+  let parameterDomains := [OperationalParameterDomain.parameter "cutoff" parameters []
+    (.parameter "cutoff")]
+  let sampledMissing := validatePreimageCutoffAgreement 5112 [] [] (.constant 3)
+    fixtureSampledIdentity none
+  let conflictingDomains := validatePreimageCutoffAgreement 5113 [] loop3 (.loopIndex 0)
+    fixtureSampledIdentity (some (.contextual .maximum [] loop2 (.loopIndex 0)))
+  let parameterMatch := validatePreimageCutoffAgreement 5114 parameters parameterDomains
+    (.parameter "cutoff") fixtureSampledIdentity
+    (some (.contextual .maximum parameters parameterDomains (.parameter "cutoff")))
+  let parameterMismatch := validatePreimageCutoffAgreement 5115 parameters parameterDomains
+    (.add (.parameter "cutoff") (.constant 1)) fixtureSampledIdentity
+    (some (.contextual .maximum parameters parameterDomains (.parameter "cutoff")))
+  match sampledMissing, conflictingDomains, parameterMatch, parameterMismatch with
+  | .error (.missingPreimageCutoff 5112), .error (.preimageCutoffMismatch 5113), .ok (),
+      .error (.preimageCutoffMismatch 5115) => true
+  | _, _, _, _ => false
+
+/-- Direct indexed reduction reads the cutoff from each physical trapdoor lane.  A shared public
+matrix and explicit trapdoor/target tables therefore accept matching lanes and reject one stale
+lane without choosing a representative. -/
+private def directIndexedTrapdoorCutoffFixture : Bool :=
+  let run (secondCutoff : Int) : Except OperationalError (List ReducedDirectMatrixFact) := do
+    let binder := { directCarrierFixtureBinder 5116 with count := .constant 2 }
+    let trapdoor (cutoff : Int) : OperationalScalarFact := match fixtureTrapdoorFact with
+      | .trapdoor fact => .trapdoor { fact with
+          preimageCutoff := some (.contextual .maximum [] [] (.constant cutoff)) }
+      | fact => fact
+    let target := boundedOperationalExprFixtureFact 5117 2
+    let (fixed, publicRef) := ({} : FixedOperationalPayloadArena).pushMatrix fixturePublicMatrixFact
+    let (fixed, targetRef) := fixed.pushMatrix target
+    let (fixed, firstTrapdoorRef) := fixed.pushScalar (trapdoor 3)
+    let (fixed, secondTrapdoorRef) := fixed.pushScalar (trapdoor secondCutoff)
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, publicValue) ← match direct.pushShared { binders := #[binder] }
+        (.matrix fixtureType) publicRef with
+      | some value => pure value
+      | none => throw (.unsupportedOperationalExpr 5116)
+    let (direct, trapdoorValue) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.scalar (.trapdoor fixtureType)) #[firstTrapdoorRef, secondTrapdoorRef] with
+      | some value => pure value
+      | none => throw (.unsupportedOperationalExpr 5117)
+    let (direct, targetValue) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) #[targetRef, targetRef] with
+      | some value => pure value
+      | none => throw (.unsupportedOperationalExpr 5118)
+    let arena : OperationalExprArena := { direct }
+    let wrap (value : OperationalIndexedValueId) : OperationalFact := {
+      context := { binders := #[binder] }, payload := .directValue value, storage := .explicitTable }
+    let operation : DirectRelationOperation := {
+      kind := .preimage (.constant 3) [], outputType := fixtureType, ownerScope := none,
+      ownerNode := 5119, outputPort := 0, parameterEnvironment := [] }
+    let (arena, output) ← arena.pushDirectRelationPointwise operation
+      #[wrap publicValue, wrap trapdoorValue, wrap targetValue]
+    arena.reducedDirectValueFactsAt [] output
+  match run 3, run 2 with
+  | .ok matching, .error (.preimageCutoffMismatch 5119) => matching.length == 2
+  | _, _ => false
+
+example : contextualCutoffFixture = true := by native_decide
+example : directContextualCutoffFixture = true := by native_decide
+example : cutoffMetadataClosureFixture = true := by native_decide
+example : directIndexedTrapdoorCutoffFixture = true := by native_decide
 
 /-! Reuse one pre-existing native fixture gate for the computationally heavy operational
 fixtures.  This keeps the trusted-evaluation surface unchanged while checking the production

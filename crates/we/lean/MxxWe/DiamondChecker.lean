@@ -274,6 +274,8 @@ private def describeOperationalError : Mxx.Certificate.OperationalError → Stri
   | .invalidMatrixParameters node => s!"invalid matrix parameters at {node}"
   | .flat node error => s!"flat operational error at {node}: {repr error}"
   | .invalidBound node bound => s!"invalid bound {bound} at {node}"
+  | .missingPreimageCutoff node => s!"missing preimage cutoff at {node}"
+  | .preimageCutoffMismatch node => s!"preimage cutoff mismatch at {node}"
   | .invalidCount node count => s!"invalid count {count} at {node}"
   | .missingGadgetLayout node => s!"missing gadget layout at {node}"
   | .ambiguousGadgetLayout node => s!"ambiguous gadget layout at {node}"

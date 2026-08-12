@@ -9,6 +9,5 @@ checked derivation, and flat hard-bound checker.
 
 ```lean
 import MxxCorrectness.Proofs.ToyExample
-import MxxCorrectness.Proofs.ToyOperationalAlignment
 ```
 -/

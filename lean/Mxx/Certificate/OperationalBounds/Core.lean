@@ -304,6 +304,9 @@ structure OperationalCompressionOrigin where
 
 structure OperationalBoundedFactorSummary where
   matrixType : MatrixTypeExpr
+  /-- Concrete row count carried from the validated matrix fact.  Bound compression cannot rely
+  on a symbolic shape expression when checking sparse-column metadata. -/
+  rowCount : Int
   hardBound : OperationalBoundExpr
   metadata : OperationalMatrixMetadata
   provenance : List OperationalCompressionToken
@@ -846,7 +849,12 @@ def operationalInnerDimension
   | .ordinaryMatrixProduct =>
       match right.metadata.knownZeroRows with
       | none => pure left.matrixType.columns
-      | some zeroRows => pure (.subtract left.matrixType.columns zeroRows)
+      | some zeroRows =>
+          match normalizeOperationalDimension zeroRows with
+          | .constant value =>
+              if value < 0 || right.rowCount < value then throw .invalidKnownZeroRows
+              else pure (.constant (right.rowCount - value))
+          | _ => throw .invalidKnownZeroRows
   | .leftPolynomialScalarBroadcast | .rightPolynomialScalarBroadcast |
       .swappedRowVectorScalarProduct => pure (.constant 1)
 
@@ -859,8 +867,13 @@ def multiplyOperationalBoundedSummaries
       right.metadata.isConstantPolynomial then .closedInt (.constant 1)
     else .closedInt left.matrixType.ringDimension
   let outputType ← (inferOperationalProductMode left.matrixType right.matrixType).map (·.2)
+  let outputRowCount := match mode with
+    | .ordinaryMatrixProduct | .rightPolynomialScalarBroadcast => left.rowCount
+    | .leftPolynomialScalarBroadcast => right.rowCount
+    | .swappedRowVectorScalarProduct => 1
   pure {
     matrixType := outputType
+    rowCount := outputRowCount
     hardBound := .multiply (.closedInt inner)
       (.multiply ringFactor (.multiply left.hardBound right.hardBound))
     metadata := {
@@ -1056,6 +1069,9 @@ def compressBoundedNoiseSum
   let firstTerm ← match terms.head? with
     | some term => pure term
     | none => throw .malformedProduct
+  let firstTermSummary ← match summaries.head? with
+    | some summary => pure summary
+    | none => throw .malformedProduct
   let content := operationalCoefficientContent terms
   let unsignedContent := Int.ofNat content
   let contentInt := if firstTerm.coefficient < 0 then -unsignedContent else unsignedContent
@@ -1074,6 +1090,7 @@ def compressBoundedNoiseSum
   }
   let summary : OperationalBoundedFactorSummary := {
     matrixType := firstTerm.product.outputType
+    rowCount := firstTermSummary.rowCount
     hardBound
     metadata
     provenance := tokens
@@ -1131,6 +1148,7 @@ abbrev OperationalExprId := Nat
 
 structure UniformBoundedSchema where
   matrixType : MatrixTypeExpr
+  rowCount : Int
   hardBound : OperationalBoundExpr
   metadata : OperationalMatrixMetadata
   deriving BEq
@@ -1198,6 +1216,7 @@ structure UniformMatrixSchema where
 def uniformBoundedSchema
     (summary : OperationalBoundedFactorSummary) : UniformBoundedSchema := {
   matrixType := summary.matrixType
+  rowCount := summary.rowCount
   hardBound := summary.hardBound
   metadata := summary.metadata
 }
@@ -1433,6 +1452,7 @@ def transferSelectedMatrixSummary
 def primitiveOperationalPolynomial
     (origin : MatrixOriginIdentity)
     (matrixType : MatrixTypeExpr)
+    (rowCount : Int)
     (totalHardBound : OperationalBoundExpr)
     (role : OperationalFactorRole)
     (identity : Option PublicMatrixIdentity)
@@ -1441,6 +1461,7 @@ def primitiveOperationalPolynomial
   let summary := match role with
     | .bounded => some {
         matrixType
+        rowCount
         hardBound := totalHardBound
         metadata
         provenance := [.primitive (.matrix origin)]
@@ -1472,7 +1493,7 @@ def OperationalMatrixFact.initializePrimitivePolynomial
     (fact : OperationalMatrixFact)
     (role : OperationalFactorRole) : OperationalMatrixFact := {
   fact with polynomial := (primitiveOperationalPolynomial fact.origin fact.matrixType
-    fact.totalHardBound role fact.identity fact.relations fact.metadata)
+    fact.matrixParams.rows fact.totalHardBound role fact.identity fact.relations fact.metadata)
 }
 
 def OperationalMatrixFact.primitiveRole (fact : OperationalMatrixFact) :

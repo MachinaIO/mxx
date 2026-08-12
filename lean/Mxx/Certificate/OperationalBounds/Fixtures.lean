@@ -111,6 +111,178 @@ private def fixtureParams : Mxx.SamplerParams := {
   columns := 1
 }
 
+private def knownZeroLeftType : MatrixTypeExpr := {
+  modulus := .constant 97, ringDimension := .constant 2,
+  rows := .constant 1, columns := .constant 3
+}
+
+private def knownZeroRightType : MatrixTypeExpr := {
+  modulus := .constant 97, ringDimension := .constant 2,
+  rows := .constant 3, columns := .constant 1
+}
+
+private def knownZeroOutputType : MatrixTypeExpr := {
+  modulus := .constant 97, ringDimension := .constant 2,
+  rows := .constant 1, columns := .constant 1
+}
+
+/-- Multiplication consumes `knownZeroRows` only after checking the concrete certified count.
+The ordinary, constant-polynomial, and unit-column cases respectively use `k*N*L*R`,
+`k*L*R`, and the reduced effective inner dimension one. -/
+private def knownZeroRowsBoundFixture : Bool :=
+  match (do
+    let left ← classifiedMatrixFact 900 0 knownZeroLeftType [] 2 false
+    let ordinaryRight ← classifiedMatrixFact 901 0 knownZeroRightType [] 1 false
+    let constantRight := { ordinaryRight with metadata := { isConstantPolynomial := true } }
+      |>.refreshPrimitivePolynomial
+    let unitRight := { constantRight with
+      metadata := { isConstantPolynomial := true, knownZeroRows := some (.constant 2) } }
+      |>.refreshPrimitivePolynomial
+    let ordinary ← multiplyConcreteMatrixFacts 902 0 knownZeroOutputType
+      .matrixMultiplyBound { node := 901, port := 0 } [] left ordinaryRight
+    let constant ← multiplyConcreteMatrixFacts 903 0 knownZeroOutputType
+      .matrixMultiplyBound { node := 901, port := 0 } [] left constantRight
+    let effective ← multiplyConcreteMatrixFacts 904 0 knownZeroOutputType
+      .matrixMultiplyBound { node := 901, port := 0 } [] left unitRight
+    let ordinaryBound ← ordinary.evaluateNoiseHardBound []
+    let constantBound ← constant.evaluateNoiseHardBound []
+    let effectiveBound ← effective.evaluateNoiseHardBound []
+    pure (ordinaryBound == 12 && constantBound == 6 && effectiveBound == 2)) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Summary row witnesses follow the actual product output, including scalar broadcasts. -/
+private def boundedSummaryRowCountFixture : Bool :=
+  match (do
+    let scalarType : MatrixTypeExpr := {
+      modulus := .constant 97, ringDimension := .constant 2,
+      rows := .constant 1, columns := .constant 1
+    }
+    let scalar ← classifiedMatrixFact 905 0 scalarType [] 2 false
+    let matrix ← classifiedMatrixFact 906 0 knownZeroRightType [] 1 false
+    let leftBroadcast ← multiplyConcreteMatrixFacts 907 0 knownZeroRightType
+      .matrixMultiplyBound { node := 906, port := 0 } [] scalar matrix
+    let rightBroadcast ← multiplyConcreteMatrixFacts 908 0 knownZeroRightType
+      .matrixMultiplyBound { node := 905, port := 0 } [] matrix scalar
+    let rowCount (fact : OperationalMatrixFact) :=
+      fact.polynomial.head?.bind fun term => term.product.factors.head?.bind fun factor =>
+        factor.boundedSummary.map OperationalBoundedFactorSummary.rowCount
+    pure (rowCount leftBroadcast == some 3 && rowCount rightBroadcast == some 3)) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Sparse-row metadata is checked at consumption, so forged negative, oversized, and symbolic
+counts cannot turn a product into a negative or unjustified bound. -/
+private def knownZeroRowsRejectedFixture : Bool :=
+  match (do
+    let left ← classifiedMatrixFact 910 0 knownZeroLeftType [] 2 false
+    let right ← classifiedMatrixFact 911 0 knownZeroRightType [] 1 false
+    let rejected (zeroRows : IntExpr) :=
+      multiplyConcreteMatrixFacts 912 0 knownZeroOutputType .matrixMultiplyBound
+        { node := 911, port := 0 } [] left
+        ({ right with metadata := { knownZeroRows := some zeroRows } }.refreshPrimitivePolynomial)
+    let negative := match rejected (.constant (-1)) with
+      | .error (.flat 912 .invalidKnownZeroRows) => true
+      | _ => false
+    let oversized := match rejected (.constant 4) with
+      | .error (.flat 912 .invalidKnownZeroRows) => true
+      | _ => false
+    let symbolic := match rejected (.parameter "unproved") with
+      | .error (.flat 912 .invalidKnownZeroRows) => true
+      | _ => false
+    pure (negative && oversized && symbolic)) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Transform transfer invalidates sparse-row metadata; a transformed unit-shaped factor therefore
+uses the ordinary constant-polynomial dimension rather than retaining an unjustified reduction. -/
+private def knownZeroRowsTransformInvalidationFixture : Bool :=
+  match (do
+    let left ← classifiedMatrixFact 920 0 knownZeroLeftType [] 2 false
+    let right ← classifiedMatrixFact 921 0 knownZeroRightType [] 1 false
+    let sparse := { right with metadata := {
+      isConstantPolynomial := true, knownZeroRows := some (.constant 2) } }.refreshPrimitivePolynomial
+    let transformed ← transformConcreteMatrixFact 922 0 knownZeroRightType .negate [] sparse
+    let product ← multiplyConcreteMatrixFacts 923 0 knownZeroOutputType .matrixMultiplyBound
+      { node := 922, port := 0 } [] left transformed
+    let bound ← product.evaluateNoiseHardBound []
+    pure (transformed.metadata.knownZeroRows.isNone && bound == 6)) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Exact empty zero polynomials remain zero products independently of sparse-row metadata. -/
+private def zeroMatrixExactProductFixture : Bool :=
+  match (do
+    let left ← classifiedMatrixFact 930 0 knownZeroLeftType [] 2 false
+    let zero ← polynomialMatrixFact 931 0 knownZeroRightType [] []
+    let product ← multiplyConcreteMatrixFacts 932 0 knownZeroOutputType .matrixMultiplyBound
+      { node := 931, port := 0 } [] left zero
+    let bound ← product.evaluateNoiseHardBound []
+    pure (product.polynomial.isEmpty && bound == 0)) with
+  | .ok value => value
+  | .error _ => false
+
+private def knownZeroRowsUnitColumnScope : Scope := {
+  nodes := #[
+    { kind := .gaussianSample knownZeroLeftType (.constant 2), arguments := [],
+      outputTypes := [.matrix knownZeroLeftType] },
+    { kind := .unitColumnMatrix knownZeroRightType (.constant 1), arguments := [],
+      outputTypes := [.matrix knownZeroRightType] },
+    { kind := .matrixMultiply, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.matrix knownZeroOutputType] }
+  ]
+  outputs := [("result", { node := 2, port := 0 })]
+  inputNames := []
+}
+
+private def knownZeroRowsUnitColumnDerivation : ScopeDerivation := { steps := #[
+  { sourceNode := 0, rule := .gaussianSample, arguments := [] },
+  { sourceNode := 1, rule := .unitColumnMatrix, arguments := [] },
+  { sourceNode := 2, rule := .matrixMultiplyBound,
+    arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] }
+] }
+
+/-- The actual Graph IR unit-column producer validates its position and seeds `k - 1` certified
+zero rows, giving effective contraction dimension one. -/
+private def knownZeroRowsUnitColumnGraphFixture : Bool :=
+  match (do
+    let facts ← evaluateScopeOperationalWithLayouts knownZeroRowsUnitColumnScope
+      knownZeroRowsUnitColumnDerivation [] []
+    let unit ← derivedMatrixFactAt 2 facts { node := 1, port := 0 }
+    let bound ← matrixMaximum 2 { node := 2, port := 0 } facts []
+    pure (unit.metadata.knownZeroRows == some (IntExpr.constant 2) && bound == 2)) with
+  | .ok value => value
+  | .error _ => false
+
+/-- A unit-column node in a parallel-body context may use the loop coordinate itself.  Every
+physical assignment is checked: all three in-range lanes share the same `k - 1` certificate,
+while the fourth lane is rejected. -/
+private def knownZeroRowsLoopVaryingUnitColumnFixture : Bool :=
+  let inRange : Node := {
+    kind := .unitColumnMatrix knownZeroRightType (.loopIndex 0)
+    arguments := []
+    outputTypes := [.matrix knownZeroRightType]
+  }
+  let domains : List OperationalParameterDomain := [.loopIndex 0 3]
+  let accepts := match genericNodeMatrixFactConcrete (.parallelBody (.root (.standalone 0)) 940)
+      0 inRange .unitColumnMatrix 0 (.matrix knownZeroRightType) {} [] domains [] with
+    | .ok fact => fact.metadata.knownZeroRows == some (IntExpr.constant 2)
+    | .error _ => false
+  let rejects := match genericNodeMatrixFactConcrete (.parallelBody (.root (.standalone 0)) 941)
+      0 inRange .unitColumnMatrix 0 (.matrix knownZeroRightType) {} []
+        [.loopIndex 0 4] [] with
+    | .error (.invalidMatrixParameters 0) => true
+    | _ => false
+  accepts && rejects
+
+example : knownZeroRowsBoundFixture = true := by native_decide
+example : boundedSummaryRowCountFixture = true := by native_decide
+example : knownZeroRowsRejectedFixture = true := by native_decide
+example : knownZeroRowsTransformInvalidationFixture = true := by native_decide
+example : zeroMatrixExactProductFixture = true := by native_decide
+example : knownZeroRowsUnitColumnGraphFixture = true := by native_decide
+example : knownZeroRowsLoopVaryingUnitColumnFixture = true := by native_decide
+
 private def interningFixtureFactor (node : Nat) : OperationalFactorKey := {
   leaf := .primitive (.matrix (.value temporaryScope { node, port := 0 }))
   inputType := fixtureType
@@ -2542,9 +2714,10 @@ private def directOrdinaryMatrixPipelineFixture : Bool :=
       | _ => throw (OperationalError.unsupportedOperationalExpr 0)
     let sumFact ← arena.direct.matrixFactAt [] [] sumId (arena.direct.values.size + 1)
     let productFact ← arena.direct.matrixFactAt [] [] productId (arena.direct.values.size + 1)
+    let (_, diagnostics) ← operationalNoiseBoundForFact arena product []
     pure (arena.nodes.isEmpty && arena.direct.values.size == 4 && sum.context == emptyContext &&
       product.context == emptyContext && sumFact.evaluateNoiseHardBound [] == Except.ok 5 &&
-      productFact.evaluateNoiseHardBound [] == Except.ok 15)) with
+      productFact.evaluateNoiseHardBound [] == Except.ok 15 && diagnostics.relationRewriteCount == 0)) with
   | Except.ok value => value
   | Except.error _ => false
 
@@ -3910,7 +4083,57 @@ private def directFamilyComplementaryBlockFixture : Bool :=
       parameterEnvironment := []
     }
     let (arena, accepted) ← arena.pushDirectMatrixPointwise operation left right
+    let (_, acceptedRewriteEvents) ←
+      arena.reducedDirectValueFactsAtWithRelationRewriteEvents [] accepted
+    let (_, repeatedRewriteEvents) ←
+      arena.reducedDirectValueFactsAtWithRelationRewriteEvents [] accepted
+    let (_, diagnostics) ← operationalNoiseBoundForFact arena accepted []
+    let directStaticMap ← match closedStaticIndexMap [] accepted.context binder 0 with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 198)
+    let (arena, directStatic) ← arena.reindexDirectMatrixFact directStaticMap accepted
+    let middle := { directCarrierFixtureBinder 199 with count := .constant 2 }
+    let firstMap ← match dynamicIndexMap accepted.context binder (IndexExpr.variable middle) with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 199)
+    let (arena, nestedMiddle) ← arena.reindexDirectMatrixFact firstMap accepted
+    let finalMap ← match closedStaticIndexMap [] nestedMiddle.context middle 0 with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 200)
+    let (arena, nestedStatic) ← arena.reindexDirectMatrixFact finalMap nestedMiddle
+    let eventJoin : PrimitiveOperation := {
+      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 201,
+      outputPort := 0, parameterEnvironment := [] }
+    let (arena, equivalentJoined) ← arena.pushDirectMatrixPointwise eventJoin directStatic nestedStatic
+    let (_, equivalentEvents) ←
+      arena.reducedDirectValueFactsAtWithRelationRewriteEvents [] equivalentJoined
+    let distinctStaticMap ← match closedStaticIndexMap [] accepted.context binder 1 with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 202)
+    let (arena, distinctStatic) ← arena.reindexDirectMatrixFact distinctStaticMap accepted
+    let (arena, distinctJoined) ← arena.pushDirectMatrixPointwise eventJoin directStatic distinctStatic
+    let (_, distinctEvents) ← arena.reducedDirectValueFactsAtWithRelationRewriteEvents [] distinctJoined
     let accepted ← arena.reducedDirectValueFactsAt [] accepted
+    let binderThree := { directCarrierFixtureBinder 198 with count := .constant 3 }
+    let (directThree, leftThreeRoot) ← match arena.direct.pushExplicit [] { binders := #[binderThree] }
+        binderThree (.matrix fixtureColumns2Type) #[leftReference, leftReference, leftReference] with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 198)
+    let (directThree, rightThreeRoot) ← match directThree.pushExplicit [] { binders := #[binderThree] }
+        binderThree (.matrix fixtureRows2Type) #[rightReference, rightReference, rightReference] with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 199)
+    let arenaThree := { arena with direct := directThree }
+    let leftThree : IndexedOperationalFact := {
+      context := { binders := #[binderThree] }, payload := .directValue leftThreeRoot,
+      storage := .explicitTable }
+    let rightThree : IndexedOperationalFact := {
+      context := { binders := #[binderThree] }, payload := .directValue rightThreeRoot,
+      storage := .explicitTable }
+    let (arenaThree, acceptedThree) ← arenaThree.pushDirectMatrixPointwise operation leftThree rightThree
+    let (acceptedThreeEntries, acceptedThreeEvents) ←
+      arenaThree.reducedDirectValueFactsAtWithRelationRewriteEvents [] acceptedThree
+    let (_, diagnosticsThree) ← operationalNoiseBoundForFact arenaThree acceptedThree []
     let (arena, rejected) ← arena.pushDirectMatrixPointwise operation left other
     let rejected := arena.reducedDirectValueFactsAt [] rejected
     let acceptedOk := accepted.length == 2 && accepted.all fun (entry : ReducedDirectMatrixFact) =>
@@ -3955,7 +4178,12 @@ private def directFamilyComplementaryBlockFixture : Bool :=
     let rejectedOk := match rejected with
       | .error (.unsupportedOperationalExpr _) => true
       | _ => false
-    pure (acceptedOk && reindexedOk && gatheredOk && gatheredRejectedOk && rejectedOk)) with
+    pure (acceptedOk && acceptedRewriteEvents.length == 2 &&
+      repeatedRewriteEvents == acceptedRewriteEvents && diagnostics.relationRewriteCount == 2 &&
+      equivalentEvents.length == 1 && distinctEvents.length == 2 &&
+      acceptedThreeEntries.length == 3 && acceptedThreeEvents.length == 3 &&
+      diagnosticsThree.relationRewriteCount == 3 &&
+      reindexedOk && gatheredOk && gatheredRejectedOk && rejectedOk)) with
   | .ok value => value
   | .error _ => false
 

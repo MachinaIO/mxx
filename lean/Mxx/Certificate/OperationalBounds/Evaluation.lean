@@ -207,7 +207,7 @@ def genericNodeMatrixFactConcrete
             totalHardBound := .closedInt (.constant cap)
             canonicalRange := .unknown
             polynomial := relationSnapshotPolynomial (primitiveOperationalPolynomial targetOrigin
-              targetType (.closedInt (.constant cap)) .large none [] {})
+              targetType targetParams.rows (.closedInt (.constant cap)) .large none [] {})
           }
           let publicIdentity := PublicMatrixIdentity.gadget descriptor.paramsId
             outputParams targetRows base small digitCount.toNat
@@ -440,9 +440,22 @@ def genericNodeMatrixFactConcrete
         | none => throw (.invalidMatrixParameters nodeIndex)
       let result ← classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
       pure ({ result with identity := some identity }).refreshPrimitivePolynomial
-  | .unitRowMatrix _ _, some matrixType | .unitColumnMatrix _ _, some matrixType =>
+  | .unitRowMatrix _ _, some matrixType =>
       classifiedMatrixFact nodeIndex outputPort matrixType environment 1 false
         (.below 2) { isConstantPolynomial := true }
+  | .unitColumnMatrix _ position, some matrixType =>
+      let params ← match matrixType.evaluate environment (.constant 0) with
+        | some params => pure params
+        | none => throw (.invalidMatrixParameters nodeIndex)
+      let positions ← evaluateIntOverLoops environment loopDomains position
+      if params.rows = 0 || params.columns != 1 || positions.isEmpty ||
+          positions.any fun index => index < 0 || index >= params.rows then
+        throw (.invalidMatrixParameters nodeIndex)
+      classifiedMatrixFact nodeIndex outputPort matrixType environment 1 false
+        (.below 2) {
+          isConstantPolynomial := true
+          knownZeroRows := some (.constant (params.rows - 1))
+        }
   | .rotationMatrix _ _, some matrixType =>
       classifiedMatrixFact nodeIndex outputPort matrixType environment 1 false
   | .gadgetMatrix _ base, some matrixType | .smallGadgetMatrix _ base, some matrixType =>
@@ -1215,6 +1228,7 @@ def summarizeOperationalSelectionFacts
       let tokens := [.sumStart, .summaryBound noiseBound, .summaryMetadata metadata, .sumEnd]
       let summary : OperationalBoundedFactorSummary := {
         matrixType := first.matrixType
+        rowCount := first.matrixParams.rows
         hardBound := noiseBound
         metadata
         provenance := tokens
@@ -2851,7 +2865,8 @@ structure OperationalAnalysisDiagnostics where
 
 def operationalAnalysisDiagnostics
     (arena : OperationalExprArena)
-    (stats : OperationalExprEvaluationStats := {}) : OperationalAnalysisDiagnostics := Id.run do
+    (stats : OperationalExprEvaluationStats := {})
+    (relationRewriteCount : Nat := 0) : OperationalAnalysisDiagnostics := Id.run do
   let mut logicalBranches := 0
   let mut storedBranches := 0
   let mut maximumPolynomialTerms := 0
@@ -2874,7 +2889,7 @@ def operationalAnalysisDiagnostics
     peakMemoEntries := arena.nodes.size
     envelopeLogicalBranchCount := logicalBranches
     envelopeStoredBranchCount := storedBranches
-    relationRewriteCount := 0
+    relationRewriteCount
     choiceJoinCount := arena.choiceJoinCount
     domainComparisonCount := arena.domainComparisonCount
     exactBranchVisitCount := arena.exactBranchVisitCount
@@ -3061,12 +3076,22 @@ def operationalNoiseBoundForFact
     Except OperationalError (Int × OperationalAnalysisDiagnostics) := do
   let initialState := OperationalExprEvaluationState.forEnvironment
     arena environment arena.evaluationState
-  let (bounds, evaluationState) ←
-    collectDecoderResidualBounds arena environment initialState residual
+  let (bounds, evaluationState, rewriteEvents) ← match residual with
+    | expression@{ payload := .directValue _, .. } => do
+        let (entries, rewriteEvents) ←
+          arena.reducedDirectValueFactsAtWithRelationRewriteEvents environment expression
+        let bounds ← entries.mapM fun entry => do
+          let _ ← entry.fact.rejectResidualLargeTerms
+          entry.fact.evaluateNoiseHardBound environment
+        pure (bounds, initialState, rewriteEvents)
+    | _ => do
+        let (bounds, evaluationState) ←
+          collectDecoderResidualBounds arena environment initialState residual
+        pure (bounds, evaluationState, [])
   let noiseBound ← match bounds with
     | head :: tail => pure (tail.foldl max head)
     | [] => throw (OperationalError.invalidCount 0 0)
-  pure (noiseBound, operationalAnalysisDiagnostics arena evaluationState.noiseStats)
+  pure (noiseBound, operationalAnalysisDiagnostics arena evaluationState.noiseStats rewriteEvents.length)
 
 /-- Applies a cheap decoder threshold to an already evaluated structural bound. -/
 def decoderNoiseCheckReportFromBound

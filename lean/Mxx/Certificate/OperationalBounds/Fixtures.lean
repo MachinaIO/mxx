@@ -727,6 +727,7 @@ example : (do
       .ok (5, 8, 8, 3, 4) := by
   native_decide
 
+
 private def samplerAndDecodeCoverageScope : Scope := {
   nodes := #[
     { kind := .trapdoorSample fixtureType (.constant 3), arguments := [], outputCount := 2,
@@ -3978,6 +3979,195 @@ private def nestedScalarPackContextFixture : Bool :=
   | .ok value => value
   | .error _ => false
 
+/-- Build one exact direct table whose lane bounds and subjects expose its physical ordering. -/
+private def reducerExactTable
+    (node count : Nat) (boundOffset : Int) :
+    Except OperationalError (OperationalExprArena × IndexedOperationalFact × IndexVariable) := do
+  let binder := { directCarrierFixtureBinder node with count := .constant count }
+  let mut fixed : FixedOperationalPayloadArena := {}
+  let mut references : Array FixedOperationalPayloadRef := #[]
+  for lane in [:count] do
+    let fact := boundedOperationalExprFixtureFact (node + lane + 1) (boundOffset + lane)
+    let (nextFixed, reference) := fixed.pushMatrix fact
+    fixed := nextFixed
+    references := references.push reference
+  let direct : DirectOperationalIndexedArena := { fixed }
+  let (direct, root) ← match direct.pushExplicit [] { binders := #[binder] } binder
+      (.matrix fixtureType) references with
+    | some result => pure result
+    | none => throw (OperationalError.unsupportedOperationalExpr direct.values.size)
+  pure ({ direct }, {
+    context := { binders := #[binder] }
+    payload := .directValue root
+    storage := .explicitTable
+  }, binder)
+
+/-- Shared logical families reduce to their one stored representative, regardless of declared
+cardinality.  This guards the aggregate path against domain enumeration. -/
+private def reducedSharedLogicalCountsFixture : Bool :=
+  let check (count : Nat) : Except OperationalError Bool := do
+    let binder := { directCarrierFixtureBinder (900 + count % 97) with count := .constant count }
+    let fact := boundedOperationalExprFixtureFact (1000 + count % 97) 7
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushMatrix fact
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, root) ← match direct.pushShared { binders := #[binder] }
+        (.matrix fixtureType) reference with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr direct.values.size)
+    let arena : OperationalExprArena := { direct }
+    let expression : IndexedOperationalFact := {
+      context := { binders := #[binder] }
+      payload := .directValue root
+      storage := .sharedTemplate
+    }
+    let entries ← arena.reducedDirectValueFactsAt [] expression
+    pure (entries.length == 1 && entries[0]?.any fun (entry : ReducedDirectMatrixFact) =>
+      entry.key.isNone && entry.ordinal == 0 &&
+        entry.fact.totalHardBound == OperationalBoundExpr.closedInt (.constant 7))
+  match check 2, check 1024, check 30720 with
+  | .ok true, .ok true, .ok true => true
+  | _, _, _ => false
+
+/-- Exact direct tables retain every physical lane in table order, while the older materializing
+API remains exhaustively assignment-driven. -/
+private def reducedExplicitTableFixture : Bool :=
+  match (do
+    let (arena, expression, binder) ← reducerExactTable 1100 3 4
+    let reduced ← arena.reducedDirectValueFactsAt [] expression
+    let exhaustive ← arena.directValueFactsAt [] expression
+    pure (reduced.length == 3 && exhaustive.length == 3 &&
+      reduced.map (fun (entry : ReducedDirectMatrixFact) =>
+        (entry.key, entry.ordinal, entry.fact.subject.node, entry.fact.totalHardBound)) == [
+          (some (IndexExpr.variable binder), 0, 1101, OperationalBoundExpr.closedInt (.constant 4)),
+          (some (IndexExpr.variable binder), 1, 1102, OperationalBoundExpr.closedInt (.constant 5)),
+          (some (IndexExpr.variable binder), 2, 1103,
+            OperationalBoundExpr.closedInt (.constant 6))] &&
+      exhaustive.map (fun (fact : OperationalMatrixFact) =>
+        (fact.subject.node, fact.totalHardBound)) == [
+        (1101, OperationalBoundExpr.closedInt (.constant 4)),
+        (1102, OperationalBoundExpr.closedInt (.constant 5)),
+        (1103, OperationalBoundExpr.closedInt (.constant 6))])) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Equal selector tables reduce pointwise lane-by-lane; independent tables fail before any
+Cartesian pairing can occur. -/
+private def reducedPointwiseCorrelationFixture : Bool :=
+  match (do
+    let (arena, left, binder) ← reducerExactTable 1200 3 1
+    let mut direct := arena.direct
+    let mut rightReferences : Array FixedOperationalPayloadRef := #[]
+    for lane in [:3] do
+      let (fixed, reference) := direct.fixed.pushMatrix
+        (boundedOperationalExprFixtureFact (1301 + lane) (10 + lane))
+      direct := { direct with fixed }
+      rightReferences := rightReferences.push reference
+    let (rightDirect, rightRoot) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) rightReferences with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr direct.values.size)
+    let arena := { arena with direct := rightDirect }
+    let right : IndexedOperationalFact := {
+      context := { binders := #[binder] }
+      payload := .directValue rightRoot
+      storage := .explicitTable
+    }
+    let operation : PrimitiveOperation := {
+      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1400,
+      outputPort := 0, parameterEnvironment := [] }
+    let (arena, output) ← arena.pushDirectMatrixPointwise operation left right
+    let reduced ← arena.reducedDirectValueFactsAt [] output
+    let independentBinder := { directCarrierFixtureBinder 1500 with count := .constant 3 }
+    let mut independentDirect := arena.direct
+    let mut independentReferences : Array FixedOperationalPayloadRef := #[]
+    for lane in [:3] do
+      let (fixed, reference) := independentDirect.fixed.pushMatrix
+        (boundedOperationalExprFixtureFact (1501 + lane) (20 + lane))
+      independentDirect := { independentDirect with fixed }
+      independentReferences := independentReferences.push reference
+    let (completedIndependentDirect, independentRoot) ← match independentDirect.pushExplicit []
+        { binders := #[independentBinder] }
+        independentBinder (.matrix fixtureType) independentReferences with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr independentDirect.values.size)
+    let independentArena := { arena with direct := completedIndependentDirect }
+    let independent : IndexedOperationalFact := {
+      context := { binders := #[independentBinder] }, payload := .directValue independentRoot,
+      storage := .explicitTable }
+    let (independentArena, rejected) ←
+      independentArena.pushDirectMatrixPointwise operation left independent
+    let rejectedResult := independentArena.reducedDirectValueFactsAt [] rejected
+    pure (reduced.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
+        (some (IndexExpr.variable binder), 0), (some (IndexExpr.variable binder), 1),
+        (some (IndexExpr.variable binder), 2)] &&
+      (match rejectedResult with
+      | .error (.unsupportedOperationalExpr _) => independentArena.nodes.isEmpty
+      | _ => false))) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Static access consumes the selected lane. Dynamic and offset maps preserve the exact key and
+physical ordinal, while gather remains unsupported. -/
+private def reducedMappedDirectFixture : Bool :=
+  match (do
+    let (arena, expression, binder) ← reducerExactTable 1600 3 4
+    let staticMap ← match closedStaticIndexMap [] expression.context binder 1 with
+      | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1600)
+    let (arena, staticOutput) ← arena.reindexDirectMatrixFact staticMap expression
+    let staticEntries ← arena.reducedDirectValueFactsAt [] staticOutput
+    let selector := { directCarrierFixtureBinder 1700 with count := .constant 3 }
+    let dynamicMap ← match dynamicIndexMap expression.context binder
+        (IndexExpr.variable selector) with
+      | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1601)
+    let (arena, dynamicOutput) ← arena.reindexDirectMatrixFact dynamicMap expression
+    let dynamicEntries ← arena.reducedDirectValueFactsAt [] dynamicOutput
+    let offsetSelector := { directCarrierFixtureBinder 1701 with count := .constant 2 }
+    let offsetMap ← match dynamicIndexMap expression.context binder
+        (IndexExpr.offset (IndexExpr.variable offsetSelector) 1) with
+      | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1602)
+    let (arena, offsetOutput) ← arena.reindexDirectMatrixFact offsetMap expression
+    let offsetEntries ← arena.reducedDirectValueFactsAt [] offsetOutput
+    let gatherMap ← match dynamicIndexMap expression.context binder
+        (IndexExpr.gather (IndexExpr.variable selector) (IndexExpr.constant 0)) with
+      | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1603)
+    let (arena, gatherOutput) ← arena.reindexDirectMatrixFact gatherMap expression
+    let gatherResult := arena.reducedDirectValueFactsAt [] gatherOutput
+    pure (staticEntries.map (fun (entry : ReducedDirectMatrixFact) =>
+        (entry.key, entry.ordinal, entry.fact.subject.node)) ==
+        [(none, 0, 1602)] &&
+      dynamicEntries.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
+        (some (IndexExpr.variable selector), 0), (some (IndexExpr.variable selector), 1),
+        (some (IndexExpr.variable selector), 2)] &&
+      offsetEntries.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
+        (some (IndexExpr.variable offsetSelector), 0),
+        (some (IndexExpr.variable offsetSelector), 1)] &&
+      match gatherResult with
+      | .error (.unsupportedOperationalExpr _) => true
+      | _ => false)) with
+  | .ok value => value
+  | .error _ => false
+
+example : reducedSharedLogicalCountsFixture = true := by native_decide
+example : reducedExplicitTableFixture = true := by native_decide
+example : reducedPointwiseCorrelationFixture = true := by native_decide
+example : reducedMappedDirectFixture = true := by native_decide
+
+#eval directFamilySelectFixture
+#eval symbolicFamilySelectFixture
+#eval (do
+  let scopeKey : ScopeTemplateKey := .root (.standalone 801)
+  let (arena, selector) ← contractFact {} scopeKey { node := 0, port := 0 } ⟨"selector"⟩
+    .integer (.integerRange (.constant 0) (.constant 1)) []
+  let facts ← evaluateScopeOperationalWithKey scopeKey directFamilySelectScope directFamilySelectDerivation
+    [] [] [selector] arena
+  let left ← match facts.arena.direct.values[56]? with
+    | some value => pure { context := value.context, payload := .directValue 56, storage := value.storage }
+    | none => throw (OperationalError.unsupportedOperationalExpr 56)
+  let right ← match facts.arena.direct.values[58]? with
+    | some value => pure { context := value.context, payload := .directValue 58, storage := value.storage }
+    | none => throw (OperationalError.unsupportedOperationalExpr 58)
+  pure (facts.arena.reducedDirectValueFactsAt [] left, facts.arena.reducedDirectValueFactsAt [] right))
+
 /-! Reuse one pre-existing native fixture gate for the computationally heavy operational
 fixtures.  This keeps the trusted-evaluation surface unchanged while checking the production
 functions rather than duplicating their behavior in proof-only reference code. -/
@@ -4026,6 +4216,10 @@ example : exactRelationSelectionFixtureResult = .ok true ∧
     nonuniformScalarSharedRejectedFixture = true ∧
     indexedScalarLoopIndexStaticFixture = true ∧
     nestedScalarPackContextFixture = true ∧
+    reducedSharedLogicalCountsFixture = true ∧
+    reducedExplicitTableFixture = true ∧
+    reducedPointwiseCorrelationFixture = true ∧
+    reducedMappedDirectFixture = true ∧
     outerEnvelopeDominatesNestedRepresentativeFixture = true ∧
     independentSelectionCartesianRejectsFixture = true ∧
     primitiveTransferRegistryCoverageFixture = true ∧

@@ -1565,8 +1565,8 @@ def matrixMaximum
       | .trapdoor fact => fact.maximum.evaluate environment #[]
       | _ => throw (.operandNotMatrix node wire)
   | expression@{ payload := .directValue _, .. } =>
-      let bounds ← (← facts.arena.directValueFactsAt environment expression).mapM
-        (evaluateOperationalConcreteBound .total environment)
+      let bounds ← (← facts.arena.reducedDirectValueFactsAt environment expression).mapM
+        (fun entry => evaluateOperationalConcreteBound .total environment entry.fact)
       match bounds with
       | head :: tail => pure (tail.foldl max head)
       | [] => throw (.invalidCount node 0)
@@ -1585,10 +1585,10 @@ def matrixMaximumExpr
       | .trapdoor fact => pure fact.maximum
       | _ => throw (.operandNotMatrix node wire)
   | expression@{ payload := .directValue _, .. } =>
-      let facts ← facts.arena.directValueFactsAt environment expression
-      match facts with
-      | head :: tail => pure (tail.foldl (fun bound fact =>
-          .maximum bound fact.totalHardBound) head.totalHardBound)
+      let entries ← facts.arena.reducedDirectValueFactsAt environment expression
+      match entries with
+      | head :: tail => pure (tail.foldl (fun bound entry =>
+          .maximum bound entry.fact.totalHardBound) head.fact.totalHardBound)
       | [] => throw (.invalidCount node 0)
 
 def maximumArgumentExprs
@@ -1670,7 +1670,8 @@ def sequentialFactHasRelation
       operationalExprHasRelation arena environment expression.payload
   | expression@{ payload := .scalar _, .. } => factHasRelation arena expression
   | expression@{ payload := .directValue _, .. } => do
-      pure <| (← arena.directValueFactsAt environment expression).any matrixFactHasRelation
+      pure <| (← arena.reducedDirectValueFactsAt environment expression).any
+        (matrixFactHasRelation ·.fact)
 
 def summarizeSequentialFact
     (arena : OperationalExprArena)
@@ -1680,8 +1681,8 @@ def summarizeSequentialFact
       pure expression
   | expression@{ payload := .scalar _, .. } => pure expression
   | expression@{ payload := .directValue _, .. } => do
-      let facts ← arena.directValueFactsAt environment expression
-      if facts.any matrixFactHasRelation then
+      let entries ← arena.reducedDirectValueFactsAt environment expression
+      if entries.any (matrixFactHasRelation ·.fact) then
         throw (.relationBearingCarriedValue temporaryScope 0 0)
       pure expression
 
@@ -2107,9 +2108,10 @@ def evaluatePreparedScope
                             (← factHasRelation facts.arena output) then
                           if ← factHasRelation facts.arena output then
                             throw (.relationBearingCarriedValue scopeKey index slot)
-                          else throw (.sequentialSchemaMismatch scopeKey index slot
-                            (sequentialCarriedLargeFactorCounts facts.arena initial)
-                            (sequentialCarriedLargeFactorCounts facts.arena output))
+                          else do
+                            let initialCounts ← sequentialCarriedLargeFactorCounts facts.arena initial
+                            let outputCounts ← sequentialCarriedLargeFactorCounts facts.arena output
+                            throw (.sequentialSchemaMismatch scopeKey index slot initialCounts outputCounts)
                     | _, _ => throw (.childInputMismatch index carriedCount outputTemplates.length)
                   let mut initialComponents : List
                       (OperationalBoundPath × OperationalBoundExpr) := []
@@ -2975,8 +2977,8 @@ partial def collectDecoderResidualBounds
         expression.payload state
       pure ([bound], state)
   | state, expression@{ payload := .directValue _, .. } => do
-      let facts ← arena.directValueFactsAt environment expression
-      let bounds ← facts.mapM (fun fact => fact.evaluateNoiseHardBound environment)
+      let entries ← arena.reducedDirectValueFactsAt environment expression
+      let bounds ← entries.mapM fun entry => entry.fact.evaluateNoiseHardBound environment
       pure (bounds, state)
   | _, _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
 
@@ -2997,7 +2999,7 @@ def operationalNodeNoiseBounds
     | some ports =>
         for fact in ports do
           match fact with
-          | { payload := .matrix _, .. } =>
+          | { payload := .matrix _, .. } | { payload := .directValue _, .. } =>
               let (bounds, nextState) ← collectDecoderResidualBounds stage.facts.arena
                 environment evaluationState fact
               result := result ++ bounds

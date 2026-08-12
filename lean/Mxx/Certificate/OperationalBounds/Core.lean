@@ -1666,6 +1666,8 @@ inductive OperationalError where
   | invalidDerivationAttachment (ownerNamespace ruleName : String)
   | invalidOperationalExprRef (id : Nat)
   | operationalExprTypeMismatch (left right : Nat)
+  /-- Decoder acceptance may only bound a fully signal-free residual. -/
+  | residualContainsLargeTerm (node : Nat)
   | incompatibleRelationDomains (node leftDomain rightDomain : Nat)
   | unknownRelationRequirement (node expression : Nat)
   | unresolvedConcreteStructure (node expression : Nat)

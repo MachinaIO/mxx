@@ -2334,6 +2334,15 @@ def OperationalMatrixFact.evaluateNoiseHardBound
     OperationalError.invalidMatrixParameters fact.subject.node
   expression.evaluateWithStates environment states
 
+/-- A decoder residual is eligible for numeric noise evaluation only once normalization and
+relation consumption have removed every signal (`Large`) term. -/
+def OperationalMatrixFact.rejectResidualLargeTerms
+    (fact : OperationalMatrixFact) : Except OperationalError Unit :=
+  if fact.polynomial.any operationalTermIsSignal then
+    throw (.residualContainsLargeTerm fact.subject.node)
+  else
+    pure ()
+
 def flatErrorAt (node : Nat) : OperationalFlatError → OperationalError
   | error => .flat node error
 

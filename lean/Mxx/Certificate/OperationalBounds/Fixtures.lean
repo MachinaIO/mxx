@@ -4994,6 +4994,110 @@ example : reducedExplicitTableFixture = true := by native_decide
 example : reducedPointwiseCorrelationFixture = true := by native_decide
 example : reducedMappedDirectFixture = true := by native_decide
 
+/-- Decoder-bound evaluation rejects a pure Large residual and a normalized mixed
+Large-plus-bounded residual before looking at their bounded-only summaries. -/
+private def residualLargeSingleAndMixedFixture : Bool :=
+  let large := (operationalExprFixtureFact 5001 8).initializePrimitivePolynomial .large
+  let bounded := boundedOperationalExprFixtureFact 5002 3
+  match (do
+    let (arena, largeRoot) := ({} : OperationalExprArena).pushConcrete large
+    let largeResidual ← arena.indexedExpr largeRoot
+    let (arena, boundedRoot) := arena.pushConcrete bounded
+    let (arena, mixedRoot) ← addOperationalExprIds 5003 0 fixtureType false []
+      deriveOperationalSchemaFact arena largeRoot boundedRoot (arena.nodes.size + 1)
+    let mixedResidual ← arena.indexedExpr mixedRoot
+    pure (operationalNoiseBoundForFact arena largeResidual [],
+      operationalNoiseBoundForFact arena mixedResidual [])) with
+  | .ok (.error (.residualContainsLargeTerm 5001), .error (.residualContainsLargeTerm 5003)) => true
+  | _ => false
+
+/-- Exact alternatives are checked as complete branches, rather than taking a bounded summary
+from one alternative and ignoring a Large term in another. -/
+private def residualLargeExactSelectionFixture : Bool :=
+  let bounded := boundedOperationalExprFixtureFact 5010 2
+  let large := (operationalExprFixtureFact 5011 8).initializePrimitivePolynomial .large
+  match (do
+    let (arena, boundedRoot) := ({} : OperationalExprArena).pushConcrete bounded
+    let (arena, largeRoot) := arena.pushConcrete large
+    let selection := DynamicSelectionIdentity.fromOrigin
+      (.local temporaryScope { node := 5012, port := 0 }) 2
+    let (arena, root) ← arena.pushSelect selection (.exact #[boundedRoot, largeRoot])
+    let residual ← arena.indexedExpr root
+    pure (operationalNoiseBoundForFact arena residual [])) with
+  | .ok (.error (.residualContainsLargeTerm 5011)) => true
+  | _ => false
+
+/-- A Shared envelope is not a partial-max shortcut: the all-branch envelope and its stored
+representative are both checked for Large residual terms. -/
+private def residualLargeSharedSelectionFixture : Bool :=
+  let bounded := boundedOperationalExprFixtureFact 5020 8
+  let large := (operationalExprFixtureFact 5021 8).initializePrimitivePolynomial .large
+  match (do
+    let (arena, representative) := ({} : OperationalExprArena).pushConcrete bounded
+    let selection := DynamicSelectionIdentity.fromOrigin
+      (.local temporaryScope { node := 5022, port := 0 }) 30720
+    let (arena, root) ← arena.pushCheckedSchemaEnvelope selection 30720 representative
+      (selectedMatrixSummary #[large]) large
+    let residual ← arena.indexedExpr root
+    let envelopeRejected := operationalNoiseBoundForFact arena residual []
+    let (representativeArena, largeRepresentative) := ({} : OperationalExprArena).pushConcrete large
+    let (representativeArena, representativeRoot) ← representativeArena.pushCheckedSchemaEnvelope
+      selection 30720 largeRepresentative (selectedMatrixSummary #[bounded]) bounded
+    let representativeResidual ← representativeArena.indexedExpr representativeRoot
+    pure (envelopeRejected,
+      operationalNoiseBoundForFact representativeArena representativeResidual [])) with
+  | .ok (.error (.residualContainsLargeTerm 5021),
+      .error (.residualContainsLargeTerm 5021)) => true
+  | _ => false
+
+/-- Direct indexed families retain their physical alternatives through the residual boundary.
+One bounded lane cannot hide a Large lane behind a family-wide maximum. -/
+private def residualLargeDirectFamilyFixture : Bool :=
+  let binder := { directCarrierFixtureBinder 5030 with count := .constant 2 }
+  let bounded := boundedOperationalExprFixtureFact 5031 2
+  let large := (operationalExprFixtureFact 5032 8).initializePrimitivePolynomial .large
+  match (show Except OperationalError (Except OperationalError (Int × OperationalAnalysisDiagnostics))
+    from do
+    let (fixed, boundedRef) := ({} : FixedOperationalPayloadArena).pushMatrix bounded
+    let (fixed, largeRef) := fixed.pushMatrix large
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, root) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) #[boundedRef, largeRef] with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 5030)
+    let arena : OperationalExprArena := { direct }
+    let residual : OperationalFact := {
+      context := { binders := #[binder] }, payload := .directValue root, storage := .explicitTable }
+    pure (operationalNoiseBoundForFact arena residual [])) with
+  | Except.ok (Except.error (.residualContainsLargeTerm 5032)) => true
+  | _ => false
+
+/-- Exact polynomial cancellation occurs before the residual boundary, so a cancelled Large
+signal leaves the zero noise residual rather than being rejected from one of its inputs. -/
+private def residualLargeCancellationFixture : Bool :=
+  let large := (operationalExprFixtureFact 5040 8).initializePrimitivePolynomial .large
+  match (do
+    let (arena, left) := ({} : OperationalExprArena).pushConcrete large
+    let (arena, right) := arena.pushConcrete large
+    let (arena, root) ← addOperationalExprIds 5042 0 fixtureType true []
+      deriveOperationalSchemaFact arena left right (arena.nodes.size + 1)
+    let residual ← arena.indexedExpr root
+    pure (operationalNoiseBoundForFact arena residual [])) with
+  | .ok (.ok (0, _)) => true
+  | _ => false
+
+/-- The relation fixture reaches the same boundary only after its exact relation has rewritten
+away the signal term; its existing bound of three is therefore an acceptance regression test. -/
+private def residualLargeRelationConsumptionFixture : Bool :=
+  exactRelationSelectionFixtureResult == .ok true
+
+example : residualLargeSingleAndMixedFixture = true := by native_decide
+example : residualLargeExactSelectionFixture = true := by native_decide
+example : residualLargeSharedSelectionFixture = true := by native_decide
+example : residualLargeDirectFamilyFixture = true := by native_decide
+example : residualLargeCancellationFixture = true := by native_decide
+example : residualLargeRelationConsumptionFixture = true := by native_decide
+
 /-! Reuse one pre-existing native fixture gate for the computationally heavy operational
 fixtures.  This keeps the trusted-evaluation surface unchanged while checking the production
 functions rather than duplicating their behavior in proof-only reference code. -/

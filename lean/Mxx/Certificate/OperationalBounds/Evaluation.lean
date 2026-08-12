@@ -2945,6 +2945,7 @@ def decoderNoiseCheckReport
     (environment : ParamEnvironment)
     (plaintextModulus ciphertextModulus : Int) :
     Except OperationalError OperationalNoiseCheckReport := do
+  let _ ← residual.rejectResidualLargeTerms
   let noiseBound ← residual.evaluateNoiseHardBound environment
   let obligation := OperationalNoiseObligation.decoderThreshold
     plaintextModulus ciphertextModulus noiseBound
@@ -2952,11 +2953,40 @@ def decoderNoiseCheckReport
     checkDecoderThreshold plaintextModulus ciphertextModulus noiseBound
   pure { outputs, obligations := [obligation], accepted, rejection }
 
+/-- Inspect every complete legacy selection alternative before reducing a decoder residual to a
+numeric bound.  Exact selections are checked branch-by-branch; Shared selections are checked both
+at their validated all-branch envelope and their stored representative.  A primitive is checked
+only after its full normalized output is derived, so exact cancellation and relation consumption
+can remove Large terms before this boundary. -/
+partial def validateResidualExpressionNoLargeTerms
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (root : OperationalExprId) : Except OperationalError Unit := do
+  let expression ← match arena.get? root with
+    | some expression => pure expression
+    | none => throw (.invalidOperationalExprRef root)
+  match expression.node with
+  | .concrete fact => fact.rejectResidualLargeTerms
+  | .primitive _ _ =>
+      let (fact, _) ← deriveOperationalSchemaFact arena environment root
+        (OperationalExprEvaluationState.forEnvironment arena environment arena.evaluationState)
+      fact.rejectResidualLargeTerms
+  | .select _ (.exact branches) =>
+      if branches.isEmpty then throw (.invalidCount 0 0)
+      branches.forM fun branch => validateResidualExpressionNoLargeTerms arena environment branch
+  | .select selection (.shared representative summaryId) => do
+      if selection.count = 0 then throw (.invalidCount 0 0)
+      let summary ← arena.validatedSchema summaryId
+      let envelope ← validateSelectedMatrixSummary representative summary
+      let _ ← envelope.rejectResidualLargeTerms
+      validateResidualExpressionNoLargeTerms arena environment representative
+
 def evaluateOperationalExprNoiseBoundWithStats
     (arena : OperationalExprArena)
     (environment : ParamEnvironment)
     (root : OperationalExprId) :
     Except OperationalError (Int × OperationalExprEvaluationStats) := do
+  let _ ← validateResidualExpressionNoLargeTerms arena environment root
   let (maximum, state) ← evaluateOperationalExprNoiseBoundWithState arena environment root
     (OperationalExprEvaluationState.forEnvironment arena environment arena.evaluationState)
   pure (maximum, state.noiseStats)
@@ -2973,12 +3003,15 @@ partial def collectDecoderResidualBounds
     (environment : ParamEnvironment) : OperationalExprEvaluationState → OperationalFact →
     Except OperationalError (List Int × OperationalExprEvaluationState)
   | state, expression@{ payload := .matrix _, .. } => do
+      let _ ← validateResidualExpressionNoLargeTerms arena environment expression.payload
       let (bound, state) ← evaluateOperationalExprNoiseBoundWithState arena environment
         expression.payload state
       pure ([bound], state)
   | state, expression@{ payload := .directValue _, .. } => do
       let entries ← arena.reducedDirectValueFactsAt environment expression
-      let bounds ← entries.mapM fun entry => entry.fact.evaluateNoiseHardBound environment
+      let bounds ← entries.mapM fun entry => do
+        let _ ← entry.fact.rejectResidualLargeTerms
+        entry.fact.evaluateNoiseHardBound environment
       pure (bounds, state)
   | _, _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
 

@@ -331,6 +331,8 @@ private def describeOperationalError : Mxx.Certificate.OperationalError → Stri
   | .invalidOperationalExprRef id => s!"invalid operational expression reference {id}"
   | .operationalExprTypeMismatch left right =>
       s!"operational expression type mismatch between {left} and {right}"
+  | .residualContainsLargeTerm node =>
+      s!"decoder residual retains a Large term at {node}"
   | .incompatibleRelationDomains node leftDomain rightDomain =>
       s!"incompatible relation domains at {node}: {leftDomain} and {rightDomain}"
   | .unknownRelationRequirement node expression =>

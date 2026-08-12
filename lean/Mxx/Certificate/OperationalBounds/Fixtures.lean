@@ -4783,9 +4783,32 @@ private def operationalQueryMemoFixture : Bool :=
       arena.evaluationState.totalStats.memoHits == 1 &&
       arena.evaluationState.totalStats.evaluations == 3 &&
       arena.evaluationState.noiseStats.memoHits == 1 &&
-      arena.evaluationState.noiseStats.evaluations == 3)) with
+      arena.evaluationState.noiseStats.evaluations == 3 &&
+      arena.evaluationState.peakMemoEntries == 10)) with
   | .ok true => true
   | _ => false
+
+example : operationalQueryMemoFixture = true := by native_decide
+
+/-- Generic memo telemetry aggregates the three request-local memo families and environment
+changes clear their high-water/reporting state together with the arrays. -/
+private def operationalDiagnosticsAggregateStatsFixture : Bool :=
+  let arena : OperationalExprArena := {}
+  let state : OperationalExprEvaluationState := {
+    environment := some []
+    totalStats := { evaluations := 2, memoHits := 3, memoMisses := 4 }
+    noiseStats := { evaluations := 5, memoHits := 6, memoMisses := 7 }
+    schemaStats := { evaluations := 8, memoHits := 9, memoMisses := 10 }
+    peakMemoEntries := 11
+    maximumPolynomialTerms := 12 }
+  let diagnostics := operationalAnalysisDiagnostics arena state
+  let reset := OperationalExprEvaluationState.forEnvironment arena [("different", .integer 1)] state
+  diagnostics.memoEvaluations == 15 && diagnostics.memoHits == 18 &&
+    diagnostics.memoMisses == 21 && diagnostics.peakMemoEntries == 11 &&
+    diagnostics.maximumPolynomialTerms == 12 && reset.peakMemoEntries == 0 &&
+    reset.maximumPolynomialTerms == 0
+
+example : operationalDiagnosticsAggregateStatsFixture = true := by native_decide
 
 /-- The expression adapter preserves selector correlation before a pointwise primitive: equal
 selection domains contribute one binder, while independent domains remain distinct. -/
@@ -5541,6 +5564,134 @@ example : reducedExplicitTableFixture = true := by native_decide
 example : reducedPointwiseCorrelationFixture = true := by native_decide
 example : reducedMappedDirectFixture = true := by native_decide
 
+/-- Direct storage diagnostics count physical allocations separately from logical lanes.  A
+three-lane Shared matrix family has one carrier node and one fixed leaf, not three copied leaves;
+its direct reduction nevertheless records the normalized one-term result. -/
+private def directStorageDiagnosticsFixture : Bool :=
+  match (do
+    let binder := { directCarrierFixtureBinder 1750 with count := .constant 3 }
+    let fact := boundedOperationalExprFixtureFact 1751 7
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushMatrix fact
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, root) ← match direct.pushShared { binders := #[binder] }
+        (.matrix fixtureType) reference with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr (1750 : Nat))
+    let arena : OperationalExprArena := { direct }
+    let residual : IndexedOperationalFact := {
+      context := { binders := #[binder] }, payload := .directValue root, storage := .sharedTemplate }
+    let (bound, diagnostics) ← operationalNoiseBoundForFact arena residual []
+    pure (bound == 7 && diagnostics.expressionNodeCount == 2 &&
+      diagnostics.envelopeLogicalBranchCount == 3 && diagnostics.envelopeStoredBranchCount == 1 &&
+      diagnostics.maximumPolynomialTerms == 1 && diagnostics.peakMemoEntries == 0)) with
+  | Except.ok true => true
+  | _ => false
+
+example : directStorageDiagnosticsFixture = true := by native_decide
+
+/-- Diagnostics are arena inventory telemetry: an unrelated scalar allocation remains visible
+alongside the selected matrix family instead of being silently pruned as unreachable. -/
+private def arenaInventoryDiagnosticsFixture : Bool :=
+  match (do
+    let binder := { directCarrierFixtureBinder 1754 with count := .constant 3 }
+    let fact := boundedOperationalExprFixtureFact 1755 7
+    let (fixed, matrixReference) := ({} : FixedOperationalPayloadArena).pushMatrix fact
+    let (fixed, scalarReference) := fixed.pushScalar .boolean
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, _) ← match direct.pushShared { binders := #[binder] }
+        (.matrix fixtureType) matrixReference with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 1754)
+    let (direct, _) ← match direct.pushShared emptyContext (.scalar .boolean) scalarReference with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 1755)
+    let arena : OperationalExprArena := { direct }
+    let diagnostics := operationalAnalysisDiagnostics arena
+    pure (diagnostics.expressionNodeCount == 4 && diagnostics.envelopeLogicalBranchCount == 4 &&
+      diagnostics.envelopeStoredBranchCount == 2) : Except OperationalError Bool) with
+  | Except.ok true => true
+  | _ => false
+
+example : arenaInventoryDiagnosticsFixture = true := by native_decide
+
+/-- Direct reduction retains widths reached by children even when a later normalization cancels
+them.  The child has two Large terms; subtracting it from itself produces the zero residual, so
+the final fact has no terms while reporting must still retain the intermediate width two. -/
+private def directIntermediatePolynomialWidthFixture : Bool :=
+  match (do
+    let first := (operationalExprFixtureFact 1760 1).initializePrimitivePolynomial .large
+    let second := (operationalExprFixtureFact 1761 1).initializePrimitivePolynomial .large
+    let (fixed, firstReference) := ({} : FixedOperationalPayloadArena).pushMatrix first
+    let (fixed, secondReference) := fixed.pushMatrix second
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, firstRoot) ← match direct.pushShared emptyContext (.matrix fixtureType) firstReference with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 1760)
+    let (direct, secondRoot) ← match direct.pushShared emptyContext (.matrix fixtureType) secondReference with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 1761)
+    let arena : OperationalExprArena := { direct }
+    let firstFact : IndexedOperationalFact := {
+      context := emptyContext, payload := .directValue firstRoot, storage := .sharedTemplate }
+    let secondFact : IndexedOperationalFact := {
+      context := emptyContext, payload := .directValue secondRoot, storage := .sharedTemplate }
+    let add : PrimitiveOperation := {
+      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1762,
+      outputPort := 0, parameterEnvironment := [] }
+    let subtract : PrimitiveOperation := { add with kind := .add true, ownerNode := 1763 }
+    let (arena, child) ← arena.pushDirectMatrixPointwise add firstFact secondFact
+    let (arena, residual) ← arena.pushDirectMatrixPointwise subtract child child
+    let (bound, diagnostics) ← operationalNoiseBoundForFact arena residual []
+    pure (bound == 0 && diagnostics.maximumPolynomialTerms == 2)) with
+  | .ok true => true
+  | _ => false
+
+example : directIntermediatePolynomialWidthFixture = true := by native_decide
+
+/-- `explicitValues` must retain its child's reporting width while it rebases the physical lane
+key.  Both outer lanes are the cancelled zero residual from the preceding construction. -/
+private def explicitValuesIntermediatePolynomialWidthFixture : Bool :=
+  match (do
+    let first := (operationalExprFixtureFact 1770 1).initializePrimitivePolynomial .large
+    let second := (operationalExprFixtureFact 1771 1).initializePrimitivePolynomial .large
+    let (fixed, firstReference) := ({} : FixedOperationalPayloadArena).pushMatrix first
+    let (fixed, secondReference) := fixed.pushMatrix second
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, firstRoot) ← match direct.pushShared emptyContext (.matrix fixtureType) firstReference with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 1770)
+    let (direct, secondRoot) ← match direct.pushShared emptyContext (.matrix fixtureType) secondReference with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 1771)
+    let arena : OperationalExprArena := { direct }
+    let firstFact : IndexedOperationalFact := {
+      context := emptyContext, payload := .directValue firstRoot, storage := .sharedTemplate }
+    let secondFact : IndexedOperationalFact := {
+      context := emptyContext, payload := .directValue secondRoot, storage := .sharedTemplate }
+    let add : PrimitiveOperation := {
+      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1772,
+      outputPort := 0, parameterEnvironment := [] }
+    let subtract : PrimitiveOperation := { add with kind := .add true, ownerNode := 1773 }
+    let (arena, child) ← arena.pushDirectMatrixPointwise add firstFact secondFact
+    let binder := { directCarrierFixtureBinder 1774 with count := .constant 2 }
+    let childRoot := child.payload.root
+    let (direct, wrappedRoot) ← match arena.direct.pushExplicitValues [] binder #[childRoot, childRoot] with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr 1774)
+    let arena := { arena with direct }
+    let wrapped : IndexedOperationalFact := {
+      context := { binders := #[binder] }, payload := .directValue wrappedRoot, storage := .explicitTable }
+    let (arena, residual) ← arena.pushDirectMatrixPointwise subtract wrapped wrapped
+    let (_, _, directMaximumPolynomialTerms) ←
+      arena.reducedDirectValueFactsAtWithDiagnostics [] residual
+    let (bound, diagnostics) ← operationalNoiseBoundForFact arena residual []
+    pure (bound == 0 && directMaximumPolynomialTerms == 2 &&
+      diagnostics.maximumPolynomialTerms == 2)) with
+  | .ok true => true
+  | _ => false
+
+example : explicitValuesIntermediatePolynomialWidthFixture = true := by native_decide
+
 /-- Decoder-bound evaluation rejects a pure Large residual and a normalized mixed
 Large-plus-bounded residual before looking at their bounded-only summaries. -/
 private def residualLargeSingleAndMixedFixture : Bool :=
@@ -5943,7 +6094,8 @@ example : exactRelationSelectionFixtureResult = .ok true ∧
     concreteStructureLifecycleFixture = true ∧
     naryMixedSelectionFixture = true ∧
     selectionTraversalComplexityFixture = true ∧
-    operationalQueryMemoFixture = true := by
+    operationalQueryMemoFixture = true ∧
+    operationalDiagnosticsAggregateStatsFixture = true := by
   native_decide
 
 

@@ -1379,7 +1379,31 @@ structure OperationalExprEvaluationState where
   totalStats : OperationalExprEvaluationStats := {}
   noiseStats : OperationalExprEvaluationStats := {}
   schemaStats : OperationalExprEvaluationStats := {}
+  /-- Reporting-only high-water mark for occupied legacy memo entries.  Array capacity is not
+  occupancy: this is updated only after a successful memo insertion. -/
+  peakMemoEntries : Nat := 0
+  /-- Reporting-only maximum over facts actually produced by the legacy evaluation envelope.
+  Direct-carrier reduction contributes separately at its own reporting boundary. -/
+  maximumPolynomialTerms : Nat := 0
   deriving BEq
+
+private def occupiedMemoEntries {α : Type} (entries : Array (Option α)) : Nat :=
+  entries.foldl (fun count entry => if entry.isSome then count + 1 else count) 0
+
+def OperationalExprEvaluationState.memoEntryCount (state : OperationalExprEvaluationState) : Nat :=
+  occupiedMemoEntries state.totalMemo + occupiedMemoEntries state.noiseMemo +
+    occupiedMemoEntries state.schemaFactMemo + occupiedMemoEntries state.schemaMemo
+
+def OperationalExprEvaluationState.recordMemoOccupancy
+    (state : OperationalExprEvaluationState) : OperationalExprEvaluationState :=
+  { state with peakMemoEntries := max state.peakMemoEntries state.memoEntryCount }
+
+def OperationalExprEvaluationState.recordPolynomialTerms
+  (state : OperationalExprEvaluationState)
+    (fact : OperationalMatrixFact) : OperationalExprEvaluationState :=
+  { state with maximumPolynomialTerms :=
+      if fact.polynomial.length > state.maximumPolynomialTerms then fact.polynomial.length
+      else state.maximumPolynomialTerms }
 
 def selectedMatrixSummary
     (branches : Array OperationalMatrixFact) : SelectedMatrixSummary :=

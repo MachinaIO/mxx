@@ -1173,8 +1173,8 @@ def OperationalExprEvaluationState.store
     (id : OperationalExprId)
     (value : Int) : OperationalExprEvaluationState :=
   match kind with
-  | .total => { state with totalMemo := state.totalMemo.set! id (some value) }
-  | .noise => { state with noiseMemo := state.noiseMemo.set! id (some value) }
+  | .total => ({ state with totalMemo := state.totalMemo.set! id (some value) }).recordMemoOccupancy
+  | .noise => ({ state with noiseMemo := state.noiseMemo.set! id (some value) }).recordMemoOccupancy
 
 def validateOperationalEnvelope
     (representative : OperationalExprId)
@@ -1371,7 +1371,7 @@ def deriveOperationalSchemaFactWithFuel
                     state := nextState
                   pure (← evaluatePrimitiveConcrete operation facts, state)
         let schemaFactMemo := state.schemaFactMemo.set! id (some fact)
-        pure (fact, { state with schemaFactMemo })
+        pure (fact, ({ state with schemaFactMemo }).recordPolynomialTerms fact |>.recordMemoOccupancy)
 
 def deriveOperationalSchemaFact
     (arena : OperationalExprArena)
@@ -1440,8 +1440,8 @@ def OperationalExprArena.deriveOperationalSchemaFactCached
             if summary.uniformSchema.isNone || summary.conservativeFact.isNone then
               throw (.unsupportedOperationalExpr id)
             pure (arena.internValidatedSchema summary)
-      let evaluationState := { evaluationState with
-        schemaMemo := evaluationState.schemaMemo.set! id (some schemaId) }
+      let evaluationState := ({ evaluationState with
+        schemaMemo := evaluationState.schemaMemo.set! id (some schemaId) }).recordMemoOccupancy
       pure (fact, { arena with evaluationState })
 
 def concatOperationalExprIds
@@ -2957,11 +2957,12 @@ structure OperationalAnalysisDiagnostics where
 
 def operationalAnalysisDiagnostics
     (arena : OperationalExprArena)
-    (stats : OperationalExprEvaluationStats := {})
-    (relationRewriteCount : Nat := 0) : OperationalAnalysisDiagnostics := Id.run do
+    (state : OperationalExprEvaluationState := arena.evaluationState)
+    (relationRewriteCount : Nat := 0)
+    (directMaximumPolynomialTerms : Nat := 0) : OperationalAnalysisDiagnostics := Id.run do
   let mut logicalBranches := 0
   let mut storedBranches := 0
-  let mut maximumPolynomialTerms := 0
+  let mut maximumPolynomialTerms := max state.maximumPolynomialTerms directMaximumPolynomialTerms
   for expression in arena.nodes do
     match expression.node with
     | .concrete fact =>
@@ -2973,12 +2974,44 @@ def operationalAnalysisDiagnostics
         logicalBranches := logicalBranches + selection.count
         storedBranches := storedBranches + 1
     | _ => pure ()
+  /- The direct carrier has one physical payload graph.  Only leaf-bearing storage introduces a
+  logical family/physical table count; mapped, result-bound, and pointwise nodes are references
+  to those same leaves and must not be charged a second time. -/
+  for value in arena.direct.values do
+    match value.payload with
+    | .shared _ _ =>
+        let environment := state.environment.getD ([] : ParamEnvironment)
+        let count := value.context.binders.foldl (fun total binder =>
+          match binder.count.evaluate environment with
+          | some value => total * value.toNat
+          | none => total) 1
+        logicalBranches := logicalBranches + count
+        storedBranches := storedBranches + 1
+    | .explicit _ _ references =>
+        logicalBranches := logicalBranches + references.size
+        storedBranches := storedBranches + references.size
+    | .explicitValues _ _ values =>
+        logicalBranches := logicalBranches + values.size
+        storedBranches := storedBranches + values.size
+    | .mapped .. | .matrixResultBound .. | .pointwise .. => pure ()
+  for fact in arena.direct.fixed.matrices do
+    maximumPolynomialTerms := max maximumPolynomialTerms fact.polynomial.length
+  let memoEvaluations := state.totalStats.evaluations + state.noiseStats.evaluations +
+    state.schemaStats.evaluations
+  let memoHits := state.totalStats.memoHits + state.noiseStats.memoHits + state.schemaStats.memoHits
+  let memoMisses := state.totalStats.memoMisses + state.noiseStats.memoMisses +
+    state.schemaStats.memoMisses
   return {
-    expressionNodeCount := arena.nodes.size
-    memoEvaluations := stats.evaluations
-    memoHits := stats.memoHits
-    memoMisses := stats.memoMisses
-    peakMemoEntries := arena.nodes.size
+    /- This is request-arena inventory telemetry, rather than root reachability telemetry:
+    `scalarNodes`, direct payload nodes, and fixed leaves are distinct producer allocations, and
+    unrelated allocations intentionally remain visible. Indexed metadata only annotates existing
+    nodes and is deliberately excluded. -/
+    expressionNodeCount := arena.nodes.size + arena.scalarNodes.size + arena.direct.values.size +
+      arena.direct.fixed.matrices.size + arena.direct.fixed.scalars.size
+    memoEvaluations
+    memoHits
+    memoMisses
+    peakMemoEntries := state.peakMemoEntries
     envelopeLogicalBranchCount := logicalBranches
     envelopeStoredBranchCount := storedBranches
     relationRewriteCount
@@ -3168,22 +3201,23 @@ def operationalNoiseBoundForFact
     Except OperationalError (Int × OperationalAnalysisDiagnostics) := do
   let initialState := OperationalExprEvaluationState.forEnvironment
     arena environment arena.evaluationState
-  let (bounds, evaluationState, rewriteEvents) ← match residual with
+  let (bounds, evaluationState, rewriteEvents, directMaximumPolynomialTerms) ← match residual with
     | expression@{ payload := .directValue _, .. } => do
-        let (entries, rewriteEvents) ←
-          arena.reducedDirectValueFactsAtWithRelationRewriteEvents environment expression
+        let (entries, rewriteEvents, maximumPolynomialTerms) ←
+          arena.reducedDirectValueFactsAtWithDiagnostics environment expression
         let bounds ← entries.mapM fun entry => do
           let _ ← entry.fact.rejectResidualLargeTerms
           entry.fact.evaluateNoiseHardBound environment
-        pure (bounds, initialState, rewriteEvents)
+        pure (bounds, initialState, rewriteEvents, maximumPolynomialTerms)
     | _ => do
         let (bounds, evaluationState) ←
           collectDecoderResidualBounds arena environment initialState residual
-        pure (bounds, evaluationState, [])
+        pure (bounds, evaluationState, [], 0)
   let noiseBound ← match bounds with
     | head :: tail => pure (tail.foldl max head)
     | [] => throw (OperationalError.invalidCount 0 0)
-  pure (noiseBound, operationalAnalysisDiagnostics arena evaluationState.noiseStats rewriteEvents.length)
+  pure (noiseBound, operationalAnalysisDiagnostics arena evaluationState rewriteEvents.length
+    directMaximumPolynomialTerms)
 
 /-- Applies a cheap decoder threshold to an already evaluated structural bound. -/
 def decoderNoiseCheckReportFromBound

@@ -790,6 +790,8 @@ def OperationalExprEvaluationState.forEnvironment
     totalStats := {}
     noiseStats := {}
     schemaStats := {}
+    peakMemoEntries := 0
+    maximumPolynomialTerms := 0
   }
 
 /-- Transfer classes, rather than broad operation names, are the closed registry keys.  In
@@ -4629,10 +4631,14 @@ private def deduplicateDirectRelationRewriteEvents
 private structure ReducedDirectMatrixEvaluation where
   entries : List ReducedDirectMatrixFact
   rewriteEvents : List DirectRelationRewriteEventKey := []
+  /-- Maximum normalized polynomial width encountered while reducing this direct sub-DAG. -/
+  maximumPolynomialTerms : Nat := 0
 
 private structure ReducedDirectScalarEvaluation where
   entries : List ReducedDirectScalarFact
   rewriteEvents : List DirectRelationRewriteEventKey := []
+  /-- Scalar reduction can invoke matrix-to-scalar nodes, so preserve their observed width. -/
+  maximumPolynomialTerms : Nat := 0
 
 /-- The sole correlation zipper for mixed direct relation operands.  A singleton shared input is
 allowed with every lane; otherwise every physical operand must have the driver's exact key and
@@ -4732,7 +4738,7 @@ private def reducedDirectMatrixFactAt
       let value ← match arena.valueAt? id with
         | some value => pure value
         | none => throw (.invalidOperationalExprRef id)
-      match value.payload with
+      let evaluation ← match value.payload with
       | .shared (.matrix _) (.matrix reference) => do
           let fact ← match arena.fixed.matrices[reference]? with
             | some fact => pure fact
@@ -4767,7 +4773,9 @@ private def reducedDirectMatrixFactAt
                 | [entry] => match entry.key with
                     | none =>
                         let entry := { entry with key := some outerKey, ordinal := outerOrdinal }
-                        pure { entries := [entry], rewriteEvents := evaluation.rewriteEvents }
+                        let result : ReducedDirectMatrixEvaluation := {
+                          entries := [entry], rewriteEvents := evaluation.rewriteEvents }
+                        pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
                     | some _ =>
                         if entry.key == some outerKey && entry.ordinal == outerOrdinal then
                           pure evaluation
@@ -4775,20 +4783,28 @@ private def reducedDirectMatrixFactAt
                 | _ =>
                     match entries.filter fun entry =>
                       entry.key == some outerKey && entry.ordinal == outerOrdinal with
-                    | [entry] => pure { entries := [entry], rewriteEvents := evaluation.rewriteEvents }
+                    | [entry] =>
+                        let result : ReducedDirectMatrixEvaluation := {
+                          entries := [entry], rewriteEvents := evaluation.rewriteEvents }
+                        pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
                     | _ => throw (.unsupportedOperationalExpr id)
           let entries := lanes.flatMap (fun lane => lane.entries)
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (lanes.flatMap (fun lane => lane.rewriteEvents))
-          pure { entries := entries, rewriteEvents := rewriteEvents }
+          let maximumPolynomialTerms := lanes.foldl (fun maximum lane =>
+            max maximum lane.maximumPolynomialTerms) 0
+          pure { entries := entries, rewriteEvents := rewriteEvents, maximumPolynomialTerms }
       | .mapped (.matrix _) source map => do
           if !map.transportValid || map.destination != value.context then
             throw (.unsupportedOperationalExpr id)
           reducedDirectMatrixFactAt arena parameters (map :: maps) source fuel
       | .matrixResultBound (.matrix _) source totalHardBound => do
           let evaluation ← reducedDirectMatrixFactAt arena parameters maps source fuel
-          pure { entries := evaluation.entries.map fun entry =>
-            { entry with fact := { entry.fact with totalHardBound } }, rewriteEvents := evaluation.rewriteEvents }
+          let entries := evaluation.entries.map fun entry =>
+            { entry with fact := { entry.fact with totalHardBound } }
+          let result : ReducedDirectMatrixEvaluation := {
+            entries := entries, rewriteEvents := evaluation.rewriteEvents }
+          pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
       | .pointwise (.matrix matrixType) (.matrix operation) inputs => do
           let inputEvaluations ← inputs.toList.mapM fun input =>
             reducedDirectMatrixFactAt arena parameters maps input fuel
@@ -4841,9 +4857,12 @@ private def reducedDirectMatrixFactAt
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (inputEvaluations.flatMap (fun value => value.rewriteEvents) ++
               entriesAndEvents.flatMap (fun value => value.2))
-          pure { entries := entries, rewriteEvents := rewriteEvents }
+          let maximumPolynomialTerms := inputEvaluations.foldl (fun maximum evaluation =>
+            max maximum evaluation.maximumPolynomialTerms) 0
+          pure { entries := entries, rewriteEvents := rewriteEvents, maximumPolynomialTerms }
       | .pointwise (.matrix matrixType) (.relation operation) inputs => do
-          let inputEvaluations ← inputs.toList.mapM fun inputId => do
+          let inputEvaluations : List (List ReducedDirectRelationArgument ×
+              List DirectRelationRewriteEventKey × Nat) ← inputs.toList.mapM fun inputId => do
             let input ← match arena.valueAt? inputId with
               | some value => pure value
               | none => throw (.invalidOperationalExprRef inputId)
@@ -4852,7 +4871,8 @@ private def reducedDirectMatrixFactAt
                 let evaluation ← reducedDirectMatrixFactAt arena parameters maps inputId fuel
                 pure (evaluation.entries.map fun entry =>
                   ReducedDirectRelationArgument.mk entry.key entry.ordinal
-                    (DirectRelationArgument.matrix entry.fact), evaluation.rewriteEvents)
+                    (DirectRelationArgument.matrix entry.fact), evaluation.rewriteEvents,
+                  evaluation.maximumPolynomialTerms)
             | .scalar (.trapdoor _) =>
                 let evaluation ← reducedDirectScalarFactAt arena parameters maps inputId fuel
                 let entries ← evaluation.entries.mapM fun entry => do
@@ -4861,7 +4881,7 @@ private def reducedDirectMatrixFactAt
                       pure (ReducedDirectRelationArgument.mk entry.key entry.ordinal
                         (DirectRelationArgument.trapdoor fact))
                   | _ => throw (.unsupportedOperationalExpr id)
-                pure (entries, evaluation.rewriteEvents)
+                pure (entries, evaluation.rewriteEvents, evaluation.maximumPolynomialTerms)
             | .scalar _ => throw (.unsupportedOperationalExpr id)
           let inputEntries := inputEvaluations.map (·.1)
           let aligned ← alignDirectRelationArguments operation.ownerNode id inputEntries
@@ -4869,18 +4889,27 @@ private def reducedDirectMatrixFactAt
             let fact ← applyDirectRelationProducer operation matrixType arguments
             pure { key, ordinal, fact }
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
-            (inputEvaluations.flatMap (fun value => value.2))
-          pure { entries := entries, rewriteEvents := rewriteEvents }
+            (inputEvaluations.flatMap (fun value => value.2.1))
+          let maximumPolynomialTerms := inputEvaluations.foldl (fun maximum value =>
+            max maximum value.2.2) 0
+          pure { entries := entries, rewriteEvents := rewriteEvents, maximumPolynomialTerms }
       | .pointwise (.matrix matrixType) (.matrixFromScalar operation) inputs => do
           let input ← match inputs with
             | #[input] => pure input
             | _ => throw (.unsupportedOutputArity operation.ownerNode inputs.size)
           let evaluation ← reducedDirectScalarFactAt arena parameters maps input fuel
-          let entries ← evaluation.entries.mapM fun entry => do
+          let entries : List ReducedDirectMatrixFact ← evaluation.entries.mapM fun entry => do
             let fact ← applyDirectMatrixFromScalarOperation operation matrixType entry.fact
             pure { key := entry.key, ordinal := entry.ordinal, fact }
-          pure { entries, rewriteEvents := evaluation.rewriteEvents }
+          let result : ReducedDirectMatrixEvaluation := {
+            entries := entries, rewriteEvents := evaluation.rewriteEvents }
+          pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
       | _ => throw (.unsupportedOperationalExpr id)
+      let observed := evaluation.entries.foldl (fun maximum entry =>
+        max maximum entry.fact.polynomial.length) 0
+      pure { evaluation with maximumPolynomialTerms :=
+        if observed > evaluation.maximumPolynomialTerms then observed
+        else evaluation.maximumPolynomialTerms }
 
 private def reducedDirectScalarFactAt
     (arena : DirectOperationalIndexedArena)
@@ -4892,7 +4921,7 @@ private def reducedDirectScalarFactAt
       let value ← match arena.valueAt? id with
         | some value => pure value
         | none => throw (.invalidOperationalExprRef id)
-      match value.payload with
+      let evaluation ← match value.payload with
       | .shared (.scalar _) (.scalar reference) => do
           let fact ← match arena.fixed.scalars[reference]? with
             | some fact => pure fact
@@ -4927,7 +4956,9 @@ private def reducedDirectScalarFactAt
                 | [entry] => match entry.key with
                     | none =>
                         let entry := { entry with key := some outerKey, ordinal := outerOrdinal }
-                        pure { entries := [entry], rewriteEvents := evaluation.rewriteEvents }
+                        let result : ReducedDirectScalarEvaluation := {
+                          entries := [entry], rewriteEvents := evaluation.rewriteEvents }
+                        pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
                     | some _ =>
                         if entry.key == some outerKey && entry.ordinal == outerOrdinal then
                           pure evaluation
@@ -4935,12 +4966,17 @@ private def reducedDirectScalarFactAt
                 | _ =>
                     match entries.filter fun entry =>
                       entry.key == some outerKey && entry.ordinal == outerOrdinal with
-                    | [entry] => pure { entries := [entry], rewriteEvents := evaluation.rewriteEvents }
+                    | [entry] =>
+                        let result : ReducedDirectScalarEvaluation := {
+                          entries := [entry], rewriteEvents := evaluation.rewriteEvents }
+                        pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
                     | _ => throw (.unsupportedOperationalExpr id)
           let entries := lanes.flatMap (fun lane => lane.entries)
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (lanes.flatMap (fun lane => lane.rewriteEvents))
-          pure { entries := entries, rewriteEvents := rewriteEvents }
+          let maximumPolynomialTerms := lanes.foldl (fun maximum lane =>
+            max maximum lane.maximumPolynomialTerms) 0
+          pure { entries := entries, rewriteEvents := rewriteEvents, maximumPolynomialTerms }
       | .mapped (.scalar _) source map => do
           if !map.transportValid || map.destination != value.context then
             throw (.unsupportedOperationalExpr id)
@@ -4953,7 +4989,9 @@ private def reducedDirectScalarFactAt
           let entries ← evaluation.entries.mapM fun entry => do
             let fact ← applyDirectMatrixToScalarOperation operation entry.fact
             pure { key := entry.key, ordinal := entry.ordinal, fact }
-          pure { entries, rewriteEvents := evaluation.rewriteEvents }
+          let result : ReducedDirectScalarEvaluation := {
+            entries := entries, rewriteEvents := evaluation.rewriteEvents }
+          pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
       | .pointwise (.scalar _) (.scalar operation) inputs => do
           let inputEvaluations ← inputs.toList.mapM fun input =>
             reducedDirectScalarFactAt arena parameters maps input fuel
@@ -4995,8 +5033,11 @@ private def reducedDirectScalarFactAt
             pure { key, ordinal, fact }
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (inputEvaluations.flatMap (fun value => value.rewriteEvents))
-          pure { entries := entries, rewriteEvents := rewriteEvents }
+          let maximumPolynomialTerms := inputEvaluations.foldl (fun maximum evaluation =>
+            max maximum evaluation.maximumPolynomialTerms) 0
+          pure { entries := entries, rewriteEvents := rewriteEvents, maximumPolynomialTerms }
       | _ => throw (.unsupportedOperationalExpr id)
+      pure evaluation
 
 end
 
@@ -5040,6 +5081,22 @@ def OperationalExprArena.reducedDirectValueFactsAtWithRelationRewriteEvents
   let evaluation ← reducedDirectMatrixFactAt arena.direct environment [] root
     (arena.direct.values.size + 1)
   pure (evaluation.entries, deduplicateDirectRelationRewriteEvents evaluation.rewriteEvents)
+
+/-- Reporting-only structural reduction telemetry.  This exposes the maximum normalized
+polynomial width reached by the actual direct evaluation path without participating in
+acceptance. -/
+def OperationalExprArena.reducedDirectValueFactsAtWithDiagnostics
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (expression : IndexedOperationalFact) :
+    Except OperationalError (List ReducedDirectMatrixFact × List DirectRelationRewriteEventKey × Nat) := do
+  let root ← match expression.payload with
+    | .directValue root => pure root
+    | .matrix root | .scalar root => throw (.unsupportedOperationalExpr root)
+  let evaluation ← reducedDirectMatrixFactAt arena.direct environment [] root
+    (arena.direct.values.size + 1)
+  pure (evaluation.entries, deduplicateDirectRelationRewriteEvents evaluation.rewriteEvents,
+    evaluation.maximumPolynomialTerms)
 
 /-- Sequential recurrences consume a direct carrier through its fixed assignments.  This keeps
 the recurrence's numeric state independent of storage while rejecting a non-uniform carried

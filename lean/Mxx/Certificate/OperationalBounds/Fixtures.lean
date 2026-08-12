@@ -1212,26 +1212,6 @@ private def relationFixtureDerivation : ScopeDerivation := { steps := #[
     arguments := [{ node := 1, port := 0 }, { node := 2, port := 0 }] }
 ] }
 
-/-- Relation-consuming multiplication preserves the established concrete bound and recomputes an
-envelope summary from its output.  The consumed relation boundary cannot survive, and an operation
-absent from the transfer registry has no permissive fallback. -/
-example : (show Except OperationalError (Int × Bool × Bool) from do
-    let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
-      relationFixtureDerivation [] [fixtureLayout]
-    let maximum ← matrixMaximum 3 { node := 3, port := 0 } facts []
-    let relationBearing ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
-    let rewritten ← derivedMatrixFactAt 3 facts { node := 3, port := 0 }
-    let source := selectedMatrixSummary #[relationBearing]
-    let output ← match transferSelectedMatrixSummary .multiplyRelation #[source] rewritten with
-      | some output => pure output
-      | none => throw (OperationalError.unsupportedOperationalExpr 0)
-    pure (maximum,
-      source.sharedFirstRelationPublicIdentity.isSome &&
-        output.sharedFirstRelationPublicIdentity.isNone && output.relationFree,
-      (transferSelectedMatrixSummary .unregistered #[source] rewritten).isNone)) =
-    Except.ok (3, true, true) := by
-  native_decide
-
 private def wrongRelationFixtureDerivation : ScopeDerivation := { steps := #[
   { sourceNode := 0, rule := .gaussianSample, arguments := [] },
   { sourceNode := 1, rule := .gadgetMatrix, arguments := [] },
@@ -3939,40 +3919,6 @@ example : complementaryBlockBoundaryMismatchFixture = true := by native_decide
 example : singletonComplementaryBlockFixture = true := by native_decide
 example : directFamilyComplementaryBlockFixture = true := by native_decide
 
-/-- The Tall-size LUT family is checked once, remains logically 30,720 distinct relation-bearing
-lane instances, and stores only one representative after uniform-schema validation. -/
-private def tallLutEnvelopeFixtureResult :
-    Except OperationalError (Nat × Nat × Bool × Bool × Bool × Bool) := do
-    let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
-      relationFixtureDerivation [] [fixtureLayout]
-    let preimage ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
-    let binder : FamilyTemplateBinder := {
-      owner := temporaryScope, producerNode := 88, binderSlot := 0
-    }
-    let selection := DynamicSelectionIdentity.fromOrigin
-      (.local temporaryScope { node := 89, port := 0 }) 30720
-    let first := indexMatrixFact binder selection { node := 90, port := 0 } preimage
-    let second := indexMatrixFact binder selection { node := 91, port := 0 } preimage
-    let checked := selectedMatrixSummary #[first, second]
-    if first == second || checked.uniformSchema.isNone ||
-        checked.sharedFirstRelationPublicIdentity.isNone then
-      throw (OperationalError.unsupportedOperationalExpr 0)
-    let (arena, representative) := ({} : OperationalExprArena).pushConcrete first
-    let (arena, root) ← arena.pushSharedSelection
-      selection 30720 representative checked
-    match arena.get? root with
-    | some { node := .select actual (.shared representative summary), .. } =>
-        let summary ← arena.validatedSchema summary
-        let relationBearing ← arena.concreteFact representative
-        pure (arena.nodes.size, actual.count, actual.index == selection.index, !summary.relationFree,
-          matrixFactHasRelation relationBearing, first != second)
-    | _ => pure (0, 0, false, false, false, false)
-
-private def tallLutEnvelopeFixture : Bool :=
-  match tallLutEnvelopeFixtureResult with
-  | .ok (2, 30720, true, true, true, true) => true
-  | _ => false
-
 /-- Correlated subterms are combined inside each complete branch before the mutually exclusive
 maximum.  Independently maximizing the two sides would incorrectly return twenty. -/
 private def completeBranchMaximumFixture : Bool :=
@@ -4002,9 +3948,9 @@ private def summaryTransferRegistryCoverageFixture : Bool :=
   let source := selectedMatrixSummary #[representative]
   let registered := #[
     EnvelopeSummaryTransferOperation.instantiationMap,
-    .recurrenceBoundShift, .addSubtract, .multiplyOrdinary, .multiplyRelation, .tensor,
+    .recurrenceBoundShift, .addSubtract, .multiplyOrdinary, .tensor,
     .concat, .transform,
-    .scale, .bggGrouping, .preimage, .decomposition]
+    .scale, .bggGrouping]
   registered.all (fun operation =>
     (transferSelectedMatrixSummary operation #[source] representative).isSome) &&
     (transferSelectedMatrixSummary .unregistered #[source] representative).isNone
@@ -4075,137 +4021,10 @@ exhaustive, so adding a constructor requires an explicit decision here and in th
 private def primitiveTransferRegistryCoverageFixture : Bool :=
   let classes := #[
     PrimitiveTransferClass.addSubtract,
-    .multiplyOrdinary, .multiplyRelation, .tensor, .concat, .transform,
-    .scale, .bggGrouping, .preimage, .decomposition]
-  classes.size == 10 && classes.all fun transferClass =>
+    .multiplyOrdinary, .tensor, .concat, .transform, .scale, .bggGrouping]
+  classes.size == 7 && classes.all fun transferClass =>
     match compositionalTransferRegistry transferClass with
     | .supported _ | .requiresConcreteStructure => true
-
-/-- Relation-consuming Shared operands require the same domain and matching public/relation
-boundary templates. A matching pair rewrites once without visiting logical branches; changing the
-preimage domain is rejected before representative evaluation. -/
-private def sharedRelationCorrelationFixture : Bool :=
-  match (do
-    let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
-      relationFixtureDerivation [] [fixtureLayout]
-    let publicMatrix ← derivedMatrixFactAt 3 facts { node := 1, port := 0 }
-    let preimage ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
-    let binder : FamilyTemplateBinder := {
-      owner := temporaryScope, producerNode := 150, binderSlot := 0
-    }
-    let selection : OperationalValueOrigin := .local temporaryScope { node := 151, port := 0 }
-    let otherSelection : OperationalValueOrigin :=
-      .local temporaryScope { node := 152, port := 0 }
-    let otherBinder : FamilyTemplateBinder := {
-      owner := temporaryScope, producerNode := 150, binderSlot := 1
-    }
-    let differentPublicIdentity : PublicMatrixIdentity :=
-      .sampledTrapdoor (.root (.standalone 151)) { node := 0, port := 0 }
-    let mapMatrixRelation
-        (map : OperationalMatrixRelation → OperationalMatrixRelation)
-        (fact : OperationalMatrixFact) : OperationalMatrixFact :=
-      { fact with
-        relations := fact.relations.map map
-        polynomial := mapOperationalPolynomial id id id id map fact.polynomial }
-    let wrongBoundaryPreimage := mapMatrixRelation
-      (fun relation => match relation with
-        | .decomposition value => .decomposition {
-            value with publicIdentity := differentPublicIdentity }
-        | .preimage value => .preimage {
-            value with publicIdentity := differentPublicIdentity }) preimage
-    let wrongProducerPreimage := mapMatrixRelation
-      (fun relation => match relation with
-        | .decomposition value => .decomposition { value with
-            producer := .value temporaryScope { node := 999, port := 0 } }
-        | .preimage value => .preimage { value with
-            producer := .value temporaryScope { node := 999, port := 0 } }) preimage
-    let selectedPublic := indexMatrixFact binder
-      (DynamicSelectionIdentity.fromOrigin selection 2) { node := 153, port := 0 }
-      publicMatrix
-    let selectedPreimage := indexMatrixFact binder
-      (DynamicSelectionIdentity.fromOrigin selection 2) { node := 154, port := 0 }
-      preimage
-    let otherPreimage := indexMatrixFact binder
-      (DynamicSelectionIdentity.fromOrigin otherSelection 2) { node := 155, port := 0 }
-      preimage
-    let selectedWrongBoundary := indexMatrixFact binder
-      (DynamicSelectionIdentity.fromOrigin selection 2)
-      { node := 158, port := 0 } wrongBoundaryPreimage
-    let selectedWrongProducer := indexMatrixFact binder
-      (DynamicSelectionIdentity.fromOrigin selection 2)
-      { node := 159, port := 0 } wrongProducerPreimage
-    let selectedOtherBinder := indexMatrixFact otherBinder
-      (DynamicSelectionIdentity.fromOrigin selection 2)
-      { node := 160, port := 0 } preimage
-    let publicSummary := selectedMatrixSummary #[selectedPublic]
-    let preimageSummary := selectedMatrixSummary #[selectedPreimage]
-    let otherSummary := selectedMatrixSummary #[otherPreimage]
-    let wrongBoundarySummary := selectedMatrixSummary #[selectedWrongBoundary]
-    let wrongProducerSummary := selectedMatrixSummary #[selectedWrongProducer]
-    let otherBinderSummary := selectedMatrixSummary #[selectedOtherBinder]
-    let (arena, publicRepresentative) := ({} : OperationalExprArena).pushConcrete selectedPublic
-    let (arena, preimageRepresentative) := arena.pushConcrete selectedPreimage
-    let (arena, otherRepresentative) := arena.pushConcrete otherPreimage
-    let (arena, wrongBoundaryRepresentative) := arena.pushConcrete selectedWrongBoundary
-    let (arena, wrongProducerRepresentative) := arena.pushConcrete selectedWrongProducer
-    let (arena, otherBinderRepresentative) := arena.pushConcrete selectedOtherBinder
-    let (arena, selectedPublicRoot) ← arena.pushSharedSelection
-      (DynamicSelectionIdentity.fromOrigin selection 30720) 30720 publicRepresentative publicSummary
-    let (arena, selectedPreimageRoot) ← arena.pushSharedSelection
-      (DynamicSelectionIdentity.fromOrigin selection 30720) 30720 preimageRepresentative preimageSummary
-    let (arena, otherPreimageRoot) ← arena.pushSharedSelection
-      (DynamicSelectionIdentity.fromOrigin otherSelection 30720) 30720 otherRepresentative otherSummary
-    let (arena, wrongBoundaryRoot) ← arena.pushSharedSelection
-      (DynamicSelectionIdentity.fromOrigin selection 30720) 30720
-        wrongBoundaryRepresentative wrongBoundarySummary
-    let (arena, wrongProducerRoot) ← arena.pushSharedSelection
-      (DynamicSelectionIdentity.fromOrigin selection 30720) 30720
-        wrongProducerRepresentative wrongProducerSummary
-    let (arena, otherBinderRoot) ← arena.pushSharedSelection
-      (DynamicSelectionIdentity.fromOrigin selection 30720) 30720
-        otherBinderRepresentative otherBinderSummary
-    -- A stale pair whose schema claims the good relation but whose representative carries a
-    -- different relation identity must survive construction only to be rejected by the concrete
-    -- representative rewrite below.
-    let (arena, staleRepresentativeRoot) ← arena.pushSharedSelection
-      (DynamicSelectionIdentity.fromOrigin selection 30720) 30720
-        wrongBoundaryRepresentative preimageSummary
-    let (arena, output) ← multiplyOperationalExprIds 156 0 fixtureType
-      (.matrixMultiplyRelation selectedPreimage.subject) selectedPreimage.subject []
-      deriveOperationalSchemaFact arena selectedPublicRoot selectedPreimageRoot
-      (arena.nodes.size + 1)
-    let accepted := match arena.get? output with
-      | some { node := .select domain (.shared _ _), .. } =>
-          domain.count == 30720 && arena.relationRewriteCount == 1
-      | _ => false
-    let selectedPublicDomain ← match arena.get? selectedPublicRoot with
-      | some { node := .select domain _, .. } => pure domain
-      | _ => throw (OperationalError.unsupportedOperationalExpr selectedPublicRoot)
-    let otherPreimageDomain ← match arena.get? otherPreimageRoot with
-      | some { node := .select domain _, .. } => pure domain
-      | _ => throw (OperationalError.unsupportedOperationalExpr otherPreimageRoot)
-    let rejected := match multiplyOperationalExprIds 157 0 fixtureType
-        (.matrixMultiplyRelation otherPreimage.subject) otherPreimage.subject []
-        deriveOperationalSchemaFact arena selectedPublicRoot otherPreimageRoot
-        (arena.nodes.size + 1) with
-      | .error (.incompatibleRelationDomains 157 left right) =>
-          left == selectedPublicDomain.ordinal && right == otherPreimageDomain.ordinal &&
-            left != right
-      | _ => false
-    let rejectsSameDomain (node : Nat) (right : OperationalExprId) :=
-      match multiplyOperationalExprIds node 0 fixtureType
-          (.matrixMultiplyRelation selectedPreimage.subject) selectedPreimage.subject []
-          deriveOperationalSchemaFact arena selectedPublicRoot right (arena.nodes.size + 1) with
-      | .error _ => true
-      | .ok _ => false
-    let boundaryRejected := rejectsSameDomain 158 wrongBoundaryRoot
-    let producerRejected := rejectsSameDomain 159 wrongProducerRoot
-    let parameterizationRejected := rejectsSameDomain 160 otherBinderRoot
-    let representativeRejected := rejectsSameDomain 161 staleRepresentativeRoot
-    pure (accepted && rejected && boundaryRejected && producerRejected &&
-      parameterizationRejected && representativeRejected)) with
-  | .ok true => true
-  | _ => false
 
 /-- Supported independent addition composes complete child maxima without a Cartesian product.
 An ordinary multiplication requiring concrete structure remains delayed while both domains are
@@ -4396,8 +4215,8 @@ private def selectionTraversalComplexityFixture : Bool :=
   | .ok true => true
   | _ => false
 
-/-- Relation, schema, and complete-bound queries all use request-local array memo entries keyed by
-expression ID. Repeating a query changes only its hit counter. -/
+/-- Schema and complete-bound queries use request-local array memo entries keyed by expression ID.
+Repeating a query changes only its hit counter. -/
 private def operationalQueryMemoFixture : Bool :=
   match (do
     let left := boundedOperationalExprFixtureFact 500 1
@@ -4406,17 +4225,13 @@ private def operationalQueryMemoFixture : Bool :=
     let (arena, rightId) := arena.pushConcrete right
     let (arena, root) := arena.pushPrimitive 502 0 fixtureType [] (.add false)
       #[leftId, rightId]
-    let (_, arena) ← arena.relationRequirementCached root
-    let (_, arena) ← arena.relationRequirementCached root
     let (_, arena) ← arena.deriveOperationalSchemaFactCached [] root
     let (_, arena) ← arena.deriveOperationalSchemaFactCached [] root
     let (_, arena) ← arena.evaluateCompleteBoundCached .total [] root
     let (_, arena) ← arena.evaluateCompleteBoundCached .total [] root
     let (_, arena) ← arena.evaluateCompleteBoundCached .noise [] root
     let (_, arena) ← arena.evaluateCompleteBoundCached .noise [] root
-    pure (arena.evaluationState.relationStats.memoHits == 1 &&
-      arena.evaluationState.relationStats.evaluations == 3 &&
-      arena.evaluationState.schemaStats.memoHits == 1 &&
+    pure (arena.evaluationState.schemaStats.memoHits == 1 &&
       arena.evaluationState.schemaStats.evaluations == 3 &&
       arena.evaluationState.totalStats.memoHits == 1 &&
       arena.evaluationState.totalStats.evaluations == 3 &&
@@ -5204,7 +5019,6 @@ example : exactRelationSelectionFixtureResult = .ok true ∧
     oneBadEndpointIdentityRejectsFixture = true ∧
     twoWayScanExpressionIsLinearFixture = true ∧
     crossSelectionRelationMismatchFixture = true ∧
-    tallLutEnvelopeFixture = true ∧
     completeBranchMaximumFixture = true ∧
     summaryTransferRegistryCoverageFixture = true ∧
     transformMemoInvocationIsolationFixture = true ∧
@@ -5234,7 +5048,6 @@ example : exactRelationSelectionFixtureResult = .ok true ∧
     outerEnvelopeDominatesNestedRepresentativeFixture = true ∧
     independentSelectionCartesianRejectsFixture = true ∧
     primitiveTransferRegistryCoverageFixture = true ∧
-    sharedRelationCorrelationFixture = true ∧
     concreteStructureLifecycleFixture = true ∧
     naryMixedSelectionFixture = true ∧
     selectionTraversalComplexityFixture = true ∧

@@ -22,8 +22,6 @@ inductive PrimitiveOperationKind where
   | scale (scalar : IntExpr) (values : List Int)
       (loopDomains : List OperationalParameterDomain)
   | bggGrouping
-  | preimage
-  | decomposition
   deriving BEq
 
 structure PrimitiveOperation where

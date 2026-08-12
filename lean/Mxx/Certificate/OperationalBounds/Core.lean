@@ -1336,7 +1336,6 @@ structure SelectedMatrixSummary where
   conservativeFact : Option OperationalMatrixFact
   relationFree : Bool
   sharedLastPublicIdentity : Option PublicMatrixIdentity
-  sharedFirstRelationPublicIdentity : Option PublicMatrixIdentity
   selectionOrigin : Option SelectionDomainKind := none
   deriving BEq
 
@@ -1345,25 +1344,6 @@ the interner always confirms the complete schema key after fingerprint bucket se
 structure ValidatedSchemaId where
   ordinal : Nat
   deriving BEq, DecidableEq, Repr
-
-/-- Structural relation demand used by relation-consuming primitive lifting. `branchLocal` names
-the mutually-exclusive domain whose concrete lane identity is required by the relation. A Shared
-choice remains branch-local: its schema is uniform, but producer and public identities are still
-lane-specific. -/
-inductive RelationRequirement where
-  | none
-  | uniform (schema : UniformMatrixSchema)
-  | branchLocal (domain : SelectionDomainId)
-  | incompatible (left right : SelectionDomainId)
-  | unknown
-  deriving BEq
-
-def relationRequirementDiagnostic : RelationRequirement → String
-  | .none => "none"
-  | .uniform _ => "uniform"
-  | .branchLocal domain => s!"branch-local({domain.ordinal})"
-  | .incompatible left right => s!"incompatible({left.ordinal},{right.ordinal})"
-  | .unknown => "unknown"
 
 structure OperationalExprEvaluationStats where
   evaluations : Nat := 0
@@ -1377,11 +1357,9 @@ structure OperationalExprEvaluationState where
   noiseMemo : Array (Option Int) := #[]
   schemaFactMemo : Array (Option OperationalMatrixFact) := #[]
   schemaMemo : Array (Option ValidatedSchemaId) := #[]
-  relationMemo : Array (Option RelationRequirement) := #[]
   totalStats : OperationalExprEvaluationStats := {}
   noiseStats : OperationalExprEvaluationStats := {}
   schemaStats : OperationalExprEvaluationStats := {}
-  relationStats : OperationalExprEvaluationStats := {}
   deriving BEq
 
 def selectedMatrixSummary
@@ -1392,7 +1370,6 @@ def selectedMatrixSummary
       conservativeFact := none
       relationFree := false
       sharedLastPublicIdentity := none
-      sharedFirstRelationPublicIdentity := none
     }
   | some first =>
       let schema := operationalUniformSchema first
@@ -1404,18 +1381,11 @@ def selectedMatrixSummary
             | some expected, some actual => publicIdentityTemplateEqual expected actual
             | _, _ => false) then
         lastIdentity else none
-      let relationIdentity := boundaryFirstRelationPublicIdentity? first
-      let sharedRelation := if relationIdentity.isSome && branches.all
-          (fun branch => match relationIdentity, boundaryFirstRelationPublicIdentity? branch with
-            | some expected, some actual => publicIdentityTemplateEqual expected actual
-            | _, _ => false) then
-        relationIdentity else none
       {
         uniformSchema := if uniform then some schema else none
         conservativeFact := if uniform then some first else none
         relationFree
         sharedLastPublicIdentity := sharedLast
-        sharedFirstRelationPublicIdentity := sharedRelation
       }
 
 inductive EnvelopeSummaryTransferOperation where
@@ -1423,14 +1393,11 @@ inductive EnvelopeSummaryTransferOperation where
   | recurrenceBoundShift
   | addSubtract
   | multiplyOrdinary
-  | multiplyRelation
   | tensor
   | concat
   | transform
   | scale
   | bggGrouping
-  | preimage
-  | decomposition
   | unregistered
   deriving BEq, DecidableEq, Repr
 
@@ -1451,14 +1418,13 @@ def transferSelectedMatrixSummary
   if recomputed.uniformSchema.isNone || recomputed.conservativeFact.isNone then
     none
   match operation with
-  | .instantiationMap | .recurrenceBoundShift | .transform | .scale |
-      .preimage | .decomposition =>
+  | .instantiationMap | .recurrenceBoundShift | .transform | .scale =>
       if sources.size == 1 then some recomputed else none
   | .multiplyOrdinary =>
       if sources.size <= 2 && alignedOrigin then
         some recomputed
       else none
-  | .addSubtract | .multiplyRelation | .tensor =>
+  | .addSubtract | .tensor =>
       if sources.size <= 2 && alignedOrigin then some recomputed else none
   | .concat | .bggGrouping =>
       if alignedOrigin then some recomputed else none

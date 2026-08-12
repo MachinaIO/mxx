@@ -1030,8 +1030,6 @@ def evaluatePrimitiveConcrete
         | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
       return ← groupBggEncodingSignal vector publicKey plaintext
         |>.mapError (.flat operation.ownerNode)
-  | .preimage | .decomposition =>
-      throw (.unresolvedConcreteStructure operation.ownerNode operation.ownerNode)
 
 partial def foldOperationalExprConcreteFacts
     {α : Type}
@@ -1183,16 +1181,8 @@ def summarizeOperationalSelectionFacts
     -- alternative has a different magnitude or identity-bearing factor. Such selections require
     -- an operation-specific exact rule rather than the relation-free representative join.
     throw (.unsupportedOperationalExpr 0)
-  let checkedSummary := selectedMatrixSummary facts
   if facts.any matrixFactHasRelation then
-    -- A relation-bearing family may be represented once only when the complete target and public
-    -- boundary templates have already been checked for every logical alternative.  The relation
-    -- must then be consumed by the immediate concrete parent operation.
-    if checkedSummary.uniformSchema.isNone ||
-        checkedSummary.sharedFirstRelationPublicIdentity.isNone then
-      throw (.unsupportedOperationalExpr 0)
-    else
-      pure first
+    throw (.unsupportedOperationalExpr 0)
   else
     let noiseSummaries ← facts.mapM fun fact =>
       fact.noiseHardBound.mapError fun _ => .invalidMatrixParameters fact.subject.node
@@ -1286,7 +1276,7 @@ def deriveOperationalSchemaFactWithFuel
                 let (fact, nextState) ← deriveOperationalSchemaFactWithFuel
                   arena environment branch state fuel
                 if matrixFactHasRelation fact then
-                  throw (.unknownRelationRequirement fact.subject.node branch)
+                  throw (.unsupportedOperationalExpr branch)
                 facts := facts.push fact
                 state := nextState
               pure (← summarizeOperationalSelectionFacts environment facts, state)
@@ -2405,31 +2395,7 @@ def evaluatePreparedScope
                   let target ← lookupFact index facts targetWire
                   match target with
                   | { payload := .matrix root, .. } =>
-                      let matrixType ← match node.outputTypes with
-                        | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
-                        | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
-                      let operation : PrimitiveOperation := {
-                        kind := .preimage, outputType := matrixType, ownerScope := some scopeKey
-                        ownerNode := index, outputPort := 0, parameterEnvironment := environment }
-                      let concreteTransfer (arguments : Array OperationalMatrixFact) := do
-                        let branch ← match arguments[0]? with
-                          | some value => pure value
-                          | none => throw (.unsupportedOutputArity index arguments.size)
-                        if arguments.size != 1 then
-                          throw (.unsupportedOutputArity index arguments.size)
-                        let (branchArena, branchFact) ← facts.arena.liftConcreteMatrixFact branch
-                        let branchFacts ← replaceOperationalFact index { facts with arena := branchArena }
-                          targetWire branchFact
-                        let output ← genericNodeMatrixFactConcrete scopeKey index node step.rule 0
-                          (.preimage matrixType) branchFacts environment loopDomains layouts
-                        pure (namespaceFreshMatrixFact scopeKey { node := index, port := 0 } output)
-                      let input ← facts.arena.indexedExpr root
-                      let (arena, output) ← mapIndexedOperationalFact facts.arena input fun arena root =>
-                        liftPrimitiveOperation operation .preimage concreteTransfer
-                          deriveOperationalSchemaFact arena #[root] (arena.nodes.size + 1)
-                      let arena ← arena.rememberIndexedExpr output
-                      facts := { facts with arena }
-                      pure [output]
+                      throw (.unsupportedOperationalExpr root)
                   | { payload := .directValue _, .. } =>
                       let matrixType ← match node.outputTypes with
                         | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
@@ -2458,31 +2424,7 @@ def evaluatePreparedScope
                   let input ← lookupFact index facts inputWire
                   match input with
                   | { payload := .matrix root, .. } =>
-                      let matrixType ← match node.outputTypes with
-                        | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
-                        | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
-                      let operation : PrimitiveOperation := {
-                        kind := .decomposition, outputType := matrixType, ownerScope := some scopeKey
-                        ownerNode := index, outputPort := 0, parameterEnvironment := environment }
-                      let concreteTransfer (arguments : Array OperationalMatrixFact) := do
-                        let branch ← match arguments[0]? with
-                          | some value => pure value
-                          | none => throw (.unsupportedOutputArity index arguments.size)
-                        if arguments.size != 1 then
-                          throw (.unsupportedOutputArity index arguments.size)
-                        let (branchArena, branchFact) ← facts.arena.liftConcreteMatrixFact branch
-                        let branchFacts ← replaceOperationalFact index { facts with arena := branchArena }
-                          inputWire branchFact
-                        let output ← genericNodeMatrixFactConcrete scopeKey index node step.rule 0
-                          (.preimage matrixType) branchFacts environment loopDomains layouts
-                        pure (namespaceFreshMatrixFact scopeKey { node := index, port := 0 } output)
-                      let input ← facts.arena.indexedExpr root
-                      let (arena, output) ← mapIndexedOperationalFact facts.arena input fun arena root =>
-                        liftPrimitiveOperation operation .decomposition concreteTransfer
-                          deriveOperationalSchemaFact arena #[root] (arena.nodes.size + 1)
-                      let arena ← arena.rememberIndexedExpr output
-                      facts := { facts with arena }
-                      pure [output]
+                      throw (.unsupportedOperationalExpr root)
                   | { payload := .directValue _, .. } =>
                       let matrixType ← match node.outputTypes with
                         | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
@@ -2883,6 +2825,8 @@ structure OperationalAnalysisDiagnostics where
   peakMemoEntries : Nat := 0
   envelopeLogicalBranchCount : Nat := 0
   envelopeStoredBranchCount : Nat := 0
+  /-- Direct indexed rewrite instrumentation is connected in Stage 11.  Until then this
+  conservative telemetry value is zero and is never used for acceptance. -/
   relationRewriteCount : Nat := 0
   choiceJoinCount : Nat := 0
   domainComparisonCount : Nat := 0
@@ -2919,7 +2863,7 @@ def operationalAnalysisDiagnostics
     peakMemoEntries := arena.nodes.size
     envelopeLogicalBranchCount := logicalBranches
     envelopeStoredBranchCount := storedBranches
-    relationRewriteCount := arena.relationRewriteCount
+    relationRewriteCount := 0
     choiceJoinCount := arena.choiceJoinCount
     domainComparisonCount := arena.domainComparisonCount
     exactBranchVisitCount := arena.exactBranchVisitCount

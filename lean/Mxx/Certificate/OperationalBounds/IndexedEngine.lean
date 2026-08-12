@@ -4259,29 +4259,30 @@ private def transportDirectCorrelation
     match key with
     | none => pure ()
     | some source => do
-        let translated ← match reindex map source with
-          | some translated => pure translated
-          | none => throw (.unsupportedOperationalExpr id)
-        match translated with
-        | .constant lane =>
-            if ordinal != lane then return none
-            key := none
-            ordinal := 0
-        | .offset (.constant lane) amount =>
-            let lane := Int.ofNat lane + amount
-            if lane < 0 || ordinal != lane.toNat then return none
-            key := none
-            ordinal := 0
-        | .variable destination => key := some (.variable destination)
-        | .offset (.variable destination) amount =>
-            let destinationOrdinal := Int.ofNat ordinal - amount
-            let count ← match destination.count.evaluate parameters with
-              | some count => pure count
-              | none => throw .nonClosedExpression
-            if destinationOrdinal < 0 || destinationOrdinal >= count then return none
-            key := some (.variable destination)
-            ordinal := destinationOrdinal.toNat
-        | .offset _ _ | .gather _ _ => throw (.unsupportedOperationalExpr id)
+        if source.freeVariables.any map.source.binders.contains then
+          let translated ← match reindex map source with
+            | some translated => pure translated
+            | none => throw (.unsupportedOperationalExpr id)
+          match translated with
+          | .constant lane =>
+              if ordinal != lane then return none
+              key := none
+              ordinal := 0
+          | .offset (.constant lane) amount =>
+              let lane := Int.ofNat lane + amount
+              if lane < 0 || ordinal != lane.toNat then return none
+              key := none
+              ordinal := 0
+          | .variable destination => key := some (.variable destination)
+          | .offset (.variable destination) amount =>
+              let destinationOrdinal := Int.ofNat ordinal - amount
+              let count ← match destination.count.evaluate parameters with
+                | some count => pure count
+                | none => throw .nonClosedExpression
+              if destinationOrdinal < 0 || destinationOrdinal >= count then return none
+              key := some (.variable destination)
+              ordinal := destinationOrdinal.toNat
+          | .offset _ _ | .gather _ _ => throw (.unsupportedOperationalExpr id)
   pure (some (key, ordinal))
 
 mutual
@@ -4346,32 +4347,35 @@ private def reducedDirectMatrixFactAt
             reducedDirectMatrixFactAt arena parameters maps input fuel
           let rec zipEntries : List (List ReducedDirectMatrixFact) →
               Except OperationalError (List (Array OperationalMatrixFact × Option DirectCorrelationKey × Nat))
-            | [] => pure []
-            | first :: remaining => do
-                let first ← match first with
-                  | [] => throw (.invalidCount operation.ownerNode 0)
-                  | [entry] => pure [ (#[entry.fact], entry.key, entry.ordinal) ]
-                  | entries => pure <| entries.map fun entry => (#[entry.fact], entry.key, entry.ordinal)
-                remaining.foldlM (fun aligned next => do
-                  let next ← match next with
-                    | [] => throw (.invalidCount operation.ownerNode 0)
-                    | [entry] => match entry.key with
-                      | none => pure <| aligned.map fun (facts, key, ordinal) =>
-                          (facts.push entry.fact, key, ordinal)
-                      | some _ =>
-                          if aligned.length != 1 then throw (.unsupportedOperationalExpr id)
-                          else aligned.mapM fun (facts, key, ordinal) =>
-                            if key == entry.key && ordinal == entry.ordinal then
-                              pure (facts.push entry.fact, key, ordinal)
-                            else throw (.unsupportedOperationalExpr id)
-                    | entries =>
-                        if aligned.length != entries.length then
-                          throw (.unsupportedOperationalExpr id)
-                        else aligned.zipWithM (fun (facts, key, ordinal) entry =>
-                          if key == entry.key && ordinal == entry.ordinal then
-                            pure (facts.push entry.fact, key, ordinal)
-                          else throw (.unsupportedOperationalExpr id)) entries
-                  pure next) first
+            | [] => throw (.invalidCount operation.ownerNode 0)
+            | inputs => do
+                if inputs.any List.isEmpty then throw (.invalidCount operation.ownerNode 0)
+                let driver? := inputs.find? fun entries => entries.length > 1
+                match driver? with
+                | some driver => driver.mapM fun driverEntry => do
+                    let arguments ← inputs.mapM fun entries => match entries with
+                      | [entry] =>
+                          if entry.key.isNone ||
+                              (entry.key == driverEntry.key && entry.ordinal == driverEntry.ordinal) then
+                            pure entry.fact
+                          else throw (.unsupportedOperationalExpr id)
+                      | _ => match entries.find? fun entry =>
+                          entry.key == driverEntry.key && entry.ordinal == driverEntry.ordinal with
+                        | some entry => pure entry.fact
+                        | none => throw (.unsupportedOperationalExpr id)
+                    pure (arguments.toArray, driverEntry.key, driverEntry.ordinal)
+                | none => do
+                    let entries ← inputs.mapM fun entries => match entries with
+                      | [entry] => pure entry
+                      | _ => throw (.unsupportedOperationalExpr id)
+                    let driver? := entries.find? fun entry => entry.key.isSome
+                    match driver? with
+                    | some driver =>
+                        if entries.all fun entry => entry.key.isNone ||
+                            (entry.key == driver.key && entry.ordinal == driver.ordinal) then
+                          pure [(entries.map (·.fact) |>.toArray, driver.key, driver.ordinal)]
+                        else throw (.unsupportedOperationalExpr id)
+                    | none => pure [(entries.map (·.fact) |>.toArray, none, 0)]
           let aligned ← zipEntries inputEntries
           aligned.mapM fun (arguments, key, ordinal) => do
             let fact ← applyDirectMatrixPointwiseOperation operation matrixType arguments
@@ -4451,30 +4455,35 @@ private def reducedDirectScalarFactAt
             reducedDirectScalarFactAt arena parameters maps input fuel
           let rec zipEntries : List (List ReducedDirectScalarFact) →
               Except OperationalError (List (Array OperationalScalarFact × Option DirectCorrelationKey × Nat))
-            | [] => pure []
-            | first :: remaining => do
-                let first ← match first with
-                  | [] => throw (.unsupportedOperationalExpr id)
-                  | entries => pure <| entries.map fun entry => (#[entry.fact], entry.key, entry.ordinal)
-                remaining.foldlM (fun aligned next => do
-                  let next ← match next with
-                    | [] => throw (.unsupportedOperationalExpr id)
-                    | [entry] => match entry.key with
-                      | none => pure <| aligned.map fun (facts, key, ordinal) =>
-                          (facts.push entry.fact, key, ordinal)
-                      | some _ =>
-                          if aligned.length != 1 then throw (.unsupportedOperationalExpr id)
-                          else aligned.mapM fun (facts, key, ordinal) =>
-                            if key == entry.key && ordinal == entry.ordinal then
-                              pure (facts.push entry.fact, key, ordinal)
-                            else throw (.unsupportedOperationalExpr id)
-                    | entries =>
-                        if aligned.length != entries.length then throw (.unsupportedOperationalExpr id)
-                        else aligned.zipWithM (fun (facts, key, ordinal) entry =>
-                          if key == entry.key && ordinal == entry.ordinal then
-                            pure (facts.push entry.fact, key, ordinal)
-                          else throw (.unsupportedOperationalExpr id)) entries
-                  pure next) first
+            | [] => throw (.unsupportedOperationalExpr id)
+            | inputs => do
+                if inputs.any List.isEmpty then throw (.unsupportedOperationalExpr id)
+                let driver? := inputs.find? fun entries => entries.length > 1
+                match driver? with
+                | some driver => driver.mapM fun driverEntry => do
+                    let arguments ← inputs.mapM fun entries => match entries with
+                      | [entry] =>
+                          if entry.key.isNone ||
+                              (entry.key == driverEntry.key && entry.ordinal == driverEntry.ordinal) then
+                            pure entry.fact
+                          else throw (.unsupportedOperationalExpr id)
+                      | _ => match entries.find? fun entry =>
+                          entry.key == driverEntry.key && entry.ordinal == driverEntry.ordinal with
+                        | some entry => pure entry.fact
+                        | none => throw (.unsupportedOperationalExpr id)
+                    pure (arguments.toArray, driverEntry.key, driverEntry.ordinal)
+                | none => do
+                    let entries ← inputs.mapM fun entries => match entries with
+                      | [entry] => pure entry
+                      | _ => throw (.unsupportedOperationalExpr id)
+                    let driver? := entries.find? fun entry => entry.key.isSome
+                    match driver? with
+                    | some driver =>
+                        if entries.all fun entry => entry.key.isNone ||
+                            (entry.key == driver.key && entry.ordinal == driver.ordinal) then
+                          pure [(entries.map (·.fact) |>.toArray, driver.key, driver.ordinal)]
+                        else throw (.unsupportedOperationalExpr id)
+                    | none => pure [(entries.map (·.fact) |>.toArray, none, 0)]
           let aligned ← zipEntries inputEntries
           aligned.mapM fun (arguments, key, ordinal) => do
             let fact ← applyDirectScalarPointwiseOperation kind arguments

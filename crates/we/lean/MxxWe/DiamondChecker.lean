@@ -298,8 +298,6 @@ private def describeOperationalError : Mxx.Certificate.OperationalError → Stri
   | .missingChildOutput node port => s!"missing child output {node}:{port}"
   | .loopInputModeMismatch node argument =>
       s!"loop input mode mismatch at {node}, argument {argument}"
-  | .selectedFamilyOperationUnsupported node =>
-      s!"unsupported selected-family operation at {node}"
   | .relationBearingCarriedValue scope node slot =>
       s!"relation-bearing sequential carry in {repr scope} at {node}, slot {slot}"
   | .sequentialSchemaMismatch scope node slot initial output =>
@@ -318,6 +316,8 @@ private def describeOperationalError : Mxx.Certificate.OperationalError → Stri
       s!"invalid operational decoder target {targetId}"
   | .unknownOperationalDecoderTarget targetId =>
       s!"unknown operational decoder target {targetId}"
+  | .emptyOperationalDecoderTargetRegistry =>
+      "the operational decoder target registry is empty"
   | .duplicateOperationalDecoderTarget targetId =>
       s!"duplicate operational decoder target {targetId}"
   | .missingProtocolContract name => s!"missing protocol input contract for {name}"

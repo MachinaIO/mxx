@@ -4077,6 +4077,19 @@ private def reducedPointwiseCorrelationFixture : Bool :=
       outputPort := 0, parameterEnvironment := [] }
     let (arena, output) ← arena.pushDirectMatrixPointwise operation left right
     let reduced ← arena.reducedDirectValueFactsAt [] output
+    let (fixed, sharedReference) := arena.direct.fixed.pushMatrix
+      (boundedOperationalExprFixtureFact 1401 7)
+    let sharedDirect := { arena.direct with fixed }
+    let (sharedDirect, sharedRoot) ← match sharedDirect.pushShared emptyContext (.matrix fixtureType) sharedReference with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr sharedDirect.values.size)
+    let arena := { arena with direct := sharedDirect }
+    let shared : IndexedOperationalFact := {
+      context := emptyContext, payload := .directValue sharedRoot, storage := .sharedTemplate }
+    let (arena, sharedFirst) ← arena.pushDirectMatrixPointwise operation shared left
+    let (arena, sharedLast) ← arena.pushDirectMatrixPointwise operation left shared
+    let sharedFirstReduced ← arena.reducedDirectValueFactsAt [] sharedFirst
+    let sharedLastReduced ← arena.reducedDirectValueFactsAt [] sharedLast
     let independentBinder := { directCarrierFixtureBinder 1500 with count := .constant 3 }
     let mut independentDirect := arena.direct
     let mut independentReferences : Array FixedOperationalPayloadRef := #[]
@@ -4097,12 +4110,23 @@ private def reducedPointwiseCorrelationFixture : Bool :=
     let (independentArena, rejected) ←
       independentArena.pushDirectMatrixPointwise operation left independent
     let rejectedResult := independentArena.reducedDirectValueFactsAt [] rejected
-    pure (reduced.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
+    let reducedOk := reduced.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
         (some (IndexExpr.variable binder), 0), (some (IndexExpr.variable binder), 1),
-        (some (IndexExpr.variable binder), 2)] &&
-      (match rejectedResult with
+        (some (IndexExpr.variable binder), 2)]
+    let sharedFirstOk := sharedFirstReduced.map (fun (entry : ReducedDirectMatrixFact) =>
+        (entry.key, entry.ordinal, entry.fact.evaluateNoiseHardBound [])) == [
+        (some (IndexExpr.variable binder), 0, Except.ok 8),
+        (some (IndexExpr.variable binder), 1, Except.ok 9),
+        (some (IndexExpr.variable binder), 2, Except.ok 10)]
+    let sharedLastOk := sharedLastReduced.map (fun (entry : ReducedDirectMatrixFact) =>
+        (entry.key, entry.ordinal, entry.fact.evaluateNoiseHardBound [])) == [
+        (some (IndexExpr.variable binder), 0, Except.ok 8),
+        (some (IndexExpr.variable binder), 1, Except.ok 9),
+        (some (IndexExpr.variable binder), 2, Except.ok 10)]
+    let rejectedOk := match rejectedResult with
       | .error (.unsupportedOperationalExpr _) => independentArena.nodes.isEmpty
-      | _ => false))) with
+      | _ => false
+    pure (reducedOk && sharedFirstOk && sharedLastOk && rejectedOk)) with
   | .ok value => value
   | .error _ => false
 
@@ -4151,22 +4175,6 @@ example : reducedSharedLogicalCountsFixture = true := by native_decide
 example : reducedExplicitTableFixture = true := by native_decide
 example : reducedPointwiseCorrelationFixture = true := by native_decide
 example : reducedMappedDirectFixture = true := by native_decide
-
-#eval directFamilySelectFixture
-#eval symbolicFamilySelectFixture
-#eval (do
-  let scopeKey : ScopeTemplateKey := .root (.standalone 801)
-  let (arena, selector) ← contractFact {} scopeKey { node := 0, port := 0 } ⟨"selector"⟩
-    .integer (.integerRange (.constant 0) (.constant 1)) []
-  let facts ← evaluateScopeOperationalWithKey scopeKey directFamilySelectScope directFamilySelectDerivation
-    [] [] [selector] arena
-  let left ← match facts.arena.direct.values[56]? with
-    | some value => pure { context := value.context, payload := .directValue 56, storage := value.storage }
-    | none => throw (OperationalError.unsupportedOperationalExpr 56)
-  let right ← match facts.arena.direct.values[58]? with
-    | some value => pure { context := value.context, payload := .directValue 58, storage := value.storage }
-    | none => throw (OperationalError.unsupportedOperationalExpr 58)
-  pure (facts.arena.reducedDirectValueFactsAt [] left, facts.arena.reducedDirectValueFactsAt [] right))
 
 /-! Reuse one pre-existing native fixture gate for the computationally heavy operational
 fixtures.  This keeps the trusted-evaluation surface unchanged while checking the production

@@ -539,21 +539,12 @@ def OperationalExprArena.promoteConcreteScalarFact
   pure ({ arena with direct }, {
     context := emptyContext, payload := .directValue value, storage := .sharedTemplate })
 
-/-- Normalize one relation operand to the direct carrier.  Existing direct values retain their
-context; only selection-free concrete legacy leaves are promoted. -/
+/-- Production relation operands are already direct values. -/
 def OperationalExprArena.promoteDirectRelationOperand
     (arena : OperationalExprArena)
     (fact : OperationalFact) : Except OperationalError (OperationalExprArena × OperationalFact) :=
   match fact with
   | direct@{ payload := .directValue _, .. } => pure (arena, direct)
-  | { context := { binders := #[] }, payload := .matrix root, .. } =>
-      match arena.get? root with
-      | some { node := .concrete value, .. } => arena.promoteConcreteMatrixFact value
-      | _ => throw (.unsupportedOperationalExpr root)
-  | { context := { binders := #[] }, payload := .scalar root, .. } =>
-      match arena.scalarNodes[root]? with
-      | some (.concrete value) => arena.promoteConcreteScalarFact value
-      | _ => throw (.unsupportedOperationalExpr root)
   | { payload := .matrix root, .. } | { payload := .scalar root, .. } =>
       throw (.unsupportedOperationalExpr root)
 
@@ -1933,39 +1924,6 @@ def lookupFact
   | some fact => pure fact
   | none => throw (.missingOperand node wire)
 
-def requireBooleanFact
-    (node : Nat)
-    (facts : OperationalScopeFacts)
-    (wire : WireRef) : Except OperationalError Unit := do
-  match ← lookupFact node facts wire with
-  | expression@{ payload := .scalar _, .. } =>
-      match ← facts.arena.concreteIndexedScalar expression with
-      | .boolean => pure ()
-      | _ => throw (.operandNotBoolean node wire)
-  | _ => throw (.operandNotBoolean node wire)
-
-def requireRealFact
-    (node : Nat)
-    (facts : OperationalScopeFacts)
-    (wire : WireRef) : Except OperationalError Unit := do
-  match ← lookupFact node facts wire with
-  | expression@{ payload := .scalar _, .. } =>
-      match ← facts.arena.concreteIndexedScalar expression with
-      | .real => pure ()
-      | _ => throw (.operandNotReal node wire)
-  | _ => throw (.operandNotReal node wire)
-
-def trapdoorFactAt
-    (node : Nat)
-    (facts : OperationalScopeFacts)
-    (wire : WireRef) : Except OperationalError OperationalTrapdoorFact := do
-  match ← lookupFact node facts wire with
-  | expression@{ payload := .scalar _, .. } =>
-      match ← facts.arena.concreteIndexedScalar expression with
-      | .trapdoor fact => pure fact
-      | _ => throw (.missingPublicIdentity node wire)
-  | _ => throw (.missingPublicIdentity node wire)
-
 def integerFact
     (node port : Nat)
     (lower upper : Int) : Except OperationalError OperationalScalarFact := do
@@ -2379,11 +2337,6 @@ def valueOriginAt
     (facts : OperationalScopeFacts)
     (wire : WireRef) : Except OperationalError OperationalValueOrigin := do
   match ← lookupFact node facts wire with
-  | expression@{ payload := .scalar _, .. } =>
-      match ← facts.arena.concreteIndexedScalar expression with
-      | .integer fact => pure fact.origin
-      | .bytes fact => pure fact.origin
-      | _ => pure (.local scope wire)
   | { payload := .directValue root, .. } =>
       /- Direct inputs may carry the enclosing parallel coordinate, but a hash query still needs
       the exact semantic source of its key.  Follow only context transport maps to a singleton
@@ -2417,11 +2370,7 @@ def valueOriginAt
                 directOriginAt source fuel
             | _ => throw (.unsupportedOperationalExpr directRoot)
       pure (← directOriginAt root (facts.arena.direct.values.size + 1))
-  | { payload := .matrix root, .. } =>
-      match facts.arena.concreteFact root with
-      | .ok { origin := .value originScope originWire, .. } => pure (.local originScope originWire)
-      | .ok { origin := .protocolInput input, .. } => pure (.protocolInput input)
-      | _ => pure (.local scope wire)
+  | _ => throw (.unsupportedOperationalExpr facts.arena.direct.values.size)
 
 def operationalPolynomialNoiseSummary
     (polynomial : OperationalPolynomial) :
@@ -4469,19 +4418,44 @@ def OperationalExprArena.directValueScalarFactAt
   if !expression.context.binders.isEmpty then throw (.unsupportedOperationalExpr root)
   arena.direct.scalarFactAt environment [] root (arena.direct.values.size + 1)
 
+/-- Production scalar boundaries admit only fully assigned direct values. -/
+def directScalarFactAt
+    (node : Nat)
+    (facts : OperationalScopeFacts)
+    (wire : WireRef) : Except OperationalError OperationalScalarFact := do
+  let expression ← lookupFact node facts wire
+  facts.arena.directValueScalarFactAt [] expression
+
+def requireBooleanFact
+    (node : Nat)
+    (facts : OperationalScopeFacts)
+    (wire : WireRef) : Except OperationalError Unit := do
+  match ← directScalarFactAt node facts wire with
+  | .boolean => pure ()
+  | _ => throw (.operandNotBoolean node wire)
+
+def requireRealFact
+    (node : Nat)
+    (facts : OperationalScopeFacts)
+    (wire : WireRef) : Except OperationalError Unit := do
+  match ← directScalarFactAt node facts wire with
+  | .real => pure ()
+  | _ => throw (.operandNotReal node wire)
+
+def trapdoorFactAt
+    (node : Nat)
+    (facts : OperationalScopeFacts)
+    (wire : WireRef) : Except OperationalError OperationalTrapdoorFact := do
+  match ← directScalarFactAt node facts wire with
+  | .trapdoor fact => pure fact
+  | _ => throw (.missingPublicIdentity node wire)
+
 def integerFactAt
     (node : Nat)
     (facts : OperationalScopeFacts)
     (wire : WireRef) : Except OperationalError OperationalIntegerFact := do
-  match ← lookupFact node facts wire with
-  | expression@{ payload := .scalar _, .. } =>
-      match ← facts.arena.concreteIndexedScalar expression with
-      | OperationalScalarFact.integer fact => pure fact
-      | _ => throw (.operandNotInteger node wire)
-  | expression@{ payload := .directValue _, .. } =>
-      match ← facts.arena.directValueScalarFactAt [] expression with
-      | OperationalScalarFact.integer fact => pure fact
-      | _ => throw (.operandNotInteger node wire)
+  match ← directScalarFactAt node facts wire with
+  | OperationalScalarFact.integer fact => pure fact
   | _ => throw (.operandNotInteger node wire)
 
 /-- Read the complete interval of an ordered direct integer family without choosing one lane.

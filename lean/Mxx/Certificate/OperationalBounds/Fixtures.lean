@@ -3987,18 +3987,34 @@ private def oneBadEndpointIdentityRejectsFixture : Bool :=
     let different : PublicMatrixIdentity :=
       .sampledTrapdoor (.root (.standalone 8)) { node := 0, port := 0 }
     let mismatching := endpointIdentityFixtureFact 72 different
-    let (goodArena, goodFirst) := ({} : OperationalExprArena).pushConcrete matchingFirst
-    let (goodArena, goodSecond) := goodArena.pushConcrete matchingSecond
-    let selection := DynamicSelectionIdentity.fromOrigin
-      (.local temporaryScope { node := 73, port := 0 }) 2
-    let (goodArena, goodRoot) ←
-      goodArena.pushSelect selection (.exact #[goodFirst, goodSecond])
-    let goodExpression ← goodArena.indexedExpr goodRoot
+    let binder := { directCarrierFixtureBinder 73 with count := .constant 2 }
+    let (fixed, goodFirst) := ({} : FixedOperationalPayloadArena).pushMatrix matchingFirst
+    let (fixed, goodSecond) := fixed.pushMatrix matchingSecond
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, goodRoot) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) #[goodFirst, goodSecond] with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr direct.values.size)
+    let goodArena : OperationalExprArena := { direct }
+    let goodExpression : OperationalFact := {
+      context := { binders := #[binder] }
+      payload := .directValue goodRoot
+      storage := .explicitTable
+    }
     requireOperationalBoundaryPublicIdentity goodArena [] 74 expected goodExpression
-    let (badArena, badFirst) := ({} : OperationalExprArena).pushConcrete matchingFirst
-    let (badArena, badSecond) := badArena.pushConcrete mismatching
-    let (badArena, badRoot) ← badArena.pushSelect selection (.exact #[badFirst, badSecond])
-    let badExpression ← badArena.indexedExpr badRoot
+    let (fixed, badFirst) := ({} : FixedOperationalPayloadArena).pushMatrix matchingFirst
+    let (fixed, badSecond) := fixed.pushMatrix mismatching
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, badRoot) ← match direct.pushExplicit [] { binders := #[binder] } binder
+        (.matrix fixtureType) #[badFirst, badSecond] with
+      | some value => pure value
+      | none => throw (OperationalError.unsupportedOperationalExpr direct.values.size)
+    let badArena : OperationalExprArena := { direct }
+    let badExpression : OperationalFact := {
+      context := { binders := #[binder] }
+      payload := .directValue badRoot
+      storage := .explicitTable
+    }
     let rejected := match requireOperationalBoundaryPublicIdentity badArena [] 74 expected
         badExpression with
       | .error (.publicIdentityMismatch 74) => true

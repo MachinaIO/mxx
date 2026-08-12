@@ -20,8 +20,6 @@ def genericNodeMatrixFactConcrete
   access below uses the later schema-derived `matrixFactAt` instead. -/
   let fixedMatrixFactAt (wire : WireRef) : Except OperationalError OperationalMatrixFact := do
     match ← lookupFact nodeIndex facts wire with
-    | { context := { binders := #[] }, payload := .matrix root, .. } =>
-        facts.arena.concreteFact root
     | { context := { binders := #[] }, payload := .directValue root, .. } =>
         facts.arena.direct.matrixFactAt environment [] root (facts.arena.direct.values.size + 1)
     | _ => throw (.operandNotMatrix nodeIndex wire)
@@ -689,6 +687,10 @@ def genericNodeFact
           storage := packedValue.storage
         })
     | _, _ => throw (.loopInputModeMismatch nodeIndex 0)
+  /- All non-source scalar operations are direct-carrier operations.  A legacy scalar expression
+  here would otherwise re-enter the retired scalar selection DAG below. -/
+  if scalarOutput && !arguments.isEmpty then
+    throw (.unsupportedOperationalExpr facts.arena.scalarNodes.size)
   if !scalarOutput && !indexedPackOutput then
     let output ← genericNodeMatrixFactConcrete scopeKey nodeIndex node rule outputPort outputType facts
       environment loopDomains layouts
@@ -1427,9 +1429,6 @@ def matrixFactAt
     (wire : WireRef)
     (environment : ParamEnvironment := []) : Except OperationalError OperationalMatrixFact := do
   match ← lookupFact node facts wire with
-  | expression@{ context := { binders := #[] }, payload := .matrix _, .. } =>
-      return (← deriveOperationalSchemaFact facts.arena environment expression.payload
-        (OperationalExprEvaluationState.empty facts.arena)).1
   | expression@{ payload := .directValue _, .. } =>
       return ← facts.arena.directValueRepresentativeFactAt environment expression
   | _ => throw (.operandNotMatrix node wire)
@@ -1648,20 +1647,13 @@ def matrixMaximum
     (facts : OperationalScopeFacts)
     (environment : ParamEnvironment) : Except OperationalError Int := do
   match ← lookupFact node facts wire with
-  | expression@{ payload := .matrix _, .. } => do
-      let (maximum, _) ← evaluateCompleteBound facts.arena environment expression.payload
-        (OperationalExprEvaluationState.empty facts.arena)
-      pure maximum
-  | expression@{ payload := .scalar _, .. } =>
-      match ← facts.arena.concreteIndexedScalar expression with
-      | .trapdoor fact => fact.maximum.evaluate environment #[]
-      | _ => throw (.operandNotMatrix node wire)
   | expression@{ payload := .directValue _, .. } =>
       let bounds ← (← facts.arena.reducedDirectValueFactsAt environment expression).mapM
         (fun entry => evaluateOperationalConcreteBound .total environment entry.fact)
       match bounds with
       | head :: tail => pure (tail.foldl max head)
       | [] => throw (.invalidCount node 0)
+  | _ => throw (.operandNotMatrix node wire)
 
 def matrixMaximumExpr
     (node : Nat)
@@ -1669,19 +1661,13 @@ def matrixMaximumExpr
     (facts : OperationalScopeFacts)
     (environment : ParamEnvironment) : Except OperationalError OperationalBoundExpr := do
   match ← lookupFact node facts wire with
-  | expression@{ payload := .matrix _, .. } =>
-      return (← deriveOperationalSchemaFact facts.arena environment expression.payload
-        (OperationalExprEvaluationState.empty facts.arena)).1.totalHardBound
-  | expression@{ payload := .scalar _, .. } =>
-      match ← facts.arena.concreteIndexedScalar expression with
-      | .trapdoor fact => pure fact.maximum
-      | _ => throw (.operandNotMatrix node wire)
   | expression@{ payload := .directValue _, .. } =>
       let entries ← facts.arena.reducedDirectValueFactsAt environment expression
       match entries with
       | head :: tail => pure (tail.foldl (fun bound entry =>
           .maximum bound entry.fact.totalHardBound) head.fact.totalHardBound)
       | [] => throw (.invalidCount node 0)
+  | _ => throw (.operandNotMatrix node wire)
 
 def maximumArgumentExprs
     (node : Nat)
@@ -1699,17 +1685,9 @@ def maximumArguments
   let values ← arguments.mapM (fun wire => matrixMaximum node wire facts environment)
   pure <| values.foldl max 0
 
-def operationalExprHasRelation
-    (arena : OperationalExprArena)
-    (environment : ParamEnvironment)
-    (root : OperationalExprId) : Except OperationalError Bool :=
-  foldOperationalExprConcreteFacts arena environment root false fun found fact =>
-    pure (found || matrixFactHasRelation fact)
-
 def factHasRelation
     (arena : OperationalExprArena) (fact : OperationalFact) : Except OperationalError Bool := do
   match fact with
-  | { payload := .matrix root, .. } => operationalExprHasRelation arena [] root
   | expression@{ payload := .directValue _, .. } =>
       pure <| matrixFactHasRelation (← arena.directValueFactAt [] expression)
   | _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
@@ -1730,37 +1708,15 @@ partial def requireOperationalBoundaryPublicIdentity
     (environment : ParamEnvironment)
     (node : Nat)
     (expected : PublicMatrixIdentity) : OperationalFact → Except OperationalError Unit
-  | expression@{ payload := .matrix _, .. } => do
-      let allMatch ← foldOperationalExprConcreteFacts arena environment expression.payload true
-        fun allMatch fact => pure (allMatch && matrixBoundaryPublicIdentityMatches expected fact)
-      if allMatch then pure () else throw (.publicIdentityMismatch node)
+  | expression@{ payload := .directValue _, .. } => do
+      let entries ← arena.reducedDirectValueFactsAt environment expression
+      if entries.all (fun entry => matrixBoundaryPublicIdentityMatches expected entry.fact) then pure ()
+      else throw (.publicIdentityMismatch node)
   | _ => throw (.operandNotMatrix node { node, port := 0 })
-
-def summarizeSequentialOperationalExpr
-    (arena : OperationalExprArena)
-    (environment : ParamEnvironment)
-    (root : OperationalExprId) : Except OperationalError OperationalMatrixFact := do
-  let summary ← foldOperationalExprConcreteFacts arena environment root none fun summary fact => do
-    if matrixFactHasRelation fact then throw (.relationBearingCarriedValue temporaryScope 0 0)
-    match summary with
-    | none => pure (some fact)
-    | some first =>
-        if !sameCarriedMatrixFactSchema first fact then
-          throw (.sequentialSchemaMismatch temporaryScope 0 0
-            (first.polynomial.map operationalLargeFactorCount)
-            (fact.polynomial.map operationalLargeFactorCount))
-        pure (some { first with
-          totalHardBound := .maximum first.totalHardBound fact.totalHardBound })
-  match summary with
-  | some fact => pure fact
-  | none => throw (.invalidCount 0 0)
 
 def sequentialFactHasRelation
     (arena : OperationalExprArena)
     (environment : ParamEnvironment) : OperationalFact → Except OperationalError Bool
-  | expression@{ payload := .matrix _, .. } =>
-      operationalExprHasRelation arena environment expression.payload
-  | expression@{ payload := .scalar _, .. } => factHasRelation arena expression
   | expression@{ payload := .directValue _, .. } => do
       let value ← match arena.direct.valueAt? expression.payload.root with
         | some value => pure value
@@ -1770,18 +1726,16 @@ def sequentialFactHasRelation
           pure ((← arena.reducedDirectValueFactsAt environment expression).any
             (fun entry => matrixFactHasRelation entry.fact))
       | OperationalIndexedPayloadSchema.scalar _ => pure false
+  | _ => throw (.operandNotMatrix 0 { node := 0, port := 0 })
 
 def summarizeSequentialFact
     (arena : OperationalExprArena)
     (environment : ParamEnvironment) : OperationalFact → Except OperationalError OperationalFact
-  | expression@{ payload := .matrix _, .. } => do
-      let _ ← summarizeSequentialOperationalExpr arena environment expression.payload
-      pure expression
-  | expression@{ payload := .scalar _, .. } => pure expression
   | expression@{ payload := .directValue _, .. } => do
       if ← sequentialFactHasRelation arena environment expression then
         throw (.relationBearingCarriedValue temporaryScope 0 0)
       pure expression
+  | _ => throw (.unsupportedOperationalExpr arena.direct.values.size)
 
 /-- Substitute one simultaneous previous-state slot through every concrete leaf of an indexed DAG.
 The arena mapper also rebuilds Shared envelopes from the mapped conservative fact, so selection
@@ -1790,22 +1744,6 @@ def abstractSequentialFact
     (slot : Nat)
     (arena : OperationalExprArena) : OperationalFact →
     Except OperationalError (OperationalExprArena × OperationalFact)
-  | expression@{ payload := .matrix _, .. } => do
-      let (arena, root) ← mapOperationalExpr
-        s!"sequential-abstract:{slot}:{expression.payload.root}" .instantiationMap arena
-        expression.payload fun fact =>
-          let maximum := OperationalBoundExpr.previous (.matrixMaximum 0 slot)
-          let polynomial := fact.polynomial.map fun term => { term with product := {
-            term.product with
-            factors := term.product.factors.map (replaceOperationalFactorHardBound maximum) }}
-          { fact with
-            totalHardBound := maximum
-            polynomial }
-      let mapped : IndexedOperationalFact := { expression with payload := .matrix root }
-      let arena ← arena.rememberIndexedExpr mapped
-      pure (arena, mapped)
-  | expression@{ payload := .scalar _, .. } =>
-      abstractCarriedMaximum slot arena expression
   | { payload := .directValue root, .. } => do
       let value ← match arena.direct.valueAt? root with
         | some value => pure value
@@ -1829,6 +1767,8 @@ def abstractSequentialFact
         storage := value.storage
       }
       pure ({ arena with direct }, rebound)
+  | { payload := .matrix root, .. } | { payload := .scalar root, .. } =>
+      throw (.unsupportedOperationalExpr root)
 
 def setSequentialFactRecurrenceState
     (count : Nat)
@@ -1838,17 +1778,6 @@ def setSequentialFactRecurrenceState
     (environment : ParamEnvironment)
     (arena : OperationalExprArena) : OperationalFact →
     Except OperationalError (OperationalExprArena × OperationalFact)
-  | expression@{ payload := .matrix _, .. } => do
-      let maximum := OperationalBoundExpr.recurrenceState
-        count paths initial transition (.matrixMaximum 0 slot)
-      let (arena, root) ← mapOperationalExpr
-        s!"sequential-recurrence:{slot}:{expression.payload.root}" .instantiationMap arena
-        expression.payload fun fact => { fact with totalHardBound := maximum }
-      let mapped : IndexedOperationalFact := { expression with payload := .matrix root }
-      let arena ← arena.rememberIndexedExpr mapped
-      pure (arena, mapped)
-  | expression@{ payload := .scalar _, .. } =>
-      setFactRecurrenceState count paths initial transition slot environment arena expression
   | { payload := .directValue root, .. } => do
       let value ← match arena.direct.valueAt? root with
         | some value => pure value
@@ -1892,6 +1821,8 @@ def setSequentialFactRecurrenceState
         storage := mappedValue.storage
       }
       pure ({ arena with direct }, rebound)
+  | { payload := .matrix root, .. } | { payload := .scalar root, .. } =>
+      throw (.unsupportedOperationalExpr root)
 
 def evaluatePreparedScope
     (definitions : Array (String × PreparedOperationalScope))

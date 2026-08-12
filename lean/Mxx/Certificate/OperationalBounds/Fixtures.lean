@@ -3520,6 +3520,62 @@ private def directPointwiseOutputNamespaceFixture : Bool :=
 example : directTensorOutputRingFixture = true ∧ directPointwiseOutputNamespaceFixture = true := by
   native_decide
 
+/-- Fresh output namespacing rewrites every shared direct leaf that carries a temporary local
+identity, while preserving the direct carrier's context and storage descriptor. -/
+private def directSharedOutputNamespaceFixture : Bool :=
+  match (do
+    let scope : ScopeTemplateKey := .root (.standalone 840)
+    let wire : WireRef := { node := 841, port := 0 }
+    let matrix := { boundedOperationalExprFixtureFact 841 2 with
+      subject := wire, origin := .value temporaryScope wire }.refreshPrimitivePolynomial
+    let integer : OperationalScalarFact := .integer {
+      subject := wire, origin := .local temporaryScope wire, lower := 3, upper := 3,
+      lowerExpression := .closedInt (.constant 3), upperExpression := .closedInt (.constant 3) }
+    let bytes : OperationalScalarFact := .bytes {
+      subject := wire, origin := .local temporaryScope wire, length := 8 }
+    let trapdoor : OperationalScalarFact := match fixtureTrapdoorFact with
+      | .trapdoor fact => .trapdoor { fact with
+          subject := wire, publicIdentity := .sampledTrapdoor temporaryScope wire }
+      | fact => fact
+    let (fixed, matrixRef) := ({} : FixedOperationalPayloadArena).pushMatrix matrix
+    let (fixed, integerRef) := fixed.pushScalar integer
+    let (fixed, bytesRef) := fixed.pushScalar bytes
+    let (fixed, trapdoorRef) := fixed.pushScalar trapdoor
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, matrixRoot) ← match direct.pushShared emptyContext (.matrix fixtureType) matrixRef with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 841)
+    let (direct, integerRoot) ← match direct.pushShared emptyContext (.scalar .integer) integerRef with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 842)
+    let (direct, bytesRoot) ← match direct.pushShared emptyContext (.scalar (.bytes 8)) bytesRef with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 843)
+    let (direct, trapdoorRoot) ← match direct.pushShared emptyContext (.scalar (.trapdoor fixtureType)) trapdoorRef with
+      | some value => pure value | none => throw (OperationalError.unsupportedOperationalExpr 844)
+    let arena : OperationalExprArena := { direct }
+    let shared root : OperationalFact := {
+      context := emptyContext, payload := .directValue root, storage := .sharedTemplate }
+    let (arena, matrix) ← namespaceFreshDirectOutput scope wire arena (shared matrixRoot)
+    let (arena, integer) ← namespaceFreshDirectOutput scope wire arena (shared integerRoot)
+    let (arena, bytes) ← namespaceFreshDirectOutput scope wire arena (shared bytesRoot)
+    let (arena, trapdoor) ← namespaceFreshDirectOutput scope wire arena (shared trapdoorRoot)
+    let matrixRoot ← match matrix.payload with
+      | .directValue root => pure root
+      | _ => throw (OperationalError.unsupportedOperationalExpr 845)
+    let matrix ← arena.direct.matrixFactAt [] [] matrixRoot (arena.direct.values.size + 1)
+    let integer ← fixtureDirectScalarFact arena integer
+    let bytes ← fixtureDirectScalarFact arena bytes
+    let trapdoor ← fixtureDirectScalarFact arena trapdoor
+    let scalarNamespacesCorrect : Bool := match integer, bytes, trapdoor with
+      | .integer integer, .bytes bytes, .trapdoor trapdoor =>
+          integer.origin == OperationalValueOrigin.local scope wire &&
+            bytes.origin == OperationalValueOrigin.local scope wire &&
+            trapdoor.publicIdentity == PublicMatrixIdentity.sampledTrapdoor scope wire
+      | _, _, _ => false
+    pure (matrix.origin == MatrixOriginIdentity.value scope wire && scalarNamespacesCorrect)) with
+  | .ok value => value
+  | .error _ => false
+
+example : directSharedOutputNamespaceFixture = true := by native_decide
+
 /-- Constant-polynomial matrix multiplication preserves the strict nonnegative range needed by a
 following coefficient extraction and LUT selection. General polynomial inputs remain unknown
 because negacyclic reduction can map a negative coefficient close to the modulus. -/

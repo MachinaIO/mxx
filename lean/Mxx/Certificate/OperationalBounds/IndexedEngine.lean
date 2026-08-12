@@ -5507,18 +5507,10 @@ def rebindIndexedScalarFact
   let arena ← arena.rememberIndexedScalar rebound
   pure (arena, rebound)
 
-/-- Rebind a wire-level fact without dropping indexed matrix metadata.  This is the replacement
-entry point for the legacy fact-only rebinding helper; family containers recurse structurally while
-indexed matrices are transported through the arena. -/
+/-- Rebind a direct wire-level fact without dropping indexed payload metadata. -/
 partial def rebindOperationalFact
     (subject : WireRef) : OperationalExprArena → OperationalFact →
     Except OperationalError (OperationalExprArena × OperationalFact)
-  | arena, expression@{ payload := .matrix _, .. } => do
-      let (arena, rebound) ← rebindIndexedOperationalFact subject arena expression
-      pure (arena, rebound)
-  | arena, expression@{ payload := .scalar _, .. } => do
-      let (arena, rebound) ← rebindIndexedScalarFact subject arena expression
-      pure (arena, rebound)
   | arena, expression@{ payload := .directValue root, .. } => do
       let value ← match arena.direct.valueAt? root with
         | some value => pure value
@@ -5535,6 +5527,7 @@ partial def rebindOperationalFact
         payload := .directValue rebound
         storage := value.storage
       })
+  | _, _ => throw (.unsupportedOperationalExpr 0)
 
 def canonicalSelectionExpression
     (origin : OperationalValueOrigin) (count : IntExpr) : IndexExpr :=
@@ -6427,17 +6420,6 @@ refer to the enclosing state, while the new carried placeholders continue to use
 partial def shiftFactPreviousDepth
     (arena : OperationalExprArena) : OperationalFact →
     Except OperationalError (OperationalExprArena × OperationalFact)
-  | expression@{ payload := .scalar _, .. } => do
-      let update : OperationalScalarFact → OperationalScalarFact
-        | .trapdoor fact => .trapdoor { fact with maximum := shiftPreviousDepth fact.maximum }
-        | .integer fact => .integer {
-            fact with
-            lowerExpression := shiftPreviousDepth fact.lowerExpression
-            upperExpression := shiftPreviousDepth fact.upperExpression
-          }
-        | fact => fact
-      let (arena, mapped) ← mapIndexedScalarLeaves arena expression update
-      pure (arena, mapped)
   | expression@{ payload := .directValue root, .. } => do
       let value ← match arena.direct.valueAt? root with
         | some value => pure value
@@ -6461,11 +6443,7 @@ partial def shiftFactPreviousDepth
         payload := .directValue mapped
         storage := value.storage
       })
-  | expression@{ payload := .matrix _, .. } => do
-      let (arena, root) ← mapOperationalExpr "shift-previous-depth" .instantiationMap arena
-        expression.payload shiftMatrixFactPreviousDepth
-      let mapped : IndexedOperationalFact := { expression with payload := .matrix root }
-      pure (← arena.rememberIndexedExpr mapped, mapped)
+  | _ => throw (.unsupportedOperationalExpr 0)
 
 /-- Namespace only identities created by this exact output.  Caller origins transported through
 an input are deliberately left unchanged. -/
@@ -6486,9 +6464,21 @@ def namespaceFreshMatrixFact
     fact.polynomial
 }
 
-/-- Namespace a newly materialized direct matrix leaf without converting it into a legacy DAG.
-Delayed direct nodes retain the already-namespaced identities of their inputs. -/
-def namespaceFreshDirectMatrixOutput
+def namespaceFreshScalarFact
+    (scope : ScopeTemplateKey)
+    (wire : WireRef) : OperationalScalarFact → OperationalScalarFact
+  | .trapdoor fact => .trapdoor {
+      fact with publicIdentity := namespaceFreshPublicIdentity scope wire fact.publicIdentity }
+  | .integer fact => .integer {
+      fact with origin := namespaceFreshValueOrigin scope wire fact.origin }
+  | .bytes fact => .bytes {
+      fact with origin := namespaceFreshValueOrigin scope wire fact.origin }
+  | fact => fact
+
+/-- Namespace newly materialized direct leaves without converting them into a legacy DAG.
+Mapped and delayed roots retain their producer-installed namespaces: they transport existing
+values and do not introduce a fresh fixed leaf at this boundary. -/
+def namespaceFreshDirectOutput
     (scope : ScopeTemplateKey)
     (wire : WireRef)
     (arena : OperationalExprArena)
@@ -6507,19 +6497,24 @@ def namespaceFreshDirectMatrixOutput
         | some replacement => pure replacement
         | none => throw (.unsupportedOperationalExpr id)
       pure ({ arena with direct }, { fact with payload := .directValue replacement })
-  | some _ => pure (arena, fact)
+  | some { context, payload := .shared (.scalar scalarType) (.scalar reference), .. } =>
+      let leaf ← match arena.direct.fixed.scalars[reference]? with
+        | some leaf => pure leaf
+        | none => throw (.invalidOperationalExprRef reference)
+      let (fixed, replacement) := arena.direct.fixed.pushScalar
+        (namespaceFreshScalarFact scope wire leaf)
+      let direct := { arena.direct with fixed }
+      let (direct, replacement) ← match direct.pushShared context (.scalar scalarType) replacement with
+        | some replacement => pure replacement
+        | none => throw (.unsupportedOperationalExpr id)
+      pure ({ arena with direct }, { fact with payload := .directValue replacement })
+  | some { payload := .explicit .., .. }
+  | some { payload := .explicitValues .., .. }
+  | some { payload := .mapped .., .. }
+  | some { payload := .matrixResultBound .., .. }
+  | some { payload := .pointwise .., .. } => pure (arena, fact)
+  | some _ => throw (.unsupportedOperationalExpr id)
   | none => throw (.invalidOperationalExprRef id)
-
-def namespaceFreshScalarFact
-    (scope : ScopeTemplateKey)
-    (wire : WireRef) : OperationalScalarFact → OperationalScalarFact
-  | .trapdoor fact => .trapdoor {
-      fact with publicIdentity := namespaceFreshPublicIdentity scope wire fact.publicIdentity }
-  | .integer fact => .integer {
-      fact with origin := namespaceFreshValueOrigin scope wire fact.origin }
-  | .bytes fact => .bytes {
-      fact with origin := namespaceFreshValueOrigin scope wire fact.origin }
-  | fact => fact
 
 def namespaceFreshOutput
     (scope : ScopeTemplateKey)
@@ -6527,16 +6522,9 @@ def namespaceFreshOutput
     (arena : OperationalExprArena)
     (fact : OperationalFact) : Except OperationalError (OperationalExprArena × OperationalFact) := do
   match fact with
-  | expression@{ payload := .scalar _, .. } => do
-      let (arena, mapped) ← mapIndexedScalarLeaves arena expression (namespaceFreshScalarFact scope wire)
-      pure (arena, mapped)
-  | expression@{ payload := .matrix _, .. } =>
-      let (arena, root) ← mapOperationalExpr "namespace-fresh-output" .instantiationMap arena
-        expression.payload (namespaceFreshMatrixFact scope wire)
-      let mapped : IndexedOperationalFact := { expression with payload := .matrix root }
-      pure (← arena.rememberIndexedExpr mapped, mapped)
   | expression@{ payload := .directValue _, .. } =>
-      namespaceFreshDirectMatrixOutput scope wire arena expression
+      namespaceFreshDirectOutput scope wire arena expression
+  | _ => throw (.unsupportedOperationalExpr 0)
 
 def namespaceFreshSelectedMatrixSummary
     (scope : ScopeTemplateKey)
@@ -6725,35 +6713,28 @@ def instantiateMatrixFactLoopIndex
 partial def instantiateFactLoopIndex
     (slot index : Nat) (arena : OperationalExprArena) : OperationalFact →
     Except OperationalError (OperationalExprArena × OperationalFact)
-  | expression@{ payload := .scalar _, .. } => do
-      let update : OperationalScalarFact → OperationalScalarFact
-        | .trapdoor fact => .trapdoor {
-            fact with
-            maximum := instantiateBoundLoopIndex slot index fact.maximum
-            preimageCutoff := fact.preimageCutoff.map (instantiateBoundLoopIndex slot index)
-            publicIdentity := instantiatePublicIdentityLoopIndex slot index fact.publicIdentity }
-        | .integer fact => .integer {
-            fact with
-            origin := instantiateValueOriginLoopIndex slot index fact.origin
-            lowerExpression := instantiateBoundLoopIndex slot index fact.lowerExpression
-            upperExpression := instantiateBoundLoopIndex slot index fact.upperExpression }
-        | .bytes fact => .bytes {
-            fact with origin := instantiateValueOriginLoopIndex slot index fact.origin }
-        | fact => fact
-      let (arena, mapped) ← mapIndexedScalarLeaves arena expression update
-      pure (arena, mapped)
-  | expression@{ payload := .matrix _, .. } => do
-      let (arena, root) ← mapOperationalExpr "instantiate-loop-index" .instantiationMap arena
-        expression.payload (instantiateMatrixFactLoopIndex slot index)
-      let mapped : IndexedOperationalFact := { expression with payload := .matrix root }
-      pure (← arena.rememberIndexedExpr mapped, mapped)
   | expression@{ payload := .directValue root, .. } => do
       let value ← match arena.direct.valueAt? root with
         | some value => pure value
         | none => throw (.invalidOperationalExprRef root)
       if value.context != expression.context then throw (.unsupportedOperationalExpr root)
-      let (direct, mapped) ← arena.direct.mapMatrixValue root
-        (fun fact => pure (instantiateMatrixFactLoopIndex slot index fact))
+      let (direct, mapped) ← match value.payload.schema with
+        | .matrix _ => do
+            arena.direct.mapMatrixValue root
+              (fun fact => pure (instantiateMatrixFactLoopIndex slot index fact))
+        | .scalar _ => do
+            arena.direct.mapScalarValue root fun
+              | .trapdoor fact => pure (.trapdoor { fact with
+                  maximum := instantiateBoundLoopIndex slot index fact.maximum
+                  preimageCutoff := fact.preimageCutoff.map (instantiateBoundLoopIndex slot index)
+                  publicIdentity := instantiatePublicIdentityLoopIndex slot index fact.publicIdentity })
+              | .integer fact => pure (.integer { fact with
+                  origin := instantiateValueOriginLoopIndex slot index fact.origin
+                  lowerExpression := instantiateBoundLoopIndex slot index fact.lowerExpression
+                  upperExpression := instantiateBoundLoopIndex slot index fact.upperExpression })
+              | .bytes fact => pure (.bytes { fact with
+                  origin := instantiateValueOriginLoopIndex slot index fact.origin })
+              | fact => pure fact
       let value ← match direct.valueAt? mapped with
         | some value => pure value
         | none => throw (.invalidOperationalExprRef mapped)
@@ -6762,6 +6743,7 @@ partial def instantiateFactLoopIndex
         payload := .directValue mapped
         storage := value.storage
       })
+  | _ => throw (.unsupportedOperationalExpr 0)
 
 def joinCanonicalRanges : List CanonicalRange → CanonicalRange
   | [] => .unknown
@@ -7352,10 +7334,6 @@ def parallelLoopIndexedMatrixOutput
     (node indexSlot port : Nat)
     (declaredCount : IntExpr)
     (count : Nat)
-    (_environment : ParamEnvironment)
-    (_deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
-      OperationalExprEvaluationState →
-      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
     (arena : OperationalExprArena)
     (output : OperationalFact) : Except OperationalError (OperationalExprArena × OperationalFact) := do
   if count = 0 then throw (.invalidCount node 0)
@@ -7375,10 +7353,7 @@ def loopTemplateArgumentExprWithDirectLaneBinder
     (count : Nat)
     (mode : LoopInputMode)
     (directLaneBinder : Option IndexVariable)
-    (_environment : ParamEnvironment)
-    (_deriveSchema : OperationalExprArena → ParamEnvironment → OperationalExprId →
-      OperationalExprEvaluationState →
-      Except OperationalError (OperationalMatrixFact × OperationalExprEvaluationState))
+    (environment : ParamEnvironment)
     (fact : OperationalFact) :
     Except OperationalError (OperationalExprArena × OperationalFact) := do
   match mode with
@@ -7395,9 +7370,7 @@ def loopTemplateArgumentExprWithDirectLaneBinder
             Keep its source family binder so a body `FamilyGetDynamic` can apply its exact gather
             map instead of silently replacing the aggregate by one loop-lane template. -/
             pure (arena, expression)
-      | { payload := .matrix _, .. } =>
-          throw (.loopInputModeMismatch node argument)
-      | expression@{ payload := .scalar _, .. } => pure (arena, expression)
+      | _ => throw (.loopInputModeMismatch node argument)
   | .zip | .zipOffset _ =>
       match fact with
       | expression@{ payload := .directValue _, .. } =>
@@ -7407,7 +7380,7 @@ def loopTemplateArgumentExprWithDirectLaneBinder
           if !expression.context.binders.contains sourceBinder then
             throw (.loopInputModeMismatch node argument)
           let offset := match mode with | .zipOffset value => value | _ => 0
-          let sourceCount ← match sourceBinder.count.evaluate _environment with
+          let sourceCount ← match sourceBinder.count.evaluate environment with
             | some value => if value > 0 then pure value.toNat else throw (.loopInputModeMismatch node argument)
             | none => throw (.loopInputModeMismatch node argument)
           if count + offset > sourceCount then throw (.loopInputModeMismatch node argument)
@@ -7417,22 +7390,7 @@ def loopTemplateArgumentExprWithDirectLaneBinder
             | some map => pure map
             | none => throw (.loopInputModeMismatch node argument)
           arena.reindexDirectMatrixFact map expression
-      | { payload := .matrix _, .. } =>
-          throw (.loopInputModeMismatch node argument)
-      | expression@{ payload := .scalar _, .. } =>
-          let (domain, _) ← arena.scalarSelectionDomain expression
-          let offset := match mode with | .zipOffset value => value | _ => 0
-          if count + offset > domain.count then throw (.loopInputModeMismatch node argument)
-          let sourceBinder ← match domain.identity.expression with
-            | .variable binder => pure binder
-            | _ => throw (.loopInputModeMismatch node argument)
-          let consumer := parallelLoopLaneSelection scope node indexSlot declaredCount
-          let assignment := .offset consumer.expression (Int.ofNat offset)
-          let map ← match dynamicIndexMap expression.context sourceBinder assignment with
-            | some map => pure map
-            | none => throw (.loopInputModeMismatch node argument)
-          let (arena, mapped) ← reindexIndexedScalarFact map arena expression
-          pure (arena, mapped)
+      | _ => throw (.loopInputModeMismatch node argument)
 
 /-- Re-express one construction-uniform family element in the template coordinate of a newly
 constructed family.  This is a binder substitution, not a claim that two family lanes have equal

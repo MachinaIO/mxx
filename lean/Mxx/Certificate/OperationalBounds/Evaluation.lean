@@ -1715,19 +1715,16 @@ def evaluatePreparedScope
         match modes, wires, inputs with
         | [], [], [] => pure (arena, [])
         | mode :: modeTail, wire :: wireTail, input :: inputTail =>
-            /- Scalar loop arguments use the direct carrier too.  This admits only concrete
-            scalar leaves for promotion; an unresolved legacy scalar family is rejected rather
-            than being reindexed through the deprecated scalar selection DAG. -/
             let (arena, input) ← match input.payload with
-              | .scalar _ => arena.promoteDirectRelationOperand input
-              | .matrix _ | .directValue _ => pure (arena, input)
+              | .directValue _ => pure (arena, input)
+              | _ => throw (.loopInputModeMismatch nodeIndex argumentIndex)
             let directLaneBinder ← match mode, input.payload with
               | .zip, .directValue _ | .zipOffset _, .directValue _ =>
                   some <$> directFamilyLaneBinderAt scopeKey scope environment wire input
               | _, _ => pure none
             let (arena, head) ←
               loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey nodeIndex indexSlot argumentIndex
-                declaredCount count mode directLaneBinder environment deriveOperationalSchemaFact input
+                declaredCount count mode directLaneBinder environment input
             let (arena, tail) ← prepareParallelInputs nodeIndex indexSlot (argumentIndex + 1)
               declaredCount count modeTail wireTail inputTail arena
             pure (arena, head :: tail)
@@ -1805,11 +1802,7 @@ def evaluatePreparedScope
                       let (arena, directElements) ← elements.foldlM (fun (arena, packed) element => do
                         let (arena, direct) ← match element with
                           | direct@{ payload := .directValue _, .. } => pure (arena, direct)
-                          | { payload := .scalar root, .. } =>
-                              match arena.scalarNodes[root]? with
-                              | some (.concrete scalar) => arena.promoteConcreteScalarFact scalar
-                              | _ => throw (.unsupportedOperationalExpr root)
-                          | { payload := .matrix root, .. } => throw (.unsupportedOperationalExpr root)
+                          | _ => throw (.loopInputModeMismatch index 0)
                         pure (arena, packed.push direct)) (facts.arena, #[])
                       let (arena, family) ← packDirectScalarFamily scopeKey index environment
                         (match node.outputTypes with
@@ -1826,16 +1819,6 @@ def evaluatePreparedScope
                     | some value => pure value
                     | none => throw .nonClosedExpression
                   match ← lookupFact index facts familyWire with
-                  /- Matrix families must have crossed the direct carrier.  Legacy matrix
-                  selection, including preimage/decomposition transport, is deliberately deferred
-                  to Stage 8 rather than falling back to ChoiceStorage here. -/
-                  | { payload := .matrix root, .. } => throw (.unsupportedOperationalExpr root)
-                  | family@{ payload := .scalar _, .. } =>
-                      if requested < 0 then throw (.invalidCount index requested)
-                      let (arena, selected) ← selectIndexedScalarStatic facts.arena family
-                        requested.toNat { node := index, port := 0 }
-                      facts := { facts with arena }
-                      pure [selected]
                   | family@{ payload := .directValue _, .. } =>
                       let binder ← directFamilyLaneBinderAt scopeKey scope environment familyWire family
                       if requested < 0 then throw (.invalidCount index requested)
@@ -1847,6 +1830,7 @@ def evaluatePreparedScope
                         arena selected
                       facts := { facts with arena }
                       pure [rebound]
+                  | _ => throw (.loopInputModeMismatch index 0)
               | .familyGetDynamic =>
                   let familyWire ← match node.arguments[0]? with
                     | some wire => pure wire
@@ -1855,7 +1839,7 @@ def evaluatePreparedScope
                     | some wire => pure wire
                     | none => throw (.missingOperand index { node := 0, port := 0 })
                   let selectionInput ← lookupFact index facts indexWire
-                  let selectionFact ← match selectionInput with
+                  let selectionFact : OperationalIntegerFact ← match selectionInput with
                     | { payload := .directValue root, .. } => do
                         let (lower, upper) ← facts.arena.direct.integerInterval root
                           (facts.arena.direct.values.size + 1)
@@ -1867,30 +1851,10 @@ def evaluatePreparedScope
                           lowerExpression := .closedInt (.constant lower)
                           upperExpression := .closedInt (.constant upper)
                         }
-                    | _ => integerFactAt index facts indexWire
+                    | _ => throw (.loopInputModeMismatch index 1)
                   let selection := selectionFact.origin
                   let family ← lookupFact index facts familyWire
                   match selectionFact.lower == selectionFact.upper, family with
-                  /- Matrix families must have crossed the direct carrier.  Legacy matrix
-                  selection, including preimage/decomposition transport, is deliberately deferred
-                  to Stage 8 rather than falling back to ChoiceStorage here. -/
-                  | _, { payload := .matrix root, .. } => throw (.unsupportedOperationalExpr root)
-                  | true, family@{ payload := .scalar _, .. } =>
-                      let requested := selectionFact.lower
-                      if requested < 0 then throw (.invalidCount index requested)
-                      let (arena, selected) ← selectIndexedScalarStatic facts.arena family
-                        requested.toNat { node := index, port := 0 }
-                      facts := { facts with arena }
-                      pure [selected]
-                  | false, family@{ payload := .scalar _, .. } =>
-                      let (domain, _) ← facts.arena.scalarSelectionDomain family
-                      if domain.count == 0 || selectionFact.lower < 0 ||
-                          selectionFact.upper >= Int.ofNat domain.count then
-                        throw (.invalidCount index selectionFact.upper)
-                      let selector := DynamicSelectionIdentity.fromOrigin selection domain.count
-                      let (arena, selected) ← selectIndexedScalarDynamic facts.arena family selector
-                      facts := { facts with arena }
-                      pure [selected]
                   | true, family@{ payload := .directValue _, .. } =>
                       let binder ← directFamilyLaneBinderAt scopeKey scope environment familyWire family
                       let requested := selectionFact.lower
@@ -1949,6 +1913,7 @@ def evaluatePreparedScope
                         arena selected
                       facts := { facts with arena }
                       pure [rebound]
+                  | _, _ => throw (.loopInputModeMismatch index 0)
               | .parallelLoop _ count indexSlot bindings modes =>
                   let evaluatedCount ← match count.evaluate environment with
                     | some value => pure value
@@ -1984,13 +1949,6 @@ def evaluatePreparedScope
                       match output with
                       /- Parallel results are direct indexed values.  Closing installs the one
                       exact loop coordinate shared by every argument and output of this node. -/
-                      | { payload := .matrix root, .. } => throw (.unsupportedOperationalExpr root)
-                      | scalar@{ payload := .scalar _, .. } =>
-                          let (arena, direct) ← currentFacts.arena.promoteDirectRelationOperand scalar
-                          let closed ← closeParallelDirectScalarOutput scopeKey index indexSlot port count arena
-                            direct
-                          let (arena, family) := closed
-                          pure ({ currentFacts with arena }, accumulated.push family)
                       | direct@{ payload := .directValue _, .. } =>
                           let root := direct.payload.root
                           let value ← match currentFacts.arena.direct.valueAt? root with
@@ -1999,12 +1957,13 @@ def evaluatePreparedScope
                           let closed ← match value.payload.schema with
                             | .matrix _ =>
                                 parallelLoopIndexedMatrixOutput scopeKey index indexSlot port count
-                                  evaluatedCount.toNat environment deriveOperationalSchemaFact currentFacts.arena direct
+                                  evaluatedCount.toNat currentFacts.arena direct
                             | .scalar _ =>
                                 closeParallelDirectScalarOutput scopeKey index indexSlot port count
                                   currentFacts.arena direct
                           let (arena, family) := closed
                           pure ({ currentFacts with arena }, accumulated.push family)
+                      | _ => throw (.loopInputModeMismatch index port)
                       )
                     (facts, #[])
                   facts := nextFacts
@@ -2577,26 +2536,13 @@ def evaluatePreparedScope
             let mut namespacedOutputs : Array OperationalFact := #[]
             for (output, port) in outputs.toArray.zipIdx do
               match output with
-              | expression@{ payload := .matrix _, .. } =>
-                  let root := expression.payload
-                  let wire : WireRef := { node := index, port }
-                  let (arena, _) ← namespaceOperationalExprInPlace scopeKey wire facts.arena {}
-                    root (facts.arena.nodes.size + 1)
-                  let expression ← arena.indexedExpr root
-                  facts := { facts with arena }
-                  namespacedOutputs := namespacedOutputs.push expression
-              | expression@{ payload := .scalar _, .. } =>
-                  let wire : WireRef := { node := index, port }
-                  let (arena, expression) ← mapIndexedScalarLeaves facts.arena expression
-                    (namespaceFreshScalarFact scopeKey wire)
-                  facts := { facts with arena }
-                  namespacedOutputs := namespacedOutputs.push expression
               | expression@{ payload := .directValue _, .. } =>
                   let wire : WireRef := { node := index, port }
-                  let (arena, expression) ← namespaceFreshDirectMatrixOutput scopeKey wire facts.arena
+                  let (arena, expression) ← namespaceFreshDirectOutput scopeKey wire facts.arena
                     expression
                   facts := { facts with arena }
                   namespacedOutputs := namespacedOutputs.push expression
+              | _ => throw (.loopInputModeMismatch index port)
             let outputs := namespacedOutputs
             facts := { facts with values := facts.values.push outputs }
             let attachments := prepared.attachmentBuckets[index]?.getD #[]

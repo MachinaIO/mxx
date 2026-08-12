@@ -1533,6 +1533,11 @@ def OperationalMatrixFact.refreshPrimitivePolynomial
 structure OperationalTrapdoorFact where
   subject : WireRef
   matrixType : MatrixTypeExpr
+  /-- Exact graph-wire contract fields; these are distinct from the evaluated sampler bound. -/
+  sigma : RealExpr
+  gadgetBase : IntExpr
+  digitCount : IntExpr
+  preimageMaxCoefficientBound : IntExpr
   matrixParams : Mxx.SamplerParams
   maximum : OperationalBoundExpr
   /-- The uncapped preimage sampler cutoff from the trapdoor wire contract. -/
@@ -1555,17 +1560,15 @@ structure OperationalBytesFact where
   length : Int
   deriving BEq, DecidableEq, Repr
 
-abbrev OperationalScalarExprId := Nat
 abbrev OperationalIndexedValueId := Nat
 
 inductive OperationalPayloadRef where
   | matrix (id : OperationalExprId)
   | directValue (id : OperationalIndexedValueId)
-  | scalar (id : OperationalScalarExprId)
   deriving BEq, Repr
 
 def OperationalPayloadRef.root : OperationalPayloadRef → Nat
-  | .matrix root | .directValue root | .scalar root => root
+  | .matrix root | .directValue root => root
 
 instance : Coe OperationalPayloadRef Nat := ⟨OperationalPayloadRef.root⟩
 
@@ -1580,7 +1583,7 @@ inductive OperationalScalarFact where
   | real
   | trapdoor (fact : OperationalTrapdoorFact)
   | bytes (fact : OperationalBytesFact)
-  | typedBlob (typeName : String)
+  | typedBlob (typeName : String) (schemaHash : List Nat)
   | unknown (wireType : WireTypeExpr)
   deriving BEq
 
@@ -1623,20 +1626,6 @@ structure DirectValueMatrixOperation where
   ownerNode : Nat
   outputPort : Nat
   parameterEnvironment : ParamEnvironment
-  deriving BEq
-
-inductive OperationalScalarExprNode where
-  | concrete (fact : OperationalScalarFact)
-  | primitive
-      (kind : OperationalScalarPrimitiveKind)
-      (arguments : Array Nat)
-      (result : OperationalScalarFact)
-  | selectExact (domain : SelectionDomainId) (branches : Array Nat)
-  | selectShared
-      (domain : SelectionDomainId)
-      (binder : FamilyTemplateBinder)
-      (subject : WireRef)
-      (representative : Nat)
   deriving BEq
 
 abbrev OperationalFact := IndexedOperationalFact

@@ -10,15 +10,56 @@ structure IndexVariable where
   count : IntExpr
   deriving BEq, DecidableEq, Repr
 
+/-- Immutable identity of a gather lookup.  `indices` is the exact executable integer-family
+producer occurrence, so two consumers of that one producer share the identity, while equal
+values emitted by different producer wires do not.  `source` is the exact family being gathered.
+The checker never treats a numeric slot or caller-supplied environment entry as this identity. -/
+structure GatherLookupOwner where
+  source : CoreWireRef
+  indices : CoreWireRef
+  deriving BEq, DecidableEq, Repr
+
 /-- Symbolic selection indices.  Dynamic selection is function application, never an indicator
-sum over every lane.  In `gather source position`, `source` carries the gathered result's
-codomain, while `position` carries the lookup-lane domain independently. -/
+sum over every lane.  A gather retains its immutable lookup-producer identity in the correlation
+key itself: `source` carries the gathered result's codomain, while `position` carries the
+lookup-lane domain independently. -/
 inductive IndexExpr where
   | constant (value : Nat)
   | variable (value : IndexVariable)
   | offset (base : IndexExpr) (amount : Int)
-  | gather (source position : IndexExpr)
+  | gather (owner : GatherLookupOwner) (source position : IndexExpr)
   deriving BEq, DecidableEq, Repr
+
+/-- Optional request-local cache of a *closed* gather lookup.  This is deliberately separate
+from `IndexExpr`: the expression carries correlation identity, while a table only caches a
+fully materialized integer-family producer for closed evaluation.  It is not the general
+semantic payload for a runtime-dependent integer computation; that remains owned by the indexed
+scalar carrier.  Repeated source lanes are retained in order. -/
+structure GatherLookupTable where
+  owner : GatherLookupOwner
+  sourceCount : IntExpr
+  positionCount : IntExpr
+  sourceIndices : Array Nat
+  deriving BEq, DecidableEq, Repr
+
+/-- A cache may be structurally nonempty before executable indexed-integer registration verifies
+its declared domains and entries.  This predicate is intentionally not an admission proof and is
+never used to select an owner from the registry. -/
+def GatherLookupTable.cacheShapeValid (table : GatherLookupTable) : Bool :=
+  !table.sourceIndices.isEmpty
+
+abbrev GatherLookupRegistry := Array GatherLookupTable
+
+/-- Lookup entries are selected only when the exact owner occurs once in the whole registry.
+Even an invalid duplicate is a collision: filtering it out would let a forged stale cache alter
+which producer identity the checker accepts.  Registration and numeric evaluation remain
+unavailable until the executable indexed-integer carrier validates the domain expressions. -/
+def GatherLookupRegistry.lookupExact
+    (registry : GatherLookupRegistry)
+    (owner : GatherLookupOwner) : Option GatherLookupTable :=
+  match registry.toList.filter (fun table => table.owner == owner) with
+  | [table] => some table
+  | _ => none
 
 structure IndexContext where
   binders : Array IndexVariable
@@ -60,7 +101,7 @@ def IndexExpr.freeVariables : IndexExpr → List IndexVariable
   | .constant _ => []
   | .variable value => [value]
   | .offset base _ => base.freeVariables
-  | .gather source position => source.freeVariables ++ position.freeVariables
+  | .gather _ source position => source.freeVariables ++ position.freeVariables
 
 def indexExpressionInBounds (context : IndexContext) (expression : IndexExpr) : Bool :=
   expression.freeVariables.all context.contains
@@ -75,7 +116,7 @@ private def staticIndexRange : IndexExpr → Option (Int × Int)
   | .offset base amount => do
       let (lower, upper) ← staticIndexRange base
       some (lower + amount, upper + amount)
-  | .gather source _ => staticIndexRange source
+  | .gather _ source _ => staticIndexRange source
 
 /-- The exact result domain retained by an index expression without evaluating parameters.
 Offsets other than zero do not preserve a complete source domain.  Gather results retain the
@@ -84,7 +125,7 @@ private def exactIndexDomain : IndexExpr → Option IntExpr
   | .constant _ => none
   | .variable binder => some binder.count
   | .offset base amount => if amount == 0 then exactIndexDomain base else none
-  | .gather source _ => exactIndexDomain source
+  | .gather _ source _ => exactIndexDomain source
 
 /-- Split an additive integer expression into its non-constant structural part and its accumulated
 constant.  This is deliberately not an arithmetic normalizer: it proves only offsets visible in
@@ -129,7 +170,7 @@ private def staticallyWithin (limit : IntExpr) (expression : IndexExpr) : Bool :
       | .offset _ _ => match variableOffset expression with
           | some (binder, offset) => symbolicOffsetWithin limit binder.count offset
           | none => false
-      | .gather source _ => exactIndexDomain source == some limit
+      | .gather _ source _ => exactIndexDomain source == some limit
       | .constant _ => false
 
 private structure ClosedIndexWitness where
@@ -210,8 +251,8 @@ private def reindexUnchecked (map : IndexMap) : IndexExpr → Option IndexExpr
   | .constant value => some (.constant value)
   | .variable binder => map.lookup? binder
   | .offset base amount => return .offset (← reindexUnchecked map base) amount
-  | .gather source position =>
-      return .gather (← reindexUnchecked map source) (← reindexUnchecked map position)
+  | .gather owner source position =>
+      return .gather owner (← reindexUnchecked map source) (← reindexUnchecked map position)
 
 def reindex (map : IndexMap) (expression : IndexExpr) : Option IndexExpr :=
   if map.transportValid then reindexUnchecked map expression else none
@@ -244,7 +285,7 @@ private def evaluatedIndexRange
   | .offset base amount => do
       let (lower, upper) ← evaluatedIndexRange parameters base
       some (lower + amount, upper + amount)
-  | .gather source _ => evaluatedIndexRange parameters source
+  | .gather _ source _ => evaluatedIndexRange parameters source
 
 private def valueInRange (value lower upper : Int) : Bool :=
   lower <= value && value < upper
@@ -258,11 +299,7 @@ private def evaluateIndexExprUnchecked
       let (lower, upper) ← evaluatedIndexRange parameters (.variable binder)
       if valueInRange value lower upper then some value else none
   | .offset base amount => return (← evaluateIndexExprUnchecked parameters environment base) + amount
-  | .gather source position => do
-      let _ ← evaluateIndexExprUnchecked parameters environment position
-      let (sourceLower, sourceUpper) ← evaluatedIndexRange parameters source
-      let value ← lookupIndexValue (.gather source position) environment
-      if valueInRange value sourceLower sourceUpper then some value else none
+  | .gather _ _ _ => none
 
 /-- Evaluate an index expression only in a context that owns every free index atom.  A gather is
 looked up by its full structural identity after both source and position have been evaluated; it is
@@ -505,6 +542,21 @@ private def fixtureOwner (node : Nat) : CoreNodeRef := {
   node := ⟨node⟩
 }
 
+private def fixtureWire (node port : Nat := 0) : CoreWireRef := {
+  stage := ⟨"indexed-fixture"⟩
+  scope := ⟨[]⟩
+  node := ⟨node⟩
+  port
+}
+
+private def fixtureGatherOwner : GatherLookupOwner := {
+  source := fixtureWire 400
+  indices := fixtureWire 401
+}
+
+private def fixtureGather (source position : IndexExpr) : IndexExpr :=
+  .gather fixtureGatherOwner source position
+
 private def fixtureVariable (node slot count : Nat) : IndexVariable := {
   owner := fixtureOwner node
   slot
@@ -610,7 +662,7 @@ example :
       count := .parameter "param4"
     }
     let map := fixtureMap (fixtureContext [lane]) (fixtureContext [sourceIndex, position]) [
-      .gather (.variable sourceIndex) (.variable position)
+      fixtureGather (.variable sourceIndex) (.variable position)
     ]
     map.validate = true := by
   native_decide
@@ -632,7 +684,7 @@ example :
       count := .parameter "param4"
     }
     let map := fixtureMap (fixtureContext [lane]) (fixtureContext [sourceIndex, position]) [
-      .gather (.variable sourceIndex) (.variable position)
+      fixtureGather (.variable sourceIndex) (.variable position)
     ]
     map.validate = false := by
   native_decide
@@ -650,7 +702,7 @@ example :
     let sourceIndex := fixtureVariable 1 0 8
     let source := fixtureContext [lane]
     let destination := fixtureContext [sourceIndex]
-    let gathered := .gather (.variable sourceIndex) (.variable sourceIndex)
+    let gathered := fixtureGather (.variable sourceIndex) (.variable sourceIndex)
     let map := fixtureMap source destination [gathered]
     reindex map (.variable lane) = some gathered := by native_decide
 
@@ -660,21 +712,21 @@ example :
     let position := fixtureVariable 2 0 8
     let source := fixtureContext [lane]
     let destination := fixtureContext [sourceIndex, position]
-    let gathered := .gather (.variable sourceIndex) (.variable position)
+    let gathered := fixtureGather (.variable sourceIndex) (.variable position)
     let map := fixtureMap source destination [gathered]
     map.validate = true := by native_decide
 
-/-- A gather's lookup lane domain may exceed its result codomain: positions 4 through 7 select
-from an eight-lane source family while the gathered result remains in the four-element codomain. -/
+/-- Generic index environments cannot forge a gather result.  The lookup payload belongs to an
+exact request-local owner rather than to a caller-supplied `(IndexExpr, Int)` binding. -/
 example :
     let sourceIndex := fixtureVariable 1 0 4
     let position := fixtureVariable 2 0 8
     let context := fixtureContext [sourceIndex, position]
-    let gathered := .gather (.variable sourceIndex) (.variable position)
+    let gathered := fixtureGather (.variable sourceIndex) (.variable position)
     (IndexedParameterExpr.index gathered).evaluate [] context [
       (.variable position, 7),
       (gathered, 3)
-    ] = some 3 := by
+    ] = none := by
   native_decide
 
 /-- Gather result values are still bounded by the source-family codomain, even when their lookup
@@ -683,11 +735,51 @@ example :
     let sourceIndex := fixtureVariable 1 0 4
     let position := fixtureVariable 2 0 8
     let context := fixtureContext [sourceIndex, position]
-    let gathered := .gather (.variable sourceIndex) (.variable position)
+    let gathered := fixtureGather (.variable sourceIndex) (.variable position)
     (IndexedParameterExpr.index gathered).evaluate [] context [
       (.variable position, 7),
       (gathered, 4)
     ] = none := by
+  native_decide
+
+/-- Closed gather caches are keyed by the integer-family producer, not by a consumer-local
+number.  Until executable indexed-integer registration validates the domain expressions, caches
+are not evaluable; nevertheless duplicate owners (including stale invalid entries) are rejected
+and the owner remains part of the symbolic correlation key. -/
+example :
+    let position := fixtureVariable 2 0 3
+    let owner : GatherLookupOwner := {
+      source := fixtureWire 10
+      indices := fixtureWire 11
+    }
+    let table : GatherLookupTable := {
+      owner
+      sourceCount := .constant 4
+      positionCount := .constant 3
+      sourceIndices := #[2, 2, 0]
+    }
+    let stale : GatherLookupTable := { table with sourceIndices := #[] }
+    table.cacheShapeValid && !stale.cacheShapeValid &&
+      (GatherLookupRegistry.lookupExact #[table] owner == some table) &&
+      (GatherLookupRegistry.lookupExact #[table, stale] owner).isNone &&
+      (IndexExpr.gather owner (IndexExpr.variable position) (IndexExpr.variable position) !=
+        IndexExpr.gather { owner with indices := fixtureWire 12 }
+          (IndexExpr.variable position) (IndexExpr.variable position)) := by
+  native_decide
+
+example :
+    let owner : GatherLookupOwner := {
+      source := fixtureWire 10
+      indices := fixtureWire 11
+    }
+    let foreign : GatherLookupOwner := { owner with indices := fixtureWire 12 }
+    let table : GatherLookupTable := {
+      owner
+      sourceCount := .constant 2
+      positionCount := .constant 2
+      sourceIndices := #[0, 1]
+    }
+    (GatherLookupRegistry.lookupExact #[table] foreign).isNone := by
   native_decide
 
 /-- Symbolic ZipOffset is accepted only when additive `IntExpr` structure proves the whole shifted
@@ -891,7 +983,7 @@ example :
     let position := fixtureVariable 2 0 8
     let source := fixtureContext [lane]
     let destination := fixtureContext [sourceIndex, position]
-    let gathered := .gather (.variable sourceIndex) (.variable position)
+    let gathered := fixtureGather (.variable sourceIndex) (.variable position)
     let map := fixtureMap source destination [gathered]
     let expression : IndexedParameterExpr := .multiply (.index (.variable lane)) (.ir (.constant 2))
     expression.reindex map = some (.multiply (.index gathered) (.ir (.constant 2))) := by
@@ -905,23 +997,23 @@ example :
     let source := fixtureContext [lane]
     let intermediate := fixtureContext [sourceIndex, position]
     let destination := fixtureContext [outer, position]
-    let first := fixtureMap source intermediate [.gather (.variable sourceIndex) (.variable position)]
+    let first := fixtureMap source intermediate [fixtureGather (.variable sourceIndex) (.variable position)]
     let second := fixtureMap intermediate destination [.variable outer, .variable position]
     let expression : IndexedParameterExpr := .index (.variable lane)
     (composeIndexMap first second).bind (expression.reindex) =
-      some (.index (.gather (.variable outer) (.variable position))) := by
+      some (.index (fixtureGather (.variable outer) (.variable position))) := by
   native_decide
 
 example :
     let sourceIndex := fixtureVariable 1 0 8
     let position := fixtureVariable 2 0 8
     let context := fixtureContext [sourceIndex, position]
-    let gathered := .gather (.variable sourceIndex) (.variable position)
+    let gathered := fixtureGather (.variable sourceIndex) (.variable position)
     (IndexedParameterExpr.index gathered).evaluate [] context [
       (.variable sourceIndex, 1),
       (.variable position, 2),
       (gathered, 6)
-    ] = some 6 := by
+    ] = none := by
   native_decide
 
 example :
@@ -970,16 +1062,16 @@ example :
     let position := fixtureVariable 2 0 10
     let source := fixtureContext [lane]
     let destination := fixtureContext [sourceIndex, position]
-    let map := fixtureMap source destination [.gather (.variable sourceIndex) (.variable position)]
+    let map := fixtureMap source destination [fixtureGather (.variable sourceIndex) (.variable position)]
     (IndexedParameterExpr.index (.variable lane)).reindex map =
-      some (.index (.gather (.variable sourceIndex) (.variable position))) := by
+      some (.index (fixtureGather (.variable sourceIndex) (.variable position))) := by
   native_decide
 
 example :
     let sourceIndex := fixtureVariable 1 0 8
     let position := fixtureVariable 2 0 8
     let context := fixtureContext [sourceIndex, position]
-    let gathered := .gather (.variable sourceIndex) (.variable position)
+    let gathered := fixtureGather (.variable sourceIndex) (.variable position)
     (IndexedParameterExpr.index gathered).evaluate [] context [
       (.variable sourceIndex, 1),
       (.variable position, -1),
@@ -991,7 +1083,7 @@ example :
     let sourceIndex := fixtureVariable 1 0 8
     let position := fixtureVariable 2 0 8
     let context := fixtureContext [sourceIndex, position]
-    let gathered := .gather (.variable sourceIndex) (.variable position)
+    let gathered := fixtureGather (.variable sourceIndex) (.variable position)
     (IndexedParameterExpr.index gathered).evaluate [] context [
       (.variable sourceIndex, 1),
       (.variable position, 2),
@@ -1003,7 +1095,7 @@ example :
     let sourceIndex := fixtureVariable 1 0 8
     let position := fixtureVariable 2 0 8
     let context := fixtureContext [sourceIndex, position]
-    let gathered := .gather (.variable sourceIndex) (.variable position)
+    let gathered := fixtureGather (.variable sourceIndex) (.variable position)
     (IndexedParameterExpr.index gathered).evaluate [] context [
       (.variable sourceIndex, 1),
       (.variable position, 2),

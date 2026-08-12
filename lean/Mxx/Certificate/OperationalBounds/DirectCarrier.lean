@@ -291,6 +291,7 @@ def scalarOperationSchemasValid
   | .boolToInt => inputs == #[.scalar .boolean] && output == .scalar .integer
   | .intBinary _ => inputs == #[.scalar .integer, .scalar .integer] && output == .scalar .integer
   | .intCompare _ => inputs == #[.scalar .integer, .scalar .integer] && output == .scalar .boolean
+  | .bitExtract _ => inputs == #[.scalar .integer] && output == .scalar .boolean
   | .intToReal => inputs == #[.scalar .integer] && output == .scalar .real
   | .realBinary _ => inputs == #[.scalar .real, .scalar .real] && output == .scalar .real
   | .realSqrt => inputs == #[.scalar .real] && output == .scalar .real
@@ -317,6 +318,8 @@ def pointwiseSchemasValid
       match operation.kind with
       | .liftIntegerToConstantPolynomial matrixType =>
           inputs == #[.scalar .integer] && operationalMatrixTypeEqual matrixType output
+      | .trapdoorPublic matrixType =>
+          inputs == #[.scalar (.trapdoor matrixType)] && operationalMatrixTypeEqual matrixType output
   | _, _ => false
 
 def DirectOperationalIndexedArena.pushValue
@@ -408,13 +411,16 @@ def DirectOperationalIndexedArena.pushPointwise
     | .relation descriptor => some (.matrix descriptor.outputType)
     | .scalar { kind := .boolToInt, .. } | .scalar { kind := .intBinary _, .. } =>
         some (.scalar .integer)
-    | .scalar { kind := .intCompare _, .. } => some (.scalar .boolean)
+    | .scalar { kind := .intCompare _, .. } | .scalar { kind := .bitExtract _, .. } =>
+        some (.scalar .boolean)
     | .scalar { kind := .intToReal, .. } | .scalar { kind := .realBinary _, .. } |
         .scalar { kind := .realSqrt, .. } => some (.scalar .real)
     | .matrixToScalar { kind := .extractCoefficient _, .. }
     | .matrixToScalar { kind := .thresholdDecodeInt .., .. } => some (.scalar .integer)
     | .matrixToScalar { kind := .thresholdDecodeBool .., .. } => some (.scalar .boolean)
     | .matrixFromScalar { kind := .liftIntegerToConstantPolynomial matrixType, .. } =>
+        some (.matrix matrixType)
+    | .matrixFromScalar { kind := .trapdoorPublic matrixType, .. } =>
         some (.matrix matrixType)
   if pointwiseSchemasValid operation schemas output then
     some (arena.pushValue context (.pointwise output operation inputs))
@@ -502,6 +508,13 @@ partial def DirectOperationalIndexedArena.mapMatrixValue
                   | .scalar _ => pure (arena, memo, mapped.push input)) (arena, memo, #[])
                 let (arena, mapped) := arena.pushValue value.context
                   (.pointwise (.matrix matrixType) (.relation operation) inputs)
+                pure (arena, memo, mapped)
+            /- Scalar-to-matrix lifts retain the scalar's direct identity and context.  The
+            enclosing mapped matrix carrier transports the same selector; do not reject this
+            executable scalar child merely because this traversal is matrix-rooted. -/
+            | .pointwise (.matrix matrixType) (.matrixFromScalar operation) inputs =>
+                let (arena, mapped) := arena.pushValue value.context
+                  (.pointwise (.matrix matrixType) (.matrixFromScalar operation) inputs)
                 pure (arena, memo, mapped)
             | _ => throw (.unsupportedOperationalExpr id)
           pure (arena, memo.insert id mapped, mapped)

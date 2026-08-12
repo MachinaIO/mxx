@@ -4214,11 +4214,11 @@ def applyDirectMatrixFromScalarOperation
     (operation : DirectValueMatrixOperation)
     (matrixType : MatrixTypeExpr)
     (input : OperationalScalarFact) : Except OperationalError OperationalMatrixFact := do
-  let integer ← match input with
-    | .integer value => pure value
-    | _ => throw (.operandNotInteger operation.ownerNode { node := 0, port := 0 })
   let output ← match operation.kind with
   | .liftIntegerToConstantPolynomial declaredType => do
+      let integer ← match input with
+        | .integer value => pure value
+        | _ => throw (.operandNotInteger operation.ownerNode { node := 0, port := 0 })
       if !operationalMatrixTypeEqual declaredType matrixType then
         throw (.outputTypeMismatch operation.ownerNode)
       let params ← match matrixType.evaluate operation.parameterEnvironment (.constant 0) with
@@ -4232,6 +4232,22 @@ def applyDirectMatrixFromScalarOperation
       classifiedMatrixFactExpr operation.ownerNode operation.outputPort matrixType
         operation.parameterEnvironment bound false (.below params.modulus.toNat)
         { isConstantPolynomial := true }
+  | .trapdoorPublic declaredType => do
+      let trapdoor ← match input with
+        | .trapdoor value => pure value
+        | _ => throw (.missingPublicIdentity operation.ownerNode { node := 0, port := 0 })
+      if !operationalMatrixTypeEqual declaredType matrixType then
+        throw (.outputTypeMismatch operation.ownerNode)
+      let cap ← match matrixCap matrixType operation.parameterEnvironment with
+        | some value => pure value
+        | none => throw (.invalidMatrixParameters operation.ownerNode)
+      let rec maximum : PublicMatrixIdentity → Int
+        | .sampledTrapdoor .. | .gadget .. => cap
+        | .indexed _ _ source | .loopInstance _ _ source => maximum source
+      let bound := maximum trapdoor.publicIdentity
+      let result ← classifiedMatrixFact operation.ownerNode operation.outputPort matrixType
+        operation.parameterEnvironment bound true
+      pure { result with identity := some trapdoor.publicIdentity }.refreshPrimitivePolynomial
   pure (directPointwiseMatrixOutput operation.ownerScope operation.ownerNode operation.outputPort output)
 
 def applyDirectMatrixToScalarOperation
@@ -4277,6 +4293,8 @@ def applyDirectScalarPointwiseOperation
       integerFactWithExpressions operation.ownerNode operation.outputPort interval.lower interval.upper
         interval.lowerExpression interval.upperExpression
   | .intCompare _, #[.integer _, .integer _] => pure .boolean
+  | .bitExtract position, #[.integer _] =>
+      if position < 0 then throw (.invalidCount operation.ownerNode position) else pure .boolean
   | .intToReal, #[.integer _] => pure .real
   | .realBinary _, #[.real, .real] => pure .real
   | .realSqrt, #[.real] => pure .real
@@ -4561,19 +4579,53 @@ retains the complete owner-bearing index expression; its ordinal records the sel
 lane without reconstructing a root assignment environment. -/
 abbrev DirectCorrelationKey := IndexExpr
 
+/-- The selector assignments that identify one physical direct lane.  Nested direct tables add
+independent assignments to this environment; repeating a selector must agree with its existing
+ordinal.  The list preserves the first structural occurrence, while all comparisons below are
+set-like, so mapped/nested paths cannot depend on traversal order. -/
+abbrev DirectCorrelationEnvironment := List (DirectCorrelationKey × Nat)
+
+private def normalizeDirectCorrelation
+    (environment : DirectCorrelationEnvironment) : Option DirectCorrelationEnvironment :=
+  environment.foldlM (fun normalized assignment =>
+    match normalized.find? fun retained => retained.1 == assignment.1 with
+    | none => pure (normalized ++ [assignment])
+    | some retained => if retained.2 == assignment.2 then pure normalized else none) []
+
+private def mergeDirectCorrelation
+    (left right : DirectCorrelationEnvironment) : Option DirectCorrelationEnvironment :=
+  normalizeDirectCorrelation (left ++ right)
+
+private def directCorrelationContained
+    (required available : DirectCorrelationEnvironment) : Bool :=
+  required.all fun assignment => available.contains assignment
+
+private def sameDirectCorrelation
+    (left right : DirectCorrelationEnvironment) : Bool :=
+  directCorrelationContained left right && directCorrelationContained right left
+
 structure ReducedDirectMatrixFact where
-  key : Option DirectCorrelationKey
-  ordinal : Nat
+  correlation : DirectCorrelationEnvironment
   fact : OperationalMatrixFact
 
+def ReducedDirectMatrixFact.key (entry : ReducedDirectMatrixFact) : Option DirectCorrelationKey :=
+  entry.correlation.head?.map (·.1)
+
+def ReducedDirectMatrixFact.ordinal (entry : ReducedDirectMatrixFact) : Nat :=
+  entry.correlation.head?.map (·.2) |>.getD 0
+
 structure ReducedDirectScalarFact where
-  key : Option DirectCorrelationKey
-  ordinal : Nat
+  correlation : DirectCorrelationEnvironment
   fact : OperationalScalarFact
 
+def ReducedDirectScalarFact.key (entry : ReducedDirectScalarFact) : Option DirectCorrelationKey :=
+  entry.correlation.head?.map (·.1)
+
+def ReducedDirectScalarFact.ordinal (entry : ReducedDirectScalarFact) : Nat :=
+  entry.correlation.head?.map (·.2) |>.getD 0
+
 structure ReducedDirectRelationArgument where
-  key : Option DirectCorrelationKey
-  ordinal : Nat
+  correlation : DirectCorrelationEnvironment
   payload : DirectRelationArgument
 
 /- The reporting identity of a map deliberately omits `closedIndex`: that field records how a
@@ -4619,14 +4671,19 @@ make events stable across shared DAG traversal and repeated bound queries. -/
 structure DirectRelationRewriteEventKey where
   pointwise : DirectRelationRewritePointwiseKey
   maps : List DirectRelationRewriteMapKey
-  key : Option DirectCorrelationKey
-  ordinal : Nat
+  correlation : DirectCorrelationEnvironment
   localOrdinal : Nat
   deriving BEq, DecidableEq, Repr
 
+private def sameDirectRelationRewriteEvent
+    (left right : DirectRelationRewriteEventKey) : Bool :=
+  left.pointwise == right.pointwise && left.maps == right.maps &&
+    sameDirectCorrelation left.correlation right.correlation && left.localOrdinal == right.localOrdinal
+
 private def deduplicateDirectRelationRewriteEvents
     (events : List DirectRelationRewriteEventKey) : List DirectRelationRewriteEventKey :=
-  events.foldl (fun retained event => if retained.contains event then retained else retained ++ [event]) []
+  events.foldl (fun retained event =>
+    if retained.any (sameDirectRelationRewriteEvent event) then retained else retained ++ [event]) []
 
 private structure ReducedDirectMatrixEvaluation where
   entries : List ReducedDirectMatrixFact
@@ -4640,91 +4697,112 @@ private structure ReducedDirectScalarEvaluation where
   /-- Scalar reduction can invoke matrix-to-scalar nodes, so preserve their observed width. -/
   maximumPolynomialTerms : Nat := 0
 
-/-- The sole correlation zipper for mixed direct relation operands.  A singleton shared input is
-allowed with every lane; otherwise every physical operand must have the driver's exact key and
-ordinal.  This is intentionally the same fail-closed rule as the existing matrix/scalar zippers. -/
+private def alignDirectCorrelationEntries {α : Type}
+    (owner id : Nat)
+    (inputs : List (List (DirectCorrelationEnvironment × α))) :
+    Except OperationalError (List (Array α × DirectCorrelationEnvironment)) := do
+  if inputs.isEmpty || inputs.any List.isEmpty then throw (.invalidCount owner 0)
+  let driver? := inputs.foldl (fun selected? entries =>
+    match selected? with
+    | none => some entries
+    | some selected =>
+        let selectedDepth := selected.foldl
+          (fun maximum (entry : DirectCorrelationEnvironment × α) => max maximum entry.1.length) 0
+        let entryDepth := entries.foldl
+          (fun maximum (entry : DirectCorrelationEnvironment × α) => max maximum entry.1.length) 0
+        if entryDepth > selectedDepth then some entries else selected?) none
+  match driver? with
+  | some driver =>
+      let driverDepth := driver.foldl
+        (fun maximum (entry : DirectCorrelationEnvironment × α) => max maximum entry.1.length) 0
+      let competing := inputs.filter fun entries =>
+        entries.foldl (fun maximum (entry : DirectCorrelationEnvironment × α) =>
+          max maximum entry.1.length) 0 == driverDepth
+      if !competing.all (fun entries => entries.all fun entry =>
+          driver.any fun driverEntry => sameDirectCorrelation entry.1 driverEntry.1) then
+        throw (.unsupportedOperationalExpr id)
+      if driver.length == 1 && inputs.all (fun entries => entries.length == 1) then do
+        let entries ← inputs.mapM fun entries => match entries with
+          | [entry] => pure entry | _ => throw (.unsupportedOperationalExpr id)
+        let correlation ← entries.foldlM (fun current entry =>
+          match mergeDirectCorrelation current entry.1 with
+          | some merged => pure merged | none => throw (.unsupportedOperationalExpr id)) []
+        pure [(entries.map (·.2) |>.toArray, correlation)]
+      else driver.mapM fun driverEntry => do
+      let arguments ← inputs.mapM fun entries => match entries with
+        | [entry] =>
+            if directCorrelationContained entry.1 driverEntry.1 then pure entry.2
+            else throw (.unsupportedOperationalExpr id)
+        | _ => match entries.filter fun entry => directCorrelationContained entry.1 driverEntry.1 with
+          | [entry] => pure entry.2
+          | _ => throw (.unsupportedOperationalExpr id)
+      pure (arguments.toArray, driverEntry.1)
+  | none => throw (.invalidCount owner 0)
+
+/-- The sole correlation zipper for mixed direct relation operands.  It selects a pre-existing
+most-specific lane and permits only operands whose assignments are a compatible subset; it never
+creates a Cartesian product of independent tables. -/
 def alignDirectRelationArguments
     (owner id : Nat)
     (inputs : List (List ReducedDirectRelationArgument)) :
-    Except OperationalError (List (Array DirectRelationArgument × Option DirectCorrelationKey × Nat)) := do
-  if inputs.isEmpty || inputs.any List.isEmpty then throw (.invalidCount owner 0)
-  let driver? := inputs.find? fun entries => entries.length > 1
-  match driver? with
-  | some driver => driver.mapM fun driverEntry => do
-      let arguments ← inputs.mapM fun entries => match entries with
-        | [entry] =>
-            if entry.key.isNone || (entry.key == driverEntry.key && entry.ordinal == driverEntry.ordinal)
-            then pure entry.payload else throw (.unsupportedOperationalExpr id)
-        | _ => match entries.find? fun entry =>
-          entry.key == driverEntry.key && entry.ordinal == driverEntry.ordinal with
-          | some entry => pure entry.payload
-          | none => throw (.unsupportedOperationalExpr id)
-      pure (arguments.toArray, driverEntry.key, driverEntry.ordinal)
-  | none => do
-      let entries ← inputs.mapM fun entries => match entries with
-        | [entry] => pure entry
-        | _ => throw (.unsupportedOperationalExpr id)
-      let driver? := entries.find? fun entry => entry.key.isSome
-      match driver? with
-      | some driver =>
-          if entries.all fun entry => entry.key.isNone ||
-              (entry.key == driver.key && entry.ordinal == driver.ordinal) then
-            pure [(entries.map (·.payload) |>.toArray, driver.key, driver.ordinal)]
-          else throw (.unsupportedOperationalExpr id)
-      | none => pure [(entries.map (·.payload) |>.toArray, none, 0)]
+    Except OperationalError (List (Array DirectRelationArgument × DirectCorrelationEnvironment)) :=
+  alignDirectCorrelationEntries owner id
+    (inputs.map (fun entries => entries.map fun entry => (entry.correlation, entry.payload)))
+
+private def transportDirectCorrelationComponent
+    (parameters : ParamEnvironment)
+    (id : OperationalIndexedValueId)
+    (maps : List IndexMap)
+    (key : DirectCorrelationKey)
+    (ordinal : Nat) : Except OperationalError (Option (Option (DirectCorrelationKey × Nat))) := do
+  let mut key := key
+  let mut ordinal := ordinal
+  for map in maps do
+    let source := key
+    /- A gather's codomain is an `IntExpr` domain witness, so its free index atoms contain only
+    the runtime position.  It nevertheless substitutes the mapped source family lane; always
+    transport the complete gather key through that map. -/
+    let transports := match source with
+      | .gather _ _ _ => true
+      | _ => source.freeVariables.any map.source.binders.contains
+    if transports then
+      let translated ← match reindex map source with
+        | some translated => pure translated
+        | none => throw (.unsupportedOperationalExpr id)
+      match translated with
+      | .constant lane =>
+          if ordinal != lane then return none
+          return some none
+      | .offset (.constant lane) amount =>
+          let lane := Int.ofNat lane + amount
+          if lane < 0 || ordinal != lane.toNat then return none
+          return some none
+      | .variable destination => key := .variable destination
+      | .offset (.variable destination) amount =>
+          let destinationOrdinal := Int.ofNat ordinal - amount
+          let count ← match destination.count.evaluate parameters with
+            | some count => pure count
+            | none => throw .nonClosedExpression
+          if destinationOrdinal < 0 || destinationOrdinal >= count then return none
+          key := .variable destination
+          ordinal := destinationOrdinal.toNat
+      /- A gather is a dependent function application.  `ordinal` remains the physical source
+      table lane, while the complete owner-bearing gather expression names the runtime lookup. -/
+      | gathered@(.gather _ _ _) => key := gathered
+      | .offset _ _ => throw (.unsupportedOperationalExpr id)
+  pure (some (some (key, ordinal)))
 
 private def transportDirectCorrelation
     (parameters : ParamEnvironment)
     (id : OperationalIndexedValueId)
     (maps : List IndexMap)
-    (key : Option DirectCorrelationKey)
-    (ordinal : Nat) : Except OperationalError (Option (Option DirectCorrelationKey × Nat)) := do
-  let mut key := key
-  let mut ordinal := ordinal
-  for map in maps do
-    match key with
-    | none => pure ()
-    | some source => do
-        /- A gather's codomain is an `IntExpr` domain witness, so its free index atoms contain
-        only the runtime position.  It nevertheless substitutes the mapped source family lane;
-        always transport the complete gather key through that map. -/
-        let transports := match source with
-          | .gather _ _ _ => true
-          | _ => source.freeVariables.any map.source.binders.contains
-        if transports then
-          let translated ← match reindex map source with
-            | some translated => pure translated
-            | none => throw (.unsupportedOperationalExpr id)
-          match translated with
-          | .constant lane =>
-              if ordinal != lane then return none
-              key := none
-              ordinal := 0
-          | .offset (.constant lane) amount =>
-              let lane := Int.ofNat lane + amount
-              if lane < 0 || ordinal != lane.toNat then return none
-              key := none
-              ordinal := 0
-          | .variable destination => key := some (.variable destination)
-          | .offset (.variable destination) amount =>
-              let destinationOrdinal := Int.ofNat ordinal - amount
-              let count ← match destination.count.evaluate parameters with
-                | some count => pure count
-                | none => throw .nonClosedExpression
-              if destinationOrdinal < 0 || destinationOrdinal >= count then return none
-              key := some (.variable destination)
-              ordinal := destinationOrdinal.toNat
-          /- A gather is a dependent function application.  `ordinal` remains the physical
-          source-table lane, while the complete owner-bearing gather expression names the
-          (possibly repeated) runtime lookup.  This represents every source lane once and never
-          expands it for each output position.  Two gathered operands can therefore zip only
-          when both the source-index value and lookup-position identities are structurally exact.
-          The fixed leaves have already been reindexed through this same map by
-          `reindexDirectMatrixFact`, so relation owners, targets, and provenance carry this
-          exact gather identity as well. -/
-          | gathered@(.gather _ _ _) => key := some gathered
-          | .offset _ _ => throw (.unsupportedOperationalExpr id)
-  pure (some (key, ordinal))
+    (correlation : DirectCorrelationEnvironment) : Except OperationalError (Option DirectCorrelationEnvironment) := do
+  let transported ← correlation.mapM fun assignment =>
+    transportDirectCorrelationComponent parameters id maps assignment.1 assignment.2
+  if transported.any Option.isNone then return none
+  match normalizeDirectCorrelation (transported.filterMap fun value => value.join) with
+  | some normalized => pure (some normalized)
+  | none => throw (.unsupportedOperationalExpr id)
 
 mutual
 
@@ -4743,7 +4821,7 @@ private def reducedDirectMatrixFactAt
           let fact ← match arena.fixed.matrices[reference]? with
             | some fact => pure fact
             | none => throw (.invalidOperationalExprRef reference)
-          pure { entries := [{ key := none, ordinal := 0, fact }] }
+          pure { entries := [{ correlation := [], fact }] }
       | .explicit (.matrix _) binder references => do
           let mapped ← references.toList.mapIdxM fun ordinal reference => do
             let fact ← match reference with
@@ -4751,43 +4829,25 @@ private def reducedDirectMatrixFactAt
                 | some fact => pure fact
                 | none => throw (.invalidOperationalExprRef reference)
               | .scalar _ => throw (.unsupportedOperationalExpr id)
-            let entry := if references.size == 1 then (none, 0) else (some (.variable binder), ordinal)
-            match ← transportDirectCorrelation parameters id maps entry.1 entry.2 with
-            | some (key, ordinal) => pure (some { key, ordinal, fact })
+            let correlation := if references.size == 1 then [] else [(.variable binder, ordinal)]
+            match ← transportDirectCorrelation parameters id maps correlation with
+            | some correlation => pure (some { correlation, fact })
             | none => pure none
           let entries := mapped.filterMap fun entry => entry
           pure { entries := entries }
       | .explicitValues (.matrix _) binder values => do
           let lanes ← values.toList.mapIdxM fun ordinal child => do
-            let outer := if values.size == 1 then (none, 0) else (some (.variable binder), ordinal)
-            let outer ← transportDirectCorrelation parameters id maps outer.1 outer.2
+            let outer := if values.size == 1 then [] else [(.variable binder, ordinal)]
+            let outer ← transportDirectCorrelation parameters id maps outer
             match outer with
             | none => pure ({ entries := [] } : ReducedDirectMatrixEvaluation)
-            | some (none, _) =>
+            | some outer => do
                 let evaluation ← reducedDirectMatrixFactAt arena parameters maps child fuel
-                return evaluation
-            | some (some outerKey, outerOrdinal) => do
-                let evaluation ← reducedDirectMatrixFactAt arena parameters maps child fuel
-                let entries := evaluation.entries
-                match entries with
-                | [entry] => match entry.key with
-                    | none =>
-                        let entry := { entry with key := some outerKey, ordinal := outerOrdinal }
-                        let result : ReducedDirectMatrixEvaluation := {
-                          entries := [entry], rewriteEvents := evaluation.rewriteEvents }
-                        pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
-                    | some _ =>
-                        if entry.key == some outerKey && entry.ordinal == outerOrdinal then
-                          pure evaluation
-                        else throw (.unsupportedOperationalExpr id)
-                | _ =>
-                    match entries.filter fun entry =>
-                      entry.key == some outerKey && entry.ordinal == outerOrdinal with
-                    | [entry] =>
-                        let result : ReducedDirectMatrixEvaluation := {
-                          entries := [entry], rewriteEvents := evaluation.rewriteEvents }
-                        pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
-                    | _ => throw (.unsupportedOperationalExpr id)
+                let entries ← evaluation.entries.mapM fun entry =>
+                  match mergeDirectCorrelation outer entry.correlation with
+                  | some correlation => pure { entry with correlation }
+                  | none => throw (.unsupportedOperationalExpr id)
+                pure { evaluation with entries }
           let entries := lanes.flatMap (fun lane => lane.entries)
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (lanes.flatMap (fun lane => lane.rewriteEvents))
@@ -4809,39 +4869,9 @@ private def reducedDirectMatrixFactAt
           let inputEvaluations ← inputs.toList.mapM fun input =>
             reducedDirectMatrixFactAt arena parameters maps input fuel
           let inputEntries := inputEvaluations.map (·.entries)
-          let rec zipEntries : List (List ReducedDirectMatrixFact) →
-              Except OperationalError (List (Array OperationalMatrixFact × Option DirectCorrelationKey × Nat))
-            | [] => throw (.invalidCount operation.ownerNode 0)
-            | inputs => do
-                if inputs.any List.isEmpty then throw (.invalidCount operation.ownerNode 0)
-                let driver? := inputs.find? fun entries => entries.length > 1
-                match driver? with
-                | some driver => driver.mapM fun driverEntry => do
-                    let arguments ← inputs.mapM fun entries => match entries with
-                      | [entry] =>
-                          if entry.key.isNone ||
-                              (entry.key == driverEntry.key && entry.ordinal == driverEntry.ordinal) then
-                            pure entry.fact
-                          else throw (.unsupportedOperationalExpr id)
-                      | _ => match entries.find? fun entry =>
-                          entry.key == driverEntry.key && entry.ordinal == driverEntry.ordinal with
-                        | some entry => pure entry.fact
-                        | none => throw (.unsupportedOperationalExpr id)
-                    pure (arguments.toArray, driverEntry.key, driverEntry.ordinal)
-                | none => do
-                    let entries ← inputs.mapM fun entries => match entries with
-                      | [entry] => pure entry
-                      | _ => throw (.unsupportedOperationalExpr id)
-                    let driver? := entries.find? fun entry => entry.key.isSome
-                    match driver? with
-                    | some driver =>
-                        if entries.all fun entry => entry.key.isNone ||
-                            (entry.key == driver.key && entry.ordinal == driver.ordinal) then
-                          pure [(entries.map (·.fact) |>.toArray, driver.key, driver.ordinal)]
-                        else throw (.unsupportedOperationalExpr id)
-                    | none => pure [(entries.map (·.fact) |>.toArray, none, 0)]
-          let aligned ← zipEntries inputEntries
-          let entriesAndEvents ← aligned.mapM fun (arguments, key, ordinal) => do
+          let aligned ← alignDirectCorrelationEntries operation.ownerNode id
+            (inputEntries.map (fun entries => entries.map fun entry => (entry.correlation, entry.fact)))
+          let entriesAndEvents ← aligned.mapM fun (arguments, correlation) => do
             let (fact, rewriteCount) ←
               applyDirectMatrixPointwiseOperationWithRelationRewriteCount operation matrixType arguments
             let pointwise : DirectRelationRewritePointwiseKey := {
@@ -4849,10 +4879,9 @@ private def reducedDirectMatrixFactAt
               outputPort := operation.outputPort }
             let events := (List.range rewriteCount).map fun localOrdinal => {
               pointwise := pointwise,
-              maps := normalizeDirectRelationRewriteMaps maps, key := key,
-              ordinal := ordinal,
+              maps := normalizeDirectRelationRewriteMaps maps, correlation := correlation,
               localOrdinal := localOrdinal }
-            pure ({ key, ordinal, fact }, events)
+            pure ({ correlation, fact }, events)
           let entries := entriesAndEvents.map (fun value => value.1)
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (inputEvaluations.flatMap (fun value => value.rewriteEvents) ++
@@ -4870,24 +4899,24 @@ private def reducedDirectMatrixFactAt
             | .matrix _ =>
                 let evaluation ← reducedDirectMatrixFactAt arena parameters maps inputId fuel
                 pure (evaluation.entries.map fun entry =>
-                  ReducedDirectRelationArgument.mk entry.key entry.ordinal
-                    (DirectRelationArgument.matrix entry.fact), evaluation.rewriteEvents,
+                  { correlation := entry.correlation,
+                    payload := DirectRelationArgument.matrix entry.fact }, evaluation.rewriteEvents,
                   evaluation.maximumPolynomialTerms)
             | .scalar (.trapdoor _) =>
                 let evaluation ← reducedDirectScalarFactAt arena parameters maps inputId fuel
                 let entries ← evaluation.entries.mapM fun entry => do
                   match entry.fact with
                   | OperationalScalarFact.trapdoor fact =>
-                      pure (ReducedDirectRelationArgument.mk entry.key entry.ordinal
+                      pure (ReducedDirectRelationArgument.mk entry.correlation
                         (DirectRelationArgument.trapdoor fact))
                   | _ => throw (.unsupportedOperationalExpr id)
                 pure (entries, evaluation.rewriteEvents, evaluation.maximumPolynomialTerms)
             | .scalar _ => throw (.unsupportedOperationalExpr id)
           let inputEntries := inputEvaluations.map (·.1)
           let aligned ← alignDirectRelationArguments operation.ownerNode id inputEntries
-          let entries ← aligned.mapM fun (arguments, key, ordinal) => do
+          let entries ← aligned.mapM fun (arguments, correlation) => do
             let fact ← applyDirectRelationProducer operation matrixType arguments
-            pure { key, ordinal, fact }
+            pure { correlation, fact }
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (inputEvaluations.flatMap (fun value => value.2.1))
           let maximumPolynomialTerms := inputEvaluations.foldl (fun maximum value =>
@@ -4900,7 +4929,7 @@ private def reducedDirectMatrixFactAt
           let evaluation ← reducedDirectScalarFactAt arena parameters maps input fuel
           let entries : List ReducedDirectMatrixFact ← evaluation.entries.mapM fun entry => do
             let fact ← applyDirectMatrixFromScalarOperation operation matrixType entry.fact
-            pure { key := entry.key, ordinal := entry.ordinal, fact }
+            pure { correlation := entry.correlation, fact }
           let result : ReducedDirectMatrixEvaluation := {
             entries := entries, rewriteEvents := evaluation.rewriteEvents }
           pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
@@ -4926,7 +4955,7 @@ private def reducedDirectScalarFactAt
           let fact ← match arena.fixed.scalars[reference]? with
             | some fact => pure fact
             | none => throw (.invalidOperationalExprRef reference)
-          pure { entries := [{ key := none, ordinal := 0, fact }] }
+          pure { entries := [{ correlation := [], fact }] }
       | .explicit (.scalar _) binder references => do
           let mapped ← references.toList.mapIdxM fun ordinal reference => do
             let fact ← match reference with
@@ -4934,43 +4963,25 @@ private def reducedDirectScalarFactAt
                 | some fact => pure fact
                 | none => throw (.invalidOperationalExprRef reference)
               | .matrix _ => throw (.unsupportedOperationalExpr id)
-            let entry := if references.size == 1 then (none, 0) else (some (.variable binder), ordinal)
-            match ← transportDirectCorrelation parameters id maps entry.1 entry.2 with
-            | some (key, ordinal) => pure (some { key, ordinal, fact })
+            let correlation := if references.size == 1 then [] else [(.variable binder, ordinal)]
+            match ← transportDirectCorrelation parameters id maps correlation with
+            | some correlation => pure (some { correlation, fact })
             | none => pure none
           let entries := mapped.filterMap fun entry => entry
           pure { entries := entries }
       | .explicitValues (.scalar _) binder values => do
           let lanes ← values.toList.mapIdxM fun ordinal child => do
-            let outer := if values.size == 1 then (none, 0) else (some (.variable binder), ordinal)
-            let outer ← transportDirectCorrelation parameters id maps outer.1 outer.2
+            let outer := if values.size == 1 then [] else [(.variable binder, ordinal)]
+            let outer ← transportDirectCorrelation parameters id maps outer
             match outer with
             | none => pure ({ entries := [] } : ReducedDirectScalarEvaluation)
-            | some (none, _) =>
+            | some outer => do
                 let evaluation ← reducedDirectScalarFactAt arena parameters maps child fuel
-                return evaluation
-            | some (some outerKey, outerOrdinal) => do
-                let evaluation ← reducedDirectScalarFactAt arena parameters maps child fuel
-                let entries := evaluation.entries
-                match entries with
-                | [entry] => match entry.key with
-                    | none =>
-                        let entry := { entry with key := some outerKey, ordinal := outerOrdinal }
-                        let result : ReducedDirectScalarEvaluation := {
-                          entries := [entry], rewriteEvents := evaluation.rewriteEvents }
-                        pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
-                    | some _ =>
-                        if entry.key == some outerKey && entry.ordinal == outerOrdinal then
-                          pure evaluation
-                        else throw (.unsupportedOperationalExpr id)
-                | _ =>
-                    match entries.filter fun entry =>
-                      entry.key == some outerKey && entry.ordinal == outerOrdinal with
-                    | [entry] =>
-                        let result : ReducedDirectScalarEvaluation := {
-                          entries := [entry], rewriteEvents := evaluation.rewriteEvents }
-                        pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
-                    | _ => throw (.unsupportedOperationalExpr id)
+                let entries ← evaluation.entries.mapM fun entry =>
+                  match mergeDirectCorrelation outer entry.correlation with
+                  | some correlation => pure { entry with correlation }
+                  | none => throw (.unsupportedOperationalExpr id)
+                pure { evaluation with entries }
           let entries := lanes.flatMap (fun lane => lane.entries)
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (lanes.flatMap (fun lane => lane.rewriteEvents))
@@ -4988,7 +4999,7 @@ private def reducedDirectScalarFactAt
           let evaluation ← reducedDirectMatrixFactAt arena parameters maps input fuel
           let entries ← evaluation.entries.mapM fun entry => do
             let fact ← applyDirectMatrixToScalarOperation operation entry.fact
-            pure { key := entry.key, ordinal := entry.ordinal, fact }
+            pure { correlation := entry.correlation, fact }
           let result : ReducedDirectScalarEvaluation := {
             entries := entries, rewriteEvents := evaluation.rewriteEvents }
           pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
@@ -4996,41 +5007,11 @@ private def reducedDirectScalarFactAt
           let inputEvaluations ← inputs.toList.mapM fun input =>
             reducedDirectScalarFactAt arena parameters maps input fuel
           let inputEntries := inputEvaluations.map (·.entries)
-          let rec zipEntries : List (List ReducedDirectScalarFact) →
-              Except OperationalError (List (Array OperationalScalarFact × Option DirectCorrelationKey × Nat))
-            | [] => throw (.unsupportedOperationalExpr id)
-            | inputs => do
-                if inputs.any List.isEmpty then throw (.unsupportedOperationalExpr id)
-                let driver? := inputs.find? fun entries => entries.length > 1
-                match driver? with
-                | some driver => driver.mapM fun driverEntry => do
-                    let arguments ← inputs.mapM fun entries => match entries with
-                      | [entry] =>
-                          if entry.key.isNone ||
-                              (entry.key == driverEntry.key && entry.ordinal == driverEntry.ordinal) then
-                            pure entry.fact
-                          else throw (.unsupportedOperationalExpr id)
-                      | _ => match entries.find? fun entry =>
-                          entry.key == driverEntry.key && entry.ordinal == driverEntry.ordinal with
-                        | some entry => pure entry.fact
-                        | none => throw (.unsupportedOperationalExpr id)
-                    pure (arguments.toArray, driverEntry.key, driverEntry.ordinal)
-                | none => do
-                    let entries ← inputs.mapM fun entries => match entries with
-                      | [entry] => pure entry
-                      | _ => throw (.unsupportedOperationalExpr id)
-                    let driver? := entries.find? fun entry => entry.key.isSome
-                    match driver? with
-                    | some driver =>
-                        if entries.all fun entry => entry.key.isNone ||
-                            (entry.key == driver.key && entry.ordinal == driver.ordinal) then
-                          pure [(entries.map (·.fact) |>.toArray, driver.key, driver.ordinal)]
-                        else throw (.unsupportedOperationalExpr id)
-                    | none => pure [(entries.map (·.fact) |>.toArray, none, 0)]
-          let aligned ← zipEntries inputEntries
-          let entries ← aligned.mapM fun (arguments, key, ordinal) => do
+          let aligned ← alignDirectCorrelationEntries operation.ownerNode id
+            (inputEntries.map (fun entries => entries.map fun entry => (entry.correlation, entry.fact)))
+          let entries ← aligned.mapM fun (arguments, correlation) => do
             let fact ← applyDirectScalarPointwiseOperation operation arguments
-            pure { key, ordinal, fact }
+            pure { correlation, fact }
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (inputEvaluations.flatMap (fun value => value.rewriteEvents))
           let maximumPolynomialTerms := inputEvaluations.foldl (fun maximum evaluation =>
@@ -5140,14 +5121,15 @@ def sameSequentialCarriedSchema
     (left right : OperationalFact) : Bool :=
   match left, right with
   | left@{ payload := .directValue _, .. }, right@{ payload := .directValue _, .. } =>
-      left.context == right.context &&
+      left.context.binders.toList.all (right.context.binders.contains) &&
+        right.context.binders.toList.all (left.context.binders.contains) &&
       match arena.direct.valueAt? left.payload.root, arena.direct.valueAt? right.payload.root with
       | some leftValue, some rightValue => match leftValue.payload.schema, rightValue.payload.schema with
         | .matrix _, .matrix _ =>
             match arena.reducedDirectValueFactsAt [] left, arena.reducedDirectValueFactsAt [] right with
             | .ok leftFacts, .ok rightFacts => leftFacts.length == rightFacts.length &&
                 (leftFacts.zip rightFacts).all fun (left, right) =>
-                  left.key == right.key && left.ordinal == right.ordinal &&
+                  left.correlation == right.correlation &&
                     sameCarriedMatrixFactSchema left.fact right.fact
             | _, _ => false
         | .scalar _, .scalar _ =>
@@ -5155,7 +5137,7 @@ def sameSequentialCarriedSchema
                 arena.reducedDirectScalarValueFactsAt [] right with
             | .ok leftFacts, .ok rightFacts => leftFacts.length == rightFacts.length &&
                 (leftFacts.zip rightFacts).all fun (left, right) =>
-                  left.key == right.key && left.ordinal == right.ordinal &&
+                  left.correlation == right.correlation &&
                     scalarSchemaTag left.fact == scalarSchemaTag right.fact
             | _, _ => false
         | _, _ => false
@@ -5977,6 +5959,29 @@ def reindexOperationalMatrixFact
     blockLayout := ← fact.blockLayout.mapM (reindexOperationalBlockLayout map)
   }
 
+/-- Reindex scalar identity/bound fields when a direct carrier map specializes its selector. -/
+def reindexOperationalScalarFact
+    (map : IndexMap) : OperationalScalarFact → Option OperationalScalarFact
+  | .integer fact => do
+      pure (.integer { fact with
+        origin := ← reindexOperationalValueOrigin map fact.origin
+        lowerExpression := ← reindexOperationalBoundExpr map fact.lowerExpression
+        upperExpression := ← reindexOperationalBoundExpr map fact.upperExpression })
+  | .trapdoor fact => do
+      let preimageCutoff ← match fact.preimageCutoff with
+        | none => pure none | some cutoff => reindexOperationalBoundExpr map cutoff
+      pure (.trapdoor { fact with
+        matrixType := ← reindexMatrixTypeExpr map fact.matrixType
+        maximum := ← reindexOperationalBoundExpr map fact.maximum
+        preimageCutoff
+        publicIdentity := ← reindexPublicMatrixIdentity map fact.publicIdentity })
+  | .bytes fact => do
+      pure (.bytes { fact with origin := ← reindexOperationalValueOrigin map fact.origin })
+  | .boolean => some .boolean
+  | .real => some .real
+  | .typedBlob typeName => some (.typedBlob typeName)
+  | .unknown wireType => some (.unknown wireType)
+
 /-- Reindex one direct matrix carrier value.  The storage map retains the indexed shape and
 composes without materializing a family, while every reachable fixed matrix leaf receives the
 same capture-free substitution.  Thus carrier metadata and the identities evaluated from those
@@ -6003,10 +6008,13 @@ def OperationalExprArena.reindexDirectMatrixFact
         match reindexOperationalMatrixFact map fact with
         | some fact => pure fact
         | none => throw (.unsupportedOperationalExpr root)
-    /- Direct scalar values carry no matrix/provenance relation fields.  Their indexed context is
-    still transported by the enclosing mapped carrier; scalar semantic kernels consume that same
-    context and never select a representative. -/
-    | .scalar _ => pure (arena.direct, root)
+    /- Scalar leaves carry indexed integer, byte, and trapdoor provenance.  Reindex their fixed
+    payloads exactly as matrix leaves, so static/dynamic direct-family access specializes the
+    symbolic selector without materializing the shared family table. -/
+    | .scalar _ => arena.direct.mapScalarValue root fun fact =>
+        match reindexOperationalScalarFact map fact with
+        | some fact => pure fact
+        | none => throw (.unsupportedOperationalExpr root)
   let (direct, mapped) ← match direct.pushMapped reindexed map with
     | some result => pure result
     | none => throw (.unsupportedOperationalExpr root)
@@ -6025,31 +6033,6 @@ def reindexOperationalIndexedMatrixFact
     (map : IndexMap)
     (fact : OperationalIndexedMatrixFact) : Option OperationalIndexedMatrixFact :=
   fact.reindex map reindexOperationalMatrixFact
-
-def reindexOperationalScalarFact
-    (map : IndexMap) : OperationalScalarFact → Option OperationalScalarFact
-  | .integer fact => do
-      pure (.integer {
-        fact with
-        origin := ← reindexOperationalValueOrigin map fact.origin
-        lowerExpression := ← reindexOperationalBoundExpr map fact.lowerExpression
-        upperExpression := ← reindexOperationalBoundExpr map fact.upperExpression })
-  | .trapdoor fact => do
-      let preimageCutoff ← match fact.preimageCutoff with
-        | none => pure none
-        | some cutoff => reindexOperationalBoundExpr map cutoff
-      pure (.trapdoor {
-        fact with
-        matrixType := ← reindexMatrixTypeExpr map fact.matrixType
-        maximum := ← reindexOperationalBoundExpr map fact.maximum
-        preimageCutoff
-        publicIdentity := ← reindexPublicMatrixIdentity map fact.publicIdentity })
-  | .bytes fact => do
-      pure (.bytes { fact with origin := ← reindexOperationalValueOrigin map fact.origin })
-  | .boolean => some .boolean
-  | .real => some .real
-  | .typedBlob typeName => some (.typedBlob typeName)
-  | .unknown wireType => some (.unknown wireType)
 
 def reindexIndexedScalarFact
     (map : IndexMap)
@@ -6482,8 +6465,19 @@ partial def shiftFactPreviousDepth
       let (arena, mapped) ← mapIndexedScalarLeaves arena expression update
       pure (arena, mapped)
   | expression@{ payload := .directValue root, .. } => do
-      let (direct, mapped) ← arena.direct.mapMatrixValue root
-        (fun fact => pure (shiftMatrixFactPreviousDepth fact))
+      let value ← match arena.direct.valueAt? root with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef root)
+      let (direct, mapped) ← match value.payload.schema with
+        | .matrix _ => do
+            arena.direct.mapMatrixValue root (fun fact => pure (shiftMatrixFactPreviousDepth fact))
+        | .scalar _ => do
+            arena.direct.mapScalarValue root fun
+              | .trapdoor fact => pure (.trapdoor { fact with maximum := shiftPreviousDepth fact.maximum })
+              | .integer fact => pure (.integer { fact with
+                  lowerExpression := shiftPreviousDepth fact.lowerExpression
+                  upperExpression := shiftPreviousDepth fact.upperExpression })
+              | fact => pure fact
       let value ← match direct.valueAt? mapped with
         | some value => pure value
         | none => throw (.invalidOperationalExprRef mapped)

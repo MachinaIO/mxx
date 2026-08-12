@@ -390,31 +390,12 @@ def genericNodeMatrixFactConcrete
         (fun result pair ↦ addOperationalPolynomials result
           (scaleOperationalPolynomial pair.1 pair.2.polynomial)) []
       polynomialMatrixFact nodeIndex outputPort matrixType environment polynomial
-  | .packPolynomialCoefficients _ coefficientBits, some matrixType =>
-      let bits ← evaluateIntMaximum environment loopDomains coefficientBits
-      if bits <= 0 then throw (.invalidBound nodeIndex bits)
-      if node.arguments.length != 1 then
-        throw (.unsupportedOutputArity nodeIndex node.arguments.length)
-      let cap ← match matrixCap matrixType environment with
-        | some value => pure value
-        | none => throw (.invalidMatrixParameters nodeIndex)
-      let params ← match matrixType.evaluate environment with
-        | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
-      if params.rows != 1 || params.columns != 1 || (2 : Int) ^ bits.toNat < params.modulus then
-        throw (.invalidMatrixParameters nodeIndex)
-      let inputWire := node.arguments.headD { node := 0, port := 0 }
-      let input ← lookupFact nodeIndex facts inputWire
-      let expectedCount := Int.ofNat params.ringDimension * bits
-      if booleanFamilyCount facts.arena input != some expectedCount then
-        throw (.loopInputModeMismatch nodeIndex 0)
-      classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
-        (if params.modulus > 0 then .below params.modulus.toNat else .unknown)
   | .trapdoorSample _ maximum, some matrixType =>
       let _ ← validateContextualCutoffNonnegative nodeIndex environment loopDomains maximum
       let cap ← match matrixCap matrixType environment with
         | some value => pure value | none => throw (.invalidMatrixParameters nodeIndex)
       let result ← classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
-      pure ({ result with identity := some (.sampledTrapdoor temporaryScope
+      pure ({ result with identity := some (.sampledTrapdoor scopeKey
         { node := nodeIndex, port := 0 }) }).refreshPrimitivePolynomial
   | .trapdoorPublic, some matrixType =>
       let trapdoorWire ← match node.arguments[0]? with
@@ -529,9 +510,19 @@ def genericNodeFact
             context := value.context, payload := .directValue root, storage := value.storage })
       | _ =>
           let scalar ← defaultScalarFact nodeIndex outputPort element environment loopDomains
-          let (arena, root) := facts.arena.pushScalarConcrete scalar
-          let (arena, element) ← finishIndexedScalar arena root
-          return ← sharedIndexedScalarFact arena binder selection subject count.toNat element
+          let scalar := indexScalarFact binder selection subject scalar
+          let context ← selectionIndexedContext selection nodeIndex
+          let (fixed, reference) := facts.arena.direct.fixed.pushScalar scalar
+          let direct := { facts.arena.direct with fixed }
+          let (direct, root) ← match direct.pushShared context
+              (.scalar (operationalScalarSchema scalar)) reference with
+            | some result => pure result
+            | none => throw (.unsupportedOperationalExpr direct.values.size)
+          let value ← match direct.valueAt? root with
+            | some value => pure value
+            | none => throw (.invalidOperationalExprRef root)
+          return ({ facts.arena with direct }, {
+            context := value.context, payload := .directValue root, storage := value.storage })
   let scalarOutput := match outputType with
     | .matrix _ | .preimage _ | .indexedFamily _ _ => false
     | _ => true
@@ -574,6 +565,11 @@ def genericNodeFact
         (directOperation (.intBinary kind)) arguments.toArray)
     | .intCompare kind => return (← facts.arena.pushDirectScalarPointwiseN
         (directOperation (.intCompare kind)) arguments.toArray)
+    | .bitExtract position =>
+        let position ← evaluateIntInvariant environment loopDomains position
+        if position < 0 then throw (.invalidCount nodeIndex position)
+        return (← facts.arena.pushDirectScalarPointwiseN
+          (directOperation (.bitExtract position)) arguments.toArray)
     | .intToReal => return (← facts.arena.pushDirectScalarPointwiseN
         (directOperation .intToReal) arguments.toArray)
     | .realBinary kind => return (← facts.arena.pushDirectScalarPointwiseN
@@ -581,6 +577,118 @@ def genericNodeFact
     | .realSqrt => return (← facts.arena.pushDirectScalarPointwiseN
         (directOperation .realSqrt) arguments.toArray)
     | _ => pure ()
+  /- Matrix outputs with one direct scalar operand remain in the direct carrier.  This must run
+  before the concrete matrix endpoint, whose legacy trapdoor lookup cannot inspect a direct scalar
+  payload. -/
+  if !scalarOutput && arguments.all fun argument => match argument.payload with
+      | .directValue _ => true
+      | _ => false then
+    match node.kind, arguments with
+    | .trapdoorPublic, [input] =>
+        let matrixType ← match outputType with
+          | .matrix matrixType => pure matrixType
+          | _ => throw (.outputTypeMismatch nodeIndex)
+        let operation : DirectValueMatrixOperation := {
+          kind := .trapdoorPublic matrixType
+          ownerScope := some scopeKey
+          ownerNode := nodeIndex
+          outputPort
+          parameterEnvironment := environment
+        }
+        return ← facts.arena.pushDirectIntegerLiftPointwise operation input
+    | .liftIntegerToConstantPolynomial matrixType, [input] =>
+        let outputType ← match outputType with
+          | .matrix outputType => pure outputType
+          | _ => throw (.outputTypeMismatch nodeIndex)
+        if !operationalMatrixTypeEqual matrixType outputType then
+          throw (.outputTypeMismatch nodeIndex)
+        let operation : DirectValueMatrixOperation := {
+          kind := .liftIntegerToConstantPolynomial matrixType
+          ownerScope := some scopeKey
+          ownerNode := nodeIndex
+          outputPort
+          parameterEnvironment := environment
+        }
+        return ← facts.arena.pushDirectIntegerLiftPointwise operation input
+    | _, _ => pure ()
+  if indexedPackOutput && arguments.all fun argument => match argument.payload with
+      | .directValue _ => true
+      | _ => false then
+    match node.kind, arguments with
+    | .packPolynomialCoefficients matrixType coefficientBits, [input] => do
+        let root ← match input with
+          | { payload := .directValue root, .. } => pure root
+          | { payload := .matrix root, .. } | { payload := .scalar root, .. } =>
+              throw (.unsupportedOperationalExpr root)
+        let value ← match facts.arena.direct.valueAt? root with
+          | some value => pure value
+          | none => throw (.invalidOperationalExprRef root)
+        let bits ← evaluateIntMaximum environment loopDomains coefficientBits
+        let params ← match matrixType.evaluate environment with
+          | some params => pure params
+          | none => throw (.invalidMatrixParameters nodeIndex)
+        let expectedCount := Int.ofNat params.ringDimension * bits
+        if bits <= 0 || params.rows != 1 || params.columns != 1 ||
+            (2 : Int) ^ bits.toNat < params.modulus then
+          throw (.loopInputModeMismatch nodeIndex 0)
+        let (coefficientBinder, coefficients) ← match value with
+        | { payload := .explicit (.scalar .boolean) binder coefficients, .. } =>
+            pure (binder, coefficients.map (fun reference => some reference))
+        | { payload := .explicitValues (.scalar .boolean) binder coefficients, .. } =>
+            pure (binder, coefficients.map (fun value =>
+              match facts.arena.direct.valueAt? value with
+              | some { payload := .shared (.scalar .boolean) reference, .. } => some reference
+              | _ => none))
+        | _ => throw (.loopInputModeMismatch nodeIndex 0)
+        if coefficientBinder.count.evaluate environment != some expectedCount then
+          throw (.loopInputModeMismatch nodeIndex 0)
+        if !value.context.binders.contains coefficientBinder then
+          throw (.loopInputModeMismatch nodeIndex 0)
+        if coefficients.size != expectedCount.toNat then
+          throw (.loopInputModeMismatch nodeIndex 0)
+        for coefficient in coefficients do
+          match coefficient with
+          | some (.scalar reference) =>
+              if facts.arena.direct.fixed.scalars[reference]? != some .boolean then
+                throw (.operandNotBoolean nodeIndex
+                  (node.arguments.headD { node := nodeIndex, port := 0 }))
+          | some (.matrix _) | none =>
+              throw (.operandNotBoolean nodeIndex
+                (node.arguments.headD { node := nodeIndex, port := 0 }))
+        let residualContext : IndexContext := {
+          binders := value.context.binders.filter (fun binder => binder != coefficientBinder) }
+        let cap ← match matrixCap matrixType environment with
+          | some value => pure value
+          | none => throw (.invalidMatrixParameters nodeIndex)
+        let packed ← residualContext.binders.foldlM (fun indexed binder =>
+          let familyBinder : FamilyTemplateBinder := {
+            owner := scopeKey
+            producerNode := nodeIndex
+            binderSlot := binder.slot
+          }
+          let selection : DynamicSelectionIdentity := {
+            index := .local scopeKey { node := nodeIndex, port := outputPort }
+            expression := .variable binder
+          }
+          pure (indexMatrixFact familyBinder selection { node := nodeIndex, port := outputPort }
+            indexed))
+          (← classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
+            (.below params.modulus.toNat))
+        let (fixed, reference) := facts.arena.direct.fixed.pushMatrix packed
+        let direct := { facts.arena.direct with fixed }
+        let (direct, packedRoot) ← match direct.pushShared residualContext (.matrix matrixType)
+            reference with
+          | some result => pure result
+          | none => throw (.unsupportedOperationalExpr root)
+        let packedValue ← match direct.valueAt? packedRoot with
+          | some packedValue => pure packedValue
+          | none => throw (.invalidOperationalExprRef packedRoot)
+        return ({ facts.arena with direct }, {
+          context := packedValue.context
+          payload := .directValue packedRoot
+          storage := packedValue.storage
+        })
+    | _, _ => throw (.loopInputModeMismatch nodeIndex 0)
   if !scalarOutput && !indexedPackOutput then
     let output ← genericNodeMatrixFactConcrete scopeKey nodeIndex node rule outputPort outputType facts
       environment loopDomains layouts
@@ -608,14 +716,12 @@ def genericNodeFact
     match node.kind with
     | .input _ =>
         let scalar ← defaultScalarFact nodeIndex outputPort outputType environment loopDomains
-        let (arena, root) := facts.arena.pushScalarConcrete scalar
-        finishIndexedScalar arena root
+        facts.arena.promoteConcreteScalarFact scalar
     | .constantInt value => do
         if !node.arguments.isEmpty then
           throw (.unsupportedOutputArity nodeIndex node.arguments.length)
         let scalar ← integerFact nodeIndex outputPort value value
-        let (arena, root) := facts.arena.pushScalarConcrete scalar
-        finishIndexedScalar arena root
+        facts.arena.promoteConcreteScalarFact scalar
     | .evaluateInt value => do
         if !node.arguments.isEmpty then
           throw (.unsupportedOutputArity nodeIndex node.arguments.length)
@@ -624,17 +730,14 @@ def genericNodeFact
           (← evaluateIntMaximum environment loopDomains value)
           (.contextual .minimum environment loopDomains value)
           (.contextual .maximum environment loopDomains value)
-        let (arena, root) := facts.arena.pushScalarConcrete scalar
-        finishIndexedScalar arena root
+        facts.arena.promoteConcreteScalarFact scalar
     | .constantBool _ =>
         if node.arguments.isEmpty then
-          let (arena, root) := facts.arena.pushScalarConcrete .boolean
-          finishIndexedScalar arena root
+          facts.arena.promoteConcreteScalarFact .boolean
         else throw (.unsupportedOutputArity nodeIndex node.arguments.length)
     | .constantReal _ =>
         if node.arguments.isEmpty then
-          let (arena, root) := facts.arena.pushScalarConcrete .real
-          finishIndexedScalar arena root
+          facts.arena.promoteConcreteScalarFact .real
         else throw (.unsupportedOutputArity nodeIndex node.arguments.length)
     | .trapdoorSample _ maximum => do
         let matrixType ← match outputType with
@@ -658,10 +761,9 @@ def genericNodeFact
           subject, matrixType, matrixParams := params
           maximum := .minimum (.closedInt (.constant cap)) boundExpr
           preimageCutoff
-          publicIdentity := .sampledTrapdoor temporaryScope { node := nodeIndex, port := 0 }
+          publicIdentity := .sampledTrapdoor scopeKey { node := nodeIndex, port := 0 }
         }
-        let (arena, root) := facts.arena.pushScalarConcrete scalar
-        finishIndexedScalar arena root
+        facts.arena.promoteConcreteScalarFact scalar
     | .gadgetTrapdoor _ base => do
         let matrixType ← match outputType with
           | .trapdoor matrixType _ _ _ _ => pure matrixType
@@ -679,8 +781,7 @@ def genericNodeFact
           publicIdentity := .gadget descriptor.paramsId params params.rows bound false
             descriptor.regularDigitCount
         }
-        let (arena, root) := facts.arena.pushScalarConcrete scalar
-        finishIndexedScalar arena root
+        facts.arena.promoteConcreteScalarFact scalar
     | .boolToInt => do
         match arguments[0]? with
         | some ({ payload := .scalar _, .. }) => pure ()
@@ -756,71 +857,8 @@ def genericNodeFact
         let (arena, root) ← mapScalarExprPointwise .realSqrt transfer arena input
           (arena.scalarNodes.size + 1)
         finishIndexedScalar arena root
-    | .packPolynomialCoefficients _ _ => do
-        let inputFact ← match arguments[0]? with
-          | some fact => pure fact
-          | none => throw (.loopInputModeMismatch nodeIndex 0)
-        let input : IndexedOperationalFact ← match inputFact with
-          | expression@{ payload := .scalar _, .. } => pure expression
-          | _ => throw (.loopInputModeMismatch nodeIndex 0)
-        if arguments.length != 1 then throw (.unsupportedOutputArity nodeIndex arguments.length)
-        let base ← genericNodeMatrixFactConcrete scopeKey nodeIndex node rule outputPort outputType
-          facts environment loopDomains layouts
-        let (coefficientDomain, coefficientRoots) ←
-          match facts.arena.scalarNodes[input.payload.root]? with
-          | some (OperationalScalarExprNode.selectExact domain branches) =>
-              if branches.size == domain.count then pure (domain, branches)
-              else throw (.loopInputModeMismatch nodeIndex 0)
-          | some (OperationalScalarExprNode.selectShared domain _ _ representative) =>
-              pure (domain, #[representative])
-          | _ => throw (.loopInputModeMismatch nodeIndex 0)
-        let coefficientBinder ← match coefficientDomain.identity.expression with
-          | .variable binder => pure binder
-          | _ => throw (.loopInputModeMismatch nodeIndex 0)
-        if (input.context.binders.filter fun candidate =>
-            candidate == coefficientBinder).size != 1 then
-          throw (.loopInputModeMismatch nodeIndex 0)
-        for root in coefficientRoots do
-          if (← facts.arena.scalarAbstract root (facts.arena.scalarNodes.size + 1)) != .boolean then
-            throw (.operandNotBoolean nodeIndex (node.arguments.headD subject))
-        let rec collectResidualDomains : Nat → Nat → Array SelectionDomainId →
-            Except OperationalError (Array SelectionDomainId)
-          | 0, root, _ => throw (.unsupportedOperationalExpr root)
-          | fuel + 1, root, domains => do
-              match facts.arena.scalarNodes[root]? with
-              | none => throw (.invalidOperationalExprRef root)
-              | some (.concrete _) => pure domains
-              | some (.primitive _ primitiveArguments _) =>
-                  primitiveArguments.foldlM
-                    (fun accumulated argument =>
-                      collectResidualDomains fuel argument accumulated) domains
-              | some (.selectExact domain branches) => do
-                  let domains := if domains.any (fun candidate => candidate == domain) then
-                    domains else domains.push domain
-                  branches.foldlM
-                    (fun accumulated branch => collectResidualDomains fuel branch accumulated) domains
-              | some (.selectShared domain _ _ representative) => do
-                  let domains := if domains.any (fun candidate => candidate == domain) then
-                    domains else domains.push domain
-                  collectResidualDomains fuel representative domains
-        let residualDomains ← coefficientRoots.foldlM (fun domains root =>
-          collectResidualDomains (facts.arena.scalarNodes.size + 1) root domains) #[]
-        if residualDomains.any (fun candidate => candidate == coefficientDomain) then
-          throw (.loopInputModeMismatch nodeIndex 0)
-        let (initialArena, initialRoot) := facts.arena.pushConcrete base
-        let mut arena := initialArena
-        let mut root := initialRoot
-        for domain in residualDomains do
-          let state := OperationalExprEvaluationState.empty arena
-          let (representative, _) ← deriveSchema arena environment root state
-          let summary := selectedMatrixSummary #[representative]
-          let (nextArena, nextRoot) ← arena.pushCheckedSchemaEnvelope domain.identity
-            domain.count root summary representative
-          arena := nextArena
-          root := nextRoot
-        let expression ← arena.indexedExpr root
-        let finalArena ← arena.rememberIndexedExpr expression
-        pure (finalArena, expression)
+    | .packPolynomialCoefficients _ _ =>
+        throw (.loopInputModeMismatch nodeIndex 0)
     | .liftIntegerToConstantPolynomial matrixType => do
         let (arena, input) ← unaryRoot
         let rec visit : Nat → OperationalExprArena → Nat →
@@ -1984,30 +2022,25 @@ def evaluatePreparedScope
                         facts.arena elements.toArray
                       facts := { facts with arena }
                       pure [family]
-                  | [.indexedFamily (.integer) count] =>
-                      let count ← match count.evaluate environment with
-                        | some value => pure value
-                        | none => throw .nonClosedExpression
-                      if count <= 0 || elements.length != count.toNat then
-                        throw (.invalidCount index count)
-                      let (arena, directElements) ← elements.foldlM (fun (arena, packed) element => do
-                        let (arena, direct) ← arena.promoteDirectRelationOperand element
-                        pure (arena, packed.push direct)) (facts.arena, #[])
-                      let (arena, family) ← packDirectScalarFamily scopeKey index environment
-                        (match node.outputTypes with
-                        | [.indexedFamily _ declaredCount] => declaredCount
-                        | _ => .constant count) arena directElements
-                      facts := { facts with arena }
-                      pure [family]
                   | [.indexedFamily _ count] =>
                       let count ← match count.evaluate environment with
                         | some value => pure value
                         | none => throw .nonClosedExpression
                       if count <= 0 || elements.length != count.toNat then
                         throw (.invalidCount index count)
-                      let selection := DynamicSelectionIdentity.fromOrigin
-                        (.local scopeKey { node := index, port := 0 }) count.toNat
-                      let (arena, family) ← packIndexedScalarFacts facts.arena selection elements
+                      let (arena, directElements) ← elements.foldlM (fun (arena, packed) element => do
+                        let (arena, direct) ← match element with
+                          | direct@{ payload := .directValue _, .. } => pure (arena, direct)
+                          | { payload := .scalar root, .. } =>
+                              match arena.scalarNodes[root]? with
+                              | some (.concrete scalar) => arena.promoteConcreteScalarFact scalar
+                              | _ => throw (.unsupportedOperationalExpr root)
+                          | { payload := .matrix root, .. } => throw (.unsupportedOperationalExpr root)
+                        pure (arena, packed.push direct)) (facts.arena, #[])
+                      let (arena, family) ← packDirectScalarFamily scopeKey index environment
+                        (match node.outputTypes with
+                        | [.indexedFamily _ declaredCount] => declaredCount
+                        | _ => .constant count) arena directElements
                       facts := { facts with arena }
                       pure [family]
                   | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
@@ -2105,12 +2138,23 @@ def evaluatePreparedScope
                           selectionFact.upper >= Int.ofNat selectorCount then
                         throw (.invalidCount index selectionFact.upper)
                       let selector ← match selectionInput with
-                        | direct@{ payload := .directValue _, .. } => do
+                        | direct@{ context := { binders := #[_] }, payload := .directValue _, .. } => do
                             let position ← directSingleIndexBinder index direct
                             let owner : GatherLookupOwner := {
                               indices := operationalGatherIndicesWire scopeKey indexWire
                             }
                             pure (.gather owner binder.count (.variable position))
+                        | { context, payload := .directValue _, .. } =>
+                            if context.binders.isEmpty then do
+                              let freshSelector := DynamicSelectionIdentity.fromDeclaredCount selection binder.count
+                              let freshBinder ← match freshSelector.expression with
+                                | .variable value => pure value
+                                | _ => throw (.loopInputModeMismatch index 0)
+                              pure <| match family.context.binders.toList.find? (fun candidate =>
+                                  candidate.owner == freshBinder.owner && candidate.slot == freshBinder.slot) with
+                                | some candidate => .variable candidate
+                                | none => freshSelector.expression
+                            else throw (.loopInputModeMismatch index 0)
                         | _ => do
                             let freshSelector := DynamicSelectionIdentity.fromDeclaredCount selection binder.count
                             let freshBinder ← match freshSelector.expression with
@@ -2319,11 +2363,11 @@ def evaluatePreparedScope
                       for (outputType, port) in node.outputTypes.zipIdx do
                         match node.kind, outputType with
                         | .thresholdDecodeBool .., .boolean =>
-                            let (nextArena, output) ← pushIndexedScalarFact arena .boolean
+                            let (nextArena, output) ← arena.promoteConcreteScalarFact .boolean
                             arena := nextArena
                             outputs := outputs ++ [output]
                         | .thresholdDecodeInt .., .integer => do
-                            let (nextArena, output) ← pushIndexedScalarFact arena
+                            let (nextArena, output) ← arena.promoteConcreteScalarFact
                               (← integerFact index port 0 (plaintext - 1))
                             arena := nextArena
                             outputs := outputs ++ [output]
@@ -2382,7 +2426,7 @@ def evaluatePreparedScope
                       let exclusiveUpper ← match exclusiveUpper? with
                         | some value => pure value
                         | none => throw (.invalidCount index 0)
-                      let (arena, output) ← pushIndexedScalarFact facts.arena
+                      let (arena, output) ← facts.arena.promoteConcreteScalarFact
                         (← integerFact index 0 0 (exclusiveUpper - 1))
                       facts := { facts with arena }
                       pure [output]
@@ -2621,6 +2665,29 @@ def evaluatePreparedScope
                         (.matrix matrixType) facts environment loopDomains layouts deriveOperationalSchemaFact
                       facts := { facts with arena }
                       pure [output]
+              | .trapdoorPublic =>
+                  let inputWire ← match node.arguments with
+                    | [wire] => pure wire
+                    | _ => throw (.unsupportedOutputArity index node.arguments.length)
+                  let input ← lookupFact index facts inputWire
+                  let (inputArena, direct) ← facts.arena.promoteDirectRelationOperand input
+                  match direct with
+                  | direct@{ payload := .directValue _, .. } =>
+                      let matrixType ← match node.outputTypes with
+                        | [.matrix matrixType] => pure matrixType
+                        | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
+                      let operation : DirectValueMatrixOperation := {
+                        kind := .trapdoorPublic matrixType
+                        ownerScope := facts.arena.activeScope
+                        ownerNode := index
+                        outputPort := 0
+                        parameterEnvironment := environment
+                      }
+                      let (arena, output) ← inputArena.pushDirectIntegerLiftPointwise operation direct
+                      facts := { facts with arena }
+                      pure [output]
+                  | _ =>
+                      throw (.unsupportedOperationalExpr index)
               | .transpose | .matrixNegate | .slice _ _ =>
                   if node.arguments.length != 1 then
                     throw (.unsupportedOutputArity index node.arguments.length)
@@ -2858,29 +2925,22 @@ def contractFact
       let evaluatedUpper ← match upper.evaluate environment with
         | some value => pure value | none => throw .nonClosedExpression
       if evaluatedLower > evaluatedUpper then throw (.inputContractMismatch "integer range")
-      let (arena, root) := arena.pushScalarConcrete (.integer {
+      arena.promoteConcreteScalarFact (.integer {
         subject
         origin
         lower := evaluatedLower
         upper := evaluatedUpper
         lowerExpression := .closedInt (.constant evaluatedLower)
         upperExpression := .closedInt (.constant evaluatedUpper) })
-      let expression ← arena.indexedScalar root
-      pure (← arena.rememberIndexedScalar expression, expression)
   | .boolean, .boolean | .boolean, .constantBool =>
-      let (arena, root) := arena.pushScalarConcrete .boolean
-      let expression ← arena.indexedScalar root
-      pure (← arena.rememberIndexedScalar expression, expression)
+      arena.promoteConcreteScalarFact .boolean
   | .bytes contractLength, .bytes wireLength =>
       let contractLength ← match contractLength.evaluate environment with
         | some value => pure value | none => throw .nonClosedExpression
       let wireLength ← match wireLength.evaluate environment with
         | some value => pure value | none => throw .nonClosedExpression
       if contractLength != wireLength then throw (.inputContractMismatch "bytes")
-      let (arena, root) := arena.pushScalarConcrete
-        (.bytes { subject, origin, length := contractLength })
-      let expression ← arena.indexedScalar root
-      pure (← arena.rememberIndexedScalar expression, expression)
+      arena.promoteConcreteScalarFact (.bytes { subject, origin, length := contractLength })
   | .family contractCount elementContract, .indexedFamily elementType wireCount =>
       let contractCount ← match contractCount.evaluate environment with
         | some value => pure value | none => throw .nonClosedExpression
@@ -2898,14 +2958,29 @@ def contractFact
       | expression@{ payload := .directValue _, .. } => do
           if !expression.context.binders.isEmpty then
             throw (.unsupportedOperationalExpr expression.payload)
-          let representative ← arena.directValueRepresentativeFactAt environment expression
-          let representative := indexMatrixFact binder selection subject representative
           let context ← selectionIndexedContext selection subject.node
-          let (fixed, reference) := arena.direct.fixed.pushMatrix representative
-          let direct := { arena.direct with fixed }
-          let (direct, root) ← match direct.pushShared context (.matrix representative.matrixType) reference with
-            | some result => pure result
-            | none => throw (.unsupportedOperationalExpr direct.values.size)
+          let root := expression.payload.root
+          let value ← match arena.direct.valueAt? root with
+            | some value => pure value
+            | none => throw (.invalidOperationalExprRef root)
+          let (direct, root) ← match value.payload.schema with
+            | .matrix _ =>
+                let representative ← arena.directValueRepresentativeFactAt environment expression
+                let representative := indexMatrixFact binder selection subject representative
+                let (fixed, reference) := arena.direct.fixed.pushMatrix representative
+                let direct := { arena.direct with fixed }
+                match direct.pushShared context (.matrix representative.matrixType) reference with
+                | some result => pure result
+                | none => throw (.unsupportedOperationalExpr direct.values.size)
+            | .scalar schema =>
+                let representative ← arena.direct.scalarFactAt environment [] root
+                  (arena.direct.values.size + 1)
+                let representative := indexScalarFact binder selection subject representative
+                let (fixed, reference) := arena.direct.fixed.pushScalar representative
+                let direct := { arena.direct with fixed }
+                match direct.pushShared context (.scalar schema) reference with
+                | some result => pure result
+                | none => throw (.unsupportedOperationalExpr direct.values.size)
           let value ← match direct.valueAt? root with
             | some value => pure value
             | none => throw (.invalidOperationalExprRef root)

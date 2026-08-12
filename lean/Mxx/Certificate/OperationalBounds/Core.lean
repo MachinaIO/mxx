@@ -1588,6 +1588,7 @@ inductive OperationalScalarPrimitiveKind where
   | boolToInt
   | intBinary (operation : IntBinaryOp)
   | intCompare (operation : IntCompareOp)
+  | bitExtract (position : Int)
   | intToReal
   | realBinary (operation : RealBinaryOp)
   | realSqrt
@@ -1613,6 +1614,7 @@ structure DirectValueScalarOperation where
 matrix primitives prevents a scalar lift from being smuggled through a matrix-only descriptor. -/
 inductive DirectValueMatrixOperationKind where
   | liftIntegerToConstantPolynomial (matrixType : MatrixTypeExpr)
+  | trapdoorPublic (matrixType : MatrixTypeExpr)
   deriving BEq
 
 structure DirectValueMatrixOperation where

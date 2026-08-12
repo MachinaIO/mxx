@@ -385,12 +385,12 @@ private def carriedSignalSchemaFixture : Bool :=
     product := { term.product with factors := term.product.factors.map fun factor =>
       { factor with transforms := [.transpose] } } } }
   match (do
-    let (arena, base) ← ({} : OperationalExprArena).liftConcreteMatrixFact base
-    let (arena, withBoundedZero) ← arena.liftConcreteMatrixFact withBoundedZero
-    let (arena, large) ← arena.liftConcreteMatrixFact large
-    let (arena, changedLarge) ← arena.liftConcreteMatrixFact changedLarge
-    pure (sameCarriedSchema arena base withBoundedZero &&
-      !sameCarriedSchema arena large changedLarge)) with
+    let (arena, base) ← ({} : OperationalExprArena).promoteConcreteMatrixFact base
+    let (arena, withBoundedZero) ← arena.promoteConcreteMatrixFact withBoundedZero
+    let (arena, large) ← arena.promoteConcreteMatrixFact large
+    let (arena, changedLarge) ← arena.promoteConcreteMatrixFact changedLarge
+    pure (sameSequentialCarriedSchema arena base withBoundedZero &&
+      !sameSequentialCarriedSchema arena large changedLarge)) with
   | .ok value => value
   | .error _ => false
 
@@ -1843,9 +1843,6 @@ private def directFamilySelectFixture : Except OperationalError Bool := do
   let dynamicOutput ← lookupFact 11 facts { node := 11, port := 0 }
   let staticBound ← matrixMaximum 11 { node := 10, port := 0 } facts []
   let dynamicBound ← matrixMaximum 11 { node := 11, port := 0 } facts []
-  let noLegacySelect := facts.arena.nodes.all fun expression => match expression.node with
-    | .select .. => false
-    | _ => true
   pure (match staticFamily, dynamicFamily, staticOutput, dynamicOutput with
     | { context := staticContext, payload := .directValue _, .. },
         { context := dynamicContext, payload := .directValue _, .. },
@@ -1855,7 +1852,7 @@ private def directFamilySelectFixture : Except OperationalError Bool := do
             /- Dynamic family access consumes the selected lane but retains both independent
             selectors introduced by the nested direct table and branch selection. -/
             staticOutputContext == emptyContext && dynamicOutputContext.binders.size == 2 &&
-            staticBound == 7 && dynamicBound == 7 && noLegacySelect
+            staticBound == 7 && dynamicBound == 7
     | _, _, _, _ => false)
 
 example : directFamilySelectFixture = .ok true := by
@@ -1949,16 +1946,13 @@ private def symbolicFamilySelectFixture : Except OperationalError Bool := do
   let dynamicOutput ← lookupFact 11 facts { node := 11, port := 0 }
   let staticBound ← matrixMaximum 11 { node := 10, port := 0 } facts environment
   let dynamicBound ← matrixMaximum 11 { node := 11, port := 0 } facts environment
-  let noLegacySelect := facts.arena.nodes.all fun expression => match expression.node with
-    | .select .. => false
-    | _ => true
   pure (match staticOutput, dynamicOutput with
     | { context := staticContext, payload := .directValue _, .. },
         { context := dynamicContext, payload := .directValue _, .. } =>
           /- The symbolic path preserves the same two independent direct selectors as the
           closed fixture; only the statically selected lane is consumed. -/
           staticContext == emptyContext && dynamicContext.binders.size == 2 &&
-            staticBound == 7 && dynamicBound == 7 && noLegacySelect
+            staticBound == 7 && dynamicBound == 7
     | _, _ => false)
 
 example : symbolicFamilySelectFixture = .ok true := by
@@ -2354,16 +2348,13 @@ private def directLoopInputFixture : Except OperationalError Bool := do
   let broadcastBound ← matrixMaximum 7 { node := 4, port := 0 } facts []
   let zipBound ← matrixMaximum 7 { node := 5, port := 0 } facts []
   let offsetBound ← matrixMaximum 7 { node := 6, port := 0 } facts []
-  let noLegacySelect := facts.arena.nodes.all fun expression => match expression.node with
-    | .select .. => false
-    | _ => true
   pure (match broadcast, zipped, offset with
     | { context := broadcastContext, payload := .directValue _, .. },
         { context := zipContext, payload := .directValue _, .. },
         { context := offsetContext, payload := .directValue _, .. } =>
           broadcastContext.binders.size == 1 && zipContext.binders.size == 1 &&
             offsetContext.binders.size == 1 && broadcastBound == 7 && zipBound == 5 &&
-            offsetBound == 5 && noLegacySelect
+            offsetBound == 5
     | _, _, _ => false)
 
 /-- A parameter-valued `familyPack` count is resolved from the production environment before a
@@ -2406,12 +2397,9 @@ private def symbolicCountDirectZipFixture : Except OperationalError Bool := do
     symbolicCountDirectZipDerivation environment []
   let output ← lookupFact 4 facts { node := 3, port := 0 }
   let bound ← matrixMaximum 4 { node := 3, port := 0 } facts environment
-  let noLegacySelect := facts.arena.nodes.all fun expression => match expression.node with
-    | .select .. => false
-    | _ => true
   pure (match output with
     | { context, payload := .directValue _, .. } =>
-        context.binders.size == 1 && bound == 5 && noLegacySelect
+        context.binders.size == 1 && bound == 5
     | _ => false)
 
 private def selectedSequentialBody : Scope := {
@@ -3074,7 +3062,7 @@ private def directOrdinaryMatrixPipelineFixture : Bool :=
     let sumFact ← arena.direct.matrixFactAt [] [] sumId (arena.direct.values.size + 1)
     let productFact ← arena.direct.matrixFactAt [] [] productId (arena.direct.values.size + 1)
     let (_, diagnostics) ← operationalNoiseBoundForFact arena product []
-    pure (arena.nodes.isEmpty && arena.direct.values.size == 4 && sum.context == emptyContext &&
+    pure (arena.direct.values.size == 4 && sum.context == emptyContext &&
       product.context == emptyContext && sumFact.evaluateNoiseHardBound [] == Except.ok 5 &&
       productFact.evaluateNoiseHardBound [] == Except.ok 15 && diagnostics.relationRewriteCount == 0)) with
   | Except.ok value => value
@@ -3626,7 +3614,7 @@ private def directScopeRelationGraphIRFixture : Bool :=
   | .ok facts => match lookupFact 4 facts { node := 3, port := 0 } with
     | .error _ => false
     | .ok { context, payload := .directValue root, .. } =>
-        !context.binders.isEmpty && facts.arena.nodes.isEmpty && (facts.arena.direct.valueAt? root).any fun value =>
+        !context.binders.isEmpty && (facts.arena.direct.valueAt? root).any fun value =>
           match value.payload with
           | .pointwise (.matrix _) (.relation { kind := .decomposition .., .. }) _ => true
           | _ => false
@@ -3860,27 +3848,34 @@ private def equivalentProductDimensionFixture : Bool :=
     rows := .constant 1, columns := .constant 1
   }
   match (do
-    let base := boundedOperationalExprFixtureFact 22 2
-    let (arena, baseId) := ({} : OperationalExprArena).pushConcrete base
-    let (arena, left) := arena.pushPrimitive 23 0 leftType [] (.add false) #[baseId, baseId]
-    let (arena, right) := arena.pushPrimitive 24 0 rightType [] (.add false) #[baseId, baseId]
-    let (arena, accepted) ← multiplyOperationalExprIds 25 0 outputType .matrixMultiplyBound
-      { node := 24, port := 0 } [] deriveOperationalSchemaFact arena left right
-      (arena.nodes.size + 1)
-    let acceptedType ← match arena.get? accepted with
-      | some expression => pure expression.matrixType
-      | none => throw (OperationalError.invalidOperationalExprRef accepted)
-    let (arena, incompatible) := arena.pushPrimitive 26 0 incompatibleRightType [] (.add false)
-      #[baseId, baseId]
-    let rejected := match multiplyOperationalExprIds 27 0 outputType .matrixMultiplyBound
-        { node := 26, port := 0 } [] deriveOperationalSchemaFact arena left incompatible
-        (arena.nodes.size + 1) with
-      | .error (.operationalExprTypeMismatch _ _) => true
+    let matrix (node : Nat) (matrixType : MatrixTypeExpr) (rows columns : Nat) :=
+      ({ boundedOperationalExprFixtureFact node 2 with
+        matrixType, matrixParams := { fixtureParams with rows, columns } }).refreshPrimitivePolynomial
+    let operation (node : Nat) (declaredOutput : MatrixTypeExpr) : PrimitiveOperation := {
+      kind := .multiply .matrixMultiplyBound { node := node - 1, port := 0 }
+      outputType := declaredOutput
+      ownerScope := none
+      ownerNode := node
+      outputPort := 0
+      parameterEnvironment := []
+    }
+    let (arena, left) ← ({} : OperationalExprArena).promoteConcreteMatrixFact (matrix 22 leftType 1 2)
+    let (arena, right) ← arena.promoteConcreteMatrixFact (matrix 23 rightType 2 3)
+    let (arena, accepted) ← arena.pushDirectMatrixPointwise (operation 25 outputType) left right
+    let acceptedType ← match accepted.payload with
+      | .directValue root => pure (← arena.direct.matrixFactAt [] [] root
+        (arena.direct.values.size + 1)).matrixType
+      | _ => throw (OperationalError.unsupportedOperationalExpr 25)
+    let (arena, incompatible) ← arena.promoteConcreteMatrixFact
+      (matrix 26 incompatibleRightType 3 3)
+    let rejected := match arena.pushDirectMatrixPointwise (operation 27 outputType) left incompatible with
+      | .error (.outputTypeMismatch 27) => true
       | _ => false
+    let valid (left right output : MatrixTypeExpr) :=
+      matrixOperationSchemasValid (operation 28 output) #[.matrix left, .matrix right] output
     pure (acceptedType == outputType && rejected &&
-      concreteMatrixProductMatches scalarType leftType leftType [] &&
-      concreteMatrixProductMatches leftType scalarType leftType [] &&
-      concreteMatrixProductMatches leftType leftType leftType [])) with
+      valid scalarType leftType leftType && valid leftType scalarType leftType &&
+      valid leftType leftType leftType)) with
   | .ok value => value
   | .error _ => false
 

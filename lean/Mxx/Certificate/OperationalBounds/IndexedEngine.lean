@@ -2257,33 +2257,73 @@ def factorPrimitiveOrigin? (factor : OperationalFactorKey) : Option MatrixOrigin
   | .primitive (.matrix origin) => some origin
   | _ => none
 
+def relationTargetOrigin : OperationalMatrixRelation → MatrixOriginIdentity
+  | .decomposition relation => relation.inputOrigin
+  | .preimage relation => relation.targetOrigin
+
+def relationMatcherTarget : OperationalMatrixRelation → RelationTargetSummary
+  | .decomposition relation => relation.inputSummary
+  | .preimage relation => relation.targetSummary
+
+def relationMatcherPublicIdentity : OperationalMatrixRelation → PublicMatrixIdentity
+  | .decomposition relation => relation.publicIdentity
+  | .preimage relation => relation.publicIdentity
+
+/-- The relation boundary is exact: both adjacent primitive identities, the declared target
+origin, and every concrete matrix shape reconstructed from the target snapshot must agree. -/
+def exactAdjacentRelationMatches
+    (environment : ParamEnvironment)
+    (left right : OperationalFactorKey)
+    (relation : OperationalMatrixRelation) : Bool :=
+  let target := relationMatcherTarget relation
+  let targetShape := target.matrixType.evaluate environment (.constant 0)
+  let snapshotRebuilds := !target.polynomial.isEmpty && target.polynomial.all fun snapshotTerm =>
+    match operationalPolynomialFromSnapshot [snapshotTerm] with
+    | [{ product, .. }] => match operationalProductFromFactors product.factors with
+      | .ok rebuilt =>
+          rebuilt.modes == snapshotTerm.product.modes &&
+            rebuilt.outputType == snapshotTerm.product.outputType &&
+            match rebuilt.outputType.evaluate environment (.constant 0), targetShape with
+            | some output, some expected =>
+                output.modulus == expected.modulus && output.ringDimension == expected.ringDimension &&
+                  output.rows == expected.rows && output.columns == expected.columns
+            | _, _ => false
+      | .error _ => false
+    | _ => false
+  let adjacentShapeMatches := match left.outputType.evaluate environment (.constant 0),
+      right.inputType.evaluate environment (.constant 0), targetShape with
+    | some leftShape, some rightShape, some expected =>
+        leftShape.modulus == rightShape.modulus &&
+          leftShape.ringDimension == rightShape.ringDimension &&
+          leftShape.columns == rightShape.rows &&
+          leftShape.rows == expected.rows && rightShape.columns == expected.columns &&
+          expected.modulus == target.matrixParams.modulus &&
+            expected.ringDimension == target.matrixParams.ringDimension &&
+            expected.rows == target.matrixParams.rows && expected.columns == target.matrixParams.columns
+    | _, _, _ => false
+  factorPublicIdentity? left == some (relationMatcherPublicIdentity relation) &&
+    factorPrimitiveOrigin? right == some (match relation with
+      | .decomposition value => value.producer
+      | .preimage value => value.producer) &&
+    relationTargetOrigin relation == target.origin && adjacentShapeMatches && snapshotRebuilds
+
 def matchingFactorRelation?
+    (environment : ParamEnvironment)
     (left right : OperationalFactorKey) : Option OperationalMatrixRelation := do
   if !left.transforms.isEmpty || !right.transforms.isEmpty then none else pure ()
-  let publicIdentity ← factorPublicIdentity? left
-  let producer ← factorPrimitiveOrigin? right
-  let identityMatches (candidate : PublicMatrixIdentity) :=
-    candidate == publicIdentity || match candidate, publicIdentity with
-      | .indexed _ candidateExpression candidateSource,
-          .indexed _ publicExpression publicSource =>
-          candidateExpression == publicExpression &&
-            publicIdentityTemplateEqual candidateSource publicSource
-      | _, _ => false
   right.relations.find? fun relation =>
-    match relation with
-      | .decomposition value => identityMatches value.publicIdentity &&
-          value.producer == producer &&
-            value.status == ReconstructionStatus.available
-      | .preimage value => identityMatches value.publicIdentity && value.producer == producer
+    (match relation with
+    | .decomposition value => value.status == ReconstructionStatus.available
+    | .preimage _ => true) && exactAdjacentRelationMatches environment left right relation
 
 def rewriteOperationalTermRelation?
-    (node : Nat)
+    (node : Nat) (environment : ParamEnvironment)
     (term : OperationalTerm) : Except OperationalError (Option OperationalPolynomial) := do
   let rec visit
       (accumulated : List OperationalFactorKey) :
       List OperationalFactorKey → Except OperationalError (Option OperationalPolynomial)
     | left :: right :: tail =>
-        match matchingFactorRelation? left right with
+        match matchingFactorRelation? environment left right with
         | none => visit (accumulated ++ [left]) (right :: tail)
         | some relation => do
             let target := match relation with
@@ -2305,16 +2345,16 @@ def rewriteOperationalTermRelation?
   visit [] term.product.factors
 
 def rewriteOperationalRelations
-    (node : Nat)
+    (node : Nat) (environment : ParamEnvironment)
     (polynomial : OperationalPolynomial) : Except OperationalError OperationalPolynomial := do
   let rec finishTerm : Nat → OperationalTerm →
       Except OperationalError OperationalPolynomial
     | 0, term => do
-        match ← rewriteOperationalTermRelation? node term with
+        match ← rewriteOperationalTermRelation? node environment term with
         | none => pure [term]
         | some _ => throw (.invalidMatrixParameters node)
     | fuel + 1, term => do
-        match ← rewriteOperationalTermRelation? node term with
+        match ← rewriteOperationalTermRelation? node environment term with
         | none => pure [term]
         | some rewritten => do
             let mut finished : OperationalPolynomial := []
@@ -2774,7 +2814,7 @@ def multiplyConcreteMatrixFacts
   let raw ← multiplyOperationalPolynomials left.polynomial right.polynomial
     |>.mapError (flatErrorAt nodeIndex)
   let contracted ← contractComplementaryBlocks nodeIndex matrixType left right raw
-  let rewritten ← rewriteOperationalRelations nodeIndex contracted
+  let rewritten ← rewriteOperationalRelations nodeIndex environment contracted
   let polynomial ← match rule with
     | .matrixMultiplyRelation declaredRight => do
         if declaredRight != rightWire then throw (.missingRelation nodeIndex declaredRight)

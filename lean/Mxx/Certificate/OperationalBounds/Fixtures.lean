@@ -2961,6 +2961,126 @@ private def crossSelectionRelationMismatchFixture : Bool :=
   | .ok (positive, rejected) => positive && rejected
   | .error _ => false
 
+/-- Exact adjacent relation matching rejects every independently forged target boundary field;
+the accepted relation may splice a multi-term snapshot, whose equal products normalize together. -/
+private def parameterizedSnapshotType
+    (matrixType : MatrixTypeExpr)
+    (snapshot : RelationSnapshotPolynomial) : RelationSnapshotPolynomial :=
+  snapshot.map fun (term : RelationSnapshotTerm) =>
+    let factors := term.product.factors.map fun (factor : RelationSnapshotFactor) => {
+      factor with
+      inputType := matrixType
+      outputType := matrixType
+      boundedSummary := factor.boundedSummary.map fun summary => { summary with matrixType }
+    }
+    { term with product := { term.product with factors, outputType := matrixType } }
+
+private def exactAdjacentRelationMatcherFixture : Bool :=
+  match (do
+    let facts ← evaluateScopeOperationalWithLayouts relationFixtureScope
+      relationFixtureDerivation [] [fixtureLayout]
+    let publicMatrix ← derivedMatrixFactAt 3 facts { node := 1, port := 0 }
+    let preimage ← derivedMatrixFactAt 3 facts { node := 2, port := 0 }
+    let publicFactor ← match publicMatrix.polynomial with
+      | [{ product := { factors := [factor], .. }, .. }] => pure factor
+      | _ => throw (OperationalError.malformedRelation 165)
+    let preimageFactor ← match preimage.polynomial with
+      | [{ product := { factors := [factor], .. }, .. }] => pure factor
+      | _ => throw (OperationalError.malformedRelation 165)
+    let matched := (matchingFactorRelation? [] publicFactor preimageFactor).isSome
+    let mapRelation (map : OperationalMatrixRelation → OperationalMatrixRelation) :=
+      { preimageFactor with relations := preimageFactor.relations.map map }
+    let rejects (map : OperationalMatrixRelation → OperationalMatrixRelation) :=
+      (matchingFactorRelation? [] publicFactor (mapRelation map)).isNone
+    let forgedType : MatrixTypeExpr := { fixtureType with rows := .constant 2 }
+    let forgedModulus : MatrixTypeExpr := { fixtureType with modulus := .constant 19 }
+    let forgedRing : MatrixTypeExpr := { fixtureType with ringDimension := .constant 2 }
+    let rewriteTarget (target : RelationTargetSummary) := { target with matrixType := forgedType }
+    let forgeSnapshot (snapshot : RelationSnapshotPolynomial) : RelationSnapshotPolynomial :=
+      snapshot.map fun (term : RelationSnapshotTerm) =>
+        { term with product := { term.product with outputType := forgedType } }
+    let forgeModes (snapshot : RelationSnapshotPolynomial) : RelationSnapshotPolynomial :=
+      snapshot.map fun (term : RelationSnapshotTerm) =>
+        { term with product := { term.product with modes := [.ordinaryMatrixProduct] } }
+    let forgeMalformed (snapshot : RelationSnapshotPolynomial) : RelationSnapshotPolynomial :=
+      snapshot.map fun (term : RelationSnapshotTerm) =>
+        { term with product := { term.product with factors := [] } }
+    let parameterType : MatrixTypeExpr := { fixtureType with modulus := .parameter "fixture_modulus" }
+    let parameterizedFactor := mapRelation fun relation => match relation with
+      | .decomposition value => .decomposition { value with inputSummary := { value.inputSummary with
+          matrixType := parameterType
+          polynomial := parameterizedSnapshotType parameterType value.inputSummary.polynomial } }
+      | .preimage value => .preimage { value with targetSummary := { value.targetSummary with
+          matrixType := parameterType
+          polynomial := parameterizedSnapshotType parameterType value.targetSummary.polynomial } }
+    let parameterizedAccepted := (matchingFactorRelation? [("fixture_modulus", .integer 17)]
+      publicFactor parameterizedFactor).isSome
+    let parameterizedMissingRejected := (matchingFactorRelation? [] publicFactor parameterizedFactor).isNone
+    let parameterizedWrongRejected := (matchingFactorRelation? [("fixture_modulus", .integer 19)]
+      publicFactor parameterizedFactor).isNone
+    let typeRejected := rejects fun relation => match relation with
+      | .decomposition value => .decomposition { value with inputSummary := rewriteTarget value.inputSummary }
+      | .preimage value => .preimage { value with targetSummary := rewriteTarget value.targetSummary }
+    let modulusRejected := rejects fun relation => match relation with
+      | .decomposition value => .decomposition { value with inputSummary :=
+          { value.inputSummary with matrixType := forgedModulus } }
+      | .preimage value => .preimage { value with targetSummary :=
+          { value.targetSummary with matrixType := forgedModulus } }
+    let ringRejected := rejects fun relation => match relation with
+      | .decomposition value => .decomposition { value with inputSummary :=
+          { value.inputSummary with matrixType := forgedRing } }
+      | .preimage value => .preimage { value with targetSummary :=
+          { value.targetSummary with matrixType := forgedRing } }
+    let publicRejected := rejects fun relation => match relation with
+      | .decomposition value => .decomposition { value with publicIdentity := fixtureSampledIdentity }
+      | .preimage value => .preimage { value with publicIdentity := fixtureSampledIdentity }
+    let producer : MatrixOriginIdentity := .value temporaryScope { node := 997, port := 0 }
+    let producerRejected := rejects fun relation => match relation with
+      | .decomposition value => .decomposition { value with producer }
+      | .preimage value => .preimage { value with producer }
+    let targetOrigin : MatrixOriginIdentity := .value temporaryScope { node := 998, port := 0 }
+    let originRejected := rejects fun relation => match relation with
+      | .decomposition value => .decomposition { value with inputOrigin := targetOrigin }
+      | .preimage value => .preimage { value with targetOrigin }
+    let paramsRejected := rejects fun relation => match relation with
+      | .decomposition value => .decomposition { value with inputSummary :=
+          { value.inputSummary with matrixParams := { value.inputSummary.matrixParams with modulus := 19 } } }
+      | .preimage value => .preimage { value with targetSummary :=
+          { value.targetSummary with matrixParams := { value.targetSummary.matrixParams with modulus := 19 } } }
+    let layoutRejected := rejects fun relation => match relation with
+      | .decomposition value => .decomposition { value with inputSummary :=
+          { value.inputSummary with polynomial := forgeSnapshot value.inputSummary.polynomial } }
+      | .preimage value => .preimage { value with targetSummary :=
+          { value.targetSummary with polynomial := forgeSnapshot value.targetSummary.polynomial } }
+    let modesRejected := rejects fun relation => match relation with
+      | .decomposition value => .decomposition { value with inputSummary :=
+          { value.inputSummary with polynomial := forgeModes value.inputSummary.polynomial } }
+      | .preimage value => .preimage { value with targetSummary :=
+          { value.targetSummary with polynomial := forgeModes value.targetSummary.polynomial } }
+    let malformedRejected := rejects fun relation => match relation with
+      | .decomposition value => .decomposition { value with inputSummary :=
+          { value.inputSummary with polynomial := forgeMalformed value.inputSummary.polynomial } }
+      | .preimage value => .preimage { value with targetSummary :=
+          { value.targetSummary with polynomial := forgeMalformed value.targetSummary.polynomial } }
+    let multiTermFactor := mapRelation fun relation => match relation with
+      | .decomposition value => .decomposition { value with inputSummary :=
+          { value.inputSummary with polynomial := value.inputSummary.polynomial ++ value.inputSummary.polynomial } }
+      | .preimage value => .preimage { value with targetSummary :=
+          { value.targetSummary with polynomial := value.targetSummary.polynomial ++ value.targetSummary.polynomial } }
+    let product ← operationalProductFromFactors [publicFactor, multiTermFactor]
+      |>.mapError (flatErrorAt 165)
+    let rewritten ← rewriteOperationalRelations 165 [] [{ coefficient := 1, product }]
+    pure (matched && parameterizedAccepted && parameterizedMissingRejected && parameterizedWrongRejected &&
+      typeRejected && modulusRejected && ringRejected && publicRejected &&
+      producerRejected && originRejected && paramsRejected && layoutRejected && modesRejected &&
+      malformedRejected &&
+      rewritten.length == 1 && rewritten.head?.any fun (term : OperationalTerm) =>
+        term.coefficient == 2)) with
+  | .ok value => value
+  | .error _ => false
+
+example : exactAdjacentRelationMatcherFixture = true := by native_decide
+
 /-- Complementary column/row concat layouts retain every physical partition snapshot and expose
 the relation-bearing pairwise products before the ordinary relation rewrite. -/
 private def complementaryBlockContractFixture : Bool :=

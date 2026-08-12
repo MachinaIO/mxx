@@ -3,7 +3,7 @@
 use crate::{EmittedProtocol, GENERATOR_VERSION, emit_lean::EmittedOperationalDecoderTarget};
 use mxx_ir_core::{ParamEnv, expr::ExprError};
 use num_bigint::BigInt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
@@ -48,7 +48,10 @@ pub struct OperationalCheckRequest {
     pub target_id: String,
 }
 
+/// The closed checker report.  This is deliberately an exact wire schema: accepting fields from
+/// a newer or different checker would weaken the fail-closed report boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationalCheckerReport {
     pub schema_version: u32,
     pub protocol_source_hash: String,
@@ -80,6 +83,43 @@ pub struct OperationalCheckerReport {
     pub maximum_polynomial_terms: u64,
 }
 
+/// A fail-closed, machine-readable diagnostic emitted when Lean cannot construct an operational
+/// report.  Fields are optional because each `OperationalError` constructor carries a different
+/// amount of location information; `reason` is always present.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationalFailureDiagnostic {
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub target_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub stage: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub scope: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub node: Option<u64>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub wire: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub context: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub operation: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub relation_owner: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub expected_identity: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub actual_identity: Option<String>,
+    pub reason: String,
+}
+
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedOperationalChecker {
     module_name: String,
@@ -104,7 +144,11 @@ pub enum OperationalRunnerError {
     #[error("could not create the temporary Lean checker: {0}")]
     Temporary(#[from] std::io::Error),
     #[error("Lean operational checker failed; stdout: {stdout}; stderr: {stderr}")]
-    CheckerFailed { stdout: String, stderr: String },
+    CheckerFailed {
+        stdout: String,
+        stderr: String,
+        diagnostic: Option<OperationalFailureDiagnostic>,
+    },
     #[error("Lean operational checker must emit exactly one nonempty JSON line, got {count}")]
     UnexpectedOutput { count: usize },
     #[error("Lean operational checker emitted {actual} reports, expected {expected}")]
@@ -128,6 +172,8 @@ pub enum OperationalRunnerError {
     TargetEcho,
     #[error("Lean operational report request digest does not match the request")]
     RequestDigest,
+    #[error("Lean operational report contains an invalid {field}: {value}")]
+    InvalidReportField { field: &'static str, value: String },
     #[error(
         "could not compile prepared Lean operational module; stdout: {stdout}; stderr: {stderr}"
     )]
@@ -135,8 +181,297 @@ pub enum OperationalRunnerError {
 }
 
 fn lean_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
+    let escaped = value
+        .chars()
+        .flat_map(|character| match character {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '\"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            character => vec![character],
+        })
+        .collect::<String>();
+    format!("\"{escaped}\"")
 }
+
+const OPERATIONAL_REPORT_LEAN_HELPERS: &str = r#"
+private def jsonString (value : String) : String := (Lean.Json.str value).compress
+
+private def rejectionJson : Option OperationalNoiseRejection -> String
+  | none => "null"
+  | some rejection => jsonString (reprStr rejection)
+
+private def operationalReportJson
+    (schemaVersion : Nat)
+    (protocolSourceHash workflowHash derivationHash toolkitHash requestDigest targetId decoderKind : String)
+    (noiseBound plaintextModulus ciphertextModulus : Int)
+    (report : OperationalNoiseCheckReport)
+    (decodeTimeNs evaluationTimeNs boundEvaluationTimeNs : Nat) : String :=
+  "{\"schema_version\":" ++ toString schemaVersion ++
+  ",\"protocol_source_hash\":" ++ jsonString protocolSourceHash ++
+  ",\"workflow_hash\":" ++ jsonString workflowHash ++
+  ",\"derivation_hash\":" ++ jsonString derivationHash ++
+  ",\"toolkit_hash\":" ++ jsonString toolkitHash ++
+  ",\"request_digest\":" ++ jsonString requestDigest ++
+  ",\"target_id\":" ++ jsonString targetId ++
+  ",\"decoder_kind\":" ++ jsonString decoderKind ++
+  ",\"noise_bound\":" ++ jsonString (toString noiseBound) ++
+  ",\"plaintext_modulus\":" ++ jsonString (toString plaintextModulus) ++
+  ",\"ciphertext_modulus\":" ++ jsonString (toString ciphertextModulus) ++
+  ",\"accepted\":" ++ (if report.accepted then "true" else "false") ++
+  ",\"rejection\":" ++ rejectionJson report.rejection ++
+  ",\"decode_time_ns\":" ++ toString decodeTimeNs ++
+  ",\"evaluation_time_ns\":" ++ toString evaluationTimeNs ++
+  ",\"bound_evaluation_time_ns\":" ++ toString boundEvaluationTimeNs ++
+  ",\"expression_node_count\":" ++ toString report.diagnostics.expressionNodeCount ++
+  ",\"memo_evaluations\":" ++ toString report.diagnostics.memoEvaluations ++
+  ",\"memo_hits\":" ++ toString report.diagnostics.memoHits ++
+  ",\"memo_misses\":" ++ toString report.diagnostics.memoMisses ++
+  ",\"peak_memo_entries\":" ++ toString report.diagnostics.peakMemoEntries ++
+  ",\"envelope_logical_branch_count\":" ++ toString report.diagnostics.envelopeLogicalBranchCount ++
+  ",\"envelope_stored_branch_count\":" ++ toString report.diagnostics.envelopeStoredBranchCount ++
+  ",\"relation_rewrite_count\":" ++ toString report.diagnostics.relationRewriteCount ++
+  ",\"transform_cache_hits\":" ++ toString report.diagnostics.transformCacheHits ++
+  ",\"transform_cache_misses\":" ++ toString report.diagnostics.transformCacheMisses ++
+  ",\"cartesian_pair_visits\":" ++ toString report.diagnostics.cartesianPairVisits ++
+  ",\"maximum_polynomial_terms\":" ++ toString report.diagnostics.maximumPolynomialTerms ++ "}"
+
+private structure OperationalFailureFields where
+  targetId : Option String := none
+  stage : Option String := none
+  scope : Option String := none
+  node : Option Nat := none
+  wire : Option String := none
+  context : Option String := none
+  operation : Option String := none
+  relationOwner : Option String := none
+  expectedIdentity : Option String := none
+  actualIdentity : Option String := none
+  reason : String := ""
+
+private def optionJson (value : Option String) : String :=
+  match value with
+  | none => "null"
+  | some value => jsonString value
+
+private def optionNatJson (value : Option Nat) : String :=
+  match value with
+  | none => "null"
+  | some value => toString value
+
+private def operationalFailureFieldsJson (fields : OperationalFailureFields) : String :=
+  "{\"target_id\":" ++ optionJson fields.targetId ++
+  ",\"stage\":" ++ optionJson fields.stage ++
+  ",\"scope\":" ++ optionJson fields.scope ++
+  ",\"node\":" ++ optionNatJson fields.node ++
+  ",\"wire\":" ++ optionJson fields.wire ++
+  ",\"context\":" ++ optionJson fields.context ++
+  ",\"operation\":" ++ optionJson fields.operation ++
+  ",\"relation_owner\":" ++ optionJson fields.relationOwner ++
+  ",\"expected_identity\":" ++ optionJson fields.expectedIdentity ++
+  ",\"actual_identity\":" ++ optionJson fields.actualIdentity ++
+  ",\"reason\":" ++ jsonString fields.reason ++ "}"
+
+private def operationalFailureFields (error : OperationalError) : OperationalFailureFields :=
+  match error with
+  | .inScope scope nested =>
+      let fields := operationalFailureFields nested
+      { fields with scope := fields.scope.or (some (reprStr scope)), reason := reprStr error }
+  | .missingOutputType node port =>
+      { node := some node, context := some s!"output port {port}",
+        operation := some "missing_output_type", reason := reprStr error }
+  | .missingOperand node wire =>
+      { node := some node, wire := some (reprStr wire), operation := some "missing_operand",
+        reason := reprStr error }
+  | .operandNotMatrix node wire =>
+      { node := some node, wire := some (reprStr wire), operation := some "operand_not_matrix",
+        reason := reprStr error }
+  | .operandNotInteger node wire =>
+      { node := some node, wire := some (reprStr wire), operation := some "operand_not_integer",
+        reason := reprStr error }
+  | .operandNotBoolean node wire =>
+      { node := some node, wire := some (reprStr wire), operation := some "operand_not_boolean",
+        reason := reprStr error }
+  | .operandNotReal node wire =>
+      { node := some node, wire := some (reprStr wire), operation := some "operand_not_real",
+        reason := reprStr error }
+  | .invalidMatrixParameters node =>
+      { node := some node, operation := some "invalid_matrix_parameters", reason := reprStr error }
+  | .flat node flatError =>
+      { node := some node, context := some (reprStr flatError), operation := some "flat_error",
+        reason := reprStr error }
+  | .invalidBound node bound =>
+      { node := some node, operation := some "invalid_bound", actualIdentity := some (toString bound),
+        reason := reprStr error }
+  | .preimageCutoffMismatch node =>
+      { node := some node, operation := some "preimage_cutoff_mismatch", reason := reprStr error }
+  | .invalidCount node count =>
+      { node := some node, operation := some "invalid_count", actualIdentity := some (toString count),
+        reason := reprStr error }
+  | .missingGadgetLayout node =>
+      { node := some node, operation := some "missing_gadget_layout", reason := reprStr error }
+  | .ambiguousGadgetLayout node =>
+      { node := some node, operation := some "ambiguous_gadget_layout", reason := reprStr error }
+  | .invalidGadgetLayout node =>
+      { node := some node, operation := some "invalid_gadget_layout", reason := reprStr error }
+  | .gadgetLayoutMismatch node =>
+      { node := some node, operation := some "gadget_layout_mismatch", reason := reprStr error }
+  | .missingPublicIdentity node wire =>
+      { node := some node, wire := some (reprStr wire), operation := some "missing_public_identity",
+        reason := reprStr error }
+  | .missingRelation node wire =>
+      { node := some node, wire := some (reprStr wire), operation := some "missing_relation",
+        reason := reprStr error }
+  | .ambiguousRelation node wire =>
+      { node := some node, wire := some (reprStr wire), operation := some "ambiguous_relation",
+        reason := reprStr error }
+  | .unavailableRelation node wire =>
+      { node := some node, wire := some (reprStr wire), operation := some "unavailable_relation",
+        reason := reprStr error }
+  | .malformedRelation node =>
+      { node := some node, operation := some "malformed_relation", reason := reprStr error }
+  | .missingDefinition name =>
+      { context := some name, operation := some "missing_definition", reason := reprStr error }
+  | .definitionFuelExhausted =>
+      { operation := some "definition_fuel_exhausted", reason := reprStr error }
+  | .publicIdentityMismatch node =>
+      { node := some node, operation := some "public_identity_mismatch", reason := reprStr error }
+  | .childInputMismatch node expected actual =>
+      { node := some node, operation := some "child_input_mismatch",
+        expectedIdentity := some (toString expected), actualIdentity := some (toString actual),
+        reason := reprStr error }
+  | .duplicateInputName name =>
+      { context := some name, operation := some "duplicate_input_name", reason := reprStr error }
+  | .missingInputNode name =>
+      { context := some name, operation := some "missing_input_node", reason := reprStr error }
+  | .unexpectedInputNode name =>
+      { context := some name, operation := some "unexpected_input_node", reason := reprStr error }
+  | .missingChildOutput node port =>
+      { node := some node, context := some s!"output port {port}",
+        operation := some "missing_child_output", reason := reprStr error }
+  | .loopInputModeMismatch node argument =>
+      { node := some node, context := some s!"argument {argument}",
+        operation := some "loop_input_mode_mismatch", reason := reprStr error }
+  | .relationBearingCarriedValue scope node slot =>
+      { scope := some (reprStr scope), node := some node, relationOwner := some (toString slot),
+        operation := some "relation_bearing_carried_value", reason := reprStr error }
+  | .sequentialSchemaMismatch scope node slot initialLargeCounts outputLargeCounts =>
+      { scope := some (reprStr scope), node := some node, relationOwner := some (toString slot),
+        operation := some "sequential_schema_mismatch",
+        expectedIdentity := some (reprStr initialLargeCounts),
+        actualIdentity := some (reprStr outputLargeCounts), reason := reprStr error }
+  | .divisionByZero =>
+      { operation := some "division_by_zero", reason := reprStr error }
+  | .negativeDenominator value =>
+      { operation := some "negative_denominator", actualIdentity := some (toString value),
+        reason := reprStr error }
+  | .invalidPreviousPath path =>
+      { operation := some "invalid_previous_path", context := some (reprStr path), reason := reprStr error }
+  | .nonClosedExpression =>
+      { operation := some "non_closed_expression", reason := reprStr error }
+  | .derivation derivationError =>
+      { operation := some "derivation_error", context := some (reprStr derivationError), reason := reprStr error }
+  | .unsupportedOutputArity node actual =>
+      { node := some node, operation := some "unsupported_output_arity",
+        actualIdentity := some (toString actual), reason := reprStr error }
+  | .outputTypeMismatch node =>
+      { node := some node, operation := some "output_type_mismatch", reason := reprStr error }
+  | .missingStageDerivation stage =>
+      { stage := some stage, operation := some "missing_stage_derivation", reason := reprStr error }
+  | .missingStageResult stage output =>
+      { stage := some stage, context := some output, operation := some "missing_stage_result",
+        reason := reprStr error }
+  | .invalidOperationalDecoderTarget targetId =>
+      { targetId := some targetId, operation := some "invalid_operational_decoder_target",
+        reason := reprStr error }
+  | .emptyOperationalDecoderTargetRegistry =>
+      { operation := some "empty_operational_decoder_target_registry", reason := reprStr error }
+  | .unknownOperationalDecoderTarget targetId =>
+      { targetId := some targetId, operation := some "unknown_operational_decoder_target",
+        reason := reprStr error }
+  | .duplicateOperationalDecoderTarget targetId =>
+      { targetId := some targetId, operation := some "duplicate_operational_decoder_target",
+        reason := reprStr error }
+  | .missingProtocolContract name =>
+      { context := some name, operation := some "missing_protocol_contract", reason := reprStr error }
+  | .inputContractMismatch name =>
+      { context := some name, operation := some "input_contract_mismatch", reason := reprStr error }
+  | .unknownDerivationAttachment ownerNamespace ruleName =>
+      { relationOwner := some (ownerNamespace ++ ":" ++ ruleName),
+        operation := some "unknown_derivation_attachment", reason := reprStr error }
+  | .missingDerivationAttachmentRole ownerNamespace ruleName roleName =>
+      { relationOwner := some (ownerNamespace ++ ":" ++ ruleName ++ ":" ++ roleName),
+        operation := some "missing_derivation_attachment_role", reason := reprStr error }
+  | .invalidDerivationAttachment ownerNamespace ruleName =>
+      { relationOwner := some (ownerNamespace ++ ":" ++ ruleName),
+        operation := some "invalid_derivation_attachment", reason := reprStr error }
+  | .operationalExprTypeMismatch left right =>
+      { operation := some "operational_expression_type_mismatch",
+        expectedIdentity := some (toString left), actualIdentity := some (toString right),
+        reason := reprStr error }
+  | .residualContainsLargeTerm node =>
+      { node := some node, operation := some "residual_contains_large_term", reason := reprStr error }
+  | .incompatibleRelationDomains node leftDomain rightDomain =>
+      { node := some node, operation := some "incompatible_relation_domains",
+        expectedIdentity := some (toString leftDomain), actualIdentity := some (toString rightDomain),
+        reason := reprStr error }
+  | .unknownRelationRequirement node expression =>
+      { node := some node, operation := some "unknown_relation_requirement",
+        actualIdentity := some (toString expression), reason := reprStr error }
+  | .unresolvedConcreteStructure node expression =>
+      { node := some node, operation := some "unresolved_concrete_structure",
+        actualIdentity := some (toString expression), reason := reprStr error }
+  | .unsupportedOperationalExpr id =>
+      { operation := some "unsupported_operational_expression", actualIdentity := some (toString id),
+        reason := reprStr error }
+  | .invalidOperationalExprRef id =>
+      { operation := some "invalid_operational_expression_reference",
+        actualIdentity := some (toString id), reason := reprStr error }
+  | .unsupportedNode node =>
+      { node := some node, operation := some "unsupported_node", reason := reprStr error }
+
+private def operationalFailureJson
+    (targetId stage : Option String) (error : OperationalError) : String :=
+  let fields := operationalFailureFields error
+  let context :=
+    match stage, fields.context with
+    | some phase, some context => some (context ++ "; pipeline_phase=" ++ phase)
+    | some phase, none => some ("pipeline_phase=" ++ phase)
+    | none, context => context
+  operationalFailureFieldsJson
+    { fields with
+      targetId := fields.targetId.or targetId
+      stage := fields.stage.or stage
+      context }
+
+private def emitOperationalFailure
+    (targetId stage : Option String) (error : OperationalError) : IO Unit :=
+  IO.eprintln ("operational_failure=" ++ operationalFailureJson targetId stage error)
+
+private def operationalDecoderKindName : OperationalDecoderKind → String
+  | .thresholdDecode _ => "threshold_decode"
+  | .booleanInterval => "boolean_interval"
+
+private def emitUnexpectedOperationalObligation
+    (targetId : String) (targetKind : OperationalDecoderKind)
+    (obligations : List OperationalNoiseObligation) : IO Unit :=
+  IO.eprintln ("operational_failure=" ++ operationalFailureFieldsJson {
+    targetId := some targetId
+    stage := some "target_noise_check"
+    context := some (reprStr obligations)
+    operation := some "unexpected_operational_obligation"
+    actualIdentity := some (operationalDecoderKindName targetKind)
+    reason := "operational checker returned obligations incompatible with the closed decoder target"
+  })
+
+private def emitPreparationFailure
+    (error : Sum Mxx.Ir.DecodeError OperationalError) : IO Unit :=
+  match error with
+  | .inr error => emitOperationalFailure none (some "prepare_workflow") error
+  | .inl error =>
+      IO.eprintln ("operational_failure={\"target_id\":null,\"stage\":\"prepare_workflow\",\"scope\":null,\"node\":null,\"wire\":null,\"context\":null,\"operation\":\"decode_error\",\"relation_owner\":null,\"expected_identity\":null,\"actual_identity\":null,\"reason\":" ++ jsonString (reprStr error) ++ "}")
+"#;
 
 fn operational_lean_arguments() -> [&'static str; 4] {
     ["env", "lean", "-DmaxHeartbeats=0", "--run"]
@@ -405,18 +740,16 @@ fn prepared_checker_source(
     let output_executions = group_representatives
         .iter()
         .enumerate()
-        .map(|(group, _)| {
+        .map(|(group, representative)| {
+            let target_id = lean_string(&requests[*representative].target_id);
             format!(
-                "IO.eprintln \"phase=evaluate_scope group={group} state=start\"\n\
-                 let evaluationStarted_{group} ← IO.monoNanosNow\n\
+                "let evaluationStarted_{group} ← IO.monoNanosNow\n\
                  let outputs_{group} ← match operationalOutputs_{group} prepared with\n\
-                 | .error error => IO.eprintln s!\"operational graph evaluation failed for request \
-                   group {group}: {{repr error}}\"; return 2\n\
+                 | .error error => emitOperationalFailure (some {}) (some \"evaluate_scope\") error; return 2\n\
                  | .ok outputs => pure outputs\n\
                  let evaluationFinished_{group} ← IO.monoNanosNow\n\
-                 let evaluationTimeNs_{group} := evaluationFinished_{group} - evaluationStarted_{group}\n\
-                 IO.eprintln s!\"phase=evaluate_scope group={group} state=finish \
-                   elapsed_ns={{evaluationTimeNs_{group}}}\""
+                 let evaluationTimeNs_{group} := evaluationFinished_{group} - evaluationStarted_{group}",
+                target_id,
             )
         })
         .collect::<Vec<_>>()
@@ -426,19 +759,17 @@ fn prepared_checker_source(
         .enumerate()
         .map(|(bound_group, representative)| {
             let output_group = request_groups[*representative];
+            let target_id = lean_string(&requests[*representative].target_id);
             format!(
-                "IO.eprintln \"phase=evaluate_decoder_bounds group={bound_group} state=start\"\n\
-                 let boundEvaluationStarted_{bound_group} ← IO.monoNanosNow\n\
+                "let boundEvaluationStarted_{bound_group} ← IO.monoNanosNow\n\
                  let boundResult_{bound_group} ← match \
                    operationalBound_{bound_group} prepared outputs_{output_group} with\n\
-                   | .error error => IO.eprintln s!\"operational bound evaluation failed for \
-                     bound group {bound_group}: {{repr error}}\"; return 2\n\
+                   | .error error => emitOperationalFailure (some {}) (some \"evaluate_decoder_bounds\") error; return 2\n\
                    | .ok result => pure result\n\
                  let boundEvaluationFinished_{bound_group} ← IO.monoNanosNow\n\
                  let boundEvaluationTimeNs_{bound_group} := \
-                   boundEvaluationFinished_{bound_group} - boundEvaluationStarted_{bound_group}\n\
-                 IO.eprintln s!\"phase=evaluate_decoder_bounds group={bound_group} state=finish \
-                   elapsed_ns={{boundEvaluationTimeNs_{bound_group}}}\""
+                   boundEvaluationFinished_{bound_group} - boundEvaluationStarted_{bound_group}",
+                target_id,
             )
         })
         .collect::<Vec<_>>()
@@ -456,63 +787,50 @@ fn prepared_checker_source(
                  let report ← match operationalTargetNoiseCheckReportFromBound outputs_{group} \
                    target_{index} ciphertextModulus_{index} noiseBound_{index} diagnostics_{index} [{}] with\n\
                    | .ok report => pure report\n\
-                   | .error error => IO.eprintln s!\"operational target check failed for request {index}: \
-                     {{repr error}}\"; return 2\n\
-                 IO.eprintln s!\"operational analysis diagnostics request {index}: \
-                   expression_nodes={{report.diagnostics.expressionNodeCount}} \
-                   memo_hits={{report.diagnostics.memoHits}} \
-                   memo_misses={{report.diagnostics.memoMisses}} \
-                   envelope_logical={{report.diagnostics.envelopeLogicalBranchCount}} \
-                   envelope_stored={{report.diagnostics.envelopeStoredBranchCount}} \
-                   relation_rewrites={{report.diagnostics.relationRewriteCount}} \
-                   transform_cache_hits={{report.diagnostics.transformCacheHits}} \
-                   transform_cache_misses={{report.diagnostics.transformCacheMisses}} \
-                   cartesian_pairs={{report.diagnostics.cartesianPairVisits}} \
-                   maximum_polynomial_terms={{report.diagnostics.maximumPolynomialTerms}}\"\n\
+                   | .error error => emitOperationalFailure (some target_{index}.targetId) (some \"target_noise_check\") error; return 2\n\
                  match report.obligations, target_{index}.kind with\n\
                      | [.decoderThreshold plaintextModulus ciphertextModulus noiseBound], \
                        .thresholdDecode _ =>\n\
-                         let accepted := if report.accepted then \"true\" else \"false\"\n\
-                         let json := \"{{\\\"schema_version\\\":5,\\\"protocol_source_hash\\\":\\\"{}\\\",\\\"workflow_hash\\\":\\\"{}\\\",\\\"derivation_hash\\\":\\\"{}\\\",\\\"toolkit_hash\\\":\\\"{}\\\",\\\"request_digest\\\":\\\"{}\\\",\\\"target_id\\\":\\\"{}\\\",\\\"decoder_kind\\\":\\\"threshold_decode\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++ \"\\\",\\\"plaintext_modulus\\\":\\\"\" ++ toString plaintextModulus ++ \"\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++ \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++ rejectionJson report.rejection ++ \",\\\"decode_time_ns\\\":\" ++ toString decodeTimeNs ++ \",\\\"evaluation_time_ns\\\":\" ++ toString evaluationTimeNs_{group} ++ \",\\\"bound_evaluation_time_ns\\\":\" ++ toString boundEvaluationTimeNs_{bound_group} ++ \",\\\"expression_node_count\\\":\" ++ toString report.diagnostics.expressionNodeCount ++ \",\\\"memo_evaluations\\\":\" ++ toString report.diagnostics.memoEvaluations ++ \",\\\"memo_hits\\\":\" ++ toString report.diagnostics.memoHits ++ \",\\\"memo_misses\\\":\" ++ toString report.diagnostics.memoMisses ++ \",\\\"peak_memo_entries\\\":\" ++ toString report.diagnostics.peakMemoEntries ++ \",\\\"envelope_logical_branch_count\\\":\" ++ toString report.diagnostics.envelopeLogicalBranchCount ++ \",\\\"envelope_stored_branch_count\\\":\" ++ toString report.diagnostics.envelopeStoredBranchCount ++ \",\\\"relation_rewrite_count\\\":\" ++ toString report.diagnostics.relationRewriteCount ++ \",\\\"transform_cache_hits\\\":\" ++ toString report.diagnostics.transformCacheHits ++ \",\\\"transform_cache_misses\\\":\" ++ toString report.diagnostics.transformCacheMisses ++ \",\\\"cartesian_pair_visits\\\":\" ++ toString report.diagnostics.cartesianPairVisits ++ \",\\\"maximum_polynomial_terms\\\":\" ++ toString report.diagnostics.maximumPolynomialTerms ++ \"}}\"\n\
+                         let json := operationalReportJson operationalReportSchemaVersion {} {} {} {} {} \
+                           target_{index}.targetId \"threshold_decode\" noiseBound plaintextModulus ciphertextModulus \
+                           report decodeTimeNs evaluationTimeNs_{group} boundEvaluationTimeNs_{bound_group}\n\
                          IO.println json\n\
                      | [.booleanInterval ciphertextModulus noiseBound], .booleanInterval =>\n\
-                         let accepted := if report.accepted then \"true\" else \"false\"\n\
-                         let json := \"{{\\\"schema_version\\\":5,\\\"protocol_source_hash\\\":\\\"{}\\\",\\\"workflow_hash\\\":\\\"{}\\\",\\\"derivation_hash\\\":\\\"{}\\\",\\\"toolkit_hash\\\":\\\"{}\\\",\\\"request_digest\\\":\\\"{}\\\",\\\"target_id\\\":\\\"{}\\\",\\\"decoder_kind\\\":\\\"boolean_interval\\\",\\\"noise_bound\\\":\\\"\" ++ toString noiseBound ++ \"\\\",\\\"plaintext_modulus\\\":\\\"2\\\",\\\"ciphertext_modulus\\\":\\\"\" ++ toString ciphertextModulus ++ \"\\\",\\\"accepted\\\":\" ++ accepted ++ \",\\\"rejection\\\":\" ++ rejectionJson report.rejection ++ \",\\\"decode_time_ns\\\":\" ++ toString decodeTimeNs ++ \",\\\"evaluation_time_ns\\\":\" ++ toString evaluationTimeNs_{group} ++ \",\\\"bound_evaluation_time_ns\\\":\" ++ toString boundEvaluationTimeNs_{bound_group} ++ \",\\\"expression_node_count\\\":\" ++ toString report.diagnostics.expressionNodeCount ++ \",\\\"memo_evaluations\\\":\" ++ toString report.diagnostics.memoEvaluations ++ \",\\\"memo_hits\\\":\" ++ toString report.diagnostics.memoHits ++ \",\\\"memo_misses\\\":\" ++ toString report.diagnostics.memoMisses ++ \",\\\"peak_memo_entries\\\":\" ++ toString report.diagnostics.peakMemoEntries ++ \",\\\"envelope_logical_branch_count\\\":\" ++ toString report.diagnostics.envelopeLogicalBranchCount ++ \",\\\"envelope_stored_branch_count\\\":\" ++ toString report.diagnostics.envelopeStoredBranchCount ++ \",\\\"relation_rewrite_count\\\":\" ++ toString report.diagnostics.relationRewriteCount ++ \",\\\"transform_cache_hits\\\":\" ++ toString report.diagnostics.transformCacheHits ++ \",\\\"transform_cache_misses\\\":\" ++ toString report.diagnostics.transformCacheMisses ++ \",\\\"cartesian_pair_visits\\\":\" ++ toString report.diagnostics.cartesianPairVisits ++ \",\\\"maximum_polynomial_terms\\\":\" ++ toString report.diagnostics.maximumPolynomialTerms ++ \"}}\"\n\
+                         let json := operationalReportJson operationalReportSchemaVersion {} {} {} {} {} \
+                           target_{index}.targetId \"boolean_interval\" noiseBound 2 ciphertextModulus \
+                           report decodeTimeNs evaluationTimeNs_{group} boundEvaluationTimeNs_{bound_group}\n\
                          IO.println json\n\
-                     | _, _ => IO.eprintln \"operational checker returned an unexpected obligation \
-                       set\"; return 3",
+                     | _, _ => emitUnexpectedOperationalObligation target_{index}.targetId target_{index}.kind \
+                       report.obligations; return 3",
                 lean_request_values(request).0,
-                prepared.protocol_source_hash,
-                prepared.workflow_hash,
-                prepared.derivation_hash,
-                prepared.toolkit_hash,
-                digest,
-                request.target_id,
-                prepared.protocol_source_hash,
-                prepared.workflow_hash,
-                prepared.derivation_hash,
-                prepared.toolkit_hash,
-                digest,
-                request.target_id,
+                lean_string(&prepared.protocol_source_hash),
+                lean_string(&prepared.workflow_hash),
+                lean_string(&prepared.derivation_hash),
+                lean_string(&prepared.toolkit_hash),
+                lean_string(&digest),
+                lean_string(&prepared.protocol_source_hash),
+                lean_string(&prepared.workflow_hash),
+                lean_string(&prepared.derivation_hash),
+                lean_string(&prepared.toolkit_hash),
+                lean_string(&digest),
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "import {}\nopen {}\nopen Mxx.Certificate\n\n{}\n\n{}\n\n\
-         private def rejectionJson : Option OperationalNoiseRejection -> String\n\
-           | none => \"null\"\n\
-           | some rejection => \"\\\"\" ++ reprStr rejection ++ \"\\\"\"\n\n\
+        "import {}\nopen {}\nopen Mxx.Certificate\n\nprivate def operationalReportSchemaVersion : Nat := {}\n\n{}\n\n{}\n\n{}\n\n\
          def main : IO UInt32 := do\n\
            let decodeStarted ← IO.monoNanosNow\n\
            match {} with\n\
-           | .error error => IO.eprintln s!\"operational graph preparation failed: {{repr error}}\"; return 2\n\
+           | .error error => emitPreparationFailure error; return 2\n\
            | .ok prepared =>\n\
              let decodeFinished ← IO.monoNanosNow\n\
              let decodeTimeNs := decodeFinished - decodeStarted\n\
 {}\n{}\nreturn 0\n",
         prepared.module_name,
         prepared.namespace,
+        OPERATIONAL_REPORT_SCHEMA_VERSION,
+        OPERATIONAL_REPORT_LEAN_HELPERS,
         output_definitions,
         bound_definitions,
         prepared.prepared_name,
@@ -552,13 +870,30 @@ fn run_operational_checker_reports(
     let status = child.wait()?;
     let stdout = stdout_reader.join().expect("Lean stdout reader panicked")?;
     let stderr = stderr_reader.join().expect("Lean stderr reader panicked")?;
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
     if !status.success() {
         return Err(OperationalRunnerError::CheckerFailed {
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            diagnostic: parse_operational_failure_diagnostic(&stderr),
+            stdout,
+            stderr,
         });
     }
-    let stdout = String::from_utf8_lossy(&stdout);
+    parse_operational_checker_reports(&stdout, expected)
+}
+
+fn parse_operational_failure_diagnostic(stderr: &str) -> Option<OperationalFailureDiagnostic> {
+    stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("operational_failure="))
+        .next_back()
+        .and_then(|json| serde_json::from_str(json).ok())
+}
+
+fn parse_operational_checker_reports(
+    stdout: &str,
+    expected: usize,
+) -> Result<Vec<OperationalCheckerReport>, OperationalRunnerError> {
     let lines = stdout.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
     if lines.len() != expected {
         return Err(OperationalRunnerError::UnexpectedReportCount { expected, actual: lines.len() });
@@ -571,8 +906,25 @@ fn run_operational_checker_reports(
         if report.schema_version != OPERATIONAL_REPORT_SCHEMA_VERSION {
             return Err(OperationalRunnerError::Schema { actual: report.schema_version });
         }
+        validate_report_shape(report)?;
     }
     Ok(reports)
+}
+
+fn validate_report_shape(report: &OperationalCheckerReport) -> Result<(), OperationalRunnerError> {
+    let noise_bound = report.noise_bound.parse::<BigInt>().map_err(|_| {
+        OperationalRunnerError::InvalidReportField {
+            field: "noise bound",
+            value: report.noise_bound.clone(),
+        }
+    })?;
+    if noise_bound < BigInt::from(0) || noise_bound.to_string() != report.noise_bound {
+        return Err(OperationalRunnerError::InvalidReportField {
+            field: "noise bound",
+            value: report.noise_bound.clone(),
+        });
+    }
+    Ok(())
 }
 
 pub fn run_operational_checker_source(
@@ -588,6 +940,7 @@ fn validate_prepared_report(
     request: &OperationalCheckRequest,
     report: &OperationalCheckerReport,
 ) -> Result<(), OperationalRunnerError> {
+    validate_report_shape(report)?;
     if report.protocol_source_hash != prepared.protocol_source_hash ||
         report.workflow_hash != prepared.workflow_hash ||
         report.derivation_hash != prepared.derivation_hash ||
@@ -682,7 +1035,7 @@ mod tests {
     #[test]
     fn rejects_unknown_schema() {
         let report = OperationalCheckerReport {
-            schema_version: 6,
+            schema_version: OPERATIONAL_REPORT_SCHEMA_VERSION + 1,
             protocol_source_hash: String::new(),
             workflow_hash: String::new(),
             derivation_hash: String::new(),
@@ -711,12 +1064,185 @@ mod tests {
             cartesian_pair_visits: 0,
             maximum_polynomial_terms: 0,
         };
-        assert_ne!(report.schema_version, OPERATIONAL_REPORT_SCHEMA_VERSION);
+        assert!(matches!(
+            parse_operational_checker_reports(&serde_json::to_string(&report).unwrap(), 1),
+            Err(OperationalRunnerError::Schema { actual })
+                if actual == OPERATIONAL_REPORT_SCHEMA_VERSION + 1
+        ));
+    }
+
+    #[test]
+    fn report_wire_schema_rejects_unknown_fields_and_non_numeric_metrics() {
+        let report = OperationalCheckerReport {
+            schema_version: OPERATIONAL_REPORT_SCHEMA_VERSION,
+            protocol_source_hash: "protocol".to_owned(),
+            workflow_hash: "workflow".to_owned(),
+            derivation_hash: "derivation".to_owned(),
+            toolkit_hash: "toolkit".to_owned(),
+            request_digest: "request".to_owned(),
+            target_id: "target".to_owned(),
+            decoder_kind: "threshold_decode".to_owned(),
+            noise_bound: "0".to_owned(),
+            plaintext_modulus: "2".to_owned(),
+            ciphertext_modulus: "17".to_owned(),
+            accepted: true,
+            rejection: None,
+            decode_time_ns: 0,
+            evaluation_time_ns: 0,
+            bound_evaluation_time_ns: 0,
+            expression_node_count: 0,
+            memo_evaluations: 0,
+            memo_hits: 0,
+            memo_misses: 0,
+            peak_memo_entries: 0,
+            envelope_logical_branch_count: 0,
+            envelope_stored_branch_count: 0,
+            relation_rewrite_count: 0,
+            transform_cache_hits: 0,
+            transform_cache_misses: 0,
+            cartesian_pair_visits: 0,
+            maximum_polynomial_terms: 0,
+        };
+        let mut unknown = serde_json::to_value(&report).unwrap();
+        unknown["unrecognized_metric"] = json!(1);
+        assert!(matches!(
+            parse_operational_checker_reports(&serde_json::to_string(&unknown).unwrap(), 1),
+            Err(OperationalRunnerError::Malformed(_))
+        ));
+
+        let mut malformed_metric = serde_json::to_value(&report).unwrap();
+        malformed_metric["evaluation_time_ns"] = json!("not-a-number");
+        assert!(matches!(
+            parse_operational_checker_reports(
+                &serde_json::to_string(&malformed_metric).unwrap(),
+                1
+            ),
+            Err(OperationalRunnerError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn failure_diagnostic_is_strict_and_retains_available_error_context() {
+        let diagnostic = r#"operational_failure={"target_id":"target","stage":null,"scope":"scope","node":4,"wire":"{ node := 3, port := 0 }","context":null,"operation":"missing_relation","relation_owner":null,"expected_identity":null,"actual_identity":null,"reason":"missingRelation 4"}"#;
+        let parsed = parse_operational_failure_diagnostic(diagnostic).unwrap();
+        assert_eq!(parsed.target_id.as_deref(), Some("target"));
+        assert_eq!(parsed.scope.as_deref(), Some("scope"));
+        assert_eq!(parsed.node, Some(4));
+        assert_eq!(parsed.operation.as_deref(), Some("missing_relation"));
+
+        let complete_json = diagnostic.strip_prefix("operational_failure=").unwrap();
+        let complete: serde_json::Value = serde_json::from_str(complete_json).unwrap();
+        for nullable_key in [
+            "target_id",
+            "stage",
+            "scope",
+            "node",
+            "wire",
+            "context",
+            "operation",
+            "relation_owner",
+            "expected_identity",
+            "actual_identity",
+        ] {
+            let mut missing = complete.clone();
+            missing.as_object_mut().unwrap().remove(nullable_key);
+            assert!(
+                parse_operational_failure_diagnostic(&format!(
+                    "operational_failure={}",
+                    serde_json::to_string(&missing).unwrap()
+                ))
+                .is_none(),
+                "diagnostic unexpectedly accepted missing key {nullable_key}"
+            );
+        }
+
+        let earlier_valid_last_malformed =
+            format!("{diagnostic}\noperational_failure={{\"reason\":\"malformed last marker\"}}");
+        assert!(parse_operational_failure_diagnostic(&earlier_valid_last_malformed).is_none());
+
+        let mut unknown = complete;
+        unknown["unknown"] = json!(null);
+        assert!(
+            parse_operational_failure_diagnostic(&format!(
+                "operational_failure={}",
+                serde_json::to_string(&unknown).unwrap()
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn diagnostic_source_preserves_specific_error_location_over_pipeline_context() {
+        assert!(
+            OPERATIONAL_REPORT_LEAN_HELPERS
+                .contains("scope := fields.scope.or (some (reprStr scope))")
+        );
+        assert!(
+            OPERATIONAL_REPORT_LEAN_HELPERS.contains("stage := fields.stage.or stage"),
+            "missingStageResult must retain its concrete stage under evaluate_decoder_bounds"
+        );
+        assert!(
+            OPERATIONAL_REPORT_LEAN_HELPERS.contains("targetId := fields.targetId.or targetId")
+        );
+        assert!(OPERATIONAL_REPORT_LEAN_HELPERS.contains("pipeline_phase="));
+        assert!(OPERATIONAL_REPORT_LEAN_HELPERS.contains(
+            "| .missingStageResult stage output =>\n      { stage := some stage, context := some output"
+        ));
+    }
+
+    #[test]
+    fn report_shape_rejects_noncanonical_or_negative_noise_bound() {
+        let mut report = OperationalCheckerReport {
+            schema_version: OPERATIONAL_REPORT_SCHEMA_VERSION,
+            protocol_source_hash: "protocol".to_owned(),
+            workflow_hash: "workflow".to_owned(),
+            derivation_hash: "derivation".to_owned(),
+            toolkit_hash: "toolkit".to_owned(),
+            request_digest: "request".to_owned(),
+            target_id: "target".to_owned(),
+            decoder_kind: "threshold_decode".to_owned(),
+            noise_bound: "0".to_owned(),
+            plaintext_modulus: "2".to_owned(),
+            ciphertext_modulus: "17".to_owned(),
+            accepted: true,
+            rejection: None,
+            decode_time_ns: 0,
+            evaluation_time_ns: 0,
+            bound_evaluation_time_ns: 0,
+            expression_node_count: 0,
+            memo_evaluations: 0,
+            memo_hits: 0,
+            memo_misses: 0,
+            peak_memo_entries: 0,
+            envelope_logical_branch_count: 0,
+            envelope_stored_branch_count: 0,
+            relation_rewrite_count: 0,
+            transform_cache_hits: 0,
+            transform_cache_misses: 0,
+            cartesian_pair_visits: 0,
+            maximum_polynomial_terms: 0,
+        };
+        validate_report_shape(&report).unwrap();
+        for noise_bound in ["-1", "01", "+1", "not-a-number"] {
+            report.noise_bound = noise_bound.to_owned();
+            assert!(matches!(
+                validate_report_shape(&report),
+                Err(OperationalRunnerError::InvalidReportField { field: "noise bound", .. })
+            ));
+        }
     }
 
     #[test]
     fn operational_runner_disables_lean_heartbeat_timeout() {
         assert!(operational_lean_arguments().contains(&"-DmaxHeartbeats=0"));
+    }
+
+    #[test]
+    fn lean_string_escapes_source_boundaries() {
+        assert_eq!(
+            lean_string("target\"slash\\newline\ncarriage\rtab\t"),
+            "\"target\\\"slash\\\\newline\\ncarriage\\rtab\\t\""
+        );
     }
 
     #[test]
@@ -770,8 +1296,22 @@ mod tests {
         assert_eq!(source.matches("operationalTargetNoiseCheckReportFromBound").count(), 2);
         assert!(source.contains("boundEvaluationTimeNs_0"));
         assert!(!source.contains("boundEvaluationTimeNs_1"));
+        assert!(source.contains(&format!(
+            "operationalReportSchemaVersion : Nat := {OPERATIONAL_REPORT_SCHEMA_VERSION}"
+        )));
+        assert!(!source.contains("phase=evaluate_scope"));
+        assert!(!source.contains("phase=evaluate_decoder_bounds"));
+        assert!(!source.contains("operational analysis diagnostics"));
         assert!(source.contains("report.diagnostics.expressionNodeCount"));
         assert!(source.contains("report.diagnostics.relationRewriteCount"));
+        assert!(source.contains("Lean.Json.str"));
+        assert!(source.contains("target_0.targetId \"threshold_decode\""));
+        assert!(source.contains("target_1.targetId \"threshold_decode\""));
+        assert!(source.contains("(some \"evaluate_scope\")"));
+        assert!(source.contains("(some \"evaluate_decoder_bounds\")"));
+        assert!(source.contains("(some \"target_noise_check\")"));
+        assert!(source.contains("emitUnexpectedOperationalObligation"));
+        assert!(source.contains("residual_contains_large_term"));
     }
 
     #[test]
@@ -850,6 +1390,27 @@ mod tests {
                 Err(OperationalRunnerError::TargetEcho)
             ));
         }
+
+        let mut corrupted = report.clone();
+        corrupted.target_id = "different-target".to_owned();
+        assert!(matches!(
+            validate_prepared_report(&prepared, &request, &corrupted),
+            Err(OperationalRunnerError::Target)
+        ));
+
+        let mut corrupted = report.clone();
+        corrupted.request_digest = "different-request".to_owned();
+        assert!(matches!(
+            validate_prepared_report(&prepared, &request, &corrupted),
+            Err(OperationalRunnerError::RequestDigest)
+        ));
+
+        let mut corrupted = report.clone();
+        corrupted.protocol_source_hash = "different-protocol".to_owned();
+        assert!(matches!(
+            validate_prepared_report(&prepared, &request, &corrupted),
+            Err(OperationalRunnerError::Freshness)
+        ));
     }
 
     #[test]

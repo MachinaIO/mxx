@@ -304,6 +304,8 @@ private def operationalFailureFields (error : OperationalError) : OperationalFai
   | .invalidBound node bound =>
       { node := some node, operation := some "invalid_bound", actualIdentity := some (toString bound),
         reason := reprStr error }
+  | .missingPreimageCutoff node =>
+      { node := some node, operation := some "missing_preimage_cutoff", reason := reprStr error }
   | .preimageCutoffMismatch node =>
       { node := some node, operation := some "preimage_cutoff_mismatch", reason := reprStr error }
   | .invalidCount node count =>

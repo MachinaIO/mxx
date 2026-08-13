@@ -4082,7 +4082,7 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
     reducedScalar.length == 1 && reducedScalar.all fun entry => match entry.fact with
       | .integer fact => fact.subject == { node := loopNode, port := 1 }
       | _ => false,
-    scalarLower == 0 && scalarUpper == 1,
+    scalarLower == 1 && scalarUpper == 1,
     transportedMatrix.context.binders.toList == [independent, nextLoopBinder],
     nestedOverlay { node := loopNode, port := 0 } matrixValue,
     nestedOverlay { node := loopNode, port := 1 } scalarValue]

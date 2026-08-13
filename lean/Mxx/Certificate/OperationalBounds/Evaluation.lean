@@ -962,6 +962,37 @@ private def preparedScopeUsesLoopSlot
 /-- Resolve the direct family lane binder from the producer's IR shape and declared family count.
 The direct carrier may also contain an independent select-choice binder, which is deliberately
 left in its context when a get substitutes only the family lane. -/
+partial def directFamilyLaneCarrierTrace
+    (arena : DirectOperationalIndexedArena)
+    (root : OperationalIndexedValueId) : Nat → String
+  | 0 => "fuel_exhausted(root=" ++ toString root ++ ")"
+  | fuel + 1 =>
+      match arena.valueAt? root with
+      | none => "missing(root=" ++ toString root ++ ")"
+      | some value =>
+          let context := reprStr value.context
+          match value.payload with
+          | .shared _ _ => "shared(root=" ++ toString root ++ "; context=" ++ context ++ ")"
+          | .explicit _ binder _ =>
+              "explicit(root=" ++ toString root ++ "; binder=" ++ reprStr binder ++
+                "; context=" ++ context ++ ")"
+          | .explicitValues _ binder _ =>
+              "explicit_values(root=" ++ toString root ++ "; binder=" ++ reprStr binder ++
+                "; context=" ++ context ++ ")"
+          | .mapped _ source map =>
+              "mapped(root=" ++ toString root ++ "; context=" ++ context ++
+                "; assignments=" ++ reprStr map.assignments ++ ") -> " ++
+                directFamilyLaneCarrierTrace arena source fuel
+          | .rebound _ source subject =>
+              "rebound(root=" ++ toString root ++ "; subject=" ++ reprStr subject ++
+                "; context=" ++ context ++ ") -> " ++ directFamilyLaneCarrierTrace arena source fuel
+          | .matrixResultBound _ source _ =>
+              "matrix_result_bound(root=" ++ toString root ++ "; context=" ++ context ++ ") -> " ++
+                directFamilyLaneCarrierTrace arena source fuel
+          | .pointwise _ _ inputs =>
+              "pointwise(root=" ++ toString root ++ "; context=" ++ context ++
+                "; inputs=" ++ reprStr inputs ++ ")"
+
 partial def directFamilyLaneBinderFromCarrier
     (arena : DirectOperationalIndexedArena)
     (root : OperationalIndexedValueId) : Nat → Option IndexVariable
@@ -986,6 +1017,18 @@ partial def directFamilyLaneBinderFromCarrier
       | .rebound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
       | .matrixResultBound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
       | _ => none
+
+private def directFamilyLaneBinderFailureDiagnostic
+    (scopeKey : ScopeTemplateKey)
+    (familyWire : WireRef)
+    (count : IntExpr)
+    (family : OperationalFact)
+    (arena : DirectOperationalIndexedArena) : Bool :=
+  operationalProgress "direct_family_lane_binder" "carrier_unresolved" (reprStr scopeKey)
+    family.payload.root arena.values.size
+    ("wire=" ++ reprStr familyWire ++ "; declared_count=" ++ reprStr count ++
+      "; fact_context=" ++ reprStr family.context ++ "; chain=" ++
+      directFamilyLaneCarrierTrace arena family.payload.root (arena.values.size + 1))
 
 def directFamilyLaneBinderAt
     (arena : OperationalExprArena)
@@ -1017,14 +1060,23 @@ def directFamilyLaneBinderAt
       let binder ← match directFamilyLaneBinderFromCarrier arena.direct root
           (arena.direct.values.size + 1) with
         | some binder => pure binder
-        | none => throw (.loopInputModeMismatch familyWire.node familyWire.port)
+        | none =>
+            if directFamilyLaneBinderFailureDiagnostic scopeKey familyWire countExpression family arena.direct
+            then throw (.loopInputModeMismatch familyWire.node familyWire.port)
+            else throw (.unsupportedOperationalExpr root)
       if !family.context.binders.contains binder then
-        throw (.loopInputModeMismatch familyWire.node familyWire.port)
+        if directFamilyLaneBinderFailureDiagnostic scopeKey familyWire countExpression family arena.direct
+        then throw (.loopInputModeMismatch familyWire.node familyWire.port)
+        else throw (.unsupportedOperationalExpr root)
       match binder.count.evaluate environment with
       | some binderCount =>
           if binderCount > 0 && binderCount == count then pure binder
-          else throw (.loopInputModeMismatch familyWire.node familyWire.port)
-      | none => throw .nonClosedExpression
+          else if directFamilyLaneBinderFailureDiagnostic scopeKey familyWire countExpression family arena.direct
+            then throw (.loopInputModeMismatch familyWire.node familyWire.port)
+            else throw (.unsupportedOperationalExpr root)
+      | none =>
+          if directFamilyLaneBinderFailureDiagnostic scopeKey familyWire countExpression family arena.direct
+          then throw .nonClosedExpression else throw (.unsupportedOperationalExpr root)
   | _ =>
       let binder ← directFamilyLaneBinder scopeKey familyWire.node producer familyWire countExpression count.toNat
       if !family.context.binders.contains binder then

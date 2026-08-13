@@ -1725,15 +1725,37 @@ def evaluatePreparedScope
                           let value ← match currentFacts.arena.direct.valueAt? root with
                             | some value => pure value
                             | none => throw (.invalidOperationalExprRef root)
-                          let closed ← match value.payload.schema with
+                          let schemaTag := match value.payload.schema with
+                            | .matrix _ => "matrix"
+                            | .scalar _ => "scalar"
+                          let detail := "port=" ++ toString port ++ "; root=" ++ toString root ++
+                            "; context=" ++ reprStr direct.context ++ "; schema=" ++ schemaTag
+                          if port == 0 || port + 1 == childOutputs.length then
+                            if operationalProgress "parallel_loop_output_close" "start" (reprStr scopeKey)
+                                port childOutputs.length detail then pure () else
+                              throw (.unsupportedOperationalExpr root)
+                          else pure ()
+                          let closedResult : Except OperationalError (OperationalExprArena × OperationalFact) :=
+                            match value.payload.schema with
                             | .matrix _ =>
                                 parallelLoopIndexedMatrixOutput scopeKey index indexSlot port count
                                   evaluatedCount.toNat environment currentFacts.arena direct
                             | .scalar _ =>
                                 closeParallelDirectScalarOutput scopeKey index indexSlot port count
                                   environment currentFacts.arena direct
-                          let (arena, family) := closed
-                          pure ({ currentFacts with arena }, accumulated.push family)
+                          match closedResult with
+                          | .ok (arena, family) =>
+                              if port == 0 || port + 1 == childOutputs.length then
+                                if operationalProgress "parallel_loop_output_close" "complete" (reprStr scopeKey)
+                                    port childOutputs.length detail then pure () else
+                                  throw (.unsupportedOperationalExpr root)
+                              else pure ()
+                              pure ({ currentFacts with arena }, accumulated.push family)
+                          | .error error =>
+                              if operationalProgress "parallel_loop_output_close" "error" (reprStr scopeKey)
+                                  port childOutputs.length (detail ++ "; error=" ++ reprStr error) then
+                                throw error
+                              else throw error
                       )
                     (facts, #[])
                   facts := nextFacts

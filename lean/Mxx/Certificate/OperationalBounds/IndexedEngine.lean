@@ -5063,6 +5063,46 @@ private def parallelLoopOutputBinderFailureDiagnostic
     ("expected=" ++ reprStr selection.expression ++ "; output_context=" ++ reprStr output.context ++
       "; root=" ++ toString root ++ "; payload=" ++ payload)
 
+/-- Compact direct-carrier path for failures after a parallel-output map has been admitted. -/
+private partial def parallelLoopOutputCarrierTrace
+    (arena : DirectOperationalIndexedArena) (root : OperationalIndexedValueId) : Nat → String
+  | 0 => "fuel_exhausted(root=" ++ toString root ++ ")"
+  | fuel + 1 =>
+      match arena.valueAt? root with
+      | none => "missing(root=" ++ toString root ++ ")"
+      | some { payload := .shared .., .. } => "shared(root=" ++ toString root ++ ")"
+      | some { payload := .explicit _ binder references, .. } =>
+          "explicit(root=" ++ toString root ++ "; binder=" ++ reprStr binder ++
+            "; entries=" ++ toString references.size ++ ")"
+      | some { payload := .explicitValues _ binder values, .. } =>
+          "explicit_values(root=" ++ toString root ++ "; binder=" ++ reprStr binder ++
+            "; entries=" ++ toString values.size ++ ")"
+      | some { payload := .mapped _ source map, .. } =>
+          "mapped(root=" ++ toString root ++ "; map=" ++ reprStr map ++ ") -> " ++
+            parallelLoopOutputCarrierTrace arena source fuel
+      | some { payload := .rebound _ source subject, .. } =>
+          "rebound(root=" ++ toString root ++ "; subject=" ++ reprStr subject ++ ") -> " ++
+            parallelLoopOutputCarrierTrace arena source fuel
+      | some { payload := .matrixResultBound _ source _, .. } =>
+          "matrix_result_bound(root=" ++ toString root ++ ") -> " ++
+            parallelLoopOutputCarrierTrace arena source fuel
+      | some { payload := .pointwise _ _ inputs, .. } =>
+          "pointwise(root=" ++ toString root ++ "; inputs=" ++ reprStr inputs ++ ")"
+
+private def parallelLoopOutputMapFailureDiagnostic
+    (event : String) (sourceBinder : IndexVariable) (selection : DynamicSelectionIdentity)
+    (output : OperationalFact) (arena : OperationalExprArena) : Bool :=
+  let root := output.payload.root
+  let candidate := dynamicIndexMap output.context sourceBinder selection.expression
+  let selectorVariables := selection.expression.freeVariables
+  operationalProgress "parallel_loop_output_map" event "" root arena.direct.values.size
+    ("source_context=" ++ reprStr output.context ++ "; source_binder=" ++ reprStr sourceBinder ++
+      "; selection=" ++ reprStr selection.expression ++ "; selection_free_variables=" ++
+      reprStr selectorVariables ++ "; context_valid=" ++ toString (validateContext output.context) ++
+      "; source_present=" ++ toString (output.context.binders.contains sourceBinder) ++
+      "; map_constructed=" ++ toString candidate.isSome ++ "; carrier=" ++
+      parallelLoopOutputCarrierTrace arena.direct root (arena.direct.values.size + 1))
+
 def packDirectScalarFamily
     (scope : ScopeTemplateKey)
     (node : Nat)
@@ -5175,8 +5215,17 @@ def closeParallelDirectMatrixOutput
           if parallelLoopOutputBinderFailureDiagnostic selection output arena then throw error
           else throw error
     let map ← match dynamicIndexMap output.context sourceBinder selection.expression with
-      | some map => pure map | none => throw (.unsupportedOperationalExpr root)
-    arena.reindexDirectFact map output environment
+      | some map => pure map
+      | none =>
+          if parallelLoopOutputMapFailureDiagnostic "construct_failed" sourceBinder selection output arena then
+            throw (.unsupportedOperationalExpr root)
+          else throw (.unsupportedOperationalExpr root)
+    match arena.reindexDirectFact map output environment with
+    | .ok result => pure result
+    | .error error =>
+        if parallelLoopOutputMapFailureDiagnostic "reindex_failed" sourceBinder selection output arena then
+          throw error
+        else throw error
 
 def closeParallelDirectScalarOutput
     (scope : ScopeTemplateKey) (node indexSlot port : Nat) (declaredCount : IntExpr)
@@ -5209,8 +5258,17 @@ def closeParallelDirectScalarOutput
               if parallelLoopOutputBinderFailureDiagnostic selection output arena then throw error
               else throw error
         let map ← match dynamicIndexMap output.context sourceBinder selection.expression with
-          | some map => pure map | none => throw (.unsupportedOperationalExpr root)
-        arena.reindexDirectFact map output environment
+          | some map => pure map
+          | none =>
+              if parallelLoopOutputMapFailureDiagnostic "construct_failed" sourceBinder selection output arena then
+                throw (.unsupportedOperationalExpr root)
+              else throw (.unsupportedOperationalExpr root)
+        match arena.reindexDirectFact map output environment with
+        | .ok result => pure result
+        | .error error =>
+            if parallelLoopOutputMapFailureDiagnostic "reindex_failed" sourceBinder selection output arena then
+              throw error
+            else throw error
 
 def parallelLoopIndexedMatrixOutput
     (scope : ScopeTemplateKey) (node indexSlot port : Nat) (declaredCount : IntExpr) (count : Nat)

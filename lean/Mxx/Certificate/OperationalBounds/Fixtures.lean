@@ -5562,8 +5562,10 @@ private def directGatherTrapdoorCutoffFixture : Bool :=
       | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6255)
     let (direct, target) ← match direct.pushShared context (.matrix fixtureType) targetReference with
       | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6255)
+    /- The relation descriptor itself carries the gathered cutoff.  Raw fixed-assignment
+    evaluation must resolve it through the same executable integer owner as the trapdoor bound. -/
     let rawOperation : DirectRelationOperation := {
-      kind := .preimage (.ir (.constant 2)) [], outputType := .fromIr fixtureType,
+      kind := .preimage (.index gathered) [.loopIndex position], outputType := .fromIr fixtureType,
       outputSchema := fixtureType, ownerScope := none, ownerNode := 6255, outputPort := 1,
       parameterEnvironment := [] }
     let (direct, rawOutput) ← match direct.pushPointwise (.relation rawOperation) #[publicValue, root, target] with

@@ -1582,89 +1582,84 @@ def OperationalExprArena.pushDirectScalarPointwiseN
   pure ({ arena with direct }, {
     context := value.context, payload := .directValue result, storage := value.storage })
 
-/-- Store a relation producer over its complete Graph-IR operand list.  Matrix and trapdoor
-inputs remain direct values, so reduction requires one shared key/ordinal. -/
-def validateDirectRelationDescriptor (operation : DirectRelationOperation) : Except OperationalError Unit := do
-  match operation.kind with
-  | .preimage maximum loopDomains =>
-      match maximum with
-      | .ir maximum =>
-          let legacyDomains : List OperationalParameterDomain ← match loopDomains with
-            | [] => pure []
-            | _ => throw (.unsupportedOperationalExpr operation.ownerNode)
-          let _ ← validateContextualCutoffNonnegative operation.ownerNode
-            operation.parameterEnvironment legacyDomains maximum
-          pure ()
-      | _ => throw (.unsupportedOperationalExpr operation.ownerNode)
-  | .decomposition declaredType base small digitCount loopDomains layouts =>
-      let declaredType ← match declaredType.closedIr? with
-        | some value => pure value | none => throw (.unsupportedOperationalExpr operation.ownerNode)
-      let base ← match base with
-        | .ir value => pure value | _ => throw (.unsupportedOperationalExpr operation.ownerNode)
-      let digitCount ← match digitCount with
-        | .ir value => pure value | _ => throw (.unsupportedOperationalExpr operation.ownerNode)
-      let loopDomains : List OperationalParameterDomain ← match loopDomains with
-        | [] => pure [] | _ => throw (.unsupportedOperationalExpr operation.ownerNode)
-      let bound ← evaluateIntInvariant operation.parameterEnvironment loopDomains base
-      let count ← evaluateIntInvariant operation.parameterEnvironment loopDomains digitCount
-      if bound <= 1 || count <= 0 then throw (.gadgetLayoutMismatch operation.ownerNode)
-      let params ← match declaredType.evaluate operation.parameterEnvironment (.constant 0) with
-        | some value => pure value | none => throw (.invalidMatrixParameters operation.ownerNode)
-      let descriptor ← resolveGadgetLayout operation.ownerNode layouts params
-      let expected := if small then descriptor.smallDigitCount else descriptor.regularDigitCount
-      if bound != descriptor.base || count.toNat != expected then
-        throw (.gadgetLayoutMismatch operation.ownerNode)
+/-- Structural admission for an owner-aware descriptor.  Evaluation is deliberately deferred:
+the same descriptor may be stored under a family, selected dynamically, and gathered before one
+complete carrier assignment supplies the exact values of its indexed leaves. -/
+def indexedParameterDescriptorValid (context : IndexContext) : IndexedParameterExpr → Bool
+  /- `.ir` is the closed Graph-IR expression form; owner-bearing coordinates introduced at an
+  indexed carrier boundary use `.index`.  The latter is checked against the exact context here
+  and resolved only at the complete fixed-assignment boundary. -/
+  | .ir _ => true
+  | .index value => indexExpressionInBounds context value
+  | .add left right | .subtract left right | .multiply left right | .divide left right |
+      .roundDivide left right =>
+      indexedParameterDescriptorValid context left && indexedParameterDescriptorValid context right
+  | .log2Ceil value => indexedParameterDescriptorValid context value
 
-/-- Validate relation types after all descriptor expressions have been closed in the producer's
-parameter environment.  This is stricter than the carrier's syntactic registry: equivalent
-templates are accepted only when their evaluated product or digit expansion has exactly the
-declared target shape. -/
-def validateDirectRelationSchemas
-    (operation : DirectRelationOperation)
-    (inputs : Array OperationalIndexedPayloadSchema)
-    (output : MatrixTypeExpr) : Except OperationalError Unit := do
-  match operation.kind, inputs with
-  | .preimage _ _, #[.matrix publicType,
-      .scalar (.trapdoor trapdoorType _ _ _ _), .matrix targetType] =>
-      let publicParams ← match publicType.evaluate operation.parameterEnvironment (.constant 0) with
-        | some value => pure value | none => throw (.invalidMatrixParameters operation.ownerNode)
-      let trapdoorParams ← match trapdoorType.evaluate operation.parameterEnvironment (.constant 0) with
-        | some value => pure value | none => throw (.invalidMatrixParameters operation.ownerNode)
-      if !sameConcreteMatrixShape publicParams trapdoorParams ||
-          !concreteMatrixProductMatches publicType output targetType operation.parameterEnvironment then
-        throw (.outputTypeMismatch operation.ownerNode)
-  | .decomposition declaredType base small digitCount loopDomains layouts, #[.matrix inputType] =>
-      let declaredType ← match declaredType.closedIr? with
-        | some value => pure value | none => throw (.unsupportedOperationalExpr operation.ownerNode)
-      let base ← match base with
-        | .ir value => pure value | _ => throw (.unsupportedOperationalExpr operation.ownerNode)
-      let digitCount ← match digitCount with
-        | .ir value => pure value | _ => throw (.unsupportedOperationalExpr operation.ownerNode)
-      let loopDomains : List OperationalParameterDomain ← match loopDomains with
-        | [] => pure [] | _ => throw (.unsupportedOperationalExpr operation.ownerNode)
-      let declaredParams ← match declaredType.evaluate operation.parameterEnvironment (.constant 0) with
-        | some value => pure value | none => throw (.invalidMatrixParameters operation.ownerNode)
-      let inputParams ← match inputType.evaluate operation.parameterEnvironment (.constant 0) with
-        | some value => pure value | none => throw (.invalidMatrixParameters operation.ownerNode)
-      let outputParams ← match output.evaluate operation.parameterEnvironment (.constant 0) with
-        | some value => pure value | none => throw (.invalidMatrixParameters operation.ownerNode)
-      let bound ← evaluateIntInvariant operation.parameterEnvironment loopDomains base
-      let count ← evaluateIntInvariant operation.parameterEnvironment loopDomains digitCount
-      let descriptor ← resolveGadgetLayout operation.ownerNode layouts declaredParams
-      let expectedCount := if small then descriptor.smallDigitCount else descriptor.regularDigitCount
-      if !sameConcreteMatrixShape declaredParams outputParams || bound != descriptor.base ||
-          count.toNat != expectedCount || outputParams.modulus != inputParams.modulus ||
-          outputParams.ringDimension != inputParams.ringDimension ||
-          outputParams.rows != inputParams.rows * count.toNat ||
-          outputParams.columns != inputParams.columns then
-        throw (.outputTypeMismatch operation.ownerNode)
-  | _, _ => throw (.outputTypeMismatch operation.ownerNode)
+def indexedMatrixTypeDescriptorValid
+    (context : IndexContext) (value : IndexedMatrixTypeExpr) : Bool :=
+  indexedParameterDescriptorValid context value.modulus &&
+    indexedParameterDescriptorValid context value.ringDimension &&
+    indexedParameterDescriptorValid context value.rows &&
+    indexedParameterDescriptorValid context value.columns
+
+def indexedOperationalParameterDomainsValid
+    (context : IndexContext) : List IndexedOperationalParameterDomain → Bool
+  | [] => true
+  | .loopIndex binder :: tail => context.binders.contains binder &&
+      indexedOperationalParameterDomainsValid context tail
+  | .parameter _ _ domains expression :: tail =>
+      indexedOperationalParameterDomainsValid context domains &&
+        indexedParameterDescriptorValid context expression &&
+        indexedOperationalParameterDomainsValid context tail
+
+/-- Store a relation producer over its complete Graph-IR operand list.  Its delayed descriptor
+must be well-scoped, but may still contain a loop, selection, or gather coordinate. -/
+def validateDirectRelationDescriptor
+    (context : IndexContext) (operation : DirectRelationOperation) : Except OperationalError Unit := do
+  if !validateContext context || !indexedMatrixTypeDescriptorValid context operation.outputType then
+    throw (.unsupportedOperationalExpr operation.ownerNode)
+  match operation.kind with
+  | .preimage maximum domains =>
+      if !indexedParameterDescriptorValid context maximum ||
+          !indexedOperationalParameterDomainsValid context domains then
+        throw (.unsupportedOperationalExpr operation.ownerNode)
+      match maximum, domains with
+      | .ir maximum, [] =>
+          let _ ← validateContextualCutoffNonnegative operation.ownerNode
+            operation.parameterEnvironment [] maximum
+          pure ()
+      | _, _ => pure ()
+  | .decomposition declaredType base small digitCount domains layouts =>
+      if !indexedMatrixTypeDescriptorValid context declaredType ||
+          !indexedParameterDescriptorValid context base ||
+          !indexedParameterDescriptorValid context digitCount ||
+          !indexedOperationalParameterDomainsValid context domains then
+        throw (.unsupportedOperationalExpr operation.ownerNode)
+      /- Fully closed descriptors remain checked at construction, preserving immediate rejection
+      of a malformed or absent gadget layout.  Indexed descriptors defer this same check until
+      their complete carrier assignment has materialized every owner-bearing field. -/
+      match declaredType.closedIr?, base, digitCount, domains with
+      | some declaredType, .ir base, .ir digitCount, [] =>
+          let bound ← evaluateIntInvariant operation.parameterEnvironment [] base
+          let count ← evaluateIntInvariant operation.parameterEnvironment [] digitCount
+          if bound <= 1 || count <= 0 then throw (.gadgetLayoutMismatch operation.ownerNode)
+          let params ← match declaredType.evaluate operation.parameterEnvironment (.constant 0) with
+            | some value => pure value | none => throw (.invalidMatrixParameters operation.ownerNode)
+          let descriptor ← resolveGadgetLayout operation.ownerNode layouts params
+          let expected := if small then descriptor.smallDigitCount else descriptor.regularDigitCount
+          if bound != descriptor.base || count.toNat != expected then
+            throw (.gadgetLayoutMismatch operation.ownerNode)
+      | _, _, _, _ => pure ()
 
 def OperationalExprArena.pushDirectRelationPointwise
     (arena : OperationalExprArena)
     (operation : DirectRelationOperation)
     (inputs : Array OperationalFact) : Except OperationalError (OperationalExprArena × OperationalFact) := do
-  validateDirectRelationDescriptor operation
+  let context ← match mergeIndexContextsN (inputs.toList.map (·.context)) with
+    | some value => pure value
+    | none => throw (.unsupportedOperationalExpr operation.ownerNode)
+  validateDirectRelationDescriptor context operation
   let inputIds ← inputs.mapM fun input => match input.payload with
     | .directValue id => pure id
   let inputSchemas ← inputIds.mapM fun id => match arena.direct.valueAt? id with
@@ -1672,7 +1667,6 @@ def OperationalExprArena.pushDirectRelationPointwise
     | none => throw (.invalidOperationalExprRef id)
   if !relationOperationSchemasValid operation inputSchemas operation.outputSchema then
     throw (.outputTypeMismatch operation.ownerNode)
-  validateDirectRelationSchemas operation inputSchemas operation.outputSchema
   let (direct, result) ← match arena.direct.pushPointwise (.relation operation) inputIds with
     | some result => pure result
     | none => throw (.unsupportedOperationalExpr arena.direct.values.size)
@@ -1795,7 +1789,6 @@ def applyDirectRelationProducer
     (operation : DirectRelationOperation)
     (matrixType : MatrixTypeExpr)
     (arguments : Array DirectRelationArgument) : Except OperationalError OperationalMatrixFact := do
-  if operation.outputSchema != matrixType then throw (.unsupportedOperationalExpr operation.ownerNode)
   let output ← match operation.kind with
   | .preimage maximum loopDomains => do
       let maximum ← match maximum with
@@ -1814,6 +1807,10 @@ def applyDirectRelationProducer
         | some (DirectRelationArgument.matrix fact) => pure fact
         | _ => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
       if arguments.size != 3 then throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+      if !sameConcreteMatrixShape publicFact.matrixParams trapdoor.matrixParams ||
+          !concreteMatrixProductMatches publicFact.matrixType matrixType target.matrixType
+            operation.parameterEnvironment then
+        throw (.outputTypeMismatch operation.ownerNode)
       let publicIdentity ← match publicFact.identity with
         | some identity => pure identity
         | none => throw (.missingPublicIdentity operation.ownerNode { node := 0, port := 0 })
@@ -1854,6 +1851,13 @@ def applyDirectRelationProducer
       let expectedCount := if small then descriptor.smallDigitCount else descriptor.regularDigitCount
       if count.toNat != expectedCount || bound != descriptor.base then
         throw (.gadgetLayoutMismatch operation.ownerNode)
+      let outputParams ← match matrixType.evaluate operation.parameterEnvironment (.constant 0) with
+        | some value => pure value | none => throw (.invalidMatrixParameters operation.ownerNode)
+      if !sameConcreteMatrixShape params outputParams || outputParams.modulus != input.matrixParams.modulus ||
+          outputParams.ringDimension != input.matrixParams.ringDimension ||
+          outputParams.rows != input.matrixParams.rows * count.toNat ||
+          outputParams.columns != input.matrixParams.columns then
+        throw (.outputTypeMismatch operation.ownerNode)
       let publicIdentity := PublicMatrixIdentity.gadget descriptor.paramsId params
         input.matrixParams.rows bound small count.toNat
       let result ← cappedMatrixFact operation.ownerNode operation.outputPort matrixType
@@ -2553,6 +2557,82 @@ private def materializeDirectScalarFact
   | .trapdoor fact => pure (.trapdoor { fact with maximum := .closed (← close fact.maximum), preimageCutoff := (← fact.preimageCutoff.mapM (fun bound => return .closed (← close bound))) })
   | fact => pure fact
 
+/-- Close one relation descriptor at the same fixed-assignment boundary used by scalar bounds.
+The evaluator is arena-aware, so `.index` retains gathered owner semantics until this point. -/
+private def materializeDirectRelationOperation
+    (arena : DirectOperationalIndexedArena)
+    (parameters : ParamEnvironment)
+    (context : IndexContext)
+    (indices : IndexValueEnvironment)
+    (operation : DirectRelationOperation) : Except OperationalError DirectRelationOperation := do
+  if !completeDirectIndexAssignment parameters context indices then
+    throw (.unsupportedOperationalExpr operation.ownerNode)
+  let rec evaluateAt (environment : ParamEnvironment) : IndexedParameterExpr → Except OperationalError Int
+    | .ir value => match value.evaluate environment with
+        | some value => pure value | none => throw .nonClosedExpression
+    | .index value => exactGatherIndex arena environment context indices value (arena.values.size + 1)
+    | .add left right => return (← evaluateAt environment left) + (← evaluateAt environment right)
+    | .subtract left right => return (← evaluateAt environment left) - (← evaluateAt environment right)
+    | .multiply left right => return (← evaluateAt environment left) * (← evaluateAt environment right)
+    | .divide left right => do
+        let right ← evaluateAt environment right
+        if right = 0 then throw .nonClosedExpression else return (← evaluateAt environment left) / right
+    | .roundDivide left right => do
+        let right ← evaluateAt environment right
+        if right = 0 then throw .nonClosedExpression else return Mxx.Ir.roundDiv (← evaluateAt environment left) right
+    | .log2Ceil value => return Mxx.Ir.log2Ceil (← evaluateAt environment value)
+  let materializeType (value : IndexedMatrixTypeExpr) : Except OperationalError MatrixTypeExpr := do
+    let modulusValue ← evaluateAt parameters value.modulus
+    let ringDimensionValue ← evaluateAt parameters value.ringDimension
+    let rowCount ← evaluateAt parameters value.rows
+    let columnCount ← evaluateAt parameters value.columns
+    let result : MatrixTypeExpr := {
+      modulus := .constant modulusValue
+      ringDimension := .constant ringDimensionValue
+      rows := .constant rowCount
+      columns := .constant columnCount
+    }
+    pure result
+  let rec materializeDomains (environment : ParamEnvironment) :
+      List IndexedOperationalParameterDomain → Except OperationalError Unit
+    | [] => pure ()
+    | .loopIndex binder :: remaining => do
+        if !context.binders.contains binder then throw (.unsupportedOperationalExpr operation.ownerNode)
+        let count ← match binder.count.evaluate environment with
+          | some value => pure value | none => throw .nonClosedExpression
+        let lane ← exactGatherIndex arena environment context indices (.variable binder)
+          (arena.values.size + 1)
+        if count <= 0 || lane < 0 || lane >= count then throw (.invalidCount operation.ownerNode lane)
+        materializeDomains environment remaining
+    | .parameter _ environment domains expression :: remaining => do
+        materializeDomains environment domains
+        let _ ← evaluateAt environment expression
+        materializeDomains environment remaining
+  let outputType ← materializeType operation.outputType
+  let kind ← match operation.kind with
+  | .preimage maximum domains => do
+      materializeDomains parameters domains
+      let maximum ← evaluateAt parameters maximum
+      if maximum < 0 then throw (.invalidBound operation.ownerNode maximum)
+      pure (.preimage (.ir (.constant maximum)) [])
+  | .decomposition declaredType base small digitCount domains layouts => do
+      materializeDomains parameters domains
+      let declaredType ← materializeType declaredType
+      let base ← evaluateAt parameters base
+      let digitCount ← evaluateAt parameters digitCount
+      pure (.decomposition (.fromIr declaredType) (.ir (.constant base)) small
+        (.ir (.constant digitCount)) [] layouts)
+  let materialized : DirectRelationOperation := {
+    kind := kind
+    outputType := .fromIr outputType
+    outputSchema := outputType
+    ownerScope := operation.ownerScope
+    ownerNode := operation.ownerNode
+    outputPort := operation.outputPort
+    parameterEnvironment := operation.parameterEnvironment
+  }
+  pure materialized
+
 mutual
 
 /-- Evaluate an owner-bearing direct index expression.  Unlike the generic indexed-facts helper,
@@ -2733,7 +2813,7 @@ def DirectOperationalIndexedArena.matrixFactAt
       | .pointwise (.matrix matrixType) (.matrix operation) inputs => do
           let arguments ← inputs.mapM fun input => arena.matrixFactAt parameters indices input fuel
           applyDirectMatrixPointwiseOperation operation matrixType arguments
-      | .pointwise (.matrix matrixType) (.relation operation) inputs => do
+      | .pointwise (.matrix _) (.relation operation) inputs => do
           let arguments ← inputs.mapM fun input => do
             let value ← match arena.valueAt? input with
               | some value => pure value
@@ -2747,7 +2827,8 @@ def DirectOperationalIndexedArena.matrixFactAt
                 | .trapdoor fact => return .trapdoor fact
                 | _ => throw (.unsupportedOperationalExpr input)
             | .scalar _ => throw (.unsupportedOperationalExpr input)
-          applyDirectRelationProducer operation matrixType arguments
+          let operation ← materializeDirectRelationOperation arena parameters value.context indices operation
+          applyDirectRelationProducer operation operation.outputSchema arguments
       | .pointwise (.matrix matrixType) (.matrixFromScalar operation) inputs => do
           let input ← match inputs with
             | #[input] => pure input
@@ -3417,6 +3498,13 @@ private def reindexReducedPointwiseOperation
     | some operation => pure operation
     | none => throw (.unsupportedOperationalExpr 0)) operation
 
+/-- Matrix and scalar reduction cross the same ordered map stack.  A relation descriptor must
+use that final context when closing its indexed fields, rather than the source context stored at
+the delayed pointwise root. -/
+private def reducedDirectMatrixContext
+    (source : IndexContext) (maps : List IndexMap) : IndexContext :=
+  maps.foldl (fun _ map => map.destination) source
+
 mutual
 
 private def reducedDirectMatrixFactAt
@@ -3524,7 +3612,7 @@ private def reducedDirectMatrixFactAt
           let maximumPolynomialTerms := inputEvaluations.foldl (fun maximum evaluation =>
             max maximum evaluation.maximumPolynomialTerms) 0
           pure { entries := entries, rewriteEvents := rewriteEvents, maximumPolynomialTerms }
-      | .pointwise (.matrix matrixType) (.relation operation) inputs => do
+      | .pointwise (.matrix _) (.relation operation) inputs => do
           let operation ← reindexReducedPointwiseOperation parameters maps (.relation operation)
           let operation ← match operation with
             | .relation operation => pure operation
@@ -3554,7 +3642,10 @@ private def reducedDirectMatrixFactAt
           let inputEntries := inputEvaluations.map (·.1)
           let aligned ← alignDirectRelationArguments arena operation.ownerNode id inputEntries
           let entries ← aligned.mapM fun (arguments, correlation) => do
-            let fact ← applyDirectRelationProducer operation matrixType arguments
+            let context := reducedDirectMatrixContext value.context maps
+            let indices := correlation.map fun (key, ordinal) => (key, Int.ofNat ordinal)
+            let operation ← materializeDirectRelationOperation arena parameters context indices operation
+            let fact ← applyDirectRelationProducer operation operation.outputSchema arguments
             pure { correlation, fact }
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (inputEvaluations.flatMap (fun value => value.2.1))
@@ -3587,6 +3678,9 @@ private def reducedDirectScalarContext
     (source : IndexContext) (maps : List IndexMap) : IndexContext :=
   maps.foldl (fun _ map => map.destination) source
 
+/-- Matrix and scalar reduction cross the same ordered map stack.  A relation descriptor must
+use that final context when closing its indexed fields, rather than the source context stored at
+the delayed pointwise root. -/
 private def reducedDirectScalarFactAt
     (arena : DirectOperationalIndexedArena)
     (parameters : ParamEnvironment)

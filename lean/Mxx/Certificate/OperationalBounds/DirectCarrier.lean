@@ -339,7 +339,9 @@ def relationOperationSchemasValid
         | .ok (_, productType) => operationalMatrixTypeEqual productType targetType
         | .error _ => false
   | .decomposition declaredType .., #[.matrix _] =>
-      declaredType.closedIr?.any (operationalMatrixTypeEqual · output)
+      /- The declared type is owner-aware and can depend on a selected family lane.  Its
+      concrete shape is checked only after that lane has materialized the descriptor. -/
+      true
   | _, _ => false
 
 def scalarOperationSchemasValid

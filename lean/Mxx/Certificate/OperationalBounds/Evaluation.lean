@@ -1050,9 +1050,12 @@ partial def directFamilyLaneBinderFromCarrier
           if inputContext != value.context || !pointwiseSchemasValid operation inputSchemas schema ||
               !validateContext value.context then
             none
-          else match value.context.binders.toList with
-          | [binder] => some binder
-          | _ => none
+          else
+            let candidates := inputs.toList.filterMap fun input =>
+              directFamilyLaneBinderFromCarrier arena input fuel
+            match candidates.eraseDups with
+            | [binder] => if value.context.binders.contains binder then some binder else none
+            | _ => none
 
 /-- Validate that one owner-bearing destination binder is actually transported by the carrier.
 Unlike `directFamilyLaneBinderFromCarrier`, this does not choose an outermost coordinate: nested

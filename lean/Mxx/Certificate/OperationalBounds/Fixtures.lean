@@ -4025,6 +4025,8 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
     context := mappedContext, payload := .directValue scalarRoot, storage := .mappedTemplate }
   let (arena, matrix) ← closeParallelDirectMatrixOutput scopeKey loopNode 0 0 count [] arena matrix
   let (arena, scalar) ← closeParallelDirectScalarOutput scopeKey loopNode 0 1 count [] arena scalar
+  let (arena, matrix) ← namespaceFreshDirectOutput scopeKey { node := loopNode, port := 0 } arena matrix
+  let (arena, scalar) ← namespaceFreshDirectOutput scopeKey { node := loopNode, port := 1 } arena scalar
   let matrixValue ← match arena.direct.valueAt? matrix.payload.root with
     | some value => pure value
     | none => throw (.invalidOperationalExprRef matrix.payload.root)

@@ -4829,6 +4829,7 @@ def namespaceFreshDirectOutput
   | some { payload := .explicitValues .., .. }
   | some { payload := .mapped .., .. }
   | some { payload := .rebound .., .. }
+  | some { payload := .indexedOutput .., .. }
   | some { payload := .matrixResultBound .., .. }
   | some { payload := .pointwise .., .. } => pure (arena, fact)
   | some _ => throw (.unsupportedOperationalExpr id)

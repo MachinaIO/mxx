@@ -4051,6 +4051,10 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
     | .trapdoor fact => some fact.subject
     | .bytes fact => some fact.subject
     | _ => none
+  let matrixLaneBinder := directFamilyLaneBinderFromCarrier arena.direct matrix.payload.root
+    (arena.direct.values.size + 1)
+  let scalarLaneBinder := directFamilyLaneBinderFromCarrier arena.direct scalar.payload.root
+    (arena.direct.values.size + 1)
   let nestedOverlay (subject : WireRef) (value : OperationalIndexedValue) := match value.payload with
     | .indexedOutput _ source indexedBinder indexedSelection indexedSubject =>
         indexedBinder == familyBinder && indexedSelection ==
@@ -4064,6 +4068,7 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
     matrixValue.context == expectedContext, scalarValue.context == expectedContext,
     matrixFact.subject == { node := loopNode, port := 0 },
     scalarSubject == some { node := loopNode, port := 1 }, matrixIndexed, scalarIndexed,
+    matrixLaneBinder == some independent, scalarLaneBinder == some independent,
     nestedOverlay { node := loopNode, port := 0 } matrixValue,
     nestedOverlay { node := loopNode, port := 1 } scalarValue]
   pure (checks.all id)

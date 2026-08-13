@@ -2273,7 +2273,12 @@ def evaluatePreparedScope
                   facts := { facts with arena }
                   pure outputs
             catch error =>
-              throw error
+              if operationalProgress "evaluate_scope" "node_error" (reprStr scopeKey)
+                  index scope.nodes.size ("arguments=" ++ reprStr node.arguments ++
+                    "; arena_values=" ++ toString facts.arena.direct.values.size ++
+                    "; error=" ++ reprStr error) then
+                throw error
+              else throw error
             let mut namespacedOutputs : Array OperationalFact := #[]
             for (output, port) in outputs.toArray.zipIdx do
                   let expression := output

@@ -13,12 +13,13 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
+    time::Instant,
 };
 use tempfile::Builder;
 use thiserror::Error;
 
 pub const OPERATIONAL_REPORT_SCHEMA_VERSION: u32 = 5;
-const OPERATIONAL_PREPARED_CACHE_FORMAT_VERSION: u32 = 6;
+const OPERATIONAL_PREPARED_CACHE_FORMAT_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationalParameterValue {
@@ -197,6 +198,17 @@ fn lean_string(value: &str) -> String {
 
 const OPERATIONAL_REPORT_LEAN_HELPERS: &str = r#"
 private def jsonString (value : String) : String := (Lean.Json.str value).compress
+
+private def emitOperationalProgress
+    (phase event : String) (targetId detail : Option String) : IO Unit :=
+  let targetField := match targetId with
+    | none => ""
+    | some target => " target_id=" ++ target
+  let detailField := match detail with
+    | none => ""
+    | some value => " detail=" ++ value
+  IO.eprintln ("operational_progress phase=" ++ phase ++ " event=" ++ event ++
+    targetField ++ detailField)
 
 private def rejectionJson : Option OperationalNoiseRejection -> String
   | none => "null"
@@ -499,6 +511,7 @@ fn stream_and_retain(
 }
 
 fn lean_version(lean_workspace: &Path) -> Result<String, OperationalRunnerError> {
+    eprintln!("operational_progress phase=lean_toolchain event=version_check_start");
     let output = Command::new("lake")
         .args(["env", "lean", "--version"])
         .current_dir(lean_workspace)
@@ -509,24 +522,54 @@ fn lean_version(lean_workspace: &Path) -> Result<String, OperationalRunnerError>
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    eprintln!(
+        "operational_progress phase=lean_toolchain event=version_check_complete version={version}"
+    );
+    Ok(version)
 }
 
-fn prepared_module_source(emitted: &EmittedProtocol, prepared_name: &str) -> String {
+fn prepared_module_source(
+    emitted: &EmittedProtocol,
+    prepared_name: &str,
+    document_paths: &[(String, PathBuf)],
+) -> String {
     let namespace = format!("{}.Generated.{}", emitted.module_root, emitted.lean_name);
-    format!(
+    let mut raw_loader_source = emitted.operational_raw_ir_template.clone();
+    for (name, path) in document_paths {
+        let token = format!("__MXX_OPERATIONAL_DOCUMENT_{name}__");
+        raw_loader_source = raw_loader_source.replace(&token, &path.to_string_lossy());
+    }
+    let source = format!(
         "import Mxx.Certificate.OperationalBounds\n{}\nnamespace {}\n\n\
-def {} : Except (Sum Mxx.Ir.DecodeError Mxx.Certificate.OperationalError) \
-Mxx.Certificate.PreparedOperationalWorkflow := do\n  \
-let decoded ← {}_decoded |>.mapError Sum.inl\n  \
-let protocol := decoded.1\n  \
-let derivations := decoded.2\n  \
-Mxx.Certificate.prepareWorkflowOperational\n    \
-({{ workflow := protocol.bundle.workflow, inputContract := protocol.bundle.inputContract, \
-operationalDecoderTargets := protocol.bundle.operationalDecoderTargets }} : \
-Mxx.Certificate.OperationalWorkflowSpec)\n    \
-derivations |>.mapError Sum.inr\n\nend {}\n",
-        emitted.ir, namespace, prepared_name, emitted.lean_name, namespace,
+def {} : IO (Except (Sum Mxx.Ir.DecodeError Mxx.Certificate.OperationalError) \
+Mxx.Certificate.PreparedOperationalWorkflow) := do\n  \
+IO.eprintln \"operational_progress phase=decode_generated_ir_and_prepare_workflow event=workflow_prepare_start\"\n  \
+let preparationStarted ← IO.monoNanosNow\n  \
+let decoded ← {}_decodedFromRawFiles\n  \
+match decoded with\n  \
+| .error error => pure (.error (Sum.inl error))\n  \
+| .ok decoded =>\n    \
+  let protocol := decoded.1\n    \
+  let derivations := decoded.2\n    \
+  let result := Mxx.Certificate.prepareWorkflowOperational\n      \
+    ({{ workflow := protocol.bundle.workflow, inputContract := protocol.bundle.inputContract, \
+    operationalDecoderTargets := protocol.bundle.operationalDecoderTargets }} : \
+    Mxx.Certificate.OperationalWorkflowSpec)\n      \
+    derivations |>.mapError Sum.inr\n    \
+  let preparationFinished ← IO.monoNanosNow\n    \
+  IO.eprintln (\"operational_progress phase=decode_generated_ir_and_prepare_workflow \
+    event=workflow_prepare_complete detail=elapsed_ns=\" ++ \
+    toString (preparationFinished - preparationStarted))\n    \
+  pure result\n\nend {}\n",
+        raw_loader_source, namespace, prepared_name, emitted.lean_name, namespace,
+    );
+    source.replace(
+        "    let preparationFinished ← IO.monoNanosNow",
+        "    let forced ← match result with\n    | .ok prepared => some <$> Mxx.Certificate.forcePreparedOperationalWorkflow prepared\n    | .error _ => pure none\n    let preparationFinished ← IO.monoNanosNow",
+    ).replace(
+        "toString (preparationFinished - preparationStarted))",
+        "toString (preparationFinished - preparationStarted) ++ match forced with\n      | none => \"\"\n      | some stats => \"; forced_entries=\" ++ toString stats.entries ++ \"; checksum=\" ++ toString stats.checksum)",
     )
 }
 
@@ -534,6 +577,11 @@ pub fn prepare_emitted_operational_checker(
     lean_workspace: &Path,
     emitted: &EmittedProtocol,
 ) -> Result<PreparedOperationalChecker, OperationalRunnerError> {
+    let preparation_started = Instant::now();
+    eprintln!(
+        "operational_progress phase=prepare_workflow event=start module={} lean_name={}",
+        emitted.module_root, emitted.lean_name
+    );
     let version = lean_version(lean_workspace)?;
     let key_material = format!(
         "{}\n{}\n{}\n{}\n{}\n{}\n{}",
@@ -550,6 +598,7 @@ pub fn prepare_emitted_operational_checker(
     let module_name = format!("MxxOperationalCache.{component}");
     let cache_root = lean_workspace.join(".lake/build/mxx-operational-cache/src");
     let source_dir = cache_root.join("MxxOperationalCache");
+    let document_dir = cache_root.join("documents").join(&component);
     let source_path = source_dir.join(format!("{component}.lean"));
     let olean_dir = lean_workspace.join(".lake/build/lib/lean/MxxOperationalCache");
     let olean_path = olean_dir.join(format!("{component}.olean"));
@@ -557,10 +606,28 @@ pub fn prepare_emitted_operational_checker(
     let prepared_name = format!("{}_preparedOperational", emitted.lean_name);
     fs::create_dir_all(&source_dir)?;
     fs::create_dir_all(&olean_dir)?;
+    fs::create_dir_all(&document_dir)?;
+    let document_paths = emitted
+        .operational_documents
+        .iter()
+        .map(|document| {
+            (document.name.clone(), document_dir.join(format!("{}.bin", document.name)))
+        })
+        .collect::<Vec<_>>();
+    for (document, (_, path)) in emitted.operational_documents.iter().zip(&document_paths) {
+        fs::write(path, &document.bytes)?;
+    }
     if !olean_path.is_file() {
-        fs::write(&source_path, prepared_module_source(emitted, &prepared_name))?;
+        eprintln!(
+            "operational_progress phase=prepare_workflow event=cache_miss component={component}"
+        );
+        fs::write(&source_path, prepared_module_source(emitted, &prepared_name, &document_paths))?;
         let temporary_olean =
             olean_dir.join(format!("{component}.{}.tmp.olean", std::process::id()));
+        let compilation_started = Instant::now();
+        eprintln!(
+            "operational_progress phase=prepare_workflow event=lean_ir_derivation_build_start component={component}"
+        );
         let output = Command::new("lake")
             .args(["env", "lean", "-DmaxHeartbeats=0", "-DmaxRecDepth=1000000", "-R"])
             .arg(&cache_root)
@@ -577,7 +644,19 @@ pub fn prepare_emitted_operational_checker(
             });
         }
         fs::rename(temporary_olean, &olean_path)?;
+        eprintln!(
+            "operational_progress phase=prepare_workflow event=lean_ir_derivation_build_complete component={component} elapsed_ms={}",
+            compilation_started.elapsed().as_millis()
+        );
+    } else {
+        eprintln!(
+            "operational_progress phase=prepare_workflow event=cache_hit component={component}"
+        );
     }
+    eprintln!(
+        "operational_progress phase=prepare_workflow event=complete component={component} elapsed_ms={}",
+        preparation_started.elapsed().as_millis()
+    );
     Ok(PreparedOperationalChecker {
         module_name,
         namespace,
@@ -745,12 +824,16 @@ fn prepared_checker_source(
         .map(|(group, representative)| {
             let target_id = lean_string(&requests[*representative].target_id);
             format!(
-                "let evaluationStarted_{group} ← IO.monoNanosNow\n\
+                "emitOperationalProgress \"evaluate_scope\" \"start\" (some {target_id}) \
+                   (some \"request_group={group}; request_index={representative}\")\n\
+                 let evaluationStarted_{group} ← IO.monoNanosNow\n\
                  let outputs_{group} ← match operationalOutputs_{group} prepared with\n\
                  | .error error => emitOperationalFailure (some {}) (some \"evaluate_scope\") error; return 2\n\
                  | .ok outputs => pure outputs\n\
                  let evaluationFinished_{group} ← IO.monoNanosNow\n\
-                 let evaluationTimeNs_{group} := evaluationFinished_{group} - evaluationStarted_{group}",
+                 let evaluationTimeNs_{group} := evaluationFinished_{group} - evaluationStarted_{group}\n\
+                 emitOperationalProgress \"evaluate_scope\" \"complete\" (some {target_id}) \
+                   (some (\"request_group={group}; elapsed_ns=\" ++ toString evaluationTimeNs_{group}))",
                 target_id,
             )
         })
@@ -763,14 +846,19 @@ fn prepared_checker_source(
             let output_group = request_groups[*representative];
             let target_id = lean_string(&requests[*representative].target_id);
             format!(
-                "let boundEvaluationStarted_{bound_group} ← IO.monoNanosNow\n\
+                "emitOperationalProgress \"resolve_target_and_evaluate_bound\" \"start\" \
+                   (some {target_id}) (some \"bound_group={bound_group}; output_group={output_group}\")\n\
+                 let boundEvaluationStarted_{bound_group} ← IO.monoNanosNow\n\
                  let boundResult_{bound_group} ← match \
                    operationalBound_{bound_group} prepared outputs_{output_group} with\n\
                    | .error error => emitOperationalFailure (some {}) (some \"evaluate_decoder_bounds\") error; return 2\n\
                    | .ok result => pure result\n\
                  let boundEvaluationFinished_{bound_group} ← IO.monoNanosNow\n\
                  let boundEvaluationTimeNs_{bound_group} := \
-                   boundEvaluationFinished_{bound_group} - boundEvaluationStarted_{bound_group}",
+                   boundEvaluationFinished_{bound_group} - boundEvaluationStarted_{bound_group}\n\
+                 emitOperationalProgress \"resolve_target_and_evaluate_bound\" \"complete\" \
+                   (some {target_id}) (some (\"bound_group={bound_group}; elapsed_ns=\" ++ \
+                     toString boundEvaluationTimeNs_{bound_group}))",
                 target_id,
             )
         })
@@ -786,6 +874,8 @@ fn prepared_checker_source(
             format!(
                 "let (target_{index}, ciphertextModulus_{index}, noiseBound_{index}, diagnostics_{index}) := \
                    boundResult_{bound_group}\n\
+                 emitOperationalProgress \"target_noise_check\" \"start\" (some target_{index}.targetId) \
+                   (some \"request_index={index}\")\n\
                  let report ← match operationalTargetNoiseCheckReportFromBound outputs_{group} \
                    target_{index} ciphertextModulus_{index} noiseBound_{index} diagnostics_{index} [{}] with\n\
                    | .ok report => pure report\n\
@@ -793,11 +883,17 @@ fn prepared_checker_source(
                  match report.obligations, target_{index}.kind with\n\
                      | [.decoderThreshold plaintextModulus ciphertextModulus noiseBound], \
                        .thresholdDecode _ =>\n\
+                         emitOperationalProgress \"target_noise_check\" \"complete\" \
+                           (some target_{index}.targetId) (some (\"request_index={index}; accepted=\" ++ \
+                             toString report.accepted ++ \"; noise_bound=\" ++ toString noiseBound))\n\
                          let json := operationalReportJson operationalReportSchemaVersion {} {} {} {} {} \
                            target_{index}.targetId \"threshold_decode\" noiseBound plaintextModulus ciphertextModulus \
                            report decodeTimeNs evaluationTimeNs_{group} boundEvaluationTimeNs_{bound_group}\n\
                          IO.println json\n\
                      | [.booleanInterval ciphertextModulus noiseBound], .booleanInterval =>\n\
+                         emitOperationalProgress \"target_noise_check\" \"complete\" \
+                           (some target_{index}.targetId) (some (\"request_index={index}; accepted=\" ++ \
+                             toString report.accepted ++ \"; noise_bound=\" ++ toString noiseBound))\n\
                          let json := operationalReportJson operationalReportSchemaVersion {} {} {} {} {} \
                            target_{index}.targetId \"boolean_interval\" noiseBound 2 ciphertextModulus \
                            report decodeTimeNs evaluationTimeNs_{group} boundEvaluationTimeNs_{bound_group}\n\
@@ -822,12 +918,16 @@ fn prepared_checker_source(
     format!(
         "import {}\nopen {}\nopen Mxx.Certificate\n\nprivate def operationalReportSchemaVersion : Nat := {}\n\n{}\n\n{}\n\n{}\n\n\
          def main : IO UInt32 := do\n\
+           emitOperationalProgress \"decode_generated_ir_and_prepare_workflow\" \"start\" none none\n\
            let decodeStarted ← IO.monoNanosNow\n\
-           match {} with\n\
+           let preparedResult ← {}\n\
+           match preparedResult with\n\
            | .error error => emitPreparationFailure error; return 2\n\
            | .ok prepared =>\n\
              let decodeFinished ← IO.monoNanosNow\n\
              let decodeTimeNs := decodeFinished - decodeStarted\n\
+             emitOperationalProgress \"decode_generated_ir_and_prepare_workflow\" \"complete\" none \
+               (some (\"elapsed_ns=\" ++ toString decodeTimeNs))\n\
 {}\n{}\nreturn 0\n",
         prepared.module_name,
         prepared.namespace,
@@ -846,8 +946,17 @@ fn run_operational_checker_reports(
     source: &str,
     expected: usize,
 ) -> Result<Vec<OperationalCheckerReport>, OperationalRunnerError> {
+    let runner_started = Instant::now();
+    eprintln!(
+        "operational_progress phase=lean_checker event=source_generation_complete expected_reports={expected} source_bytes={}",
+        source.len()
+    );
     let file = Builder::new().prefix("mxx-operational-").suffix(".lean").tempfile()?;
     std::fs::write(file.path(), source)?;
+    eprintln!(
+        "operational_progress phase=lean_checker event=launch path={} expected_reports={expected}",
+        file.path().display()
+    );
     let mut child = Command::new("lake")
         .args(operational_lean_arguments())
         .arg(file.path())
@@ -874,6 +983,11 @@ fn run_operational_checker_reports(
     let stderr = stderr_reader.join().expect("Lean stderr reader panicked")?;
     let stdout = String::from_utf8_lossy(&stdout).into_owned();
     let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    eprintln!(
+        "operational_progress phase=lean_checker event=process_exit success={} elapsed_ms={}",
+        status.success(),
+        runner_started.elapsed().as_millis()
+    );
     if !status.success() {
         return Err(OperationalRunnerError::CheckerFailed {
             diagnostic: parse_operational_failure_diagnostic(&stderr),
@@ -999,14 +1113,31 @@ pub fn run_prepared_operational_checks(
     prepared: &PreparedOperationalChecker,
     requests: &[OperationalCheckRequest],
 ) -> Result<Vec<OperationalCheckerReport>, OperationalRunnerError> {
+    eprintln!(
+        "operational_progress phase=prepared_checker event=start request_count={} target_ids={}",
+        requests.len(),
+        requests.iter().map(|request| request.target_id.as_str()).collect::<Vec<_>>().join(",")
+    );
     let reports = run_operational_checker_reports(
         lean_workspace,
         &prepared_checker_source(prepared, requests),
         requests.len(),
     )?;
     for (request, report) in requests.iter().zip(&reports) {
+        eprintln!(
+            "operational_progress phase=prepared_checker event=validate_report_start target_id={}",
+            request.target_id
+        );
         validate_prepared_report(prepared, request, report)?;
+        eprintln!(
+            "operational_progress phase=prepared_checker event=validate_report_complete target_id={} accepted={} noise_bound={}",
+            request.target_id, report.accepted, report.noise_bound
+        );
     }
+    eprintln!(
+        "operational_progress phase=prepared_checker event=complete request_count={}",
+        reports.len()
+    );
     Ok(reports)
 }
 
@@ -1301,8 +1432,16 @@ mod tests {
         assert!(source.contains(&format!(
             "operationalReportSchemaVersion : Nat := {OPERATIONAL_REPORT_SCHEMA_VERSION}"
         )));
-        assert!(!source.contains("phase=evaluate_scope"));
-        assert!(!source.contains("phase=evaluate_decoder_bounds"));
+        assert!(source.contains(
+            "operational_progress phase=decode_generated_ir_and_prepare_workflow event=start"
+        ));
+        assert!(source.contains("operational_progress phase=evaluate_scope event=start"));
+        assert!(
+            source.contains(
+                "operational_progress phase=resolve_target_and_evaluate_bound event=start"
+            )
+        );
+        assert!(source.contains("operational_progress phase=target_noise_check event=complete"));
         assert!(!source.contains("operational analysis diagnostics"));
         assert!(source.contains("report.diagnostics.expressionNodeCount"));
         assert!(source.contains("report.diagnostics.relationRewriteCount"));

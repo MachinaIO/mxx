@@ -1,8 +1,17 @@
 import Mxx.Certificate.OperationalBounds.IndexedEngine
+import Mxx.Certificate.OperationalBounds.Progress
 
 namespace Mxx.Certificate
 
 open Mxx.Ir
+
+/-- Every delayed descriptor is bound at construction to the complete owner-bearing contexts of
+its direct operands.  Graph IR's numeric loop slots are accepted only when this merge identifies
+one lexical binder; ambiguous slots never enter the carrier. -/
+def directOperationIndexContext (inputs : List OperationalFact) : Except OperationalError IndexContext :=
+  match mergeIndexContextsN (inputs.map (·.context)) with
+  | some context => pure context
+  | none => throw (.unsupportedOperationalExpr 0)
 
 def genericNodeMatrixFactConcrete
     (scopeKey : ScopeTemplateKey)
@@ -130,8 +139,9 @@ def genericNodeMatrixFactConcrete
         | none => throw (.missingPublicIdentity nodeIndex publicWire)
       if publicIdentity != trapdoor.publicIdentity then
         throw (.publicIdentityMismatch nodeIndex)
+      let trapdoorCutoff ← trapdoor.preimageCutoff.mapM (requireMaterializedScalarBound nodeIndex)
       let _ ← validatePreimageCutoffAgreement nodeIndex environment loopDomains maximum
-        trapdoor.publicIdentity trapdoor.preimageCutoff
+        trapdoor.publicIdentity trapdoorCutoff
       let result ← cappedMatrixFactExpr nodeIndex outputPort matrixType environment bound
       let relation : PreimageRelation := {
         producer := result.origin
@@ -150,21 +160,36 @@ def genericNodeMatrixFactConcrete
       let keyOrigin ← valueOriginAt scopeKey nodeIndex facts keyWire
       let trailingIntegerOrigins ← (node.arguments.drop 1).mapM
         (valueOriginAt scopeKey nodeIndex facts)
-      let hashIdentity (targetType : MatrixTypeExpr) : DeterministicHashIdentity := {
-        keyOrigin
-        matrixType := targetType
-        parameterEnvironment := environment
-        parameterDomains := loopDomains
-        tagPrefix
-        tagExpressions
-        tagDecimalExpressions
-        tagU64LeExpressions
-        trailingIntegerOrigins
-      }
+      let hashInputs ← node.arguments.mapM (lookupFact nodeIndex facts)
+      let context ← directOperationIndexContext hashInputs
+      let parameterEnvironment ← match IndexedParamEnvironment.fromIrAtWithDomains context loopDomains environment with
+        | some value => pure value | none => throw (.unsupportedOperationalExpr nodeIndex)
+      let parameterDomains ← match IndexedOperationalParameterDomain.fromIrAt context loopDomains with
+        | some value => pure value | none => throw (.unsupportedOperationalExpr nodeIndex)
+      let tagExpressions ← match tagExpressions.mapM (IndexedParameterExpr.fromIrAt context) with
+        | some value => pure value | none => throw (.unsupportedOperationalExpr nodeIndex)
+      let tagDecimalExpressions ← match tagDecimalExpressions.mapM (IndexedParameterExpr.fromIrAt context) with
+        | some value => pure value | none => throw (.unsupportedOperationalExpr nodeIndex)
+      let tagU64LeExpressions ← match tagU64LeExpressions.mapM (IndexedParameterExpr.fromIrAt context) with
+        | some value => pure value | none => throw (.unsupportedOperationalExpr nodeIndex)
+      let hashIdentity (targetType : MatrixTypeExpr) : Except OperationalError DeterministicHashIdentity := do
+        let matrixType ← match IndexedMatrixTypeExpr.fromIrAt context targetType with
+          | some value => pure value | none => throw (.unsupportedOperationalExpr nodeIndex)
+        pure {
+          keyOrigin
+          matrixType
+          parameterEnvironment
+          parameterDomains
+          tagPrefix
+          tagExpressions
+          tagDecimalExpressions
+          tagU64LeExpressions
+          trailingIntegerOrigins
+        }
       match variant with
       | .plain =>
           let result ← classifiedMatrixFact nodeIndex outputPort matrixType environment cap true
-          pure { result with origin := .deterministicHash (hashIdentity matrixType) }
+          pure { result with origin := .deterministicHash (← hashIdentity matrixType) }
       | .decomposed | .smallDecomposed =>
           let base ← match base with
             | some expression => evaluateIntInvariant environment loopDomains expression
@@ -197,7 +222,7 @@ def genericNodeMatrixFactConcrete
             rows := targetRows
             columns := outputParams.columns
           }
-          let targetOrigin := MatrixOriginIdentity.deterministicHash (hashIdentity targetType)
+          let targetOrigin := MatrixOriginIdentity.deterministicHash (← hashIdentity targetType)
           let targetSummary : RelationTargetSummary := {
             origin := targetOrigin
             matrixType := targetType
@@ -313,7 +338,9 @@ def genericNodeMatrixFactConcrete
       if params.rows != 1 || params.columns != 1 || params.modulus <= 0 ||
           params.ringDimension == 0 then
         throw (.invalidMatrixParameters nodeIndex)
-      let bound := OperationalBoundExpr.maximum (.negate input.lowerExpression) input.upperExpression
+      let lower ← requireMaterializedScalarBound nodeIndex input.lowerExpression
+      let upper ← requireMaterializedScalarBound nodeIndex input.upperExpression
+      let bound := OperationalBoundExpr.maximum (.negate lower) upper
       classifiedMatrixFactExpr nodeIndex outputPort matrixType environment bound
         false (.below params.modulus.toNat) { isConstantPolynomial := true }
   | .matrixNegate, some matrixType =>
@@ -720,8 +747,8 @@ def genericNodeFact
         let scalar : OperationalScalarFact := .trapdoor {
           subject, matrixType, matrixParams := params
           sigma, gadgetBase, digitCount, preimageMaxCoefficientBound := cutoff
-          maximum := .minimum (.closedInt (.constant cap)) boundExpr
-          preimageCutoff
+          maximum := .closed (.minimum (.closedInt (.constant cap)) boundExpr)
+          preimageCutoff := preimageCutoff.map .closed
           publicIdentity := .sampledTrapdoor scopeKey { node := nodeIndex, port := 0 }
         }
         facts.arena.promoteConcreteScalarFact scalar
@@ -739,7 +766,7 @@ def genericNodeFact
         let scalar : OperationalScalarFact := .trapdoor {
           subject, matrixType, matrixParams := params
           sigma, gadgetBase, digitCount, preimageMaxCoefficientBound := cutoff
-          maximum := .closedInt (.constant (absolute bound))
+          maximum := .closed (.closedInt (.constant (absolute bound)))
           preimageCutoff := none
           publicIdentity := .gadget descriptor.paramsId params params.rows bound false
             descriptor.regularDigitCount
@@ -836,10 +863,124 @@ def preparedDefinitionAt
   | some (_, definition) => pure definition
   | none => throw (OperationalError.missingDefinition s!"node-{node}")
 
+/-- Whether an executable real expression reads one exact lexical Graph-IR loop slot. -/
+private def realExprUsesLoopSlot (slot : Nat) : RealExpr → Bool
+  | .rational _ | .parameter _ => false
+  | .fromInt value => intExprUsesLoop slot value
+  | .add left right | .subtract left right | .multiply left right | .divide left right =>
+      realExprUsesLoopSlot slot left || realExprUsesLoopSlot slot right
+  | .sqrt value => realExprUsesLoopSlot slot value
+
+private def matrixTypeUsesLoopSlot (slot : Nat) (matrixType : MatrixTypeExpr) : Bool :=
+  intExprUsesLoop slot matrixType.modulus || intExprUsesLoop slot matrixType.ringDimension ||
+    intExprUsesLoop slot matrixType.rows || intExprUsesLoop slot matrixType.columns
+
+private def wireTypeUsesLoopSlot (slot : Nat) : WireTypeExpr → Bool
+  | .constantInt | .constantReal | .constantBool | .integer | .real | .boolean => false
+  | .bytes length => intExprUsesLoop slot length
+  | .typedBlob _ _ => false
+  | .matrix matrixType | .preimage matrixType => matrixTypeUsesLoopSlot slot matrixType
+  | .trapdoor matrixType sigma base digitCount cutoff =>
+      matrixTypeUsesLoopSlot slot matrixType || realExprUsesLoopSlot slot sigma ||
+        intExprUsesLoop slot base || intExprUsesLoop slot digitCount || intExprUsesLoop slot cutoff
+  | .indexedFamily element count => wireTypeUsesLoopSlot slot element || intExprUsesLoop slot count
+
+/-- Scan every Graph-IR expression field evaluated in the current lexical scope.  The caller
+scans nested definitions separately, because a nested loop may shadow the numeric slot. -/
+private def nodeKindUsesLoopSlot (slot : Nat) : NodeKind → Bool
+  | .input _ | .constantInt _ | .constantBool _ | .boolToInt | .intToReal | .intBinary _ |
+      .realBinary _ | .realSqrt | .intCompare _ | .select | .trapdoorPublic | .matrixAdd |
+      .matrixSubtract | .matrixMultiply | .matrixNegate | .transpose | .tensor | .concat _ |
+      .familyPack | .familyGetDynamic => false
+  | .evaluateInt value => intExprUsesLoop slot value
+  | .constantReal value => realExprUsesLoopSlot slot value
+  | .zeroMatrix matrixType | .identityMatrix matrixType | .liftIntegerToConstantPolynomial matrixType |
+      .uniformResidueSample matrixType => matrixTypeUsesLoopSlot slot matrixType
+  | .constantMatrix matrixType coefficients =>
+      matrixTypeUsesLoopSlot slot matrixType || coefficients.any (intExprUsesLoop slot)
+  | .unitRowMatrix matrixType index | .unitColumnMatrix matrixType index =>
+      matrixTypeUsesLoopSlot slot matrixType || intExprUsesLoop slot index
+  | .gadgetMatrix matrixType base | .smallGadgetMatrix matrixType base |
+      .gadgetTrapdoor matrixType base =>
+      matrixTypeUsesLoopSlot slot matrixType || intExprUsesLoop slot base
+  | .powerOfBaseMatrix matrixType base exponent =>
+      matrixTypeUsesLoopSlot slot matrixType || intExprUsesLoop slot base || intExprUsesLoop slot exponent
+  | .rotationMatrix matrixType exponent =>
+      matrixTypeUsesLoopSlot slot matrixType || intExprUsesLoop slot exponent
+  | .bitExtract exponent | .extractCoefficient exponent | .matrixScale exponent |
+      .familyGetStatic exponent => intExprUsesLoop slot exponent
+  | .uniformIntervalSample matrixType minimum maximum =>
+      matrixTypeUsesLoopSlot slot matrixType || intExprUsesLoop slot minimum || intExprUsesLoop slot maximum
+  | .gaussianSample matrixType cutoff | .trapdoorSample matrixType cutoff |
+      .preimageSample matrixType cutoff =>
+      matrixTypeUsesLoopSlot slot matrixType || intExprUsesLoop slot cutoff
+  | .hashSample matrixType _ _ tags decimalTags u64Tags base digitCount =>
+      matrixTypeUsesLoopSlot slot matrixType || tags.any (intExprUsesLoop slot) ||
+        decimalTags.any (intExprUsesLoop slot) || u64Tags.any (intExprUsesLoop slot) ||
+        base.any (intExprUsesLoop slot) || digitCount.any (intExprUsesLoop slot)
+  | .gadgetDecompose matrixType base _ digits =>
+      matrixTypeUsesLoopSlot slot matrixType || intExprUsesLoop slot base || intExprUsesLoop slot digits
+  | .slice rows columns => rows.any (fun (rowCount, columnCount) =>
+      intExprUsesLoop slot rowCount || intExprUsesLoop slot columnCount) ||
+        columns.any (fun (rowCount, columnCount) =>
+          intExprUsesLoop slot rowCount || intExprUsesLoop slot columnCount)
+  | .thresholdDecodeBool ciphertext plaintext length | .thresholdDecodeInt ciphertext plaintext length =>
+      intExprUsesLoop slot ciphertext || intExprUsesLoop slot plaintext || intExprUsesLoop slot length
+  | .crtRecompose plaintextModuli reconstructionCoefficients =>
+      plaintextModuli.any (intExprUsesLoop slot) || reconstructionCoefficients.any (intExprUsesLoop slot)
+  | .packPolynomialCoefficients matrixType coefficientBits =>
+      matrixTypeUsesLoopSlot slot matrixType || intExprUsesLoop slot coefficientBits
+  | .subgraphCall _ bindings => bindings.any fun (_, value) => intExprUsesLoop slot value
+  | .parallelLoop _ count _ bindings _ | .sequentialLoop _ count _ bindings _ =>
+      intExprUsesLoop slot count || bindings.any (fun (_, value) => intExprUsesLoop slot value)
+
+private def nodeUsesLoopSlot (slot : Nat) (node : Node) : Bool :=
+  nodeKindUsesLoopSlot slot node.kind || node.outputTypes.any (wireTypeUsesLoopSlot slot)
+
+/-- Determine whether the sequential body needs the exact lexical binder before its evaluation.
+Calls inherit their caller's lexical frame, while a nested loop with the same numeric slot shadows
+it; scan that loop's own count/bindings but never mistake its body-local binder for the parent. -/
+private def preparedScopeUsesLoopSlot
+    (definitions : Array (String × PreparedOperationalScope))
+    (slot : Nat) : Nat → PreparedOperationalScope → Bool
+  | 0, _ => false
+  | fuel + 1, prepared =>
+      prepared.scope.nodes.zipIdx.any fun (node, nodeIndex) =>
+        nodeUsesLoopSlot slot node ||
+          match prepared.definitionIndices[nodeIndex]? with
+          | some (some definitionIndex) =>
+              match definitions[definitionIndex]? with
+              | some (_, child) =>
+                  match node.kind with
+                  | .parallelLoop _ _ nestedSlot _ _ | .sequentialLoop _ _ nestedSlot _ _ =>
+                      nestedSlot != slot && preparedScopeUsesLoopSlot definitions slot fuel child
+                  | .subgraphCall .. => preparedScopeUsesLoopSlot definitions slot fuel child
+                  | _ => false
+              | none => false
+          | _ => false
+
 /-- Resolve the direct family lane binder from the producer's IR shape and declared family count.
 The direct carrier may also contain an independent select-choice binder, which is deliberately
 left in its context when a get substitutes only the family lane. -/
+partial def directFamilyLaneBinderFromCarrier
+    (arena : DirectOperationalIndexedArena)
+    (root : OperationalIndexedValueId) : Nat → Option IndexVariable
+  | 0 => none
+  | fuel + 1 => do
+      let value ← arena.valueAt? root
+      match value.payload with
+      | .explicit _ binder _ | .explicitValues _ binder _ => some binder
+      | .mapped _ source map => do
+          let sourceBinder ← directFamilyLaneBinderFromCarrier arena source fuel
+          match map.assignmentFor sourceBinder with
+          | some (.variable destination) => some destination
+          | _ => none
+      | .rebound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
+      | .matrixResultBound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
+      | _ => none
+
 def directFamilyLaneBinderAt
+    (arena : OperationalExprArena)
     (scopeKey : ScopeTemplateKey)
     (scope : Scope)
     (environment : ParamEnvironment)
@@ -861,15 +1002,21 @@ def directFamilyLaneBinderAt
   match producer.kind with
   | .input _ =>
       /- A broadcast direct family enters a loop body through an input node, so the child IR does
-      not repeat the parent's `familyPack` producer.  This is the only input-shaped case accepted
-      here: recover the already-carried lane binder only when the declared count identifies it
-      uniquely.  In particular, do not turn a malformed or independently selected input into a
-      single-binder family. -/
+      not repeat the parent's `familyPack` producer.  Recover the already-carried lane binder
+      from the compact carrier root. -/
       let root := family.payload.root
       if !validateContext family.context then throw (.unsupportedOperationalExpr root)
-      match family.context.binders.toList.filter (fun candidate => candidate.count == countExpression) with
-      | [binder] => pure binder
-      | _ => throw (.loopInputModeMismatch familyWire.node familyWire.port)
+      let binder ← match directFamilyLaneBinderFromCarrier arena.direct root
+          (arena.direct.values.size + 1) with
+        | some binder => pure binder
+        | none => throw (.loopInputModeMismatch familyWire.node familyWire.port)
+      if !family.context.binders.contains binder then
+        throw (.loopInputModeMismatch familyWire.node familyWire.port)
+      match binder.count.evaluate environment with
+      | some binderCount =>
+          if binderCount > 0 && binderCount == count then pure binder
+          else throw (.loopInputModeMismatch familyWire.node familyWire.port)
+      | none => throw .nonClosedExpression
   | _ =>
       let binder ← directFamilyLaneBinder scopeKey familyWire.node producer familyWire countExpression count.toNat
       if !family.context.binders.contains binder then
@@ -891,7 +1038,6 @@ def deriveOrdinaryOutputs
   | port, outputType :: tail => do
       let (arena, output) ← genericNodeFact scopeKey nodeIndex node rule port outputType facts
         environment loopDomains layouts
-      let (arena, output) ← namespaceFreshOutput scopeKey { node := nodeIndex, port } arena output
       let (arena, tail) ← deriveOrdinaryOutputs scopeKey nodeIndex node rule environment
         loopDomains layouts { facts with arena } (port + 1) tail
       pure (arena, output :: tail)
@@ -916,19 +1062,19 @@ def evaluatePrimitiveConcrete
   match operation.kind with
   | .add subtract =>
       let (left, right) ← binaryArguments
-      return ← addConcreteMatrixFacts operation.ownerNode operation.outputPort operation.outputType
+      return ← addConcreteMatrixFacts operation.ownerNode operation.outputPort operation.outputSchema
         subtract operation.parameterEnvironment left right
   | .multiply rule rightWire =>
       let (left, right) ← binaryArguments
       return ← multiplyConcreteMatrixFacts operation.ownerNode operation.outputPort
-        operation.outputType rule rightWire operation.parameterEnvironment left right
+        operation.outputSchema rule rightWire operation.parameterEnvironment left right
   | .tensor =>
       let (left, right) ← binaryArguments
-      return ← tensorConcreteMatrixFacts operation.ownerNode operation.outputPort operation.outputType
+      return ← tensorConcreteMatrixFacts operation.ownerNode operation.outputPort operation.outputSchema
         operation.parameterEnvironment left right
   | .concat axis =>
       return ← concatConcreteMatrixFacts operation.ownerNode operation.outputPort axis
-        operation.outputType operation.parameterEnvironment arguments
+        operation.outputSchema operation.parameterEnvironment arguments
   | .transform transform =>
       if arguments.size != 1 then
         throw (.unsupportedOutputArity operation.ownerNode arguments.size)
@@ -936,25 +1082,30 @@ def evaluatePrimitiveConcrete
         | some value => pure value
         | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
       return ← transformConcreteMatrixFact operation.ownerNode operation.outputPort
-        operation.outputType transform operation.parameterEnvironment value
+        operation.outputSchema transform operation.parameterEnvironment value
   | .slice rows columns =>
       if arguments.size != 1 then
         throw (.unsupportedOutputArity operation.ownerNode arguments.size)
       let value ← match arguments[0]? with
         | some value => pure value
         | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
-      let polynomial ← sliceOperationalPolynomial rows columns operation.outputType value.polynomial
+      let polynomial ← sliceOperationalPolynomial rows columns operation.outputSchema value.polynomial
         |>.mapError (flatErrorAt operation.ownerNode)
-      polynomialMatrixFact operation.ownerNode operation.outputPort operation.outputType
+      polynomialMatrixFact operation.ownerNode operation.outputPort operation.outputSchema
         operation.parameterEnvironment polynomial value.canonicalRange
-  | .scale scalar values loopDomains =>
+  | .scale scalar loopDomains =>
       if arguments.size != 1 then
         throw (.unsupportedOutputArity operation.ownerNode arguments.size)
       let value ← match arguments[0]? with
         | some value => pure value
         | none => throw (.unsupportedOutputArity operation.ownerNode arguments.size)
+      let scalar ← match scalar with
+        | .ir scalar => pure scalar | _ => throw (.unsupportedOperationalExpr operation.ownerNode)
+      let loopDomains : List OperationalParameterDomain ← match loopDomains with
+        | [] => pure [] | _ => throw (.unsupportedOperationalExpr operation.ownerNode)
+      let scalarValue ← evaluateIntInvariant operation.parameterEnvironment loopDomains scalar
       return ← scaleConcreteMatrixFact operation.ownerNode operation.outputPort
-        operation.outputType scalar values operation.parameterEnvironment loopDomains value
+        operation.outputSchema scalar [scalarValue] operation.parameterEnvironment loopDomains value
   | .bggGrouping =>
       if arguments.size != 3 then
         throw (.unsupportedOutputArity operation.ownerNode arguments.size)
@@ -1124,20 +1275,27 @@ def setSequentialFactRecurrenceState
               | .trapdoor fact =>
                   let maximum := OperationalBoundExpr.recurrenceState count paths initial transition
                     (.matrixMaximum 0 slot)
-                  pure (.trapdoor { fact with maximum })
+                  pure (.trapdoor { fact with maximum := .closed maximum })
               | .integer fact =>
                   let lowerExpression := OperationalBoundExpr.recurrenceState count paths
                     initial transition (.integerLower 0 slot)
                   let upperExpression := OperationalBoundExpr.recurrenceState count paths
                     initial transition (.integerUpper 0 slot)
-                  pure (.integer { fact with lowerExpression, upperExpression })
+                  let fact := { fact with lowerExpression := .closed lowerExpression }
+                  pure (.integer { fact with upperExpression := .closed upperExpression })
               | fact => pure fact)
       let (direct, mapped) ← match value.payload.schema with
         | OperationalIndexedPayloadSchema.scalar .integer =>
             direct.mapScalarValue environment mapped (fun fact => match fact with
               | .integer integer => do
-                  let lower ← integer.lowerExpression.evaluateWithStates environment []
-                  let upper ← integer.upperExpression.evaluateWithStates environment []
+                  let lowerExpression ← match integer.lowerExpression.closedOperational? with
+                    | some expression => pure expression
+                    | none => throw (.unsupportedOperationalExpr mapped)
+                  let upperExpression ← match integer.upperExpression.closedOperational? with
+                    | some expression => pure expression
+                    | none => throw (.unsupportedOperationalExpr mapped)
+                  let lower ← lowerExpression.evaluateWithStates environment []
+                  let upper ← upperExpression.evaluateWithStates environment []
                   if lower > upper then throw (.invalidBound slot lower)
                   pure (.integer { integer with lower, upper })
               | _ => throw (.unsupportedOperationalExpr mapped))
@@ -1164,6 +1322,10 @@ def evaluatePreparedScope
   | scopeKey, fuel + 1, prepared, environment, loopDomains, initialArena, inputFacts => do
       let scope := prepared.scope
       let derivation := prepared.derivation
+      if operationalProgress "evaluate_scope" "scope_start" (reprStr scopeKey) 0 scope.nodes.size
+          ("input_facts=" ++ toString inputFacts.length ++ "; fuel=" ++ toString (fuel + 1)) then
+        pure ()
+      else throw (.unsupportedOperationalExpr 0)
       if !inputFacts.isEmpty && inputFacts.length != scope.inputNames.length then
         throw (.childInputMismatch 0 scope.inputNames.length inputFacts.length)
       let rec collectChildOutputs
@@ -1201,7 +1363,7 @@ def evaluatePreparedScope
         | [], [], [] => pure (arena, [])
         | mode :: modeTail, wire :: wireTail, input :: inputTail =>
             let directLaneBinder ← match mode with
-              | .zip | .zipOffset _ => some <$> directFamilyLaneBinderAt scopeKey scope environment wire input
+              | .zip | .zipOffset _ => some <$> directFamilyLaneBinderAt arena scopeKey scope environment wire input
               | _ => pure none
             let (arena, head) ←
               loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey nodeIndex indexSlot argumentIndex
@@ -1215,6 +1377,12 @@ def evaluatePreparedScope
       }
       for node in scope.nodes do
             let index := facts.values.size
+            if operationalProgressBlock index scope.nodes.size then
+              if operationalProgress "evaluate_scope" "node_block_start" (reprStr scopeKey)
+                  index scope.nodes.size ("output_count=" ++ toString node.outputCount ++
+                    "; arena_values=" ++ toString facts.arena.direct.values.size) then pure () else
+                throw (.unsupportedOperationalExpr index)
+            else pure ()
             facts := { facts with arena := {
               facts.arena with activeScope := some scopeKey, activeNode := some index
             } }
@@ -1246,6 +1414,9 @@ def evaluatePreparedScope
                     | _ => throw (OperationalError.childInputMismatch index
                         scope.inputNames.length inputFacts.length)
               | .subgraphCall _ bindings =>
+                  if operationalProgress "evaluate_scope" "subgraph_call_start" (reprStr scopeKey)
+                      index scope.nodes.size ("bindings=" ++ toString bindings.length) then pure () else
+                    throw (.unsupportedOperationalExpr index)
                   let actualInputs ← node.arguments.mapM (lookupFact index facts)
                   let boundParams ← match evaluateBindings environment bindings with
                     | some values => pure values
@@ -1260,8 +1431,14 @@ def evaluatePreparedScope
                   let (arena, outputs) ←
                     collectChildOutputs index 0 child.scope.outputs facts.arena childFacts
                   facts := { facts with arena }
+                  if operationalProgress "evaluate_scope" "subgraph_call_complete" (reprStr scopeKey)
+                      index scope.nodes.size ("outputs=" ++ toString outputs.length) then pure () else
+                    throw (.unsupportedOperationalExpr index)
                   pure outputs
               | .familyPack =>
+                  if operationalProgress "evaluate_scope" "family_pack_start" (reprStr scopeKey)
+                      index scope.nodes.size ("arguments=" ++ toString node.arguments.length) then pure () else
+                    throw (.unsupportedOperationalExpr index)
                   let elements ← node.arguments.mapM (lookupFact index facts)
                   match node.outputTypes with
                   | [.indexedFamily (.matrix _) familyCount] | [.indexedFamily (.preimage _) familyCount] =>
@@ -1290,6 +1467,9 @@ def evaluatePreparedScope
                       pure [family]
                   | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
               | .familyGetStatic familyIndex =>
+                  if operationalProgress "evaluate_scope" "family_static_get_start" (reprStr scopeKey)
+                      index scope.nodes.size ("index=" ++ reprStr familyIndex) then pure () else
+                    throw (.unsupportedOperationalExpr index)
                   let familyWire ← match node.arguments[0]? with
                     | some wire => pure wire
                     | none => throw (.missingOperand index { node := 0, port := 0 })
@@ -1297,17 +1477,20 @@ def evaluatePreparedScope
                     | some value => pure value
                     | none => throw .nonClosedExpression
                   let family ← lookupFact index facts familyWire
-                  let binder ← directFamilyLaneBinderAt scopeKey scope environment familyWire family
+                  let binder ← directFamilyLaneBinderAt facts.arena scopeKey scope environment familyWire family
                   if requested < 0 then throw (.invalidCount index requested)
                   let staticMap ← match closedStaticIndexMap environment family.context binder requested.toNat with
                     | some map => pure map
                     | none => throw (.loopInputModeMismatch index 0)
-                  let (arena, selected) ← facts.arena.reindexDirectMatrixFact staticMap family environment
+                  let (arena, selected) ← facts.arena.reindexDirectFact staticMap family environment
                   let (arena, rebound) ← rebindOperationalFact { node := index, port := 0 }
                     arena selected environment
                   facts := { facts with arena }
                   pure [rebound]
               | .familyGetDynamic =>
+                  if operationalProgress "evaluate_scope" "family_dynamic_get_start" (reprStr scopeKey)
+                      index scope.nodes.size ("arguments=" ++ toString node.arguments.length) then pure () else
+                    throw (.unsupportedOperationalExpr index)
                   let familyWire ← match node.arguments[0]? with
                     | some wire => pure wire
                     | none => throw (.missingOperand index { node := 0, port := 0 })
@@ -1317,33 +1500,32 @@ def evaluatePreparedScope
                   let selectionInput ← lookupFact index facts indexWire
                   let selectionFact : OperationalIntegerFact ← match selectionInput with
                     | { payload := .directValue root, .. } => do
-                        let (lower, upper) ← facts.arena.direct.integerInterval root
+                        let (lower, upper) ← facts.arena.direct.integerInterval index indexWire root
                           (facts.arena.direct.values.size + 1)
                         pure {
                           subject := indexWire
                           origin := .local scopeKey indexWire
                           lower
                           upper
-                          lowerExpression := .closedInt (.constant lower)
-                          upperExpression := .closedInt (.constant upper)
+                          lowerExpression := .closed (.closedInt (.constant lower))
+                          upperExpression := .closed (.closedInt (.constant upper))
                         }
-                  let selection := selectionFact.origin
                   let family ← lookupFact index facts familyWire
                   match selectionFact.lower == selectionFact.upper with
                   | true =>
-                      let binder ← directFamilyLaneBinderAt scopeKey scope environment familyWire family
+                      let binder ← directFamilyLaneBinderAt facts.arena scopeKey scope environment familyWire family
                       let requested := selectionFact.lower
                       if requested < 0 then throw (.invalidCount index requested)
                       let staticMap ← match closedStaticIndexMap environment family.context binder requested.toNat with
                         | some map => pure map
                         | none => throw (.loopInputModeMismatch index 0)
-                      let (arena, selected) ← facts.arena.reindexDirectMatrixFact staticMap family environment
+                      let (arena, selected) ← facts.arena.reindexDirectFact staticMap family environment
                       let (arena, rebound) ← rebindOperationalFact { node := index, port := 0 }
                         arena selected environment
                       facts := { facts with arena }
                       pure [rebound]
                   | false =>
-                      let binder ← directFamilyLaneBinderAt scopeKey scope environment familyWire family
+                      let binder ← directFamilyLaneBinderAt facts.arena scopeKey scope environment familyWire family
                       let selectorCount := match binder.count.evaluate environment with
                         | some count => if count > 0 then count.toNat else 0
                         | none => 0
@@ -1352,6 +1534,9 @@ def evaluatePreparedScope
                         throw (.invalidCount index selectionFact.upper)
                       let selector ← match selectionInput with
                         | direct@{ context := { binders := #[_] }, payload := .directValue _, .. } => do
+                            if operationalProgress "evaluate_scope" "gather_selector_transport" (reprStr scopeKey)
+                                index scope.nodes.size "source=loop_index" then pure () else
+                              throw (.unsupportedOperationalExpr index)
                             let position ← directSingleIndexBinder index direct
                             let owner : GatherLookupOwner := {
                               indices := operationalGatherIndicesWire scopeKey indexWire
@@ -1359,7 +1544,16 @@ def evaluatePreparedScope
                             pure (.gather owner binder.count (.variable position))
                         | { context, payload := .directValue _, .. } =>
                             if context.binders.isEmpty then do
-                              let freshSelector := DynamicSelectionIdentity.fromDeclaredCount selection binder.count
+                              /- A dynamic family projection introduces its own executable
+                              selector coordinate.  The scalar input wire supplies its interval,
+                              but does not own this projection: another consumer of the same
+                              scalar (for example a preceding family `select`) must retain its
+                              independent selector rather than being collapsed by a shared
+                              source-wire identity. -/
+                              let projectionOrigin : OperationalValueOrigin :=
+                                .local scopeKey { node := index, port := 1 }
+                              let freshSelector := DynamicSelectionIdentity.fromDeclaredCount
+                                projectionOrigin binder.count
                               let freshBinder ← match freshSelector.expression with
                                 | .variable value => pure value
                                 | _ => throw (.loopInputModeMismatch index 0)
@@ -1368,18 +1562,38 @@ def evaluatePreparedScope
                                 | some candidate => .variable candidate
                                 | none => freshSelector.expression
                             else throw (.loopInputModeMismatch index 0)
+                      /- A dependent gather is evaluated from the exact executable integer-family
+                      producer, not from a slot-only `IntExpr` projection.  Register before
+                      constructing the mapped matrix view so any collision is rejected at the
+                      producer boundary rather than depending on later reduction order. -/
+                      match selector with
+                      | .gather owner _ _ =>
+                          let root ← match selectionInput.payload with
+                            | .directValue root => pure root
+                          let direct ← match facts.arena.direct.registerGatherIntegerRoot owner root with
+                            | some direct => pure direct
+                            | none => throw (.unsupportedOperationalExpr index)
+                          facts := { facts with arena := { facts.arena with direct } }
+                      | _ => pure ()
                       if selector.freeVariables.isEmpty then throw (.loopInputModeMismatch index 0)
                       let dynamicMap ← match dynamicIndexMap family.context binder selector with
                         | some map => pure map
                         | none => match closedDynamicIndexMap environment family.context binder selector with
                           | some map => pure map
                           | none => throw (.loopInputModeMismatch index 0)
-                      let (arena, selected) ← facts.arena.reindexDirectMatrixFact dynamicMap family environment
+                      let (arena, selected) ← facts.arena.reindexDirectFact dynamicMap family environment
+                      if operationalProgress "evaluate_scope" "family_dynamic_get_reindex_complete"
+                          (reprStr scopeKey) index scope.nodes.size "" then pure () else
+                        throw (.unsupportedOperationalExpr index)
                       let (arena, rebound) ← rebindOperationalFact { node := index, port := 0 }
                         arena selected environment
                       facts := { facts with arena }
                       pure [rebound]
               | .parallelLoop _ count indexSlot bindings modes =>
+                  if operationalProgress "evaluate_scope" "parallel_loop_prepare_start" (reprStr scopeKey)
+                      index scope.nodes.size ("index_slot=" ++ toString indexSlot ++
+                        "; modes=" ++ toString modes.length ++ "; count=" ++ reprStr count) then pure () else
+                    throw (.unsupportedOperationalExpr index)
                   let evaluatedCount ← match count.evaluate environment with
                     | some value => pure value
                     | none => throw .nonClosedExpression
@@ -1406,6 +1620,10 @@ def evaluatePreparedScope
                     childKey fuel child (boundParams ++ iterationEnvironment)
                     childDomains facts.arena templateInputs).mapError (.inScope childKey)
                   facts := { facts with arena := childFacts.arena }
+                  if operationalProgress "evaluate_scope" "parallel_loop_body_complete" (reprStr scopeKey)
+                      index scope.nodes.size ("index_slot=" ++ toString indexSlot ++
+                        "; child_outputs=" ++ toString childFacts.values.size) then pure () else
+                    throw (.unsupportedOperationalExpr index)
                   let childOutputs ← scopeOutputFacts index child.scope.outputs childFacts
                   if childOutputs.length != node.outputCount then
                     throw (.childInputMismatch index node.outputCount childOutputs.length)
@@ -1433,6 +1651,10 @@ def evaluatePreparedScope
                   facts := nextFacts
                   pure outputs.toList
               | .sequentialLoop _ count indexSlot bindings carriedCount =>
+                  if operationalProgress "evaluate_scope" "sequential_loop_prepare_start" (reprStr scopeKey)
+                      index scope.nodes.size ("index_slot=" ++ toString indexSlot ++
+                        "; carried=" ++ toString carriedCount ++ "; count=" ++ reprStr count) then pure () else
+                    throw (.unsupportedOperationalExpr index)
                   let evaluatedCount ← match count.evaluate environment with
                     | some value => pure value
                     | none => throw .nonClosedExpression
@@ -1456,21 +1678,42 @@ def evaluatePreparedScope
                     let (arena, shifted) ← shiftFactPreviousDepth environment facts.arena fact
                     facts := { facts with arena }
                     shiftedInvariantFacts := shiftedInvariantFacts ++ [shifted]
-                  let iterationEnvironment := replaceLoopIndex environment indexSlot 0
-                  let sequentialDomains := .loopIndex indexSlot evaluatedCount.toNat ::
-                    loopDomains.filter fun domain => match domain with
-                      | .loopIndex candidate _ => candidate != indexSlot
-                      | .parameter _ _ _ _ => true
+                  let child ← preparedDefinitionAt index prepared definitions
+                  let needsLexicalBinder := preparedScopeUsesLoopSlot definitions indexSlot fuel child
+                  if operationalProgress "evaluate_scope" "sequential_loop_dependency_gate"
+                      (reprStr scopeKey) index scope.nodes.size
+                      ("index_slot=" ++ toString indexSlot ++ "; lexical_binder=" ++
+                        toString needsLexicalBinder) then pure () else
+                    throw (.unsupportedOperationalExpr index)
+                  /- Introduce the sequential lexical coordinate only when the prepared body
+                  actually reads this loop's slot.  Otherwise a synthetic zero-valued binder
+                  would leak into invariant carried descriptors and their contextual domains. -/
+                  let mut bodyInputs : List OperationalFact := []
+                  for fact in abstractCarried ++ shiftedInvariantFacts do
+                    if needsLexicalBinder then
+                      let (arena, indexed) ← sequentialLoopTemplateArgumentExpr facts.arena scopeKey
+                        index indexSlot count environment fact
+                      facts := { facts with arena }
+                      bodyInputs := bodyInputs ++ [indexed]
+                    else
+                      bodyInputs := bodyInputs ++ [fact]
+                  let iterationEnvironment := if needsLexicalBinder then
+                    replaceLoopIndex environment indexSlot 0 else environment
+                  let sequentialDomains := if needsLexicalBinder then
+                    .loopIndex indexSlot evaluatedCount.toNat ::
+                      loopDomains.filter fun domain => match domain with
+                        | .loopIndex candidate _ => candidate != indexSlot
+                        | .parameter _ _ _ _ => true
+                  else loopDomains
                   let boundParams ← match evaluateBindings iterationEnvironment bindings with
                     | some values => pure values
                     | none => throw .nonClosedExpression
                   let childDomains ← extendParameterDomains iterationEnvironment sequentialDomains bindings
-                  let child ← preparedDefinitionAt index prepared definitions
                   let childKey := .sequentialBody scopeKey index
                   let childFacts ← (evaluatePreparedScope definitions layouts
                     childKey fuel child
                     (boundParams ++ iterationEnvironment) childDomains
-                    facts.arena (abstractCarried ++ shiftedInvariantFacts)).mapError (.inScope childKey)
+                    facts.arena bodyInputs).mapError (.inScope childKey)
                   facts := { facts with arena := childFacts.arena }
                   let rawOutputTemplates ← scopeOutputFacts index child.scope.outputs childFacts
                   if rawOutputTemplates.length != carriedCount then
@@ -1584,7 +1827,27 @@ def evaluatePreparedScope
                   let indexWire ← match node.arguments[0]? with
                     | some wire => pure wire
                     | none => throw (.missingOperand index { node := 0, port := 0 })
-                  let selection ← integerFactAt index facts indexWire
+                  /- Selectors may be loop-indexed direct scalar values.  Recover their hull
+                  from the authoritative direct reducer instead of requiring a context-free
+                  representative; the subsequent direct selection retains the executable
+                  selector provenance. -/
+                  let selectionInput ← lookupFact index facts indexWire
+                  let selection : OperationalIntegerFact ← match selectionInput with
+                    | { payload := .directValue root, .. } => do
+                        let (lower, upper) ← facts.arena.direct.integerInterval index indexWire root
+                          (facts.arena.direct.values.size + 1)
+                        pure {
+                          subject := indexWire
+                          origin := .local scopeKey indexWire
+                          lower
+                          upper
+                          lowerExpression := .closed (.closedInt (.constant lower))
+                          upperExpression := .closed (.closedInt (.constant upper))
+                        }
+                  let selectionExpression : Option IndexExpr := match selectionInput with
+                    | { context := { binders := #[binder] }, payload := .directValue _, .. } =>
+                        some (.variable binder)
+                    | _ => none
                   let branchWires := node.arguments.drop 1
                   if branchWires.isEmpty || selection.lower < 0 ||
                       selection.upper >= Int.ofNat branchWires.length then
@@ -1598,8 +1861,8 @@ def evaluatePreparedScope
                         | none => throw .nonClosedExpression
                       if expectedCount <= 0 then throw (.invalidCount index expectedCount)
                       let branchLaneBinders ← branchWires.zip branches |>.mapM fun (wire, branch) =>
-                        directFamilyLaneBinderAt scopeKey scope environment wire branch
-                      let (arena, output) ← selectUniformMatrixFamiliesWithLaneBinders scopeKey index selection
+                        directFamilyLaneBinderAt facts.arena scopeKey scope environment wire branch
+                      let (arena, output) ← selectUniformMatrixFamiliesWithLaneBinders scopeKey index selection selectionExpression
                         matrixType count expectedCount.toNat branches branchLaneBinders environment
                         facts.arena
                       facts := { facts with arena }
@@ -1627,8 +1890,11 @@ def evaluatePreparedScope
                   let axis ← match node.kind with
                     | .concat axis => pure axis
                     | _ => throw (.unsupportedNode index)
+                  let context ← directOperationIndexContext inputs.toList
+                  let outputDescriptor ← match IndexedMatrixTypeExpr.fromIrAt context matrixType with
+                    | some value => pure value | none => throw (.unsupportedOperationalExpr index)
                   let operation : PrimitiveOperation := {
-                    kind := .concat axis, outputType := matrixType,
+                    kind := .concat axis, outputType := outputDescriptor, outputSchema := matrixType,
                     ownerScope := facts.arena.activeScope, ownerNode := index, outputPort := 0,
                     parameterEnvironment := environment }
                   let (arena, output) ← facts.arena.pushDirectMatrixPointwiseN operation inputs
@@ -1653,9 +1919,21 @@ def evaluatePreparedScope
                       let (arena, inputs) ← inputs.foldlM (fun (arena, promoted) input => do
                         let (arena, input) ← arena.promoteDirectRelationOperand input
                         pure (arena, promoted.push input)) (facts.arena, #[])
+                      let context ← directOperationIndexContext inputs.toList
+                      let maximum? := match node.kind with
+                        | .preimageSample _ maximum => IndexedParameterExpr.fromIrAt context maximum
+                        | _ => IndexedParameterExpr.fromIrAt context (.constant 0)
+                      let maximum ← match maximum? with
+                        | some value => pure value | none => throw (.unsupportedOperationalExpr index)
+                      let outputDescriptor? := IndexedMatrixTypeExpr.fromIrAt context matrixType
+                      let outputDescriptor ← match outputDescriptor? with
+                        | some value => pure value | none => throw (.unsupportedOperationalExpr index)
+                      let domains? := IndexedOperationalParameterDomain.fromIrAt context loopDomains
+                      let domains ← match domains? with
+                        | some value => pure value | none => throw (.unsupportedOperationalExpr index)
                       let operation : DirectRelationOperation := {
-                        kind := .preimage (match node.kind with | .preimageSample _ maximum => maximum | _ => .constant 0)
-                          loopDomains, outputType := matrixType, ownerScope := some scopeKey,
+                        kind := .preimage maximum domains, outputType := outputDescriptor,
+                        outputSchema := matrixType, ownerScope := some scopeKey,
                         ownerNode := index, outputPort := 0, parameterEnvironment := environment }
                       let (arena, output) ← arena.pushDirectRelationPointwise operation inputs
                       facts := { facts with arena }
@@ -1668,12 +1946,33 @@ def evaluatePreparedScope
                   let (arena, inputs) ← inputs.foldlM (fun (arena, promoted) input => do
                     let (arena, input) ← arena.promoteDirectRelationOperand input
                     pure (arena, promoted.push input)) (facts.arena, #[])
+                  let context ← directOperationIndexContext inputs.toList
+                  let declaredType? := match node.kind with
+                    | .gadgetDecompose declaredType _ _ _ => IndexedMatrixTypeExpr.fromIrAt context declaredType
+                    | _ => IndexedMatrixTypeExpr.fromIrAt context matrixType
+                  let declaredType ← match declaredType? with
+                    | some value => pure value | none => throw (.unsupportedOperationalExpr index)
+                  let base? := match node.kind with
+                    | .gadgetDecompose _ base _ _ => IndexedParameterExpr.fromIrAt context base
+                    | _ => IndexedParameterExpr.fromIrAt context (.constant 0)
+                  let base ← match base? with
+                    | some value => pure value | none => throw (.unsupportedOperationalExpr index)
+                  let digitCount? := match node.kind with
+                    | .gadgetDecompose _ _ _ digitCount => IndexedParameterExpr.fromIrAt context digitCount
+                    | _ => IndexedParameterExpr.fromIrAt context (.constant 0)
+                  let digitCount ← match digitCount? with
+                    | some value => pure value | none => throw (.unsupportedOperationalExpr index)
+                  let outputDescriptor? := IndexedMatrixTypeExpr.fromIrAt context matrixType
+                  let outputDescriptor ← match outputDescriptor? with
+                    | some value => pure value | none => throw (.unsupportedOperationalExpr index)
+                  let domains? := IndexedOperationalParameterDomain.fromIrAt context loopDomains
+                  let domains ← match domains? with
+                    | some value => pure value | none => throw (.unsupportedOperationalExpr index)
                   let operation : DirectRelationOperation := {
-                    kind := .decomposition (match node.kind with | .gadgetDecompose declaredType _ _ _ => declaredType | _ => matrixType)
-                      (match node.kind with | .gadgetDecompose _ base _ _ => base | _ => .constant 0)
+                    kind := .decomposition declaredType base
                       (match node.kind with | .gadgetDecompose _ _ small _ => small | _ => false)
-                      (match node.kind with | .gadgetDecompose _ _ _ digitCount => digitCount | _ => .constant 0)
-                      loopDomains layouts, outputType := matrixType, ownerScope := some scopeKey
+                      digitCount domains layouts, outputType := outputDescriptor,
+                      outputSchema := matrixType, ownerScope := some scopeKey
                     ownerNode := index, outputPort := 0, parameterEnvironment := environment }
                   let (arena, output) ← arena.pushDirectRelationPointwise operation inputs
                   facts := { facts with arena }
@@ -1692,9 +1991,15 @@ def evaluatePreparedScope
                       let scalar ← match node.kind with
                         | .matrixScale scalar => pure scalar
                         | _ => throw (.unsupportedNode index)
-                      let values ← evaluateIntOverLoops environment loopDomains scalar
+                      let context ← directOperationIndexContext [direct]
+                      let scalar ← match IndexedParameterExpr.fromIrAt context scalar with
+                        | some value => pure value | none => throw (.unsupportedOperationalExpr index)
+                      let outputDescriptor ← match IndexedMatrixTypeExpr.fromIrAt context matrixType with
+                        | some value => pure value | none => throw (.unsupportedOperationalExpr index)
+                      let domains ← match IndexedOperationalParameterDomain.fromIrAt context loopDomains with
+                        | some value => pure value | none => throw (.unsupportedOperationalExpr index)
                       let operation : PrimitiveOperation := {
-                        kind := .scale scalar values loopDomains, outputType := matrixType,
+                        kind := .scale scalar domains, outputType := outputDescriptor, outputSchema := matrixType,
                         ownerScope := facts.arena.activeScope, ownerNode := index, outputPort := 0,
                         parameterEnvironment := environment }
                       let (arena, output) ← facts.arena.pushDirectMatrixPointwiseN operation #[direct]
@@ -1751,6 +2056,9 @@ def evaluatePreparedScope
                     | none => throw (.missingOperand index { node := 0, port := 0 })
                   let input ← lookupFact index facts inputWire
                   let direct := input
+                      let context ← directOperationIndexContext [direct]
+                      let outputDescriptor ← match IndexedMatrixTypeExpr.fromIrAt context matrixType with
+                        | some value => pure value | none => throw (.unsupportedOperationalExpr index)
                       let operationKind : PrimitiveOperationKind ← match node.kind with
                         | .transpose => pure (.transform .transpose)
                         | .matrixNegate => pure (.transform .negate)
@@ -1758,7 +2066,8 @@ def evaluatePreparedScope
                         | _ => throw (.unsupportedNode index)
                       let operation : PrimitiveOperation := {
                         kind := operationKind
-                        outputType := matrixType,
+                        outputType := outputDescriptor
+                        outputSchema := matrixType
                         ownerScope := facts.arena.activeScope, ownerNode := index, outputPort := 0,
                         parameterEnvironment := environment }
                       let (arena, output) ← facts.arena.pushDirectMatrixPointwiseN operation #[direct]
@@ -1781,9 +2090,13 @@ def evaluatePreparedScope
                   let subtract := match node.kind with
                     | .matrixSubtract => true
                     | _ => false
+                  let context ← directOperationIndexContext [left, right]
+                  let outputDescriptor ← match IndexedMatrixTypeExpr.fromIrAt context matrixType with
+                    | some value => pure value | none => throw (.unsupportedOperationalExpr index)
                   let operation : PrimitiveOperation := {
                     kind := .add subtract
-                    outputType := matrixType
+                    outputType := outputDescriptor
+                    outputSchema := matrixType
                     ownerScope := facts.arena.activeScope
                     ownerNode := index
                     outputPort := 0
@@ -1806,9 +2119,13 @@ def evaluatePreparedScope
                   let matrixType ← match node.outputTypes with
                     | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
                     | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
+                  let context ← directOperationIndexContext [left, right]
+                  let outputDescriptor ← match IndexedMatrixTypeExpr.fromIrAt context matrixType with
+                    | some value => pure value | none => throw (.unsupportedOperationalExpr index)
                   let operation : PrimitiveOperation := {
                     kind := .multiply step.rule rightWire
-                    outputType := matrixType
+                    outputType := outputDescriptor
+                    outputSchema := matrixType
                     ownerScope := facts.arena.activeScope
                     ownerNode := index
                     outputPort := 0
@@ -1824,8 +2141,12 @@ def evaluatePreparedScope
                     | [.matrix matrixType] | [.preimage matrixType] => pure matrixType
                     | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
                   let inputs ← node.arguments.toArray.mapM (lookupFact index facts)
+                  let context ← directOperationIndexContext inputs.toList
+                  let outputDescriptor ← match IndexedMatrixTypeExpr.fromIrAt context matrixType with
+                    | some value => pure value | none => throw (.unsupportedOperationalExpr index)
                   let operation : PrimitiveOperation := {
-                    kind := .tensor, outputType := matrixType, ownerScope := facts.arena.activeScope,
+                    kind := .tensor, outputType := outputDescriptor, outputSchema := matrixType,
+                    ownerScope := facts.arena.activeScope,
                     ownerNode := index, outputPort := 0, parameterEnvironment := environment }
                   let (arena, output) ← facts.arena.pushDirectMatrixPointwiseN operation inputs
                   facts := { facts with arena }
@@ -1850,6 +2171,15 @@ def evaluatePreparedScope
             facts := { facts with values := facts.values.push outputs }
             let attachments := prepared.attachmentBuckets[index]?.getD #[]
             facts := ← applyPreparedDerivationAttachments index attachments facts
+            if operationalProgressBlock index scope.nodes.size then
+              if operationalProgress "evaluate_scope" "node_block_complete" (reprStr scopeKey)
+                  (index + 1) scope.nodes.size ("outputs=" ++ toString outputs.size ++
+                    "; arena_values=" ++ toString facts.arena.direct.values.size) then pure () else
+                throw (.unsupportedOperationalExpr index)
+            else pure ()
+      if operationalProgress "evaluate_scope" "scope_complete" (reprStr scopeKey) scope.nodes.size
+          scope.nodes.size ("arena_values=" ++ toString facts.arena.direct.values.size) then pure () else
+        throw (.unsupportedOperationalExpr scope.nodes.size)
       pure facts
 def evaluatePreparedProgramOperationalWithKey
     (programKey : ProgramInstanceKey)
@@ -1953,8 +2283,8 @@ def contractFact
         origin
         lower := evaluatedLower
         upper := evaluatedUpper
-        lowerExpression := .closedInt (.constant evaluatedLower)
-        upperExpression := .closedInt (.constant evaluatedUpper) })
+        lowerExpression := .closed (.closedInt (.constant evaluatedLower))
+        upperExpression := .closed (.closedInt (.constant evaluatedUpper)) })
   | .boolean, .boolean | .boolean, .constantBool =>
       arena.promoteConcreteScalarFact .boolean
   | .bytes contractLength, .bytes wireLength =>
@@ -2074,7 +2404,7 @@ def operationalAnalysisDiagnostics
     | .explicitValues _ _ values =>
         logicalBranches := logicalBranches + values.size
         storedBranches := storedBranches + values.size
-    | .mapped .. | .matrixResultBound .. | .pointwise .. => pure ()
+    | .mapped .. | .rebound .. | .matrixResultBound .. | .pointwise .. => pure ()
   for fact in arena.direct.fixed.matrices do
     maximumPolynomialTerms := max maximumPolynomialTerms fact.polynomial.length
   return {
@@ -2219,6 +2549,9 @@ def operationalNoiseBoundForFact
     (residual : OperationalFact)
     (environment : ParamEnvironment) :
     Except OperationalError (Int × OperationalAnalysisDiagnostics) := do
+  if operationalProgress "direct_arena_reduction" "start" (reprStr arena.activeScope) 0
+      arena.direct.values.size ("root=" ++ toString residual.payload.root) then pure () else
+    throw (.unsupportedOperationalExpr residual.payload.root)
   let (bounds, rewriteEvents, directMaximumPolynomialTerms) ← match residual with
     | expression => do
         let (entries, rewriteEvents, maximumPolynomialTerms) ←
@@ -2227,9 +2560,18 @@ def operationalNoiseBoundForFact
           let _ ← entry.fact.rejectResidualLargeTerms
           entry.fact.evaluateNoiseHardBound environment
         pure (bounds, rewriteEvents, maximumPolynomialTerms)
+  if operationalProgress "direct_arena_reduction" "complete" (reprStr arena.activeScope)
+      bounds.length bounds.length ("rewrite_events=" ++ toString rewriteEvents.length ++
+        "; maximum_polynomial_terms=" ++ toString directMaximumPolynomialTerms) then pure () else
+    throw (.unsupportedOperationalExpr residual.payload.root)
+  if operationalProgress "symbolic_bound_evaluation" "start" (reprStr arena.activeScope) 0
+      bounds.length "" then pure () else throw (.unsupportedOperationalExpr residual.payload.root)
   let noiseBound ← match bounds with
     | head :: tail => pure (tail.foldl max head)
     | [] => throw (OperationalError.invalidCount 0 0)
+  if operationalProgress "symbolic_bound_evaluation" "complete" (reprStr arena.activeScope)
+      bounds.length bounds.length ("noise_bound=" ++ toString noiseBound) then pure () else
+    throw (.unsupportedOperationalExpr residual.payload.root)
   pure (noiseBound, operationalAnalysisDiagnostics arena environment rewriteEvents.length
     directMaximumPolynomialTerms)
 
@@ -2315,6 +2657,193 @@ structure PreparedOperationalWorkflow where
   stages : Array PreparedOperationalStage
   inputContract : InputContract
   operationalDecoderTargets : List OperationalDecoderTarget
+
+/-- A strict structural traversal used only to make generated-document timing truthful.  Its
+checksum recursively visits typed executable payloads without using `reprStr` or contributing to
+operational acceptance. -/
+structure OperationalForceStats where
+  entries : Nat := 0
+  checksum : Nat := 0
+
+private def forcedIntExprChecksum : IntExpr → Nat
+  | .constant value => value.natAbs + 1
+  | .parameter name => name.length + 2
+  | .loopIndex slot => slot + 3
+  | .add left right | .subtract left right | .multiply left right | .divide left right |
+      .roundDivide left right => forcedIntExprChecksum left + forcedIntExprChecksum right + 5
+  | .log2Ceil value => forcedIntExprChecksum value + 7
+
+private def forcedRealExprChecksum : RealExpr → Nat
+  | .rational value => value.num.natAbs + value.den + 1
+  | .parameter name => name.length + 2
+  | .fromInt value => forcedIntExprChecksum value + 3
+  | .add left right | .subtract left right | .multiply left right | .divide left right =>
+      forcedRealExprChecksum left + forcedRealExprChecksum right + 5
+  | .sqrt value => forcedRealExprChecksum value + 7
+
+private def forcedMatrixTypeChecksum (matrixType : MatrixTypeExpr) : Nat :=
+  forcedIntExprChecksum matrixType.modulus + forcedIntExprChecksum matrixType.ringDimension +
+    forcedIntExprChecksum matrixType.rows + forcedIntExprChecksum matrixType.columns + 1
+
+private def forcedWireTypeChecksum : WireTypeExpr → Nat
+  | .constantInt | .constantReal | .constantBool | .integer | .real | .boolean => 1
+  | .bytes length => forcedIntExprChecksum length + 2
+  | .typedBlob name schemaHash => name.length + schemaHash.foldl (· + ·) 0 + 3
+  | .matrix matrixType | .preimage matrixType => forcedMatrixTypeChecksum matrixType + 5
+  | .trapdoor matrixType sigma base digits maximum => forcedMatrixTypeChecksum matrixType +
+      forcedRealExprChecksum sigma + forcedIntExprChecksum base + forcedIntExprChecksum digits +
+      forcedIntExprChecksum maximum + 7
+  | .indexedFamily element count => forcedWireTypeChecksum element + forcedIntExprChecksum count + 11
+
+private def forcedWireChecksum (wire : WireRef) : Nat := wire.node + wire.port + 1
+
+private def forcedNodeChecksum (node : Mxx.Ir.Node) : Nat :=
+  let kindChecksum := match node.kind with
+    | .input name => name.length + 1
+    | .constantInt value => value.natAbs + 2
+    | .evaluateInt value | .bitExtract value | .extractCoefficient value | .matrixScale value =>
+        forcedIntExprChecksum value + 3
+    | .constantReal value => forcedRealExprChecksum value + 4
+    | .constantBool value => if value then 5 else 6
+    | .zeroMatrix matrixType | .identityMatrix matrixType | .liftIntegerToConstantPolynomial matrixType |
+        .uniformResidueSample matrixType => forcedMatrixTypeChecksum matrixType + 7
+    | .constantMatrix matrixType coefficients => forcedMatrixTypeChecksum matrixType +
+        coefficients.foldl (fun sum value => sum + forcedIntExprChecksum value) 0 + 8
+    | .unitRowMatrix matrixType index | .unitColumnMatrix matrixType index |
+        .gadgetMatrix matrixType index | .smallGadgetMatrix matrixType index |
+        .rotationMatrix matrixType index | .gadgetTrapdoor matrixType index |
+        .gaussianSample matrixType index | .preimageSample matrixType index =>
+        forcedMatrixTypeChecksum matrixType + forcedIntExprChecksum index + 9
+    | .powerOfBaseMatrix matrixType base exponent => forcedMatrixTypeChecksum matrixType +
+        forcedIntExprChecksum base + forcedIntExprChecksum exponent + 10
+    | .boolToInt | .intToReal | .realSqrt | .select | .trapdoorPublic | .matrixAdd |
+        .matrixSubtract | .matrixMultiply | .matrixNegate | .transpose | .tensor | .familyPack |
+        .familyGetDynamic => 11
+    | .intBinary _ | .realBinary _ | .intCompare _ => 12
+    | .uniformIntervalSample matrixType minimum maximum => forcedMatrixTypeChecksum matrixType +
+        forcedIntExprChecksum minimum + forcedIntExprChecksum maximum + 13
+    | .hashSample matrixType _ tags expressions decimalExpressions u64Expressions base digits =>
+        forcedMatrixTypeChecksum matrixType + tags.foldl (· + ·) 0 +
+          expressions.foldl (fun sum value => sum + forcedIntExprChecksum value) 0 +
+          decimalExpressions.foldl (fun sum value => sum + forcedIntExprChecksum value) 0 +
+          u64Expressions.foldl (fun sum value => sum + forcedIntExprChecksum value) 0 +
+          (base.map forcedIntExprChecksum).getD 0 + (digits.map forcedIntExprChecksum).getD 0 + 14
+    | .gadgetDecompose matrixType base _ digits => forcedMatrixTypeChecksum matrixType +
+        forcedIntExprChecksum base + forcedIntExprChecksum digits + 15
+    | .trapdoorSample matrixType maximum => forcedMatrixTypeChecksum matrixType +
+        forcedIntExprChecksum maximum + 16
+    | .slice rows columns => (rows.map (fun bounds => forcedIntExprChecksum bounds.1 +
+        forcedIntExprChecksum bounds.2)).getD 0 + (columns.map (fun bounds =>
+        forcedIntExprChecksum bounds.1 + forcedIntExprChecksum bounds.2)).getD 0 + 17
+    | .concat _ => 18
+    | .thresholdDecodeBool ciphertext plaintext length | .thresholdDecodeInt ciphertext plaintext length =>
+        forcedIntExprChecksum ciphertext + forcedIntExprChecksum plaintext + forcedIntExprChecksum length + 19
+    | .crtRecompose plaintexts coefficients => plaintexts.foldl (fun sum value => sum +
+        forcedIntExprChecksum value) 0 + coefficients.foldl (fun sum value => sum + forcedIntExprChecksum value) 0 + 20
+    | .packPolynomialCoefficients matrixType bits => forcedMatrixTypeChecksum matrixType +
+        forcedIntExprChecksum bits + 21
+    | .familyGetStatic index => forcedIntExprChecksum index + 22
+    | .subgraphCall name bindings => name.length + bindings.foldl (fun sum binding =>
+        sum + binding.1.length + forcedIntExprChecksum binding.2) 0 + 23
+    | .parallelLoop name count slot bindings modes => name.length + forcedIntExprChecksum count + slot +
+        bindings.foldl (fun sum binding => sum + binding.1.length + forcedIntExprChecksum binding.2) 0 +
+        modes.foldl (fun sum mode => sum + match mode with | .broadcast => 1 | .zip => 2 | .zipOffset offset => offset + 3) 0 + 24
+    | .sequentialLoop name count slot bindings carried => name.length + forcedIntExprChecksum count + slot + carried +
+        bindings.foldl (fun sum binding => sum + binding.1.length + forcedIntExprChecksum binding.2) 0 + 25
+  kindChecksum + node.arguments.foldl (fun sum wire => sum + forcedWireChecksum wire) 0 +
+    node.outputTypes.foldl (fun sum wireType => sum + forcedWireTypeChecksum wireType) 0 + node.outputCount
+
+private def forcedDerivationStepChecksum (step : NodeDerivation) : Nat :=
+  step.sourceNode + step.arguments.foldl (fun sum wire => sum + forcedWireChecksum wire) 0 +
+    match step.rule with
+    | .matrixMultiplyRelation wire => forcedWireChecksum wire + 3
+    | .matrixMultiplyBound => 5
+    | _ => 1
+
+private def forcedAttachmentChecksum (attachment : DerivationAttachment) : Nat :=
+  attachment.ownerNamespace.length + attachment.ruleName.length + attachment.roles.foldl
+    (fun sum role => sum + role.1.length + forcedWireChecksum role.2) 0 + 1
+
+private def emitOperationalForceProgress
+    (kind document scope event : String) (processed total checksum : Nat) : IO Unit :=
+  IO.eprintln ("operational_progress phase=" ++ kind ++ " event=" ++ event ++
+    " document=" ++ document ++ " scope=" ++ scope ++ " processed=" ++ toString processed ++
+    " total=" ++ toString total ++ " detail=checksum=" ++ toString checksum)
+
+private def forceOperationalScope
+    (kind document scopeName : String) (scope : Scope) : IO OperationalForceStats := do
+  let mut checksum := scope.outputs.length + scope.inputNames.length
+  let total := scope.nodes.size
+  for (node, index) in scope.nodes.zipIdx do
+    checksum := checksum + forcedNodeChecksum node
+    let position := index + 1
+    if operationalProgressBlock (position - 1) total then
+      emitOperationalForceProgress kind document scopeName "node_block" position total checksum
+  pure { entries := total, checksum }
+
+/-- Force every decoded executable node before a raw-document decode is reported complete. -/
+def forceProgOperationalDocument (document : String) (program : Prog) : IO OperationalForceStats := do
+  emitOperationalForceProgress "document_decode_force" document "root" "start" 0
+    (program.root.nodes.size + program.definitions.foldl (fun count entry => count + entry.2.nodes.size) 0) 0
+  let root ← forceOperationalScope "document_decode_force" document "root" program.root
+  let mut entries := root.entries
+  let mut checksum := root.checksum
+  for (name, scope) in program.definitions do
+    let forced ← forceOperationalScope "document_decode_force" document name scope
+    entries := entries + forced.entries
+    checksum := checksum + name.length + forced.checksum
+  emitOperationalForceProgress "document_decode_force" document "all_scopes" "complete" entries entries checksum
+  pure { entries, checksum }
+
+private def forceOperationalScopeDerivation
+    (document scopeName : String) (derivation : ScopeDerivation) : IO OperationalForceStats := do
+  let mut checksum := 0
+  let total := derivation.steps.size + derivation.attachments.length
+  let mut processed := 0
+  for step in derivation.steps do
+    checksum := checksum + forcedDerivationStepChecksum step
+    processed := processed + 1
+    if operationalProgressBlock (processed - 1) total then
+      emitOperationalForceProgress "document_derivation_force" document scopeName "block" processed total checksum
+  for attachment in derivation.attachments do
+    checksum := checksum + forcedAttachmentChecksum attachment
+    processed := processed + 1
+    if operationalProgressBlock (processed - 1) total then
+      emitOperationalForceProgress "document_derivation_force" document scopeName "block" processed total checksum
+  pure { entries := processed, checksum }
+
+/-- Force each decoded derivation payload before its document decode is reported complete. -/
+def forceProgramDerivationOperationalDocument
+    (document : String) (derivation : ProgramDerivation) : IO OperationalForceStats := do
+  let root ← forceOperationalScopeDerivation document "root" derivation.root
+  let mut entries := root.entries
+  let mut checksum := root.checksum
+  for (name, scope) in derivation.definitions do
+    let forced ← forceOperationalScopeDerivation document name scope
+    entries := entries + forced.entries
+    checksum := checksum + name.length + forced.checksum
+  emitOperationalForceProgress "document_derivation_force" document "all_scopes" "complete"
+    entries entries checksum
+  pure { entries, checksum }
+
+/-- Force all prepared structural tables before preparation is reported complete.  This traverses
+the same frozen program and derivation data as the evaluator, but does not construct facts or
+change any acceptance result. -/
+def forcePreparedOperationalWorkflow
+    (prepared : PreparedOperationalWorkflow) : IO OperationalForceStats := do
+  let mut entries := 0
+  let mut checksum := prepared.inputContract.inputs.length + prepared.operationalDecoderTargets.length
+  for stage in prepared.stages do
+    let root ← forceOperationalScope "prepared_workflow_force" stage.id "root" stage.program.root.scope
+    entries := entries + root.entries
+    checksum := checksum + stage.id.length + root.checksum + stage.inputs.size
+    for (name, scope) in stage.program.definitions do
+      let forced ← forceOperationalScope "prepared_workflow_force" stage.id name scope.scope
+      entries := entries + forced.entries
+      checksum := checksum + name.length + forced.checksum
+  emitOperationalForceProgress "prepared_workflow_force" "workflow" "all_stages" "complete"
+    entries entries checksum
+  pure { entries, checksum }
 
 def decoderNode
     (stage : PreparedOperationalStage)
@@ -2426,6 +2955,8 @@ def operationalTargetNoiseBound
     (environment : ParamEnvironment) :
     Except OperationalError
       (OperationalDecoderTarget × Int × Int × OperationalAnalysisDiagnostics) := do
+  if operationalProgress "resolve_target_and_evaluate_bound" "target_lookup_start" "workflow" 0 0
+      ("target_id=" ++ targetId) then pure () else throw (.unsupportedOperationalExpr 0)
   let target ← prepared.decoderTarget targetId
   let stage ← match outputs.find? (fun result => result.stage == target.residualStage.name) with
     | some result => pure result
@@ -2434,6 +2965,9 @@ def operationalTargetNoiseBound
     | some output => pure output.2
     | none => throw (.missingStageResult target.residualStage.name target.residualOutput)
   let residualModulus ← operationalFactModulus stage.facts.arena residual environment
+  if operationalProgress "resolve_target_and_evaluate_bound" "target_lookup_complete" "workflow" 0 0
+      ("target_id=" ++ targetId ++ "; residual_stage=" ++ target.residualStage.name ++
+        "; residual_output=" ++ target.residualOutput) then pure () else throw (.unsupportedOperationalExpr 0)
   let decoderStage ← decoderStageForTarget prepared target
   match target.kind with
   | .thresholdDecode plaintextModulus =>
@@ -2441,6 +2975,9 @@ def operationalTargetNoiseBound
   | .booleanInterval =>
       validateBooleanIntervalDecoderTarget decoderStage target residualModulus environment
   let (noiseBound, diagnostics) ← operationalNoiseBoundForFact stage.facts.arena residual environment
+  if operationalProgress "resolve_target_and_evaluate_bound" "target_bound_complete" "workflow" 0 0
+      ("target_id=" ++ targetId ++ "; noise_bound=" ++ toString noiseBound) then pure () else
+    throw (.unsupportedOperationalExpr 0)
   pure (target, residualModulus, noiseBound, diagnostics)
 
 def validateOperationalDecoderTargets
@@ -2491,14 +3028,21 @@ def evaluatePreparedWorkflowOperational
   let mut results := []
   let mut arena : OperationalExprArena := {}
   for stage in prepared.stages do
+    if operationalProgress "evaluate_workflow" "stage_start" stage.id results.length prepared.stages.size
+        ("inputs=" ++ toString stage.inputs.size) then pure () else throw (.unsupportedOperationalExpr 0)
     let scopeKey := ScopeTemplateKey.root (.workflowStage ⟨stage.id⟩)
     let mut inputFacts : List OperationalFact := []
     for input in stage.inputs do
       let fact ← match input.source with
         | .artifact producer output => do
+            if operationalProgress "artifact_input_rebinding" "start" stage.id inputFacts.length
+                stage.inputs.size ("producer=" ++ producer ++ "; output=" ++ output) then pure () else
+              throw (.unsupportedOperationalExpr 0)
             let output ← findStageOutput results producer output
             let (nextArena, rebound) ← rebindOperationalFact input.subject arena output environment
             arena := nextArena
+            if operationalProgress "artifact_input_rebinding" "complete" stage.id inputFacts.length
+                stage.inputs.size "" then pure () else throw (.unsupportedOperationalExpr 0)
             pure rebound
         | .protocol protocolName => do
             let (protocolInput, contract) ← match prepared.inputContract.inputs.find? fun entry =>
@@ -2515,6 +3059,10 @@ def evaluatePreparedWorkflowOperational
     arena := facts.arena
     let outputs ← collectOperationalOutputs stage.program.root.scope facts
     results := results ++ [{ stage := stage.id, outputs, facts }]
+    if operationalProgress "evaluate_workflow" "stage_complete" stage.id results.length
+        prepared.stages.size ("outputs=" ++ toString outputs.length ++
+          "; arena_values=" ++ toString arena.direct.values.size) then pure () else
+      throw (.unsupportedOperationalExpr 0)
   pure results
 
 /-- Evaluates the exact frozen workflow in stage order. Protocol inputs are constructed from the

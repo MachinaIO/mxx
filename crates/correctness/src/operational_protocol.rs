@@ -59,13 +59,16 @@ fn exact_input_contract(
     }
 }
 
-/// Builds the closed workflow used solely by the generic operational checker. Artifact bindings
-/// are inferred by matching each artifact input to exactly one preceding artifact output with the
-/// same name; all ordinary inputs receive exact structural contracts.
+/// Builds a closed operational protocol from executable graphs. Artifact bindings are inferred by
+/// matching each artifact input to exactly one preceding artifact output with the same name; all
+/// ordinary inputs receive exact structural contracts. `complete_bundle` must install the
+/// protocol-owned endpoint and decoder-target declarations before this function validates and
+/// returns the declaration.
 pub fn operational_protocol_from_graphs(
     stages: Vec<(String, &BuiltGraph)>,
     entrypoint: &str,
     exact_matrix_input_metadata: &BTreeMap<String, ExactMatrixInputMetadata>,
+    complete_bundle: impl FnOnce(&mut ClosedProtocolBundle),
 ) -> Result<ProtocolDecl, OperationalProtocolError> {
     if stages.is_empty() {
         return Err(OperationalProtocolError::EmptyWorkflow);
@@ -144,25 +147,21 @@ pub fn operational_protocol_from_graphs(
             .map_err(|error| OperationalProtocolError::Ideal(error.to_string()))?,
     )
     .map_err(|error| OperationalProtocolError::Ideal(error.to_string()))?;
-    ProtocolDecl::new(ProtocolDecl {
-        params: Vec::new(),
-        bundle: ClosedProtocolBundle {
-            workflow: Workflow {
-                stages: protocol_stages,
-                entrypoint: StageId(entrypoint.to_owned()),
-            },
-            ideal,
-            requirements: Vec::new(),
-            comparator: ComparatorSpec::Equality { endpoints: Vec::new() },
-            endpoints: EndpointAnchors::default(),
-            operational_decoder_targets: Vec::new(),
-            endpoint_specs: Vec::new(),
-            input_contract: InputContract { inputs: input_contract },
-            input_bindings,
-            precondition_spec: ProtocolPreconditionSpec::default(),
-        },
-    })
-    .map_err(|error| OperationalProtocolError::Protocol(error.to_string()))
+    let mut bundle = ClosedProtocolBundle {
+        workflow: Workflow { stages: protocol_stages, entrypoint: StageId(entrypoint.to_owned()) },
+        ideal,
+        requirements: Vec::new(),
+        comparator: ComparatorSpec::Equality { endpoints: Vec::new() },
+        endpoints: EndpointAnchors::default(),
+        operational_decoder_targets: Vec::new(),
+        endpoint_specs: Vec::new(),
+        input_contract: InputContract { inputs: input_contract },
+        input_bindings,
+        precondition_spec: ProtocolPreconditionSpec::default(),
+    };
+    complete_bundle(&mut bundle);
+    ProtocolDecl::new(ProtocolDecl { params: Vec::new(), bundle })
+        .map_err(|error| OperationalProtocolError::Protocol(error.to_string()))
 }
 
 #[cfg(test)]

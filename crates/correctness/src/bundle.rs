@@ -565,12 +565,14 @@ impl ClosedProtocolBundle {
                 .outputs()
                 .get(&target.residual_output)
                 .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
-            if !matches!(
-                output_type(&residual_stage.graph, residual.value),
-                Some(WireType::Matrix(_))
-            ) {
-                return Err(BundleValidationError::InvalidOperationalDecoderTarget);
-            }
+            let residual_matrix_type = match output_type(&residual_stage.graph, residual.value) {
+                Some(WireType::Matrix(matrix_type)) => matrix_type,
+                Some(WireType::IndexedFamily { element, .. }) => match element.as_ref() {
+                    WireType::Matrix(matrix_type) => matrix_type,
+                    _ => return Err(BundleValidationError::InvalidOperationalDecoderTarget),
+                },
+                _ => return Err(BundleValidationError::InvalidOperationalDecoderTarget),
+            };
             let decoder_stage = stages
                 .get(&target.decoder_stage)
                 .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
@@ -610,15 +612,37 @@ impl ClosedProtocolBundle {
                         output_bool: true,
                         ..
                     },
-                ) if plaintext_modulus == decoder_plaintext_modulus &&
-                    decoder_stage.graph.root_scope().arguments(decoder)
+                ) => {
+                    let decoder_input_matches_modulus = decoder_stage
+                        .graph
+                        .root_scope()
+                        .arguments(decoder)
                         .and_then(|arguments| arguments.first().copied())
                         .and_then(|wire| output_type(&decoder_stage.graph, wire))
-                        .is_some_and(|decoder_input| matches!(
-                            (decoder_input, output_type(&residual_stage.graph, residual.value)),
-                            (WireType::Matrix(decoder_type), Some(WireType::Matrix(residual_type)))
-                                if decoder_type.modulus == residual_type.modulus
-                        )) => {}
+                        .is_some_and(|decoder_input| {
+                            matches!(
+                                (decoder_input, output_type(&residual_stage.graph, residual.value)),
+                                (WireType::Matrix(decoder_type), _)
+                                    if decoder_type.modulus == residual_matrix_type.modulus
+                            )
+                        });
+                    let residual_family_witness_matches = !matches!(
+                        output_type(&residual_stage.graph, residual.value),
+                        Some(WireType::IndexedFamily { .. })
+                    ) || (target.decoder_stage ==
+                        target.residual_stage &&
+                        threshold_decoder_input_matches_residual_family(
+                            &decoder_stage.graph,
+                            target.decoder_node,
+                            residual.value,
+                        ));
+                    if plaintext_modulus != decoder_plaintext_modulus ||
+                        !decoder_input_matches_modulus ||
+                        !residual_family_witness_matches
+                    {
+                        return Err(BundleValidationError::InvalidOperationalDecoderTarget);
+                    }
+                }
                 (
                     OperationalDecoderKind::BooleanInterval,
                     EndpointSpecId::DiamondBooleanInterval,
@@ -628,7 +652,8 @@ impl ClosedProtocolBundle {
                         residual_stage,
                         residual_anchor,
                         ..
-                    } = &endpoint.semantics else {
+                    } = &endpoint.semantics
+                    else {
                         return Err(BundleValidationError::OperationalDecoderTargetKindMismatch);
                     };
                     let residual_anchor = stages
@@ -770,6 +795,35 @@ fn boolean_interval_decoder_matches(
         )
 }
 
+/// Checks the minimal provenance path required when a threshold decoder targets a matrix family.
+///
+/// A family-level operational bound may use one fixed lane as its executable decoder witness, but
+/// that witness must be selected from the declared residual output and then sliced.  Matching only
+/// on the matrix modulus would permit an unrelated same-modulus matrix to stand in for the target.
+fn threshold_decoder_input_matches_residual_family(
+    graph: &Graph,
+    decoder_node: NodeId,
+    residual: WireRef,
+) -> bool {
+    let decoder = WireRef { node: decoder_node, port: Port(0) };
+    let Some((NodeKind::ThresholdDecode { .. }, [decoder_input])) =
+        node_kind_and_arguments(graph, decoder)
+    else {
+        return false;
+    };
+    let Some((NodeKind::Slice { .. }, [selected_lane])) =
+        node_kind_and_arguments(graph, decoder_input)
+    else {
+        return false;
+    };
+    let Some((NodeKind::FamilyGetStatic { .. }, [source_family])) =
+        node_kind_and_arguments(graph, selected_lane)
+    else {
+        return false;
+    };
+    source_family == residual
+}
+
 fn root_inputs(
     graph: &Graph,
 ) -> impl Iterator<Item = (&str, &WireType, Option<&mxx_ir_core::node::ArtifactInput>)> {
@@ -828,7 +882,95 @@ fn contract_matches_wire(contract: &InputValueContract, wire_type: &WireType) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, IdealSpec, Int, PurePredicateSpec, Ring, SemanticAnchor};
+    use mxx_dsl::{
+        Bool, DslContext, Family, IdealSpec, Int, PurePredicateSpec, Ring, SemanticAnchor,
+    };
+    use mxx_ir_core::node::IndexRange;
+
+    fn threshold_family_bundle(decoder_uses_residual_lane: bool) -> ClosedProtocolBundle {
+        let stage_id = StageId("threshold-family-stage".to_owned());
+        let ring = Ring::new(17, 1);
+        let residuals =
+            Family::pack(vec![ring.zero((1, 1)), ring.zero((1, 1))]).expect("residual family");
+        let decoder_source =
+            if decoder_uses_residual_lane { residuals.get_static(0) } else { ring.zero((1, 1)) };
+        let decoder = decoder_source
+            .slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None)
+            .threshold_decode_bools(IntExpr::constant(17), 1)
+            .into_iter()
+            .next()
+            .expect("decoder output")
+            .semantic_anchor("threshold-family.result")
+            .expect("decoder anchor");
+        let stage = DslContext::new("threshold-family-stage")
+            .family_output("residual", residuals)
+            .expect("residual output")
+            .bool_output("decoded", decoder)
+            .expect("decoded output")
+            .build()
+            .expect("threshold-family graph");
+        let decoder_node = stage.graph.outputs()["decoded"].value.node;
+        let ideal = IdealSpec::new(
+            DslContext::new("threshold-family-ideal")
+                .bool_output("ideal", Bool::constant(false))
+                .expect("ideal output")
+                .build()
+                .expect("ideal graph"),
+        )
+        .expect("pure ideal");
+        let endpoint = EndpointSpecId::ToyThresholdDecode;
+
+        ClosedProtocolBundle {
+            workflow: Workflow {
+                stages: vec![ProtocolStage {
+                    id: stage_id.clone(),
+                    graph: stage.graph,
+                    semantic_anchors: stage.anchors,
+                    derivation_attachments: stage.derivation_attachments,
+                    bindings: Vec::new(),
+                }],
+                entrypoint: stage_id.clone(),
+            },
+            ideal,
+            requirements: Vec::new(),
+            comparator: ComparatorSpec::Equality {
+                endpoints: vec![ComparatorEndpointBinding {
+                    endpoint,
+                    actual_input: "decoded".to_owned(),
+                    ideal_input: "ideal".to_owned(),
+                    result_output: "failure".to_owned(),
+                    failure_value: true,
+                }],
+            },
+            endpoints: EndpointAnchors {
+                entries: vec![EndpointAnchor {
+                    spec: endpoint,
+                    stage: stage_id.clone(),
+                    semantic_anchor: "threshold-family.result".to_owned(),
+                    semantics: EndpointSemanticBinding::ThresholdDecode,
+                    workflow_output: OutputRef {
+                        stage: stage_id.clone(),
+                        output: "decoded".to_owned(),
+                    },
+                    ideal_output: "ideal".to_owned(),
+                }],
+            },
+            operational_decoder_targets: vec![OperationalDecoderTarget {
+                target_id: "threshold-family".to_owned(),
+                residual_stage: stage_id.clone(),
+                residual_output: "residual".to_owned(),
+                decoder_stage: stage_id,
+                decoder_node,
+                kind: OperationalDecoderKind::ThresholdDecode {
+                    plaintext_modulus: IntExpr::constant(17),
+                },
+            }],
+            endpoint_specs: vec![endpoint],
+            input_contract: InputContract::default(),
+            input_bindings: Vec::new(),
+            precondition_spec: ProtocolPreconditionSpec::default(),
+        }
+    }
 
     fn valid_bundle() -> ClosedProtocolBundle {
         let ring = Ring::new(17, 1);
@@ -1154,6 +1296,15 @@ mod tests {
         assert_eq!(boolean_interval_bundle(IntExpr::constant(17)).validate(), Ok(()));
         assert_eq!(
             boolean_interval_bundle(IntExpr::constant(19)).validate(),
+            Err(BundleValidationError::InvalidOperationalDecoderTarget)
+        );
+    }
+
+    #[test]
+    fn threshold_family_target_requires_decoder_provenance_from_residual_output() {
+        assert_eq!(threshold_family_bundle(true).validate(), Ok(()));
+        assert_eq!(
+            threshold_family_bundle(false).validate(),
             Err(BundleValidationError::InvalidOperationalDecoderTarget)
         );
     }

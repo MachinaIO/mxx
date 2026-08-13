@@ -17,8 +17,35 @@ private def operationalGatherFixtureOwner (node : Nat) : GatherLookupOwner := {
 private def operationalFixtureGather (node : Nat) (source position : IndexExpr) : IndexExpr :=
   let sourceCount := match source with
     | .variable binder => binder.count
+    | .constant count => .constant count
     | _ => .constant 1
   .gather (operationalGatherFixtureOwner node) sourceCount position
+
+/-- Install the executable integer producer for a direct carrier gather fixture. -/
+private def registerOperationalFixtureGather
+    (arena : OperationalExprArena)
+    (node : Nat)
+    (position : IndexVariable)
+    (ordinals : List Nat) : Except OperationalError OperationalExprArena := do
+  let (fixed, references) ← ordinals.foldlM (fun (fixed, references) ordinal => do
+    let fact : OperationalScalarFact := .integer {
+      subject := { node, port := 0 }
+      origin := .local temporaryScope { node, port := 0 }
+      lower := ordinal
+      upper := ordinal
+      lowerExpression := .closed (.closedInt (.constant ordinal))
+      upperExpression := .closed (.closedInt (.constant ordinal)) }
+    let (fixed, reference) := fixed.pushScalar fact
+    pure (fixed, references.push reference)) (arena.direct.fixed, #[])
+  let direct := { arena.direct with fixed }
+  let (direct, root) ← match direct.pushExplicit [] { binders := #[position] } position
+      (.scalar .integer) references with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr node)
+  let direct ← match direct.registerGatherIntegerRoot (operationalGatherFixtureOwner node) root with
+    | some direct => pure direct
+    | none => throw (.unsupportedOperationalExpr node)
+  pure { arena with direct }
 
 private def fixtureDirectScalarFact
     (arena : OperationalExprArena)
@@ -68,8 +95,8 @@ example : (do
       | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 0)
     let secondMap ← match closedStaticIndexMap [] family.context binder 1 with
       | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 0)
-    let (arena, first) ← arena.reindexDirectMatrixFact firstMap family
-    let (arena, second) ← arena.reindexDirectMatrixFact secondMap family
+    let (arena, first) ← arena.reindexDirectFact firstMap family
+    let (arena, second) ← arena.reindexDirectFact secondMap family
     let first ← fixtureDirectScalarFact arena first
     let second ← fixtureDirectScalarFact arena second
     match first, second with
@@ -89,8 +116,8 @@ example : (do
     let map ← match closedStaticIndexMap [] family.context binder 1 with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 0)
-    let (arena, first) ← arena.reindexDirectMatrixFact map family
-    let (arena, second) ← arena.reindexDirectMatrixFact map family
+    let (arena, first) ← arena.reindexDirectFact map family
+    let (arena, second) ← arena.reindexDirectFact map family
     match ← fixtureDirectScalarFact arena first, ← fixtureDirectScalarFact arena second with
     | .bytes first, .bytes second => pure (first.origin == second.origin)
     | _, _ => pure false) = .ok true := by
@@ -388,8 +415,8 @@ private def fixtureTrapdoorFact : OperationalScalarFact := .trapdoor {
   digitCount := .constant 1
   preimageMaxCoefficientBound := .constant 3
   matrixParams := fixtureParams
-  maximum := .closedInt (.constant 3)
-  preimageCutoff := some (.contextual .maximum [] [] (.constant 3))
+  maximum := .closed (.closedInt (.constant 3))
+  preimageCutoff := some (.closed (.contextual .maximum [] [] (.constant 3)))
   publicIdentity := fixtureSampledIdentity
 }
 
@@ -488,96 +515,23 @@ example : (do
     matrixMaximum 2 { node := 2, port := 0 } facts []) = .ok 3 := by
   native_decide
 
-/-- A fresh sample produced by one parallel-body template denotes a different source in each
-lane, so subtraction across distinct lanes cannot cancel structurally. -/
-example : (do
-    let facts ← evaluateScopeOperationalWithLayouts fixtureScope fixtureDerivation [] []
-    let sample ← lookupFact 2 facts { node := 1, port := 0 }
-    let (arena, first) ← instantiateFactLoopIndex 0 0 facts.arena sample []
-    let (arena, second) ← instantiateFactLoopIndex 0 1 arena sample []
-    match first, second with
-    | first@{ context := { binders := #[] }, payload := .directValue _, .. },
-        second@{ context := { binders := #[] }, payload := .directValue _, .. } =>
-        let first ← arena.directValueFactAt [] first
-        let second ← arena.directValueFactAt [] second
-        pure (!(subtractOperationalPolynomials first.polynomial second.polynomial).isEmpty)
-    | _, _ => pure false) = .ok true := by
-  native_decide
+/-- Ordinary outputs are namespaced once at the common scope-output boundary.  The two concrete
+leaves each allocate one source and one namespaced carrier value; the delayed add allocates only
+its operation node. -/
+private def ordinaryOutputSingleNamespaceFixture : Except OperationalError Bool := do
+  let scopeKey : ScopeTemplateKey := .root (.standalone 803)
+  let facts ← evaluateScopeOperationalWithKey scopeKey fixtureScope fixtureDerivation [] []
+  let zeroOutput ← lookupFact 2 facts { node := 0, port := 0 }
+  let sampleOutput ← lookupFact 2 facts { node := 1, port := 0 }
+  let zero ← facts.arena.direct.matrixFactAt [] [] zeroOutput.payload.root
+    (facts.arena.direct.values.size + 1)
+  let sample ← facts.arena.direct.matrixFactAt [] [] sampleOutput.payload.root
+    (facts.arena.direct.values.size + 1)
+  pure (facts.arena.direct.values.size == 5 &&
+    zero.origin == .value scopeKey { node := 0, port := 0 } &&
+    sample.origin == .value scopeKey { node := 1, port := 0 })
 
-/-- Loop instantiation specializes every trapdoor wire-contract field and rebuilds the direct
-carrier schema from that same specialized leaf. -/
-example : (show Except OperationalError Bool from do
-    let matrixType : MatrixTypeExpr := {
-      modulus := .add (.constant 17) (.loopIndex 7)
-      ringDimension := .loopIndex 7
-      rows := .add (.loopIndex 7) (.constant 1)
-      columns := .constant 2
-    }
-    let trapdoor : OperationalScalarFact := .trapdoor {
-      subject := { node := 714, port := 0 }
-      matrixType
-      sigma := .fromInt (.loopIndex 7)
-      gadgetBase := .add (.loopIndex 7) (.constant 2)
-      digitCount := .loopIndex 7
-      preimageMaxCoefficientBound := .add (.loopIndex 7) (.constant 3)
-      matrixParams := fixtureParams
-      maximum := .closedInt (.loopIndex 7)
-      preimageCutoff := some (.closedInt (.add (.loopIndex 7) (.constant 3)))
-      publicIdentity := fixtureSampledIdentity
-    }
-    let (arena, source) ← ({} : OperationalExprArena).promoteConcreteScalarFact trapdoor
-    let (arena, instantiated) ← instantiateFactLoopIndex 7 4 arena source []
-    let leaf ← fixtureDirectScalarFact arena instantiated
-    let root := instantiated.payload.root
-    let value ← match arena.direct.valueAt? root with
-      | some value => pure value
-      | none => throw (.invalidOperationalExprRef root)
-    match leaf, value.payload.schema with
-    | .trapdoor leaf, .scalar (.trapdoor matrixType sigma gadgetBase digitCount cutoff) =>
-        pure (leaf.matrixType == matrixType && leaf.sigma == sigma &&
-          leaf.gadgetBase == gadgetBase && leaf.digitCount == digitCount &&
-          leaf.preimageMaxCoefficientBound == cutoff &&
-          matrixType == {
-            modulus := .add (.constant 17) (.constant 4)
-            ringDimension := .constant 4
-            rows := .add (.constant 4) (.constant 1)
-            columns := .constant 2
-          } && sigma == .fromInt (.constant 4) &&
-          gadgetBase == .add (.constant 4) (.constant 2) && digitCount == .constant 4 &&
-          cutoff == .add (.constant 4) (.constant 3) &&
-          leaf.maximum == .closedInt (.constant 4) &&
-          leaf.preimageCutoff == some (.closedInt (.add (.constant 4) (.constant 3))))
-    | _, _ => pure false) = .ok true := by
-  native_decide
-
-/-- A direct scalar value forged with a stale declared schema is rejected before loop rebinding;
-the mapper must never repair the tag from its fixed leaf. -/
-private def forgedScalarSchemaBeforeRebindRejectedFixture : Bool :=
-  match (show Except OperationalError Bool from do
-    let scalar : OperationalScalarFact := .integer {
-      subject := { node := 715, port := 0 }
-      origin := .local temporaryScope { node := 715, port := 0 }
-      lower := 0
-      upper := 0
-      lowerExpression := .closedInt (.constant 0)
-      upperExpression := .closedInt (.constant 0)
-    }
-    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushScalar scalar
-    let direct : DirectOperationalIndexedArena := { fixed }
-    let (direct, root) := direct.pushValue emptyContext
-      (.shared (.scalar .boolean) reference)
-    let arena : OperationalExprArena := { direct }
-    let source : OperationalFact := {
-      context := emptyContext
-      payload := .directValue root
-      storage := .sharedTemplate
-    }
-    let _ ← instantiateFactLoopIndex 0 0 arena source []
-    pure false) with
-  | .error (.unsupportedOperationalExpr 0) => true
-  | _ => false
-
-example : forgedScalarSchemaBeforeRebindRejectedFixture = true := by
+example : ordinaryOutputSingleNamespaceFixture = .ok true := by
   native_decide
 
 /-- Scalar direct-table rebinding uses the caller's parameter environment when validating family
@@ -591,8 +545,8 @@ private def parameterizedScalarTableRebindFixture : Bool :=
       origin := .local temporaryScope { node, port := 0 }
       lower := value
       upper := value
-      lowerExpression := .closedInt (.constant value)
-      upperExpression := .closedInt (.constant value)
+      lowerExpression := .closed (.closedInt (.constant value))
+      upperExpression := .closed (.closedInt (.constant value))
     }
     let (fixed, firstReference) := ({} : FixedOperationalPayloadArena).pushScalar (scalar 716 1)
     let (fixed, secondReference) := fixed.pushScalar (scalar 717 2)
@@ -2079,11 +2033,13 @@ private def productionGatherLoopFixture : Except OperationalError Bool := do
   let owner : GatherLookupOwner := {
     indices := { scope, node := 0, port := 0 }
   }
-  pure (maximum == 7 && entries.length == 3 && entries.all fun entry =>
-    (match entry.key with
-    | some (.gather actualOwner (.constant 3) (.variable position)) =>
-        actualOwner == owner && position.count == .constant 2
-    | _ => false) && entry.ordinal < 3 && !matrixFactHasRelation entry.fact)
+  pure (maximum == 5 && entries.length == 2 && entries.all fun entry =>
+    entry.correlation.any (fun assignment => match assignment.1 with
+      | .gather actualOwner (.constant 3) (.variable position) =>
+          actualOwner == owner && position.count == .constant 2 && assignment.2 < 3
+      | _ => false) && entry.correlation.any (fun assignment => match assignment.1 with
+        | .variable position => position.count == .constant 2 && assignment.2 < 2
+        | _ => false) && !matrixFactHasRelation entry.fact)
 
 example : productionGatherLoopFixture = .ok true := by native_decide
 
@@ -2638,8 +2594,8 @@ example : (do
       | { payload := .directValue _, .. }, .integer value =>
           value.lower == 4 && value.upper == 4 &&
             match value.lowerExpression, value.upperExpression with
-            | .recurrenceState 2 paths _ _ (OperationalBoundPath.integerLower 0 0),
-                .recurrenceState 2 upperPaths _ _ (OperationalBoundPath.integerUpper 0 0) =>
+            | .closed (.recurrenceState 2 paths _ _ (OperationalBoundPath.integerLower 0 0)),
+                .closed (.recurrenceState 2 upperPaths _ _ (OperationalBoundPath.integerUpper 0 0)) =>
                 paths == [(OperationalBoundPath.integerLower 0 0),
                   (OperationalBoundPath.integerUpper 0 0)] && upperPaths == paths
             | _, _ => false
@@ -2686,16 +2642,16 @@ private def directIntegerIntervalSequentialFixture : Except OperationalError Boo
   match result, ← facts.arena.directValueScalarFactAt [] result with
   | { payload := .directValue _, .. }, .integer value =>
       pure <| value.lower == 2 && value.upper == 5 &&
-        value.lowerExpression == .recurrenceState 2
+        value.lowerExpression == .closed (.recurrenceState 2
           [(.integerLower 0 0), (.integerUpper 0 0)]
           [.closedInt (.constant 2), .closedInt (.constant 5)]
           [.previous (.integerLower 0 0), .previous (.integerUpper 0 0)]
-          (.integerLower 0 0) &&
-        value.upperExpression == .recurrenceState 2
+          (.integerLower 0 0)) &&
+        value.upperExpression == .closed (.recurrenceState 2
           [(.integerLower 0 0), (.integerUpper 0 0)]
           [.closedInt (.constant 2), .closedInt (.constant 5)]
           [.previous (.integerLower 0 0), .previous (.integerUpper 0 0)]
-          (.integerUpper 0 0)
+          (.integerUpper 0 0))
   | _, _ => pure false
 
 example : directIntegerIntervalSequentialFixture = .ok true := by
@@ -2789,26 +2745,6 @@ example : (.recurrence 0 [.closedInt (.constant 7)]
 /-- A typed carried placeholder has no meaning outside recurrence evaluation. -/
 example : (.previous (.matrixMaximum 0 0) : OperationalBoundExpr).evaluate [] #[] =
     .error (.invalidPreviousPath (.matrixMaximum 0 0)) := by
-  native_decide
-
-private def sampledLoopIdentity : PublicMatrixIdentity :=
-  .sampledTrapdoor (.parallelBody (.root (.standalone 0)) 4) { node := 2, port := 0 }
-
-/-- Independent samples produced at one body wire receive distinct concrete loop identities. -/
-example : instantiatePublicIdentityLoopIndex 0 0 sampledLoopIdentity !=
-    instantiatePublicIdentityLoopIndex 0 1 sampledLoopIdentity := by
-  native_decide
-
-/-- Nested loop instantiation retains both concrete selections. -/
-example : instantiatePublicIdentityLoopIndex 1 3
-    (instantiatePublicIdentityLoopIndex 0 2 sampledLoopIdentity) =
-    .loopInstance 0 (.constant 2) (.loopInstance 1 (.constant 3) sampledLoopIdentity) := by
-  native_decide
-
-/-- Deterministic gadget matrices are not spuriously made lane-local. -/
-example : instantiatePublicIdentityLoopIndex 0 7
-    (.gadget "fixture" fixtureParams 1 2 false 3) =
-    (.gadget "fixture" fixtureParams 1 2 false 3) := by
   native_decide
 
 private def mismatchedFixtureType : MatrixTypeExpr :=
@@ -3002,11 +2938,11 @@ private def directOrdinaryMatrixPipelineFixture : Bool :=
       (boundedOperationalExprFixtureFact 801 2)
     let (arena, right) ← arena.promoteConcreteMatrixFact (boundedOperationalExprFixtureFact 802 3)
     let add : PrimitiveOperation := {
-      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 803,
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 803,
       outputPort := 0, parameterEnvironment := [] }
     let (arena, sum) ← arena.pushDirectMatrixPointwise add left right
     let multiply : PrimitiveOperation := {
-      kind := .multiply .matrixMultiplyBound { node := 803, port := 0 }, outputType := fixtureType,
+      kind := .multiply .matrixMultiplyBound { node := 803, port := 0 }, outputType := .fromIr fixtureType, outputSchema := fixtureType,
       ownerScope := none, ownerNode := 804, outputPort := 0, parameterEnvironment := [] }
     let (arena, product) ← arena.pushDirectMatrixPointwise multiply sum right
     let sumId := sum.payload.root
@@ -3056,7 +2992,7 @@ private def directBggGroupingFixture : Bool :=
       context := { binders := #[binder] }, payload := .directValue root, storage := .explicitTable }
     let arena : OperationalExprArena := { direct }
     let operation : PrimitiveOperation := {
-      kind := .bggGrouping, outputType := fixtureType, ownerScope := none, ownerNode := 814,
+      kind := .bggGrouping, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 814,
       outputPort := 0, parameterEnvironment := [] }
     let (arena, grouped) ← arena.pushDirectMatrixPointwiseN operation
       #[table vectorRoot, table publicKeyRoot, table plaintextRoot]
@@ -3170,7 +3106,7 @@ private def directValueContextCorrelationFixture : Bool :=
   let (fixed, rightRef) := fixed.pushMatrix rightFact
   let direct : DirectOperationalIndexedArena := { fixed }
   let operation := OperationalIndexedPointwiseOperation.matrix {
-    kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 809,
+    kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 809,
     outputPort := 0, parameterEnvironment := [] }
   match direct.pushShared { binders := #[shared] } (.matrix fixtureType) leftRef with
   | none => false
@@ -3238,7 +3174,7 @@ private def directRelationProducerFixture : Bool :=
     let wrap (context : IndexContext) (root : OperationalIndexedValueId) : OperationalFact :=
       { context, payload := .directValue root, storage := .explicitTable }
     let operation : DirectRelationOperation := {
-      kind := .preimage (.constant 3) [], outputType := fixtureType, ownerScope := none,
+      kind := .preimage (.ir (.constant 3)) [], outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none,
       ownerNode := 824, outputPort := 0, parameterEnvironment := [] }
     let (arena, accepted) ← arena.pushDirectRelationPointwise operation
       #[wrap { binders := #[binder] } publicValue, wrap { binders := #[binder] } trapdoor,
@@ -3289,8 +3225,9 @@ private def directRelationLaneAlignmentFixture : Bool :=
       storage := .explicitTable
     }
     let op : DirectRelationOperation := {
-      kind := .preimage (.constant 3) []
-      outputType := fixtureType
+      kind := .preimage (.ir (.constant 3)) []
+      outputType := .fromIr fixtureType
+      outputSchema := fixtureType
       ownerScope := none
       ownerNode := 829
       outputPort := 0
@@ -3326,7 +3263,7 @@ private def directRelationClosedSchemaFixture : Bool :=
           digitCount := .constant 1
           preimageMaxCoefficientBound := .constant 3
           matrixParams := { fixtureParams with rows := 2 }
-          maximum := .closedInt (.constant 3)
+          maximum := .closed (.closedInt (.constant 3))
           publicIdentity := fixtureSampledIdentity
         }
     let (fixed, publicRef) := ({} : FixedOperationalPayloadArena).pushMatrix fixturePublicMatrixFact
@@ -3351,11 +3288,12 @@ private def directRelationClosedSchemaFixture : Bool :=
     let wrap (value : OperationalIndexedValueId) : OperationalFact :=
       { context := emptyContext, payload := .directValue value, storage := .sharedTemplate }
     let preimage (maximum : IntExpr) (outputType : MatrixTypeExpr) : DirectRelationOperation := {
-      kind := .preimage maximum [], outputType, ownerScope := none, ownerNode := 834,
+      kind := .preimage (.ir maximum) [], outputType := .fromIr outputType,
+      outputSchema := outputType, ownerScope := none, ownerNode := 834,
       outputPort := 0, parameterEnvironment := [] }
     let decomposition : DirectRelationOperation := {
-      kind := .decomposition fixtureType (.constant 2) false (.constant 1) [] [fixtureLayout]
-      outputType := fixtureRows2Type, ownerScope := none, ownerNode := 835,
+      kind := .decomposition (.fromIr fixtureType) (.ir (.constant 2)) false (.ir (.constant 1)) [] [fixtureLayout]
+      outputType := .fromIr fixtureRows2Type, outputSchema := fixtureRows2Type, ownerScope := none, ownerNode := 835,
       outputPort := 0, parameterEnvironment := [] }
     let rejected (result : Except OperationalError (OperationalExprArena × OperationalFact)) :=
       match result with | .error _ => true | .ok _ => false
@@ -3381,10 +3319,10 @@ private def canonicalRangeTransformFixture : Bool :=
   match (do
     let input := { boundedOperationalExprFixtureFact 845 2 with canonicalRange := .below 2 }
     let negate : PrimitiveOperation := {
-      kind := .transform .negate, outputType := fixtureType, ownerScope := none, ownerNode := 846,
+      kind := .transform .negate, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 846,
       outputPort := 0, parameterEnvironment := [] }
     let scale (node : Nat) (scalar : Int) : PrimitiveOperation := {
-      kind := .scale (.constant scalar) [scalar] [], outputType := fixtureType, ownerScope := none,
+      kind := .scale (.ir (.constant scalar)) [], outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none,
       ownerNode := node, outputPort := 0, parameterEnvironment := [] }
     let negated ← applyDirectMatrixPointwiseOperation negate fixtureType #[input]
     let scaled ← applyDirectMatrixPointwiseOperation (scale 847 2) fixtureType #[input]
@@ -3397,8 +3335,8 @@ private def canonicalRangeTransformFixture : Bool :=
     let decompose (node : Nat) (fact : OperationalMatrixFact) :
         Except OperationalError ReconstructionStatus := do
       let operation : DirectRelationOperation := {
-        kind := .decomposition fixtureType (.constant 2) true (.constant 1) [] [fixtureLayout]
-        outputType := fixtureType, ownerScope := none, ownerNode := node, outputPort := 0,
+        kind := .decomposition (.fromIr fixtureType) (.ir (.constant 2)) true (.ir (.constant 1)) [] [fixtureLayout]
+        outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := node, outputPort := 0,
         parameterEnvironment := [] }
       let output ← applyDirectRelationProducer operation fixtureType #[.matrix fact]
       match output.relations with
@@ -3446,8 +3384,9 @@ private def directDecompositionFamilyFixture : Bool :=
       | none => throw (OperationalError.unsupportedOperationalExpr 830)
     let arena : OperationalExprArena := { direct }
     let operation : DirectRelationOperation := {
-      kind := .decomposition fixtureType (.constant 2) false (.constant 1) [] [fixtureLayout]
-      outputType := fixtureType
+      kind := .decomposition (.fromIr fixtureType) (.ir (.constant 2)) false (.ir (.constant 1)) [] [fixtureLayout]
+      outputType := .fromIr fixtureType
+      outputSchema := fixtureType
       ownerScope := none
       ownerNode := 833
       outputPort := 0
@@ -3464,15 +3403,16 @@ private def directDecompositionFamilyFixture : Bool :=
     let map ← match dynamicIndexMap output.context binder (IndexExpr.variable selector) with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 834)
-    let (arena, mappedOutput) ← arena.reindexDirectMatrixFact map output
+    let (arena, mappedOutput) ← arena.reindexDirectFact map output
     let mappedEntries ← arena.reducedDirectValueFactsAt [] mappedOutput
     let gatherPosition := { directCarrierFixtureBinder 835 with count := .constant 3 }
+    let arena ← registerOperationalFixtureGather arena 835 gatherPosition [0, 1, 0]
     let gathered := operationalFixtureGather 835 (IndexExpr.variable selector)
       (IndexExpr.variable gatherPosition)
     let gatherMap ← match dynamicIndexMap output.context binder gathered with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 835)
-    let (arena, gatheredOutput) ← arena.reindexDirectMatrixFact gatherMap output
+    let (arena, gatheredOutput) ← arena.reindexDirectFact gatherMap output
     let gatheredEntries ← arena.reducedDirectValueFactsAt [] gatheredOutput
     let sourceOk := entries.length == 2 && entries.all fun entry =>
       entry.key == some (IndexExpr.variable binder) && entry.fact.relations.any fun relation =>
@@ -3486,15 +3426,15 @@ private def directDecompositionFamilyFixture : Bool :=
         | .decomposition value => value.producer == entry.fact.origin &&
             value.inputOrigin != entry.fact.origin
         | _ => false
-    let gatheredOk := gatheredEntries.length == 2 && gatheredEntries.all fun entry =>
-      entry.key == some gathered && entry.fact.relations.any fun relation =>
+    let gatheredOk := gatheredEntries.length == 3 && gatheredEntries.all fun entry =>
+      entry.correlation.any (fun assignment => assignment.1 == gathered) && entry.fact.relations.any fun relation =>
         match relation with
         | .decomposition value =>
             value.producer == entry.fact.origin &&
-            value.inputOrigin == MatrixOriginIdentity.indexed sourceFamily gathered
-              (match entry.ordinal with
-              | 0 => (boundedOperationalExprFixtureFact 831 2).origin
-              | _ => (boundedOperationalExprFixtureFact 832 3).origin) &&
+            (value.inputOrigin == MatrixOriginIdentity.indexed sourceFamily gathered
+              (boundedOperationalExprFixtureFact 831 2).origin ||
+              value.inputOrigin == MatrixOriginIdentity.indexed sourceFamily gathered
+                (boundedOperationalExprFixtureFact 832 3).origin) &&
             value.inputSummary.origin == value.inputOrigin
         | _ => false
     pure (sourceOk && mappedOk && gatheredOk)) with
@@ -3516,8 +3456,9 @@ private def directDecompositionDigitExpansionFixture : Bool :=
       | none => throw (OperationalError.unsupportedOperationalExpr 836)
     let arena : OperationalExprArena := { direct }
     let operation : DirectRelationOperation := {
-      kind := .decomposition fixtureRows2Type (.constant 2) false (.constant 2) [] [layout]
-      outputType := fixtureRows2Type
+      kind := .decomposition (.fromIr fixtureRows2Type) (.ir (.constant 2)) false (.ir (.constant 2)) [] [layout]
+      outputType := .fromIr fixtureRows2Type
+      outputSchema := fixtureRows2Type
       ownerScope := none
       ownerNode := 837
       outputPort := 0
@@ -3544,8 +3485,9 @@ example : directDecompositionDigitExpansionFixture = true := by native_decide
 relation tables retain one reduced producer result per physical lane. -/
 private def directRelationPhysicalCardinalityFixture : Bool :=
   let operation : DirectRelationOperation := {
-    kind := .preimage (.constant 3) []
-    outputType := fixtureType
+    kind := .preimage (.ir (.constant 3)) []
+    outputType := .fromIr fixtureType
+    outputSchema := fixtureType
     ownerScope := none
     ownerNode := 835
     outputPort := 0
@@ -3696,8 +3638,8 @@ private def directIntegerLiftFixture : Bool :=
     origin := .local temporaryScope { node := 816, port := 0 }
     lower := -3
     upper := 5
-    lowerExpression := .closedInt (.constant (-3))
-    upperExpression := .closedInt (.constant 5)
+    lowerExpression := .closed (.closedInt (.constant (-3)))
+    upperExpression := .closed (.closedInt (.constant 5))
   }
   let integer : OperationalScalarFact := .integer integerFact
   let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushScalar integer
@@ -3720,7 +3662,10 @@ private def directIntegerLiftFixture : Bool :=
               match direct.matrixFactAt [] [(.variable binder, 0)] output (direct.values.size + 1) with
               | .ok fact => fact.metadata.isConstantPolynomial &&
                   fact.totalHardBound == .minimum (.closedInt (.constant 8))
-                    (.maximum (.negate integerFact.lowerExpression) integerFact.upperExpression)
+                    (.maximum (.negate (integerFact.lowerExpression.closedOperational?.getD
+                      (.closedInt (.constant integerFact.lower))))
+                      (integerFact.upperExpression.closedOperational?.getD
+                        (.closedInt (.constant integerFact.upper))))
               | .error _ => false
 
 example : directIntegerLiftFixture = true := by
@@ -3734,10 +3679,12 @@ private def directTensorOutputRingFixture : Bool :=
   let (fixed, rightReference) := fixed.pushMatrix right
   let direct : DirectOperationalIndexedArena := { fixed }
   let forgedModulus : PrimitiveOperation := {
-    kind := .tensor, outputType := { fixtureType with modulus := .constant 19 }, ownerScope := none,
+    kind := .tensor, outputType := .fromIr { fixtureType with modulus := .constant 19 },
+    outputSchema := { fixtureType with modulus := .constant 19 }, ownerScope := none,
     ownerNode := 832, outputPort := 0, parameterEnvironment := [] }
   let forgedDimension : PrimitiveOperation := {
-    kind := .tensor, outputType := { fixtureType with ringDimension := .constant 2 }, ownerScope := none,
+    kind := .tensor, outputType := .fromIr { fixtureType with ringDimension := .constant 2 },
+    outputSchema := { fixtureType with ringDimension := .constant 2 }, ownerScope := none,
     ownerNode := 833, outputPort := 0, parameterEnvironment := [] }
   match direct.pushShared emptyContext (.matrix fixtureType) leftReference with
   | none => false
@@ -3757,7 +3704,7 @@ private def directPointwiseOutputNamespaceFixture : Bool :=
   let (fixed, rightReference) := fixed.pushMatrix right
   let direct : DirectOperationalIndexedArena := { fixed }
   let operation : PrimitiveOperation := {
-    kind := .add false, outputType := fixtureType, ownerScope := some scope, ownerNode := 837,
+    kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := some scope, ownerNode := 837,
     outputPort := 1, parameterEnvironment := [] }
   match direct.pushShared emptyContext (.matrix fixtureType) leftReference with
   | none => false
@@ -3792,7 +3739,8 @@ private def directSharedOutputNamespaceFixture : Bool :=
       subject := wire, origin := .value temporaryScope wire }.refreshPrimitivePolynomial
     let integer : OperationalScalarFact := .integer {
       subject := wire, origin := .local temporaryScope wire, lower := 3, upper := 3,
-      lowerExpression := .closedInt (.constant 3), upperExpression := .closedInt (.constant 3) }
+      lowerExpression := .closed (.closedInt (.constant 3)),
+      upperExpression := .closed (.closedInt (.constant 3)) }
     let bytes : OperationalScalarFact := .bytes {
       subject := wire, origin := .local temporaryScope wire, length := 8 }
     let trapdoor : OperationalScalarFact := match fixtureTrapdoorFact with
@@ -3879,7 +3827,8 @@ private def equivalentProductDimensionFixture : Bool :=
         matrixType, matrixParams := { fixtureParams with rows, columns } }).refreshPrimitivePolynomial
     let operation (node : Nat) (declaredOutput : MatrixTypeExpr) : PrimitiveOperation := {
       kind := .multiply .matrixMultiplyBound { node := node - 1, port := 0 }
-      outputType := declaredOutput
+      outputType := .fromIr declaredOutput
+      outputSchema := declaredOutput
       ownerScope := none
       ownerNode := node
       outputPort := 0
@@ -4288,7 +4237,8 @@ private def directFamilyComplementaryBlockFixture : Bool :=
     let relationRule : DerivationRule := .matrixMultiplyRelation relationWire
     let operation : PrimitiveOperation := {
       kind := .multiply relationRule relationWire
-      outputType := fixtureType
+      outputType := .fromIr fixtureType
+      outputSchema := fixtureType
       ownerScope := none
       ownerNode := 194
       outputPort := 0
@@ -4303,18 +4253,18 @@ private def directFamilyComplementaryBlockFixture : Bool :=
     let directStaticMap ← match closedStaticIndexMap [] accepted.context binder 0 with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 198)
-    let (arena, directStatic) ← arena.reindexDirectMatrixFact directStaticMap accepted
+    let (arena, directStatic) ← arena.reindexDirectFact directStaticMap accepted
     let middle := { directCarrierFixtureBinder 199 with count := .constant 2 }
     let firstMap ← match dynamicIndexMap accepted.context binder (IndexExpr.variable middle) with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 199)
-    let (arena, nestedMiddle) ← arena.reindexDirectMatrixFact firstMap accepted
+    let (arena, nestedMiddle) ← arena.reindexDirectFact firstMap accepted
     let finalMap ← match closedStaticIndexMap [] nestedMiddle.context middle 0 with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 200)
-    let (arena, nestedStatic) ← arena.reindexDirectMatrixFact finalMap nestedMiddle
+    let (arena, nestedStatic) ← arena.reindexDirectFact finalMap nestedMiddle
     let eventJoin : PrimitiveOperation := {
-      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 201,
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 201,
       outputPort := 0, parameterEnvironment := [] }
     let (arena, equivalentJoined) ← arena.pushDirectMatrixPointwise eventJoin directStatic nestedStatic
     let (_, equivalentEvents) ←
@@ -4322,7 +4272,7 @@ private def directFamilyComplementaryBlockFixture : Bool :=
     let distinctStaticMap ← match closedStaticIndexMap [] accepted.context binder 1 with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 202)
-    let (arena, distinctStatic) ← arena.reindexDirectMatrixFact distinctStaticMap accepted
+    let (arena, distinctStatic) ← arena.reindexDirectFact distinctStaticMap accepted
     let (arena, distinctJoined) ← arena.pushDirectMatrixPointwise eventJoin directStatic distinctStatic
     let (_, distinctEvents) ← arena.reducedDirectValueFactsAtWithRelationRewriteEvents [] distinctJoined
     let accepted ← arena.reducedDirectValueFactsAt [] accepted
@@ -4354,36 +4304,38 @@ private def directFamilyComplementaryBlockFixture : Bool :=
     let map ← match dynamicIndexMap left.context binder (IndexExpr.variable selector) with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 195)
-    let (arena, reindexedLeft) ← arena.reindexDirectMatrixFact map left
-    let (arena, reindexedRight) ← arena.reindexDirectMatrixFact map right
+    let (arena, reindexedLeft) ← arena.reindexDirectFact map left
+    let (arena, reindexedRight) ← arena.reindexDirectFact map right
     let (arena, reindexedAccepted) ← arena.pushDirectMatrixPointwise operation reindexedLeft reindexedRight
     let reindexedAccepted ← arena.reducedDirectValueFactsAt [] reindexedAccepted
     let reindexedOk := reindexedAccepted.length == 2 &&
       reindexedAccepted.all fun (entry : ReducedDirectMatrixFact) =>
         entry.key == some (IndexExpr.variable selector) && !matrixFactHasRelation entry.fact
     let gatherPosition := { directCarrierFixtureBinder 196 with count := .constant 3 }
+    let arena ← registerOperationalFixtureGather arena 196 gatherPosition [0, 1, 0]
     let gathered := operationalFixtureGather 196 (IndexExpr.variable selector)
       (IndexExpr.variable gatherPosition)
     let gatherMap ← match dynamicIndexMap left.context binder gathered with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 196)
-    let (arena, gatheredLeft) ← arena.reindexDirectMatrixFact gatherMap left
-    let (arena, gatheredRight) ← arena.reindexDirectMatrixFact gatherMap right
+    let (arena, gatheredLeft) ← arena.reindexDirectFact gatherMap left
+    let (arena, gatheredRight) ← arena.reindexDirectFact gatherMap right
     let (arena, gatheredAccepted) ← arena.pushDirectMatrixPointwise operation gatheredLeft gatheredRight
     let gatheredAccepted ← arena.reducedDirectValueFactsAt [] gatheredAccepted
     let distinctPosition := { directCarrierFixtureBinder 197 with count := .constant 3 }
+    let arena ← registerOperationalFixtureGather arena 197 distinctPosition [0, 1, 0]
     let distinctGathered :=
       operationalFixtureGather 197 (IndexExpr.variable selector) (IndexExpr.variable distinctPosition)
     let distinctGatherMap ← match dynamicIndexMap right.context binder distinctGathered with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 197)
-    let (arena, distinctGatheredRight) ← arena.reindexDirectMatrixFact distinctGatherMap right
+    let (arena, distinctGatheredRight) ← arena.reindexDirectFact distinctGatherMap right
     let (arena, gatheredRejected) ←
       arena.pushDirectMatrixPointwise operation gatheredLeft distinctGatheredRight
     let gatheredRejected := arena.reducedDirectValueFactsAt [] gatheredRejected
-    let gatheredOk := gatheredAccepted.length == 2 &&
+    let gatheredOk := gatheredAccepted.length == 3 &&
       gatheredAccepted.all fun (entry : ReducedDirectMatrixFact) =>
-        entry.key == some gathered && !matrixFactHasRelation entry.fact
+        entry.correlation.any (fun assignment => assignment.1 == gathered) && !matrixFactHasRelation entry.fact
     let gatheredRejectedOk := match gatheredRejected with
       | .error (.unsupportedOperationalExpr _) => true
       | _ => false
@@ -4415,8 +4367,8 @@ private def indexedScalarFixtureInteger (node lower upper : Nat) : OperationalSc
     origin := .local temporaryScope { node, port := 0 }
     lower := Int.ofNat lower
     upper := Int.ofNat upper
-    lowerExpression := .closedInt (.constant (Int.ofNat lower))
-    upperExpression := .closedInt (.constant (Int.ofNat upper))
+    lowerExpression := .closed (.closedInt (.constant (Int.ofNat lower)))
+    upperExpression := .closed (.closedInt (.constant (Int.ofNat upper)))
   }
 
 /-- Direct packing consumes only the explicit coefficient-family binder.  The residual direct
@@ -4459,12 +4411,12 @@ private def nestedDirectPackContextFixture : Bool :=
     let secondMap ← match closedStaticIndexMap [] expression.context inner 1 with
       | some map => pure map
       | none => throw (OperationalError.unsupportedOperationalExpr 785)
-    let (arena, first) ← arena.reindexDirectMatrixFact firstMap expression
-    let (arena, second) ← arena.reindexDirectMatrixFact secondMap expression
+    let (arena, first) ← arena.reindexDirectFact firstMap expression
+    let (arena, second) ← arena.reindexDirectFact secondMap expression
     let firstEntries ← arena.reducedDirectValueFactsAt [] first
     let secondEntries ← arena.reducedDirectValueFactsAt [] second
     let subtract : PrimitiveOperation := {
-      kind := .add true, outputType := fixtureType, ownerScope := none, ownerNode := 786,
+      kind := .add true, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 786,
       outputPort := 0, parameterEnvironment := [] }
     let (arena, residual) ← arena.pushDirectMatrixPointwise subtract first second
     let residualEntries ← arena.reducedDirectValueFactsAt [] residual
@@ -4572,7 +4524,7 @@ private def reducedPointwiseCorrelationFixture : Bool :=
       storage := .explicitTable
     }
     let operation : PrimitiveOperation := {
-      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1400,
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 1400,
       outputPort := 0, parameterEnvironment := [] }
     let (arena, output) ← arena.pushDirectMatrixPointwise operation left right
     let reduced ← arena.reducedDirectValueFactsAt [] output
@@ -4642,39 +4594,41 @@ private def reducedMappedDirectFixture : Bool :=
     let (arena, expression, binder) ← reducerExactTable 1600 3 4
     let staticMap ← match closedStaticIndexMap [] expression.context binder 1 with
       | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1600)
-    let (arena, staticOutput) ← arena.reindexDirectMatrixFact staticMap expression
+    let (arena, staticOutput) ← arena.reindexDirectFact staticMap expression
     let staticEntries ← arena.reducedDirectValueFactsAt [] staticOutput
     let selector := { directCarrierFixtureBinder 1700 with count := .constant 3 }
     let dynamicMap ← match dynamicIndexMap expression.context binder
         (IndexExpr.variable selector) with
       | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1601)
-    let (arena, dynamicOutput) ← arena.reindexDirectMatrixFact dynamicMap expression
+    let (arena, dynamicOutput) ← arena.reindexDirectFact dynamicMap expression
     let dynamicEntries ← arena.reducedDirectValueFactsAt [] dynamicOutput
     let offsetSelector := { directCarrierFixtureBinder 1701 with count := .constant 2 }
     let offsetMap ← match dynamicIndexMap expression.context binder
         (IndexExpr.offset (IndexExpr.variable offsetSelector) 1) with
       | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1602)
-    let (arena, offsetOutput) ← arena.reindexDirectMatrixFact offsetMap expression
+    let (arena, offsetOutput) ← arena.reindexDirectFact offsetMap expression
     let offsetEntries ← arena.reducedDirectValueFactsAt [] offsetOutput
     let gatherPosition := { directCarrierFixtureBinder 1702 with count := .constant 4 }
+    let arena ← registerOperationalFixtureGather arena 1702 gatherPosition [0, 1, 2, 0]
     let gathered := operationalFixtureGather 1702 (IndexExpr.variable selector)
       (IndexExpr.variable gatherPosition)
     let gatherMap ← match dynamicIndexMap expression.context binder gathered with
       | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1603)
-    let (arena, gatherOutput) ← arena.reindexDirectMatrixFact gatherMap expression
+    let (arena, gatherOutput) ← arena.reindexDirectFact gatherMap expression
     let gatherEntries ← arena.reducedDirectValueFactsAt [] gatherOutput
     let (arena, gatherPointwise) ← arena.pushDirectMatrixPointwise {
-      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1604,
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 1604,
       outputPort := 0, parameterEnvironment := [] } gatherOutput gatherOutput
     let gatherPointwiseEntries ← arena.reducedDirectValueFactsAt [] gatherPointwise
     let distinctPosition := { directCarrierFixtureBinder 1703 with count := .constant 4 }
+    let arena ← registerOperationalFixtureGather arena 1703 distinctPosition [0, 1, 2, 0]
     let distinctGathered :=
       operationalFixtureGather 1703 (IndexExpr.variable selector) (IndexExpr.variable distinctPosition)
     let distinctGatherMap ← match dynamicIndexMap expression.context binder distinctGathered with
       | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 1605)
-    let (arena, distinctGatherOutput) ← arena.reindexDirectMatrixFact distinctGatherMap expression
+    let (arena, distinctGatherOutput) ← arena.reindexDirectFact distinctGatherMap expression
     let (arena, rejectedGatherPointwise) ← arena.pushDirectMatrixPointwise {
-      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1606,
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 1606,
       outputPort := 0, parameterEnvironment := [] } gatherOutput distinctGatherOutput
     let rejectedGatherResult := arena.reducedDirectValueFactsAt [] rejectedGatherPointwise
     pure (staticEntries.map (fun (entry : ReducedDirectMatrixFact) =>
@@ -4685,10 +4639,12 @@ private def reducedMappedDirectFixture : Bool :=
         (some (IndexExpr.variable selector), 2)] &&
       offsetEntries.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
         (some (IndexExpr.variable offsetSelector), 0), (some (IndexExpr.variable offsetSelector), 1)] &&
-      gatherEntries.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
-        (some gathered, 0), (some gathered, 1), (some gathered, 2)] &&
-      gatherPointwiseEntries.map (fun (entry : ReducedDirectMatrixFact) => (entry.key, entry.ordinal)) == [
-        (some gathered, 0), (some gathered, 1), (some gathered, 2)] &&
+      gatherEntries.length == 4 && gatherEntries.all (fun entry =>
+        entry.correlation.any (fun assignment => assignment.1 == gathered) &&
+          entry.correlation.any (fun assignment => assignment.1 == IndexExpr.variable gatherPosition)) &&
+      gatherPointwiseEntries.length == 4 && gatherPointwiseEntries.all (fun entry =>
+        entry.correlation.any (fun assignment => assignment.1 == gathered) &&
+          entry.correlation.any (fun assignment => assignment.1 == IndexExpr.variable gatherPosition)) &&
       match rejectedGatherResult with
       | .error (.unsupportedOperationalExpr _) => true
       | _ => false)) with
@@ -4698,6 +4654,97 @@ private def reducedMappedDirectFixture : Bool :=
 example : reducedSharedLogicalCountsFixture = true := by native_decide
 example : reducedExplicitTableFixture = true := by native_decide
 example : reducedPointwiseCorrelationFixture = true := by native_decide
+
+/-- A gather over a mapped executable integer table keeps the runtime position separate from the
+physical base-table lane.  The offset map selects physical lanes one and two at positions zero
+and one; the repeated value at lane zero must not introduce a second position-zero alternative.
+Distinct gather owners with identical slots and counts remain independent. -/
+private def mappedGatherPhysicalLaneFixture : Bool :=
+  match (do
+    let (arena, source, sourceBinder) ← reducerExactTable 6300 3 4
+    let position := { directCarrierFixtureBinder 6301 with count := .constant 2 }
+    let base := { directCarrierFixtureBinder 6302 with count := .constant 3 }
+    let baseContext : IndexContext := { binders := #[base] }
+    let initial : FixedOperationalPayloadArena × Array FixedOperationalPayloadRef :=
+      (arena.direct.fixed, #[])
+    let (fixed, references) ← ([1, 1, 2] : List Int).foldlM
+      (fun (state : FixedOperationalPayloadArena × Array FixedOperationalPayloadRef) selected => do
+      let fixed : FixedOperationalPayloadArena := state.1
+      let references : Array FixedOperationalPayloadRef := state.2
+      let fact : OperationalScalarFact := .integer {
+        subject := { node := 6303, port := references.size }
+        origin := .local temporaryScope { node := 6303, port := references.size }
+        lower := selected
+        upper := selected
+        lowerExpression := .closed (.closedInt (.constant selected))
+        upperExpression := .closed (.closedInt (.constant selected)) }
+      let (fixed, reference) := fixed.pushScalar fact
+      pure (fixed, references.push reference)) initial
+    let direct := { arena.direct with fixed }
+    let (direct, producerRoot) ← match direct.pushExplicit [] baseContext base (.scalar .integer) references with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 6303)
+    let arena : OperationalExprArena := { arena with direct }
+    let producer : IndexedOperationalFact := {
+      context := baseContext, payload := .directValue producerRoot, storage := .explicitTable }
+    let producerMap ← match dynamicIndexMap baseContext base (.offset (.variable position) 1) with
+      | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 6304)
+    let (arena, mappedProducer) ← arena.reindexDirectFact producerMap producer
+    let direct ← match arena.direct.registerGatherIntegerRoot (operationalGatherFixtureOwner 6305)
+        mappedProducer.payload.root with
+      | some direct => pure direct | none => throw (OperationalError.unsupportedOperationalExpr 6305)
+    let direct ← match direct.registerGatherIntegerRoot (operationalGatherFixtureOwner 6306)
+        mappedProducer.payload.root with
+      | some direct => pure direct | none => throw (OperationalError.unsupportedOperationalExpr 6306)
+    let arena : OperationalExprArena := { arena with direct }
+    let gathered := operationalFixtureGather 6305 (.constant 3) (.variable position)
+    let gatherMap ← match dynamicIndexMap source.context sourceBinder gathered with
+      | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 6305)
+    let (arena, selected) ← arena.reindexDirectFact gatherMap source
+    let reduced ← arena.reducedDirectValueFactsAt [] selected
+    let p0 ← arena.direct.matrixFactAt [] [(.variable position, 0)] selected.payload.root
+      (arena.direct.values.size + 1)
+    let p1 ← arena.direct.matrixFactAt [] [(.variable position, 1)] selected.payload.root
+      (arena.direct.values.size + 1)
+    let probe : OperationalScalarFact := .integer {
+      subject := { node := 6305, port := 1 }
+      origin := .local temporaryScope { node := 6305, port := 1 }
+      lower := 0
+      upper := 2
+      lowerExpression := .closedInt (.index gathered)
+      upperExpression := .closedInt (.index gathered) }
+    let probe0 ← arena.direct.materializeScalarFact [] { binders := #[position] }
+      [(.variable position, 0)] probe
+    let probe1 ← arena.direct.materializeScalarFact [] { binders := #[position] }
+      [(.variable position, 1)] probe
+    let foreignGathered := operationalFixtureGather 6306 (.constant 3) (.variable position)
+    let foreignMap ← match dynamicIndexMap source.context sourceBinder foreignGathered with
+      | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 6306)
+    let (arena, foreignSelected) ← arena.reindexDirectFact foreignMap source
+    let operation : PrimitiveOperation := {
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType,
+      ownerScope := none, ownerNode := 6307, outputPort := 0, parameterEnvironment := [] }
+    let (arena, joined) ← arena.pushDirectMatrixPointwise operation selected foreignSelected
+    let rejected := arena.reducedDirectValueFactsAt [] joined
+    let reducedOk := reduced.map (fun (entry : ReducedDirectMatrixFact) =>
+        (entry.fact.subject.node, entry.correlation)) == [
+      (6302, [(gathered, 1), (.variable position, 0), (.offset (.variable position) 1, 1)]),
+      (6303, [(gathered, 2), (.variable position, 1), (.offset (.variable position) 1, 2)])]
+    let materializedOk := match probe0, probe1 with
+      | .integer first, .integer second =>
+          first.lowerExpression == IndexedOperationalBoundExpr.closed (.closedInt (.constant 1)) &&
+            first.upperExpression == IndexedOperationalBoundExpr.closed (.closedInt (.constant 1)) &&
+            second.lowerExpression == IndexedOperationalBoundExpr.closed (.closedInt (.constant 2)) &&
+            second.upperExpression == IndexedOperationalBoundExpr.closed (.closedInt (.constant 2))
+      | _, _ => false
+    let rejectedOk := match rejected with
+      | .error (.unsupportedOperationalExpr _) => true
+      | _ => false
+    pure (reducedOk && p0.subject.node == 6302 && p1.subject.node == 6303 && materializedOk && rejectedOk)) with
+  | .ok value => value
+  | .error _ => false
+
+example : mappedGatherPhysicalLaneFixture = true := by native_decide
 
 /-- Nested direct tables retain both independent physical assignments.  Reusing the nested
 table in a pointwise primitive zips exact composite environments rather than expanding them. -/
@@ -4713,7 +4760,7 @@ private def reducedNestedExplicitValuesCorrelationFixture : Bool :=
       context := { binders := #[inner, outer] }, payload := .directValue root, storage := .explicitTable }
     let entries ← arena.reducedDirectValueFactsAt [] nested
     let (arena, pointwise) ← arena.pushDirectMatrixPointwise {
-      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1552,
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 1552,
       outputPort := 0, parameterEnvironment := [] } nested nested
     let zipped ← arena.reducedDirectValueFactsAt [] pointwise
     pure (entries.map (fun (entry : ReducedDirectMatrixFact) => entry.correlation) == [
@@ -4801,7 +4848,7 @@ private def directIntermediatePolynomialWidthFixture : Bool :=
     let secondFact : IndexedOperationalFact := {
       context := emptyContext, payload := .directValue secondRoot, storage := .sharedTemplate }
     let add : PrimitiveOperation := {
-      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1762,
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 1762,
       outputPort := 0, parameterEnvironment := [] }
     let subtract : PrimitiveOperation := { add with kind := .add true, ownerNode := 1763 }
     let (arena, child) ← arena.pushDirectMatrixPointwise add firstFact secondFact
@@ -4834,7 +4881,7 @@ private def explicitValuesIntermediatePolynomialWidthFixture : Bool :=
     let secondFact : IndexedOperationalFact := {
       context := emptyContext, payload := .directValue secondRoot, storage := .sharedTemplate }
     let add : PrimitiveOperation := {
-      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 1772,
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 1772,
       outputPort := 0, parameterEnvironment := [] }
     let subtract : PrimitiveOperation := { add with kind := .add true, ownerNode := 1773 }
     let (arena, child) ← arena.pushDirectMatrixPointwise add firstFact secondFact
@@ -4876,7 +4923,7 @@ private def residualLargeSingleAndMixedFixture : Bool :=
     let largeResidual : OperationalFact := {
       context := emptyContext, payload := .directValue largeRoot, storage := .sharedTemplate }
     let operation : PrimitiveOperation := {
-      kind := .add false, outputType := fixtureType, ownerScope := none,
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none,
       ownerNode := 5003, outputPort := 0, parameterEnvironment := [] }
     let (arena, mixedResidual) ← arena.pushDirectMatrixPointwise operation largeResidual {
       context := emptyContext, payload := .directValue boundedRoot, storage := .sharedTemplate }
@@ -4920,7 +4967,7 @@ private def residualLargeCancellationFixture : Bool :=
     let input : OperationalFact := {
       context := emptyContext, payload := .directValue root, storage := .sharedTemplate }
     let operation : PrimitiveOperation := {
-      kind := .add true, outputType := fixtureType, ownerScope := none,
+      kind := .add true, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none,
       ownerNode := 5042, outputPort := 0, parameterEnvironment := [] }
     let (arena, residual) ← arena.pushDirectMatrixPointwise operation input input
     pure (operationalNoiseBoundForFact arena residual [])) with
@@ -4969,16 +5016,16 @@ private def contextualCutoffFixture : Bool :=
 private def directContextualCutoffFixture : Bool :=
   let trapdoor : OperationalTrapdoorFact := match fixtureTrapdoorFact with
     | .trapdoor fact => { fact with
-        preimageCutoff := some (.contextual .maximum [] [] (.constant 3)) }
+        preimageCutoff := some (.closed (.contextual .maximum [] [] (.constant 3))) }
     | _ => {
         subject := { node := 0, port := 1 }, matrixType := fixtureType, matrixParams := fixtureParams,
         sigma := .rational 1, gadgetBase := .constant 2, digitCount := .constant 1,
         preimageMaxCoefficientBound := .constant 3,
-        maximum := .closedInt (.constant 3),
-        preimageCutoff := some (.contextual .maximum [] [] (.constant 3)),
+        maximum := .closed (.closedInt (.constant 3)),
+        preimageCutoff := some (.closed (.contextual .maximum [] [] (.constant 3))),
         publicIdentity := fixtureSampledIdentity }
   let operation (cutoff : IntExpr) : DirectRelationOperation := {
-    kind := .preimage cutoff [], outputType := fixtureType, ownerScope := none,
+    kind := .preimage (.ir cutoff) [], outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none,
     ownerNode := 5110, outputPort := 0, parameterEnvironment := [] }
   let target := boundedOperationalExprFixtureFact 5111 2
   match applyDirectRelationProducer (operation (.constant 3)) fixtureType
@@ -5019,7 +5066,7 @@ private def directIndexedTrapdoorCutoffFixture : Bool :=
     let binder := { directCarrierFixtureBinder 5116 with count := .constant 2 }
     let trapdoor (cutoff : Int) : OperationalScalarFact := match fixtureTrapdoorFact with
       | .trapdoor fact => .trapdoor { fact with
-          preimageCutoff := some (.contextual .maximum [] [] (.constant cutoff)) }
+          preimageCutoff := some (.closed (.contextual .maximum [] [] (.constant cutoff))) }
       | fact => fact
     let target := boundedOperationalExprFixtureFact 5117 2
     let (fixed, publicRef) := ({} : FixedOperationalPayloadArena).pushMatrix fixturePublicMatrixFact
@@ -5043,7 +5090,7 @@ private def directIndexedTrapdoorCutoffFixture : Bool :=
     let wrap (value : OperationalIndexedValueId) : OperationalFact := {
       context := { binders := #[binder] }, payload := .directValue value, storage := .explicitTable }
     let operation : DirectRelationOperation := {
-      kind := .preimage (.constant 3) [], outputType := fixtureType, ownerScope := none,
+      kind := .preimage (.ir (.constant 3)) [], outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none,
       ownerNode := 5119, outputPort := 0, parameterEnvironment := [] }
     let (arena, output) ← arena.pushDirectRelationPointwise operation
       #[wrap publicValue, wrap trapdoorValue, wrap targetValue]
@@ -5063,16 +5110,36 @@ private def parallelLoopScopeOwnedIdentityFixture : Bool :=
   let root : ScopeTemplateKey := .root (.standalone 91)
   let sameInput := parallelLoopLaneSelection root 40 0 (.constant 3)
   let sameOutput := parallelLoopLaneSelection root 40 0 (.constant 3)
-  let nested := parallelLoopLaneSelection (.parallelBody root 40) 40 0 (.constant 3)
-  let sibling := parallelLoopLaneSelection root 41 0 (.constant 3)
-  match parallelLoopLaneBinder root 40 0 (.constant 3),
-      parallelLoopLaneBinder (.parallelBody root 40) 40 0 (.constant 3) with
-  | .ok sameBinder, .ok nestedBinder =>
-      sameInput.expression == sameOutput.expression && sameInput.expression != nested.expression &&
-        sameInput.expression != sibling.expression && sameBinder != nestedBinder
-  | _, _ => false
+  let innerInput := parallelLoopLaneSelection (.parallelBody root 40) 41 1 (.constant 3)
+  let innerOutput := parallelLoopLaneSelection (.parallelBody root 40) 41 1 (.constant 3)
+  match sameInput.expression, sameOutput.expression, innerInput.expression, innerOutput.expression with
+  | .variable outerInput, .variable outerOutput, .variable innerInput, .variable innerOutput =>
+      outerInput.slot == 0 && outerInput == outerOutput && innerInput.slot == 1 &&
+        innerInput == innerOutput && innerInput != outerInput
+  | _, _, _, _ => false
 
 example : parallelLoopScopeOwnedIdentityFixture = true := by native_decide
+
+/-- Two source coordinates can be intentionally coalesced by one validated map.  Reindexing
+must retain exactly one equal destination binding/domain and reject a conflicting binding. -/
+private def reindexCoalescedDestinationFixture : Bool :=
+  let left := { directCarrierFixtureBinder 6190 with slot := 0, count := .constant 2 }
+  let right := { directCarrierFixtureBinder 6191 with slot := 1, count := .constant 2 }
+  let destination := { directCarrierFixtureBinder 6192 with slot := 2, count := .constant 2 }
+  let map : IndexMap := {
+    source := { binders := #[left, right] }
+    destination := { binders := #[destination] }
+    assignments := #[.variable destination, .variable destination]
+  }
+  let equalEnvironment : ParamEnvironment := [(.loopIndex 0, .integer 1), (.loopIndex 1, .integer 1)]
+  let conflictingEnvironment : ParamEnvironment :=
+    [(.loopIndex 0, .integer 1), (.loopIndex 1, .integer 0)]
+  map.transportValid &&
+    reindexParamEnvironment map equalEnvironment == some [(.loopIndex 2, .integer 1)] &&
+    reindexParamEnvironment map conflictingEnvironment == none &&
+    reindexParameterDomains [] map [.loopIndex 0 2, .loopIndex 1 2] == some [.loopIndex 2 2]
+
+example : reindexCoalescedDestinationFixture = true := by native_decide
 
 /-- Actual scalar `ParallelLoop` lowering: an integer family is zipped, one integer is
 broadcast, and the body adds them through `DirectScalarOperation`.  The output remains a direct
@@ -5140,6 +5207,91 @@ private def directScalarParallelFixture : Except OperationalError Bool := do
 
 example : directScalarParallelFixture = .ok true := by native_decide
 
+/-- A zipped scalar selector remains an integer direct carrier across a parallel-loop boundary,
+then drives a selected matrix family and its dynamic lane access in the same nested body.  This
+matches Tall's `Family::select(chunk, chunks).get(offset)` shape. -/
+private def nestedScalarSelectGetBody : Scope := {
+  nodes := #[
+    { kind := .input "chunk", arguments := [], outputTypes := [.integer] },
+    { kind := .input "offset", arguments := [], outputTypes := [.integer] },
+    { kind := .input "left", arguments := [], outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+    { kind := .input "right", arguments := [], outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+    { kind := .select, arguments := [{ node := 0, port := 0 }, { node := 2, port := 0 },
+      { node := 3, port := 0 }], outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+    { kind := .familyGetDynamic, arguments := [{ node := 4, port := 0 }, { node := 1, port := 0 }],
+      outputTypes := [.matrix fixtureType] }
+  ]
+  outputs := [("result", { node := 5, port := 0 })]
+  inputNames := ["chunk", "offset", "left", "right"]
+}
+
+private def nestedScalarSelectGetProgram : Prog := {
+  root := {
+    nodes := #[
+      { kind := .constantInt 0, arguments := [], outputTypes := [.integer] },
+      { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
+      { kind := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }],
+        outputTypes := [.indexedFamily .integer (.constant 2)] },
+      { kind := .constantInt 1, arguments := [], outputTypes := [.integer] },
+      { kind := .constantInt 0, arguments := [], outputTypes := [.integer] },
+      { kind := .familyPack, arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }],
+        outputTypes := [.indexedFamily .integer (.constant 2)] },
+      { kind := .gaussianSample fixtureType (.constant 2), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 3), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .familyPack, arguments := [{ node := 6, port := 0 }, { node := 7, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+      { kind := .gaussianSample fixtureType (.constant 5), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .gaussianSample fixtureType (.constant 7), arguments := [], outputTypes := [.matrix fixtureType] },
+      { kind := .familyPack, arguments := [{ node := 9, port := 0 }, { node := 10, port := 0 }],
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] },
+      { kind := .parallelLoop "nested-select-get" (.constant 2) 0 [] [.zip, .zip, .broadcast, .broadcast],
+        arguments := [{ node := 2, port := 0 }, { node := 5, port := 0 }, { node := 8, port := 0 },
+          { node := 11, port := 0 }], outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)] }
+    ]
+    outputs := [("result", { node := 12, port := 0 })]
+    inputNames := []
+  }
+  definitions := [("nested-select-get", nestedScalarSelectGetBody)]
+}
+
+private def nestedScalarSelectGetDerivation : ProgramDerivation := {
+  root := { steps := #[
+    { sourceNode := 0, rule := .constantInt, arguments := [] },
+    { sourceNode := 1, rule := .constantInt, arguments := [] },
+    { sourceNode := 2, rule := .familyPack, arguments := [{ node := 0, port := 0 }, { node := 1, port := 0 }] },
+    { sourceNode := 3, rule := .constantInt, arguments := [] },
+    { sourceNode := 4, rule := .constantInt, arguments := [] },
+    { sourceNode := 5, rule := .familyPack, arguments := [{ node := 3, port := 0 }, { node := 4, port := 0 }] },
+    { sourceNode := 6, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 7, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 8, rule := .familyPack, arguments := [{ node := 6, port := 0 }, { node := 7, port := 0 }] },
+    { sourceNode := 9, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 10, rule := .gaussianSample, arguments := [] },
+    { sourceNode := 11, rule := .familyPack, arguments := [{ node := 9, port := 0 }, { node := 10, port := 0 }] },
+    { sourceNode := 12, rule := .parallelLoop, arguments := [{ node := 2, port := 0 }, { node := 5, port := 0 },
+      { node := 8, port := 0 }, { node := 11, port := 0 }] }
+  ] }
+  definitions := [("nested-select-get", { steps := #[
+    { sourceNode := 0, rule := .input, arguments := [] },
+    { sourceNode := 1, rule := .input, arguments := [] },
+    { sourceNode := 2, rule := .input, arguments := [] },
+    { sourceNode := 3, rule := .input, arguments := [] },
+    { sourceNode := 4, rule := .select, arguments := [{ node := 0, port := 0 }, { node := 2, port := 0 },
+      { node := 3, port := 0 }] },
+    { sourceNode := 5, rule := .familyGetDynamic, arguments := [{ node := 4, port := 0 }, { node := 1, port := 0 }] }
+  ] })]
+}
+
+private def nestedScalarSelectGetFixture : Except OperationalError Bool := do
+  let facts ← evaluateProgramOperationalWithLayouts nestedScalarSelectGetProgram
+    nestedScalarSelectGetDerivation [] []
+  let output ← lookupFact 13 facts { node := 12, port := 0 }
+  let entries ← facts.arena.reducedDirectValueFactsAt [] output
+  let maxima ← entries.mapM fun entry => entry.fact.evaluateNoiseHardBound []
+  pure (maxima == [3, 5])
+
+example : nestedScalarSelectGetFixture = .ok true := by native_decide
+
 /-- Node-level noise telemetry dispatches direct values by their schema: matrix ports contribute
 their residual bound, while scalar ports at the same node are intentionally not decoder residuals. -/
 private def mixedDirectNodeNoiseFixture : Except OperationalError Bool := do
@@ -5176,7 +5328,7 @@ private def directEndpointNoiseMaximumFixture : Bool :=
     let wrap root : OperationalFact := {
       context := { binders := #[binder] }, payload := .directValue root, storage := .explicitTable }
     let operation : PrimitiveOperation := {
-      kind := .add false, outputType := fixtureType, ownerScope := none, ownerNode := 6205,
+      kind := .add false, outputType := .fromIr fixtureType, outputSchema := fixtureType, ownerScope := none, ownerNode := 6205,
       outputPort := 0, parameterEnvironment := [] }
     let (arena, summed) ← arena.pushDirectMatrixPointwise operation (wrap leftRoot) (wrap rightRoot)
     let lanes ← arena.reducedDirectValueFactsAt [] summed
@@ -5216,7 +5368,7 @@ private def directScalarZipOffsetFixture : Bool :=
         (.offset (.variable selector) 1) with
       | some value => pure value
       | none => throw (OperationalError.unsupportedOperationalExpr 6210)
-    let (arena, mapped) ← arena.reindexDirectMatrixFact map source
+    let (arena, mapped) ← arena.reindexDirectFact map source
     let root := mapped.payload.root
     let first ← arena.direct.scalarFactAt [] [(.variable selector, 0)] root
       (arena.direct.values.size + 1)
@@ -5293,7 +5445,7 @@ private def directBooleanToIntStaticFixture : Bool :=
     let map ← match closedStaticIndexMap [] mapped.context binder 1 with
       | some value => pure value
       | none => throw (OperationalError.unsupportedOperationalExpr 6241)
-    let (arena, selected) ← arena.reindexDirectMatrixFact map mapped
+    let (arena, selected) ← arena.reindexDirectFact map mapped
     let root := selected.payload.root
     let fact ← arena.direct.scalarFactAt [] [] root (arena.direct.values.size + 1)
     pure (selected.context == emptyContext && (match fact with
@@ -5310,8 +5462,8 @@ private def directScalarLoopIndexStaticFixture : Bool :=
     let binder := { directCarrierFixtureBinder 6250 with count := .constant 2 }
     let scalar : OperationalScalarFact := .integer {
       subject := { node := 6251, port := 0 }, origin := .local temporaryScope { node := 6251, port := 0 },
-      lower := 0, upper := 1, lowerExpression := .closedInt (.loopIndex binder.slot),
-      upperExpression := .closedInt (.loopIndex binder.slot) }
+      lower := 0, upper := 1, lowerExpression := .closedInt (.index (.variable binder)),
+      upperExpression := .closedInt (.index (.variable binder)) }
     let (fixed, first) := ({} : FixedOperationalPayloadArena).pushScalar scalar
     let (fixed, second) := fixed.pushScalar scalar
     let direct : DirectOperationalIndexedArena := { fixed }
@@ -5324,14 +5476,220 @@ private def directScalarLoopIndexStaticFixture : Bool :=
     let map ← match closedStaticIndexMap [] source.context binder 1 with
       | some value => pure value
       | none => throw (OperationalError.unsupportedOperationalExpr 6250)
-    let (arena, selected) ← arena.reindexDirectMatrixFact map source
+    let (arena, selected) ← arena.reindexDirectFact map source
     let root := selected.payload.root
-    match ← arena.direct.scalarFactAt [] [] root (arena.direct.values.size + 1) with
-    | .integer fact => pure (fact.lowerExpression == OperationalBoundExpr.closedInt (.constant 1) &&
-        fact.upperExpression == OperationalBoundExpr.closedInt (.constant 1))
+    match ← arena.direct.materializedScalarFactAt [] [] root (arena.direct.values.size + 1) with
+    | .integer fact => pure (fact.lowerExpression == IndexedOperationalBoundExpr.closed
+          (.closedInt (.constant 1)) &&
+        fact.upperExpression == IndexedOperationalBoundExpr.closed (.closedInt (.constant 1)))
     | _ => pure false) with
   | .ok value => value
   | .error _ => false
+
+/-- A scalar cutoff/interval descriptor may depend on a gathered executable index.  The direct
+materialization boundary resolves that gather through its registered integer producer and closes
+the bound at the selected position; no slot-only lowering is involved. -/
+private def directGatherBoundMaterializationFixture : Bool :=
+  match (do
+    let position := { directCarrierFixtureBinder 6253 with count := .constant 2 }
+    let context : IndexContext := { binders := #[position] }
+    let gathered := operationalFixtureGather 6254 (.constant 3) (.variable position)
+    let scalar : OperationalScalarFact := .integer {
+      subject := { node := 6254, port := 0 }, origin := .local temporaryScope { node := 6254, port := 0 },
+      lower := 0, upper := 3,
+      lowerExpression := .closedInt (.index gathered), upperExpression := .closedInt (.index gathered) }
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushScalar scalar
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, root) ← match direct.pushShared context (.scalar .integer) reference with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6254)
+    let arena : OperationalExprArena := { direct }
+    let arena ← registerOperationalFixtureGather arena 6254 position [1, 2]
+    let lift : DirectValueMatrixOperation := {
+      kind := .liftIntegerToConstantPolynomial fixtureType, ownerScope := none, ownerNode := 6254,
+      outputPort := 1, parameterEnvironment := [] }
+    let (liftDirect, lifted) ← match arena.direct.pushPointwise (.matrixFromScalar lift) #[root] with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6254)
+    let lifted ← liftDirect.matrixFactAt [] [(.variable position, 1)] lifted
+      (liftDirect.values.size + 1)
+    let scalarOperation : DirectScalarOperation := {
+      kind := .intBinary .add, ownerScope := none, ownerNode := 6254, outputPort := 2,
+      }
+    let (scalarDirect, scalarOutput) ← match arena.direct.pushPointwise (.scalar scalarOperation) #[root, root] with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6254)
+    let scalarOutput ← scalarDirect.scalarFactAt [] [(.variable position, 1)] scalarOutput
+      (scalarDirect.values.size + 1)
+    match ← arena.direct.materializedScalarFactAt [] [(.variable position, 1)] root
+        (arena.direct.values.size + 1) with
+    | .integer fact => pure (fact.lowerExpression == IndexedOperationalBoundExpr.closed
+          (.closedInt (.constant 2)) &&
+        fact.upperExpression == IndexedOperationalBoundExpr.closed (.closedInt (.constant 2)) &&
+        lifted.totalHardBound == OperationalBoundExpr.minimum (.closedInt (.constant 8))
+          (.maximum (.negate (.closedInt (.constant 2))) (.closedInt (.constant 2))) &&
+        match scalarOutput with
+        | .integer scalar => scalar.lower == 0 && scalar.upper == 6 &&
+            scalar.lowerExpression == IndexedOperationalBoundExpr.closed
+              (.add (.closedInt (.constant 2)) (.closedInt (.constant 2))) &&
+            scalar.upperExpression == IndexedOperationalBoundExpr.closed
+              (.add (.closedInt (.constant 2)) (.closedInt (.constant 2)))
+        | _ => false)
+    | _ => pure false) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Gathered trapdoor cutoffs are materialized before the direct preimage relation compares its
+declared cutoff.  The positive lane agrees exactly and the adjacent declared cutoff is rejected. -/
+private def directGatherTrapdoorCutoffFixture : Bool :=
+  match (do
+    let position := { directCarrierFixtureBinder 6254 with count := .constant 2 }
+    let context : IndexContext := { binders := #[position] }
+    let gathered := operationalFixtureGather 6255 (.constant 3) (.variable position)
+    let trapdoor : OperationalScalarFact := match fixtureTrapdoorFact with
+      | .trapdoor fact => .trapdoor { fact with
+          maximum := .closedInt (.index gathered), preimageCutoff := some (.closedInt (.index gathered)) }
+      | _ => fixtureTrapdoorFact
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushScalar trapdoor
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let schema := OperationalIndexedPayloadSchema.scalar (.trapdoor fixtureType (RealExpr.rational 1)
+      (.constant 2) (.constant 1) (.constant 3))
+    let (direct, root) ← match direct.pushShared context schema reference with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6255)
+    let arena : OperationalExprArena := { direct }
+    let arena ← registerOperationalFixtureGather arena 6255 position [1, 2]
+    let (fixed, publicReference) := arena.direct.fixed.pushMatrix fixturePublicMatrixFact
+    let (fixed, targetReference) := fixed.pushMatrix (boundedOperationalExprFixtureFact 6256 2)
+    let direct := { arena.direct with fixed }
+    let (direct, publicValue) ← match direct.pushShared context (.matrix fixtureType) publicReference with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6255)
+    let (direct, target) ← match direct.pushShared context (.matrix fixtureType) targetReference with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6255)
+    let rawOperation : DirectRelationOperation := {
+      kind := .preimage (.ir (.constant 2)) [], outputType := .fromIr fixtureType,
+      outputSchema := fixtureType, ownerScope := none, ownerNode := 6255, outputPort := 1,
+      parameterEnvironment := [] }
+    let (direct, rawOutput) ← match direct.pushPointwise (.relation rawOperation) #[publicValue, root, target] with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6255)
+    let rawOutput ← direct.matrixFactAt [] [(.variable position, 1)] rawOutput (direct.values.size + 1)
+    let trapdoor ← arena.direct.materializedScalarFactAt [] [(.variable position, 1)] root
+      (arena.direct.values.size + 1)
+    let trapdoor ← match trapdoor with
+      | .trapdoor fact => pure fact | _ => throw (OperationalError.unsupportedOperationalExpr 6255)
+    let operation (cutoff : Int) : DirectRelationOperation := {
+      kind := .preimage (.ir (.constant cutoff)) [], outputType := .fromIr fixtureType,
+      outputSchema := fixtureType, ownerScope := none, ownerNode := 6255, outputPort := 0,
+      parameterEnvironment := [] }
+    let target := boundedOperationalExprFixtureFact 6256 2
+    match applyDirectRelationProducer (operation 2) fixtureType
+        #[.matrix fixturePublicMatrixFact, .trapdoor trapdoor, .matrix target],
+        applyDirectRelationProducer (operation 1) fixtureType
+          #[.matrix fixturePublicMatrixFact, .trapdoor trapdoor, .matrix target] with
+    | .ok _, .error (.preimageCutoffMismatch 6255) =>
+        pure (rawOutput.subject == ({ node := 6255, port := 1 } : WireRef))
+    | _, _ => pure false) with
+  | .ok value => value
+  | .error _ => false
+
+/-- Reindexing a scalar lane transports contextual bounds through symbolic source and destination
+binders after closing both declared counts in the request environment.  A constant bound and local
+origin do not require an unrelated source coordinate; unresolved, mismatched, out-of-range, and
+foreign loop coordinates remain rejected. -/
+private def symbolicScalarReindexDomainFixture : Bool :=
+  let source := { directCarrierFixtureBinder 6255 with count := .parameter "source_count" }
+  let destination := { directCarrierFixtureBinder 6256 with count := .parameter "destination_count" }
+  let sourceContext : IndexContext := { binders := #[source] }
+  let environment : ParamEnvironment := [
+    ("source_count", .integer 2), ("destination_count", .integer 2)]
+  let mismatchEnvironment : ParamEnvironment := [
+    ("source_count", .integer 2), ("destination_count", .integer 3)]
+  let origin : OperationalValueOrigin := .local temporaryScope { node := 6257, port := 0 }
+  let scalar : OperationalScalarFact := .integer {
+    subject := { node := 6257, port := 0 }, origin,
+    lower := 7, upper := 7,
+    lowerExpression := .contextual .maximum [] [.loopIndex source] (.ir (.constant 7)),
+    upperExpression := .contextual .maximum [] [.loopIndex source] (.ir (.constant 7)) }
+  let independent : OperationalScalarFact := .integer {
+    subject := { node := 6257, port := 1 }, origin,
+    lower := 7, upper := 7,
+    lowerExpression := .closedInt (.ir (.constant 7)), upperExpression := .closedInt (.ir (.constant 7)) }
+  let foreign : OperationalScalarFact := .integer {
+    subject := { node := 6258, port := 0 }, origin,
+    lower := 0, upper := 0,
+    lowerExpression := .closedInt (.index (.variable { source with slot := source.slot + 1 })),
+    upperExpression := .closedInt (.ir (.constant 0)) }
+  match closedDynamicIndexMap environment sourceContext source (.variable destination) with
+  | none => false
+  | some map =>
+      let transported := match reindexOperationalScalarFact environment map scalar with
+        | some (.integer fact) =>
+            fact.origin == origin && match fact.lowerExpression, fact.upperExpression with
+              | .contextual .maximum _ [.loopIndex lowerBinder] (.ir (.constant 7)),
+                .contextual .maximum _ [.loopIndex upperBinder] (.ir (.constant 7)) =>
+                  lowerBinder == destination && upperBinder == destination
+              | _, _ => false
+        | _ => false
+      let independentTransported := match reindexOperationalScalarFact environment map independent with
+        | some (.integer fact) => fact.origin == origin &&
+            fact.lowerExpression == .closedInt (.ir (.constant 7)) &&
+            fact.upperExpression == .closedInt (.ir (.constant 7))
+        | _ => false
+      transported && independentTransported &&
+        closedDynamicIndexMap [] sourceContext source (.variable destination) == none &&
+        closedDynamicIndexMap mismatchEnvironment sourceContext source (.variable destination) == none &&
+        closedStaticIndexMap environment sourceContext source 2 == none &&
+        reindexOperationalScalarFact environment map foreign == none
+
+/-- A delayed scale carries loop arithmetic in its multiplier, output schema, and contextual
+domain.  Reindexing a family must move all three together before a fixed assignment can execute
+the primitive. -/
+private def directPointwiseScaleReindexFixture : Bool :=
+  let source := { directCarrierFixtureBinder 6260 with count := .constant 2 }
+  let destination := { directCarrierFixtureBinder 6261 with count := .constant 2 }
+  let sourceContext : IndexContext := { binders := #[source] }
+  let matrixType : MatrixTypeExpr := {
+    modulus := .constant 17, ringDimension := .constant 2,
+    rows := .loopIndex source.slot, columns := .constant 1 }
+  match IndexedMatrixTypeExpr.fromIrAt sourceContext matrixType,
+      closedDynamicIndexMap [] sourceContext source (.variable destination) with
+  | some outputType, some map =>
+    let operation : PrimitiveOperation := {
+      kind := .scale (.add (.index (.variable source)) (.ir (.constant 1))) [.loopIndex source]
+      outputType, outputSchema := matrixType, ownerScope := some temporaryScope, ownerNode := 6262,
+      outputPort := 0, parameterEnvironment := [] }
+    match reindexOperationalIndexedPointwiseOperation [] map (.matrix operation) with
+    | some (.matrix result) => match result.kind with
+      | .scale (.add (.index (.variable scaleBinder)) (.ir (.constant 1))) [.loopIndex domainBinder] =>
+          result.ownerScope == some temporaryScope && result.ownerNode == 6262 && result.outputPort == 0 &&
+            scaleBinder == destination && domainBinder == destination &&
+            result.outputType.rows == .index (.variable destination)
+      | _ => false
+    | _ => false
+  | _, _ => false
+
+/-- Relation pointwise descriptors carry both the executable cutoff and the declared output
+schema.  They must be transported in lockstep; retaining either source loop coordinate would
+make a Tall sampler relation evaluate against a stale lane. -/
+private def directPointwiseRelationReindexFixture : Bool :=
+  let source := { directCarrierFixtureBinder 6263 with count := .constant 2 }
+  let destination := { directCarrierFixtureBinder 6264 with count := .constant 2 }
+  let sourceContext : IndexContext := { binders := #[source] }
+  let matrixType : MatrixTypeExpr := {
+    modulus := .constant 17, ringDimension := .constant 2,
+    rows := .loopIndex source.slot, columns := .constant 1 }
+  match IndexedMatrixTypeExpr.fromIrAt sourceContext matrixType,
+      closedDynamicIndexMap [] sourceContext source (.variable destination) with
+  | some outputType, some map =>
+    let operation : DirectRelationOperation := {
+      kind := .preimage (.add (.index (.variable source)) (.ir (.constant 4))) [.loopIndex source]
+      outputType, outputSchema := matrixType, ownerScope := some temporaryScope, ownerNode := 6265,
+      outputPort := 0, parameterEnvironment := [] }
+    match reindexOperationalIndexedPointwiseOperation [] map (.relation operation) with
+    | some (.relation result) => match result.kind with
+      | .preimage (.add (.index (.variable cutoffBinder)) (.ir (.constant 4))) [.loopIndex domainBinder] =>
+          result.ownerScope == some temporaryScope && result.ownerNode == 6265 && result.outputPort == 0 &&
+            cutoffBinder == destination && domainBinder == destination &&
+            result.outputType.rows == .index (.variable destination)
+      | _ => false
+    | _ => false
+  | _, _ => false
 
 example : directEndpointNoiseMaximumFixture = true := by native_decide
 example : directScalarZipOffsetFixture = true := by native_decide
@@ -5339,6 +5697,11 @@ example : nestedDirectScalarContextFixture = true := by native_decide
 example : directMixedScalarPointwiseFixture = true := by native_decide
 example : directBooleanToIntStaticFixture = true := by native_decide
 example : directScalarLoopIndexStaticFixture = true := by native_decide
+example : directGatherBoundMaterializationFixture = true := by native_decide
+example : directGatherTrapdoorCutoffFixture = true := by native_decide
+example : symbolicScalarReindexDomainFixture = true := by native_decide
+example : directPointwiseScaleReindexFixture = true := by native_decide
+example : directPointwiseRelationReindexFixture = true := by native_decide
 
 /-- Hash provenance follows a direct transport chain only when each map owns its immediate
 source and destination context.  A manually forged mapped carrier cannot substitute a key
@@ -5376,6 +5739,149 @@ private def malformedDirectMapProvenanceFixture : Bool :=
   | _ => false
 
 example : malformedDirectMapProvenanceFixture = true := by native_decide
+
+/-- Nested mapped views apply their source-to-destination transports in inner-to-outer order at
+the one fixed leaf.  The first map retains a distinct dynamic owner, the second closes that owner
+to lane one, so reversing them would be ill-typed.  The arena grows by exactly two view nodes;
+the two fixed lanes and their provenance are not cloned. -/
+private def lazyNestedMapOrderAndArenaDeltaFixture : Bool :=
+  match (do
+    let source := { directCarrierFixtureBinder 6110 with count := .constant 2 }
+    let middle := { directCarrierFixtureBinder 6111 with count := .constant 2 }
+    let sourceContext : IndexContext := { binders := #[source] }
+    let middleContext : IndexContext := { binders := #[middle] }
+    let scalar (lane : Nat) : OperationalScalarFact := .integer {
+      subject := { node := 6112, port := lane }
+      origin := .protocolFamilyElement ⟨"lazy-map"⟩ (.variable source)
+      lower := lane, upper := lane
+      lowerExpression := .closedInt (.index (.variable source))
+      upperExpression := .closedInt (.index (.variable source)) }
+    let (fixed, first) := ({} : FixedOperationalPayloadArena).pushScalar (scalar 0)
+    let (fixed, second) := fixed.pushScalar (scalar 1)
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, root) ← match direct.pushExplicit [] sourceContext source (.scalar .integer)
+        #[first, second] with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 6112)
+    let expression : OperationalFact := {
+      context := sourceContext, payload := .directValue root, storage := .explicitTable }
+    let firstMap ← match closedDynamicIndexMap [] sourceContext source (.variable middle) with
+      | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 6113)
+    let arena : OperationalExprArena := { direct }
+    let (arena, middleExpression) ← arena.reindexDirectFact firstMap expression
+    let finalMap ← match closedStaticIndexMap [] middleContext middle 1 with
+      | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 6114)
+    let before := arena.direct.values.size
+    let (arena, output) ← arena.reindexDirectFact finalMap middleExpression
+    let after := arena.direct.values.size
+    let root := output.payload.root
+    let value ← match arena.direct.valueAt? root with
+      | some value => pure value | none => throw (OperationalError.invalidOperationalExprRef root)
+    let selected ← arena.direct.materializedScalarFactAt [] [] root
+      (arena.direct.values.size + 1)
+    let compact := match value.payload with
+        | .mapped (.scalar .integer) sourceRoot map =>
+            sourceRoot == root - 2 && map.source == sourceContext && map.destination == emptyContext &&
+              map.assignments == #[IndexExpr.constant 1]
+        | _ => false
+    let materialized := match selected with
+          | .integer fact => fact.origin == OperationalValueOrigin.protocolFamilyElement ⟨"lazy-map"⟩
+                (IndexExpr.constant 1) &&
+              fact.lowerExpression == IndexedOperationalBoundExpr.closed
+                (OperationalBoundExpr.closedInt (IntExpr.constant 1)) &&
+              fact.upperExpression == IndexedOperationalBoundExpr.closed
+                (OperationalBoundExpr.closedInt (IntExpr.constant 1))
+          | _ => false
+    pure (before == 2 && after == 3 && arena.direct.fixed.scalars.size == 2 &&
+      output.context == emptyContext && compact && materialized)) with
+  | .ok value => value
+  | .error _ => false
+
+example : lazyNestedMapOrderAndArenaDeltaFixture = true := by native_decide
+
+/-- A result-bound annotation may sit outside a lazy mapped matrix view.  Its replacement bound
+must receive the view's pending transport before it replaces the reduced source bound. -/
+private def lazyMappedResultBoundTransportFixture : Bool :=
+  match (do
+    let binder := { directCarrierFixtureBinder 6115 with count := .constant 2 }
+    let context : IndexContext := { binders := #[binder] }
+    let fact := { boundedOperationalExprFixtureFact 6116 7 with
+      totalHardBound := .closedInt (.loopIndex binder.slot) }
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushMatrix fact
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, source) ← match direct.pushShared context (.matrix fixtureType) reference with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 6116)
+    let map ← match closedStaticIndexMap [] context binder 1 with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 6117)
+    let (direct, mapped) ← match direct.pushMapped source map with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 6118)
+    let (direct, root) ← match direct.pushMatrixResultBound mapped
+        (OperationalBoundExpr.closedInt (.loopIndex binder.slot)) with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 6119)
+    let arena : OperationalExprArena := { direct }
+    let expression : OperationalFact := {
+      context := emptyContext
+      payload := .directValue root
+      storage := .mappedTemplate
+    }
+    let direct ← arena.direct.matrixFactAt [] [] root (arena.direct.values.size + 1)
+    let entries ← arena.reducedDirectValueFactsAt [] expression
+    pure (direct.totalHardBound == OperationalBoundExpr.closedInt (.constant 1) &&
+      entries.length == 1 && entries.all fun entry =>
+      entry.fact.totalHardBound == OperationalBoundExpr.closedInt (.constant 1))) with
+  | .ok value => value
+  | .error _ => false
+
+example : lazyMappedResultBoundTransportFixture = true := by native_decide
+
+/-- A subject overlay on a lazily selected matrix stays beneath the outer map view.  Both direct
+and reduced evaluation must therefore transport the selected leaf first and only then apply the
+output-wire subject, without cloning the fixed payload. -/
+private def lazyMappedReboundOrderFixture : Bool :=
+  match (do
+    let binder := { directCarrierFixtureBinder 6120 with count := .constant 2 }
+    let context : IndexContext := { binders := #[binder] }
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushMatrix
+      (boundedOperationalExprFixtureFact 6121 7)
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, source) ← match direct.pushExplicit [] context binder (.matrix fixtureType)
+        #[reference, reference] with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 6122)
+    let arena : OperationalExprArena := { direct }
+    let sourceFact : OperationalFact := {
+      context, payload := .directValue source, storage := .explicitTable }
+    let map ← match closedStaticIndexMap [] context binder 1 with
+      | some map => pure map
+      | none => throw (OperationalError.unsupportedOperationalExpr 6123)
+    let (arena, selected) ← arena.reindexDirectFact map sourceFact
+    let subject : WireRef := { node := 6124, port := 0 }
+    let (arena, rebound) ← rebindOperationalFact subject arena selected []
+    let root := rebound.payload.root
+    let value ← match arena.direct.valueAt? root with
+      | some value => pure value
+      | none => throw (OperationalError.invalidOperationalExprRef root)
+    let ordered := match value.payload with
+      | .mapped (.matrix _) reboundRoot outerMap =>
+          match arena.direct.valueAt? reboundRoot with
+          | some { payload := .rebound (.matrix _) base reboundSubject, .. } =>
+              base == source && reboundSubject == subject && outerMap == map
+          | _ => false
+      | _ => false
+    let selectedFact ← arena.direct.matrixFactAt [] [] root (arena.direct.values.size + 1)
+    let reduced ← arena.reducedDirectValueFactsAt [] rebound
+    pure (ordered && selectedFact.subject == subject && reduced.length == 1 &&
+      reduced.all (fun entry => entry.fact.subject == subject) &&
+      arena.direct.fixed.matrices.size == 1)) with
+  | .ok value => value
+  | .error _ => false
+
+example : lazyMappedReboundOrderFixture = true := by native_decide
+
 
 /-! Reuse one pre-existing native fixture gate for the computationally heavy operational
 fixtures.  This keeps the trusted-evaluation surface unchanged while checking the production

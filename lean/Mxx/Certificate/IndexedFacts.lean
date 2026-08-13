@@ -42,6 +42,26 @@ structure GatherLookupOwner where
   indices : GatherLookupWire
   deriving BEq, DecidableEq, Repr
 
+/-- Structural hash for owner-keyed executable gather lookup registries.  This follows the full
+prepared-program scope path and producer wire, so numeric node/slot coincidences cannot merge
+owners from different nested scopes. -/
+private def gatherProgramInstanceHash : GatherProgramInstanceKey → UInt64
+  | .temporary => 1
+  | .workflowStage stage => 3 ^^^ hash stage.name
+  | .ideal => 5
+  | .requirement index => 7 ^^^ UInt64.ofNat index
+  | .standalone ordinal => 11 ^^^ UInt64.ofNat ordinal
+
+private def gatherScopeHash : GatherScopeTemplateKey → UInt64
+  | .root program => 13 ^^^ gatherProgramInstanceHash program
+  | .callBody parent node => (17 ^^^ gatherScopeHash parent) ^^^ UInt64.ofNat node
+  | .parallelBody parent node => (19 ^^^ gatherScopeHash parent) ^^^ UInt64.ofNat node
+  | .sequentialBody parent node => (23 ^^^ gatherScopeHash parent) ^^^ UInt64.ofNat node
+
+instance : Hashable GatherLookupOwner where
+  hash owner := ((29 ^^^ gatherScopeHash owner.indices.scope) ^^^ UInt64.ofNat owner.indices.node) ^^^
+    UInt64.ofNat owner.indices.port
+
 /-- Symbolic selection indices.  Dynamic selection is function application, never an indicator
 sum over every lane.  A gather retains its immutable lookup-producer identity in the correlation
 key itself: `sourceCount` carries the gathered result's codomain, while `position` carries the
@@ -274,6 +294,12 @@ private def closedIndexTransportValid (map : IndexMap) : Bool :=
   | none => false
 
 def IndexMap.transportValid (map : IndexMap) : Bool := map.validate || closedIndexTransportValid map
+
+/-- A direct-carrier context lift introduces free destination binders but has no source binder to
+substitute in a fixed leaf.  It must survive adjacent-map composition so a later get can still
+specialize the owner-bearing identity installed by loop closure. -/
+def IndexMap.isDirectCarrierContextLift (map : IndexMap) : Bool :=
+  map.source.binders.isEmpty && map.assignments.isEmpty
 
 private def reindexUnchecked (map : IndexMap) : IndexExpr → Option IndexExpr
   | .constant value => some (.constant value)

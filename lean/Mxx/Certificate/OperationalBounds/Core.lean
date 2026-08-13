@@ -68,6 +68,238 @@ inductive OperationalBoundExpr where
       (output : OperationalBoundPath)
   deriving BEq, Repr
 
+/-- A matrix descriptor carried by a direct indexed value.  Graph IR continues to use
+`MatrixTypeExpr`; this owner-aware form is the carrier boundary used after a dynamic family
+selection, where a loop coordinate may have become a dependent gather expression. -/
+structure IndexedMatrixTypeExpr where
+  modulus : IndexedParameterExpr
+  ringDimension : IndexedParameterExpr
+  rows : IndexedParameterExpr
+  columns : IndexedParameterExpr
+  deriving BEq, DecidableEq, Repr
+
+def IndexedMatrixTypeExpr.closedIr? : IndexedMatrixTypeExpr → Option MatrixTypeExpr
+  | { modulus := .ir modulus, ringDimension := .ir ringDimension, rows := .ir rows,
+      columns := .ir columns } => some { modulus, ringDimension, rows, columns }
+  | _ => none
+
+def IndexedMatrixTypeExpr.fromIr (value : MatrixTypeExpr) : IndexedMatrixTypeExpr := {
+  modulus := .ir value.modulus
+  ringDimension := .ir value.ringDimension
+  rows := .ir value.rows
+  columns := .ir value.columns
+}
+
+/-- Resolve a Graph-IR loop slot against the lexical context which owns it.  A numeric slot is
+not a global identity: a descriptor is rejected when the current context cannot identify exactly
+one owner-bearing binder. -/
+def IndexContext.uniqueBinderAtSlot? (context : IndexContext) (slot : Nat) : Option IndexVariable :=
+  match context.binders.toList.filter (fun binder => binder.slot == slot) with
+  | [binder] => some binder
+  | _ => none
+
+/-- Lift a Graph-IR integer expression into the direct-carrier descriptor language.  Parameters
+remain closed IR atoms, whereas every loop coordinate is immediately made owner-aware. -/
+def IndexedParameterExpr.fromIrAt (context : IndexContext) : IntExpr → Option IndexedParameterExpr
+  | .constant value => some (.ir (.constant value))
+  | .parameter name => some (.ir (.parameter name))
+  | .loopIndex slot => return .index (.variable (← context.uniqueBinderAtSlot? slot))
+  | .add left right => return .add (← fromIrAt context left) (← fromIrAt context right)
+  | .subtract left right => return .subtract (← fromIrAt context left) (← fromIrAt context right)
+  | .multiply left right => return .multiply (← fromIrAt context left) (← fromIrAt context right)
+  | .divide left right => return .divide (← fromIrAt context left) (← fromIrAt context right)
+  | .roundDivide left right => return .roundDivide (← fromIrAt context left) (← fromIrAt context right)
+  | .log2Ceil value => return .log2Ceil (← fromIrAt context value)
+
+/-- Lift a matrix Graph-IR type at its carrier boundary.  This is intentionally fallible so an
+ambiguous numeric loop slot cannot enter delayed direct storage. -/
+def IndexedMatrixTypeExpr.fromIrAt
+    (context : IndexContext) (value : MatrixTypeExpr) : Option IndexedMatrixTypeExpr := do
+  pure {
+    modulus := ← IndexedParameterExpr.fromIrAt context value.modulus
+    ringDimension := ← IndexedParameterExpr.fromIrAt context value.ringDimension
+    rows := ← IndexedParameterExpr.fromIrAt context value.rows
+    columns := ← IndexedParameterExpr.fromIrAt context value.columns
+  }
+
+/-- A contextual integer domain whose definition may refer to exact indexed coordinates.  It is
+not keyed only by a numeric loop slot: owner-bearing parameter expressions survive nested loop,
+selection, and gather transport. -/
+inductive IndexedOperationalParameterDomain where
+  | loopIndex (binder : IndexVariable)
+  | parameter
+      (name : String)
+      (environment : ParamEnvironment)
+      (domains : List IndexedOperationalParameterDomain)
+      (expression : IndexedParameterExpr)
+  deriving BEq, Repr
+
+/-- The parameter frame retained by an indexed descriptor.  Loop bindings use full index
+expressions, so a dynamic get or gather never collapses an owner-bearing coordinate into its
+numeric Graph-IR slot. -/
+inductive IndexedParamKey where
+  | parameter (name : String)
+  | index (expression : IndexExpr)
+  deriving BEq, DecidableEq, Repr
+
+abbrev IndexedParamEnvironment := List (IndexedParamKey × ParamValue)
+
+def insertIndexedParamBinding
+    (binding : IndexedParamKey × ParamValue) : IndexedParamEnvironment → Option IndexedParamEnvironment
+  | [] => some [binding]
+  | (key, value) :: tail =>
+      if key == binding.1 then
+        if value == binding.2 then some ((key, value) :: tail) else none
+      else
+        return (key, value) :: (← insertIndexedParamBinding binding tail)
+
+/-- Lift the executable parameter frame at a carrier boundary.  The values remain exact, while
+loop keys are converted to their lexical owner-bearing index expressions. -/
+def IndexedParamEnvironment.fromIrAt
+    (context : IndexContext) : ParamEnvironment → Option IndexedParamEnvironment
+  | [] => some []
+  | (.parameter name, value) :: remaining => do
+      let remaining ← fromIrAt context remaining
+      insertIndexedParamBinding (.parameter name, value) remaining
+  | (.loopIndex slot, value) :: remaining => do
+      let binder ← context.uniqueBinderAtSlot? slot
+      let remaining ← fromIrAt context remaining
+      insertIndexedParamBinding (.index (.variable binder), value) remaining
+
+/-- Translate the older Graph-IR domain syntax only at the owner-aware carrier boundary.  This
+does not preserve a slot-only domain: each loop occurrence is resolved through `context`, and
+ambiguous slots fail the translation. -/
+def IndexedOperationalParameterDomain.fromIrAt
+    (context : IndexContext) : List OperationalParameterDomain → Option (List IndexedOperationalParameterDomain)
+  | [] => some []
+  | .loopIndex slot _ :: remaining => do
+      let binder ← context.uniqueBinderAtSlot? slot
+      let remaining ← fromIrAt context remaining
+      if remaining.contains (.loopIndex binder) then some remaining
+      else some (.loopIndex binder :: remaining)
+  | .parameter name environment domains expression :: remaining => do
+      let domains ← fromIrAt context domains
+      let expression ← IndexedParameterExpr.fromIrAt context expression
+      let remaining ← fromIrAt context remaining
+      let candidate := IndexedOperationalParameterDomain.parameter name environment domains expression
+      match remaining.filter fun domain => match domain with
+        | .parameter existing _ _ _ => existing == name
+        | .loopIndex _ => false with
+      | [] => some (candidate :: remaining)
+      | [existing] => if existing == candidate then some remaining else none
+      | _ => none
+
+/-- Keep parameter bindings symbolic when a child frame binds them to a lexical index.  The
+executable child environment still contains its template representative (often zero), but the
+hash identity records the binding expression itself, which is the value later substituted by
+static get, dynamic get, or gather transport. -/
+def IndexedParamEnvironment.fromIrAtWithDomains
+    (context : IndexContext)
+    (domains : List OperationalParameterDomain) : ParamEnvironment → Option IndexedParamEnvironment
+  | [] => some []
+  | (.parameter name, value) :: remaining => do
+      let remaining ← fromIrAtWithDomains context domains remaining
+      let key ← match domains.find? fun domain => match domain with
+        | .parameter candidate _ _ _ => candidate == name
+        | .loopIndex _ _ => false with
+        | some (.parameter _ _ _ expression) => do
+            match ← IndexedParameterExpr.fromIrAt context expression with
+            | .index expression => some (.index expression)
+            | _ => none
+        | _ => some (.parameter name)
+      insertIndexedParamBinding (key, value) remaining
+  | (.loopIndex slot, value) :: remaining => do
+      let binder ← context.uniqueBinderAtSlot? slot
+      let remaining ← fromIrAtWithDomains context domains remaining
+      insertIndexedParamBinding (.index (.variable binder), value) remaining
+
+/-- Owner-aware direct-carrier bound syntax.  This deliberately mirrors only the descriptor
+surface needed by fixed-assignment operations; recursive sequential state remains in the
+closed operational-bound language until it is materialized at its recurrence boundary. -/
+inductive IndexedOperationalBoundExpr where
+  | closedInt (value : IndexedParameterExpr)
+  | contextual
+      (kind : ContextualExtremum)
+      (environment : ParamEnvironment)
+      (domains : List IndexedOperationalParameterDomain)
+      (value : IndexedParameterExpr)
+  | closedOperational (value : OperationalBoundExpr)
+  deriving BEq, Repr
+
+/-- Check whether an indexed descriptor depends on one executable parameter binding. -/
+private def indexedParameterUses (name : String) : IndexedParameterExpr → Bool
+  | .ir value =>
+      let rec visit : IntExpr → Bool
+        | .constant _ | .loopIndex _ => false
+        | .parameter candidate => candidate == name
+        | .add left right | .subtract left right | .multiply left right | .divide left right |
+            .roundDivide left right => visit left || visit right
+        | .log2Ceil value => visit value
+      visit value
+  | .index _ => false
+  | .add left right | .subtract left right | .multiply left right | .divide left right |
+      .roundDivide left right => indexedParameterUses name left || indexedParameterUses name right
+  | .log2Ceil value => indexedParameterUses name value
+
+private def replaceIndexedBoundParameter
+    (environment : ParamEnvironment) (name : String) (value : Int) : ParamEnvironment :=
+  (.parameter name, .integer value) :: environment.filter (fun entry => entry.1 != .parameter name)
+
+/-- Evaluate the finite owner-aware domain of one direct scalar leaf.  A bound is materialized
+only after the carrier has selected a complete lane assignment; until then it remains in the
+indexed descriptor form and is transported by exact binder identity. -/
+private def indexedBoundDomainAssignments
+    (parameters : ParamEnvironment) (context : IndexContext) (indices : IndexValueEnvironment) :
+    List IndexedOperationalParameterDomain → Option (List (ParamEnvironment × IndexValueEnvironment))
+  | [] => some [(parameters, indices)]
+  | .loopIndex binder :: remaining => do
+      if !context.binders.contains binder then none
+      let count ← binder.count.evaluate parameters
+      if count <= 0 then none
+      let tails ← indexedBoundDomainAssignments parameters context indices remaining
+      let mut assignments := []
+      for lane in List.range count.toNat do
+        for (tailParameters, tailIndices) in tails do
+          assignments := (tailParameters, (.variable binder, Int.ofNat lane) :: tailIndices) :: assignments
+      some assignments
+  | .parameter name environment domains expression :: remaining => do
+      let tails ← indexedBoundDomainAssignments parameters context indices remaining
+      if !indexedParameterUses name expression then some tails else do
+        let sources ← indexedBoundDomainAssignments environment context indices domains
+        let values ← sources.mapM fun (sourceParameters, sourceIndices) =>
+          expression.evaluate sourceParameters context sourceIndices
+        let mut assignments := []
+        for (tailParameters, tailIndices) in tails do
+          for value in values do
+            assignments := (replaceIndexedBoundParameter tailParameters name value, tailIndices) :: assignments
+        some assignments
+
+def IndexedOperationalBoundExpr.materialize
+    (parameters : ParamEnvironment) (context : IndexContext) (indices : IndexValueEnvironment) :
+    IndexedOperationalBoundExpr → Option OperationalBoundExpr
+  | .closedOperational value => some value
+  | .closedInt value => do
+      let value ← value.evaluate parameters context indices
+      some (.closedInt (.constant value))
+  | .contextual kind _ domains value => do
+      let assignments ← indexedBoundDomainAssignments parameters context indices domains
+      let values ← assignments.mapM fun (assignmentParameters, assignmentIndices) =>
+        value.evaluate assignmentParameters context assignmentIndices
+      let first ← values.head?
+      let result := match kind with
+        | .minimum => values.drop 1 |>.foldl min first
+        | .maximum => values.drop 1 |>.foldl max first
+        | .maximumAbsolute => values.drop 1 |>.foldl (fun maximum value =>
+            max maximum value.natAbs) first.natAbs
+      some (.closedInt (.constant result))
+
+def IndexedOperationalBoundExpr.closed (value : OperationalBoundExpr) : IndexedOperationalBoundExpr :=
+  .closedOperational value
+
+def IndexedOperationalBoundExpr.closedOperational? : IndexedOperationalBoundExpr → Option OperationalBoundExpr
+  | .closedOperational value => some value
+  | _ => none
+
 inductive CanonicalRange where
   | unknown
   | below (upperExclusive : Nat)
@@ -183,13 +415,13 @@ instance : SelectionIdentityLike SelectionDomainId where
 
 structure DeterministicHashIdentity where
   keyOrigin : OperationalValueOrigin
-  matrixType : MatrixTypeExpr
-  parameterEnvironment : ParamEnvironment
-  parameterDomains : List OperationalParameterDomain
+  matrixType : IndexedMatrixTypeExpr
+  parameterEnvironment : IndexedParamEnvironment
+  parameterDomains : List IndexedOperationalParameterDomain
   tagPrefix : List Nat
-  tagExpressions : List IntExpr
-  tagDecimalExpressions : List IntExpr
-  tagU64LeExpressions : List IntExpr
+  tagExpressions : List IndexedParameterExpr
+  tagDecimalExpressions : List IndexedParameterExpr
+  tagU64LeExpressions : List IndexedParameterExpr
   trailingIntegerOrigins : List OperationalValueOrigin
   deriving BEq, Repr
 
@@ -494,6 +726,36 @@ def operationalIntExprFingerprint : IntExpr → UInt64
       (operationalIntExprFingerprint right)
   | .log2Ceil value => mixOperationalFingerprint 109 (operationalIntExprFingerprint value)
 
+def operationalIndexedParameterFingerprint : IndexedParameterExpr → UInt64
+  | .ir value => mixOperationalFingerprint 113 (operationalIntExprFingerprint value)
+  | .index value => mixOperationalFingerprint 127 (hash (reprStr value))
+  | .add left right => mixOperationalFingerprint
+      (mixOperationalFingerprint 131 (operationalIndexedParameterFingerprint left))
+      (operationalIndexedParameterFingerprint right)
+  | .subtract left right => mixOperationalFingerprint
+      (mixOperationalFingerprint 137 (operationalIndexedParameterFingerprint left))
+      (operationalIndexedParameterFingerprint right)
+  | .multiply left right => mixOperationalFingerprint
+      (mixOperationalFingerprint 139 (operationalIndexedParameterFingerprint left))
+      (operationalIndexedParameterFingerprint right)
+  | .divide left right => mixOperationalFingerprint
+      (mixOperationalFingerprint 149 (operationalIndexedParameterFingerprint left))
+      (operationalIndexedParameterFingerprint right)
+  | .roundDivide left right => mixOperationalFingerprint
+      (mixOperationalFingerprint 151 (operationalIndexedParameterFingerprint left))
+      (operationalIndexedParameterFingerprint right)
+  | .log2Ceil value => mixOperationalFingerprint 157 (operationalIndexedParameterFingerprint value)
+
+def operationalIndexedParamEnvironmentFingerprint (environment : IndexedParamEnvironment) : UInt64 :=
+  environment.foldl (fun state binding =>
+    let key := match binding.1 with
+      | .parameter name => mixOperationalFingerprint 163 (hash name)
+      | .index expression => mixOperationalFingerprint 167 (hash (reprStr expression))
+    let value := match binding.2 with
+      | .integer value => UInt64.ofInt value
+      | .rational value => hash (reprStr value)
+    mixOperationalFingerprint state (mixOperationalFingerprint key value)) 173
+
 def operationalProgramFingerprint : ProgramInstanceKey → UInt64
   | .temporary => 1
   | .workflowStage stage => mixOperationalFingerprint 2 (hash stage.name)
@@ -551,17 +813,19 @@ def operationalMatrixOriginFingerprint : MatrixOriginIdentity → UInt64
   | .deterministicHash query =>
       let seed := mixOperationalFingerprint 43
         (operationalValueOriginFingerprint query.keyOrigin)
+      let seed := mixOperationalFingerprint seed
+        (operationalIndexedParamEnvironmentFingerprint query.parameterEnvironment)
       let seed := query.tagPrefix.foldl
         (fun state byte => mixOperationalFingerprint state (UInt64.ofNat byte)) seed
       let seed := query.tagExpressions.foldl
         (fun state value => mixOperationalFingerprint state
-          (operationalIntExprFingerprint value)) seed
+          (operationalIndexedParameterFingerprint value)) seed
       let seed := query.tagDecimalExpressions.foldl
         (fun state value => mixOperationalFingerprint state
-          (operationalIntExprFingerprint value)) seed
+          (operationalIndexedParameterFingerprint value)) seed
       let seed := query.tagU64LeExpressions.foldl
         (fun state value => mixOperationalFingerprint state
-          (operationalIntExprFingerprint value)) seed
+          (operationalIndexedParameterFingerprint value)) seed
       let seed := query.trailingIntegerOrigins.foldl
         (fun state origin => mixOperationalFingerprint state
           (operationalValueOriginFingerprint origin)) seed
@@ -1269,9 +1533,10 @@ structure OperationalTrapdoorFact where
   digitCount : IntExpr
   preimageMaxCoefficientBound : IntExpr
   matrixParams : Mxx.SamplerParams
-  maximum : OperationalBoundExpr
+  /-- Owner-aware until this scalar leaf is reduced at one complete direct assignment. -/
+  maximum : IndexedOperationalBoundExpr
   /-- The uncapped preimage sampler cutoff from the trapdoor wire contract. -/
-  preimageCutoff : Option OperationalBoundExpr := none
+  preimageCutoff : Option IndexedOperationalBoundExpr := none
   publicIdentity : PublicMatrixIdentity
   deriving BEq
 
@@ -1280,8 +1545,9 @@ structure OperationalIntegerFact where
   origin : OperationalValueOrigin
   lower : Int
   upper : Int
-  lowerExpression : OperationalBoundExpr
-  upperExpression : OperationalBoundExpr
+  /-- Bounds retain full indexed owners while a direct carrier is reindexed. -/
+  lowerExpression : IndexedOperationalBoundExpr
+  upperExpression : IndexedOperationalBoundExpr
   deriving BEq
 
 structure OperationalBytesFact where
@@ -1440,5 +1706,64 @@ inductive OperationalError where
   | unsupportedNode (node : Nat)
   deriving BEq, DecidableEq, Repr
 
+/-- Enumerate one owner-aware descriptor domain with the caller's fixed-assignment evaluator.
+The descriptor language itself does not choose how an `.index` leaf is interpreted: generic
+callers may use its closed evaluator, while direct carriers supply the arena-aware gather
+evaluator. -/
+private def indexedBoundDomainAssignmentsWith
+    (evaluate : ParamEnvironment → IndexContext → IndexValueEnvironment → IndexedParameterExpr →
+      Except OperationalError Int)
+    (parameters : ParamEnvironment) (context : IndexContext) (indices : IndexValueEnvironment) :
+    List IndexedOperationalParameterDomain → Except OperationalError
+      (List (ParamEnvironment × IndexValueEnvironment))
+  | [] => pure [(parameters, indices)]
+  | .loopIndex binder :: remaining => do
+      if !context.binders.contains binder then throw .nonClosedExpression
+      let count ← match binder.count.evaluate parameters with
+        | some count => pure count
+        | none => throw .nonClosedExpression
+      if count <= 0 then throw .nonClosedExpression
+      let tails ← indexedBoundDomainAssignmentsWith evaluate parameters context indices remaining
+      let mut assignments := []
+      for lane in List.range count.toNat do
+        for (tailParameters, tailIndices) in tails do
+          assignments := (tailParameters, (.variable binder, Int.ofNat lane) :: tailIndices) :: assignments
+      pure assignments
+  | .parameter name environment domains expression :: remaining => do
+      let tails ← indexedBoundDomainAssignmentsWith evaluate parameters context indices remaining
+      if !indexedParameterUses name expression then pure tails else do
+        let sources ← indexedBoundDomainAssignmentsWith evaluate environment context indices domains
+        let values ← sources.mapM fun (sourceParameters, sourceIndices) =>
+          evaluate sourceParameters context sourceIndices expression
+        let mut assignments := []
+        for (tailParameters, tailIndices) in tails do
+          for value in values do
+            assignments := (replaceIndexedBoundParameter tailParameters name value, tailIndices) :: assignments
+        pure assignments
+
+/-- Materialize a direct-carrier bound at one complete assignment.  The evaluator is injected so
+gather-bearing `.index` leaves stay owner-aware and are resolved through the registered direct
+integer producer rather than being lowered to slot-only Graph-IR expressions. -/
+def IndexedOperationalBoundExpr.materializeWith
+    (evaluate : ParamEnvironment → IndexContext → IndexValueEnvironment → IndexedParameterExpr →
+      Except OperationalError Int)
+    (parameters : ParamEnvironment) (context : IndexContext) (indices : IndexValueEnvironment) :
+    IndexedOperationalBoundExpr → Except OperationalError OperationalBoundExpr
+  | .closedOperational value => pure value
+  | .closedInt value => do
+      pure (.closedInt (.constant (← evaluate parameters context indices value)))
+  | .contextual kind _ domains value => do
+      let assignments ← indexedBoundDomainAssignmentsWith evaluate parameters context indices domains
+      let values ← assignments.mapM fun (assignmentParameters, assignmentIndices) =>
+        evaluate assignmentParameters context assignmentIndices value
+      let first ← match values.head? with
+        | some value => pure value
+        | none => throw .nonClosedExpression
+      let result := match kind with
+        | .minimum => values.drop 1 |>.foldl min first
+        | .maximum => values.drop 1 |>.foldl max first
+        | .maximumAbsolute => values.drop 1 |>.foldl (fun maximum value =>
+            max maximum value.natAbs) first.natAbs
+      pure (.closedInt (.constant result))
 
 end Mxx.Certificate

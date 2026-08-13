@@ -19,14 +19,18 @@ inductive PrimitiveOperationKind where
   | concat (axis : ConcatAxis)
   | transform (operation : OperationalFactorTransform)
   | slice (rows columns : Option (IntExpr × IntExpr))
-  | scale (scalar : IntExpr) (values : List Int)
-      (loopDomains : List OperationalParameterDomain)
+  | scale (scalar : IndexedParameterExpr)
+      (loopDomains : List IndexedOperationalParameterDomain)
   | bggGrouping
   deriving BEq
 
 structure PrimitiveOperation where
   kind : PrimitiveOperationKind
-  outputType : MatrixTypeExpr
+  outputType : IndexedMatrixTypeExpr
+  /-- The Graph-IR shape checked when constructing a delayed carrier.  The owner-aware descriptor
+  above is evaluated again at each fixed assignment before reduction; this schema is never a
+  substitute for that evaluation. -/
+  outputSchema : MatrixTypeExpr
   ownerScope : Option ScopeTemplateKey
   ownerNode : Nat
   outputPort : Nat
@@ -108,15 +112,16 @@ def FixedOperationalPayloadArena.pushScalar
   ({ arena with scalars := arena.scalars.push fact }, .scalar arena.scalars.size)
 
 inductive DirectRelationOperationKind where
-  | preimage (maximum : IntExpr) (loopDomains : List OperationalParameterDomain)
-  | decomposition (declaredType : MatrixTypeExpr) (base : IntExpr) (small : Bool)
-      (digitCount : IntExpr) (loopDomains : List OperationalParameterDomain)
+  | preimage (maximum : IndexedParameterExpr) (loopDomains : List IndexedOperationalParameterDomain)
+  | decomposition (declaredType : IndexedMatrixTypeExpr) (base : IndexedParameterExpr) (small : Bool)
+      (digitCount : IndexedParameterExpr) (loopDomains : List IndexedOperationalParameterDomain)
       (layouts : List Mxx.GadgetLayoutDescriptor)
   deriving BEq
 
 structure DirectRelationOperation where
   kind : DirectRelationOperationKind
-  outputType : MatrixTypeExpr
+  outputType : IndexedMatrixTypeExpr
+  outputSchema : MatrixTypeExpr
   ownerScope : Option ScopeTemplateKey
   ownerNode : Nat
   outputPort : Nat
@@ -163,6 +168,13 @@ inductive OperationalIndexedPayload where
       (schema : OperationalIndexedPayloadSchema)
       (source : OperationalIndexedValueId)
       (map : IndexMap)
+  /-- A wire-bound view over one direct carrier root.  Rebinding is intentionally lazy: the
+  subject overlay is applied only after all pending maps have reached a fixed leaf, where the
+  relation/provenance invariant is checked before replacement. -/
+  | rebound
+      (schema : OperationalIndexedPayloadSchema)
+      (source : OperationalIndexedValueId)
+      (subject : WireRef)
   /-- A root-result annotation preserves the source carrier and replaces only the complete
   fixed-assignment result's total hard bound.  Sequential recurrences use this after the body
   has already consumed its internal relations, so no leaf relation is retained or rewritten. -/
@@ -179,23 +191,49 @@ inductive OperationalIndexedPayload where
 def OperationalIndexedPayload.schema :
     OperationalIndexedPayload → OperationalIndexedPayloadSchema
   | .shared schema _ | .explicit schema _ _ | .explicitValues schema _ _ | .mapped schema _ _ |
-      .matrixResultBound schema _ _ | .pointwise schema _ _ => schema
+      .rebound schema _ _ | .matrixResultBound schema _ _ | .pointwise schema _ _ => schema
 
 def OperationalIndexedPayload.storage : OperationalIndexedPayload → IndexedStorage
   | .shared .. => .sharedTemplate
   | .explicit .. | .explicitValues .. => .explicitTable
-  | .mapped .. | .matrixResultBound .. | .pointwise .. => .mappedTemplate
+  | .mapped .. | .rebound .. | .matrixResultBound .. | .pointwise .. => .mappedTemplate
 
 abbrev OperationalIndexedValue := IndexedFact OperationalIndexedPayload
 
 structure DirectOperationalIndexedArena where
   fixed : FixedOperationalPayloadArena := {}
   values : Array OperationalIndexedValue := #[]
+  /-- The one executable integer producer for each dependent gather owner.  This is a registry
+  rather than a cache: owner identity is part of the indexed semantics, and an ambiguous owner
+  is rejected before any matrix lane can consume it. -/
+  gatherIntegerRoots : Std.HashMap GatherLookupOwner OperationalIndexedValueId := {}
   deriving BEq
 
 def DirectOperationalIndexedArena.valueAt?
     (arena : DirectOperationalIndexedArena)
     (id : OperationalIndexedValueId) : Option OperationalIndexedValue := arena.values[id]?
+
+/-- Register one executable integer-family root for a gather owner.  Repeating the exact same
+registration is idempotent because multiple dynamic family gets may consume one executable index
+wire.  A different root is rejected: choosing either would erase owner provenance. -/
+def DirectOperationalIndexedArena.registerGatherIntegerRoot
+    (arena : DirectOperationalIndexedArena)
+    (owner : GatherLookupOwner)
+    (root : OperationalIndexedValueId) : Option DirectOperationalIndexedArena := do
+  let value ← arena.valueAt? root
+  match value.payload.schema, value.context.binders.toList with
+  | .scalar .integer, [_] =>
+      match arena.gatherIntegerRoots[owner]? with
+      | none => some { arena with gatherIntegerRoots := arena.gatherIntegerRoots.insert owner root }
+      | some existing => if existing == root then some arena else none
+  | _, _ => none
+
+/-- Resolve only an unambiguous owner registration.  The registry constructor above prevents
+duplicates, but this still rejects a malformed arena assembled by a fixture or future caller. -/
+def DirectOperationalIndexedArena.gatherIntegerRoot?
+    (arena : DirectOperationalIndexedArena)
+    (owner : GatherLookupOwner) : Option OperationalIndexedValueId :=
+  arena.gatherIntegerRoots[owner]?
 
 def explicitCountValid
     (environment : ParamEnvironment)
@@ -215,7 +253,7 @@ def matrixOperationSchemasValid
     (operation : PrimitiveOperation)
     (inputs : Array OperationalIndexedPayloadSchema)
     (output : MatrixTypeExpr) : Bool :=
-  if !operationalMatrixTypeEqual operation.outputType output then false else
+  if !operationalMatrixTypeEqual operation.outputSchema output then false else
   match operation.kind, inputs with
   | .add _, #[.matrix left, .matrix right] =>
       operationalMatrixTypeEqual left output && operationalMatrixTypeEqual right output
@@ -281,7 +319,7 @@ def matrixOperationSchemasValid
         | none => input.columns
       operationalSameRing input output && operationalDimensionEqual output.rows expectedRows &&
         operationalDimensionEqual output.columns expectedColumns
-  | .scale _ _ _, #[.matrix input] => operationalMatrixTypeEqual input output
+  | .scale _ _, #[.matrix input] => operationalMatrixTypeEqual input output
   | .bggGrouping, #[.matrix vector, .matrix _, .matrix _] =>
       operationalMatrixTypeEqual vector output
   | _, _ => false
@@ -292,7 +330,7 @@ def relationOperationSchemasValid
     (operation : DirectRelationOperation)
     (inputs : Array OperationalIndexedPayloadSchema)
     (output : MatrixTypeExpr) : Bool :=
-  if !operationalMatrixTypeEqual operation.outputType output then false else
+  if !operationalMatrixTypeEqual operation.outputSchema output then false else
   match operation.kind, inputs with
   | .preimage .., #[.matrix publicType,
       .scalar (.trapdoor trapdoorType _ _ _ _), .matrix targetType] =>
@@ -301,7 +339,7 @@ def relationOperationSchemasValid
         | .ok (_, productType) => operationalMatrixTypeEqual productType targetType
         | .error _ => false
   | .decomposition declaredType .., #[.matrix _] =>
-      operationalMatrixTypeEqual declaredType output
+      declaredType.closedIr?.any (operationalMatrixTypeEqual · output)
   | _, _ => false
 
 def scalarOperationSchemasValid
@@ -400,13 +438,50 @@ def DirectOperationalIndexedArena.pushMapped
   if !map.transportValid || map.source != sourceValue.context then none else
   match sourceValue.payload with
   | .mapped schema base prior => do
-      if prior.validate && map.validate then
+      if !prior.isDirectCarrierContextLift && prior.validate && map.validate then
         match composeIndexMap prior map with
         | some composed => some (arena.pushValue map.destination (.mapped schema base composed))
         | none => none
       else
         some (arena.pushValue map.destination (.mapped schema source map))
   | payload => some (arena.pushValue map.destination (.mapped payload.schema source map))
+
+/-- Store a mapped view whose result schema has already crossed the same capture-free transport.
+Only the compact schema is rebuilt at view construction; fixed facts, relation inventories, and
+delayed pointwise children remain behind the view until one fixed-assignment reduction. -/
+def DirectOperationalIndexedArena.pushMappedWithSchema
+    (arena : DirectOperationalIndexedArena)
+    (source : OperationalIndexedValueId)
+    (map : IndexMap)
+    (schema : OperationalIndexedPayloadSchema) : Option
+    (DirectOperationalIndexedArena × OperationalIndexedValueId) := do
+  let sourceValue ← arena.valueAt? source
+  if !map.transportValid || map.source != sourceValue.context then none else
+  match sourceValue.payload with
+  | .mapped _ base prior => do
+      if !prior.isDirectCarrierContextLift && prior.validate && map.validate then
+        let composed ← composeIndexMap prior map
+        some (arena.pushValue map.destination (.mapped schema base composed))
+      else some (arena.pushValue map.destination (.mapped schema source map))
+  | _ => some (arena.pushValue map.destination (.mapped schema source map))
+
+/-- Add a constant-size subject overlay without traversing or cloning the source DAG.  Nested
+overlays collapse to the latest graph boundary: only that subject is observable at reduction. -/
+def DirectOperationalIndexedArena.pushRebound
+    (arena : DirectOperationalIndexedArena)
+    (source : OperationalIndexedValueId)
+    (subject : WireRef) : Option (DirectOperationalIndexedArena × OperationalIndexedValueId) := do
+  let value ← arena.valueAt? source
+  match value.payload with
+  /- Keep the externally observable map view outermost.  The rebound remains lazy beneath it,
+  and reduction records the outer map before applying this subject overlay at the fixed leaf. -/
+  | .mapped schema base map =>
+      let baseValue ← arena.valueAt? base
+      let (arena, rebound) := arena.pushValue baseValue.context
+        (.rebound baseValue.payload.schema base subject)
+      some (arena.pushValue value.context (.mapped schema rebound map))
+  | .rebound schema base _ => some (arena.pushValue value.context (.rebound schema base subject))
+  | payload => some (arena.pushValue value.context (.rebound payload.schema source subject))
 
 /-- Annotate a direct matrix root after its fixed-assignment computation.  The source ID remains
 authoritative for context, storage, schema, identity, provenance, and relations; evaluation alone
@@ -430,8 +505,8 @@ def DirectOperationalIndexedArena.pushPointwise
   let (context, _) ← mergeIndexedFactShapeN values
   let schemas := values.toArray.map fun value => value.payload.schema
   let output ← match operation with
-    | .matrix descriptor => some (.matrix descriptor.outputType)
-    | .relation descriptor => some (.matrix descriptor.outputType)
+    | .matrix descriptor => some (.matrix descriptor.outputSchema)
+    | .relation descriptor => some (.matrix descriptor.outputSchema)
     | .scalar { kind := .boolToInt, .. } | .scalar { kind := .intBinary _, .. } =>
         some (.scalar .integer)
     | .scalar { kind := .intCompare _, .. } | .scalar { kind := .bitExtract _, .. } =>
@@ -507,6 +582,12 @@ partial def DirectOperationalIndexedArena.mapMatrixValue
                 let (arena, memo, source) ← visit fuel arena memo source
                 let (arena, mapped) := arena.pushValue value.context
                   (.mapped (.matrix matrixType) source map)
+                pure (arena, memo, mapped)
+            | .rebound (.matrix _) source subject => do
+                let (arena, memo, source) ← visit fuel arena memo source
+                let (arena, mapped) ← match arena.pushRebound source subject with
+                  | some result => pure result
+                  | none => throw (.unsupportedOperationalExpr id)
                 pure (arena, memo, mapped)
             | .matrixResultBound (.matrix matrixType) source totalHardBound => do
                 let (arena, memo, source) ← visit fuel arena memo source
@@ -656,6 +737,12 @@ partial def DirectOperationalIndexedArena.mapScalarValue
                   | none => throw (.invalidOperationalExprRef mapped)
                 if mappedValue.context != value.context then throw (.unsupportedOperationalExpr id)
                 pure (arena, memo, mapped)
+            | .rebound (.scalar _) source subject => do
+                let (arena, memo, source) ← visit fuel arena memo source
+                let (arena, mapped) ← match arena.pushRebound source subject with
+                  | some result => pure result
+                  | none => throw (.unsupportedOperationalExpr id)
+                pure (arena, memo, mapped)
             | .pointwise (.scalar scalarType) operation inputs => do
                 let originalInputs ← match inputs.toList.mapM arena.valueAt? with
                   | some inputs => pure inputs
@@ -711,11 +798,12 @@ def directCarrierMatrixType
 def directCarrierMatrixOperation
     (kind : PrimitiveOperationKind)
     (outputType : MatrixTypeExpr) : PrimitiveOperation := {
-  kind
-  outputType
-  ownerScope := none
-  ownerNode := 0
-  outputPort := 0
+  kind := kind,
+  outputType := .fromIr outputType,
+  outputSchema := outputType,
+  ownerScope := none,
+  ownerNode := 0,
+  outputPort := 0,
   parameterEnvironment := []
 }
 

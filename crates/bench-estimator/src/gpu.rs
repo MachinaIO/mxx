@@ -22,7 +22,7 @@ use mxx_runtime::{
     backend::{IndexRange, PreimageRequest, SampleRange, poly::gpu::GpuDcrtBackend},
 };
 use num_bigint::BigInt;
-use num_traits::ToPrimitive;
+use num_traits::{One, ToPrimitive};
 use std::{fmt, sync::Arc};
 use tracing::{debug, info};
 
@@ -392,11 +392,36 @@ impl GpuNodeMeasurementBackend {
                 Ok(Vec::new())
             }
             NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
-                let ty = matrix_type.evaluate(bindings).ok_or_else(|| {
-                    GpuMeasurementError(
-                        "constant-polynomial lift matrix type is unavailable".to_owned(),
-                    )
-                })?;
+                let modulus = matrix_type
+                    .modulus
+                    .evaluate(bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                if modulus <= BigInt::one() {
+                    return Err(GpuMeasurementError(
+                        "constant-polynomial lift matrix modulus must exceed one".to_owned(),
+                    ));
+                }
+                let positive_dimension = |expression: &mxx_ir_core::IntExpr, label: &str| {
+                    expression
+                        .evaluate(bindings)
+                        .map_err(|error| GpuMeasurementError(error.to_string()))?
+                        .to_usize()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            GpuMeasurementError(format!(
+                                "constant-polynomial lift matrix {label} must be a positive usize"
+                            ))
+                        })
+                };
+                let ty = ConcreteMatrixType {
+                    modulus,
+                    ring_dimension: positive_dimension(
+                        &matrix_type.ring_dimension,
+                        "ring dimension",
+                    )?,
+                    rows: positive_dimension(&matrix_type.rows, "rows")?,
+                    columns: positive_dimension(&matrix_type.columns, "columns")?,
+                };
                 (0..batch_size)
                     .map(|_| {
                         let identity = backend

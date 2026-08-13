@@ -15,11 +15,16 @@ use mxx_bgg::{
     TallRotationEncodingCompiler, bind_lwe_lookup_invocations, required_tall_rotation_encodings,
 };
 use mxx_correctness::{
-    ExactMatrixInputMetadata, OperationalCheckRequest, OperationalCheckerReport,
-    OperationalGadgetLayout, emit_protocol_for, operational_protocol_from_graphs,
-    prepare_emitted_operational_checker, run_prepared_operational_checks,
+    ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
+    EndpointSemanticBinding, EndpointSpecId, ExactMatrixInputMetadata, OperationalCheckRequest,
+    OperationalCheckerReport, OperationalDecoderKind, OperationalDecoderTarget,
+    OperationalGadgetLayout, OutputRef, StageId, emit_protocol_for,
+    operational_protocol_from_graphs, prepare_emitted_operational_checker,
+    run_prepared_operational_checks,
 };
-use mxx_dsl::{BuiltGraph, DslContext, Family, Ring, SemanticAnchor, parallel_zip};
+use mxx_dsl::{
+    Bool, BuiltGraph, DslContext, Family, IdealSpec, Ring, SemanticAnchor, parallel_zip,
+};
 use mxx_gadgets::{
     circuit::{PolyCircuit, PolyGateKind},
     circuit_gadgets::arith::nested_rns::{
@@ -34,7 +39,7 @@ use mxx_ir_core::{
         export_validated_manifest, production_id,
     },
     encoding::spec_hash,
-    node::NodeKind,
+    node::{IndexRange, NodeKind},
 };
 use mxx_primitives::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
@@ -77,6 +82,11 @@ const SECRET_ARTIFACT: &str = "tall_nested_rns_secret";
 const C_B0_ARTIFACT: &str = "tall_nested_rns_c_b0";
 const LOOKUP_C_B_ARTIFACT: &str = "tall_nested_rns_lookup_c_b";
 const INPUT_PUBLIC_KEY_PREFIX: &str = "tall_nested_rns_input_public_key";
+const TALL_OPERATIONAL_TARGET_ID: &str = "tall-threshold-decode";
+const TALL_OPERATIONAL_RESIDUAL: &str = "operational_residual";
+const TALL_OPERATIONAL_DECODED: &str = "operational_decoded";
+const TALL_DECODER_RESIDUAL_ANCHOR: &str = "tall.decoder.residual";
+const TALL_DECODER_RESULT_ANCHOR: &str = "tall.decoder.result";
 
 #[derive(Clone, Debug)]
 struct TestConfig {
@@ -320,10 +330,65 @@ fn run_tall_operational_check(
             },
         );
     }
+    let (crt_moduli, crt_bits, _) = parameters.to_crt();
+    let q_max = crt_moduli.iter().copied().max().expect("nonempty CRT basis");
+    let decoder_stage = StageId("encoding".to_owned());
+    let decoder_node = encoding
+        .graph
+        .outputs()
+        .get(TALL_OPERATIONAL_DECODED)
+        .ok_or_else(|| "Tall operational decoder output is absent".to_owned())?
+        .value
+        .node;
+    let endpoint = EndpointSpecId::ToyThresholdDecode;
+    let ideal = IdealSpec::new(
+        DslContext::new("gpu-tall-nested-rns-operational-ideal")
+            .bool_output(TALL_OPERATIONAL_DECODED, Bool::constant(false))
+            .map_err(|error| error.to_string())?
+            .build()
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     let protocol = operational_protocol_from_graphs(
         vec![("producer".to_owned(), producer), ("encoding".to_owned(), encoding)],
         "encoding",
         &exact_input_metadata,
+        |bundle| {
+            bundle.ideal = ideal;
+            bundle.comparator = ComparatorSpec::Equality {
+                endpoints: vec![ComparatorEndpointBinding {
+                    endpoint,
+                    actual_input: TALL_OPERATIONAL_DECODED.to_owned(),
+                    ideal_input: TALL_OPERATIONAL_DECODED.to_owned(),
+                    result_output: "failure".to_owned(),
+                    failure_value: true,
+                }],
+            };
+            bundle.endpoints = EndpointAnchors {
+                entries: vec![EndpointAnchor {
+                    spec: endpoint,
+                    stage: decoder_stage.clone(),
+                    semantic_anchor: TALL_DECODER_RESULT_ANCHOR.to_owned(),
+                    semantics: EndpointSemanticBinding::ThresholdDecode,
+                    workflow_output: OutputRef {
+                        stage: decoder_stage.clone(),
+                        output: TALL_OPERATIONAL_DECODED.to_owned(),
+                    },
+                    ideal_output: TALL_OPERATIONAL_DECODED.to_owned(),
+                }],
+            };
+            bundle.operational_decoder_targets = vec![OperationalDecoderTarget {
+                target_id: TALL_OPERATIONAL_TARGET_ID.to_owned(),
+                residual_stage: decoder_stage.clone(),
+                residual_output: TALL_OPERATIONAL_RESIDUAL.to_owned(),
+                decoder_stage,
+                decoder_node,
+                kind: OperationalDecoderKind::ThresholdDecode {
+                    plaintext_modulus: IntExpr::constant(q_max),
+                },
+            }];
+            bundle.endpoint_specs = vec![endpoint];
+        },
     )
     .map_err(|error| error.to_string())?;
     let emitted = emit_protocol_for("TallNestedRnsCandidate", &protocol, "MxxCorrectness", &[])
@@ -334,8 +399,6 @@ fn run_tall_operational_check(
         derivation_source_bytes = emitted.derivation_ir.len(),
         "emitted Tall correctness sources"
     );
-    let (crt_moduli, crt_bits, _) = parameters.to_crt();
-    let q_max = crt_moduli.iter().copied().max().expect("nonempty CRT basis");
     let base_bits = parameters.base_bits() as usize;
     let small_digit_count = crt_bits.div_ceil(base_bits);
     let request = OperationalCheckRequest {
@@ -351,10 +414,7 @@ fn run_tall_operational_check(
             crt_bits,
             crt_moduli,
         }],
-        residual_stage: "encoding".to_owned(),
-        residual_output: "operational_residual".to_owned(),
-        plaintext_modulus: BigInt::from(q_max),
-        ciphertext_modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+        target_id: TALL_OPERATIONAL_TARGET_ID.to_owned(),
     };
     let lean_workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lean");
     let preparation_started = Instant::now();
@@ -377,15 +437,9 @@ fn run_tall_operational_check(
         "reused cached Tall operational IR and derivation"
     );
 
-    // Keep the first request identical to the selection request. The second request exercises
-    // the intended cheap multi-parameter path against the same prepared symbolic graph without
-    // affecting candidate acceptance.
-    let mut diagnostic_request = request.clone();
-    diagnostic_request.ciphertext_modulus += BigInt::from(1u8);
     let evaluation_started = Instant::now();
-    let mut reports =
-        run_prepared_operational_checks(&lean_workspace, &prepared, &[request, diagnostic_request])
-            .map_err(|error| error.to_string())?;
+    let mut reports = run_prepared_operational_checks(&lean_workspace, &prepared, &[request])
+        .map_err(|error| error.to_string())?;
     info!(
         elapsed = ?evaluation_started.elapsed(),
         request_count = reports.len(),
@@ -401,11 +455,11 @@ fn run_tall_operational_check(
             "measured Lean Tall operational request"
         );
     }
-    if reports.len() != 2 {
-        return Err(format!("expected two Tall operational reports, got {}", reports.len()));
+    if reports.len() != 1 {
+        return Err(format!("expected one Tall operational report, got {}", reports.len()));
     }
-    if reports[0].request_digest == reports[1].request_digest {
-        return Err("distinct Tall parameter requests produced the same digest".to_owned());
+    if reports[0].request_digest.is_empty() {
+        return Err("Tall operational report omitted its request digest".to_owned());
     }
     Ok(reports.remove(0))
 }
@@ -978,7 +1032,7 @@ fn build_encoding_graph(
     if include_operational_residual {
         let gadget =
             ring.gadget(layout.secret_dimension, layout.gadget_base.clone(), layout.digit_count);
-        let public_key = output_public_key;
+        let public_key = output_public_key.clone();
         let residuals = parallel_zip(
             (encoding_rows, output_plaintexts, transformed_secrets),
             move |_, (encoding, plaintext, transformed_secret)| {
@@ -987,11 +1041,30 @@ fn build_encoding_graph(
                 encoding - signal
             },
         )
-        .map_err(|error| error.to_string())?
-        .semantic_anchor("tall.decoder.residual")
         .map_err(|error| error.to_string())?;
+        // The operational target remains the complete residual family.  The
+        // executable decoder is a fixed lane witness taken from that exact
+        // family, rather than an independently computed same-modulus matrix.
+        let decoder_input = residuals
+            .get_static(0)
+            .slice(
+                Some(IndexRange { start: 0.into(), end: 1.into() }),
+                Some(IndexRange { start: 0.into(), end: 1.into() }),
+            )
+            .semantic_anchor(TALL_DECODER_RESIDUAL_ANCHOR)
+            .map_err(|error| error.to_string())?;
+        let q_max = parameters.to_crt().0.into_iter().max().expect("nonempty CRT basis");
+        let decoded = decoder_input
+            .threshold_decode_bools(IntExpr::constant(q_max), 1)
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Tall operational decoder has no Boolean output".to_owned())?
+            .semantic_anchor(TALL_DECODER_RESULT_ANCHOR)
+            .map_err(|error| error.to_string())?;
         context = context
-            .family_output("operational_residual", residuals)
+            .family_output(TALL_OPERATIONAL_RESIDUAL, residuals)
+            .map_err(|error| error.to_string())?
+            .bool_output(TALL_OPERATIONAL_DECODED, decoded)
             .map_err(|error| error.to_string())?;
     }
     context.build().map_err(|error| error.to_string())

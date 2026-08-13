@@ -1031,7 +1031,20 @@ partial def directFamilyLaneBinderFromCarrier
               | _, _, _ => none
       | .rebound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
       | .matrixResultBound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
-      | _ => none
+      /- `pushPointwise` constructs this context by merging its direct input contexts and checks
+      the payload schemas. Re-establish both invariants here before using a unique owner-aware
+      binder: a hand-constructed root must not advertise a lane absent from its inputs, and an
+      arbitrary input cannot be selected because it may be a broadcast operand. -/
+      | .pointwise schema operation inputs => do
+          let inputValues ← inputs.toList.mapM arena.valueAt?
+          let (inputContext, _) ← mergeIndexedFactShapeN inputValues
+          let inputSchemas := inputValues.toArray.map fun input => input.payload.schema
+          if inputContext != value.context || !pointwiseSchemasValid operation inputSchemas schema ||
+              !validateContext value.context then
+            none
+          else match value.context.binders.toList with
+          | [binder] => some binder
+          | _ => none
 
 private def directFamilyLaneBinderFailureDiagnostic
     (scopeKey : ScopeTemplateKey)

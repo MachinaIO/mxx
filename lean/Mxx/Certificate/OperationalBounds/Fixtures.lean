@@ -3742,6 +3742,134 @@ private def directIntegerLiftFixture : Bool :=
 example : directIntegerLiftFixture = true := by
   native_decide
 
+/-- A family coordinate remains recoverable through a pointwise carrier and lazy rebinding.
+The outer identity map models a graph-boundary reindex without depending on a protocol node. -/
+private def pointwiseArtifactFamilyZipFixture : Except OperationalError Bool := do
+  let scopeKey : ScopeTemplateKey := .root (.workflowStage ⟨"pointwise-consumer"⟩)
+  let wire : WireRef := { node := 0, port := 0 }
+  let scope : Scope := {
+    nodes := #[{
+      kind := .input "pointwise-artifact-family"
+      arguments := []
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)]
+    }]
+    outputs := []
+    inputNames := ["pointwise-artifact-family"]
+  }
+  let lane ← parallelLoopLaneBinder scopeKey 818 1 (.constant 2)
+  let context : IndexContext := { binders := #[lane] }
+  let (fixed, laneReference) := ({} : FixedOperationalPayloadArena).pushMatrix
+    (boundedOperationalExprFixtureFact 818 1)
+  let (fixed, broadcastReference) := fixed.pushMatrix (boundedOperationalExprFixtureFact 819 1)
+  let direct : DirectOperationalIndexedArena := { fixed }
+  let (direct, laneInput) ← match direct.pushShared context (.matrix fixtureType) laneReference with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr 818)
+  let (direct, broadcastInput) ← match direct.pushShared emptyContext (.matrix fixtureType)
+      broadcastReference with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr 819)
+  let operation : PrimitiveOperation := {
+    kind := .add false
+    outputType := .fromIr fixtureType
+    outputSchema := fixtureType
+    ownerScope := none
+    ownerNode := 820
+    outputPort := 0
+    parameterEnvironment := []
+  }
+  /- Keep the broadcast operand first: a resolver that descends into an arbitrary pointwise
+  input would lose the lane binder, whereas the merged pointwise context remains authoritative. -/
+  let (direct, pointwise) ← match direct.pushPointwise (.matrix operation) #[broadcastInput, laneInput] with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr 820)
+  let (direct, rebound) ← match direct.pushRebound pointwise { node := 821, port := 0 } with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr pointwise)
+  let (direct, rebound) ← match direct.pushRebound rebound { node := 822, port := 0 } with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr rebound)
+  let identity : IndexMap := {
+    source := context
+    destination := context
+    assignments := #[.variable lane]
+  }
+  let (direct, mapped) ← match direct.pushMapped rebound identity with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr rebound)
+  let arena : OperationalExprArena := { direct }
+  let family : OperationalFact := {
+    context
+    payload := .directValue mapped
+    storage := .mappedTemplate
+  }
+  let binder ← directFamilyLaneBinderAt arena scopeKey scope [] wire family
+  let (_, transported) ← loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey 823 0 0
+    (.constant 2) 2 .zip (some binder) [] family
+  let consumer ← parallelLoopLaneBinder scopeKey 823 0 (.constant 2)
+  pure (binder == lane && transported.context.binders.toList == [consumer])
+
+example : pointwiseArtifactFamilyZipFixture = .ok true := by native_decide
+
+/-- A stored pointwise context is not trusted when it disagrees with the merged input contexts.
+This root is deliberately constructed without `pushPointwise`; its apparent family lane must not
+be recovered or transported into a zip. -/
+private def malformedPointwiseFamilyCarrierRejectedFixture : Bool :=
+  match (do
+    let scopeKey : ScopeTemplateKey := .root (.workflowStage ⟨"malformed-pointwise"⟩)
+    let wire : WireRef := { node := 0, port := 0 }
+    let scope : Scope := {
+      nodes := #[{
+        kind := .input "malformed-pointwise-family"
+        arguments := []
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)]
+      }]
+      outputs := []
+      inputNames := ["malformed-pointwise-family"]
+    }
+    let lane ← parallelLoopLaneBinder scopeKey 824 0 (.constant 2)
+    let forgedContext : IndexContext := { binders := #[lane] }
+    let (fixed, leftReference) := ({} : FixedOperationalPayloadArena).pushMatrix
+      (boundedOperationalExprFixtureFact 824 1)
+    let (fixed, rightReference) := fixed.pushMatrix (boundedOperationalExprFixtureFact 825 1)
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, left) ← match direct.pushShared emptyContext (.matrix fixtureType) leftReference with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 824)
+    let (direct, right) ← match direct.pushShared emptyContext (.matrix fixtureType) rightReference with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 825)
+    let operation : PrimitiveOperation := {
+      kind := .add false
+      outputType := .fromIr fixtureType
+      outputSchema := fixtureType
+      ownerScope := none
+      ownerNode := 826
+      outputPort := 0
+      parameterEnvironment := []
+    }
+    let (direct, malformed) := direct.pushValue forgedContext
+      (.pointwise (.matrix fixtureType) (.matrix operation) #[left, right])
+    let arena : OperationalExprArena := { direct }
+    let family : OperationalFact := {
+      context := forgedContext
+      payload := .directValue malformed
+      storage := .mappedTemplate
+    }
+    let recovery := directFamilyLaneBinderFromCarrier arena.direct malformed
+      (arena.direct.values.size + 1)
+    let zipResult := do
+      let binder ← directFamilyLaneBinderAt arena scopeKey scope [] wire family
+      loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey 827 0 0
+        (.constant 2) 2 .zip (some binder) [] family
+    pure (recovery.isNone && match zipResult with
+      | .error (.loopInputModeMismatch 0 0) => true
+      | _ => false)) with
+  | .ok value => value
+  | .error _ => false
+
+example : malformedPointwiseFamilyCarrierRejectedFixture = true := by native_decide
+
 /-- Direct tensor rejects a forged output ring even when the Kronecker shape happens to match. -/
 private def directTensorOutputRingFixture : Bool :=
   let left := boundedOperationalExprFixtureFact 830 2

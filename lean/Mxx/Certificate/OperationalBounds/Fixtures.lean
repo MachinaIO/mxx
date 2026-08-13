@@ -151,6 +151,61 @@ private def sharedArtifactFamilyZipFixture : Except OperationalError Bool := do
 
 example : sharedArtifactFamilyZipFixture = .ok true := by native_decide
 
+/-- A child input carrying a nested family selects the unique positive domain whose evaluated
+count matches the declared family count.  The declaration and binder may use different syntax;
+an enclosing loop coordinate remains independent. -/
+private def nestedInputFamilyEvaluatedCountFixture : Except OperationalError Bool := do
+  let scopeKey : ScopeTemplateKey := .root (.workflowStage ⟨"nested-input-family"⟩)
+  let declaredCount : IntExpr := .add (.constant 80) (.constant 7)
+  let scope : Scope := {
+    nodes := #[{
+      kind := .input "nested-family"
+      arguments := []
+      outputTypes := [.indexedFamily (.bytes (.constant 32)) declaredCount]
+    }]
+    outputs := []
+    inputNames := ["nested-family"]
+  }
+  let (arena, family) ← contractFact {} scopeKey { node := 0, port := 0 }
+    ⟨"nested-family-artifact"⟩ (.indexedFamily (.bytes (.constant 32)) (.constant 87))
+    (.family (.constant 87) (.bytes (.constant 32))) []
+  let inner ← match family.context.binders[0]? with
+    | some binder => pure binder
+    | none => throw (.unsupportedOperationalExpr family.payload.root)
+  let outer ← parallelLoopLaneBinder scopeKey 1 0 (.constant 8)
+  let destination : IndexContext := { binders := #[inner, outer] }
+  let map : IndexMap := {
+    source := family.context, destination, assignments := #[.variable inner] }
+  let (arena, nested) ← arena.reindexDirectFact map family
+  let selected ← directFamilyLaneBinderAt arena scopeKey scope [] { node := 0, port := 0 } nested
+  pure (selected == inner)
+
+example : nestedInputFamilyEvaluatedCountFixture = .ok true := by native_decide
+
+/-- Equal evaluated counts do not authorize choosing between distinct owner-bearing coordinates. -/
+private def ambiguousInputFamilyEvaluatedCountRejectedFixture : Bool :=
+  match (do
+    let scopeKey : ScopeTemplateKey := .root (.workflowStage ⟨"ambiguous-input-family"⟩)
+    let scope : Scope := {
+      nodes := #[{
+        kind := .input "ambiguous-family"
+        arguments := []
+        outputTypes := [.indexedFamily (.bytes (.constant 32)) (.constant 87)]
+      }]
+      outputs := []
+      inputNames := ["ambiguous-family"]
+    }
+    let (arena, family) ← contractFact {} scopeKey { node := 0, port := 0 }
+      ⟨"ambiguous-family-artifact"⟩ (.indexedFamily (.bytes (.constant 32)) (.constant 87))
+      (.family (.constant 87) (.bytes (.constant 32))) []
+    let (arena, ambiguous) ← closeParallelDirectScalarOutput scopeKey 2 1 0
+      (.constant 87) [] arena family
+    directFamilyLaneBinderAt arena scopeKey scope [] { node := 0, port := 0 } ambiguous) with
+  | .error (.loopInputModeMismatch 0 0) => true
+  | _ => false
+
+example : ambiguousInputFamilyEvaluatedCountRejectedFixture = true := by native_decide
+
 /-- A lazy artifact rebind preserves an outer checked context lift.  The source payload itself
 has no family binder, so lane recovery must use the one destination binder introduced by the map
 rather than descending to the empty shared leaf or reconstructing an owner from the consumer. -/

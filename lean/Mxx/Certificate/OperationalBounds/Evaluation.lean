@@ -1054,6 +1054,50 @@ partial def directFamilyLaneBinderFromCarrier
           | [binder] => some binder
           | _ => none
 
+/-- Validate that one owner-bearing destination binder is actually transported by the carrier.
+Unlike `directFamilyLaneBinderFromCarrier`, this does not choose an outermost coordinate: nested
+families ask about the binder selected from their declared evaluated domain. -/
+partial def directFamilyLaneBinderSupported
+    (arena : DirectOperationalIndexedArena)
+    (root : OperationalIndexedValueId)
+    (requested : IndexVariable) : Nat → Bool
+  | 0 => false
+  | fuel + 1 => match arena.valueAt? root with
+      | none => false
+      | some value => match value.payload with
+          | .shared _ _ => value.context.binders.contains requested
+          | .explicit _ binder _ | .explicitValues _ binder _ => binder == requested
+          | .mapped _ source map =>
+              match arena.valueAt? source with
+              | none => false
+              | some sourceValue =>
+                  if !map.transportValid || map.source != sourceValue.context ||
+                      map.destination != value.context then false
+                  else
+                    (sourceValue.context.binders.toList.any fun sourceBinder =>
+                      (map.assignmentFor sourceBinder).bind IndexExpr.identityVariable? == some requested &&
+                        directFamilyLaneBinderSupported arena source sourceBinder fuel) ||
+                    (sourceValue.context.binders.isEmpty && map.isDirectCarrierContextLift &&
+                      map.destination.binders.toList == [requested])
+          | .rebound _ source _ => directFamilyLaneBinderSupported arena source requested fuel
+          | .indexedOutput _ source _ selection _ =>
+              selection.expression.identityVariable? == some requested ||
+                directFamilyLaneBinderSupported arena source requested fuel
+          | .matrixResultBound _ source _ =>
+              directFamilyLaneBinderSupported arena source requested fuel
+          | .pointwise schema operation inputs =>
+              match inputs.toList.mapM arena.valueAt? with
+              | none => false
+              | some inputValues =>
+                  let inputSchemas := inputValues.toArray.map fun input => input.payload.schema
+                  match mergeIndexedFactShapeN inputValues with
+                  | none => false
+                  | some (inputContext, _) =>
+                      inputContext == value.context && validateContext value.context &&
+                        pointwiseSchemasValid operation inputSchemas schema &&
+                        inputs.toList.any fun input =>
+                          directFamilyLaneBinderSupported arena input requested fuel
+
 private def directFamilyLaneBinderFailureDiagnostic
     (scopeKey : ScopeTemplateKey)
     (familyWire : WireRef)
@@ -1088,31 +1132,24 @@ def directFamilyLaneBinderAt
   if count <= 0 then throw (.invalidCount familyWire.node count)
   match producer.kind with
   | .input _ =>
-      /- A broadcast direct family enters a loop body through an input node, so the child IR does
-      not repeat the parent's `familyPack` producer.  Recover the already-carried lane binder
-      from the compact carrier root. -/
+      /- A nested family may enter a child scope with both its own lane and enclosing loop or
+      selection coordinates.  The child input declaration identifies the family lane by its
+      positive evaluated domain size; storage shape and outermost carrier wrapper do not.  An
+      equal-sized second coordinate is genuinely ambiguous and remains fail-closed. -/
       let root := family.payload.root
       if !validateContext family.context then throw (.unsupportedOperationalExpr root)
-      let binder ← match directFamilyLaneBinderFromCarrier arena.direct root
-          (arena.direct.values.size + 1) with
-        | some binder => pure binder
-        | none =>
-            if directFamilyLaneBinderFailureDiagnostic scopeKey familyWire countExpression family arena.direct
-            then throw (.loopInputModeMismatch familyWire.node familyWire.port)
-            else throw (.unsupportedOperationalExpr root)
-      if !family.context.binders.contains binder then
-        if directFamilyLaneBinderFailureDiagnostic scopeKey familyWire countExpression family arena.direct
-        then throw (.loopInputModeMismatch familyWire.node familyWire.port)
-        else throw (.unsupportedOperationalExpr root)
-      match binder.count.evaluate environment with
-      | some binderCount =>
-          if binderCount > 0 && binderCount == count then pure binder
-          else if directFamilyLaneBinderFailureDiagnostic scopeKey familyWire countExpression family arena.direct
-            then throw (.loopInputModeMismatch familyWire.node familyWire.port)
-            else throw (.unsupportedOperationalExpr root)
-      | none =>
+      let candidates := family.context.binders.toList.filter fun candidate =>
+        match candidate.count.evaluate environment with
+        | some candidateCount => candidateCount > 0 && candidateCount == count &&
+            directFamilyLaneBinderSupported arena.direct root candidate
+              (arena.direct.values.size + 1)
+        | none => false
+      match candidates with
+      | [binder] => pure binder
+      | _ =>
           if directFamilyLaneBinderFailureDiagnostic scopeKey familyWire countExpression family arena.direct
-          then throw .nonClosedExpression else throw (.unsupportedOperationalExpr root)
+          then throw (.loopInputModeMismatch familyWire.node familyWire.port)
+          else throw (.unsupportedOperationalExpr root)
   | _ =>
       let binder ← directFamilyLaneBinder scopeKey familyWire.node producer familyWire countExpression count.toNat
       if !family.context.binders.contains binder then

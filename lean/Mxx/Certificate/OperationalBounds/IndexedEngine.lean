@@ -3725,6 +3725,11 @@ private def reducedDirectMatrixFactAt
             let fact ← rebindMatrixSubject subject entry.fact
             pure { entry with fact }
           pure { evaluation with entries }
+      | .indexedOutput (.matrix _) source binder selection subject => do
+          let evaluation ← reducedDirectMatrixFactAt arena parameters maps source fuel
+          let entries := evaluation.entries.map fun entry =>
+            { entry with fact := overlayIndexMatrixFact binder selection subject entry.fact }
+          pure { evaluation with entries }
       | .matrixResultBound (.matrix _) source totalHardBound => do
           let evaluation ← reducedDirectMatrixFactAt arena parameters maps source fuel
           /- The pending maps are normally applied at fixed leaves.  This annotation is installed
@@ -3898,6 +3903,11 @@ private def reducedDirectScalarFactAt
           let evaluation ← reducedDirectScalarFactAt arena parameters maps source fuel
           let entries := evaluation.entries.map fun entry =>
             { entry with fact := rebindOperationalScalarFact subject entry.fact }
+          pure { evaluation with entries }
+      | .indexedOutput (.scalar _) source binder selection subject => do
+          let evaluation ← reducedDirectScalarFactAt arena parameters maps source fuel
+          let entries := evaluation.entries.map fun entry =>
+            { entry with fact := overlayIndexScalarFact binder selection subject entry.fact }
           pure { evaluation with entries }
       | .pointwise (.scalar _) (.matrixToScalar operation) inputs => do
           let operation ← reindexReducedPointwiseOperation parameters maps (.matrixToScalar operation)
@@ -4576,7 +4586,15 @@ def OperationalExprArena.reindexDirectFact
       (OperationalExprArena × IndexedOperationalFact) := do
   let root ← match expression.payload with
     | .directValue root => pure root
-  if !map.transportValid || map.source != expression.context then throw (.unsupportedOperationalExpr root)
+  if !map.transportValid || map.source != expression.context then
+    if operationalProgress "reindex_direct_fact" "admission_failed" ""
+        root arena.direct.values.size ("transport_valid=" ++ toString map.transportValid ++
+          "; map_source=" ++ reprStr map.source ++
+          "; fact_context=" ++ reprStr expression.context ++
+          "; destination_context=" ++ reprStr map.destination ++
+          "; assignments=" ++ reprStr map.assignments) then
+      throw (.unsupportedOperationalExpr root)
+    else throw (.unsupportedOperationalExpr root)
   /- `pushMapped` composes adjacent capture-free maps.  No fixed table, relation inventory, or
   delayed pointwise DAG is copied here: final reduction transports the one selected fixed result
   through that composed map before any enclosing `.rebound` subject overlay is validated. -/

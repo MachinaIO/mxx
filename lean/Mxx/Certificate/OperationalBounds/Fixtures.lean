@@ -4038,6 +4038,10 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
     (arena.direct.values.size + 1)
   let scalarFact ← arena.direct.scalarFactAt [] indices scalar.payload.root
     (arena.direct.values.size + 1)
+  let reducedMatrix ← arena.reducedDirectValueFactsAt [] matrix
+  let reducedScalar ← arena.reducedDirectScalarValueFactsAt [] scalar
+  let (scalarLower, scalarUpper) ← arena.direct.integerInterval loopNode
+    { node := loopNode, port := 1 } scalar.payload.root (arena.direct.values.size + 1)
   let familyBinder := parallelLoopFamilyBinder scopeKey loopNode 0
   let matrixIndexed := match matrixFact.origin with
     | .indexed binder expression _ => binder == familyBinder && expression == .variable expected
@@ -4055,6 +4059,10 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
     (arena.direct.values.size + 1)
   let scalarLaneBinder := directFamilyLaneBinderFromCarrier arena.direct scalar.payload.root
     (arena.direct.values.size + 1)
+  let nextLoopNode := 839
+  let (arena, transportedMatrix) ← loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey
+    nextLoopNode 0 0 count 8 .zip matrixLaneBinder [] matrix
+  let nextLoopBinder ← parallelLoopLaneBinder scopeKey nextLoopNode 0 count
   let nestedOverlay (subject : WireRef) (value : OperationalIndexedValue) := match value.payload with
     | .indexedOutput _ source indexedBinder indexedSelection indexedSubject =>
         indexedBinder == familyBinder && indexedSelection ==
@@ -4069,6 +4077,13 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
     matrixFact.subject == { node := loopNode, port := 0 },
     scalarSubject == some { node := loopNode, port := 1 }, matrixIndexed, scalarIndexed,
     matrixLaneBinder == some expected, scalarLaneBinder == some expected,
+    reducedMatrix.length == 1 && reducedMatrix.all fun entry =>
+      entry.fact.subject == { node := loopNode, port := 0 },
+    reducedScalar.length == 1 && reducedScalar.all fun entry => match entry.fact with
+      | .integer fact => fact.subject == { node := loopNode, port := 1 }
+      | _ => false,
+    scalarLower == 0 && scalarUpper == 1,
+    transportedMatrix.context.binders.toList == [independent, nextLoopBinder],
     nestedOverlay { node := loopNode, port := 0 } matrixValue,
     nestedOverlay { node := loopNode, port := 1 } scalarValue]
   pure (checks.all id)

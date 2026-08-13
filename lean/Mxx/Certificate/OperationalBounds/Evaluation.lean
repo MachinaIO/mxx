@@ -1159,6 +1159,42 @@ def directFamilyLaneBinderAt
         throw (.loopInputModeMismatch familyWire.node familyWire.port)
       pure binder
 
+/-- Preserve an indexed integer selector as the exact producer-backed gather used by an ordinary
+branch select.  A logical selection identity is only safe for a context-free selector; otherwise
+the direct carrier determines the unique runtime position and remains registered under the
+selector wire's owner. -/
+def executableDirectSelectExpression
+    (scopeKey : ScopeTemplateKey)
+    (node : Nat)
+    (selectorWire : WireRef)
+    (selection : OperationalIntegerFact)
+    (selectionInput : OperationalFact)
+    (branchCount : Nat)
+    (arena : OperationalExprArena) : Except OperationalError (OperationalExprArena × Option IndexExpr) := do
+  if selection.lower == selection.upper then pure (arena, none) else
+    match selectionInput with
+    | direct@{ payload := .directValue root, .. } =>
+        if direct.context.binders.isEmpty then
+          /- A context-free interval has no executable runtime coordinate to preserve.  Its
+          origin-keyed identity is the declared selection semantics, but pass it explicitly so
+          the direct branch selector cannot silently fall back from an indexed producer. -/
+          pure (arena, some (DynamicSelectionIdentity.fromOrigin selection.origin branchCount).expression)
+        else do
+          let position ← match direct.context.binders.toList with
+            | [binder] => pure binder
+            | _ => match (directFamilyLaneBinderFromCarrier arena.direct root
+                (arena.direct.values.size + 1)) with
+              | some binder =>
+                  if direct.context.binders.contains binder then pure binder
+                  else throw (.unsupportedOperationalExpr node)
+              | none => throw (.unsupportedOperationalExpr node)
+          let owner : GatherLookupOwner := { indices := operationalGatherIndicesWire scopeKey selectorWire }
+          let directArena ← match arena.direct.registerGatherIntegerRoot owner root position with
+            | some directArena => pure directArena
+            | none => throw (.unsupportedOperationalExpr node)
+          pure ({ arena with direct := directArena },
+            some (.gather owner (IntExpr.constant (Int.ofNat branchCount)) (.variable position)))
+
 def deriveOrdinaryOutputs
     (scopeKey : ScopeTemplateKey)
     (nodeIndex : Nat)
@@ -1527,6 +1563,12 @@ def evaluatePreparedScope
             let step ← match derivation.steps[index]? with
               | some step => pure step
               | none => throw (.derivation (.missingNode index))
+            if operationalProgressBlock index scope.nodes.size then
+              if operationalProgress "evaluate_scope" "node_rule" (reprStr scopeKey)
+                  index scope.nodes.size ("rule=" ++ reprStr step.rule ++
+                    "; arguments=" ++ reprStr node.arguments) then pure () else
+                throw (.unsupportedOperationalExpr index)
+            else pure ()
             let outputs ← try
               match node.kind with
               | .input _ =>
@@ -2039,14 +2081,13 @@ def evaluatePreparedScope
                           lowerExpression := .closed (.closedInt (.constant lower))
                           upperExpression := .closed (.closedInt (.constant upper))
                         }
-                  let selectionExpression : Option IndexExpr := match selectionInput with
-                    | { context := { binders := #[binder] }, payload := .directValue _, .. } =>
-                        some (.variable binder)
-                    | _ => none
                   let branchWires := node.arguments.drop 1
                   if branchWires.isEmpty || selection.lower < 0 ||
                       selection.upper >= Int.ofNat branchWires.length then
                     throw (.invalidCount index selection.upper)
+                  let (arena, selectionExpression) ← executableDirectSelectExpression scopeKey index indexWire
+                    selection selectionInput branchWires.length facts.arena
+                  facts := { facts with arena }
                   let branches ← branchWires.mapM (lookupFact index facts)
                   match node.outputTypes with
                   | [.indexedFamily (.matrix matrixType) count]
@@ -2065,6 +2106,7 @@ def evaluatePreparedScope
                   | [.matrix matrixType] | [.preimage matrixType] =>
                       let (arena, output) ← selectDirectMatrixBranches scopeKey index selection
                         { node := index, port := 0 } matrixType environment facts.arena branches.toArray
+                        selectionExpression
                       facts := { facts with arena }
                       pure [output]
                   | [outputType] =>
@@ -2073,7 +2115,7 @@ def evaluatePreparedScope
                         | none => throw (.outputTypeMismatch index)
                       let (arena, output) ← selectDirectScalarBranches scopeKey index selection
                         { node := index, port := 0 } schema environment
-                        facts.arena branches.toArray
+                        facts.arena branches.toArray selectionExpression
                       facts := { facts with arena }
                       pure [output]
                   | _ => throw (.unsupportedOutputArity index node.outputTypes.length)
@@ -2363,14 +2405,65 @@ def evaluatePreparedScope
             for (output, port) in outputs.toArray.zipIdx do
                   let expression := output
                   let wire : WireRef := { node := index, port }
-                  let (arena, expression) ← namespaceFreshDirectOutput scopeKey wire facts.arena
-                    expression
+                  let (arena, expression) ← try
+                    namespaceFreshDirectOutput scopeKey wire facts.arena expression
+                  catch error =>
+                    let root := expression.payload.root
+                    let schemaDetail : OperationalIndexedPayloadSchema → String
+                      | .matrix _ => "matrix"
+                      | .scalar scalar => match scalar with
+                        | .boolean => "scalar_boolean"
+                        | .integer => "scalar_integer"
+                        | .real => "scalar_real"
+                        | .bytes _ => "scalar_bytes"
+                        | .trapdoor .. => "scalar_trapdoor"
+                        | .typedBlob .. => "scalar_typed_blob"
+                        | .unknown _ => "scalar_unknown"
+                    let payloadDetail := match facts.arena.direct.valueAt? root with
+                      | none => "missing"
+                      | some value => match value.payload with
+                        | .shared schema (.matrix reference) =>
+                            "shared_matrix(schema=" ++ schemaDetail schema ++
+                              "; reference=" ++ toString reference ++ ")"
+                        | .shared schema (.scalar reference) =>
+                            "shared_scalar(schema=" ++ schemaDetail schema ++
+                              "; reference=" ++ toString reference ++ ")"
+                        | .explicit .. => "explicit"
+                        | .explicitValues .. => "explicit_values"
+                        | .mapped .. => "mapped"
+                        | .rebound .. => "rebound"
+                        | .indexedOutput .. => "indexed_output"
+                        | .matrixResultBound .. => "matrix_result_bound"
+                        | .pointwise .. => "pointwise"
+                    if operationalProgress "evaluate_scope" "namespace_error" (reprStr scopeKey)
+                        index scope.nodes.size ("wire=" ++ reprStr wire ++ "; root=" ++
+                          toString root ++ "; payload=" ++ payloadDetail ++
+                          "; error=" ++ reprStr error) then
+                      throw error
+                    else throw error
                   facts := { facts with arena }
                   namespacedOutputs := namespacedOutputs.push expression
             let outputs := namespacedOutputs
             facts := { facts with values := facts.values.push outputs }
             let attachments := prepared.attachmentBuckets[index]?.getD #[]
-            facts := ← applyPreparedDerivationAttachments index attachments facts
+            facts := ← try
+              applyPreparedDerivationAttachments index attachments facts
+            catch error =>
+              let attachmentDetail := attachments.toList.map fun attachment =>
+                (attachment.ownerNamespace, attachment.ruleName, attachment.roles)
+              let roleRoots := attachments.toList.flatMap fun attachment =>
+                attachment.roles.filterMap fun (name, wire) =>
+                  match facts.values[wire.node]? >>= fun outputs => outputs[wire.port]? with
+                  | some { payload := .directValue root, .. } =>
+                      some (name ++ "@" ++ reprStr wire ++ " root=" ++ toString root ++
+                        " carrier=" ++ directFamilyLaneCarrierTrace facts.arena.direct root
+                          (facts.arena.direct.values.size + 1))
+                  | none => none
+              if operationalProgress "evaluate_scope" "attachment_error" (reprStr scopeKey)
+                  index scope.nodes.size ("attachments=" ++ reprStr attachmentDetail ++
+                    "; role_roots=" ++ reprStr roleRoots ++ "; error=" ++ reprStr error) then
+                throw error
+              else throw error
             if operationalProgressBlock index scope.nodes.size then
               if operationalProgress "evaluate_scope" "node_block_complete" (reprStr scopeKey)
                   (index + 1) scope.nodes.size ("outputs=" ++ toString outputs.size ++

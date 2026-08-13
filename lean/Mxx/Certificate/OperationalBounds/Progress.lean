@@ -17,6 +17,6 @@ def operationalProgress
   true
 
 def operationalProgressBlock (node total : Nat) : Bool :=
-  node == 0 || node + 1 == total || (node + 1) % 1024 == 0
+  node < 32 || node + 1 == total || (node + 1) % 1024 == 0
 
 end Mxx.Certificate

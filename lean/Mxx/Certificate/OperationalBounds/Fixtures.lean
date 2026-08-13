@@ -5263,6 +5263,180 @@ private def mappedGatherPhysicalLaneFixture : Bool :=
 
 example : mappedGatherPhysicalLaneFixture = true := by native_decide
 
+/-- Ordinary branch selection consumes the executable indexed integer producer, rather than
+manufacturing a selector identity from the select node.  The same gather transport applies to
+both matrix and scalar branch tables. -/
+private def executableDirectSelectFixture : Bool :=
+  match (do
+    let position := { directCarrierFixtureBinder 6410 with count := .constant 2 }
+    let matrix0 := boundedOperationalExprFixtureFact 6411 3
+    let matrix1 := boundedOperationalExprFixtureFact 6412 5
+    let scalar0 : OperationalScalarFact := .integer {
+      subject := { node := 6413, port := 0 }
+      origin := .local temporaryScope { node := 6413, port := 0 }
+      lower := 7
+      upper := 7
+      lowerExpression := .closed (.closedInt (.constant 7))
+      upperExpression := .closed (.closedInt (.constant 7)) }
+    let scalar1 : OperationalScalarFact := .integer {
+      subject := { node := 6414, port := 0 }
+      origin := .local temporaryScope { node := 6414, port := 0 }
+      lower := 9
+      upper := 9
+      lowerExpression := .closed (.closedInt (.constant 9))
+      upperExpression := .closed (.closedInt (.constant 9)) }
+    let selector0 : OperationalScalarFact := .integer {
+      subject := { node := 6415, port := 0 }
+      origin := .local temporaryScope { node := 6415, port := 0 }
+      lower := 1
+      upper := 1
+      lowerExpression := .closed (.closedInt (.constant 1))
+      upperExpression := .closed (.closedInt (.constant 1)) }
+    let selector1 : OperationalScalarFact := .integer {
+      subject := { node := 6415, port := 1 }
+      origin := .local temporaryScope { node := 6415, port := 1 }
+      lower := 0
+      upper := 0
+      lowerExpression := .closed (.closedInt (.constant 0))
+      upperExpression := .closed (.closedInt (.constant 0)) }
+    let (fixed, matrixRef0) := ({} : FixedOperationalPayloadArena).pushMatrix matrix0
+    let (fixed, matrixRef1) := fixed.pushMatrix matrix1
+    let (fixed, scalarRef0) := fixed.pushScalar scalar0
+    let (fixed, scalarRef1) := fixed.pushScalar scalar1
+    let (fixed, selectorRef0) := fixed.pushScalar selector0
+    let (fixed, selectorRef1) := fixed.pushScalar selector1
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, matrixRoot0) ← match direct.pushShared emptyContext (.matrix fixtureType) matrixRef0 with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6411)
+    let (direct, matrixRoot1) ← match direct.pushShared emptyContext (.matrix fixtureType) matrixRef1 with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6412)
+    let (direct, scalarRoot0) ← match direct.pushShared emptyContext (.scalar .integer) scalarRef0 with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6413)
+    let (direct, scalarRoot1) ← match direct.pushShared emptyContext (.scalar .integer) scalarRef1 with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6414)
+    let (direct, selectorRoot) ← match direct.pushExplicit [] { binders := #[position] } position
+        (.scalar .integer) #[selectorRef0, selectorRef1] with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6415)
+    let arena : OperationalExprArena := { direct := direct }
+    let selectorContext : IndexContext := { binders := #[position] }
+    let selectorInput : OperationalFact := {
+      context := selectorContext
+      payload := .directValue selectorRoot
+      storage := .explicitTable
+    }
+    let selection : OperationalIntegerFact := {
+      subject := { node := 6415, port := 0 }
+      origin := .local temporaryScope { node := 6415, port := 0 }
+      lower := 0
+      upper := 1
+      lowerExpression := .closed (.closedInt (.constant 0))
+      upperExpression := .closed (.closedInt (.constant 1))
+    }
+    let (arena, selector?) ← executableDirectSelectExpression temporaryScope 6416 { node := 6415, port := 0 }
+      selection selectorInput 2 arena
+    let selector ← match selector? with
+      | some selector => pure selector
+      | none => throw (OperationalError.unsupportedOperationalExpr 6416)
+    let matrixBranches : Array OperationalFact := #[
+      { context := emptyContext
+        payload := .directValue matrixRoot0
+        storage := .sharedTemplate },
+      { context := emptyContext
+        payload := .directValue matrixRoot1
+        storage := .sharedTemplate }]
+    let scalarBranches : Array OperationalFact := #[
+      { context := emptyContext
+        payload := .directValue scalarRoot0
+        storage := .sharedTemplate },
+      { context := emptyContext
+        payload := .directValue scalarRoot1
+        storage := .sharedTemplate }]
+    let (arena, matrices) ← selectDirectMatrixBranches temporaryScope 6416 selection { node := 6416, port := 0 }
+      fixtureType [] arena matrixBranches selector
+    let (arena, scalars) ← selectDirectScalarBranches temporaryScope 6417 selection { node := 6417, port := 0 }
+      .integer [] arena scalarBranches selector
+    let matrixAt0 ← arena.direct.matrixFactAt [] [(.variable position, 0)] matrices.payload.root
+      (arena.direct.values.size + 1)
+    let matrixAt1 ← arena.direct.matrixFactAt [] [(.variable position, 1)] matrices.payload.root
+      (arena.direct.values.size + 1)
+    let scalarAt0 ← arena.direct.scalarFactAt [] [(.variable position, 0)] scalars.payload.root
+      (arena.direct.values.size + 1)
+    let scalarAt1 ← arena.direct.scalarFactAt [] [(.variable position, 1)] scalars.payload.root
+      (arena.direct.values.size + 1)
+    let matrixBound0 ← matrixAt0.totalHardBound.evaluate [] #[]
+    let matrixBound1 ← matrixAt1.totalHardBound.evaluate [] #[]
+    pure (matrixBound0 == 5 && matrixBound1 == 3 &&
+      match scalarAt0, scalarAt1 with
+      | .integer first, .integer second => first.lower == 9 && second.lower == 7
+      | _, _ => false)) with
+  | .ok value => value
+  | .error _ => false
+
+example : executableDirectSelectFixture = true := by native_decide
+
+/-- Selector owners are keyed by the wire, and a multi-binder shared scalar cannot be assigned a
+runtime position by guessing a slot. -/
+private def executableDirectSelectRejectsCollisionAndAmbiguityFixture : Bool :=
+  match (show Except OperationalError Bool from do
+    let first := { directCarrierFixtureBinder 6420 with count := .constant 2 }
+    let second := { directCarrierFixtureBinder 6421 with count := .constant 2 }
+    let fact : OperationalScalarFact := .integer {
+      subject := { node := 6422, port := 0 }
+      origin := .local temporaryScope { node := 6422, port := 0 }
+      lower := 0
+      upper := 1
+      lowerExpression := .closed (.closedInt (.constant 0))
+      upperExpression := .closed (.closedInt (.constant 1))
+    }
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushScalar fact
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, root) ← match direct.pushShared { binders := #[first, second] } (.scalar .integer) reference with
+      | some result => pure result | none => throw (OperationalError.unsupportedOperationalExpr 6422)
+    let context : IndexContext := { binders := #[first, second] }
+    let input : OperationalFact := {
+      context
+      payload := .directValue root
+      storage := .sharedTemplate
+    }
+    let selection : OperationalIntegerFact := {
+      subject := { node := 6422, port := 0 }
+      origin := .local temporaryScope { node := 6422, port := 0 }
+      lower := 0
+      upper := 1
+      lowerExpression := .closed (.closedInt (.constant 0))
+      upperExpression := .closed (.closedInt (.constant 1))
+    }
+    let rejected : Except OperationalError (OperationalExprArena × Option IndexExpr) :=
+      executableDirectSelectExpression temporaryScope 6423 { node := 6422, port := 0 }
+        selection input 2 { direct := direct }
+    let owner : GatherLookupOwner := {
+      indices := operationalGatherIndicesWire temporaryScope { node := 6422, port := 0 } }
+    let registered ← match direct.registerGatherIntegerRoot owner root first with
+      | some registered => pure registered
+      | none => throw (OperationalError.unsupportedOperationalExpr 6424)
+    let (registered, singleRoot) ← match registered.pushShared { binders := #[first] }
+        (.scalar .integer) reference with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 6425)
+    let singleInput : OperationalFact := {
+      context := { binders := #[first] }
+      payload := .directValue singleRoot
+      storage := .sharedTemplate
+    }
+    let collision : Except OperationalError (OperationalExprArena × Option IndexExpr) :=
+      executableDirectSelectExpression temporaryScope 6423 { node := 6422, port := 0 }
+        selection singleInput 2 { direct := registered }
+    pure ((match rejected with
+      | .error (OperationalError.unsupportedOperationalExpr _) => true
+      | _ => false) &&
+      match collision with
+      | .error (OperationalError.unsupportedOperationalExpr _) => true
+      | _ => false)) with
+  | Except.ok value => value
+  | Except.error _ => false
+
+example : executableDirectSelectRejectsCollisionAndAmbiguityFixture = true := by native_decide
+
 /-- Nested direct tables retain both independent physical assignments.  Reusing the nested
 table in a pointwise primitive zips exact composite environments rather than expanding them. -/
 private def reducedNestedExplicitValuesCorrelationFixture : Bool :=

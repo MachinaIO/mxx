@@ -5343,7 +5343,8 @@ def packDirectScalarFamily
 def selectDirectMatrixBranches
     (scope : ScopeTemplateKey) (node : Nat) (selection : OperationalIntegerFact) (subject : WireRef)
     (matrixType : MatrixTypeExpr) (environment : ParamEnvironment) (arena : OperationalExprArena)
-    (branches : Array OperationalFact) : Except OperationalError (OperationalExprArena × OperationalFact) := do
+    (branches : Array OperationalFact) (selectionExpression : Option IndexExpr) :
+    Except OperationalError (OperationalExprArena × OperationalFact) := do
   if branches.isEmpty then throw (.invalidCount node 0)
   let count := branches.size
   let values ← branches.mapM fun branch => match arena.direct.valueAt? branch.payload.root with
@@ -5358,8 +5359,10 @@ def selectDirectMatrixBranches
       match closedStaticIndexMap environment family.context binder selection.lower.toNat with
       | some map => pure map | none => throw (.unsupportedOperationalExpr node)
     else
-      let selection := DynamicSelectionIdentity.fromOrigin selection.origin count
-      match dynamicIndexMap family.context binder selection.expression with
+      let executableSelection ← match selectionExpression with
+        | some expression => pure expression
+        | none => throw (.unsupportedOperationalExpr node)
+      match dynamicIndexMap family.context binder executableSelection with
       | some map => pure map | none => throw (.unsupportedOperationalExpr node)
   let (arena, selected) ← arena.reindexDirectFact map family environment
   rebindOperationalFact subject arena selected environment
@@ -5367,7 +5370,7 @@ def selectDirectMatrixBranches
 def selectDirectScalarBranches
     (scope : ScopeTemplateKey) (node : Nat) (selection : OperationalIntegerFact) (subject : WireRef)
     (schema : OperationalFixedScalarSchema) (environment : ParamEnvironment)
-    (arena : OperationalExprArena) (branches : Array OperationalFact) : Except OperationalError
+    (arena : OperationalExprArena) (branches : Array OperationalFact) (selectionExpression : Option IndexExpr) : Except OperationalError
       (OperationalExprArena × OperationalFact) := do
   if branches.isEmpty then throw (.invalidCount node 0)
   let count := branches.size
@@ -5383,8 +5386,10 @@ def selectDirectScalarBranches
       match closedStaticIndexMap environment family.context binder selection.lower.toNat with
       | some map => pure map | none => throw (.unsupportedOperationalExpr node)
     else
-      let selection := DynamicSelectionIdentity.fromOrigin selection.origin count
-      match dynamicIndexMap family.context binder selection.expression with
+      let executableSelection ← match selectionExpression with
+        | some expression => pure expression
+        | none => throw (.unsupportedOperationalExpr node)
+      match dynamicIndexMap family.context binder executableSelection with
       | some map => pure map | none => throw (.unsupportedOperationalExpr node)
   let (arena, selected) ← arena.reindexDirectFact map family environment
   rebindOperationalFact subject arena selected environment

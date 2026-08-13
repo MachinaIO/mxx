@@ -12,7 +12,7 @@ def DiamondWeFamily_protocolSourceHash : String := "bd2606c01c2131459d6c40e89985
 
 def DiamondWeFamily_workflowHash : String := "a19defee77a3d3c0f0fe9a72c0835bf03b2d5570a12c66b34043cd89c5abaa8f"
 
-def DiamondWeFamily_toolkitHash : String := "d45abd1456a30693499051d3ea25c93f3cfb915609efee5bd3800f3466b1b149"
+def DiamondWeFamily_toolkitHash : String := "4410af54891f729f811bcf64ab703247b15753c25b1484c3a03723330fa3f9e6"
 
 def DiamondWeFamily_derivationHash : String := "fcba3c37aef856bc8091aaf26f34aa211992dae138458e603b91b7175eff390a"
 

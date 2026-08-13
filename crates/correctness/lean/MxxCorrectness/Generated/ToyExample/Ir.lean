@@ -12,7 +12,7 @@ def ToyExample_protocolSourceHash : String := "c894ed871c835c66f3dbb1c42a53b03a5
 
 def ToyExample_workflowHash : String := "f0727b300c312d49e01c5cba55cf8d11de69de7efa5d17b68a4133c5a6a15c6b"
 
-def ToyExample_toolkitHash : String := "d45abd1456a30693499051d3ea25c93f3cfb915609efee5bd3800f3466b1b149"
+def ToyExample_toolkitHash : String := "4410af54891f729f811bcf64ab703247b15753c25b1484c3a03723330fa3f9e6"
 
 def ToyExample_derivationHash : String := "1eb7ee1d85bf85dc59fea9e4e198e1cfa94df8fd0bf8168d408a754514520933"
 

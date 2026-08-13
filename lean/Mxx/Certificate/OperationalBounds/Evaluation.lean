@@ -1691,8 +1691,29 @@ def evaluatePreparedScope
                                     (facts.arena.direct.values.size + 1)) with
                                   | some binder =>
                                       if direct.context.binders.contains binder then pure binder
-                                      else throw (.loopInputModeMismatch index 0)
-                                  | none => throw (.loopInputModeMismatch index 0)
+                                      else
+                                        if operationalProgress "evaluate_scope"
+                                            "gather_selector_carrier_unresolved" (reprStr scopeKey)
+                                            index scope.nodes.size
+                                            ("root=" ++ toString root ++
+                                              "; context=" ++ reprStr direct.context ++
+                                              "; recovered=" ++ reprStr binder ++
+                                              "; chain=" ++ directFamilyLaneCarrierTrace
+                                                facts.arena.direct root
+                                                (facts.arena.direct.values.size + 1)) then
+                                          throw (.loopInputModeMismatch index 0)
+                                        else throw (.unsupportedOperationalExpr index)
+                                  | none =>
+                                      if operationalProgress "evaluate_scope"
+                                          "gather_selector_carrier_unresolved" (reprStr scopeKey)
+                                          index scope.nodes.size
+                                          ("root=" ++ toString root ++
+                                            "; context=" ++ reprStr direct.context ++
+                                            "; recovered=none; chain=" ++ directFamilyLaneCarrierTrace
+                                              facts.arena.direct root
+                                              (facts.arena.direct.values.size + 1)) then
+                                        throw (.loopInputModeMismatch index 0)
+                                      else throw (.unsupportedOperationalExpr index)
                               let owner : GatherLookupOwner := {
                                 indices := operationalGatherIndicesWire scopeKey indexWire
                               }

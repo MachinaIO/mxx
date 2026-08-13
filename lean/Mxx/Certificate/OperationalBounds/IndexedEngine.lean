@@ -1,4 +1,5 @@
 import Mxx.Certificate.OperationalBounds.DescriptorTransport
+import Mxx.Certificate.OperationalBounds.Progress
 
 namespace Mxx.Certificate
 
@@ -5034,6 +5035,34 @@ def parallelLoopOutputBinder
       | _ => throw (.unsupportedOperationalExpr root)
   | _ => throw (.unsupportedOperationalExpr root)
 
+/-- Emit complete owner-aware context evidence when closing a parallel body cannot find its
+lexical lane.  The diagnostic is failure-only; the carrier remains the authoritative source and
+the result still fails closed. -/
+private def parallelLoopOutputBinderFailureDiagnostic
+    (selection : DynamicSelectionIdentity)
+    (output : OperationalFact)
+  (arena : OperationalExprArena) : Bool :=
+  let root := output.payload.root
+  let payload := match arena.direct.valueAt? root with
+    | some { payload := .shared .., .. } => "shared"
+    | some { payload := .explicit _ binder references, .. } =>
+        "explicit; binder=" ++ reprStr binder ++ "; entries=" ++ toString references.size
+    | some { payload := .explicitValues _ binder values, .. } =>
+        "explicit_values; binder=" ++ reprStr binder ++ "; entries=" ++ toString values.size
+    | some { payload := .mapped _ source map, .. } =>
+        "mapped; source=" ++ toString source ++ "; map=" ++ reprStr map
+    | some { payload := .rebound _ source subject, .. } =>
+        "rebound; source=" ++ toString source ++ "; subject=" ++ reprStr subject
+    | some { payload := .matrixResultBound _ source _, .. } =>
+        "matrix_result_bound; source=" ++ toString source
+    | some { payload := .pointwise _ _ inputs, .. } =>
+        "pointwise; inputs=" ++ reprStr inputs
+    | none => "missing_direct_root"
+  operationalProgress "parallel_loop_output_binder" "unresolved" ""
+    root arena.direct.values.size
+    ("expected=" ++ reprStr selection.expression ++ "; output_context=" ++ reprStr output.context ++
+      "; root=" ++ toString root ++ "; payload=" ++ payload)
+
 def packDirectScalarFamily
     (scope : ScopeTemplateKey)
     (node : Nat)
@@ -5140,7 +5169,11 @@ def closeParallelDirectMatrixOutput
       context := emptyContext, payload := .directValue indexed, storage := indexedValue.storage }
     ({ arena with direct }).reindexDirectFact map expression environment
   else
-    let sourceBinder ← parallelLoopOutputBinder selection output.context root
+    let sourceBinder ← match parallelLoopOutputBinder selection output.context root with
+      | .ok binder => pure binder
+      | .error error =>
+          if parallelLoopOutputBinderFailureDiagnostic selection output arena then throw error
+          else throw error
     let map ← match dynamicIndexMap output.context sourceBinder selection.expression with
       | some map => pure map | none => throw (.unsupportedOperationalExpr root)
     arena.reindexDirectFact map output environment
@@ -5170,7 +5203,11 @@ def closeParallelDirectScalarOutput
           context := emptyContext, payload := .directValue indexed, storage := indexedValue.storage }
         ({ arena with direct }).reindexDirectFact map expression environment
       else
-        let sourceBinder ← parallelLoopOutputBinder selection output.context root
+        let sourceBinder ← match parallelLoopOutputBinder selection output.context root with
+          | .ok binder => pure binder
+          | .error error =>
+              if parallelLoopOutputBinderFailureDiagnostic selection output arena then throw error
+              else throw error
         let map ← match dynamicIndexMap output.context sourceBinder selection.expression with
           | some map => pure map | none => throw (.unsupportedOperationalExpr root)
         arena.reindexDirectFact map output environment

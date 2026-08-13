@@ -969,6 +969,14 @@ partial def directFamilyLaneBinderFromCarrier
   | fuel + 1 => do
       let value ← arena.valueAt? root
       match value.payload with
+      /- A workflow artifact may enter the consuming stage as one shared external family: its
+      physical lane coordinate lives in the owner-aware fact context rather than an explicit
+      table payload.  It is usable for a zip only when that context has one unambiguous lane
+      binder; `directFamilyLaneBinderAt` validates the declared family count before transport. -/
+      | .shared _ _ =>
+          match value.context.binders.toList with
+          | [binder] => some binder
+          | _ => none
       | .explicit _ binder _ | .explicitValues _ binder _ => some binder
       | .mapped _ source map => do
           let sourceBinder ← directFamilyLaneBinderFromCarrier arena source fuel

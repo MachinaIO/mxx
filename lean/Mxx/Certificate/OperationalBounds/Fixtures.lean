@@ -123,6 +123,34 @@ example : (do
     | _, _ => pure false) = .ok true := by
   native_decide
 
+/-- A shared artifact family is an executable zip input even though it has no explicit-table
+payload: its unique owner-aware context binder is transported into the consumer loop coordinate.
+This is the workflow-stage shape used by a producer artifact consumed by Tall's encoding loop. -/
+private def sharedArtifactFamilyZipFixture : Except OperationalError Bool := do
+  let scopeKey : ScopeTemplateKey := .root (.workflowStage ⟨"consumer"⟩)
+  let scope : Scope := {
+    nodes := #[{
+      kind := .input "artifact-family"
+      arguments := []
+      outputTypes := [.indexedFamily (.bytes (.constant 32)) (.constant 2)]
+    }]
+    outputs := []
+    inputNames := ["artifact-family"]
+  }
+  let (arena, family) ← contractFact {} scopeKey { node := 0, port := 0 }
+    ⟨"producer-artifact-family"⟩ (.indexedFamily (.bytes (.constant 32)) (.constant 2))
+    (.family (.constant 2) (.bytes (.constant 32))) []
+  let binder ← directFamilyLaneBinderAt arena scopeKey scope [] { node := 0, port := 0 } family
+  let (arena, transported) ← loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey 1 0 0
+    (.constant 2) 2 .zip (some binder) [] family
+  let consumer ← parallelLoopLaneBinder scopeKey 1 0 (.constant 2)
+  let root ← match arena.direct.valueAt? transported.payload.root with
+    | some value => pure value
+    | none => throw (.invalidOperationalExprRef transported.payload.root)
+  pure (transported.context.binders.toList == [consumer] && root.context == transported.context)
+
+example : sharedArtifactFamilyZipFixture = .ok true := by native_decide
+
 private def fixtureType : MatrixTypeExpr := {
   modulus := .constant 17, ringDimension := .constant 1,
   rows := .constant 1, columns := .constant 1

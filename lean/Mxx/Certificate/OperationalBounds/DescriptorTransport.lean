@@ -115,17 +115,49 @@ def sameReindexedContextualDomainKey : OperationalParameterDomain → Operationa
   | .parameter left _ _ _, .parameter right _ _ _ => left == right
   | _, _ => false
 
-def reindexOperationalValueOrigin
+private def indexedParameterFreeVariables : IndexedParameterExpr → List IndexVariable
+  | .ir _ => []
+  | .index value => value.freeVariables
+  | .add left right | .subtract left right | .multiply left right | .divide left right |
+      .roundDivide left right => indexedParameterFreeVariables left ++ indexedParameterFreeVariables right
+  | .log2Ceil value => indexedParameterFreeVariables value
+
+private def indexedMatrixTypeFreeVariables (value : IndexedMatrixTypeExpr) : List IndexVariable :=
+  indexedParameterFreeVariables value.modulus ++ indexedParameterFreeVariables value.ringDimension ++
+    indexedParameterFreeVariables value.rows ++ indexedParameterFreeVariables value.columns
+
+private def indexedParameterEnvironmentFreeVariables : IndexedParamEnvironment → List IndexVariable
+  | [] => []
+  | (.parameter _, _) :: tail => indexedParameterEnvironmentFreeVariables tail
+  | (.index expression, _) :: tail =>
+      expression.freeVariables ++ indexedParameterEnvironmentFreeVariables tail
+
+private def indexedOperationalParameterDomainFreeVariables :
+    List IndexedOperationalParameterDomain → List IndexVariable
+  | [] => []
+  | .loopIndex binder :: tail => binder :: indexedOperationalParameterDomainFreeVariables tail
+  | .parameter _ _ domains expression :: tail =>
+      indexedOperationalParameterDomainFreeVariables domains ++ indexedParameterFreeVariables expression ++
+        indexedOperationalParameterDomainFreeVariables tail
+
+private def mapOwnsAllOrNoFreeVariables
+    (map : IndexMap) (freeVariables : List IndexVariable) : Option Bool :=
+  let owned := freeVariables.filter map.source.binders.contains
+  if owned.isEmpty then some false
+  else if owned.length == freeVariables.length then some true
+  else none
+
+private def reindexOperationalValueOriginUnchecked
     (map : IndexMap) : OperationalValueOrigin → Option OperationalValueOrigin
   | .local scope wire => some (.local scope wire)
   | .protocolInput input => some (.protocolInput input)
   | .protocolFamilyElement input index =>
       return .protocolFamilyElement input (← reindex map index)
   | .loopInstance slot index source =>
-      return .loopInstance slot (← reindex map index) (← reindexOperationalValueOrigin map source)
+      return .loopInstance slot (← reindex map index) (← reindexOperationalValueOriginUnchecked map source)
   | .indexed binder expression source =>
       return .indexed binder (← reindex map expression)
-        (← reindexOperationalValueOrigin map source)
+        (← reindexOperationalValueOriginUnchecked map source)
 
 /-- The contextual binders that occur in a value origin.  A mapped carrier may transport the
 origin only when it owns all of these binders; a disjoint enclosing map must leave the semantic
@@ -135,6 +167,16 @@ def operationalValueOriginFreeVariables : OperationalValueOrigin → List IndexV
   | .protocolFamilyElement _ index => index.freeVariables
   | .loopInstance _ index source => index.freeVariables ++ operationalValueOriginFreeVariables source
   | .indexed _ expression source => expression.freeVariables ++ operationalValueOriginFreeVariables source
+
+/-- Transport one complete value identity only when the map owns all of its index atoms.  A
+disjoint enclosing carrier map preserves the identity; a partial overlap is malformed because it
+would detach one nested selector from the rest of that exact executable identity. -/
+def reindexOperationalValueOrigin
+    (map : IndexMap) (origin : OperationalValueOrigin) : Option OperationalValueOrigin := do
+  match mapOwnsAllOrNoFreeVariables map (operationalValueOriginFreeVariables origin) with
+  | false => some origin
+  | true => reindexOperationalValueOriginUnchecked map origin
+  | none => none
 
 def reindexDynamicSelectionIdentity
     (map : IndexMap)
@@ -303,7 +345,24 @@ def reindexOperationalBoundExpr
       return .recurrenceState count paths (← initial.mapM (reindexOperationalBoundExpr transportEnvironment map))
         (← transition.mapM (reindexOperationalBoundExpr transportEnvironment map)) output
 
-def reindexMatrixOriginIdentity
+private def deterministicHashFreeVariables (query : DeterministicHashIdentity) : List IndexVariable :=
+  operationalValueOriginFreeVariables query.keyOrigin ++
+    indexedMatrixTypeFreeVariables query.matrixType ++
+    indexedParameterEnvironmentFreeVariables query.parameterEnvironment ++
+    indexedOperationalParameterDomainFreeVariables query.parameterDomains ++
+    query.tagExpressions.flatMap indexedParameterFreeVariables ++
+    query.tagDecimalExpressions.flatMap indexedParameterFreeVariables ++
+    query.tagU64LeExpressions.flatMap indexedParameterFreeVariables ++
+    query.trailingIntegerOrigins.flatMap operationalValueOriginFreeVariables
+
+def matrixOriginFreeVariables : MatrixOriginIdentity → List IndexVariable
+  | .value _ _ | .protocolInput _ => []
+  | .protocolFamilyElement _ index => index.freeVariables
+  | .deterministicHash query => deterministicHashFreeVariables query
+  | .loopInstance _ index source => index.freeVariables ++ matrixOriginFreeVariables source
+  | .indexed _ expression source => expression.freeVariables ++ matrixOriginFreeVariables source
+
+private def reindexMatrixOriginIdentityUnchecked
     (environment : ParamEnvironment) (map : IndexMap) : MatrixOriginIdentity → Option MatrixOriginIdentity
   | .value scope wire => some (.value scope wire)
   | .protocolInput input => some (.protocolInput input)
@@ -320,25 +379,45 @@ def reindexMatrixOriginIdentity
         tagDecimalExpressions := ← query.tagDecimalExpressions.mapM (IndexedParameterExpr.reindex map)
         tagU64LeExpressions := ← query.tagU64LeExpressions.mapM (IndexedParameterExpr.reindex map)
         trailingIntegerOrigins := ← query.trailingIntegerOrigins.mapM
-          (reindexOperationalValueOrigin map)
+          (reindexOperationalValueOriginUnchecked map)
       }
   | .loopInstance slot index source =>
       return .loopInstance slot (← reindex map index)
-        (← reindexMatrixOriginIdentity environment map source)
+        (← reindexMatrixOriginIdentityUnchecked environment map source)
   | .indexed binder expression source =>
       return .indexed binder (← reindex map expression)
-        (← reindexMatrixOriginIdentity environment map source)
+        (← reindexMatrixOriginIdentityUnchecked environment map source)
 
-def reindexPublicMatrixIdentity
+def reindexMatrixOriginIdentity
+    (environment : ParamEnvironment) (map : IndexMap) (origin : MatrixOriginIdentity) :
+    Option MatrixOriginIdentity := do
+  match mapOwnsAllOrNoFreeVariables map (matrixOriginFreeVariables origin) with
+  | false => some origin
+  | true => reindexMatrixOriginIdentityUnchecked environment map origin
+  | none => none
+
+def publicMatrixIdentityFreeVariables : PublicMatrixIdentity → List IndexVariable
+  | .sampledTrapdoor _ _ | .gadget .. => []
+  | .indexed _ expression source => expression.freeVariables ++ publicMatrixIdentityFreeVariables source
+  | .loopInstance _ index source => index.freeVariables ++ publicMatrixIdentityFreeVariables source
+
+private def reindexPublicMatrixIdentityUnchecked
     (map : IndexMap) : PublicMatrixIdentity → Option PublicMatrixIdentity
   | .sampledTrapdoor scope wire => some (.sampledTrapdoor scope wire)
   | .gadget paramsId params inputRows base small digitCount =>
       some (.gadget paramsId params inputRows base small digitCount)
   | .indexed binder expression source =>
       return .indexed binder (← reindex map expression)
-        (← reindexPublicMatrixIdentity map source)
+        (← reindexPublicMatrixIdentityUnchecked map source)
   | .loopInstance slot index source =>
-      return .loopInstance slot (← reindex map index) (← reindexPublicMatrixIdentity map source)
+      return .loopInstance slot (← reindex map index) (← reindexPublicMatrixIdentityUnchecked map source)
+
+def reindexPublicMatrixIdentity
+    (map : IndexMap) (identity : PublicMatrixIdentity) : Option PublicMatrixIdentity := do
+  match mapOwnsAllOrNoFreeVariables map (publicMatrixIdentityFreeVariables identity) with
+  | false => some identity
+  | true => reindexPublicMatrixIdentityUnchecked map identity
+  | none => none
 
 def reindexOperationalPrimitiveIdentityFully
     (transportEnvironment : ParamEnvironment) (map : IndexMap) :
@@ -576,6 +655,50 @@ def reindexOperationalFactorTransform
   | .rowEmbed axis part => some (.rowEmbed axis part)
   | .columnEmbed axis part => some (.columnEmbed axis part)
 
+private def reindexPrimitiveOperationKind
+    (map : IndexMap) : PrimitiveOperationKind → Option PrimitiveOperationKind
+  | .add subtract => some (.add subtract)
+  | .multiply rule rightWire => some (.multiply rule rightWire)
+  | .tensor => some .tensor
+  | .concat axis => some (.concat axis)
+  | .transform transform =>
+      return .transform (← reindexOperationalFactorTransform map transform)
+  | .slice rows columns => do
+      let rows ← rows.mapM fun (start, stop) => do
+        pure (← reindexIntExpr map start, ← reindexIntExpr map stop)
+      let columns ← columns.mapM fun (start, stop) => do
+        pure (← reindexIntExpr map start, ← reindexIntExpr map stop)
+      pure (.slice rows columns)
+  | .scale scalar loopDomains =>
+      return .scale (← scalar.reindex map) (← reindexIndexedOperationalParameterDomains map loopDomains)
+  | .bggGrouping => some .bggGrouping
+
+private def reindexDirectRelationOperationKind
+    (map : IndexMap) : DirectRelationOperationKind → Option DirectRelationOperationKind
+  | .preimage maximum loopDomains =>
+      return .preimage (← maximum.reindex map)
+        (← reindexIndexedOperationalParameterDomains map loopDomains)
+  | .decomposition declaredType base small digitCount loopDomains layouts =>
+      return .decomposition (← reindexIndexedMatrixTypeExpr map declaredType) (← base.reindex map)
+        small (← digitCount.reindex map) (← reindexIndexedOperationalParameterDomains map loopDomains)
+        layouts
+
+private def reindexDirectValueScalarOperationKind
+    (map : IndexMap) : DirectValueScalarOperationKind → Option DirectValueScalarOperationKind
+  | .extractCoefficient position => return .extractCoefficient (← reindexIntExpr map position)
+  | .thresholdDecodeBool ciphertext plaintext length =>
+      return .thresholdDecodeBool (← reindexIntExpr map ciphertext) (← reindexIntExpr map plaintext)
+        (← reindexIntExpr map length)
+  | .thresholdDecodeInt ciphertext plaintext length =>
+      return .thresholdDecodeInt (← reindexIntExpr map ciphertext) (← reindexIntExpr map plaintext)
+        (← reindexIntExpr map length)
+
+private def reindexDirectValueMatrixOperationKind
+    (map : IndexMap) : DirectValueMatrixOperationKind → Option DirectValueMatrixOperationKind
+  | .liftIntegerToConstantPolynomial matrixType =>
+      return .liftIntegerToConstantPolynomial (← reindexMatrixTypeExpr map matrixType)
+  | .trapdoorPublic matrixType => return .trapdoorPublic (← reindexMatrixTypeExpr map matrixType)
+
 /-- Reindex every expression-bearing field of one delayed pointwise descriptor.  Producer
 ownership is an exact executable identity, not an index expression, and is therefore retained
 unchanged. -/
@@ -583,64 +706,75 @@ def reindexOperationalIndexedPointwiseOperation
     (_environment : ParamEnvironment) (map : IndexMap) :
     OperationalIndexedPointwiseOperation → Option OperationalIndexedPointwiseOperation
   | .matrix operation => do
-      let kind : PrimitiveOperationKind ← match operation.kind with
-        | .add subtract => pure (.add subtract)
-        | .multiply rule rightWire => pure (.multiply rule rightWire)
-        | .tensor => pure .tensor
-        | .concat axis => pure (.concat axis)
-        | .transform transform =>
-            pure (PrimitiveOperationKind.transform (← reindexOperationalFactorTransform map transform))
-        | .slice rows columns =>
-            let rows ← rows.mapM fun (start, stop) => do
-              pure (← reindexIntExpr map start, ← reindexIntExpr map stop)
-            let columns ← columns.mapM fun (start, stop) => do
-              pure (← reindexIntExpr map start, ← reindexIntExpr map stop)
-            pure (PrimitiveOperationKind.slice rows columns)
-        | .scale scalar loopDomains =>
-            pure (PrimitiveOperationKind.scale (← scalar.reindex map)
-              (← reindexIndexedOperationalParameterDomains map loopDomains))
-        | .bggGrouping => pure .bggGrouping
+      let kind ← reindexPrimitiveOperationKind map operation.kind
       let outputType ← reindexIndexedMatrixTypeExpr map operation.outputType
       let outputSchema ← reindexMatrixTypeExpr map operation.outputSchema
       let parameterEnvironment ← reindexParamEnvironment map operation.parameterEnvironment
       pure (.matrix { operation with kind, outputType, outputSchema, parameterEnvironment })
   | .relation operation => do
-      let kind : DirectRelationOperationKind ← match operation.kind with
-        | .preimage maximum loopDomains =>
-            pure (DirectRelationOperationKind.preimage (← maximum.reindex map)
-              (← reindexIndexedOperationalParameterDomains map loopDomains))
-        | .decomposition declaredType base small digitCount loopDomains layouts =>
-            pure (DirectRelationOperationKind.decomposition
-              (← reindexIndexedMatrixTypeExpr map declaredType) (← base.reindex map)
-              small (← digitCount.reindex map)
-              (← reindexIndexedOperationalParameterDomains map loopDomains) layouts)
+      let kind ← reindexDirectRelationOperationKind map operation.kind
       let outputType ← reindexIndexedMatrixTypeExpr map operation.outputType
       let outputSchema ← reindexMatrixTypeExpr map operation.outputSchema
       let parameterEnvironment ← reindexParamEnvironment map operation.parameterEnvironment
       pure (.relation { operation with kind, outputType, outputSchema, parameterEnvironment })
   | .scalar operation => some (.scalar operation)
   | .matrixToScalar operation => do
-      let kind : DirectValueScalarOperationKind ← match operation.kind with
-        | .extractCoefficient position =>
-            pure (DirectValueScalarOperationKind.extractCoefficient (← reindexIntExpr map position))
-        | .thresholdDecodeBool ciphertext plaintext length =>
-            pure (DirectValueScalarOperationKind.thresholdDecodeBool
-              (← reindexIntExpr map ciphertext) (← reindexIntExpr map plaintext)
-              (← reindexIntExpr map length))
-        | .thresholdDecodeInt ciphertext plaintext length =>
-            pure (DirectValueScalarOperationKind.thresholdDecodeInt
-              (← reindexIntExpr map ciphertext) (← reindexIntExpr map plaintext)
-              (← reindexIntExpr map length))
+      let kind ← reindexDirectValueScalarOperationKind map operation.kind
       let parameterEnvironment ← reindexParamEnvironment map operation.parameterEnvironment
       pure (.matrixToScalar { operation with kind, parameterEnvironment })
   | .matrixFromScalar operation => do
-      let kind : DirectValueMatrixOperationKind ← match operation.kind with
-        | .liftIntegerToConstantPolynomial matrixType =>
-            pure (DirectValueMatrixOperationKind.liftIntegerToConstantPolynomial
-              (← reindexMatrixTypeExpr map matrixType))
-        | .trapdoorPublic matrixType =>
-            pure (DirectValueMatrixOperationKind.trapdoorPublic (← reindexMatrixTypeExpr map matrixType))
+      let kind ← reindexDirectValueMatrixOperationKind map operation.kind
       let parameterEnvironment ← reindexParamEnvironment map operation.parameterEnvironment
       pure (.matrixFromScalar { operation with kind, parameterEnvironment })
+
+/-- Name the first top-level matrix-fact field that rejects a reindex map.  This retraces work
+only after the production transport has already failed, preserving its success-path cost. -/
+def operationalMatrixFactReindexFailureField
+    (environment : ParamEnvironment) (map : IndexMap) (fact : OperationalMatrixFact) : String :=
+  if map.isDirectCarrierContextLift then "unexpected_direct_carrier_context_lift"
+  else if (reindexMatrixOriginIdentity environment map fact.origin).isNone then "origin"
+  else if (reindexMatrixTypeExpr map fact.matrixType).isNone then "matrix_type"
+  else if (reindexOperationalBoundExpr environment map fact.totalHardBound).isNone then "total_bound"
+  else if (fact.identity.mapM (reindexPublicMatrixIdentity map)).isNone then "identity"
+  else if (fact.relations.mapM (reindexOperationalMatrixRelation environment map)).isNone then "relations"
+  else if (reindexOperationalPolynomial environment map fact.polynomial).isNone then "polynomial"
+  else if (fact.blockLayout.mapM (reindexOperationalBlockLayout environment map)).isNone then "block_layout"
+  else "unknown"
+
+/-- Name the descriptor field that rejects a reindex map.  It is intentionally top-level: nested
+field traces can be added later without making failure diagnostics protocol-specific. -/
+def operationalPointwiseOperationReindexFailureField
+    (map : IndexMap) (operation : OperationalIndexedPointwiseOperation) : String :=
+  match operation with
+  | .matrix operation =>
+      if (reindexPrimitiveOperationKind map operation.kind).isNone then "kind"
+      else if (reindexIndexedMatrixTypeExpr map operation.outputType).isNone then "output_type"
+      else if (reindexMatrixTypeExpr map operation.outputSchema).isNone then "output_schema"
+      else if (reindexParamEnvironment map operation.parameterEnvironment).isNone then "parameter_environment"
+      else "unknown"
+  | .relation operation =>
+      if (reindexDirectRelationOperationKind map operation.kind).isNone then "kind"
+      else if (reindexIndexedMatrixTypeExpr map operation.outputType).isNone then "output_type"
+      else if (reindexMatrixTypeExpr map operation.outputSchema).isNone then "output_schema"
+      else if (reindexParamEnvironment map operation.parameterEnvironment).isNone then "parameter_environment"
+      else "unknown"
+  | .scalar _ => "scalar_descriptor_unexpected_failure"
+  | .matrixToScalar operation =>
+      if (reindexDirectValueScalarOperationKind map operation.kind).isNone then "kind"
+      else if (reindexParamEnvironment map operation.parameterEnvironment).isNone then "parameter_environment"
+      else "unknown"
+  | .matrixFromScalar operation =>
+      if (reindexDirectValueMatrixOperationKind map operation.kind).isNone then "kind"
+      else if (reindexParamEnvironment map operation.parameterEnvironment).isNone then "parameter_environment"
+      else "unknown"
+
+/-- Stable descriptor tags keep failure logs filterable by operation family without exposing
+producer node numbers or protocol names. -/
+def operationalPointwiseOperationDescriptorKind : OperationalIndexedPointwiseOperation → String
+  | .matrix _ => "matrix"
+  | .relation _ => "relation"
+  | .scalar _ => "scalar"
+  | .matrixToScalar _ => "matrix_to_scalar"
+  | .matrixFromScalar _ => "matrix_from_scalar"
 
 end Mxx.Certificate

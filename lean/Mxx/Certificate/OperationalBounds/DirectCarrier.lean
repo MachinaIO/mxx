@@ -457,15 +457,7 @@ def DirectOperationalIndexedArena.pushMapped
     (map : IndexMap) : Option (DirectOperationalIndexedArena × OperationalIndexedValueId) := do
   let sourceValue ← arena.valueAt? source
   if !map.transportValid || map.source != sourceValue.context then none else
-  match sourceValue.payload with
-  | .mapped schema base prior => do
-      if !prior.isDirectCarrierContextLift && prior.validate && map.validate then
-        match composeIndexMap prior map with
-        | some composed => some (arena.pushValue map.destination (.mapped schema base composed))
-        | none => none
-      else
-        some (arena.pushValue map.destination (.mapped schema source map))
-  | payload => some (arena.pushValue map.destination (.mapped payload.schema source map))
+    some (arena.pushValue map.destination (.mapped sourceValue.payload.schema source map))
 
 /-- Store a mapped view whose result schema has already crossed the same capture-free transport.
 Only the compact schema is rebuilt at view construction; fixed facts, relation inventories, and
@@ -478,13 +470,7 @@ def DirectOperationalIndexedArena.pushMappedWithSchema
     (DirectOperationalIndexedArena × OperationalIndexedValueId) := do
   let sourceValue ← arena.valueAt? source
   if !map.transportValid || map.source != sourceValue.context then none else
-  match sourceValue.payload with
-  | .mapped _ base prior => do
-      if !prior.isDirectCarrierContextLift && prior.validate && map.validate then
-        let composed ← composeIndexMap prior map
-        some (arena.pushValue map.destination (.mapped schema base composed))
-      else some (arena.pushValue map.destination (.mapped schema source map))
-  | _ => some (arena.pushValue map.destination (.mapped schema source map))
+    some (arena.pushValue map.destination (.mapped schema source map))
 
 /-- Add a constant-size subject overlay without traversing or cloning the source DAG.  Nested
 overlays collapse to the latest graph boundary: only that subject is observable at reduction. -/
@@ -911,8 +897,8 @@ example : (
     | none => false) = true := by
   native_decide
 
-/-- Nested mapped storage is flattened by composing maps.  The original value ID and payload
-schema are preserved; no destination fixed reference can be forged. -/
+/-- Nested mapped storage preserves executable transport boundaries.  The original value IDs and
+payload schema are preserved; no destination fixed reference can be forged. -/
 example : (
     let sourceBinder := directCarrierFixtureBinder 2
     let middleBinder := directCarrierFixtureBinder 3
@@ -939,8 +925,8 @@ example : (
             | some (arena, result) =>
                 arena.values[result]?.any fun value =>
                   value.context == emptyContext && value.payload ==
-                    .mapped (.scalar .real) source {
-                      source := sourceContext
+                    .mapped (.scalar .real) mapped {
+                      source := middleContext
                       destination := emptyContext
                       assignments := #[.constant 1]
                     }

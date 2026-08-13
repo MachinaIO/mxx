@@ -1195,6 +1195,36 @@ def executableDirectSelectExpression
           pure ({ arena with direct := directArena },
             some (.gather owner (IntExpr.constant (Int.ofNat branchCount)) (.variable position)))
 
+/-- Failure-only select telemetry.  Integer intervals are the first reducer consumer for a
+branch selector, so retain the exact direct carrier chain and context when reduction rejects a
+selector before packing any branch family. -/
+private def directSelectIntervalFailureDiagnostic
+    (scopeKey : ScopeTemplateKey) (node : Nat) (wire : WireRef)
+    (selection : OperationalFact) (arena : OperationalExprArena) (error : OperationalError) : Bool :=
+  let root := selection.payload.root
+  let payload := match arena.direct.valueAt? root with
+    | some { payload := .shared .., .. } => "shared"
+    | some { payload := .explicit _ binder references, .. } =>
+        "explicit; binder=" ++ reprStr binder ++ "; entries=" ++ toString references.size
+    | some { payload := .explicitValues _ binder values, .. } =>
+        "explicit_values; binder=" ++ reprStr binder ++ "; entries=" ++ toString values.size
+    | some { payload := .mapped _ source map, .. } =>
+        "mapped; source=" ++ toString source ++ "; map=" ++ reprStr map
+    | some { payload := .rebound _ source subject, .. } =>
+        "rebound; source=" ++ toString source ++ "; subject=" ++ reprStr subject
+    | some { payload := .indexedOutput _ source binder selector subject, .. } =>
+        "indexed_output; source=" ++ toString source ++ "; binder=" ++ reprStr binder ++
+          "; selection=" ++ reprStr selector ++ "; subject=" ++ reprStr subject
+    | some { payload := .matrixResultBound _ source _, .. } => "matrix_result_bound; source=" ++ toString source
+    | some { payload := .pointwise _ _ inputs, .. } => "pointwise; inputs=" ++ reprStr inputs
+    | none => "missing"
+  operationalProgress "direct_select_interval" "reduction_failure" (reprStr scopeKey)
+    node arena.direct.values.size
+    ("wire=" ++ reprStr wire ++ "; root=" ++ toString root ++ "; context=" ++
+      reprStr selection.context ++ "; payload=" ++ payload ++ "; chain=" ++
+      directFamilyLaneCarrierTrace arena.direct root (arena.direct.values.size + 1) ++
+      "; error=" ++ reprStr error)
+
 def deriveOrdinaryOutputs
     (scopeKey : ScopeTemplateKey)
     (nodeIndex : Nat)
@@ -1678,8 +1708,25 @@ def evaluatePreparedScope
                   let selectionInput ← lookupFact index facts indexWire
                   let selectionFact : OperationalIntegerFact ← match selectionInput with
                     | { payload := .directValue root, .. } => do
-                        let (lower, upper) ← facts.arena.direct.integerInterval index indexWire root
-                          (facts.arena.direct.values.size + 1)
+                        let (lower, upper) ← try
+                          facts.arena.direct.integerInterval index indexWire root
+                            (facts.arena.direct.values.size + 1)
+                          catch error =>
+                            match error with
+                            | .unsupportedOperationalExpr _ =>
+                                if facts.arena.directScalarEnvelopeShapePrefilter selectionInput then
+                                  facts.arena.directIntegerEnvelopeInterval environment index indexWire
+                                    selectionInput
+                                else throw error
+                            | _ => throw error
+                        if operationalProgress "evaluate_scope" "family_dynamic_get_interval_resolved"
+                            (reprStr scopeKey) index scope.nodes.size
+                            ("lower=" ++ toString lower ++ "; upper=" ++ toString upper ++
+                              "; root=" ++ toString root ++ "; context=" ++
+                              reprStr selectionInput.context ++ "; chain=" ++
+                              directFamilyLaneCarrierTrace facts.arena.direct root
+                                (facts.arena.direct.values.size + 1)) then pure () else
+                          throw (.unsupportedOperationalExpr index)
                         pure {
                           subject := indexWire
                           origin := .local scopeKey indexWire
@@ -1689,6 +1736,10 @@ def evaluatePreparedScope
                           upperExpression := .closed (.closedInt (.constant upper))
                         }
                   let family ← lookupFact index facts familyWire
+                  if operationalProgress "evaluate_scope" "family_dynamic_get_family_loaded"
+                      (reprStr scopeKey) index scope.nodes.size
+                      ("family_context=" ++ reprStr family.context) then pure () else
+                    throw (.unsupportedOperationalExpr index)
                   match selectionFact.lower == selectionFact.upper with
                   | true =>
                       let binder ← directFamilyLaneBinderAt facts.arena scopeKey scope environment familyWire family
@@ -1704,6 +1755,10 @@ def evaluatePreparedScope
                       pure [rebound]
                   | false =>
                       let binder ← directFamilyLaneBinderAt facts.arena scopeKey scope environment familyWire family
+                      if operationalProgress "evaluate_scope" "family_dynamic_get_binder_resolved"
+                          (reprStr scopeKey) index scope.nodes.size
+                          ("binder=" ++ reprStr binder) then pure () else
+                        throw (.unsupportedOperationalExpr index)
                       let selectorCount := match binder.count.evaluate environment with
                         | some count => if count > 0 then count.toNat else 0
                         | none => 0
@@ -2071,8 +2126,20 @@ def evaluatePreparedScope
                   let selectionInput ← lookupFact index facts indexWire
                   let selection : OperationalIntegerFact ← match selectionInput with
                     | { payload := .directValue root, .. } => do
-                        let (lower, upper) ← facts.arena.direct.integerInterval index indexWire root
-                          (facts.arena.direct.values.size + 1)
+                        let (lower, upper) ← try
+                          facts.arena.direct.integerInterval index indexWire root
+                            (facts.arena.direct.values.size + 1)
+                        catch error =>
+                          match error with
+                          | .unsupportedOperationalExpr _ =>
+                              if facts.arena.directScalarEnvelopeShapePrefilter selectionInput then
+                                facts.arena.directIntegerEnvelopeInterval environment index indexWire
+                                  selectionInput
+                              else throw error
+                          | _ =>
+                              if directSelectIntervalFailureDiagnostic scopeKey index indexWire selectionInput
+                                  facts.arena error then throw error
+                              else throw (.unsupportedOperationalExpr root)
                         pure {
                           subject := indexWire
                           origin := .local scopeKey indexWire
@@ -2799,15 +2866,36 @@ def decoderNoiseCheckReport
     checkDecoderThreshold plaintextModulus ciphertextModulus noiseBound
   pure { outputs, obligations := [obligation], accepted, rejection }
 
+/-- Evaluate the conservative compact envelope after exact reduction rejects an ordinary
+relation-free pointwise operation.  The envelope carries no representative polynomial, so a
+possible signal term is rejected before its bound is consumed. -/
+def directMatrixEnvelopeNoiseBound
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (expression : OperationalFact) : Except OperationalError (Int × DirectMatrixEnvelope) := do
+  if !arena.directMatrixEnvelopeShapePrefilter expression then
+    throw (.unsupportedOperationalExpr expression.payload.root)
+  let envelope ← arena.directMatrixEnvelope environment expression
+  if envelope.hasLarge then throw (.residualContainsLargeTerm expression.payload.root)
+  let bound ← envelope.hardBound.evaluateWithStates environment []
+  pure (bound, envelope)
+
 def collectDecoderResidualBounds
     (arena : OperationalExprArena)
     (environment : ParamEnvironment) : OperationalFact → Except OperationalError (List Int)
   | expression => do
-      let entries ← arena.reducedDirectValueFactsAt environment expression
-      let bounds ← entries.mapM fun entry => do
-        let _ ← entry.fact.rejectResidualLargeTerms
-        entry.fact.evaluateNoiseHardBound environment
-      pure bounds
+      try
+        let entries ← arena.reducedDirectValueFactsAt environment expression
+        let bounds ← entries.mapM fun entry => do
+          let _ ← entry.fact.rejectResidualLargeTerms
+          entry.fact.evaluateNoiseHardBound environment
+        pure bounds
+      catch error => match error with
+        | .unsupportedOperationalExpr _ =>
+            if arena.directMatrixEnvelopeShapePrefilter expression then
+              pure [((← directMatrixEnvelopeNoiseBound arena environment expression).1)]
+            else throw error
+        | _ => throw error
 
 /-- Evaluate every matrix-like port produced at `node` across all workflow stages.  This helper is
 used only by the external performance harness to time former hot nodes; it does not affect the
@@ -2847,12 +2935,20 @@ def operationalNoiseBoundForFact
     throw (.unsupportedOperationalExpr residual.payload.root)
   let (bounds, rewriteEvents, directMaximumPolynomialTerms) ← match residual with
     | expression => do
-        let (entries, rewriteEvents, maximumPolynomialTerms) ←
-          arena.reducedDirectValueFactsAtWithDiagnostics environment expression
-        let bounds ← entries.mapM fun entry => do
-          let _ ← entry.fact.rejectResidualLargeTerms
-          entry.fact.evaluateNoiseHardBound environment
-        pure (bounds, rewriteEvents, maximumPolynomialTerms)
+        try
+          let (entries, rewriteEvents, maximumPolynomialTerms) ←
+            arena.reducedDirectValueFactsAtWithDiagnostics environment expression
+          let bounds ← entries.mapM fun entry => do
+            let _ ← entry.fact.rejectResidualLargeTerms
+            entry.fact.evaluateNoiseHardBound environment
+          pure (bounds, rewriteEvents, maximumPolynomialTerms)
+        catch error => match error with
+          | .unsupportedOperationalExpr _ => do
+              if arena.directMatrixEnvelopeShapePrefilter expression then
+                let (bound, envelope) ← directMatrixEnvelopeNoiseBound arena environment expression
+                pure ([bound], [], envelope.maximumPolynomialTerms)
+              else throw error
+          | _ => throw error
   if operationalProgress "direct_arena_reduction" "complete" (reprStr arena.activeScope)
       bounds.length bounds.length ("rewrite_events=" ++ toString rewriteEvents.length ++
         "; maximum_polynomial_terms=" ++ toString directMaximumPolynomialTerms) then pure () else

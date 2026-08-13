@@ -3314,9 +3314,121 @@ private def sameDirectCorrelation
     (left right : DirectCorrelationEnvironment) : Bool :=
   directCorrelationContained left right && directCorrelationContained right left
 
+/-- Recover the executable position carried by one gather alternative.  The gathered result
+identity and its selected result ordinal remain in the complete correlation environment; this
+helper merely exposes the independently recorded runtime position used to align two gathers. -/
+private def directGatherExecutablePosition?
+    (correlation : DirectCorrelationEnvironment) : Option (IndexExpr × Nat) := do
+  let gathers := correlation.filterMap fun assignment => match assignment.1 with
+    | .gather _ _ position => some position
+    | _ => none
+  let position ← match gathers with
+    | [position] => some position
+    | _ => none
+  let assignments := correlation.filter fun assignment =>
+    canonicalDirectCorrelationKey assignment.1 == canonicalDirectCorrelationKey position
+  match assignments with
+  | [assignment] => some (canonicalDirectCorrelationKey assignment.1, assignment.2)
+  | _ => none
+
+/-- One gather alternative's operand-local proof that its runtime position crossed a real
+capture-free map after the gather was materialized.  This is not arena state and cannot be
+borrowed by another operand: it is reconstructed only from that leaf's pending map stack. -/
+structure DirectGatherPositionPath where
+  gather : IndexExpr
+  destination : IndexExpr
+  ordinal : Nat
+  deriving BEq, Repr
+
+private def sameGatherOwnerAndDomain (left right : IndexExpr) : Bool :=
+  match left, right with
+  | .gather leftOwner leftCount _, .gather rightOwner rightCount _ =>
+      leftOwner == rightOwner && leftCount == rightCount
+  | _, _ => false
+
+/-- Locate the operand's own map that carried this gather.  A compacted map may already have
+rewritten the gather's position, so matching the whole pre-map expression would lose precisely
+the evidence needed after composition.  The gather owner and source domain remain immutable. -/
+private def gatherMapDestination?
+    (maps : List IndexMap) (gathered : IndexExpr) : Option (IndexExpr × List IndexMap) :=
+  match maps with
+  | [] => none
+  | map :: remaining =>
+      match map.assignments.toList.filter (sameGatherOwnerAndDomain gathered) with
+      | [destination@(.gather _ _ _)] => some (destination, remaining)
+      | _ => gatherMapDestination? remaining gathered
+
+private def transportGatherPositionPath
+    (parameters : ParamEnvironment) (maps : List IndexMap) (position : IndexExpr) (ordinal : Nat) : Option (IndexExpr × Nat) := do
+  let mut position := position
+  let mut ordinal := ordinal
+  let mut transported := false
+  for map in maps do
+    if position.freeVariables.any map.source.binders.contains then
+      let translated ← reindex map position
+      match translated with
+      | .constant lane =>
+          /- A closed transport is an assertion about the *existing* executable coordinate.  It
+          must not manufacture a matching lane by replacing the incoming ordinal. -/
+          if ordinal != lane then failure else pure ()
+          position := .constant lane
+          transported := true
+      | .variable binder =>
+          let bound ← binder.count.evaluate parameters
+          if bound <= 0 || Int.ofNat ordinal >= bound then failure else pure ()
+          position := .variable binder
+          transported := true
+      | .offset (.variable binder) amount =>
+          let shifted := Int.ofNat ordinal - amount
+          if shifted < 0 then failure else pure ()
+          let bound ← binder.count.evaluate parameters
+          if bound <= 0 || shifted >= bound then failure else pure ()
+          position := .variable binder
+          ordinal := shifted.toNat
+          transported := true
+      | .offset (.constant lane) amount =>
+          let destination := Int.ofNat lane + amount
+          if destination < 0 then failure else pure ()
+          if ordinal != destination.toNat then failure else pure ()
+          position := .constant destination.toNat
+          transported := true
+      | .gather _ _ _ => failure
+      | .offset _ _ => failure
+  if transported then some (canonicalDirectCorrelationKey position, ordinal) else none
+
+private def directGatherPositionPaths
+    (parameters : ParamEnvironment) (maps : List IndexMap)
+    (correlation : DirectCorrelationEnvironment) : List DirectGatherPositionPath :=
+  correlation.filterMap fun assignment => match assignment.1 with
+    | gathered@(.gather _ _ position) => do
+        let (_, positionOrdinal) ← directGatherExecutablePosition? correlation
+        let (mappedGather, suffix) ← gatherMapDestination? maps gathered
+        let mappedPosition ← match mappedGather with
+          | .gather _ _ mappedPosition => some mappedPosition
+          | _ => none
+        let (destination, ordinal) ←
+          transportGatherPositionPath parameters suffix mappedPosition positionOrdinal
+        some { gather := gathered, destination, ordinal }
+    | _ => none
+
+/-- Merge inherited gather provenance with records introduced at the current carrier boundary.
+Identical records are harmless aliases of the same transport and are retained once.  A single
+immutable gather identity cannot claim two destination coordinates or ordinals in one reduced
+alternative: that would make later correlation alignment traversal-order dependent. -/
+private def mergeDirectGatherPositionPaths
+    (inherited introduced : List DirectGatherPositionPath) : Option (List DirectGatherPositionPath) :=
+  (inherited ++ introduced).foldlM (fun retained path =>
+    match retained.find? fun candidate => candidate.gather == path.gather with
+    | none => pure (retained ++ [path])
+    | some candidate =>
+        if candidate.destination == path.destination && candidate.ordinal == path.ordinal then
+          pure retained
+        else none) []
+
 structure ReducedDirectMatrixFact where
   correlation : DirectCorrelationEnvironment
   fact : OperationalMatrixFact
+  positionPaths : List DirectGatherPositionPath := []
 
 def ReducedDirectMatrixFact.key (entry : ReducedDirectMatrixFact) : Option DirectCorrelationKey :=
   entry.correlation.head?.map (·.1)
@@ -3327,6 +3439,7 @@ def ReducedDirectMatrixFact.ordinal (entry : ReducedDirectMatrixFact) : Nat :=
 structure ReducedDirectScalarFact where
   correlation : DirectCorrelationEnvironment
   fact : OperationalScalarFact
+  positionPaths : List DirectGatherPositionPath := []
 
 def ReducedDirectScalarFact.key (entry : ReducedDirectScalarFact) : Option DirectCorrelationKey :=
   entry.correlation.head?.map (·.1)
@@ -3337,6 +3450,7 @@ def ReducedDirectScalarFact.ordinal (entry : ReducedDirectScalarFact) : Nat :=
 structure ReducedDirectRelationArgument where
   correlation : DirectCorrelationEnvironment
   payload : DirectRelationArgument
+  positionPaths : List DirectGatherPositionPath := []
 
 /- The reporting identity of a map deliberately omits `closedIndex`: that field records how a
 transport was admitted, whereas a rewrite event is identified by its fully transported source
@@ -3359,9 +3473,10 @@ private def normalizeDirectRelationRewriteMaps (maps : List IndexMap) : List Dir
         let composed : IndexMap := {
           source := current.source, destination := next.destination, assignments := assignments.toArray }
         normalize composed remaining
-  /- Reducer descent prepends each outer map, so restore source-to-destination order before
-  composing. -/
-  match maps.reverse with
+  /- Nested `.mapped` descent prepends the innermost map after its outer caller has already
+  supplied the earlier transport, so this stack is source-to-destination order.  Compose it
+  solely for stable rewrite-event identity; semantic reduction keeps the individual maps. -/
+  match maps with
   | [] => []
   | first :: remaining => match normalize first remaining with
     | some key => [key]
@@ -3395,6 +3510,18 @@ private def deduplicateDirectRelationRewriteEvents
   events.foldl (fun retained event =>
     if retained.any (sameDirectRelationRewriteEvent event) then retained else retained ++ [event]) []
 
+/-- Work performed by the exact gather-position zipper.  These counters are reporting-only;
+they are incremented at the index insertion and lookup sites, never inferred from a fixture. -/
+structure DirectGatherAlignmentWork where
+  indexBuildEntries : Nat := 0
+  driverLookupVisits : Nat := 0
+  deriving BEq, DecidableEq, Repr
+
+private def DirectGatherAlignmentWork.add
+    (left right : DirectGatherAlignmentWork) : DirectGatherAlignmentWork := {
+  indexBuildEntries := left.indexBuildEntries + right.indexBuildEntries
+  driverLookupVisits := left.driverLookupVisits + right.driverLookupVisits }
+
 private structure ReducedDirectMatrixEvaluation where
   entries : List ReducedDirectMatrixFact
   rewriteEvents : List DirectRelationRewriteEventKey := []
@@ -3407,50 +3534,264 @@ private structure ReducedDirectScalarEvaluation where
   /-- Scalar reduction can invoke matrix-to-scalar nodes, so preserve their observed width. -/
   maximumPolynomialTerms : Nat := 0
 
-private def alignDirectCorrelationEntries {α : Type}
-    (arena : DirectOperationalIndexedArena) (owner id : Nat)
-    (inputs : List (List (DirectCorrelationEnvironment × α))) :
-    Except OperationalError (List (Array α × DirectCorrelationEnvironment)) := do
-  let inputs := inputs.map fun entries => entries.filterMap fun (correlation, payload) => do
-    let correlation ← normalizeDirectCorrelation correlation
-    pure (correlation, payload)
+private structure DirectCorrelationEntry (α : Type) where
+  correlation : DirectCorrelationEnvironment
+  payload : α
+  positionPaths : List DirectGatherPositionPath
+
+/-- A reduced operand may carry several provenance records only when they name the same
+executable coordinate.  Selecting with `any` would let an unrelated path in the same operand
+manufacture a join, so ambiguity is rejected before correlation alignment. -/
+private def agreedDirectGatherPositionPath?
+    (paths : List DirectGatherPositionPath) : Option DirectGatherPositionPath :=
+  match paths with
+  | [] => none
+  | first :: remaining =>
+      if remaining.all fun candidate =>
+          candidate.destination == first.destination && candidate.ordinal == first.ordinal then
+        some first
+      else none
+
+/-- One canonical executable gather coordinate.  The custom hash uses the derived structural
+representation, while `Std.HashMap` still compares this complete key with `BEq`; hash collisions
+therefore remain distinct buckets and can never manufacture or reject a selector match. -/
+private structure DirectGatherPositionKey where
+  destination : IndexExpr
+  ordinal : Nat
+  deriving BEq
+
+private instance : Hashable DirectGatherPositionKey where
+  hash key := hash (reprStr key.destination) ^^^ UInt64.ofNat key.ordinal
+
+private abbrev DirectGatherPositionIndex (α : Type) :=
+  Std.HashMap DirectGatherPositionKey (DirectCorrelationEntry α)
+
+private def directGatherPositionIndex {α : Type}
+    (id : Nat) (entries : List (DirectCorrelationEntry α)) :
+    Except OperationalError (DirectGatherPositionIndex α × Nat) := do
+  let index ← entries.foldlM (fun index entry => do
+    let path ← match agreedDirectGatherPositionPath? entry.positionPaths with
+      | some path => pure path
+      | none => throw (.unsupportedOperationalExpr id)
+    let key : DirectGatherPositionKey := {
+      destination := canonicalDirectCorrelationKey path.destination, ordinal := path.ordinal }
+    match index[key]? with
+    | none => pure (index.insert key entry)
+    | some _ =>
+        /- Repeated executable coordinates in one operand are ambiguous.  Hash collisions reach
+        independent `Std.HashMap` keys by the full `BEq` instance and never get here. -/
+        throw (.unsupportedOperationalExpr id)) {}
+  pure (index, entries.length)
+
+private def directGatherEntryAt? {α : Type}
+    (index : DirectGatherPositionIndex α) (key : DirectGatherPositionKey) :
+    Option (DirectCorrelationEntry α) := do
+  index[key]?
+
+private def directGatherIdentities
+    (correlation : DirectCorrelationEnvironment) : List IndexExpr :=
+  correlation.filterMap fun assignment => match assignment.1 with
+    | gathered@(.gather _ _ _) => some gathered
+    | _ => none
+
+/-- Relation factors may carry more than one gather path after generic composition.  Compare the
+complete post-reindex inventory, preserving gather owner/domain and the canonical executable
+coordinate.  This accepts syntactically different maps that reach the same selector, but never
+selects an arbitrary singleton path from a mixed operand. -/
+private def directGatherOwner? : IndexExpr → Option GatherLookupOwner
+  | .gather owner _ _ => some owner
+  | _ => none
+
+private structure DirectGatherRelationPathKey where
+  selector : GatherLookupOwner
+  destination : IndexExpr
+  ordinal : Nat
+  deriving BEq
+
+private instance : Hashable DirectGatherRelationPathKey where
+  hash key := hash key.selector ^^^ hash (reprStr key.destination) ^^^ UInt64.ofNat key.ordinal
+
+private def directGatherRelationPathKey?
+    (path : DirectGatherPositionPath) : Option DirectGatherRelationPathKey := do
+  let selector ← directGatherOwner? path.gather
+  some { selector, destination := canonicalDirectCorrelationKey path.destination, ordinal := path.ordinal }
+
+private def directGatherRelationInventory
+    (id : Nat) (paths : List DirectGatherPositionPath) : Except OperationalError
+    (Std.HashMap DirectGatherRelationPathKey Unit) :=
+  paths.foldlM (fun inventory path => do
+    let key ← match directGatherRelationPathKey? path with
+      | some key => pure key
+      | none => throw (.unsupportedOperationalExpr id)
+    if inventory.contains key then throw (.unsupportedOperationalExpr id)
+    else pure (inventory.insert key ())) {}
+
+private def sameDirectGatherRelationInventory
+    (id : Nat) (left right : List DirectGatherPositionPath) : Except OperationalError Bool := do
+  let left ← directGatherRelationInventory id left
+  let right ← directGatherRelationInventory id right
+  pure (left.size == right.size && left.toList.all fun (key, _) => right.contains key)
+
+private def directRelationGatherPathsCompatible
+    (id : Nat) (paths : List (List DirectGatherPositionPath)) : Except OperationalError Bool :=
+  match paths.filter (fun paths => !paths.isEmpty) with
+  | [] | [_] => pure true
+  | first :: remaining => remaining.foldlM (fun compatible next => do
+      if !compatible then pure false else sameDirectGatherRelationInventory id first next) true
+
+private def directGatherSelectorInventory
+    (id : Nat) (correlation : DirectCorrelationEnvironment) : Except OperationalError
+    (Std.HashMap GatherLookupOwner Unit) :=
+  (directGatherIdentities correlation).foldlM (fun inventory gathered => do
+    let owner ← match directGatherOwner? gathered with
+      | some owner => pure owner
+      | none => throw (.unsupportedOperationalExpr id)
+    pure (inventory.insert owner ())) {}
+
+private def directRelationSelectedInputsCompatible {α : Type}
+    (id : Nat) (entries : List (DirectCorrelationEntry α)) : Except OperationalError Bool := do
+  let paths := entries.map (·.positionPaths)
+  if paths.any (fun paths => !paths.isEmpty) then
+    directRelationGatherPathsCompatible id paths
+  else
+    match entries with
+    | [] | [_] => pure true
+    | first :: remaining => do
+        let first ← directGatherSelectorInventory id first.correlation
+        remaining.allM fun entry => do
+          let current ← directGatherSelectorInventory id entry.correlation
+          pure (first.size == current.size && first.toList.all fun (owner, _) => current.contains owner)
+
+private def alignDirectCorrelationEntriesWithWork {α : Type}
+    (owner id : Nat)
+    (inputs : List (List (DirectCorrelationEntry α))) :
+    Except OperationalError ((List (Array α × DirectCorrelationEnvironment × List DirectGatherPositionPath ×
+      List (DirectCorrelationEntry α))) × DirectGatherAlignmentWork) := do
+  let inputs := inputs.map fun entries => entries.filterMap fun entry => do
+    let correlation ← normalizeDirectCorrelation entry.correlation
+    pure { entry with correlation }
   if inputs.isEmpty || inputs.any List.isEmpty then throw (.invalidCount owner 0)
+  /- A gather result ordinal is an ordinal in its source family, not an executable zip position.
+  When all gather alternatives expose one exact runtime position, zip them by that position even
+  if their source families have different sizes.  Each operand must contribute exactly one
+  alternative at each position; duplicates, absent evidence, and ambiguous position proofs fail
+  closed.  Non-gather operands still use the ordinary subset rule below. -/
+  let gatherIdentities := inputs.foldl (fun retained entries => entries.foldl (fun retained entry =>
+      (directGatherIdentities entry.correlation).foldl (fun retained gathered =>
+        if retained.contains gathered then retained else retained ++ [gathered]) retained) retained) []
+  let gatheredInputs := inputs.filter fun entries =>
+    entries.any fun entry => !entry.positionPaths.isEmpty
+  /- Each reduced operand transports its own gather position through its own pending map stack
+  before it reaches this zipper.  Thus equal normalized position expressions here are exactly a
+  path-scoped proof that both operands arrived at the same executable destination coordinate.
+  No arena-wide equality registry is consulted: unrelated maps, branching views, and equal
+  numeric slots cannot create a match. -/
+  if gatherIdentities.length > 1 then
+    if gatheredInputs.length != inputs.length ||
+        !gatheredInputs.all (fun entries => entries.all fun entry =>
+          (agreedDirectGatherPositionPath? entry.positionPaths).isSome) then
+      throw (.unsupportedOperationalExpr id)
+    let indexed ← gatheredInputs.mapM (directGatherPositionIndex id)
+    let indexes := indexed.map (·.1)
+    let indexBuildEntries := indexed.foldl (fun total (_, count) => total + count) 0
+    let driver? := gatheredInputs.foldl (fun selected? entries =>
+      match selected? with
+      | none => some entries
+      | some selected => if entries.length > selected.length then some entries else selected) none
+    match driver? with
+    | some driver =>
+        let results ← driver.mapM fun driverEntry => do
+          let path ← match agreedDirectGatherPositionPath? driverEntry.positionPaths with
+            | some path => pure path
+            | none => throw (.unsupportedOperationalExpr id)
+          let position : DirectGatherPositionKey := {
+            destination := canonicalDirectCorrelationKey path.destination, ordinal := path.ordinal }
+          let selected ← indexes.mapM fun index =>
+            match directGatherEntryAt? index position with
+            | some entry => pure entry
+            | none => throw (.unsupportedOperationalExpr id)
+          let correlation ← selected.foldlM (fun current entry =>
+            match mergeDirectCorrelation current entry.correlation with
+            | some merged => pure merged
+            | none => throw (.unsupportedOperationalExpr id)) []
+          pure (selected.map (·.payload) |>.toArray, correlation,
+            selected.flatMap (·.positionPaths), selected)
+        return (results, { indexBuildEntries, driverLookupVisits := driver.length * indexes.length })
+    | none => throw (.invalidCount owner 0)
   let driver? := inputs.foldl (fun selected? entries =>
     match selected? with
     | none => some entries
     | some selected =>
         let selectedDepth := selected.foldl
-          (fun maximum (entry : DirectCorrelationEnvironment × α) => max maximum entry.1.length) 0
+          (fun maximum (entry : DirectCorrelationEntry α) => max maximum entry.correlation.length) 0
         let entryDepth := entries.foldl
-          (fun maximum (entry : DirectCorrelationEnvironment × α) => max maximum entry.1.length) 0
+          (fun maximum (entry : DirectCorrelationEntry α) => max maximum entry.correlation.length) 0
         if entryDepth > selectedDepth then some entries else selected?) none
   match driver? with
   | some driver =>
       let driverDepth := driver.foldl
-        (fun maximum (entry : DirectCorrelationEnvironment × α) => max maximum entry.1.length) 0
+        (fun maximum (entry : DirectCorrelationEntry α) => max maximum entry.correlation.length) 0
       let competing := inputs.filter fun entries =>
-        entries.foldl (fun maximum (entry : DirectCorrelationEnvironment × α) =>
-          max maximum entry.1.length) 0 == driverDepth
+        entries.foldl (fun maximum (entry : DirectCorrelationEntry α) =>
+          max maximum entry.correlation.length) 0 == driverDepth
       if !competing.all (fun entries => entries.all fun entry =>
-          driver.any fun driverEntry => sameDirectCorrelation entry.1 driverEntry.1) then
+          driver.any fun driverEntry =>
+            sameDirectCorrelation entry.correlation driverEntry.correlation) then
         throw (.unsupportedOperationalExpr id)
       if driver.length == 1 && inputs.all (fun entries => entries.length == 1) then do
         let entries ← inputs.mapM fun entries => match entries with
           | [entry] => pure entry | _ => throw (.unsupportedOperationalExpr id)
         let correlation ← entries.foldlM (fun current entry =>
-          match mergeDirectCorrelation current entry.1 with
+          match mergeDirectCorrelation current entry.correlation with
           | some merged => pure merged | none => throw (.unsupportedOperationalExpr id)) []
-        pure [(entries.map (·.2) |>.toArray, correlation)]
-      else driver.mapM fun driverEntry => do
-      let arguments ← inputs.mapM fun entries => match entries with
-        | [entry] =>
-            if directCorrelationContained entry.1 driverEntry.1 then pure entry.2
-            else throw (.unsupportedOperationalExpr id)
-        | _ => match entries.filter fun entry => directCorrelationContained entry.1 driverEntry.1 with
-          | [entry] => pure entry.2
-          | _ => throw (.unsupportedOperationalExpr id)
-      pure (arguments.toArray, driverEntry.1)
+        pure ([(entries.map (·.payload) |>.toArray, correlation,
+          entries.flatMap (·.positionPaths), entries)], {})
+      else do
+        let results ← driver.mapM fun driverEntry => do
+          let selected ← inputs.mapM fun entries => match entries with
+            | [entry] =>
+                if directCorrelationContained entry.correlation driverEntry.correlation then pure entry
+                else throw (.unsupportedOperationalExpr id)
+            | _ => match entries.filter fun entry =>
+                directCorrelationContained entry.correlation driverEntry.correlation with
+              | [entry] => pure entry
+              | _ => throw (.unsupportedOperationalExpr id)
+          pure (selected.map (·.payload) |>.toArray, driverEntry.correlation,
+            driverEntry.positionPaths, selected)
+        pure (results, {})
   | none => throw (.invalidCount owner 0)
+
+private def alignDirectCorrelationEntries {α : Type}
+    (owner id : Nat)
+    (inputs : List (List (DirectCorrelationEntry α))) :
+    Except OperationalError (List (Array α × DirectCorrelationEnvironment × List DirectGatherPositionPath ×
+      List (DirectCorrelationEntry α))) := do
+  let (results, _) ← alignDirectCorrelationEntriesWithWork owner id inputs
+  pure results
+
+/-- Reporting-only work counter for the same gather-position zipper used by direct pointwise
+reduction.  It accepts already reduced operand lanes so fixtures can assert the exact linear
+index-build and lookup work without a synthetic estimator or acceptance dependency. -/
+def directGatherAlignmentWorkForMatrixInputs
+    (owner id : Nat) (inputs : List (List ReducedDirectMatrixFact)) :
+    Except OperationalError DirectGatherAlignmentWork := do
+  let inputs := inputs.map fun entries => entries.map fun entry => {
+    correlation := entry.correlation, payload := entry.fact, positionPaths := entry.positionPaths }
+  let (_, work) ← alignDirectCorrelationEntriesWithWork owner id inputs
+  pure work
+
+/-- Force failure-only evidence at the single correlation zipper.  This shows whether a mapped
+zip produced incompatible owner-bearing environments before any operation-specific transfer is
+attempted; it does not enumerate or merge missing Cartesian combinations. -/
+private def directCorrelationAlignmentFailureDiagnostic {α : Type}
+    (owner id : Nat) (inputs : List (List (DirectCorrelationEntry α)))
+    (error : OperationalError) : Bool :=
+  let correlations := inputs.map fun entries => entries.map (·.correlation)
+  let positionPaths := inputs.map fun entries => entries.map (·.positionPaths)
+  operationalProgress "direct_correlation_alignment" "failure" "" id inputs.length
+    ("owner=" ++ toString owner ++ "; correlations=" ++ reprStr correlations ++
+      "; position_paths=" ++ reprStr positionPaths ++
+      "; error=" ++ reprStr error)
 
 /-- The sole correlation zipper for mixed direct relation operands.  It selects a pre-existing
 most-specific lane and permits only operands whose assignments are a compatible subset; it never
@@ -3458,9 +3799,13 @@ creates a Cartesian product of independent tables. -/
 def alignDirectRelationArguments
     (arena : DirectOperationalIndexedArena) (owner id : Nat)
     (inputs : List (List ReducedDirectRelationArgument)) :
-    Except OperationalError (List (Array DirectRelationArgument × DirectCorrelationEnvironment)) :=
-  alignDirectCorrelationEntries arena owner id
-    (inputs.map (fun entries => entries.map fun entry => (entry.correlation, entry.payload)))
+    Except OperationalError (List (Array DirectRelationArgument × DirectCorrelationEnvironment ×
+      List DirectGatherPositionPath × List (DirectCorrelationEntry DirectRelationArgument))) :=
+  (alignDirectCorrelationEntries owner id
+    (inputs.map (fun entries => entries.map fun entry => {
+      correlation := entry.correlation, payload := entry.payload, positionPaths := entry.positionPaths }))).map
+    (List.map fun (arguments, correlation, paths, inputEntries) =>
+      (arguments, correlation, paths, inputEntries))
 
 /-- Recover exact integer table lanes from the compact direct carrier.  This is deliberately
 limited to fixed integer leaves and capture-free maps: a gathered family selection may use those
@@ -3634,7 +3979,13 @@ private def reindexReducedMatrixFact
     Except OperationalError OperationalMatrixFact :=
   maps.foldlM (fun fact map => match reindexOperationalMatrixFact parameters map fact with
     | some fact => pure fact
-    | none => throw (.unsupportedOperationalExpr 0)) fact
+    | none =>
+        if operationalDiagnostic "reindex" ("payload=matrix_fact reason=" ++
+            operationalMatrixFactReindexFailureField parameters map fact ++ " source=" ++
+            reprStr map.source ++ " destination=" ++ reprStr map.destination ++
+            " assignments=" ++ reprStr map.assignments) then
+          throw (.unsupportedOperationalExpr 0)
+        else throw (.unsupportedOperationalExpr 0)) fact
 
 private def reindexReducedScalarFact
     (parameters : ParamEnvironment) (maps : List IndexMap) (fact : OperationalScalarFact) :
@@ -3649,7 +4000,28 @@ private def reindexReducedPointwiseOperation
     Except OperationalError OperationalIndexedPointwiseOperation :=
   maps.foldlM (fun operation map => match reindexOperationalIndexedPointwiseOperation parameters map operation with
     | some operation => pure operation
-    | none => throw (.unsupportedOperationalExpr 0)) operation
+    | none =>
+        if operationalDiagnostic "reindex" ("payload=pointwise_operation descriptor_kind=" ++
+            operationalPointwiseOperationDescriptorKind operation ++ " reason=" ++
+            operationalPointwiseOperationReindexFailureField map operation ++ " source=" ++
+            reprStr map.source ++ " destination=" ++ reprStr map.destination ++
+            " assignments=" ++ reprStr map.assignments) then
+          throw (.unsupportedOperationalExpr 0)
+        else throw (.unsupportedOperationalExpr 0)) operation
+
+/-- A closed parallel output carries an executable selection identity in addition to the delayed
+payload below it.  When an enclosing zip reindexes that output, reduction must transport this
+identity through the same owner-aware maps as the fixed leaves and pointwise descriptors.  A
+direct-carrier context lift has no source coordinate to substitute, so it deliberately leaves the
+already-installed lexical selection unchanged. -/
+private def reindexReducedDynamicSelection
+    (maps : List IndexMap) (selection : DynamicSelectionIdentity) :
+    Except OperationalError DynamicSelectionIdentity :=
+  maps.foldlM (fun selection map =>
+    if map.isDirectCarrierContextLift then pure selection else
+    match reindexDynamicSelectionIdentity map selection with
+    | some selection => pure selection
+    | none => throw (.unsupportedOperationalExpr 0)) selection
 
 /-- Matrix and scalar reduction cross the same ordered map stack.  A relation descriptor must
 use that final context when closing its indexed fields, rather than the source context stored at
@@ -3657,6 +4029,122 @@ the delayed pointwise root. -/
 private def reducedDirectMatrixContext
     (source : IndexContext) (maps : List IndexMap) : IndexContext :=
   maps.foldl (fun _ map => map.destination) source
+
+private def reducedDirectPayloadSchemaDiagnostic : OperationalIndexedPayloadSchema → String
+  | .matrix matrixType => "matrix:" ++ reprStr matrixType
+  | .scalar .integer => "scalar:integer"
+  | .scalar .boolean => "scalar:boolean"
+  | .scalar .real => "scalar:real"
+  | .scalar (.trapdoor _ _ _ _ _) => "scalar:trapdoor"
+  | .scalar (.bytes _) => "scalar:bytes"
+  | .scalar (.typedBlob _ _) => "scalar:typed_blob"
+  | .scalar (.unknown _) => "scalar:unknown"
+
+private def reducedDirectPrimitiveOperationKindDiagnostic : PrimitiveOperationKind → String
+  | .add false => "matrix:add"
+  | .add true => "matrix:subtract"
+  | .multiply _ _ => "matrix:multiply"
+  | .tensor => "matrix:tensor"
+  | .concat .rows => "matrix:concat_rows"
+  | .concat .columns => "matrix:concat_columns"
+  | .concat .diagonal => "matrix:concat_diagonal"
+  | .transform .negate => "matrix:transform_negate"
+  | .transform .transpose => "matrix:transform_transpose"
+  | .transform (.rowSlice _ _) => "matrix:transform_row_slice"
+  | .transform (.columnSlice _ _) => "matrix:transform_column_slice"
+  | .transform (.rowEmbed _ _) => "matrix:transform_row_embed"
+  | .transform (.columnEmbed _ _) => "matrix:transform_column_embed"
+  | .slice _ _ => "matrix:slice"
+  | .scale _ _ => "matrix:scale"
+  | .bggGrouping => "matrix:bgg_grouping"
+
+private def reducedDirectPointwiseOperationDiagnostic : OperationalIndexedPointwiseOperation → String
+  | .matrix operation => reducedDirectPrimitiveOperationKindDiagnostic operation.kind ++
+      "; owner=" ++ toString operation.ownerNode ++ "; output_port=" ++ toString operation.outputPort ++
+      "; output_schema=" ++ reprStr operation.outputSchema
+  | .relation operation =>
+      let kind := match operation.kind with
+        | .preimage _ _ => "relation:preimage"
+        | .decomposition _ _ _ _ _ _ => "relation:decomposition"
+      kind ++ "; owner=" ++ toString operation.ownerNode ++ "; output_port=" ++
+        toString operation.outputPort ++ "; output_schema=" ++ reprStr operation.outputSchema
+  | .scalar operation =>
+      let kind := match operation.kind with
+        | .boolToInt => "scalar:bool_to_int"
+        | .intBinary .add => "scalar:int_add"
+        | .intBinary .subtract => "scalar:int_subtract"
+        | .intBinary .multiply => "scalar:int_multiply"
+        | .intBinary .divide => "scalar:int_divide"
+        | .intBinary .remainder => "scalar:int_remainder"
+        | .intCompare .equal => "scalar:int_equal"
+        | .intCompare .less => "scalar:int_less"
+        | .intCompare .lessEqual => "scalar:int_less_equal"
+        | .bitExtract _ => "scalar:bit_extract"
+        | .intToReal => "scalar:int_to_real"
+        | .realBinary .add => "scalar:real_add"
+        | .realBinary .subtract => "scalar:real_subtract"
+        | .realBinary .multiply => "scalar:real_multiply"
+        | .realBinary .divide => "scalar:real_divide"
+        | .realSqrt => "scalar:real_sqrt"
+      kind ++ "; owner=" ++ toString operation.ownerNode ++ "; output_port=" ++
+        toString operation.outputPort
+  | .matrixToScalar operation =>
+      let kind := match operation.kind with
+        | .extractCoefficient _ => "matrix_to_scalar:extract_coefficient"
+        | .thresholdDecodeBool _ _ _ => "matrix_to_scalar:threshold_decode_bool"
+        | .thresholdDecodeInt _ _ _ => "matrix_to_scalar:threshold_decode_int"
+      kind ++ "; owner=" ++ toString operation.ownerNode ++ "; output_port=" ++
+        toString operation.outputPort
+  | .matrixFromScalar operation =>
+      let kind := match operation.kind with
+        | .liftIntegerToConstantPolynomial _ => "matrix_from_scalar:lift_integer"
+        | .trapdoorPublic _ => "matrix_from_scalar:trapdoor_public"
+      kind ++ "; owner=" ++ toString operation.ownerNode ++ "; output_port=" ++
+        toString operation.outputPort
+
+/-- Failure-only structural telemetry for delayed direct reduction.  This is intentionally kept
+at the reduction boundary: it records the concrete payload and complete pending-map stack that
+produced a fail-closed result, without adding a success-path traversal or a protocol-specific
+exception. -/
+private def reducedDirectPayloadDiagnostic : OperationalIndexedPayload → String
+  | .shared schema reference => "shared; schema=" ++ reducedDirectPayloadSchemaDiagnostic schema ++
+      "; reference=" ++ reprStr reference
+  | .explicit schema binder references =>
+      "explicit; schema=" ++ reducedDirectPayloadSchemaDiagnostic schema ++ "; binder=" ++ reprStr binder ++
+        "; entries=" ++ toString references.size
+  | .explicitValues schema binder values =>
+      "explicit_values; schema=" ++ reducedDirectPayloadSchemaDiagnostic schema ++ "; binder=" ++
+        reprStr binder ++ "; entries=" ++ toString values.size
+  | .mapped schema source map =>
+      "mapped; schema=" ++ reducedDirectPayloadSchemaDiagnostic schema ++ "; source=" ++ toString source ++
+        "; map=" ++ reprStr map
+  | .rebound schema source subject =>
+      "rebound; schema=" ++ reducedDirectPayloadSchemaDiagnostic schema ++ "; source=" ++ toString source ++
+        "; subject=" ++ reprStr subject
+  | .indexedOutput schema source binder selection subject =>
+      "indexed_output; source=" ++ toString source ++ "; binder=" ++ reprStr binder ++
+        "; schema=" ++ reducedDirectPayloadSchemaDiagnostic schema ++ "; selection=" ++ reprStr selection ++
+        "; subject=" ++ reprStr subject
+  | .matrixResultBound schema source _ =>
+      "matrix_result_bound; schema=" ++ reducedDirectPayloadSchemaDiagnostic schema ++
+        "; source=" ++ toString source
+  | .pointwise schema operation inputs =>
+      "pointwise; schema=" ++ reducedDirectPayloadSchemaDiagnostic schema ++ "; operation=" ++
+        reducedDirectPointwiseOperationDiagnostic operation ++ "; inputs=" ++ reprStr inputs
+
+private def reducedDirectPointwiseFailureDiagnostic
+    (phase : String) (id : OperationalIndexedValueId) (operation : OperationalIndexedPointwiseOperation)
+    (maps : List IndexMap) (detail : String) (error : OperationalError) : Bool :=
+  operationalProgress "reduced_direct_pointwise" phase "" id maps.length
+    ("operation=" ++ reducedDirectPointwiseOperationDiagnostic operation ++ "; maps=" ++ reprStr maps ++
+      "; " ++ detail ++ "; error=" ++ reprStr error)
+
+private def reducedDirectReductionFailureDiagnostic
+    (kind : String) (id : OperationalIndexedValueId) (value : OperationalIndexedValue)
+    (maps : List IndexMap) (error : OperationalError) : Bool :=
+  operationalProgress "reduced_direct_reduction" (kind ++ "_failure") "" id maps.length
+    ("context=" ++ reprStr value.context ++ "; payload=" ++ reducedDirectPayloadDiagnostic value.payload ++
+      "; maps=" ++ reprStr maps ++ "; error=" ++ reprStr error)
 
 mutual
 
@@ -3670,7 +4158,8 @@ private def reducedDirectMatrixFactAt
       let value ← match arena.valueAt? id with
         | some value => pure value
         | none => throw (.invalidOperationalExprRef id)
-      let evaluation ← match value.payload with
+      let evaluation ← try
+        match value.payload with
       | .shared (.matrix _) (.matrix reference) => do
           let fact ← match arena.fixed.matrices[reference]? with
             | some fact => pure fact
@@ -3687,7 +4176,8 @@ private def reducedDirectMatrixFactAt
             let fact ← reindexReducedMatrixFact parameters maps fact
             let correlation := if references.size == 1 then [] else [(.variable binder, ordinal)]
             let correlations ← transportDirectCorrelation arena parameters id maps correlation
-            pure (correlations.map fun correlation => { correlation, fact })
+            pure (correlations.map fun correlation => {
+              correlation, fact, positionPaths := directGatherPositionPaths parameters maps correlation })
           let entries := mapped.flatten
           pure { entries := entries }
       | .explicitValues (.matrix _) binder values => do
@@ -3695,15 +4185,23 @@ private def reducedDirectMatrixFactAt
             let outer := if values.size == 1 then [] else [(.variable binder, ordinal)]
             let outer ← transportDirectCorrelation arena parameters id maps outer
             outer.mapM fun outer => do
+                let introduced := directGatherPositionPaths parameters maps outer
                 let evaluation ← reducedDirectMatrixFactAt arena parameters maps child fuel
                 /- A direct-value table adds one owner-bearing table-lane assignment to every
                 child alternative.  A conflicting assignment rejects only that physical
                 alternative: another child lane may still be compatible with the enclosing
                 selection.  `mergeDirectCorrelation` compares the complete `IndexExpr`, hence
                 equal slot/count pairs belonging to distinct owners remain independent. -/
-                let entries := evaluation.entries.filterMap fun entry =>
-                  (mergeDirectCorrelation outer entry.correlation).map fun correlation =>
-                    { entry with correlation }
+                let candidates ← evaluation.entries.mapM fun entry => do
+                  match mergeDirectCorrelation outer entry.correlation with
+                  | none => pure none
+                  | some correlation => do
+                      let positionPaths ← match
+                          mergeDirectGatherPositionPaths entry.positionPaths introduced with
+                        | some paths => pure paths
+                        | none => throw (.unsupportedOperationalExpr id)
+                      pure (some { entry with correlation, positionPaths })
+                let entries := candidates.filterMap fun candidate => candidate
                 pure { evaluation with entries }
           let lanes := lanes.flatten
           let entries := lanes.flatMap (fun lane => lane.entries)
@@ -3724,6 +4222,7 @@ private def reducedDirectMatrixFactAt
           pure { evaluation with entries }
       | .indexedOutput (.matrix _) source binder selection subject => do
           let evaluation ← reducedDirectMatrixFactAt arena parameters maps source fuel
+          let selection ← reindexReducedDynamicSelection maps selection
           let entries := evaluation.entries.map fun entry =>
             { entry with fact := overlayIndexMatrixFact binder selection subject entry.fact }
           pure { evaluation with entries }
@@ -3743,18 +4242,47 @@ private def reducedDirectMatrixFactAt
             entries := entries, rewriteEvents := evaluation.rewriteEvents }
           pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
       | .pointwise (.matrix matrixType) (.matrix operation) inputs => do
-          let operation ← reindexReducedPointwiseOperation parameters maps (.matrix operation)
+          let descriptor : OperationalIndexedPointwiseOperation := .matrix operation
+          let operation ← try reindexReducedPointwiseOperation parameters maps descriptor catch error =>
+            if reducedDirectPointwiseFailureDiagnostic "descriptor_transport" id descriptor maps
+                ("payload_schema=" ++ reducedDirectPayloadSchemaDiagnostic (.matrix matrixType)) error then
+              throw error
+            else throw (.unsupportedOperationalExpr id)
           let operation ← match operation with
             | .matrix operation => pure operation
             | _ => throw (.unsupportedOperationalExpr id)
-          let inputEvaluations ← inputs.toList.mapM fun input =>
-            reducedDirectMatrixFactAt arena parameters maps input fuel
+          let inputEvaluations ← inputs.toList.mapIdxM fun childIndex childId =>
+            try reducedDirectMatrixFactAt arena parameters maps childId fuel catch error =>
+              if reducedDirectPointwiseFailureDiagnostic "child_reduction" id descriptor maps
+                  ("child_index=" ++ toString childIndex ++ "; child_id=" ++ toString childId) error then
+                throw error
+              else throw (.unsupportedOperationalExpr id)
           let inputEntries := inputEvaluations.map (·.entries)
-          let aligned ← alignDirectCorrelationEntries arena operation.ownerNode id
-            (inputEntries.map (fun entries => entries.map fun entry => (entry.correlation, entry.fact)))
-          let entriesAndEvents ← aligned.mapM fun (arguments, correlation) => do
-            let (fact, rewriteCount) ←
+          let correlationInputs := inputEntries.map fun entries =>
+            entries.map fun entry => {
+              correlation := entry.correlation, payload := entry.fact, positionPaths := entry.positionPaths }
+          let aligned ← try
+            alignDirectCorrelationEntries operation.ownerNode id correlationInputs
+          catch error =>
+            if directCorrelationAlignmentFailureDiagnostic operation.ownerNode id correlationInputs error then
+              throw error
+            else throw (.unsupportedOperationalExpr id)
+          let entriesAndEvents ← aligned.mapIdxM fun alignmentIndex
+              (arguments, correlation, positionPaths, inputEntries) => do
+            let (fact, rewriteCount) ← try
               applyDirectMatrixPointwiseOperationWithRelationRewriteCount operation matrixType arguments
+              catch error =>
+                if reducedDirectPointwiseFailureDiagnostic "primitive_application" id descriptor maps
+                    ("alignment_index=" ++ toString alignmentIndex ++ "; correlation=" ++
+                      reprStr correlation ++ "; argument_count=" ++ toString arguments.size) error then
+                  throw error
+                else throw (.unsupportedOperationalExpr id)
+            match operation.kind with
+            | .multiply (.matrixMultiplyRelation _) _ =>
+                if !(← directRelationSelectedInputsCompatible id inputEntries) then
+                  throw (.unsupportedOperationalExpr id)
+                if rewriteCount == 0 then throw (.unsupportedOperationalExpr id)
+            | _ => pure ()
             let pointwise : DirectRelationRewritePointwiseKey := {
               ownerScope := operation.ownerScope, ownerNode := operation.ownerNode,
               outputPort := operation.outputPort }
@@ -3762,7 +4290,7 @@ private def reducedDirectMatrixFactAt
               pointwise := pointwise,
               maps := normalizeDirectRelationRewriteMaps maps, correlation := correlation,
               localOrdinal := localOrdinal }
-            pure ({ correlation, fact }, events)
+            pure ({ correlation, fact, positionPaths }, events)
           let entries := entriesAndEvents.map (fun value => value.1)
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (inputEvaluations.flatMap (fun value => value.rewriteEvents) ++
@@ -3785,7 +4313,8 @@ private def reducedDirectMatrixFactAt
                 let evaluation ← reducedDirectMatrixFactAt arena parameters maps inputId fuel
                 pure (evaluation.entries.map fun entry =>
                   { correlation := entry.correlation,
-                    payload := DirectRelationArgument.matrix entry.fact }, evaluation.rewriteEvents,
+                    payload := DirectRelationArgument.matrix entry.fact, positionPaths := entry.positionPaths },
+                  evaluation.rewriteEvents,
                   evaluation.maximumPolynomialTerms)
             | .scalar (.trapdoor _ _ _ _ _) =>
                 let evaluation ← reducedDirectScalarFactAt arena parameters maps inputId fuel
@@ -3793,18 +4322,21 @@ private def reducedDirectMatrixFactAt
                   match entry.fact with
                   | OperationalScalarFact.trapdoor fact =>
                       pure (ReducedDirectRelationArgument.mk entry.correlation
-                        (DirectRelationArgument.trapdoor fact))
+                        (DirectRelationArgument.trapdoor fact) entry.positionPaths)
                   | _ => throw (.unsupportedOperationalExpr id)
                 pure (entries, evaluation.rewriteEvents, evaluation.maximumPolynomialTerms)
             | .scalar _ => throw (.unsupportedOperationalExpr id)
           let inputEntries := inputEvaluations.map (·.1)
           let aligned ← alignDirectRelationArguments arena operation.ownerNode id inputEntries
-          let entries ← aligned.mapM fun (arguments, correlation) => do
+          let entries ← aligned.mapM fun
+              (arguments, correlation, positionPaths, inputEntries) => do
+            if !(← directRelationSelectedInputsCompatible id inputEntries) then
+              throw (.unsupportedOperationalExpr id)
             let context := reducedDirectMatrixContext value.context maps
             let indices := correlation.map fun (key, ordinal) => (key, Int.ofNat ordinal)
             let operation ← materializeDirectRelationOperation arena parameters context indices operation
             let fact ← applyDirectRelationProducer operation operation.outputSchema arguments
-            pure { correlation, fact }
+            pure { correlation, fact, positionPaths }
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (inputEvaluations.flatMap (fun value => value.2.1))
           let maximumPolynomialTerms := inputEvaluations.foldl (fun maximum value =>
@@ -3821,11 +4353,14 @@ private def reducedDirectMatrixFactAt
           let evaluation ← reducedDirectScalarFactAt arena parameters maps input fuel
           let entries : List ReducedDirectMatrixFact ← evaluation.entries.mapM fun entry => do
             let fact ← applyDirectMatrixFromScalarOperation operation matrixType entry.fact
-            pure { correlation := entry.correlation, fact }
+            pure { correlation := entry.correlation, fact, positionPaths := entry.positionPaths }
           let result : ReducedDirectMatrixEvaluation := {
             entries := entries, rewriteEvents := evaluation.rewriteEvents }
           pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
-      | _ => throw (.unsupportedOperationalExpr id)
+        | _ => throw (.unsupportedOperationalExpr id)
+      catch error =>
+        if reducedDirectReductionFailureDiagnostic "matrix" id value maps error then throw error
+        else throw (.unsupportedOperationalExpr id)
       let observed := evaluation.entries.foldl (fun maximum entry =>
         max maximum entry.fact.polynomial.length) 0
       pure { evaluation with maximumPolynomialTerms :=
@@ -3849,7 +4384,8 @@ private def reducedDirectScalarFactAt
       let value ← match arena.valueAt? id with
         | some value => pure value
         | none => throw (.invalidOperationalExprRef id)
-      let evaluation ← match value.payload with
+      let evaluation ← try
+        match value.payload with
       | .shared (.scalar _) (.scalar reference) => do
           let fact ← match arena.fixed.scalars[reference]? with
             | some fact => pure fact
@@ -3869,10 +4405,11 @@ private def reducedDirectScalarFactAt
             let correlation := if references.size == 1 then [] else [(.variable binder, ordinal)]
             let correlations ← transportDirectCorrelation arena parameters id maps correlation
             correlations.mapM fun correlation => do
-              let fact ← arena.materializeScalarFact parameters
+              let materialized ← arena.materializeScalarFact parameters
                 (reducedDirectScalarContext value.context maps)
                 (correlation.map fun (key, ordinal) => (key, Int.ofNat ordinal)) fact
-              pure { correlation, fact }
+              let paths := directGatherPositionPaths parameters maps correlation
+              pure ⟨correlation, materialized, paths⟩
           let entries := mapped.flatten
           pure { entries := entries }
       | .explicitValues (.scalar _) binder values => do
@@ -3880,10 +4417,18 @@ private def reducedDirectScalarFactAt
             let outer := if values.size == 1 then [] else [(.variable binder, ordinal)]
             let outer ← transportDirectCorrelation arena parameters id maps outer
             outer.mapM fun outer => do
+                let introduced := directGatherPositionPaths parameters maps outer
                 let evaluation ← reducedDirectScalarFactAt arena parameters maps child fuel
-                let entries := evaluation.entries.filterMap fun entry =>
-                  (mergeDirectCorrelation outer entry.correlation).map fun correlation =>
-                    { entry with correlation }
+                let candidates ← evaluation.entries.mapM fun entry => do
+                  match mergeDirectCorrelation outer entry.correlation with
+                  | none => pure none
+                  | some correlation => do
+                      let positionPaths ← match
+                          mergeDirectGatherPositionPaths entry.positionPaths introduced with
+                        | some paths => pure paths
+                        | none => throw (.unsupportedOperationalExpr id)
+                      pure (some { entry with correlation, positionPaths })
+                let entries := candidates.filterMap fun candidate => candidate
                 pure { evaluation with entries }
           let lanes := lanes.flatten
           let entries := lanes.flatMap (fun lane => lane.entries)
@@ -3903,6 +4448,7 @@ private def reducedDirectScalarFactAt
           pure { evaluation with entries }
       | .indexedOutput (.scalar _) source binder selection subject => do
           let evaluation ← reducedDirectScalarFactAt arena parameters maps source fuel
+          let selection ← reindexReducedDynamicSelection maps selection
           let entries := evaluation.entries.map fun entry =>
             { entry with fact := overlayIndexScalarFact binder selection subject entry.fact }
           pure { evaluation with entries }
@@ -3917,7 +4463,7 @@ private def reducedDirectScalarFactAt
           let evaluation ← reducedDirectMatrixFactAt arena parameters maps input fuel
           let entries ← evaluation.entries.mapM fun entry => do
             let fact ← applyDirectMatrixToScalarOperation operation entry.fact
-            pure { correlation := entry.correlation, fact }
+            pure { correlation := entry.correlation, fact, positionPaths := entry.positionPaths }
           let result : ReducedDirectScalarEvaluation := {
             entries := entries, rewriteEvents := evaluation.rewriteEvents }
           pure { result with maximumPolynomialTerms := evaluation.maximumPolynomialTerms }
@@ -3929,17 +4475,27 @@ private def reducedDirectScalarFactAt
           let inputEvaluations ← inputs.toList.mapM fun input =>
             reducedDirectScalarFactAt arena parameters maps input fuel
           let inputEntries := inputEvaluations.map (·.entries)
-          let aligned ← alignDirectCorrelationEntries arena operation.ownerNode id
-            (inputEntries.map (fun entries => entries.map fun entry => (entry.correlation, entry.fact)))
-          let entries ← aligned.mapM fun (arguments, correlation) => do
+          let correlationInputs := inputEntries.map fun entries =>
+            entries.map fun entry => {
+              correlation := entry.correlation, payload := entry.fact, positionPaths := entry.positionPaths }
+          let aligned ← try
+            alignDirectCorrelationEntries operation.ownerNode id correlationInputs
+          catch error =>
+            if directCorrelationAlignmentFailureDiagnostic operation.ownerNode id correlationInputs error then
+              throw error
+            else throw (.unsupportedOperationalExpr id)
+          let entries ← aligned.mapM fun (arguments, correlation, positionPaths, _) => do
             let fact ← applyDirectScalarPointwiseOperation operation arguments
-            pure { correlation, fact }
+            pure { correlation, fact, positionPaths }
           let rewriteEvents := deduplicateDirectRelationRewriteEvents
             (inputEvaluations.flatMap (fun value => value.rewriteEvents))
           let maximumPolynomialTerms := inputEvaluations.foldl (fun maximum evaluation =>
             max maximum evaluation.maximumPolynomialTerms) 0
           pure { entries := entries, rewriteEvents := rewriteEvents, maximumPolynomialTerms }
-      | _ => throw (.unsupportedOperationalExpr id)
+        | _ => throw (.unsupportedOperationalExpr id)
+      catch error =>
+        if reducedDirectReductionFailureDiagnostic "scalar" id value maps error then throw error
+        else throw (.unsupportedOperationalExpr id)
       pure evaluation
 
 /-- Hull the authoritative direct scalar reduction.  This is the only interval endpoint used by
@@ -3954,6 +4510,11 @@ def DirectOperationalIndexedArena.integerInterval
       let intervals ← evaluation.entries.mapM fun entry => match entry.fact with
         | .integer fact => pure (fact.lower, fact.upper)
         | _ => throw (.operandNotInteger owner wire)
+      if operationalProgress "direct_integer_interval" "entries" "" owner intervals.length
+          ("wire=" ++ reprStr wire ++ "; root=" ++ toString id ++ "; intervals=" ++
+            reprStr intervals ++ "; correlations=" ++
+            reprStr (evaluation.entries.map (·.correlation))) then pure () else
+        throw (.unsupportedOperationalExpr id)
       match intervals with
       | [] => throw (.invalidCount owner 0)
       | first :: rest => pure <| rest.foldl (fun (lower, upper) (nextLower, nextUpper) =>
@@ -5550,5 +6111,398 @@ def sequentialLoopTemplateArgumentExpr
     pure (arena, fact)
   else
     throw (.loopInputModeMismatch node indexSlot)
+
+/-- A relation-free, identity-free summary of a compact direct matrix carrier.  This is an
+analysis result, never a replacement `OperationalMatrixFact`: callers which need provenance,
+relations, or an exact polynomial must continue through `reducedDirectValueFactsAt`.  It bounds
+ordinary delayed pointwise addition without materializing a Cartesian product of gather domains. -/
+structure DirectMatrixEnvelope where
+  matrixType : MatrixTypeExpr
+  hardBound : OperationalBoundExpr
+  hasLarge : Bool
+  canonicalRange : CanonicalRange
+  relationFree : Bool
+  storedAlternativeVisits : Nat
+  maximumPolynomialTerms : Nat
+  deriving Repr
+
+private def directMatrixEnvelopeForFact
+    (fact : OperationalMatrixFact) : Except OperationalError DirectMatrixEnvelope := do
+  let canonicalRange ← match fact.canonicalRange with
+    | .below 0 => throw (.invalidMatrixParameters fact.subject.node)
+    | range => pure range
+  pure {
+    matrixType := fact.matrixType
+    hardBound := fact.totalHardBound
+    hasLarge := fact.polynomial.any operationalTermIsSignal
+    canonicalRange
+    relationFree := !matrixFactHasRelation fact
+    storedAlternativeVisits := 1
+    maximumPolynomialTerms := fact.polynomial.length
+  }
+
+/-- Check the final direct-carrier invariant before a bound-only consumer traverses a delayed
+carrier.  Constructors enforce the same facts on the normal path, but endpoint analysis must
+also reject a manually assembled malformed arena rather than treating one surviving branch as a
+valid envelope.  This is storage validation only: it neither reduces a carrier nor changes the
+exact reduction semantics. -/
+private partial def directCarrierPayloadValidAt
+    (arena : DirectOperationalIndexedArena)
+    (environment : ParamEnvironment)
+    (id : OperationalIndexedValueId) : Nat → Bool
+  | 0 => false
+  | fuel + 1 => match arena.valueAt? id with
+    | none => false
+    | some value =>
+        validateContext value.context && match value.payload with
+        | .shared schema reference => arena.fixed.refHasSchema schema reference
+        | .explicit schema binder references =>
+            value.context == { binders := #[binder] } && explicitCountValid environment binder references &&
+              references.all (arena.fixed.refHasSchema schema)
+        | .explicitValues schema binder values =>
+            match values.toList.mapM arena.valueAt? with
+            | none => false
+            | some children =>
+                !values.isEmpty &&
+                  explicitCountValid environment binder
+                    (Array.replicate values.size (.matrix 0)) &&
+                  children.all (fun child => child.payload.schema == schema) &&
+                  values.toList.all (fun child =>
+                    directCarrierPayloadValidAt arena environment child fuel) &&
+                  match mergeIndexContextsN (children.map (·.context)) with
+                  | some context =>
+                      match extendContext context binder with
+                      | some context => value.context == context
+                      | none => false
+                  | none => false
+        | .mapped schema source map =>
+            match arena.valueAt? source, reindexOperationalIndexedPayloadSchema map schema with
+            | some sourceValue, some _ =>
+                directCarrierPayloadValidAt arena environment source fuel && map.transportValid &&
+                  map.source == sourceValue.context && map.destination == value.context &&
+                  reindexOperationalIndexedPayloadSchema map sourceValue.payload.schema == some schema
+            | _, _ => false
+        | .rebound schema source _ =>
+            match arena.valueAt? source with
+            | some sourceValue =>
+                directCarrierPayloadValidAt arena environment source fuel &&
+                  sourceValue.context == value.context && sourceValue.payload.schema == schema
+            | none => false
+        | .indexedOutput schema source _ selection _ =>
+            match arena.valueAt? source, selection.expression.identityVariable? with
+            | some sourceValue, some selector =>
+                directCarrierPayloadValidAt arena environment source fuel &&
+                  sourceValue.payload.schema == schema &&
+                  match extendContext sourceValue.context selector with
+                  | some context => value.context == context &&
+                      indexExpressionInBounds value.context selection.expression
+                  | none => false
+            | _, _ => false
+        | .matrixResultBound schema source _ =>
+            match arena.valueAt? source with
+            | some sourceValue =>
+                directCarrierPayloadValidAt arena environment source fuel &&
+                  sourceValue.context == value.context && sourceValue.payload.schema == schema &&
+                  match schema with | .matrix _ => true | .scalar _ => false
+            | none => false
+        | .pointwise schema operation inputs =>
+            match inputs.toList.mapM arena.valueAt? with
+            | none => false
+            | some children =>
+                inputs.toList.all (fun child =>
+                  directCarrierPayloadValidAt arena environment child fuel) &&
+                  match mergeIndexedFactShapeN children with
+                  | some (context, _) =>
+                      value.context == context &&
+                        pointwiseSchemasValid operation (children.toArray.map (·.payload.schema)) schema
+                  | none => false
+
+/-- `PrimitiveOperation.outputType` is an owner-aware descriptor and may not silently disagree
+with the Graph-IR output schema retained beside it.  Envelope evaluation has no fixed index
+assignment, so only descriptors closed in the request environment are admitted here. -/
+private def closedPrimitiveOutputTypeMatchesSchema
+    (environment : ParamEnvironment)
+    (operation : PrimitiveOperation) : Bool :=
+  match operation.outputType.closedIr?, operation.outputSchema.evaluate environment (.constant 0) with
+  | some outputType, some schema =>
+      match outputType.evaluate environment (.constant 0) with
+      | some outputType => sameConcreteMatrixShape outputType schema
+      | none => false
+  | _, _ => false
+
+/- Fold alternatives of one carrier domain.  The domain denotes a choice, hence its bound is a
+maximum rather than an addition. -/
+private def joinDirectMatrixEnvelopeAlternatives
+    (left right : DirectMatrixEnvelope) : Except OperationalError DirectMatrixEnvelope := do
+  if left.matrixType != right.matrixType then throw (.outputTypeMismatch 0)
+  pure {
+    matrixType := left.matrixType
+    hardBound := .maximum left.hardBound right.hardBound
+    hasLarge := left.hasLarge || right.hasLarge
+    canonicalRange := joinCanonicalRanges [left.canonicalRange, right.canonicalRange]
+    relationFree := left.relationFree && right.relationFree
+    storedAlternativeVisits := left.storedAlternativeVisits + right.storedAlternativeVisits
+    maximumPolynomialTerms := max left.maximumPolynomialTerms right.maximumPolynomialTerms
+  }
+
+/- Transfer a relation-free ordinary pointwise addition/subtraction.  Unlike domain folding,
+both operands occur in every result, so their hard bounds add. -/
+private def transferDirectMatrixEnvelopeAdd
+    (environment : ParamEnvironment)
+    (subtract : Bool)
+    (left right : DirectMatrixEnvelope) : Except OperationalError DirectMatrixEnvelope := do
+  if left.matrixType != right.matrixType then throw (.outputTypeMismatch 0)
+  let modulus ← match left.matrixType.modulus.evaluate environment with
+    | some modulus => pure modulus
+    | none => throw .nonClosedExpression
+  if modulus <= 0 then throw (.invalidMatrixParameters 0)
+  let canonicalRange := match left.canonicalRange, right.canonicalRange with
+    | .below leftUpper, .below rightUpper =>
+        if leftUpper == 0 || rightUpper == 0 then .unknown else
+        if subtract then
+          /- Residue subtraction wraps unless the right operand is exactly zero. -/
+          if rightUpper <= 1 then .below leftUpper else .unknown
+        else
+          /- For `0 ≤ a < A`, `0 ≤ b < B`, the representative of `a+b mod q` is
+          below `min q (A+B-1)`.  This is the same canonical-residue arithmetic used by the
+          concrete matrix path, but applied to a branch hull rather than a representative. -/
+          .below (min modulus.toNat (leftUpper + rightUpper - 1))
+    | _, _ => .unknown
+  pure {
+    matrixType := left.matrixType
+    hardBound := .add left.hardBound right.hardBound
+    hasLarge := left.hasLarge || right.hasLarge
+    canonicalRange
+    relationFree := left.relationFree && right.relationFree
+    storedAlternativeVisits := left.storedAlternativeVisits + right.storedAlternativeVisits
+    maximumPolynomialTerms := left.maximumPolynomialTerms + right.maximumPolynomialTerms
+  }
+
+/-- Fold a direct matrix carrier into an envelope without assigning unresolved gather
+coordinates.  Mapped views preserve the source bound but must still be structurally valid.
+Only relation-free add/sub is admitted; every other delayed primitive continues to require the
+exact correlation zipper. -/
+private def directMatrixEnvelopeAt
+    (arena : DirectOperationalIndexedArena)
+    (environment : ParamEnvironment)
+    (maps : List IndexMap)
+    (id : OperationalIndexedValueId) : Nat → Except OperationalError DirectMatrixEnvelope
+  | 0 => throw (.unsupportedOperationalExpr id)
+  | fuel + 1 => do
+      let value ← match arena.valueAt? id with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef id)
+      match value.payload with
+      | .shared (.matrix _) (.matrix reference) =>
+          match arena.fixed.matrices[reference]? with
+          | some fact => directMatrixEnvelopeForFact (← reindexReducedMatrixFact environment maps fact)
+          | none => throw (.invalidOperationalExprRef reference)
+      | .explicit (.matrix _) _ references => do
+          let summaries ← references.toList.mapM fun reference => match reference with
+            | .matrix reference => match arena.fixed.matrices[reference]? with
+              | some fact => do
+                  directMatrixEnvelopeForFact (← reindexReducedMatrixFact environment maps fact)
+              | none => throw (.invalidOperationalExprRef reference)
+            | .scalar _ => throw (.unsupportedOperationalExpr id)
+          match summaries with
+          | [] => throw (.invalidCount id 0)
+          | first :: remaining => remaining.foldlM joinDirectMatrixEnvelopeAlternatives first
+      | .explicitValues (.matrix _) _ values => do
+          let summaries ← values.toList.mapM fun child =>
+            directMatrixEnvelopeAt arena environment maps child fuel
+          match summaries with
+          | [] => throw (.invalidCount id 0)
+          | first :: remaining => remaining.foldlM joinDirectMatrixEnvelopeAlternatives first
+      | .mapped (.matrix _) source map =>
+          if !map.transportValid || map.destination != value.context then
+            throw (.unsupportedOperationalExpr id)
+          else directMatrixEnvelopeAt arena environment (map :: maps) source fuel
+      | .rebound (.matrix _) source _ | .indexedOutput (.matrix _) source _ _ _ =>
+          directMatrixEnvelopeAt arena environment maps source fuel
+      /- A result-bound annotation can carry an indexed expression which needs the exact mapped
+      assignment.  Do not silently drop that transport in the compact envelope path. -/
+      | .matrixResultBound .. => throw (.unsupportedOperationalExpr id)
+      | .pointwise (.matrix matrixType) (.matrix operation) inputs => do
+          let descriptor ← reindexReducedPointwiseOperation environment maps (.matrix operation)
+          let operation ← match descriptor with
+            | .matrix operation => pure operation
+            | _ => throw (.unsupportedOperationalExpr id)
+          if operation.outputSchema != matrixType ||
+              !closedPrimitiveOutputTypeMatchesSchema environment operation then
+            throw (.outputTypeMismatch operation.ownerNode)
+          match operation.kind, inputs.toList with
+          | .add subtract, [left, right] => do
+              let left ← directMatrixEnvelopeAt arena environment maps left fuel
+              let right ← directMatrixEnvelopeAt arena environment maps right fuel
+              if !matrixOperationSchemasValid operation #[.matrix left.matrixType, .matrix right.matrixType]
+                  matrixType then throw (.outputTypeMismatch operation.ownerNode)
+              let result ← transferDirectMatrixEnvelopeAdd environment subtract left right
+              if result.matrixType != matrixType || !result.relationFree then
+                throw (.unsupportedOperationalExpr id)
+              let cap ← match matrixCap matrixType environment with
+                | some cap => pure cap
+                | none => throw (.invalidMatrixParameters operation.ownerNode)
+              let hardBound := OperationalBoundExpr.minimum
+                (OperationalBoundExpr.closedInt (IntExpr.constant cap)) result.hardBound
+              pure { result with matrixType := matrixType, hardBound := hardBound }
+          | _, _ => throw (.unsupportedOperationalExpr id)
+      | _ => throw (.unsupportedOperationalExpr id)
+
+/-- Conservative bound-only analysis for a delayed direct carrier.  Exact reductions stay the
+authority for all structural consumers; this API deliberately exposes no representative fact,
+identity, or relation inventory. -/
+def OperationalExprArena.directMatrixEnvelope
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (expression : OperationalFact) : Except OperationalError DirectMatrixEnvelope := do
+  let root := expression.payload.root
+  if !directCarrierPayloadValidAt arena.direct environment root (arena.direct.values.size + 1) then
+    throw (.unsupportedOperationalExpr root)
+  let envelope ← directMatrixEnvelopeAt arena.direct environment [] root (arena.direct.values.size + 1)
+  if !envelope.relationFree then throw (.unsupportedOperationalExpr root)
+  pure envelope
+
+/-- Cheap structural prefilter for a delayed matrix envelope.  It recognizes only an ordinary
+binary add/sub through carrier views; it does not inspect contexts, maps, schemas, relations, or
+expression bounds.  Those are admission invariants of `directMatrixEnvelope`, so a shared outer
+loop binder cannot make this prefilter reject independently gathered nested operands. -/
+private def directMatrixEnvelopeShapePrefilterAt
+    (arena : DirectOperationalIndexedArena) (id : OperationalIndexedValueId) : Nat → Bool
+  | 0 => false
+  | fuel + 1 => match arena.valueAt? id with
+      | some { payload := .mapped (.matrix _) source _, .. }
+      | some { payload := .rebound (.matrix _) source _, .. }
+      | some { payload := .indexedOutput (.matrix _) source _ _ _, .. } =>
+          directMatrixEnvelopeShapePrefilterAt arena source fuel
+      | some { payload := .pointwise (.matrix _) (.matrix { kind := .add _, .. }) #[_, _], .. } => true
+      | _ => false
+
+/-- Cheap structural prefilter only.  Every accepted candidate must subsequently pass the
+authoritative recursive validation in `directMatrixEnvelope`. -/
+def OperationalExprArena.directMatrixEnvelopeShapePrefilter
+    (arena : OperationalExprArena) (expression : OperationalFact) : Bool :=
+  directMatrixEnvelopeShapePrefilterAt arena.direct expression.payload.root
+    (arena.direct.values.size + 1)
+
+/-- Conservative interval transfer for coefficient extraction from a compact matrix envelope.
+This is deliberately an interval-only API: it cannot manufacture the scalar
+identity needed by a relation or exact scalar pointwise operation.  A strict canonical range is
+retained; otherwise every canonical residue modulo `q` remains possible. -/
+private def directScalarExactIntervalAt
+    (arena : DirectOperationalIndexedArena)
+    (environment : ParamEnvironment)
+    (maps : List IndexMap)
+    (id : OperationalIndexedValueId) : Nat → Except OperationalError (Int × Int)
+  | 0 => throw (.unsupportedOperationalExpr id)
+  | fuel + 1 => do
+      let evaluation ← reducedDirectScalarFactAt arena environment maps id fuel
+      let intervals ← evaluation.entries.mapM fun entry => match entry.fact with
+        | .integer fact => pure (fact.lower, fact.upper)
+        | _ => throw (.operandNotInteger 0 { node := 0, port := 0 })
+      match intervals with
+      | [] => throw (.invalidCount id 0)
+      | first :: remaining => pure <| remaining.foldl (fun (lower, upper) (nextLower, nextUpper) =>
+          (min lower nextLower, max upper nextUpper)) first
+
+private def directScalarEnvelopeIntervalAt
+    (arena : DirectOperationalIndexedArena)
+    (environment : ParamEnvironment)
+    (maps : List IndexMap)
+    (id : OperationalIndexedValueId) : Nat → Except OperationalError (Int × Int)
+  | 0 => throw (.unsupportedOperationalExpr id)
+  | fuel + 1 => do
+      let value ← match arena.valueAt? id with
+        | some value => pure value
+        | none => throw (.invalidOperationalExprRef id)
+      match value.payload with
+      | .mapped (.scalar _) source map =>
+          if !map.transportValid || map.destination != value.context then
+            throw (.unsupportedOperationalExpr id)
+          else directScalarEnvelopeIntervalAt arena environment (map :: maps) source fuel
+      | .rebound (.scalar _) source _ | .indexedOutput (.scalar _) source _ _ _ =>
+          directScalarEnvelopeIntervalAt arena environment maps source fuel
+      | .pointwise (.scalar .integer) (.matrixToScalar operation) #[matrix] =>
+          let descriptor ← reindexReducedPointwiseOperation environment maps (.matrixToScalar operation)
+          let operation ← match descriptor with
+            | .matrixToScalar operation => pure operation
+            | _ => throw (.unsupportedOperationalExpr id)
+          if !directMatrixEnvelopeShapePrefilterAt arena matrix fuel then
+            directScalarExactIntervalAt arena environment maps id fuel
+          else match operation.kind with
+          | .extractCoefficient position => do
+              let envelope ← directMatrixEnvelopeAt arena environment maps matrix fuel
+              let modulus ← match envelope.matrixType.modulus.evaluate environment with
+                | some modulus => pure modulus
+                | none => throw .nonClosedExpression
+              if modulus <= 0 then throw (.invalidMatrixParameters operation.ownerNode)
+              let ringDimension ← match envelope.matrixType.ringDimension.evaluate environment with
+                | some value => pure value
+                | none => throw .nonClosedExpression
+              let position ← evaluateIntInvariant operation.parameterEnvironment [] position
+              if position < 0 || ringDimension <= 0 || position >= ringDimension then
+                throw (.invalidCount operation.ownerNode position)
+              match envelope.canonicalRange with
+              | .below 0 => throw (.invalidMatrixParameters operation.ownerNode)
+              | .below upper => pure (0, upper - 1)
+              | .unknown => pure (0, modulus - 1)
+          | _ => throw (.unsupportedOperationalExpr id)
+      | .pointwise (.scalar .integer) (.scalar operation) #[left, right] => do
+          let descriptor ← reindexReducedPointwiseOperation environment maps (.scalar operation)
+          let operation ← match descriptor with
+            | .scalar operation => pure operation
+            | _ => throw (.unsupportedOperationalExpr id)
+          match operation.kind with
+          | .intBinary kind => do
+              let (leftLower, leftUpper) ← directScalarEnvelopeIntervalAt arena environment maps left fuel
+              let (rightLower, rightUpper) ← directScalarEnvelopeIntervalAt arena environment maps right fuel
+              let left ← match ← integerFact operation.ownerNode operation.outputPort leftLower leftUpper with
+                | .integer fact => pure fact | _ => throw (.operandNotInteger operation.ownerNode
+                    { node := operation.ownerNode, port := operation.outputPort })
+              let right ← match ← integerFact operation.ownerNode operation.outputPort rightLower rightUpper with
+                | .integer fact => pure fact | _ => throw (.operandNotInteger operation.ownerNode
+                    { node := operation.ownerNode, port := operation.outputPort })
+              let interval ← integerBinaryInterval operation.ownerNode kind left right
+              pure (interval.lower, interval.upper)
+          | _ => directScalarExactIntervalAt arena environment maps id fuel
+      | _ => directScalarExactIntervalAt arena environment maps id fuel
+
+def OperationalExprArena.directIntegerEnvelopeInterval
+    (arena : OperationalExprArena)
+    (environment : ParamEnvironment)
+    (owner : Nat)
+    (wire : WireRef)
+    (expression : OperationalFact) : Except OperationalError (Int × Int) := do
+  let _ := owner
+  let _ := wire
+  if !directCarrierPayloadValidAt arena.direct environment expression.payload.root
+      (arena.direct.values.size + 1) then
+    throw (.unsupportedOperationalExpr expression.payload.root)
+  directScalarEnvelopeIntervalAt arena.direct environment [] expression.payload.root
+    (arena.direct.values.size + 1)
+
+private def directScalarEnvelopeShapePrefilterAt
+    (arena : DirectOperationalIndexedArena) (id : OperationalIndexedValueId) : Nat → Bool
+  | 0 => false
+  | fuel + 1 => match arena.valueAt? id with
+      | some { payload := .mapped (.scalar _) source _, .. }
+      | some { payload := .rebound (.scalar _) source _, .. }
+      | some { payload := .indexedOutput (.scalar _) source _ _ _, .. } =>
+          directScalarEnvelopeShapePrefilterAt arena source fuel
+      | some { payload := .pointwise (.scalar .integer) descriptor inputs, .. } =>
+          match descriptor, inputs with
+          | .matrixToScalar { kind := .extractCoefficient _, .. }, #[matrix] =>
+              directMatrixEnvelopeShapePrefilterAt arena matrix fuel
+          | .scalar { kind := .intBinary _, .. }, #[left, right] =>
+              directScalarEnvelopeShapePrefilterAt arena left fuel ||
+                directScalarEnvelopeShapePrefilterAt arena right fuel
+          | _, _ => false
+      | _ => false
+
+/-- Cheap scalar-extraction structural prefilter.  This never admits a carrier by itself;
+`directIntegerEnvelopeInterval` performs the authoritative recursive validation. -/
+def OperationalExprArena.directScalarEnvelopeShapePrefilter
+    (arena : OperationalExprArena) (expression : OperationalFact) : Bool :=
+  directScalarEnvelopeShapePrefilterAt arena.direct expression.payload.root
+    (arena.direct.values.size + 1)
 
 end Mxx.Certificate

@@ -19,4 +19,10 @@ def operationalProgress
 def operationalProgressBlock (node total : Nat) : Bool :=
   node < 32 || node + 1 == total || (node + 1) % 1024 == 0
 
+/-- Emit one structured checker diagnostic.  Callers invoke this only on fail-closed paths; the
+stable category key makes the message selectable without coupling diagnostics to a protocol. -/
+def operationalDiagnostic (category detail : String) : Bool :=
+  dbg_trace ("operational_diagnostic category=" ++ category ++ " " ++ detail)
+  true
+
 end Mxx.Certificate

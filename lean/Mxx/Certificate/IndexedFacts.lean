@@ -300,8 +300,6 @@ private def closedIndexTransportValid (map : IndexMap) : Bool :=
           map.assignments.toList map.destination
   | none => false
 
-def IndexMap.transportValid (map : IndexMap) : Bool := map.validate || closedIndexTransportValid map
-
 /-- A direct-carrier context lift introduces free destination binders but has no source binder to
 substitute in a fixed leaf.  It must survive adjacent-map composition so a later get can still
 specialize the owner-bearing identity installed by loop closure. -/
@@ -315,18 +313,20 @@ private def reindexUnchecked (map : IndexMap) : IndexExpr → Option IndexExpr
   | .gather owner sourceCount position =>
       return .gather owner sourceCount (← reindexUnchecked map position)
 
+def IndexMap.transportValid (map : IndexMap) : Bool := map.validate || closedIndexTransportValid map
+
 def reindex (map : IndexMap) (expression : IndexExpr) : Option IndexExpr :=
   if map.transportValid then reindexUnchecked map expression else none
 
 def composeIndexMap (first second : IndexMap) : Option IndexMap := do
-  if !first.validate || !second.validate || first.destination != second.source then none
+  if !first.transportValid || !second.transportValid || first.destination != second.source then none
   let assignments ← first.assignments.toList.mapM (reindex second)
   let composed : IndexMap := {
     source := first.source
     destination := second.destination
     assignments := assignments.toArray
   }
-  if composed.validate then some composed else none
+  if composed.transportValid then some composed else none
 
 /-- Runtime values for free index atoms.  Keys are complete `IndexExpr` values, rather than
 numeric slots, so separately owned selectors cannot be conflated during evaluation. -/
@@ -893,7 +893,8 @@ example :
     let intermediate := fixtureContext [loop]
     let first := fixtureMap source intermediate [.offset (.variable loop) 2]
     let second := fixtureMap intermediate emptyContext [.constant 3]
-    composeIndexMap first second = some (fixtureMap source emptyContext [.offset (.constant 3) 2]) := by
+    composeIndexMap first second = some
+      (fixtureMap source emptyContext [.offset (.constant 3) 2]) := by
   native_decide
 
 example :

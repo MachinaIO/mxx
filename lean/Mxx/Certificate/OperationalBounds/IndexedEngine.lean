@@ -4585,10 +4585,25 @@ def OperationalExprArena.reindexDirectFact
     | none => throw (.invalidOperationalExprRef root)
   let schema ← match reindexOperationalIndexedPayloadSchema map source.payload.schema with
     | some value => pure value
-    | none => throw (.unsupportedOperationalExpr root)
+    | none =>
+        if operationalProgress "reindex_direct_fact" "schema_transport_failed" ""
+            root arena.direct.values.size ("source_context=" ++ reprStr expression.context ++
+              "; destination_context=" ++ reprStr map.destination ++
+              "; assignments=" ++ reprStr map.assignments ++
+              "; schema_kind=" ++ match source.payload.schema with
+                | .matrix _ => "matrix"
+                | .scalar _ => "scalar") then
+          throw (.unsupportedOperationalExpr root)
+        else throw (.unsupportedOperationalExpr root)
   let (direct, mapped) ← match arena.direct.pushMappedWithSchema root map schema with
     | some result => pure result
-    | none => throw (.unsupportedOperationalExpr root)
+    | none =>
+        if operationalProgress "reindex_direct_fact" "mapped_construction_failed" ""
+            root arena.direct.values.size ("source_context=" ++ reprStr expression.context ++
+              "; destination_context=" ++ reprStr map.destination ++
+              "; assignments=" ++ reprStr map.assignments) then
+          throw (.unsupportedOperationalExpr root)
+        else throw (.unsupportedOperationalExpr root)
   let value ← match direct.valueAt? mapped with
     | some value => pure value
     | none => throw (.invalidOperationalExprRef mapped)

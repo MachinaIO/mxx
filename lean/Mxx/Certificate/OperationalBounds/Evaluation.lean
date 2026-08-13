@@ -1010,10 +1010,25 @@ partial def directFamilyLaneBinderFromCarrier
           | _ => none
       | .explicit _ binder _ | .explicitValues _ binder _ => some binder
       | .mapped _ source map => do
-          let sourceBinder ← directFamilyLaneBinderFromCarrier arena source fuel
-          match map.assignmentFor sourceBinder with
-          | some (.variable destination) => some destination
-          | _ => none
+          let sourceValue ← arena.valueAt? source
+          if !map.transportValid || map.source != sourceValue.context || map.destination != value.context then
+            none
+          else match directFamilyLaneBinderFromCarrier arena source fuel with
+          | some sourceBinder =>
+              match map.assignmentFor sourceBinder with
+              | some (.variable destination) => some destination
+              | _ => none
+          /- A direct-carrier context lift has no source lane to substitute: a parent loop can
+          introduce exactly one owner-bearing destination lane around a shared artifact, then
+          lazy rebound views preserve that map.  Recover only that checked singleton destination,
+          never a binder reconstructed from the consumer scope or a multi-binder context. -/
+          | none =>
+              match sourceValue.context.binders.toList, map.destination.binders.toList,
+                  value.context.binders.toList with
+              | [], [destination], [current] =>
+                  if map.isDirectCarrierContextLift && destination == current then some destination
+                  else none
+              | _, _, _ => none
       | .rebound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
       | .matrixResultBound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
       | _ => none

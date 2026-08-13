@@ -151,6 +151,49 @@ private def sharedArtifactFamilyZipFixture : Except OperationalError Bool := do
 
 example : sharedArtifactFamilyZipFixture = .ok true := by native_decide
 
+/-- A lazy artifact rebind preserves an outer checked context lift.  The source payload itself
+has no family binder, so lane recovery must use the one destination binder introduced by the map
+rather than descending to the empty shared leaf or reconstructing an owner from the consumer. -/
+private def liftedArtifactFamilyZipFixture : Except OperationalError Bool := do
+  let scopeKey : ScopeTemplateKey := .root (.workflowStage ⟨"lifted-consumer"⟩)
+  let scope : Scope := {
+    nodes := #[{
+      kind := .input "lifted-artifact-family"
+      arguments := []
+      outputTypes := [.indexedFamily (.bytes (.constant 32)) (.constant 2)]
+    }]
+    outputs := []
+    inputNames := ["lifted-artifact-family"]
+  }
+  let (arena, source) ← contractFact {} scopeKey { node := 7, port := 0 }
+    ⟨"artifact-shared-leaf"⟩ (.bytes (.constant 32)) (.bytes (.constant 32)) []
+  let lane ← parallelLoopLaneBinder scopeKey 8 1 (.constant 2)
+  let destination : IndexContext := { binders := #[lane] }
+  let lift : IndexMap := { source := emptyContext, destination, assignments := #[] }
+  let (direct, mapped) ← match arena.direct.pushMapped source.payload.root lift with
+    | some value => pure value
+    | none => throw (.unsupportedOperationalExpr source.payload.root)
+  let (direct, rebound) ← match direct.pushRebound mapped { node := 8, port := 0 } with
+    | some value => pure value
+    | none => throw (.unsupportedOperationalExpr mapped)
+  let (direct, rebound) ← match direct.pushRebound rebound { node := 9, port := 0 } with
+    | some value => pure value
+    | none => throw (.unsupportedOperationalExpr rebound)
+  let arena : OperationalExprArena := { arena with direct }
+  let family : OperationalFact := {
+    context := destination
+    payload := .directValue rebound
+    storage := .mappedTemplate
+  }
+  let binder ← directFamilyLaneBinderAt arena scopeKey scope [] { node := 0, port := 0 } family
+  let transportedResult ← loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey 10 0 0
+    (.constant 2) 2 .zip (some binder) [] family
+  let transported := transportedResult.2
+  let consumer ← parallelLoopLaneBinder scopeKey 10 0 (.constant 2)
+  pure (binder == lane && transported.context.binders.toList == [consumer])
+
+example : liftedArtifactFamilyZipFixture = .ok true := by native_decide
+
 private def fixtureType : MatrixTypeExpr := {
   modulus := .constant 17, ringDimension := .constant 1,
   rows := .constant 1, columns := .constant 1

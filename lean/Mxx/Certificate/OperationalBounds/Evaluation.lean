@@ -1711,11 +1711,22 @@ def evaluatePreparedScope
                           facts := { facts with arena := { facts.arena with direct } }
                       | _ => pure ()
                       if selector.freeVariables.isEmpty then throw (.loopInputModeMismatch index 0)
-                      let dynamicMap ← match dynamicIndexMap family.context binder selector with
+                      let dynamicCandidate := dynamicIndexMap family.context binder selector
+                      let closedCandidate := closedDynamicIndexMap environment family.context binder selector
+                      let dynamicMap ← match dynamicCandidate with
                         | some map => pure map
-                        | none => match closedDynamicIndexMap environment family.context binder selector with
+                        | none => match closedCandidate with
                           | some map => pure map
-                          | none => throw (.loopInputModeMismatch index 0)
+                          | none =>
+                              if operationalProgress "evaluate_scope" "family_dynamic_get_map_rejected"
+                                  (reprStr scopeKey) index scope.nodes.size
+                                  ("family_context=" ++ reprStr family.context ++
+                                    "; source_binder=" ++ reprStr binder ++
+                                    "; selector=" ++ reprStr selector ++
+                                    "; selector_free=" ++ reprStr selector.freeVariables ++
+                                    "; selection_context=" ++ reprStr selectionInput.context) then
+                                throw (.loopInputModeMismatch index 0)
+                              else throw (.unsupportedOperationalExpr index)
                       let (arena, selected) ← facts.arena.reindexDirectFact dynamicMap family environment
                       if operationalProgress "evaluate_scope" "family_dynamic_get_reindex_complete"
                           (reprStr scopeKey) index scope.nodes.size "" then pure () else

@@ -1016,7 +1016,7 @@ partial def directFamilyLaneBinderFromCarrier
           else match directFamilyLaneBinderFromCarrier arena source fuel with
           | some sourceBinder =>
               match map.assignmentFor sourceBinder with
-              | some (.variable destination) => some destination
+              | some assignment => assignment.identityVariable?
               | _ => none
           /- A direct-carrier context lift has no source lane to substitute: a parent loop can
           introduce exactly one owner-bearing destination lane around a shared artifact, then

@@ -3870,6 +3870,117 @@ private def malformedPointwiseFamilyCarrierRejectedFixture : Bool :=
 
 example : malformedPointwiseFamilyCarrierRejectedFixture = true := by native_decide
 
+/-- A zero offset is the identity index transport, so an explicit family lane remains recoverable
+through a mapped and rebound carrier without treating a protocol graph node specially. -/
+private def zeroOffsetMappedFamilyLaneFixture : Except OperationalError Bool := do
+  let scopeKey : ScopeTemplateKey := .root (.workflowStage ⟨"zero-offset-consumer"⟩)
+  let wire : WireRef := { node := 0, port := 0 }
+  let scope : Scope := {
+    nodes := #[{
+      kind := .input "zero-offset-family"
+      arguments := []
+      outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 2)]
+    }]
+    outputs := []
+    inputNames := ["zero-offset-family"]
+  }
+  let sourceBinder := { directCarrierFixtureBinder 828 with count := .constant 2 }
+  let destinationBinder ← parallelLoopLaneBinder scopeKey 829 0 (.constant 2)
+  let sourceContext : IndexContext := { binders := #[sourceBinder] }
+  let destinationContext : IndexContext := { binders := #[destinationBinder] }
+  let (fixed, firstReference) := ({} : FixedOperationalPayloadArena).pushMatrix
+    (boundedOperationalExprFixtureFact 828 1)
+  let (fixed, secondReference) := fixed.pushMatrix (boundedOperationalExprFixtureFact 829 1)
+  let direct : DirectOperationalIndexedArena := { fixed }
+  let (direct, explicit) ← match direct.pushExplicit [] sourceContext sourceBinder (.matrix fixtureType)
+      #[firstReference, secondReference] with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr 828)
+  let identity : IndexMap := {
+    source := sourceContext
+    destination := destinationContext
+    assignments := #[.offset (.offset (.variable destinationBinder) 0) 0]
+  }
+  let (direct, rebound) ← match direct.pushRebound explicit { node := 830, port := 0 } with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr explicit)
+  let (direct, rebound) ← match direct.pushRebound rebound { node := 831, port := 0 } with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr rebound)
+  let (direct, mapped) ← match direct.pushMapped rebound identity with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr rebound)
+  let arena : OperationalExprArena := { direct }
+  let family : OperationalFact := {
+    context := destinationContext
+    payload := .directValue mapped
+    storage := .mappedTemplate
+  }
+  let binder ← directFamilyLaneBinderAt arena scopeKey scope [] wire family
+  let (_, transported) ← loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey 832 0 0
+    (.constant 2) 2 .zip (some binder) [] family
+  let consumer ← parallelLoopLaneBinder scopeKey 832 0 (.constant 2)
+  pure (binder == destinationBinder && transported.context.binders.toList == [consumer])
+
+example : zeroOffsetMappedFamilyLaneFixture = .ok true := by native_decide
+
+/-- A nonzero offset changes the physical lane coordinate.  It must not be normalized to a
+family binder merely because its underlying variable has the same owner-aware identity. -/
+private def nonzeroOffsetMappedFamilyLaneRejectedFixture : Bool :=
+  match (do
+    let scopeKey : ScopeTemplateKey := .root (.workflowStage ⟨"nonzero-offset-consumer"⟩)
+    let wire : WireRef := { node := 0, port := 0 }
+    let scope : Scope := {
+      nodes := #[{
+        kind := .input "nonzero-offset-family"
+        arguments := []
+        outputTypes := [.indexedFamily (.matrix fixtureType) (.constant 1)]
+      }]
+      outputs := []
+      inputNames := ["nonzero-offset-family"]
+    }
+    let sourceBinder := { directCarrierFixtureBinder 833 with count := .constant 2 }
+    let destinationBinder ← parallelLoopLaneBinder scopeKey 834 0 (.constant 1)
+    let sourceContext : IndexContext := { binders := #[sourceBinder] }
+    let destinationContext : IndexContext := { binders := #[destinationBinder] }
+    let (fixed, firstReference) := ({} : FixedOperationalPayloadArena).pushMatrix
+      (boundedOperationalExprFixtureFact 833 1)
+    let (fixed, secondReference) := fixed.pushMatrix (boundedOperationalExprFixtureFact 834 1)
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, explicit) ← match direct.pushExplicit [] sourceContext sourceBinder (.matrix fixtureType)
+        #[firstReference, secondReference] with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 833)
+    let shifted : IndexMap := {
+      source := sourceContext
+      destination := destinationContext
+      assignments := #[.offset (.variable destinationBinder) 1]
+    }
+    let (direct, mapped) ← match direct.pushMapped explicit shifted with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 834)
+    let arena : OperationalExprArena := { direct }
+    let family : OperationalFact := {
+      context := destinationContext
+      payload := .directValue mapped
+      storage := .mappedTemplate
+    }
+    let recovery := directFamilyLaneBinderFromCarrier arena.direct mapped
+      (arena.direct.values.size + 1)
+    let gather := IndexExpr.gather (operationalGatherFixtureOwner 835) (.constant 3)
+      (.variable destinationBinder)
+    let zipResult := do
+      let binder ← directFamilyLaneBinderAt arena scopeKey scope [] wire family
+      loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey 835 0 0
+        (.constant 1) 1 .zip (some binder) [] family
+    pure (recovery.isNone && gather.identityVariable?.isNone && match zipResult with
+      | .error (.loopInputModeMismatch 0 0) => true
+      | _ => false)) with
+  | .ok value => value
+  | .error _ => false
+
+example : nonzeroOffsetMappedFamilyLaneRejectedFixture = true := by native_decide
+
 /-- Direct tensor rejects a forged output ring even when the Kronecker shape happens to match. -/
 private def directTensorOutputRingFixture : Bool :=
   let left := boundedOperationalExprFixtureFact 830 2

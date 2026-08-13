@@ -149,6 +149,13 @@ def IndexExpr.freeVariables : IndexExpr → List IndexVariable
   available in the destination context. -/
   | .gather _ _ position => position.freeVariables
 
+/-- Recover a binder only from a syntactic identity transport.  Nested zero offsets arise from
+composed maps; nonzero offsets and gathers remain distinct physical coordinates. -/
+def IndexExpr.identityVariable? : IndexExpr → Option IndexVariable
+  | .variable binder => some binder
+  | .offset base 0 => base.identityVariable?
+  | _ => none
+
 def indexExpressionInBounds (context : IndexContext) (expression : IndexExpr) : Bool :=
   expression.freeVariables.all context.contains
 

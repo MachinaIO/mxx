@@ -211,13 +211,18 @@ def OperationalIndexedPayload.storage : OperationalIndexedPayload → IndexedSto
 
 abbrev OperationalIndexedValue := IndexedFact OperationalIndexedPayload
 
+structure GatherIntegerRoot where
+  root : OperationalIndexedValueId
+  position : IndexVariable
+  deriving BEq
+
 structure DirectOperationalIndexedArena where
   fixed : FixedOperationalPayloadArena := {}
   values : Array OperationalIndexedValue := #[]
   /-- The one executable integer producer for each dependent gather owner.  This is a registry
   rather than a cache: owner identity is part of the indexed semantics, and an ambiguous owner
   is rejected before any matrix lane can consume it. -/
-  gatherIntegerRoots : Std.HashMap GatherLookupOwner OperationalIndexedValueId := {}
+  gatherIntegerRoots : Std.HashMap GatherLookupOwner GatherIntegerRoot := {}
   deriving BEq
 
 def DirectOperationalIndexedArena.valueAt?
@@ -230,20 +235,23 @@ wire.  A different root is rejected: choosing either would erase owner provenanc
 def DirectOperationalIndexedArena.registerGatherIntegerRoot
     (arena : DirectOperationalIndexedArena)
     (owner : GatherLookupOwner)
-    (root : OperationalIndexedValueId) : Option DirectOperationalIndexedArena := do
+    (root : OperationalIndexedValueId)
+    (position : IndexVariable) : Option DirectOperationalIndexedArena := do
   let value ← arena.valueAt? root
-  match value.payload.schema, value.context.binders.toList with
-  | .scalar .integer, [_] =>
+  match value.payload.schema with
+  | .scalar .integer =>
+      if !validateContext value.context || !value.context.binders.contains position then none
+      let registered : GatherIntegerRoot := { root, position }
       match arena.gatherIntegerRoots[owner]? with
-      | none => some { arena with gatherIntegerRoots := arena.gatherIntegerRoots.insert owner root }
-      | some existing => if existing == root then some arena else none
-  | _, _ => none
+      | none => some { arena with gatherIntegerRoots := arena.gatherIntegerRoots.insert owner registered }
+      | some existing => if existing == registered then some arena else none
+  | _ => none
 
 /-- Resolve only an unambiguous owner registration.  The registry constructor above prevents
 duplicates, but this still rejects a malformed arena assembled by a fixture or future caller. -/
 def DirectOperationalIndexedArena.gatherIntegerRoot?
     (arena : DirectOperationalIndexedArena)
-    (owner : GatherLookupOwner) : Option OperationalIndexedValueId :=
+    (owner : GatherLookupOwner) : Option GatherIntegerRoot :=
   arena.gatherIntegerRoots[owner]?
 
 def explicitCountValid

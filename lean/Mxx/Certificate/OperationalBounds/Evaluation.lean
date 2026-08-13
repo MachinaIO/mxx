@@ -1726,10 +1726,13 @@ def evaluatePreparedScope
                       constructing the mapped matrix view so any collision is rejected at the
                       producer boundary rather than depending on later reduction order. -/
                       match selector with
-                      | .gather owner _ _ =>
+                      | .gather owner _ positionExpression =>
                           let root ← match selectionInput.payload with
                             | .directValue root => pure root
-                          let direct ← match facts.arena.direct.registerGatherIntegerRoot owner root with
+                          let position ← match positionExpression.identityVariable? with
+                            | some position => pure position
+                            | none => throw (.unsupportedOperationalExpr index)
+                          let direct ← match facts.arena.direct.registerGatherIntegerRoot owner root position with
                             | some direct => pure direct
                             | none => throw (.unsupportedOperationalExpr index)
                           facts := { facts with arena := { facts.arena with direct } }

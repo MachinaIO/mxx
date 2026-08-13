@@ -2520,13 +2520,12 @@ private def exactGatherIndex
       if count <= 0 then throw (.invalidCount owner.indices.node count)
       let position ← exactGatherIndex arena parameters context indices position fuel
       if position < 0 then throw (.invalidCount owner.indices.node position)
-      let root ← match arena.gatherIntegerRoot? owner with
-        | some root => pure root | none => throw (.unsupportedOperationalExpr owner.indices.node)
+      let registered ← match arena.gatherIntegerRoot? owner with
+        | some registered => pure registered | none => throw (.unsupportedOperationalExpr owner.indices.node)
+      let root := registered.root
       let rootValue ← match arena.valueAt? root with
         | some value => pure value | none => throw (.invalidOperationalExprRef root)
-      let binder ← match rootValue.context.binders.toList with
-        | [binder] => pure binder
-        | _ => throw (.unsupportedOperationalExpr root)
+      let binder := registered.position
       let entries ← match exactGatherSelections arena root fuel with
         | some entries => pure entries | none => throw (.unsupportedOperationalExpr root)
       /- A mapped executable integer table retains its physical source lane separately from the
@@ -2664,15 +2663,14 @@ def DirectOperationalIndexedArena.indexExprAt
             | none => throw .nonClosedExpression
           if sourceBound <= 0 then throw (.invalidCount owner.indices.node sourceBound)
           let position ← arena.indexExprAt parameters context indices position fuel
-          let root ← match arena.gatherIntegerRoot? owner with
-            | some root => pure root
+          let registered ← match arena.gatherIntegerRoot? owner with
+            | some registered => pure registered
             | none => throw (.unsupportedOperationalExpr owner.indices.node)
+          let root := registered.root
           let rootValue ← match arena.valueAt? root with
             | some value => pure value
             | none => throw (.invalidOperationalExprRef root)
-          let positionBinder ← match rootValue.context.binders.toList with
-            | [binder] => pure binder
-            | _ => throw (.unsupportedOperationalExpr root)
+          let positionBinder := registered.position
           let selected ← arena.scalarFactAt parameters [(.variable positionBinder, position)] root fuel
           let ordinal ← match selected with
             | .integer fact => pure fact
@@ -3535,8 +3533,9 @@ private def gatherPositionAssignments
   let bound ← match sourceCount.evaluate parameters with
     | some bound => pure bound | none => throw .nonClosedExpression
   if bound <= 0 || ordinal >= bound.toNat then return []
-  let root ← match arena.gatherIntegerRoot? owner with
-    | some root => pure root | none => throw (.unsupportedOperationalExpr id)
+  let registered ← match arena.gatherIntegerRoot? owner with
+    | some registered => pure registered | none => throw (.unsupportedOperationalExpr id)
+  let root := registered.root
   let rootValue ← match arena.valueAt? root with
     | some value => pure value | none => throw (.invalidOperationalExprRef root)
   /- For an exact integer table, recover `(transported selection key, physical lane, selected
@@ -3551,9 +3550,7 @@ private def gatherPositionAssignments
       | some selections => do
           let (lower, upper) ← gatherPositionDomain parameters position
           let positions := List.range (upper - lower).toNat |>.map fun offset => lower + offset
-          let binder ← match rootValue.context.binders.toList with
-            | [binder] => pure binder
-            | _ => throw (.unsupportedOperationalExpr root)
+          let binder := registered.position
           let candidates ← selections.foldlM (fun retained (key, physicalLane, selected) => do
             if selected != Int.ofNat ordinal then pure retained else do
             let matchingPositions ← positions.filterMapM fun executablePosition => do

@@ -42,7 +42,7 @@ private def registerOperationalFixtureGather
       (.scalar .integer) references with
     | some result => pure result
     | none => throw (.unsupportedOperationalExpr node)
-  let direct ← match direct.registerGatherIntegerRoot (operationalGatherFixtureOwner node) root with
+  let direct ← match direct.registerGatherIntegerRoot (operationalGatherFixtureOwner node) root position with
     | some direct => pure direct
     | none => throw (.unsupportedOperationalExpr node)
   pure { arena with direct }
@@ -4122,6 +4122,14 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
   let nextLoopBinder ← parallelLoopLaneBinder scopeKey nextLoopNode 0 count
   let transportedScalarLaneBinder := directFamilyLaneBinderFromCarrier arena.direct
     transportedScalar.payload.root (arena.direct.values.size + 1)
+  let gatherOwner := operationalGatherFixtureOwner 840
+  let registeredDirect ← match arena.direct.registerGatherIntegerRoot gatherOwner
+      transportedScalar.payload.root nextLoopBinder with
+    | some direct => pure direct
+    | none => throw (.unsupportedOperationalExpr transportedScalar.payload.root)
+  let registered := registeredDirect.gatherIntegerRoot? gatherOwner
+  let conflictingRegistration := registeredDirect.registerGatherIntegerRoot gatherOwner
+    transportedScalar.payload.root independent
   let nestedOverlay (subject : WireRef) (value : OperationalIndexedValue) := match value.payload with
     | .indexedOutput _ source indexedBinder indexedSelection indexedSubject =>
         indexedBinder == familyBinder && indexedSelection ==
@@ -4145,6 +4153,8 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
     transportedMatrix.context.binders.toList == [independent, nextLoopBinder],
     transportedScalar.context.binders.toList == [independent, nextLoopBinder],
     transportedScalarLaneBinder == some nextLoopBinder,
+    registered == some { root := transportedScalar.payload.root, position := nextLoopBinder },
+    conflictingRegistration.isNone,
     nestedOverlay { node := loopNode, port := 0 } matrixValue,
     nestedOverlay { node := loopNode, port := 1 } scalarValue]
   pure (checks.all id)
@@ -5198,10 +5208,10 @@ private def mappedGatherPhysicalLaneFixture : Bool :=
       | some map => pure map | none => throw (OperationalError.unsupportedOperationalExpr 6304)
     let (arena, mappedProducer) ← arena.reindexDirectFact producerMap producer
     let direct ← match arena.direct.registerGatherIntegerRoot (operationalGatherFixtureOwner 6305)
-        mappedProducer.payload.root with
+        mappedProducer.payload.root position with
       | some direct => pure direct | none => throw (OperationalError.unsupportedOperationalExpr 6305)
     let direct ← match direct.registerGatherIntegerRoot (operationalGatherFixtureOwner 6306)
-        mappedProducer.payload.root with
+        mappedProducer.payload.root position with
       | some direct => pure direct | none => throw (OperationalError.unsupportedOperationalExpr 6306)
     let arena : OperationalExprArena := { arena with direct }
     let gathered := operationalFixtureGather 6305 (.constant 3) (.variable position)

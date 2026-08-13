@@ -4117,7 +4117,11 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
   let nextLoopNode := 839
   let (arena, transportedMatrix) ← loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey
     nextLoopNode 0 0 count 8 .zip matrixLaneBinder [] matrix
+  let (arena, transportedScalar) ← loopTemplateArgumentExprWithDirectLaneBinder arena scopeKey
+    nextLoopNode 0 1 count 8 .zip scalarLaneBinder [] scalar
   let nextLoopBinder ← parallelLoopLaneBinder scopeKey nextLoopNode 0 count
+  let transportedScalarLaneBinder := directFamilyLaneBinderFromCarrier arena.direct
+    transportedScalar.payload.root (arena.direct.values.size + 1)
   let nestedOverlay (subject : WireRef) (value : OperationalIndexedValue) := match value.payload with
     | .indexedOutput _ source indexedBinder indexedSelection indexedSubject =>
         indexedBinder == familyBinder && indexedSelection ==
@@ -4139,6 +4143,8 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
       | _ => false,
     scalarLower == 1 && scalarUpper == 1,
     transportedMatrix.context.binders.toList == [independent, nextLoopBinder],
+    transportedScalar.context.binders.toList == [independent, nextLoopBinder],
+    transportedScalarLaneBinder == some nextLoopBinder,
     nestedOverlay { node := loopNode, port := 0 } matrixValue,
     nestedOverlay { node := loopNode, port := 1 } scalarValue]
   pure (checks.all id)

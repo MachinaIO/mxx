@@ -1666,23 +1666,10 @@ def evaluatePreparedScope
                           selectionFact.upper >= Int.ofNat selectorCount then
                         throw (.invalidCount index selectionFact.upper)
                       let selector ← match selectionInput with
-                        | direct@{ context := { binders := #[_] }, payload := .directValue _, .. } => do
-                            if operationalProgress "evaluate_scope" "gather_selector_transport" (reprStr scopeKey)
-                                index scope.nodes.size "source=loop_index" then pure () else
-                              throw (.unsupportedOperationalExpr index)
-                            let position ← directSingleIndexBinder index direct
-                            let owner : GatherLookupOwner := {
-                              indices := operationalGatherIndicesWire scopeKey indexWire
-                            }
-                            pure (.gather owner binder.count (.variable position))
-                        | { context, payload := .directValue _, .. } =>
-                            if context.binders.isEmpty then do
-                              /- A dynamic family projection introduces its own executable
-                              selector coordinate.  The scalar input wire supplies its interval,
-                              but does not own this projection: another consumer of the same
-                              scalar (for example a preceding family `select`) must retain its
-                              independent selector rather than being collapsed by a shared
-                              source-wire identity. -/
+                        | direct@{ payload := .directValue root, .. } => do
+                            if direct.context.binders.isEmpty then do
+                              /- A dynamic family projection introduces its own executable selector
+                              coordinate when the scalar is not already indexed. -/
                               let projectionOrigin : OperationalValueOrigin :=
                                 .local scopeKey { node := index, port := 1 }
                               let freshSelector := DynamicSelectionIdentity.fromDeclaredCount
@@ -1694,7 +1681,22 @@ def evaluatePreparedScope
                                   candidate.owner == freshBinder.owner && candidate.slot == freshBinder.slot) with
                                 | some candidate => .variable candidate
                                 | none => freshSelector.expression
-                            else throw (.loopInputModeMismatch index 0)
+                            else do
+                              if operationalProgress "evaluate_scope" "gather_selector_transport" (reprStr scopeKey)
+                                  index scope.nodes.size "source=loop_index" then pure () else
+                                throw (.unsupportedOperationalExpr index)
+                              let position ← match direct.context.binders.toList with
+                                | [binder] => pure binder
+                                | _ => match (directFamilyLaneBinderFromCarrier facts.arena.direct root
+                                    (facts.arena.direct.values.size + 1)) with
+                                  | some binder =>
+                                      if direct.context.binders.contains binder then pure binder
+                                      else throw (.loopInputModeMismatch index 0)
+                                  | none => throw (.loopInputModeMismatch index 0)
+                              let owner : GatherLookupOwner := {
+                                indices := operationalGatherIndicesWire scopeKey indexWire
+                              }
+                              pure (.gather owner binder.count (.variable position))
                       /- A dependent gather is evaluated from the exact executable integer-family
                       producer, not from a slot-only `IntExpr` projection.  Register before
                       constructing the mapped matrix view so any collision is rejected at the

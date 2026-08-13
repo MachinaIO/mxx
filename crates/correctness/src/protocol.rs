@@ -314,98 +314,9 @@ impl ProtocolDecl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ComparatorSpec, InputContract, InputContractEntry, InputValueContract,
-        ProtocolInputBinding, ProtocolInputDestination, ProtocolPreconditionSpec, Workflow,
-    };
-    use mxx_dsl::{DslContext, IdealSpec, Ring};
-    use mxx_ir_core::artifact::{ArtifactConfidentiality, ProductionId, SpecHash};
 
     fn valid_protocol() -> ProtocolDecl {
-        let ring = Ring::new(17, 1);
-        let producer = DslContext::new("producer")
-            .public_output("artifact", ring.input("message", (1, 1)))
-            .unwrap()
-            .build()
-            .unwrap();
-        let consumer = DslContext::new("consumer")
-            .output(
-                "result",
-                ring.artifact_input(
-                    ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] },
-                    "artifact",
-                    (1, 1),
-                    ArtifactConfidentiality::Public,
-                ),
-            )
-            .unwrap()
-            .build()
-            .unwrap();
-        let ideal = IdealSpec::new(
-            DslContext::new("ideal")
-                .output("result", ring.input("message", (1, 1)))
-                .unwrap()
-                .build()
-                .unwrap(),
-        )
-        .unwrap();
-        let input = crate::ProtocolInputId::from("message");
-        ProtocolDecl {
-            params: Vec::new(),
-            bundle: ClosedProtocolBundle {
-                workflow: Workflow {
-                    stages: vec![
-                        ProtocolStage {
-                            id: StageId("producer".to_owned()),
-                            graph: producer.graph,
-                            semantic_anchors: producer.anchors,
-                            derivation_attachments: producer.derivation_attachments,
-                            bindings: Vec::new(),
-                        },
-                        ProtocolStage {
-                            id: StageId("consumer".to_owned()),
-                            graph: consumer.graph,
-                            semantic_anchors: consumer.anchors,
-                            derivation_attachments: consumer.derivation_attachments,
-                            bindings: vec![ArtifactBinding {
-                                consumer_input: StageInputName("artifact".to_owned()),
-                                producer_stage: StageId("producer".to_owned()),
-                                producer_output: ArtifactName("artifact".to_owned()),
-                            }],
-                        },
-                    ],
-                    entrypoint: StageId("consumer".to_owned()),
-                },
-                ideal,
-                requirements: Vec::new(),
-                comparator: ComparatorSpec::Equality { endpoints: Vec::new() },
-                endpoints: Default::default(),
-                operational_decoder_targets: Vec::new(),
-                endpoint_specs: Vec::new(),
-                input_contract: InputContract {
-                    inputs: vec![InputContractEntry {
-                        id: input.clone(),
-                        name: "message".to_owned(),
-                        value: InputValueContract::MatrixExact {
-                            matrix_type: ring.matrix_type((1, 1)),
-                            canonical_coefficient_exclusive_upper_bound: None,
-                            is_constant_polynomial: false,
-                        },
-                    }],
-                },
-                input_bindings: vec![ProtocolInputBinding {
-                    input,
-                    destinations: vec![
-                        ProtocolInputDestination::WorkflowStage {
-                            stage: StageId("producer".to_owned()),
-                            input: StageInputName("message".to_owned()),
-                        },
-                        ProtocolInputDestination::Ideal { input: "message".to_owned() },
-                    ],
-                }],
-                precondition_spec: ProtocolPreconditionSpec::default(),
-            },
-        }
+        crate::toy_example::protocol()
     }
 
     #[test]

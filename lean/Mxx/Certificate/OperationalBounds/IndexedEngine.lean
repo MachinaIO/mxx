@@ -1646,6 +1646,10 @@ def validateDirectRelationDescriptor
           if bound <= 1 || count <= 0 then throw (.gadgetLayoutMismatch operation.ownerNode)
           let params ← match declaredType.evaluate operation.parameterEnvironment (.constant 0) with
             | some value => pure value | none => throw (.invalidMatrixParameters operation.ownerNode)
+          let outputParams ← match operation.outputSchema.evaluate operation.parameterEnvironment (.constant 0) with
+            | some value => pure value | none => throw (.invalidMatrixParameters operation.ownerNode)
+          if !sameConcreteMatrixShape params outputParams then
+            throw (.outputTypeMismatch operation.ownerNode)
           let descriptor ← resolveGadgetLayout operation.ownerNode layouts params
           let expected := if small then descriptor.smallDigitCount else descriptor.regularDigitCount
           if bound != descriptor.base || count.toNat != expected then
@@ -2565,8 +2569,6 @@ private def materializeDirectRelationOperation
     (context : IndexContext)
     (indices : IndexValueEnvironment)
     (operation : DirectRelationOperation) : Except OperationalError DirectRelationOperation := do
-  if !completeDirectIndexAssignment parameters context indices then
-    throw (.unsupportedOperationalExpr operation.ownerNode)
   let rec evaluateAt (environment : ParamEnvironment) : IndexedParameterExpr → Except OperationalError Int
     | .ir value => match value.evaluate environment with
         | some value => pure value | none => throw .nonClosedExpression

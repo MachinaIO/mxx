@@ -1034,11 +1034,10 @@ partial def directFamilyLaneBinderFromCarrier
                   else none
               | _, _, _ => none
       | .rebound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
-      /- `indexedOutput` adds the enclosing loop's correlation coordinate after the source family
-      has already been constructed.  It is not a replacement for an inner physical family lane:
-      zip consumers must keep following the authoritative source carrier while the overlay
-      selector remains present in the value context. -/
-      | .indexedOutput _ source _ _ _ => directFamilyLaneBinderFromCarrier arena source fuel
+      /- The overlay is the executable outer family produced by the parallel loop.  Its exact
+      lexical selector is therefore the physical lane seen by a downstream zip; any source-family
+      coordinate remains an independent nested dimension in the context. -/
+      | .indexedOutput _ _ _ selection _ => selection.expression.identityVariable?
       | .matrixResultBound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
       /- `pushPointwise` constructs this context by merging its direct input contexts and checks
       the payload schemas. Re-establish both invariants here before using a unique owner-aware

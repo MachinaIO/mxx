@@ -4068,7 +4068,7 @@ private def parallelLoopUniformIndependentContextFixture : Except OperationalErr
     matrixValue.context == expectedContext, scalarValue.context == expectedContext,
     matrixFact.subject == { node := loopNode, port := 0 },
     scalarSubject == some { node := loopNode, port := 1 }, matrixIndexed, scalarIndexed,
-    matrixLaneBinder == some independent, scalarLaneBinder == some independent,
+    matrixLaneBinder == some expected, scalarLaneBinder == some expected,
     nestedOverlay { node := loopNode, port := 0 } matrixValue,
     nestedOverlay { node := loopNode, port := 1 } scalarValue]
   pure (checks.all id)

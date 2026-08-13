@@ -3981,6 +3981,120 @@ private def nonzeroOffsetMappedFamilyLaneRejectedFixture : Bool :=
 
 example : nonzeroOffsetMappedFamilyLaneRejectedFixture = true := by native_decide
 
+/-- Closing a parallel loop adds its lexical coordinate to outputs that are uniform over that
+coordinate but already indexed by an independent selector.  Matrix and scalar carriers retain
+the selector while their fixed leaves receive the loop-family identity. -/
+private def parallelLoopUniformIndependentContextFixture : Except OperationalError Bool := do
+  let scopeKey : ScopeTemplateKey := .root (.workflowStage ⟨"uniform-loop-output"⟩)
+  let count : IntExpr := .constant 8
+  let loopNode := 836
+  let sourceBinder := { directCarrierFixtureBinder 837 with count := .constant 87 }
+  let independent := { directCarrierFixtureBinder 838 with count := .constant 87 }
+  let sourceContext : IndexContext := { binders := #[sourceBinder] }
+  let mappedContext : IndexContext := { binders := #[independent] }
+  let expected ← parallelLoopLaneBinder scopeKey loopNode 0 count
+  let expectedContext : IndexContext := { binders := #[independent, expected] }
+  let (fixed, matrixReference) := ({} : FixedOperationalPayloadArena).pushMatrix
+    (boundedOperationalExprFixtureFact 836 1)
+  let scalar ← integerFact 837 0 1 1
+  let (fixed, scalarReference) := fixed.pushScalar scalar
+  let direct : DirectOperationalIndexedArena := { fixed }
+  let (direct, matrixRoot) ← match direct.pushShared sourceContext (.matrix fixtureType) matrixReference with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr 836)
+  let (direct, scalarRoot) ← match direct.pushShared sourceContext (.scalar .integer) scalarReference with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr 837)
+  /- Start from an ordinary substitution-mapped root.  Closing the loop then appends the new
+  coordinate as a distinct lazy extension boundary instead of composing through this map. -/
+  let substitution : IndexMap := {
+    source := sourceContext
+    destination := mappedContext
+    assignments := #[.variable independent]
+  }
+  let (direct, matrixRoot) ← match direct.pushMapped matrixRoot substitution with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr matrixRoot)
+  let (direct, scalarRoot) ← match direct.pushMapped scalarRoot substitution with
+    | some result => pure result
+    | none => throw (.unsupportedOperationalExpr scalarRoot)
+  let arena : OperationalExprArena := { direct }
+  let matrix : OperationalFact := {
+    context := mappedContext, payload := .directValue matrixRoot, storage := .mappedTemplate }
+  let scalar : OperationalFact := {
+    context := mappedContext, payload := .directValue scalarRoot, storage := .mappedTemplate }
+  let (arena, matrix) ← closeParallelDirectMatrixOutput scopeKey loopNode 0 0 count [] arena matrix
+  let (arena, scalar) ← closeParallelDirectScalarOutput scopeKey loopNode 0 1 count [] arena scalar
+  let matrixValue ← match arena.direct.valueAt? matrix.payload.root with
+    | some value => pure value
+    | none => throw (.invalidOperationalExprRef matrix.payload.root)
+  let scalarValue ← match arena.direct.valueAt? scalar.payload.root with
+    | some value => pure value
+    | none => throw (.invalidOperationalExprRef scalar.payload.root)
+  let indices : IndexValueEnvironment := [(.variable independent, 0), (.variable expected, 0)]
+  let matrixFact ← arena.direct.matrixFactAt [] indices matrix.payload.root
+    (arena.direct.values.size + 1)
+  let scalarFact ← arena.direct.scalarFactAt [] indices scalar.payload.root
+    (arena.direct.values.size + 1)
+  let familyBinder := parallelLoopFamilyBinder scopeKey loopNode 0
+  let matrixIndexed := match matrixFact.origin with
+    | .indexed binder expression _ => binder == familyBinder && expression == .variable expected
+    | _ => false
+  let scalarIndexed := match scalarFact with
+    | .integer { origin := .indexed binder expression _, .. } =>
+        binder == familyBinder && expression == .variable expected
+    | _ => false
+  let scalarSubject := match scalarFact with
+    | .integer fact => some fact.subject
+    | .trapdoor fact => some fact.subject
+    | .bytes fact => some fact.subject
+    | _ => none
+  let nestedOverlay (subject : WireRef) (value : OperationalIndexedValue) := match value.payload with
+    | .indexedOutput _ source indexedBinder indexedSelection indexedSubject =>
+        indexedBinder == familyBinder && indexedSelection ==
+          parallelLoopLaneSelection scopeKey loopNode 0 count && indexedSubject == subject &&
+          (arena.direct.valueAt? source).any fun sourceValue =>
+            match sourceValue.payload with
+            | .mapped .. => true
+            | _ => false
+    | _ => false
+  let checks := [matrix.context == expectedContext, scalar.context == expectedContext,
+    matrixValue.context == expectedContext, scalarValue.context == expectedContext,
+    matrixFact.subject == { node := loopNode, port := 0 },
+    scalarSubject == some { node := loopNode, port := 1 }, matrixIndexed, scalarIndexed,
+    nestedOverlay { node := loopNode, port := 0 } matrixValue,
+    nestedOverlay { node := loopNode, port := 1 } scalarValue]
+  pure (checks.all id)
+
+example : parallelLoopUniformIndependentContextFixture = .ok true := by native_decide
+
+/-- A pre-existing binder with the loop selector's owner and slot but a conflicting count is not
+an independent dimension.  The uniform-output lift rejects it instead of silently merging it. -/
+private def parallelLoopUniformConflictingContextRejectedFixture : Bool :=
+  match (do
+    let scopeKey : ScopeTemplateKey := .root (.workflowStage ⟨"conflicting-loop-output"⟩)
+    let count : IntExpr := .constant 8
+    let loopNode := 838
+    let expected ← parallelLoopLaneBinder scopeKey loopNode 0 count
+    let conflicting := { expected with count := .constant 7 }
+    let context : IndexContext := { binders := #[conflicting] }
+    let (fixed, reference) := ({} : FixedOperationalPayloadArena).pushMatrix
+      (boundedOperationalExprFixtureFact 838 1)
+    let direct : DirectOperationalIndexedArena := { fixed }
+    let (direct, root) ← match direct.pushShared context (.matrix fixtureType) reference with
+      | some result => pure result
+      | none => throw (OperationalError.unsupportedOperationalExpr 838)
+    let output : OperationalFact := {
+      context, payload := .directValue root, storage := .mappedTemplate }
+    let result := closeParallelDirectMatrixOutput scopeKey loopNode 0 0 count [] { direct } output
+    pure (match result with
+      | .error (.unsupportedOperationalExpr _) => true
+      | _ => false)) with
+  | .ok value => value
+  | .error _ => false
+
+example : parallelLoopUniformConflictingContextRejectedFixture = true := by native_decide
+
 /-- Direct tensor rejects a forged output ring even when the Kronecker shape happens to match. -/
 private def directTensorOutputRingFixture : Bool :=
   let left := boundedOperationalExprFixtureFact 830 2

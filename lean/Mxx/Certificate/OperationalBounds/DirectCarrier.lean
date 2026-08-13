@@ -175,6 +175,15 @@ inductive OperationalIndexedPayload where
       (schema : OperationalIndexedPayloadSchema)
       (source : OperationalIndexedValueId)
       (subject : WireRef)
+  /-- A parallel-loop result which is uniform in the newly closed coordinate.  The source keeps
+  its existing indexed context; evaluation adds the exact lexical selection and indexes the
+  resolved fixed leaf only after all prior substitutions have been applied. -/
+  | indexedOutput
+      (schema : OperationalIndexedPayloadSchema)
+      (source : OperationalIndexedValueId)
+      (binder : FamilyTemplateBinder)
+      (selection : DynamicSelectionIdentity)
+      (subject : WireRef)
   /-- A root-result annotation preserves the source carrier and replaces only the complete
   fixed-assignment result's total hard bound.  Sequential recurrences use this after the body
   has already consumed its internal relations, so no leaf relation is retained or rewritten. -/
@@ -191,12 +200,14 @@ inductive OperationalIndexedPayload where
 def OperationalIndexedPayload.schema :
     OperationalIndexedPayload → OperationalIndexedPayloadSchema
   | .shared schema _ | .explicit schema _ _ | .explicitValues schema _ _ | .mapped schema _ _ |
-      .rebound schema _ _ | .matrixResultBound schema _ _ | .pointwise schema _ _ => schema
+      .rebound schema _ _ | .indexedOutput schema _ _ _ _ | .matrixResultBound schema _ _ |
+      .pointwise schema _ _ => schema
 
 def OperationalIndexedPayload.storage : OperationalIndexedPayload → IndexedStorage
   | .shared .. => .sharedTemplate
   | .explicit .. | .explicitValues .. => .explicitTable
-  | .mapped .. | .rebound .. | .matrixResultBound .. | .pointwise .. => .mappedTemplate
+  | .mapped .. | .rebound .. | .indexedOutput .. | .matrixResultBound .. | .pointwise .. =>
+      .mappedTemplate
 
 abbrev OperationalIndexedValue := IndexedFact OperationalIndexedPayload
 
@@ -485,6 +496,22 @@ def DirectOperationalIndexedArena.pushRebound
   | .rebound schema base _ => some (arena.pushValue value.context (.rebound schema base subject))
   | payload => some (arena.pushValue value.context (.rebound payload.schema source subject))
 
+/-- Close a loop over a direct value whose result is uniform in that loop coordinate.  This is a
+dedicated leaf overlay, not an `IndexMap`: earlier substitutions stay on the source and are
+evaluated first, while the fresh lexical selector is applied exactly once at the fixed result. -/
+def DirectOperationalIndexedArena.pushIndexedOutput
+    (arena : DirectOperationalIndexedArena)
+    (source : OperationalIndexedValueId)
+    (binder : FamilyTemplateBinder)
+    (selection : DynamicSelectionIdentity)
+    (subject : WireRef) : Option (DirectOperationalIndexedArena × OperationalIndexedValueId) := do
+  let value ← arena.valueAt? source
+  let selector ← match selection.expression with
+    | .variable selector => some selector
+    | _ => none
+  let context ← extendContext value.context selector
+  some (arena.pushValue context (.indexedOutput value.payload.schema source binder selection subject))
+
 /-- Annotate a direct matrix root after its fixed-assignment computation.  The source ID remains
 authoritative for context, storage, schema, identity, provenance, and relations; evaluation alone
 replaces the resulting total bound. -/
@@ -584,6 +611,12 @@ partial def DirectOperationalIndexedArena.mapMatrixValue
                 let (arena, memo, source) ← visit fuel arena memo source
                 let (arena, mapped) := arena.pushValue value.context
                   (.mapped (.matrix matrixType) source map)
+                pure (arena, memo, mapped)
+            | .indexedOutput (.matrix matrixType) source binder selection subject => do
+                let (arena, memo, source) ← visit fuel arena memo source
+                let (arena, mapped) ← match arena.pushIndexedOutput source binder selection subject with
+                  | some result => pure result
+                  | none => throw (.unsupportedOperationalExpr id)
                 pure (arena, memo, mapped)
             | .rebound (.matrix _) source subject => do
                 let (arena, memo, source) ← visit fuel arena memo source
@@ -738,6 +771,12 @@ partial def DirectOperationalIndexedArena.mapScalarValue
                   | some value => pure value
                   | none => throw (.invalidOperationalExprRef mapped)
                 if mappedValue.context != value.context then throw (.unsupportedOperationalExpr id)
+                pure (arena, memo, mapped)
+            | .indexedOutput (.scalar scalarType) source binder selection subject => do
+                let (arena, memo, source) ← visit fuel arena memo source
+                let (arena, mapped) ← match arena.pushIndexedOutput source binder selection subject with
+                  | some result => pure result
+                  | none => throw (.unsupportedOperationalExpr id)
                 pure (arena, memo, mapped)
             | .rebound (.scalar _) source subject => do
                 let (arena, memo, source) ← visit fuel arena memo source

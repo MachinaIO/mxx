@@ -986,6 +986,10 @@ partial def directFamilyLaneCarrierTrace
           | .rebound _ source subject =>
               "rebound(root=" ++ toString root ++ "; subject=" ++ reprStr subject ++
                 "; context=" ++ context ++ ") -> " ++ directFamilyLaneCarrierTrace arena source fuel
+          | .indexedOutput _ source binder selection subject =>
+              "indexed_output(root=" ++ toString root ++ "; binder=" ++ reprStr binder ++
+                "; selection=" ++ reprStr selection ++ "; subject=" ++ reprStr subject ++
+                "; context=" ++ context ++ ") -> " ++ directFamilyLaneCarrierTrace arena source fuel
           | .matrixResultBound _ source _ =>
               "matrix_result_bound(root=" ++ toString root ++ "; context=" ++ context ++ ") -> " ++
                 directFamilyLaneCarrierTrace arena source fuel
@@ -1030,6 +1034,7 @@ partial def directFamilyLaneBinderFromCarrier
                   else none
               | _, _, _ => none
       | .rebound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
+      | .indexedOutput _ _ _ selection _ => selection.expression.identityVariable?
       | .matrixResultBound _ source _ => directFamilyLaneBinderFromCarrier arena source fuel
       /- `pushPointwise` constructs this context by merging its direct input contexts and checks
       the payload schemas. Re-establish both invariants here before using a unique owner-aware
@@ -2514,7 +2519,7 @@ def operationalAnalysisDiagnostics
     | .explicitValues _ _ values =>
         logicalBranches := logicalBranches + values.size
         storedBranches := storedBranches + values.size
-    | .mapped .. | .rebound .. | .matrixResultBound .. | .pointwise .. => pure ()
+    | .mapped .. | .rebound .. | .indexedOutput .. | .matrixResultBound .. | .pointwise .. => pure ()
   for fact in arena.direct.fixed.matrices do
     maximumPolynomialTerms := max maximumPolynomialTerms fact.polynomial.length
   return {

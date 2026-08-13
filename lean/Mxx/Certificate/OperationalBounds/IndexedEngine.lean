@@ -2723,6 +2723,153 @@ def DirectOperationalIndexedArena.indexedMatrixTypeAt
     columns := .constant (← arena.indexedParameterAt parameters context indices value.columns)
   }
 
+/-- Indexing a closed uniform loop output happens while the direct evaluator is already reducing
+its source.  These local transport helpers deliberately mirror the later family-selection
+transport, but live before the recursive evaluator so the overlay stays executable. -/
+private def overlayMapPrimitiveIdentity
+    (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
+    (mapPublic : PublicMatrixIdentity → PublicMatrixIdentity)
+    (mapValue : OperationalValueOrigin → OperationalValueOrigin) :
+    OperationalPrimitiveIdentity → OperationalPrimitiveIdentity
+  | .matrix identity => .matrix (mapOrigin identity)
+  | .publicMatrix identity => .publicMatrix (mapPublic identity)
+  | .value identity => .value (mapValue identity)
+  | .parameterScalar environment domains value => .parameterScalar environment domains value
+  | .identityMatrix type => .identityMatrix type
+  | .indexedArtifact input index => .indexedArtifact input index
+  | .recurrenceResult scope node path => .recurrenceResult scope node path
+  | .carriedInput path => .carriedInput path
+
+private def overlayMapCompressionToken
+    (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
+    (mapPublic : PublicMatrixIdentity → PublicMatrixIdentity)
+    (mapValue : OperationalValueOrigin → OperationalValueOrigin)
+    (mapBound : OperationalBoundExpr → OperationalBoundExpr) :
+    OperationalCompressionToken → OperationalCompressionToken
+  | .primitive identity => .primitive (overlayMapPrimitiveIdentity mapOrigin mapPublic mapValue identity)
+  | .summaryBound bound => .summaryBound (mapBound bound)
+  | token => token
+
+private def overlayMapBoundedSummary
+    (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
+    (mapPublic : PublicMatrixIdentity → PublicMatrixIdentity)
+    (mapValue : OperationalValueOrigin → OperationalValueOrigin)
+    (mapBound : OperationalBoundExpr → OperationalBoundExpr)
+    (summary : OperationalBoundedFactorSummary) : OperationalBoundedFactorSummary := {
+  summary with
+  hardBound := mapBound summary.hardBound
+  provenance := summary.provenance.map (overlayMapCompressionToken mapOrigin mapPublic mapValue mapBound)
+}
+
+private def overlayMapRelationSnapshotPolynomial
+    (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
+    (mapPublic : PublicMatrixIdentity → PublicMatrixIdentity)
+    (mapValue : OperationalValueOrigin → OperationalValueOrigin)
+    (mapBound : OperationalBoundExpr → OperationalBoundExpr)
+    (polynomial : RelationSnapshotPolynomial) : RelationSnapshotPolynomial :=
+  polynomial.map fun term => {
+    term with
+    product := {
+      term.product with
+      factors := term.product.factors.map fun factor =>
+      let boundedSummary := factor.boundedSummary.map
+        (overlayMapBoundedSummary mapOrigin mapPublic mapValue mapBound)
+      let leaf := match factor.leaf with
+        | .primitive identity => .primitive (overlayMapPrimitiveIdentity mapOrigin mapPublic mapValue identity)
+        | .boundedSummary origin summary =>
+            let tokens := origin.tokens.map
+              (overlayMapCompressionToken mapOrigin mapPublic mapValue mapBound)
+            .boundedSummary { origin with tokens }
+              (overlayMapBoundedSummary mapOrigin mapPublic mapValue mapBound summary)
+        | .exactTransform tokens type =>
+            let tokens := tokens.map (overlayMapCompressionToken mapOrigin mapPublic mapValue mapBound)
+            .exactTransform tokens type
+        { factor with leaf, boundedSummary }
+    }
+  }
+
+private def overlayMapOperationalPolynomial
+    (mapOrigin : MatrixOriginIdentity → MatrixOriginIdentity)
+    (mapPublic : PublicMatrixIdentity → PublicMatrixIdentity)
+    (mapValue : OperationalValueOrigin → OperationalValueOrigin)
+    (mapBound : OperationalBoundExpr → OperationalBoundExpr)
+    (mapRelation : OperationalMatrixRelation → OperationalMatrixRelation)
+    (polynomial : OperationalPolynomial) : OperationalPolynomial :=
+  polynomial.map fun term => {
+    term with
+    product := {
+      term.product with
+      factors := term.product.factors.map fun factor =>
+      let boundedSummary := factor.boundedSummary.map
+        (overlayMapBoundedSummary mapOrigin mapPublic mapValue mapBound)
+      let leaf := match factor.leaf with
+        | .primitive identity => .primitive (overlayMapPrimitiveIdentity mapOrigin mapPublic mapValue identity)
+        | .boundedSummary origin summary =>
+            let tokens := origin.tokens.map
+              (overlayMapCompressionToken mapOrigin mapPublic mapValue mapBound)
+            .boundedSummary { origin with tokens }
+              (overlayMapBoundedSummary mapOrigin mapPublic mapValue mapBound summary)
+        | .exactTransform tokens type =>
+            let tokens := tokens.map (overlayMapCompressionToken mapOrigin mapPublic mapValue mapBound)
+            .exactTransform tokens type
+        { factor with leaf, boundedSummary, relations := factor.relations.map mapRelation }
+    }
+  }
+
+private def overlayIndexMatrixFact
+    (binder : FamilyTemplateBinder) (selection : DynamicSelectionIdentity) (subject : WireRef)
+    (fact : OperationalMatrixFact) : OperationalMatrixFact :=
+  let mapOrigin (origin : MatrixOriginIdentity) := .indexed binder selection.expression origin
+  let mapPublic (identity : PublicMatrixIdentity) := .indexed binder selection.expression identity
+  let mapValue (origin : OperationalValueOrigin) := .indexed binder selection.expression origin
+  let mapTarget (target : RelationTargetSummary) : RelationTargetSummary := {
+    target with
+    origin := mapOrigin target.origin
+    polynomial := overlayMapRelationSnapshotPolynomial mapOrigin mapPublic mapValue id target.polynomial
+  }
+  let mapRelation : OperationalMatrixRelation → OperationalMatrixRelation
+    | .decomposition relation => .decomposition {
+        relation with
+        producer := mapOrigin relation.producer
+        publicIdentity := mapPublic relation.publicIdentity
+        inputOrigin := mapOrigin relation.inputOrigin
+        inputSummary := mapTarget relation.inputSummary
+      }
+    | .preimage relation => .preimage {
+        relation with
+        producer := mapOrigin relation.producer
+        publicIdentity := mapPublic relation.publicIdentity
+        targetOrigin := mapOrigin relation.targetOrigin
+        targetSummary := mapTarget relation.targetSummary
+      }
+  { fact with
+    subject
+    origin := mapOrigin fact.origin
+    identity := fact.identity.map mapPublic
+    relations := fact.relations.map mapRelation
+    polynomial := overlayMapOperationalPolynomial mapOrigin mapPublic mapValue id mapRelation fact.polynomial
+  }
+
+private def overlayIndexScalarFact
+    (binder : FamilyTemplateBinder) (selection : DynamicSelectionIdentity) (subject : WireRef) :
+    OperationalScalarFact → OperationalScalarFact
+  | .integer fact => .integer {
+      fact with
+      subject
+      origin := .indexed binder selection.expression fact.origin
+    }
+  | .trapdoor fact => .trapdoor {
+      fact with
+      subject
+      publicIdentity := .indexed binder selection.expression fact.publicIdentity
+    }
+  | .bytes fact => .bytes {
+      fact with
+      subject
+      origin := .indexed binder selection.expression fact.origin
+    }
+  | fact => fact
+
 /-- Evaluate one direct indexed matrix value at a complete index assignment.  This is the only
 place direct delayed nodes invoke the fixed-assignment matrix kernels. -/
 def rebindOperationalScalarFact
@@ -2805,6 +2952,9 @@ def DirectOperationalIndexedArena.matrixFactAt
               | none => throw (.unsupportedOperationalExpr id)
       | .rebound (.matrix _) source subject => do
           rebindMatrixSubject subject (← arena.matrixFactAt parameters indices source fuel)
+      | .indexedOutput (.matrix _) source binder selection subject => do
+          let fact ← arena.matrixFactAt parameters indices source fuel
+          pure (overlayIndexMatrixFact binder selection subject fact)
       | .matrixResultBound (.matrix _) source totalHardBound => do
           let maps ← directPendingMaps arena source (arena.values.size + 1)
           let source ← arena.matrixFactAt parameters indices source fuel
@@ -2925,6 +3075,9 @@ def DirectOperationalIndexedArena.scalarFactAt
               | none => throw (.unsupportedOperationalExpr id)
       | .rebound (.scalar _) source subject =>
           pure (rebindOperationalScalarFact subject (← arena.scalarFactAt parameters indices source fuel))
+      | .indexedOutput (.scalar _) source binder selection subject =>
+          pure (overlayIndexScalarFact binder selection subject
+            (← arena.scalarFactAt parameters indices source fuel))
       | .pointwise (.scalar _) (.matrixToScalar operation) inputs => do
           let input ← match inputs with
             | #[input] => pure input
@@ -4363,6 +4516,15 @@ partial def DirectOperationalIndexedArena.reindexValue
                 if mappedValue.context != value.context || mappedValue.payload.schema != schema then
                   throw (.unsupportedOperationalExpr id)
                 pure (arena, memo, mapped)
+            | .indexedOutput schema source binder selection subject => do
+                let (arena, memo, source) ← visit fuel arena memo source
+                let (arena, mapped) ← match arena.pushIndexedOutput source binder selection subject with
+                  | some result => pure result | none => throw (.unsupportedOperationalExpr id)
+                let mappedValue ← match arena.valueAt? mapped with
+                  | some value => pure value | none => throw (.invalidOperationalExprRef mapped)
+                if mappedValue.context != value.context || mappedValue.payload.schema != schema then
+                  throw (.unsupportedOperationalExpr id)
+                pure (arena, memo, mapped)
             | .matrixResultBound schema source totalHardBound => do
                 let (arena, memo, source) ← visit fuel arena memo source
                 let bound ← match reindexOperationalBoundExpr environment map totalHardBound with
@@ -5053,6 +5215,9 @@ private def parallelLoopOutputBinderFailureDiagnostic
         "mapped; source=" ++ toString source ++ "; map=" ++ reprStr map
     | some { payload := .rebound _ source subject, .. } =>
         "rebound; source=" ++ toString source ++ "; subject=" ++ reprStr subject
+    | some { payload := .indexedOutput _ source binder selection subject, .. } =>
+        "indexed_output; source=" ++ toString source ++ "; binder=" ++ reprStr binder ++
+          "; selection=" ++ reprStr selection ++ "; subject=" ++ reprStr subject
     | some { payload := .matrixResultBound _ source _, .. } =>
         "matrix_result_bound; source=" ++ toString source
     | some { payload := .pointwise _ _ inputs, .. } =>
@@ -5082,6 +5247,10 @@ private partial def parallelLoopOutputCarrierTrace
             parallelLoopOutputCarrierTrace arena source fuel
       | some { payload := .rebound _ source subject, .. } =>
           "rebound(root=" ++ toString root ++ "; subject=" ++ reprStr subject ++ ") -> " ++
+            parallelLoopOutputCarrierTrace arena source fuel
+      | some { payload := .indexedOutput _ source binder selection subject, .. } =>
+          "indexed_output(root=" ++ toString root ++ "; binder=" ++ reprStr binder ++
+            "; selection=" ++ reprStr selection ++ "; subject=" ++ reprStr subject ++ ") -> " ++
             parallelLoopOutputCarrierTrace arena source fuel
       | some { payload := .matrixResultBound _ source _, .. } =>
           "matrix_result_bound(root=" ++ toString root ++ ") -> " ++
@@ -5209,23 +5378,35 @@ def closeParallelDirectMatrixOutput
       context := emptyContext, payload := .directValue indexed, storage := indexedValue.storage }
     ({ arena with direct }).reindexDirectFact map expression environment
   else
-    let sourceBinder ← match parallelLoopOutputBinder selection output.context root with
-      | .ok binder => pure binder
+    let expected ← match selection.expression with
+      | .variable binder => pure binder
+      | _ => throw (.unsupportedOperationalExpr root)
+    if output.context.binders.contains expected then
+      let sourceBinder ← match parallelLoopOutputBinder selection output.context root with
+        | .ok binder => pure binder
+        | .error error =>
+            if parallelLoopOutputBinderFailureDiagnostic selection output arena then throw error
+            else throw error
+      let map ← match dynamicIndexMap output.context sourceBinder selection.expression with
+        | some map => pure map
+        | none =>
+            if parallelLoopOutputMapFailureDiagnostic "construct_failed" sourceBinder selection output arena then
+              throw (.unsupportedOperationalExpr root)
+            else throw (.unsupportedOperationalExpr root)
+      match arena.reindexDirectFact map output environment with
+      | .ok result => pure result
       | .error error =>
-          if parallelLoopOutputBinderFailureDiagnostic selection output arena then throw error
+          if parallelLoopOutputMapFailureDiagnostic "reindex_failed" sourceBinder selection output arena then
+            throw error
           else throw error
-    let map ← match dynamicIndexMap output.context sourceBinder selection.expression with
-      | some map => pure map
-      | none =>
-          if parallelLoopOutputMapFailureDiagnostic "construct_failed" sourceBinder selection output arena then
-            throw (.unsupportedOperationalExpr root)
-          else throw (.unsupportedOperationalExpr root)
-    match arena.reindexDirectFact map output environment with
-    | .ok result => pure result
-    | .error error =>
-        if parallelLoopOutputMapFailureDiagnostic "reindex_failed" sourceBinder selection output arena then
-          throw error
-        else throw error
+    else
+      let (direct, indexed) ← match arena.direct.pushIndexedOutput root binder selection subject with
+        | some result => pure result
+        | none => throw (.unsupportedOperationalExpr root)
+      let value ← match direct.valueAt? indexed with
+        | some value => pure value | none => throw (.invalidOperationalExprRef indexed)
+      pure ({ arena with direct }, {
+        context := value.context, payload := .directValue indexed, storage := value.storage })
 
 def closeParallelDirectScalarOutput
     (scope : ScopeTemplateKey) (node indexSlot port : Nat) (declaredCount : IntExpr)
@@ -5252,23 +5433,35 @@ def closeParallelDirectScalarOutput
           context := emptyContext, payload := .directValue indexed, storage := indexedValue.storage }
         ({ arena with direct }).reindexDirectFact map expression environment
       else
-        let sourceBinder ← match parallelLoopOutputBinder selection output.context root with
-          | .ok binder => pure binder
+        let expected ← match selection.expression with
+          | .variable binder => pure binder
+          | _ => throw (.unsupportedOperationalExpr root)
+        if output.context.binders.contains expected then
+          let sourceBinder ← match parallelLoopOutputBinder selection output.context root with
+            | .ok binder => pure binder
+            | .error error =>
+                if parallelLoopOutputBinderFailureDiagnostic selection output arena then throw error
+                else throw error
+          let map ← match dynamicIndexMap output.context sourceBinder selection.expression with
+            | some map => pure map
+            | none =>
+                if parallelLoopOutputMapFailureDiagnostic "construct_failed" sourceBinder selection output arena then
+                  throw (.unsupportedOperationalExpr root)
+                else throw (.unsupportedOperationalExpr root)
+          match arena.reindexDirectFact map output environment with
+          | .ok result => pure result
           | .error error =>
-              if parallelLoopOutputBinderFailureDiagnostic selection output arena then throw error
+              if parallelLoopOutputMapFailureDiagnostic "reindex_failed" sourceBinder selection output arena then
+                throw error
               else throw error
-        let map ← match dynamicIndexMap output.context sourceBinder selection.expression with
-          | some map => pure map
-          | none =>
-              if parallelLoopOutputMapFailureDiagnostic "construct_failed" sourceBinder selection output arena then
-                throw (.unsupportedOperationalExpr root)
-              else throw (.unsupportedOperationalExpr root)
-        match arena.reindexDirectFact map output environment with
-        | .ok result => pure result
-        | .error error =>
-            if parallelLoopOutputMapFailureDiagnostic "reindex_failed" sourceBinder selection output arena then
-              throw error
-            else throw error
+        else
+          let (direct, indexed) ← match arena.direct.pushIndexedOutput root binder selection subject with
+            | some result => pure result
+            | none => throw (.unsupportedOperationalExpr root)
+          let value ← match direct.valueAt? indexed with
+            | some value => pure value | none => throw (.invalidOperationalExprRef indexed)
+          pure ({ arena with direct }, {
+            context := value.context, payload := .directValue indexed, storage := value.storage })
 
 def parallelLoopIndexedMatrixOutput
     (scope : ScopeTemplateKey) (node indexSlot port : Nat) (declaredCount : IntExpr) (count : Nat)

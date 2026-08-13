@@ -1144,150 +1144,6 @@ structure OperationalMatrixFact where
   blockLayout : Option OperationalBlockLayout := none
   deriving BEq
 
-abbrev OperationalExprId := Nat
-
-structure UniformBoundedSchema where
-  matrixType : MatrixTypeExpr
-  rowCount : Int
-  hardBound : OperationalBoundExpr
-  metadata : OperationalMatrixMetadata
-  deriving BEq
-
-structure UniformSnapshotFactorSchema where
-  transforms : List OperationalFactorTransform
-  inputType : MatrixTypeExpr
-  outputType : MatrixTypeExpr
-  role : OperationalFactorRole
-  bounded : Option UniformBoundedSchema
-  deriving BEq
-
-structure UniformSnapshotTermSchema where
-  coefficient : Int
-  factors : List UniformSnapshotFactorSchema
-  modes : List OperationalProductMode
-  outputType : MatrixTypeExpr
-  deriving BEq
-
-structure UniformTargetSchema where
-  matrixType : MatrixTypeExpr
-  matrixParams : Mxx.SamplerParams
-  totalHardBound : OperationalBoundExpr
-  canonicalRange : CanonicalRange
-  polynomial : List UniformSnapshotTermSchema
-  deriving BEq
-
-structure UniformRelationSchema where
-  isPreimage : Bool
-  target : UniformTargetSchema
-  base : Int := 0
-  small : Bool := false
-  digitCount : Nat := 0
-  status : ReconstructionStatus := .available
-  deriving BEq
-
-structure UniformFactorSchema where
-  transforms : List OperationalFactorTransform
-  inputType : MatrixTypeExpr
-  outputType : MatrixTypeExpr
-  role : OperationalFactorRole
-  bounded : Option UniformBoundedSchema
-  protections : List OperationalCompressionProtection
-  relations : List UniformRelationSchema
-  deriving BEq
-
-structure UniformTermSchema where
-  coefficient : Int
-  factors : List UniformFactorSchema
-  modes : List OperationalProductMode
-  outputType : MatrixTypeExpr
-  deriving BEq
-
-structure UniformMatrixSchema where
-  matrixType : MatrixTypeExpr
-  matrixParams : Mxx.SamplerParams
-  totalHardBound : OperationalBoundExpr
-  polynomial : List UniformTermSchema
-  metadata : OperationalMatrixMetadata
-  canonicalRange : CanonicalRange
-  hasPublicIdentity : Bool
-  relations : List UniformRelationSchema
-  deriving BEq
-
-def uniformBoundedSchema
-    (summary : OperationalBoundedFactorSummary) : UniformBoundedSchema := {
-  matrixType := summary.matrixType
-  rowCount := summary.rowCount
-  hardBound := summary.hardBound
-  metadata := summary.metadata
-}
-
-def uniformSnapshotFactorSchema
-    (factor : RelationSnapshotFactor) : UniformSnapshotFactorSchema := {
-  transforms := factor.transforms
-  inputType := factor.inputType
-  outputType := factor.outputType
-  role := factor.role
-  bounded := factor.boundedSummary.map uniformBoundedSchema
-}
-
-def uniformSnapshotTermSchema
-    (term : RelationSnapshotTerm) : UniformSnapshotTermSchema := {
-  coefficient := term.coefficient
-  factors := term.product.factors.map uniformSnapshotFactorSchema
-  modes := term.product.modes
-  outputType := term.product.outputType
-}
-
-def uniformTargetSchema (target : RelationTargetSummary) : UniformTargetSchema := {
-  matrixType := target.matrixType
-  matrixParams := target.matrixParams
-  totalHardBound := target.totalHardBound
-  canonicalRange := target.canonicalRange
-  polynomial := target.polynomial.map uniformSnapshotTermSchema
-}
-
-def uniformRelationSchema : OperationalMatrixRelation → UniformRelationSchema
-  | .decomposition relation => {
-      isPreimage := false
-      target := uniformTargetSchema relation.inputSummary
-      base := relation.base
-      small := relation.small
-      digitCount := relation.digitCount
-      status := relation.status
-    }
-  | .preimage relation => {
-      isPreimage := true
-      target := uniformTargetSchema relation.targetSummary
-    }
-
-def uniformFactorSchema (factor : OperationalFactorKey) : UniformFactorSchema := {
-  transforms := factor.transforms
-  inputType := factor.inputType
-  outputType := factor.outputType
-  role := factor.role
-  bounded := factor.boundedSummary.map uniformBoundedSchema
-  protections := factor.protections
-  relations := factor.relations.map uniformRelationSchema
-}
-
-def uniformTermSchema (term : OperationalTerm) : UniformTermSchema := {
-  coefficient := term.coefficient
-  factors := term.product.factors.map uniformFactorSchema
-  modes := term.product.modes
-  outputType := term.product.outputType
-}
-
-def operationalUniformSchema (fact : OperationalMatrixFact) : UniformMatrixSchema := {
-  matrixType := fact.matrixType
-  matrixParams := fact.matrixParams
-  totalHardBound := fact.totalHardBound
-  polynomial := fact.polynomial.map uniformTermSchema
-  metadata := fact.metadata
-  canonicalRange := fact.canonicalRange
-  hasPublicIdentity := fact.identity.isSome
-  relations := fact.relations.map uniformRelationSchema
-}
-
 def matrixFactHasRelation (fact : OperationalMatrixFact) : Bool :=
   !fact.relations.isEmpty || fact.polynomial.any fun term =>
     term.product.factors.any fun factor => !factor.relations.isEmpty
@@ -1346,132 +1202,6 @@ def publicIdentityTemplateEqual : PublicMatrixIdentity → PublicMatrixIdentity 
       leftBinder == rightBinder && leftExpression == rightExpression &&
         publicIdentityTemplateEqual leftSource rightSource
   | _, _ => false
-
-structure SelectedMatrixSummary where
-  uniformSchema : Option UniformMatrixSchema
-  /-- Complete conservative value for the selected outer domain.  The structural representative
-  retains branch-local identities and nested choices; this fact owns the joined bounds, metadata,
-  canonical range, and relation schema used by transfer and endpoint evaluation. -/
-  conservativeFact : Option OperationalMatrixFact
-  relationFree : Bool
-  sharedLastPublicIdentity : Option PublicMatrixIdentity
-  selectionOrigin : Option SelectionDomainKind := none
-  deriving BEq
-
-/-- Request-local handle for an all-branch matrix schema.  Equality of handles is constant time;
-the interner always confirms the complete schema key after fingerprint bucket selection. -/
-structure ValidatedSchemaId where
-  ordinal : Nat
-  deriving BEq, DecidableEq, Repr
-
-structure OperationalExprEvaluationStats where
-  evaluations : Nat := 0
-  memoHits : Nat := 0
-  memoMisses : Nat := 0
-  deriving BEq, DecidableEq, Inhabited, Repr
-
-structure OperationalExprEvaluationState where
-  environment : Option ParamEnvironment := none
-  totalMemo : Array (Option Int) := #[]
-  noiseMemo : Array (Option Int) := #[]
-  schemaFactMemo : Array (Option OperationalMatrixFact) := #[]
-  schemaMemo : Array (Option ValidatedSchemaId) := #[]
-  totalStats : OperationalExprEvaluationStats := {}
-  noiseStats : OperationalExprEvaluationStats := {}
-  schemaStats : OperationalExprEvaluationStats := {}
-  /-- Reporting-only high-water mark for occupied legacy memo entries.  Array capacity is not
-  occupancy: this is updated only after a successful memo insertion. -/
-  peakMemoEntries : Nat := 0
-  /-- Reporting-only maximum over facts actually produced by the legacy evaluation envelope.
-  Direct-carrier reduction contributes separately at its own reporting boundary. -/
-  maximumPolynomialTerms : Nat := 0
-  deriving BEq
-
-private def occupiedMemoEntries {α : Type} (entries : Array (Option α)) : Nat :=
-  entries.foldl (fun count entry => if entry.isSome then count + 1 else count) 0
-
-def OperationalExprEvaluationState.memoEntryCount (state : OperationalExprEvaluationState) : Nat :=
-  occupiedMemoEntries state.totalMemo + occupiedMemoEntries state.noiseMemo +
-    occupiedMemoEntries state.schemaFactMemo + occupiedMemoEntries state.schemaMemo
-
-def OperationalExprEvaluationState.recordMemoOccupancy
-    (state : OperationalExprEvaluationState) : OperationalExprEvaluationState :=
-  { state with peakMemoEntries := max state.peakMemoEntries state.memoEntryCount }
-
-def OperationalExprEvaluationState.recordPolynomialTerms
-  (state : OperationalExprEvaluationState)
-    (fact : OperationalMatrixFact) : OperationalExprEvaluationState :=
-  { state with maximumPolynomialTerms :=
-      if fact.polynomial.length > state.maximumPolynomialTerms then fact.polynomial.length
-      else state.maximumPolynomialTerms }
-
-def selectedMatrixSummary
-    (branches : Array OperationalMatrixFact) : SelectedMatrixSummary :=
-  match branches[0]? with
-  | none => {
-      uniformSchema := none
-      conservativeFact := none
-      relationFree := false
-      sharedLastPublicIdentity := none
-    }
-  | some first =>
-      let schema := operationalUniformSchema first
-      let uniform := branches.all fun branch => operationalUniformSchema branch == schema
-      let relationFree := branches.all fun branch => !matrixFactHasRelation branch
-      let lastIdentity := boundaryLastPublicIdentity? first
-      let sharedLast := if lastIdentity.isSome &&
-          branches.all (fun branch => match lastIdentity, boundaryLastPublicIdentity? branch with
-            | some expected, some actual => publicIdentityTemplateEqual expected actual
-            | _, _ => false) then
-        lastIdentity else none
-      {
-        uniformSchema := if uniform then some schema else none
-        conservativeFact := if uniform then some first else none
-        relationFree
-        sharedLastPublicIdentity := sharedLast
-      }
-
-inductive EnvelopeSummaryTransferOperation where
-  | instantiationMap
-  | recurrenceBoundShift
-  | addSubtract
-  | multiplyOrdinary
-  | tensor
-  | concat
-  | transform
-  | scale
-  | bggGrouping
-  | unregistered
-  deriving BEq, DecidableEq, Repr
-
-/-- Fail-closed registry for operations that may transfer a checked uniform envelope. Every
-source must already carry a complete uniform schema. Registered operations recompute every output
-field from the post-operation representative; no pre-operation boundary template is copied. -/
-def transferSelectedMatrixSummary
-    (operation : EnvelopeSummaryTransferOperation)
-    (sources : Array SelectedMatrixSummary)
-    (conservativeOutput : OperationalMatrixFact) : Option SelectedMatrixSummary := do
-  if sources.isEmpty || sources.any (fun source =>
-      source.uniformSchema.isNone || source.conservativeFact.isNone) then
-    none
-  let first ← sources[0]?
-  let alignedOrigin := sources.all (·.selectionOrigin == first.selectionOrigin)
-  let recomputed := {
-    selectedMatrixSummary #[conservativeOutput] with selectionOrigin := first.selectionOrigin }
-  if recomputed.uniformSchema.isNone || recomputed.conservativeFact.isNone then
-    none
-  match operation with
-  | .instantiationMap | .recurrenceBoundShift | .transform | .scale =>
-      if sources.size == 1 then some recomputed else none
-  | .multiplyOrdinary =>
-      if sources.size <= 2 && alignedOrigin then
-        some recomputed
-      else none
-  | .addSubtract | .tensor =>
-      if sources.size <= 2 && alignedOrigin then some recomputed else none
-  | .concat | .bggGrouping =>
-      if alignedOrigin then some recomputed else none
-  | .unregistered => none
 
 def primitiveOperationalPolynomial
     (origin : MatrixOriginIdentity)
@@ -1563,12 +1293,11 @@ structure OperationalBytesFact where
 abbrev OperationalIndexedValueId := Nat
 
 inductive OperationalPayloadRef where
-  | matrix (id : OperationalExprId)
   | directValue (id : OperationalIndexedValueId)
   deriving BEq, Repr
 
 def OperationalPayloadRef.root : OperationalPayloadRef → Nat
-  | .matrix root | .directValue root => root
+  | .directValue root => root
 
 instance : Coe OperationalPayloadRef Nat := ⟨OperationalPayloadRef.root⟩
 
@@ -1629,10 +1358,6 @@ structure DirectValueMatrixOperation where
   deriving BEq
 
 abbrev OperationalFact := IndexedOperationalFact
-
-def OperationalFact.operationalExprRoot? : OperationalFact → Option OperationalExprId
-  | { payload := .matrix root, .. } => some root
-  | _ => none
 
 abbrev OperationalState := Array OperationalFact
 

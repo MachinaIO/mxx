@@ -282,6 +282,8 @@ def matrixOperationSchemasValid
       operationalSameRing input output && operationalDimensionEqual output.rows expectedRows &&
         operationalDimensionEqual output.columns expectedColumns
   | .scale _ _ _, #[.matrix input] => operationalMatrixTypeEqual input output
+  | .bggGrouping, #[.matrix vector, .matrix _, .matrix _] =>
+      operationalMatrixTypeEqual vector output
   | _, _ => false
 
 /-- Closed schemas for direct relation producers.  The concrete kernel performs the remaining
@@ -373,10 +375,9 @@ def DirectOperationalIndexedArena.pushExplicit
     some (arena.pushValue context (.explicit schema binder references))
   else none
 
-/-- Store an ordered table of already-authoritative direct values without converting any lane
-through the legacy expression arena.  All lane schemas must agree; their contexts are merged
-with the fresh family binder in first-occurrence order, so shared selector variables remain one
-correlated dimension rather than a Cartesian expansion. -/
+/-- Store an ordered table of already-authoritative direct values.  All lane schemas must agree;
+their contexts are merged with the fresh family binder in first-occurrence order, so shared
+selector variables remain one correlated dimension rather than a Cartesian expansion. -/
 def DirectOperationalIndexedArena.pushExplicitValues
     (environment : ParamEnvironment)
     (arena : DirectOperationalIndexedArena)
@@ -451,7 +452,7 @@ def DirectOperationalIndexedArena.pushPointwise
 /-- Rebuild one direct matrix value while transforming only the fixed matrix leaves reachable from
 the requested root.  The direct carrier's contexts, index maps, delayed operations, and sharing
 are retained; callers use this at graph-boundary rebinding points where subject metadata must
-change without reconstructing the legacy expression arena. -/
+change without reconstructing the carrier. -/
 partial def DirectOperationalIndexedArena.mapMatrixValue
     (arena : DirectOperationalIndexedArena)
     (root : OperationalIndexedValueId)
@@ -748,8 +749,8 @@ example :
     !pointwiseSchemasValid (.matrix operation) #[.matrix left, .matrix right] (.matrix wrongOutput) = true := by
   native_decide
 
-/-- Fixed references cannot name the legacy expression arena, and a missing direct fixed entry is
-rejected before an indexed value is allocated. -/
+/-- Fixed references name only direct fixed entries, and a missing entry is rejected before an
+indexed value is allocated. -/
 example : directCarrierFixtureArena.pushShared emptyContext (.scalar .real) (.scalar 99) = none := by
   native_decide
 

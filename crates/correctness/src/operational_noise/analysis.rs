@@ -721,13 +721,25 @@ fn merge_sort(
     right: Result<MxxSort, AnalysisError>,
 ) -> Result<MxxSort, AnalysisError> {
     match (left, right) {
-        (Ok(left), Ok(right)) if left == right => Ok(left),
+        (Ok(left), Ok(right)) if sorts_equal(&left, &right) => Ok(left),
         // The current public error registry carries `WireType` values, while
         // analysis works over owner-resolved MxxSort values.  Lowering performs
         // that lossless boundary conversion; until then preserve the first
         // existing typed error rather than fabricate a WireType.
         (Err(error), _) | (_, Err(error)) => Err(error),
         (Ok(expected), Ok(actual)) => Err(AnalysisError::EClassSortConflict { expected, actual }),
+    }
+}
+
+/// Equality for e-class sorts.  Closed arithmetic in matrix attributes and
+/// byte lengths is semantic, not syntactic: relation preflight and the typed
+/// operator transfers already use the same rule.  Runtime-dependent
+/// expressions still require structural equality through `resolved_equal`.
+fn sorts_equal(left: &MxxSort, right: &MxxSort) -> bool {
+    match (left, right) {
+        (MxxSort::Matrix(left), MxxSort::Matrix(right)) => matrix_types_equal(left, right),
+        (MxxSort::Bytes(left), MxxSort::Bytes(right)) => resolved_equal(left, right),
+        _ => left == right,
     }
 }
 
@@ -2550,6 +2562,78 @@ mod tests {
         let _ = complete.merge_from(incomplete);
 
         assert!(matches!(complete.sort, Err(AnalysisError::EClassSortConflict { .. })));
+    }
+
+    #[test]
+    fn merge_accepts_semantically_equal_closed_matrix_types() {
+        let literal = ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(2.into()),
+            columns: ResolvedIntExpr::Const(2.into()),
+        };
+        let arithmetic = ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Add(
+                Box::new(ResolvedIntExpr::Const(16.into())),
+                Box::new(ResolvedIntExpr::Const(1.into())),
+            ),
+            ring_dimension: ResolvedIntExpr::Sub(
+                Box::new(ResolvedIntExpr::Const(2.into())),
+                Box::new(ResolvedIntExpr::Const(1.into())),
+            ),
+            rows: ResolvedIntExpr::Mul(
+                Box::new(ResolvedIntExpr::Const(1.into())),
+                Box::new(ResolvedIntExpr::Const(2.into())),
+            ),
+            columns: ResolvedIntExpr::Add(
+                Box::new(ResolvedIntExpr::Const(1.into())),
+                Box::new(ResolvedIntExpr::Const(1.into())),
+            ),
+        };
+        let mut merged = AnalysisData::matrix(literal, None);
+
+        merged.merge_from(AnalysisData::matrix(arithmetic, None));
+
+        assert!(matches!(merged.sort, Ok(MxxSort::Matrix(_))));
+    }
+
+    #[test]
+    fn merge_accepts_semantically_equal_closed_byte_lengths() {
+        let mut merged = data_for_sort(MxxSort::Bytes(ResolvedIntExpr::Const(2.into())));
+        merged.merge_from(data_for_sort(MxxSort::Bytes(ResolvedIntExpr::Add(
+            Box::new(ResolvedIntExpr::Const(1.into())),
+            Box::new(ResolvedIntExpr::Const(1.into())),
+        ))));
+
+        assert!(matches!(merged.sort, Ok(MxxSort::Bytes(_))));
+
+        let mut unequal = data_for_sort(MxxSort::Bytes(ResolvedIntExpr::Const(2.into())));
+        unequal.merge_from(data_for_sort(MxxSort::Bytes(ResolvedIntExpr::Const(3.into()))));
+        assert!(matches!(unequal.sort, Err(AnalysisError::EClassSortConflict { .. })));
+    }
+
+    #[test]
+    fn merge_rejects_unequal_or_runtime_distinct_matrix_types() {
+        let mut unequal = AnalysisData::matrix(scalar_matrix_type(1), None);
+        unequal.merge_from(AnalysisData::matrix(scalar_matrix_type(2), None));
+        assert!(matches!(unequal.sort, Err(AnalysisError::EClassSortConflict { .. })));
+
+        let binder = |node| BinderKey {
+            loop_scope: OccurrenceScope {
+                program: ProgramKey::Ideal,
+                definition: mxx_ir_core::FrozenGraphScopeId::Root,
+                path: Box::new([]),
+            },
+            loop_node: mxx_ir_core::NodeId(node),
+            slot: 0,
+        };
+        let mut left = scalar_matrix_type(1);
+        left.columns = ResolvedIntExpr::Binder(binder(1));
+        let mut right = scalar_matrix_type(1);
+        right.columns = ResolvedIntExpr::Binder(binder(2));
+        let mut unresolved = AnalysisData::matrix(left, None);
+        unresolved.merge_from(AnalysisData::matrix(right, None));
+        assert!(matches!(unresolved.sort, Err(AnalysisError::EClassSortConflict { .. })));
     }
 
     #[test]

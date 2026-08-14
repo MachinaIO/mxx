@@ -1137,7 +1137,14 @@ mod tests {
         let context = RewriteContext::new(SharedRewriteBudget::new());
         context.register(registration(source, public, target));
 
-        assert!(checked_replacement(&mut egraph, &context, &[public, relation], 1).is_some());
+        let product = egraph.add(MxxLang::MatrixMultiply(vec![public, relation].into()));
+        let replacement = checked_replacement(&mut egraph, &context, &[public, relation], 1)
+            .expect("closed-equivalent relation layout is rewritten")
+            .0;
+        egraph.union(product, replacement);
+        egraph.rebuild();
+
+        assert!(matches!(egraph[egraph.find(product)].data.sort, Ok(MxxSort::Matrix(_))));
         assert_eq!(context.failure(), None);
     }
 

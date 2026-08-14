@@ -8,7 +8,7 @@
 use super::{
     OperationalAcceptanceReport, OperationalSimulationDiagnostics, OperationalSimulationReport,
     analysis::{MxxAnalysis, ResourceBudget},
-    bound::{BoundEvaluationControl, BoundEvaluationError, BoundEvaluator},
+    bound::BoundEvaluationError,
     error::{OperationalSimulationError, TargetError},
     extract::{ExtractionControl, ProposalNodeClassification, extract_best_proposal},
     language::MxxLang,
@@ -92,12 +92,6 @@ struct ProgressState {
     last_emitted: Instant,
 }
 
-/// Read-only bound callbacks still update the one job's progress owner through
-/// this interior-mutability bridge.
-struct BoundControlAdapter<'a, 'control> {
-    control: RefCell<&'a mut SimulationControl<'control>>,
-}
-
 /// Shares the production progress owner with graph lowering.
 struct LoweringControlAdapter<'a, 'control> {
     control: &'a mut SimulationControl<'control>,
@@ -116,15 +110,6 @@ impl LoweringControl for LoweringControlAdapter<'_, '_> {
         );
         let _ = self.control.work(1, None, None);
         Ok(())
-    }
-}
-
-impl BoundEvaluationControl for BoundControlAdapter<'_, '_> {
-    fn validate_pack(&self, term: egg::Id, _bit_count: usize) -> Result<(), BoundEvaluationError> {
-        self.control
-            .borrow_mut()
-            .work(1, None, None)
-            .map_err(|_| BoundEvaluationError::InvalidPack { term })
     }
 }
 
@@ -467,7 +452,7 @@ pub fn check_operational_noise_candidate_with_progress(
             }
             Ok((lowerer, roots, stage, wire, context))
         },
-        |(mut lowerer, roots, stage, wire, context), control| {
+        |(lowerer, roots, stage, wire, context), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
             let control = RefCell::new(control);
             let mut invalid_dag = |_| OperationalSimulationError::Lower {
@@ -481,6 +466,7 @@ pub fn check_operational_noise_candidate_with_progress(
             let view = lowerer.production_bound_view();
             control.borrow_mut().reserve_owned_elements(roots.len())?;
             let mut proposals = Vec::with_capacity(roots.len());
+            let mut bounds = Vec::with_capacity(roots.len());
             for root in roots {
                 let root = lowerer.egraph.find(root);
                 let proposal = extract_best_proposal(
@@ -511,7 +497,15 @@ pub fn check_operational_noise_candidate_with_progress(
                         },
                     });
                 }
-                if proposal.cost.large_residual {
+                let semantic_bound = proposal.semantic_bound.clone().ok_or_else(|| {
+                    OperationalSimulationError::Bound {
+                        site: site(&stage, wire, "extract semantic bound"),
+                        source: super::error::BoundError::EvaluationFailed {
+                            source: BoundEvaluationError::NonMatrixTerm { term: root },
+                        },
+                    }
+                })?;
+                if matches!(semantic_bound.coefficient_class, super::bound::BoundClass::Large) {
                     let source = proposal.first_large_source.and_then(|source| {
                         lowerer
                             .egraph
@@ -531,6 +525,7 @@ pub fn check_operational_noise_candidate_with_progress(
                         ),
                     });
                 }
+                bounds.push((root, semantic_bound));
                 proposals.push(proposal);
             }
             drop(view);
@@ -542,38 +537,24 @@ pub fn check_operational_noise_candidate_with_progress(
                 Some(lowerer.egraph.total_size() as u64),
             )?;
             control.borrow_mut().diagnostics_mut().final_term_count = term_count as u64;
-            let mut extracted_egraph = EGraph::new(lowerer.egraph.analysis.clone());
-            control.borrow_mut().reserve_owned_elements(proposals.len())?;
-            let extracted_roots = proposals
-                .iter()
-                .map(|proposal| extracted_egraph.add_expr(&proposal.expression))
-                .collect::<Vec<_>>();
-            lowerer.egraph = extracted_egraph;
-            Ok((lowerer, extracted_roots, stage, wire))
+            drop(lowerer);
+            Ok((bounds, stage, wire))
         },
-        |(lowerer, roots, stage, wire), control| {
+        |(bounds, stage, wire), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
-            let bound_control = BoundControlAdapter { control: RefCell::new(control) };
-            let view = lowerer.production_bound_view_with_control(&bound_control);
             let mut bound = BigUint::zero();
-            for root in roots {
-                let result = match BoundEvaluator::new(&view).evaluate(root) {
-                    Ok(result) => result,
-                    Err(source) => {
-                        return Err(OperationalSimulationError::Bound {
+            for (root, result) in bounds {
+                let maximum =
+                    result.coefficient_class.maximum_absolute_coefficient().ok_or_else(|| {
+                        OperationalSimulationError::Bound {
                             site: site(&stage, wire, "bound"),
-                            source: super::error::BoundError::EvaluationFailed { source },
-                        });
-                    }
-                };
-                let maximum = result
-                    .coefficient_class
-                    .maximum_absolute_coefficient()
-                    .expect("BoundEvaluator rejects final Large roots");
+                            source: super::error::BoundError::EvaluationFailed {
+                                source: BoundEvaluationError::UnconsumedLargeTerm { term: root },
+                            },
+                        }
+                    })?;
                 bound = bound.max(maximum);
             }
-            drop(view);
-            drop(bound_control);
             control.work(1, None, None)?;
             Ok(bound)
         },

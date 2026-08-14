@@ -42,6 +42,10 @@ pub struct ProposalNodeClassification {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtractedProposal {
     pub cost: ProposalCost,
+    /// Exact coefficient bound of the selected matrix root.  Generic
+    /// non-matrix extraction users receive `None`; production rejects that
+    /// case before final acceptance.
+    pub semantic_bound: Option<MatrixBound>,
     /// Ephemeral diagnostic for a selected Large residual.  It is never
     /// stored in the e-graph, analysis data, or a source registry.
     pub first_large_source: Option<AtomicSourceId>,
@@ -138,10 +142,21 @@ pub fn extract_best_proposal<I: BoundInput>(
                 else {
                     continue;
                 };
-                let improves = candidates[index].as_ref().is_none_or(|current| {
+                let replace = candidates[index].as_ref().is_none_or(|current| {
                     cost < current.cost || (cost == current.cost && node < &current.node)
                 });
-                if improves {
+                // A selected node can acquire a different semantic bound when
+                // one of its selected children is refreshed at the same public
+                // cost.  Keep that node current even if the derived ordering
+                // cost worsens; a later scan then compares every alternative
+                // against the refreshed candidate.
+                let refresh = candidates[index].as_ref().is_some_and(|current| {
+                    node == &current.node &&
+                        (cost != current.cost ||
+                            semantic_bound != current.semantic_bound ||
+                            first_large_source != current.first_large_source)
+                });
+                if replace || refresh {
                     candidates[index] = Some(Candidate {
                         cost,
                         semantic_bound,
@@ -161,10 +176,9 @@ pub fn extract_best_proposal<I: BoundInput>(
 
     let root = egraph.find(root);
     let root_index = usize::from(root);
-    let Some(root_candidate) = candidates.get(root_index).and_then(Option::as_ref) else {
+    if candidates.get(root_index).and_then(Option::as_ref).is_none() {
         return Err((control.invalid_dag)(root));
-    };
-    let root_cost = root_candidate.cost.clone();
+    }
 
     let mut work = vec![BuildFrame::Enter(root)];
     let mut nodes = Vec::<MxxLang>::new();
@@ -208,11 +222,40 @@ pub fn extract_best_proposal<I: BoundInput>(
                 if let Some(child) = missing_child {
                     return Err((control.invalid_dag)(child));
                 }
+                // Relaxation selects by public lexicographic cost.  A child can
+                // change to an equally priced finite alternative without changing
+                // an ancestor's cost, so refresh the selected node only after its
+                // selected children are complete.  This is the same zero-first
+                // transfer used for final evaluation, not a second bound cache.
+                let semantic_bound = matches!(&egraph[class].data.sort, Ok(MxxSort::Matrix(_)))
+                    .then(|| {
+                        let children = CandidateChildBounds { egraph, candidates: &candidates };
+                        BoundEvaluator::evaluate_selected_node(
+                            bound_input,
+                            class,
+                            &candidate.node,
+                            &children,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|source| (control.bound_error)(source))?;
+                let first_large_source = selected_first_large_source(
+                    egraph,
+                    &candidate.node,
+                    semantic_bound.as_ref(),
+                    &candidates,
+                );
                 let output = Id::from(nodes.len());
                 nodes.push(output_node);
                 let Some(candidate) = candidates[index].as_mut() else {
                     return Err((control.invalid_dag)(class));
                 };
+                candidate.semantic_bound = semantic_bound;
+                candidate.cost.large_residual = candidate
+                    .semantic_bound
+                    .as_ref()
+                    .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large));
+                candidate.first_large_source = first_large_source;
                 candidate.output = Some(output);
                 candidate.state = ExtractionState::Complete;
             }
@@ -223,11 +266,16 @@ pub fn extract_best_proposal<I: BoundInput>(
     if !expression.is_dag() {
         return Err((control.invalid_dag)(root));
     }
-    let first_large_source = candidates
+    let root_candidate = candidates
         .get(root_index)
         .and_then(Option::as_ref)
-        .and_then(|candidate| candidate.first_large_source);
-    Ok(ExtractedProposal { cost: root_cost, first_large_source, expression })
+        .ok_or_else(|| (control.invalid_dag)(root))?;
+    Ok(ExtractedProposal {
+        cost: root_candidate.cost.clone(),
+        semantic_bound: root_candidate.semantic_bound.clone(),
+        first_large_source: root_candidate.first_large_source,
+        expression,
+    })
 }
 
 struct CandidateChildBounds<'a> {
@@ -284,23 +332,8 @@ fn proposal_cost<I: BoundInput>(
     let large_residual = semantic_bound
         .as_ref()
         .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large));
-    let first_large_source = large_residual
-        .then(|| match node {
-            MxxLang::Atom { source, .. } => Some(*source),
-            _ => node.children().iter().find_map(|child| {
-                let child = egraph.find(*child);
-                candidates
-                    .get(usize::from(child))
-                    .and_then(Option::as_ref)
-                    .filter(|candidate| {
-                        candidate.semantic_bound.as_ref().is_some_and(|bound| {
-                            matches!(bound.coefficient_class, BoundClass::Large)
-                        })
-                    })
-                    .and_then(|candidate| candidate.first_large_source)
-            }),
-        })
-        .flatten();
+    let first_large_source =
+        selected_first_large_source(egraph, node, semantic_bound.as_ref(), candidates);
     Ok(Some((
         ProposalCost {
             remaining_relation_redexes: child_remaining
@@ -318,6 +351,32 @@ fn proposal_cost<I: BoundInput>(
         semantic_bound,
         first_large_source,
     )))
+}
+
+fn selected_first_large_source(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    node: &MxxLang,
+    semantic_bound: Option<&MatrixBound>,
+    candidates: &[Option<Candidate>],
+) -> Option<AtomicSourceId> {
+    semantic_bound
+        .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large))
+        .then(|| match node {
+            MxxLang::Atom { source, .. } => Some(*source),
+            _ => node.children().iter().find_map(|child| {
+                let child = egraph.find(*child);
+                candidates
+                    .get(usize::from(child))
+                    .and_then(Option::as_ref)
+                    .filter(|candidate| {
+                        candidate.semantic_bound.as_ref().is_some_and(|bound| {
+                            matches!(bound.coefficient_class, BoundClass::Large)
+                        })
+                    })
+                    .and_then(|candidate| candidate.first_large_source)
+            }),
+        })
+        .flatten()
 }
 
 #[cfg(test)]
@@ -602,6 +661,11 @@ mod tests {
             result.expression[result.expression.root()],
             MxxLang::Atom { source, .. } if source == bounded_source
         ));
+        assert!(matches!(
+            result.semantic_bound.map(|bound| bound.coefficient_class),
+            Some(BoundClass::Bounded { maximum_absolute_coefficient })
+                if maximum_absolute_coefficient == BigUint::from(3_u8)
+        ));
     }
 
     #[test]
@@ -620,6 +684,66 @@ mod tests {
         assert!(result.cost.large_residual);
         assert_eq!(result.first_large_source, Some(large_source));
         assert_eq!(result.expression.as_ref().len(), 2);
+        assert!(matches!(
+            result.semantic_bound.map(|bound| bound.coefficient_class),
+            Some(BoundClass::Large)
+        ));
+    }
+
+    #[test]
+    fn same_node_refresh_propagates_zero_over_a_large_child() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        // The e-class order deliberately makes `delayed` unavailable while
+        // `descendant` first selects its bounded transpose alternative.
+        let (root_placeholder, root_source) = matrix_atom(&mut egraph, "root");
+        let (ready, ready_source) = matrix_atom(&mut egraph, "ready");
+        let (descendant, descendant_source) = matrix_atom(&mut egraph, "descendant");
+        let (delayed, delayed_source) = matrix_atom(&mut egraph, "delayed");
+        let (large, large_source) = matrix_atom(&mut egraph, "large");
+        let transpose = egraph.add(MxxLang::MatrixTranspose([ready]));
+        let negate = egraph.add(MxxLang::MatrixNegate([delayed]));
+        let product = egraph.add(MxxLang::MatrixMultiply(vec![descendant, large].into()));
+        egraph.union(descendant, transpose);
+        egraph.union(descendant, negate);
+        egraph.union(root_placeholder, product);
+        egraph.rebuild();
+        let input = SemanticInput {
+            atom_classes: BTreeMap::from([
+                (root_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (ready_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (
+                    descendant_source,
+                    BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() },
+                ),
+                (delayed_source, BoundClass::ExactZero),
+                (large_source, BoundClass::Large),
+            ]),
+            ..Default::default()
+        };
+        let mut invalid = |_| panic!("fixture has a finite selected DAG");
+        let mut bound_error = |error| panic!("fixture has valid matrix bounds: {error:?}");
+        let result = extract_best_proposal(
+            &egraph,
+            root_placeholder,
+            &input,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut |_, node, _| {
+                Ok(ProposalNodeClassification {
+                    relation_redex: matches!(
+                        node,
+                        MxxLang::Atom { source, .. }
+                            if *source == root_source || *source == descendant_source
+                    ),
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(!result.cost.large_residual);
+        assert_eq!(
+            result.semantic_bound.map(|bound| bound.coefficient_class),
+            Some(BoundClass::ExactZero)
+        );
     }
 
     struct NoSelectedChildren;

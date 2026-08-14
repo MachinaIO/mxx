@@ -6070,6 +6070,181 @@ mod tests {
     }
 
     #[test]
+    fn parallel_zip_state_input_shadows_a_completed_stale_memo() {
+        use mxx_ir_core::graph::{
+            GraphOutput, NodeHandle, SubgraphHandle, with_new_construction_scope,
+        };
+
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let count = IntExpr::constant(2);
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(matrix.clone())),
+            count: count.clone(),
+        };
+        let root = NodeHandle::new(
+            NodeKind::Input {
+                name: "values".to_owned(),
+                wire_type: family_type.clone(),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![family_type.clone()],
+        )
+        .output(0)
+        .expect("family input");
+        let body = with_new_construction_scope(|scope| {
+            let input = NodeHandle::new(
+                NodeKind::Input {
+                    name: "item".to_owned(),
+                    wire_type: WireType::Matrix(matrix.clone()),
+                    artifact: None,
+                },
+                Vec::new(),
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .expect("Zip body input");
+            SubgraphHandle::new("zip-body", scope, vec![input.clone()], vec![input])
+                .expect("Zip body")
+        });
+        let family = NodeHandle::parallel_loop(
+            body,
+            vec![root],
+            vec![family_type.clone()],
+            ParallelLoop {
+                count: count.clone(),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: Vec::new(),
+                input_modes: vec![LoopInputMode::Zip],
+            },
+        )
+        .output(0)
+        .expect("Zip output");
+        let output = NodeHandle::new(
+            NodeKind::FamilyGetStatic { index: IntExpr::constant(0) },
+            vec![family],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .expect("selected Zip output");
+        let graph = mxx_ir_core::graph::Graph::freeze(
+            "zip-memo-shadow",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze Zip graph")
+        .0;
+        let root_scope = graph.root_scope();
+        let loop_node = root_scope
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+            .and_then(|node| root_scope.node_id(node))
+            .expect("frozen Zip loop owner");
+        let body_scope = graph
+            .child_scope_id(&FrozenGraphScopeId::Root, loop_node)
+            .expect("frozen Zip body scope");
+        let body_input = *graph
+            .scope(&body_scope)
+            .expect("Zip body scope")
+            .inputs()
+            .first()
+            .expect("Zip body input");
+        let stage = StageId("encrypt".to_owned());
+        let body_occurrence = OccurrenceScope {
+            program: super::super::identity::ProgramKey::WorkflowStage(stage.clone()),
+            definition: body_scope,
+            path: Box::new([super::super::identity::OccurrenceFrame::ParallelLoop {
+                parent: FrozenGraphScopeId::Root,
+                owner: loop_node,
+            }]),
+        };
+        let shadowed = LoweringWire {
+            source: WireSourceKey { scope: body_occurrence.clone(), wire: body_input },
+            indices: Box::new([]),
+        };
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = graph;
+        let input_id = crate::ProtocolInputId::from("values");
+        protocol.bundle.input_contract.inputs.push(crate::InputContractEntry {
+            id: input_id.clone(),
+            name: "values".to_owned(),
+            value: InputValueContract::Family {
+                count,
+                element: Box::new(InputValueContract::MatrixExact {
+                    matrix_type: matrix.clone(),
+                    canonical_coefficient_exclusive_upper_bound: Some(IntExpr::constant(7)),
+                    is_constant_polynomial: true,
+                }),
+            },
+        });
+        protocol.bundle.input_bindings.push(crate::ProtocolInputBinding {
+            input: input_id,
+            destinations: vec![ProtocolInputDestination::WorkflowStage {
+                stage: stage.clone(),
+                input: StageInputName("values".to_owned()),
+            }],
+        });
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "zip-memo-shadow".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let sort = MxxSort::Matrix(
+            lowerer.resolve_matrix_type(&matrix, &root_test_environment()).unwrap(),
+        );
+        let stale = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::GraphWire(
+                    super::super::identity::GraphWireSourceKey {
+                        wire: shadowed.source.clone(),
+                        coordinate_binders: Box::new([]),
+                    },
+                ),
+                sort,
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            },
+        );
+        let stale_term = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(stale),
+            indices: Box::new([]),
+        });
+        lowerer.finish_wire(&shadowed, LoweredValue::Term(stale_term));
+        let LoweredValue::Term(lowered) = lowerer
+            .lower_stage_wire(
+                &stage,
+                protocol.bundle.workflow.stages[0].graph.outputs()["output"].value,
+            )
+            .expect("production Zip lowering")
+        else {
+            panic!("matrix output")
+        };
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(lowered)
+                .expect("finite Zip bound")
+                .coefficient_class,
+            BoundClass::bounded(6_u8.into())
+        );
+        assert!(lowerer.egraph[lowerer.egraph.find(lowered)].nodes.iter().any(|node| matches!(node, MxxLang::Atom { source, .. } if matches!(lowerer.egraph.analysis.symbols.atomic_sources.get(source.0).unwrap().key, super::super::identity::AtomicSourceKey::ProtocolInput(_)))));
+    }
+
+    #[test]
     fn runtime_and_stable_indices_have_distinct_memo_keys() {
         let source = WireSourceKey {
             scope: OccurrenceScope {

@@ -320,6 +320,12 @@ pub(crate) fn canonical_nonnegative_residue(value: &BigInt, modulus: &BigUint) -
     ((value % &modulus) + &modulus) % &modulus
 }
 
+/// The canonical small-decomposition contract: every coefficient is below `upper`,
+/// and the producer's closed small-digit limit is `limit`.
+pub fn canonical_range_within_limit(upper: Option<&BigUint>, limit: &BigUint) -> bool {
+    upper.is_some_and(|upper| upper <= limit)
+}
+
 /// Computes `base^exponent mod modulus` without first allocating `base^exponent`.
 ///
 /// The exponent bit guard is a checker resource boundary. The Stage 7 bound
@@ -379,6 +385,16 @@ pub enum SamplerIdentity {
         target: egg::Id,
         arguments: Box<[egg::Id]>,
         matrix_type: ResolvedMatrixType,
+        base: ResolvedIntExpr,
+        digit_count: ResolvedIntExpr,
+        small: bool,
+        range_proved: bool,
+    },
+    GadgetDecomposition {
+        source: GraphWireSourceKey,
+        indices: Box<[egg::Id]>,
+        public: egg::Id,
+        target: egg::Id,
         base: ResolvedIntExpr,
         digit_count: ResolvedIntExpr,
         small: bool,
@@ -488,6 +504,15 @@ pub struct SymbolTables {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_small_range_accepts_equality_and_strictly_smaller_only() {
+        let limit = BigUint::from(8_u8);
+        assert!(canonical_range_within_limit(Some(&BigUint::from(8_u8)), &limit));
+        assert!(canonical_range_within_limit(Some(&BigUint::from(7_u8)), &limit));
+        assert!(!canonical_range_within_limit(Some(&BigUint::from(9_u8)), &limit));
+        assert!(!canonical_range_within_limit(None, &limit));
+    }
 
     fn scope(program: ProgramKey) -> OccurrenceScope {
         OccurrenceScope { program, definition: FrozenGraphScopeId::Root, path: Box::new([]) }

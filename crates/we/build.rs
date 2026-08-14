@@ -30,9 +30,7 @@ fn main() {
         workspace.join("crates/correctness/build_support.rs").display()
     );
     println!("cargo:rerun-if-env-changed=MXX_REGENERATE_CORRECTNESS");
-    let checker = workspace.join("lean/.lake/build/bin/mxx_diamond_checker");
     let derivation_checker = workspace.join("lean/.lake/build/bin/mxx_diamond_derivation_checker");
-    println!("cargo:rustc-env=MXX_DIAMOND_CHECKER={}", checker.display());
     println!("cargo:rustc-env=MXX_DIAMOND_DERIVATION_CHECKER={}", derivation_checker.display());
 
     if env::var_os("MXX_REGENERATE_CORRECTNESS").is_some() {
@@ -57,7 +55,6 @@ fn main() {
         &[
             "MxxWe.Generated.DiamondWeFamily.Ir",
             "MxxWe.Generated.DiamondWeFamily.Derivation",
-            "mxx_diamond_checker",
             "mxx_diamond_derivation_checker",
         ],
         "Diamond WE generated protocol and checker build",
@@ -65,7 +62,6 @@ fn main() {
     .unwrap_or_else(|error| panic!("{error}"));
     build_support::verify_no_proof_holes(workspace, &[&workspace.join("lean/Mxx"), &owner_lean])
         .unwrap_or_else(|error| panic!("{error}"));
-    assert!(checker.is_file(), "Diamond WE checker was not produced at {}", checker.display());
     assert!(
         derivation_checker.is_file(),
         "Diamond WE derivation checker was not produced at {}",

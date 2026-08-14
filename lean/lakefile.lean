@@ -23,10 +23,6 @@ lean_lib MxxGadgets where
 lean_lib MxxWe where
   srcDir := "../crates/we/lean"
 
-lean_exe mxx_diamond_checker where
-  root := `MxxWe.DiamondChecker
-  srcDir := "../crates/we/lean"
-
 lean_exe mxx_diamond_derivation_checker where
   root := `MxxWe.DiamondDerivationChecker
   srcDir := "../crates/we/lean"

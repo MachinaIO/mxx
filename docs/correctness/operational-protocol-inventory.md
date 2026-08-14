@@ -3,22 +3,19 @@
 ## Purpose
 
 This is the normative inventory for the execution-aligned operational checker. Every executable
-Rust IR variant and every nested operation variant has one row below. Rust-to-Lean emission is in
-`crates/correctness/src/emit_lean.rs`; the exhaustive Lean transfer classification and the actual
-transfer functions are in `lean/Mxx/Certificate/OperationalBounds.lean`.
+Rust IR variant and every nested operation variant has one row below. Protocol emission is in
+`crates/correctness/src/emit_lean.rs`; operational transfer classification is owned by the Rust
+operational-noise checker.
 
 The compiler-enforced coverage boundary has three parts:
 
 1. Rust emission matches `NodeKind` exhaustively and has no catch-all arm.
-2. Lean `operationalTransferClass` matches every `NodeKind` exhaustively.
-3. Nested enums are matched by the exhaustive `classifyIntBinary`, `classifyIntCompare`,
-   `classifyRealBinary`, `classifyConcatAxis`, `classifyHashVariant`, and
-   `classifyLoopInputMode` functions.
+2. The operational lowering dispatch matches every `NodeKind` exhaustively.
+3. Nested enums are matched exhaustively at their Rust lowering boundary.
 
 Adding a constructor to any of those enums therefore breaks compilation until an explicit
-operational-checker decision is made. Structural nodes are evaluated by `evaluateCheckedScope`;
-ordinary scalar and matrix nodes are evaluated by `genericNodeFact`. A valid emitted node must
-reach one of those paths or a documented normal rejection, never an implicit default fact.
+operational-checker decision is made. A valid emitted node must reach an explicit lowering path or
+a documented normal rejection, never an implicit default fact.
 
 All matrix equalities used by relations are equalities in `R_q`, not integer equalities. `B` is
 the shared source public matrix in a preimage relation: branch-specific targets and preimages obey

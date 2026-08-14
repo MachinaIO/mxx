@@ -2,18 +2,15 @@ use super::{
     DiamondWeCompiler, DiamondWeConfig, default_error_max_coefficient_bound,
     default_preimage_max_coefficient_bound,
 };
+use mxx_correctness::operational_noise::{
+    OperationalCheckRequest, OperationalGadgetLayout, OperationalParameterValue,
+    OperationalSimulationReport, check_operational_noise_candidate,
+};
 use mxx_gadgets::circuit::{BooleanCircuitError, BooleanCircuitShape};
-use mxx_ir_core::{ParamEnv, RealExpr};
+use mxx_ir_core::RealExpr;
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
-use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeMap,
-    io::{BufRead, BufReader, Write},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::BTreeMap, process::Command, sync::Arc, time::Instant};
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -72,7 +69,7 @@ pub enum DiamondParameterSearchError {
     Expression,
     #[error("the selected Diamond compiler configuration is invalid: {0}")]
     Config(String),
-    #[error("the Lean Diamond checker failed: {0}")]
+    #[error("the Rust operational checker could not evaluate the Diamond candidate: {0}")]
     CheckerInfrastructure(String),
 }
 
@@ -108,7 +105,6 @@ impl DiamondParameterSearch {
             error_sigma = self.error_sigma,
             "starting Diamond WE parameter search"
         );
-        let mut checker = LeanCheckerSession::start()?;
         let mut cache = BTreeMap::<usize, Candidate>::new();
         let mut evaluate = |crt_depth: usize| -> Result<bool, DiamondParameterSearchError> {
             let started = Instant::now();
@@ -116,12 +112,7 @@ impl DiamondParameterSearch {
                 info!(crt_depth, "evaluating Diamond WE parameter candidate");
                 let (log_ring_dimension, achieved) =
                     self.select_ring_dimension(crt_depth, &mut estimate_security)?;
-                entry.insert(self.evaluate_candidate(
-                    crt_depth,
-                    log_ring_dimension,
-                    achieved,
-                    &mut checker,
-                )?);
+                entry.insert(self.evaluate_candidate(crt_depth, log_ring_dimension, achieved)?);
                 let candidate = cache.get(&crt_depth).expect("inserted candidate");
                 info!(
                     crt_depth,
@@ -234,7 +225,6 @@ impl DiamondParameterSearch {
         crt_depth: usize,
         log_ring_dimension: usize,
         achieved_security_bits: u64,
-        checker: &mut LeanCheckerSession,
     ) -> Result<Candidate, DiamondParameterSearchError> {
         let started = Instant::now();
         let ring_dimension = 1u32
@@ -286,14 +276,26 @@ impl DiamondParameterSearch {
             setup_elapsed_seconds = started.elapsed().as_secs_f64(),
             "constructed Diamond WE checker candidate"
         );
+        let declaration = compiler
+            .protocol_decl()
+            .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?;
+        let request = operational_request(&parameters, &compiler)?;
         let checker_started = Instant::now();
-        let correct = checker.accepts(&parameters, &compiler)?;
+        let report = check_operational_noise_candidate(declaration.protocol(), &request).map_err(
+            |error| DiamondParameterSearchError::CheckerInfrastructure(error.to_string()),
+        )?;
+        let correct = operational_decision(&report);
         info!(
             crt_depth,
             ring_dimension,
             accepted = correct,
+            noise_bound = %report.noise_bound,
+            ciphertext_modulus = %report.ciphertext_modulus,
+            lowered_term_count = report.diagnostics.lowered_term_count,
+            egraph_node_count = report.diagnostics.egraph_node_count,
+            relation_rewrite_count = report.diagnostics.relation_rewrite_count,
             elapsed_seconds = checker_started.elapsed().as_secs_f64(),
-            "finished Diamond WE Lean hard-bound check"
+            "finished Diamond WE Rust operational-noise check"
         );
         Ok(Candidate {
             selected: DiamondSelectedParameters {
@@ -336,155 +338,45 @@ impl DiamondParameterSearch {
     }
 }
 
-fn checker_arguments(
+/// A successfully evaluated report is a candidate decision; only checker errors are search
+/// infrastructure failures.  Keeping this boundary explicit prevents ordinary rejected bounds
+/// from aborting CRT-depth search.
+fn operational_decision(report: &OperationalSimulationReport) -> bool {
+    report.accepted
+}
+
+fn operational_request(
     parameters: &DCRTPolyParams,
     compiler: &DiamondWeCompiler,
-) -> Result<Vec<String>, DiamondParameterSearchError> {
+) -> Result<OperationalCheckRequest, DiamondParameterSearchError> {
     let config = &compiler.config;
-    let trapdoor_sigma = config
-        .trapdoor_sigma
-        .evaluate_rational(&ParamEnv::default())
-        .map_err(|_| DiamondParameterSearchError::Expression)?;
-    let error_sigma = config
-        .error_sigma
-        .evaluate_rational(&ParamEnv::default())
-        .map_err(|_| DiamondParameterSearchError::Expression)?;
     let (crt_moduli, crt_bits, _) = parameters.to_crt();
     let base_bits = parameters.base_bits();
     let small_digit_count = crt_bits.div_ceil(base_bits as usize);
     let smallest_crt_modulus =
         crt_moduli.iter().copied().min().ok_or(DiamondParameterSearchError::InvalidRange)?;
-    let descriptor_material = format!(
-        "dcrt-v1|{}|{}|{}|{}|{}",
-        parameters.ring_dimension(),
-        crt_bits,
-        base_bits,
-        config.gadget_base,
-        crt_moduli.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
-    );
-    let layout_id = format!("{:x}", Sha256::digest(descriptor_material.as_bytes()));
-    let mut arguments = vec![
-        compiler.shape.instance_width.to_string(),
-        compiler.shape.witness_width.to_string(),
-        compiler.shape.depth.to_string(),
-        compiler.shape.max_layer_width.to_string(),
-        config.ring_dimension.to_string(),
-        config.input_count.to_string(),
-        config.digit_base.to_string(),
-        config.batch_bits.to_string(),
-        config.digit_count.to_string(),
-        config.modulus.to_string(),
-        config.gadget_base.to_string(),
-        config.error_max_coefficient_bound.to_string(),
-        config.preimage_max_coefficient_bound.to_string(),
-        trapdoor_sigma.numerator().to_string(),
-        trapdoor_sigma.denominator().to_string(),
-        error_sigma.numerator().to_string(),
-        error_sigma.denominator().to_string(),
-        layout_id,
-        parameters.ring_dimension().to_string(),
-        crt_bits.to_string(),
-        base_bits.to_string(),
-        config.gadget_base.to_string(),
-        config.digit_count.to_string(),
-        small_digit_count.to_string(),
-        smallest_crt_modulus.to_string(),
-        crt_moduli.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
-        "diamond-boolean-interval".to_owned(),
-    ];
-    // The checker echoes this value.  It binds an acceptance response to the complete candidate
-    // request, including the ordered CRT layout metadata, without affecting generated Lean code.
-    let request_hash = format!("{:x}", Sha256::digest(arguments.join("\u{1f}").as_bytes()));
-    arguments.push(request_hash);
-    Ok(arguments)
-}
-
-struct LeanCheckerSession {
-    child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-}
-
-impl LeanCheckerSession {
-    fn start() -> Result<Self, DiamondParameterSearchError> {
-        let mut child = Command::new(env!("MXX_DIAMOND_CHECKER"))
-            // Cargo's build-script environment contains the complete Lean dependency path and can
-            // exceed execve's argument-and-environment limit when inherited by the checker.
-            .env_clear()
-            .arg("--server")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                DiamondParameterSearchError::CheckerInfrastructure(error.to_string())
-            })?;
-        let input = child.stdin.take().ok_or_else(|| {
-            DiamondParameterSearchError::CheckerInfrastructure(
-                "checker stdin is unavailable".into(),
-            )
-        })?;
-        let output = child.stdout.take().ok_or_else(|| {
-            DiamondParameterSearchError::CheckerInfrastructure(
-                "checker stdout is unavailable".into(),
-            )
-        })?;
-        Ok(Self { child, input, output: BufReader::new(output) })
-    }
-
-    fn accepts(
-        &mut self,
-        parameters: &DCRTPolyParams,
-        compiler: &DiamondWeCompiler,
-    ) -> Result<bool, DiamondParameterSearchError> {
-        let arguments = checker_arguments(parameters, compiler)?;
-        let request_hash = arguments.last().expect("checker request hash is present");
-        writeln!(self.input, "{}", arguments.join(" ")).and_then(|()| self.input.flush()).map_err(
-            |error| DiamondParameterSearchError::CheckerInfrastructure(error.to_string()),
-        )?;
-        let mut response = String::new();
-        self.output.read_line(&mut response).map_err(|error| {
-            DiamondParameterSearchError::CheckerInfrastructure(error.to_string())
-        })?;
-        let mut response = response.trim().split_ascii_whitespace();
-        let decision = response.next();
-        let response_hash = response.next();
-        if response.next().is_some() {
-            return Err(DiamondParameterSearchError::CheckerInfrastructure(
-                "malformed checker response".into(),
-            ));
-        }
-        if response_hash != Some(request_hash.as_str()) {
-            return Err(DiamondParameterSearchError::CheckerInfrastructure(
-                "checker response does not match the request".into(),
-            ));
-        }
-        match decision {
-            Some("true") => Ok(true),
-            Some("false") => Ok(false),
-            None => Err(DiamondParameterSearchError::CheckerInfrastructure(
-                "checker terminated without a response".into(),
-            )),
-            Some(other) => Err(DiamondParameterSearchError::CheckerInfrastructure(format!(
-                "malformed checker response: {other}"
-            ))),
-        }
-    }
-}
-
-impl Drop for LeanCheckerSession {
-    fn drop(&mut self) {
-        let _ = self.input.write_all(b"quit\n");
-        let _ = self.input.flush();
-        let _ = self.child.wait();
-    }
-}
-
-#[cfg(test)]
-fn lean_checker_accepts(
-    parameters: &DCRTPolyParams,
-    compiler: &DiamondWeCompiler,
-) -> Result<bool, DiamondParameterSearchError> {
-    LeanCheckerSession::start()?.accepts(parameters, compiler)
+    let environment = compiler
+        .circuit_bindings()
+        .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?
+        .integers
+        .into_iter()
+        .map(|(name, value)| (name, OperationalParameterValue::Integer(value)))
+        .collect();
+    Ok(OperationalCheckRequest {
+        environment,
+        layouts: vec![OperationalGadgetLayout {
+            params_id: "diamond-dcrt".to_owned(),
+            ring_dimension: parameters.ring_dimension() as usize,
+            crt_moduli,
+            crt_bits,
+            base_bits: base_bits as usize,
+            base: config.gadget_base.clone(),
+            regular_digit_count: config.digit_count,
+            small_digit_count,
+            smallest_crt_modulus,
+        }],
+        target_id: "diamond-boolean-interval".to_owned(),
+    })
 }
 
 fn lattice_security_bits(
@@ -548,20 +440,68 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the generated Lean checker executable"]
-    fn exact_cutoffs_and_lean_checker_match_rust() {
+    fn operational_request_uses_the_concrete_dcrt_layout_and_all_graph_parameters() {
         assert_eq!(
             default_error_max_coefficient_bound(&RealExpr::from_integer(4)).unwrap(),
             BigInt::from(26)
         );
         let search = small_search();
-        let selected = search.search_with_security_estimator(|_, _| Ok(1)).unwrap();
-        assert!(lean_checker_accepts(&selected.parameters, &selected.compiler).unwrap());
+        let parameters = DCRTPolyParams::new(32, 2, 60, 2);
+        let error_sigma = RealExpr::from_f64_exact(search.error_sigma).unwrap();
+        let trapdoor_sigma = RealExpr::from_f64_exact(search.trapdoor_sigma).unwrap();
+        let compiler = DiamondWeCompiler::new(
+            DiamondWeConfig {
+                modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+                ring_dimension: parameters.ring_dimension() as usize,
+                input_count: search.input_count,
+                digit_base: search.digit_base,
+                batch_bits: search.batch_bits,
+                gadget_base: BigInt::from(1_u8) << search.gadget_base_bits,
+                digit_count: parameters.modulus_digits(),
+                trapdoor_sigma,
+                error_sigma,
+                error_max_coefficient_bound: BigInt::from(26),
+                preimage_max_coefficient_bound: BigInt::from(26),
+                bgg_tag: search.bgg_tag,
+            },
+            search.shape,
+        )
+        .unwrap();
+        let request = operational_request(&parameters, &compiler).unwrap();
+        let bindings = compiler.circuit_bindings().unwrap();
+        assert_eq!(request.environment.len(), bindings.integers.len());
+        assert_eq!(request.target_id, "diamond-boolean-interval");
+        assert_eq!(request.layouts.len(), 1);
+        let layout = &request.layouts[0];
+        let (crt_moduli, crt_bits, _) = parameters.to_crt();
+        assert_eq!(layout.ring_dimension, parameters.ring_dimension() as usize);
+        assert_eq!(layout.crt_moduli, crt_moduli);
+        assert_eq!(layout.crt_bits, crt_bits);
+        assert_eq!(layout.base_bits, parameters.base_bits() as usize);
+        assert_eq!(layout.base, compiler.config.gadget_base);
+    }
 
-        let mut invalid_hard_bound = selected.compiler.clone();
-        invalid_hard_bound.config.error_max_coefficient_bound =
-            invalid_hard_bound.config.modulus.clone();
-        assert!(!lean_checker_accepts(&selected.parameters, &invalid_hard_bound).unwrap());
+    #[test]
+    fn evaluated_operational_reports_preserve_accepted_and_rejected_candidates() {
+        let accepted = mxx_correctness::operational_noise::OperationalSimulationReport {
+            target_id: "diamond-boolean-interval".to_owned(),
+            noise_bound: BigUint::from(1_u8),
+            ciphertext_modulus: BigUint::from(17_u8),
+            accepted: true,
+            acceptance:
+                mxx_correctness::operational_noise::OperationalAcceptanceReport::BooleanInterval {
+                    quarter: BigInt::from(4),
+                    false_lower_margin: BigInt::from(1),
+                    false_upper_margin: BigInt::from(1),
+                    true_lower_margin: BigInt::from(1),
+                    true_upper_margin: BigInt::from(1),
+                },
+            diagnostics: Default::default(),
+        };
+        let mut rejected = accepted.clone();
+        rejected.accepted = false;
+        assert!(operational_decision(&accepted));
+        assert!(!operational_decision(&rejected));
     }
 
     #[test]

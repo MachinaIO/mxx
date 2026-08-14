@@ -1,5 +1,4 @@
 import MxxCorrectness.Generated.ToyExample.Ir
-import MxxCorrectness.OperationalToy
 
 /-!
 The proof sources below are retained for the later end-to-end correctness milestone, but they use

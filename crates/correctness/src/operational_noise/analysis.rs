@@ -20,7 +20,8 @@ use num_traits::{One, Signed, Zero};
 use smallvec::SmallVec;
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
+    hash::{Hash, Hasher},
     rc::Rc,
     sync::{
         Arc,
@@ -422,13 +423,13 @@ impl ScalarProvenance {
 }
 
 /// The direct sampler output identity that may support a checked relation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RelationSource {
     pub source: AtomicSourceId,
     pub indices: Box<[egg::Id]>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum RelationUnavailableReason {
     SmallDecompositionRangeNotProved,
 }
@@ -456,7 +457,7 @@ impl PartialEq for RelationProvenance {
 
 impl Eq for RelationProvenance {}
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum RelationProvenanceNode {
     Direct(RelationSource),
     Unavailable { source: RelationSource, reason: RelationUnavailableReason },
@@ -466,12 +467,27 @@ enum RelationProvenanceNode {
 #[derive(Debug, Default)]
 struct RelationProvenanceArena {
     nodes: Vec<RelationProvenanceNode>,
+    interned: HashMap<u64, Vec<usize>>,
 }
 
 impl RelationProvenanceArena {
     fn intern(&mut self, node: RelationProvenanceNode) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        node.hash(&mut hasher);
+        self.intern_digest(node, hasher.finish())
+    }
+
+    fn intern_digest(&mut self, node: RelationProvenanceNode, digest: u64) -> usize {
+        if let Some(id) = self
+            .interned
+            .get(&digest)
+            .and_then(|bucket| bucket.iter().copied().find(|id| self.nodes[*id] == node))
+        {
+            return id;
+        }
         let id = self.nodes.len();
         self.nodes.push(node);
+        self.interned.entry(digest).or_default().push(id);
         id
     }
 }
@@ -488,10 +504,21 @@ pub(crate) enum RelationProvenanceVisit<'a> {
 /// Iterates provenance without cloning it or descending through the Rust call
 /// stack.  Consumers receive relation leaves in depth-first order and can
 /// ignore switch metadata when only relation candidates matter.
+#[cfg(test)]
 pub(crate) fn visit_relation_provenance(
     values: &[RelationProvenance],
     mut visit: impl FnMut(RelationProvenanceVisit<'_>),
 ) {
+    let _ = try_visit_relation_provenance(values, || true, |value| visit(value));
+}
+
+/// Iterates the shared provenance DAG and stops before visiting a node when
+/// the job-wide budget callback rejects the next unit of work.
+pub(crate) fn try_visit_relation_provenance(
+    values: &[RelationProvenance],
+    mut reserve_visit: impl FnMut() -> bool,
+    mut visit: impl FnMut(RelationProvenanceVisit<'_>),
+) -> bool {
     for root in values {
         let arena = root.arena.borrow();
         let mut work = Box::new(ProvenanceWorkChunk::empty());
@@ -507,6 +534,9 @@ pub(crate) fn visit_relation_provenance(
             }
             work.len -= 1;
             let node = work.values[work.len].take().expect("initialized work item");
+            if !reserve_visit() {
+                return false;
+            }
             match &arena.nodes[node] {
                 RelationProvenanceNode::Direct(source) => {
                     visit(RelationProvenanceVisit::Direct(source))
@@ -536,6 +566,7 @@ pub(crate) fn visit_relation_provenance(
             }
         }
     }
+    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2097,6 +2128,44 @@ mod tests {
             indices: Box::new([]),
         }));
         RelationProvenance { arena, node }
+    }
+
+    #[test]
+    fn provenance_arena_semantically_interns_equal_nodes() {
+        let mut arena = RelationProvenanceArena::default();
+        let source = RelationSource { source: AtomicSourceId(7), indices: Box::new([]) };
+        let first = arena.intern(RelationProvenanceNode::Direct(source.clone()));
+        let second = arena.intern(RelationProvenanceNode::Direct(source));
+        assert_eq!(first, second);
+        assert_eq!(arena.nodes.len(), 1);
+    }
+
+    #[test]
+    fn provenance_digest_collision_still_checks_full_semantics() {
+        let mut arena = RelationProvenanceArena::default();
+        let first = RelationProvenanceNode::Direct(RelationSource {
+            source: AtomicSourceId(7),
+            indices: Box::new([]),
+        });
+        let second = RelationProvenanceNode::Direct(RelationSource {
+            source: AtomicSourceId(8),
+            indices: Box::new([]),
+        });
+        let first_id = arena.intern_digest(first.clone(), 0);
+        let second_id = arena.intern_digest(second, 0);
+        let repeated_id = arena.intern_digest(first, 0);
+        assert_ne!(first_id, second_id);
+        assert_eq!(first_id, repeated_id);
+        assert_eq!(arena.nodes.len(), 2);
+    }
+
+    #[test]
+    fn provenance_traversal_stops_before_an_uncharged_visit() {
+        let provenance = test_direct_provenance();
+        let mut visited = 0;
+        let completed = try_visit_relation_provenance(&[provenance], || false, |_| visited += 1);
+        assert!(!completed);
+        assert_eq!(visited, 0);
     }
 
     fn constant_matrix(

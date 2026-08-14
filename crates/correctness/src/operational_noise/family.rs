@@ -7,11 +7,11 @@
 
 use super::{
     analysis::IntegerDomain,
-    identity::{BinderKey, ResolvedIntExpr},
+    identity::{BinderId, BinderKey, ResolvedIntExpr},
     language::MxxLang,
     lower::LoweredInt,
 };
-use egg::{EGraph, Id};
+use egg::{AstSize, EGraph, Extractor, Id, Language, RecExpr};
 use mxx_ir_core::types::ConcreteMatrixType;
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
@@ -65,6 +65,44 @@ pub enum FamilyCoverageError {
     MatrixTypeMismatch { expected: ConcreteMatrixType, actual: ConcreteMatrixType },
     StorageMismatch,
     SelectorCaseCountMismatch { expected: usize, actual: usize },
+    NonAffineSharedMaximum,
+}
+
+/// Maximizes an analysis-owned affine value over the retained closed family domains.
+/// The work is linear in binder count and never enumerates their Cartesian product.
+pub fn shared_affine_maximum(
+    domain: &IntegerDomain,
+    binder_domains: &[CoverageBinderDomain],
+) -> Result<BigInt, FamilyCoverageError> {
+    let IntegerDomain::Affine { constant, coefficients, binders } = domain else {
+        return match domain {
+            IntegerDomain::Exact(value) => Ok(value.clone()),
+            IntegerDomain::IntervalOnly(_) => Err(FamilyCoverageError::NonAffineSharedMaximum),
+            IntegerDomain::Affine { .. } => unreachable!(),
+        };
+    };
+    if binders.len() != binder_domains.len() || coefficients.len() != binder_domains.len() {
+        return Err(FamilyCoverageError::NonAffineSharedMaximum);
+    }
+    let mut maximum = constant.clone();
+    for retained in binder_domains {
+        let Some(interval) = binders.get(&retained.binder) else {
+            return Err(FamilyCoverageError::NonAffineSharedMaximum);
+        };
+        if interval.minimum != retained.minimum || interval.maximum != retained.maximum {
+            return Err(FamilyCoverageError::NonAffineSharedMaximum);
+        }
+        let Some(coefficient) = coefficients.get(&retained.binder) else {
+            return Err(FamilyCoverageError::NonAffineSharedMaximum);
+        };
+        maximum += coefficient *
+            if coefficient.sign() == num_bigint::Sign::Minus {
+                &retained.minimum
+            } else {
+                &retained.maximum
+            };
+    }
+    Ok(maximum)
 }
 
 impl FamilyLoweringValue {
@@ -198,6 +236,41 @@ pub fn shared_element(
         return Err(FamilyCoverageError::StorageMismatch);
     };
     Ok((representative, domain, binders))
+}
+
+/// Instantiates one shared representative by replacing only its owning binder.
+/// Other binder nodes are retained, so nested independent domains stay symbolic.
+pub fn instantiate_shared_element<A>(
+    egraph: &mut EGraph<MxxLang, A>,
+    representative: Id,
+    binder: BinderId,
+    replacement: Id,
+) -> Id
+where
+    A: egg::Analysis<MxxLang>,
+{
+    let extractor = Extractor::new(egraph, AstSize);
+    let (_, template) = extractor.find_best(representative);
+    let (_, replacement) = extractor.find_best(replacement);
+    let mut instantiated = RecExpr::default();
+    let mut template_ids = Vec::with_capacity(template.len());
+    for node in template.as_ref() {
+        let root = if matches!(node, MxxLang::IntBinder(candidate) if *candidate == binder) {
+            let mut replacement_ids = Vec::with_capacity(replacement.len());
+            for replacement_node in replacement.as_ref() {
+                let rebuilt = replacement_node
+                    .clone()
+                    .map_children(|child| replacement_ids[usize::from(child)]);
+                replacement_ids.push(instantiated.add(rebuilt));
+            }
+            *replacement_ids.last().expect("extracted replacement is nonempty")
+        } else {
+            let rebuilt = node.clone().map_children(|child| template_ids[usize::from(child)]);
+            instantiated.add(rebuilt)
+        };
+        template_ids.push(root);
+    }
+    egraph.add_expr(&instantiated)
 }
 
 /// Selects a compact family.  Exact storage evaluates only stored references;
@@ -345,7 +418,7 @@ impl VectorRecurrence {
         if self.count.is_zero() {
             return Ok(self.initial.clone());
         }
-        if let Some(rows) = self.affine_rows() {
+        if let Some(rows) = self.affine_rows(control)? {
             return self.evaluate_affine(rows, control);
         }
         self.evaluate_general(control)
@@ -388,6 +461,7 @@ impl VectorRecurrence {
     ) -> Result<Box<[BigUint]>, E> {
         let state_size = self.initial.len();
         let dimension = state_size + 2;
+        (control.reserve_owned_elements)(rows.len())?;
         (control.reserve_owned_elements)(dimension.checked_mul(dimension).ok_or_else(|| {
             (control.failure)(RecurrenceFailure::IntegerBits {
                 limit: control.max_integer_bits.clone(),
@@ -405,6 +479,7 @@ impl VectorRecurrence {
         matrix[state_size + 1][state_size + 1] = BigUint::one();
 
         let power = matrix_power(matrix, &self.count, control)?;
+        (control.reserve_owned_elements)(dimension)?;
         let mut input = self.initial.to_vec();
         input.push(BigUint::zero());
         input.push(BigUint::one());
@@ -412,11 +487,32 @@ impl VectorRecurrence {
         Ok(output[..state_size].to_vec().into_boxed_slice())
     }
 
-    fn affine_rows(&self) -> Option<Vec<AffineRow>> {
-        self.transition
+    fn affine_rows<E>(
+        &self,
+        control: &mut RecurrenceControl<'_, E>,
+    ) -> Result<Option<Vec<AffineRow>>, E> {
+        (control.check_deadline)()?;
+        let row_width = self.initial.len().checked_add(3).ok_or_else(|| {
+            (control.failure)(RecurrenceFailure::IntegerBits {
+                limit: control.max_integer_bits.clone(),
+                observed: BigUint::from(usize::BITS),
+                operation: "affine row width",
+            })
+        })?;
+        (control.reserve_owned_elements)(
+            self.transition.len().checked_mul(row_width).ok_or_else(|| {
+                (control.failure)(RecurrenceFailure::IntegerBits {
+                    limit: control.max_integer_bits.clone(),
+                    observed: BigUint::from(usize::BITS),
+                    operation: "affine rows allocation",
+                })
+            })?,
+        )?;
+        Ok(self
+            .transition
             .iter()
             .map(|expression| affine_expression(expression, self.initial.len()))
-            .collect()
+            .collect())
     }
 
     fn transition_node_count(&self) -> u64 {
@@ -615,6 +711,20 @@ fn matrix_power<E>(
     control: &mut RecurrenceControl<'_, E>,
 ) -> Result<Vec<Vec<BigUint>>, E> {
     let dimension = power.len();
+    let cells = dimension.checked_mul(dimension).ok_or_else(|| {
+        (control.failure)(RecurrenceFailure::IntegerBits {
+            limit: control.max_integer_bits.clone(),
+            observed: BigUint::from(usize::BITS),
+            operation: "affine power matrix dimension",
+        })
+    })?;
+    (control.reserve_owned_elements)(cells.checked_add(1).ok_or_else(|| {
+        (control.failure)(RecurrenceFailure::IntegerBits {
+            limit: control.max_integer_bits.clone(),
+            observed: BigUint::from(usize::BITS),
+            operation: "affine power allocation",
+        })
+    })?)?;
     let mut result = identity_matrix(dimension);
     let mut remaining = exponent.clone();
     while !remaining.is_zero() {
@@ -644,13 +754,30 @@ fn matrix_product<E>(
     control: &mut RecurrenceControl<'_, E>,
 ) -> Result<Vec<Vec<BigUint>>, E> {
     let dimension = left.len();
+    let cells = dimension.checked_mul(dimension).ok_or_else(|| {
+        (control.failure)(RecurrenceFailure::IntegerBits {
+            limit: control.max_integer_bits.clone(),
+            observed: BigUint::from(usize::BITS),
+            operation: "affine product matrix dimension",
+        })
+    })?;
+    (control.reserve_owned_elements)(cells)?;
     let mut output = vec![vec![BigUint::zero(); dimension]; dimension];
     for row in 0..dimension {
         for column in 0..dimension {
             let mut value = BigUint::zero();
             for inner in 0..dimension {
                 (control.check_deadline)()?;
-                value += &left[row][inner] * &right[inner][column];
+                validate_product_bits(
+                    &left[row][inner],
+                    &right[inner][column],
+                    "affine-matrix-product",
+                    control,
+                )?;
+                (control.reserve_owned_elements)(1)?;
+                let product = &left[row][inner] * &right[inner][column];
+                validate_sum_bits(&value, &product, "affine-matrix-product", control)?;
+                value += product;
                 validate_bits(&value, "affine-matrix-product", control)?;
             }
             output[row][column] = value;
@@ -664,17 +791,56 @@ fn matrix_vector_product<E>(
     vector: &[BigUint],
     control: &mut RecurrenceControl<'_, E>,
 ) -> Result<Vec<BigUint>, E> {
+    (control.reserve_owned_elements)(matrix.len())?;
     let mut output = Vec::with_capacity(matrix.len());
     for row in matrix {
         let mut value = BigUint::zero();
         for (coefficient, input) in row.iter().zip(vector) {
             (control.check_deadline)()?;
-            value += coefficient * input;
+            validate_product_bits(coefficient, input, "affine-matrix-vector", control)?;
+            (control.reserve_owned_elements)(1)?;
+            let product = coefficient * input;
+            validate_sum_bits(&value, &product, "affine-matrix-vector", control)?;
+            value += product;
             validate_bits(&value, "affine-matrix-vector", control)?;
         }
         output.push(value);
     }
     Ok(output)
+}
+
+fn validate_product_bits<E>(
+    left: &BigUint,
+    right: &BigUint,
+    operation: &'static str,
+    control: &mut RecurrenceControl<'_, E>,
+) -> Result<(), E> {
+    let observed = BigUint::from(left.bits()) + BigUint::from(right.bits());
+    if observed > *control.max_integer_bits {
+        return Err((control.failure)(RecurrenceFailure::IntegerBits {
+            limit: control.max_integer_bits.clone(),
+            observed,
+            operation,
+        }));
+    }
+    Ok(())
+}
+
+fn validate_sum_bits<E>(
+    left: &BigUint,
+    right: &BigUint,
+    operation: &'static str,
+    control: &mut RecurrenceControl<'_, E>,
+) -> Result<(), E> {
+    let observed = BigUint::from(left.bits().max(right.bits())) + BigUint::one();
+    if observed > *control.max_integer_bits {
+        return Err((control.failure)(RecurrenceFailure::IntegerBits {
+            limit: control.max_integer_bits.clone(),
+            observed,
+            operation,
+        }));
+    }
+    Ok(())
 }
 
 fn validate_bits<E>(
@@ -696,6 +862,7 @@ fn validate_bits<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operational_noise::{analysis::MxxAnalysis, identity::BinderDescriptor};
 
     fn evaluate(recurrence: &VectorRecurrence) -> Result<Box<[BigUint]>, RecurrenceFailure> {
         let step_limit = BigUint::from(100_u8);
@@ -779,5 +946,74 @@ mod tests {
             }),
             Err(RecurrenceFailure::StepLimit { .. })
         ));
+    }
+
+    #[test]
+    fn shared_template_instantiation_replaces_only_the_owner_binder() {
+        let mut analysis = MxxAnalysis::default();
+        let scope = crate::operational_noise::identity::OccurrenceScope {
+            program: crate::operational_noise::identity::ProgramKey::Ideal,
+            definition: mxx_ir_core::FrozenGraphScopeId::Root,
+            path: Box::new([]),
+        };
+        let owner =
+            BinderKey { loop_scope: scope.clone(), loop_node: mxx_ir_core::NodeId(1), slot: 0 };
+        let outer = BinderKey { loop_scope: scope, loop_node: mxx_ir_core::NodeId(2), slot: 0 };
+        let owner_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
+            key: owner,
+            minimum: 0.into(),
+            maximum: 7.into(),
+        }));
+        let outer_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
+            key: outer,
+            minimum: 0.into(),
+            maximum: 3.into(),
+        }));
+        let mut egraph = EGraph::new(analysis);
+        let owner_term = egraph.add(MxxLang::IntBinder(owner_id));
+        let outer_term = egraph.add(MxxLang::IntBinder(outer_id));
+        let representative = egraph.add(MxxLang::IntAdd([owner_term, outer_term]));
+        let replacement = egraph.add(MxxLang::IntConst(5.into()));
+
+        let instantiated =
+            instantiate_shared_element(&mut egraph, representative, owner_id, replacement);
+        let (_, expression) = Extractor::new(&egraph, AstSize).find_best(instantiated);
+
+        assert!(expression.iter().any(|node| node == &MxxLang::IntConst(5.into())));
+        assert!(expression.iter().any(|node| node == &MxxLang::IntBinder(outer_id)));
+        assert!(!expression.iter().any(|node| node == &MxxLang::IntBinder(owner_id)));
+    }
+
+    #[test]
+    fn shared_affine_maximum_uses_nested_domain_endpoints_without_product() {
+        let scope = crate::operational_noise::identity::OccurrenceScope {
+            program: crate::operational_noise::identity::ProgramKey::Ideal,
+            definition: mxx_ir_core::FrozenGraphScopeId::Root,
+            path: Box::new([]),
+        };
+        let outer =
+            BinderKey { loop_scope: scope.clone(), loop_node: mxx_ir_core::NodeId(1), slot: 0 };
+        let inner = BinderKey { loop_scope: scope, loop_node: mxx_ir_core::NodeId(2), slot: 0 };
+        let retained = vec![
+            CoverageBinderDomain { binder: outer.clone(), minimum: 0.into(), maximum: 4.into() },
+            CoverageBinderDomain { binder: inner.clone(), minimum: 1.into(), maximum: 6.into() },
+        ];
+        let domain = IntegerDomain::Affine {
+            constant: 5.into(),
+            coefficients: BTreeMap::from([(outer.clone(), 3.into()), (inner.clone(), (-2).into())]),
+            binders: BTreeMap::from([
+                (
+                    outer,
+                    crate::operational_noise::analysis::IntegerInterval::new(0.into(), 4.into())
+                        .unwrap(),
+                ),
+                (
+                    inner,
+                    crate::operational_noise::analysis::IntegerInterval::new(1.into(), 6.into())
+                        .unwrap(),
+                ),
+            ]),
+        };
+        assert_eq!(shared_affine_maximum(&domain, &retained).unwrap(), BigInt::from(15));
     }
 }

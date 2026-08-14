@@ -317,7 +317,6 @@ operational_error_registry! {
         RelationTrapdoorMismatch { source: AtomicSourceKey },
         RelationTargetMismatch { source: AtomicSourceKey },
         BlockedRelationRewrite { reason: RelationRewriteBlockReason },
-        InvalidAdditiveRelationSort { expression: usize },
         RewriteDidNotSaturate { reason: String },
         InvalidRelationProducer { producer: WireSourceKey },
         MismatchedRelationIndex { expected: AtomicSourceKey, actual: AtomicSourceKey },

@@ -8,7 +8,7 @@
 use super::{
     analysis::{
         MxxAnalysis, MxxSort, RelationProvenance, RelationProvenanceVisit, RelationSource,
-        visit_relation_provenance,
+        try_visit_relation_provenance,
     },
     identity::{
         AtomicRelationRole, AtomicSourceId, AtomicSourceKey, MatrixConstantValue, SamplerIdentity,
@@ -18,7 +18,7 @@ use super::{
 };
 use egg::{Applier, EGraph, Id, SearchMatches, Searcher, Subst, Symbol, Var};
 use num_bigint::BigInt;
-use num_traits::{One, Zero};
+use num_traits::Zero;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -28,19 +28,15 @@ use std::{
     time::Instant,
 };
 
-/// A relation derived from one concrete sampler output.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct DerivedRelation {
-    pub expected_public: Id,
-    pub target: Id,
-    pub trapdoor: Option<TrapdoorDescriptorId>,
-    pub indices: Box<[Id]>,
-}
-
 /// A closed relation registration supplied by source lowering.
 ///
 /// `source` is deliberately an atom source rather than a node number: the
 /// atom's ordered index children are checked separately after rebuild.
+/// This compact rewrite snapshot is intentionally distinct from
+/// [`SamplerIdentity`]: the sampler owns producer semantics, while egg's
+/// callbacks require an immutable lookup keyed by the final `AtomicSourceId`.
+/// Reconstructing that reverse mapping inside every callback would either lose
+/// the atom identity or repeatedly scan all sampler/source descriptors.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct RelationRegistration {
     pub source: AtomicSourceId,
@@ -67,9 +63,8 @@ pub enum RelationFailure {
     MismatchedLayout { source: AtomicSourceId },
     MismatchedTrapdoor { source: AtomicSourceId },
     MismatchedTarget { source: AtomicSourceId },
-    InvalidAdditiveSort { expression: Id },
-    DeadlineExceeded,
-    OwnedElementLimitExceeded,
+    DeadlineExceeded { observed: std::time::Duration },
+    OwnedElementLimitExceeded { observed: usize },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -112,15 +107,17 @@ impl SharedRewriteBudget {
 
     fn reserve(&self, additional: usize) -> Result<(), RelationFailure> {
         if Instant::now() >= self.deadline {
-            return Err(RelationFailure::DeadlineExceeded);
+            return Err(RelationFailure::DeadlineExceeded {
+                observed: Instant::now().saturating_duration_since(self.deadline),
+            });
         }
         let mut observed = self.owned.load(Ordering::Relaxed);
         loop {
             let Some(next) = observed.checked_add(additional) else {
-                return Err(RelationFailure::OwnedElementLimitExceeded);
+                return Err(RelationFailure::OwnedElementLimitExceeded { observed: usize::MAX });
             };
             if next > self.owned_limit {
-                return Err(RelationFailure::OwnedElementLimitExceeded);
+                return Err(RelationFailure::OwnedElementLimitExceeded { observed: next });
             }
             match self.owned.compare_exchange_weak(
                 observed,
@@ -181,12 +178,8 @@ impl RewriteContext {
         true
     }
 
-    fn note_candidate(&self) -> bool {
-        if !self.reserve(1) {
-            return false;
-        }
+    fn note_candidate(&self) {
         self.state.lock().expect("relation context lock").counters.candidates += 1;
-        true
     }
 
     fn note_rewrite(&self, selector_distribution: bool) {
@@ -342,19 +335,24 @@ fn checked_replacement(
     let actual_public = egraph.find(factors[relation_position - 1]);
     let provenance = &egraph[relation].data.relation_provenance;
     let mut candidates = Vec::new();
-    if let Err(failure) = flatten_provenance(provenance, &mut candidates) {
-        context.fail(failure);
+    if !flatten_provenance(provenance, context, &mut candidates) {
         return None;
     }
     let mut replacements = BTreeSet::new();
     let mut sources = BTreeSet::new();
-    for source in candidates {
-        if !context.note_candidate() {
-            return None;
-        }
+    let mut failures = BTreeSet::new();
+    for candidate in candidates {
+        context.note_candidate();
+        let source = match candidate {
+            RelationCandidate::Direct(source) => source,
+            RelationCandidate::Unavailable(source) => {
+                failures.insert(RelationFailure::UnavailableRelation { source: source.source });
+                continue;
+            }
+        };
         let registrations = context.registrations(source.source);
         if registrations.is_empty() {
-            context.fail(RelationFailure::MissingRegistration { source: source.source });
+            failures.insert(RelationFailure::MissingRegistration { source: source.source });
             continue;
         }
         for registration in registrations {
@@ -368,17 +366,17 @@ fn checked_replacement(
             if let Err(failure) =
                 preflight_registration(egraph, relation, &source, &registration, preflight_public)
             {
-                context.fail(failure);
+                failures.insert(failure);
                 continue;
             }
             if !same_canonical_indices(egraph, &source.indices, &registration.indices) {
-                context.fail(RelationFailure::MismatchedIndex { source: source.source });
+                failures.insert(RelationFailure::MismatchedIndex { source: source.source });
                 continue;
             }
             if distributed_public.is_none() &&
                 egraph.find(registration.expected_public) != actual_public
             {
-                context.fail(RelationFailure::MismatchedPublic { source: source.source });
+                failures.insert(RelationFailure::MismatchedPublic { source: source.source });
                 continue;
             }
             let target = egraph.find(registration.target);
@@ -399,7 +397,7 @@ fn checked_replacement(
             let replacement = match (additive_public, distributed) {
                 (_, Some(replacement)) => replacement,
                 (true, None) => {
-                    context.fail(RelationFailure::TransformedOperand);
+                    failures.insert(RelationFailure::TransformedOperand);
                     continue;
                 }
                 (false, None) => {
@@ -415,7 +413,12 @@ fn checked_replacement(
             .fail(RelationFailure::AmbiguousReplacement { sources: sources.into_iter().collect() });
         return None;
     }
-    let replacement = replacements.into_iter().next()?;
+    let Some(replacement) = replacements.into_iter().next() else {
+        if let Some(failure) = failures.into_iter().next() {
+            context.fail(failure);
+        }
+        return None;
+    };
     let selector_distribution =
         switch_node(egraph, actual_public).is_some() || switch_node(egraph, relation).is_some();
     Some((replacement, selector_distribution))
@@ -466,8 +469,11 @@ pub fn classify_proposal_node(
             continue;
         }
         let mut sources = Vec::new();
-        flatten_provenance(&egraph[relation].data.relation_provenance, &mut sources)?;
-        for source in sources {
+        if !flatten_provenance(&egraph[relation].data.relation_provenance, context, &mut sources) {
+            return Err(context.failure().expect("failed provenance reservation records a failure"));
+        }
+        for candidate in sources {
+            let RelationCandidate::Direct(source) = candidate else { continue };
             for registration in context.registrations(source.source) {
                 let public = egraph.find(factors[relation_position - 1]);
                 let distributed_public =
@@ -624,6 +630,52 @@ fn preflight_registration(
             return Err(RelationFailure::MismatchedTarget { source: source.source });
         }
     }
+    if matches!(
+        source_descriptor.relation_role,
+        Some(
+            AtomicRelationRole::GadgetDecomposition |
+                AtomicRelationRole::SmallGadgetDecomposition { range_proved: true }
+        )
+    ) {
+        let AtomicSourceKey::Sampler(sampler_id) = source_descriptor.key else {
+            return Err(RelationFailure::InvalidRelationProducer { source: source.source });
+        };
+        let Some(SamplerIdentity::GadgetDecomposition {
+            public,
+            target: sampler_target,
+            base,
+            digit_count,
+            small,
+            ..
+        }) = egraph.analysis.symbols.samplers.get(sampler_id.0)
+        else {
+            return Err(RelationFailure::InvalidRelationProducer { source: source.source });
+        };
+        let public_is_exact_gadget = egraph[expected_public].nodes.iter().any(|node| {
+            let MxxLang::MatrixConstant(spec_id) = node else { return false };
+            egraph.analysis.symbols.matrix_constants.get(spec_id.0).is_some_and(|spec| {
+                spec.matrix_type == *public_matrix &&
+                    matches!(&spec.value,
+                        MatrixConstantValue::Gadget { base: spec_base, small: spec_small }
+                        if spec_base == base && spec_small == small)
+            })
+        });
+        let layout_is_exact = matches!(
+            (&source_matrix.rows, &target_matrix.rows, digit_count),
+            (
+                super::identity::ResolvedIntExpr::Const(source_rows),
+                super::identity::ResolvedIntExpr::Const(target_rows),
+                super::identity::ResolvedIntExpr::Const(digits),
+            ) if digits > &BigInt::zero() && source_rows == &(target_rows * digits)
+        );
+        if egraph.find(*public) != expected_public ||
+            egraph.find(*sampler_target) != target ||
+            !public_is_exact_gadget ||
+            !layout_is_exact
+        {
+            return Err(RelationFailure::MismatchedTarget { source: source.source });
+        }
+    }
     if !registration.trapdoor.is_none_or(|trapdoor_id| {
         egraph.analysis.symbols.trapdoors.get(trapdoor_id.0).is_some_and(|trapdoor| {
             egraph.find(trapdoor.public) == expected_public &&
@@ -728,129 +780,33 @@ fn same_canonical_indices(
         left.iter().zip(right).all(|(left, right)| egraph.find(*left) == egraph.find(*right))
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RelationCandidate {
+    Direct(RelationSource),
+    Unavailable(RelationSource),
+}
+
 fn flatten_provenance(
     values: &[RelationProvenance],
-    out: &mut Vec<RelationSource>,
-) -> Result<(), RelationFailure> {
-    let mut unavailable = None;
-    visit_relation_provenance(values, |visit| match visit {
-        RelationProvenanceVisit::Direct(source) => out.push(source.clone()),
-        RelationProvenanceVisit::Unavailable { source, .. } => unavailable = Some(source.source),
-        RelationProvenanceVisit::Switch { .. } => {}
-    });
-    if let Some(source) = unavailable {
-        return Err(RelationFailure::UnavailableRelation { source });
-    }
-    out.sort_by(|left, right| {
-        left.source.cmp(&right.source).then(left.indices.cmp(&right.indices))
-    });
+    context: &RewriteContext,
+    out: &mut Vec<RelationCandidate>,
+) -> bool {
+    let completed = try_visit_relation_provenance(
+        values,
+        || context.reserve(1),
+        |visit| match visit {
+            RelationProvenanceVisit::Direct(source) => {
+                out.push(RelationCandidate::Direct(source.clone()))
+            }
+            RelationProvenanceVisit::Unavailable { source, .. } => {
+                out.push(RelationCandidate::Unavailable(source.clone()));
+            }
+            RelationProvenanceVisit::Switch { .. } => {}
+        },
+    );
+    out.sort();
     out.dedup();
-    Ok(())
-}
-
-/// Exact key for the deliberately small additive normal form.  The sort is
-/// part of the key so same-named or same-shaped terms of different types can
-/// never cancel.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct ExactExpressionKey {
-    pub expression: Id,
-    pub sort: MxxSort,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SignedAdditiveTerm {
-    pub coefficient: BigInt,
-    pub expression: Id,
-    pub sort: MxxSort,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AdditiveNormalForm {
-    pub terms: BTreeMap<ExactExpressionKey, BigInt>,
-}
-
-impl AdditiveNormalForm {
-    /// Collects only addition, negation, integer-constant scale and typed
-    /// zero.  It neither distributes multiplication nor reorders factors.
-    pub fn collect(
-        egraph: &EGraph<MxxLang, MxxAnalysis>,
-        root: Id,
-    ) -> Result<Self, RelationFailure> {
-        let mut result = Self::default();
-        let mut work = vec![(egraph.find(root), BigInt::one())];
-        while let Some((term, coefficient)) = work.pop() {
-            let term = egraph.find(term);
-            if egraph[term].data.sort.is_err() {
-                return Err(RelationFailure::InvalidAdditiveSort { expression: term });
-            }
-            let mut expanded = false;
-            for node in &egraph[term].nodes {
-                match node {
-                    MxxLang::MatrixAdd(children) => {
-                        expanded = true;
-                        for child in children.iter().rev() {
-                            work.push((*child, coefficient.clone()));
-                        }
-                        break;
-                    }
-                    MxxLang::MatrixNegate([child]) => {
-                        expanded = true;
-                        work.push((*child, -coefficient.clone()));
-                        break;
-                    }
-                    MxxLang::MatrixScale([matrix, scalar]) => {
-                        if let Some(value) = exact_integer_constant(egraph, *scalar) {
-                            expanded = true;
-                            work.push((*matrix, coefficient.clone() * value));
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if expanded || typed_zero(egraph, term) || coefficient.is_zero() {
-                continue;
-            }
-            let Ok(sort) = egraph[term].data.sort.clone() else {
-                return Err(RelationFailure::InvalidAdditiveSort { expression: term });
-            };
-            let key = ExactExpressionKey { expression: term, sort };
-            let entry = result.terms.entry(key).or_insert_with(BigInt::zero);
-            *entry += coefficient;
-        }
-        result.terms.retain(|_, coefficient| !coefficient.is_zero());
-        Ok(result)
-    }
-
-    pub fn signed_terms(&self) -> Vec<SignedAdditiveTerm> {
-        self.terms
-            .iter()
-            .map(|(key, coefficient)| SignedAdditiveTerm {
-                coefficient: coefficient.clone(),
-                expression: key.expression,
-                sort: key.sort.clone(),
-            })
-            .collect()
-    }
-}
-
-fn exact_integer_constant(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> Option<BigInt> {
-    egraph[egraph.find(term)].nodes.iter().find_map(|node| match node {
-        MxxLang::IntConst(value) => Some(value.clone()),
-        _ => None,
-    })
-}
-
-fn typed_zero(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> bool {
-    egraph[egraph.find(term)].nodes.iter().any(|node| match node {
-        MxxLang::MatrixConstant(spec) => egraph
-            .analysis
-            .symbols
-            .matrix_constants
-            .get(spec.0)
-            .is_some_and(|descriptor| matches!(descriptor.value, MatrixConstantValue::Zero)),
-        _ => false,
-    })
+    completed
 }
 
 /// Builds the only selector correlation allowed by the relation engine.
@@ -895,59 +851,19 @@ fn switch_node(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        super::identity::{AtomicSourceDescriptor, AtomicSourceKey, SymbolTables},
-        *,
-    };
+    use super::*;
     use std::time::Duration;
-
-    fn matrix() -> MxxSort {
-        MxxSort::Matrix(super::super::identity::ResolvedMatrixType {
-            modulus: super::super::identity::ResolvedIntExpr::Const(17.into()),
-            ring_dimension: super::super::identity::ResolvedIntExpr::Const(1.into()),
-            rows: super::super::identity::ResolvedIntExpr::Const(1.into()),
-            columns: super::super::identity::ResolvedIntExpr::Const(1.into()),
-        })
-    }
-
-    #[test]
-    fn normal_form_cancels_only_exact_rebuilt_matrix_identities() {
-        let mut symbols = SymbolTables::default();
-        let source = symbols.atomic_sources.intern(AtomicSourceDescriptor {
-            key: AtomicSourceKey::ProtocolInput("a".into()),
-            sort: matrix(),
-            integer_domain: None,
-            canonical_residue_convention: None,
-            relation_role: None,
-        });
-        let mut graph = EGraph::new(MxxAnalysis::new(symbols));
-        let a = graph.add(MxxLang::Atom { source: AtomicSourceId(source), indices: Box::new([]) });
-        let minus_a = graph.add(MxxLang::MatrixNegate([a]));
-        let sum = graph.add(MxxLang::MatrixAdd(vec![a, minus_a].into_boxed_slice()));
-        graph.rebuild();
-        assert!(
-            AdditiveNormalForm::collect(&graph, sum).expect("valid matrix sum").terms.is_empty()
-        );
-    }
-
-    #[test]
-    fn normal_form_rejects_invalid_sort_before_flattening() {
-        let mut graph = EGraph::new(MxxAnalysis::default());
-        let invalid = graph.add(MxxLang::MatrixAdd(Box::new([])));
-        graph.rebuild();
-        assert_eq!(
-            AdditiveNormalForm::collect(&graph, invalid),
-            Err(RelationFailure::InvalidAdditiveSort { expression: graph.find(invalid) })
-        );
-    }
 
     #[test]
     fn shared_budget_is_cumulative_and_observes_the_job_deadline() {
         let budget = SharedRewriteBudget::new(Instant::now() + Duration::from_secs(1), 2);
         assert!(budget.reserve(1).is_ok());
         assert!(budget.reserve(1).is_ok());
-        assert_eq!(budget.reserve(1), Err(RelationFailure::OwnedElementLimitExceeded));
+        assert_eq!(
+            budget.reserve(1),
+            Err(RelationFailure::OwnedElementLimitExceeded { observed: 3 })
+        );
         let expired = SharedRewriteBudget::new(Instant::now(), 1);
-        assert_eq!(expired.reserve(1), Err(RelationFailure::DeadlineExceeded));
+        assert!(matches!(expired.reserve(1), Err(RelationFailure::DeadlineExceeded { .. })));
     }
 }

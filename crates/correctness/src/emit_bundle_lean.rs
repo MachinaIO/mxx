@@ -188,24 +188,6 @@ pub fn emit_closed_protocol_bundle(
             ])
         })),
     )]);
-    let operational_decoder_targets =
-        list(bundle.operational_decoder_targets.iter().map(|target| {
-            let kind = match &target.kind {
-                crate::OperationalDecoderKind::ThresholdDecode { plaintext_modulus } => {
-                    format!(".thresholdDecode ({})", int_expr(plaintext_modulus))
-                }
-                crate::OperationalDecoderKind::BooleanInterval => ".booleanInterval".to_owned(),
-            };
-            record(&[
-                ("targetId", lean_string(&target.target_id)),
-                ("residualStage", stage_id(&target.residual_stage.0)),
-                ("residualOutput", lean_string(&target.residual_output)),
-                ("decoderStage", stage_id(&target.decoder_stage.0)),
-                ("decoderNode", target.decoder_node.0.to_string()),
-                ("kind", kind),
-            ])
-        }));
-
     let anchor_bindings = list(bundle.workflow.stages.iter().flat_map(|stage| {
         stage.semantic_anchors.iter().map(|(label, wires)| {
             record(&[
@@ -226,7 +208,6 @@ pub fn emit_closed_protocol_bundle(
         ("requirements", list(names.requirement_programs.iter().cloned())),
         ("comparator", comparator),
         ("endpoints", endpoints),
-        ("operationalDecoderTargets", operational_decoder_targets),
         ("anchorBindings", anchor_bindings),
         (
             "endpointSpecs",

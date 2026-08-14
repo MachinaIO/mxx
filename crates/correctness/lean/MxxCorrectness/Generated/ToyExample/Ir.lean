@@ -8,11 +8,11 @@ def ToyExample_generatorVersion : String := "mxx-correctness-emitter-v11"
 
 def ToyExample_protocolSourcePaths : List String := ["crates/correctness/Cargo.toml", "crates/correctness/examples/emit_correctness.rs", "crates/correctness/src", "crates/dsl/Cargo.toml", "crates/dsl/src", "crates/ir-core/Cargo.toml", "crates/ir-core/src"]
 
-def ToyExample_protocolSourceHash : String := "735aaefa019854bd90bbcb423c21c69e0c07180c780c76caacf5f616920f2dee"
+def ToyExample_protocolSourceHash : String := "d1b8a03c4fd89167d3053feabb7048119d5a141ca16f6aea4a568254943bdf95"
 
 def ToyExample_workflowHash : String := "f0727b300c312d49e01c5cba55cf8d11de69de7efa5d17b68a4133c5a6a15c6b"
 
-def ToyExample_toolkitHash : String := "b52a9b1a89ddc0a80e0e974d3f66c9fd579c06a36eb7efa87e780455e16c1a9a"
+def ToyExample_toolkitHash : String := "fd25f57d3661b9ddbf1d8f74cde89a42af825f333099fac90cee6e02d0cb01f9"
 
 def ToyExample_derivationHash : String := "1eb7ee1d85bf85dc59fea9e4e198e1cfa94df8fd0bf8168d408a754514520933"
 
@@ -77,7 +77,7 @@ def ToyExample_ideal : Mxx.Ir.Prog :=
   }
 
 def ToyExample_protocol : Mxx.Certificate.ClosedProtocolDecl :=
-  { parameters := [{ name := "cutoff", kind := .dimension }], bundle := { workflow := { stages := [{ id := "encrypt", program := ToyExample_stage_encrypt, inputs := [("message", .protocol "message")] }, { id := "decrypt", program := ToyExample_stage_decrypt, inputs := [("ciphertext", .artifact "encrypt" "ciphertext")] }], entrypoint := "decrypt" }, ideal := ToyExample_ideal, requirements := [], comparator := .equality ([{ endpoint := .toyThresholdDecode, actualInput := "decoded", idealInput := "result", resultOutput := "failure", failureValue := true }]), endpoints := { entries := [{ specification := .toyThresholdDecode, stage := { name := "decrypt" }, semanticAnchor := { stage := { name := "decrypt" }, label := "decoded-endpoint" }, semantics := .thresholdDecode, workflowOutput := "decoded", idealOutput := "result" }] }, operationalDecoderTargets := [{ targetId := "toy-threshold", residualStage := { name := "encrypt" }, residualOutput := "operational-residual", decoderStage := { name := "decrypt" }, decoderNode := 1, kind := .thresholdDecode (.constant (2 : Int)) }], anchorBindings := [{ anchor := { stage := { name := "encrypt" }, label := "toy.decoder.residual" }, wires := [{ stage := { name := "encrypt" }, scope := { path := [] }, node := { value := 7 }, port := 0 }] }, { anchor := { stage := { name := "decrypt" }, label := "decoded-endpoint" }, wires := [{ stage := { name := "decrypt" }, scope := { path := [] }, node := { value := 1 }, port := 0 }] }], endpointSpecs := [.toyThresholdDecode], inputContract := { inputs := [({ name := "message" }, "message", .boolean)] }, inputBindings := [{ input := { name := "message" }, destinations := [.workflowStage { name := "encrypt" } "message", .ideal "message"] }], preconditionSpec := { requirementOutputs := [] } } }
+  { parameters := [{ name := "cutoff", kind := .dimension }], bundle := { workflow := { stages := [{ id := "encrypt", program := ToyExample_stage_encrypt, inputs := [("message", .protocol "message")] }, { id := "decrypt", program := ToyExample_stage_decrypt, inputs := [("ciphertext", .artifact "encrypt" "ciphertext")] }], entrypoint := "decrypt" }, ideal := ToyExample_ideal, requirements := [], comparator := .equality ([{ endpoint := .toyThresholdDecode, actualInput := "decoded", idealInput := "result", resultOutput := "failure", failureValue := true }]), endpoints := { entries := [{ specification := .toyThresholdDecode, stage := { name := "decrypt" }, semanticAnchor := { stage := { name := "decrypt" }, label := "decoded-endpoint" }, semantics := .thresholdDecode, workflowOutput := "decoded", idealOutput := "result" }] }, anchorBindings := [{ anchor := { stage := { name := "encrypt" }, label := "toy.decoder.residual" }, wires := [{ stage := { name := "encrypt" }, scope := { path := [] }, node := { value := 7 }, port := 0 }] }, { anchor := { stage := { name := "decrypt" }, label := "decoded-endpoint" }, wires := [{ stage := { name := "decrypt" }, scope := { path := [] }, node := { value := 1 }, port := 0 }] }], endpointSpecs := [.toyThresholdDecode], inputContract := { inputs := [({ name := "message" }, "message", .boolean)] }, inputBindings := [{ input := { name := "message" }, destinations := [.workflowStage { name := "encrypt" } "message", .ideal "message"] }], preconditionSpec := { requirementOutputs := [] } } }
 
 def ToyExample_stage_encrypt_derivation : Mxx.Certificate.ProgramDerivation :=
   { root :=

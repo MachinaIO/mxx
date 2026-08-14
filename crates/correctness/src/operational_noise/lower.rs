@@ -33,10 +33,7 @@ use mxx_ir_core::{
 };
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Structural-family dispatch is deliberately outside ordinary expression lowering.
 ///
@@ -55,19 +52,24 @@ pub trait FamilyResolver {
 /// The lowering side of the single checker-job resource owner.  Production
 /// callers pass one live implementation through [`GraphLowerer::new_with_control`];
 /// direct lowering tests may use [`GraphLowerer::new`] without a budget.
-pub trait LoweringControl: Send + Sync {
+pub trait LoweringControl {
     fn check_deadline(&self) -> Result<(), LowerError>;
     fn reserve_owned_elements(&self, requested: usize) -> Result<(), LowerError>;
+    fn work(
+        &mut self,
+        scope: &OccurrenceScope,
+        node: mxx_ir_core::NodeId,
+    ) -> Result<(), LowerError>;
 }
 
 /// Read-only production bridge from a lowered e-graph to the bound evaluator.
 /// It deliberately has no memo: `BoundEvaluator` owns computed bounds.
-pub struct ProductionBoundInput<'a, 'protocol> {
-    lowerer: &'a GraphLowerer<'protocol>,
+pub struct ProductionBoundInput<'a, 'protocol, 'control> {
+    lowerer: &'a GraphLowerer<'protocol, 'control>,
     control: Option<&'a dyn BoundEvaluationControl>,
 }
 
-impl BoundInput for ProductionBoundInput<'_, '_> {
+impl BoundInput for ProductionBoundInput<'_, '_, '_> {
     fn node(&self, term: Id) -> Option<&MxxLang> {
         self.lowerer.egraph[self.lowerer.egraph.find(term)].nodes.first()
     }
@@ -286,7 +288,7 @@ impl BoundInput for ProductionBoundInput<'_, '_> {
     }
 }
 
-impl ProductionBoundInput<'_, '_> {
+impl ProductionBoundInput<'_, '_, '_> {
     /// Evaluates a graph-owned sequential descriptor without rebuilding its
     /// body or materializing any logical iteration/lane graph.  Each numeric
     /// iteration evaluates the one fixed transition with a read-only overlay
@@ -383,13 +385,13 @@ impl ProductionBoundInput<'_, '_> {
 /// A recurrence transition delegates every ordinary fact to the production
 /// input, overriding only the descriptor's carried-state atoms.  It owns no
 /// cache; each [`BoundEvaluator`] remains the sole owner of its bound memo.
-struct SequentialBoundInput<'a, 'protocol> {
-    base: &'a ProductionBoundInput<'a, 'protocol>,
+struct SequentialBoundInput<'a, 'protocol, 'control> {
+    base: &'a ProductionBoundInput<'a, 'protocol, 'control>,
     states: &'a [super::identity::AtomicSourceId],
     values: &'a [MatrixBound],
 }
 
-impl BoundInput for SequentialBoundInput<'_, '_> {
+impl BoundInput for SequentialBoundInput<'_, '_, '_> {
     fn node(&self, term: Id) -> Option<&MxxLang> {
         self.base.node(term)
     }
@@ -667,6 +669,14 @@ enum LoweringFrame {
         output_type: WireType,
         dependency_count: usize,
     },
+    FinishGadgetDecompose {
+        wire: LoweringWire,
+        environment: LowerEnv,
+        base: IntExpr,
+        digit_count: IntExpr,
+        small: bool,
+        output_type: WireType,
+    },
     FinishParallelLoop {
         wire: LoweringWire,
         environment: LowerEnv,
@@ -689,16 +699,16 @@ enum LoweringFrame {
 }
 
 /// The sole mutable owner for one lowering/rewrite job.
-pub struct GraphLowerer<'a> {
+pub struct GraphLowerer<'a, 'control> {
     pub protocol: &'a ProtocolDecl,
     pub request: &'a OperationalCheckRequest,
     pub egraph: EGraph<MxxLang, MxxAnalysis>,
     memo: HashMap<LoweringWireKey, LoweredValue>,
     active: HashSet<LoweringWireKey>,
-    control: Option<Arc<dyn LoweringControl>>,
+    control: Option<&'control mut dyn LoweringControl>,
 }
 
-impl<'a> GraphLowerer<'a> {
+impl<'a> GraphLowerer<'a, '_> {
     pub fn new(
         protocol: &'a ProtocolDecl,
         request: &'a OperationalCheckRequest,
@@ -715,7 +725,7 @@ impl<'a> GraphLowerer<'a> {
     }
 }
 
-impl<'a> GraphLowerer<'a> {
+impl<'a, 'control> GraphLowerer<'a, 'control> {
     /// Constructs a production lowerer with the job-wide control bridge.
     /// This bridge is retained by nested parallel and sequential body walks,
     /// rather than being recreated per lexical scope.
@@ -723,7 +733,7 @@ impl<'a> GraphLowerer<'a> {
         protocol: &'a ProtocolDecl,
         request: &'a OperationalCheckRequest,
         analysis: MxxAnalysis,
-        control: Arc<dyn LoweringControl>,
+        control: &'control mut dyn LoweringControl,
     ) -> Self {
         Self {
             protocol,
@@ -732,6 +742,20 @@ impl<'a> GraphLowerer<'a> {
             memo: HashMap::new(),
             active: HashSet::new(),
             control: Some(control),
+        }
+    }
+
+    /// Consumes the lowering-phase view and returns the same lowered state with
+    /// no remaining borrow of the job control.
+    pub fn into_uncontrolled(mut self) -> GraphLowerer<'a, 'static> {
+        self.control = None;
+        GraphLowerer {
+            protocol: self.protocol,
+            request: self.request,
+            egraph: self.egraph,
+            memo: self.memo,
+            active: self.active,
+            control: None,
         }
     }
 
@@ -851,7 +875,8 @@ impl<'a> GraphLowerer<'a> {
                     }
                 }
                 .into(),
-                SamplerIdentity::DecomposedHash { public, target, indices, .. } => {
+                SamplerIdentity::DecomposedHash { public, target, indices, .. } |
+                SamplerIdentity::GadgetDecomposition { public, target, indices, .. } => {
                     Some(super::relation::RelationRegistration {
                         source: super::identity::AtomicSourceId(
                             self.egraph
@@ -882,7 +907,7 @@ impl<'a> GraphLowerer<'a> {
 
     /// Returns the one production view used by the bound evaluator.  It reads
     /// canonical e-graph analysis and exact lowering descriptors only.
-    pub fn production_bound_view(&self) -> ProductionBoundInput<'_, 'a> {
+    pub fn production_bound_view(&self) -> ProductionBoundInput<'_, 'a, 'control> {
         ProductionBoundInput { lowerer: self, control: None }
     }
 
@@ -892,7 +917,7 @@ impl<'a> GraphLowerer<'a> {
     pub fn production_bound_view_with_control<'b>(
         &'b self,
         control: &'b dyn BoundEvaluationControl,
-    ) -> ProductionBoundInput<'b, 'a> {
+    ) -> ProductionBoundInput<'b, 'a, 'control> {
         ProductionBoundInput { lowerer: self, control: Some(control) }
     }
 
@@ -974,6 +999,9 @@ impl<'a> GraphLowerer<'a> {
             }
             match frame {
                 LoweringFrame::Enter { wire, environment } => {
+                    if let Some(control) = self.control.as_deref_mut() {
+                        control.work(&wire.source.scope, wire.source.wire.node)?;
+                    }
                     if let Some(value) = self.begin_wire(&wire)? {
                         values.push(value);
                         continue;
@@ -1147,6 +1175,40 @@ impl<'a> GraphLowerer<'a> {
                                         environment: environment.clone(),
                                     });
                                 }
+                                continue;
+                            }
+                            if let NodeKind::GadgetDecompose { base, small, digit_count } =
+                                node.kind()
+                            {
+                                let arguments = scope
+                                    .arguments(node)
+                                    .ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
+                                let [argument] = arguments.as_slice() else {
+                                    return Err(LowerError::InvalidOperandArity {
+                                        expected: 1,
+                                        actual: arguments.len(),
+                                    });
+                                };
+                                work.push(LoweringFrame::FinishGadgetDecompose {
+                                    wire: wire.clone(),
+                                    environment: environment.clone(),
+                                    base: base.clone(),
+                                    digit_count: digit_count.clone(),
+                                    small: *small,
+                                    output_type: node.output_types()
+                                        [wire.source.wire.port.0 as usize]
+                                        .clone(),
+                                });
+                                work.push(LoweringFrame::Enter {
+                                    wire: LoweringWire {
+                                        source: WireSourceKey {
+                                            scope: environment.occurrence.clone(),
+                                            wire: *argument,
+                                        },
+                                        indices: Box::new([]),
+                                    },
+                                    environment: environment.clone(),
+                                });
                                 continue;
                             }
                             if let NodeKind::PreimageSample { max_coefficient_bound, .. } =
@@ -1875,6 +1937,24 @@ impl<'a> GraphLowerer<'a> {
                         }
                     };
                     let value = if let Some(public) = public {
+                        let range_proved = if small {
+                            base.as_ref()
+                                .and_then(resolved_nonnegative)
+                                .zip(
+                                    self.egraph[self.egraph.find(target)]
+                                        .data
+                                        .canonical_coefficient_exclusive_upper
+                                        .as_ref(),
+                                )
+                                .is_some_and(|(limit, upper)| {
+                                    super::identity::canonical_range_within_limit(
+                                        Some(upper),
+                                        &limit,
+                                    )
+                                })
+                        } else {
+                            false
+                        };
                         let sampler = self.egraph.analysis.symbols.samplers.intern(
                             SamplerIdentity::DecomposedHash {
                                 source: super::identity::GraphWireSourceKey {
@@ -1897,7 +1977,7 @@ impl<'a> GraphLowerer<'a> {
                                 base: base.expect("decomposed hash base"),
                                 digit_count: digit_count.expect("decomposed hash digits"),
                                 small,
-                                range_proved: false,
+                                range_proved,
                             },
                         );
                         let source = self.egraph.analysis.symbols.atomic_sources.intern(
@@ -1910,7 +1990,7 @@ impl<'a> GraphLowerer<'a> {
                                 canonical_residue_convention: None,
                                 relation_role: Some(if small {
                                     super::identity::AtomicRelationRole::SmallDecomposedHash {
-                                        range_proved: false,
+                                        range_proved,
                                     }
                                 } else {
                                     super::identity::AtomicRelationRole::DecomposedHash
@@ -1930,6 +2010,125 @@ impl<'a> GraphLowerer<'a> {
                     } else {
                         LoweredValue::Term(target)
                     };
+                    self.finish_wire(&wire, value.clone());
+                    values.push(value);
+                }
+                LoweringFrame::FinishGadgetDecompose {
+                    wire,
+                    environment,
+                    base,
+                    digit_count,
+                    small,
+                    output_type,
+                } => {
+                    let LoweredValue::Term(target) = values
+                        .pop()
+                        .ok_or(LowerError::InvalidOperandArity { expected: 1, actual: 0 })?
+                    else {
+                        return Err(LowerError::InvalidOperandArity { expected: 1, actual: 0 });
+                    };
+                    let (WireType::Matrix(matrix) | WireType::Preimage(matrix)) = output_type
+                    else {
+                        return Err(LowerError::InvalidOperandSort {
+                            expected: WireType::Int,
+                            actual: output_type,
+                        });
+                    };
+                    let output_matrix = self.resolve_matrix_type(&matrix, &environment)?;
+                    let base = self.resolve_int(&base, &environment)?;
+                    let digit_count = self.resolve_int(&digit_count, &environment)?;
+                    let Some(base_limit) = resolved_nonnegative(&base) else {
+                        return Err(LowerError::NonExactIdentityIndex {
+                            expression: IntExpr::constant(0),
+                        });
+                    };
+                    let range_proved = small &&
+                        super::identity::canonical_range_within_limit(
+                            self.egraph[self.egraph.find(target)]
+                                .data
+                                .canonical_coefficient_exclusive_upper
+                                .as_ref(),
+                            &base_limit,
+                        );
+                    let Some(digits) =
+                        resolved_nonnegative(&digit_count).and_then(|v| v.to_usize())
+                    else {
+                        return Err(LowerError::NonExactIdentityIndex {
+                            expression: IntExpr::constant(0),
+                        });
+                    };
+                    let Some(output_rows) = resolved_nonnegative(&output_matrix.rows) else {
+                        return Err(LowerError::NonExactIdentityIndex {
+                            expression: matrix.rows.clone(),
+                        });
+                    };
+                    let Some(target_rows) = output_rows
+                        .to_usize()
+                        .filter(|rows| digits != 0 && rows % digits == 0)
+                        .map(|rows| rows / digits)
+                    else {
+                        return Err(LowerError::InvalidOperandArity { expected: digits, actual: 0 });
+                    };
+                    let mut gadget_matrix = output_matrix.clone();
+                    gadget_matrix.rows = ResolvedIntExpr::Const(BigInt::from(target_rows));
+                    gadget_matrix.columns = ResolvedIntExpr::Const(BigInt::from(output_rows));
+                    let gadget = self.egraph.analysis.symbols.matrix_constants.intern(
+                        super::identity::MatrixConstantSpec {
+                            matrix_type: gadget_matrix,
+                            value: super::identity::MatrixConstantValue::Gadget {
+                                base: base.clone(),
+                                small,
+                            },
+                        },
+                    );
+                    let public = self.egraph.add(MxxLang::MatrixConstant(
+                        super::identity::MatrixConstantSpecId(gadget),
+                    ));
+                    let indices: Box<[Id]> = environment
+                        .active_coordinates
+                        .iter()
+                        .map(|coordinate| coordinate.index.term)
+                        .collect();
+                    let sampler = self.egraph.analysis.symbols.samplers.intern(
+                        SamplerIdentity::GadgetDecomposition {
+                            source: super::identity::GraphWireSourceKey {
+                                wire: wire.source.clone(),
+                                coordinate_binders: environment
+                                    .active_coordinates
+                                    .iter()
+                                    .map(|coordinate| coordinate.binder.clone())
+                                    .collect(),
+                            },
+                            indices: indices.clone(),
+                            public,
+                            target,
+                            base,
+                            digit_count,
+                            small,
+                            range_proved,
+                        },
+                    );
+                    let source = self.egraph.analysis.symbols.atomic_sources.intern(
+                        super::identity::AtomicSourceDescriptor {
+                            key: super::identity::AtomicSourceKey::Sampler(SamplerDescriptorId(
+                                sampler,
+                            )),
+                            sort: MxxSort::Matrix(output_matrix),
+                            integer_domain: None,
+                            canonical_residue_convention: None,
+                            relation_role: Some(if small {
+                                super::identity::AtomicRelationRole::SmallGadgetDecomposition {
+                                    range_proved,
+                                }
+                            } else {
+                                super::identity::AtomicRelationRole::GadgetDecomposition
+                            }),
+                        },
+                    );
+                    let value = LoweredValue::Term(self.egraph.add(MxxLang::Atom {
+                        source: super::identity::AtomicSourceId(source),
+                        indices,
+                    }));
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
                 }
@@ -2680,15 +2879,61 @@ impl<'a> GraphLowerer<'a> {
     }
 
     fn shared_family_element(
-        &self,
+        &mut self,
         family: &FamilyLoweringValue,
-        _index: &LoweredInt,
+        index: &LoweredInt,
     ) -> Result<LoweredValue, LowerError> {
-        let (representative, _, _) = family::shared_element(family)
+        let (representative, domain, _) = family::shared_element(family)
             .map_err(|_| LowerError::InvalidFamilyCount { count: IntExpr::constant(0) })?;
-        // The parallel-loop frame installs the requested index as the body binder before
-        // constructing this representative, so no logical family lane is enumerated here.
-        Ok(LoweredValue::Term(representative))
+        let index_domain =
+            self.integer_analysis(index.term).map(|(domain, _)| domain).ok_or_else(|| {
+                LowerError::FamilyAccessOutOfRange {
+                    index: IntExpr::constant(-1),
+                    count: IntExpr::constant(domain.logical_count.clone()),
+                }
+            })?;
+        family::validate_family_index(&index_domain, &domain.logical_count).map_err(|_| {
+            LowerError::FamilyAccessOutOfRange {
+                index: index
+                    .stable_identity
+                    .as_ref()
+                    .and_then(|value| match value {
+                        ResolvedIntExpr::Const(value) => Some(IntExpr::constant(value.clone())),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| IntExpr::constant(-1)),
+                count: IntExpr::constant(domain.logical_count.clone()),
+            }
+        })?;
+        let binder_id = self
+            .egraph
+            .analysis
+            .symbols
+            .binders
+            .values
+            .iter()
+            .position(|descriptor| descriptor.key == domain.binder)
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or_else(|| LowerError::InvalidFamilyCount {
+                count: IntExpr::constant(domain.logical_count.clone()),
+            })?;
+        if let Some(control) = &self.control {
+            control.check_deadline()?;
+            // Extraction visits at most the existing e-graph twice and the rebuilt
+            // expression contains at most both extracted expressions. Charge that
+            // conservative bound before either allocation begins.
+            control.reserve_owned_elements(self.egraph.total_size().checked_mul(4).ok_or(
+                LowerError::InvalidFamilyCount {
+                    count: IntExpr::constant(domain.logical_count.clone()),
+                },
+            )?)?;
+        }
+        Ok(LoweredValue::Term(family::instantiate_shared_element(
+            &mut self.egraph,
+            representative,
+            super::identity::BinderId(binder_id),
+            index.term,
+        )))
     }
 
     fn family_element(
@@ -2892,16 +3137,34 @@ impl<'a> GraphLowerer<'a> {
                 actual: *element,
             });
         };
+        let mut binder_domains = environment
+            .active_coordinates
+            .iter()
+            .map(|coordinate| {
+                let interval = self
+                    .integer_analysis(coordinate.index.term)
+                    .and_then(|(domain, _)| domain.interval().ok())
+                    .ok_or_else(|| LowerError::InvalidFamilyCount {
+                        count: specification.count.clone(),
+                    })?;
+                Ok(family::CoverageBinderDomain {
+                    binder: coordinate.binder.clone(),
+                    minimum: interval.minimum,
+                    maximum: interval.maximum,
+                })
+            })
+            .collect::<Result<Vec<_>, LowerError>>()?;
+        binder_domains.push(family::CoverageBinderDomain {
+            binder: binder.clone(),
+            minimum: BigInt::zero(),
+            maximum,
+        });
         let value = FamilyLoweringValue {
             element_type: self.concrete_matrix_type(&matrix, environment)?,
             storage: FamilyCoverageStorage::SharedTemplate {
                 domain: family::LoopDomainKey { binder: binder.clone(), logical_count },
                 representative,
-                binder_domains: Box::new([family::CoverageBinderDomain {
-                    binder,
-                    minimum: BigInt::zero(),
-                    maximum,
-                }]),
+                binder_domains: binder_domains.into_boxed_slice(),
             },
         };
         value
@@ -3229,6 +3492,30 @@ mod tests {
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
+    #[derive(Default)]
+    struct RecordingLoweringControl {
+        sites: Vec<(OccurrenceScope, mxx_ir_core::NodeId)>,
+    }
+
+    impl LoweringControl for RecordingLoweringControl {
+        fn check_deadline(&self) -> Result<(), LowerError> {
+            Ok(())
+        }
+
+        fn reserve_owned_elements(&self, _requested: usize) -> Result<(), LowerError> {
+            Ok(())
+        }
+
+        fn work(
+            &mut self,
+            scope: &OccurrenceScope,
+            node: mxx_ir_core::NodeId,
+        ) -> Result<(), LowerError> {
+            self.sites.push((scope.clone(), node));
+            Ok(())
+        }
+    }
+
     fn hash_layout() -> super::super::OperationalGadgetLayout {
         super::super::OperationalGadgetLayout {
             params_id: "hash-layout".to_owned(),
@@ -3392,6 +3679,37 @@ mod tests {
             super::super::identity::MatrixConstantValue::Gadget { small: false, .. }
         ));
         assert_eq!(lowerer.relation_registrations().len(), 1);
+    }
+
+    #[test]
+    fn lowering_reports_owner_resolved_work_without_static_callback_ownership() {
+        let (graph, output) = decomposed_hash_graph(HashVariant::Decomposed, 3);
+        let protocol = hash_protocol(graph);
+        let request = OperationalCheckRequest {
+            environment: vec![(
+                "cutoff".to_owned(),
+                super::super::OperationalParameterValue::Integer(BigInt::from(1)),
+            )],
+            layouts: vec![hash_layout()],
+            target_id: "hash".to_owned(),
+        };
+        let mut control = RecordingLoweringControl::default();
+        let mut lowerer = GraphLowerer::new_with_control(
+            &protocol,
+            &request,
+            MxxAnalysis::default(),
+            &mut control,
+        );
+        lowerer
+            .lower_stage_wire(&StageId("encrypt".to_owned()), output)
+            .expect("lower with borrowed progress control");
+        let lowerer = lowerer.into_uncontrolled();
+        assert!(lowerer.lowered_wire_count() >= 3);
+        assert!(control.sites.len() >= 3);
+        assert!(control.sites.iter().all(|(scope, _)| {
+            scope.program ==
+                super::super::identity::ProgramKey::WorkflowStage(StageId("encrypt".to_owned()))
+        }));
     }
 
     #[test]

@@ -579,12 +579,6 @@
       "rationale": "Tall relation diagnostics preserve the exact generic reason a rewrite was blocked."
     },
     {
-      "error_tag": "Relation.InvalidAdditiveRelationSort",
-      "tall_reachability": "reachable_for_relation_terms",
-      "classification": "relation_validation",
-      "rationale": "Tall relation diagnostics preserve the exact generic expression rejected during additive normalization."
-    },
-    {
       "error_tag": "Relation.RewriteDidNotSaturate",
       "tall_reachability": "reachable_for_relation_terms",
       "classification": "relation_validation",

@@ -139,7 +139,7 @@ jobs:
         working-directory: lean
         run: |
           lake build Mxx MxxCorrectness MxxGadgets MxxWe \
-            mxx_diamond_checker mxx_diamond_derivation_checker
+            mxx_diamond_derivation_checker
 
       - name: Run Rust to Lean checker integration test
         run: |

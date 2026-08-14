@@ -106,6 +106,7 @@ struct TestConfig {
     trapdoor_sigma: f64,
     benchmark_warmups: usize,
     benchmark_iterations: usize,
+    stop_after_benchmark_estimation: bool,
     parameter_simulation_parallelism: usize,
     preimage_progress_interval: usize,
     max_parallel_instances: usize,
@@ -141,6 +142,10 @@ impl TestConfig {
             trapdoor_sigma: env_f64("MXX_TALL_NESTED_RNS_TRAPDOOR_SIGMA", 4.578)?,
             benchmark_warmups: env_usize("MXX_TALL_NESTED_RNS_BENCH_WARMUPS", 1)?,
             benchmark_iterations: env_usize("MXX_TALL_NESTED_RNS_BENCH_ITERATIONS", 2)?,
+            stop_after_benchmark_estimation: env_bool(
+                "MXX_TALL_NESTED_RNS_STOP_AFTER_BENCHMARK_ESTIMATION",
+                false,
+            )?,
             // Lean elaboration of the generated workflow is CPU-only and independent across
             // parameter candidates. Keep the default batch small because each checker can use
             // tens of GiB for large LUT graphs.
@@ -252,6 +257,14 @@ fn env_usize(name: &str, default: usize) -> Result<usize, String> {
 fn env_u64(name: &str, default: u64) -> Result<u64, String> {
     env::var(name).map_or(Ok(default), |value| {
         value.parse().map_err(|_| format!("{name} must be a nonnegative integer"))
+    })
+}
+
+fn env_bool(name: &str, default: bool) -> Result<bool, String> {
+    env::var(name).map_or(Ok(default), |value| match value.as_str() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(format!("{name} must be 0 or 1")),
     })
 }
 
@@ -1749,6 +1762,10 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
     );
     let _reports = benchmark_estimation(&selected, &config, &gpu_parameters, &device_ids)
         .expect("benchmark estimation");
+    if config.stop_after_benchmark_estimation {
+        info!("stopped successfully after benchmark estimation before preprocessing execution");
+        return;
+    }
     let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)
         .expect("end-to-end processing");
     runtime_verification(&selected, &gpu_parameters, outputs).expect("runtime verification");

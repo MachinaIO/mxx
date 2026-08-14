@@ -36,21 +36,6 @@ pub fn verify_generated_freshness(
     )
 }
 
-pub fn verify_generated_freshness_without_protocol_source_hash(
-    workspace: &Path,
-    generated: &Path,
-    lean_name: &str,
-    source_paths: &[&str],
-) -> Result<GeneratedFreshness, String> {
-    verify_generated_freshness_with_protocol_source_hash(
-        workspace,
-        generated,
-        lean_name,
-        source_paths,
-        false,
-    )
-}
-
 fn verify_generated_freshness_with_protocol_source_hash(
     workspace: &Path,
     generated: &Path,

@@ -21,15 +21,10 @@ fn main() {
     build_support::emit_rerun_paths(workspace, SOURCE_PATHS, &owner_lean);
     println!("cargo:rerun-if-changed={}", manifest.join("build_support.rs").display());
     println!("cargo:rerun-if-env-changed=MXX_REGENERATE_CORRECTNESS");
-
     if env::var_os("MXX_REGENERATE_CORRECTNESS").is_some() {
         return;
     }
-
-    // TODO: Restore protocol-source-hash validation once the legacy Lean operational checker is
-    // deleted and the new Rust checker is complete. The migration changes source files before the
-    // generated Toy example can be regenerated; all other generated-file validation remains on.
-    let freshness = build_support::verify_generated_freshness_without_protocol_source_hash(
+    let freshness = build_support::verify_generated_freshness(
         workspace,
         &generated,
         "ToyExample",

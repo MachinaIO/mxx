@@ -21,7 +21,10 @@ use std::collections::BTreeSet;
 use num_bigint::{BigInt, BigUint};
 
 pub use error::{OperationalSimulationError, RequestError};
-pub use simulation::check_operational_noise_candidate;
+pub use simulation::{
+    ProgressEvent, ProgressEventKind, check_operational_noise_candidate,
+    check_operational_noise_candidate_with_progress,
+};
 
 /// A concrete value supplied for one named protocol parameter.
 #[derive(Clone, Debug, Eq, PartialEq)]

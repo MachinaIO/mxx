@@ -1415,39 +1415,4 @@ mod tests {
         assert_eq!(first.freshness.workflow_hash, second.freshness.workflow_hash);
         assert_eq!(first.freshness.workflow_hash, direct.freshness.workflow_hash);
     }
-
-    #[test]
-    #[ignore = "measures Lean compilation of the midsize binary transport"]
-    fn binary_transport_midsize_timing_gate() {
-        use std::{path::Path, time::Instant};
-
-        let declaration = DiamondWeProtocolFamily::new(b"mxx:diamond-we").protocol_decl().unwrap();
-        let emit_started = Instant::now();
-        let emitted = mxx_correctness::emit_protocol_for(
-            "diamond-we-family-midsize",
-            declaration.protocol(),
-            "MxxWe",
-            DIAMOND_PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        let emit_elapsed = emit_started.elapsed();
-        let lean_workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
-        let cold_started = Instant::now();
-        let prepared =
-            mxx_correctness::prepare_emitted_operational_checker(&lean_workspace, &emitted)
-                .unwrap();
-        let cold_elapsed = cold_started.elapsed();
-        let warm_started = Instant::now();
-        let warm = mxx_correctness::prepare_emitted_operational_checker(&lean_workspace, &emitted)
-            .unwrap();
-        let warm_elapsed = warm_started.elapsed();
-        assert_eq!(prepared.olean_path(), warm.olean_path());
-        eprintln!(
-            "midsize binary transport: generated_bytes={} emit_seconds={:.3} cold_prepare_seconds={:.3} warm_prepare_seconds={:.3}",
-            emitted.ir.len(),
-            emit_elapsed.as_secs_f64(),
-            cold_elapsed.as_secs_f64(),
-            warm_elapsed.as_secs_f64(),
-        );
-    }
 }

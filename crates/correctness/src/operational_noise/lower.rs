@@ -610,9 +610,10 @@ pub struct LowerEnv {
     pub parameters: BTreeMap<String, ResolvedIntExpr>,
     pub binders: Vec<(BinderKey, LoweredInt)>,
     pub inputs: BTreeMap<WireRef, LoweringWire>,
-    /// Sequential carried inputs are symbolic state terms rather than parent
-    /// wires.  Keeping them separate preserves the ordinary input alias path.
-    pub state_inputs: BTreeMap<WireRef, LoweredValue>,
+    /// Loop-owned input values, including sequential carried state.  The
+    /// source occurrence is part of the key so a nested subgraph can retain a
+    /// parent-loop binding without confusing equal local node numbers.
+    pub state_inputs: BTreeMap<WireSourceKey, LoweredValue>,
     pub active_coordinates: Vec<Coordinate>,
 }
 
@@ -1039,7 +1040,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             output_count: node.output_types().len(),
                         });
                     }
-                    if let Some(value) = environment.state_inputs.get(&wire.source.wire) {
+                    if let Some(value) = environment.state_inputs.get(&wire.source) {
                         self.finish_wire(&wire, value.clone());
                         values.push(value.clone());
                         continue;
@@ -1474,7 +1475,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                         )
                                     })
                                     .collect();
-                                child.state_inputs.clear();
                                 let parameter_bindings = call.bindings.clone();
                                 for (name, expression) in &parameter_bindings {
                                     let value = self
@@ -3726,7 +3726,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     }
                 }
             };
-            child.state_inputs.insert(input, value);
+            child
+                .state_inputs
+                .insert(WireSourceKey { scope: child.occurrence.clone(), wire: input }, value);
         }
         for (name, expression) in &specification.bindings {
             let value = self.resolve_int(expression, &child)?;
@@ -3946,7 +3948,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 };
                 let value =
                     self.normalize_singleton_for_input(arguments[position].clone(), &input_type)?;
-                child.state_inputs.insert(child_inputs[position], value);
+                child.state_inputs.insert(
+                    WireSourceKey { scope: child.occurrence.clone(), wire: child_inputs[position] },
+                    value,
+                );
                 continue;
             }
             let LoweredValue::Term(initial_term) = arguments[position] else {
@@ -3986,7 +3991,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 },
             );
             child.state_inputs.insert(
-                child_inputs[position],
+                WireSourceKey { scope: child.occurrence.clone(), wire: child_inputs[position] },
                 LoweredValue::Term(self.egraph.add(MxxLang::Atom {
                     source: super::identity::AtomicSourceId(state),
                     indices: Box::new([]),
@@ -3999,7 +4004,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             .skip(specification.carried_count)
             .zip(arguments.iter().skip(specification.carried_count).cloned())
         {
-            child.state_inputs.insert(input, argument);
+            child
+                .state_inputs
+                .insert(WireSourceKey { scope: child.occurrence.clone(), wire: input }, argument);
         }
         for (name, expression) in &specification.bindings {
             let value = self.resolve_int(expression, &child)?;
@@ -5006,6 +5013,125 @@ mod tests {
         )
         .expect("freeze deep graph")
         .0
+    }
+
+    #[test]
+    fn parallel_body_binding_survives_a_nested_subgraph_call() {
+        use mxx_ir_core::{
+            graph::{GraphOutput, NodeHandle, SubgraphHandle, with_new_construction_scope},
+            node::LoopInputMode,
+        };
+
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let root = NodeHandle::new(
+            NodeKind::UniformIntervalSample {
+                matrix_type: matrix.clone(),
+                range: mxx_ir_core::node::SampleRange {
+                    minimum: IntExpr::constant(0),
+                    maximum: IntExpr::constant(0),
+                },
+            },
+            Vec::new(),
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .expect("root constant");
+        let body = with_new_construction_scope(|scope| {
+            let body_input = NodeHandle::new(
+                NodeKind::Input {
+                    name: "parallel-input".to_owned(),
+                    wire_type: WireType::Matrix(matrix.clone()),
+                    artifact: None,
+                },
+                Vec::new(),
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .expect("parallel body input");
+            let identity = with_new_construction_scope(|inner_scope| {
+                let input = NodeHandle::new(
+                    NodeKind::Input {
+                        name: "subgraph-input".to_owned(),
+                        wire_type: WireType::Matrix(matrix.clone()),
+                        artifact: None,
+                    },
+                    Vec::new(),
+                    vec![WireType::Matrix(matrix.clone())],
+                )
+                .output(0)
+                .expect("subgraph input");
+                SubgraphHandle::new("identity", inner_scope, vec![input.clone()], vec![input])
+                    .expect("identity subgraph")
+            });
+            let output = NodeHandle::subgraph_call(
+                identity,
+                vec![body_input.clone()],
+                Vec::new(),
+                vec![None],
+            )
+            .output(0)
+            .expect("subgraph output");
+            SubgraphHandle::new("parallel-body", scope, vec![body_input], vec![output])
+                .expect("parallel body")
+        });
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(matrix.clone())),
+            count: IntExpr::constant(2),
+        };
+        let family = NodeHandle::parallel_loop(
+            body,
+            vec![root],
+            vec![family_type],
+            mxx_ir_core::node::ParallelLoop {
+                count: IntExpr::constant(2),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: Vec::new(),
+                input_modes: vec![LoopInputMode::Broadcast],
+            },
+        )
+        .output(0)
+        .expect("parallel output");
+        let output = NodeHandle::new(
+            NodeKind::FamilyGetStatic { index: IntExpr::constant(0) },
+            vec![family],
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .expect("family element");
+        let graph = mxx_ir_core::graph::Graph::freeze(
+            "parallel-subgraph-alias",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze graph")
+        .0;
+        let output = graph.outputs()["output"].value;
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = graph;
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "parallel-subgraph-alias".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        lowerer
+            .lower_stage_wire(&StageId("encrypt".to_owned()), output)
+            .expect("bound parallel input lowers through subgraph call");
+        assert!(lowerer.egraph.analysis.symbols.atomic_sources.values.iter().all(|descriptor| {
+            !matches!(descriptor.key, super::super::identity::AtomicSourceKey::GraphWire(_))
+        }));
     }
 
     #[test]

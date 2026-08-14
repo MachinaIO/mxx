@@ -353,8 +353,8 @@ pub fn validate_with_manifests(
     check_manifests(manifests)?;
     check_bindings(graph, bindings)?;
     check_topological(graph)?;
-    // This is the single source for parameter-only validity and is also emitted as Lean
-    // `ParamsValid`. The remaining validation derives concrete types, checks wire flow and
+    // This is the single source for parameter-only validity used by operational checking.
+    // The remaining validation derives concrete types, checks wire flow and
     // shapes, and constructs execution/liveness data.
     crate::constraints::evaluate_param_constraints(graph, bindings)?;
 

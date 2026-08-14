@@ -8,7 +8,7 @@ use num_bigint::BigInt;
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 
-/// A decidable parameter condition shared by concrete validation and Lean emission.
+/// A decidable parameter condition shared by concrete validation and operational checking.
 ///
 /// These constraints intentionally contain only compile-time expressions. Scheduling,
 /// liveness, concrete wire flow, and manifest checks remain validation-only concerns.

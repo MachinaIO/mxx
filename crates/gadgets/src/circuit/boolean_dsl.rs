@@ -147,8 +147,8 @@ pub trait BooleanLayerGate<T> {
 /// Optional owner hooks for matrix-valued Boolean evaluation.
 ///
 /// The generic gadget does not assign symbolic meaning.  An owning implementation may retain
-/// frozen derivation references on the initial family and each selected lane value; the Lean
-/// checker remains responsible for validating and applying those references.
+/// frozen derivation references on the initial family and each selected lane value; the Rust
+/// operational checker validates and applies those references.
 pub trait BooleanMatrixLayerGate: BooleanLayerGate<Mat> {
     fn retain_initial_family(&self, family: Family<Mat>) -> Result<Family<Mat>, DslError> {
         Ok(family)

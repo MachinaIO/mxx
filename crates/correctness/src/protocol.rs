@@ -20,7 +20,7 @@ pub struct OutputRef {
     pub output: String,
 }
 
-/// A stable frozen-IR node identity transported to Lean as protocol data.
+/// A stable frozen-IR node identity retained as protocol data.
 ///
 /// This reference has no symbolic or proof meaning on the Rust side.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -73,7 +73,7 @@ pub struct ArtifactBinding {
     /// Consumer input whose executable graph carries a concrete runtime
     /// `ProductionId`. Runtime production identity is not protocol identity.
     pub consumer_input: StageInputName,
-    /// Stage-relative producer identity used by the protocol hash and Lean bundle.
+    /// Stage-relative producer identity used by the protocol declaration.
     pub producer_stage: StageId,
     /// Producer output and runtime artifact name must agree.
     pub producer_output: ArtifactName,
@@ -94,11 +94,10 @@ pub struct ParameterDecl {
 
 pub type ParamDecls = Vec<ParameterDecl>;
 
-/// The single canonical Rust declaration transported to Lean.
+/// The single canonical Rust protocol declaration.
 ///
-/// Rust stores only compile-parameter declarations and the closed protocol bundle. Symbolic
-/// facts, rule choices, derived bounds, and endpoint proofs are deliberately absent: Lean derives
-/// and checks them from this frozen data.
+/// Rust stores compile-parameter declarations and the closed protocol bundle. The operational
+/// checker computes coefficient bounds and validates decoder targets from this frozen data.
 #[derive(Clone)]
 pub struct ProtocolDecl {
     pub params: ParamDecls,

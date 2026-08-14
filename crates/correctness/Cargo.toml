@@ -3,7 +3,7 @@ name = "mxx-correctness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Perfect-correctness declarations, Lean emission, and verification for mxx"
+description = "Perfect-correctness declarations and Rust operational checking for mxx"
 
 [dependencies]
 mxx-ir-core.workspace = true

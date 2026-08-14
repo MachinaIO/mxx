@@ -17,16 +17,6 @@ use mxx_ir_core::{
 pub const PROTOCOL_NAME: &str = "toy-example";
 pub const DECODED_ENDPOINT: &str = "decoded-endpoint";
 pub const RESIDUAL_ANCHOR: &str = "toy.decoder.residual";
-pub const PROTOCOL_SOURCE_PATHS: &[&str] = &[
-    "crates/correctness/Cargo.toml",
-    "crates/correctness/examples/emit_correctness.rs",
-    "crates/correctness/src",
-    "crates/dsl/Cargo.toml",
-    "crates/dsl/src",
-    "crates/ir-core/Cargo.toml",
-    "crates/ir-core/src",
-];
-
 pub fn protocol() -> ProtocolDecl {
     let ring = Ring::new(256, 1);
     let message = ring.bool_input("message");

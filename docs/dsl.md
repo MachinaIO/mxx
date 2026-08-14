@@ -42,4 +42,4 @@ Correctness declarations use `IdealSpec::new` and `PurePredicateSpec::new`. Thes
 sampling nodes and retain a deterministic graph consumed by `mxx-correctness::ProtocolDecl`.
 There is no virtual matrix, assumption, symbolic overlay, or second expression DAG.
 
-See `docs/runtime.md` for execution and `docs/lean.md` for correctness verification.
+See `docs/runtime.md` for execution and `docs/correctness/operational-protocol-inventory.md` for checking semantics.

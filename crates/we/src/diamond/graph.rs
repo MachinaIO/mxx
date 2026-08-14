@@ -36,21 +36,6 @@ pub const HASH_KEY_INPUT: &str = "diamond-hash-key";
 pub const MESSAGE_INPUT: &str = "diamond-message";
 pub const DECODED_OUTPUT: &str = "diamond-decoded";
 pub const NOISY_PLAINTEXT_OUTPUT: &str = "diamond-noisy-plaintext";
-pub const DIAMOND_PROTOCOL_SOURCE_PATHS: &[&str] = &[
-    "crates/bgg/Cargo.toml",
-    "crates/bgg/src",
-    "crates/correctness/Cargo.toml",
-    "crates/correctness/src",
-    "crates/dsl/Cargo.toml",
-    "crates/dsl/src",
-    "crates/gadgets/Cargo.toml",
-    "crates/gadgets/src",
-    "crates/ir-core/Cargo.toml",
-    "crates/ir-core/src",
-    "crates/we/Cargo.toml",
-    "crates/we/examples/emit_correctness.rs",
-    "crates/we/src",
-];
 const IDEAL_MESSAGE_OUTPUT: &str = "message";
 
 #[derive(Clone)]
@@ -1348,71 +1333,5 @@ mod tests {
             ComparatorSpec::Equality { endpoints }
                 if endpoints.len() == 1 && endpoints[0].failure_value
         ));
-        let emitted = mxx_correctness::emit_protocol_for(
-            "diamond-we-family",
-            declaration.protocol(),
-            "MxxWe",
-            DIAMOND_PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        assert!(
-            emitted
-                .proof_ir
-                .contains("def DiamondWeFamily_protocol : Mxx.Certificate.ClosedProtocolDecl")
-        );
-        assert!(!emitted.proof_ir.contains("SparseCertificate"));
-        assert!(
-            emitted
-                .proof_ir
-                .contains(".roundDivide (.parameter \"diamond_modulus\") (.constant (2 : Int))")
-        );
-        assert!(!emitted.proof_ir.contains(
-            ".roundDivide (.subtract (.parameter \"diamond_modulus\") (.constant (1 : Int))) \
-             (.constant (2 : Int))"
-        ));
-    }
-
-    #[test]
-    fn protocol_hash_is_independent_of_runtime_parameter_bindings() {
-        let first = compiler();
-        let mut second_config = first.config.clone();
-        second_config.modulus = 769.into();
-        second_config.ring_dimension = 16;
-        second_config.digit_count = 3;
-        let second = DiamondWeCompiler::new(
-            second_config,
-            BooleanCircuitShape {
-                instance_width: 1,
-                witness_width: 1,
-                depth: 3,
-                max_layer_width: 4,
-            },
-        )
-        .unwrap();
-        let direct =
-            DiamondWeProtocolFamily::new(first.config.bgg_tag.clone()).protocol_decl().unwrap();
-        let first = mxx_correctness::emit_protocol_for(
-            "diamond-we-family",
-            first.protocol_decl().unwrap().protocol(),
-            "MxxWe",
-            DIAMOND_PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        let second = mxx_correctness::emit_protocol_for(
-            "diamond-we-family",
-            second.protocol_decl().unwrap().protocol(),
-            "MxxWe",
-            DIAMOND_PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        let direct = mxx_correctness::emit_protocol_for(
-            "diamond-we-family",
-            direct.protocol(),
-            "MxxWe",
-            DIAMOND_PROTOCOL_SOURCE_PATHS,
-        )
-        .unwrap();
-        assert_eq!(first.freshness.workflow_hash, second.freshness.workflow_hash);
-        assert_eq!(first.freshness.workflow_hash, direct.freshness.workflow_hash);
     }
 }

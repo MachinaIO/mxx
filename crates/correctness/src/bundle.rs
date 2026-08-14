@@ -78,7 +78,7 @@ pub struct TrapdoorContractMismatch {
     pub actual: TrapdoorContractValue,
 }
 
-/// A closed endpoint registry key. Its matcher and soundness theorem live in Lean.
+/// A closed endpoint registry key used by the Rust operational checker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum EndpointSpecId {
     ToyThresholdDecode,
@@ -87,9 +87,9 @@ pub enum EndpointSpecId {
 
 /// A symbolic upper bound explicitly assumed by an external-input contract.
 ///
-/// This is protocol data, not a Rust-derived analyzer result. Rust only emits
-/// this syntax; Lean converts it to its authoritative `BoundExpr`, checks the
-/// input obligation, and performs all evaluation.
+/// This is protocol data, not a Rust-derived analyzer result. The Rust
+/// operational checker converts it to its internal bound expression, checks
+/// the input obligation, and evaluates it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value")]
 pub enum DeclaredBoundExpr {
@@ -356,10 +356,10 @@ pub enum BundleValidationError {
 }
 
 impl ClosedProtocolBundle {
-    /// Performs construction-time hygiene before emission.
+    /// Performs construction-time hygiene before operational checking.
     ///
-    /// These checks are not correctness evidence. The generated Lean bundle
-    /// verifier repeats every theorem-relevant condition independently.
+    /// These checks are not operational-checker evidence. The checker validates
+    /// theorem-relevant conditions from the frozen bundle independently.
     pub fn new(bundle: Self) -> Result<Self, BundleValidationError> {
         bundle.validate()?;
         Ok(bundle)

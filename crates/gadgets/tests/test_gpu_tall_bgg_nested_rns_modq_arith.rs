@@ -164,7 +164,7 @@ impl TestConfig {
                 "MXX_TALL_NESTED_RNS_STOP_AFTER_BENCHMARK_ESTIMATION",
                 false,
             )?,
-            // Lean elaboration of the generated workflow is CPU-only and independent across
+            // Operational checking of the generated workflow is CPU-only and independent across
             // parameter candidates. Keep the default batch small because each checker can use
             // tens of GiB for large LUT graphs.
             parameter_simulation_parallelism: env_usize(

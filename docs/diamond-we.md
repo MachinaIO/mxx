@@ -42,10 +42,9 @@ separate projection used by the final decoder.
 
 ## Correctness and parameters
 
-The end-to-end Lean correctness theorem is still in progress. The generated closed protocol,
-registered-rule analysis, hard-bound algebra, and executable parameter checker are available for
-review, while the unfinished endpoint composition is excluded from the normal `MxxWe` build. The
-precise boundary and review commands are documented in `docs/diamond-we-correctness-status.md`.
+The Rust operational checker is the active acceptance path for the constructed closed protocol
+and registered-rule analysis. There is currently no end-to-end correctness theorem; the checker
+uses explicit hard bounds and the executable parameter checker instead.
 
 `DiamondWeProtocolFamily::protocol_decl` returns a validated `WitnessEncryptionProtocolDecl`. The
 declaration is built directly from symbolic circuit and cryptographic parameters; it does not own a
@@ -64,7 +63,7 @@ declared cutoff. CPU preimage sampling rejects a whole candidate, preserving the
 
 `DiamondParameterSearch` fixes the circuit shape and searches ring dimension and modulus depth. It
 uses the ordinary untruncated Gaussian only for lattice-security estimation. Correctness uses a
-worst-case recurrence with full ring and inner-dimension factors, then invokes the compiled Lean
+worst-case recurrence with full ring and inner-dimension factors, then invokes the Rust
 checker before accepting a candidate. The checker receives all 15 symbolic protocol parameters,
 including the four circuit-family dimensions and both sampler sigmas. Rational sigmas are passed as
 exact numerator/denominator pairs. Candidate acceptance therefore evaluates the generated

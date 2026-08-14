@@ -3,18 +3,17 @@
 ## Purpose
 
 This is the normative inventory for the execution-aligned operational checker. Every executable
-Rust IR variant and every nested operation variant has one row below. Protocol emission is in
-`crates/correctness/src/emit_lean.rs`; operational transfer classification is owned by the Rust
-operational-noise checker.
+Rust IR variant and every nested operation variant has one row below. The Rust
+operational-noise checker owns both protocol-bound resolution and coefficient-bound transfer.
 
 The compiler-enforced coverage boundary has three parts:
 
-1. Rust emission matches `NodeKind` exhaustively and has no catch-all arm.
+1. Rust lowering matches `NodeKind` exhaustively and has no catch-all arm.
 2. The operational lowering dispatch matches every `NodeKind` exhaustively.
 3. Nested enums are matched exhaustively at their Rust lowering boundary.
 
 Adding a constructor to any of those enums therefore breaks compilation until an explicit
-operational-checker decision is made. A valid emitted node must reach an explicit lowering path or
+operational-checker decision is made. A valid graph node must reach an explicit lowering path or
 a documented normal rejection, never an implicit default fact.
 
 All matrix equalities used by relations are equalities in `R_q`, not integer equalities. `B` is
@@ -25,7 +24,7 @@ the shared source public matrix in a preimage relation: branch-specific targets 
 
 | Variant | Inputs | Exact operational result | Bound or interval | Identity/relation handling | Normal rejection | Source |
 |---|---|---|---|---|---|---|
-| `Input` | Protocol-bound input contract | Contract fact with root protocol identity | Declared interval, cutoff, or conservative matrix cap | Preserves protocol input/family/artifact identity | Missing or mismatched contract | Current contract path |
+| `Input` | Protocol-bound input contract | Contract fact with root protocol identity | Resolves to `ExactZero`, `Bounded(B)`, or explicit `Large` with no finite operational bound; no implicit default | Preserves protocol input/family/artifact identity | Missing or mismatched contract | Current contract path |
 | `ConstantInt` | none | Exact integer | `[v,v]` | Fresh executable scalar origin | Non-integer output or operands present | Current IR semantics |
 | `EvaluateInt` | none | Parameter expression | Exact minimum/maximum over declared loop domains | Parameter provenance remains contextual | Non-integer output or unevaluable expression | Current IR semantics |
 | `ConstantReal` | none | Exact real syntax | No noise bound | No matrix identity | Non-real output or operands present | Current IR semantics |
@@ -35,8 +34,8 @@ the shared source public matrix in a preimage relation: branch-specific targets 
 | `IntBinary.Add` | two integers | `x + y` | `[lx+ly, ux+uy]` | Scalar origin from node | Wrong type/arity | Historical scalar interval rule |
 | `IntBinary.Subtract` | two integers | `x - y` | `[lx-uy, ux-ly]` | Scalar origin from node | Wrong type/arity | Historical scalar interval rule |
 | `IntBinary.Multiply` | two integers | `x * y` | Min/max of all four endpoint products | Scalar origin from node | Wrong type/arity | Historical scalar interval rule |
-| `IntBinary.Divide` | two integers | Rust/Lean integer division | Endpoint envelope when divisor interval excludes zero | Scalar origin from node | Possible zero divisor | Current IR evaluator |
-| `IntBinary.Remainder` | two integers | Rust/Lean remainder | Conservative signed endpoint envelope | Scalar origin from node | Possible zero divisor | Current IR evaluator |
+| `IntBinary.Divide` | two integers | Rust integer division | Endpoint envelope when divisor interval excludes zero | Scalar origin from node | Possible zero divisor | Current IR evaluator |
+| `IntBinary.Remainder` | two integers | Rust remainder | Conservative signed endpoint envelope | Scalar origin from node | Possible zero divisor | Current IR evaluator |
 | `IntCompare.Equal` | two integers | Exact comparison expression | Boolean fact | No matrix identity | Wrong type/arity | Current IR evaluator |
 | `IntCompare.Less` | two integers | Exact comparison expression | Boolean fact | No matrix identity | Wrong type/arity | Current IR evaluator |
 | `IntCompare.LessEqual` | two integers | Exact comparison expression | Boolean fact | No matrix identity | Wrong type/arity | Current IR evaluator |
@@ -57,18 +56,18 @@ the shared source public matrix in a preimage relation: branch-specific targets 
 | `ConstantMatrix.Identity` | none | One bounded identity factor | `1`; constant polynomial | Structural identity factor | Type/shape mismatch | Deterministic leaf rule |
 | `ConstantMatrix.UnitRow` | none | One bounded exact factor | `1`; constant polynomial | Exact origin retained | Invalid index/type | Deterministic leaf rule |
 | `ConstantMatrix.UnitColumn` | none | One bounded exact factor | `1`; constant polynomial | Exact origin retained | Invalid index/type | Deterministic leaf rule |
-| `ConstantMatrix.Gadget` | none | One Large public factor | Centered cap | Gadget identity from explicit layout | Missing/mismatched layout | Historical gadget rule |
-| `ConstantMatrix.Gadget(small)` | none | One Large public factor | Centered cap | Small-gadget identity from explicit layout | Missing/mismatched layout | Historical gadget rule |
-| `ConstantMatrix.PowerOfBase` | none | One Large exact factor | Centered cap | Exact node origin | Invalid base/type | Deterministic leaf rule |
+| `ConstantMatrix.Gadget` | none | Regular gadget matrix | `Large`; no finite operational bound | Gadget identity from explicit layout | Missing/mismatched layout or base `<= 1` | Current matrix rule |
+| `ConstantMatrix.Gadget(small)` | none | Small gadget matrix | `Bounded(base - 1)` | Small-gadget identity from explicit layout | Missing/mismatched layout or base `<= 1` | Current matrix rule |
+| `ConstantMatrix.PowerOfBase` | none | Exact scalar polynomial | `Bounded(abs(base)^exponent)` | Exact node origin | Invalid exponent or non-scalar type | Current matrix rule |
 | `ConstantMatrix.Rotation` | none | One bounded exact factor | `1` | Exact node origin | Invalid exponent/type | Deterministic leaf rule |
 | `ConstantMatrix.Polynomial` | none | One bounded exact factor, or zero | Maximum absolute coefficient; constant-polynomial derived from positions | Exact node origin | Unevaluable coefficient/type | Deterministic leaf rule |
-| `GadgetTrapdoor` | none | Port 0 is one Large gadget-public factor; port 1 is a trapdoor fact | Public uses centered cap; trapdoor uses explicit base bound | Both ports share one public identity | Missing/mismatched layout/type/output | Historical gadget rule |
-| `TrapdoorSample` | none | Port 0 is one Large sampled public factor; port 1 is a trapdoor fact | Public uses centered cap; trapdoor uses explicit nonnegative cutoff | Both ports share one sampled public identity | Invalid cutoff/type/output | Sampler contract |
-| `TrapdoorPublic` | trapdoor | One Large public factor | Centered cap | Recovers the trapdoor's exact public identity | Missing trapdoor identity/type | Sampler contract |
-| `UniformResidueSample` | none | One Large sampled factor | Centered cap | Fresh sampled origin | Invalid matrix parameters | Sampler contract |
+| `GadgetTrapdoor` | none | Port 0 is a `Large` gadget-public factor; port 1 is a trapdoor fact | Public has no finite operational bound; trapdoor uses explicit base bound | Both ports share one public identity | Missing/mismatched layout/type/output | Current source rule |
+| `TrapdoorSample` | none | Port 0 is a `Large` sampled public factor; port 1 is a trapdoor fact | Public has no finite operational bound; trapdoor uses explicit nonnegative cutoff | Both ports share one public identity | Invalid cutoff/type/output | Current source rule |
+| `TrapdoorPublic` | trapdoor | One `Large` public factor | No finite operational bound | Recovers the trapdoor's exact public identity | Missing trapdoor identity/type | Current source rule |
+| `UniformResidueSample` | none | One `Large` sampled factor | No finite operational bound | Fresh sampled origin | Invalid matrix parameters | Current source rule |
 | `UniformIntervalSample` | none | One bounded sampled factor | `max(abs(min),abs(max))`; canonical range only when nonnegative | Fresh sampled origin | Invalid interval/type | Historical deterministic support rule |
 | `GaussianSample` | none | One bounded sampled factor | Explicit nonnegative cutoff | Fresh sampled origin | Negative cutoff/type | Sampler contract |
-| `HashSample.Plain` | key and ordered integer tags | One Large deterministic factor | Centered cap | Complete hash-query identity | Bad key/tag/type | Historical hash identity rule |
+| `HashSample.Plain` | key and ordered integer tags | One `Large` deterministic factor | No finite operational bound without an authoritative hard output range | Complete hash-query identity | Bad key/tag/type | Current source rule |
 | `HashSample.Decomposed` | key and ordered integer tags | One bounded decomposition factor | Gadget decomposition hard bound | Relation snapshot points to the matching plain hash query | Missing base/count/layout or bad query/type | Historical decomposition rule |
 | `HashSample.SmallDecomposed` | key and ordered integer tags | One bounded decomposition factor | Small decomposition hard bound | Relation snapshot points to the matching plain hash query | Missing base/count/layout or bad query/type | Historical decomposition rule |
 | `PreimageSample` | public matrix, matching trapdoor, target | One bounded preimage factor | Explicit nonnegative cutoff | Owns `B*K=target (mod R_q)`; `B` identity must match trapdoor | Wrong arity/identity/type/cutoff | Sampler contract and historical rewrite |
@@ -79,21 +78,21 @@ the shared source public matrix in a preimage relation: branch-specific targets 
 
 | Variant | Inputs | Exact operational terms | Hard bound and metadata | Identity/relation handling | Normal rejection | Source |
 |---|---|---|---|---|---|---|
-| `MatrixBinary.Add` | two same-type matrices | Concatenate, merge identical products, compress bounded sum | Triangle inequality; constant only if both constant; zero rows cleared | Relations remain only on untouched bare factors | Type/arity mismatch or analysis cap | Historical affine normalization |
-| `MatrixBinary.Subtract` | two same-type matrices | Negate right coefficients, merge, cancel, compress | Triangle inequality after exact cancellation | Structural identity controls cancellation | Type/arity mismatch or analysis cap | Historical affine normalization |
-| `MatrixBinary.Multiply` | two compatible matrices | Distributive ordered-product cross product | Deterministic `productBound`; right zero rows reduce contraction | Exhaustive adjacent preimage/decomposition rewrite before compression | Type/arity/mode mismatch or analysis cap | Historical matrix affine/product rule |
-| `MatrixNegate` | matrix | Negate additive coefficients | Absolute hard bound unchanged | Complete factor identity retained | Type/arity mismatch | Historical affine normalization |
-| `MatrixScale` | matrix and static scalar expression | Multiply additive coefficients; nonuniform dynamic value becomes a factor | Absolute scalar times bound | Identity retained for uniform static scale | Unevaluable scalar/type/arity | Historical affine normalization |
-| `Transpose` | matrix | Reverse factor order and transpose every factor | Recomputed typed product bound/metadata | Relations are not transported through transforms | Unsupported transformed type/arity | Historical transform rule |
-| `Slice` | matrix | Row slice transforms left boundary; column slice transforms right boundary | Recomputed boundary-factor bound; canonical range retained | Relations are not transported through transforms | Invalid range/type/arity or unsupported mixed transform | Historical transform rule |
-| `Tensor` | two matrices | Explicit distributive tensor product | Tensor-specific deterministic bound | Relation ownership is not guessed across tensor | Type/arity mismatch or unsupported typed tensor | Current evaluator plus historical bound arithmetic |
-| `Concat.Rows` | one or more matrices | Embed each term's left boundary and combine | Bounded contributions use triangle inequality | Factor order and signal identities retained | Empty/type/shape mismatch or unsupported embedding | Historical transform rule |
-| `Concat.Columns` | one or more matrices | Embed each term's right boundary and combine | Bounded contributions use triangle inequality | Factor order and signal identities retained | Empty/type/shape mismatch or unsupported embedding | Historical transform rule |
-| `Concat.Diagonal` | one or more matrices | Embed both boundaries and combine | Bounded contributions use triangle inequality | Factor order and signal identities retained | Empty/type/shape mismatch or unsupported embedding | Historical transform rule |
+| `MatrixBinary.Add` | two same-type matrices | Coefficient-wise addition | `ExactZero` is identity; finite bounds add; otherwise `Large` | Only proved algebraic equality may cancel correlated terms | Type/arity mismatch | Current bound transfer |
+| `MatrixBinary.Subtract` | two same-type matrices | Coefficient-wise subtraction | Same as addition; a proved `X - X` is zero | Structural e-class identity controls cancellation | Type/arity mismatch | Current bound transfer |
+| `MatrixBinary.Multiply` | two compatible matrices | Matrix/ring product | Zero first; `Large` factor is `Large`; finite bounds use inner-summand and ring factors | Optional exact relation rewrite is identity-checked | Type/arity/mode mismatch | Current product transfer |
+| `MatrixNegate` | matrix | Coefficient-wise negation | Preserves the class | Exact identity retained | Type/arity mismatch | Current bound transfer |
+| `MatrixScale` | matrix and integer scalar interval | Coefficient-wise scaling | Scalar maximum absolute value scales finite bounds; zero annihilates | Matrix identity retained | Missing scalar domain/type/arity | Current bound transfer |
+| `Transpose` | matrix | Coefficient-preserving view | Preserves the class and constant-polynomial metadata | No new relation is inferred | Unsupported transformed type/arity | Current bound transfer |
+| `Slice` | matrix | Coefficient-preserving view | Preserves the coefficient class and constant-polynomial flag; clears `known_zero_rows` | No new relation is inferred | Invalid range/type/arity | Current bound transfer |
+| `Tensor` | two matrices | Tensor product | Zero first; otherwise same polynomial ring factor as multiplication, without an inner-sum factor | No relation is inferred | Type/arity mismatch | Current product transfer |
+| `Concat.Rows` | one or more matrices | Disjoint row embedding | Maximum of input classes | Input identities remain local to their embedded entries | Empty/type/shape mismatch | Current bound transfer |
+| `Concat.Columns` | one or more matrices | Disjoint column embedding | Maximum of input classes | Input identities remain local to their embedded entries | Empty/type/shape mismatch | Current bound transfer |
+| `Concat.Diagonal` | one or more matrices | Disjoint diagonal embedding | Maximum of input classes | Input identities remain local to their embedded entries | Empty/type/shape mismatch | Current bound transfer |
 | `ThresholdDecode(bool)` | scalar matrix | Boolean outputs from canonical coefficients | Output facts are Boolean; decoder obligation uses input noise | Does not transport matrix identity | Invalid p/q/count/type/output count | Current evaluator and generic threshold obligation |
 | `ThresholdDecode(int)` | scalar matrix | Integer outputs from canonical coefficients | Each result in `[0,p-1]`; decoder obligation uses input noise | Does not transport matrix identity | Invalid p/q/count/type/output count | Current evaluator and generic threshold obligation |
 | `CrtRecompose` | equal one-row matrices and positional CRT metadata | Weighted sum of input polynomials | Deterministic scaled-sum hard bound | Preserves exact factor provenance in each summand | Empty/mismatched metadata/type/modulus/coefficient | Current IR semantics |
-| `PackPolynomialCoefficients` | exact Boolean family | One exact Large reconstructed residue polynomial | Centered cap; canonical residue range | Fresh exact output identity | Wrong family size/type/bit width/output shape | Current IR semantics |
+| `PackPolynomialCoefficients` | coefficient-major Boolean bits | Reconstructs each coefficient as `sum_k 2^k bit_k` | Maximum reconstructed coefficient, capped at `q - 1`; known-zero bits tighten it | Fresh output identity | Non-Boolean/missing bit domain, wrong bit count, width, or output shape | Current bound transfer |
 
 ## Families, selection, and nested execution
 
@@ -112,22 +111,6 @@ the shared source public matrix in a preimage relation: branch-specific targets 
 
 ## Generic acceptance
 
-### Exact Boolean protocol carriers
-
-The `mxx-correctness.protocol-boolean-signal-grouping` attachment is an untrusted structural hint
-for the exact executable chain
-
-```text
-Boolean protocol input -> BoolToInt -> Select(zero, nonzero constant matrix)
-```
-
-Lean verifies every named wire, direct operand, node kind, matrix type, and the nonzero constant
-carrier before representing the selected value as one exact Large signal factor. The attachment
-contains no role or bound accepted by assertion. A wrong selector, zero branch, carrier, or selected
-output is rejected as `invalidDerivationAttachment`. This lets Toy form and anchor the executable
-residual `ciphertext - encoded_message`; the selected carrier cancels before the Gaussian term is
-measured as noise.
-
 The generic decoder obligation is exactly
 
 ```text
@@ -138,6 +121,6 @@ and is evaluated with exact integers. Equality at the boundary rejects. The repo
 facts, obligations, acceptance, and a stable rejection reason. Protocol-specific search code may
 parallelize independent candidate reports, but it must not duplicate or replace the bound formula.
 
-This operational checker is a parameter-search and runtime-validation component. Its local and
-end-to-end Lean soundness proofs are tracked separately; passing this checker alone is not yet a
-proved end-to-end correctness theorem.
+This operational checker is a parameter-search and runtime-validation component. It is the
+active implementation acceptance path, but passing it alone is not yet a proved end-to-end
+correctness theorem.

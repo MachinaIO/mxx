@@ -74,4 +74,4 @@ worst-case bounds and accepts a candidate only after the generic Rust operationa
 the frozen workflow and concrete parameter environment.
 
 `mxx-func-enc` and `mxx-io` currently expose compiling interface shells. Their protocol modules
-remain disabled.
+remain disabled. Diamond iO must migrate to the Rust operational checker before it is enabled.

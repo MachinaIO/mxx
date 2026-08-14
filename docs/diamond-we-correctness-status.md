@@ -3,7 +3,7 @@
 The Diamond WE correctness proof is incomplete. This checkpoint keeps the implemented pieces
 reviewable without presenting the unfinished end-to-end theorem as part of the normal build.
 
-## Included in the normal build
+## Implemented and explicitly verified
 
 - The generated parameterized `ClosedProtocolDecl`.
 - The typed certificate identities, expressions, affine facts, recurrence paths, and closed rule
@@ -16,9 +16,10 @@ reviewable without presenting the unfinished end-to-end theorem as part of the n
 - Diamond parameter search calls that Rust checker directly and retains its structured report for
   each accepted or rejected candidate.
 
-Building `MxxWe` establishes only that this stable subset type-checks. Rust checker acceptance
-establishes the implemented operational bound and decoder inequality for the supplied frozen
-workflow and concrete parameter environment; it is not an end-to-end correctness theorem.
+The explicit Lean gate builds `MxxWe` and the derivation checker. Ordinary Cargo builds do not
+invoke Lean. Rust checker acceptance establishes the implemented operational bound and decoder
+inequality for the supplied frozen workflow and concrete parameter environment; it is not an
+end-to-end correctness theorem.
 
 ## Work in progress
 
@@ -34,14 +35,14 @@ gap.
 
 ## Review commands
 
-Run the stable checkpoint build with:
+Run the explicit Lean checkpoint build with:
 
 ```text
 cd lean
 lake build MxxWe mxx_diamond_derivation_checker
 ```
 
-The repository-wide generated-source and Rust build gate is:
+The repository-wide generated-source freshness, Lean derivation, and Rust build gate is:
 
 ```text
 scripts/verified_build.sh

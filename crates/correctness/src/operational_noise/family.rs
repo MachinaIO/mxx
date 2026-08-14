@@ -11,7 +11,7 @@ use super::{
     language::MxxLang,
     lower::LoweredInt,
 };
-use egg::{CostFunction, EGraph, Extractor, Id, Language, RecExpr};
+use egg::{EGraph, Id, Language, RecExpr};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use std::collections::BTreeMap;
@@ -249,65 +249,77 @@ pub fn instantiate_shared_element<A, E>(
 where
     A: egg::Analysis<MxxLang>,
 {
-    struct ProgressAstSize<'a, E> {
-        progress: &'a mut dyn FnMut() -> Result<(), E>,
-        failure: std::rc::Rc<std::cell::RefCell<Option<E>>>,
-    }
-    impl<E> CostFunction<MxxLang> for ProgressAstSize<'_, E> {
-        type Cost = usize;
-        fn cost<C>(&mut self, enode: &MxxLang, mut costs: C) -> usize
-        where
-            C: FnMut(Id) -> usize,
-        {
-            if self.failure.borrow().is_none() &&
-                let Err(error) = (self.progress)()
-            {
-                *self.failure.borrow_mut() = Some(error);
-            }
-            enode.fold(1, |sum, child| sum.saturating_add(costs(child)))
-        }
-    }
-    fn extract<A, E>(
+    /// Copies just the raw-node DAG reachable from `root`.  E-class extraction
+    /// scans every e-class, including unrelated protocol fragments; lowering
+    /// needs one existing representative instead.  The explicit post-order
+    /// stack keeps deeply nested honest graphs stack-safe.
+    fn materialize<A, E>(
         egraph: &EGraph<MxxLang, A>,
         root: Id,
+        binder_replacement: Option<(BinderId, Id)>,
+        expression: &mut RecExpr<MxxLang>,
+        memo: &mut std::collections::HashMap<Id, Id>,
         progress: &mut dyn FnMut() -> Result<(), E>,
-    ) -> Result<RecExpr<MxxLang>, E>
+    ) -> Result<Id, E>
     where
         A: egg::Analysis<MxxLang>,
     {
-        let failure = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let extractor = Extractor::new(
-            egraph,
-            ProgressAstSize { progress, failure: std::rc::Rc::clone(&failure) },
-        );
-        let (_, expression) = extractor.find_best(root);
-        if let Some(error) = failure.borrow_mut().take() {
-            return Err(error);
+        enum Visit {
+            Enter(Id),
+            Exit(Id),
         }
-        Ok(expression)
-    }
-    let template = extract(egraph, representative, progress)?;
-    let replacement = extract(egraph, replacement, progress)?;
-    let mut instantiated = RecExpr::default();
-    let mut template_ids = Vec::with_capacity(template.len());
-    for node in template.as_ref() {
-        progress()?;
-        let root = if matches!(node, MxxLang::IntBinder(candidate) if *candidate == binder) {
-            let mut replacement_ids = Vec::with_capacity(replacement.len());
-            for replacement_node in replacement.as_ref() {
-                progress()?;
-                let rebuilt = replacement_node
-                    .clone()
-                    .map_children(|child| replacement_ids[usize::from(child)]);
-                replacement_ids.push(instantiated.add(rebuilt));
+
+        let mut stack = vec![Visit::Enter(root)];
+        while let Some(visit) = stack.pop() {
+            let id = match visit {
+                Visit::Enter(id) => {
+                    if memo.contains_key(&id) {
+                        continue;
+                    }
+                    if let Some((binder, replacement)) = binder_replacement {
+                        if matches!(egraph.id_to_node(id), MxxLang::IntBinder(candidate) if *candidate == binder)
+                        {
+                            memo.insert(id, replacement);
+                            continue;
+                        }
+                    }
+                    stack.push(Visit::Exit(id));
+                    for child in egraph.id_to_node(id).children().iter().rev() {
+                        if !memo.contains_key(child) {
+                            stack.push(Visit::Enter(*child));
+                        }
+                    }
+                    continue;
+                }
+                Visit::Exit(id) => id,
+            };
+            if memo.contains_key(&id) {
+                continue;
             }
-            *replacement_ids.last().expect("extracted replacement is nonempty")
-        } else {
-            let rebuilt = node.clone().map_children(|child| template_ids[usize::from(child)]);
-            instantiated.add(rebuilt)
-        };
-        template_ids.push(root);
+            progress()?;
+            let rebuilt = egraph.id_to_node(id).clone().map_children(|child| memo[&child]);
+            memo.insert(id, expression.add(rebuilt));
+        }
+        Ok(memo[&root])
     }
+
+    let mut instantiated = RecExpr::default();
+    // Each context has its own memo because a raw node containing `binder`
+    // has a different meaning in the replacement and template contexts.  Both
+    // append into one expression, so every binder occurrence shares the one
+    // materialized replacement root.
+    let mut replacement_memo = std::collections::HashMap::new();
+    let replacement_root =
+        materialize(egraph, replacement, None, &mut instantiated, &mut replacement_memo, progress)?;
+    let mut template_memo = std::collections::HashMap::new();
+    materialize(
+        egraph,
+        representative,
+        Some((binder, replacement_root)),
+        &mut instantiated,
+        &mut template_memo,
+        progress,
+    )?;
     Ok(egraph.add_expr(&instantiated))
 }
 
@@ -802,12 +814,23 @@ mod tests {
             },
         )
         .unwrap();
-        let (_, expression) = Extractor::new(&egraph, egg::AstSize).find_best(instantiated);
+        let expression = egraph.id_to_expr(instantiated);
 
         assert!(expression.iter().any(|node| node == &MxxLang::IntConst(5.into())));
         assert!(expression.iter().any(|node| node == &MxxLang::IntBinder(outer_id)));
         assert!(!expression.iter().any(|node| node == &MxxLang::IntBinder(owner_id)));
-        assert!(progress_calls >= 6, "both extractor scans and rebuild report work");
+        assert_eq!(progress_calls, 3, "only the reachable raw DAG is materialized");
+
+        for value in 0..1_000 {
+            egraph.add(MxxLang::IntConst(value.into()));
+        }
+        let mut unrelated_progress_calls = 0;
+        instantiate_shared_element(&mut egraph, representative, owner_id, replacement, &mut || {
+            unrelated_progress_calls += 1;
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(unrelated_progress_calls, progress_calls);
 
         let mut rejected = || Err::<(), _>("progress stopped");
         assert_eq!(
@@ -820,6 +843,43 @@ mod tests {
             ),
             Err("progress stopped")
         );
+    }
+
+    #[test]
+    fn shared_template_instantiation_reuses_one_nontrivial_replacement_dag() {
+        let mut analysis = MxxAnalysis::default();
+        let scope = crate::operational_noise::identity::OccurrenceScope {
+            program: crate::operational_noise::identity::ProgramKey::Ideal,
+            definition: mxx_ir_core::FrozenGraphScopeId::Root,
+            path: Box::new([]),
+        };
+        let owner = BinderKey { loop_scope: scope, loop_node: mxx_ir_core::NodeId(1), slot: 0 };
+        let owner_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
+            key: owner,
+            minimum: 0.into(),
+            maximum: 7.into(),
+        }));
+        let mut egraph = EGraph::new(analysis);
+        let owner_term = egraph.add(MxxLang::IntBinder(owner_id));
+        let representative = egraph.add(MxxLang::IntAdd([owner_term, owner_term]));
+        let two = egraph.add(MxxLang::IntConst(2.into()));
+        let three = egraph.add(MxxLang::IntConst(3.into()));
+        let replacement = egraph.add(MxxLang::IntAdd([two, three]));
+
+        let instantiated = instantiate_shared_element(
+            &mut egraph,
+            representative,
+            owner_id,
+            replacement,
+            &mut || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        let expression = egraph.id_to_expr(instantiated);
+        assert_eq!(expression.len(), 4, "replacement is appended once, not once per binder");
+        let MxxLang::IntAdd([left, right]) = expression[expression.root()] else {
+            panic!("instantiated template must retain its outer addition");
+        };
+        assert_eq!(left, right, "both binder occurrences must use the same replacement root");
     }
 
     #[test]

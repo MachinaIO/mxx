@@ -237,7 +237,7 @@ pub enum OperationalDecoderKind {
 }
 
 /// Names the residual and executable decoder whose acceptance margin is checked
-/// by the Lean operational checker.
+/// by the Rust operational checker.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationalDecoderTarget {
     pub target_id: String,

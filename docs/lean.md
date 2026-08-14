@@ -19,10 +19,11 @@ MXX_REGENERATE_CORRECTNESS=1 cargo run -p mxx-correctness --example emit_correct
 MXX_REGENERATE_CORRECTNESS=1 cargo run -p mxx-we --example emit_correctness
 ```
 
-The explicit regeneration flag lets the emitter compile when the checked-in source hash is stale.
-Normal Cargo builds do not accept stale generated input: each owning crate's `build.rs` recomputes
-the complete declared protocol-source hash and the shared Lean toolkit hash before building its
-Lean targets.
+The explicit regeneration flag lets the emitter compile when the checked-in generated source is
+stale. Ordinary Cargo builds do not invoke Lean or reject generated-source freshness: Rust
+operational checking is self-contained. The explicit Lean gate regenerates both owners into a
+scratch directory, compares the result with the checked-in sources, verifies metadata hashes, and
+builds the Lean libraries.
 
 Each command mechanically translates its linked workflow, stage graph, artifact binding,
 sampler cutoff, ideal graph, requirements, comparator, input contract, and endpoint anchors into
@@ -96,13 +97,14 @@ Useful local gates are:
 
 ```text
 MXX_REGENERATE_CORRECTNESS=1 cargo run -p mxx-correctness --example emit_correctness
+scripts/verified_build.sh
 cargo build -p mxx-correctness
-cargo check -p mxx-gadgets
 ```
 
 `mxx-we` uses the generic Rust operational checker directly during parameter search. Diamond
 protocol emission produces one parameterized protocol family rather than a selected shape or
 cryptographic configuration. The crate-owned Lean build remains the theorem-development and
-derivation-validation path; it is not the production operational parameter checker. The final
-workflow soundness theorem is still under migration, so the current build must not be presented as
-an end-to-end Diamond correctness result.
+derivation-validation path, invoked explicitly by `scripts/verified_build.sh` and CI; it is not
+part of ordinary Cargo builds or the production operational parameter checker. The final workflow
+soundness theorem is still under migration, so the current build must not be presented as an
+end-to-end Diamond correctness result.

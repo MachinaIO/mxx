@@ -439,10 +439,11 @@ pub fn classify_proposal_node(
     let large_atom_witness = match node {
         MxxLang::Atom { source, .. } => {
             egraph.analysis.symbols.atomic_sources.get(source.0).and_then(|descriptor| {
-                (!matches!(
-                    descriptor.key,
-                    AtomicSourceKey::Sampler(_) | AtomicSourceKey::SequentialRecurrence { .. }
-                ))
+                (matches!(descriptor.sort, MxxSort::Matrix(_)) &&
+                    !matches!(
+                        &descriptor.key,
+                        AtomicSourceKey::Sampler(_) | AtomicSourceKey::SequentialRecurrence { .. }
+                    ))
                 .then_some(*source)
             })
         }
@@ -875,7 +876,7 @@ mod tests {
     use super::*;
     use crate::operational_noise::identity::{
         AtomicSourceDescriptor, AtomicSourceKey, CanonicalResidueConvention, ResolvedIntExpr,
-        ResolvedMatrixType,
+        ResolvedMatrixType, SamplerDescriptorId,
     };
 
     fn scalar_matrix_type() -> ResolvedMatrixType {
@@ -902,6 +903,50 @@ mod tests {
         let source = AtomicSourceId(source);
         let term = egraph.add(MxxLang::Atom { source, indices: Box::new([]) });
         (term, source)
+    }
+
+    #[test]
+    fn only_nonsampler_matrix_atoms_are_large_extraction_witnesses() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let protocol_atom = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, name: &str, sort| {
+            let source = AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(
+                AtomicSourceDescriptor {
+                    key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(name)),
+                    sort,
+                    integer_domain: None,
+                    canonical_residue_convention: None,
+                    relation_role: None,
+                },
+            ));
+            egraph.add(MxxLang::Atom { source, indices: Box::new([]) })
+        };
+        let bytes = protocol_atom(
+            &mut egraph,
+            "hash-key",
+            MxxSort::Bytes(ResolvedIntExpr::Const(32.into())),
+        );
+        let integer = protocol_atom(&mut egraph, "counter", MxxSort::Int);
+        let (matrix, matrix_source) = matrix_atom(&mut egraph, "plaintext", None);
+        let sampler_source =
+            AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+                key: AtomicSourceKey::Sampler(SamplerDescriptorId(0)),
+                sort: MxxSort::Matrix(scalar_matrix_type()),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            }));
+        let sampler = egraph.add(MxxLang::Atom { source: sampler_source, indices: Box::new([]) });
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+
+        for term in [bytes, integer, sampler] {
+            let node = egraph[egraph.find(term)].nodes.first().expect("atom node");
+            assert_eq!(classify_proposal_node(&egraph, node, &context).unwrap(), (false, None));
+        }
+        let node = egraph[egraph.find(matrix)].nodes.first().expect("matrix atom node");
+        assert_eq!(
+            classify_proposal_node(&egraph, node, &context).unwrap(),
+            (false, Some(matrix_source)),
+        );
     }
 
     fn registration(

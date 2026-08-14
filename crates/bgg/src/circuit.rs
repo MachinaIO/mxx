@@ -5,7 +5,9 @@ use crate::{
     EncodingCompileError, NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire,
     NaiveBggSlotTransferCompiler, NaiveBggVecCompiler, NaiveVecCompileError,
     SlotFamilyCompileError,
-    tall_encoding::{BggTallEncodingCompiler, BggTallEncodingWire, TallCompileError},
+    tall_encoding::{
+        BggTallEncodingCompiler, BggTallEncodingWire, BggTallPlaintext, TallCompileError,
+    },
 };
 use mxx_dsl::{GraphValue, Subgraph};
 use mxx_gadgets::{
@@ -37,6 +39,16 @@ where
 {
     type Wire = A::Wire;
     type Error = A::Error;
+
+    fn enter_subcircuit_inputs(
+        &mut self,
+        inputs: Vec<Self::Wire>,
+        input_max_plaintext_norm_ranges: Option<
+            &[mxx_gadgets::circuit::SubCircuitInputMaxPlaintextNormRange],
+        >,
+    ) -> Result<Vec<Self::Wire>, Self::Error> {
+        self.arithmetic.enter_subcircuit_inputs(inputs, input_max_plaintext_norm_ranges)
+    }
 }
 
 impl<P, A, L, S> ArithmeticCircuitLowering<P> for ConfiguredCircuitLowering<'_, A, L, S>
@@ -466,6 +478,31 @@ struct TallEncodingLowering<'a, P> {
 impl<P> CircuitLoweringTypes for TallEncodingLowering<'_, P> {
     type Wire = BggTallEncodingWire;
     type Error = CircuitCompileError;
+
+    fn enter_subcircuit_inputs(
+        &mut self,
+        mut inputs: Vec<Self::Wire>,
+        input_max_plaintext_norm_ranges: Option<
+            &[mxx_gadgets::circuit::SubCircuitInputMaxPlaintextNormRange],
+        >,
+    ) -> Result<Vec<Self::Wire>, Self::Error> {
+        let Some(ranges) = input_max_plaintext_norm_ranges else {
+            return Ok(inputs);
+        };
+        for range in ranges {
+            let exclusive_upper = &range.norm + BigUint::from(1u8);
+            for input in &mut inputs[range.start..range.end] {
+                if !matches!(input.plaintext, BggTallPlaintext::Diagonal(_)) {
+                    return Err(CircuitCompileError::Structure(
+                        "sub-circuit plaintext norm metadata requires revealed tall plaintexts"
+                            .to_owned(),
+                    ));
+                }
+                input.canonical_input_exclusive_upper = Some(exclusive_upper.clone());
+            }
+        }
+        Ok(inputs)
+    }
 }
 
 impl<P: Poly> ArithmeticCircuitLowering<P> for TallEncodingLowering<'_, P> {
@@ -849,7 +886,30 @@ mod tests {
         PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
-    use num_bigint::BigInt;
+    use num_bigint::{BigInt, BigUint};
+
+    #[derive(Default)]
+    struct RecordingTallLookup {
+        canonical_input_exclusive_upper: Option<BigUint>,
+    }
+
+    impl CircuitLoweringTypes for RecordingTallLookup {
+        type Wire = BggTallEncodingWire;
+        type Error = CircuitCompileError;
+    }
+
+    impl PublicLookupLowering<DCRTPoly> for RecordingTallLookup {
+        fn public_lookup(
+            &mut self,
+            _circuit: &PolyCircuit<DCRTPoly>,
+            _lookup_id: usize,
+            input: &Self::Wire,
+            _gate: GateInstance<'_>,
+        ) -> Result<Self::Wire, Self::Error> {
+            self.canonical_input_exclusive_upper = input.canonical_input_exclusive_upper.clone();
+            Ok(input.clone())
+        }
+    }
 
     fn matrix_type(parameters: &DCRTPolyParams, rows: usize, columns: usize) -> MatrixType {
         MatrixType {
@@ -950,6 +1010,60 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(calls, vec![&bounds, &bounds, &bounds]);
         graph.validate(&ParamEnv::default()).expect("validation");
+    }
+
+    #[test]
+    fn unstructured_tall_nested_call_attaches_the_exclusive_plaintext_upper() {
+        let mut parent = PolyCircuit::<DCRTPoly>::new();
+        let lookup = parent.register_public_lookup(
+            PublicLutProgram::new(8, LutExpr::input()).expect("identity lookup"),
+        );
+        let mut child = PolyCircuit::<DCRTPoly>::new();
+        let child_input = child.input(1).as_single_wire();
+        let child_output = child.public_lookup_gate(child_input, lookup);
+        child.output([child_output]);
+
+        let parent_input = parent.input(1).as_single_wire();
+        let child_id = parent.register_sub_circuit(child);
+        let output = parent.call_sub_circuit_with_max_plaintext_norms(
+            child_id,
+            [parent_input],
+            [mxx_gadgets::circuit::SubCircuitInputMaxPlaintextNormRange::new(
+                0,
+                1,
+                BigUint::from(6u8),
+            )],
+        );
+        parent.output(output);
+
+        let ring = Ring::new(17, 8);
+        let public_key =
+            BggPublicKeyCompiler { ring: ring.clone(), base: 2.into(), digit_count: 2.into() };
+        let tall = |name: &str| BggTallEncodingWire {
+            rows: ring.input_family(format!("{name}-rows"), 1, (1, 2)),
+            pubkey: BggPublicKeyWire {
+                matrix: ring.input(format!("{name}-public"), (1, 2)),
+                reveal_plaintext: true,
+            },
+            plaintext: BggTallPlaintext::Diagonal(ring.input_family(
+                format!("{name}-plaintext"),
+                1,
+                (1, 1),
+            )),
+            canonical_input_exclusive_upper: None,
+        };
+        let mut lookup = RecordingTallLookup::default();
+        let mut slots = NoSlotOperations::<BggTallEncodingWire>::default();
+        PolyCircuitCompiler { public_key }
+            .compile_tall_encodings_with_lowerings(
+                &parent,
+                tall("one"),
+                [tall("input")],
+                &mut lookup,
+                &mut slots,
+            )
+            .expect("unstructured tall lowering");
+        assert_eq!(lookup.canonical_input_exclusive_upper, Some(BigUint::from(7u8)));
     }
 
     #[test]

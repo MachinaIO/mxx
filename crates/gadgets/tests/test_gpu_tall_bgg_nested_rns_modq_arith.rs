@@ -511,8 +511,7 @@ fn run_tall_operational_check(
     let evaluation_started = Instant::now();
     info!(target = request.target_id, "begin Tall operational noise checker");
     let report = check_operational_noise_candidate_with_progress(&protocol, &request, |event| {
-        let emit = event.event != ProgressEventKind::Progress || event.processed % 4_096 == 0;
-        if event.event == ProgressEventKind::Progress && emit {
+        if event.event == ProgressEventKind::Progress {
             debug!(
                 phase = ?event.phase,
                 event = ?event.event,

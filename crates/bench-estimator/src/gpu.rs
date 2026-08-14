@@ -384,7 +384,7 @@ impl GpuNodeMeasurementBackend {
             NodeKind::GadgetDecompose { small, .. } => (0..batch_size)
                 .map(|_| backend.gadget_decompose(matrix(0)?, *small).map_err(backend_error))
                 .collect(),
-            NodeKind::ExtractCoefficient { position } => {
+            NodeKind::ExtractCoefficient { position, .. } => {
                 let position = evaluate_usize(position)?;
                 for _ in 0..batch_size {
                     backend.extract_coefficient(matrix(0)?, position).map_err(backend_error)?;

@@ -881,7 +881,7 @@ fn boolean_interval_decoder_matches(
     else {
         return false;
     };
-    let Some((NodeKind::ExtractCoefficient { position }, [coefficient_input])) =
+    let Some((NodeKind::ExtractCoefficient { position, .. }, [coefficient_input])) =
         node_kind_and_arguments(graph, coefficient)
     else {
         return false;

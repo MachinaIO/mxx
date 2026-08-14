@@ -33,7 +33,6 @@ use std::{
 };
 use tracing::{debug, error, info};
 
-const PROGRESS_WORK_CADENCE: u64 = 4_096;
 const PROGRESS_TIME_CADENCE: Duration = Duration::from_secs(1);
 
 /// Logical checker phase reported by progress events and diagnostics.
@@ -91,7 +90,6 @@ pub enum ProgressEventKind {
 struct ProgressState {
     processed: u64,
     last_emitted: Instant,
-    next_work_threshold: u64,
 }
 
 /// Read-only bound callbacks still update the one job's progress owner through
@@ -132,7 +130,7 @@ impl BoundEvaluationControl for BoundControlAdapter<'_, '_> {
 
 impl ProgressState {
     fn new(started: Instant) -> Self {
-        Self { processed: 0, last_emitted: started, next_work_threshold: PROGRESS_WORK_CADENCE }
+        Self { processed: 0, last_emitted: started }
     }
 }
 
@@ -199,13 +197,9 @@ impl<'a> SimulationControl<'a> {
     ) -> Result<(), OperationalSimulationError> {
         self.progress.processed = self.progress.processed.saturating_add(units);
         let now = Instant::now();
-        if self.progress.processed >= self.progress.next_work_threshold ||
-            now.duration_since(self.progress.last_emitted) >= PROGRESS_TIME_CADENCE
-        {
+        if now.duration_since(self.progress.last_emitted) >= PROGRESS_TIME_CADENCE {
             self.emit(ProgressEventKind::Progress, total_or_discovered, egraph_nodes, now);
             self.progress.last_emitted = now;
-            self.progress.next_work_threshold =
-                self.progress.processed.saturating_add(PROGRESS_WORK_CADENCE);
         }
         Ok(())
     }
@@ -399,7 +393,7 @@ pub fn check_operational_noise_candidate_with_progress(
                         }
                     }
                 }
-                LoweredValue::Trapdoor(_) => {
+                LoweredValue::Trapdoor(_) | LoweredValue::TrapdoorFamily { .. } => {
                     return Err(OperationalSimulationError::Lower {
                         site: site(&stage, wire, "lower residual"),
                         source: super::error::LowerError::FamilyProducerNotResolved {
@@ -1021,7 +1015,7 @@ fn boolean_interval_decoder_matches(
     else {
         return false
     };
-    let Some((NodeKind::ExtractCoefficient { position }, [coefficient_input])) =
+    let Some((NodeKind::ExtractCoefficient { position, .. }, [coefficient_input])) =
         node_kind_and_arguments(graph, coefficient)
     else {
         return false
@@ -1434,30 +1428,6 @@ mod tests {
                 ..
             }) if target_id == "toy-threshold"
         ));
-    }
-
-    #[test]
-    fn progress_emits_at_the_shared_work_cadence() {
-        let mut events = Vec::new();
-        let report = check_with_test_control(
-            boolean_target(17),
-            &mut |event| events.push(event),
-            |control| {
-                control.work(PROGRESS_WORK_CADENCE - 1, Some(PROGRESS_WORK_CADENCE), None)?;
-                control.work(1, Some(PROGRESS_WORK_CADENCE), None)?;
-                Ok(())
-            },
-            |_, _| Ok(()),
-            |_, _| Ok(()),
-            |_, _| Ok(0_u8.into()),
-        )
-        .expect("successful simulation");
-        assert!(report.accepted);
-        assert!(events.iter().any(|event| {
-            event.phase == CheckerPhase::Lower &&
-                event.event == ProgressEventKind::Progress &&
-                event.processed == PROGRESS_WORK_CADENCE
-        }));
     }
 
     #[test]

@@ -839,9 +839,23 @@ impl Mat {
 
     #[track_caller]
     pub fn extract_coefficient(self, position: impl Into<IntExpr>) -> Int {
+        self.extract_coefficient_with_canonical_input_exclusive_upper(position, None)
+    }
+
+    /// Extracts a coefficient and optionally records a compile-time-only
+    /// exclusive upper bound for a canonical input integer.
+    #[track_caller]
+    pub fn extract_coefficient_with_canonical_input_exclusive_upper(
+        self,
+        position: impl Into<IntExpr>,
+        canonical_input_exclusive_upper: Option<num_bigint::BigUint>,
+    ) -> Int {
         let pending = self.pending;
         let node = NodeHandle::new(
-            NodeKind::ExtractCoefficient { position: position.into() },
+            NodeKind::ExtractCoefficient {
+                position: position.into(),
+                canonical_input_exclusive_upper,
+            },
             vec![self.value],
             vec![WireType::Int],
         );

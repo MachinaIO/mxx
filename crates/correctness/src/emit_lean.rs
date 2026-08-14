@@ -1005,7 +1005,7 @@ fn lean_node_kind(
         ),
         NodeKind::RealSqrt => ".realSqrt".to_owned(),
         NodeKind::BitExtract { bit } => format!(".bitExtract ({})", lean_ir_int_expr(bit)),
-        NodeKind::ExtractCoefficient { position } => {
+        NodeKind::ExtractCoefficient { position, .. } => {
             format!(".extractCoefficient ({})", lean_ir_int_expr(position))
         }
         NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {

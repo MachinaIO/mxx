@@ -14,14 +14,14 @@ use super::{
     error::{LowerError, SelectorOnlyConsumer},
     family::{self, FamilyCoverageStorage, FamilyLoweringValue},
     identity::{
-        BinderKey, OccurrenceScope, ResolvedIntExpr, SamplerDescriptorId, SamplerIdentity,
-        SequentialRecurrenceDescriptor, SequentialStateKey, TrapdoorDescriptorId, TrapdoorIdentity,
-        TrapdoorSourceKey, WireSourceKey,
+        BinderKey, CanonicalResidueConvention, OccurrenceScope, ResolvedIntExpr,
+        SamplerDescriptorId, SamplerIdentity, SequentialRecurrenceDescriptor, SequentialStateKey,
+        TrapdoorDescriptorId, TrapdoorIdentity, TrapdoorSourceKey, WireSourceKey,
     },
     language::MxxLang,
 };
 use crate::{InputValueContract, ProtocolDecl, ProtocolInputDestination, StageId, StageInputName};
-use egg::{EGraph, Id};
+use egg::{EGraph, Id, RecExpr};
 use mxx_ir_core::{
     IntExpr, RealExpr, WireRef, WireType,
     graph::FrozenGraphScopeId,
@@ -131,7 +131,37 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
             super::identity::AtomicSourceKey::ProtocolInput(_) |
             super::identity::AtomicSourceKey::GraphWire(_) => BoundClass::Large,
         };
-        Ok(MatrixBound { matrix_type, coefficient_class, metadata: MatrixMetadata::unknown() })
+        let metadata = match &descriptor.key {
+            super::identity::AtomicSourceKey::ProtocolInput(input) => self
+                .lowerer
+                .protocol
+                .bundle
+                .input_contract
+                .inputs
+                .iter()
+                .find(|entry| entry.id == *input)
+                .and_then(|entry| match &entry.value {
+                    InputValueContract::MatrixExact { is_constant_polynomial, .. } => {
+                        Some(MatrixMetadata {
+                            is_constant_polynomial: *is_constant_polynomial,
+                            known_zero_rows: None,
+                        })
+                    }
+                    InputValueContract::Family { element, .. } => match element.as_ref() {
+                        InputValueContract::MatrixExact { is_constant_polynomial, .. } => {
+                            Some(MatrixMetadata {
+                                is_constant_polynomial: *is_constant_polynomial,
+                                known_zero_rows: None,
+                            })
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(MatrixMetadata::unknown),
+            _ => MatrixMetadata::unknown(),
+        };
+        Ok(MatrixBound { matrix_type, coefficient_class, metadata })
     }
 
     fn matrix_constant(
@@ -540,6 +570,11 @@ pub enum LoweredValue {
     Term(Id),
     Family(FamilyLoweringValue),
     Trapdoor(TrapdoorDescriptorId),
+    TrapdoorFamily {
+        representative: TrapdoorDescriptorId,
+        binder: BinderKey,
+        logical_count: num_bigint::BigUint,
+    },
 }
 
 /// Lexical bindings for one concrete scope occurrence.
@@ -578,6 +613,11 @@ enum LoweringFrame {
     },
     FinishAlias {
         wire: LoweringWire,
+    },
+    FinishProtocolTrapdoor {
+        wire: LoweringWire,
+        environment: LowerEnv,
+        output_type: WireType,
     },
     FinishValue {
         wire: LoweringWire,
@@ -643,6 +683,10 @@ pub struct GraphLowerer<'a, 'control> {
     pub egraph: EGraph<MxxLang, MxxAnalysis>,
     memo: HashMap<LoweringWireKey, LoweredValue>,
     active: HashSet<LoweringWireKey>,
+    /// Extracted shared representatives are immutable valid snapshots.  They
+    /// are keyed by canonical e-class at first use and remain valid after
+    /// later unions; a later canonical root simply causes a harmless miss.
+    shared_templates: HashMap<Id, RecExpr<MxxLang>>,
     control: Option<&'control mut dyn LoweringControl>,
 }
 
@@ -658,6 +702,7 @@ impl<'a> GraphLowerer<'a, '_> {
             egraph: EGraph::new(analysis),
             memo: HashMap::new(),
             active: HashSet::new(),
+            shared_templates: HashMap::new(),
             control: None,
         }
     }
@@ -679,6 +724,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             egraph: EGraph::new(analysis),
             memo: HashMap::new(),
             active: HashSet::new(),
+            shared_templates: HashMap::new(),
             control: Some(control),
         }
     }
@@ -693,6 +739,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             egraph: self.egraph,
             memo: self.memo,
             active: self.active,
+            shared_templates: self.shared_templates,
             control: None,
         }
     }
@@ -746,7 +793,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         selector_allowed: bool,
     ) -> Result<(), LowerError> {
         let data = &self.egraph[self.egraph.find(term)].data;
-        if data.sort != Ok(expected_sort) {
+        if data.sort != Ok(expected_sort.clone()) {
             let actual = match data.sort.as_ref().ok() {
                 Some(MxxSort::Int) => mxx_ir_core::WireType::Int,
                 Some(MxxSort::Bool) => mxx_ir_core::WireType::Bool,
@@ -765,27 +812,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             return Err(LowerError::SelectorOnlyValueUsedByForbiddenConsumer { consumer });
         }
         Ok(())
-    }
-
-    /// Applies one authoritative call-boundary range annotation and immediately unions it with
-    /// the matrix child.  No parallel metadata table is retained.
-    pub fn attach_canonical_range(
-        &mut self,
-        child: Id,
-        upper: num_bigint::BigUint,
-    ) -> Result<Id, LowerError> {
-        if upper == num_bigint::BigUint::from(0_u8) ||
-            !matches!(self.egraph[self.egraph.find(child)].data.sort, Ok(MxxSort::Matrix(_)))
-        {
-            return Err(LowerError::InvalidInternalCanonicalRangeContract {
-                upper,
-                modulus: num_bigint::BigUint::from(0_u8),
-            });
-        }
-        let annotation =
-            self.egraph.add(MxxLang::MatrixCanonicalRangeContract { upper, input: [child] });
-        self.egraph.union(annotation, child);
-        Ok(annotation)
     }
 
     /// Begins one memoized wire lowering.  A repeated active key is a graph dependency cycle;
@@ -1103,6 +1129,18 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     }
                     match node_dispatch(node.kind()) {
                         NodeDispatch::Source => {
+                            if let NodeKind::Input { artifact: None, .. } = node.kind() {
+                                let output_type =
+                                    node.output_types()[wire.source.wire.port.0 as usize].clone();
+                                if matches!(output_type, WireType::Trapdoor { .. }) {
+                                    work.push(LoweringFrame::FinishProtocolTrapdoor {
+                                        wire,
+                                        environment,
+                                        output_type,
+                                    });
+                                    continue;
+                                }
+                            }
                             if let NodeKind::HashSample {
                                 matrix_type,
                                 variant,
@@ -1246,13 +1284,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     },
                                     indices: wire.indices.clone(),
                                 };
-                                let public_atom = self.atom_for_wire(
+                                let public = self.atom_for_wire(
                                     &public,
                                     &environment,
                                     WireType::Matrix(matrix_type.clone()),
                                     None,
                                 )?;
-                                let public = self.egraph.add(public_atom);
                                 let source = TrapdoorSourceKey::GraphWire(
                                     super::identity::GraphWireSourceKey {
                                         wire: wire.source.clone(),
@@ -1323,17 +1360,23 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                 let value = if wire.indices.is_empty() {
                                     self.lower_source_family(&wire, &environment, *element, count)?
                                 } else {
-                                    let atom =
-                                        self.atom_for_wire(&wire, &environment, *element, role)?;
-                                    LoweredValue::Term(self.egraph.add(atom))
+                                    LoweredValue::Term(self.atom_for_wire(
+                                        &wire,
+                                        &environment,
+                                        *element,
+                                        role,
+                                    )?)
                                 };
                                 self.finish_wire(&wire, value.clone());
                                 values.push(value);
                                 continue;
                             }
-                            let atom =
-                                self.atom_for_wire(&wire, &environment, output_type, role)?;
-                            let value = LoweredValue::Term(self.egraph.add(atom));
+                            let value = LoweredValue::Term(self.atom_for_wire(
+                                &wire,
+                                &environment,
+                                output_type,
+                                role,
+                            )?);
                             self.finish_wire(&wire, value.clone());
                             values.push(value);
                         }
@@ -1536,9 +1579,29 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     logical_count,
                     maximum,
                 } => {
-                    let LoweredValue::Term(representative) =
-                        values.pop().ok_or(LowerError::MissingWire { wire: wire.source.wire })?
-                    else {
+                    let representative_value =
+                        values.pop().ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
+                    let representative_value =
+                        if let WireType::IndexedFamily { element, .. } = &output_type {
+                            self.normalize_singleton_for_input(representative_value, element)?
+                        } else {
+                            representative_value
+                        };
+                    if let LoweredValue::Trapdoor(representative) = representative_value {
+                        if !matches!(&output_type, WireType::IndexedFamily { element, .. } if matches!(element.as_ref(), WireType::Trapdoor { .. }))
+                        {
+                            return Err(LowerError::NonUniformParallelMatrixType {
+                                expected: output_type,
+                                actual: WireType::Int,
+                            });
+                        }
+                        let value =
+                            LoweredValue::TrapdoorFamily { representative, binder, logical_count };
+                        self.finish_wire(&wire, value.clone());
+                        values.push(value);
+                        continue;
+                    }
+                    let LoweredValue::Term(representative) = representative_value else {
                         return Err(LowerError::NonUniformParallelMatrixType {
                             expected: output_type,
                             actual: WireType::Int,
@@ -1572,8 +1635,20 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             actual: values.len(),
                         });
                     }
-                    let transitions = values
-                        .split_off(values.len() - dependency_count)
+                    let transition_values = values.split_off(values.len() - dependency_count);
+                    if count == ResolvedIntExpr::Const(BigInt::from(1_u8)) {
+                        let value = transition_values.get(carried_index).cloned().ok_or(
+                            LowerError::InvalidOutputPort {
+                                wire: wire.source.wire,
+                                output_count: transition_values.len(),
+                            },
+                        )?;
+                        let value = self.normalize_singleton_for_input(value, &output_type)?;
+                        self.finish_wire(&wire, value.clone());
+                        values.push(value);
+                        continue;
+                    }
+                    let transitions = transition_values
                         .into_iter()
                         .map(|value| match value {
                             LoweredValue::Term(term) => Ok(term),
@@ -1602,6 +1677,15 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
                 }
+                LoweringFrame::FinishProtocolTrapdoor { wire, environment, output_type } => {
+                    let trapdoor =
+                        self.protocol_input_trapdoor(&wire, &environment, &output_type)?.ok_or(
+                            LowerError::FamilyProducerNotResolved { family: wire.source.wire },
+                        )?;
+                    let value = LoweredValue::Trapdoor(trapdoor);
+                    self.finish_wire(&wire, value.clone());
+                    values.push(value);
+                }
                 LoweringFrame::FinishValue { wire, value } => {
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
@@ -1612,7 +1696,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     let value = match value {
                         LoweredValue::Term(term) => LoweredValue::Term(term),
                         LoweredValue::Family(family) => self.family_element(&family, &index)?,
-                        LoweredValue::Trapdoor(_) => {
+                        LoweredValue::Trapdoor(_) | LoweredValue::TrapdoorFamily { .. } => {
                             return Err(LowerError::FamilyProducerNotResolved {
                                 family: wire.source.wire,
                             });
@@ -1719,7 +1803,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         .into_iter()
                         .map(|value| match value {
                             LoweredValue::Term(term) => Ok(term),
-                            LoweredValue::Family(_) | LoweredValue::Trapdoor(_) => {
+                            LoweredValue::Family(_) |
+                            LoweredValue::Trapdoor(_) |
+                            LoweredValue::TrapdoorFamily { .. } => {
                                 Err(LowerError::InvalidOperandArity {
                                     expected: dependency_count,
                                     actual: dependency_count,
@@ -2186,8 +2272,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let mut indexed_environment = environment.clone();
         indexed_environment.active_coordinates.push(Coordinate { binder: binder.clone(), index });
         let element_type = self.resolve_family_element_sort(&element, &indexed_environment)?;
-        let atom = self.atom_for_wire(&indexed_wire, &indexed_environment, element, None)?;
-        let representative = self.egraph.add(atom);
+        let representative =
+            self.atom_for_wire(&indexed_wire, &indexed_environment, element, None)?;
         Ok(LoweredValue::Family(FamilyLoweringValue {
             element_type,
             storage: FamilyCoverageStorage::SharedTemplate {
@@ -2209,7 +2295,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         environment: &LowerEnv,
         ty: WireType,
         relation_role: Option<super::identity::AtomicRelationRole>,
-    ) -> Result<MxxLang, LowerError> {
+    ) -> Result<Id, LowerError> {
         let sort = match ty {
             WireType::Int | WireType::ConstantInt => MxxSort::Int,
             WireType::Bool | WireType::ConstantBool => MxxSort::Bool,
@@ -2225,7 +2311,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 return Err(LowerError::FamilyProducerNotResolved { family: wire.source.wire });
             }
         };
-        let (key, integer_domain) =
+        let (key, integer_domain, canonical_residue_convention) =
             self.protocol_input_source(wire, environment, &sort)?.unwrap_or_else(|| {
                 (
                     super::identity::AtomicSourceKey::GraphWire(
@@ -2239,24 +2325,26 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         },
                     ),
                     None,
+                    None,
                 )
             });
         let descriptor = super::identity::AtomicSourceDescriptor {
             key,
             sort,
             integer_domain,
-            canonical_residue_convention: None,
+            canonical_residue_convention,
             relation_role,
         };
         let source = self.egraph.analysis.symbols.atomic_sources.intern(descriptor);
-        Ok(MxxLang::Atom {
+        let atom = self.egraph.add(MxxLang::Atom {
             source: super::identity::AtomicSourceId(source),
             indices: environment
                 .active_coordinates
                 .iter()
                 .map(|coordinate| coordinate.index.term)
                 .collect(),
-        })
+        });
+        Ok(atom)
     }
 
     /// Normalizes a non-artifact root-stage input to its closed protocol input identity.  The
@@ -2267,7 +2355,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         environment: &LowerEnv,
         sort: &MxxSort,
     ) -> Result<
-        Option<(super::identity::AtomicSourceKey, Option<super::identity::IntegerSourceDomain>)>,
+        Option<(
+            super::identity::AtomicSourceKey,
+            Option<super::identity::IntegerSourceDomain>,
+            Option<CanonicalResidueConvention>,
+        )>,
         LowerError,
     > {
         let super::identity::ProgramKey::WorkflowStage(stage) = &wire.source.scope.program else {
@@ -2311,8 +2403,16 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             .iter()
             .find(|entry| entry.id == input)
             .ok_or_else(|| LowerError::MissingProtocolInputBinding { input: input.clone() })?;
-        let integer_domain = match (&contract.value, sort) {
-            (InputValueContract::IntegerRange { lower, upper }, MxxSort::Int) => {
+        let integer_range = match &contract.value {
+            InputValueContract::IntegerRange { lower, upper } => Some((lower, upper)),
+            InputValueContract::Family { element, .. } => match element.as_ref() {
+                InputValueContract::IntegerRange { lower, upper } => Some((lower, upper)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let integer_domain = match (integer_range, sort) {
+            (Some((lower, upper)), MxxSort::Int) => {
                 let lower = self.resolve_int(lower, environment)?;
                 let upper = self.resolve_int(upper, environment)?;
                 let (ResolvedIntExpr::Const(minimum), ResolvedIntExpr::Const(maximum)) =
@@ -2324,7 +2424,167 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             }
             _ => None,
         };
-        Ok(Some((super::identity::AtomicSourceKey::ProtocolInput(input), integer_domain)))
+        let canonical_upper_expression = match &contract.value {
+            InputValueContract::MatrixExact {
+                canonical_coefficient_exclusive_upper_bound, ..
+            } => Some(canonical_coefficient_exclusive_upper_bound.as_ref()),
+            InputValueContract::Family { element, .. } => match element.as_ref() {
+                InputValueContract::MatrixExact {
+                    canonical_coefficient_exclusive_upper_bound,
+                    ..
+                } => Some(canonical_coefficient_exclusive_upper_bound.as_ref()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let canonical_residue_convention = match (canonical_upper_expression, sort) {
+            (Some(upper), MxxSort::Matrix(matrix)) => {
+                let modulus = resolved_nonnegative(&matrix.modulus).ok_or_else(|| {
+                    LowerError::InvalidExtractCoefficientCanonicalUpper {
+                        upper: num_bigint::BigUint::from(0_u8),
+                        modulus: num_bigint::BigUint::from(0_u8),
+                    }
+                })?;
+                let upper = match upper {
+                    Some(upper) => match self.resolve_int(upper, environment)? {
+                        ResolvedIntExpr::Const(upper) => upper.to_biguint().ok_or_else(|| {
+                            LowerError::InvalidExtractCoefficientCanonicalUpper {
+                                upper: num_bigint::BigUint::from(0_u8),
+                                modulus: modulus.clone(),
+                            }
+                        })?,
+                        _ => {
+                            return Err(LowerError::UnboundParameter {
+                                parameter: contract.name.clone(),
+                            })
+                        }
+                    },
+                    None => modulus.clone(),
+                };
+                if upper.is_zero() || upper > modulus {
+                    return Err(LowerError::InvalidExtractCoefficientCanonicalUpper {
+                        upper,
+                        modulus,
+                    });
+                }
+                Some(CanonicalResidueConvention::Nonnegative)
+            }
+            _ => None,
+        };
+        Ok(Some((
+            super::identity::AtomicSourceKey::ProtocolInput(input),
+            integer_domain,
+            canonical_residue_convention,
+        )))
+    }
+
+    fn protocol_input_trapdoor(
+        &mut self,
+        wire: &LoweringWire,
+        environment: &LowerEnv,
+        output_type: &WireType,
+    ) -> Result<Option<TrapdoorDescriptorId>, LowerError> {
+        let super::identity::ProgramKey::WorkflowStage(stage) = &wire.source.scope.program else {
+            return Ok(None);
+        };
+        let graph = self.graph_for_program(&wire.source.scope.program)?;
+        let scope = graph
+            .scope(&wire.source.scope.definition)
+            .ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
+        let NodeKind::Input { name, artifact: None, .. } = scope
+            .node(wire.source.wire.node)
+            .ok_or(LowerError::MissingNode { node: wire.source.wire.node })?
+            .kind()
+        else {
+            return Ok(None)
+        };
+        let destination = ProtocolInputDestination::WorkflowStage {
+            stage: stage.clone(),
+            input: StageInputName(name.clone()),
+        };
+        let input = self
+            .protocol
+            .bundle
+            .input_bindings
+            .iter()
+            .find(|binding| binding.destinations.contains(&destination))
+            .map(|binding| binding.input.clone())
+            .ok_or_else(|| LowerError::MissingProtocolInputBinding {
+                input: crate::ProtocolInputId(name.clone()),
+            })?;
+        let contract = self
+            .protocol
+            .bundle
+            .input_contract
+            .inputs
+            .iter()
+            .find(|entry| entry.id == input)
+            .ok_or_else(|| LowerError::MissingProtocolInputBinding { input: input.clone() })?;
+        let InputValueContract::Trapdoor {
+            matrix_type,
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+            public_input,
+        } = &contract.value
+        else {
+            return Ok(None)
+        };
+        let public_contract = self
+            .protocol
+            .bundle
+            .input_contract
+            .inputs
+            .iter()
+            .find(|entry| entry.id == *public_input)
+            .ok_or_else(|| LowerError::MissingProtocolInputBinding {
+                input: public_input.clone(),
+            })?;
+        let InputValueContract::MatrixExact { matrix_type: public_matrix, .. } =
+            &public_contract.value
+        else {
+            return Err(LowerError::MissingProtocolInputBinding { input: public_input.clone() });
+        };
+        if matrix_type != public_matrix {
+            return Err(LowerError::InvalidOperandSort {
+                expected: output_type.clone(),
+                actual: output_type.clone(),
+            });
+        }
+        let matrix_type = self.resolve_matrix_type(matrix_type, environment)?;
+        let public = self.egraph.analysis.symbols.atomic_sources.intern(
+            super::identity::AtomicSourceDescriptor {
+                key: super::identity::AtomicSourceKey::ProtocolInput(public_input.clone()),
+                sort: MxxSort::Matrix(matrix_type.clone()),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            },
+        );
+        let public = self.egraph.add(MxxLang::Atom {
+            source: super::identity::AtomicSourceId(public),
+            indices: environment
+                .active_coordinates
+                .iter()
+                .map(|coordinate| coordinate.index.term)
+                .collect(),
+        });
+        let descriptor = TrapdoorIdentity {
+            source: TrapdoorSourceKey::ProtocolInput(input),
+            indices: environment
+                .active_coordinates
+                .iter()
+                .map(|coordinate| coordinate.index.term)
+                .collect(),
+            matrix_type,
+            public,
+            sigma_bits: self.resolve_real(sigma, environment)?.to_bits(),
+            gadget_base: self.resolve_int(gadget_base, environment)?,
+            digit_count: self.resolve_int(digit_count, environment)?,
+            preimage_cutoff: self.resolve_int(preimage_max_coefficient_bound, environment)?,
+        };
+        Ok(Some(TrapdoorDescriptorId(self.egraph.analysis.symbols.trapdoors.intern(descriptor))))
     }
 
     /// Lowers a graph attribute expression without recursive descent.  Attribute division is
@@ -2544,26 +2804,28 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 .iter()
                 .map(|value| match value {
                     LoweredValue::Term(term) => Ok(*term),
-                    LoweredValue::Trapdoor(_) => Err(LowerError::InvalidOperandSort {
-                        expected: WireType::Matrix(MatrixType {
-                            modulus: IntExpr::constant(1),
-                            ring_dimension: IntExpr::constant(1),
-                            rows: IntExpr::constant(1),
-                            columns: IntExpr::constant(1),
-                        }),
-                        actual: WireType::Trapdoor {
-                            matrix: MatrixType {
+                    LoweredValue::Trapdoor(_) | LoweredValue::TrapdoorFamily { .. } => {
+                        Err(LowerError::InvalidOperandSort {
+                            expected: WireType::Matrix(MatrixType {
                                 modulus: IntExpr::constant(1),
                                 ring_dimension: IntExpr::constant(1),
                                 rows: IntExpr::constant(1),
                                 columns: IntExpr::constant(1),
+                            }),
+                            actual: WireType::Trapdoor {
+                                matrix: MatrixType {
+                                    modulus: IntExpr::constant(1),
+                                    ring_dimension: IntExpr::constant(1),
+                                    rows: IntExpr::constant(1),
+                                    columns: IntExpr::constant(1),
+                                },
+                                sigma: RealExpr::from(0_i32),
+                                gadget_base: IntExpr::constant(2),
+                                digit_count: IntExpr::constant(1),
+                                preimage_max_coefficient_bound: IntExpr::constant(0),
                             },
-                            sigma: RealExpr::from(0_i32),
-                            gadget_base: IntExpr::constant(2),
-                            digit_count: IntExpr::constant(1),
-                            preimage_max_coefficient_bound: IntExpr::constant(0),
-                        },
-                    }),
+                        })
+                    }
                     LoweredValue::Family(_) => {
                         Err(LowerError::InvalidOperandArity { expected, actual: arguments.len() })
                     }
@@ -2694,7 +2956,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     .iter()
                     .map(|value| match value {
                         LoweredValue::Term(value) => Ok(*value),
-                        LoweredValue::Trapdoor(_) => {
+                        LoweredValue::Trapdoor(_) | LoweredValue::TrapdoorFamily { .. } => {
                             Err(LowerError::InvalidOperandArity { expected: 0, actual: 1 })
                         }
                         LoweredValue::Family(_) => {
@@ -2709,10 +2971,27 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 };
                 self.egraph.add(MxxLang::MatrixConcat { axis, inputs: values.into_boxed_slice() })
             }
-            NodeKind::ExtractCoefficient { position } => {
+            NodeKind::ExtractCoefficient { position, canonical_input_exclusive_upper } => {
                 let matrix = terms(1)?[0];
                 let position = self.lower_int_expr(position, environment)?;
-                self.egraph.add(MxxLang::ExtractCoefficient([matrix, position.term]))
+                if let Some(upper) = canonical_input_exclusive_upper {
+                    let modulus = match &self.egraph[self.egraph.find(matrix)].data.sort {
+                        Ok(MxxSort::Matrix(matrix)) => {
+                            resolved_nonnegative(&matrix.modulus).unwrap_or_default()
+                        }
+                        _ => num_bigint::BigUint::default(),
+                    };
+                    if upper.is_zero() || upper > &modulus {
+                        return Err(LowerError::InvalidExtractCoefficientCanonicalUpper {
+                            upper: upper.clone(),
+                            modulus,
+                        });
+                    }
+                }
+                self.egraph.add(MxxLang::ExtractCoefficient {
+                    canonical_exclusive_upper: canonical_input_exclusive_upper.clone(),
+                    input: [matrix, position.term],
+                })
             }
             NodeKind::LiftIntegerToConstantPolynomial { matrix_type: ty } => {
                 let input = terms(1)?[0];
@@ -2744,7 +3023,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         .iter()
                         .map(|value| match value {
                             LoweredValue::Term(value) => Ok(*value),
-                            LoweredValue::Trapdoor(_) => {
+                            LoweredValue::Trapdoor(_) | LoweredValue::TrapdoorFamily { .. } => {
                                 Err(LowerError::InvalidOperandArity { expected: 0, actual: 1 })
                             }
                             LoweredValue::Family(_) => {
@@ -2813,7 +3092,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             expected: element_wire_type.clone(),
                             actual: self.scalar_wire_type(*term).unwrap_or(WireType::Int),
                         }),
-                        LoweredValue::Family(_) | LoweredValue::Trapdoor(_) => {
+                        LoweredValue::Family(_) |
+                        LoweredValue::Trapdoor(_) |
+                        LoweredValue::TrapdoorFamily { .. } => {
                             Err(LowerError::FamilyElementTypeMismatch {
                                 expected: element_wire_type.clone(),
                                 actual: WireType::Int,
@@ -2831,6 +3112,17 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 Ok(LoweredValue::Family(value))
             }
             NodeKind::FamilyGetStatic { index } => {
+                if let [LoweredValue::TrapdoorFamily { representative, binder, logical_count }] =
+                    arguments
+                {
+                    let index = self.lower_int_expr(index, environment)?;
+                    return self.trapdoor_family_element(
+                        *representative,
+                        binder,
+                        logical_count,
+                        &index,
+                    );
+                }
                 let [LoweredValue::Family(family)] = arguments else {
                     return Err(LowerError::InvalidOperandArity {
                         expected: 1,
@@ -2856,6 +3148,18 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 self.shared_family_element(family, &index)
             }
             NodeKind::FamilyGetDynamic => {
+                if let [
+                    LoweredValue::TrapdoorFamily { representative, binder, logical_count },
+                    LoweredValue::Term(selector),
+                ] = arguments
+                {
+                    return self.trapdoor_family_element(
+                        *representative,
+                        binder,
+                        logical_count,
+                        &LoweredInt { term: *selector, stable_identity: None },
+                    );
+                }
                 let [LoweredValue::Family(family), LoweredValue::Term(selector)] = arguments else {
                     return Err(LowerError::InvalidOperandArity {
                         expected: 2,
@@ -2883,7 +3187,17 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         actual: arguments.len(),
                     });
                 };
-                let families = cases.iter().cloned().collect::<Vec<_>>();
+                let mut families = cases.iter().cloned().collect::<Vec<_>>();
+                if !matches!(output_type, WireType::IndexedFamily { .. }) {
+                    let zero = self.add_int(BigInt::zero(), ResolvedIntExpr::Const(BigInt::zero()));
+                    for value in &mut families {
+                        if let LoweredValue::Family(family) = value &&
+                            matches!(&family.storage, FamilyCoverageStorage::SharedTemplate { domain, .. } if domain.logical_count == num_bigint::BigUint::from(1_u8))
+                        {
+                            *value = self.family_element(family, &zero)?;
+                        }
+                    }
+                }
                 if families.iter().all(|value| matches!(value, LoweredValue::Family(_))) {
                     let families = families
                         .into_iter()
@@ -2892,6 +3206,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             _ => unreachable!(),
                         })
                         .collect::<Vec<_>>();
+                    let families = self.align_selected_shared_families(families).map_err(|_| {
+                        LowerError::IncompatibleFamilyCoverage {
+                            expected: output_type.clone(),
+                            actual: output_type.clone(),
+                        }
+                    })?;
                     return family::select_family(&mut self.egraph, *selector, &families)
                         .map(LoweredValue::Family)
                         .map_err(|_| LowerError::IncompatibleFamilyCoverage {
@@ -2899,7 +3219,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             actual: output_type,
                         });
                 }
-                let terms = cases
+                let terms = families
                     .iter()
                     .map(|value| match value {
                         LoweredValue::Term(term) => Ok(*term),
@@ -2925,6 +3245,102 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         }
     }
 
+    /// A Select chooses one value at one logical family index.  Branch-local
+    /// parallel loops may use distinct binder identities for that same index;
+    /// align those alpha-equivalent templates to the first case without
+    /// enumerating their logical elements.
+    fn align_selected_shared_families(
+        &mut self,
+        mut families: Vec<FamilyLoweringValue>,
+    ) -> Result<Vec<FamilyLoweringValue>, ()> {
+        let Some(FamilyLoweringValue {
+            element_type: common_element_type,
+            storage:
+                FamilyCoverageStorage::SharedTemplate {
+                    domain: common_domain,
+                    binder_domains: common_binder_domains,
+                    ..
+                },
+        }) = families.first()
+        else {
+            return Ok(families);
+        };
+        let common_element_type = common_element_type.clone();
+        let common_domain = common_domain.clone();
+        let common_binder_domains = common_binder_domains.clone();
+        let common_binder_id = self
+            .egraph
+            .analysis
+            .symbols
+            .binders
+            .values
+            .iter()
+            .position(|descriptor| descriptor.key == common_domain.binder)
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or(())?;
+        let common_binder_term =
+            self.egraph.add(MxxLang::IntBinder(super::identity::BinderId(common_binder_id)));
+        for family in families.iter_mut().skip(1) {
+            if family.element_type != common_element_type {
+                return Err(());
+            }
+            let FamilyCoverageStorage::SharedTemplate { domain, representative, binder_domains } =
+                &family.storage
+            else {
+                return Ok(families);
+            };
+            if domain.logical_count != common_domain.logical_count ||
+                binder_domains.len() != common_binder_domains.len()
+            {
+                return Err(());
+            }
+            let mut normalized_domains = binder_domains.to_vec();
+            for binder_domain in &mut normalized_domains {
+                if binder_domain.binder == domain.binder {
+                    binder_domain.binder = common_domain.binder.clone();
+                }
+            }
+            if normalized_domains.as_slice() != common_binder_domains.as_ref() {
+                return Err(());
+            }
+            if domain.binder == common_domain.binder {
+                continue;
+            }
+            let binder_id = self
+                .egraph
+                .analysis
+                .symbols
+                .binders
+                .values
+                .iter()
+                .position(|descriptor| descriptor.key == domain.binder)
+                .and_then(|id| u32::try_from(id).ok())
+                .ok_or(())?;
+            let scope = domain.binder.loop_scope.clone();
+            let node = domain.binder.loop_node;
+            let control = &mut self.control;
+            let representative = family::instantiate_shared_element(
+                &mut self.egraph,
+                &mut self.shared_templates,
+                *representative,
+                super::identity::BinderId(binder_id),
+                common_binder_term,
+                &mut || {
+                    if let Some(control) = control.as_deref_mut() {
+                        control.work(&scope, node).map_err(|_| ())?;
+                    }
+                    Ok(())
+                },
+            )?;
+            family.storage = FamilyCoverageStorage::SharedTemplate {
+                domain: common_domain.clone(),
+                representative,
+                binder_domains: common_binder_domains.clone(),
+            };
+        }
+        Ok(families)
+    }
+
     fn shared_family_element(
         &mut self,
         family: &FamilyLoweringValue,
@@ -2932,15 +3348,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
     ) -> Result<LoweredValue, LowerError> {
         let (representative, domain, _) = family::shared_element(family)
             .map_err(|_| LowerError::InvalidFamilyCount { count: IntExpr::constant(0) })?;
-        let index_domain =
-            self.integer_analysis(index.term).map(|(domain, _)| domain).ok_or_else(|| {
-                LowerError::FamilyAccessOutOfRange {
-                    index: IntExpr::constant(-1),
-                    count: IntExpr::constant(domain.logical_count.clone()),
-                }
-            })?;
-        family::validate_family_index(&index_domain, &domain.logical_count).map_err(|_| {
-            LowerError::FamilyAccessOutOfRange {
+        let Some(index_analysis) = self.integer_analysis(index.term) else {
+            return Err(LowerError::MissingIntegerAnalysis { term: index.term });
+        };
+        let index_domain = index_analysis.0;
+        if family::validate_family_index(index_domain, &domain.logical_count).is_err() {
+            return Err(LowerError::FamilyAccessOutOfRange {
                 index: index
                     .stable_identity
                     .as_ref()
@@ -2950,8 +3363,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     })
                     .unwrap_or_else(|| IntExpr::constant(-1)),
                 count: IntExpr::constant(domain.logical_count.clone()),
-            }
-        })?;
+            });
+        }
+        if index.stable_identity.as_ref() == Some(&ResolvedIntExpr::Binder(domain.binder.clone())) {
+            return Ok(LoweredValue::Term(representative));
+        }
         let binder_id = self
             .egraph
             .analysis
@@ -2969,6 +3385,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let control = &mut self.control;
         family::instantiate_shared_element(
             &mut self.egraph,
+            &mut self.shared_templates,
             representative,
             super::identity::BinderId(binder_id),
             index.term,
@@ -3007,6 +3424,98 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             FamilyCoverageStorage::SharedTemplate { .. } => {
                 self.shared_family_element(family, index)
             }
+        }
+    }
+
+    fn trapdoor_family_element(
+        &mut self,
+        representative: TrapdoorDescriptorId,
+        binder: &BinderKey,
+        logical_count: &num_bigint::BigUint,
+        index: &LoweredInt,
+    ) -> Result<LoweredValue, LowerError> {
+        let index_domain =
+            self.integer_analysis(index.term).map(|(domain, _)| domain).ok_or_else(|| {
+                LowerError::FamilyAccessOutOfRange {
+                    index: IntExpr::constant(-1),
+                    count: IntExpr::constant(logical_count.clone()),
+                }
+            })?;
+        family::validate_family_index(index_domain, logical_count).map_err(|_| {
+            LowerError::FamilyAccessOutOfRange {
+                index: IntExpr::constant(-1),
+                count: IntExpr::constant(logical_count.clone()),
+            }
+        })?;
+        let binder_id = self
+            .egraph
+            .analysis
+            .symbols
+            .binders
+            .values
+            .iter()
+            .position(|descriptor| &descriptor.key == binder)
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or_else(|| LowerError::InvalidFamilyCount {
+                count: IntExpr::constant(logical_count.clone()),
+            })?;
+        let template =
+            self.egraph.analysis.symbols.trapdoors.get(representative.0).cloned().ok_or(
+                LowerError::FamilyProducerNotResolved {
+                    family: WireRef {
+                        node: binder.loop_node,
+                        port: mxx_ir_core::Port(binder.slot),
+                    },
+                },
+            )?;
+        let mut instantiate = |term| {
+            family::instantiate_shared_element(
+                &mut self.egraph,
+                &mut self.shared_templates,
+                term,
+                super::identity::BinderId(binder_id),
+                index.term,
+                &mut || Ok::<(), LowerError>(()),
+            )
+        };
+        let public = instantiate(template.public)?;
+        let indices = template
+            .indices
+            .iter()
+            .copied()
+            .map(&mut instantiate)
+            .collect::<Result<Vec<_>, _>>()?;
+        let descriptor =
+            TrapdoorIdentity { public, indices: indices.into_boxed_slice(), ..template };
+        let descriptor = self.egraph.analysis.symbols.trapdoors.intern(descriptor);
+        Ok(LoweredValue::Trapdoor(TrapdoorDescriptorId(descriptor)))
+    }
+
+    fn normalize_singleton_for_input(
+        &mut self,
+        value: LoweredValue,
+        input_type: &WireType,
+    ) -> Result<LoweredValue, LowerError> {
+        if matches!(input_type, WireType::IndexedFamily { .. }) {
+            return Ok(value);
+        }
+        let zero = self.add_int(BigInt::zero(), ResolvedIntExpr::Const(BigInt::zero()));
+        match value {
+            LoweredValue::Family(family)
+                if matches!(
+                    &family.storage,
+                    FamilyCoverageStorage::SharedTemplate { domain, .. }
+                        if domain.logical_count == num_bigint::BigUint::from(1_u8)
+                ) =>
+            {
+                self.family_element(&family, &zero)
+            }
+            LoweredValue::TrapdoorFamily { representative, binder, logical_count }
+                if logical_count == num_bigint::BigUint::from(1_u8) =>
+            {
+                self.trapdoor_family_element(representative, &binder, &logical_count, &zero)
+            }
+            value => Ok(value),
         }
     }
 
@@ -3103,16 +3612,15 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             .collect();
         child.binders.push((binder.clone(), index.clone()));
         child.active_coordinates.push(Coordinate { binder: binder.clone(), index: index.clone() });
-        for ((input, argument), mode) in child_inputs
-            .iter()
-            .copied()
-            .zip(arguments)
-            .zip(specification.input_modes.iter())
+        for ((input, argument), mode) in
+            child_inputs.iter().copied().zip(arguments).zip(specification.input_modes.iter())
         {
             let value = match mode {
                 LoopInputMode::Broadcast => argument,
                 LoopInputMode::Zip => match argument {
                     LoweredValue::Family(family) => self.family_element(&family, &index)?,
+                    LoweredValue::TrapdoorFamily { representative, binder, logical_count } => self
+                        .trapdoor_family_element(representative, &binder, &logical_count, &index)?,
                     value => value,
                 },
                 LoopInputMode::ZipOffset { offset } => {
@@ -3128,6 +3636,14 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     match argument {
                         LoweredValue::Family(family) => {
                             self.family_element(&family, &offset_index)?
+                        }
+                        LoweredValue::TrapdoorFamily { representative, binder, logical_count } => {
+                            self.trapdoor_family_element(
+                                representative,
+                                &binder,
+                                &logical_count,
+                                &offset_index,
+                            )?
                         }
                         value => value,
                     }
@@ -3185,8 +3701,15 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         };
         let element_wire_type = *element;
         let element_type = self.resolve_family_element_sort(&element_wire_type, environment)?;
-        if self.egraph[self.egraph.find(representative)].data.sort != Ok(element_type.clone()) {
-            eprintln!("parallel family expected {element_type:?}, actual {:?}, nodes {:?}", self.egraph[self.egraph.find(representative)].data.sort, self.egraph[self.egraph.find(representative)].nodes);
+        let actual_sort = &self.egraph[self.egraph.find(representative)].data.sort;
+        let sort_matches = match (&element_type, actual_sort) {
+            (MxxSort::Matrix(expected), Ok(MxxSort::Matrix(actual))) => {
+                super::analysis::matrix_types_equal(expected, actual)
+            }
+            (expected, Ok(actual)) => expected == actual,
+            (_, Err(_)) => false,
+        };
+        if !sort_matches {
             return Err(LowerError::FamilyElementTypeMismatch {
                 expected: element_wire_type,
                 actual: self.scalar_wire_type(representative).unwrap_or(WireType::Int),
@@ -3272,6 +3795,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let count_identity = count.stable_identity.ok_or_else(|| {
             LowerError::NonExactIdentityIndex { expression: specification.count.clone() }
         })?;
+        let single_iteration = count_identity == ResolvedIntExpr::Const(BigInt::from(1_u8));
         let (child_definition, child_inputs, child_outputs, parent_arguments) = {
             let graph = self.graph_for_program(&environment.occurrence.program)?;
             let parent = graph
@@ -3332,6 +3856,22 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let mut initial = Vec::with_capacity(specification.carried_count);
         let mut output_types = Vec::with_capacity(specification.carried_count);
         for position in 0..specification.carried_count {
+            if single_iteration {
+                let input_type = {
+                    let graph = self.graph_for_program(&child.occurrence.program)?;
+                    let scope = graph
+                        .scope(&child.occurrence.definition)
+                        .ok_or(LowerError::MissingWire { wire: child_inputs[position] })?;
+                    let input_node = scope
+                        .node(child_inputs[position].node)
+                        .ok_or(LowerError::MissingNode { node: child_inputs[position].node })?;
+                    input_node.output_types()[child_inputs[position].port.0 as usize].clone()
+                };
+                let value =
+                    self.normalize_singleton_for_input(arguments[position].clone(), &input_type)?;
+                child.state_inputs.insert(child_inputs[position], value);
+                continue;
+            }
             let LoweredValue::Term(initial_term) = arguments[position] else {
                 return Err(LowerError::InvalidOperandArity {
                     expected: specification.carried_count,
@@ -3380,15 +3920,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             .iter()
             .copied()
             .skip(specification.carried_count)
-            .zip(parent_arguments.into_iter().skip(specification.carried_count))
+            .zip(arguments.iter().skip(specification.carried_count).cloned())
         {
-            child.inputs.insert(
-                input,
-                LoweringWire {
-                    source: WireSourceKey { scope: wire.source.scope.clone(), wire: argument },
-                    indices: wire.indices.clone(),
-                },
-            );
+            child.state_inputs.insert(input, argument);
         }
         for (name, expression) in &specification.bindings {
             let value = self.resolve_int(expression, &child)?;
@@ -3428,6 +3962,14 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         output_type: WireType,
         carried_index: usize,
     ) -> Result<LoweredValue, LowerError> {
+        if count == ResolvedIntExpr::Const(BigInt::from(1_u8)) {
+            return transition.get(carried_index).copied().map(LoweredValue::Term).ok_or(
+                LowerError::InvalidOutputPort {
+                    wire: wire.source.wire,
+                    output_count: transition.len(),
+                },
+            );
+        }
         let recurrence = self.egraph.analysis.symbols.sequential_recurrences.intern(
             SequentialRecurrenceDescriptor {
                 loop_scope: environment.occurrence.clone(),
@@ -3495,25 +4037,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         }
     }
 
-    /// Resolves a compile-time integer only when both its owner-resolved syntax and canonical
-    /// e-class analysis prove one value. This admits folded constants and singleton affine
-    /// binder expressions while keeping interval-valued and runtime-only terms fail-closed.
-    fn resolve_exact_int_value(
-        &mut self,
-        expression: &IntExpr,
-        environment: &LowerEnv,
-    ) -> Result<BigInt, LowerError> {
-        let lowered = self.lower_int_expr(expression, environment)?;
-        if lowered.stable_identity.is_none() {
-            return Err(LowerError::NonExactIdentityIndex { expression: expression.clone() });
-        }
-        let term = self.egraph.find(lowered.term);
-        self.integer_analysis(term)
-            .and_then(|(domain, _)| domain.interval().ok())
-            .and_then(|interval| (interval.minimum == interval.maximum).then_some(interval.minimum))
-            .ok_or_else(|| LowerError::NonExactIdentityIndex { expression: expression.clone() })
-    }
-
     fn resolve_int(
         &mut self,
         expression: &IntExpr,
@@ -3555,6 +4078,21 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             if let ResolvedIntExpr::Const(value) = value {
                 env.integers.insert(name.clone(), value.clone());
             }
+        }
+        for (name, parameter) in &self.request.environment {
+            let rational = match parameter {
+                super::OperationalParameterValue::Integer(value) => {
+                    mxx_ir_core::Rational::from_integer(value.clone())
+                }
+                super::OperationalParameterValue::Rational { numerator, denominator } => {
+                    mxx_ir_core::Rational::new(numerator.clone(), denominator.clone()).map_err(
+                        |_| LowerError::InvalidRealOperation {
+                            operation: NodeKind::ConstantReal(value.clone()),
+                        },
+                    )?
+                }
+            };
+            env.reals.insert(name.clone(), rational);
         }
         value.evaluate_f64(&env).ok().filter(|value| value.is_finite()).ok_or_else(|| {
             LowerError::InvalidRealOperation { operation: NodeKind::ConstantReal(value.clone()) }
@@ -3602,6 +4140,108 @@ mod tests {
     }
 
     #[test]
+    fn extract_coefficient_uses_direct_upper_and_rejects_oversized_upper() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "extract-upper".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let matrix_type = super::super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(BigInt::from(17)),
+            ring_dimension: ResolvedIntExpr::Const(BigInt::from(1)),
+            rows: ResolvedIntExpr::Const(BigInt::from(1)),
+            columns: ResolvedIntExpr::Const(BigInt::from(1)),
+        };
+        let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ProtocolInput(
+                    crate::ProtocolInputId::from("extract-input"),
+                ),
+                sort: MxxSort::Matrix(matrix_type),
+                integer_domain: None,
+                canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
+                relation_role: None,
+            },
+        );
+        let matrix = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(source),
+            indices: Box::new([]),
+        });
+        let environment = root_test_environment();
+        let kind = NodeKind::ExtractCoefficient {
+            position: IntExpr::constant(0),
+            canonical_input_exclusive_upper: Some(4_u8.into()),
+        };
+        let LoweredValue::Term(extract) =
+            lowerer.lower_node(&kind, &[LoweredValue::Term(matrix)], &environment).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            lowerer.integer_analysis(extract).unwrap().0.interval().unwrap(),
+            super::super::analysis::IntegerInterval::new(0.into(), 3.into()).unwrap()
+        );
+
+        let invalid = NodeKind::ExtractCoefficient {
+            position: IntExpr::constant(0),
+            canonical_input_exclusive_upper: Some(18_u8.into()),
+        };
+        assert!(matches!(
+            lowerer.lower_node(&invalid, &[LoweredValue::Term(matrix)], &environment),
+            Err(LowerError::InvalidExtractCoefficientCanonicalUpper { upper, modulus })
+                if upper == 18_u8.into() && modulus == 17_u8.into()
+        ));
+    }
+
+    #[test]
+    fn plain_extract_uses_authoritative_source_full_modulus_fallback() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "extract-fallback".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let matrix_type = super::super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(BigInt::from(17)),
+            ring_dimension: ResolvedIntExpr::Const(BigInt::from(1)),
+            rows: ResolvedIntExpr::Const(BigInt::from(1)),
+            columns: ResolvedIntExpr::Const(BigInt::from(1)),
+        };
+        let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ProtocolInput(
+                    crate::ProtocolInputId::from("fallback-input"),
+                ),
+                sort: MxxSort::Matrix(matrix_type),
+                integer_domain: None,
+                canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
+                relation_role: None,
+            },
+        );
+        let matrix = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(source),
+            indices: Box::new([]),
+        });
+        let kind = NodeKind::ExtractCoefficient {
+            position: IntExpr::constant(0),
+            canonical_input_exclusive_upper: None,
+        };
+        let LoweredValue::Term(extract) = lowerer
+            .lower_node(&kind, &[LoweredValue::Term(matrix)], &root_test_environment())
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            lowerer.integer_analysis(extract).unwrap().0.interval().unwrap(),
+            super::super::analysis::IntegerInterval::new(0.into(), 16.into()).unwrap()
+        );
+    }
+
+    #[test]
     fn scalar_consumer_validation_uses_the_consumed_boolean_sort() {
         let protocol = crate::toy_example::protocol();
         let request = OperationalCheckRequest {
@@ -3620,82 +4260,6 @@ mod tests {
             lowerer.validate_boolean_consumer(integer, SelectorOnlyConsumer::BoolToInt, false,),
             Err(LowerError::InvalidOperandSort { expected: WireType::Bool, actual: WireType::Int })
         );
-    }
-
-    #[test]
-    fn exact_integer_resolution_accepts_folded_constants_and_singleton_affine_binders() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "exact-integer".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let mut environment = root_test_environment();
-        let binder = BinderKey {
-            loop_scope: environment.occurrence.clone(),
-            loop_node: mxx_ir_core::NodeId(7),
-            slot: 0,
-        };
-        let binder_id = lowerer.egraph.analysis.symbols.binders.intern(
-            super::super::identity::BinderDescriptor {
-                key: binder.clone(),
-                minimum: BigInt::from(3),
-                maximum: BigInt::from(3),
-            },
-        );
-        let binder_term =
-            lowerer.egraph.add(MxxLang::IntBinder(super::super::identity::BinderId(binder_id)));
-        environment.binders.push((
-            binder.clone(),
-            LoweredInt {
-                term: binder_term,
-                stable_identity: Some(ResolvedIntExpr::Binder(binder)),
-            },
-        ));
-        let folded = IntExpr::Add(Box::new(IntExpr::constant(2)), Box::new(IntExpr::constant(5)));
-        let affine = IntExpr::Add(Box::new(IntExpr::LoopIndex(0)), Box::new(IntExpr::constant(4)));
-        assert_eq!(lowerer.resolve_exact_int_value(&folded, &environment).unwrap(), 7.into());
-        assert_eq!(lowerer.resolve_exact_int_value(&affine, &environment).unwrap(), 7.into());
-    }
-
-    #[test]
-    fn exact_integer_resolution_rejects_a_non_singleton_binder_domain() {
-        let protocol = crate::toy_example::protocol();
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "inexact-integer".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let mut environment = root_test_environment();
-        let binder = BinderKey {
-            loop_scope: environment.occurrence.clone(),
-            loop_node: mxx_ir_core::NodeId(8),
-            slot: 0,
-        };
-        let binder_id = lowerer.egraph.analysis.symbols.binders.intern(
-            super::super::identity::BinderDescriptor {
-                key: binder.clone(),
-                minimum: BigInt::from(0),
-                maximum: BigInt::from(1),
-            },
-        );
-        let binder_term =
-            lowerer.egraph.add(MxxLang::IntBinder(super::super::identity::BinderId(binder_id)));
-        environment.binders.push((
-            binder.clone(),
-            LoweredInt {
-                term: binder_term,
-                stable_identity: Some(ResolvedIntExpr::Binder(binder)),
-            },
-        ));
-        let expression =
-            IntExpr::Add(Box::new(IntExpr::LoopIndex(0)), Box::new(IntExpr::constant(4)));
-        assert!(matches!(
-            lowerer.resolve_exact_int_value(&expression, &environment),
-            Err(LowerError::NonExactIdentityIndex { expression: rejected }) if rejected == expression
-        ));
     }
 
     fn hash_layout() -> super::super::OperationalGadgetLayout {
@@ -4100,6 +4664,263 @@ mod tests {
         assert!(matches!(
             (lowerer.begin_wire(&wire), &value),
             (Ok(Some(LoweredValue::Term(reused))), LoweredValue::Term(value)) if reused == *value
+        ));
+    }
+
+    #[test]
+    fn select_aligns_alpha_equivalent_shared_family_binders_without_lanes() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "shared-select".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let scope = root_test_environment().occurrence;
+        let first =
+            BinderKey { loop_scope: scope.clone(), loop_node: mxx_ir_core::NodeId(1), slot: 0 };
+        let second = BinderKey { loop_scope: scope, loop_node: mxx_ir_core::NodeId(2), slot: 0 };
+        let first_id =
+            super::super::identity::BinderId(lowerer.egraph.analysis.symbols.binders.intern(
+                super::super::identity::BinderDescriptor {
+                    key: first.clone(),
+                    minimum: BigInt::zero(),
+                    maximum: BigInt::from(511_u16),
+                },
+            ));
+        let second_id =
+            super::super::identity::BinderId(lowerer.egraph.analysis.symbols.binders.intern(
+                super::super::identity::BinderDescriptor {
+                    key: second.clone(),
+                    minimum: BigInt::zero(),
+                    maximum: BigInt::from(511_u16),
+                },
+            ));
+        let family = |binder: BinderKey, representative| FamilyLoweringValue {
+            element_type: MxxSort::Int,
+            storage: FamilyCoverageStorage::SharedTemplate {
+                domain: family::LoopDomainKey {
+                    binder: binder.clone(),
+                    logical_count: 512_u16.into(),
+                },
+                representative,
+                binder_domains: vec![family::CoverageBinderDomain {
+                    binder,
+                    minimum: BigInt::zero(),
+                    maximum: BigInt::from(511_u16),
+                }]
+                .into_boxed_slice(),
+            },
+        };
+        let first_family = family(first.clone(), lowerer.egraph.add(MxxLang::IntBinder(first_id)));
+        let second_family = family(second, lowerer.egraph.add(MxxLang::IntBinder(second_id)));
+        let aligned = lowerer
+            .align_selected_shared_families(vec![first_family, second_family])
+            .expect("equal family domains differ only by alpha-renamed owner");
+        let (_, domain, _) = family::shared_element(&aligned[1]).unwrap();
+        assert_eq!(domain.binder, first);
+
+        let mut incompatible = aligned[1].clone();
+        let FamilyCoverageStorage::SharedTemplate { domain, binder_domains, .. } =
+            &mut incompatible.storage
+        else {
+            unreachable!()
+        };
+        domain.logical_count = 511_u16.into();
+        binder_domains[0].maximum = BigInt::from(510_u16);
+        assert!(
+            lowerer.align_selected_shared_families(vec![aligned[0].clone(), incompatible]).is_err()
+        );
+    }
+
+    fn protocol_trapdoor_input_fixture(
+        public_contract: InputValueContract,
+    ) -> (crate::ProtocolDecl, WireRef) {
+        use mxx_ir_core::graph::{GraphOutput, NodeHandle};
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let sigma = RealExpr::FromInt(IntExpr::constant(2));
+        let trapdoor_type = WireType::Trapdoor {
+            matrix: matrix.clone(),
+            sigma: sigma.clone(),
+            gadget_base: IntExpr::constant(2),
+            digit_count: IntExpr::constant(3),
+            preimage_max_coefficient_bound: IntExpr::constant(5),
+        };
+        let public = NodeHandle::new(
+            NodeKind::Input {
+                name: "public".to_owned(),
+                wire_type: WireType::Matrix(matrix.clone()),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let trapdoor = NodeHandle::new(
+            NodeKind::Input {
+                name: "trapdoor".to_owned(),
+                wire_type: trapdoor_type,
+                artifact: None,
+            },
+            Vec::new(),
+            vec![WireType::Trapdoor {
+                matrix: matrix.clone(),
+                sigma: sigma.clone(),
+                gadget_base: IntExpr::constant(2),
+                digit_count: IntExpr::constant(3),
+                preimage_max_coefficient_bound: IntExpr::constant(5),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let graph = mxx_ir_core::graph::Graph::freeze(
+            "protocol-trapdoor-input",
+            Vec::new(),
+            BTreeMap::from([
+                ("output".to_owned(), GraphOutput { value: trapdoor, confidentiality: None }),
+                ("public".to_owned(), GraphOutput { value: public, confidentiality: None }),
+            ]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let output = graph.outputs()["output"].value;
+        let mut protocol = crate::toy_example::protocol();
+        let stage = StageId("encrypt".to_owned());
+        protocol.bundle.workflow.stages[0].graph = graph;
+        protocol.bundle.input_contract.inputs = vec![
+            crate::InputContractEntry {
+                id: crate::ProtocolInputId::from("public"),
+                name: "public".to_owned(),
+                value: public_contract,
+            },
+            crate::InputContractEntry {
+                id: crate::ProtocolInputId::from("trapdoor"),
+                name: "trapdoor".to_owned(),
+                value: InputValueContract::Trapdoor {
+                    matrix_type: matrix,
+                    sigma,
+                    gadget_base: IntExpr::constant(2),
+                    digit_count: IntExpr::constant(3),
+                    preimage_max_coefficient_bound: IntExpr::constant(5),
+                    public_input: crate::ProtocolInputId::from("public"),
+                },
+            },
+        ];
+        protocol.bundle.input_bindings = vec![
+            crate::ProtocolInputBinding {
+                input: crate::ProtocolInputId::from("public"),
+                destinations: vec![ProtocolInputDestination::WorkflowStage {
+                    stage: stage.clone(),
+                    input: StageInputName("public".to_owned()),
+                }],
+            },
+            crate::ProtocolInputBinding {
+                input: crate::ProtocolInputId::from("trapdoor"),
+                destinations: vec![ProtocolInputDestination::WorkflowStage {
+                    stage,
+                    input: StageInputName("trapdoor".to_owned()),
+                }],
+            },
+        ];
+        (protocol, output)
+    }
+
+    #[test]
+    fn protocol_trapdoor_input_uses_its_declared_public_contract() {
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let (protocol, output) = protocol_trapdoor_input_fixture(InputValueContract::MatrixExact {
+            matrix_type: matrix,
+            canonical_coefficient_exclusive_upper_bound: Some(IntExpr::constant(7)),
+            is_constant_polynomial: true,
+        });
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "trapdoor-input".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let LoweredValue::Trapdoor(id) =
+            lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output).unwrap()
+        else {
+            panic!("protocol trapdoor input")
+        };
+        let descriptor = lowerer.egraph.analysis.symbols.trapdoors.get(id.0).unwrap();
+        assert_eq!(
+            descriptor.source,
+            TrapdoorSourceKey::ProtocolInput(crate::ProtocolInputId::from("trapdoor"))
+        );
+        assert_eq!(descriptor.gadget_base, ResolvedIntExpr::Const(BigInt::from(2)));
+        assert_eq!(descriptor.digit_count, ResolvedIntExpr::Const(BigInt::from(3)));
+        assert_eq!(descriptor.preimage_cutoff, ResolvedIntExpr::Const(BigInt::from(5)));
+        let MxxLang::Atom { source, .. } =
+            lowerer.egraph[lowerer.egraph.find(descriptor.public)].nodes.first().unwrap()
+        else {
+            panic!("public protocol atom")
+        };
+        assert!(
+            matches!(lowerer.egraph.analysis.symbols.atomic_sources.get(source.0).unwrap().key, super::super::identity::AtomicSourceKey::ProtocolInput(ref id) if id == &crate::ProtocolInputId::from("public"))
+        );
+    }
+
+    #[test]
+    fn protocol_trapdoor_input_rejects_a_non_matrix_declared_public_contract() {
+        let (protocol, output) = protocol_trapdoor_input_fixture(InputValueContract::Boolean);
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "trapdoor-input".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        assert!(matches!(
+            lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output),
+            Err(LowerError::MissingProtocolInputBinding { input })
+                if input == crate::ProtocolInputId::from("public")
+        ));
+    }
+
+    #[test]
+    fn protocol_trapdoor_input_rejects_a_missing_declared_public_contract() {
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let (mut protocol, output) =
+            protocol_trapdoor_input_fixture(InputValueContract::MatrixExact {
+                matrix_type: matrix,
+                canonical_coefficient_exclusive_upper_bound: None,
+                is_constant_polynomial: true,
+            });
+        protocol
+            .bundle
+            .input_contract
+            .inputs
+            .retain(|entry| entry.id != crate::ProtocolInputId::from("public"));
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "trapdoor-input".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        assert!(matches!(
+            lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output),
+            Err(LowerError::MissingProtocolInputBinding { input })
+                if input == crate::ProtocolInputId::from("public")
         ));
     }
 

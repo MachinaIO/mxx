@@ -829,7 +829,7 @@ fn validate_node(
             })?;
             vec![ConcreteWireType::Preimage(ConcreteMatrixType { rows, ..input })]
         }
-        NodeKind::ExtractCoefficient { position } => {
+        NodeKind::ExtractCoefficient { position, .. } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
             let position =

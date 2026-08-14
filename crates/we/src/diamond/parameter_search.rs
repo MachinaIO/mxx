@@ -499,11 +499,9 @@ mod tests {
     fn smallest_diamond_candidate_reaches_typed_checker_rejection() {
         let (parameters, compiler) = smallest_checker_candidate();
         let declaration = compiler.protocol_decl().unwrap();
-        eprintln!("{:#?}", declaration.protocol());
         let request = operational_request(&parameters, &compiler).unwrap();
         let error = check_operational_noise_candidate(declaration.protocol(), &request)
             .expect_err("the current Diamond residual is rejected during typed lowering");
-        eprintln!("{error:?}");
         assert!(matches!(
             error,
             mxx_correctness::operational_noise::OperationalSimulationError::Lower {

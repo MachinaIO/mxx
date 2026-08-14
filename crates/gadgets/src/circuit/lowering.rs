@@ -58,6 +58,16 @@ impl<'a> GateInstance<'a> {
 pub trait CircuitLoweringTypes {
     type Wire: Clone;
     type Error: Error + Send + Sync + 'static;
+
+    /// Attaches call-specific compile-time metadata to child inputs before the
+    /// child circuit is expanded. Ordinary lowerers leave inputs unchanged.
+    fn enter_subcircuit_inputs(
+        &mut self,
+        inputs: Vec<Self::Wire>,
+        _input_max_plaintext_norm_ranges: Option<&[SubCircuitInputMaxPlaintextNormRange]>,
+    ) -> Result<Vec<Self::Wire>, Self::Error> {
+        Ok(inputs)
+    }
 }
 
 /// Scheme-specific lowering for public lookup gates.
@@ -812,6 +822,15 @@ where
                 let info = circuit.sub_circuit_call_info(*call_id);
                 let child = circuit.registered_sub_circuit_ref(info.sub_circuit_id);
                 let child_inputs = flatten_inputs(&values, &info.inputs, gate_id)?;
+                let child_inputs = lowering
+                    .enter_subcircuit_inputs(
+                        child_inputs,
+                        child
+                            .sub_circuit_input_max_plaintext_norm_ranges
+                            .as_deref()
+                            .or(info.input_max_plaintext_norm_ranges.as_deref()),
+                    )
+                    .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?;
                 call_path.push(info.scoped_call_id);
                 let outputs = lower_scoped(
                     child.as_ref(),
@@ -843,6 +862,15 @@ where
                     .enumerate()
                 {
                     let child_inputs = flatten_inputs(&values, call_inputs, gate_id)?;
+                    let child_inputs = lowering
+                        .enter_subcircuit_inputs(
+                            child_inputs,
+                            child
+                                .sub_circuit_input_max_plaintext_norm_ranges
+                                .as_deref()
+                                .or(info.input_max_plaintext_norm_ranges.as_deref()),
+                        )
+                        .map_err(|source| CircuitLowerError::Operation { gate: gate_id, source })?;
                     call_path.push(*scoped_call_id);
                     let outputs = lower_scoped(
                         child.as_ref(),

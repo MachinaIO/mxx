@@ -218,7 +218,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
         match node {
             Atom { source, .. } => self.input.atom_bound(*source, term),
             MatrixConstant(spec) => self.bound_matrix_constant(term, *spec),
-            MatrixCanonicalRangeContract { input, .. } => Ok(self.child(input[0])?.clone()),
             HashPlain { .. } => Ok(MatrixBound {
                 matrix_type: self.input.matrix_type(term)?,
                 coefficient_class: BoundClass::Large,
@@ -291,7 +290,7 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             RealMul(_) |
             RealDiv(_) |
             RealSqrt(_) |
-            ExtractCoefficient(_) => Err(BoundEvaluationError::NonMatrixTerm { term }),
+            ExtractCoefficient { .. } => Err(BoundEvaluationError::NonMatrixTerm { term }),
         }
     }
 
@@ -681,20 +680,44 @@ pub fn product_bound(
     right: &MatrixBound,
 ) -> Result<MatrixBound, BoundEvaluationError> {
     if left.matrix_type.modulus != right.matrix_type.modulus ||
-        left.matrix_type.ring_dimension != right.matrix_type.ring_dimension ||
-        left.matrix_type.columns != right.matrix_type.rows
+        left.matrix_type.ring_dimension != right.matrix_type.ring_dimension
     {
         return Err(BoundEvaluationError::IncompatibleMatrixProduct {
             left: left.matrix_type.clone(),
             right: right.matrix_type.clone(),
         });
     }
-    let rows = BigUint::from(right.matrix_type.rows);
-    let known_zero_rows = right.metadata.known_zero_rows.clone().unwrap_or_default();
-    if known_zero_rows > rows {
-        return Err(BoundEvaluationError::InvalidKnownZeroRows { known_zero_rows, row_count: rows });
-    }
-    let effective_inner = BigUint::from(left.matrix_type.columns) - known_zero_rows;
+    let left_scalar = left.matrix_type.rows == 1 && left.matrix_type.columns == 1;
+    let right_scalar = right.matrix_type.rows == 1 && right.matrix_type.columns == 1;
+    let (matrix_type, effective_inner) = if left_scalar {
+        (right.matrix_type.clone(), BigUint::one())
+    } else if right_scalar {
+        (left.matrix_type.clone(), BigUint::one())
+    } else {
+        if left.matrix_type.columns != right.matrix_type.rows {
+            return Err(BoundEvaluationError::IncompatibleMatrixProduct {
+                left: left.matrix_type.clone(),
+                right: right.matrix_type.clone(),
+            });
+        }
+        let rows = BigUint::from(right.matrix_type.rows);
+        let known_zero_rows = right.metadata.known_zero_rows.clone().unwrap_or_default();
+        if known_zero_rows > rows {
+            return Err(BoundEvaluationError::InvalidKnownZeroRows {
+                known_zero_rows,
+                row_count: rows,
+            });
+        }
+        (
+            ConcreteMatrixType {
+                modulus: left.matrix_type.modulus.clone(),
+                ring_dimension: left.matrix_type.ring_dimension,
+                rows: left.matrix_type.rows,
+                columns: right.matrix_type.columns,
+            },
+            BigUint::from(left.matrix_type.columns) - known_zero_rows,
+        )
+    };
     let ring_factor =
         if left.metadata.is_constant_polynomial || right.metadata.is_constant_polynomial {
             BigUint::one()
@@ -702,12 +725,7 @@ pub fn product_bound(
             BigUint::from(left.matrix_type.ring_dimension)
         };
     Ok(MatrixBound {
-        matrix_type: ConcreteMatrixType {
-            modulus: left.matrix_type.modulus.clone(),
-            ring_dimension: left.matrix_type.ring_dimension,
-            rows: left.matrix_type.rows,
-            columns: right.matrix_type.columns,
-        },
+        matrix_type,
         coefficient_class: multiply_classes(
             &left.coefficient_class,
             &right.coefficient_class,
@@ -740,9 +758,7 @@ fn matrix_children(node: &MxxLang, term: Id) -> Result<Vec<Id>, BoundEvaluationE
         HashPlain { .. } |
         LiftConstantPolynomial { .. } |
         PackPolynomialCoefficients { .. } => Ok(Vec::new()),
-        MatrixCanonicalRangeContract { input, .. } |
-        MatrixNegate(input) |
-        MatrixTranspose(input) => Ok(vec![input[0]]),
+        MatrixNegate(input) | MatrixTranspose(input) => Ok(vec![input[0]]),
         MatrixSlice { input, .. } => Ok(vec![input[0]]),
         MatrixAdd(children) |
         MatrixMultiply(children) |
@@ -784,7 +800,7 @@ fn matrix_children(node: &MxxLang, term: Id) -> Result<Vec<Id>, BoundEvaluationE
         RealMul(_) |
         RealDiv(_) |
         RealSqrt(_) |
-        ExtractCoefficient(_) => Err(BoundEvaluationError::NonMatrixTerm { term }),
+        ExtractCoefficient { .. } => Err(BoundEvaluationError::NonMatrixTerm { term }),
     }
 }
 
@@ -890,6 +906,20 @@ mod tests {
         };
         let right = bounded(matrix(1, 1), 3);
         assert_eq!(product_bound(&left, &right).unwrap().coefficient_class, BoundClass::Large);
+    }
+
+    #[test]
+    fn singleton_matrix_product_uses_scalar_runtime_semantics() {
+        let scalar = bounded(matrix(1, 1), 3);
+        let row = bounded(matrix(1, 2), 5);
+        let right_scalar = product_bound(&row, &scalar).unwrap();
+        let left_scalar = product_bound(&scalar, &row).unwrap();
+        assert_eq!(right_scalar.matrix_type, row.matrix_type);
+        assert_eq!(left_scalar.matrix_type, row.matrix_type);
+        assert_eq!(
+            right_scalar.coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: 15_u8.into() }
+        );
     }
 
     #[test]

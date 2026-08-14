@@ -740,7 +740,11 @@ impl LweLookupCompiler {
         let (rows, plaintexts) = parallel_zip(
             (input.rows.clone(), input_plaintexts.clone(), c_b_rows.clone()),
             move |_, (input_row, plaintext, c_b)| {
-                let input_index = plaintext.extract_coefficient(0);
+                let input_index = plaintext
+                    .extract_coefficient_with_canonical_input_exclusive_upper(
+                        0,
+                        input.canonical_input_exclusive_upper.clone(),
+                    );
                 let chunk = input_index.clone().div(Int::constant(LOOKUP_ARTIFACT_CHUNK_ROWS));
                 let offset = input_index.clone().rem(Int::constant(LOOKUP_ARTIFACT_CHUNK_ROWS));
                 let low =
@@ -763,6 +767,7 @@ impl LweLookupCompiler {
             rows,
             pubkey: output_public_key,
             plaintext: BggTallPlaintext::Diagonal(plaintexts),
+            canonical_input_exclusive_upper: None,
         })
     }
 
@@ -1473,6 +1478,7 @@ mod tests {
         RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
         transcript::SamplingMode,
     };
+    use num_bigint::BigUint;
 
     fn identity_lut(length: u64) -> PublicLutProgram {
         PublicLutProgram::new(length, LutExpr::input()).expect("identity LUT")
@@ -1568,6 +1574,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            canonical_input_exclusive_upper: Some(BigUint::from(4u8)),
         };
         let c_b_rows = Family::pack(
             (0..slots).map(|slot| ring.input(format!("c-b-{slot}"), (1, digits + 2))).collect(),
@@ -1661,6 +1668,15 @@ mod tests {
                 .unwrap();
         }
         let graph = context.build().unwrap();
+        assert!(graph.graph.scopes().values().flat_map(|scope| scope.nodes()).any(|node| {
+            matches!(
+                node.kind(),
+                NodeKind::ExtractCoefficient {
+                    canonical_input_exclusive_upper: Some(upper),
+                    ..
+                } if upper == &BigUint::from(4u8)
+            )
+        }));
         assert_eq!(
             graph
                 .graph
@@ -1756,6 +1772,7 @@ mod tests {
             rows: rows.clone(),
             pubkey: BggPublicKeyWire { matrix: ring.zero((1, digits)), reveal_plaintext: true },
             plaintext,
+            canonical_input_exclusive_upper: None,
         };
         assert!(matches!(
             lookup.tall_encoding(

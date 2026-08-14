@@ -625,7 +625,7 @@ impl DiamondGpuMeasurementBackend {
                         .map_err(Self::backend_error)
                 })
             }
-            NodeKind::ExtractCoefficient { position } => {
+            NodeKind::ExtractCoefficient { position, .. } => {
                 let input = Self::matrix_argument(node, 0)?.clone();
                 let position = position
                     .evaluate(bindings)

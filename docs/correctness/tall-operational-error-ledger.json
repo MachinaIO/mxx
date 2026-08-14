@@ -237,6 +237,12 @@
       "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
     },
     {
+      "error_tag": "Lower.MissingIntegerAnalysis",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "A dynamic family selector requires an integer e-class domain before range validation."
+    },
+    {
       "error_tag": "Lower.MissingProtocolInputBinding",
       "tall_reachability": "reachable",
       "classification": "graph_lowering",
@@ -267,10 +273,10 @@
       "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
     },
     {
-      "error_tag": "Lower.InvalidInternalCanonicalRangeContract",
+      "error_tag": "Lower.InvalidExtractCoefficientCanonicalUpper",
       "tall_reachability": "reachable",
       "classification": "graph_lowering",
-      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+      "rationale": "An ExtractCoefficient canonical exclusive upper must be positive and no greater than its resolved matrix modulus."
     },
     {
       "error_tag": "Lower.UnboundParameter",

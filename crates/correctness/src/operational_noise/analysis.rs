@@ -863,7 +863,7 @@ impl Analysis<MxxLang> for MxxAnalysis {
         let mut data = make_analysis_data(egraph, enode);
         // Only the syntactic ExtractCoefficient node is a direct extraction.
         // Every operator or wrapper, including an all-equal Switch, clears it.
-        if !matches!(enode, MxxLang::ExtractCoefficient(_)) {
+        if !matches!(enode, MxxLang::ExtractCoefficient { .. }) {
             data.direct_extract = None;
         }
         data
@@ -1096,21 +1096,6 @@ fn make_analysis_data(egraph: &EGraph<MxxLang, MxxAnalysis>, enode: &MxxLang) ->
                 )
             })
             .unwrap_or_else(invalid_analysis_data),
-        MatrixCanonicalRangeContract { upper, input } => {
-            let mut data = egraph[input[0]].data.clone();
-            if !matches!(data.sort, Ok(MxxSort::Matrix(_))) ||
-                upper.is_zero() ||
-                data.canonical_residue_convention !=
-                    Some(CanonicalResidueConvention::Nonnegative)
-            {
-                return invalid_analysis_data();
-            }
-            data.canonical_coefficient_exclusive_upper = Some(
-                data.canonical_coefficient_exclusive_upper
-                    .map_or_else(|| upper.clone(), |existing| existing.min(upper.clone())),
-            );
-            data
-        }
         HashPlain { query, arguments } => {
             let Some(spec) = egraph.analysis.symbols.hash_queries.get(query.0) else {
                 return invalid_analysis_data();
@@ -1187,7 +1172,9 @@ fn make_analysis_data(egraph: &EGraph<MxxLang, MxxAnalysis>, enode: &MxxLang) ->
         MatrixTensor(children) => matrix_tensor(egraph, children),
         MatrixConcat { axis, inputs } => matrix_concat(egraph, *axis, inputs),
         Switch(children) => switch_data(egraph, children),
-        ExtractCoefficient(children) => extract_coefficient_data(egraph, children),
+        ExtractCoefficient { canonical_exclusive_upper, input } => {
+            extract_coefficient_data(egraph, canonical_exclusive_upper.as_ref(), input)
+        }
         LiftConstantPolynomial { matrix_type, input } => {
             let Some(source) = int_data(egraph, input[0]) else {
                 return invalid_analysis_data();
@@ -1263,21 +1250,35 @@ fn graph_wire_coordinates_are_authoritative(
     let binders = match &descriptor.key {
         super::identity::AtomicSourceKey::GraphWire(source) => source.coordinate_binders.as_ref(),
         super::identity::AtomicSourceKey::Sampler(id) => {
-            let Some(super::identity::SamplerIdentity::Preimage {
-                source, indices: recorded, ..
-            }) = egraph.analysis.symbols.samplers.get(id.0)
-            else {
+            let Some(sampler) = egraph.analysis.symbols.samplers.get(id.0) else {
                 return false;
             };
-            if recorded.as_ref() != indices {
+            let (_source, recorded) = match sampler {
+                super::identity::SamplerIdentity::Preimage { source, indices, .. } |
+                super::identity::SamplerIdentity::DecomposedHash { source, indices, .. } |
+                super::identity::SamplerIdentity::GadgetDecomposition {
+                    source, indices, ..
+                } => (source, indices),
+            };
+            if recorded.len() != indices.len() ||
+                recorded
+                    .iter()
+                    .zip(indices)
+                    .any(|(recorded, actual)| egraph.find(*recorded) != egraph.find(*actual))
+            {
                 return false;
             }
-            source.coordinate_binders.as_ref()
+            // Sampler descriptors are the relation authority.  A shared
+            // family may substitute an owner index by a checked runtime
+            // selector, so requiring that selector to be syntactically the
+            // old binder would reject the same recorded relation value.
+            return true;
         }
-        // Protocol inputs and other non-relation atoms have no graph-owned
-        // coordinate registry. Their indexed identity is the source together
-        // with the checked integer indices carried by the Atom itself.
-        _ => return descriptor.relation_role.is_none(),
+        // Protocol inputs and other non-graph atoms have no owner-binder
+        // registry. Their identity is the source plus the checked integer
+        // children, including when the source is an explicitly registered
+        // relation producer.
+        _ => return true,
     };
     if binders.len() != indices.len() {
         return false;
@@ -1558,7 +1559,7 @@ fn resolved_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {
         resolved_constant(left).zip(resolved_constant(right)).is_some_and(|(l, r)| l == r)
 }
 
-fn matrix_types_equal(left: &ResolvedMatrixType, right: &ResolvedMatrixType) -> bool {
+pub(crate) fn matrix_types_equal(left: &ResolvedMatrixType, right: &ResolvedMatrixType) -> bool {
     resolved_equal(&left.modulus, &right.modulus) &&
         resolved_equal(&left.ring_dimension, &right.ring_dimension) &&
         resolved_equal(&left.rows, &right.rows) &&
@@ -1607,28 +1608,34 @@ fn matrix_multiply(egraph: &EGraph<MxxLang, MxxAnalysis>, children: &[egg::Id]) 
     let Some(first) = matrix_sort(egraph, *first_id).cloned() else {
         return invalid_analysis_data();
     };
-    let mut columns = first.columns.clone();
+    let mut result = first;
     for child in &children[1..] {
         let Some(next) = matrix_sort(egraph, *child) else {
             return invalid_analysis_data();
         };
-        if !resolved_equal(&next.modulus, &first.modulus) ||
-            !resolved_equal(&next.ring_dimension, &first.ring_dimension) ||
-            !resolved_equal(&columns, &next.rows)
+        if !resolved_equal(&next.modulus, &result.modulus) ||
+            !resolved_equal(&next.ring_dimension, &result.ring_dimension)
         {
             return invalid_analysis_data();
         }
-        columns = next.columns.clone();
+        // Graph IR multiplication follows the runtime's scalar convention:
+        // a 1x1 matrix is one polynomial scalar and broadcasts over the
+        // matrix on either side.  All other products use ordinary dimensions.
+        if resolved_equal(&result.rows, &ResolvedIntExpr::Const(BigInt::one())) &&
+            resolved_equal(&result.columns, &ResolvedIntExpr::Const(BigInt::one()))
+        {
+            result = next.clone();
+        } else if resolved_equal(&next.rows, &ResolvedIntExpr::Const(BigInt::one())) &&
+            resolved_equal(&next.columns, &ResolvedIntExpr::Const(BigInt::one()))
+        {
+            continue;
+        } else if resolved_equal(&result.columns, &next.rows) {
+            result.columns = next.columns.clone();
+        } else {
+            return invalid_analysis_data();
+        }
     }
-    AnalysisData::matrix(
-        ResolvedMatrixType {
-            modulus: first.modulus,
-            ring_dimension: first.ring_dimension,
-            rows: first.rows,
-            columns,
-        },
-        None,
-    )
+    AnalysisData::matrix(result, None)
 }
 
 fn matrix_tensor(egraph: &EGraph<MxxLang, MxxAnalysis>, children: &[egg::Id; 2]) -> AnalysisData {
@@ -1671,14 +1678,16 @@ fn matrix_concat(
         let Some(next) = matrix_sort(egraph, *input) else {
             return invalid_analysis_data();
         };
-        if next.modulus != first.modulus || next.ring_dimension != first.ring_dimension {
+        if !resolved_equal(&next.modulus, &first.modulus) ||
+            !resolved_equal(&next.ring_dimension, &first.ring_dimension)
+        {
             return invalid_analysis_data();
         }
         match axis {
-            super::identity::Axis::Rows if next.columns == columns => {
+            super::identity::Axis::Rows if resolved_equal(&next.columns, &columns) => {
                 rows = ResolvedIntExpr::Add(Box::new(rows), Box::new(next.rows.clone()));
             }
-            super::identity::Axis::Columns if next.rows == rows => {
+            super::identity::Axis::Columns if resolved_equal(&next.rows, &rows) => {
                 columns = ResolvedIntExpr::Add(Box::new(columns), Box::new(next.columns.clone()));
             }
             super::identity::Axis::Diagonal => {
@@ -1737,7 +1746,10 @@ fn switch_data(egraph: &EGraph<MxxLang, MxxAnalysis>, children: &[egg::Id]) -> A
         return invalid_analysis_data();
     }
     let first = &egraph[cases[0]].data;
-    if cases.iter().any(|id| egraph[*id].data.sort != first.sort) {
+    if cases.iter().any(|id| match (&first.sort, &egraph[*id].data.sort) {
+        (Ok(MxxSort::Matrix(first)), Ok(MxxSort::Matrix(next))) => !matrix_types_equal(first, next),
+        (first, next) => first != next,
+    }) {
         return invalid_analysis_data();
     }
     // A Switch constructs only scalar metadata plus one arena node.  Its
@@ -1837,6 +1849,7 @@ fn switch_data(egraph: &EGraph<MxxLang, MxxAnalysis>, children: &[egg::Id]) -> A
 
 fn extract_coefficient_data(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
+    canonical_exclusive_upper: Option<&BigUint>,
     children: &[egg::Id; 2],
 ) -> AnalysisData {
     let Some(matrix) = matrix_sort(egraph, children[0]) else {
@@ -1851,14 +1864,18 @@ fn extract_coefficient_data(
     let Some(modulus) = modulus.to_biguint() else {
         return invalid_analysis_data();
     };
-    let Some(convention) = egraph[children[0]].data.canonical_residue_convention else {
+    let matrix_data = &egraph[children[0]].data;
+    let canonical_exclusive_upper =
+        canonical_exclusive_upper.or(matrix_data.canonical_coefficient_exclusive_upper.as_ref());
+    let convention = matrix_data.canonical_residue_convention;
+    if canonical_exclusive_upper.is_none() && convention.is_none() {
         return invalid_analysis_data();
-    };
+    }
     let Ok(domain) = MxxAnalysis::extract_coefficient_domain(
         matrix,
         &modulus,
-        egraph[children[0]].data.canonical_coefficient_exclusive_upper.as_ref(),
-        convention,
+        canonical_exclusive_upper,
+        convention.unwrap_or(CanonicalResidueConvention::Nonnegative),
     ) else {
         return invalid_analysis_data();
     };
@@ -2122,7 +2139,10 @@ mod tests {
         let matrix =
             constant_matrix(&mut egraph, matrix_type.clone(), MatrixConstantValue::Identity);
         let position = egraph.add(MxxLang::IntConst(0.into()));
-        let extract = egraph.add(MxxLang::ExtractCoefficient([matrix, position]));
+        let extract = egraph.add(MxxLang::ExtractCoefficient {
+            canonical_exclusive_upper: None,
+            input: [matrix, position],
+        });
         let direct_lift = egraph.add(MxxLang::LiftConstantPolynomial {
             matrix_type: matrix_type.clone(),
             input: [extract],
@@ -2148,7 +2168,10 @@ mod tests {
         let matrix =
             constant_matrix(&mut egraph, matrix_type.clone(), MatrixConstantValue::Identity);
         let position = egraph.add(MxxLang::IntConst(0.into()));
-        let extract = egraph.add(MxxLang::ExtractCoefficient([matrix, position]));
+        let extract = egraph.add(MxxLang::ExtractCoefficient {
+            canonical_exclusive_upper: None,
+            input: [matrix, position],
+        });
         let selector = egraph.add(MxxLang::IntConst(0.into()));
         let switched =
             egraph.add(MxxLang::Switch(vec![selector, extract, extract].into_boxed_slice()));
@@ -2166,7 +2189,10 @@ mod tests {
         let matrix =
             constant_matrix(&mut egraph, matrix_type.clone(), MatrixConstantValue::Identity);
         let position = egraph.add(MxxLang::IntConst(0.into()));
-        let extract = egraph.add(MxxLang::ExtractCoefficient([matrix, position]));
+        let extract = egraph.add(MxxLang::ExtractCoefficient {
+            canonical_exclusive_upper: None,
+            input: [matrix, position],
+        });
         let zero = egraph.add(MxxLang::IntConst(0.into()));
         let added = egraph.add(MxxLang::IntAdd([extract, zero]));
         let negated = egraph.add(MxxLang::MatrixNegate([matrix]));
@@ -2190,6 +2216,18 @@ mod tests {
         assert!(egraph[add].data.sort.is_err());
         assert!(egraph[multiply].data.sort.is_err());
         assert!(egraph[switch].data.sort.is_err());
+    }
+
+    #[test]
+    fn matrix_multiply_broadcasts_a_singleton_polynomial_matrix() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let scalar = constant_matrix(&mut egraph, scalar_matrix_type(1), MatrixConstantValue::Zero);
+        let row = constant_matrix(&mut egraph, scalar_matrix_type(2), MatrixConstantValue::Zero);
+        let right_scalar = egraph.add(MxxLang::MatrixMultiply(vec![row, scalar].into()));
+        let left_scalar = egraph.add(MxxLang::MatrixMultiply(vec![scalar, row].into()));
+        let expected = Ok(MxxSort::Matrix(scalar_matrix_type(2)));
+        assert_eq!(egraph[right_scalar].data.sort, expected);
+        assert_eq!(egraph[left_scalar].data.sort, expected);
     }
 
     #[test]

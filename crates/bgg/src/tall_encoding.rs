@@ -18,6 +18,7 @@ use mxx_ir_core::{
     node::{ConcatAxis, IndexRange},
     types::MatrixType,
 };
+use num_bigint::BigUint;
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -30,6 +31,9 @@ pub struct BggTallEncodingWire {
     pub pubkey: BggPublicKeyWire,
     /// Known or hidden diagonal plaintext metadata.
     pub plaintext: BggTallPlaintext,
+    /// Compile-time-only exclusive upper bound for the revealed canonical
+    /// plaintext input. This is meaningful only when `plaintext` is diagonal.
+    pub canonical_input_exclusive_upper: Option<BigUint>,
 }
 
 /// Plaintext metadata for a tall BGG+ wire.
@@ -162,6 +166,7 @@ impl BggTallEncodingCompiler {
             rows,
             pubkey: self.public_key.mul(&lhs.pubkey, &rhs.pubkey),
             plaintext,
+            canonical_input_exclusive_upper: None,
         })
     }
 
@@ -262,6 +267,7 @@ impl BggTallEncodingCompiler {
                 reveal_plaintext: input.pubkey.reveal_plaintext,
             },
             plaintext: BggTallPlaintext::Diagonal(rotated_plaintexts),
+            canonical_input_exclusive_upper: None,
         })
     }
 
@@ -295,6 +301,7 @@ impl BggTallEncodingCompiler {
             rows,
             pubkey: public_operation(&self.public_key, &lhs.pubkey, &rhs.pubkey),
             plaintext,
+            canonical_input_exclusive_upper: None,
         })
     }
 
@@ -320,7 +327,7 @@ impl BggTallEncodingCompiler {
         } else {
             self.public_key.small_scalar_mul(&input.pubkey, scalar)
         };
-        Ok(BggTallEncodingWire { rows, pubkey, plaintext })
+        Ok(BggTallEncodingWire { rows, pubkey, plaintext, canonical_input_exclusive_upper: None })
     }
 }
 
@@ -464,6 +471,7 @@ impl BggTallEncodingSampler {
                 } else {
                     BggTallPlaintext::Hidden
                 },
+                canonical_input_exclusive_upper: None,
             })
             .collect();
         Ok(BggTallEncodingSample { encodings, slot_secret_matrices })
@@ -665,11 +673,22 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            canonical_input_exclusive_upper: None,
         };
         let left = wire("left");
         let right = wire("right");
         let sum = compiler.add(&left, &right).unwrap();
         let product = compiler.simd_mul(&left, &right).unwrap();
+        let mut bounded = left.clone();
+        bounded.canonical_input_exclusive_upper = Some(BigUint::from(7u8));
+        assert!(
+            compiler
+                .small_scalar_mul(&bounded, &ring.identity(1))
+                .unwrap()
+                .canonical_input_exclusive_upper
+                .is_none()
+        );
+        assert!(compiler.add(&bounded, &right).unwrap().canonical_input_exclusive_upper.is_none());
         let mut context = DslContext::new("tall-arithmetic-runtime")
             .output("sum-public", sum.pubkey.matrix)
             .unwrap()
@@ -779,6 +798,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            canonical_input_exclusive_upper: None,
         };
         let rotation = TallRotationEncodingWires {
             key: TallRotationEncodingKey { num_slots: slots as u32, offset: 1 },
@@ -1167,6 +1187,7 @@ mod tests {
             plaintext: BggTallPlaintext::Diagonal(
                 Family::pack((0..slots).map(|_| ring.zero((1, 1))).collect()).unwrap(),
             ),
+            canonical_input_exclusive_upper: None,
         };
         let public_key_type = input_public.matrix.matrix_type().clone();
         let mut public_lowering = BggTallSlotPublicKeyLowering {
@@ -1295,11 +1316,13 @@ mod tests {
             rows: ring.input_family("rows", 2, (1, 2)),
             pubkey: input_public,
             plaintext: BggTallPlaintext::Diagonal(ring.input_family("plaintexts", 2, (1, 1))),
+            canonical_input_exclusive_upper: None,
         };
         let one = BggTallEncodingWire {
             rows: ring.input_family("one-rows", 2, (1, 2)),
             pubkey: one_public,
             plaintext: BggTallPlaintext::Diagonal(ring.input_family("one-plaintexts", 2, (1, 1))),
+            canonical_input_exclusive_upper: None,
         };
         let mut lowering = BggTallSlotLowering {
             compiler: BggTallEncodingCompiler { public_key: public_compiler },
@@ -1622,6 +1645,7 @@ mod tests {
                 Family::pack((0..physical_slots).map(|_| ring.zero((1, 1))).collect())
                     .expect("packed plaintexts"),
             ),
+            canonical_input_exclusive_upper: None,
         };
         let one = BggTallEncodingWire {
             plaintext: BggTallPlaintext::Diagonal(

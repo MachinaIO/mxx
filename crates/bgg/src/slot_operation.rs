@@ -2124,6 +2124,7 @@ mod tall {
                     plaintext: BggTallPlaintext::Diagonal(
                         Parallel::range(0).map(move |_| ring.zero((1, 1)))?,
                     ),
+                    canonical_input_exclusive_upper: None,
                 });
             }
             let identity = gate_token(gate);
@@ -2166,6 +2167,7 @@ mod tall {
                 rows: Family::pack(rows)?,
                 pubkey: self.output_public_key(gate, false),
                 plaintext: BggTallPlaintext::Diagonal(Family::pack(plaintexts)?),
+                canonical_input_exclusive_upper: None,
             })
         }
 
@@ -2251,6 +2253,7 @@ mod tall {
                 rows: Family::pack(rows)?,
                 pubkey: self.output_public_key(gate, true),
                 plaintext: BggTallPlaintext::Diagonal(Family::pack(plaintexts)?),
+                canonical_input_exclusive_upper: None,
             })
         }
     }

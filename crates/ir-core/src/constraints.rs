@@ -153,7 +153,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                     positive(&mut constraints, count, format!("{prefix}: family count"));
                 }
                 NodeKind::FamilyGetStatic { index } |
-                NodeKind::ExtractCoefficient { position: index } |
+                NodeKind::ExtractCoefficient { position: index, .. } |
                 NodeKind::BitExtract { bit: index } => {
                     nonnegative(&mut constraints, index, format!("{prefix}: index"));
                 }

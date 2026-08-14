@@ -103,6 +103,8 @@ pub enum NodeKind {
     },
     ExtractCoefficient {
         position: IntExpr,
+        /// Compile-time-only exclusive upper bound for a canonical input.
+        canonical_input_exclusive_upper: Option<BigUint>,
     },
     /// Lifts an integer into the constant coefficient of a scalar polynomial.
     LiftIntegerToConstantPolynomial {

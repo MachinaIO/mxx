@@ -1663,7 +1663,7 @@ where
                     self.backend.gadget_decompose(&input, *small).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
-            NodeKind::ExtractCoefficient { position } => {
+            NodeKind::ExtractCoefficient { position, .. } => {
                 let input = self.matrix(values, node.args[0])?;
                 let position = self.eval_usize(node.id, position, env)?;
                 let output = self

@@ -1,10 +1,8 @@
 //! The compact expression language used by the operational-noise checker.
 //!
 //! `MxxLang` is deliberately an analysis language, rather than another Graph
-//! IR.  Its only checker-internal annotation is
-//! [`MxxLang::MatrixCanonicalRangeContract`]; lowering creates that annotation
-//! at a validated subgraph-input binding and immediately unions it with its
-//! matrix child.  No runtime operation is introduced here.
+//! IR. Canonical coefficient metadata belongs directly to the checker
+//! `ExtractCoefficient` term; no checker-only matrix operation is introduced.
 
 use crate::operational_noise::identity::{
     AtomicSourceId, Axis, BinderId, CrtSpecId, HashQuerySpecId, MatrixConstantSpecId,
@@ -60,14 +58,6 @@ pub enum MxxLang {
 
     MatrixConstant(MatrixConstantSpecId),
 
-    /// A validated, checker-only annotation for a canonical matrix range.
-    ///
-    /// This is not a Graph IR operation and never participates in a rewrite.
-    MatrixCanonicalRangeContract {
-        upper: BigUint,
-        input: [Id; 1],
-    },
-
     HashPlain {
         query: HashQuerySpecId,
         arguments: Box<[Id]>,
@@ -91,7 +81,10 @@ pub enum MxxLang {
 
     /// Ordered as `selector, case0, case1, ...`.
     Switch(Box<[Id]>),
-    ExtractCoefficient([Id; 2]),
+    ExtractCoefficient {
+        canonical_exclusive_upper: Option<BigUint>,
+        input: [Id; 2],
+    },
     LiftConstantPolynomial {
         matrix_type: ResolvedMatrixType,
         input: [Id; 1],
@@ -137,7 +130,6 @@ impl MxxLang {
             Self::RealDiv(_) => "real-div",
             Self::RealSqrt(_) => "real-sqrt",
             Self::MatrixConstant(_) => "matrix-constant",
-            Self::MatrixCanonicalRangeContract { .. } => "matrix-canonical-range-contract",
             Self::HashPlain { .. } => "hash-plain",
             Self::MatrixAdd(_) => "matrix-add",
             Self::MatrixMultiply(_) => "matrix-multiply",
@@ -148,7 +140,7 @@ impl MxxLang {
             Self::MatrixTensor(_) => "matrix-tensor",
             Self::MatrixConcat { .. } => "matrix-concat",
             Self::Switch(_) => "switch",
-            Self::ExtractCoefficient(_) => "extract-coefficient",
+            Self::ExtractCoefficient { .. } => "extract-coefficient",
             Self::LiftConstantPolynomial { .. } => "lift-constant-polynomial",
             Self::CrtRecompose { .. } => "crt-recompose",
             Self::PackPolynomialCoefficients { .. } => "pack-polynomial-coefficients",
@@ -176,8 +168,8 @@ impl Language for MxxLang {
             (Self::RealConst(left), Self::RealConst(right)) => left == right,
             (Self::MatrixConstant(left), Self::MatrixConstant(right)) => left == right,
             (
-                Self::MatrixCanonicalRangeContract { upper: left_upper, .. },
-                Self::MatrixCanonicalRangeContract { upper: right_upper, .. },
+                Self::ExtractCoefficient { canonical_exclusive_upper: left_upper, .. },
+                Self::ExtractCoefficient { canonical_exclusive_upper: right_upper, .. },
             ) => left_upper == right_upper,
             (Self::BitExtract { bit: left_bit, .. }, Self::BitExtract { bit: right_bit, .. }) => {
                 left_bit == right_bit
@@ -242,8 +234,7 @@ impl Language for MxxLang {
             (Self::MatrixNegate(_), Self::MatrixNegate(_)) |
             (Self::MatrixScale(_), Self::MatrixScale(_)) |
             (Self::MatrixTranspose(_), Self::MatrixTranspose(_)) |
-            (Self::MatrixTensor(_), Self::MatrixTensor(_)) |
-            (Self::ExtractCoefficient(_), Self::ExtractCoefficient(_)) => true,
+            (Self::MatrixTensor(_), Self::MatrixTensor(_)) => true,
             _ => false,
         }
     }
@@ -273,8 +264,8 @@ impl Language for MxxLang {
             Self::RealMul(children) |
             Self::RealDiv(children) |
             Self::MatrixScale(children) |
-            Self::MatrixTensor(children) |
-            Self::ExtractCoefficient(children) => children,
+            Self::MatrixTensor(children) => children,
+            Self::ExtractCoefficient { input, .. } => input,
             Self::IntLog2Ceil(children) |
             Self::BoolToInt(children) |
             Self::IntToReal(children) |
@@ -282,7 +273,6 @@ impl Language for MxxLang {
             Self::MatrixNegate(children) |
             Self::MatrixTranspose(children) => children,
             Self::BitExtract { input, .. } |
-            Self::MatrixCanonicalRangeContract { input, .. } |
             Self::MatrixSlice { input, .. } |
             Self::LiftConstantPolynomial { input, .. } => input,
             Self::IntConst(_) |
@@ -319,8 +309,8 @@ impl Language for MxxLang {
             Self::RealMul(children) |
             Self::RealDiv(children) |
             Self::MatrixScale(children) |
-            Self::MatrixTensor(children) |
-            Self::ExtractCoefficient(children) => children,
+            Self::MatrixTensor(children) => children,
+            Self::ExtractCoefficient { input, .. } => input,
             Self::IntLog2Ceil(children) |
             Self::BoolToInt(children) |
             Self::IntToReal(children) |
@@ -328,7 +318,6 @@ impl Language for MxxLang {
             Self::MatrixNegate(children) |
             Self::MatrixTranspose(children) => children,
             Self::BitExtract { input, .. } |
-            Self::MatrixCanonicalRangeContract { input, .. } |
             Self::MatrixSlice { input, .. } |
             Self::LiftConstantPolynomial { input, .. } => input,
             Self::IntConst(_) |

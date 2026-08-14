@@ -6,12 +6,16 @@
 //! the supplied finite count; it has no policy ceiling.
 
 use super::{
-    analysis::{IntegerDomain, MxxSort},
-    identity::{BinderId, BinderKey, ResolvedIntExpr},
+    analysis::{IntegerDomain, MxxAnalysis, MxxSort},
+    identity::{
+        AtomicSourceDescriptor, AtomicSourceId, AtomicSourceKey, BinderId, BinderKey,
+        ResolvedIntExpr, SamplerDescriptorId, SamplerIdentity, TrapdoorDescriptorId,
+        TrapdoorIdentity,
+    },
     language::MxxLang,
     lower::LoweredInt,
 };
-use egg::{EGraph, Id, Language, RecExpr};
+use egg::{CostFunction, EGraph, Extractor, Id, Language, RecExpr};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use std::collections::BTreeMap;
@@ -239,88 +243,334 @@ pub fn shared_element(
 
 /// Instantiates one shared representative by replacing only its owning binder.
 /// Other binder nodes are retained, so nested independent domains stay symbolic.
-pub fn instantiate_shared_element<A, E>(
-    egraph: &mut EGraph<MxxLang, A>,
+/// Extracts one immutable, semantically valid template snapshot.  A lowering
+/// job retains it by canonical root; later unions may make it nonminimal but
+/// cannot invalidate an already valid expression.
+/// Records every descriptor term reachable from `roots` before materializing
+/// anything.  `Extractor::new` computes costs for the whole e-graph, so a
+/// descriptor closure must share one extractor rather than construct one per
+/// descriptor root.
+fn snapshot_shared_template_closure<E>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    templates: &mut std::collections::HashMap<Id, RecExpr<MxxLang>>,
+    roots: impl IntoIterator<Item = Id>,
+    progress: &mut dyn FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let mut pending = roots
+        .into_iter()
+        .map(|root| egraph.find(root))
+        .filter(|root| !templates.contains_key(root))
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    struct ProgressAstSize<'a, E> {
+        progress: &'a mut dyn FnMut() -> Result<(), E>,
+        failure: std::rc::Rc<std::cell::RefCell<Option<E>>>,
+    }
+    impl<E> CostFunction<MxxLang> for ProgressAstSize<'_, E> {
+        type Cost = usize;
+        fn cost<C>(&mut self, enode: &MxxLang, mut costs: C) -> usize
+        where
+            C: FnMut(Id) -> usize,
+        {
+            if self.failure.borrow().is_none() &&
+                let Err(error) = (self.progress)()
+            {
+                *self.failure.borrow_mut() = Some(error);
+            }
+            enode.fold(1, |sum, child| sum.saturating_add(costs(child)))
+        }
+    }
+    let failure = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let extractor =
+        Extractor::new(egraph, ProgressAstSize { progress, failure: std::rc::Rc::clone(&failure) });
+
+    let mut scheduled = std::collections::HashSet::new();
+    while let Some(root) = pending.pop() {
+        let root = egraph.find(root);
+        if !scheduled.insert(root) || templates.contains_key(&root) {
+            continue;
+        }
+        let (_, expression) = extractor.find_best(root);
+        if let Some(error) = failure.borrow_mut().take() {
+            return Err(error);
+        }
+        for node in expression.as_ref() {
+            let MxxLang::Atom { source, .. } = node else { continue };
+            let Some(AtomicSourceDescriptor { key: AtomicSourceKey::Sampler(id), .. }) =
+                egraph.analysis.symbols.atomic_sources.get(source.0)
+            else {
+                continue;
+            };
+            let sampler = egraph
+                .analysis
+                .symbols
+                .samplers
+                .get(id.0)
+                .expect("every sampler Atom has an interned descriptor");
+            match sampler {
+                SamplerIdentity::Preimage { indices, public, trapdoor, target, .. } => {
+                    pending.extend(indices.iter().copied());
+                    pending.extend([*public, *target]);
+                    let trapdoor = egraph
+                        .analysis
+                        .symbols
+                        .trapdoors
+                        .get(trapdoor.0)
+                        .expect("every preimage sampler trapdoor is interned");
+                    pending.extend(trapdoor.indices.iter().copied());
+                    pending.push(trapdoor.public);
+                }
+                SamplerIdentity::DecomposedHash { indices, public, target, arguments, .. } => {
+                    pending.extend(indices.iter().copied());
+                    pending.extend([*public, *target]);
+                    pending.extend(arguments.iter().copied());
+                }
+                SamplerIdentity::GadgetDecomposition { indices, public, target, .. } => {
+                    pending.extend(indices.iter().copied());
+                    pending.extend([*public, *target]);
+                }
+            }
+        }
+        templates.insert(root, expression);
+    }
+    Ok(())
+}
+
+pub fn instantiate_shared_element<E>(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    templates: &mut std::collections::HashMap<Id, RecExpr<MxxLang>>,
     representative: Id,
     binder: BinderId,
     replacement: Id,
     progress: &mut dyn FnMut() -> Result<(), E>,
-) -> Result<Id, E>
-where
-    A: egg::Analysis<MxxLang>,
-{
-    /// Copies just the raw-node DAG reachable from `root`.  E-class extraction
-    /// scans every e-class, including unrelated protocol fragments; lowering
-    /// needs one existing representative instead.  The explicit post-order
-    /// stack keeps deeply nested honest graphs stack-safe.
-    fn materialize<A, E>(
-        egraph: &EGraph<MxxLang, A>,
-        root: Id,
-        binder_replacement: Option<(BinderId, Id)>,
-        expression: &mut RecExpr<MxxLang>,
-        memo: &mut std::collections::HashMap<Id, Id>,
-        progress: &mut dyn FnMut() -> Result<(), E>,
-    ) -> Result<Id, E>
-    where
-        A: egg::Analysis<MxxLang>,
-    {
-        enum Visit {
-            Enter(Id),
-            Exit(Id),
-        }
+) -> Result<Id, E> {
+    // The snapshots are immutable valid expressions.  Complete the entire
+    // descriptor reference closure before `egraph.add` can change canonical
+    // classes or symbol-table descriptors.
+    snapshot_shared_template_closure(egraph, templates, [representative], progress)?;
 
-        let mut stack = vec![Visit::Enter(root)];
-        while let Some(visit) = stack.pop() {
-            let id = match visit {
-                Visit::Enter(id) => {
-                    if memo.contains_key(&id) {
-                        continue;
-                    }
-                    if let Some((binder, replacement)) = binder_replacement {
-                        if matches!(egraph.id_to_node(id), MxxLang::IntBinder(candidate) if *candidate == binder)
-                        {
-                            memo.insert(id, replacement);
-                            continue;
-                        }
-                    }
-                    stack.push(Visit::Exit(id));
-                    for child in egraph.id_to_node(id).children().iter().rev() {
-                        if !memo.contains_key(child) {
-                            stack.push(Visit::Enter(*child));
-                        }
-                    }
+    enum Work {
+        Enter(Id),
+        Exit(Id, RecExpr<MxxLang>),
+    }
+    let mut completed = std::collections::HashMap::<Id, Id>::new();
+    let mut scheduled = std::collections::HashSet::new();
+    // Descriptor fields retain original e-class handles.  Remember their
+    // canonical snapshot handle before materialization so re-interning below
+    // never needs an immutable e-graph borrow while mutating symbol tables.
+    let mut canonical = std::collections::HashMap::<Id, Id>::new();
+    let replacement = egraph.find(replacement);
+    completed.insert(replacement, replacement);
+    canonical.insert(replacement, replacement);
+    let mut work = vec![Work::Enter(representative)];
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(root) => {
+                let original = root;
+                let root = egraph.find(root);
+                canonical.insert(original, root);
+                if !scheduled.insert(root) {
                     continue;
                 }
-                Visit::Exit(id) => id,
-            };
-            if memo.contains_key(&id) {
-                continue;
+                let template = templates
+                    .get(&root)
+                    .expect("descriptor closure snapshots every scheduled root")
+                    .clone();
+                let mut references = Vec::new();
+                for node in template.as_ref() {
+                    let MxxLang::Atom { source, .. } = node else { continue };
+                    let Some(AtomicSourceDescriptor { key: AtomicSourceKey::Sampler(id), .. }) =
+                        egraph.analysis.symbols.atomic_sources.get(source.0)
+                    else {
+                        continue
+                    };
+                    let sampler = egraph
+                        .analysis
+                        .symbols
+                        .samplers
+                        .get(id.0)
+                        .expect("every sampler Atom has an interned descriptor");
+                    match sampler {
+                        SamplerIdentity::Preimage { indices, public, trapdoor, target, .. } => {
+                            references.extend(indices.iter().copied());
+                            references.extend([*public, *target]);
+                            let trapdoor = egraph
+                                .analysis
+                                .symbols
+                                .trapdoors
+                                .get(trapdoor.0)
+                                .expect("every preimage sampler trapdoor is interned");
+                            references.extend(trapdoor.indices.iter().copied());
+                            references.push(trapdoor.public);
+                        }
+                        SamplerIdentity::DecomposedHash {
+                            indices,
+                            public,
+                            target,
+                            arguments,
+                            ..
+                        } => {
+                            references.extend(indices.iter().copied());
+                            references.extend([*public, *target]);
+                            references.extend(arguments.iter().copied());
+                        }
+                        SamplerIdentity::GadgetDecomposition {
+                            indices, public, target, ..
+                        } => {
+                            references.extend(indices.iter().copied());
+                            references.extend([*public, *target]);
+                        }
+                    }
+                }
+                work.push(Work::Exit(root, template));
+                for reference in references.into_iter().rev() {
+                    let reference_root = egraph.find(reference);
+                    canonical.insert(reference, reference_root);
+                    if reference_root != root {
+                        work.push(Work::Enter(reference));
+                    }
+                }
             }
-            progress()?;
-            let rebuilt = egraph.id_to_node(id).clone().map_children(|child| memo[&child]);
-            memo.insert(id, expression.add(rebuilt));
+            Work::Exit(root, template) => {
+                let mut ids = Vec::with_capacity(template.len());
+                for node in template.as_ref() {
+                    progress()?;
+                    let rebuilt = if matches!(node, MxxLang::IntBinder(candidate) if *candidate == binder)
+                    {
+                        completed[&egraph.find(replacement)]
+                    } else if let MxxLang::Atom { source, .. } = node {
+                        let descriptor = egraph
+                            .analysis
+                            .symbols
+                            .atomic_sources
+                            .get(source.0)
+                            .expect("every Atom source is interned")
+                            .clone();
+                        let AtomicSourceKey::Sampler(sampler_id) = descriptor.key else {
+                            ids.push(
+                                egraph.add(
+                                    node.clone().map_children(|child| ids[usize::from(child)]),
+                                ),
+                            );
+                            continue;
+                        };
+                        // Descriptor IDs are e-class IDs recorded by the
+                        // same extractor snapshots queued above.  `completed`
+                        // is keyed by those canonical snapshot IDs, so this
+                        // lookup does not borrow the e-graph while the
+                        // interners below are mutated.
+                        let remap = |term: Id| completed[&canonical[&term]];
+                        let sampler = egraph
+                            .analysis
+                            .symbols
+                            .samplers
+                            .get(sampler_id.0)
+                            .expect("every sampler Atom has an interned descriptor")
+                            .clone();
+                        let sampler = match sampler {
+                            SamplerIdentity::Preimage {
+                                source,
+                                indices,
+                                public,
+                                trapdoor,
+                                target,
+                                cutoff,
+                            } => {
+                                let trapdoor = egraph
+                                    .analysis
+                                    .symbols
+                                    .trapdoors
+                                    .get(trapdoor.0)
+                                    .expect("every preimage sampler trapdoor is interned")
+                                    .clone();
+                                let trapdoor = TrapdoorIdentity {
+                                    indices: trapdoor
+                                        .indices
+                                        .iter()
+                                        .map(|term| remap(*term))
+                                        .collect(),
+                                    public: remap(trapdoor.public),
+                                    ..trapdoor
+                                };
+                                let trapdoor = TrapdoorDescriptorId(
+                                    egraph.analysis.symbols.trapdoors.intern(trapdoor),
+                                );
+                                SamplerIdentity::Preimage {
+                                    source,
+                                    indices: indices.iter().map(|term| remap(*term)).collect(),
+                                    public: remap(public),
+                                    trapdoor,
+                                    target: remap(target),
+                                    cutoff,
+                                }
+                            }
+                            SamplerIdentity::DecomposedHash {
+                                source,
+                                indices,
+                                public,
+                                target,
+                                arguments,
+                                matrix_type,
+                                base,
+                                digit_count,
+                                small,
+                                range_proved,
+                            } => SamplerIdentity::DecomposedHash {
+                                source,
+                                indices: indices.iter().map(|term| remap(*term)).collect(),
+                                public: remap(public),
+                                target: remap(target),
+                                arguments: arguments.iter().map(|term| remap(*term)).collect(),
+                                matrix_type,
+                                base,
+                                digit_count,
+                                small,
+                                range_proved,
+                            },
+                            SamplerIdentity::GadgetDecomposition {
+                                source,
+                                indices,
+                                public,
+                                target,
+                                base,
+                                digit_count,
+                                small,
+                                range_proved,
+                            } => SamplerIdentity::GadgetDecomposition {
+                                source,
+                                indices: indices.iter().map(|term| remap(*term)).collect(),
+                                public: remap(public),
+                                target: remap(target),
+                                base,
+                                digit_count,
+                                small,
+                                range_proved,
+                            },
+                        };
+                        let indices = match &sampler {
+                            SamplerIdentity::Preimage { indices, .. } |
+                            SamplerIdentity::DecomposedHash { indices, .. } |
+                            SamplerIdentity::GadgetDecomposition { indices, .. } => indices.clone(),
+                        };
+                        let sampler = egraph.analysis.symbols.samplers.intern(sampler);
+                        let source =
+                            egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+                                key: AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
+                                ..descriptor
+                            });
+                        egraph.add(MxxLang::Atom { source: AtomicSourceId(source), indices })
+                    } else {
+                        egraph.add(node.clone().map_children(|child| ids[usize::from(child)]))
+                    };
+                    ids.push(rebuilt);
+                }
+                completed.insert(root, *ids.last().expect("egg extraction is nonempty"));
+            }
         }
-        Ok(memo[&root])
     }
-
-    let mut instantiated = RecExpr::default();
-    // Each context has its own memo because a raw node containing `binder`
-    // has a different meaning in the replacement and template contexts.  Both
-    // append into one expression, so every binder occurrence shares the one
-    // materialized replacement root.
-    let mut replacement_memo = std::collections::HashMap::new();
-    let replacement_root =
-        materialize(egraph, replacement, None, &mut instantiated, &mut replacement_memo, progress)?;
-    let mut template_memo = std::collections::HashMap::new();
-    materialize(
-        egraph,
-        representative,
-        Some((binder, replacement_root)),
-        &mut instantiated,
-        &mut template_memo,
-        progress,
-    )?;
-    Ok(egraph.add_expr(&instantiated))
+    Ok(completed[&egraph.find(representative)])
 }
 
 /// Selects a compact family.  Exact storage evaluates only stored references;
@@ -730,7 +980,13 @@ fn matrix_vector_product(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operational_noise::{analysis::MxxAnalysis, identity::BinderDescriptor};
+    use crate::operational_noise::{
+        analysis::MxxAnalysis,
+        identity::{
+            AtomicRelationRole, AtomicSourceDescriptor, BinderDescriptor, GraphWireSourceKey,
+            OccurrenceScope, ProgramKey, ResolvedMatrixType, TrapdoorSourceKey, WireSourceKey,
+        },
+    };
 
     fn evaluate(recurrence: &VectorRecurrence) -> Result<Box<[BigUint]>, RecurrenceFailure> {
         recurrence.evaluate()
@@ -801,10 +1057,12 @@ mod tests {
         let outer_term = egraph.add(MxxLang::IntBinder(outer_id));
         let representative = egraph.add(MxxLang::IntAdd([owner_term, outer_term]));
         let replacement = egraph.add(MxxLang::IntConst(5.into()));
+        let mut templates = std::collections::HashMap::new();
 
         let mut progress_calls = 0;
         let instantiated = instantiate_shared_element(
             &mut egraph,
+            &mut templates,
             representative,
             owner_id,
             replacement,
@@ -819,23 +1077,35 @@ mod tests {
         assert!(expression.iter().any(|node| node == &MxxLang::IntConst(5.into())));
         assert!(expression.iter().any(|node| node == &MxxLang::IntBinder(outer_id)));
         assert!(!expression.iter().any(|node| node == &MxxLang::IntBinder(owner_id)));
-        assert_eq!(progress_calls, 3, "only the reachable raw DAG is materialized");
+        assert!(progress_calls >= 3, "extraction and copying report bounded work");
 
         for value in 0..1_000 {
             egraph.add(MxxLang::IntConst(value.into()));
         }
+        let new_replacement = egraph.add(MxxLang::IntConst(6.into()));
         let mut unrelated_progress_calls = 0;
-        instantiate_shared_element(&mut egraph, representative, owner_id, replacement, &mut || {
-            unrelated_progress_calls += 1;
-            Ok::<(), ()>(())
-        })
+        instantiate_shared_element(
+            &mut egraph,
+            &mut templates,
+            representative,
+            owner_id,
+            new_replacement,
+            &mut || {
+                unrelated_progress_calls += 1;
+                Ok::<(), ()>(())
+            },
+        )
         .unwrap();
-        assert_eq!(unrelated_progress_calls, progress_calls);
+        assert!(
+            unrelated_progress_calls < progress_calls,
+            "a new replacement reuses the representative snapshot without re-extracting the graph"
+        );
 
         let mut rejected = || Err::<(), _>("progress stopped");
         assert_eq!(
             instantiate_shared_element(
                 &mut egraph,
+                &mut templates,
                 representative,
                 owner_id,
                 replacement,
@@ -865,9 +1135,11 @@ mod tests {
         let two = egraph.add(MxxLang::IntConst(2.into()));
         let three = egraph.add(MxxLang::IntConst(3.into()));
         let replacement = egraph.add(MxxLang::IntAdd([two, three]));
+        let mut templates = std::collections::HashMap::new();
 
         let instantiated = instantiate_shared_element(
             &mut egraph,
+            &mut templates,
             representative,
             owner_id,
             replacement,
@@ -880,6 +1152,123 @@ mod tests {
             panic!("instantiated template must retain its outer addition");
         };
         assert_eq!(left, right, "both binder occurrences must use the same replacement root");
+    }
+
+    #[test]
+    fn shared_sampler_instantiation_reinterns_cross_owner_descriptor_terms() {
+        let mut analysis = MxxAnalysis::default();
+        let scope = OccurrenceScope {
+            program: ProgramKey::Ideal,
+            definition: mxx_ir_core::FrozenGraphScopeId::Root,
+            path: Box::new([]),
+        };
+        let owner =
+            BinderKey { loop_scope: scope.clone(), loop_node: mxx_ir_core::NodeId(1), slot: 0 };
+        let replacement_owner =
+            BinderKey { loop_scope: scope.clone(), loop_node: mxx_ir_core::NodeId(2), slot: 0 };
+        let owner_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
+            key: owner.clone(),
+            minimum: 0.into(),
+            maximum: 7.into(),
+        }));
+        let replacement_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
+            key: replacement_owner,
+            minimum: 0.into(),
+            maximum: 7.into(),
+        }));
+        let matrix_type = ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(1.into()),
+            columns: ResolvedIntExpr::Const(1.into()),
+        };
+        let matrix_source = analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+            key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from("matrix")),
+            sort: MxxSort::Matrix(matrix_type.clone()),
+            integer_domain: None,
+            canonical_residue_convention: None,
+            relation_role: None,
+        });
+        let mut egraph = EGraph::new(analysis);
+        let owner_term = egraph.add(MxxLang::IntBinder(owner_id));
+        let replacement = egraph.add(MxxLang::IntBinder(replacement_id));
+        let public = egraph
+            .add(MxxLang::Atom { source: AtomicSourceId(matrix_source), indices: Box::new([]) });
+        let trapdoor =
+            TrapdoorDescriptorId(egraph.analysis.symbols.trapdoors.intern(TrapdoorIdentity {
+                source: TrapdoorSourceKey::ProtocolInput(crate::ProtocolInputId::from("trapdoor")),
+                indices: Box::new([]),
+                matrix_type: matrix_type.clone(),
+                public,
+                sigma_bits: 0,
+                gadget_base: ResolvedIntExpr::Const(2.into()),
+                digit_count: ResolvedIntExpr::Const(1.into()),
+                preimage_cutoff: ResolvedIntExpr::Const(1.into()),
+            }));
+        let wire = WireSourceKey {
+            scope: scope.clone(),
+            wire: mxx_ir_core::WireRef { node: mxx_ir_core::NodeId(3), port: mxx_ir_core::Port(0) },
+        };
+        let sampler = egraph.analysis.symbols.samplers.intern(SamplerIdentity::Preimage {
+            source: GraphWireSourceKey { wire, coordinate_binders: vec![owner].into_boxed_slice() },
+            indices: vec![owner_term].into_boxed_slice(),
+            public,
+            trapdoor,
+            target: public,
+            cutoff: ResolvedIntExpr::Const(1.into()),
+        });
+        let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+            key: AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
+            sort: MxxSort::Matrix(matrix_type),
+            integer_domain: None,
+            canonical_residue_convention: None,
+            relation_role: Some(AtomicRelationRole::Preimage),
+        });
+        let representative = egraph.add(MxxLang::Atom {
+            source: AtomicSourceId(source),
+            indices: vec![owner_term].into_boxed_slice(),
+        });
+        let mut templates = std::collections::HashMap::new();
+        let instantiated = instantiate_shared_element(
+            &mut egraph,
+            &mut templates,
+            representative,
+            owner_id,
+            replacement,
+            &mut || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        assert!(egraph[instantiated].data.sort.is_ok());
+        let MxxLang::Atom { source, indices } = &egraph[instantiated].nodes[0] else {
+            panic!("instantiated sampler remains an Atom");
+        };
+        let AtomicSourceKey::Sampler(sampler) = egraph
+            .analysis
+            .symbols
+            .atomic_sources
+            .get(source.0)
+            .expect("instantiated source is interned")
+            .key
+        else {
+            panic!("sampler source")
+        };
+        let SamplerIdentity::Preimage {
+            indices: recorded,
+            public: recorded_public,
+            trapdoor,
+            target,
+            ..
+        } = egraph.analysis.symbols.samplers.get(sampler.0).expect("descriptor is interned")
+        else {
+            panic!("preimage descriptor")
+        };
+        assert_eq!(indices.len(), 1);
+        assert_eq!(egraph.find(indices[0]), egraph.find(replacement));
+        assert_eq!(egraph.find(recorded[0]), egraph.find(indices[0]));
+        assert_eq!(egraph.find(*recorded_public), egraph.find(public));
+        assert_eq!(egraph.find(*target), egraph.find(public));
+        let trapdoor = egraph.analysis.symbols.trapdoors.get(trapdoor.0).unwrap();
+        assert_eq!(egraph.find(trapdoor.public), egraph.find(public));
     }
 
     #[test]

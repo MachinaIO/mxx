@@ -184,8 +184,14 @@ mod tests {
             pair.clone(),
             vec![integer.clone(), boolean.clone()],
             Vec::new(),
+            vec![None, None],
         );
-        let second = NodeHandle::subgraph_call(pair, vec![integer.clone(), boolean], Vec::new());
+        let second = NodeHandle::subgraph_call(
+            pair,
+            vec![integer.clone(), boolean],
+            Vec::new(),
+            vec![None, None],
+        );
         let loop_output = NodeHandle::parallel_loop(
             loop_body,
             vec![integer],

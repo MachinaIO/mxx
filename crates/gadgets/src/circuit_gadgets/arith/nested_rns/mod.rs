@@ -20,8 +20,8 @@ mod poly;
 
 use crate::{
     circuit::{
-        BatchedWire, LutExpr, PolyCircuit, PublicLutProgram, SubCircuitParamSpec,
-        SubCircuitParamValue, gate::GateId,
+        BatchedWire, LutExpr, PolyCircuit, PublicLutProgram, SubCircuitInputMaxPlaintextNormRange,
+        SubCircuitParamSpec, SubCircuitParamValue, gate::GateId,
     },
     circuit_gadgets::conv_mul::{
         negacyclic_conv_mul_right_decomposed_term_many_subcircuit, negacyclic_conv_mul_right_sparse,
@@ -68,8 +68,6 @@ pub struct NestedRnsPolyContext {
     lazy_reduce_id: usize,
     decomposition_terms_id: usize,
     gadget_decompose_id: usize,
-    mul_lazy_reduce_id: usize,
-    mul_right_sparse_id: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,8 +81,6 @@ struct NestedRnsRegisteredSubcircuitIds {
     lazy_reduce_id: usize,
     decomposition_terms_id: usize,
     gadget_decompose_id: usize,
-    mul_lazy_reduce_id: usize,
-    mul_right_sparse_id: usize,
 }
 
 #[derive(Debug, Clone)]

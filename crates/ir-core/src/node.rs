@@ -3,7 +3,7 @@ use crate::{
     expr::{IntExpr, RealExpr},
     types::WireType,
 };
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use serde::{Deserialize, Serialize};
 
 /// Executable operation represented by a declarative graph node.
@@ -221,6 +221,14 @@ pub enum HashVariant {
 pub struct SubgraphCall {
     pub definition: String,
     pub bindings: Vec<(String, IntExpr)>,
+    /// Per-argument canonical coefficient exclusive upper bounds.
+    ///
+    /// A `Some(U)` states that the corresponding argument is a constant
+    /// polynomial whose canonical coefficient is in `0..U`.  It is an
+    /// authoritative producer contract, rather than a value observed while
+    /// executing the graph.  Every call argument, including synthetic
+    /// constants, has one entry; an argument without this contract is `None`.
+    pub canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

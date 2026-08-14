@@ -174,6 +174,36 @@ where
             .call(inputs)
             .map_err(|error| CircuitLowerError::GraphStructure(error.to_string()))
     }
+
+    fn call_audited_constant_lut_subgraph(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<A::Wire>,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<Vec<A::Wire>, CircuitLowerError<A::Error>> {
+        definition
+            .call_with_canonical_input_exclusive_uppers(inputs, canonical_input_exclusive_uppers)
+            .map_err(|error| CircuitLowerError::GraphStructure(error.to_string()))
+    }
+
+    fn call_audited_constant_lut_subgraph_parallel(
+        &mut self,
+        definition: &Self::Subgraph,
+        inputs: Vec<Vec<A::Wire>>,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<Vec<Vec<A::Wire>>, CircuitLowerError<A::Error>> {
+        inputs
+            .into_iter()
+            .map(|inputs| {
+                definition
+                    .call_with_canonical_input_exclusive_uppers(
+                        inputs,
+                        canonical_input_exclusive_uppers.clone(),
+                    )
+                    .map_err(|error| CircuitLowerError::GraphStructure(error.to_string()))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -862,6 +892,64 @@ mod tests {
             .build()
             .expect("build");
         built.validate(&ParamEnv::default()).expect("validation");
+    }
+
+    #[test]
+    fn configured_lowering_forwards_audited_lut_ranges_for_normal_and_parallel_calls() {
+        let context = DslContext::new("audited-lut-range-forwarding");
+        let ring = Ring::new(17, 8);
+        let public_key =
+            BggPublicKeyCompiler { ring: ring.clone(), base: 2.into(), digit_count: 2.into() };
+        let arithmetic =
+            PublicKeyLowering::<DCRTPoly> { compiler: &public_key, marker: PhantomData };
+        let mut lookup = NoPublicLookup::<BggPublicKeyWire>::default();
+        let mut slots = NoSlotOperations::<BggPublicKeyWire>::default();
+        let mut lowering =
+            ConfiguredCircuitLowering { arithmetic, lookup: &mut lookup, slots: &mut slots };
+        let input =
+            |name| BggPublicKeyWire { matrix: ring.input(name, (1, 1)), reveal_plaintext: true };
+        let definition = Subgraph::define(
+            "audited-lut-child",
+            vec![input("definition-input").schema()],
+            |values| values,
+        )
+        .expect("subgraph definition");
+        let bounds = vec![Some(BigUint::from(4u8))];
+        let normal = lowering
+            .call_audited_constant_lut_subgraph(
+                &definition,
+                vec![input("normal-input")],
+                bounds.clone(),
+            )
+            .expect("normal call");
+        let parallel = lowering
+            .call_audited_constant_lut_subgraph_parallel(
+                &definition,
+                vec![vec![input("parallel-left")], vec![input("parallel-right")]],
+                bounds.clone(),
+            )
+            .expect("parallel calls");
+        let graph = context
+            .output("normal", normal[0].matrix.clone())
+            .expect("normal output")
+            .output("parallel-left", parallel[0][0].matrix.clone())
+            .expect("parallel left output")
+            .output("parallel-right", parallel[1][0].matrix.clone())
+            .expect("parallel right output")
+            .build()
+            .expect("graph");
+        let calls = graph
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                NodeKind::SubgraphCall(call) => Some(&call.canonical_input_exclusive_uppers),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec![&bounds, &bounds, &bounds]);
+        graph.validate(&ParamEnv::default()).expect("validation");
     }
 
     #[test]

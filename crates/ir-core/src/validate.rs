@@ -97,7 +97,42 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
         for (scope_id, scope) in graph.scopes() {
             let parent_declared = declared_by_scope.get(scope_id).cloned().unwrap_or_default();
             for (position, node) in scope.nodes().iter().enumerate() {
-                let Some(child) = graph.child_scope_id(scope_id, NodeId(position as u64)) else {
+                let node_id = NodeId(position as u64);
+                if let NodeKind::SubgraphCall(call) = node.kind() {
+                    if call.canonical_input_exclusive_uppers.len() != node.arguments().len() {
+                        return Err(ValidationError::Node {
+                            scope: scope_id.clone(),
+                            node: node_id,
+                            message: "canonical input exclusive upper bound count does not match call arguments"
+                                .to_owned(),
+                        });
+                    }
+                    if call
+                        .canonical_input_exclusive_uppers
+                        .iter()
+                        .any(|upper| upper.as_ref().is_some_and(|upper| upper.is_zero()))
+                    {
+                        return Err(ValidationError::Node {
+                            scope: scope_id.clone(),
+                            node: node_id,
+                            message: "canonical input exclusive upper bounds must be positive"
+                                .to_owned(),
+                        });
+                    }
+                    if call.canonical_input_exclusive_uppers.iter().zip(node.arguments()).any(
+                        |(upper, argument)| {
+                            upper.is_some() && !matches!(argument.wire_type(), WireType::Matrix(_))
+                        },
+                    ) {
+                        return Err(ValidationError::Node {
+                            scope: scope_id.clone(),
+                            node: node_id,
+                            message: "canonical input exclusive upper bounds require matrix call arguments"
+                                .to_owned(),
+                        });
+                    }
+                }
+                let Some(child) = graph.child_scope_id(scope_id, node_id) else {
                     continue;
                 };
                 let binding_names = match node.kind() {
@@ -1992,6 +2027,38 @@ mod tests {
         assert_eq!(
             child_loop_dependencies(&parent, &[("i".to_owned(), IntExpr::Var("i".to_owned()))]),
             BTreeSet::from(["i".to_owned()])
+        );
+    }
+
+    #[test]
+    fn subgraph_call_requires_one_positive_canonical_upper_per_argument() {
+        let body = crate::with_new_construction_scope(|scope| {
+            let value = input("body-value", matrix_type(17, 1, 1));
+            crate::SubgraphHandle::new("bounded-subgraph", scope, vec![value.clone()], vec![value])
+                .expect("subgraph")
+        });
+        let outer = input("outer-value", matrix_type(17, 1, 1));
+        let missing =
+            NodeHandle::subgraph_call(body.clone(), vec![outer.clone()], Vec::new(), Vec::new())
+                .output(0)
+                .expect("output");
+        assert_eq!(
+            node_message(
+                validate(&graph("missing-upper", missing), &ParamEnv::default()).unwrap_err()
+            ),
+            "canonical input exclusive upper bound count does not match call arguments"
+        );
+        let zero = NodeHandle::subgraph_call(
+            body,
+            vec![outer],
+            Vec::new(),
+            vec![Some(num_bigint::BigUint::zero())],
+        )
+        .output(0)
+        .expect("output");
+        assert_eq!(
+            node_message(validate(&graph("zero-upper", zero), &ParamEnv::default()).unwrap_err()),
+            "canonical input exclusive upper bounds must be positive"
         );
     }
 

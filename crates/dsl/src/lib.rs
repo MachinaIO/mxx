@@ -14,6 +14,7 @@ use mxx_ir_core::{
     },
     types::{MatrixType, WireType},
 };
+use num_bigint::BigUint;
 use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
@@ -57,6 +58,12 @@ pub enum DslError {
     SubgraphCapture,
     #[error("graph value schema does not match its flattened values")]
     Schema,
+    #[error("canonical input exclusive upper bound count does not match flattened subgraph inputs")]
+    CanonicalInputUpperCount,
+    #[error("canonical input exclusive upper bounds must be positive")]
+    CanonicalInputUpperZero,
+    #[error("canonical input exclusive upper bounds require matrix subgraph inputs")]
+    CanonicalInputUpperNonMatrix,
     #[error("parallel families have different counts")]
     FamilyCountMismatch,
     #[error(transparent)]
@@ -4411,14 +4418,58 @@ impl<I: GraphValue, O: GraphValue> Subgraph<I, O> {
     }
 
     pub fn call(&self, input: I) -> Result<O, DslError> {
-        let node = NodeHandle::subgraph_call(self.handle.clone(), input.flatten(), Vec::new());
+        let flattened = input.flatten();
+        let input_count = flattened.len();
+        self.call_flattened(flattened, input.pending(), vec![None; input_count])
+    }
+
+    /// Calls this subgraph with authoritative canonical coefficient bounds for
+    /// its flattened arguments.  `Some(U)` means a constant-polynomial
+    /// argument has canonical coefficients in `0..U`; `None` supplies no
+    /// such contract.  The vector includes every argument, including a
+    /// synthetic constant-one argument when the caller supplies one.
+    pub fn call_with_canonical_input_exclusive_uppers(
+        &self,
+        input: I,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<O, DslError> {
+        let flattened = input.flatten();
+        self.call_flattened(flattened, input.pending(), canonical_input_exclusive_uppers)
+    }
+
+    fn call_flattened(
+        &self,
+        flattened: Vec<ValueHandle>,
+        input_pending: Pending,
+        canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
+    ) -> Result<O, DslError> {
+        if canonical_input_exclusive_uppers.len() != flattened.len() {
+            return Err(DslError::CanonicalInputUpperCount);
+        }
+        if canonical_input_exclusive_uppers
+            .iter()
+            .any(|upper| upper.as_ref().is_some_and(|upper| upper == &BigUint::from(0u8)))
+        {
+            return Err(DslError::CanonicalInputUpperZero);
+        }
+        if canonical_input_exclusive_uppers.iter().zip(&flattened).any(|(upper, input)| {
+            upper.is_some() && !matches!(input.wire_type(), WireType::Matrix(_))
+        }) {
+            return Err(DslError::CanonicalInputUpperNonMatrix);
+        }
+        let node = NodeHandle::subgraph_call(
+            self.handle.clone(),
+            flattened,
+            Vec::new(),
+            canonical_input_exclusive_uppers,
+        );
         let values = (0..self.output_schema.wire_types().len())
             .map(|port| node.output(port as u32).expect("subgraph output"))
             .collect::<Vec<_>>();
         O::from_values(
             &self.output_schema,
             &values,
-            Pending::merge([input.pending(), self.pending.clone()]),
+            Pending::merge([input_pending, self.pending.clone()]),
         )
     }
 }
@@ -4893,5 +4944,60 @@ mod tests {
         let selected = Family::select(selector, vec![left, right]).unwrap();
         let built = context.public_family_output("selected", selected).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn subgraph_call_carries_canonical_input_exclusive_uppers() {
+        let ring = Ring::new(17, 8);
+        let matrix = MatType(ring.matrix_type((1, 1)));
+        let subgraph = Subgraph::<Mat, Mat>::define("bounded-matrix", matrix, |value| value)
+            .expect("subgraph definition");
+        let context = DslContext::new("bounded-subgraph");
+        let output = subgraph
+            .call_with_canonical_input_exclusive_uppers(
+                ring.input("input", (1, 1)),
+                vec![Some(BigUint::from(4u8))],
+            )
+            .expect("bounded subgraph call");
+        let built = context.output("output", output).expect("output").build().expect("graph");
+        let call = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find_map(|node| match node.kind() {
+                NodeKind::SubgraphCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("subgraph call node");
+        assert_eq!(call.canonical_input_exclusive_uppers, vec![Some(BigUint::from(4u8))]);
+        let encoded = serde_json::to_vec(&built.graph).expect("serialize graph");
+        let decoded: Graph = serde_json::from_slice(&encoded).expect("deserialize graph");
+        assert_eq!(built.graph, decoded);
+        mxx_ir_core::validate(&decoded, &ParamEnv::default()).expect("valid graph");
+    }
+
+    #[test]
+    fn subgraph_call_rejects_invalid_canonical_input_exclusive_uppers() {
+        let subgraph = Subgraph::<Int, Int>::define("bounded-int-errors", IntType, |value| value)
+            .expect("subgraph definition");
+        assert!(matches!(
+            subgraph.call_with_canonical_input_exclusive_uppers(Int::constant(0), Vec::new()),
+            Err(DslError::CanonicalInputUpperCount)
+        ));
+        assert!(matches!(
+            subgraph.call_with_canonical_input_exclusive_uppers(
+                Int::constant(0),
+                vec![Some(BigUint::from(0u8))]
+            ),
+            Err(DslError::CanonicalInputUpperZero)
+        ));
+        assert!(matches!(
+            subgraph.call_with_canonical_input_exclusive_uppers(
+                Int::constant(0),
+                vec![Some(BigUint::from(1u8))]
+            ),
+            Err(DslError::CanonicalInputUpperNonMatrix)
+        ));
     }
 }

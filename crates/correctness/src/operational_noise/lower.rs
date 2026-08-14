@@ -157,8 +157,8 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
             super::identity::AtomicSourceKey::ProtocolInput(input) => {
                 self.protocol_matrix_bound(input, &matrix_type, term)?
             }
-            super::identity::AtomicSourceKey::GraphWire(_) => {
-                return Err(BoundEvaluationError::OpaqueGraphWire { term });
+            super::identity::AtomicSourceKey::GraphWire(source) => {
+                return Err(BoundEvaluationError::OpaqueGraphWire { source: source.clone() });
             }
             super::identity::AtomicSourceKey::ExplicitLarge(_) => {
                 (BoundClass::Large, MatrixMetadata::unknown())
@@ -769,7 +769,9 @@ pub struct LowerEnv {
     pub occurrence: OccurrenceScope,
     pub parameters: BTreeMap<String, ResolvedIntExpr>,
     pub binders: Vec<(BinderKey, LoweredInt)>,
-    pub inputs: BTreeMap<WireRef, LoweringWire>,
+    /// Ordinary call-input aliases keyed by their complete owning occurrence.
+    /// Inherited entries remain available while lowering a nested call.
+    pub inputs: BTreeMap<WireSourceKey, LoweringWire>,
     /// Loop-owned input values, including sequential carried state.  The
     /// source occurrence is part of the key so a nested subgraph can retain a
     /// parent-loop binding without confusing equal local node numbers.
@@ -1205,9 +1207,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         values.push(value.clone());
                         continue;
                     }
-                    if wire.source.scope == environment.occurrence &&
-                        let Some(bound) = environment.inputs.get(&wire.source.wire)
-                    {
+                    if let Some(bound) = environment.inputs.get(&wire.source) {
                         if let Some(index) = bound.indices.first() {
                             work.push(LoweringFrame::FinishIndexedAlias {
                                 wire,
@@ -1618,23 +1618,25 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                         owner: wire.source.wire.node,
                                     }])
                                     .collect();
-                                child.inputs = child_inputs
-                                    .iter()
-                                    .copied()
-                                    .zip(arguments)
-                                    .map(|(input, argument)| {
-                                        (
-                                            input,
-                                            LoweringWire {
-                                                source: WireSourceKey {
-                                                    scope: wire.source.scope.clone(),
-                                                    wire: argument,
+                                child.inputs.extend(
+                                    child_inputs.iter().copied().zip(arguments).map(
+                                        |(input, argument)| {
+                                            (
+                                                WireSourceKey {
+                                                    scope: child.occurrence.clone(),
+                                                    wire: input,
                                                 },
-                                                indices: wire.indices.clone(),
-                                            },
-                                        )
-                                    })
-                                    .collect();
+                                                LoweringWire {
+                                                    source: WireSourceKey {
+                                                        scope: wire.source.scope.clone(),
+                                                        wire: argument,
+                                                    },
+                                                    indices: wire.indices.clone(),
+                                                },
+                                            )
+                                        },
+                                    ),
+                                );
                                 let parameter_bindings = call.bindings.clone();
                                 for (name, expression) in &parameter_bindings {
                                     let value = self
@@ -4959,21 +4961,20 @@ mod tests {
     #[test]
     fn opaque_graph_and_escaped_sequential_state_have_dedicated_errors() {
         let scope = root_test_environment().occurrence;
+        let opaque_source = super::super::identity::GraphWireSourceKey {
+            wire: WireSourceKey {
+                scope: scope.clone(),
+                wire: WireRef { node: mxx_ir_core::NodeId(1), port: mxx_ir_core::Port(0) },
+            },
+            coordinate_binders: Box::new([]),
+        };
         with_production_bound_atom(
             None,
-            super::super::identity::AtomicSourceKey::GraphWire(
-                super::super::identity::GraphWireSourceKey {
-                    wire: WireSourceKey {
-                        scope: scope.clone(),
-                        wire: WireRef { node: mxx_ir_core::NodeId(1), port: mxx_ir_core::Port(0) },
-                    },
-                    coordinate_binders: Box::new([]),
-                },
-            ),
+            super::super::identity::AtomicSourceKey::GraphWire(opaque_source.clone()),
             |lowerer, source, term| {
                 assert_eq!(
                     lowerer.production_bound_view().atom_bound(source, term),
-                    Err(BoundEvaluationError::OpaqueGraphWire { term })
+                    Err(BoundEvaluationError::OpaqueGraphWire { source: opaque_source })
                 );
             },
         );
@@ -5933,6 +5934,137 @@ mod tests {
         lowerer
             .lower_stage_wire(&StageId("encrypt".to_owned()), output)
             .expect("bound parallel input lowers through subgraph call");
+        assert!(lowerer.egraph.analysis.symbols.atomic_sources.values.iter().all(|descriptor| {
+            !matches!(descriptor.key, super::super::identity::AtomicSourceKey::GraphWire(_))
+        }));
+    }
+
+    #[test]
+    fn protocol_input_identity_and_bound_survive_two_nested_calls() {
+        use mxx_ir_core::graph::{
+            GraphOutput, NodeHandle, SubgraphHandle, with_new_construction_scope,
+        };
+
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let root_input = NodeHandle::new(
+            NodeKind::Input {
+                name: "plaintext".to_owned(),
+                wire_type: WireType::Matrix(matrix.clone()),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .expect("root input");
+        let inner = with_new_construction_scope(|scope| {
+            let input = NodeHandle::new(
+                NodeKind::Input {
+                    name: "inner-input".to_owned(),
+                    wire_type: WireType::Matrix(matrix.clone()),
+                    artifact: None,
+                },
+                Vec::new(),
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .expect("inner input");
+            SubgraphHandle::new("inner", scope, vec![input.clone()], vec![input])
+                .expect("inner subgraph")
+        });
+        let outer = with_new_construction_scope(|scope| {
+            let input = NodeHandle::new(
+                NodeKind::Input {
+                    name: "outer-input".to_owned(),
+                    wire_type: WireType::Matrix(matrix.clone()),
+                    artifact: None,
+                },
+                Vec::new(),
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .expect("outer input");
+            let output =
+                NodeHandle::subgraph_call(inner, vec![input.clone()], Vec::new(), vec![None])
+                    .output(0)
+                    .expect("inner call output");
+            SubgraphHandle::new("outer", scope, vec![input], vec![output]).expect("outer subgraph")
+        });
+        let output = NodeHandle::subgraph_call(outer, vec![root_input], Vec::new(), vec![None])
+            .output(0)
+            .expect("outer call output");
+        let graph = mxx_ir_core::graph::Graph::freeze(
+            "nested-protocol-input",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze nested graph")
+        .0;
+        let nested_inputs = graph
+            .scopes()
+            .values()
+            .filter_map(|scope| scope.inputs().first().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(nested_inputs.len(), 2);
+        assert_eq!(nested_inputs[0], nested_inputs[1], "local wire IDs intentionally collide");
+        let output = graph.outputs()["output"].value;
+        let input_id = crate::ProtocolInputId::from("plaintext");
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = graph;
+        protocol.bundle.input_contract.inputs.push(crate::InputContractEntry {
+            id: input_id.clone(),
+            name: "plaintext".to_owned(),
+            value: InputValueContract::MatrixExact {
+                matrix_type: matrix,
+                canonical_coefficient_exclusive_upper_bound: Some(IntExpr::constant(7)),
+                is_constant_polynomial: true,
+            },
+        });
+        protocol.bundle.input_bindings.push(crate::ProtocolInputBinding {
+            input: input_id.clone(),
+            destinations: vec![ProtocolInputDestination::WorkflowStage {
+                stage: StageId("encrypt".to_owned()),
+                input: StageInputName("plaintext".to_owned()),
+            }],
+        });
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "nested-protocol-input".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let LoweredValue::Term(term) = lowerer
+            .lower_stage_wire(&StageId("encrypt".to_owned()), output)
+            .expect("nested protocol input")
+        else {
+            panic!("protocol matrix input")
+        };
+        let atom = lowerer.egraph[lowerer.egraph.find(term)]
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                MxxLang::Atom { source, .. } => Some(*source),
+                _ => None,
+            })
+            .expect("protocol input atom");
+        assert!(matches!(
+            &lowerer.egraph.analysis.symbols.atomic_sources.get(atom.0).unwrap().key,
+            super::super::identity::AtomicSourceKey::ProtocolInput(found) if found == &input_id
+        ));
+        let bound = lowerer.production_bound_view().atom_bound(atom, term).unwrap();
+        assert_eq!(bound.coefficient_class, BoundClass::bounded(6_u8.into()));
+        assert!(bound.metadata.is_constant_polynomial);
         assert!(lowerer.egraph.analysis.symbols.atomic_sources.values.iter().all(|descriptor| {
             !matches!(descriptor.key, super::super::identity::AtomicSourceKey::GraphWire(_))
         }));

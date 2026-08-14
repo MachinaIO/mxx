@@ -6,7 +6,7 @@
 //! canonical extracted term to its final [`MatrixBound`].
 
 use super::{
-    identity::{AtomicSourceId, Axis, CrtSpecId, MatrixConstantSpecId},
+    identity::{AtomicSourceId, Axis, CrtSpecId, GraphWireSourceKey, MatrixConstantSpecId},
     language::MxxLang,
 };
 use egg::Id;
@@ -150,7 +150,7 @@ pub enum BoundEvaluationError {
     InvalidPack { term: Id },
     InvalidSwitchReachability { term: Id },
     MissingInputBoundContract { term: Id },
-    OpaqueGraphWire { term: Id },
+    OpaqueGraphWire { source: GraphWireSourceKey },
     SequentialStateOutsideOverlay { term: Id },
     InvalidDeclaredBound { term: Id },
     UnconsumedLargeTerm { term: Id },

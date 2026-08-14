@@ -534,12 +534,18 @@ impl NestedRnsPolyContext {
         lut_real_to_v_id: usize,
     ) -> Vec<BatchedWire> {
         assert_eq!(inputs.len(), lut_x_to_y_ids.len());
+        assert_eq!(inputs.len(), lut_x_to_real_ids.len());
+        let (first_input, remaining_inputs) =
+            inputs.split_first().expect("nested-RNS decomposition requires at least one p modulus");
         let mut outputs = Vec::with_capacity(inputs.len() + 1);
-        let mut real_sum = circuit.const_zero_gate();
-        for p_idx in 0..inputs.len() {
-            let y_i = circuit.public_lookup_gate(inputs[p_idx], lut_x_to_y_ids[p_idx]);
+        let first_y = circuit.public_lookup_gate(*first_input, lut_x_to_y_ids[0]);
+        outputs.push(first_y);
+        let mut real_sum = circuit.public_lookup_gate(*first_input, lut_x_to_real_ids[0]);
+        for (offset, input) in remaining_inputs.iter().enumerate() {
+            let p_idx = offset + 1;
+            let y_i = circuit.public_lookup_gate(*input, lut_x_to_y_ids[p_idx]);
             outputs.push(y_i);
-            let real_i = circuit.public_lookup_gate(inputs[p_idx], lut_x_to_real_ids[p_idx]);
+            let real_i = circuit.public_lookup_gate(*input, lut_x_to_real_ids[p_idx]);
             real_sum = circuit.add_gate(real_sum, real_i);
         }
         outputs.push(circuit.public_lookup_gate(real_sum, lut_real_to_v_id));

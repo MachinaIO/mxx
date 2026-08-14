@@ -21,7 +21,8 @@ use mxx_ir_core::{
     artifact::{ArtifactConfidentiality, ProductionId},
     types::MatrixType,
 };
-use num_bigint::{BigInt, Sign};
+use num_bigint::{BigInt, BigUint, Sign};
+use num_traits::Zero;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -181,6 +182,9 @@ struct LweLookupEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LweLookupTable {
     entries: Vec<LweLookupEntry>,
+    /// Exclusive canonical upper bound for every output, when every static
+    /// table value is nonnegative. This is table metadata, not a new IR value.
+    canonical_output_exclusive_upper: Option<BigUint>,
 }
 
 impl LweLookupTable {
@@ -195,6 +199,7 @@ impl LweLookupTable {
             return Err(LweLookupCompileError::EmptyTable);
         }
         let mut seen = vec![false; entries.len()];
+        let mut canonical_output_maximum = Some(BigUint::zero());
         for entry in &entries {
             if entry.row >= entries.len() {
                 return Err(LweLookupCompileError::RowOutOfRange {
@@ -205,11 +210,18 @@ impl LweLookupTable {
             if std::mem::replace(&mut seen[entry.row], true) {
                 return Err(LweLookupCompileError::DuplicateRow(entry.row));
             }
+            match (canonical_output_maximum.as_mut(), entry.output.to_biguint()) {
+                (Some(maximum), Some(output)) => *maximum = maximum.clone().max(output),
+                (_, None) => canonical_output_maximum = None,
+                (None, Some(_)) => {}
+            }
         }
         if let Some(row) = seen.iter().position(|present| !present) {
             return Err(LweLookupCompileError::MissingRow(row));
         }
-        Ok(Self { entries })
+        let canonical_output_exclusive_upper =
+            canonical_output_maximum.map(|maximum| maximum + BigUint::from(1u8));
+        Ok(Self { entries, canonical_output_exclusive_upper })
     }
 
     pub fn from_public_lut(table: &PublicLutProgram) -> Result<Self, LweLookupCompileError> {
@@ -239,6 +251,14 @@ impl LweLookupTable {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    fn canonical_output_exclusive_upper_for_modulus(&self, modulus: &IntExpr) -> Option<BigUint> {
+        let upper = self.canonical_output_exclusive_upper.as_ref()?;
+        let IntExpr::Const(modulus) = modulus else {
+            return None;
+        };
+        (upper <= &modulus.to_biguint()?).then(|| upper.clone())
     }
 
     fn commitment(&self) -> [u8; 32] {
@@ -767,7 +787,9 @@ impl LweLookupCompiler {
             rows,
             pubkey: output_public_key,
             plaintext: BggTallPlaintext::Diagonal(plaintexts),
-            canonical_input_exclusive_upper: None,
+            canonical_input_exclusive_upper: self
+                .table
+                .canonical_output_exclusive_upper_for_modulus(&self.high_matrix_type.modulus),
         })
     }
 
@@ -1461,7 +1483,7 @@ fn lookup_error(gate: GateInstance<'_>, source: LweLookupCompileError) -> Circui
 mod tests {
     use super::*;
     use crate::{
-        BggEncodingCompiler, BggPublicKeyCompiler,
+        BggEncodingCompiler, BggPublicKeyCompiler, BggTallEncodingCompiler,
         test_utils::{matrix_output, row},
     };
     use mxx_dsl::DslContext;
@@ -1532,15 +1554,33 @@ mod tests {
     }
 
     #[test]
+    fn static_table_records_only_nonnegative_output_bounds() {
+        let nonnegative =
+            LweLookupTable::new([(0, BigInt::from(0)), (1, BigInt::from(9))]).unwrap();
+        assert_eq!(nonnegative.canonical_output_exclusive_upper, Some(BigUint::from(10u8)));
+        assert_eq!(
+            nonnegative.canonical_output_exclusive_upper_for_modulus(&IntExpr::constant(9)),
+            None,
+            "a canonical output range must fit the matrix modulus"
+        );
+        assert_eq!(
+            LweLookupTable::new([(0, BigInt::from(-1)), (1, BigInt::from(9))])
+                .unwrap()
+                .canonical_output_exclusive_upper,
+            None
+        );
+    }
+
+    #[test]
     fn tall_lookup_shares_one_helper_family_and_matches_every_runtime_row() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let digits = parameters.modulus_digits();
         let slots = 4;
         let table = LweLookupTable::new([
-            (0, BigInt::from(9)),
-            (1, BigInt::from(7)),
-            (2, BigInt::from(5)),
-            (3, BigInt::from(3)),
+            (0, BigInt::from(1)),
+            (1, BigInt::from(1)),
+            (2, BigInt::from(1)),
+            (3, BigInt::from(0)),
         ])
         .unwrap();
         let lookup = compiler(
@@ -1656,8 +1696,22 @@ mod tests {
             .import_artifacts(&LweLookupArtifacts::for_compiler(production_id.clone(), &lookup))
             .unwrap();
         let output = lookup.tall_encoding(&input, &c_b_rows, &artifacts).unwrap();
+        assert_eq!(output.canonical_input_exclusive_upper, Some(BigUint::from(2u8)));
+        let tall_compiler = BggTallEncodingCompiler {
+            public_key: BggPublicKeyCompiler {
+                ring: ring.clone(),
+                base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
+                digit_count: IntExpr::constant(digits),
+            },
+        };
+        let accumulated = tall_compiler.add(&output, &output).unwrap();
+        assert_eq!(accumulated.canonical_input_exclusive_upper, Some(BigUint::from(3u8)));
+        let final_output = lookup.tall_encoding(&accumulated, &c_b_rows, &artifacts).unwrap();
         let BggTallPlaintext::Diagonal(output_plaintexts) = output.plaintext else {
             panic!("public lookup must reveal its output")
+        };
+        let BggTallPlaintext::Diagonal(final_plaintexts) = final_output.plaintext else {
+            panic!("the accumulated public lookup must reveal its output")
         };
         let mut context = DslContext::new("tall-lookup-runtime");
         for slot in 0..slots {
@@ -1665,6 +1719,8 @@ mod tests {
                 .output(format!("row-{slot}"), output.rows.get_static(slot))
                 .unwrap()
                 .output(format!("plain-{slot}"), output_plaintexts.get_static(slot))
+                .unwrap()
+                .output(format!("final-plain-{slot}"), final_plaintexts.get_static(slot))
                 .unwrap();
         }
         let graph = context.build().unwrap();
@@ -1677,6 +1733,15 @@ mod tests {
                 } if upper == &BigUint::from(4u8)
             )
         }));
+        assert!(graph.graph.scopes().values().flat_map(|scope| scope.nodes()).any(|node| {
+            matches!(
+                node.kind(),
+                NodeKind::ExtractCoefficient {
+                    canonical_input_exclusive_upper: Some(upper),
+                    ..
+                } if upper == &BigUint::from(3u8)
+            )
+        }));
         assert_eq!(
             graph
                 .graph
@@ -1685,8 +1750,8 @@ mod tests {
                 .flat_map(|scope| scope.nodes())
                 .filter(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
                 .count(),
-            2,
-            "one shared low/high helper selection must serve every row"
+            4,
+            "each of the two lookup stages uses one shared low/high helper selection"
         );
 
         let indices = [0usize, 1, 1, 3];
@@ -1717,7 +1782,7 @@ mod tests {
             .unwrap();
         let result =
             execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
-        let outputs = [9usize, 7, 5, 3];
+        let outputs = [1usize, 1, 1, 0];
         for slot in 0..slots {
             let index = indices[slot];
             let expected = c_b_values[slot].clone() * high_values[index].clone() +
@@ -1728,6 +1793,13 @@ mod tests {
                 &DCRTPolyMatrix::from_poly_vec_row(
                     &parameters,
                     vec![DCRTPoly::from_usize_to_constant(&parameters, outputs[index])],
+                )
+            );
+            assert_eq!(
+                matrix_output(&result, &format!("final-plain-{slot}")),
+                &DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_usize_to_constant(&parameters, 1)],
                 )
             );
         }

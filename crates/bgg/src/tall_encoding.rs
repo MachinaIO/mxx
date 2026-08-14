@@ -19,6 +19,7 @@ use mxx_ir_core::{
     types::MatrixType,
 };
 use num_bigint::BigUint;
+use num_traits::{One, Zero};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -32,7 +33,7 @@ pub struct BggTallEncodingWire {
     /// Known or hidden diagonal plaintext metadata.
     pub plaintext: BggTallPlaintext,
     /// Compile-time-only exclusive upper bound for the revealed canonical
-    /// plaintext input. This is meaningful only when `plaintext` is diagonal.
+    /// plaintext. This is meaningful only when `plaintext` is diagonal.
     pub canonical_input_exclusive_upper: Option<BigUint>,
 }
 
@@ -111,12 +112,18 @@ impl BggTallEncodingCompiler {
         lhs: &BggTallEncodingWire,
         rhs: &BggTallEncodingWire,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
-        self.binary(
+        let mut output = self.binary(
             lhs,
             rhs,
             |left, right| left + right,
             |compiler, left, right| compiler.add(left, right),
-        )
+        )?;
+        output.canonical_input_exclusive_upper = canonical_sum_upper(
+            lhs.canonical_input_exclusive_upper.as_ref(),
+            rhs.canonical_input_exclusive_upper.as_ref(),
+            &output.rows.element_type().modulus,
+        );
+        Ok(output)
     }
 
     /// Subtracts two tall encodings row by row.
@@ -509,6 +516,22 @@ fn plaintext_count_mismatch(wire: &BggTallEncodingWire) -> bool {
     }
 }
 
+fn canonical_sum_upper(
+    lhs: Option<&BigUint>,
+    rhs: Option<&BigUint>,
+    modulus: &IntExpr,
+) -> Option<BigUint> {
+    let (lhs, rhs) = (lhs?, rhs?);
+    if lhs.is_zero() || rhs.is_zero() {
+        return None;
+    }
+    let IntExpr::Const(modulus) = modulus else {
+        return None;
+    };
+    let upper = lhs + rhs - BigUint::one();
+    (upper <= modulus.to_biguint()?).then_some(upper)
+}
+
 pub(crate) fn rotate_family(
     rows: &Family<Mat>,
     offset: usize,
@@ -688,7 +711,28 @@ mod tests {
                 .canonical_input_exclusive_upper
                 .is_none()
         );
-        assert!(compiler.add(&bounded, &right).unwrap().canonical_input_exclusive_upper.is_none());
+        let mut bounded_right = right.clone();
+        bounded_right.canonical_input_exclusive_upper = Some(BigUint::from(4u8));
+        assert_eq!(
+            compiler.add(&bounded, &bounded_right).unwrap().canonical_input_exclusive_upper,
+            Some(BigUint::from(10u8)),
+            "[0, 7) + [0, 4) has exclusive upper bound 10"
+        );
+        let IntExpr::Const(modulus) = &left.rows.element_type().modulus else {
+            panic!("test ring has a concrete modulus")
+        };
+        let mut wrapping_left = left.clone();
+        wrapping_left.canonical_input_exclusive_upper = modulus.to_biguint();
+        let mut wrapping_right = right.clone();
+        wrapping_right.canonical_input_exclusive_upper = Some(BigUint::from(2u8));
+        assert!(
+            compiler
+                .add(&wrapping_left, &wrapping_right)
+                .unwrap()
+                .canonical_input_exclusive_upper
+                .is_none(),
+            "a sum that reaches the modulus is not a canonical nonwrapping range"
+        );
         let mut context = DslContext::new("tall-arithmetic-runtime")
             .output("sum-public", sum.pubkey.matrix)
             .unwrap()

@@ -496,8 +496,10 @@ pub fn check_operational_noise_candidate_with_progress(
                 {
                     return Err(OperationalSimulationError::Bound {
                         site: site(&stage, wire, "extract residual"),
-                        source: super::error::BoundError::BoundExpressionNotEvaluable {
-                            expression: IntExpr::constant(0),
+                        source: super::error::BoundError::UnresolvedExtraction {
+                            remaining_relation_redexes: proposal.cost.remaining_relation_redexes,
+                            hidden_relation_redexes: proposal.cost.hidden_relation_redexes,
+                            large_atom_count: proposal.cost.large_atom_count,
                         },
                     });
                 }
@@ -528,24 +530,17 @@ pub fn check_operational_noise_candidate_with_progress(
             for root in roots {
                 let result = match BoundEvaluator::new(&view).evaluate(root) {
                     Ok(result) => result,
-                    Err(_) => {
+                    Err(source) => {
                         return Err(OperationalSimulationError::Bound {
                             site: site(&stage, wire, "bound"),
-                            source: super::error::BoundError::BoundExpressionNotEvaluable {
-                                expression: IntExpr::constant(0),
-                            },
+                            source: super::error::BoundError::EvaluationFailed { source },
                         });
                     }
                 };
-                let maximum =
-                    result.coefficient_class.maximum_absolute_coefficient().ok_or_else(|| {
-                        OperationalSimulationError::Bound {
-                            site: site(&stage, wire, "bound"),
-                            source: super::error::BoundError::BoundExpressionNotEvaluable {
-                                expression: IntExpr::constant(0),
-                            },
-                        }
-                    })?;
+                let maximum = result
+                    .coefficient_class
+                    .maximum_absolute_coefficient()
+                    .expect("BoundEvaluator rejects final Large roots");
                 bound = bound.max(maximum);
             }
             drop(view);

@@ -687,10 +687,16 @@
       "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
     },
     {
-      "error_tag": "Bound.BoundExpressionNotEvaluable",
+      "error_tag": "Bound.UnresolvedExtraction",
+      "tall_reachability": "reachable",
+      "classification": "relation_extraction",
+      "rationale": "The generic extractor rejects a residual relation redex or Large atom before numeric noise evaluation; its counters identify the unconsumed category without protocol-specific state."
+    },
+    {
+      "error_tag": "Bound.EvaluationFailed",
       "tall_reachability": "reachable",
       "classification": "noise_bound_evaluation",
-      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this preserves its concrete fail-closed error instead of replacing it with a synthetic integer expression."
     },
     {
       "error_tag": "Bound.SequentialArityMismatch",

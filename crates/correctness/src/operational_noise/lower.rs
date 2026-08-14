@@ -9,7 +9,7 @@ use super::{
     analysis::{IntegerDomain, MxxAnalysis, MxxSort, ScalarProvenance},
     bound::{
         BoundClass, BoundEvaluationControl, BoundEvaluationError, BoundEvaluator, BoundInput,
-        MatrixBound, MatrixMetadata, ResolvedMatrixConstant,
+        MatrixBound, MatrixMetadata, ResolvedMatrixConstant, gadget_digit_bound,
     },
     error::{LowerError, SelectorOnlyConsumer},
     family::{self, FamilyCoverageStorage, FamilyLoweringValue},
@@ -110,19 +110,23 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
                     .samplers
                     .get(id.0)
                     .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
-                let SamplerIdentity::Preimage { cutoff, .. } = sampler else {
-                    return Ok(MatrixBound {
-                        matrix_type,
-                        coefficient_class: BoundClass::Large,
-                        metadata: MatrixMetadata::unknown(),
-                    });
-                };
-                let cutoff = resolved_integer(cutoff)
-                    .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
-                let cutoff = cutoff
-                    .to_biguint()
-                    .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
-                BoundClass::Bounded { maximum_absolute_coefficient: cutoff }
+                match sampler {
+                    SamplerIdentity::Preimage { cutoff, .. } => {
+                        let cutoff = resolved_integer(cutoff)
+                            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
+                        let cutoff = cutoff
+                            .to_biguint()
+                            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
+                        BoundClass::Bounded { maximum_absolute_coefficient: cutoff }
+                    }
+                    SamplerIdentity::DecomposedHash { base, small, .. } |
+                    SamplerIdentity::GadgetDecomposition { base, small, .. } => {
+                        let base = resolved_integer(base)
+                            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
+                        gadget_digit_bound(&base, *small)
+                            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?
+                    }
+                }
             }
             // A carried-state placeholder is meaningful only inside the
             // descriptor-owned simultaneous transition overlay below.
@@ -4146,7 +4150,7 @@ mod tests {
             rows: ResolvedIntExpr::Const(BigInt::from(1)),
             columns: ResolvedIntExpr::Const(BigInt::from(1)),
         };
-        let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+        let atom_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
             super::super::identity::AtomicSourceDescriptor {
                 key: super::super::identity::AtomicSourceKey::ProtocolInput(
                     crate::ProtocolInputId::from("extract-input"),
@@ -4158,7 +4162,7 @@ mod tests {
             },
         );
         let matrix = lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(source),
+            source: super::super::identity::AtomicSourceId(atom_source),
             indices: Box::new([]),
         });
         let environment = root_test_environment();
@@ -4202,7 +4206,7 @@ mod tests {
             rows: ResolvedIntExpr::Const(BigInt::from(1)),
             columns: ResolvedIntExpr::Const(BigInt::from(1)),
         };
-        let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+        let atom_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
             super::super::identity::AtomicSourceDescriptor {
                 key: super::super::identity::AtomicSourceKey::ProtocolInput(
                     crate::ProtocolInputId::from("fallback-input"),
@@ -4214,7 +4218,7 @@ mod tests {
             },
         );
         let matrix = lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(source),
+            source: super::super::identity::AtomicSourceId(atom_source),
             indices: Box::new([]),
         });
         let kind = NodeKind::ExtractCoefficient {
@@ -4398,8 +4402,11 @@ mod tests {
         };
         let stage = StageId("encrypt".to_owned());
         let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let lowered = lowerer.lower_stage_wire(&stage, output).expect("lower decomposed hash");
-        assert!(matches!(lowered, LoweredValue::Term(_)));
+        let LoweredValue::Term(lowered) =
+            lowerer.lower_stage_wire(&stage, output).expect("lower decomposed hash")
+        else {
+            panic!("decomposed hash is a matrix term")
+        };
         let samplers = &lowerer.egraph.analysis.symbols.samplers.values;
         let [
             SamplerIdentity::DecomposedHash {
@@ -4451,6 +4458,117 @@ mod tests {
             super::super::identity::MatrixConstantValue::Gadget { small: false, .. }
         ));
         assert_eq!(lowerer.relation_registrations().len(), 1);
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(lowered)
+                .expect("regular decomposed hash has a finite digit bound")
+                .coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: 2_u8.into() },
+        );
+    }
+
+    #[test]
+    fn gadget_decomposition_sampler_uses_the_regular_digit_bound() {
+        let (graph, output) = decomposed_hash_graph(HashVariant::Decomposed, 3);
+        let protocol = hash_protocol(graph);
+        let request = OperationalCheckRequest {
+            environment: vec![(
+                "cutoff".to_owned(),
+                super::super::OperationalParameterValue::Integer(BigInt::from(1)),
+            )],
+            layouts: vec![hash_layout()],
+            target_id: "hash".to_owned(),
+        };
+        let stage = StageId("encrypt".to_owned());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let LoweredValue::Term(decomposed_hash) =
+            lowerer.lower_stage_wire(&stage, output).expect("lower decomposed hash")
+        else {
+            panic!("decomposed hash is a matrix term")
+        };
+        let sampler = lowerer.egraph.analysis.symbols.samplers.values[0].clone();
+        let SamplerIdentity::DecomposedHash {
+            source,
+            indices,
+            public,
+            target,
+            base,
+            digit_count,
+            ..
+        } = sampler
+        else {
+            panic!("fixture produces a decomposed hash sampler")
+        };
+        let sampler =
+            lowerer.egraph.analysis.symbols.samplers.intern(SamplerIdentity::GadgetDecomposition {
+                source: source.clone(),
+                indices: indices.clone(),
+                public,
+                target,
+                base: base.clone(),
+                digit_count: digit_count.clone(),
+                small: false,
+                range_proved: false,
+            });
+        let sort = lowerer.egraph[lowerer.egraph.find(decomposed_hash)]
+            .data
+            .sort
+            .clone()
+            .expect("decomposed hash has a matrix sort");
+        let atom_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
+                sort: sort.clone(),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: Some(
+                    super::super::identity::AtomicRelationRole::GadgetDecomposition,
+                ),
+            },
+        );
+        let decomposition = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(atom_source),
+            indices: indices.clone(),
+        });
+
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(decomposition)
+                .expect("regular gadget decomposition has a finite digit bound")
+                .coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: 2_u8.into() },
+        );
+
+        let sampler =
+            lowerer.egraph.analysis.symbols.samplers.intern(SamplerIdentity::GadgetDecomposition {
+                source,
+                indices: indices.clone(),
+                public,
+                target,
+                base: ResolvedIntExpr::Const(BigInt::from(1)),
+                digit_count,
+                small: false,
+                range_proved: false,
+            });
+        let atom_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
+                sort,
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: Some(
+                    super::super::identity::AtomicRelationRole::GadgetDecomposition,
+                ),
+            },
+        );
+        let invalid = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(atom_source),
+            indices,
+        });
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view()).evaluate(invalid),
+            Err(BoundEvaluationError::InvalidMatrixConstant { term: invalid }),
+        );
     }
 
     #[test]
@@ -4505,7 +4623,7 @@ mod tests {
     }
 
     #[test]
-    fn small_decomposed_hash_interns_a_small_sampler_descriptor() {
+    fn small_decomposed_hash_has_a_digit_bound_without_a_range_proof() {
         let (graph, output) = decomposed_hash_graph(HashVariant::SmallDecomposed, 3);
         let protocol = hash_protocol(graph);
         let request = OperationalCheckRequest {
@@ -4518,12 +4636,23 @@ mod tests {
         };
         let stage = StageId("encrypt".to_owned());
         let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        lowerer.lower_stage_wire(&stage, output).expect("lower small decomposed hash");
+        let LoweredValue::Term(lowered) =
+            lowerer.lower_stage_wire(&stage, output).expect("lower small decomposed hash")
+        else {
+            panic!("small decomposed hash is a matrix term")
+        };
         assert!(matches!(
             lowerer.egraph.analysis.symbols.samplers.values.as_slice(),
             [SamplerIdentity::DecomposedHash { small: true, range_proved: false, .. }]
         ));
         assert_eq!(lowerer.relation_registrations().len(), 1);
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(lowered)
+                .expect("unrestricted small decomposition still has a finite digit bound")
+                .coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: 3_u8.into() },
+        );
     }
 
     fn deep_parallel_graph(depth: usize, logical_count: i64) -> mxx_ir_core::graph::Graph {

@@ -338,7 +338,12 @@ operational_error_registry! {
         LargeValueUsedAsNoise { source: AtomicSourceKey },
         IncompatibleMatrixProduct { operands: MatrixProductOperands },
         InvalidProductMode { operands: MatrixProductOperands },
-        BoundExpressionNotEvaluable { expression: IntExpr },
+        UnresolvedExtraction {
+            remaining_relation_redexes: u64,
+            hidden_relation_redexes: u64,
+            large_atom_count: u64,
+        },
+        EvaluationFailed { source: super::bound::BoundEvaluationError },
         SequentialArityMismatch { expected: usize, actual: usize },
         SequentialSchemaMismatch { expected: WireType, actual: WireType },
         RelationBearingSequentialState { source: AtomicSourceKey },

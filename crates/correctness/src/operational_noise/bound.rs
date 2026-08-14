@@ -64,6 +64,25 @@ impl BoundClass {
     }
 }
 
+/// The exact coefficient cap of one gadget-decomposition digit.
+///
+/// This is independent of whether the small-mode reconstruction relation has
+/// an authoritative input-range proof.  That proof governs relation use; both
+/// decomposition modes always have the documented finite digit cap.
+pub(crate) fn gadget_digit_bound(base: &BigInt, small: bool) -> Option<BoundClass> {
+    if base <= &BigInt::one() {
+        return None;
+    }
+    let absolute = base.to_biguint().expect("positive gadget base");
+    Some(BoundClass::Bounded {
+        maximum_absolute_coefficient: if small {
+            absolute - BigUint::one()
+        } else {
+            (absolute / BigUint::from(2_u8)).max(BigUint::one())
+        },
+    })
+}
+
 /// Metadata that has a proof-preserving matrix transfer rule.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MatrixMetadata {
@@ -338,20 +357,8 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                 }
                 BoundClass::Bounded { maximum_absolute_coefficient: BigUint::one() }
             }
-            ResolvedMatrixConstant::Gadget { base, small } => {
-                let absolute = base.abs().to_biguint().unwrap_or_default();
-                if small {
-                    if absolute < BigUint::from(2_u8) {
-                        return Err(BoundEvaluationError::InvalidMatrixConstant { term });
-                    }
-                    BoundClass::Bounded { maximum_absolute_coefficient: absolute - BigUint::one() }
-                } else {
-                    BoundClass::Bounded {
-                        maximum_absolute_coefficient: (absolute / BigUint::from(2_u8))
-                            .max(BigUint::one()),
-                    }
-                }
-            }
+            ResolvedMatrixConstant::Gadget { base, small } => gadget_digit_bound(&base, small)
+                .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?,
             ResolvedMatrixConstant::PowerOfBase { base, exponent } => {
                 if matrix_type.rows != 1 || matrix_type.columns != 1 {
                     return Err(BoundEvaluationError::InvalidMatrixConstant { term });
@@ -1045,6 +1052,75 @@ mod tests {
             BoundEvaluator::new(&input).evaluate(root).unwrap().coefficient_class,
             BoundClass::Bounded { maximum_absolute_coefficient: 65_536_u32.into() },
         );
+    }
+
+    #[test]
+    fn gadget_constants_use_the_shared_regular_and_small_digit_bounds() {
+        let regular = Id::from(0);
+        let small = Id::from(1);
+        let mut input = Input::default();
+        input.nodes.insert(regular, MxxLang::MatrixConstant(MatrixConstantSpecId(0)));
+        input.nodes.insert(small, MxxLang::MatrixConstant(MatrixConstantSpecId(1)));
+        input.types.insert(regular, matrix(1, 1));
+        input.types.insert(small, matrix(1, 1));
+        input.constants.insert(
+            0,
+            (matrix(1, 1), ResolvedMatrixConstant::Gadget { base: 4.into(), small: false }),
+        );
+        input.constants.insert(
+            1,
+            (matrix(1, 1), ResolvedMatrixConstant::Gadget { base: 4.into(), small: true }),
+        );
+
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(regular).unwrap().coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: 2_u8.into() },
+        );
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(small).unwrap().coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: 3_u8.into() },
+        );
+    }
+
+    #[test]
+    fn gadget_digit_bound_rejects_nonpositive_and_unit_bases_in_both_modes() {
+        for small in [false, true] {
+            for base in [-2, 0, 1] {
+                assert_eq!(gadget_digit_bound(&base.into(), small), None);
+            }
+            assert_eq!(
+                gadget_digit_bound(&3.into(), small),
+                Some(BoundClass::Bounded {
+                    maximum_absolute_coefficient: if small { 2_u8.into() } else { 1_u8.into() },
+                }),
+            );
+            assert_eq!(
+                gadget_digit_bound(&4.into(), small),
+                Some(BoundClass::Bounded {
+                    maximum_absolute_coefficient: if small { 3_u8.into() } else { 2_u8.into() },
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn gadget_constants_reject_nonpositive_and_unit_bases() {
+        for small in [false, true] {
+            for base in [-2, 0, 1] {
+                let root = Id::from(0);
+                let mut input = Input::default();
+                input.nodes.insert(root, MxxLang::MatrixConstant(MatrixConstantSpecId(0)));
+                input.types.insert(root, matrix(1, 1));
+                input.constants.insert(
+                    0,
+                    (matrix(1, 1), ResolvedMatrixConstant::Gadget { base: base.into(), small }),
+                );
+                assert_eq!(
+                    BoundEvaluator::new(&input).evaluate(root),
+                    Err(BoundEvaluationError::InvalidMatrixConstant { term: root }),
+                );
+            }
+        }
     }
 
     #[test]

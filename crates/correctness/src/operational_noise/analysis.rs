@@ -6,7 +6,7 @@
 //! but can never become an ordinary numeric/noise scalar through congruence.
 
 use super::{
-    error::{AnalysisError, ResourceObserved},
+    error::{AnalysisError, ResourceLimitKind, ResourceObserved},
     identity::{
         AtomicRelationRole, AtomicSourceId, BinderKey, CanonicalResidueConvention, ResolvedIntExpr,
         ResolvedMatrixType, SymbolTables,
@@ -18,7 +18,16 @@ use mxx_ir_core::{IntExpr, ParamEnv, expr::euclidean_div_rem};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Signed, Zero};
 use smallvec::SmallVec;
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 /// The complete sort carried by every checker e-class.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -715,7 +724,9 @@ fn merge_sort(
 pub struct MxxAnalysis {
     pub symbols: SymbolTables,
     pub resource_failure: Option<ResourceObserved>,
+    pub resource_failure_kind: Option<ResourceLimitKind>,
     relation_sources_per_eclass: usize,
+    switch_case_limit: usize,
     pub(crate) resource_budget: ResourceBudget,
     provenance_arena: Rc<RefCell<RelationProvenanceArena>>,
 }
@@ -723,73 +734,101 @@ pub struct MxxAnalysis {
 #[derive(Clone, Debug)]
 pub(crate) struct ResourceBudget {
     pub(crate) total_owned_element_limit: usize,
-    pub(crate) total_owned_elements: usize,
+    total_owned_elements: Arc<AtomicUsize>,
+    started: Instant,
+    deadline: Instant,
+    total_time_limit: Duration,
     temporary_elements: usize,
-    temporary_failure: Option<ResourceObserved>,
+    temporary_failure: Option<(ResourceLimitKind, ResourceObserved)>,
 }
 
 impl ResourceBudget {
-    pub(crate) fn production() -> Self {
+    fn standalone_for_tests() -> Self {
+        let started = Instant::now();
         Self {
             total_owned_element_limit: 2_000_000,
-            total_owned_elements: 0,
+            total_owned_elements: Arc::new(AtomicUsize::new(0)),
+            started,
+            deadline: started + Duration::from_secs(120),
+            total_time_limit: Duration::from_secs(120),
             temporary_elements: 0,
             temporary_failure: None,
         }
     }
 
-    pub(crate) fn reserve(&mut self, additional: usize) -> Result<(), ResourceObserved> {
-        let observed = || ResourceObserved::Counter {
-            limit: self.total_owned_element_limit as u64,
-            observed: self
-                .total_owned_elements
-                .checked_add(self.temporary_elements)
-                .and_then(|total| total.checked_add(additional))
-                .unwrap_or(usize::MAX) as u64,
-        };
-        let Some(remaining) = self
-            .total_owned_element_limit
-            .checked_sub(self.total_owned_elements)
-            .and_then(|remaining| remaining.checked_sub(self.temporary_elements))
-        else {
-            return Err(observed());
-        };
-        if additional > remaining {
-            return Err(observed());
+    #[cfg(test)]
+    fn production() -> Self {
+        Self::standalone_for_tests()
+    }
+
+    #[cfg(test)]
+    fn owned(&self) -> usize {
+        self.total_owned_elements.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn from_shared(
+        total_owned_element_limit: usize,
+        total_owned_elements: Arc<AtomicUsize>,
+        started: Instant,
+        deadline: Instant,
+        total_time_limit: Duration,
+    ) -> Self {
+        Self {
+            total_owned_element_limit,
+            total_owned_elements,
+            started,
+            deadline,
+            total_time_limit,
+            temporary_elements: 0,
+            temporary_failure: None,
         }
-        self.total_owned_elements = self
-            .total_owned_elements
-            .checked_add(additional)
-            .expect("remaining capacity guarantees owned-element addition cannot overflow");
-        Ok(())
+    }
+
+    pub(crate) fn reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), (ResourceLimitKind, ResourceObserved)> {
+        let now = Instant::now();
+        if now >= self.deadline {
+            return Err((
+                ResourceLimitKind::TotalTime,
+                ResourceObserved::Duration {
+                    limit: self.total_time_limit,
+                    observed: now.duration_since(self.started),
+                },
+            ));
+        }
+        let mut current = self.total_owned_elements.load(Ordering::Relaxed);
+        loop {
+            let observed = current.checked_add(additional).unwrap_or(usize::MAX);
+            if observed > self.total_owned_element_limit {
+                return Err((
+                    ResourceLimitKind::TotalOwnedElements,
+                    ResourceObserved::Counter {
+                        limit: self.total_owned_element_limit.min(u64::MAX as usize) as u64,
+                        observed: observed.min(u64::MAX as usize) as u64,
+                    },
+                ));
+            }
+            match self.total_owned_elements.compare_exchange_weak(
+                current,
+                observed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(next) => current = next,
+            }
+        }
     }
 
     fn reserve_temporary(&mut self, additional: usize) -> Result<(), ResourceObserved> {
-        let observed = || ResourceObserved::Counter {
-            limit: self.total_owned_element_limit as u64,
-            observed: self
-                .total_owned_elements
-                .checked_add(self.temporary_elements)
-                .and_then(|total| total.checked_add(additional))
-                .unwrap_or(usize::MAX) as u64,
-        };
-        let Some(remaining) = self
-            .total_owned_element_limit
-            .checked_sub(self.total_owned_elements)
-            .and_then(|remaining| remaining.checked_sub(self.temporary_elements))
-        else {
-            let error = observed();
-            self.temporary_failure = Some(error.clone());
-            return Err(error);
-        };
-        if additional > remaining {
-            let error = observed();
-            self.temporary_failure = Some(error.clone());
-            return Err(error);
+        if let Err((kind, observed)) = self.reserve(additional) {
+            self.temporary_failure = Some((kind, observed.clone()));
+            return Err(observed);
         }
-        self.temporary_elements = self.temporary_elements.checked_add(additional).expect(
-            "remaining capacity guarantees temporary owned-element addition cannot overflow",
-        );
+        self.temporary_elements =
+            self.temporary_elements.checked_add(additional).unwrap_or(usize::MAX);
         Ok(())
     }
 
@@ -812,8 +851,27 @@ impl MxxAnalysis {
         Self {
             symbols,
             resource_failure: None,
+            resource_failure_kind: None,
             relation_sources_per_eclass: 64,
-            resource_budget: ResourceBudget::production(),
+            switch_case_limit: 65_536,
+            resource_budget: ResourceBudget::standalone_for_tests(),
+            provenance_arena: Rc::default(),
+        }
+    }
+
+    pub(crate) fn with_resource_budget(
+        symbols: SymbolTables,
+        relation_sources_per_eclass: usize,
+        switch_case_limit: usize,
+        resource_budget: ResourceBudget,
+    ) -> Self {
+        Self {
+            symbols,
+            resource_failure: None,
+            resource_failure_kind: None,
+            relation_sources_per_eclass,
+            switch_case_limit,
+            resource_budget,
             provenance_arena: Rc::default(),
         }
     }
@@ -823,25 +881,40 @@ impl MxxAnalysis {
         Self {
             symbols,
             resource_failure: None,
+            resource_failure_kind: None,
             relation_sources_per_eclass,
-            resource_budget: ResourceBudget::production(),
+            switch_case_limit: 65_536,
+            resource_budget: ResourceBudget::standalone_for_tests(),
             provenance_arena: Rc::default(),
         }
     }
 
     fn reserve_owned_elements(&mut self, additional: Option<usize>) -> bool {
         let reservation = additional
-            .ok_or_else(|| ResourceObserved::Counter {
-                limit: self.resource_budget.total_owned_element_limit as u64,
-                observed: u64::MAX,
+            .ok_or_else(|| {
+                (
+                    ResourceLimitKind::TotalOwnedElements,
+                    ResourceObserved::Counter {
+                        limit: self.resource_budget.total_owned_element_limit as u64,
+                        observed: u64::MAX,
+                    },
+                )
             })
             .and_then(|additional| self.resource_budget.reserve(additional));
-        if let Err(ref observed) = reservation &&
+        if let Err((kind, observed)) = &reservation &&
             self.resource_failure.is_none()
         {
             self.resource_failure = Some(observed.clone());
+            self.resource_failure_kind = Some(kind.clone());
         }
         reservation.is_ok()
+    }
+
+    fn fail_resource(&mut self, kind: ResourceLimitKind, observed: ResourceObserved) {
+        if self.resource_failure.is_none() {
+            self.resource_failure = Some(observed);
+            self.resource_failure_kind = Some(kind);
+        }
     }
 
     /// Makes the selector domain for `ExtractCoefficient` from an authoritative
@@ -895,27 +968,22 @@ impl Analysis<MxxLang> for MxxAnalysis {
     type Data = AnalysisData;
 
     fn make(egraph: &mut EGraph<MxxLang, Self>, enode: &MxxLang) -> Self::Data {
+        if let MxxLang::Switch(children) = enode {
+            let case_count = children.len().saturating_sub(1);
+            if case_count > egraph.analysis.switch_case_limit {
+                egraph.analysis.fail_resource(
+                    ResourceLimitKind::SwitchCases,
+                    ResourceObserved::Counter {
+                        limit: egraph.analysis.switch_case_limit as u64,
+                        observed: case_count.min(u64::MAX as usize) as u64,
+                    },
+                );
+                return invalid_analysis_data();
+            }
+        }
         // Reserve structural children and the complete prospective switch
         // provenance before its owned branch collections are constructed.
-        let prospective_provenance = {
-            let mut budget = std::mem::replace(
-                &mut egraph.analysis.resource_budget,
-                ResourceBudget {
-                    total_owned_element_limit: 0,
-                    total_owned_elements: 0,
-                    temporary_elements: 0,
-                    temporary_failure: None,
-                },
-            );
-            let prospective = prospective_provenance_owned_elements(egraph, enode, &mut budget);
-            egraph.analysis.resource_budget = budget;
-            prospective
-        };
-        if let Some(observed) = egraph.analysis.resource_budget.temporary_failure.take() &&
-            egraph.analysis.resource_failure.is_none()
-        {
-            egraph.analysis.resource_failure = Some(observed);
-        }
+        let prospective_provenance = prospective_provenance_owned_elements(egraph, enode);
         let prospective_total = prospective_provenance
             .and_then(|provenance| enode.children().len().checked_add(provenance));
         if !egraph.analysis.reserve_owned_elements(prospective_total) {
@@ -937,10 +1005,8 @@ impl Analysis<MxxLang> for MxxAnalysis {
             self.relation_sources_per_eclass,
             &mut self.resource_budget,
         );
-        if let Some(observed) = self.resource_budget.temporary_failure.take() &&
-            self.resource_failure.is_none()
-        {
-            self.resource_failure = Some(observed);
+        if let Some((kind, observed)) = self.resource_budget.temporary_failure.take() {
+            self.fail_resource(kind, observed);
         }
         let Some((additional, relation_overflow)) = preflight else {
             return DidMerge(false, false);
@@ -952,6 +1018,7 @@ impl Analysis<MxxLang> for MxxAnalysis {
                     observed: self.relation_sources_per_eclass.checked_add(1).unwrap_or(usize::MAX)
                         as u64,
                 });
+                self.resource_failure_kind = Some(ResourceLimitKind::RelationSourcesPerEClass);
             }
             return DidMerge(false, false);
         }
@@ -1387,7 +1454,6 @@ fn graph_wire_coordinates_are_authoritative(
 fn prospective_provenance_owned_elements(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     enode: &MxxLang,
-    _budget: &mut ResourceBudget,
 ) -> Option<usize> {
     match enode {
         MxxLang::Atom { source, indices } => egraph
@@ -1438,7 +1504,7 @@ fn provenance_owned_elements_with_budget(
 
 #[cfg(test)]
 fn provenance_owned_elements(data: &AnalysisData) -> Option<usize> {
-    let mut budget = ResourceBudget::production();
+    let mut budget = ResourceBudget::standalone_for_tests();
     let total = provenance_owned_elements_with_budget(data, &mut budget)?;
     debug_assert_eq!(budget.temporary_elements, 0);
     Some(total)
@@ -2473,7 +2539,7 @@ mod tests {
         let selector = egraph.add(MxxLang::IntConst(0.into()));
         let first =
             egraph.add(MxxLang::Atom { source: AtomicSourceId(relation), indices: Box::new([]) });
-        let before = egraph.analysis.resource_budget.total_owned_elements;
+        let before = egraph.analysis.resource_budget.owned();
         // The Switch needs only its arena node and immediate branch handles,
         // plus the language node's children: 66 + 66 owned elements.
         egraph.analysis.resource_budget.total_owned_element_limit = before + 131;
@@ -2508,7 +2574,7 @@ mod tests {
             selected = egraph.add(MxxLang::Switch(vec![selector, selected].into_boxed_slice()));
         }
 
-        let before = egraph.analysis.resource_budget.total_owned_elements;
+        let before = egraph.analysis.resource_budget.owned();
         egraph.analysis.resource_budget.total_owned_element_limit = before + 3;
         let overflow = egraph.add(MxxLang::Switch(vec![selector, selected].into_boxed_slice()));
 
@@ -2627,7 +2693,7 @@ mod tests {
 
         assert!(!merged.0 && !merged.1);
         assert!(to.relation_provenance.is_empty());
-        assert_eq!(analysis.resource_budget.total_owned_elements, 0);
+        assert_eq!(analysis.resource_budget.owned(), 0);
         assert_eq!(
             analysis.resource_failure,
             Some(ResourceObserved::Counter {
@@ -2638,7 +2704,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_merge_preflight_releases_temporary_reservations_on_success_and_failure() {
+    fn deep_merge_preflight_releases_scratch_but_keeps_cumulative_reservations() {
         const DEPTH: usize = 256;
         let mut symbols = SymbolTables::default();
         let relation = symbols.atomic_sources.intern(AtomicSourceDescriptor {
@@ -2657,15 +2723,15 @@ mod tests {
         }
         let mut to = AnalysisData::matrix(scalar_matrix_type(1), None);
         let from = egraph[selected].data.clone();
-        let before = egraph.analysis.resource_budget.total_owned_elements;
+        let before = egraph.analysis.resource_budget.owned();
         let merged = <MxxAnalysis as Analysis<MxxLang>>::merge(&mut egraph.analysis, &mut to, from);
         assert!(merged.0 && merged.1);
         assert_eq!(egraph.analysis.resource_budget.temporary_elements, 0);
-        assert_eq!(egraph.analysis.resource_budget.total_owned_elements, before);
+        assert!(egraph.analysis.resource_budget.owned() > before);
 
         let mut failed_to = AnalysisData::matrix(scalar_matrix_type(1), None);
         let failed_from = egraph[selected].data.clone();
-        let before = egraph.analysis.resource_budget.total_owned_elements;
+        let before = egraph.analysis.resource_budget.owned();
         egraph.analysis.resource_budget.total_owned_element_limit = before + 1;
         let merged = <MxxAnalysis as Analysis<MxxLang>>::merge(
             &mut egraph.analysis,

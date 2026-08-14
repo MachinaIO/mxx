@@ -26,8 +26,8 @@ use mxx_ir_core::{
     IntExpr, RealExpr, WireRef, WireType,
     graph::FrozenGraphScopeId,
     node::{
-        ConcatAxis, IntBinaryOp, IntCompareOp, LoopInputMode, MatrixBinaryOp, NodeKind,
-        ParallelLoop, RealBinaryOp, SequentialLoop,
+        ConcatAxis, HashVariant, IntBinaryOp, IntCompareOp, LoopInputMode, MatrixBinaryOp,
+        NodeKind, ParallelLoop, RealBinaryOp, SequentialLoop,
     },
     types::MatrixType,
 };
@@ -110,7 +110,13 @@ impl BoundInput for ProductionBoundInput<'_, '_> {
                     .samplers
                     .get(id.0)
                     .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
-                let SamplerIdentity::Preimage { cutoff, .. } = sampler;
+                let SamplerIdentity::Preimage { cutoff, .. } = sampler else {
+                    return Ok(MatrixBound {
+                        matrix_type,
+                        coefficient_class: BoundClass::Large,
+                        metadata: MatrixMetadata::unknown(),
+                    });
+                };
                 let cutoff = resolved_integer(cutoff)
                     .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
                 let cutoff = cutoff
@@ -297,6 +303,11 @@ impl ProductionBoundInput<'_, '_> {
             .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
         let count = resolved_nonnegative(&descriptor.count)
             .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
+        if let Some(limit) = self.control.and_then(BoundEvaluationControl::recurrence_step_limit) {
+            if count > limit {
+                return Err(BoundEvaluationError::RecurrenceStepLimitExceeded { limit, count });
+            }
+        }
         if descriptor.initial.len() != descriptor.transition.len() ||
             descriptor.transition.len() != descriptor.output_types.len() ||
             carried_index >= descriptor.transition.len()
@@ -642,6 +653,20 @@ enum LoweringFrame {
         cutoff: IntExpr,
         output_type: WireType,
     },
+    FinishHashSample {
+        wire: LoweringWire,
+        environment: LowerEnv,
+        matrix_type: MatrixType,
+        variant: HashVariant,
+        tag_prefix: Vec<u8>,
+        tag_expressions: Vec<IntExpr>,
+        tag_decimal_expressions: Vec<IntExpr>,
+        tag_u64_le_expressions: Vec<IntExpr>,
+        base: Option<IntExpr>,
+        digit_count: Option<IntExpr>,
+        output_type: WireType,
+        dependency_count: usize,
+    },
     FinishParallelLoop {
         wire: LoweringWire,
         environment: LowerEnv,
@@ -798,7 +823,7 @@ impl<'a> GraphLowerer<'a> {
             .values
             .iter()
             .enumerate()
-            .map(|(id, sampler)| match sampler {
+            .filter_map(|(id, sampler)| match sampler {
                 SamplerIdentity::Preimage { public, trapdoor, target, indices, .. } => {
                     super::relation::RelationRegistration {
                         source: super::identity::AtomicSourceId(
@@ -824,6 +849,32 @@ impl<'a> GraphLowerer<'a> {
                         trapdoor: Some(*trapdoor),
                         indices: indices.clone(),
                     }
+                }
+                .into(),
+                SamplerIdentity::DecomposedHash { public, target, indices, .. } => {
+                    Some(super::relation::RelationRegistration {
+                        source: super::identity::AtomicSourceId(
+                            self.egraph
+                                .analysis
+                                .symbols
+                                .atomic_sources
+                                .values
+                                .iter()
+                                .position(|source| {
+                                    matches!(source.key,
+                                        super::identity::AtomicSourceKey::Sampler(
+                                            super::identity::SamplerDescriptorId(source_id)
+                                        ) if source_id == id as u32
+                                    )
+                                })
+                                .expect("lowered sampler has an atom source")
+                                as u32,
+                        ),
+                        expected_public: *public,
+                        target: *target,
+                        trapdoor: None,
+                        indices: indices.clone(),
+                    })
                 }
             })
             .collect()
@@ -1048,6 +1099,56 @@ impl<'a> GraphLowerer<'a> {
                     }
                     match node_dispatch(node.kind()) {
                         NodeDispatch::Source => {
+                            if let NodeKind::HashSample {
+                                matrix_type,
+                                variant,
+                                tag_prefix,
+                                tag_expressions,
+                                tag_decimal_expressions,
+                                tag_u64_le_expressions,
+                                base,
+                                digit_count,
+                            } = node.kind()
+                            {
+                                let arguments = scope
+                                    .arguments(node)
+                                    .ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
+                                if arguments.is_empty() {
+                                    return Err(LowerError::InvalidOperandArity {
+                                        expected: 1,
+                                        actual: 0,
+                                    });
+                                }
+                                work.push(LoweringFrame::FinishHashSample {
+                                    wire: wire.clone(),
+                                    environment: environment.clone(),
+                                    matrix_type: matrix_type.clone(),
+                                    variant: *variant,
+                                    tag_prefix: tag_prefix.clone(),
+                                    tag_expressions: tag_expressions.clone(),
+                                    tag_decimal_expressions: tag_decimal_expressions.clone(),
+                                    tag_u64_le_expressions: tag_u64_le_expressions.clone(),
+                                    base: base.clone(),
+                                    digit_count: digit_count.clone(),
+                                    output_type: node.output_types()
+                                        [wire.source.wire.port.0 as usize]
+                                        .clone(),
+                                    dependency_count: arguments.len(),
+                                });
+                                for argument in arguments.into_iter().rev() {
+                                    work.push(LoweringFrame::Enter {
+                                        wire: LoweringWire {
+                                            source: WireSourceKey {
+                                                scope: environment.occurrence.clone(),
+                                                wire: argument,
+                                            },
+                                            indices: Box::new([]),
+                                        },
+                                        environment: environment.clone(),
+                                    });
+                                }
+                                continue;
+                            }
                             if let NodeKind::PreimageSample { max_coefficient_bound, .. } =
                                 node.kind()
                             {
@@ -1153,6 +1254,20 @@ impl<'a> GraphLowerer<'a> {
                             let role = match node.kind() {
                                 NodeKind::PreimageSample { .. } => {
                                     Some(super::identity::AtomicRelationRole::Preimage)
+                                }
+                                NodeKind::HashSample {
+                                    variant: HashVariant::Decomposed, ..
+                                } => Some(super::identity::AtomicRelationRole::DecomposedHash),
+                                NodeKind::HashSample {
+                                    variant: HashVariant::SmallDecomposed,
+                                    ..
+                                } => {
+                                    Some(super::identity::AtomicRelationRole::SmallDecomposedHash {
+                                        // The Graph IR has no range proof on a hash sampler.
+                                        // A relation consumer therefore remains fail-closed until
+                                        // an explicit producer contract establishes this fact.
+                                        range_proved: false,
+                                    })
                                 }
                                 NodeKind::GadgetDecompose { small: false, .. } => {
                                     Some(super::identity::AtomicRelationRole::GadgetDecomposition)
@@ -1525,6 +1640,296 @@ impl<'a> GraphLowerer<'a> {
                                 .collect(),
                         }),
                     );
+                    self.finish_wire(&wire, value.clone());
+                    values.push(value);
+                }
+                LoweringFrame::FinishHashSample {
+                    wire,
+                    environment,
+                    matrix_type,
+                    variant,
+                    tag_prefix,
+                    tag_expressions,
+                    tag_decimal_expressions,
+                    tag_u64_le_expressions,
+                    base,
+                    digit_count,
+                    output_type,
+                    dependency_count,
+                } => {
+                    let arguments =
+                        values.split_off(values.len().checked_sub(dependency_count).ok_or(
+                            LowerError::InvalidOperandArity {
+                                expected: dependency_count,
+                                actual: values.len(),
+                            },
+                        )?);
+                    let arguments = arguments
+                        .into_iter()
+                        .map(|value| match value {
+                            LoweredValue::Term(term) => Ok(term),
+                            LoweredValue::Family(_) | LoweredValue::Trapdoor(_) => {
+                                Err(LowerError::InvalidOperandArity {
+                                    expected: dependency_count,
+                                    actual: dependency_count,
+                                })
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let Some(key) = arguments.first() else {
+                        return Err(LowerError::InvalidOperandArity { expected: 1, actual: 0 });
+                    };
+                    if !matches!(
+                        self.egraph[self.egraph.find(*key)].data.sort,
+                        Ok(MxxSort::Bytes(_))
+                    ) || arguments.iter().skip(1).any(|argument| {
+                        !matches!(
+                            self.egraph[self.egraph.find(*argument)].data.sort,
+                            Ok(MxxSort::Int)
+                        )
+                    }) {
+                        return Err(LowerError::InvalidOperandSort {
+                            expected: WireType::Int,
+                            actual: WireType::Int,
+                        });
+                    }
+                    let (WireType::Matrix(output_matrix) | WireType::Preimage(output_matrix)) =
+                        output_type
+                    else {
+                        return Err(LowerError::InvalidOperandSort {
+                            expected: WireType::Matrix(matrix_type),
+                            actual: output_type,
+                        });
+                    };
+                    if output_matrix != matrix_type {
+                        return Err(LowerError::InvalidOperandSort {
+                            expected: WireType::Matrix(matrix_type),
+                            actual: WireType::Matrix(output_matrix),
+                        });
+                    }
+                    let output_matrix = self.resolve_matrix_type(&output_matrix, &environment)?;
+                    let mut tag_program = Vec::new();
+                    if !tag_prefix.is_empty() {
+                        tag_program.push(super::identity::HashTagPart::Literal(
+                            tag_prefix.into_boxed_slice(),
+                        ));
+                    }
+                    for expression in &tag_expressions {
+                        tag_program.push(super::identity::HashTagPart::BinaryStatic(
+                            self.resolve_int(expression, &environment)?,
+                        ));
+                    }
+                    for expression in &tag_decimal_expressions {
+                        tag_program.push(super::identity::HashTagPart::DecimalStatic(
+                            self.resolve_int(expression, &environment)?,
+                        ));
+                    }
+                    for expression in &tag_u64_le_expressions {
+                        tag_program.push(super::identity::HashTagPart::U64LeStatic(
+                            self.resolve_int(expression, &environment)?,
+                        ));
+                    }
+                    for argument in 1..arguments.len() {
+                        let argument = u16::try_from(argument).map_err(|_| {
+                            LowerError::InvalidOperandArity {
+                                expected: u16::MAX as usize,
+                                actual: arguments.len(),
+                            }
+                        })?;
+                        tag_program.push(super::identity::HashTagPart::BinaryArgument { argument });
+                    }
+                    let (target, public, base, digit_count, small) = match variant {
+                        HashVariant::Plain => {
+                            if base.is_some() || digit_count.is_some() {
+                                return Err(LowerError::InvalidOperandArity {
+                                    expected: 0,
+                                    actual: 1,
+                                });
+                            }
+                            let query = self.egraph.analysis.symbols.hash_queries.intern(
+                                super::identity::HashQuerySpec {
+                                    matrix_type: output_matrix.clone(),
+                                    tag_program: tag_program.into_boxed_slice(),
+                                },
+                            );
+                            (
+                                self.egraph.add(MxxLang::HashPlain {
+                                    query: super::identity::HashQuerySpecId(query),
+                                    arguments: arguments.clone().into_boxed_slice(),
+                                }),
+                                None,
+                                None,
+                                None,
+                                false,
+                            )
+                        }
+                        HashVariant::Decomposed | HashVariant::SmallDecomposed => {
+                            let (Some(base), Some(digit_count)) = (base, digit_count) else {
+                                return Err(LowerError::InvalidOperandArity {
+                                    expected: 2,
+                                    actual: 0,
+                                });
+                            };
+                            let base = self.resolve_int(&base, &environment)?;
+                            let digit_count = self.resolve_int(&digit_count, &environment)?;
+                            let Some(base_value) = resolved_integer(&base) else {
+                                return Err(LowerError::NonExactIdentityIndex {
+                                    expression: IntExpr::constant(0),
+                                });
+                            };
+                            let Some(digit_count_value) = resolved_nonnegative(&digit_count) else {
+                                return Err(LowerError::NonExactIdentityIndex {
+                                    expression: IntExpr::constant(0),
+                                });
+                            };
+                            let Some(rows) = resolved_nonnegative(&output_matrix.rows) else {
+                                return Err(LowerError::NonExactIdentityIndex {
+                                    expression: matrix_type.rows.clone(),
+                                });
+                            };
+                            let Some(output_rows) = rows.to_usize() else {
+                                return Err(LowerError::NonExactIdentityIndex {
+                                    expression: matrix_type.rows.clone(),
+                                });
+                            };
+                            let Some(digit_count_usize) = digit_count_value.to_usize() else {
+                                return Err(LowerError::NonExactIdentityIndex {
+                                    expression: IntExpr::constant(0),
+                                });
+                            };
+                            if base_value <= BigInt::from(1) ||
+                                digit_count_usize == 0 ||
+                                output_rows == 0 ||
+                                output_rows % digit_count_usize != 0
+                            {
+                                return Err(LowerError::InvalidOperandArity {
+                                    expected: digit_count_usize,
+                                    actual: output_rows,
+                                });
+                            }
+                            let small = variant == HashVariant::SmallDecomposed;
+                            let Some(modulus) = resolved_integer(&output_matrix.modulus) else {
+                                return Err(LowerError::NonExactIdentityIndex {
+                                    expression: matrix_type.modulus.clone(),
+                                });
+                            };
+                            let Some(ring_dimension) =
+                                resolved_nonnegative(&output_matrix.ring_dimension)
+                                    .and_then(|value| value.to_usize())
+                            else {
+                                return Err(LowerError::NonExactIdentityIndex {
+                                    expression: matrix_type.ring_dimension.clone(),
+                                });
+                            };
+                            let layout_matches = self.request.layouts.iter().any(|layout| {
+                                let layout_modulus = layout
+                                    .crt_moduli
+                                    .iter()
+                                    .fold(BigInt::from(1), |product, modulus| {
+                                        product * BigInt::from(*modulus)
+                                    });
+                                layout.ring_dimension == ring_dimension &&
+                                    layout_modulus == modulus &&
+                                    layout.base == base_value &&
+                                    (if small {
+                                        layout.small_digit_count
+                                    } else {
+                                        layout.regular_digit_count
+                                    }) == digit_count_usize
+                            });
+                            if !layout_matches {
+                                return Err(LowerError::InvalidOperandArity {
+                                    expected: 1,
+                                    actual: 0,
+                                });
+                            }
+                            let plain_rows = output_rows / digit_count_usize;
+                            let mut plain_matrix = output_matrix.clone();
+                            plain_matrix.rows = ResolvedIntExpr::Const(BigInt::from(plain_rows));
+                            let mut gadget_matrix = plain_matrix.clone();
+                            gadget_matrix.columns =
+                                ResolvedIntExpr::Const(BigInt::from(output_rows));
+                            let query = self.egraph.analysis.symbols.hash_queries.intern(
+                                super::identity::HashQuerySpec {
+                                    matrix_type: plain_matrix,
+                                    tag_program: tag_program.into_boxed_slice(),
+                                },
+                            );
+                            let target = self.egraph.add(MxxLang::HashPlain {
+                                query: super::identity::HashQuerySpecId(query),
+                                arguments: arguments.clone().into_boxed_slice(),
+                            });
+                            let gadget = self.egraph.analysis.symbols.matrix_constants.intern(
+                                super::identity::MatrixConstantSpec {
+                                    matrix_type: gadget_matrix,
+                                    value: super::identity::MatrixConstantValue::Gadget {
+                                        base: base.clone(),
+                                        small,
+                                    },
+                                },
+                            );
+                            let public = self.egraph.add(MxxLang::MatrixConstant(
+                                super::identity::MatrixConstantSpecId(gadget),
+                            ));
+                            (target, Some(public), Some(base), Some(digit_count), small)
+                        }
+                    };
+                    let value = if let Some(public) = public {
+                        let sampler = self.egraph.analysis.symbols.samplers.intern(
+                            SamplerIdentity::DecomposedHash {
+                                source: super::identity::GraphWireSourceKey {
+                                    wire: wire.source.clone(),
+                                    coordinate_binders: environment
+                                        .active_coordinates
+                                        .iter()
+                                        .map(|coordinate| coordinate.binder.clone())
+                                        .collect(),
+                                },
+                                indices: environment
+                                    .active_coordinates
+                                    .iter()
+                                    .map(|coordinate| coordinate.index.term)
+                                    .collect(),
+                                public,
+                                target,
+                                arguments: arguments.into_boxed_slice(),
+                                matrix_type: output_matrix.clone(),
+                                base: base.expect("decomposed hash base"),
+                                digit_count: digit_count.expect("decomposed hash digits"),
+                                small,
+                                range_proved: false,
+                            },
+                        );
+                        let source = self.egraph.analysis.symbols.atomic_sources.intern(
+                            super::identity::AtomicSourceDescriptor {
+                                key: super::identity::AtomicSourceKey::Sampler(
+                                    SamplerDescriptorId(sampler),
+                                ),
+                                sort: MxxSort::Matrix(output_matrix),
+                                integer_domain: None,
+                                canonical_residue_convention: None,
+                                relation_role: Some(if small {
+                                    super::identity::AtomicRelationRole::SmallDecomposedHash {
+                                        range_proved: false,
+                                    }
+                                } else {
+                                    super::identity::AtomicRelationRole::DecomposedHash
+                                }),
+                            },
+                        );
+                        LoweredValue::Term(
+                            self.egraph.add(MxxLang::Atom {
+                                source: super::identity::AtomicSourceId(source),
+                                indices: environment
+                                    .active_coordinates
+                                    .iter()
+                                    .map(|coordinate| coordinate.index.term)
+                                    .collect(),
+                            }),
+                        )
+                    } else {
+                        LoweredValue::Term(target)
+                    };
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
                 }
@@ -2823,6 +3228,213 @@ mod tests {
     use super::*;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
+
+    fn hash_layout() -> super::super::OperationalGadgetLayout {
+        super::super::OperationalGadgetLayout {
+            params_id: "hash-layout".to_owned(),
+            ring_dimension: 1,
+            crt_moduli: vec![17],
+            crt_bits: 5,
+            base_bits: 2,
+            base: BigInt::from(4),
+            regular_digit_count: 3,
+            small_digit_count: 3,
+            smallest_crt_modulus: 17,
+        }
+    }
+
+    fn decomposed_hash_graph(
+        variant: HashVariant,
+        digit_count: i64,
+    ) -> (mxx_ir_core::graph::Graph, WireRef) {
+        use mxx_ir_core::graph::{GraphOutput, NodeHandle};
+
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(3),
+            columns: IntExpr::constant(2),
+        };
+        let key = NodeHandle::new(
+            NodeKind::Input {
+                name: "key".to_owned(),
+                wire_type: WireType::Bytes { length: IntExpr::constant(32) },
+                artifact: None,
+            },
+            Vec::new(),
+            vec![WireType::Bytes { length: IntExpr::constant(32) }],
+        )
+        .output(0)
+        .expect("hash key output");
+        let runtime_tag = NodeHandle::new(
+            NodeKind::ConstantInt(BigInt::from(23)),
+            Vec::new(),
+            vec![WireType::Int],
+        )
+        .output(0)
+        .expect("runtime tag output");
+        let hash = NodeHandle::new(
+            NodeKind::HashSample {
+                matrix_type: matrix.clone(),
+                variant,
+                tag_prefix: b"hash-fixture".to_vec(),
+                tag_expressions: vec![IntExpr::constant(7)],
+                tag_decimal_expressions: vec![IntExpr::constant(8)],
+                tag_u64_le_expressions: vec![IntExpr::constant(9)],
+                base: Some(IntExpr::constant(4)),
+                digit_count: Some(IntExpr::constant(digit_count)),
+            },
+            vec![key, runtime_tag],
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .expect("hash output");
+        let graph = mxx_ir_core::graph::Graph::freeze(
+            "decomposed-hash-fixture",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: hash.clone(), confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze hash graph")
+        .0;
+        let output = graph.outputs()["output"].value;
+        (graph, output)
+    }
+
+    fn hash_protocol(graph: mxx_ir_core::graph::Graph) -> crate::ProtocolDecl {
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = graph;
+        let key = crate::ProtocolInputId("hash-key".to_owned());
+        protocol.bundle.input_contract.inputs.push(crate::InputContractEntry {
+            id: key.clone(),
+            name: "key".to_owned(),
+            value: crate::InputValueContract::Bytes { length: IntExpr::constant(32) },
+        });
+        protocol.bundle.input_bindings.push(crate::ProtocolInputBinding {
+            input: key,
+            destinations: vec![ProtocolInputDestination::WorkflowStage {
+                stage: StageId("encrypt".to_owned()),
+                input: StageInputName("key".to_owned()),
+            }],
+        });
+        protocol
+    }
+
+    #[test]
+    fn decomposed_hash_lowers_exact_query_gadget_and_relation() {
+        let (graph, output) = decomposed_hash_graph(HashVariant::Decomposed, 3);
+        let protocol = hash_protocol(graph);
+        let request = OperationalCheckRequest {
+            environment: vec![(
+                "cutoff".to_owned(),
+                super::super::OperationalParameterValue::Integer(BigInt::from(1)),
+            )],
+            layouts: vec![hash_layout()],
+            target_id: "hash".to_owned(),
+        };
+        let stage = StageId("encrypt".to_owned());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let lowered = lowerer.lower_stage_wire(&stage, output).expect("lower decomposed hash");
+        assert!(matches!(lowered, LoweredValue::Term(_)));
+        let samplers = &lowerer.egraph.analysis.symbols.samplers.values;
+        let [
+            SamplerIdentity::DecomposedHash {
+                public,
+                target,
+                arguments,
+                matrix_type,
+                base,
+                digit_count,
+                small,
+                ..
+            },
+        ] = samplers.as_slice()
+        else {
+            panic!("one decomposed hash sampler")
+        };
+        assert_eq!(arguments.len(), 2, "key then runtime tag arguments are retained");
+        assert_eq!(matrix_type.rows, ResolvedIntExpr::Const(BigInt::from(3)));
+        assert_eq!(*base, ResolvedIntExpr::Const(BigInt::from(4)));
+        assert_eq!(*digit_count, ResolvedIntExpr::Const(BigInt::from(3)));
+        assert!(!small);
+        let target = lowerer.egraph.find(*target);
+        let MxxLang::HashPlain { query, arguments: hash_arguments } =
+            lowerer.egraph[target].nodes.first().expect("hash target")
+        else {
+            panic!("decomposed target is HashPlain")
+        };
+        assert_eq!(hash_arguments.len(), 2);
+        let query = lowerer.egraph.analysis.symbols.hash_queries.get(query.0).expect("query spec");
+        assert_eq!(query.matrix_type.rows, ResolvedIntExpr::Const(BigInt::from(1)));
+        assert!(matches!(query.tag_program.as_ref(), [
+            super::super::identity::HashTagPart::Literal(prefix),
+            super::super::identity::HashTagPart::BinaryStatic(_),
+            super::super::identity::HashTagPart::DecimalStatic(_),
+            super::super::identity::HashTagPart::U64LeStatic(_),
+            super::super::identity::HashTagPart::BinaryArgument { argument: 1 },
+        ] if prefix.as_ref() == b"hash-fixture"));
+        let public = lowerer.egraph.find(*public);
+        let MxxLang::MatrixConstant(spec) = lowerer.egraph[public].nodes.first().expect("gadget")
+        else {
+            panic!("public is gadget matrix constant")
+        };
+        let gadget =
+            lowerer.egraph.analysis.symbols.matrix_constants.get(spec.0).expect("gadget spec");
+        assert_eq!(gadget.matrix_type.rows, ResolvedIntExpr::Const(BigInt::from(1)));
+        assert_eq!(gadget.matrix_type.columns, ResolvedIntExpr::Const(BigInt::from(3)));
+        assert!(matches!(
+            gadget.value,
+            super::super::identity::MatrixConstantValue::Gadget { small: false, .. }
+        ));
+        assert_eq!(lowerer.relation_registrations().len(), 1);
+    }
+
+    #[test]
+    fn decomposed_hash_rejects_nondivisible_output_rows() {
+        let (graph, output) = decomposed_hash_graph(HashVariant::Decomposed, 2);
+        let protocol = hash_protocol(graph);
+        let request = OperationalCheckRequest {
+            environment: vec![(
+                "cutoff".to_owned(),
+                super::super::OperationalParameterValue::Integer(BigInt::from(1)),
+            )],
+            layouts: vec![hash_layout()],
+            target_id: "hash".to_owned(),
+        };
+        let stage = StageId("encrypt".to_owned());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        assert!(matches!(
+            lowerer.lower_stage_wire(&stage, output),
+            Err(LowerError::InvalidOperandArity { .. })
+        ));
+    }
+
+    #[test]
+    fn small_decomposed_hash_interns_a_small_sampler_descriptor() {
+        let (graph, output) = decomposed_hash_graph(HashVariant::SmallDecomposed, 3);
+        let protocol = hash_protocol(graph);
+        let request = OperationalCheckRequest {
+            environment: vec![(
+                "cutoff".to_owned(),
+                super::super::OperationalParameterValue::Integer(BigInt::from(1)),
+            )],
+            layouts: vec![hash_layout()],
+            target_id: "hash".to_owned(),
+        };
+        let stage = StageId("encrypt".to_owned());
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        lowerer.lower_stage_wire(&stage, output).expect("lower small decomposed hash");
+        assert!(matches!(
+            lowerer.egraph.analysis.symbols.samplers.values.as_slice(),
+            [SamplerIdentity::DecomposedHash { small: true, range_proved: false, .. }]
+        ));
+        assert_eq!(lowerer.relation_registrations().len(), 1);
+    }
 
     fn deep_parallel_graph(depth: usize, logical_count: i64) -> mxx_ir_core::graph::Graph {
         use mxx_ir_core::{

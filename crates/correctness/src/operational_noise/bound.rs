@@ -114,6 +114,7 @@ pub enum BoundEvaluationError {
     InvalidPack { term: Id },
     IntegerLimitExceeded { operation: &'static str, value: BigUint },
     IntegerBitLimitExceeded { operation: &'static str, bits: BigUint },
+    RecurrenceStepLimitExceeded { limit: BigUint, count: BigUint },
     UnconsumedLargeTerm { term: Id },
 }
 
@@ -179,6 +180,11 @@ pub trait BoundEvaluationControl {
         operation: &'static str,
     ) -> Result<(), BoundEvaluationError>;
     fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError>;
+    /// The job-wide recurrence ceiling.  Test inputs may omit it; production
+    /// adapters must return the `CheckerLimits` value for the active job.
+    fn recurrence_step_limit(&self) -> Option<BigUint> {
+        None
+    }
 }
 
 /// Evaluates one extracted matrix root without recursion.

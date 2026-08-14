@@ -83,6 +83,12 @@ pub enum SelectorOnlyConsumer {
     NoiseBoundArithmetic,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelationRewriteBlockReason {
+    DifferentSelector,
+    TransformedOperand,
+}
+
 /// Describes a matrix operand pair at the point a numeric product transfer fails.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MatrixProductOperands {
@@ -301,6 +307,18 @@ operational_error_registry! {
     }
 
     Relation => RelationError {
+        UnknownRelationSource { source: super::identity::AtomicSourceId },
+        MissingRelationRegistration { source: AtomicSourceKey },
+        InvalidRelationSource { source: AtomicSourceKey },
+        MismatchedRelationIndices { source: AtomicSourceKey },
+        RelationTypeMismatch { source: AtomicSourceKey },
+        RelationLayoutMismatch { source: AtomicSourceKey },
+        RelationPublicMismatch { source: AtomicSourceKey },
+        RelationTrapdoorMismatch { source: AtomicSourceKey },
+        RelationTargetMismatch { source: AtomicSourceKey },
+        BlockedRelationRewrite { reason: RelationRewriteBlockReason },
+        InvalidAdditiveRelationSort { expression: usize },
+        RewriteDidNotSaturate { reason: String },
         InvalidRelationProducer { producer: WireSourceKey },
         MismatchedRelationIndex { expected: AtomicSourceKey, actual: AtomicSourceKey },
         MismatchedRelationType { expected: WireType, actual: WireType },
@@ -329,6 +347,7 @@ operational_error_registry! {
         LargeSequentialState { source: AtomicSourceKey },
         UnsupportedRecurrenceExpression { expression: IntExpr },
         SequentialMetadataNotInvariant { expected: WireType, actual: WireType },
+        SharedFamilyMaximumNotProved { count: BigUint },
     }
 
     Resource => ResourceLimitKind {

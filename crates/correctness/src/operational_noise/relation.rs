@@ -10,7 +10,10 @@ use super::{
         MxxAnalysis, MxxSort, RelationProvenance, RelationProvenanceVisit, RelationSource,
         visit_relation_provenance,
     },
-    identity::{AtomicRelationRole, AtomicSourceId, MatrixConstantValue, TrapdoorDescriptorId},
+    identity::{
+        AtomicRelationRole, AtomicSourceId, AtomicSourceKey, MatrixConstantValue, SamplerIdentity,
+        TrapdoorDescriptorId,
+    },
     language::MxxLang,
 };
 use egg::{Applier, EGraph, Id, SearchMatches, Searcher, Subst, Symbol, Var};
@@ -359,9 +362,9 @@ fn checked_replacement(
             // ending in this registration's exact public operand.  Validate that
             // summand before accepting the relation; the enclosing addition is
             // not itself the sampler public key.
-            let preflight_public =
-                distribution_public_operand(egraph, actual_public, registration.expected_public)
-                    .unwrap_or(actual_public);
+            let distributed_public =
+                distribution_public_operand(egraph, actual_public, registration.expected_public);
+            let preflight_public = distributed_public.unwrap_or(actual_public);
             if let Err(failure) =
                 preflight_registration(egraph, relation, &source, &registration, preflight_public)
             {
@@ -372,7 +375,9 @@ fn checked_replacement(
                 context.fail(RelationFailure::MismatchedIndex { source: source.source });
                 continue;
             }
-            if egraph.find(registration.expected_public) != actual_public {
+            if distributed_public.is_none() &&
+                egraph.find(registration.expected_public) != actual_public
+            {
                 context.fail(RelationFailure::MismatchedPublic { source: source.source });
                 continue;
             }
@@ -447,9 +452,13 @@ pub fn classify_proposal_node(
     context: &RewriteContext,
 ) -> Result<(bool, bool), RelationFailure> {
     let large_atom = matches!(node, MxxLang::Atom { source, .. }
-    if egraph.analysis.symbols.atomic_sources.get(source.0).is_some_and(|descriptor| !matches!(
-        descriptor.key, super::identity::AtomicSourceKey::Sampler(_)
-    )));
+    if !matches!(
+        egraph.analysis.symbols.atomic_sources.get(source.0).map(|descriptor| &descriptor.key),
+        Some(
+            super::identity::AtomicSourceKey::Sampler(_) |
+            super::identity::AtomicSourceKey::SequentialRecurrence { .. }
+        )
+    ));
     let MxxLang::MatrixMultiply(factors) = node else { return Ok((false, large_atom)) };
     for relation_position in 1..factors.len() {
         let relation = egraph.find(factors[relation_position]);
@@ -461,9 +470,9 @@ pub fn classify_proposal_node(
         for source in sources {
             for registration in context.registrations(source.source) {
                 let public = egraph.find(factors[relation_position - 1]);
-                let preflight_public =
-                    distribution_public_operand(egraph, public, registration.expected_public)
-                        .unwrap_or(public);
+                let distributed_public =
+                    distribution_public_operand(egraph, public, registration.expected_public);
+                let preflight_public = distributed_public.unwrap_or(public);
                 if preflight_registration(
                     egraph,
                     relation,
@@ -472,7 +481,9 @@ pub fn classify_proposal_node(
                     preflight_public,
                 )
                 .is_ok() &&
-                    same_canonical_indices(egraph, &source.indices, &registration.indices)
+                    same_canonical_indices(egraph, &source.indices, &registration.indices) &&
+                    (distributed_public.is_some() ||
+                        egraph.find(registration.expected_public) == public)
                 {
                     return Ok((true, large_atom));
                 }
@@ -555,9 +566,63 @@ fn preflight_registration(
             AtomicRelationRole::DecomposedHash |
                 AtomicRelationRole::SmallDecomposedHash { range_proved: true }
         )
-    ) && !egraph[target].nodes.iter().any(|node| matches!(node, MxxLang::HashPlain { .. }))
-    {
-        return Err(RelationFailure::MismatchedTarget { source: source.source });
+    ) {
+        let AtomicSourceKey::Sampler(sampler_id) = source_descriptor.key else {
+            return Err(RelationFailure::InvalidRelationProducer { source: source.source });
+        };
+        let Some(SamplerIdentity::DecomposedHash {
+            public,
+            target: sampler_target,
+            arguments,
+            matrix_type,
+            base,
+            digit_count,
+            small,
+            ..
+        }) = egraph.analysis.symbols.samplers.get(sampler_id.0)
+        else {
+            return Err(RelationFailure::InvalidRelationProducer { source: source.source });
+        };
+        if egraph.find(*public) != expected_public ||
+            egraph.find(*sampler_target) != target ||
+            matrix_type != source_matrix
+        {
+            return Err(RelationFailure::MismatchedTarget { source: source.source });
+        }
+        let public_is_exact_gadget = egraph[expected_public].nodes.iter().any(|node| {
+            let MxxLang::MatrixConstant(spec_id) = node else { return false };
+            egraph.analysis.symbols.matrix_constants.get(spec_id.0).is_some_and(|spec| {
+                spec.matrix_type == *public_matrix &&
+                    matches!(
+                        &spec.value,
+                        MatrixConstantValue::Gadget { base: spec_base, small: spec_small }
+                        if spec_base == base && spec_small == small
+                    )
+            })
+        });
+        if !public_is_exact_gadget {
+            return Err(RelationFailure::MismatchedPublic { source: source.source });
+        }
+        let target_is_exact_hash = egraph[target].nodes.iter().any(|node| {
+            let MxxLang::HashPlain { query, arguments: hash_arguments } = node else {
+                return false;
+            };
+            egraph.analysis.symbols.hash_queries.get(query.0).is_some_and(|query| {
+                query.matrix_type == *target_matrix &&
+                    same_canonical_indices(egraph, hash_arguments, arguments)
+            })
+        });
+        let layout_is_exact = matches!(
+            (&source_matrix.rows, &public_matrix.rows, digit_count),
+            (
+                super::identity::ResolvedIntExpr::Const(source_rows),
+                super::identity::ResolvedIntExpr::Const(public_rows),
+                super::identity::ResolvedIntExpr::Const(digits),
+            ) if digits > &BigInt::zero() && source_rows == &(public_rows * digits)
+        );
+        if !target_is_exact_hash || !layout_is_exact {
+            return Err(RelationFailure::MismatchedTarget { source: source.source });
+        }
     }
     if !registration.trapdoor.is_none_or(|trapdoor_id| {
         egraph.analysis.symbols.trapdoors.get(trapdoor_id.0).is_some_and(|trapdoor| {

@@ -7,7 +7,7 @@
 
 use super::{
     OperationalAcceptanceReport, OperationalSimulationDiagnostics, OperationalSimulationReport,
-    analysis::MxxAnalysis,
+    analysis::{MxxAnalysis, ResourceBudget},
     bound::{BoundEvaluationControl, BoundEvaluationError, BoundEvaluator},
     error::{
         CheckerPhase, OperationalSimulationError, ResourceLimitKind, ResourceObserved, TargetError,
@@ -17,7 +17,7 @@ use super::{
     relation::{RelationApplier, RelationSearcher, RewriteContext, SharedRewriteBudget},
 };
 use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
-use egg::{EGraph, Rewrite, Runner};
+use egg::{EGraph, Rewrite, Runner, StopReason};
 use mxx_ir_core::{
     FrozenGraphScopeId, IntExpr, ParamEnv, WireRef, WireType,
     node::{IntCompareOp, NodeKind},
@@ -186,6 +186,10 @@ impl BoundEvaluationControl for BoundControlAdapter<'_, '_> {
     fn validate_pack(&self, term: egg::Id, _bit_count: usize) -> Result<(), BoundEvaluationError> {
         self.check_deadline().map_err(|_| BoundEvaluationError::InvalidPack { term })
     }
+
+    fn recurrence_step_limit(&self) -> Option<BigUint> {
+        Some(self.control.borrow().limits.recurrence_step_limit.clone())
+    }
 }
 
 impl ProgressState {
@@ -248,6 +252,20 @@ impl<'a> SimulationControl<'a> {
             owned_elements: Arc::clone(&self.owned_elements),
             total_owned_element_limit: self.limits.total_owned_element_limit,
         })
+    }
+
+    fn analysis_budget(&self) -> ResourceBudget {
+        ResourceBudget::from_shared(
+            self.limits.total_owned_element_limit,
+            Arc::clone(&self.owned_elements),
+            self.started,
+            self.deadline,
+            self.limits.total_time_limit,
+        )
+    }
+
+    fn check_switch_cases(&mut self, observed: usize) -> Result<(), OperationalSimulationError> {
+        self.check_counter(ResourceLimitKind::SwitchCases, self.limits.switch_case_limit, observed)
     }
 
     pub(crate) fn check_deadline(&mut self) -> Result<(), OperationalSimulationError> {
@@ -459,10 +477,16 @@ pub fn check_operational_noise_candidate(
         &mut emit,
         |control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
+            let analysis = MxxAnalysis::with_resource_budget(
+                Default::default(),
+                limits.relation_sources_per_eclass,
+                limits.switch_case_limit,
+                control.analysis_budget(),
+            );
             let mut lowerer = GraphLowerer::new_with_control(
                 protocol,
                 request,
-                MxxAnalysis::default(),
+                analysis,
                 control.lowering_control(),
             );
             let value = lowerer.lower_stage_wire(&stage, wire).map_err(|source| {
@@ -474,8 +498,11 @@ pub fn check_operational_noise_candidate(
                 Some(lowerer.egraph.total_size() as u64),
             )?;
             control.diagnostics_mut().lowered_term_count = lowerer.lowered_wire_count() as u64;
-            let root = match value {
-                LoweredValue::Term(root) => root,
+            let roots = match value {
+                LoweredValue::Term(root) => {
+                    control.reserve_owned_elements(1)?;
+                    vec![root].into_boxed_slice()
+                }
                 LoweredValue::Family(family) => {
                     family.validate().map_err(|_| OperationalSimulationError::Lower {
                         site: site(&stage, wire, "validate residual family"),
@@ -485,18 +512,17 @@ pub fn check_operational_noise_candidate(
                     })?;
                     match family.storage {
                         super::family::FamilyCoverageStorage::ExactStored { elements } => {
-                            let selector = lowerer
-                                .egraph
-                                .add(super::language::MxxLang::IntConst(BigInt::zero()));
-                            let mut children = Vec::with_capacity(elements.len() + 1);
-                            children.push(selector);
-                            children.extend(elements.iter().copied());
-                            lowerer.egraph.add(super::language::MxxLang::Switch(children.into()))
+                            control.check_switch_cases(elements.len())?;
+                            elements
                         }
-                        super::family::FamilyCoverageStorage::SharedTemplate {
-                            representative,
-                            ..
-                        } => representative,
+                        super::family::FamilyCoverageStorage::SharedTemplate { domain, .. } => {
+                            return Err(OperationalSimulationError::Bound {
+                                site: site(&stage, wire, "prove shared family maximum"),
+                                source: super::error::BoundError::SharedFamilyMaximumNotProved {
+                                    count: domain.logical_count,
+                                },
+                            });
+                        }
                     }
                 }
                 LoweredValue::Trapdoor(_) => {
@@ -508,9 +534,15 @@ pub fn check_operational_noise_candidate(
                     });
                 }
             };
-            Ok((lowerer, root, stage.clone(), wire))
+            if let (Some(kind), Some(observed)) = (
+                lowerer.egraph.analysis.resource_failure_kind.clone(),
+                lowerer.egraph.analysis.resource_failure.clone(),
+            ) {
+                return Err(control.resource_error(kind, observed));
+            }
+            Ok((lowerer, roots, stage.clone(), wire))
         },
-        |(mut lowerer, root, stage, wire), control| {
+        |(mut lowerer, roots, stage, wire), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
             let registrations = lowerer.relation_registrations();
             let budget = control.rewrite_budget();
@@ -530,13 +562,39 @@ pub fn check_operational_noise_candidate(
                 .with_node_limit(limits.node_limit)
                 .with_time_limit(limits.total_time_limit)
                 .run(&[rewrite]);
-            if runner.iterations.len() >= limits.iteration_limit {
-                // Egg reports a bounded fixed point only by reaching the
-                // configured iteration cap.  A proposal from that state is
-                // not saturated and must never be accepted.
-                control.check_rewrite_iterations(limits.iteration_limit + 1)?;
+            match runner.stop_reason.as_ref() {
+                Some(StopReason::Saturated) => {}
+                Some(StopReason::IterationLimit(limit)) => {
+                    control.check_rewrite_iterations(limit.saturating_add(1))?;
+                }
+                Some(StopReason::NodeLimit(limit)) => {
+                    control.check_egraph_nodes(limit.saturating_add(1))?
+                }
+                Some(StopReason::TimeLimit(_)) => control.check_deadline()?,
+                Some(StopReason::Other(reason)) => {
+                    return Err(OperationalSimulationError::Relation {
+                        site: site(&stage, wire, "relation rewrite"),
+                        source: super::error::RelationError::RewriteDidNotSaturate {
+                            reason: reason.clone(),
+                        },
+                    });
+                }
+                None => {
+                    return Err(OperationalSimulationError::Relation {
+                        site: site(&stage, wire, "relation rewrite"),
+                        source: super::error::RelationError::RewriteDidNotSaturate {
+                            reason: "missing stop reason".to_owned(),
+                        },
+                    });
+                }
             }
             lowerer.egraph = runner.egraph;
+            if let (Some(kind), Some(observed)) = (
+                lowerer.egraph.analysis.resource_failure_kind.clone(),
+                lowerer.egraph.analysis.resource_failure.clone(),
+            ) {
+                return Err(control.resource_error(kind, observed));
+            }
             control.check_rewrite_iterations(runner.iterations.len())?;
             control.check_egraph_nodes(lowerer.egraph.total_size())?;
             control.work(
@@ -552,11 +610,32 @@ pub fn check_operational_noise_candidate(
             control.diagnostics_mut().relation_candidate_count = counters.candidates;
             control.diagnostics_mut().relation_rewrite_count = counters.rewrites;
             if let Some(failure) = context.failure() {
-                return Err(relation_error(&stage, wire, failure));
+                return Err(match failure {
+                    super::relation::RelationFailure::DeadlineExceeded => control.resource_error(
+                        ResourceLimitKind::TotalTime,
+                        ResourceObserved::Duration {
+                            limit: limits.total_time_limit,
+                            observed: control.started.elapsed(),
+                        },
+                    ),
+                    super::relation::RelationFailure::OwnedElementLimitExceeded => {
+                        let observed = control.owned_elements.load(Ordering::Relaxed);
+                        control.resource_error(
+                            ResourceLimitKind::TotalOwnedElements,
+                            ResourceObserved::Counter {
+                                limit: limits.total_owned_element_limit as u64,
+                                observed: observed.saturating_add(1) as u64,
+                            },
+                        )
+                    }
+                    failure => {
+                        relation_error(&stage, wire, &lowerer.egraph.analysis.symbols, failure)
+                    }
+                });
             }
-            Ok((lowerer, root, stage, wire, context))
+            Ok((lowerer, roots, stage, wire, context))
         },
-        |(mut lowerer, root, stage, wire, context), control| {
+        |(mut lowerer, roots, stage, wire, context), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
             let control = RefCell::new(control);
             let mut check_node_count = |count| control.borrow_mut().check_egraph_nodes(count);
@@ -566,75 +645,64 @@ pub fn check_operational_noise_candidate(
                 site: site(&stage, wire, "extract"),
                 source: super::error::LowerError::CyclicGraphDependency { wire },
             };
-            let proposal = extract_best_proposal(
-                &lowerer.egraph,
-                root,
-                &mut ExtractionControl {
-                    check_node_count: &mut check_node_count,
-                    reserve_owned_elements: &mut reserve,
-                    check_deadline: &mut deadline,
-                    invalid_dag: &mut invalid_dag,
-                },
-                &mut |_, node, egraph| {
-                    let (relation_redex, large_atom) =
-                        super::relation::classify_proposal_node(egraph, node, &context)
-                            .map_err(|failure| relation_error(&stage, wire, failure))?;
-                    Ok(ProposalNodeClassification { relation_redex, large_atom })
-                },
-            )?;
-            if proposal.cost.remaining_relation_redexes != 0 ||
-                proposal.cost.hidden_relation_redexes != 0 ||
-                proposal.cost.large_atom_count != 0
-            {
-                return Err(OperationalSimulationError::Bound {
-                    site: site(&stage, wire, "extract residual"),
-                    source: super::error::BoundError::UnconsumedLargeTerm {
-                        source: super::identity::AtomicSourceKey::GraphWire(
-                            super::identity::GraphWireSourceKey {
-                                wire: super::identity::WireSourceKey {
-                                    scope: super::identity::OccurrenceScope {
-                                        program: super::identity::ProgramKey::WorkflowStage(
-                                            stage.clone(),
-                                        ),
-                                        definition: FrozenGraphScopeId::Root,
-                                        path: Box::new([]),
-                                    },
-                                    wire,
-                                },
-                                coordinate_binders: Box::new([]),
-                            },
-                        ),
+            control.borrow_mut().reserve_owned_elements(roots.len())?;
+            let mut proposals = Vec::with_capacity(roots.len());
+            for root in roots {
+                let proposal = extract_best_proposal(
+                    &lowerer.egraph,
+                    root,
+                    &mut ExtractionControl {
+                        check_node_count: &mut check_node_count,
+                        reserve_owned_elements: &mut reserve,
+                        check_deadline: &mut deadline,
+                        invalid_dag: &mut invalid_dag,
                     },
-                });
+                    &mut |_, node, egraph| {
+                        let (relation_redex, large_atom) =
+                            super::relation::classify_proposal_node(egraph, node, &context)
+                                .map_err(|failure| {
+                                    relation_error(&stage, wire, &egraph.analysis.symbols, failure)
+                                })?;
+                        Ok(ProposalNodeClassification { relation_redex, large_atom })
+                    },
+                )?;
+                if proposal.cost.remaining_relation_redexes != 0 ||
+                    proposal.cost.hidden_relation_redexes != 0 ||
+                    proposal.cost.large_atom_count != 0
+                {
+                    return Err(OperationalSimulationError::Bound {
+                        site: site(&stage, wire, "extract residual"),
+                        source: super::error::BoundError::BoundExpressionNotEvaluable {
+                            expression: IntExpr::constant(0),
+                        },
+                    });
+                }
+                proposals.push(proposal);
             }
+            let term_count =
+                proposals.iter().map(|proposal| proposal.expression.as_ref().len()).sum::<usize>();
             control.borrow_mut().work(
-                proposal.expression.as_ref().len() as u64,
+                term_count as u64,
                 None,
                 Some(lowerer.egraph.total_size() as u64),
             )?;
-            control.borrow_mut().diagnostics_mut().final_term_count =
-                proposal.expression.as_ref().len() as u64;
+            control.borrow_mut().diagnostics_mut().final_term_count = term_count as u64;
             let mut extracted_egraph = EGraph::new(lowerer.egraph.analysis.clone());
-            let extracted_root = extracted_egraph.add_expr(&proposal.expression);
+            control.borrow_mut().reserve_owned_elements(proposals.len())?;
+            let extracted_roots = proposals
+                .iter()
+                .map(|proposal| extracted_egraph.add_expr(&proposal.expression))
+                .collect::<Vec<_>>();
             lowerer.egraph = extracted_egraph;
-            Ok((lowerer, extracted_root, stage, wire))
+            Ok((lowerer, extracted_roots, stage, wire))
         },
-        |(lowerer, root, stage, wire), control| {
+        |(lowerer, roots, stage, wire), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
             let bound_control = BoundControlAdapter { control: RefCell::new(control) };
             let view = lowerer.production_bound_view_with_control(&bound_control);
-            let result = BoundEvaluator::new(&view).evaluate(root).map_err(|_| {
-                OperationalSimulationError::Bound {
-                    site: site(&stage, wire, "bound"),
-                    source: super::error::BoundError::BoundExpressionNotEvaluable {
-                        expression: IntExpr::constant(0),
-                    },
-                }
-            })?;
-            drop(view);
-            drop(bound_control);
-            let bound =
-                result.coefficient_class.maximum_absolute_coefficient().ok_or_else(|| {
+            let mut bound = BigUint::zero();
+            for root in roots {
+                let result = BoundEvaluator::new(&view).evaluate(root).map_err(|_| {
                     OperationalSimulationError::Bound {
                         site: site(&stage, wire, "bound"),
                         source: super::error::BoundError::BoundExpressionNotEvaluable {
@@ -642,6 +710,19 @@ pub fn check_operational_noise_candidate(
                         },
                     }
                 })?;
+                let maximum =
+                    result.coefficient_class.maximum_absolute_coefficient().ok_or_else(|| {
+                        OperationalSimulationError::Bound {
+                            site: site(&stage, wire, "bound"),
+                            source: super::error::BoundError::BoundExpressionNotEvaluable {
+                                expression: IntExpr::constant(0),
+                            },
+                        }
+                    })?;
+                bound = bound.max(maximum);
+            }
+            drop(view);
+            drop(bound_control);
             control.work(1, None, None)?;
             Ok(bound)
         },
@@ -1057,82 +1138,72 @@ fn site(stage: &StageId, wire: WireRef, operation: &str) -> super::error::ErrorS
 fn relation_error(
     stage: &StageId,
     wire: WireRef,
+    symbols: &super::identity::SymbolTables,
     failure: super::relation::RelationFailure,
 ) -> OperationalSimulationError {
-    let key = super::identity::AtomicSourceKey::GraphWire(super::identity::GraphWireSourceKey {
-        wire: super::identity::WireSourceKey {
-            scope: super::identity::OccurrenceScope {
-                program: super::identity::ProgramKey::WorkflowStage(stage.clone()),
-                definition: FrozenGraphScopeId::Root,
-                path: Box::new([]),
-            },
-            wire,
-        },
-        coordinate_binders: Box::new([]),
-    });
+    let key = |source: super::identity::AtomicSourceId| {
+        symbols.atomic_sources.get(source.0).map(|descriptor| descriptor.key.clone())
+    };
     let source = match failure {
-        super::relation::RelationFailure::MissingRegistration { .. } |
-        super::relation::RelationFailure::InvalidRelationProducer { .. } => {
-            super::error::RelationError::InvalidRelationProducer {
-                producer: match key.clone() {
-                    super::identity::AtomicSourceKey::GraphWire(producer) => producer.wire,
-                    _ => unreachable!(),
-                },
+        super::relation::RelationFailure::MissingRegistration { source } => key(source)
+            .map(|source| super::error::RelationError::MissingRelationRegistration { source })
+            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
+        super::relation::RelationFailure::InvalidRelationProducer { source } => key(source)
+            .map(|source| super::error::RelationError::InvalidRelationSource { source })
+            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
+        super::relation::RelationFailure::MismatchedIndex { source } => key(source)
+            .map(|source| super::error::RelationError::MismatchedRelationIndices { source })
+            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
+        super::relation::RelationFailure::MismatchedType { source } => key(source)
+            .map(|source| super::error::RelationError::RelationTypeMismatch { source })
+            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
+        super::relation::RelationFailure::MismatchedLayout { source } => key(source)
+            .map(|source| super::error::RelationError::RelationLayoutMismatch { source })
+            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
+        super::relation::RelationFailure::MismatchedPublic { source } => key(source)
+            .map(|source| super::error::RelationError::RelationPublicMismatch { source })
+            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
+        super::relation::RelationFailure::MismatchedTrapdoor { source } => key(source)
+            .map(|source| super::error::RelationError::RelationTrapdoorMismatch { source })
+            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
+        super::relation::RelationFailure::MismatchedTarget { source } => key(source)
+            .map(|source| super::error::RelationError::RelationTargetMismatch { source })
+            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
+        super::relation::RelationFailure::UnavailableRelation { source } => key(source)
+            .map(|source| super::error::RelationError::SmallDecompositionRangeNotProved { source })
+            .unwrap_or(super::error::RelationError::UnknownRelationSource { source }),
+        super::relation::RelationFailure::AmbiguousReplacement { sources } => {
+            let mut candidates = Vec::with_capacity(sources.len());
+            for source in sources {
+                let Some(source) = key(source) else {
+                    return OperationalSimulationError::Relation {
+                        site: site(stage, wire, "relation rewrite"),
+                        source: super::error::RelationError::UnknownRelationSource { source },
+                    };
+                };
+                candidates.push(source);
             }
-        }
-        super::relation::RelationFailure::MismatchedIndex { .. } => {
-            super::error::RelationError::MismatchedRelationIndex {
-                expected: key.clone(),
-                actual: key.clone(),
-            }
-        }
-        super::relation::RelationFailure::MismatchedType { .. } => {
-            super::error::RelationError::TransformedRelationOperand {
-                operand: match key.clone() {
-                    super::identity::AtomicSourceKey::GraphWire(value) => value.wire,
-                    _ => unreachable!(),
-                },
-            }
-        }
-        super::relation::RelationFailure::MismatchedLayout { .. } => {
-            super::error::RelationError::MismatchedRelationLayout {
-                expected: IntExpr::constant(0),
-                actual: IntExpr::constant(0),
-            }
-        }
-        super::relation::RelationFailure::MismatchedPublic { .. } => {
-            super::error::RelationError::MismatchedPreimagePublicIdentity {
-                expected: key.clone(),
-                actual: key.clone(),
-            }
-        }
-        super::relation::RelationFailure::MismatchedTrapdoor { .. } => {
-            super::error::RelationError::MismatchedTrapdoorIdentity {
-                expected: key.clone(),
-                actual: key.clone(),
-            }
-        }
-        super::relation::RelationFailure::MismatchedTarget { .. } => {
-            super::error::RelationError::MismatchedRelationTargetIdentity {
-                expected: key.clone(),
-                actual: key.clone(),
-            }
+            super::error::RelationError::AmbiguousRelationSource { candidates: candidates.into() }
         }
         super::relation::RelationFailure::DifferentSelectorBlocked => {
-            super::error::RelationError::DifferentSelectorRelationBlocked {
-                left: key.clone(),
-                right: key.clone(),
+            super::error::RelationError::BlockedRelationRewrite {
+                reason: super::error::RelationRewriteBlockReason::DifferentSelector,
             }
         }
-        super::relation::RelationFailure::UnavailableRelation { .. } => {
-            super::error::RelationError::SmallDecompositionRangeNotProved { source: key.clone() }
+        super::relation::RelationFailure::TransformedOperand => {
+            super::error::RelationError::BlockedRelationRewrite {
+                reason: super::error::RelationRewriteBlockReason::TransformedOperand,
+            }
         }
-        _ => super::error::RelationError::TransformedRelationOperand {
-            operand: match key {
-                super::identity::AtomicSourceKey::GraphWire(value) => value.wire,
-                _ => unreachable!(),
-            },
-        },
+        super::relation::RelationFailure::InvalidAdditiveSort { expression } => {
+            super::error::RelationError::InvalidAdditiveRelationSort {
+                expression: usize::from(expression),
+            }
+        }
+        super::relation::RelationFailure::DeadlineExceeded |
+        super::relation::RelationFailure::OwnedElementLimitExceeded => unreachable!(
+            "relation resource failures are mapped through the shared simulation control"
+        ),
     };
     OperationalSimulationError::Relation { site: site(stage, wire, "relation rewrite"), source }
 }
@@ -1419,6 +1490,147 @@ mod tests {
                 observed: ResourceObserved::Counter { limit: 2, observed: 3 },
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn analysis_uses_the_same_cumulative_counter_as_the_driver() {
+        let mut limits = CheckerLimits::production();
+        limits.total_owned_element_limit = 2;
+        let error = check_with_limits(
+            boolean_target(17),
+            &limits,
+            &mut |_| {},
+            |control| {
+                control.reserve_owned_elements(1)?;
+                let analysis = MxxAnalysis::with_resource_budget(
+                    Default::default(),
+                    limits.relation_sources_per_eclass,
+                    limits.switch_case_limit,
+                    control.analysis_budget(),
+                );
+                let mut egraph = EGraph::new(analysis);
+                let left = egraph.add(super::super::language::MxxLang::IntConst(1.into()));
+                let right = egraph.add(super::super::language::MxxLang::IntConst(2.into()));
+                let _ = egraph
+                    .add(super::super::language::MxxLang::MatrixAdd(vec![left, right].into()));
+                let kind = egraph.analysis.resource_failure_kind.clone().expect("resource kind");
+                let observed = egraph.analysis.resource_failure.clone().expect("resource value");
+                Err(control.resource_error(kind, observed))
+            },
+            |_: (), _| Ok(()),
+            |_, _| Ok(()),
+            |_, _| Ok(0_u8.into()),
+        )
+        .expect_err("analysis must observe the driver's earlier reservation");
+        assert!(matches!(
+            error,
+            OperationalSimulationError::ResourceLimitExceeded {
+                phase: CheckerPhase::Lower,
+                kind: ResourceLimitKind::TotalOwnedElements,
+                observed: ResourceObserved::Counter { limit: 2, observed: 3 },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn analysis_uses_the_driver_deadline_and_switch_limit() {
+        let mut limits = CheckerLimits::production();
+        limits.switch_case_limit = 1;
+        let mut emit = |_| {};
+        let mut control = SimulationControl::new(&limits, &mut emit);
+        let analysis = MxxAnalysis::with_resource_budget(
+            Default::default(),
+            limits.relation_sources_per_eclass,
+            limits.switch_case_limit,
+            control.analysis_budget(),
+        );
+        let mut egraph = EGraph::new(analysis);
+        let selector = egraph.add(super::super::language::MxxLang::IntConst(0.into()));
+        let first = egraph.add(super::super::language::MxxLang::IntConst(1.into()));
+        let second = egraph.add(super::super::language::MxxLang::IntConst(2.into()));
+        let _ = egraph
+            .add(super::super::language::MxxLang::Switch(vec![selector, first, second].into()));
+        assert_eq!(egraph.analysis.resource_failure_kind, Some(ResourceLimitKind::SwitchCases));
+        assert_eq!(
+            egraph.analysis.resource_failure,
+            Some(ResourceObserved::Counter { limit: 1, observed: 2 })
+        );
+
+        control.deadline = Instant::now();
+        let analysis = MxxAnalysis::with_resource_budget(
+            Default::default(),
+            limits.relation_sources_per_eclass,
+            limits.switch_case_limit,
+            control.analysis_budget(),
+        );
+        let mut egraph = EGraph::new(analysis);
+        let _ = egraph.add(super::super::language::MxxLang::IntConst(0.into()));
+        assert_eq!(egraph.analysis.resource_failure_kind, Some(ResourceLimitKind::TotalTime));
+        assert!(matches!(
+            egraph.analysis.resource_failure,
+            Some(ResourceObserved::Duration { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_family_case_count_uses_the_production_switch_limit() {
+        let mut limits = CheckerLimits::production();
+        limits.switch_case_limit = 1;
+        let error = check_with_limits(
+            boolean_target(17),
+            &limits,
+            &mut |_| {},
+            |control| {
+                control.check_switch_cases(2)?;
+                Ok(())
+            },
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+            |_, _| Ok(0_u8.into()),
+        )
+        .expect_err("two family cases exceed the configured production limit");
+        assert!(matches!(
+            error,
+            OperationalSimulationError::ResourceLimitExceeded {
+                phase: CheckerPhase::Lower,
+                kind: ResourceLimitKind::SwitchCases,
+                observed: ResourceObserved::Counter { limit: 1, observed: 2 },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn relation_diagnostic_uses_the_registered_source_instead_of_the_residual_root() {
+        let mut symbols = super::super::identity::SymbolTables::default();
+        let source =
+            symbols.atomic_sources.intern(super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ProtocolInput(
+                    crate::ProtocolInputId::from("relation-source"),
+                ),
+                sort: super::super::analysis::MxxSort::Int,
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            });
+        let error = relation_error(
+            &StageId("stage".to_owned()),
+            WireRef { node: mxx_ir_core::NodeId(9), port: mxx_ir_core::Port(0) },
+            &symbols,
+            super::super::relation::RelationFailure::MissingRegistration {
+                source: super::super::identity::AtomicSourceId(source),
+            },
+        );
+        assert!(matches!(
+            error,
+            OperationalSimulationError::Relation {
+                source: super::super::error::RelationError::MissingRelationRegistration {
+                    source: super::super::identity::AtomicSourceKey::ProtocolInput(id),
+                },
+                ..
+            } if id == crate::ProtocolInputId::from("relation-source")
         ));
     }
 }

@@ -235,6 +235,9 @@ pub struct CrtSpec {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum HashTagPart {
     Literal(Box<[u8]>),
+    BinaryStatic(ResolvedIntExpr),
+    DecimalStatic(ResolvedIntExpr),
+    U64LeStatic(ResolvedIntExpr),
     BinaryArgument { argument: u16 },
     DecimalArgument { argument: u16 },
     U64LeArgument { argument: u16 },
@@ -365,6 +368,21 @@ pub enum SamplerIdentity {
         trapdoor: TrapdoorDescriptorId,
         target: egg::Id,
         cutoff: ResolvedIntExpr,
+    },
+    /// A decomposed hash sampler is registered against its exact gadget and
+    /// plain-hash e-classes.  The ordered hash arguments include the key and
+    /// every runtime tag integer, so equal shapes never substitute identities.
+    DecomposedHash {
+        source: GraphWireSourceKey,
+        indices: Box<[egg::Id]>,
+        public: egg::Id,
+        target: egg::Id,
+        arguments: Box<[egg::Id]>,
+        matrix_type: ResolvedMatrixType,
+        base: ResolvedIntExpr,
+        digit_count: ResolvedIntExpr,
+        small: bool,
+        range_proved: bool,
     },
 }
 

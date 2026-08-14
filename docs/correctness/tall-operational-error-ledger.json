@@ -519,6 +519,78 @@
       "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
     },
     {
+      "error_tag": "Relation.UnknownRelationSource",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact source identity available from the generic relation engine."
+    },
+    {
+      "error_tag": "Relation.MissingRelationRegistration",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact source identity available from the generic relation engine."
+    },
+    {
+      "error_tag": "Relation.InvalidRelationSource",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact source identity available from the generic relation engine."
+    },
+    {
+      "error_tag": "Relation.MismatchedRelationIndices",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact source identity available from the generic relation engine."
+    },
+    {
+      "error_tag": "Relation.RelationTypeMismatch",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact source identity available from the generic relation engine."
+    },
+    {
+      "error_tag": "Relation.RelationLayoutMismatch",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact source identity available from the generic relation engine."
+    },
+    {
+      "error_tag": "Relation.RelationPublicMismatch",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact source identity available from the generic relation engine."
+    },
+    {
+      "error_tag": "Relation.RelationTrapdoorMismatch",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact source identity available from the generic relation engine."
+    },
+    {
+      "error_tag": "Relation.RelationTargetMismatch",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact source identity available from the generic relation engine."
+    },
+    {
+      "error_tag": "Relation.BlockedRelationRewrite",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact generic reason a rewrite was blocked."
+    },
+    {
+      "error_tag": "Relation.InvalidAdditiveRelationSort",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall relation diagnostics preserve the exact generic expression rejected during additive normalization."
+    },
+    {
+      "error_tag": "Relation.RewriteDidNotSaturate",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall rejects a generic relation rewrite pass that stops without saturation."
+    },
+    {
       "error_tag": "Relation.InvalidRelationProducer",
       "tall_reachability": "reachable_for_relation_terms",
       "classification": "relation_validation",
@@ -667,6 +739,12 @@
       "tall_reachability": "reachable",
       "classification": "noise_bound_evaluation",
       "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.SharedFamilyMaximumNotProved",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "A symbolic Tall family may use one representative only after a closed uniform maximum proof; the checker rejects an unproved representative without expanding logical lanes."
     },
     {
       "error_tag": "Resource.RewriteIterations",

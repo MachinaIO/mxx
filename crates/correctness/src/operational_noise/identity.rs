@@ -80,6 +80,10 @@ pub struct GraphWireSourceKey {
 pub enum AtomicSourceKey {
     ProtocolInput(ProtocolInputId),
     GraphWire(GraphWireSourceKey),
+    /// A Graph-IR source operation whose semantics explicitly permit an
+    /// unbounded public matrix.  This is distinct from an opaque computed
+    /// wire, which the production bound bridge rejects.
+    ExplicitLarge(GraphWireSourceKey),
     /// One symbolic carried value in a sequential-loop body.  This is never a
     /// runtime sampler: the recurrence descriptor below binds it to the
     /// previous iteration's state when the bound phase evaluates the loop.

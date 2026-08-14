@@ -254,6 +254,9 @@ fn input_value_contract(value: &InputValueContract) -> String {
                 declared_bound(max_centered_coefficient)
             )
         }
+        InputValueContract::MatrixLarge { matrix_type: value } => {
+            format!(".matrixLarge ({})", matrix_type(value))
+        }
         InputValueContract::Trapdoor { .. } => {
             panic!("the legacy Lean emitter cannot serialize a trapdoor input contract")
         }
@@ -468,6 +471,14 @@ mod tests {
 
         assert!(emitted.starts_with(".matrixExact ("));
         assert!(emitted.ends_with("(some (.parameter \"p\")) true"));
+    }
+
+    #[test]
+    fn explicit_large_matrix_contract_emits_its_distinct_syntax() {
+        let contract =
+            InputValueContract::MatrixLarge { matrix_type: Ring::new(17, 8).matrix_type((2, 3)) };
+
+        assert!(input_value_contract(&contract).starts_with(".matrixLarge ("));
     }
 
     #[test]

@@ -23,6 +23,7 @@ inductive InputValueContract where
       (canonicalExclusiveUpper : Option IntExpr)
       (isConstantPolynomial : Bool)
   | matrixBounded (type : MatrixTypeExpr) (bound : DeclaredBoundExpr)
+  | matrixLarge (type : MatrixTypeExpr)
   | integerRange (lower upper : IntExpr)
   | boolean
   | bytes (length : IntExpr)

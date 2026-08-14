@@ -128,6 +128,12 @@ pub enum InputValueContract {
         /// An assumption on the external input, not a Rust-derived fact.
         max_centered_coefficient: DeclaredBoundExpr,
     },
+    /// An explicit declaration that this matrix is not assigned a small finite
+    /// coefficient bound. This is distinct from an omitted bound contract,
+    /// which the operational checker rejects.
+    MatrixLarge {
+        matrix_type: MatrixType,
+    },
     /// A protocol-supplied trapdoor.  `public_input` is the only declared
     /// association with its public matrix; callers must not infer a pairing
     /// from input names or matrix types.
@@ -979,7 +985,8 @@ fn contract_matches_wire(contract: &InputValueContract, wire_type: &WireType) ->
     match (contract, wire_type) {
         (
             InputValueContract::MatrixExact { matrix_type, .. } |
-            InputValueContract::MatrixBounded { matrix_type, .. },
+            InputValueContract::MatrixBounded { matrix_type, .. } |
+            InputValueContract::MatrixLarge { matrix_type },
             WireType::Matrix(actual),
         ) => matrix_type == actual,
         (
@@ -1708,6 +1715,48 @@ mod tests {
             upper: IntExpr::constant(1),
         };
         assert_eq!(bundle.validate(), Err(BundleValidationError::InputContractTypeMismatch));
+    }
+
+    #[test]
+    fn explicit_large_matrix_contract_matches_only_its_declared_matrix_type() {
+        let mut bundle = valid_bundle();
+        let matrix_type = match &bundle.input_contract.inputs[1].value {
+            InputValueContract::MatrixExact { matrix_type, .. } => matrix_type.clone(),
+            contract => panic!("fixture residual must be matrix exact, got {contract:?}"),
+        };
+        bundle.input_contract.inputs[1].value = InputValueContract::MatrixLarge { matrix_type };
+        assert_eq!(bundle.validate(), Ok(()));
+
+        bundle.input_contract.inputs[1].value =
+            InputValueContract::MatrixLarge { matrix_type: Ring::new(19, 1).matrix_type((1, 1)) };
+        assert_eq!(bundle.validate(), Err(BundleValidationError::InputContractTypeMismatch));
+    }
+
+    #[test]
+    fn matrix_contract_variants_match_matrix_and_family_wires() {
+        let matrix_type = Ring::new(17, 1).matrix_type((1, 1));
+        let matrix_wire = WireType::Matrix(matrix_type.clone());
+        let contracts = [
+            InputValueContract::MatrixExact {
+                matrix_type: matrix_type.clone(),
+                canonical_coefficient_exclusive_upper_bound: None,
+                is_constant_polynomial: false,
+            },
+            InputValueContract::MatrixBounded {
+                matrix_type: matrix_type.clone(),
+                max_centered_coefficient: DeclaredBoundExpr::Constant(3u8.into()),
+            },
+            InputValueContract::MatrixLarge { matrix_type: matrix_type.clone() },
+        ];
+        assert!(contracts.iter().all(|contract| contract_matches_wire(contract, &matrix_wire)));
+
+        let family_contract = InputValueContract::Family {
+            count: IntExpr::constant(2),
+            element: Box::new(InputValueContract::MatrixLarge { matrix_type: matrix_type.clone() }),
+        };
+        let family_wire =
+            WireType::IndexedFamily { count: IntExpr::constant(2), element: Box::new(matrix_wire) };
+        assert!(contract_matches_wire(&family_contract, &family_wire));
     }
 
     #[test]

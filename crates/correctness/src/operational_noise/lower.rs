@@ -20,7 +20,10 @@ use super::{
     },
     language::MxxLang,
 };
-use crate::{InputValueContract, ProtocolDecl, ProtocolInputDestination, StageId, StageInputName};
+use crate::{
+    DeclaredBoundExpr, InputValueContract, ProtocolDecl, ProtocolInputDestination, StageId,
+    StageInputName,
+};
 use egg::{EGraph, Id};
 use mxx_ir_core::{
     IntExpr, RealExpr, WireRef, WireType,
@@ -31,8 +34,8 @@ use mxx_ir_core::{
     },
     types::MatrixType,
 };
-use num_bigint::BigInt;
-use num_traits::{Signed, ToPrimitive, Zero};
+use num_bigint::{BigInt, BigUint};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Structural-family dispatch is deliberately outside ordinary expression lowering.
@@ -100,7 +103,7 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
             .get(source.0)
             .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
         let matrix_type = self.matrix_type(term)?;
-        let coefficient_class = match &descriptor.key {
+        let (coefficient_class, metadata) = match &descriptor.key {
             super::identity::AtomicSourceKey::Sampler(id) => {
                 let sampler = self
                     .lowerer
@@ -110,12 +113,12 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
                     .samplers
                     .get(id.0)
                     .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
-                match sampler {
+                let coefficient_class = match sampler {
                     SamplerIdentity::Gaussian { max_coefficient_bound, .. } => {
                         let maximum_absolute_coefficient = resolved_integer(max_coefficient_bound)
                             .and_then(|bound| bound.to_biguint())
                             .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
-                        BoundClass::Bounded { maximum_absolute_coefficient }
+                        BoundClass::bounded(maximum_absolute_coefficient)
                     }
                     SamplerIdentity::UniformInterval { minimum, maximum, .. } => {
                         let minimum = resolved_integer(minimum)
@@ -125,13 +128,13 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
                         if minimum > maximum {
                             return Err(BoundEvaluationError::InvalidMatrixConstant { term });
                         }
-                        BoundClass::Bounded {
-                            maximum_absolute_coefficient: minimum
+                        BoundClass::bounded(
+                            minimum
                                 .abs()
                                 .max(maximum.abs())
                                 .to_biguint()
                                 .expect("absolute interval endpoint"),
-                        }
+                        )
                     }
                     SamplerIdentity::Preimage { cutoff, .. } => {
                         let cutoff = resolved_integer(cutoff)
@@ -139,7 +142,7 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
                         let cutoff = cutoff
                             .to_biguint()
                             .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
-                        BoundClass::Bounded { maximum_absolute_coefficient: cutoff }
+                        BoundClass::bounded(cutoff)
                     }
                     SamplerIdentity::DecomposedHash { base, small, .. } |
                     SamplerIdentity::GadgetDecomposition { base, small, .. } => {
@@ -148,44 +151,24 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
                         gadget_digit_bound(&base, *small)
                             .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?
                     }
-                }
+                };
+                (coefficient_class, MatrixMetadata::unknown())
+            }
+            super::identity::AtomicSourceKey::ProtocolInput(input) => {
+                self.protocol_matrix_bound(input, &matrix_type, term)?
+            }
+            super::identity::AtomicSourceKey::GraphWire(_) => {
+                return Err(BoundEvaluationError::OpaqueGraphWire { term });
+            }
+            super::identity::AtomicSourceKey::ExplicitLarge(_) => {
+                (BoundClass::Large, MatrixMetadata::unknown())
             }
             // A carried-state placeholder is meaningful only inside the
             // descriptor-owned simultaneous transition overlay below.
-            super::identity::AtomicSourceKey::SequentialRecurrence { .. } |
             super::identity::AtomicSourceKey::SequentialState(_) |
-            super::identity::AtomicSourceKey::ProtocolInput(_) |
-            super::identity::AtomicSourceKey::GraphWire(_) => BoundClass::Large,
-        };
-        let metadata = match &descriptor.key {
-            super::identity::AtomicSourceKey::ProtocolInput(input) => self
-                .lowerer
-                .protocol
-                .bundle
-                .input_contract
-                .inputs
-                .iter()
-                .find(|entry| entry.id == *input)
-                .and_then(|entry| match &entry.value {
-                    InputValueContract::MatrixExact { is_constant_polynomial, .. } => {
-                        Some(MatrixMetadata {
-                            is_constant_polynomial: *is_constant_polynomial,
-                            known_zero_rows: None,
-                        })
-                    }
-                    InputValueContract::Family { element, .. } => match element.as_ref() {
-                        InputValueContract::MatrixExact { is_constant_polynomial, .. } => {
-                            Some(MatrixMetadata {
-                                is_constant_polynomial: *is_constant_polynomial,
-                                known_zero_rows: None,
-                            })
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                })
-                .unwrap_or_else(MatrixMetadata::unknown),
-            _ => MatrixMetadata::unknown(),
+            super::identity::AtomicSourceKey::SequentialRecurrence { .. } => {
+                return Err(BoundEvaluationError::SequentialStateOutsideOverlay { term });
+            }
         };
         Ok(MatrixBound { matrix_type, coefficient_class, metadata })
     }
@@ -308,9 +291,175 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
         }
         Ok(())
     }
+
+    fn pack_bit_maximum(&self, term: Id, bit: Id) -> Result<BigUint, BoundEvaluationError> {
+        let bit = self.lowerer.egraph.find(bit);
+        let data = &self.lowerer.egraph[bit].data;
+        if data.sort != Ok(MxxSort::Bool) ||
+            data.scalar_provenance != Some(ScalarProvenance::Ordinary)
+        {
+            return Err(BoundEvaluationError::InvalidPack { term });
+        }
+        Ok(if data.possible_true { BigUint::one() } else { BigUint::zero() })
+    }
+
+    fn switch_reachable_cases(
+        &self,
+        term: Id,
+        selector: Id,
+        case_count: usize,
+    ) -> Result<Box<[bool]>, BoundEvaluationError> {
+        let selector = self.lowerer.egraph.find(selector);
+        let interval = self.lowerer.egraph[selector]
+            .data
+            .integer_domain
+            .as_ref()
+            .ok_or(BoundEvaluationError::InvalidSwitchReachability { term })?
+            .interval()
+            .map_err(|_| BoundEvaluationError::InvalidSwitchReachability { term })?;
+        let minimum = interval
+            .minimum
+            .to_usize()
+            .ok_or(BoundEvaluationError::InvalidSwitchReachability { term })?;
+        let maximum = interval
+            .maximum
+            .to_usize()
+            .filter(|maximum| *maximum < case_count)
+            .ok_or(BoundEvaluationError::InvalidSwitchReachability { term })?;
+        if case_count == 0 || minimum > maximum {
+            return Err(BoundEvaluationError::InvalidSwitchReachability { term });
+        }
+        Ok((0..case_count).map(|case| minimum <= case && case <= maximum).collect())
+    }
 }
 
 impl ProductionBoundInput<'_, '_, '_> {
+    fn protocol_matrix_bound(
+        &self,
+        input: &crate::ProtocolInputId,
+        matrix_type: &mxx_ir_core::types::ConcreteMatrixType,
+        term: Id,
+    ) -> Result<(BoundClass, MatrixMetadata), BoundEvaluationError> {
+        let contract = self
+            .lowerer
+            .protocol
+            .bundle
+            .input_contract
+            .inputs
+            .iter()
+            .find(|entry| entry.id == *input)
+            .map(|entry| Self::family_element_contract(&entry.value))
+            .ok_or(BoundEvaluationError::MissingInputBoundContract { term })?;
+        match contract {
+            InputValueContract::MatrixBounded { max_centered_coefficient, .. } => Ok((
+                BoundClass::bounded(self.evaluate_declared_bound(max_centered_coefficient, term)?),
+                MatrixMetadata::unknown(),
+            )),
+            InputValueContract::MatrixExact {
+                canonical_coefficient_exclusive_upper_bound: Some(upper),
+                is_constant_polynomial,
+                ..
+            } => {
+                let upper = self.evaluate_contract_int(upper, term)?;
+                let modulus = matrix_type
+                    .modulus
+                    .to_biguint()
+                    .filter(|modulus| !modulus.is_zero())
+                    .ok_or(BoundEvaluationError::InvalidDeclaredBound { term })?;
+                if upper.is_zero() || upper > modulus {
+                    return Err(BoundEvaluationError::InvalidDeclaredBound { term });
+                }
+                Ok((
+                    BoundClass::bounded(upper - BigUint::one()),
+                    MatrixMetadata {
+                        is_constant_polynomial: *is_constant_polynomial,
+                        known_zero_rows: None,
+                    },
+                ))
+            }
+            InputValueContract::MatrixLarge { .. } => {
+                Ok((BoundClass::Large, MatrixMetadata::unknown()))
+            }
+            _ => Err(BoundEvaluationError::MissingInputBoundContract { term }),
+        }
+    }
+
+    fn family_element_contract(mut contract: &InputValueContract) -> &InputValueContract {
+        while let InputValueContract::Family { element, .. } = contract {
+            contract = element;
+        }
+        contract
+    }
+
+    fn contract_param_env(&self) -> mxx_ir_core::ParamEnv {
+        let mut environment = mxx_ir_core::ParamEnv::default();
+        environment.integers.extend(self.lowerer.request.environment.iter().filter_map(
+            |(name, value)| match value {
+                super::OperationalParameterValue::Integer(value) => {
+                    Some((name.clone(), value.clone()))
+                }
+                super::OperationalParameterValue::Rational { .. } => None,
+            },
+        ));
+        environment
+    }
+
+    fn evaluate_contract_int(
+        &self,
+        expression: &IntExpr,
+        term: Id,
+    ) -> Result<BigUint, BoundEvaluationError> {
+        expression
+            .evaluate(&self.contract_param_env())
+            .ok()
+            .and_then(|value| value.to_biguint())
+            .ok_or(BoundEvaluationError::InvalidDeclaredBound { term })
+    }
+
+    fn evaluate_declared_bound(
+        &self,
+        expression: &DeclaredBoundExpr,
+        term: Id,
+    ) -> Result<BigUint, BoundEvaluationError> {
+        let invalid = || BoundEvaluationError::InvalidDeclaredBound { term };
+        match expression {
+            DeclaredBoundExpr::Constant(value) => Ok(value.clone()),
+            DeclaredBoundExpr::Parameter(value) => self.evaluate_contract_int(value, term),
+            DeclaredBoundExpr::Add(left, right) => Ok(self.evaluate_declared_bound(left, term)? +
+                self.evaluate_declared_bound(right, term)?),
+            DeclaredBoundExpr::Multiply(left, right) => Ok(self
+                .evaluate_declared_bound(left, term)? *
+                self.evaluate_declared_bound(right, term)?),
+            DeclaredBoundExpr::Maximum(left, right) => Ok(self
+                .evaluate_declared_bound(left, term)?
+                .max(self.evaluate_declared_bound(right, term)?)),
+            DeclaredBoundExpr::Minimum(left, right) => Ok(self
+                .evaluate_declared_bound(left, term)?
+                .min(self.evaluate_declared_bound(right, term)?)),
+            DeclaredBoundExpr::Absolute(value) => value
+                .evaluate(&self.contract_param_env())
+                .map(|value| value.abs().to_biguint().expect("absolute integer"))
+                .map_err(|_| invalid()),
+            DeclaredBoundExpr::FloorDivide { value, positive_divisor } => {
+                if positive_divisor.is_zero() {
+                    return Err(invalid());
+                }
+                Ok(self.evaluate_declared_bound(value, term)? / positive_divisor)
+            }
+            DeclaredBoundExpr::MatrixProduct { ring_dimension, inner_dimension, left, right } => {
+                let ring_dimension = self.evaluate_contract_int(ring_dimension, term)?;
+                let inner_dimension = self.evaluate_contract_int(inner_dimension, term)?;
+                if ring_dimension.is_zero() || inner_dimension.is_zero() {
+                    return Err(invalid());
+                }
+                Ok(ring_dimension *
+                    inner_dimension *
+                    self.evaluate_declared_bound(left, term)? *
+                    self.evaluate_declared_bound(right, term)?)
+            }
+        }
+    }
+
     /// Evaluates a graph-owned sequential descriptor without rebuilding its
     /// body or materializing any logical iteration/lane graph.  Each numeric
     /// iteration evaluates the one fixed transition with a read-only overlay
@@ -458,6 +607,17 @@ impl BoundInput for SequentialBoundInput<'_, '_, '_> {
     }
     fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError> {
         self.base.validate_pack(term, bit_count)
+    }
+    fn pack_bit_maximum(&self, term: Id, bit: Id) -> Result<BigUint, BoundEvaluationError> {
+        self.base.pack_bit_maximum(term, bit)
+    }
+    fn switch_reachable_cases(
+        &self,
+        term: Id,
+        selector: Id,
+        case_count: usize,
+    ) -> Result<Box<[bool]>, BoundEvaluationError> {
+        self.base.switch_reachable_cases(term, selector, case_count)
     }
 }
 
@@ -2331,27 +2491,31 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 return Err(LowerError::FamilyProducerNotResolved { family: wire.source.wire });
             }
         };
+        let graph_source = super::identity::GraphWireSourceKey {
+            wire: wire.source.clone(),
+            coordinate_binders: environment
+                .active_coordinates
+                .iter()
+                .map(|coordinate| coordinate.binder.clone())
+                .collect(),
+        };
         let (key, integer_domain, canonical_residue_convention) = if let Some(sampler) =
             self.non_relation_sampler_for_wire(wire, environment)?
         {
             (super::identity::AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)), None, None)
         } else {
-            self.protocol_input_source(wire, environment, &sort)?.unwrap_or_else(|| {
-                (
-                    super::identity::AtomicSourceKey::GraphWire(
-                        super::identity::GraphWireSourceKey {
-                            wire: wire.source.clone(),
-                            coordinate_binders: environment
-                                .active_coordinates
-                                .iter()
-                                .map(|coordinate| coordinate.binder.clone())
-                                .collect(),
-                        },
-                    ),
+            match self.protocol_input_source(wire, environment, &sort)? {
+                Some(protocol) => protocol,
+                None => (
+                    if self.is_explicit_large_source(wire)? {
+                        super::identity::AtomicSourceKey::ExplicitLarge(graph_source)
+                    } else {
+                        super::identity::AtomicSourceKey::GraphWire(graph_source)
+                    },
                     None,
                     None,
-                )
-            })
+                ),
+            }
         };
         let descriptor = super::identity::AtomicSourceDescriptor {
             key,
@@ -2370,6 +2534,20 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 .collect(),
         });
         Ok(atom)
+    }
+
+    fn is_explicit_large_source(&self, wire: &LoweringWire) -> Result<bool, LowerError> {
+        let node = self
+            .graph_for_program(&wire.source.scope.program)?
+            .scope(&wire.source.scope.definition)
+            .ok_or(LowerError::MissingWire { wire: wire.source.wire })?
+            .node(wire.source.wire.node)
+            .ok_or(LowerError::MissingNode { node: wire.source.wire.node })?;
+        Ok(
+            matches!(node.kind(), NodeKind::UniformResidueSample { .. } | NodeKind::TrapdoorPublic) ||
+                matches!(node.kind(), NodeKind::TrapdoorSample { .. }) &&
+                    wire.source.wire.port.0 == 0,
+        )
     }
 
     fn non_relation_sampler_for_wire(
@@ -2987,9 +3165,35 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         self.egraph.add(MxxLang::MatrixAdd(values.into_boxed_slice()))
                     }
                     MatrixBinaryOp::Subtract => {
-                        let negate = self.egraph.add(MxxLang::MatrixNegate([values[1]]));
-                        self.egraph
-                            .add(MxxLang::MatrixAdd(vec![values[0], negate].into_boxed_slice()))
+                        if self.egraph.find(values[0]) == self.egraph.find(values[1]) {
+                            let canonical = self.egraph.find(values[0]);
+                            let Ok(MxxSort::Matrix(matrix_type)) =
+                                self.egraph[canonical].data.sort.clone()
+                            else {
+                                return Err(LowerError::InvalidOperandSort {
+                                    expected: WireType::Matrix(MatrixType {
+                                        modulus: IntExpr::constant(1),
+                                        ring_dimension: IntExpr::constant(1),
+                                        rows: IntExpr::constant(1),
+                                        columns: IntExpr::constant(1),
+                                    }),
+                                    actual: WireType::Int,
+                                });
+                            };
+                            let zero = self.egraph.analysis.symbols.matrix_constants.intern(
+                                super::identity::MatrixConstantSpec {
+                                    matrix_type,
+                                    value: super::identity::MatrixConstantValue::Zero,
+                                },
+                            );
+                            self.egraph.add(MxxLang::MatrixConstant(
+                                super::identity::MatrixConstantSpecId(zero),
+                            ))
+                        } else {
+                            let negate = self.egraph.add(MxxLang::MatrixNegate([values[1]]));
+                            self.egraph
+                                .add(MxxLang::MatrixAdd(vec![values[0], negate].into_boxed_slice()))
+                        }
                     }
                     MatrixBinaryOp::Multiply => {
                         self.egraph.add(MxxLang::MatrixMultiply(values.into_boxed_slice()))
@@ -3317,8 +3521,65 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) => {
                 unreachable!("loop lowering is scheduled on the outer continuation stack")
             }
-            NodeKind::PackPolynomialCoefficients { .. } => {
-                Err(LowerError::PackRequiresExplicitBooleanFamily { actual: output_type })
+            NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
+                let [LoweredValue::Family(family)] = arguments else {
+                    return Err(LowerError::InvalidOperandArity {
+                        expected: 1,
+                        actual: arguments.len(),
+                    });
+                };
+                if family.element_type != MxxSort::Bool {
+                    return Err(LowerError::PackRequiresExplicitBooleanFamily {
+                        actual: output_type,
+                    });
+                }
+                let FamilyCoverageStorage::ExactStored { elements } = &family.storage else {
+                    return Err(LowerError::PackRequiresExplicitBooleanFamily {
+                        actual: output_type,
+                    });
+                };
+                let matrix_type = self.resolve_matrix_type(matrix_type, environment)?;
+                let coefficient_bits = self.resolve_int(coefficient_bits, environment)?;
+                let Some(coefficient_bits_value) = resolved_integer(&coefficient_bits) else {
+                    return Err(LowerError::InvalidPackBitCount {
+                        coefficient_bits: BigInt::from(-1),
+                        modulus: resolved_integer(&matrix_type.modulus)
+                            .unwrap_or_else(|| BigInt::from(-1)),
+                    });
+                };
+                let Some(coefficient_bits_usize) = coefficient_bits_value.to_usize() else {
+                    return Err(LowerError::InvalidPackBitCount {
+                        coefficient_bits: coefficient_bits_value,
+                        modulus: resolved_integer(&matrix_type.modulus)
+                            .unwrap_or_else(|| BigInt::from(-1)),
+                    });
+                };
+                let ring_dimension = resolved_nonnegative(&matrix_type.ring_dimension)
+                    .and_then(|value| value.to_usize())
+                    .ok_or_else(|| LowerError::InvalidPackBitCount {
+                        coefficient_bits: coefficient_bits_value.clone(),
+                        modulus: resolved_integer(&matrix_type.modulus)
+                            .unwrap_or_else(|| BigInt::from(-1)),
+                    })?;
+                let expected =
+                    ring_dimension.checked_mul(coefficient_bits_usize).ok_or_else(|| {
+                        LowerError::InvalidPackBitCount {
+                            coefficient_bits: coefficient_bits_value.clone(),
+                            modulus: resolved_integer(&matrix_type.modulus)
+                                .unwrap_or_else(|| BigInt::from(-1)),
+                        }
+                    })?;
+                if coefficient_bits_usize == 0 || elements.len() != expected {
+                    return Err(LowerError::InvalidPackBitWidth {
+                        expected,
+                        actual: elements.len(),
+                    });
+                }
+                Ok(LoweredValue::Term(self.egraph.add(MxxLang::PackPolynomialCoefficients {
+                    matrix_type,
+                    coefficient_bits,
+                    bits: elements.clone(),
+                })))
             }
             NodeKind::SubgraphCall(_) | NodeKind::ThresholdDecode { .. } => unreachable!(),
             _ => unreachable!("only structural nodes reach structural lowering"),
@@ -4342,6 +4603,13 @@ mod tests {
             Some(17_u8.into()),
         );
         assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(lifted)
+                .expect("integer domain is the lifted coefficient bound")
+                .coefficient_class,
+            BoundClass::bounded(16_u8.into()),
+        );
+        assert_eq!(
             lowerer.validate_integer_consumer(extract, SelectorOnlyConsumer::MatrixScale, false,),
             Err(LowerError::SelectorOnlyValueUsedByForbiddenConsumer {
                 consumer: SelectorOnlyConsumer::MatrixScale,
@@ -4536,6 +4804,542 @@ mod tests {
         };
         let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
         lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output).map(|_| ())
+    }
+
+    fn with_production_bound_atom(
+        contract: Option<InputValueContract>,
+        key: super::super::identity::AtomicSourceKey,
+        inspect: impl FnOnce(&GraphLowerer<'_, '_>, super::super::identity::AtomicSourceId, Id),
+    ) {
+        let mut protocol = crate::toy_example::protocol();
+        if let Some(contract) = contract {
+            protocol.bundle.input_contract.inputs.push(crate::InputContractEntry {
+                id: crate::ProtocolInputId::from("bound-input"),
+                name: "bound-input".to_owned(),
+                value: contract,
+            });
+        }
+        let request = OperationalCheckRequest {
+            environment: vec![(
+                "declared".to_owned(),
+                super::super::OperationalParameterValue::Integer(BigInt::from(3)),
+            )],
+            layouts: Vec::new(),
+            target_id: "production-bound-atom".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key,
+                sort: MxxSort::Matrix(super::super::identity::ResolvedMatrixType {
+                    modulus: ResolvedIntExpr::Const(BigInt::from(17)),
+                    ring_dimension: ResolvedIntExpr::Const(BigInt::from(1)),
+                    rows: ResolvedIntExpr::Const(BigInt::from(1)),
+                    columns: ResolvedIntExpr::Const(BigInt::from(1)),
+                }),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            },
+        );
+        let source = super::super::identity::AtomicSourceId(source);
+        let term = lowerer.egraph.add(MxxLang::Atom { source, indices: Box::new([]) });
+        inspect(&lowerer, source, term);
+    }
+
+    #[test]
+    fn protocol_matrix_bounds_are_exactly_the_declared_contracts() {
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        with_production_bound_atom(
+            Some(InputValueContract::MatrixBounded {
+                matrix_type: matrix.clone(),
+                max_centered_coefficient: DeclaredBoundExpr::Multiply(
+                    Box::new(DeclaredBoundExpr::Parameter(IntExpr::Var("declared".to_owned()))),
+                    Box::new(DeclaredBoundExpr::Constant(2_u8.into())),
+                ),
+            }),
+            super::super::identity::AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(
+                "bound-input",
+            )),
+            |lowerer, source, term| {
+                let bound = lowerer.production_bound_view().atom_bound(source, term).unwrap();
+                assert_eq!(bound.coefficient_class, BoundClass::bounded(6_u8.into()));
+                assert_eq!(bound.metadata, MatrixMetadata::unknown());
+            },
+        );
+        with_production_bound_atom(
+            Some(InputValueContract::MatrixExact {
+                matrix_type: matrix,
+                canonical_coefficient_exclusive_upper_bound: Some(IntExpr::constant(7)),
+                is_constant_polynomial: true,
+            }),
+            super::super::identity::AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(
+                "bound-input",
+            )),
+            |lowerer, source, term| {
+                let bound = lowerer.production_bound_view().atom_bound(source, term).unwrap();
+                assert_eq!(bound.coefficient_class, BoundClass::bounded(6_u8.into()));
+                assert!(bound.metadata.is_constant_polynomial);
+            },
+        );
+    }
+
+    #[test]
+    fn missing_invalid_and_explicit_large_input_bounds_remain_distinct() {
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        for upper in [None, Some(IntExpr::constant(0)), Some(IntExpr::constant(18))] {
+            with_production_bound_atom(
+                Some(InputValueContract::MatrixExact {
+                    matrix_type: matrix.clone(),
+                    canonical_coefficient_exclusive_upper_bound: upper,
+                    is_constant_polynomial: false,
+                }),
+                super::super::identity::AtomicSourceKey::ProtocolInput(
+                    crate::ProtocolInputId::from("bound-input"),
+                ),
+                |lowerer, source, term| {
+                    let expected = if matches!(
+                        lowerer.protocol.bundle.input_contract.inputs.last().unwrap().value,
+                        InputValueContract::MatrixExact {
+                            canonical_coefficient_exclusive_upper_bound: None,
+                            ..
+                        }
+                    ) {
+                        BoundEvaluationError::MissingInputBoundContract { term }
+                    } else {
+                        BoundEvaluationError::InvalidDeclaredBound { term }
+                    };
+                    assert_eq!(
+                        lowerer.production_bound_view().atom_bound(source, term),
+                        Err(expected)
+                    );
+                },
+            );
+        }
+        with_production_bound_atom(
+            Some(InputValueContract::MatrixLarge { matrix_type: matrix }),
+            super::super::identity::AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(
+                "bound-input",
+            )),
+            |lowerer, source, term| {
+                assert_eq!(
+                    lowerer
+                        .production_bound_view()
+                        .atom_bound(source, term)
+                        .unwrap()
+                        .coefficient_class,
+                    BoundClass::Large
+                );
+            },
+        );
+        with_production_bound_atom(
+            None,
+            super::super::identity::AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(
+                "bound-input",
+            )),
+            |lowerer, source, term| {
+                assert_eq!(
+                    lowerer.production_bound_view().atom_bound(source, term),
+                    Err(BoundEvaluationError::MissingInputBoundContract { term })
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn opaque_graph_and_escaped_sequential_state_have_dedicated_errors() {
+        let scope = root_test_environment().occurrence;
+        with_production_bound_atom(
+            None,
+            super::super::identity::AtomicSourceKey::GraphWire(
+                super::super::identity::GraphWireSourceKey {
+                    wire: WireSourceKey {
+                        scope: scope.clone(),
+                        wire: WireRef { node: mxx_ir_core::NodeId(1), port: mxx_ir_core::Port(0) },
+                    },
+                    coordinate_binders: Box::new([]),
+                },
+            ),
+            |lowerer, source, term| {
+                assert_eq!(
+                    lowerer.production_bound_view().atom_bound(source, term),
+                    Err(BoundEvaluationError::OpaqueGraphWire { term })
+                );
+            },
+        );
+        with_production_bound_atom(
+            None,
+            super::super::identity::AtomicSourceKey::SequentialState(SequentialStateKey {
+                loop_scope: scope,
+                loop_node: mxx_ir_core::NodeId(2),
+                carried_index: 0,
+            }),
+            |lowerer, source, term| {
+                assert_eq!(
+                    lowerer.production_bound_view().atom_bound(source, term),
+                    Err(BoundEvaluationError::SequentialStateOutsideOverlay { term })
+                );
+            },
+        );
+    }
+
+    fn assert_explicit_large_source(
+        kind: NodeKind,
+        arguments: Vec<mxx_ir_core::graph::ValueHandle>,
+        output_types: Vec<WireType>,
+        port: u32,
+    ) {
+        use mxx_ir_core::graph::{GraphOutput, NodeHandle};
+
+        let output = NodeHandle::new(kind, arguments, output_types)
+            .output(port)
+            .expect("explicit-large output");
+        let graph = mxx_ir_core::graph::Graph::freeze(
+            "explicit-large-source",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze explicit-large graph")
+        .0;
+        let output = graph.outputs()["output"].value;
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = graph;
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "explicit-large-source".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let LoweredValue::Term(term) = lowerer
+            .lower_stage_wire(&StageId("encrypt".to_owned()), output)
+            .expect("lower explicit-large source")
+        else {
+            panic!("explicit-large source is a matrix term")
+        };
+        let MxxLang::Atom { source, .. } =
+            lowerer.egraph[lowerer.egraph.find(term)].nodes.first().unwrap()
+        else {
+            panic!("explicit-large source is an atom")
+        };
+        assert!(matches!(
+            lowerer.egraph.analysis.symbols.atomic_sources.get(source.0).unwrap().key,
+            super::super::identity::AtomicSourceKey::ExplicitLarge(_)
+        ));
+        assert_eq!(
+            lowerer.production_bound_view().atom_bound(*source, term).unwrap().coefficient_class,
+            BoundClass::Large,
+        );
+    }
+
+    #[test]
+    fn only_semantically_explicit_source_operations_create_large_atoms() {
+        use mxx_ir_core::graph::NodeHandle;
+
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        assert_explicit_large_source(
+            NodeKind::UniformResidueSample { matrix_type: matrix.clone() },
+            Vec::new(),
+            vec![WireType::Matrix(matrix.clone())],
+            0,
+        );
+        let trapdoor_type = WireType::Trapdoor {
+            matrix: matrix.clone(),
+            sigma: mxx_ir_core::RealExpr::from_integer(1),
+            gadget_base: IntExpr::constant(2),
+            digit_count: IntExpr::constant(2),
+            preimage_max_coefficient_bound: IntExpr::constant(3),
+        };
+        assert_explicit_large_source(
+            NodeKind::TrapdoorSample {
+                matrix_type: matrix.clone(),
+                sigma: mxx_ir_core::RealExpr::from_integer(1),
+                gadget_base: IntExpr::constant(2),
+                digit_count: IntExpr::constant(2),
+                preimage_max_coefficient_bound: IntExpr::constant(3),
+            },
+            Vec::new(),
+            vec![WireType::Matrix(matrix.clone()), trapdoor_type.clone()],
+            0,
+        );
+        let trapdoor = NodeHandle::new(
+            NodeKind::GadgetTrapdoor { matrix_type: matrix.clone(), base: IntExpr::constant(2) },
+            Vec::new(),
+            vec![trapdoor_type],
+        )
+        .output(0)
+        .expect("gadget trapdoor");
+        assert_explicit_large_source(
+            NodeKind::TrapdoorPublic,
+            vec![trapdoor],
+            vec![WireType::Matrix(matrix)],
+            0,
+        );
+    }
+
+    #[test]
+    fn zero_sampler_annihilates_explicit_large_and_equal_subtraction_is_zero() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "zero-large".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let matrix_type = super::super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(1.into()),
+            columns: ResolvedIntExpr::Const(1.into()),
+        };
+        let graph_source = super::super::identity::GraphWireSourceKey {
+            wire: WireSourceKey {
+                scope: root_test_environment().occurrence,
+                wire: WireRef { node: mxx_ir_core::NodeId(7), port: mxx_ir_core::Port(0) },
+            },
+            coordinate_binders: Box::new([]),
+        };
+        let sampler = lowerer.egraph.analysis.symbols.samplers.intern(SamplerIdentity::Gaussian {
+            source: graph_source.clone(),
+            indices: Box::new([]),
+            max_coefficient_bound: ResolvedIntExpr::Const(0.into()),
+        });
+        let zero_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
+                sort: MxxSort::Matrix(matrix_type.clone()),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            },
+        );
+        let large_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ExplicitLarge(graph_source),
+                sort: MxxSort::Matrix(matrix_type),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            },
+        );
+        let zero = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(zero_source),
+            indices: Box::new([]),
+        });
+        let large = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(large_source),
+            indices: Box::new([]),
+        });
+        let product = lowerer.egraph.add(MxxLang::MatrixMultiply([zero, large].into()));
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(product)
+                .unwrap()
+                .coefficient_class,
+            BoundClass::ExactZero,
+        );
+        let LoweredValue::Term(cancelled) = lowerer
+            .lower_node(
+                &NodeKind::MatrixBinary(MatrixBinaryOp::Subtract),
+                &[LoweredValue::Term(large), LoweredValue::Term(large)],
+                &root_test_environment(),
+            )
+            .unwrap()
+        else {
+            panic!("matrix subtraction")
+        };
+        assert!(matches!(
+            lowerer.egraph[lowerer.egraph.find(cancelled)].nodes.first(),
+            Some(MxxLang::MatrixConstant(_))
+        ));
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(cancelled)
+                .unwrap()
+                .coefficient_class,
+            BoundClass::ExactZero,
+        );
+        let other_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ExplicitLarge(
+                    super::super::identity::GraphWireSourceKey {
+                        wire: WireSourceKey {
+                            scope: root_test_environment().occurrence,
+                            wire: WireRef {
+                                node: mxx_ir_core::NodeId(8),
+                                port: mxx_ir_core::Port(0),
+                            },
+                        },
+                        coordinate_binders: Box::new([]),
+                    },
+                ),
+                sort: lowerer.egraph[lowerer.egraph.find(large)].data.sort.clone().unwrap(),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            },
+        );
+        let other = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(other_source),
+            indices: Box::new([]),
+        });
+        let LoweredValue::Term(not_cancelled) = lowerer
+            .lower_node(
+                &NodeKind::MatrixBinary(MatrixBinaryOp::Subtract),
+                &[LoweredValue::Term(large), LoweredValue::Term(other)],
+                &root_test_environment(),
+            )
+            .unwrap()
+        else {
+            panic!("matrix subtraction")
+        };
+        assert!(matches!(
+            lowerer.egraph[lowerer.egraph.find(not_cancelled)].nodes.first(),
+            Some(MxxLang::MatrixAdd(_))
+        ));
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view()).evaluate(not_cancelled),
+            Err(BoundEvaluationError::UnconsumedLargeTerm { term: not_cancelled }),
+        );
+        let selector = lowerer.egraph.add(MxxLang::IntConst(0.into()));
+        let selected_zero = lowerer
+            .egraph
+            .add(MxxLang::Switch(vec![selector, cancelled, large].into_boxed_slice()));
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(selected_zero)
+                .unwrap()
+                .coefficient_class,
+            BoundClass::ExactZero,
+        );
+        let out_of_range = lowerer.egraph.add(MxxLang::IntConst(2.into()));
+        let invalid_switch = lowerer
+            .egraph
+            .add(MxxLang::Switch(vec![out_of_range, cancelled, large].into_boxed_slice()));
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view()).evaluate(invalid_switch),
+            Err(BoundEvaluationError::InvalidSwitchReachability { term: invalid_switch }),
+        );
+    }
+
+    #[test]
+    fn artifact_alias_preserves_the_producer_preimage_cutoff() {
+        use mxx_dsl::{DslContext, Ring};
+        use mxx_ir_core::artifact::{ArtifactConfidentiality, ProductionId, SpecHash};
+
+        let ring = Ring::new(17, 1);
+        let trapdoor = ring.sample_trapdoor(1, 1, 2, 2, 9);
+        let preimage = trapdoor
+            .sample_preimage(
+                ring.zero((1, 1)),
+                (trapdoor.public_matrix().matrix_type().columns.clone(), 1),
+            )
+            .as_mat();
+        let producer = DslContext::new("preimage-producer")
+            .private_output("preimage", preimage)
+            .expect("producer output")
+            .build()
+            .expect("producer graph");
+        let placeholder = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
+        let artifact =
+            ring.artifact_input(placeholder, "preimage", (4, 1), ArtifactConfidentiality::Private);
+        let consumer = DslContext::new("preimage-consumer")
+            .private_output("copied", artifact)
+            .expect("consumer output")
+            .build()
+            .expect("consumer graph");
+        let output = consumer.graph.outputs()["copied"].value;
+
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = producer.graph;
+        protocol.bundle.workflow.stages[1].graph = consumer.graph;
+        protocol.bundle.workflow.stages[1].bindings = vec![crate::ArtifactBinding {
+            consumer_input: StageInputName("preimage".to_owned()),
+            producer_stage: StageId("encrypt".to_owned()),
+            producer_output: crate::ArtifactName("preimage".to_owned()),
+        }];
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "artifact-preimage".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let LoweredValue::Term(term) = lowerer
+            .lower_stage_wire(&StageId("decrypt".to_owned()), output)
+            .expect("artifact aliases producer")
+        else {
+            panic!("preimage artifact is a matrix term")
+        };
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(term)
+                .expect("preimage cutoff remains authoritative")
+                .coefficient_class,
+            BoundClass::bounded(9_u8.into())
+        );
+    }
+
+    #[test]
+    fn explicit_boolean_family_pack_lowers_without_lane_inference() {
+        use mxx_dsl::{Bool, DslContext, Family, Ring};
+
+        let ring = Ring::new(17, 1);
+        let bits = Family::<Bool>::pack(vec![
+            Bool::constant(true),
+            Bool::constant(false),
+            Bool::constant(true),
+            Bool::constant(false),
+            Bool::constant(false),
+        ])
+        .expect("five explicit bits");
+        let packed = ring.pack_polynomial_coefficients(bits, 5);
+        let built = DslContext::new("pack-bits")
+            .private_output("packed", packed)
+            .expect("packed output")
+            .build()
+            .expect("pack graph");
+        let output = built.graph.outputs()["packed"].value;
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = built.graph;
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "pack-bits".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let LoweredValue::Term(term) = lowerer
+            .lower_stage_wire(&StageId("encrypt".to_owned()), output)
+            .expect("explicit bits lower")
+        else {
+            panic!("packed polynomial is a matrix term")
+        };
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(term)
+                .expect("Boolean domains bound packed coefficient")
+                .coefficient_class,
+            BoundClass::bounded(5_u8.into())
+        );
     }
 
     #[test]

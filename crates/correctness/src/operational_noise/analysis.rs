@@ -1248,7 +1248,10 @@ fn graph_wire_coordinates_are_authoritative(
         return false;
     }
     let binders = match &descriptor.key {
-        super::identity::AtomicSourceKey::GraphWire(source) => source.coordinate_binders.as_ref(),
+        super::identity::AtomicSourceKey::GraphWire(source) |
+        super::identity::AtomicSourceKey::ExplicitLarge(source) => {
+            source.coordinate_binders.as_ref()
+        }
         super::identity::AtomicSourceKey::Sampler(id) => {
             let Some(sampler) = egraph.analysis.symbols.samplers.get(id.0) else {
                 return false;

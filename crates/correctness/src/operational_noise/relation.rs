@@ -429,28 +429,16 @@ fn distribution_public_operand(
     })
 }
 
-/// Closed production classification used by extraction.  It deliberately
-/// consults only e-node syntax and analysis-owned source/role tables.
+/// Closed relation-redex classification used by extraction.  Matrix bounds
+/// are resolved independently through the authoritative bound input and the
+/// shared node transfer; source syntax is never treated as a bound contract.
 pub fn classify_proposal_node(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     node: &MxxLang,
     context: &RewriteContext,
-) -> Result<(bool, Option<AtomicSourceId>), RelationFailure> {
-    let large_atom_witness = match node {
-        MxxLang::Atom { source, .. } => {
-            egraph.analysis.symbols.atomic_sources.get(source.0).and_then(|descriptor| {
-                (matches!(descriptor.sort, MxxSort::Matrix(_)) &&
-                    !matches!(
-                        &descriptor.key,
-                        AtomicSourceKey::Sampler(_) | AtomicSourceKey::SequentialRecurrence { .. }
-                    ))
-                .then_some(*source)
-            })
-        }
-        _ => None,
-    };
+) -> Result<bool, RelationFailure> {
     let MxxLang::MatrixMultiply(factors) = node else {
-        return Ok((false, large_atom_witness));
+        return Ok(false);
     };
     for relation_position in 1..factors.len() {
         let relation = egraph.find(factors[relation_position]);
@@ -480,12 +468,12 @@ pub fn classify_proposal_node(
                     (distributed_public.is_some() ||
                         egraph.find(registration.expected_public) == public)
                 {
-                    return Ok((true, large_atom_witness));
+                    return Ok(true);
                 }
             }
         }
     }
-    Ok((false, large_atom_witness))
+    Ok(false)
 }
 
 /// Validates the exact Graph-derived records before accepting an e-class
@@ -906,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn only_nonsampler_matrix_atoms_are_large_extraction_witnesses() {
+    fn source_kinds_do_not_affect_relation_redex_classification() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let protocol_atom = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, name: &str, sort| {
             let source = AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(
@@ -926,7 +914,7 @@ mod tests {
             MxxSort::Bytes(ResolvedIntExpr::Const(32.into())),
         );
         let integer = protocol_atom(&mut egraph, "counter", MxxSort::Int);
-        let (matrix, matrix_source) = matrix_atom(&mut egraph, "plaintext", None);
+        let (matrix, _) = matrix_atom(&mut egraph, "plaintext", None);
         let sampler_source =
             AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
                 key: AtomicSourceKey::Sampler(SamplerDescriptorId(0)),
@@ -940,13 +928,10 @@ mod tests {
 
         for term in [bytes, integer, sampler] {
             let node = egraph[egraph.find(term)].nodes.first().expect("atom node");
-            assert_eq!(classify_proposal_node(&egraph, node, &context).unwrap(), (false, None));
+            assert!(!classify_proposal_node(&egraph, node, &context).unwrap());
         }
         let node = egraph[egraph.find(matrix)].nodes.first().expect("matrix atom node");
-        assert_eq!(
-            classify_proposal_node(&egraph, node, &context).unwrap(),
-            (false, Some(matrix_source)),
-        );
+        assert!(!classify_proposal_node(&egraph, node, &context).unwrap());
     }
 
     fn registration(

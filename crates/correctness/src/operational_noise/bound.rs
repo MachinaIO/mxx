@@ -12,7 +12,7 @@ use super::{
 use egg::Id;
 use mxx_ir_core::types::ConcreteMatrixType;
 use num_bigint::{BigInt, BigUint};
-use num_traits::{One, Signed, Zero};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use std::collections::BTreeMap;
 
 /// Whether a matrix has a numeric centered-coefficient bound.
@@ -24,6 +24,16 @@ pub enum BoundClass {
 }
 
 impl BoundClass {
+    /// Builds the finite class while preserving the unique representation of
+    /// an exactly-zero matrix.
+    pub fn bounded(maximum_absolute_coefficient: BigUint) -> Self {
+        if maximum_absolute_coefficient.is_zero() {
+            Self::ExactZero
+        } else {
+            Self::Bounded { maximum_absolute_coefficient }
+        }
+    }
+
     pub fn maximum_absolute_coefficient(&self) -> Option<BigUint> {
         match self {
             Self::ExactZero => Some(BigUint::ZERO),
@@ -56,11 +66,7 @@ impl BoundClass {
                 Self::Large => return Self::Large,
             }
         }
-        if maximum.is_zero() {
-            Self::ExactZero
-        } else {
-            Self::Bounded { maximum_absolute_coefficient: maximum }
-        }
+        Self::bounded(maximum)
     }
 }
 
@@ -74,13 +80,24 @@ pub(crate) fn gadget_digit_bound(base: &BigInt, small: bool) -> Option<BoundClas
         return None;
     }
     let absolute = base.to_biguint().expect("positive gadget base");
-    Some(BoundClass::Bounded {
-        maximum_absolute_coefficient: if small {
-            absolute - BigUint::one()
-        } else {
-            (absolute / BigUint::from(2_u8)).max(BigUint::one())
-        },
-    })
+    Some(BoundClass::bounded(if small {
+        absolute - BigUint::one()
+    } else {
+        (absolute / BigUint::from(2_u8)).max(BigUint::one())
+    }))
+}
+
+/// The coefficient class of a gadget *matrix*.  This is intentionally
+/// distinct from [`gadget_digit_bound`]: a regular gadget matrix is a public
+/// large value, while small-mode has the explicit digit-range cap.
+pub(crate) fn gadget_matrix_bound(base: &BigInt, small: bool) -> Option<BoundClass> {
+    if base <= &BigInt::one() {
+        return None;
+    }
+    if !small {
+        return Some(BoundClass::Large);
+    }
+    Some(BoundClass::bounded(base.to_biguint().expect("positive gadget base") - BigUint::one()))
 }
 
 /// Metadata that has a proof-preserving matrix transfer rule.
@@ -131,6 +148,11 @@ pub enum BoundEvaluationError {
     InvalidMatrixScale { term: Id },
     InvalidCrtRecompose { term: Id },
     InvalidPack { term: Id },
+    InvalidSwitchReachability { term: Id },
+    MissingInputBoundContract { term: Id },
+    OpaqueGraphWire { term: Id },
+    SequentialStateOutsideOverlay { term: Id },
+    InvalidDeclaredBound { term: Id },
     UnconsumedLargeTerm { term: Id },
 }
 
@@ -163,6 +185,22 @@ pub trait BoundInput {
         term: Id,
     ) -> Result<Box<[BigInt]>, BoundEvaluationError>;
     fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError>;
+    /// Returns the proven maximum for one Boolean coefficient bit.  The
+    /// production bridge must reject non-Boolean or missing-domain values.
+    fn pack_bit_maximum(&self, term: Id, _bit: Id) -> Result<BigUint, BoundEvaluationError> {
+        Err(BoundEvaluationError::InvalidPack { term })
+    }
+    /// Returns exactly the stored switch cases reachable from the selector's
+    /// authoritative integer domain.  The result is positional and must have
+    /// one entry per case; it never expands logical selector/family products.
+    fn switch_reachable_cases(
+        &self,
+        term: Id,
+        _selector: Id,
+        _case_count: usize,
+    ) -> Result<Box<[bool]>, BoundEvaluationError> {
+        Err(BoundEvaluationError::InvalidSwitchReachability { term })
+    }
 }
 
 /// Semantic validation used by production bound inputs.
@@ -174,11 +212,30 @@ pub trait BoundEvaluationControl {
 pub struct BoundEvaluator<'a, I> {
     input: &'a I,
     memo: BTreeMap<Id, MatrixBound>,
+    selected_children: Option<&'a dyn SelectedChildBounds>,
+}
+
+/// Read-only access to the already-selected child bounds of one extraction
+/// candidate.  Extraction implements this over its existing candidate table;
+/// it is not a second memo or an analysis-owned cache.
+pub(crate) trait SelectedChildBounds {
+    fn child_bound(&self, term: Id) -> Option<&MatrixBound>;
 }
 
 impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
     pub fn new(input: &'a I) -> Self {
-        Self { input, memo: BTreeMap::new() }
+        Self { input, memo: BTreeMap::new(), selected_children: None }
+    }
+
+    /// Applies the exact same node transfer used by final evaluation to one
+    /// extraction candidate whose child bounds have already been selected.
+    pub(crate) fn evaluate_selected_node(
+        input: &'a I,
+        term: Id,
+        node: &MxxLang,
+        children: &'a dyn SelectedChildBounds,
+    ) -> Result<MatrixBound, BoundEvaluationError> {
+        Self { input, memo: BTreeMap::new(), selected_children: Some(children) }.finish(term, node)
     }
 
     pub fn memo(&self) -> &BTreeMap<Id, MatrixBound> {
@@ -201,7 +258,7 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                         .node(term)
                         .ok_or(BoundEvaluationError::MissingExtractedTerm { term })?
                         .clone();
-                    let children = matrix_children(&node, term)?;
+                    let children = self.matrix_children(&node, term)?;
                     work.push(Work::Finish(term, node));
                     for child in children.into_iter().rev() {
                         if !self.memo.contains_key(&child) {
@@ -229,7 +286,31 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
     }
 
     fn child(&self, term: Id) -> Result<&MatrixBound, BoundEvaluationError> {
-        self.memo.get(&term).ok_or(BoundEvaluationError::ExtractedExpressionCycle { term })
+        self.memo
+            .get(&term)
+            .or_else(|| self.selected_children.and_then(|children| children.child_bound(term)))
+            .ok_or(BoundEvaluationError::ExtractedExpressionCycle { term })
+    }
+
+    fn matrix_children(&self, node: &MxxLang, term: Id) -> Result<Vec<Id>, BoundEvaluationError> {
+        let MxxLang::Switch(children) = node else {
+            return matrix_children(node, term);
+        };
+        let Some((selector, cases)) = children.split_first() else {
+            return Err(BoundEvaluationError::EmptyMatrixOperation { term });
+        };
+        if cases.is_empty() {
+            return Err(BoundEvaluationError::EmptyMatrixOperation { term });
+        }
+        let reachable = self.input.switch_reachable_cases(term, *selector, cases.len())?;
+        if reachable.len() != cases.len() || !reachable.iter().any(|reachable| *reachable) {
+            return Err(BoundEvaluationError::InvalidSwitchReachability { term });
+        }
+        Ok(cases
+            .iter()
+            .zip(reachable.iter())
+            .filter_map(|(case, reachable)| reachable.then_some(*case))
+            .collect())
     }
 
     fn finish(&self, term: Id, node: &MxxLang) -> Result<MatrixBound, BoundEvaluationError> {
@@ -277,13 +358,9 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                 metadata: MatrixMetadata { is_constant_polynomial: true, known_zero_rows: None },
             }),
             CrtRecompose { spec, inputs } => self.bound_crt(term, *spec, inputs),
-            PackPolynomialCoefficients { bits, .. } => {
+            PackPolynomialCoefficients { coefficient_bits, bits, .. } => {
                 self.input.validate_pack(term, bits.len())?;
-                Ok(MatrixBound {
-                    matrix_type: self.input.matrix_type(term)?,
-                    coefficient_class: BoundClass::Large,
-                    metadata: MatrixMetadata::unknown(),
-                })
+                self.bound_pack(term, coefficient_bits, bits)
             }
             IntConst(_) |
             IntParameter(_) |
@@ -357,7 +434,7 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                 }
                 BoundClass::Bounded { maximum_absolute_coefficient: BigUint::one() }
             }
-            ResolvedMatrixConstant::Gadget { base, small } => gadget_digit_bound(&base, small)
+            ResolvedMatrixConstant::Gadget { base, small } => gadget_matrix_bound(&base, small)
                 .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?,
             ResolvedMatrixConstant::PowerOfBase { base, exponent } => {
                 if matrix_type.rows != 1 || matrix_type.columns != 1 {
@@ -367,7 +444,7 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                 let exponent = exponent
                     .try_into()
                     .map_err(|_| BoundEvaluationError::InvalidMatrixConstant { term })?;
-                BoundClass::Bounded { maximum_absolute_coefficient: absolute.pow(exponent) }
+                BoundClass::bounded(absolute.pow(exponent))
             }
             ResolvedMatrixConstant::Rotation { exponent } => {
                 if matrix_type.rows != 1 || matrix_type.columns != 1 || exponent.is_negative() {
@@ -380,13 +457,7 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                     return Err(BoundEvaluationError::InvalidMatrixConstant { term });
                 }
                 BoundClass::maximum(coefficients.iter().map(|coefficient| {
-                    let maximum_absolute_coefficient =
-                        coefficient.abs().to_biguint().unwrap_or_default();
-                    if maximum_absolute_coefficient.is_zero() {
-                        BoundClass::ExactZero
-                    } else {
-                        BoundClass::Bounded { maximum_absolute_coefficient }
-                    }
+                    BoundClass::bounded(coefficient.abs().to_biguint().unwrap_or_default())
                 }))
             }
         };
@@ -604,14 +675,23 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
     }
 
     fn bound_switch(&self, term: Id, children: &[Id]) -> Result<MatrixBound, BoundEvaluationError> {
-        let Some((_, cases)) = children.split_first() else {
+        let Some((selector, cases)) = children.split_first() else {
             return Err(BoundEvaluationError::EmptyMatrixOperation { term });
         };
         if cases.is_empty() {
             return Err(BoundEvaluationError::EmptyMatrixOperation { term });
         }
+        let reachable = self.input.switch_reachable_cases(term, *selector, cases.len())?;
+        if reachable.len() != cases.len() || !reachable.iter().any(|reachable| *reachable) {
+            return Err(BoundEvaluationError::InvalidSwitchReachability { term });
+        }
         let matrix_type = self.input.matrix_type(term)?;
-        let bounds = cases.iter().map(|id| self.child(*id)).collect::<Result<Vec<_>, _>>()?;
+        let bounds = cases
+            .iter()
+            .zip(reachable.iter())
+            .filter_map(|(case, reachable)| reachable.then_some(*case))
+            .map(|id| self.child(id))
+            .collect::<Result<Vec<_>, _>>()?;
         if bounds.iter().any(|bound| bound.matrix_type != matrix_type) {
             return Err(BoundEvaluationError::IncompatibleMatrixProduct {
                 left: bounds[0].matrix_type.clone(),
@@ -662,12 +742,16 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             }
             all_constant_polynomials &= bound.metadata.is_constant_polynomial;
             let factor = coefficient.abs().to_biguint().unwrap_or_default();
-            class = class.add(&match &bound.coefficient_class {
-                BoundClass::ExactZero => BoundClass::ExactZero,
-                BoundClass::Bounded { maximum_absolute_coefficient } => BoundClass::Bounded {
-                    maximum_absolute_coefficient: maximum_absolute_coefficient * factor,
-                },
-                BoundClass::Large => BoundClass::Large,
+            class = class.add(&if factor.is_zero() {
+                BoundClass::ExactZero
+            } else {
+                match &bound.coefficient_class {
+                    BoundClass::ExactZero => BoundClass::ExactZero,
+                    BoundClass::Bounded { maximum_absolute_coefficient } => {
+                        BoundClass::bounded(maximum_absolute_coefficient * factor)
+                    }
+                    BoundClass::Large => BoundClass::Large,
+                }
             });
         }
         Ok(MatrixBound {
@@ -677,6 +761,57 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                 is_constant_polynomial: all_constant_polynomials,
                 known_zero_rows: None,
             },
+        })
+    }
+
+    fn bound_pack(
+        &self,
+        term: Id,
+        coefficient_bits: &super::identity::ResolvedIntExpr,
+        bits: &[Id],
+    ) -> Result<MatrixBound, BoundEvaluationError> {
+        let matrix_type = self.input.matrix_type(term)?;
+        let super::identity::ResolvedIntExpr::Const(width) = coefficient_bits else {
+            return Err(BoundEvaluationError::InvalidPack { term });
+        };
+        let width = width
+            .to_usize()
+            .filter(|width| *width > 0)
+            .ok_or(BoundEvaluationError::InvalidPack { term })?;
+        if matrix_type.rows != 1 ||
+            matrix_type.columns != 1 ||
+            bits.len() !=
+                matrix_type
+                    .ring_dimension
+                    .checked_mul(width)
+                    .ok_or(BoundEvaluationError::InvalidPack { term })?
+        {
+            return Err(BoundEvaluationError::InvalidPack { term });
+        }
+        let modulus = matrix_type
+            .modulus
+            .to_biguint()
+            .filter(|modulus| !modulus.is_zero())
+            .ok_or(BoundEvaluationError::InvalidPack { term })?;
+        let cap = &modulus - BigUint::one();
+        let mut maximum = BigUint::zero();
+        for coefficient_bits in bits.chunks_exact(width) {
+            let coefficient = coefficient_bits.iter().enumerate().try_fold(
+                BigUint::zero(),
+                |sum, (position, bit)| {
+                    let maximum = self.input.pack_bit_maximum(term, *bit)?;
+                    if maximum > BigUint::one() {
+                        return Err(BoundEvaluationError::InvalidPack { term });
+                    }
+                    Ok(sum + (maximum << position))
+                },
+            )?;
+            maximum = maximum.max(coefficient.min(cap.clone()));
+        }
+        Ok(MatrixBound {
+            matrix_type,
+            coefficient_class: BoundClass::bounded(maximum),
+            metadata: MatrixMetadata { is_constant_polynomial: false, known_zero_rows: None },
         })
     }
 }
@@ -752,7 +887,7 @@ fn multiply_classes(left: &BoundClass, right: &BoundClass, factor: &BigUint) -> 
         (
             BoundClass::Bounded { maximum_absolute_coefficient: left },
             BoundClass::Bounded { maximum_absolute_coefficient: right },
-        ) => BoundClass::Bounded { maximum_absolute_coefficient: factor * left * right },
+        ) => BoundClass::bounded(factor * left * right),
         _ => BoundClass::Large,
     }
 }
@@ -814,7 +949,7 @@ fn matrix_children(node: &MxxLang, term: Id) -> Result<Vec<Id>, BoundEvaluationE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operational_noise::identity::Axis;
+    use crate::operational_noise::identity::{Axis, ResolvedIntExpr, ResolvedMatrixType};
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
@@ -826,6 +961,8 @@ mod tests {
         constants: BTreeMap<u32, (ConcreteMatrixType, ResolvedMatrixConstant)>,
         crt_coefficients: BTreeMap<u32, Box<[BigInt]>>,
         scalars: BTreeMap<Id, BigUint>,
+        pack_bit_maxima: BTreeMap<Id, BigUint>,
+        switch_reachability: BTreeMap<Id, Box<[bool]>>,
     }
 
     impl BoundInput for Input {
@@ -878,6 +1015,23 @@ mod tests {
         fn validate_pack(&self, _: Id, _: usize) -> Result<(), BoundEvaluationError> {
             Ok(())
         }
+        fn pack_bit_maximum(&self, term: Id, bit: Id) -> Result<BigUint, BoundEvaluationError> {
+            self.pack_bit_maxima
+                .get(&bit)
+                .cloned()
+                .ok_or(BoundEvaluationError::InvalidPack { term })
+        }
+        fn switch_reachable_cases(
+            &self,
+            term: Id,
+            _: Id,
+            _: usize,
+        ) -> Result<Box<[bool]>, BoundEvaluationError> {
+            self.switch_reachability
+                .get(&term)
+                .cloned()
+                .ok_or(BoundEvaluationError::InvalidSwitchReachability { term })
+        }
     }
 
     fn matrix(rows: usize, columns: usize) -> ConcreteMatrixType {
@@ -889,6 +1043,23 @@ mod tests {
             matrix_type,
             coefficient_class: BoundClass::Bounded { maximum_absolute_coefficient: value.into() },
             metadata: MatrixMetadata::unknown(),
+        }
+    }
+
+    fn pack_matrix_type() -> ConcreteMatrixType {
+        ConcreteMatrixType { modulus: BigInt::from(17), ring_dimension: 2, rows: 1, columns: 1 }
+    }
+
+    fn pack_node(bits: Vec<Id>) -> MxxLang {
+        MxxLang::PackPolynomialCoefficients {
+            matrix_type: ResolvedMatrixType {
+                modulus: ResolvedIntExpr::Const(17.into()),
+                ring_dimension: ResolvedIntExpr::Const(2.into()),
+                rows: ResolvedIntExpr::Const(1.into()),
+                columns: ResolvedIntExpr::Const(1.into()),
+            },
+            coefficient_bits: ResolvedIntExpr::Const(5.into()),
+            bits: bits.into_boxed_slice(),
         }
     }
 
@@ -970,12 +1141,137 @@ mod tests {
         }
         input.atoms.insert(AtomicSourceId(0), bounded(matrix(1, 1), 4));
         input.atoms.insert(AtomicSourceId(1), bounded(matrix(1, 1), 7));
+        input.switch_reachability.insert(root, vec![true, true].into());
         let result = BoundEvaluator::new(&input).evaluate(root).unwrap();
         assert_eq!(
             result.coefficient_class,
             BoundClass::Bounded { maximum_absolute_coefficient: 7_u8.into() }
         );
         let _ = Axis::Rows;
+    }
+
+    #[test]
+    fn switch_evaluates_only_the_exact_reachable_case() {
+        let large = Id::from(0);
+        let bounded_case = Id::from(1);
+        let root = Id::from(2);
+        let mut input = Input::default();
+        input.nodes.insert(
+            large,
+            MxxLang::HashPlain {
+                query: super::super::identity::HashQuerySpecId(0),
+                arguments: Box::new([]),
+            },
+        );
+        input.nodes.insert(
+            bounded_case,
+            MxxLang::Atom { source: AtomicSourceId(0), indices: Box::new([]) },
+        );
+        input.nodes.insert(
+            root,
+            MxxLang::Switch(vec![Id::from(9), large, bounded_case].into_boxed_slice()),
+        );
+        for id in [large, bounded_case, root] {
+            input.types.insert(id, matrix(1, 1));
+        }
+        input.atoms.insert(AtomicSourceId(0), bounded(matrix(1, 1), 3));
+        input.switch_reachability.insert(root, vec![false, true].into());
+
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(root).unwrap().coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: 3_u8.into() },
+        );
+    }
+
+    #[test]
+    fn switch_bounded_interval_uses_maximum_of_its_reachable_cases() {
+        let first = Id::from(0);
+        let second = Id::from(1);
+        let third = Id::from(2);
+        let root = Id::from(3);
+        let mut input = Input::default();
+        for (id, source) in [(first, 0), (second, 1), (third, 2)] {
+            input.nodes.insert(
+                id,
+                MxxLang::Atom { source: AtomicSourceId(source), indices: Box::new([]) },
+            );
+            input.types.insert(id, matrix(1, 1));
+            input.atoms.insert(AtomicSourceId(source), bounded(matrix(1, 1), (source + 2).into()));
+        }
+        input.nodes.insert(
+            root,
+            MxxLang::Switch(vec![Id::from(9), first, second, third].into_boxed_slice()),
+        );
+        input.types.insert(root, matrix(1, 1));
+        input.switch_reachability.insert(root, vec![false, true, true].into());
+
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(root).unwrap().coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: 4_u8.into() },
+        );
+    }
+
+    #[test]
+    fn switch_all_reachable_large_case_rejects() {
+        let bounded_case = Id::from(0);
+        let large = Id::from(1);
+        let root = Id::from(2);
+        let mut input = Input::default();
+        input.nodes.insert(
+            bounded_case,
+            MxxLang::Atom { source: AtomicSourceId(0), indices: Box::new([]) },
+        );
+        input.nodes.insert(
+            large,
+            MxxLang::HashPlain {
+                query: super::super::identity::HashQuerySpecId(0),
+                arguments: Box::new([]),
+            },
+        );
+        input.nodes.insert(
+            root,
+            MxxLang::Switch(vec![Id::from(9), bounded_case, large].into_boxed_slice()),
+        );
+        for id in [bounded_case, large, root] {
+            input.types.insert(id, matrix(1, 1));
+        }
+        input.atoms.insert(AtomicSourceId(0), bounded(matrix(1, 1), 1));
+        input.switch_reachability.insert(root, vec![true, true].into());
+
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(root),
+            Err(BoundEvaluationError::UnconsumedLargeTerm { term: root }),
+        );
+    }
+
+    #[test]
+    fn switch_missing_or_invalid_reachability_is_a_contract_error() {
+        let first = Id::from(0);
+        let second = Id::from(1);
+        let root = Id::from(2);
+        let mut input = Input::default();
+        for (id, source) in [(first, 0), (second, 1)] {
+            input.nodes.insert(
+                id,
+                MxxLang::Atom { source: AtomicSourceId(source), indices: Box::new([]) },
+            );
+            input.types.insert(id, matrix(1, 1));
+            input.atoms.insert(AtomicSourceId(source), bounded(matrix(1, 1), 1));
+        }
+        input
+            .nodes
+            .insert(root, MxxLang::Switch(vec![Id::from(9), first, second].into_boxed_slice()));
+        input.types.insert(root, matrix(1, 1));
+
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(root),
+            Err(BoundEvaluationError::InvalidSwitchReachability { term: root }),
+        );
+        input.switch_reachability.insert(root, vec![true].into());
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(root),
+            Err(BoundEvaluationError::InvalidSwitchReachability { term: root }),
+        );
     }
 
     #[test]
@@ -1055,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn gadget_constants_use_the_shared_regular_and_small_digit_bounds() {
+    fn gadget_matrices_distinguish_regular_large_from_small_bounded() {
         let regular = Id::from(0);
         let small = Id::from(1);
         let mut input = Input::default();
@@ -1073,12 +1369,92 @@ mod tests {
         );
 
         assert_eq!(
-            BoundEvaluator::new(&input).evaluate(regular).unwrap().coefficient_class,
-            BoundClass::Bounded { maximum_absolute_coefficient: 2_u8.into() },
+            BoundEvaluator::new(&input).evaluate(regular),
+            Err(BoundEvaluationError::UnconsumedLargeTerm { term: regular }),
         );
         assert_eq!(
             BoundEvaluator::new(&input).evaluate(small).unwrap().coefficient_class,
             BoundClass::Bounded { maximum_absolute_coefficient: 3_u8.into() },
+        );
+    }
+
+    #[test]
+    fn regular_gadget_matrix_is_large_but_decomposition_digits_stay_finite() {
+        assert_eq!(gadget_matrix_bound(&4.into(), false), Some(BoundClass::Large));
+        assert_eq!(
+            gadget_matrix_bound(&4.into(), true),
+            Some(BoundClass::Bounded { maximum_absolute_coefficient: 3_u8.into() }),
+        );
+        assert_eq!(
+            gadget_digit_bound(&4.into(), false),
+            Some(BoundClass::Bounded { maximum_absolute_coefficient: 2_u8.into() }),
+        );
+    }
+
+    #[test]
+    fn pack_reconstructs_weighted_boolean_coefficients_and_caps_at_modulus() {
+        let root = Id::from(0);
+        let bits = (1_usize..=10).map(Id::from).collect::<Vec<_>>();
+        let mut input = Input::default();
+        input.nodes.insert(root, pack_node(bits.clone()));
+        input.types.insert(root, pack_matrix_type());
+        for bit in bits {
+            input.pack_bit_maxima.insert(bit, BigUint::one());
+        }
+
+        let result = BoundEvaluator::new(&input).evaluate(root).unwrap();
+        assert_eq!(
+            result.coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: 16_u8.into() },
+        );
+        assert!(!result.metadata.is_constant_polynomial);
+    }
+
+    #[test]
+    fn pack_known_zero_bits_tighten_the_coefficient_bound() {
+        let root = Id::from(0);
+        let bits = (1_usize..=10).map(Id::from).collect::<Vec<_>>();
+        let mut input = Input::default();
+        input.nodes.insert(root, pack_node(bits.clone()));
+        input.types.insert(root, pack_matrix_type());
+        input.pack_bit_maxima.insert(Id::from(1), BigUint::one());
+        for bit in bits.iter().skip(1) {
+            input.pack_bit_maxima.insert(*bit, BigUint::zero());
+        }
+
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(root).unwrap().coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: BigUint::one() },
+        );
+    }
+
+    #[test]
+    fn crt_zero_reconstruction_coefficient_annihilates_large_input() {
+        let large = Id::from(0);
+        let root = Id::from(1);
+        let mut input = Input::default();
+        input
+            .nodes
+            .insert(large, MxxLang::Atom { source: AtomicSourceId(0), indices: Box::new([]) });
+        input.nodes.insert(
+            root,
+            MxxLang::CrtRecompose { spec: CrtSpecId(0), inputs: vec![large].into_boxed_slice() },
+        );
+        input.types.insert(large, matrix(1, 1));
+        input.types.insert(root, matrix(1, 1));
+        input.atoms.insert(
+            AtomicSourceId(0),
+            MatrixBound {
+                matrix_type: matrix(1, 1),
+                coefficient_class: BoundClass::Large,
+                metadata: MatrixMetadata::unknown(),
+            },
+        );
+        input.crt_coefficients.insert(0, vec![BigInt::zero()].into());
+
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(root).unwrap().coefficient_class,
+            BoundClass::ExactZero,
         );
     }
 
@@ -1157,6 +1533,7 @@ mod tests {
         input.atoms.insert(AtomicSourceId(0), bounded(matrix(1, 1), 1));
         input.atoms.insert(AtomicSourceId(1), bounded(matrix(2, 1), 1));
         input.crt_coefficients.insert(0, vec![1.into(), 1.into()].into());
+        input.switch_reachability.insert(switched, vec![true, true].into());
 
         for root in [tensor, switched, crt] {
             assert!(matches!(

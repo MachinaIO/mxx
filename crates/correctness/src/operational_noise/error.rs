@@ -341,8 +341,6 @@ operational_error_registry! {
         UnresolvedExtraction {
             remaining_relation_redexes: u64,
             hidden_relation_redexes: u64,
-            large_atom_count: u64,
-            large_atom_witness: Option<AtomicSourceKey>,
         },
         EvaluationFailed { source: super::bound::BoundEvaluationError },
         SequentialArityMismatch { expected: usize, actual: usize },

@@ -474,50 +474,66 @@ pub fn check_operational_noise_candidate_with_progress(
                 site: site(&stage, wire, "extract"),
                 source: super::error::LowerError::CyclicGraphDependency { wire },
             };
+            let mut bound_error = |source| OperationalSimulationError::Bound {
+                site: site(&stage, wire, "extract semantic bound"),
+                source: super::error::BoundError::EvaluationFailed { source },
+            };
+            let view = lowerer.production_bound_view();
             control.borrow_mut().reserve_owned_elements(roots.len())?;
             let mut proposals = Vec::with_capacity(roots.len());
             for root in roots {
+                let root = lowerer.egraph.find(root);
                 let proposal = extract_best_proposal(
                     &lowerer.egraph,
                     root,
-                    &mut ExtractionControl { invalid_dag: &mut invalid_dag },
+                    &view,
+                    &mut ExtractionControl {
+                        invalid_dag: &mut invalid_dag,
+                        bound_error: &mut bound_error,
+                    },
                     &mut |_, node, egraph| {
-                        let (relation_redex, large_atom_witness) =
+                        let relation_redex =
                             super::relation::classify_proposal_node(egraph, node, &context)
                                 .map_err(|failure| {
                                     relation_error(&stage, wire, &egraph.analysis.symbols, failure)
                                 })?;
-                        Ok(ProposalNodeClassification {
-                            relation_redex,
-                            large_atom: large_atom_witness.is_some(),
-                            large_atom_witness,
-                        })
+                        Ok(ProposalNodeClassification { relation_redex })
                     },
                 )?;
                 if proposal.cost.remaining_relation_redexes != 0 ||
-                    proposal.cost.hidden_relation_redexes != 0 ||
-                    proposal.cost.large_atom_count != 0
+                    proposal.cost.hidden_relation_redexes != 0
                 {
                     return Err(OperationalSimulationError::Bound {
                         site: site(&stage, wire, "extract residual"),
                         source: super::error::BoundError::UnresolvedExtraction {
                             remaining_relation_redexes: proposal.cost.remaining_relation_redexes,
                             hidden_relation_redexes: proposal.cost.hidden_relation_redexes,
-                            large_atom_count: proposal.cost.large_atom_count,
-                            large_atom_witness: proposal.large_atom_witness.and_then(|source| {
-                                lowerer
-                                    .egraph
-                                    .analysis
-                                    .symbols
-                                    .atomic_sources
-                                    .get(source.0)
-                                    .map(|descriptor| descriptor.key.clone())
-                            }),
                         },
+                    });
+                }
+                if proposal.cost.large_residual {
+                    let source = proposal.first_large_source.and_then(|source| {
+                        lowerer
+                            .egraph
+                            .analysis
+                            .symbols
+                            .atomic_sources
+                            .get(source.0)
+                            .map(|descriptor| descriptor.key.clone())
+                    });
+                    return Err(OperationalSimulationError::Bound {
+                        site: site(&stage, wire, "extract residual"),
+                        source: source.map_or_else(
+                            || super::error::BoundError::EvaluationFailed {
+                                source: BoundEvaluationError::UnconsumedLargeTerm { term: root },
+                            },
+                            |source| super::error::BoundError::UnconsumedLargeTerm { source },
+                        ),
                     });
                 }
                 proposals.push(proposal);
             }
+            drop(view);
             let term_count =
                 proposals.iter().map(|proposal| proposal.expression.as_ref().len()).sum::<usize>();
             control.borrow_mut().work(

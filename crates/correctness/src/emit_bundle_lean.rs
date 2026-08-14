@@ -273,6 +273,9 @@ fn input_value_contract(value: &InputValueContract) -> String {
                 declared_bound(max_centered_coefficient)
             )
         }
+        InputValueContract::Trapdoor { .. } => {
+            panic!("the legacy Lean emitter cannot serialize a trapdoor input contract")
+        }
         InputValueContract::IntegerRange { lower, upper } => {
             format!(".integerRange ({}) ({})", int_expr(lower), int_expr(upper))
         }

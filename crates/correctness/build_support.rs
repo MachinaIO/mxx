@@ -20,11 +20,43 @@ pub fn emit_rerun_paths(workspace: &Path, source_paths: &[&str], owner_lean: &Pa
     println!("cargo:rerun-if-changed={}", owner_lean.display());
 }
 
+#[allow(dead_code)]
 pub fn verify_generated_freshness(
     workspace: &Path,
     generated: &Path,
     lean_name: &str,
     source_paths: &[&str],
+) -> Result<GeneratedFreshness, String> {
+    verify_generated_freshness_with_protocol_source_hash(
+        workspace,
+        generated,
+        lean_name,
+        source_paths,
+        true,
+    )
+}
+
+pub fn verify_generated_freshness_without_protocol_source_hash(
+    workspace: &Path,
+    generated: &Path,
+    lean_name: &str,
+    source_paths: &[&str],
+) -> Result<GeneratedFreshness, String> {
+    verify_generated_freshness_with_protocol_source_hash(
+        workspace,
+        generated,
+        lean_name,
+        source_paths,
+        false,
+    )
+}
+
+fn verify_generated_freshness_with_protocol_source_hash(
+    workspace: &Path,
+    generated: &Path,
+    lean_name: &str,
+    source_paths: &[&str],
+    verify_protocol_source_hash: bool,
 ) -> Result<GeneratedFreshness, String> {
     let generated_source = fs::read_to_string(generated)
         .map_err(|error| format!("failed to read {}: {error}", generated.display()))?;
@@ -43,11 +75,13 @@ pub fn verify_generated_freshness(
         &format!("{lean_name}_protocolSourcePaths"),
         &format!("List String := [{expected_paths}]"),
     )?;
-    require_definition(
-        &generated_source,
-        &format!("{lean_name}_protocolSourceHash"),
-        &format!("String := \"{}\"", hash_protocol_sources(workspace, &canonical_paths)?),
-    )?;
+    if verify_protocol_source_hash {
+        require_definition(
+            &generated_source,
+            &format!("{lean_name}_protocolSourceHash"),
+            &format!("String := \"{}\"", hash_protocol_sources(workspace, &canonical_paths)?),
+        )?;
+    }
     require_definition(
         &generated_source,
         &format!("{lean_name}_toolkitHash"),

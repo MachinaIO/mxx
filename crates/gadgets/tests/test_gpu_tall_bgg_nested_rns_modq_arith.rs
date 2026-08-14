@@ -353,6 +353,7 @@ fn run_tall_operational_check(
         vec![("producer".to_owned(), producer), ("encoding".to_owned(), encoding)],
         "encoding",
         &exact_input_metadata,
+        &BTreeMap::new(),
         |bundle| {
             bundle.ideal = ideal;
             bundle.comparator = ComparatorSpec::Equality {

@@ -1,0 +1,654 @@
+{
+  "schema_version": 1,
+  "scope": "Generic Tall reachability classification for every operational-checker error tag. Rows describe checker phases and do not assert fixture-specific node identities.",
+  "entries": [
+    {
+      "error_tag": "Target.MissingTargetId",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DuplicateTargetId",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.MissingStage",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.MissingResidualOutput",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.InvalidResidualSort",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.MissingDecoderWire",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderWireNotRoot",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderWorkflowOutputMismatch",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderSemanticAnchorMismatch",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderKindMismatch",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderArityMismatch",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderOutputCountMismatch",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderOutputPortOutOfRange",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderOutputTypeMismatch",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderInputDoesNotConsumeResidual",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderAttributeMismatch",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.ResidualModulusMismatch",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.DecoderModulusMismatch",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.NonClosedCiphertextModulus",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.NonPositiveCiphertextModulus",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.NonClosedPlaintextModulus",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.NonPositivePlaintextModulus",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Target.BooleanIntervalModulusBelowFour",
+      "tall_reachability": "reachable",
+      "classification": "target_validation",
+      "rationale": "Tall uses the generic closed-target resolution and decoder-validation path; malformed declarations fail closed with this typed target error."
+    },
+    {
+      "error_tag": "Lower.MissingWire",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.MissingNode",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.CyclicGraphDependency",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidOutputPort",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidOperandArity",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidOperandSort",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.MissingChildBinding",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.MissingProtocolInputBinding",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.ArtifactProducerMissing",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.ArtifactProducerAmbiguous",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.ArtifactTypeMismatch",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidProtocolTrapdoorContract",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidInternalCanonicalRangeContract",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.UnboundParameter",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.UnboundBinder",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.EmptyBinderDomain",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.NonAffineLoopExpression",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.NonExactIdentityIndex",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.ExactDivisionNotProved",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.DivisionByZeroDomain",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.NonExactEuclideanDomain",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidRoundDivDenominator",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidLog2CeilArgument",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.IntervalOperationNotSupported",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.NonUniformParallelMatrixType",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidFamilyCount",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.FamilyProducerNotResolved",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.IncompatibleFamilyCoverage",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.FamilyAccessOutOfRange",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.FamilyElementTypeMismatch",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.NegativeSamplerCutoff",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidUniformInterval",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.PackRequiresExplicitBooleanFamily",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidPackBitCount",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidPackBitWidth",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.InvalidRealOperation",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.SelectorOnlyValueUsedByForbiddenConsumer",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Analysis.EClassSortConflict",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.MatrixTypeMismatch",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.MatrixShapeMismatch",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidMatrixDimension",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidConstantMatrix",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidSliceRange",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidConcatAxisOrShape",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidTensorShape",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidCrtSpecification",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidGadgetLayout",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidHashQuery",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidTrapdoorDescriptor",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidSamplerDescriptor",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.UnknownCanonicalResidueRange",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Analysis.InvalidKnownZeroRows",
+      "tall_reachability": "reachable",
+      "classification": "egraph_analysis",
+      "rationale": "Tall terms use the generic typed e-graph analysis; incompatible or invalid analysis facts fail closed with this error."
+    },
+    {
+      "error_tag": "Relation.InvalidRelationProducer",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.MismatchedRelationIndex",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.MismatchedRelationType",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.MismatchedRelationLayout",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.MismatchedHashQueryIdentity",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.MismatchedPreimagePublicIdentity",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.MismatchedTrapdoorIdentity",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.MismatchedRelationTargetIdentity",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.SmallDecompositionRangeNotProved",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.AmbiguousRelationSource",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.DifferentSelectorRelationBlocked",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.TransformedRelationOperand",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Relation.RelationRewriteWouldChangeFactorOrder",
+      "tall_reachability": "reachable_for_relation_terms",
+      "classification": "relation_validation",
+      "rationale": "Tall sampler and decomposition terms are checked by the generic relation engine when such a relation is encountered; this error rejects an unproved relation match."
+    },
+    {
+      "error_tag": "Bound.NegativeSequentialSamplerCutoff",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.UnconsumedLargeTerm",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.LargeValueUsedAsNoise",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.IncompatibleMatrixProduct",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.InvalidProductMode",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.BoundExpressionNotEvaluable",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.SequentialArityMismatch",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.SequentialSchemaMismatch",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.RelationBearingSequentialState",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.LargeSequentialState",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.UnsupportedRecurrenceExpression",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Bound.SequentialMetadataNotInvariant",
+      "tall_reachability": "reachable",
+      "classification": "noise_bound_evaluation",
+      "rationale": "Tall residuals use the generic deterministic bound evaluator; this error rejects a value or recurrence that cannot be bounded soundly."
+    },
+    {
+      "error_tag": "Resource.RewriteIterations",
+      "tall_reachability": "reachable_if_limit_exceeded",
+      "classification": "resource_limit",
+      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
+    },
+    {
+      "error_tag": "Resource.EGraphNodes",
+      "tall_reachability": "reachable_if_limit_exceeded",
+      "classification": "resource_limit",
+      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
+    },
+    {
+      "error_tag": "Resource.TotalOwnedElements",
+      "tall_reachability": "reachable_if_limit_exceeded",
+      "classification": "resource_limit",
+      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
+    },
+    {
+      "error_tag": "Resource.TotalTime",
+      "tall_reachability": "reachable_if_limit_exceeded",
+      "classification": "resource_limit",
+      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
+    },
+    {
+      "error_tag": "Resource.RelationSourcesPerEClass",
+      "tall_reachability": "reachable_if_limit_exceeded",
+      "classification": "resource_limit",
+      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
+    },
+    {
+      "error_tag": "Resource.SwitchCases",
+      "tall_reachability": "reachable_if_limit_exceeded",
+      "classification": "resource_limit",
+      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
+    },
+    {
+      "error_tag": "Resource.RecurrenceSteps",
+      "tall_reachability": "reachable_if_limit_exceeded",
+      "classification": "resource_limit",
+      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
+    },
+    {
+      "error_tag": "Resource.IntegerBits",
+      "tall_reachability": "reachable_if_limit_exceeded",
+      "classification": "resource_limit",
+      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
+    }
+  ]
+}

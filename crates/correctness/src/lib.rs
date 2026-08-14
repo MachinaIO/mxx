@@ -9,6 +9,7 @@ pub mod emit_bundle_lean;
 pub mod emit_lean;
 pub mod freshness;
 pub mod ir_binary;
+pub mod operational_noise;
 pub mod operational_protocol;
 pub mod operational_runner;
 pub mod protocol;
@@ -25,7 +26,8 @@ pub use freshness::{
     verify_freshness,
 };
 pub use operational_protocol::{
-    ExactMatrixInputMetadata, OperationalProtocolError, operational_protocol_from_graphs,
+    ExactMatrixInputMetadata, ExactTrapdoorInputMetadata, OperationalProtocolError,
+    operational_protocol_from_graphs,
 };
 pub use operational_runner::{
     OPERATIONAL_REPORT_SCHEMA_VERSION, OperationalCheckRequest, OperationalCheckerReport,

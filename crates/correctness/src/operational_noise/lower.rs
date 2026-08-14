@@ -6,7 +6,7 @@
 
 use super::{
     OperationalCheckRequest,
-    analysis::{IntegerDomain, MxxAnalysis, MxxSort, ScalarProvenance},
+    analysis::{IntegerDomain, MxxAnalysis, MxxSort, ScalarProvenance, resolved_constant},
     bound::{
         BoundClass, BoundEvaluationControl, BoundEvaluationError, BoundEvaluator, BoundInput,
         MatrixBound, MatrixMetadata, ResolvedMatrixConstant, gadget_digit_bound,
@@ -622,10 +622,7 @@ impl BoundInput for SequentialBoundInput<'_, '_, '_> {
 }
 
 fn resolved_integer(value: &ResolvedIntExpr) -> Option<BigInt> {
-    match value {
-        ResolvedIntExpr::Const(value) => Some(value.clone()),
-        _ => None,
-    }
+    resolved_constant(value)
 }
 fn resolved_nonnegative(value: &ResolvedIntExpr) -> Option<num_bigint::BigUint> {
     resolved_integer(value)?.to_biguint()
@@ -4594,6 +4591,75 @@ mod tests {
             Err(LowerError::InvalidExtractCoefficientCanonicalUpper { upper, modulus })
                 if upper == 18_u8.into() && modulus == 17_u8.into()
         ));
+    }
+
+    #[test]
+    fn concrete_matrix_type_evaluates_closed_dimensions_and_rejects_unresolved_binders() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "closed-matrix-dimensions".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let one_column = super::super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(1009.into()),
+            ring_dimension: ResolvedIntExpr::Const(8.into()),
+            rows: ResolvedIntExpr::Const(1.into()),
+            columns: ResolvedIntExpr::Const(1.into()),
+        };
+        let constant = |lowerer: &mut GraphLowerer<'_, '_>| {
+            let spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
+                super::super::identity::MatrixConstantSpec {
+                    matrix_type: one_column.clone(),
+                    value: super::super::identity::MatrixConstantValue::Zero,
+                },
+            );
+            lowerer
+                .egraph
+                .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)))
+        };
+        let left = constant(&mut lowerer);
+        let right = constant(&mut lowerer);
+        let concat = lowerer.egraph.add(MxxLang::MatrixConcat {
+            axis: super::super::identity::Axis::Columns,
+            inputs: Box::new([left, right]),
+        });
+        assert_eq!(lowerer.production_bound_view().matrix_type(concat).unwrap().columns, 2);
+
+        let binder = BinderKey {
+            loop_scope: root_test_environment().occurrence,
+            loop_node: mxx_ir_core::NodeId(1),
+            slot: 0,
+        };
+        assert!(
+            concrete_matrix_type(&super::super::identity::ResolvedMatrixType {
+                columns: ResolvedIntExpr::Binder(binder),
+                ..one_column
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resolved_integer_requires_closed_exact_operations() {
+        let constant = |value| Box::new(ResolvedIntExpr::Const(BigInt::from(value)));
+        assert_eq!(
+            resolved_integer(&ResolvedIntExpr::Div(constant(12), constant(3))),
+            Some(BigInt::from(4))
+        );
+        assert_eq!(
+            resolved_integer(&ResolvedIntExpr::RoundDiv(constant(-3), constant(2))),
+            Some(BigInt::from(-1))
+        );
+        assert_eq!(
+            resolved_integer(&ResolvedIntExpr::Log2Ceil(constant(9))),
+            Some(BigInt::from(4))
+        );
+        assert!(resolved_integer(&ResolvedIntExpr::Div(constant(1), constant(0))).is_none());
+        assert!(resolved_integer(&ResolvedIntExpr::Div(constant(5), constant(2))).is_none());
+        assert!(resolved_integer(&ResolvedIntExpr::Log2Ceil(constant(0))).is_none());
+        assert!(resolved_integer(&ResolvedIntExpr::Parameter("unresolved".to_owned())).is_none());
     }
 
     #[test]

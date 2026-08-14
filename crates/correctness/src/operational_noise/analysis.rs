@@ -1543,20 +1543,63 @@ fn matrix_sort(egraph: &EGraph<MxxLang, MxxAnalysis>, id: egg::Id) -> Option<&Re
     }
 }
 
-fn resolved_constant(expression: &ResolvedIntExpr) -> Option<BigInt> {
-    match expression {
-        ResolvedIntExpr::Const(value) => Some(value.clone()),
-        ResolvedIntExpr::Add(left, right) => {
-            Some(resolved_constant(left)? + resolved_constant(right)?)
-        }
-        ResolvedIntExpr::Sub(left, right) => {
-            Some(resolved_constant(left)? - resolved_constant(right)?)
-        }
-        ResolvedIntExpr::Mul(left, right) => {
-            Some(resolved_constant(left)? * resolved_constant(right)?)
-        }
-        _ => None,
+pub(crate) fn resolved_constant(expression: &ResolvedIntExpr) -> Option<BigInt> {
+    enum Work<'a> {
+        Enter(&'a ResolvedIntExpr),
+        Add,
+        Sub,
+        Mul,
+        Div,
+        RoundDiv,
+        Log2Ceil,
     }
+
+    let mut values = Vec::new();
+    let mut work = vec![Work::Enter(expression)];
+    while let Some(work_item) = work.pop() {
+        match work_item {
+            Work::Enter(ResolvedIntExpr::Const(value)) => values.push(value.clone()),
+            Work::Enter(ResolvedIntExpr::Parameter(_) | ResolvedIntExpr::Binder(_)) => {
+                return None;
+            }
+            Work::Enter(ResolvedIntExpr::Add(left, right)) => {
+                work.extend([Work::Add, Work::Enter(right), Work::Enter(left)]);
+            }
+            Work::Enter(ResolvedIntExpr::Sub(left, right)) => {
+                work.extend([Work::Sub, Work::Enter(right), Work::Enter(left)]);
+            }
+            Work::Enter(ResolvedIntExpr::Mul(left, right)) => {
+                work.extend([Work::Mul, Work::Enter(right), Work::Enter(left)]);
+            }
+            Work::Enter(ResolvedIntExpr::Div(left, right)) => {
+                work.extend([Work::Div, Work::Enter(right), Work::Enter(left)]);
+            }
+            Work::Enter(ResolvedIntExpr::RoundDiv(left, right)) => {
+                work.extend([Work::RoundDiv, Work::Enter(right), Work::Enter(left)]);
+            }
+            Work::Enter(ResolvedIntExpr::Log2Ceil(value)) => {
+                work.extend([Work::Log2Ceil, Work::Enter(value)]);
+            }
+            Work::Add | Work::Sub | Work::Mul | Work::Div | Work::RoundDiv => {
+                let right = values.pop()?;
+                let left = values.pop()?;
+                let value = match work_item {
+                    Work::Add => left + right,
+                    Work::Sub => left - right,
+                    Work::Mul => left * right,
+                    Work::Div => exact_quotient(&left, &right).ok()?,
+                    Work::RoundDiv => evaluate_round_div(&left, &right).ok()?,
+                    Work::Log2Ceil | Work::Enter(_) => unreachable!("binary operation was matched"),
+                };
+                values.push(value);
+            }
+            Work::Log2Ceil => {
+                let value = values.pop()?;
+                (value >= BigInt::one()).then(|| values.push(log2_ceil(&value)))?;
+            }
+        }
+    }
+    (values.len() == 1).then(|| values.pop()).flatten()
 }
 
 fn resolved_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {

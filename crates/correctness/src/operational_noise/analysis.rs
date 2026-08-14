@@ -1602,7 +1602,11 @@ pub(crate) fn resolved_constant(expression: &ResolvedIntExpr) -> Option<BigInt> 
     (values.len() == 1).then(|| values.pop()).flatten()
 }
 
-fn resolved_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {
+/// Compares owner-resolved integer attributes without requiring their closed
+/// arithmetic syntax to be identical.  An unresolved parameter or binder is
+/// equal only to the same expression, so callers remain fail-closed for
+/// runtime-dependent dimensions.
+pub(crate) fn resolved_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {
     left == right ||
         resolved_constant(left).zip(resolved_constant(right)).is_some_and(|(l, r)| l == r)
 }

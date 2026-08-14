@@ -8,7 +8,7 @@
 use super::{
     analysis::{
         MxxAnalysis, MxxSort, RelationProvenance, RelationProvenanceVisit, RelationSource,
-        try_visit_relation_provenance,
+        matrix_types_equal, resolved_constant, resolved_equal, try_visit_relation_provenance,
     },
     identity::{
         AtomicRelationRole, AtomicSourceId, AtomicSourceKey, MatrixConstantValue, SamplerIdentity,
@@ -527,16 +527,16 @@ fn preflight_registration(
     else {
         return Err(RelationFailure::MismatchedType { source: source.source });
     };
-    if source_matrix.modulus != public_matrix.modulus ||
-        source_matrix.ring_dimension != public_matrix.ring_dimension ||
-        source_matrix.modulus != target_matrix.modulus ||
-        source_matrix.ring_dimension != target_matrix.ring_dimension
+    if !resolved_equal(&source_matrix.modulus, &public_matrix.modulus) ||
+        !resolved_equal(&source_matrix.ring_dimension, &public_matrix.ring_dimension) ||
+        !resolved_equal(&source_matrix.modulus, &target_matrix.modulus) ||
+        !resolved_equal(&source_matrix.ring_dimension, &target_matrix.ring_dimension)
     {
         return Err(RelationFailure::MismatchedLayout { source: source.source });
     }
-    if public_matrix.columns != source_matrix.rows ||
-        target_matrix.rows != public_matrix.rows ||
-        target_matrix.columns != source_matrix.columns
+    if !resolved_equal(&public_matrix.columns, &source_matrix.rows) ||
+        !resolved_equal(&target_matrix.rows, &public_matrix.rows) ||
+        !resolved_equal(&target_matrix.columns, &source_matrix.columns)
     {
         return Err(RelationFailure::MismatchedType { source: source.source });
     }
@@ -568,14 +568,14 @@ fn preflight_registration(
         };
         if egraph.find(*public) != expected_public ||
             egraph.find(*sampler_target) != target ||
-            matrix_type != source_matrix
+            !matrix_types_equal(matrix_type, source_matrix)
         {
             return Err(RelationFailure::MismatchedTarget { source: source.source });
         }
         let public_is_exact_gadget = egraph[expected_public].nodes.iter().any(|node| {
             let MxxLang::MatrixConstant(spec_id) = node else { return false };
             egraph.analysis.symbols.matrix_constants.get(spec_id.0).is_some_and(|spec| {
-                spec.matrix_type == *public_matrix &&
+                matrix_types_equal(&spec.matrix_type, public_matrix) &&
                     matches!(
                         &spec.value,
                         MatrixConstantValue::Gadget { base: spec_base, small: spec_small }
@@ -591,18 +591,16 @@ fn preflight_registration(
                 return false;
             };
             egraph.analysis.symbols.hash_queries.get(query.0).is_some_and(|query| {
-                query.matrix_type == *target_matrix &&
+                matrix_types_equal(&query.matrix_type, target_matrix) &&
                     same_canonical_indices(egraph, hash_arguments, arguments)
             })
         });
-        let layout_is_exact = matches!(
-            (&source_matrix.rows, &public_matrix.rows, digit_count),
-            (
-                super::identity::ResolvedIntExpr::Const(source_rows),
-                super::identity::ResolvedIntExpr::Const(public_rows),
-                super::identity::ResolvedIntExpr::Const(digits),
-            ) if digits > &BigInt::zero() && source_rows == &(public_rows * digits)
-        );
+        let layout_is_exact = resolved_constant(&source_matrix.rows)
+            .zip(resolved_constant(&public_matrix.rows))
+            .zip(resolved_constant(digit_count))
+            .is_some_and(|((source_rows, public_rows), digits)| {
+                digits > BigInt::zero() && source_rows == public_rows * digits
+            });
         if !target_is_exact_hash || !layout_is_exact {
             return Err(RelationFailure::MismatchedTarget { source: source.source });
         }
@@ -631,20 +629,18 @@ fn preflight_registration(
         let public_is_exact_gadget = egraph[expected_public].nodes.iter().any(|node| {
             let MxxLang::MatrixConstant(spec_id) = node else { return false };
             egraph.analysis.symbols.matrix_constants.get(spec_id.0).is_some_and(|spec| {
-                spec.matrix_type == *public_matrix &&
+                matrix_types_equal(&spec.matrix_type, public_matrix) &&
                     matches!(&spec.value,
                         MatrixConstantValue::Gadget { base: spec_base, small: spec_small }
                         if spec_base == base && spec_small == small)
             })
         });
-        let layout_is_exact = matches!(
-            (&source_matrix.rows, &target_matrix.rows, digit_count),
-            (
-                super::identity::ResolvedIntExpr::Const(source_rows),
-                super::identity::ResolvedIntExpr::Const(target_rows),
-                super::identity::ResolvedIntExpr::Const(digits),
-            ) if digits > &BigInt::zero() && source_rows == &(target_rows * digits)
-        );
+        let layout_is_exact = resolved_constant(&source_matrix.rows)
+            .zip(resolved_constant(&target_matrix.rows))
+            .zip(resolved_constant(digit_count))
+            .is_some_and(|((source_rows, target_rows), digits)| {
+                digits > BigInt::zero() && source_rows == target_rows * digits
+            });
         if egraph.find(*public) != expected_public ||
             egraph.find(*sampler_target) != target ||
             !public_is_exact_gadget ||
@@ -656,7 +652,7 @@ fn preflight_registration(
     if !registration.trapdoor.is_none_or(|trapdoor_id| {
         egraph.analysis.symbols.trapdoors.get(trapdoor_id.0).is_some_and(|trapdoor| {
             egraph.find(trapdoor.public) == expected_public &&
-                trapdoor.matrix_type == *public_matrix
+                matrix_types_equal(&trapdoor.matrix_type, public_matrix)
         })
     }) {
         return Err(RelationFailure::MismatchedTrapdoor { source: source.source });
@@ -881,9 +877,18 @@ mod tests {
         name: &str,
         relation_role: Option<AtomicRelationRole>,
     ) -> (Id, AtomicSourceId) {
+        matrix_atom_with_type(egraph, name, scalar_matrix_type(), relation_role)
+    }
+
+    fn matrix_atom_with_type(
+        egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+        name: &str,
+        matrix_type: ResolvedMatrixType,
+        relation_role: Option<AtomicRelationRole>,
+    ) -> (Id, AtomicSourceId) {
         let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
             key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(name)),
-            sort: MxxSort::Matrix(scalar_matrix_type()),
+            sort: MxxSort::Matrix(matrix_type),
             integer_domain: None,
             canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
             relation_role,
@@ -1075,6 +1080,129 @@ mod tests {
         let target = egraph.add(MxxLang::IntConst(0.into()));
         let (relation, source) =
             matrix_atom(&mut egraph, "relation", Some(AtomicRelationRole::Preimage));
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, public, target));
+
+        assert!(checked_replacement(&mut egraph, &context, &[public, relation], 1).is_none());
+        assert_eq!(context.failure(), Some(RelationFailure::MismatchedType { source }));
+    }
+
+    #[test]
+    fn preimage_relation_accepts_equal_closed_dimension_expressions() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let public_type = ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(2.into()),
+            columns: ResolvedIntExpr::Add(
+                Box::new(ResolvedIntExpr::Const(1.into())),
+                Box::new(ResolvedIntExpr::Const(1.into())),
+            ),
+        };
+        let relation_type = ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Add(
+                Box::new(ResolvedIntExpr::Const(16.into())),
+                Box::new(ResolvedIntExpr::Const(1.into())),
+            ),
+            ring_dimension: ResolvedIntExpr::Sub(
+                Box::new(ResolvedIntExpr::Const(2.into())),
+                Box::new(ResolvedIntExpr::Const(1.into())),
+            ),
+            rows: ResolvedIntExpr::Mul(
+                Box::new(ResolvedIntExpr::Const(1.into())),
+                Box::new(ResolvedIntExpr::Const(2.into())),
+            ),
+            columns: ResolvedIntExpr::Const(3.into()),
+        };
+        let target_type = ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Sub(
+                Box::new(ResolvedIntExpr::Const(3.into())),
+                Box::new(ResolvedIntExpr::Const(1.into())),
+            ),
+            columns: ResolvedIntExpr::Add(
+                Box::new(ResolvedIntExpr::Const(2.into())),
+                Box::new(ResolvedIntExpr::Const(1.into())),
+            ),
+        };
+        let (public, _) = matrix_atom_with_type(&mut egraph, "public", public_type, None);
+        let (target, _) = matrix_atom_with_type(&mut egraph, "target", target_type, None);
+        let (relation, source) = matrix_atom_with_type(
+            &mut egraph,
+            "relation",
+            relation_type,
+            Some(AtomicRelationRole::Preimage),
+        );
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, public, target));
+
+        assert!(checked_replacement(&mut egraph, &context, &[public, relation], 1).is_some());
+        assert_eq!(context.failure(), None);
+    }
+
+    #[test]
+    fn preimage_relation_rejects_unequal_closed_dimensions() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let matrix = |rows: i32, columns: i32| ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(rows.into()),
+            columns: ResolvedIntExpr::Const(columns.into()),
+        };
+        let (public, _) = matrix_atom_with_type(&mut egraph, "public", matrix(2, 2), None);
+        let (target, _) = matrix_atom_with_type(&mut egraph, "target", matrix(3, 3), None);
+        let (relation, source) = matrix_atom_with_type(
+            &mut egraph,
+            "relation",
+            matrix(2, 3),
+            Some(AtomicRelationRole::Preimage),
+        );
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, public, target));
+
+        assert!(checked_replacement(&mut egraph, &context, &[public, relation], 1).is_none());
+        assert_eq!(context.failure(), Some(RelationFailure::MismatchedType { source }));
+    }
+
+    #[test]
+    fn preimage_relation_rejects_different_runtime_dimension_binders() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let matrix = |rows, columns| ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows,
+            columns,
+        };
+        let left = super::super::identity::BinderKey {
+            loop_scope: super::super::identity::OccurrenceScope {
+                program: super::super::identity::ProgramKey::Ideal,
+                definition: mxx_ir_core::FrozenGraphScopeId::Root,
+                path: Box::new([]),
+            },
+            loop_node: mxx_ir_core::NodeId(1),
+            slot: 0,
+        };
+        let right =
+            super::super::identity::BinderKey { loop_node: mxx_ir_core::NodeId(2), ..left.clone() };
+        let (public, _) = matrix_atom_with_type(
+            &mut egraph,
+            "public",
+            matrix(ResolvedIntExpr::Const(2.into()), ResolvedIntExpr::Binder(left)),
+            None,
+        );
+        let (target, _) = matrix_atom_with_type(
+            &mut egraph,
+            "target",
+            matrix(ResolvedIntExpr::Const(2.into()), ResolvedIntExpr::Const(3.into())),
+            None,
+        );
+        let (relation, source) = matrix_atom_with_type(
+            &mut egraph,
+            "relation",
+            matrix(ResolvedIntExpr::Binder(right), ResolvedIntExpr::Const(3.into())),
+            Some(AtomicRelationRole::Preimage),
+        );
         let context = RewriteContext::new(SharedRewriteBudget::new());
         context.register(registration(source, public, target));
 

@@ -383,7 +383,7 @@ fn selected_first_large_source(
 mod tests {
     use super::*;
     use crate::operational_noise::{
-        analysis::{MxxAnalysis, MxxSort},
+        analysis::{MxxAnalysis, MxxSort, resolved_constant},
         bound::{BoundEvaluationError, ResolvedMatrixConstant},
         identity::{
             AtomicRelationRole, AtomicSourceDescriptor, AtomicSourceKey,
@@ -397,6 +397,7 @@ mod tests {
     };
     use mxx_ir_core::types::ConcreteMatrixType;
     use num_bigint::{BigInt, BigUint};
+    use num_traits::ToPrimitive;
     use std::{cell::Cell, collections::BTreeMap};
 
     struct NoBounds;
@@ -447,6 +448,7 @@ mod tests {
     #[derive(Default)]
     struct SemanticInput {
         nodes: BTreeMap<Id, MxxLang>,
+        matrix_types: BTreeMap<Id, ConcreteMatrixType>,
         atom_classes: BTreeMap<AtomicSourceId, BoundClass>,
         missing: Option<AtomicSourceId>,
         reachable_cases: BTreeMap<Id, Box<[bool]>>,
@@ -481,8 +483,8 @@ mod tests {
         fn node(&self, term: Id) -> Option<&MxxLang> {
             self.nodes.get(&term)
         }
-        fn matrix_type(&self, _: Id) -> Result<ConcreteMatrixType, BoundEvaluationError> {
-            Ok(concrete_scalar_matrix_type())
+        fn matrix_type(&self, term: Id) -> Result<ConcreteMatrixType, BoundEvaluationError> {
+            Ok(self.matrix_types.get(&term).cloned().unwrap_or_else(concrete_scalar_matrix_type))
         }
         fn atom_bound(
             &self,
@@ -493,7 +495,7 @@ mod tests {
                 return Err(BoundEvaluationError::MissingInputBoundContract { term });
             }
             Ok(MatrixBound {
-                matrix_type: concrete_scalar_matrix_type(),
+                matrix_type: self.matrix_type(term)?,
                 coefficient_class: self.atom_classes[&source].clone(),
                 metadata: super::super::bound::MatrixMetadata::unknown(),
             })
@@ -538,6 +540,56 @@ mod tests {
         }
     }
 
+    fn resolved_matrix_type(rows: i64, columns: i64) -> ResolvedMatrixType {
+        ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(rows.into()),
+            columns: ResolvedIntExpr::Const(columns.into()),
+        }
+    }
+
+    fn typed_matrix_atom(
+        egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+        name: &str,
+        rows: i64,
+        columns: i64,
+        relation_role: Option<AtomicRelationRole>,
+    ) -> (Id, AtomicSourceId) {
+        let source =
+            AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+                key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(name)),
+                sort: MxxSort::Matrix(resolved_matrix_type(rows, columns)),
+                integer_domain: None,
+                canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
+                relation_role,
+            }));
+        (egraph.add(MxxLang::Atom { source, indices: Box::new([]) }), source)
+    }
+
+    fn populate_matrix_types(input: &mut SemanticInput, egraph: &EGraph<MxxLang, MxxAnalysis>) {
+        for class in egraph.classes() {
+            let Ok(MxxSort::Matrix(matrix)) = &class.data.sort else { continue };
+            let (Some(modulus), Some(ring_dimension), Some(rows), Some(columns)) = (
+                resolved_constant(&matrix.modulus),
+                resolved_constant(&matrix.ring_dimension),
+                resolved_constant(&matrix.rows),
+                resolved_constant(&matrix.columns),
+            ) else {
+                panic!("typed extraction fixture only uses resolved matrix dimensions");
+            };
+            input.matrix_types.insert(
+                class.id,
+                ConcreteMatrixType {
+                    modulus,
+                    ring_dimension: ring_dimension.to_usize().expect("small ring dimension"),
+                    rows: rows.to_usize().expect("small row count"),
+                    columns: columns.to_usize().expect("small column count"),
+                },
+            );
+        }
+    }
+
     fn extract_with_input(
         egraph: &EGraph<MxxLang, MxxAnalysis>,
         root: Id,
@@ -556,81 +608,100 @@ mod tests {
     }
 
     #[test]
-    fn extraction_selects_a_finite_two_level_affine_relation_residual() {
+    fn extraction_prefers_two_chunk_affine_preimage_boundary_over_public_large_sources() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
-        let (b0, b0_source) = matrix_atom(&mut egraph, "b0");
-        let (b1, b1_source) = matrix_atom(&mut egraph, "b1");
-        let (prefix, prefix_source) = matrix_atom(&mut egraph, "prefix");
-        let (error, error_source) = matrix_atom(&mut egraph, "error");
-        let relation_atom = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, name: &str| {
-            let source = AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(
-                AtomicSourceDescriptor {
-                    key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(name)),
-                    sort: MxxSort::Matrix(scalar_matrix_type()),
-                    integer_domain: None,
-                    canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
-                    relation_role: Some(AtomicRelationRole::Preimage),
-                },
-            ));
-            let term = egraph.add(MxxLang::Atom { source, indices: Box::new([]) });
-            (term, source)
+        let (s, s_source) = typed_matrix_atom(&mut egraph, "s", 1, 1, None);
+        let (t, t_source) = typed_matrix_atom(&mut egraph, "t", 1, 1, None);
+        let (b0, b0_source) = typed_matrix_atom(&mut egraph, "b0", 1, 1, None);
+        let (b1, b1_source) = typed_matrix_atom(&mut egraph, "b1", 1, 2, None);
+        let (e0, e0_source) = typed_matrix_atom(&mut egraph, "e0", 1, 1, None);
+        let (e_left, e_left_source) = typed_matrix_atom(&mut egraph, "e-left", 1, 1, None);
+        let (e_right, e_right_source) = typed_matrix_atom(&mut egraph, "e-right", 1, 1, None);
+        let (k0_left, k0_left_source) =
+            typed_matrix_atom(&mut egraph, "k0-left", 1, 1, Some(AtomicRelationRole::Preimage));
+        let (k0_right, k0_right_source) =
+            typed_matrix_atom(&mut egraph, "k0-right", 1, 1, Some(AtomicRelationRole::Preimage));
+        let (k1, k1_source) =
+            typed_matrix_atom(&mut egraph, "k1", 2, 1, Some(AtomicRelationRole::Preimage));
+        let (large_target, large_target_source) =
+            typed_matrix_atom(&mut egraph, "large-target", 1, 1, None);
+
+        let scaled_b0 = egraph.add(MxxLang::MatrixMultiply(vec![s, b0].into_boxed_slice()));
+        let c_b0 = egraph.add(MxxLang::MatrixAdd(vec![scaled_b0, e0].into_boxed_slice()));
+        let slice = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, start: i64, end: i64| {
+            let spec = SliceSpecId(egraph.analysis.symbols.slices.intern(SliceSpec {
+                rows: None,
+                columns: Some(ResolvedIndexRange {
+                    start: ResolvedIntExpr::Const(start.into()),
+                    end: ResolvedIntExpr::Const(end.into()),
+                }),
+            }));
+            egraph.add(MxxLang::MatrixSlice { spec, input: [b1] })
         };
-        let (inner, inner_source) = relation_atom(&mut egraph, "inner");
-        let (outer, outer_source) = relation_atom(&mut egraph, "outer");
-        let (outer_target, outer_target_source) = matrix_atom(&mut egraph, "outer-target");
-        let spec = SliceSpecId(egraph.analysis.symbols.slices.intern(SliceSpec {
-            rows: None,
-            columns: Some(ResolvedIndexRange {
-                start: ResolvedIntExpr::Const(0.into()),
-                end: ResolvedIntExpr::Const(1.into()),
-            }),
-        }));
-        let slice = egraph.add(MxxLang::MatrixSlice { spec, input: [b1] });
-        let signal = egraph.add(MxxLang::MatrixMultiply(vec![prefix, slice].into()));
-        let inner_target = egraph.add(MxxLang::MatrixAdd(vec![signal, error].into()));
-        let inner_product = egraph.add(MxxLang::MatrixMultiply(vec![b0, inner].into()));
-        let concat = egraph.add(MxxLang::MatrixConcat {
+        let target = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, start, end, error| {
+            let selected_columns = slice(egraph, start, end);
+            let signal =
+                egraph.add(MxxLang::MatrixMultiply(vec![t, selected_columns].into_boxed_slice()));
+            egraph.add(MxxLang::MatrixAdd(vec![signal, error].into_boxed_slice()))
+        };
+        let target_left = target(&mut egraph, 0, 1, e_left);
+        let target_right = target(&mut egraph, 1, 2, e_right);
+        let chunk_left =
+            egraph.add(MxxLang::MatrixMultiply(vec![c_b0, k0_left].into_boxed_slice()));
+        let chunk_right =
+            egraph.add(MxxLang::MatrixMultiply(vec![c_b0, k0_right].into_boxed_slice()));
+        let chunks = egraph.add(MxxLang::MatrixConcat {
             axis: super::super::identity::Axis::Columns,
-            inputs: vec![inner_product].into(),
+            inputs: vec![chunk_left, chunk_right].into_boxed_slice(),
         });
-        let root = egraph.add(MxxLang::MatrixMultiply(vec![concat, outer].into()));
+        let root = egraph.add(MxxLang::MatrixMultiply(vec![chunks, k1].into_boxed_slice()));
+
         let context = RewriteContext::new(SharedRewriteBudget::new());
+        for (source, target) in [(k0_left_source, target_left), (k0_right_source, target_right)] {
+            context.register(RelationRegistration {
+                source,
+                expected_public: b0,
+                target,
+                trapdoor: None,
+                indices: Box::new([]),
+            });
+        }
         context.register(RelationRegistration {
-            source: inner_source,
-            expected_public: b0,
-            target: inner_target,
-            trapdoor: None,
-            indices: Box::new([]),
-        });
-        context.register(RelationRegistration {
-            source: outer_source,
+            source: k1_source,
             expected_public: b1,
-            target: outer_target,
+            target: large_target,
             trapdoor: None,
             indices: Box::new([]),
         });
         let rewrite = egg::Rewrite::new(
-            "test-extraction-nested-affine-relation",
+            "test-extraction-two-chunk-affine-preimage-boundary",
             RelationSearcher::new(context.clone()),
             RelationApplier::new(context.clone()),
         )
         .expect("closed relation rewrite");
         let egraph = egg::Runner::default().with_egraph(egraph).run(&[rewrite]).egraph;
-        let input = SemanticInput {
+        assert_eq!(context.failure(), None);
+
+        let mut input = SemanticInput {
             atom_classes: BTreeMap::from([
                 (b0_source, BoundClass::Large),
                 (b1_source, BoundClass::Large),
-                (prefix_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
-                (error_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
-                (inner_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
-                (outer_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (large_target_source, BoundClass::Large),
+                (s_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (t_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (e0_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (e_left_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (e_right_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (k0_left_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
                 (
-                    outer_target_source,
+                    k0_right_source,
                     BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() },
                 ),
+                (k1_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
             ]),
             ..Default::default()
         };
+        populate_matrix_types(&mut input, &egraph);
         let mut invalid = |_| panic!("fixture has a finite selected DAG");
         let mut bound_error = |error| panic!("fixture has valid bounds: {error:?}");
         let result = extract_best_proposal(
@@ -644,13 +715,35 @@ mod tests {
                     .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
             },
         )
-        .expect("finite normalized residual extracts");
-        assert!(!result.cost.large_residual);
+        .expect("two-level normalized residual extracts");
+
         assert_eq!(result.cost.remaining_relation_redexes, 0);
         assert_eq!(result.cost.hidden_relation_redexes, 0);
-        assert_eq!(result.first_large_source, None);
+        assert!(result.cost.large_residual);
+        assert_eq!(result.first_large_source, Some(large_target_source));
+
+        input.atom_classes.insert(
+            large_target_source,
+            BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() },
+        );
+        let mut invalid = |_| panic!("fixture has a finite selected DAG");
+        let mut bound_error = |error| panic!("fixture has valid bounds: {error:?}");
+        let finite = extract_best_proposal(
+            &egraph,
+            root,
+            &input,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut |_, node, egraph| {
+                super::super::relation::classify_proposal_node(egraph, node, &context)
+                    .map(|relation_redex| ProposalNodeClassification { relation_redex })
+                    .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
+            },
+        )
+        .expect("finite two-level normalized residual extracts");
+        assert!(!finite.cost.large_residual);
+        assert_eq!(finite.first_large_source, None);
         assert!(matches!(
-            result.semantic_bound.map(|bound| bound.coefficient_class),
+            finite.semantic_bound.map(|bound| bound.coefficient_class),
             Some(BoundClass::Bounded { .. }) | Some(BoundClass::ExactZero)
         ));
     }

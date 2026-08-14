@@ -1001,13 +1001,23 @@ fn relation_guided_distribution(
         });
         if has_expected_public {
             let product_factors = product.expect("checked above");
-            terms.push(target_spliced_product(
+            let replacement = target_spliced_product(
                 egraph,
                 &factors[..relation_position - 1],
                 &product_factors[..product_factors.len() - 1],
                 target,
                 &factors[relation_position + 1..],
-            ));
+            );
+            // `target_spliced_product` distributes the already-validated
+            // relation target through the fixed prefix.  Keep that exact
+            // target addition at this physical level so a later registered
+            // relation can recognize a concat of affine slices without
+            // inventing a general product-distribution rewrite.
+            if let Some(expanded) = unique_add_terms(egraph, replacement) {
+                terms.extend(expanded.iter().copied());
+            } else {
+                terms.push(replacement);
+            }
             consumed = true;
         } else {
             terms.push(ordered_product_sequence(

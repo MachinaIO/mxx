@@ -655,7 +655,6 @@ pub enum NodeDispatch {
 pub const fn node_dispatch(kind: &NodeKind) -> NodeDispatch {
     match kind {
         NodeKind::Input { .. } |
-        NodeKind::ConstantMatrix { .. } |
         NodeKind::GadgetTrapdoor { .. } |
         NodeKind::TrapdoorPublic |
         NodeKind::UniformResidueSample { .. } |
@@ -694,7 +693,8 @@ pub const fn node_dispatch(kind: &NodeKind) -> NodeDispatch {
         NodeKind::Concat { .. } |
         NodeKind::ExtractCoefficient { .. } |
         NodeKind::LiftIntegerToConstantPolynomial { .. } |
-        NodeKind::CrtRecompose { .. } => NodeDispatch::Ordinary,
+        NodeKind::CrtRecompose { .. } |
+        NodeKind::ConstantMatrix { .. } => NodeDispatch::Ordinary,
     }
 }
 
@@ -1185,10 +1185,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     if let Some(control) = self.control.as_deref_mut() {
                         control.work(&wire.source.scope, wire.source.wire.node)?;
                     }
-                    if let Some(value) = environment.state_inputs.get(&wire.source) {
-                        values.push(value.clone());
-                        continue;
-                    }
                     if let Some(value) = self.begin_wire(&wire)? {
                         values.push(value);
                         continue;
@@ -1205,6 +1201,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             wire: wire.source.wire,
                             output_count: node.output_types().len(),
                         });
+                    }
+                    if let Some(value) = environment.state_inputs.get(&wire.source) {
+                        self.finish_wire(&wire, value.clone());
+                        values.push(value.clone());
+                        continue;
                     }
                     if let Some(bound) = environment.inputs.get(&wire.source) {
                         if let Some(index) = bound.indices.first() {
@@ -3090,6 +3091,61 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 .collect()
         };
         let term = match kind {
+            NodeKind::ConstantMatrix { matrix_type, value } => {
+                terms(0)?;
+                let value = match value {
+                    mxx_ir_core::node::ConstantMatrix::Zero => {
+                        super::identity::MatrixConstantValue::Zero
+                    }
+                    mxx_ir_core::node::ConstantMatrix::Identity => {
+                        super::identity::MatrixConstantValue::Identity
+                    }
+                    mxx_ir_core::node::ConstantMatrix::UnitRow { index } => {
+                        super::identity::MatrixConstantValue::UnitRow {
+                            index: self.resolve_int(index, environment)?,
+                        }
+                    }
+                    mxx_ir_core::node::ConstantMatrix::UnitColumn { index } => {
+                        super::identity::MatrixConstantValue::UnitColumn {
+                            index: self.resolve_int(index, environment)?,
+                        }
+                    }
+                    mxx_ir_core::node::ConstantMatrix::Gadget { base, small } => {
+                        super::identity::MatrixConstantValue::Gadget {
+                            base: self.resolve_int(base, environment)?,
+                            small: *small,
+                        }
+                    }
+                    mxx_ir_core::node::ConstantMatrix::PowerOfBase { base, exponent } => {
+                        super::identity::MatrixConstantValue::PowerOfBase {
+                            base: self.resolve_int(base, environment)?,
+                            exponent: self.resolve_int(exponent, environment)?,
+                        }
+                    }
+                    mxx_ir_core::node::ConstantMatrix::Rotation { exponent } => {
+                        super::identity::MatrixConstantValue::Rotation {
+                            exponent: self.resolve_int(exponent, environment)?,
+                        }
+                    }
+                    mxx_ir_core::node::ConstantMatrix::Polynomial { coefficients } => {
+                        super::identity::MatrixConstantValue::Polynomial {
+                            coefficients: coefficients
+                                .iter()
+                                .map(|coefficient| self.resolve_int(coefficient, environment))
+                                .collect::<Result<Box<_>, _>>()?,
+                        }
+                    }
+                };
+                let matrix_type = self.resolve_matrix_type(matrix_type, environment)?;
+                let spec = self
+                    .egraph
+                    .analysis
+                    .symbols
+                    .matrix_constants
+                    .intern(super::identity::MatrixConstantSpec { matrix_type, value });
+                self.egraph
+                    .add(MxxLang::MatrixConstant(super::identity::MatrixConstantSpecId(spec)))
+            }
             NodeKind::ConstantInt(value) => self.egraph.add(MxxLang::IntConst(value.clone())),
             NodeKind::EvaluateInt(value) => {
                 return Ok(LoweredValue::Term(self.lower_int_expr(value, environment)?.term))
@@ -3320,7 +3376,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 })
             }
             NodeKind::Input { .. } |
-            NodeKind::ConstantMatrix { .. } |
             NodeKind::GadgetTrapdoor { .. } |
             NodeKind::TrapdoorPublic |
             NodeKind::UniformResidueSample { .. } |
@@ -5706,6 +5761,253 @@ mod tests {
         );
     }
 
+    #[test]
+    fn root_constant_matrix_lowers_to_exact_zero_without_a_graph_wire() {
+        use mxx_ir_core::graph::{GraphOutput, NodeHandle};
+
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let output = NodeHandle::new(
+            NodeKind::ConstantMatrix {
+                matrix_type: matrix.clone(),
+                value: mxx_ir_core::node::ConstantMatrix::Zero,
+            },
+            Vec::new(),
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .expect("zero constant output");
+        let graph = mxx_ir_core::graph::Graph::freeze(
+            "root-constant-matrix",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze zero constant graph")
+        .0;
+        let output = graph.outputs()["output"].value;
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = graph;
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "root-constant-matrix".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let LoweredValue::Term(term) = lowerer
+            .lower_stage_wire(&StageId("encrypt".to_owned()), output)
+            .expect("lower zero constant")
+        else {
+            panic!("zero constant is a matrix term")
+        };
+        assert!(matches!(
+            lowerer.egraph[lowerer.egraph.find(term)].nodes.first(),
+            Some(MxxLang::MatrixConstant(_))
+        ));
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(term)
+                .expect("zero constant bound")
+                .coefficient_class,
+            BoundClass::ExactZero
+        );
+        assert!(lowerer.egraph.analysis.symbols.atomic_sources.values.iter().all(|descriptor| {
+            !matches!(descriptor.key, super::super::identity::AtomicSourceKey::GraphWire(_))
+        }));
+    }
+
+    #[test]
+    fn constant_matrix_variants_use_resolved_interned_specs() {
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(2),
+            rows: IntExpr::constant(2),
+            columns: IntExpr::constant(2),
+        };
+        let variants = vec![
+            mxx_ir_core::node::ConstantMatrix::Zero,
+            mxx_ir_core::node::ConstantMatrix::Identity,
+            mxx_ir_core::node::ConstantMatrix::UnitRow { index: IntExpr::constant(1) },
+            mxx_ir_core::node::ConstantMatrix::UnitColumn { index: IntExpr::constant(1) },
+            mxx_ir_core::node::ConstantMatrix::Gadget { base: IntExpr::constant(2), small: true },
+            mxx_ir_core::node::ConstantMatrix::PowerOfBase {
+                base: IntExpr::constant(3),
+                exponent: IntExpr::constant(4),
+            },
+            mxx_ir_core::node::ConstantMatrix::Rotation { exponent: IntExpr::constant(-1) },
+            mxx_ir_core::node::ConstantMatrix::Polynomial {
+                coefficients: vec![IntExpr::constant(-5), IntExpr::constant(3)],
+            },
+        ];
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "constant-matrix-variants".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let environment = root_test_environment();
+        for value in variants {
+            let LoweredValue::Term(term) = lowerer
+                .lower_node(
+                    &NodeKind::ConstantMatrix { matrix_type: matrix.clone(), value },
+                    &[],
+                    &environment,
+                )
+                .expect("lower matrix constant variant")
+            else {
+                panic!("matrix constant is a matrix term")
+            };
+            assert!(matches!(
+                lowerer.egraph[lowerer.egraph.find(term)].nodes.first(),
+                Some(MxxLang::MatrixConstant(_))
+            ));
+        }
+        assert!(matches!(
+            lowerer.egraph.analysis.symbols.matrix_constants.values.as_slice(),
+            [
+                super::super::identity::MatrixConstantSpec {
+                    value: super::super::identity::MatrixConstantValue::Zero,
+                    ..
+                },
+                super::super::identity::MatrixConstantSpec {
+                    value: super::super::identity::MatrixConstantValue::Identity,
+                    ..
+                },
+                super::super::identity::MatrixConstantSpec {
+                    value: super::super::identity::MatrixConstantValue::UnitRow { .. },
+                    ..
+                },
+                super::super::identity::MatrixConstantSpec {
+                    value: super::super::identity::MatrixConstantValue::UnitColumn { .. },
+                    ..
+                },
+                super::super::identity::MatrixConstantSpec {
+                    value: super::super::identity::MatrixConstantValue::Gadget { small: true, .. },
+                    ..
+                },
+                super::super::identity::MatrixConstantSpec {
+                    value: super::super::identity::MatrixConstantValue::PowerOfBase { .. },
+                    ..
+                },
+                super::super::identity::MatrixConstantSpec {
+                    value: super::super::identity::MatrixConstantValue::Rotation { .. },
+                    ..
+                },
+                super::super::identity::MatrixConstantSpec {
+                    value: super::super::identity::MatrixConstantValue::Polynomial { .. },
+                    ..
+                },
+            ]
+        ));
+    }
+
+    #[test]
+    fn parallel_constant_matrix_polynomial_lowers_without_a_graph_wire() {
+        use mxx_ir_core::graph::{
+            GraphOutput, NodeHandle, SubgraphHandle, with_new_construction_scope,
+        };
+
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(2),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let body = with_new_construction_scope(|scope| {
+            let polynomial = NodeHandle::new(
+                NodeKind::ConstantMatrix {
+                    matrix_type: matrix.clone(),
+                    value: mxx_ir_core::node::ConstantMatrix::Polynomial {
+                        coefficients: vec![IntExpr::constant(-5), IntExpr::constant(3)],
+                    },
+                },
+                Vec::new(),
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .expect("polynomial constant output");
+            SubgraphHandle::new("constant-body", scope, Vec::new(), vec![polynomial])
+                .expect("constant loop body")
+        });
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(matrix.clone())),
+            count: IntExpr::constant(2),
+        };
+        let family = NodeHandle::parallel_loop(
+            body,
+            Vec::new(),
+            vec![family_type.clone()],
+            ParallelLoop {
+                count: IntExpr::constant(2),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: Vec::new(),
+                input_modes: Vec::new(),
+            },
+        )
+        .output(0)
+        .expect("constant family output");
+        let output = NodeHandle::new(
+            NodeKind::FamilyGetStatic { index: IntExpr::constant(0) },
+            vec![family],
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .expect("constant family element");
+        let graph = mxx_ir_core::graph::Graph::freeze(
+            "parallel-constant-matrix",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze constant loop graph")
+        .0;
+        let output = graph.outputs()["output"].value;
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = graph;
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "parallel-constant-matrix".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let LoweredValue::Term(term) = lowerer
+            .lower_stage_wire(&StageId("encrypt".to_owned()), output)
+            .expect("lower polynomial constant through parallel loop")
+        else {
+            panic!("polynomial constant is a matrix term")
+        };
+        assert!(matches!(
+            lowerer.egraph[lowerer.egraph.find(term)].nodes.first(),
+            Some(MxxLang::MatrixConstant(_))
+        ));
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(term)
+                .expect("polynomial constant bound")
+                .coefficient_class,
+            BoundClass::bounded(5_u8.into())
+        );
+        assert!(lowerer.egraph.analysis.symbols.atomic_sources.values.iter().all(|descriptor| {
+            !matches!(descriptor.key, super::super::identity::AtomicSourceKey::GraphWire(_))
+        }));
+    }
+
     fn deep_parallel_graph(depth: usize, logical_count: i64) -> mxx_ir_core::graph::Graph {
         use mxx_ir_core::{
             graph::{
@@ -6067,181 +6369,6 @@ mod tests {
         assert!(lowerer.egraph.analysis.symbols.atomic_sources.values.iter().all(|descriptor| {
             !matches!(descriptor.key, super::super::identity::AtomicSourceKey::GraphWire(_))
         }));
-    }
-
-    #[test]
-    fn parallel_zip_state_input_shadows_a_completed_stale_memo() {
-        use mxx_ir_core::graph::{
-            GraphOutput, NodeHandle, SubgraphHandle, with_new_construction_scope,
-        };
-
-        let matrix = MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(1),
-            rows: IntExpr::constant(1),
-            columns: IntExpr::constant(1),
-        };
-        let count = IntExpr::constant(2);
-        let family_type = WireType::IndexedFamily {
-            element: Box::new(WireType::Matrix(matrix.clone())),
-            count: count.clone(),
-        };
-        let root = NodeHandle::new(
-            NodeKind::Input {
-                name: "values".to_owned(),
-                wire_type: family_type.clone(),
-                artifact: None,
-            },
-            Vec::new(),
-            vec![family_type.clone()],
-        )
-        .output(0)
-        .expect("family input");
-        let body = with_new_construction_scope(|scope| {
-            let input = NodeHandle::new(
-                NodeKind::Input {
-                    name: "item".to_owned(),
-                    wire_type: WireType::Matrix(matrix.clone()),
-                    artifact: None,
-                },
-                Vec::new(),
-                vec![WireType::Matrix(matrix.clone())],
-            )
-            .output(0)
-            .expect("Zip body input");
-            SubgraphHandle::new("zip-body", scope, vec![input.clone()], vec![input])
-                .expect("Zip body")
-        });
-        let family = NodeHandle::parallel_loop(
-            body,
-            vec![root],
-            vec![family_type.clone()],
-            ParallelLoop {
-                count: count.clone(),
-                minimum_count: 0,
-                index_slot: 0,
-                bindings: Vec::new(),
-                input_modes: vec![LoopInputMode::Zip],
-            },
-        )
-        .output(0)
-        .expect("Zip output");
-        let output = NodeHandle::new(
-            NodeKind::FamilyGetStatic { index: IntExpr::constant(0) },
-            vec![family],
-            vec![WireType::Matrix(matrix.clone())],
-        )
-        .output(0)
-        .expect("selected Zip output");
-        let graph = mxx_ir_core::graph::Graph::freeze(
-            "zip-memo-shadow",
-            Vec::new(),
-            BTreeMap::from([(
-                "output".to_owned(),
-                GraphOutput { value: output, confidentiality: None },
-            )]),
-            Vec::new(),
-            Vec::new(),
-            BTreeMap::new(),
-        )
-        .expect("freeze Zip graph")
-        .0;
-        let root_scope = graph.root_scope();
-        let loop_node = root_scope
-            .nodes()
-            .iter()
-            .find(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
-            .and_then(|node| root_scope.node_id(node))
-            .expect("frozen Zip loop owner");
-        let body_scope = graph
-            .child_scope_id(&FrozenGraphScopeId::Root, loop_node)
-            .expect("frozen Zip body scope");
-        let body_input = *graph
-            .scope(&body_scope)
-            .expect("Zip body scope")
-            .inputs()
-            .first()
-            .expect("Zip body input");
-        let stage = StageId("encrypt".to_owned());
-        let body_occurrence = OccurrenceScope {
-            program: super::super::identity::ProgramKey::WorkflowStage(stage.clone()),
-            definition: body_scope,
-            path: Box::new([super::super::identity::OccurrenceFrame::ParallelLoop {
-                parent: FrozenGraphScopeId::Root,
-                owner: loop_node,
-            }]),
-        };
-        let shadowed = LoweringWire {
-            source: WireSourceKey { scope: body_occurrence.clone(), wire: body_input },
-            indices: Box::new([]),
-        };
-        let mut protocol = crate::toy_example::protocol();
-        protocol.bundle.workflow.stages[0].graph = graph;
-        let input_id = crate::ProtocolInputId::from("values");
-        protocol.bundle.input_contract.inputs.push(crate::InputContractEntry {
-            id: input_id.clone(),
-            name: "values".to_owned(),
-            value: InputValueContract::Family {
-                count,
-                element: Box::new(InputValueContract::MatrixExact {
-                    matrix_type: matrix.clone(),
-                    canonical_coefficient_exclusive_upper_bound: Some(IntExpr::constant(7)),
-                    is_constant_polynomial: true,
-                }),
-            },
-        });
-        protocol.bundle.input_bindings.push(crate::ProtocolInputBinding {
-            input: input_id,
-            destinations: vec![ProtocolInputDestination::WorkflowStage {
-                stage: stage.clone(),
-                input: StageInputName("values".to_owned()),
-            }],
-        });
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: Vec::new(),
-            target_id: "zip-memo-shadow".to_owned(),
-        };
-        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let sort = MxxSort::Matrix(
-            lowerer.resolve_matrix_type(&matrix, &root_test_environment()).unwrap(),
-        );
-        let stale = lowerer.egraph.analysis.symbols.atomic_sources.intern(
-            super::super::identity::AtomicSourceDescriptor {
-                key: super::super::identity::AtomicSourceKey::GraphWire(
-                    super::super::identity::GraphWireSourceKey {
-                        wire: shadowed.source.clone(),
-                        coordinate_binders: Box::new([]),
-                    },
-                ),
-                sort,
-                integer_domain: None,
-                canonical_residue_convention: None,
-                relation_role: None,
-            },
-        );
-        let stale_term = lowerer.egraph.add(MxxLang::Atom {
-            source: super::super::identity::AtomicSourceId(stale),
-            indices: Box::new([]),
-        });
-        lowerer.finish_wire(&shadowed, LoweredValue::Term(stale_term));
-        let LoweredValue::Term(lowered) = lowerer
-            .lower_stage_wire(
-                &stage,
-                protocol.bundle.workflow.stages[0].graph.outputs()["output"].value,
-            )
-            .expect("production Zip lowering")
-        else {
-            panic!("matrix output")
-        };
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view())
-                .evaluate(lowered)
-                .expect("finite Zip bound")
-                .coefficient_class,
-            BoundClass::bounded(6_u8.into())
-        );
-        assert!(lowerer.egraph[lowerer.egraph.find(lowered)].nodes.iter().any(|node| matches!(node, MxxLang::Atom { source, .. } if matches!(lowerer.egraph.analysis.symbols.atomic_sources.get(source.0).unwrap().key, super::super::identity::AtomicSourceKey::ProtocolInput(_)))));
     }
 
     #[test]

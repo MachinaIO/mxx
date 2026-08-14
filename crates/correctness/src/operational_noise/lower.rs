@@ -3263,6 +3263,14 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     SelectorOnlyConsumer::MatrixScale,
                     false,
                 )?;
+                if scalar
+                    .stable_identity
+                    .as_ref()
+                    .and_then(resolved_integer)
+                    .is_some_and(|value| value.is_one())
+                {
+                    return Ok(LoweredValue::Term(matrix));
+                }
                 self.egraph.add(MxxLang::MatrixScale([scalar.term, matrix]))
             }
             NodeKind::Transpose => self.egraph.add(MxxLang::MatrixTranspose([terms(1)?[0]])),
@@ -4660,6 +4668,66 @@ mod tests {
         assert!(resolved_integer(&ResolvedIntExpr::Div(constant(5), constant(2))).is_none());
         assert!(resolved_integer(&ResolvedIntExpr::Log2Ceil(constant(0))).is_none());
         assert!(resolved_integer(&ResolvedIntExpr::Parameter("unresolved".to_owned())).is_none());
+    }
+
+    #[test]
+    fn matrix_scale_elides_only_closed_identity_scalars() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "matrix-scale-identity".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let matrix_type = super::super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(1.into()),
+            columns: ResolvedIntExpr::Const(1.into()),
+        };
+        let relation_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ProtocolInput(
+                    crate::ProtocolInputId::from("scale-preimage"),
+                ),
+                sort: MxxSort::Matrix(matrix_type),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: Some(super::super::identity::AtomicRelationRole::Preimage),
+            },
+        );
+        let environment = root_test_environment();
+        let matrix = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(relation_source),
+            indices: Box::new([]),
+        });
+        let scale = |scalar| NodeKind::MatrixScale { scalar };
+        let identity = lowerer
+            .lower_node(
+                &scale(IntExpr::Sub(
+                    Box::new(IntExpr::constant(2)),
+                    Box::new(IntExpr::constant(1)),
+                )),
+                &[LoweredValue::Term(matrix)],
+                &environment,
+            )
+            .expect("closed arithmetic identity scale lowers");
+        assert!(
+            matches!(identity, LoweredValue::Term(term) if lowerer.egraph.find(term) == lowerer.egraph.find(matrix))
+        );
+        assert!(!lowerer.egraph[lowerer.egraph.find(matrix)].data.relation_provenance.is_empty());
+        for scalar in [IntExpr::constant(0), IntExpr::constant(2)] {
+            let LoweredValue::Term(term) = lowerer
+                .lower_node(&scale(scalar), &[LoweredValue::Term(matrix)], &environment)
+                .expect("non-identity scale lowers")
+            else {
+                unreachable!()
+            };
+            assert!(matches!(
+                lowerer.egraph[lowerer.egraph.find(term)].nodes.first(),
+                Some(MxxLang::MatrixScale(_))
+            ));
+        }
     }
 
     #[test]

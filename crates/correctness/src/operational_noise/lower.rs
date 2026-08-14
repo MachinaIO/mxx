@@ -2988,10 +2988,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             }
             NodeKind::LiftIntegerToConstantPolynomial { matrix_type: ty } => {
                 let input = terms(1)?[0];
+                let direct_extract =
+                    self.egraph[self.egraph.find(input)].data.direct_extract.is_some();
                 self.validate_integer_consumer(
                     input,
                     SelectorOnlyConsumer::LiftConstantPolynomial,
-                    false,
+                    direct_extract,
                 )?;
                 let matrix_type = self.resolve_matrix_type(ty, environment)?;
                 self.egraph.add(MxxLang::LiftConstantPolynomial { matrix_type, input: [input] })
@@ -4151,7 +4153,7 @@ mod tests {
                 ),
                 sort: MxxSort::Matrix(matrix_type),
                 integer_domain: None,
-                canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
+                canonical_residue_convention: None,
                 relation_role: None,
             },
         );
@@ -4228,6 +4230,40 @@ mod tests {
         assert_eq!(
             lowerer.integer_analysis(extract).unwrap().0.interval().unwrap(),
             super::super::analysis::IntegerInterval::new(0.into(), 16.into()).unwrap()
+        );
+        let lift = NodeKind::LiftIntegerToConstantPolynomial {
+            matrix_type: MatrixType {
+                modulus: IntExpr::constant(17),
+                ring_dimension: IntExpr::constant(1),
+                rows: IntExpr::constant(1),
+                columns: IntExpr::constant(1),
+            },
+        };
+        let LoweredValue::Term(lifted) = lowerer
+            .lower_node(&lift, &[LoweredValue::Term(extract)], &root_test_environment())
+            .expect("a direct canonical extraction may be lifted")
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            lowerer.egraph[lowerer.egraph.find(lifted)].data.canonical_coefficient_exclusive_upper,
+            Some(17_u8.into()),
+        );
+        assert_eq!(
+            lowerer.validate_integer_consumer(extract, SelectorOnlyConsumer::MatrixScale, false,),
+            Err(LowerError::SelectorOnlyValueUsedByForbiddenConsumer {
+                consumer: SelectorOnlyConsumer::MatrixScale,
+            })
+        );
+        let zero = lowerer.egraph.add(MxxLang::IntConst(0.into()));
+        let laundered = lowerer.egraph.add(MxxLang::IntAdd([extract, zero]));
+        assert_eq!(
+            lowerer.validate_integer_consumer(
+                laundered,
+                SelectorOnlyConsumer::LiftConstantPolynomial,
+                false,
+            ),
+            Err(LowerError::InvalidOperandSort { expected: WireType::Int, actual: WireType::Int })
         );
     }
 

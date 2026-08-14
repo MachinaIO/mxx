@@ -1867,15 +1867,13 @@ fn extract_coefficient_data(
     let matrix_data = &egraph[children[0]].data;
     let canonical_exclusive_upper =
         canonical_exclusive_upper.or(matrix_data.canonical_coefficient_exclusive_upper.as_ref());
-    let convention = matrix_data.canonical_residue_convention;
-    if canonical_exclusive_upper.is_none() && convention.is_none() {
-        return invalid_analysis_data();
-    }
     let Ok(domain) = MxxAnalysis::extract_coefficient_domain(
         matrix,
         &modulus,
         canonical_exclusive_upper,
-        convention.unwrap_or(CanonicalResidueConvention::Nonnegative),
+        // Runtime extraction returns the canonical nonnegative residue.  A missing
+        // narrower contract therefore has the authoritative full-modulus range.
+        CanonicalResidueConvention::Nonnegative,
     ) else {
         return invalid_analysis_data();
     };

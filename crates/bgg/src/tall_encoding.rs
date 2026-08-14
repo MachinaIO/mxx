@@ -581,7 +581,7 @@ mod tests {
         },
         test_utils::{PolyVec, execute_polyvec_circuit},
     };
-    use mxx_ir_core::ParamEnv;
+    use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -1360,7 +1360,7 @@ mod tests {
             rows: ring.input_family("rows", 2, (1, 2)),
             pubkey: input_public,
             plaintext: BggTallPlaintext::Diagonal(ring.input_family("plaintexts", 2, (1, 1))),
-            canonical_input_exclusive_upper: None,
+            canonical_input_exclusive_upper: Some(BigUint::from(7u8)),
         };
         let one = BggTallEncodingWire {
             rows: ring.input_family("one-rows", 2, (1, 2)),
@@ -1397,6 +1397,15 @@ mod tests {
             .build()
             .unwrap();
         built.validate(&ParamEnv::default()).expect("valid executable graph");
+        assert!(built.graph.scopes().values().flat_map(|scope| scope.nodes()).any(|node| {
+            matches!(
+                node.kind(),
+                NodeKind::ExtractCoefficient {
+                    canonical_input_exclusive_upper: Some(upper),
+                    ..
+                } if upper == &BigUint::from(7u8)
+            )
+        }));
     }
 
     #[test]

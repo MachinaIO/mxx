@@ -2138,7 +2138,10 @@ mod tall {
                     let plaintext_matrix = plaintexts.get_static(source);
                     let plaintext = plaintext_matrix
                         .clone()
-                        .extract_coefficient(0)
+                        .extract_coefficient_with_canonical_input_exclusive_upper(
+                            0,
+                            input.canonical_input_exclusive_upper.clone(),
+                        )
                         .lift_to_constant_polynomial(plaintext_matrix.matrix_type().clone());
                     let decomposed = self
                         .slots
@@ -2209,7 +2212,10 @@ mod tall {
                             let plaintext_matrix = input_plaintexts.get_static(source);
                             let plaintext = plaintext_matrix
                                 .clone()
-                                .extract_coefficient(0)
+                                .extract_coefficient_with_canonical_input_exclusive_upper(
+                                    0,
+                                    input.canonical_input_exclusive_upper.clone(),
+                                )
                                 .lift_to_constant_polynomial(
                                     plaintext_matrix.matrix_type().clone(),
                                 );

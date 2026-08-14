@@ -13,7 +13,7 @@ use crate::{
 };
 use mxx_ir_core::{FrozenGraphScopeId, IntExpr, NodeId, WireRef, WireType, node::NodeKind};
 use num_bigint::{BigInt, BigUint};
-use std::{fmt, time::Duration};
+use std::fmt;
 
 /// Identifies the graph occurrence and operation which owns a non-target failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -265,8 +265,6 @@ operational_error_registry! {
         DivisionByZeroDomain { divisor: IntExpr },
         NonExactEuclideanDomain { divisor: IntExpr },
         InvalidRoundDivDenominator { divisor: IntExpr },
-        ResourceDeadlineExceeded,
-        ResourceAllocationExceeded { requested: usize },
         InvalidLog2CeilArgument { argument: IntExpr },
         IntervalOperationNotSupported { expression: IntExpr },
         NonUniformParallelMatrixType { expected: WireType, actual: WireType },
@@ -349,36 +347,6 @@ operational_error_registry! {
         SharedFamilyMaximumNotProved { count: BigUint },
     }
 
-    Resource => ResourceLimitKind {
-        RewriteIterations,
-        EGraphNodes,
-        TotalOwnedElements,
-        TotalTime,
-        RelationSourcesPerEClass,
-        SwitchCases,
-        RecurrenceSteps,
-        IntegerBits,
-    }
-}
-
-/// Records the exact limit observation rather than reducing distinct resources to one counter.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ResourceObserved {
-    Counter { limit: u64, observed: u64 },
-    Duration { limit: Duration, observed: Duration },
-    Recurrence { limit: BigUint, count: BigUint, transition_nodes: u64, observed: BigUint },
-    IntegerBits { limit: BigUint, observed: BigUint, operation: String },
-}
-
-/// Marks the checker phase in which a resource budget was exhausted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CheckerPhase {
-    Target,
-    Lower,
-    Rewrite,
-    Extract,
-    Bound,
-    Acceptance,
 }
 
 /// Public, fail-closed result for one operational-noise simulation.
@@ -386,28 +354,10 @@ pub enum CheckerPhase {
 pub enum OperationalSimulationError {
     Request(RequestError),
     Target(TargetError),
-    Lower {
-        site: ErrorSite,
-        source: LowerError,
-    },
-    Analysis {
-        site: ErrorSite,
-        source: AnalysisError,
-    },
-    Relation {
-        site: ErrorSite,
-        source: RelationError,
-    },
-    Bound {
-        site: ErrorSite,
-        source: BoundError,
-    },
-    ResourceLimitExceeded {
-        phase: CheckerPhase,
-        kind: ResourceLimitKind,
-        observed: ResourceObserved,
-        diagnostics: super::OperationalSimulationDiagnostics,
-    },
+    Lower { site: ErrorSite, source: LowerError },
+    Analysis { site: ErrorSite, source: AnalysisError },
+    Relation { site: ErrorSite, source: RelationError },
+    Bound { site: ErrorSite, source: BoundError },
 }
 
 impl fmt::Display for OperationalSimulationError {

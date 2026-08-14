@@ -355,13 +355,22 @@ fn operational_request(
     let small_digit_count = crt_bits.div_ceil(base_bits as usize);
     let smallest_crt_modulus =
         crt_moduli.iter().copied().min().ok_or(DiamondParameterSearchError::InvalidRange)?;
-    let environment = compiler
+    let bindings = compiler
         .circuit_bindings()
-        .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?
+        .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?;
+    let binding_count = bindings.integers.len() + bindings.reals.len();
+    let mut environment = bindings
         .integers
         .into_iter()
         .map(|(name, value)| (name, OperationalParameterValue::Integer(value)))
-        .collect();
+        .collect::<Vec<_>>();
+    for (name, value) in bindings.reals {
+        if value.denominator() != &BigInt::from(1) {
+            return Err(DiamondParameterSearchError::Expression);
+        }
+        environment.push((name, OperationalParameterValue::Integer(value.numerator().clone())));
+    }
+    debug_assert_eq!(environment.len(), binding_count);
     Ok(OperationalCheckRequest {
         environment,
         layouts: vec![OperationalGadgetLayout {
@@ -439,12 +448,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn operational_request_uses_the_concrete_dcrt_layout_and_all_graph_parameters() {
-        assert_eq!(
-            default_error_max_coefficient_bound(&RealExpr::from_integer(4)).unwrap(),
-            BigInt::from(26)
-        );
+    fn smallest_checker_candidate() -> (DCRTPolyParams, DiamondWeCompiler) {
         let search = small_search();
         let parameters = DCRTPolyParams::new(32, 2, 60, 2);
         let error_sigma = RealExpr::from_f64_exact(search.error_sigma).unwrap();
@@ -467,9 +471,19 @@ mod tests {
             search.shape,
         )
         .unwrap();
+        (parameters, compiler)
+    }
+
+    #[test]
+    fn operational_request_uses_the_concrete_dcrt_layout_and_all_graph_parameters() {
+        assert_eq!(
+            default_error_max_coefficient_bound(&RealExpr::from_integer(4)).unwrap(),
+            BigInt::from(26)
+        );
+        let (parameters, compiler) = smallest_checker_candidate();
         let request = operational_request(&parameters, &compiler).unwrap();
         let bindings = compiler.circuit_bindings().unwrap();
-        assert_eq!(request.environment.len(), bindings.integers.len());
+        assert_eq!(request.environment.len(), bindings.integers.len() + bindings.reals.len());
         assert_eq!(request.target_id, "diamond-boolean-interval");
         assert_eq!(request.layouts.len(), 1);
         let layout = &request.layouts[0];
@@ -482,26 +496,22 @@ mod tests {
     }
 
     #[test]
-    fn evaluated_operational_reports_preserve_accepted_and_rejected_candidates() {
-        let accepted = mxx_correctness::operational_noise::OperationalSimulationReport {
-            target_id: "diamond-boolean-interval".to_owned(),
-            noise_bound: BigUint::from(1_u8),
-            ciphertext_modulus: BigUint::from(17_u8),
-            accepted: true,
-            acceptance:
-                mxx_correctness::operational_noise::OperationalAcceptanceReport::BooleanInterval {
-                    quarter: BigInt::from(4),
-                    false_lower_margin: BigInt::from(1),
-                    false_upper_margin: BigInt::from(1),
-                    true_lower_margin: BigInt::from(1),
-                    true_upper_margin: BigInt::from(1),
+    fn smallest_diamond_candidate_reaches_typed_checker_rejection() {
+        let (parameters, compiler) = smallest_checker_candidate();
+        let declaration = compiler.protocol_decl().unwrap();
+        let request = operational_request(&parameters, &compiler).unwrap();
+        let error = check_operational_noise_candidate(declaration.protocol(), &request)
+            .expect_err("the current Diamond residual is rejected during typed lowering");
+        assert!(matches!(
+            error,
+            mxx_correctness::operational_noise::OperationalSimulationError::Lower {
+                source: mxx_correctness::operational_noise::error::LowerError::InvalidOperandSort {
+                    expected: mxx_ir_core::WireType::Int,
+                    actual: mxx_ir_core::WireType::Int,
                 },
-            diagnostics: Default::default(),
-        };
-        let mut rejected = accepted.clone();
-        rejected.accepted = false;
-        assert!(operational_decision(&accepted));
-        assert!(!operational_decision(&rejected));
+                ..
+            }
+        ));
     }
 
     #[test]

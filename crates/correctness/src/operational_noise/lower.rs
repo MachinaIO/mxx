@@ -49,12 +49,10 @@ pub trait FamilyResolver {
     ) -> Result<LoweringWire, LowerError>;
 }
 
-/// The lowering side of the single checker-job resource owner.  Production
-/// callers pass one live implementation through [`GraphLowerer::new_with_control`];
-/// direct lowering tests may use [`GraphLowerer::new`] without a budget.
+/// The lowering side of the checker progress reporter. Production callers pass
+/// one live implementation through [`GraphLowerer::new_with_control`]; direct
+/// lowering tests may use [`GraphLowerer::new`] without it.
 pub trait LoweringControl {
-    fn check_deadline(&self) -> Result<(), LowerError>;
-    fn reserve_owned_elements(&self, requested: usize) -> Result<(), LowerError>;
     fn work(
         &mut self,
         scope: &OccurrenceScope,
@@ -248,38 +246,6 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
             .ok_or(BoundEvaluationError::InvalidCrtRecompose { term })
     }
 
-    fn validate_integer(
-        &self,
-        value: &num_bigint::BigUint,
-        operation: &'static str,
-    ) -> Result<(), BoundEvaluationError> {
-        if let Some(control) = &self.control {
-            control.validate_integer_bits(value, operation)?;
-        }
-        Ok(())
-    }
-    fn validate_integer_bits(
-        &self,
-        value: &num_bigint::BigUint,
-        operation: &'static str,
-    ) -> Result<(), BoundEvaluationError> {
-        if let Some(control) = self.control {
-            control.validate_integer_bits(value, operation)?;
-        }
-        Ok(())
-    }
-    fn reserve_owned_elements(&self, requested: usize) -> Result<(), BoundEvaluationError> {
-        if let Some(control) = self.control {
-            control.reserve_owned_elements(requested)?;
-        }
-        Ok(())
-    }
-    fn check_deadline(&self) -> Result<(), BoundEvaluationError> {
-        if let Some(control) = self.control {
-            control.check_deadline()?;
-        }
-        Ok(())
-    }
     fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError> {
         if let Some(control) = self.control {
             control.validate_pack(term, bit_count)?;
@@ -305,18 +271,12 @@ impl ProductionBoundInput<'_, '_, '_> {
             .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
         let count = resolved_nonnegative(&descriptor.count)
             .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
-        if let Some(limit) = self.control.and_then(BoundEvaluationControl::recurrence_step_limit) {
-            if count > limit {
-                return Err(BoundEvaluationError::RecurrenceStepLimitExceeded { limit, count });
-            }
-        }
         if descriptor.initial.len() != descriptor.transition.len() ||
             descriptor.transition.len() != descriptor.output_types.len() ||
             carried_index >= descriptor.transition.len()
         {
             return Err(BoundEvaluationError::InvalidMatrixConstant { term });
         }
-        self.reserve_owned_elements(descriptor.transition.len())?;
         let mut state = descriptor
             .initial
             .iter()
@@ -331,8 +291,6 @@ impl ProductionBoundInput<'_, '_, '_> {
         let state_sources = self.sequential_state_sources(descriptor, term)?;
         let mut iteration = num_bigint::BigUint::zero();
         while iteration < count {
-            self.check_deadline()?;
-            self.reserve_owned_elements(descriptor.transition.len())?;
             let overlay =
                 SequentialBoundInput { base: self, states: &state_sources, values: &state };
             let next = descriptor
@@ -441,26 +399,6 @@ impl BoundInput for SequentialBoundInput<'_, '_, '_> {
         term: Id,
     ) -> Result<Box<[BigInt]>, BoundEvaluationError> {
         self.base.crt_coefficients(spec, term)
-    }
-    fn validate_integer(
-        &self,
-        value: &num_bigint::BigUint,
-        operation: &'static str,
-    ) -> Result<(), BoundEvaluationError> {
-        self.base.validate_integer(value, operation)
-    }
-    fn validate_integer_bits(
-        &self,
-        value: &num_bigint::BigUint,
-        operation: &'static str,
-    ) -> Result<(), BoundEvaluationError> {
-        self.base.validate_integer_bits(value, operation)
-    }
-    fn reserve_owned_elements(&self, requested: usize) -> Result<(), BoundEvaluationError> {
-        self.base.reserve_owned_elements(requested)
-    }
-    fn check_deadline(&self) -> Result<(), BoundEvaluationError> {
-        self.base.check_deadline()
     }
     fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError> {
         self.base.validate_pack(term, bit_count)
@@ -811,17 +749,14 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
     /// Begins one memoized wire lowering.  A repeated active key is a graph dependency cycle;
     /// completed keys return their one stored result without repeating graph work.
     pub fn begin_wire(&mut self, wire: &LoweringWire) -> Result<Option<LoweredValue>, LowerError> {
-        if let Some(control) = &self.control {
-            control.check_deadline()?;
-            control.reserve_owned_elements(1)?;
-        }
         let key = LoweringWireKey::from(wire);
         if let Some(value) = self.memo.get(&key) {
             return Ok(Some(value.clone()));
         }
-        if !self.active.insert(key) {
+        if self.active.contains(&key) {
             return Err(LowerError::CyclicGraphDependency { wire: wire.source.wire });
         }
+        self.active.insert(key);
         Ok(None)
     }
 
@@ -911,9 +846,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         ProductionBoundInput { lowerer: self, control: None }
     }
 
-    /// Constructs the production evaluator view with the caller's single
-    /// job-wide resource owner.  Checker execution must use this entry point;
-    /// the control-free view remains only for direct, deterministic unit tests.
+    /// Constructs the production evaluator view with semantic pack validation.
+    /// The control-free view remains available for direct, deterministic unit
+    /// tests.
     pub fn production_bound_view_with_control<'b>(
         &'b self,
         control: &'b dyn BoundEvaluationControl,
@@ -994,9 +929,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let mut work = vec![LoweringFrame::Enter { wire: root, environment: root_environment }];
         let mut values = Vec::<LoweredValue>::new();
         while let Some(frame) = work.pop() {
-            if let Some(control) = &self.control {
-                control.check_deadline()?;
-            }
             match frame {
                 LoweringFrame::Enter { wire, environment } => {
                     if let Some(control) = self.control.as_deref_mut() {
@@ -1167,10 +1099,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     work.push(LoweringFrame::Enter {
                                         wire: LoweringWire {
                                             source: WireSourceKey {
-                                                scope: environment.occurrence.clone(),
+                                                scope: wire.source.scope.clone(),
                                                 wire: argument,
                                             },
-                                            indices: Box::new([]),
+                                            indices: wire.indices.clone(),
                                         },
                                         environment: environment.clone(),
                                     });
@@ -1202,10 +1134,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                 work.push(LoweringFrame::Enter {
                                     wire: LoweringWire {
                                         source: WireSourceKey {
-                                            scope: environment.occurrence.clone(),
+                                            scope: wire.source.scope.clone(),
                                             wire: *argument,
                                         },
-                                        indices: Box::new([]),
+                                        indices: wire.indices.clone(),
                                     },
                                     environment: environment.clone(),
                                 });
@@ -1235,10 +1167,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     work.push(LoweringFrame::Enter {
                                         wire: LoweringWire {
                                             source: WireSourceKey {
-                                                scope: environment.occurrence.clone(),
+                                                scope: wire.source.scope.clone(),
                                                 wire: argument,
                                             },
-                                            indices: Box::new([]),
+                                            indices: wire.indices.clone(),
                                         },
                                         environment: environment.clone(),
                                     });
@@ -1365,10 +1297,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                 work.push(LoweringFrame::Enter {
                                     wire: LoweringWire {
                                         source: WireSourceKey {
-                                            scope: environment.occurrence.clone(),
+                                            scope: wire.source.scope.clone(),
                                             wire: argument,
                                         },
-                                        indices: Box::new([]),
+                                        indices: wire.indices.clone(),
                                     },
                                     environment: environment.clone(),
                                 });
@@ -1417,10 +1349,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                             input,
                                             LoweringWire {
                                                 source: WireSourceKey {
-                                                    scope: environment.occurrence.clone(),
+                                                    scope: wire.source.scope.clone(),
                                                     wire: argument,
                                                 },
-                                                indices: Box::new([]),
+                                                indices: wire.indices.clone(),
                                             },
                                         )
                                     })
@@ -1442,14 +1374,14 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     wire: wire.source.wire,
                                     output_count: child_outputs.len(),
                                 })?;
-                                work.push(LoweringFrame::FinishAlias { wire });
+                                work.push(LoweringFrame::FinishAlias { wire: wire.clone() });
                                 work.push(LoweringFrame::Enter {
                                     wire: LoweringWire {
                                         source: WireSourceKey {
                                             scope: child.occurrence.clone(),
                                             wire: output,
                                         },
-                                        indices: Box::new([]),
+                                        indices: wire.indices.clone(),
                                     },
                                     environment: child,
                                 });
@@ -1471,10 +1403,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     work.push(LoweringFrame::Enter {
                                         wire: LoweringWire {
                                             source: WireSourceKey {
-                                                scope: environment.occurrence.clone(),
+                                                scope: wire.source.scope.clone(),
                                                 wire: argument,
                                             },
-                                            indices: Box::new([]),
+                                            indices: wire.indices.clone(),
                                         },
                                         environment: environment.clone(),
                                     });
@@ -2296,10 +2228,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let mut work = vec![Frame::Enter(expression)];
         let mut values = Vec::<LoweredInt>::new();
         while let Some(frame) = work.pop() {
-            if let Some(control) = &self.control {
-                control.check_deadline()?;
-                control.reserve_owned_elements(1)?;
-            }
             match frame {
                 Frame::Enter(
                     value @ (IntExpr::Const(_) | IntExpr::Var(_) | IntExpr::LoopIndex(_)),
@@ -2917,17 +2845,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             .ok_or_else(|| LowerError::InvalidFamilyCount {
                 count: IntExpr::constant(domain.logical_count.clone()),
             })?;
-        if let Some(control) = &self.control {
-            control.check_deadline()?;
-            // Extraction visits at most the existing e-graph twice and the rebuilt
-            // expression contains at most both extracted expressions. Charge that
-            // conservative bound before either allocation begins.
-            control.reserve_owned_elements(self.egraph.total_size().checked_mul(4).ok_or(
-                LowerError::InvalidFamilyCount {
-                    count: IntExpr::constant(domain.logical_count.clone()),
-                },
-            )?)?;
-        }
         let scope = domain.binder.loop_scope.clone();
         let node = domain.binder.loop_node;
         let control = &mut self.control;
@@ -3071,24 +2988,28 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             child_inputs.iter().copied().zip(parent_arguments).zip(specification.input_modes.iter())
         {
             let indices: Box<[LoweredInt]> = match mode {
-                LoopInputMode::Broadcast => Box::new([]),
-                LoopInputMode::Zip => Box::new([index.clone()]),
+                LoopInputMode::Broadcast => wire.indices.clone(),
+                LoopInputMode::Zip => wire.indices.iter().cloned().chain([index.clone()]).collect(),
                 LoopInputMode::ZipOffset { offset } => {
                     let offset = self.add_int(
                         BigInt::from(*offset),
                         ResolvedIntExpr::Const(BigInt::from(*offset)),
                     );
-                    Box::new([self.combine_int(
-                        vec![index.clone(), offset],
-                        MxxLang::IntAdd,
-                        ResolvedIntExpr::Add,
-                    )?])
+                    wire.indices
+                        .iter()
+                        .cloned()
+                        .chain([self.combine_int(
+                            vec![index.clone(), offset],
+                            MxxLang::IntAdd,
+                            ResolvedIntExpr::Add,
+                        )?])
+                        .collect()
                 }
             };
             child.inputs.insert(
                 input,
                 LoweringWire {
-                    source: WireSourceKey { scope: environment.occurrence.clone(), wire: argument },
+                    source: WireSourceKey { scope: wire.source.scope.clone(), wire: argument },
                     indices,
                 },
             );
@@ -3340,8 +3261,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             child.inputs.insert(
                 input,
                 LoweringWire {
-                    source: WireSourceKey { scope: environment.occurrence.clone(), wire: argument },
-                    indices: Box::new([]),
+                    source: WireSourceKey { scope: wire.source.scope.clone(), wire: argument },
+                    indices: wire.indices.clone(),
                 },
             );
         }
@@ -3428,24 +3349,41 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         matrix: &MatrixType,
         environment: &LowerEnv,
     ) -> Result<mxx_ir_core::types::ConcreteMatrixType, LowerError> {
-        let integer = |value: &ResolvedIntExpr| match value {
-            ResolvedIntExpr::Const(value) => Ok(value.clone()),
-            _ => Err(LowerError::NonExactIdentityIndex { expression: IntExpr::constant(0) }),
-        };
-        let modulus = integer(&self.resolve_int(&matrix.modulus, environment)?)?;
-        let ring_dimension = integer(&self.resolve_int(&matrix.ring_dimension, environment)?)?
+        let modulus = self.resolve_exact_int_value(&matrix.modulus, environment)?;
+        let ring_dimension = self
+            .resolve_exact_int_value(&matrix.ring_dimension, environment)?
             .to_usize()
             .ok_or_else(|| LowerError::NonExactIdentityIndex {
                 expression: matrix.ring_dimension.clone(),
             })?;
-        let rows = integer(&self.resolve_int(&matrix.rows, environment)?)?
+        let rows = self
+            .resolve_exact_int_value(&matrix.rows, environment)?
             .to_usize()
             .ok_or_else(|| LowerError::NonExactIdentityIndex { expression: matrix.rows.clone() })?;
         let columns =
-            integer(&self.resolve_int(&matrix.columns, environment)?)?.to_usize().ok_or_else(
+            self.resolve_exact_int_value(&matrix.columns, environment)?.to_usize().ok_or_else(
                 || LowerError::NonExactIdentityIndex { expression: matrix.columns.clone() },
             )?;
         Ok(mxx_ir_core::types::ConcreteMatrixType { modulus, ring_dimension, rows, columns })
+    }
+
+    /// Resolves a compile-time integer only when both its owner-resolved syntax and canonical
+    /// e-class analysis prove one value. This admits folded constants and singleton affine
+    /// binder expressions while keeping interval-valued and runtime-only terms fail-closed.
+    fn resolve_exact_int_value(
+        &mut self,
+        expression: &IntExpr,
+        environment: &LowerEnv,
+    ) -> Result<BigInt, LowerError> {
+        let lowered = self.lower_int_expr(expression, environment)?;
+        if lowered.stable_identity.is_none() {
+            return Err(LowerError::NonExactIdentityIndex { expression: expression.clone() });
+        }
+        let term = self.egraph.find(lowered.term);
+        self.integer_analysis(term)
+            .and_then(|(domain, _)| domain.interval().ok())
+            .and_then(|interval| (interval.minimum == interval.maximum).then_some(interval.minimum))
+            .ok_or_else(|| LowerError::NonExactIdentityIndex { expression: expression.clone() })
     }
 
     fn resolve_int(
@@ -3508,14 +3446,6 @@ mod tests {
     }
 
     impl LoweringControl for RecordingLoweringControl {
-        fn check_deadline(&self) -> Result<(), LowerError> {
-            Ok(())
-        }
-
-        fn reserve_owned_elements(&self, _requested: usize) -> Result<(), LowerError> {
-            Ok(())
-        }
-
         fn work(
             &mut self,
             scope: &OccurrenceScope,
@@ -3524,6 +3454,99 @@ mod tests {
             self.sites.push((scope.clone(), node));
             Ok(())
         }
+    }
+
+    fn root_test_environment() -> LowerEnv {
+        LowerEnv {
+            occurrence: OccurrenceScope {
+                program: super::super::identity::ProgramKey::WorkflowStage(StageId(
+                    "encrypt".to_owned(),
+                )),
+                definition: FrozenGraphScopeId::Root,
+                path: Box::new([]),
+            },
+            parameters: BTreeMap::new(),
+            binders: Vec::new(),
+            inputs: BTreeMap::new(),
+            state_inputs: BTreeMap::new(),
+            active_coordinates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exact_integer_resolution_accepts_folded_constants_and_singleton_affine_binders() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "exact-integer".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut environment = root_test_environment();
+        let binder = BinderKey {
+            loop_scope: environment.occurrence.clone(),
+            loop_node: mxx_ir_core::NodeId(7),
+            slot: 0,
+        };
+        let binder_id = lowerer.egraph.analysis.symbols.binders.intern(
+            super::super::identity::BinderDescriptor {
+                key: binder.clone(),
+                minimum: BigInt::from(3),
+                maximum: BigInt::from(3),
+            },
+        );
+        let binder_term =
+            lowerer.egraph.add(MxxLang::IntBinder(super::super::identity::BinderId(binder_id)));
+        environment.binders.push((
+            binder.clone(),
+            LoweredInt {
+                term: binder_term,
+                stable_identity: Some(ResolvedIntExpr::Binder(binder)),
+            },
+        ));
+        let folded = IntExpr::Add(Box::new(IntExpr::constant(2)), Box::new(IntExpr::constant(5)));
+        let affine = IntExpr::Add(Box::new(IntExpr::LoopIndex(0)), Box::new(IntExpr::constant(4)));
+        assert_eq!(lowerer.resolve_exact_int_value(&folded, &environment).unwrap(), 7.into());
+        assert_eq!(lowerer.resolve_exact_int_value(&affine, &environment).unwrap(), 7.into());
+    }
+
+    #[test]
+    fn exact_integer_resolution_rejects_a_non_singleton_binder_domain() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "inexact-integer".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let mut environment = root_test_environment();
+        let binder = BinderKey {
+            loop_scope: environment.occurrence.clone(),
+            loop_node: mxx_ir_core::NodeId(8),
+            slot: 0,
+        };
+        let binder_id = lowerer.egraph.analysis.symbols.binders.intern(
+            super::super::identity::BinderDescriptor {
+                key: binder.clone(),
+                minimum: BigInt::from(0),
+                maximum: BigInt::from(1),
+            },
+        );
+        let binder_term =
+            lowerer.egraph.add(MxxLang::IntBinder(super::super::identity::BinderId(binder_id)));
+        environment.binders.push((
+            binder.clone(),
+            LoweredInt {
+                term: binder_term,
+                stable_identity: Some(ResolvedIntExpr::Binder(binder)),
+            },
+        ));
+        let expression =
+            IntExpr::Add(Box::new(IntExpr::LoopIndex(0)), Box::new(IntExpr::constant(4)));
+        assert!(matches!(
+            lowerer.resolve_exact_int_value(&expression, &environment),
+            Err(LowerError::NonExactIdentityIndex { expression: rejected }) if rejected == expression
+        ));
     }
 
     fn hash_layout() -> super::super::OperationalGadgetLayout {
@@ -3841,7 +3864,7 @@ mod tests {
             .expect("family element output")
         }
 
-        let input = NodeHandle::new(
+        let root_source = NodeHandle::new(
             NodeKind::ConstantMatrix {
                 matrix_type: matrix.clone(),
                 value: mxx_ir_core::node::ConstantMatrix::Zero,
@@ -3851,6 +3874,16 @@ mod tests {
         )
         .output(0)
         .expect("root input output");
+        // Keep a parent-owned dependency below the wire captured by every nested body.
+        // Lowering that captured wire must retain the wire owner's definition instead of
+        // accidentally resolving this source node in the innermost child definition.
+        let input = NodeHandle::new(
+            NodeKind::MatrixScale { scalar: IntExpr::constant(1) },
+            vec![root_source],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .expect("parent-owned dependency output");
         let output = nested(depth, input, &matrix, logical_count);
         mxx_ir_core::graph::Graph::freeze(
             "deep-parallel-lowering",
@@ -3890,6 +3923,35 @@ mod tests {
         };
 
         assert_ne!(LoweringWireKey::from(&stable), LoweringWireKey::from(&runtime));
+    }
+
+    #[test]
+    fn completed_shared_dependency_is_reused_but_an_active_back_edge_is_rejected() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "memo-colors".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let wire = LoweringWire {
+            source: WireSourceKey {
+                scope: root_test_environment().occurrence,
+                wire: WireRef { node: mxx_ir_core::NodeId(1), port: mxx_ir_core::Port(0) },
+            },
+            indices: Box::new([]),
+        };
+        assert!(lowerer.begin_wire(&wire).unwrap().is_none(), "white becomes active gray");
+        assert!(matches!(
+            lowerer.begin_wire(&wire),
+            Err(LowerError::CyclicGraphDependency { wire: rejected }) if rejected == wire.source.wire
+        ));
+        let value = LoweredValue::Term(lowerer.egraph.add(MxxLang::IntConst(1.into())));
+        lowerer.finish_wire(&wire, value.clone());
+        assert!(matches!(
+            (lowerer.begin_wire(&wire), &value),
+            (Ok(Some(LoweredValue::Term(reused))), LoweredValue::Term(value)) if reused == *value
+        ));
     }
 
     #[test]

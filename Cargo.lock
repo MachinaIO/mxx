@@ -586,6 +586,7 @@ dependencies = [
  "smallvec",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

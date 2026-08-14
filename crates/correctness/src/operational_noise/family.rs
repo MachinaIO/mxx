@@ -2,8 +2,8 @@
 //!
 //! This module deliberately owns neither graph-wire memoization nor integer
 //! analysis.  [`GraphLowerer`](super::lower::GraphLowerer) supplies one
-//! symbolic element at a time, and the caller supplies all resource and error
-//! policy through [`RecurrenceControl`].
+//! symbolic element at a time.  Numeric recurrence evaluation is exact over
+//! the supplied finite count; it has no policy ceiling.
 
 use super::{
     analysis::IntegerDomain,
@@ -427,65 +427,36 @@ pub enum RecurrenceFailure {
     ArityMismatch { expected: usize, actual: usize },
     PreviousOutOfRange { index: usize, state_size: usize },
     NegativeCutoff { cutoff: BigInt },
-    StepLimit { limit: BigUint, count: BigUint, transition_nodes: u64 },
-    IntegerBits { limit: BigUint, observed: BigUint, operation: &'static str },
-}
-
-/// Callbacks into the single simulation-wide deadline and resource owner.
-pub struct RecurrenceControl<'a, E> {
-    pub recurrence_step_limit: &'a BigUint,
-    pub max_integer_bits: &'a BigUint,
-    pub check_deadline: &'a mut dyn FnMut() -> Result<(), E>,
-    /// Charges every recurrence-owned container to the caller's one job-wide
-    /// cumulative allocation budget.  This is deliberately a callback rather
-    /// than a recurrence-local counter, so nested loop bodies cannot reset it.
-    pub reserve_owned_elements: &'a mut dyn FnMut(usize) -> Result<(), E>,
-    pub failure: &'a mut dyn FnMut(RecurrenceFailure) -> E,
+    SizeOverflow { operation: &'static str },
 }
 
 impl VectorRecurrence {
     /// Evaluates the general O(C*T) path, or the affine O(S^3 log C) fast
     /// path when the whole transition has the required nonnegative form.
-    pub fn evaluate<E>(&self, control: &mut RecurrenceControl<'_, E>) -> Result<Box<[BigUint]>, E> {
+    pub fn evaluate(&self) -> Result<Box<[BigUint]>, RecurrenceFailure> {
         if self.initial.len() != self.transition.len() {
-            return Err((control.failure)(RecurrenceFailure::ArityMismatch {
+            return Err(RecurrenceFailure::ArityMismatch {
                 expected: self.initial.len(),
                 actual: self.transition.len(),
-            }));
+            });
         }
-        self.validate_values(control, &self.initial, "initial-state")?;
         if self.count.is_zero() {
             return Ok(self.initial.clone());
         }
-        if let Some(rows) = self.affine_rows(control)? {
-            return self.evaluate_affine(rows, control);
+        if let Some(rows) = self.affine_rows()? {
+            return self.evaluate_affine(rows);
         }
-        self.evaluate_general(control)
+        self.evaluate_general()
     }
 
-    fn evaluate_general<E>(
-        &self,
-        control: &mut RecurrenceControl<'_, E>,
-    ) -> Result<Box<[BigUint]>, E> {
-        let transition_nodes = self.transition_node_count();
-        let work = &self.count * BigUint::from(transition_nodes);
-        if work > *control.recurrence_step_limit {
-            return Err((control.failure)(RecurrenceFailure::StepLimit {
-                limit: control.recurrence_step_limit.clone(),
-                count: self.count.clone(),
-                transition_nodes,
-            }));
-        }
-        (control.reserve_owned_elements)(self.initial.len())?;
+    fn evaluate_general(&self) -> Result<Box<[BigUint]>, RecurrenceFailure> {
         let mut state = self.initial.to_vec();
         let mut iteration = BigUint::zero();
         while iteration < self.count {
-            (control.check_deadline)()?;
-            (control.reserve_owned_elements)(self.transition.len())?;
             let mut memo = BTreeMap::new();
             let mut next = Vec::with_capacity(self.transition.len());
             for expression in self.transition.iter() {
-                next.push(evaluate_expression(expression, &state, &iteration, &mut memo, control)?);
+                next.push(evaluate_expression(expression, &state, &iteration, &mut memo)?);
             }
             state = next;
             iteration += BigUint::one();
@@ -493,21 +464,14 @@ impl VectorRecurrence {
         Ok(state.into_boxed_slice())
     }
 
-    fn evaluate_affine<E>(
-        &self,
-        rows: Vec<AffineRow>,
-        control: &mut RecurrenceControl<'_, E>,
-    ) -> Result<Box<[BigUint]>, E> {
+    fn evaluate_affine(&self, rows: Vec<AffineRow>) -> Result<Box<[BigUint]>, RecurrenceFailure> {
         let state_size = self.initial.len();
-        let dimension = state_size + 2;
-        (control.reserve_owned_elements)(rows.len())?;
-        (control.reserve_owned_elements)(dimension.checked_mul(dimension).ok_or_else(|| {
-            (control.failure)(RecurrenceFailure::IntegerBits {
-                limit: control.max_integer_bits.clone(),
-                observed: BigUint::from(usize::BITS),
-                operation: "affine recurrence matrix dimension",
-            })
-        })?)?;
+        let dimension = state_size
+            .checked_add(2)
+            .ok_or(RecurrenceFailure::SizeOverflow { operation: "affine recurrence dimension" })?;
+        dimension
+            .checked_mul(dimension)
+            .ok_or(RecurrenceFailure::SizeOverflow { operation: "affine recurrence matrix" })?;
         let mut matrix = vec![vec![BigUint::zero(); dimension]; dimension];
         for (row_index, row) in rows.iter().enumerate() {
             matrix[row_index][..state_size].clone_from_slice(&row.previous);
@@ -517,61 +481,29 @@ impl VectorRecurrence {
         matrix[state_size][state_size] = BigUint::one();
         matrix[state_size + 1][state_size + 1] = BigUint::one();
 
-        let power = matrix_power(matrix, &self.count, control)?;
-        (control.reserve_owned_elements)(dimension)?;
+        let power = matrix_power(matrix, &self.count)?;
         let mut input = self.initial.to_vec();
         input.push(BigUint::zero());
         input.push(BigUint::one());
-        let output = matrix_vector_product(&power, &input, control)?;
+        let output = matrix_vector_product(&power, &input)?;
         Ok(output[..state_size].to_vec().into_boxed_slice())
     }
 
-    fn affine_rows<E>(
-        &self,
-        control: &mut RecurrenceControl<'_, E>,
-    ) -> Result<Option<Vec<AffineRow>>, E> {
-        (control.check_deadline)()?;
-        let row_width = self.initial.len().checked_add(3).ok_or_else(|| {
-            (control.failure)(RecurrenceFailure::IntegerBits {
-                limit: control.max_integer_bits.clone(),
-                observed: BigUint::from(usize::BITS),
-                operation: "affine row width",
-            })
-        })?;
-        (control.reserve_owned_elements)(
-            self.transition.len().checked_mul(row_width).ok_or_else(|| {
-                (control.failure)(RecurrenceFailure::IntegerBits {
-                    limit: control.max_integer_bits.clone(),
-                    observed: BigUint::from(usize::BITS),
-                    operation: "affine rows allocation",
-                })
-            })?,
-        )?;
+    fn affine_rows(&self) -> Result<Option<Vec<AffineRow>>, RecurrenceFailure> {
+        let row_width = self
+            .initial
+            .len()
+            .checked_add(3)
+            .ok_or(RecurrenceFailure::SizeOverflow { operation: "affine row width" })?;
+        self.transition
+            .len()
+            .checked_mul(row_width)
+            .ok_or(RecurrenceFailure::SizeOverflow { operation: "affine rows allocation" })?;
         Ok(self
             .transition
             .iter()
             .map(|expression| affine_expression(expression, self.initial.len()))
             .collect())
-    }
-
-    fn transition_node_count(&self) -> u64 {
-        let mut nodes = BTreeMap::new();
-        for expression in self.transition.iter() {
-            count_nodes(expression, &mut nodes);
-        }
-        u64::try_from(nodes.len()).unwrap_or(u64::MAX)
-    }
-
-    fn validate_values<E>(
-        &self,
-        control: &mut RecurrenceControl<'_, E>,
-        values: &[BigUint],
-        operation: &'static str,
-    ) -> Result<(), E> {
-        for value in values {
-            validate_bits(value, operation, control)?;
-        }
-        Ok(())
     }
 }
 
@@ -645,33 +577,12 @@ fn scale_row(mut row: AffineRow, scalar: &BigUint) -> AffineRow {
     row
 }
 
-fn count_nodes<'a>(expression: &'a RecurrenceExpr, nodes: &mut BTreeMap<&'a RecurrenceExpr, ()>) {
-    let mut work = vec![expression];
-    while let Some(expression) = work.pop() {
-        if nodes.insert(expression, ()).is_some() {
-            continue;
-        }
-        match expression {
-            RecurrenceExpr::Add(left, right) | RecurrenceExpr::Mul(left, right) => {
-                work.push(left);
-                work.push(right);
-            }
-            RecurrenceExpr::Max(children) => work.extend(children.iter()),
-            RecurrenceExpr::Const(_) |
-            RecurrenceExpr::SignedAffineCutoff { .. } |
-            RecurrenceExpr::Previous(_) |
-            RecurrenceExpr::Iteration => {}
-        }
-    }
-}
-
-fn evaluate_expression<E>(
+fn evaluate_expression(
     expression: &RecurrenceExpr,
     state: &[BigUint],
     iteration: &BigUint,
     memo: &mut BTreeMap<RecurrenceExpr, BigUint>,
-    control: &mut RecurrenceControl<'_, E>,
-) -> Result<BigUint, E> {
+) -> Result<BigUint, RecurrenceFailure> {
     enum Work<'a> {
         Enter(&'a RecurrenceExpr),
         Finish(&'a RecurrenceExpr),
@@ -682,7 +593,6 @@ fn evaluate_expression<E>(
     let mut scheduled = BTreeMap::<&RecurrenceExpr, ()>::new();
     let mut work = vec![Work::Enter(expression)];
     while let Some(item) = work.pop() {
-        (control.check_deadline)()?;
         match item {
             Work::Enter(expression) if memo.contains_key(expression) => {}
             Work::Enter(expression) if scheduled.insert(expression, ()).is_some() => {}
@@ -712,16 +622,14 @@ fn evaluate_expression<E>(
                     RecurrenceExpr::SignedAffineCutoff { constant, iteration_coefficient } => {
                         let value =
                             constant + iteration_coefficient * BigInt::from(iteration.clone());
-                        value.to_biguint().ok_or_else(|| {
-                            (control.failure)(RecurrenceFailure::NegativeCutoff { cutoff: value })
-                        })?
+                        value
+                            .to_biguint()
+                            .ok_or(RecurrenceFailure::NegativeCutoff { cutoff: value })?
                     }
                     RecurrenceExpr::Previous(index) => {
-                        state.get(*index).cloned().ok_or_else(|| {
-                            (control.failure)(RecurrenceFailure::PreviousOutOfRange {
-                                index: *index,
-                                state_size: state.len(),
-                            })
+                        state.get(*index).cloned().ok_or(RecurrenceFailure::PreviousOutOfRange {
+                            index: *index,
+                            state_size: state.len(),
                         })?
                     }
                     RecurrenceExpr::Iteration => iteration.clone(),
@@ -733,47 +641,30 @@ fn evaluate_expression<E>(
                         })
                     }
                 };
-                validate_bits(&value, "recurrence-expression", control)?;
-                (control.reserve_owned_elements)(1)?;
                 memo.insert(expression.clone(), value);
             }
         }
     }
-    memo.remove(expression).ok_or_else(|| {
-        (control.failure)(RecurrenceFailure::ArityMismatch { expected: 1, actual: 0 })
-    })
+    memo.remove(expression).ok_or(RecurrenceFailure::ArityMismatch { expected: 1, actual: 0 })
 }
 
-fn matrix_power<E>(
+fn matrix_power(
     mut power: Vec<Vec<BigUint>>,
     exponent: &BigUint,
-    control: &mut RecurrenceControl<'_, E>,
-) -> Result<Vec<Vec<BigUint>>, E> {
+) -> Result<Vec<Vec<BigUint>>, RecurrenceFailure> {
     let dimension = power.len();
-    let cells = dimension.checked_mul(dimension).ok_or_else(|| {
-        (control.failure)(RecurrenceFailure::IntegerBits {
-            limit: control.max_integer_bits.clone(),
-            observed: BigUint::from(usize::BITS),
-            operation: "affine power matrix dimension",
-        })
-    })?;
-    (control.reserve_owned_elements)(cells.checked_add(1).ok_or_else(|| {
-        (control.failure)(RecurrenceFailure::IntegerBits {
-            limit: control.max_integer_bits.clone(),
-            observed: BigUint::from(usize::BITS),
-            operation: "affine power allocation",
-        })
-    })?)?;
+    dimension
+        .checked_mul(dimension)
+        .ok_or(RecurrenceFailure::SizeOverflow { operation: "affine power matrix" })?;
     let mut result = identity_matrix(dimension);
     let mut remaining = exponent.clone();
     while !remaining.is_zero() {
-        (control.check_deadline)()?;
         if (&remaining & BigUint::one()) == BigUint::one() {
-            result = matrix_product(&result, &power, control)?;
+            result = matrix_product(&result, &power)?;
         }
         remaining >>= 1_usize;
         if !remaining.is_zero() {
-            power = matrix_product(&power, &power, control)?;
+            power = matrix_product(&power, &power)?;
         }
     }
     Ok(result)
@@ -787,37 +678,21 @@ fn identity_matrix(dimension: usize) -> Vec<Vec<BigUint>> {
     matrix
 }
 
-fn matrix_product<E>(
+fn matrix_product(
     left: &[Vec<BigUint>],
     right: &[Vec<BigUint>],
-    control: &mut RecurrenceControl<'_, E>,
-) -> Result<Vec<Vec<BigUint>>, E> {
+) -> Result<Vec<Vec<BigUint>>, RecurrenceFailure> {
     let dimension = left.len();
-    let cells = dimension.checked_mul(dimension).ok_or_else(|| {
-        (control.failure)(RecurrenceFailure::IntegerBits {
-            limit: control.max_integer_bits.clone(),
-            observed: BigUint::from(usize::BITS),
-            operation: "affine product matrix dimension",
-        })
-    })?;
-    (control.reserve_owned_elements)(cells)?;
+    dimension
+        .checked_mul(dimension)
+        .ok_or(RecurrenceFailure::SizeOverflow { operation: "affine product matrix" })?;
     let mut output = vec![vec![BigUint::zero(); dimension]; dimension];
     for row in 0..dimension {
         for column in 0..dimension {
             let mut value = BigUint::zero();
             for inner in 0..dimension {
-                (control.check_deadline)()?;
-                validate_product_bits(
-                    &left[row][inner],
-                    &right[inner][column],
-                    "affine-matrix-product",
-                    control,
-                )?;
-                (control.reserve_owned_elements)(1)?;
                 let product = &left[row][inner] * &right[inner][column];
-                validate_sum_bits(&value, &product, "affine-matrix-product", control)?;
                 value += product;
-                validate_bits(&value, "affine-matrix-product", control)?;
             }
             output[row][column] = value;
         }
@@ -825,77 +700,20 @@ fn matrix_product<E>(
     Ok(output)
 }
 
-fn matrix_vector_product<E>(
+fn matrix_vector_product(
     matrix: &[Vec<BigUint>],
     vector: &[BigUint],
-    control: &mut RecurrenceControl<'_, E>,
-) -> Result<Vec<BigUint>, E> {
-    (control.reserve_owned_elements)(matrix.len())?;
+) -> Result<Vec<BigUint>, RecurrenceFailure> {
     let mut output = Vec::with_capacity(matrix.len());
     for row in matrix {
         let mut value = BigUint::zero();
         for (coefficient, input) in row.iter().zip(vector) {
-            (control.check_deadline)()?;
-            validate_product_bits(coefficient, input, "affine-matrix-vector", control)?;
-            (control.reserve_owned_elements)(1)?;
             let product = coefficient * input;
-            validate_sum_bits(&value, &product, "affine-matrix-vector", control)?;
             value += product;
-            validate_bits(&value, "affine-matrix-vector", control)?;
         }
         output.push(value);
     }
     Ok(output)
-}
-
-fn validate_product_bits<E>(
-    left: &BigUint,
-    right: &BigUint,
-    operation: &'static str,
-    control: &mut RecurrenceControl<'_, E>,
-) -> Result<(), E> {
-    let observed = BigUint::from(left.bits()) + BigUint::from(right.bits());
-    if observed > *control.max_integer_bits {
-        return Err((control.failure)(RecurrenceFailure::IntegerBits {
-            limit: control.max_integer_bits.clone(),
-            observed,
-            operation,
-        }));
-    }
-    Ok(())
-}
-
-fn validate_sum_bits<E>(
-    left: &BigUint,
-    right: &BigUint,
-    operation: &'static str,
-    control: &mut RecurrenceControl<'_, E>,
-) -> Result<(), E> {
-    let observed = BigUint::from(left.bits().max(right.bits())) + BigUint::one();
-    if observed > *control.max_integer_bits {
-        return Err((control.failure)(RecurrenceFailure::IntegerBits {
-            limit: control.max_integer_bits.clone(),
-            observed,
-            operation,
-        }));
-    }
-    Ok(())
-}
-
-fn validate_bits<E>(
-    value: &BigUint,
-    operation: &'static str,
-    control: &mut RecurrenceControl<'_, E>,
-) -> Result<(), E> {
-    let observed = BigUint::from(value.bits());
-    if observed > *control.max_integer_bits {
-        return Err((control.failure)(RecurrenceFailure::IntegerBits {
-            limit: control.max_integer_bits.clone(),
-            observed,
-            operation,
-        }));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -904,18 +722,7 @@ mod tests {
     use crate::operational_noise::{analysis::MxxAnalysis, identity::BinderDescriptor};
 
     fn evaluate(recurrence: &VectorRecurrence) -> Result<Box<[BigUint]>, RecurrenceFailure> {
-        let step_limit = BigUint::from(100_u8);
-        let bits = BigUint::from(1_000_u16);
-        let mut deadline = || Ok::<(), RecurrenceFailure>(());
-        let mut reserve = |_| Ok::<(), RecurrenceFailure>(());
-        let mut failure = |failure| failure;
-        recurrence.evaluate(&mut RecurrenceControl {
-            recurrence_step_limit: &step_limit,
-            max_integer_bits: &bits,
-            check_deadline: &mut deadline,
-            reserve_owned_elements: &mut reserve,
-            failure: &mut failure,
-        })
+        recurrence.evaluate()
     }
 
     #[test]
@@ -930,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn affine_fast_path_handles_large_count_without_step_budget() {
+    fn affine_fast_path_handles_large_count() {
         let recurrence = VectorRecurrence {
             initial: vec![BigUint::one()].into_boxed_slice(),
             transition: vec![RecurrenceExpr::Mul(
@@ -944,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn max_forces_the_general_path_and_enforces_step_limit() {
+    fn max_forces_the_general_path_without_a_step_ceiling() {
         let recurrence = VectorRecurrence {
             initial: vec![BigUint::one()].into_boxed_slice(),
             transition: vec![RecurrenceExpr::Max(
@@ -954,37 +761,7 @@ mod tests {
             .into_boxed_slice(),
             count: BigUint::from(101_u8),
         };
-        assert!(matches!(evaluate(&recurrence), Err(RecurrenceFailure::StepLimit { .. })));
-    }
-
-    #[test]
-    fn recurrence_charges_the_shared_allocation_callback() {
-        let recurrence = VectorRecurrence {
-            initial: vec![BigUint::one()].into_boxed_slice(),
-            transition: vec![RecurrenceExpr::Previous(0)].into_boxed_slice(),
-            count: BigUint::one(),
-        };
-        let step_limit = BigUint::from(10_u8);
-        let bits = BigUint::from(1_000_u16);
-        let mut deadline = || Ok::<(), RecurrenceFailure>(());
-        let mut reserve = |_| {
-            Err(RecurrenceFailure::StepLimit {
-                limit: BigUint::zero(),
-                count: BigUint::zero(),
-                transition_nodes: 0,
-            })
-        };
-        let mut failure = |failure| failure;
-        assert!(matches!(
-            recurrence.evaluate(&mut RecurrenceControl {
-                recurrence_step_limit: &step_limit,
-                max_integer_bits: &bits,
-                check_deadline: &mut deadline,
-                reserve_owned_elements: &mut reserve,
-                failure: &mut failure,
-            }),
-            Err(RecurrenceFailure::StepLimit { .. })
-        ));
+        assert_eq!(evaluate(&recurrence).unwrap().as_ref(), &[BigUint::from(2_u8)]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Shared execution controls and exact decoder acceptance for operational simulation.
 //!
-//! The graph-specific stages remain injected here: this driver owns the one deadline,
-//! cumulative allocation budget, diagnostics, and progress cadence for a checker job.
+//! The graph-specific stages remain injected here: this driver owns diagnostics and the
+//! progress cadence for a checker job.
 //! It deliberately does not manufacture a bound when lowering or relation rewriting is
 //! unavailable.
 
@@ -9,9 +9,7 @@ use super::{
     OperationalAcceptanceReport, OperationalSimulationDiagnostics, OperationalSimulationReport,
     analysis::{MxxAnalysis, ResourceBudget},
     bound::{BoundEvaluationControl, BoundEvaluationError, BoundEvaluator},
-    error::{
-        CheckerPhase, OperationalSimulationError, ResourceLimitKind, ResourceObserved, TargetError,
-    },
+    error::{OperationalSimulationError, TargetError},
     extract::{ExtractionControl, ProposalNodeClassification, extract_best_proposal},
     language::MxxLang,
     lower::{GraphLowerer, LoweredValue, LoweringControl},
@@ -33,36 +31,20 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tracing::{debug, error, info};
 
 const PROGRESS_WORK_CADENCE: u64 = 4_096;
 const PROGRESS_TIME_CADENCE: Duration = Duration::from_secs(1);
 
-/// Fixed private production ceilings for one complete checker job.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CheckerLimits {
-    pub iteration_limit: usize,
-    pub node_limit: usize,
-    pub total_owned_element_limit: usize,
-    pub total_time_limit: Duration,
-    pub relation_sources_per_eclass: usize,
-    pub switch_case_limit: usize,
-    pub recurrence_step_limit: BigUint,
-    pub max_integer_bits: BigUint,
-}
-
-impl CheckerLimits {
-    pub(crate) fn production() -> Self {
-        Self {
-            iteration_limit: 32,
-            node_limit: 2_000_000,
-            total_owned_element_limit: 2_000_000,
-            total_time_limit: Duration::from_secs(120),
-            relation_sources_per_eclass: 64,
-            switch_case_limit: 65_536,
-            recurrence_step_limit: BigUint::from(10_000_000_u32),
-            max_integer_bits: BigUint::from(16_777_216_u32),
-        }
-    }
+/// Logical checker phase reported by progress events and diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckerPhase {
+    Target,
+    Lower,
+    Rewrite,
+    Extract,
+    Bound,
+    Acceptance,
 }
 
 /// A decoder target after the graph-specific validation stage has closed its moduli.
@@ -91,6 +73,8 @@ pub struct ProgressEvent {
     pub total_or_discovered: Option<u64>,
     pub elapsed_ms: u64,
     pub egraph_nodes: Option<u64>,
+    pub owned_elements: u64,
+    pub rewrite_iterations: u64,
     pub program: Option<String>,
     pub scope: Option<String>,
     pub node: Option<u64>,
@@ -110,70 +94,18 @@ struct ProgressState {
     next_work_threshold: u64,
 }
 
-/// Read-only bound callbacks still mutate the one job control through this
-/// interior-mutability bridge; no phase gets its own deadline or allocation
-/// counter.
-struct BoundControlAdapter<'a, 'limits> {
-    control: RefCell<&'a mut SimulationControl<'limits>>,
-    failure: RefCell<Option<(ResourceLimitKind, ResourceObserved)>>,
+/// Read-only bound callbacks still update the one job's progress owner through
+/// this interior-mutability bridge.
+struct BoundControlAdapter<'a, 'control> {
+    control: RefCell<&'a mut SimulationControl<'control>>,
 }
 
-#[derive(Clone, Debug)]
-struct AdapterResourceFailure {
-    kind: ResourceLimitKind,
-    observed: ResourceObserved,
-}
-
-/// Shares the production job limits with graph lowering without giving it a
-/// phase-local clock or allocation counter.
-struct LoweringControlAdapter<'a, 'limits> {
-    control: &'a mut SimulationControl<'limits>,
-    failure: RefCell<Option<AdapterResourceFailure>>,
+/// Shares the production progress owner with graph lowering.
+struct LoweringControlAdapter<'a, 'control> {
+    control: &'a mut SimulationControl<'control>,
 }
 
 impl LoweringControl for LoweringControlAdapter<'_, '_> {
-    fn check_deadline(&self) -> Result<(), super::error::LowerError> {
-        let now = Instant::now();
-        if now >= self.control.deadline {
-            self.failure.borrow_mut().get_or_insert(AdapterResourceFailure {
-                kind: ResourceLimitKind::TotalTime,
-                observed: ResourceObserved::Duration {
-                    limit: self.control.limits.total_time_limit,
-                    observed: now.duration_since(self.control.started),
-                },
-            });
-            return Err(super::error::LowerError::ResourceDeadlineExceeded);
-        }
-        Ok(())
-    }
-
-    fn reserve_owned_elements(&self, requested: usize) -> Result<(), super::error::LowerError> {
-        self.check_deadline()?;
-        let mut current = self.control.owned_elements.load(Ordering::Relaxed);
-        loop {
-            let observed = current.checked_add(requested).unwrap_or(usize::MAX);
-            if observed > self.control.limits.total_owned_element_limit {
-                self.failure.borrow_mut().get_or_insert(AdapterResourceFailure {
-                    kind: ResourceLimitKind::TotalOwnedElements,
-                    observed: ResourceObserved::Counter {
-                        limit: self.control.limits.total_owned_element_limit as u64,
-                        observed: observed.min(u64::MAX as usize) as u64,
-                    },
-                });
-                return Err(super::error::LowerError::ResourceAllocationExceeded { requested });
-            }
-            match self.control.owned_elements.compare_exchange_weak(
-                current,
-                observed,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(next) => current = next,
-            }
-        }
-    }
-
     fn work(
         &mut self,
         scope: &super::identity::OccurrenceScope,
@@ -184,72 +116,17 @@ impl LoweringControl for LoweringControlAdapter<'_, '_> {
             format!("{:?}", scope.definition),
             node.0 as u64,
         );
-        self.control.work(1, None, None).map_err(|error| {
-            if let OperationalSimulationError::ResourceLimitExceeded { kind, observed, .. } = error
-            {
-                self.failure.borrow_mut().get_or_insert(AdapterResourceFailure { kind, observed });
-            }
-            super::error::LowerError::ResourceDeadlineExceeded
-        })
+        let _ = self.control.work(1, None, None);
+        Ok(())
     }
 }
 
 impl BoundEvaluationControl for BoundControlAdapter<'_, '_> {
-    fn check_deadline(&self) -> Result<(), BoundEvaluationError> {
-        self.control.borrow_mut().work(1, None, None).map_err(|error| {
-            self.record(error);
-            BoundEvaluationError::IntegerLimitExceeded {
-                operation: "bound progress",
-                value: BigUint::zero(),
-            }
-        })?;
-        self.control.borrow_mut().check_deadline().map_err(|error| {
-            self.record(error);
-            BoundEvaluationError::IntegerLimitExceeded {
-                operation: "bound deadline",
-                value: BigUint::zero(),
-            }
-        })
-    }
-
-    fn reserve_owned_elements(&self, requested: usize) -> Result<(), BoundEvaluationError> {
-        self.control.borrow_mut().reserve_owned_elements(requested).map_err(|error| {
-            self.record(error);
-            BoundEvaluationError::IntegerLimitExceeded {
-                operation: "bound allocation",
-                value: BigUint::from(requested),
-            }
-        })
-    }
-
-    fn validate_integer_bits(
-        &self,
-        value: &BigUint,
-        operation: &'static str,
-    ) -> Result<(), BoundEvaluationError> {
-        self.control.borrow_mut().check_integer_bits(value, operation).map_err(|error| {
-            self.record(error);
-            BoundEvaluationError::IntegerBitLimitExceeded {
-                operation,
-                bits: BigUint::from(value.bits()),
-            }
-        })
-    }
-
     fn validate_pack(&self, term: egg::Id, _bit_count: usize) -> Result<(), BoundEvaluationError> {
-        self.check_deadline().map_err(|_| BoundEvaluationError::InvalidPack { term })
-    }
-
-    fn recurrence_step_limit(&self) -> Option<BigUint> {
-        Some(self.control.borrow().limits.recurrence_step_limit.clone())
-    }
-}
-
-impl BoundControlAdapter<'_, '_> {
-    fn record(&self, error: OperationalSimulationError) {
-        if let OperationalSimulationError::ResourceLimitExceeded { kind, observed, .. } = error {
-            self.failure.borrow_mut().get_or_insert((kind, observed));
-        }
+        self.control
+            .borrow_mut()
+            .work(1, None, None)
+            .map_err(|_| BoundEvaluationError::InvalidPack { term })
     }
 }
 
@@ -259,12 +136,9 @@ impl ProgressState {
     }
 }
 
-/// One job's mutable controls.  Stage implementations receive this instead of constructing
-/// phase-local deadlines or resource counters.
+/// One job's mutable progress and diagnostics owner.
 pub(crate) struct SimulationControl<'a> {
-    limits: &'a CheckerLimits,
     started: Instant,
-    deadline: Instant,
     phase: CheckerPhase,
     owned_elements: Arc<AtomicUsize>,
     diagnostics: OperationalSimulationDiagnostics,
@@ -274,12 +148,10 @@ pub(crate) struct SimulationControl<'a> {
 }
 
 impl<'a> SimulationControl<'a> {
-    fn new(limits: &'a CheckerLimits, emit_progress: &'a mut dyn FnMut(ProgressEvent)) -> Self {
+    fn new(emit_progress: &'a mut dyn FnMut(ProgressEvent)) -> Self {
         let started = Instant::now();
         Self {
-            limits,
             started,
-            deadline: started + limits.total_time_limit,
             phase: CheckerPhase::Target,
             owned_elements: Arc::new(AtomicUsize::new(0)),
             diagnostics: OperationalSimulationDiagnostics::default(),
@@ -300,105 +172,20 @@ impl<'a> SimulationControl<'a> {
     }
 
     fn rewrite_budget(&self) -> SharedRewriteBudget {
-        SharedRewriteBudget::from_shared(
-            self.deadline,
-            self.limits.total_owned_element_limit,
-            Arc::clone(&self.owned_elements),
-        )
+        SharedRewriteBudget::from_shared(Arc::clone(&self.owned_elements))
     }
 
     fn analysis_budget(&self) -> ResourceBudget {
-        ResourceBudget::from_shared(
-            self.limits.total_owned_element_limit,
-            Arc::clone(&self.owned_elements),
-            self.started,
-            self.deadline,
-            self.limits.total_time_limit,
-        )
-    }
-
-    fn check_switch_cases(&mut self, observed: usize) -> Result<(), OperationalSimulationError> {
-        self.check_counter(ResourceLimitKind::SwitchCases, self.limits.switch_case_limit, observed)
-    }
-
-    pub(crate) fn check_deadline(&mut self) -> Result<(), OperationalSimulationError> {
-        let now = Instant::now();
-        if now >= self.deadline {
-            return Err(self.resource_error(
-                ResourceLimitKind::TotalTime,
-                ResourceObserved::Duration {
-                    limit: self.limits.total_time_limit,
-                    observed: now.duration_since(self.started),
-                },
-            ));
-        }
-        Ok(())
+        ResourceBudget::from_shared(Arc::clone(&self.owned_elements))
     }
 
     pub(crate) fn reserve_owned_elements(
         &mut self,
         requested: usize,
     ) -> Result<(), OperationalSimulationError> {
-        self.check_deadline()?;
-        let mut current = self.owned_elements.load(Ordering::Relaxed);
-        loop {
-            let observed = current.checked_add(requested).unwrap_or(usize::MAX);
-            if observed > self.limits.total_owned_element_limit {
-                return Err(self.resource_error(
-                    ResourceLimitKind::TotalOwnedElements,
-                    ResourceObserved::Counter {
-                        limit: self.limits.total_owned_element_limit.min(u64::MAX as usize) as u64,
-                        observed: observed.min(u64::MAX as usize) as u64,
-                    },
-                ));
-            }
-            match self.owned_elements.compare_exchange_weak(
-                current,
-                observed,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(next) => current = next,
-            }
-        }
-    }
-
-    pub(crate) fn check_egraph_nodes(
-        &mut self,
-        observed: usize,
-    ) -> Result<(), OperationalSimulationError> {
-        self.check_counter(ResourceLimitKind::EGraphNodes, self.limits.node_limit, observed)
-    }
-
-    pub(crate) fn check_rewrite_iterations(
-        &mut self,
-        observed: usize,
-    ) -> Result<(), OperationalSimulationError> {
-        self.check_counter(
-            ResourceLimitKind::RewriteIterations,
-            self.limits.iteration_limit,
-            observed,
-        )
-    }
-
-    pub(crate) fn check_integer_bits(
-        &mut self,
-        value: &BigUint,
-        operation: impl Into<String>,
-    ) -> Result<(), OperationalSimulationError> {
-        self.check_deadline()?;
-        let observed = BigUint::from(value.bits());
-        if observed > self.limits.max_integer_bits {
-            return Err(self.resource_error(
-                ResourceLimitKind::IntegerBits,
-                ResourceObserved::IntegerBits {
-                    limit: self.limits.max_integer_bits.clone(),
-                    observed,
-                    operation: operation.into(),
-                },
-            ));
-        }
+        let _ = self.owned_elements.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(requested))
+        });
         Ok(())
     }
 
@@ -410,7 +197,6 @@ impl<'a> SimulationControl<'a> {
         total_or_discovered: Option<u64>,
         egraph_nodes: Option<u64>,
     ) -> Result<(), OperationalSimulationError> {
-        self.check_deadline()?;
         self.progress.processed = self.progress.processed.saturating_add(units);
         let now = Instant::now();
         if self.progress.processed >= self.progress.next_work_threshold ||
@@ -427,7 +213,6 @@ impl<'a> SimulationControl<'a> {
     fn begin_phase(&mut self, phase: CheckerPhase) -> Result<Instant, OperationalSimulationError> {
         self.phase = phase;
         self.progress = ProgressState::new(Instant::now());
-        self.check_deadline()?;
         self.emit(ProgressEventKind::Start, None, None, Instant::now());
         Ok(Instant::now())
     }
@@ -438,29 +223,9 @@ impl<'a> SimulationControl<'a> {
         total_or_discovered: Option<u64>,
         egraph_nodes: Option<u64>,
     ) -> Result<Duration, OperationalSimulationError> {
-        self.check_deadline()?;
         let now = Instant::now();
         self.emit(ProgressEventKind::Complete, total_or_discovered, egraph_nodes, now);
         Ok(now.duration_since(phase_started))
-    }
-
-    fn check_counter(
-        &mut self,
-        kind: ResourceLimitKind,
-        limit: usize,
-        observed: usize,
-    ) -> Result<(), OperationalSimulationError> {
-        self.check_deadline()?;
-        if observed > limit {
-            return Err(self.resource_error(
-                kind,
-                ResourceObserved::Counter {
-                    limit: limit.min(u64::MAX as usize) as u64,
-                    observed: observed.min(u64::MAX as usize) as u64,
-                },
-            ));
-        }
-        Ok(())
     }
 
     fn emit(
@@ -477,37 +242,12 @@ impl<'a> SimulationControl<'a> {
             total_or_discovered,
             elapsed_ms: now.duration_since(self.started).as_millis() as u64,
             egraph_nodes,
+            owned_elements: self.owned_elements.load(Ordering::Relaxed) as u64,
+            rewrite_iterations: self.diagnostics.rewrite_iteration_count,
             program: self.progress_site.as_ref().map(|(program, _, _)| program.clone()),
             scope: self.progress_site.as_ref().map(|(_, scope, _)| scope.clone()),
             node: self.progress_site.as_ref().map(|(_, _, node)| *node),
         });
-    }
-
-    fn resource_error(
-        &self,
-        kind: ResourceLimitKind,
-        observed: ResourceObserved,
-    ) -> OperationalSimulationError {
-        OperationalSimulationError::ResourceLimitExceeded {
-            phase: self.phase,
-            kind,
-            observed,
-            diagnostics: self.diagnostics.clone(),
-        }
-    }
-
-    fn enrich_error(&self, error: OperationalSimulationError) -> OperationalSimulationError {
-        match error {
-            OperationalSimulationError::ResourceLimitExceeded { phase, kind, observed, .. } => {
-                OperationalSimulationError::ResourceLimitExceeded {
-                    phase,
-                    kind,
-                    observed,
-                    diagnostics: self.diagnostics.clone(),
-                }
-            }
-            error => error,
-        }
     }
 }
 
@@ -518,7 +258,64 @@ pub fn check_operational_noise_candidate(
     protocol: &ProtocolDecl,
     request: &super::OperationalCheckRequest,
 ) -> Result<OperationalSimulationReport, OperationalSimulationError> {
-    check_operational_noise_candidate_with_progress(protocol, request, |_| {})
+    let target = request.target_id.clone();
+    let started = Instant::now();
+    let mut last_progress = None;
+    info!(target, "operational noise simulation begin");
+    let result = check_operational_noise_candidate_with_progress(protocol, request, |event| {
+        last_progress = Some(event.clone());
+        match event.event {
+            ProgressEventKind::Progress => debug!(
+                target,
+                phase = ?event.phase,
+                elapsed_ms = event.elapsed_ms,
+                processed = event.processed,
+                total_or_discovered = ?event.total_or_discovered,
+                owned_elements = event.owned_elements,
+                egraph_nodes = ?event.egraph_nodes,
+                rewrite_iterations = event.rewrite_iterations,
+                program = ?event.program,
+                scope = ?event.scope,
+                node = ?event.node,
+                "operational noise simulation progress"
+            ),
+            ProgressEventKind::Start => info!(
+                target,
+                phase = ?event.phase,
+                elapsed_ms = event.elapsed_ms,
+                owned_elements = event.owned_elements,
+                "operational noise simulation phase begin"
+            ),
+            ProgressEventKind::Complete => info!(
+                target,
+                phase = ?event.phase,
+                elapsed_ms = event.elapsed_ms,
+                processed = event.processed,
+                owned_elements = event.owned_elements,
+                egraph_nodes = ?event.egraph_nodes,
+                rewrite_iterations = event.rewrite_iterations,
+                "operational noise simulation phase complete"
+            ),
+        }
+    });
+    match &result {
+        Ok(report) => info!(
+            target,
+            elapsed = ?started.elapsed(),
+            accepted = report.accepted,
+            noise_bound = %report.noise_bound,
+            diagnostics = ?report.diagnostics,
+            "operational noise simulation complete"
+        ),
+        Err(simulation_error) => error!(
+            target,
+            elapsed = ?started.elapsed(),
+            error = %simulation_error,
+            partial_progress = ?last_progress,
+            "operational noise simulation failed with partial diagnostics"
+        ),
+    }
+    result
 }
 
 /// Checks one closed protocol candidate and exposes best-effort progress at instrumented work
@@ -529,8 +326,7 @@ pub fn check_operational_noise_candidate_with_progress(
     request: &super::OperationalCheckRequest,
     mut emit: impl FnMut(ProgressEvent),
 ) -> Result<OperationalSimulationReport, OperationalSimulationError> {
-    let limits = CheckerLimits::production();
-    let mut control = SimulationControl::new(&limits, &mut emit);
+    let mut control = SimulationControl::new(&mut emit);
     let target_started = control.begin_phase(CheckerPhase::Target)?;
     control.work(
         protocol.params.len().saturating_add(request.environment.len()) as u64,
@@ -539,10 +335,8 @@ pub fn check_operational_noise_candidate_with_progress(
     )?;
     request
         .validate(protocol.params.iter().map(|parameter| parameter.name.clone()))
-        .map_err(OperationalSimulationError::Request)
-        .map_err(|error| control.enrich_error(error))?;
-    let (target, stage, wire) = resolve_target(protocol, request, &mut control)
-        .map_err(|error| control.enrich_error(error))?;
+        .map_err(OperationalSimulationError::Request)?;
+    let (target, stage, wire) = resolve_target(protocol, request, &mut control)?;
     control.work(1, None, None)?;
     control.complete_phase(target_started, None, None)?;
     check_with_control(
@@ -550,25 +344,16 @@ pub fn check_operational_noise_candidate_with_progress(
         &mut control,
         |control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
-            let analysis = MxxAnalysis::with_resource_budget(
-                Default::default(),
-                limits.relation_sources_per_eclass,
-                limits.switch_case_limit,
-                control.analysis_budget(),
-            );
-            let mut lowering_control =
-                LoweringControlAdapter { control, failure: RefCell::new(None) };
+            let analysis =
+                MxxAnalysis::with_resource_budget(Default::default(), control.analysis_budget());
+            let mut lowering_control = LoweringControlAdapter { control };
             let mut lowerer =
                 GraphLowerer::new_with_control(protocol, request, analysis, &mut lowering_control);
             let lowered = lowerer.lower_stage_wire(&stage, wire);
             let lowerer = lowerer.into_uncontrolled();
-            let lowering_failure = lowering_control.failure.into_inner();
             let value = match lowered {
                 Ok(value) => value,
                 Err(source) => {
-                    if let Some(failure) = lowering_failure {
-                        return Err(control.resource_error(failure.kind, failure.observed));
-                    }
                     return Err(OperationalSimulationError::Lower {
                         site: site(&stage, wire, "lower"),
                         source,
@@ -594,10 +379,7 @@ pub fn check_operational_noise_candidate_with_progress(
                         },
                     })?;
                     match family.storage {
-                        super::family::FamilyCoverageStorage::ExactStored { elements } => {
-                            control.check_switch_cases(elements.len())?;
-                            elements
-                        }
+                        super::family::FamilyCoverageStorage::ExactStored { elements } => elements,
                         super::family::FamilyCoverageStorage::SharedTemplate {
                             domain,
                             representative,
@@ -626,12 +408,6 @@ pub fn check_operational_noise_candidate_with_progress(
                     });
                 }
             };
-            if let (Some(kind), Some(observed)) = (
-                lowerer.egraph.analysis.resource_failure_kind.clone(),
-                lowerer.egraph.analysis.resource_failure.clone(),
-            ) {
-                return Err(control.resource_error(kind, observed));
-            }
             Ok((lowerer, roots, stage.clone(), wire))
         },
         |(mut lowerer, roots, stage, wire), control| {
@@ -650,24 +426,19 @@ pub fn check_operational_noise_candidate_with_progress(
             .expect("closed relation rewrite name");
             let runner = Runner::default()
                 .with_egraph(std::mem::take(&mut lowerer.egraph))
-                .with_iter_limit(limits.iteration_limit)
-                .with_node_limit(limits.node_limit)
-                .with_time_limit(limits.total_time_limit)
+                .with_iter_limit(usize::MAX)
+                .with_node_limit(usize::MAX)
+                .with_time_limit(Duration::MAX)
                 .run(&[rewrite]);
             match runner.stop_reason.as_ref() {
                 Some(StopReason::Saturated) => {}
-                Some(StopReason::IterationLimit(limit)) => {
-                    control.check_rewrite_iterations(limit.saturating_add(1))?;
-                }
-                Some(StopReason::NodeLimit(limit)) => {
-                    control.check_egraph_nodes(limit.saturating_add(1))?
-                }
-                Some(StopReason::TimeLimit(_)) => control.check_deadline()?,
-                Some(StopReason::Other(reason)) => {
+                Some(reason) => {
                     return Err(OperationalSimulationError::Relation {
                         site: site(&stage, wire, "relation rewrite"),
                         source: super::error::RelationError::RewriteDidNotSaturate {
-                            reason: reason.clone(),
+                            reason: format!(
+                                "internal inconsistency: explicitly unbounded egg runner stopped with {reason:?}"
+                            ),
                         },
                     });
                 }
@@ -681,17 +452,9 @@ pub fn check_operational_noise_candidate_with_progress(
                 }
             }
             lowerer.egraph = runner.egraph;
-            if let (Some(kind), Some(observed)) = (
-                lowerer.egraph.analysis.resource_failure_kind.clone(),
-                lowerer.egraph.analysis.resource_failure.clone(),
-            ) {
-                return Err(control.resource_error(kind, observed));
-            }
-            control.check_rewrite_iterations(runner.iterations.len())?;
-            control.check_egraph_nodes(lowerer.egraph.total_size())?;
             control.work(
                 runner.iterations.len() as u64,
-                Some(limits.iteration_limit as u64),
+                None,
                 Some(lowerer.egraph.total_size() as u64),
             )?;
             let counters = context.counters();
@@ -703,23 +466,6 @@ pub fn check_operational_noise_candidate_with_progress(
             control.diagnostics_mut().relation_rewrite_count = counters.rewrites;
             if let Some(failure) = context.failure() {
                 return Err(match failure {
-                    super::relation::RelationFailure::DeadlineExceeded { observed } => control
-                        .resource_error(
-                            ResourceLimitKind::TotalTime,
-                            ResourceObserved::Duration {
-                                limit: limits.total_time_limit,
-                                observed: limits.total_time_limit.saturating_add(observed),
-                            },
-                        ),
-                    super::relation::RelationFailure::OwnedElementLimitExceeded { observed } => {
-                        control.resource_error(
-                            ResourceLimitKind::TotalOwnedElements,
-                            ResourceObserved::Counter {
-                                limit: limits.total_owned_element_limit as u64,
-                                observed: observed.min(u64::MAX as usize) as u64,
-                            },
-                        )
-                    }
                     failure => {
                         relation_error(&stage, wire, &lowerer.egraph.analysis.symbols, failure)
                     }
@@ -730,9 +476,6 @@ pub fn check_operational_noise_candidate_with_progress(
         |(mut lowerer, roots, stage, wire, context), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
             let control = RefCell::new(control);
-            let mut check_node_count = |count| control.borrow_mut().check_egraph_nodes(count);
-            let mut reserve = |count| control.borrow_mut().reserve_owned_elements(count);
-            let mut deadline = || control.borrow_mut().check_deadline();
             let mut invalid_dag = |_| OperationalSimulationError::Lower {
                 site: site(&stage, wire, "extract"),
                 source: super::error::LowerError::CyclicGraphDependency { wire },
@@ -743,12 +486,7 @@ pub fn check_operational_noise_candidate_with_progress(
                 let proposal = extract_best_proposal(
                     &lowerer.egraph,
                     root,
-                    &mut ExtractionControl {
-                        check_node_count: &mut check_node_count,
-                        reserve_owned_elements: &mut reserve,
-                        check_deadline: &mut deadline,
-                        invalid_dag: &mut invalid_dag,
-                    },
+                    &mut ExtractionControl { invalid_dag: &mut invalid_dag },
                     &mut |_, node, egraph| {
                         let (relation_redex, large_atom) =
                             super::relation::classify_proposal_node(egraph, node, &context)
@@ -790,20 +528,13 @@ pub fn check_operational_noise_candidate_with_progress(
         },
         |(lowerer, roots, stage, wire), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
-            let bound_control =
-                BoundControlAdapter { control: RefCell::new(control), failure: RefCell::new(None) };
+            let bound_control = BoundControlAdapter { control: RefCell::new(control) };
             let view = lowerer.production_bound_view_with_control(&bound_control);
             let mut bound = BigUint::zero();
             for root in roots {
                 let result = match BoundEvaluator::new(&view).evaluate(root) {
                     Ok(result) => result,
                     Err(_) => {
-                        if let Some((kind, observed)) = bound_control.failure.borrow_mut().take() {
-                            return Err(bound_control
-                                .control
-                                .borrow()
-                                .resource_error(kind, observed));
-                        }
                         return Err(OperationalSimulationError::Bound {
                             site: site(&stage, wire, "bound"),
                             source: super::error::BoundError::BoundExpressionNotEvaluable {
@@ -1173,14 +904,8 @@ fn resolve_target(
         }
     }
     control.reserve_owned_elements(request.environment.len())?;
-    for (name, value) in &request.environment {
+    for _ in &request.environment {
         control.work(1, Some(request.environment.len() as u64), None)?;
-        if let super::OperationalParameterValue::Integer(value) = value {
-            control.check_integer_bits(
-                &value.magnitude().clone(),
-                format!("target parameter {name}"),
-            )?;
-        }
     }
     let environment = ParamEnv {
         integers: request
@@ -1208,7 +933,6 @@ fn resolve_target(
                 actual: modulus,
             })
         })?;
-    control.check_integer_bits(&ciphertext_modulus, "target ciphertext modulus")?;
     let kind = match &target.kind {
         OperationalDecoderKind::BooleanInterval => ResolvedDecoderKind::BooleanInterval,
         OperationalDecoderKind::ThresholdDecode { plaintext_modulus } => {
@@ -1225,7 +949,6 @@ fn resolve_target(
                         actual: value,
                     })
                 })?;
-            control.check_integer_bits(&plaintext_modulus, "target plaintext modulus")?;
             ResolvedDecoderKind::Threshold { plaintext_modulus }
         }
     };
@@ -1486,23 +1209,14 @@ fn relation_error(
                 reason: super::error::RelationRewriteBlockReason::TransformedOperand,
             }
         }
-        super::relation::RelationFailure::DeadlineExceeded { .. } |
-        super::relation::RelationFailure::OwnedElementLimitExceeded { .. } => unreachable!(
-            "relation resource failures are mapped through the shared simulation control"
-        ),
     };
     OperationalSimulationError::Relation { site: site(stage, wire, "relation rewrite"), source }
 }
 
-/// Drives the real lower/rewrite/extract/bound stages under one job-wide resource policy.
-///
-/// It is module-private because production callers use [`CheckerLimits::production`]; tests
-/// inject small limits to exercise each typed resource boundary.  The callbacks own the actual
-/// graph semantics and must call [`SimulationControl::work`] at their existing work boundaries.
+/// Drives injected stages with the same progress and diagnostics owner used in production.
 #[cfg(test)]
-pub(crate) fn check_with_limits<Lowered, Rewritten, Extracted>(
+pub(crate) fn check_with_test_control<Lowered, Rewritten, Extracted>(
     target: ResolvedAcceptanceTarget,
-    limits: &CheckerLimits,
     emit_progress: &mut dyn FnMut(ProgressEvent),
     lower: impl FnMut(&mut SimulationControl<'_>) -> Result<Lowered, OperationalSimulationError>,
     rewrite: impl FnMut(
@@ -1518,7 +1232,7 @@ pub(crate) fn check_with_limits<Lowered, Rewritten, Extracted>(
         &mut SimulationControl<'_>,
     ) -> Result<BigUint, OperationalSimulationError>,
 ) -> Result<OperationalSimulationReport, OperationalSimulationError> {
-    let mut control = SimulationControl::new(limits, emit_progress);
+    let mut control = SimulationControl::new(emit_progress);
     check_with_control(target, &mut control, lower, rewrite, extract, bound)
 }
 
@@ -1540,27 +1254,26 @@ fn check_with_control<Lowered, Rewritten, Extracted>(
     ) -> Result<BigUint, OperationalSimulationError>,
 ) -> Result<OperationalSimulationReport, OperationalSimulationError> {
     let phase_started = control.begin_phase(CheckerPhase::Lower)?;
-    let lowered = lower(control).map_err(|error| control.enrich_error(error))?;
+    let lowered = lower(control)?;
     let elapsed = control.complete_phase(phase_started, None, None)?;
     control.diagnostics.lowering_milliseconds = elapsed.as_millis() as u64;
 
     let phase_started = control.begin_phase(CheckerPhase::Rewrite)?;
-    let rewritten = rewrite(lowered, control).map_err(|error| control.enrich_error(error))?;
+    let rewritten = rewrite(lowered, control)?;
     let elapsed = control.complete_phase(phase_started, None, None)?;
     control.diagnostics.rewrite_milliseconds = elapsed.as_millis() as u64;
 
     let phase_started = control.begin_phase(CheckerPhase::Extract)?;
-    let extracted = extract(rewritten, control).map_err(|error| control.enrich_error(error))?;
+    let extracted = extract(rewritten, control)?;
     control.complete_phase(phase_started, None, None)?;
 
     let phase_started = control.begin_phase(CheckerPhase::Bound)?;
-    let noise_bound = bound(extracted, control).map_err(|error| control.enrich_error(error))?;
-    control.check_integer_bits(&noise_bound, "final noise bound")?;
+    let noise_bound = bound(extracted, control)?;
     let elapsed = control.complete_phase(phase_started, None, None)?;
     control.diagnostics.bound_milliseconds = elapsed.as_millis() as u64;
 
     let phase_started = control.begin_phase(CheckerPhase::Acceptance)?;
-    let (accepted, acceptance) = check_acceptance(&target, &noise_bound, control)?;
+    let (accepted, acceptance) = check_acceptance(&target, &noise_bound)?;
     control.complete_phase(phase_started, None, None)?;
     control.diagnostics.total_milliseconds = control.started.elapsed().as_millis() as u64;
 
@@ -1577,13 +1290,10 @@ fn check_with_control<Lowered, Rewritten, Extracted>(
 fn check_acceptance(
     target: &ResolvedAcceptanceTarget,
     noise_bound: &BigUint,
-    control: &mut SimulationControl<'_>,
 ) -> Result<(bool, OperationalAcceptanceReport), OperationalSimulationError> {
-    control.check_deadline()?;
     match &target.kind {
         ResolvedDecoderKind::Threshold { plaintext_modulus } => {
             let threshold_left = BigUint::from(2_u8) * plaintext_modulus * noise_bound;
-            control.check_integer_bits(&threshold_left, "decoder threshold left side")?;
             let margin = BigInt::from(target.ciphertext_modulus.clone()) -
                 BigInt::from(threshold_left.clone());
             let accepted = threshold_left < target.ciphertext_modulus;
@@ -1654,9 +1364,8 @@ mod tests {
     }
 
     fn run_acceptance(target: ResolvedAcceptanceTarget, noise: u32) -> OperationalSimulationReport {
-        check_with_limits(
+        check_with_test_control(
             target,
-            &CheckerLimits::production(),
             &mut |_| {},
             |_| Ok(()),
             |_, _| Ok(()),
@@ -1664,23 +1373,6 @@ mod tests {
             |_, _| Ok(noise.into()),
         )
         .expect("acceptance result")
-    }
-
-    #[test]
-    fn production_limits_match_the_fixed_resource_policy() {
-        assert_eq!(
-            CheckerLimits::production(),
-            CheckerLimits {
-                iteration_limit: 32,
-                node_limit: 2_000_000,
-                total_owned_element_limit: 2_000_000,
-                total_time_limit: Duration::from_secs(120),
-                relation_sources_per_eclass: 64,
-                switch_case_limit: 65_536,
-                recurrence_step_limit: 10_000_000_u32.into(),
-                max_integer_bits: 16_777_216_u32.into(),
-            }
-        );
     }
 
     #[test]
@@ -1731,9 +1423,8 @@ mod tests {
             layouts: Vec::new(),
             target_id: "toy-threshold".to_owned(),
         };
-        let limits = CheckerLimits::production();
         let mut emit = |_| {};
-        let mut control = SimulationControl::new(&limits, &mut emit);
+        let mut control = SimulationControl::new(&mut emit);
         let error = resolve_target(&protocol, &request, &mut control)
             .expect_err("the decoder input must be derived from the declared residual");
         assert!(matches!(
@@ -1748,9 +1439,8 @@ mod tests {
     #[test]
     fn progress_emits_at_the_shared_work_cadence() {
         let mut events = Vec::new();
-        let report = check_with_limits(
+        let report = check_with_test_control(
             boolean_target(17),
-            &CheckerLimits::production(),
             &mut |event| events.push(event),
             |control| {
                 control.work(PROGRESS_WORK_CADENCE - 1, Some(PROGRESS_WORK_CADENCE), None)?;
@@ -1771,198 +1461,12 @@ mod tests {
     }
 
     #[test]
-    fn lowering_adapter_retains_exact_owned_limit_observation() {
-        let limits = CheckerLimits { total_owned_element_limit: 1, ..CheckerLimits::production() };
+    fn owned_element_reservations_are_observed_without_rejecting() {
         let mut emit = |_| {};
-        let mut control = SimulationControl::new(&limits, &mut emit);
-        let adapter = LoweringControlAdapter { control: &mut control, failure: RefCell::new(None) };
-        assert!(adapter.reserve_owned_elements(2).is_err());
-        let failure = adapter.failure.into_inner().unwrap();
-        assert_eq!(failure.kind, ResourceLimitKind::TotalOwnedElements);
-        assert_eq!(failure.observed, ResourceObserved::Counter { limit: 1, observed: 2 });
-    }
-
-    #[test]
-    fn bound_adapter_retains_exact_owned_limit_observation() {
-        let limits = CheckerLimits { total_owned_element_limit: 0, ..CheckerLimits::production() };
-        let mut emit = |_| {};
-        let mut control = SimulationControl::new(&limits, &mut emit);
-        let adapter = BoundControlAdapter {
-            control: RefCell::new(&mut control),
-            failure: RefCell::new(None),
-        };
-        assert!(adapter.reserve_owned_elements(3).is_err());
-        assert_eq!(
-            adapter.failure.into_inner(),
-            Some((
-                ResourceLimitKind::TotalOwnedElements,
-                ResourceObserved::Counter { limit: 0, observed: 3 }
-            ))
-        );
-    }
-
-    #[test]
-    fn target_resolution_observes_the_job_deadline() {
-        let protocol = crate::toy_example::protocol();
-        let request = super::super::OperationalCheckRequest {
-            environment: vec![(
-                "cutoff".to_owned(),
-                super::super::OperationalParameterValue::Integer(1.into()),
-            )],
-            layouts: Vec::new(),
-            target_id: "toy-threshold".to_owned(),
-        };
-        let limits =
-            CheckerLimits { total_time_limit: Duration::ZERO, ..CheckerLimits::production() };
-        let mut emit = |_| {};
-        let mut control = SimulationControl::new(&limits, &mut emit);
-        assert!(matches!(
-            resolve_target(&protocol, &request, &mut control),
-            Err(OperationalSimulationError::ResourceLimitExceeded {
-                phase: CheckerPhase::Target,
-                kind: ResourceLimitKind::TotalTime,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn cumulative_owned_budget_is_not_refunded_between_allocations() {
-        let mut limits = CheckerLimits::production();
-        limits.total_owned_element_limit = 2;
-        let error = check_with_limits(
-            boolean_target(17),
-            &limits,
-            &mut |_| {},
-            |control| {
-                control.reserve_owned_elements(1)?;
-                control.reserve_owned_elements(1)?;
-                control.reserve_owned_elements(1)?;
-                Ok(())
-            },
-            |_, _| Ok(()),
-            |_, _| Ok(()),
-            |_, _| Ok(0_u8.into()),
-        )
-        .expect_err("third reservation must exceed the job-wide budget");
-        assert!(matches!(
-            error,
-            OperationalSimulationError::ResourceLimitExceeded {
-                phase: CheckerPhase::Lower,
-                kind: ResourceLimitKind::TotalOwnedElements,
-                observed: ResourceObserved::Counter { limit: 2, observed: 3 },
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn analysis_uses_the_same_cumulative_counter_as_the_driver() {
-        let mut limits = CheckerLimits::production();
-        limits.total_owned_element_limit = 2;
-        let error = check_with_limits(
-            boolean_target(17),
-            &limits,
-            &mut |_| {},
-            |control| {
-                control.reserve_owned_elements(1)?;
-                let analysis = MxxAnalysis::with_resource_budget(
-                    Default::default(),
-                    limits.relation_sources_per_eclass,
-                    limits.switch_case_limit,
-                    control.analysis_budget(),
-                );
-                let mut egraph = EGraph::new(analysis);
-                let left = egraph.add(super::super::language::MxxLang::IntConst(1.into()));
-                let right = egraph.add(super::super::language::MxxLang::IntConst(2.into()));
-                let _ = egraph
-                    .add(super::super::language::MxxLang::MatrixAdd(vec![left, right].into()));
-                let kind = egraph.analysis.resource_failure_kind.clone().expect("resource kind");
-                let observed = egraph.analysis.resource_failure.clone().expect("resource value");
-                Err(control.resource_error(kind, observed))
-            },
-            |_: (), _| Ok(()),
-            |_, _| Ok(()),
-            |_, _| Ok(0_u8.into()),
-        )
-        .expect_err("analysis must observe the driver's earlier reservation");
-        assert!(matches!(
-            error,
-            OperationalSimulationError::ResourceLimitExceeded {
-                phase: CheckerPhase::Lower,
-                kind: ResourceLimitKind::TotalOwnedElements,
-                observed: ResourceObserved::Counter { limit: 2, observed: 3 },
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn analysis_uses_the_driver_deadline_and_switch_limit() {
-        let mut limits = CheckerLimits::production();
-        limits.switch_case_limit = 1;
-        let mut emit = |_| {};
-        let mut control = SimulationControl::new(&limits, &mut emit);
-        let analysis = MxxAnalysis::with_resource_budget(
-            Default::default(),
-            limits.relation_sources_per_eclass,
-            limits.switch_case_limit,
-            control.analysis_budget(),
-        );
-        let mut egraph = EGraph::new(analysis);
-        let selector = egraph.add(super::super::language::MxxLang::IntConst(0.into()));
-        let first = egraph.add(super::super::language::MxxLang::IntConst(1.into()));
-        let second = egraph.add(super::super::language::MxxLang::IntConst(2.into()));
-        let _ = egraph
-            .add(super::super::language::MxxLang::Switch(vec![selector, first, second].into()));
-        assert_eq!(egraph.analysis.resource_failure_kind, Some(ResourceLimitKind::SwitchCases));
-        assert_eq!(
-            egraph.analysis.resource_failure,
-            Some(ResourceObserved::Counter { limit: 1, observed: 2 })
-        );
-
-        control.deadline = Instant::now();
-        let analysis = MxxAnalysis::with_resource_budget(
-            Default::default(),
-            limits.relation_sources_per_eclass,
-            limits.switch_case_limit,
-            control.analysis_budget(),
-        );
-        let mut egraph = EGraph::new(analysis);
-        let _ = egraph.add(super::super::language::MxxLang::IntConst(0.into()));
-        assert_eq!(egraph.analysis.resource_failure_kind, Some(ResourceLimitKind::TotalTime));
-        assert!(matches!(
-            egraph.analysis.resource_failure,
-            Some(ResourceObserved::Duration { .. })
-        ));
-    }
-
-    #[test]
-    fn exact_family_case_count_uses_the_production_switch_limit() {
-        let mut limits = CheckerLimits::production();
-        limits.switch_case_limit = 1;
-        let error = check_with_limits(
-            boolean_target(17),
-            &limits,
-            &mut |_| {},
-            |control| {
-                control.check_switch_cases(2)?;
-                Ok(())
-            },
-            |_, _| Ok(()),
-            |_, _| Ok(()),
-            |_, _| Ok(0_u8.into()),
-        )
-        .expect_err("two family cases exceed the configured production limit");
-        assert!(matches!(
-            error,
-            OperationalSimulationError::ResourceLimitExceeded {
-                phase: CheckerPhase::Lower,
-                kind: ResourceLimitKind::SwitchCases,
-                observed: ResourceObserved::Counter { limit: 1, observed: 2 },
-                ..
-            }
-        ));
+        let mut control = SimulationControl::new(&mut emit);
+        assert!(control.reserve_owned_elements(usize::MAX).is_ok());
+        assert!(control.reserve_owned_elements(3).is_ok());
+        assert_eq!(control.owned_elements.load(Ordering::Relaxed), usize::MAX);
     }
 
     #[test]

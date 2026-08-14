@@ -36,16 +36,8 @@ pub struct ExtractedProposal {
     pub expression: RecExpr<MxxLang>,
 }
 
-/// Job-owned resource checks injected by the simulation driver.
-///
-/// These callbacks are the only extraction boundary to `CheckerLimits`, the
-/// cumulative owned-element budget, and the one shared deadline.  They return
-/// the driver's fully populated typed resource error, so extraction does not
-/// create a second limits object or diagnostics owner.
+/// Maps extraction failures that require the simulation driver's source site.
 pub struct ExtractionControl<'a> {
-    pub check_node_count: &'a mut dyn FnMut(usize) -> Result<(), OperationalSimulationError>,
-    pub reserve_owned_elements: &'a mut dyn FnMut(usize) -> Result<(), OperationalSimulationError>,
-    pub check_deadline: &'a mut dyn FnMut() -> Result<(), OperationalSimulationError>,
     /// Maps an e-class with no finite DAG representative to the existing
     /// site-bearing analysis error owned by the driver.
     pub invalid_dag: &'a mut dyn FnMut(Id) -> OperationalSimulationError,
@@ -97,40 +89,26 @@ pub fn extract_best_proposal(
         &EGraph<MxxLang, MxxAnalysis>,
     ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
 ) -> Result<ExtractedProposal, OperationalSimulationError> {
-    (control.check_deadline)()?;
-    let node_count = egraph.total_size();
-    (control.check_deadline)()?;
-    (control.check_node_count)(node_count)?;
-
     let class_count = egraph.number_of_classes();
-    (control.reserve_owned_elements)(class_count)?;
     let mut classes = Vec::with_capacity(class_count);
     for class in egraph.classes() {
-        (control.check_deadline)()?;
         classes.push(class.id);
     }
-    (control.check_deadline)()?;
     classes.sort_unstable();
-    (control.check_deadline)()?;
 
     // Canonical egg ids are bounded by the number of inserted e-nodes.  One
     // indexed table holds both dynamic-programming choices and DAG build state.
     let slot_count = egraph.nodes().len();
-    (control.reserve_owned_elements)(slot_count)?;
     let mut candidates = vec![None::<Candidate>; slot_count];
 
     for _ in 0..class_count {
-        (control.check_deadline)()?;
         let mut changed = false;
         for &class_id in &classes {
-            (control.check_deadline)()?;
             let canonical = egraph.find(class_id);
             let index = usize::from(canonical);
             let class = &egraph[canonical];
             for node in class.iter() {
-                (control.check_deadline)()?;
-                let Some(cost) =
-                    proposal_cost(egraph, canonical, node, &candidates, control, classify)?
+                let Some(cost) = proposal_cost(egraph, canonical, node, &candidates, classify)?
                 else {
                     continue;
                 };
@@ -138,9 +116,6 @@ pub fn extract_best_proposal(
                     cost < current.cost || (cost == current.cost && node < &current.node)
                 });
                 if improves {
-                    // A cloned variadic e-node owns these child slots.  A later
-                    // replacement reserves again; the cumulative budget is not refunded.
-                    (control.reserve_owned_elements)(node.children().len())?;
                     candidates[index] = Some(Candidate {
                         cost,
                         node: node.clone(),
@@ -163,11 +138,9 @@ pub fn extract_best_proposal(
     };
     let root_cost = root_candidate.cost.clone();
 
-    (control.reserve_owned_elements)(1)?;
     let mut work = vec![BuildFrame::Enter(root)];
     let mut nodes = Vec::<MxxLang>::new();
     while let Some(frame) = work.pop() {
-        (control.check_deadline)()?;
         let class = match frame {
             BuildFrame::Enter(class) | BuildFrame::Finish(class) => egraph.find(class),
         };
@@ -182,11 +155,8 @@ pub fn extract_best_proposal(
                     ExtractionState::Visiting => return Err((control.invalid_dag)(class)),
                     ExtractionState::Pending => candidate.state = ExtractionState::Visiting,
                 }
-                let child_count = candidate.node.children().len();
-                (control.reserve_owned_elements)(1usize.saturating_add(child_count))?;
                 work.push(BuildFrame::Finish(class));
                 for &child in candidate.node.children().iter().rev() {
-                    (control.check_deadline)()?;
                     work.push(BuildFrame::Enter(egraph.find(child)));
                 }
             }
@@ -194,17 +164,8 @@ pub fn extract_best_proposal(
                 let Some(candidate) = candidates.get(index).and_then(Option::as_ref) else {
                     return Err((control.invalid_dag)(class));
                 };
-                (control.reserve_owned_elements)(
-                    1usize.saturating_add(candidate.node.children().len()),
-                )?;
                 let mut missing_child = None;
-                let mut control_error = None;
                 let output_node = candidate.node.clone().map_children(|child| {
-                    if control_error.is_none() {
-                        if let Err(error) = (control.check_deadline)() {
-                            control_error = Some(error);
-                        }
-                    }
                     let child = egraph.find(child);
                     let output = candidates
                         .get(usize::from(child))
@@ -218,9 +179,6 @@ pub fn extract_best_proposal(
                         }
                     }
                 });
-                if let Some(error) = control_error {
-                    return Err(error);
-                }
                 if let Some(child) = missing_child {
                     return Err((control.invalid_dag)(child));
                 }
@@ -235,8 +193,6 @@ pub fn extract_best_proposal(
         }
     }
 
-    (control.check_deadline)()?;
-    (control.check_node_count)(node_count)?;
     let expression = RecExpr::from(nodes);
     if !expression.is_dag() {
         return Err((control.invalid_dag)(root));
@@ -249,7 +205,6 @@ fn proposal_cost(
     class: Id,
     node: &MxxLang,
     candidates: &[Option<Candidate>],
-    control: &mut ExtractionControl<'_>,
     classify: &mut dyn FnMut(
         Id,
         &MxxLang,
@@ -261,7 +216,6 @@ fn proposal_cost(
     let mut large_atom_count = 0_u64;
     let mut node_count = 1_u64;
     for &child in node.children() {
-        (control.check_deadline)()?;
         let child = egraph.find(child);
         let Some(child) = candidates.get(usize::from(child)).and_then(Option::as_ref) else {
             return Ok(None);
@@ -290,30 +244,12 @@ fn proposal_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operational_noise::{
-        analysis::MxxAnalysis,
-        error::{CheckerPhase, ResourceLimitKind, ResourceObserved},
-    };
-    use std::{cell::Cell, time::Duration};
+    use crate::operational_noise::analysis::MxxAnalysis;
+    use std::cell::Cell;
 
-    fn resource_error(
-        kind: ResourceLimitKind,
-        limit: u64,
-        observed: u64,
-    ) -> OperationalSimulationError {
-        OperationalSimulationError::ResourceLimitExceeded {
-            phase: CheckerPhase::Extract,
-            kind,
-            observed: ResourceObserved::Counter { limit, observed },
-            diagnostics: Default::default(),
-        }
-    }
-
-    fn extract_with_limits(
+    fn extract(
         egraph: &EGraph<MxxLang, MxxAnalysis>,
         root: Id,
-        node_limit: usize,
-        owned_limit: usize,
         classify: &mut dyn FnMut(
             Id,
             &MxxLang,
@@ -321,44 +257,11 @@ mod tests {
         )
             -> Result<ProposalNodeClassification, OperationalSimulationError>,
     ) -> Result<ExtractedProposal, OperationalSimulationError> {
-        let owned = Cell::new(0_usize);
-        let mut check_nodes = |observed: usize| {
-            if observed > node_limit {
-                Err(resource_error(
-                    ResourceLimitKind::EGraphNodes,
-                    node_limit as u64,
-                    observed as u64,
-                ))
-            } else {
-                Ok(())
-            }
-        };
-        let mut reserve = |amount: usize| {
-            let observed = owned.get().checked_add(amount).unwrap_or(usize::MAX);
-            if observed > owned_limit {
-                Err(resource_error(
-                    ResourceLimitKind::TotalOwnedElements,
-                    owned_limit as u64,
-                    observed as u64,
-                ))
-            } else {
-                owned.set(observed);
-                Ok(())
-            }
-        };
-        let mut deadline = || Ok(());
-        let mut invalid = |_| {
-            resource_error(ResourceLimitKind::EGraphNodes, node_limit as u64, node_limit as u64)
-        };
+        let mut invalid = |_| panic!("valid test graph must have a finite DAG representative");
         extract_best_proposal(
             egraph,
             root,
-            &mut ExtractionControl {
-                check_node_count: &mut check_nodes,
-                reserve_owned_elements: &mut reserve,
-                check_deadline: &mut deadline,
-                invalid_dag: &mut invalid,
-            },
+            &mut ExtractionControl { invalid_dag: &mut invalid },
             classify,
         )
     }
@@ -379,7 +282,7 @@ mod tests {
                 large_atom: matches!(node, MxxLang::IntMul(_)),
             })
         };
-        let result = extract_with_limits(&egraph, compact_large, 32, 1_000, &mut classify).unwrap();
+        let result = extract(&egraph, compact_large, &mut classify).unwrap();
 
         assert_eq!(result.cost.remaining_relation_redexes, 0);
         assert_eq!(result.cost.large_atom_count, 1);
@@ -402,7 +305,7 @@ mod tests {
             })
         };
 
-        let result = extract_with_limits(&egraph, outer, 32, 1_000, &mut classify).unwrap();
+        let result = extract(&egraph, outer, &mut classify).unwrap();
         assert_eq!(result.cost.remaining_relation_redexes, 1);
         assert_eq!(result.cost.hidden_relation_redexes, 1);
     }
@@ -418,36 +321,9 @@ mod tests {
             Ok(ProposalNodeClassification::default())
         };
 
-        let result = extract_with_limits(&egraph, two, 8, 128, &mut classify).unwrap();
+        let result = extract(&egraph, two, &mut classify).unwrap();
         assert_eq!(result.cost, ProposalCost { node_count: 1, ..Default::default() });
         assert_eq!(result.expression[result.expression.root()], MxxLang::IntConst(1.into()));
-    }
-
-    #[test]
-    fn node_and_owned_element_limits_fail_closed() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let root = egraph.add(MxxLang::IntConst(1.into()));
-        egraph.rebuild();
-        let mut classify = |_: Id, _: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
-            Ok(ProposalNodeClassification::default())
-        };
-
-        assert!(matches!(
-            extract_with_limits(&egraph, root, 0, 128, &mut classify),
-            Err(OperationalSimulationError::ResourceLimitExceeded {
-                phase: CheckerPhase::Extract,
-                kind: ResourceLimitKind::EGraphNodes,
-                ..
-            })
-        ));
-        assert!(matches!(
-            extract_with_limits(&egraph, root, 8, 0, &mut classify),
-            Err(OperationalSimulationError::ResourceLimitExceeded {
-                phase: CheckerPhase::Extract,
-                kind: ResourceLimitKind::TotalOwnedElements,
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -460,7 +336,7 @@ mod tests {
             Ok(ProposalNodeClassification::default())
         };
 
-        let result = extract_with_limits(&egraph, root, 8, 256, &mut classify).unwrap();
+        let result = extract(&egraph, root, &mut classify).unwrap();
         assert_eq!(result.expression.as_ref().len(), 2);
         assert!(result.expression.is_dag());
     }
@@ -480,58 +356,8 @@ mod tests {
             Ok(ProposalNodeClassification::default())
         };
 
-        let result = extract_with_limits(&egraph, root, 64, 10_000, &mut classify).unwrap();
+        let result = extract(&egraph, root, &mut classify).unwrap();
         assert!(result.expression.is_dag());
         assert!(calls.get() <= egraph.number_of_classes() * egraph.total_size());
-    }
-
-    #[test]
-    fn shared_deadline_failure_is_forwarded_without_fallback() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let root = egraph.add(MxxLang::IntConst(1.into()));
-        egraph.rebuild();
-        let calls = Cell::new(0_usize);
-        let mut check_nodes = |_| Ok(());
-        let mut reserve = |_| Ok(());
-        let mut deadline = || {
-            let observed = calls.get() + 1;
-            calls.set(observed);
-            if observed >= 3 {
-                Err(OperationalSimulationError::ResourceLimitExceeded {
-                    phase: CheckerPhase::Extract,
-                    kind: ResourceLimitKind::TotalTime,
-                    observed: ResourceObserved::Duration {
-                        limit: Duration::from_secs(1),
-                        observed: Duration::from_secs(2),
-                    },
-                    diagnostics: Default::default(),
-                })
-            } else {
-                Ok(())
-            }
-        };
-        let mut invalid = |_| resource_error(ResourceLimitKind::EGraphNodes, 1, 1);
-        let mut classify = |_: Id, _: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
-            Ok(ProposalNodeClassification::default())
-        };
-
-        assert!(matches!(
-            extract_best_proposal(
-                &egraph,
-                root,
-                &mut ExtractionControl {
-                    check_node_count: &mut check_nodes,
-                    reserve_owned_elements: &mut reserve,
-                    check_deadline: &mut deadline,
-                    invalid_dag: &mut invalid,
-                },
-                &mut classify,
-            ),
-            Err(OperationalSimulationError::ResourceLimitExceeded {
-                phase: CheckerPhase::Extract,
-                kind: ResourceLimitKind::TotalTime,
-                ..
-            })
-        ));
     }
 }

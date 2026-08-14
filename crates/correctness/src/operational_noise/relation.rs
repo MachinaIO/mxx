@@ -25,7 +25,6 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
 };
 
 /// A closed relation registration supplied by source lowering.
@@ -63,8 +62,6 @@ pub enum RelationFailure {
     MismatchedLayout { source: AtomicSourceId },
     MismatchedTrapdoor { source: AtomicSourceId },
     MismatchedTarget { source: AtomicSourceId },
-    DeadlineExceeded { observed: std::time::Duration },
-    OwnedElementLimitExceeded { observed: usize },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -85,39 +82,23 @@ struct RelationState {
 /// reserves through this object; it never starts a phase-local clock or count.
 #[derive(Clone, Debug)]
 pub struct SharedRewriteBudget {
-    deadline: Instant,
-    owned_limit: usize,
     owned: Arc<AtomicUsize>,
 }
 
 impl SharedRewriteBudget {
-    pub fn new(deadline: Instant, owned_element_limit: usize) -> Self {
-        Self { deadline, owned_limit: owned_element_limit, owned: Arc::new(AtomicUsize::new(0)) }
+    pub fn new() -> Self {
+        Self { owned: Arc::new(AtomicUsize::new(0)) }
     }
     /// Uses the simulation driver's cumulative counter.  This is the
     /// production constructor: relation callbacks never own a second budget.
-    pub(crate) fn from_shared(
-        deadline: Instant,
-        owned_element_limit: usize,
-        owned: Arc<AtomicUsize>,
-    ) -> Self {
-        Self { deadline, owned_limit: owned_element_limit, owned }
+    pub(crate) fn from_shared(owned: Arc<AtomicUsize>) -> Self {
+        Self { owned }
     }
 
     fn reserve(&self, additional: usize) -> Result<(), RelationFailure> {
-        if Instant::now() >= self.deadline {
-            return Err(RelationFailure::DeadlineExceeded {
-                observed: Instant::now().saturating_duration_since(self.deadline),
-            });
-        }
         let mut observed = self.owned.load(Ordering::Relaxed);
         loop {
-            let Some(next) = observed.checked_add(additional) else {
-                return Err(RelationFailure::OwnedElementLimitExceeded { observed: usize::MAX });
-            };
-            if next > self.owned_limit {
-                return Err(RelationFailure::OwnedElementLimitExceeded { observed: next });
-            }
+            let next = observed.saturating_add(additional);
             match self.owned.compare_exchange_weak(
                 observed,
                 next,
@@ -851,18 +832,13 @@ fn switch_node(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
-    fn shared_budget_is_cumulative_and_observes_the_job_deadline() {
-        let budget = SharedRewriteBudget::new(Instant::now() + Duration::from_secs(1), 2);
+    fn shared_budget_observes_owned_work() {
+        let budget = SharedRewriteBudget::new();
         assert!(budget.reserve(1).is_ok());
         assert!(budget.reserve(1).is_ok());
-        assert_eq!(
-            budget.reserve(1),
-            Err(RelationFailure::OwnedElementLimitExceeded { observed: 3 })
-        );
-        let expired = SharedRewriteBudget::new(Instant::now(), 1);
-        assert!(matches!(expired.reserve(1), Err(RelationFailure::DeadlineExceeded { .. })));
+        assert!(budget.reserve(1).is_ok());
+        assert_eq!(budget.owned.load(Ordering::Relaxed), 3);
     }
 }

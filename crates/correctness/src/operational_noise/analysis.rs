@@ -6,7 +6,7 @@
 //! but can never become an ordinary numeric/noise scalar through congruence.
 
 use super::{
-    error::{AnalysisError, ResourceLimitKind, ResourceObserved},
+    error::AnalysisError,
     identity::{
         AtomicRelationRole, AtomicSourceId, BinderKey, CanonicalResidueConvention, ResolvedIntExpr,
         ResolvedMatrixType, SymbolTables,
@@ -27,7 +27,6 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 /// The complete sort carried by every checker e-class.
@@ -647,24 +646,7 @@ impl AnalysisData {
     /// Applies the specified sticky e-class merge.  It does not canonicalize
     /// relation IDs: egg canonicalization belongs to the post-rebuild relation
     /// phase, so merge order cannot affect the raw stored provenance.
-    pub(crate) fn merge_from(
-        &mut self,
-        from: Self,
-        relation_limit: usize,
-        budget: &mut ResourceBudget,
-    ) -> (bool, bool) {
-        // Complete the relation-limit check before changing any scalar facts
-        // or moving a provenance collection.  The analysis owner separately
-        // reserves the exact owned-element delta before calling this method.
-        let Some((_, relation_overflow)) =
-            merge_provenance_delta(self, &from, relation_limit, budget)
-        else {
-            return (false, true);
-        };
-        if relation_overflow {
-            return (false, true);
-        }
-
+    pub(crate) fn merge_from(&mut self, from: Self) -> bool {
         // `egg::DidMerge` permits conservative change reporting.  Comparing
         // the inputs avoids cloning their potentially deep provenance trees.
         let inputs_differ = *self != from;
@@ -717,14 +699,13 @@ impl AnalysisData {
         };
         for provenance in from.relation_provenance {
             if !self.relation_provenance.contains(&provenance) {
-                debug_assert!(self.relation_provenance.len() < relation_limit);
                 self.relation_provenance.push(provenance);
             }
         }
         if missing_integer_domain || missing_scalar_provenance || missing_real_constant {
             make_sort_conflict_sticky(&mut self.sort);
         }
-        (inputs_differ, false)
+        inputs_differ
     }
 }
 
@@ -754,120 +735,40 @@ fn merge_sort(
 #[derive(Clone, Debug)]
 pub struct MxxAnalysis {
     pub symbols: SymbolTables,
-    pub resource_failure: Option<ResourceObserved>,
-    pub resource_failure_kind: Option<ResourceLimitKind>,
-    relation_sources_per_eclass: usize,
-    switch_case_limit: usize,
     pub(crate) resource_budget: ResourceBudget,
     provenance_arena: Rc<RefCell<RelationProvenanceArena>>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResourceBudget {
-    pub(crate) total_owned_element_limit: usize,
     total_owned_elements: Arc<AtomicUsize>,
-    started: Instant,
-    deadline: Instant,
-    total_time_limit: Duration,
-    temporary_elements: usize,
-    temporary_failure: Option<(ResourceLimitKind, ResourceObserved)>,
 }
 
 impl ResourceBudget {
     fn standalone_for_tests() -> Self {
-        let started = Instant::now();
-        Self {
-            total_owned_element_limit: 2_000_000,
-            total_owned_elements: Arc::new(AtomicUsize::new(0)),
-            started,
-            deadline: started + Duration::from_secs(120),
-            total_time_limit: Duration::from_secs(120),
-            temporary_elements: 0,
-            temporary_failure: None,
-        }
+        Self { total_owned_elements: Arc::new(AtomicUsize::new(0)) }
     }
 
-    #[cfg(test)]
-    fn production() -> Self {
-        Self::standalone_for_tests()
+    pub(crate) fn from_shared(total_owned_elements: Arc<AtomicUsize>) -> Self {
+        Self { total_owned_elements }
     }
 
-    #[cfg(test)]
-    fn owned(&self) -> usize {
-        self.total_owned_elements.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn from_shared(
-        total_owned_element_limit: usize,
-        total_owned_elements: Arc<AtomicUsize>,
-        started: Instant,
-        deadline: Instant,
-        total_time_limit: Duration,
-    ) -> Self {
-        Self {
-            total_owned_element_limit,
-            total_owned_elements,
-            started,
-            deadline,
-            total_time_limit,
-            temporary_elements: 0,
-            temporary_failure: None,
-        }
-    }
-
-    pub(crate) fn reserve(
-        &mut self,
-        additional: usize,
-    ) -> Result<(), (ResourceLimitKind, ResourceObserved)> {
-        let now = Instant::now();
-        if now >= self.deadline {
-            return Err((
-                ResourceLimitKind::TotalTime,
-                ResourceObserved::Duration {
-                    limit: self.total_time_limit,
-                    observed: now.duration_since(self.started),
-                },
-            ));
-        }
+    pub(crate) fn reserve(&mut self, additional: usize) {
         let mut current = self.total_owned_elements.load(Ordering::Relaxed);
         loop {
-            let observed = current.checked_add(additional).unwrap_or(usize::MAX);
-            if observed > self.total_owned_element_limit {
-                return Err((
-                    ResourceLimitKind::TotalOwnedElements,
-                    ResourceObserved::Counter {
-                        limit: self.total_owned_element_limit.min(u64::MAX as usize) as u64,
-                        observed: observed.min(u64::MAX as usize) as u64,
-                    },
-                ));
-            }
+            let observed = current
+                .checked_add(additional)
+                .expect("owned-element accounting must not overflow");
             match self.total_owned_elements.compare_exchange_weak(
                 current,
                 observed,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => return,
                 Err(next) => current = next,
             }
         }
-    }
-
-    fn reserve_temporary(&mut self, additional: usize) -> Result<(), ResourceObserved> {
-        if let Err((kind, observed)) = self.reserve(additional) {
-            self.temporary_failure = Some((kind, observed.clone()));
-            return Err(observed);
-        }
-        self.temporary_elements =
-            self.temporary_elements.checked_add(additional).unwrap_or(usize::MAX);
-        Ok(())
-    }
-
-    fn release_temporary(&mut self, released: usize) {
-        self.temporary_elements = self
-            .temporary_elements
-            .checked_sub(released)
-            .expect("temporary reservations must be released exactly once");
     }
 }
 
@@ -881,10 +782,6 @@ impl MxxAnalysis {
     pub fn new(symbols: SymbolTables) -> Self {
         Self {
             symbols,
-            resource_failure: None,
-            resource_failure_kind: None,
-            relation_sources_per_eclass: 64,
-            switch_case_limit: 65_536,
             resource_budget: ResourceBudget::standalone_for_tests(),
             provenance_arena: Rc::default(),
         }
@@ -892,60 +789,16 @@ impl MxxAnalysis {
 
     pub(crate) fn with_resource_budget(
         symbols: SymbolTables,
-        relation_sources_per_eclass: usize,
-        switch_case_limit: usize,
         resource_budget: ResourceBudget,
     ) -> Self {
-        Self {
-            symbols,
-            resource_failure: None,
-            resource_failure_kind: None,
-            relation_sources_per_eclass,
-            switch_case_limit,
-            resource_budget,
-            provenance_arena: Rc::default(),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_relation_limit(symbols: SymbolTables, relation_sources_per_eclass: usize) -> Self {
-        Self {
-            symbols,
-            resource_failure: None,
-            resource_failure_kind: None,
-            relation_sources_per_eclass,
-            switch_case_limit: 65_536,
-            resource_budget: ResourceBudget::standalone_for_tests(),
-            provenance_arena: Rc::default(),
-        }
+        Self { symbols, resource_budget, provenance_arena: Rc::default() }
     }
 
     fn reserve_owned_elements(&mut self, additional: Option<usize>) -> bool {
-        let reservation = additional
-            .ok_or_else(|| {
-                (
-                    ResourceLimitKind::TotalOwnedElements,
-                    ResourceObserved::Counter {
-                        limit: self.resource_budget.total_owned_element_limit as u64,
-                        observed: u64::MAX,
-                    },
-                )
-            })
-            .and_then(|additional| self.resource_budget.reserve(additional));
-        if let Err((kind, observed)) = &reservation &&
-            self.resource_failure.is_none()
-        {
-            self.resource_failure = Some(observed.clone());
-            self.resource_failure_kind = Some(kind.clone());
-        }
-        reservation.is_ok()
-    }
-
-    fn fail_resource(&mut self, kind: ResourceLimitKind, observed: ResourceObserved) {
-        if self.resource_failure.is_none() {
-            self.resource_failure = Some(observed);
-            self.resource_failure_kind = Some(kind);
-        }
+        additional.is_some_and(|additional| {
+            self.resource_budget.reserve(additional);
+            true
+        })
     }
 
     /// Makes the selector domain for `ExtractCoefficient` from an authoritative
@@ -999,19 +852,6 @@ impl Analysis<MxxLang> for MxxAnalysis {
     type Data = AnalysisData;
 
     fn make(egraph: &mut EGraph<MxxLang, Self>, enode: &MxxLang) -> Self::Data {
-        if let MxxLang::Switch(children) = enode {
-            let case_count = children.len().saturating_sub(1);
-            if case_count > egraph.analysis.switch_case_limit {
-                egraph.analysis.fail_resource(
-                    ResourceLimitKind::SwitchCases,
-                    ResourceObserved::Counter {
-                        limit: egraph.analysis.switch_case_limit as u64,
-                        observed: case_count.min(u64::MAX as usize) as u64,
-                    },
-                );
-                return invalid_analysis_data();
-            }
-        }
         // Reserve structural children and the complete prospective switch
         // provenance before its owned branch collections are constructed.
         let prospective_provenance = prospective_provenance_owned_elements(egraph, enode);
@@ -1030,35 +870,7 @@ impl Analysis<MxxLang> for MxxAnalysis {
     }
 
     fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
-        let preflight = merge_provenance_delta(
-            to,
-            &from,
-            self.relation_sources_per_eclass,
-            &mut self.resource_budget,
-        );
-        if let Some((kind, observed)) = self.resource_budget.temporary_failure.take() {
-            self.fail_resource(kind, observed);
-        }
-        let Some((additional, relation_overflow)) = preflight else {
-            return DidMerge(false, false);
-        };
-        if relation_overflow {
-            if self.resource_failure.is_none() {
-                self.resource_failure = Some(ResourceObserved::Counter {
-                    limit: self.relation_sources_per_eclass as u64,
-                    observed: self.relation_sources_per_eclass.checked_add(1).unwrap_or(usize::MAX)
-                        as u64,
-                });
-                self.resource_failure_kind = Some(ResourceLimitKind::RelationSourcesPerEClass);
-            }
-            return DidMerge(false, false);
-        }
-        if !self.reserve_owned_elements(Some(additional)) {
-            return DidMerge(false, false);
-        }
-        let (changed, overflow) =
-            to.merge_from(from, self.relation_sources_per_eclass, &mut self.resource_budget);
-        debug_assert!(!overflow, "relation provenance preflight must prevent overflow");
+        let changed = to.merge_from(from);
         // The second flag may conservatively report that `from` changed.  It
         // shares the clone-free input comparison from `merge_from`.
         DidMerge(changed, changed)
@@ -1517,110 +1329,27 @@ impl ProvenanceWorkChunk {
     }
 }
 
-/// Counts a prospective copied provenance tree without an unbounded `Vec`.
-/// Each fixed-size work chunk is reserved from the job budget before its box
-/// is allocated, then released when traversal drops the chunk.
-#[cfg(test)]
-fn provenance_owned_elements_with_budget(
-    data: &AnalysisData,
-    budget: &mut ResourceBudget,
-) -> Option<usize> {
-    let mut total = 0_usize;
-    for provenance in &data.relation_provenance {
-        total =
-            total.checked_add(provenance_owned_elements_for_with_budget(provenance, budget)?)?;
-    }
-    Some(total)
-}
-
 #[cfg(test)]
 fn provenance_owned_elements(data: &AnalysisData) -> Option<usize> {
-    let mut budget = ResourceBudget::standalone_for_tests();
-    let total = provenance_owned_elements_with_budget(data, &mut budget)?;
-    debug_assert_eq!(budget.temporary_elements, 0);
-    Some(total)
-}
-
-fn provenance_owned_elements_for_with_budget(
-    provenance: &RelationProvenance,
-    budget: &mut ResourceBudget,
-) -> Option<usize> {
-    let arena = provenance.arena.borrow();
-    budget.reserve_temporary(PROVENANCE_WORK_CHUNK_SIZE).ok()?;
-    let mut reserved_chunks = 1_usize;
-    let mut current = Box::new(ProvenanceWorkChunk::empty());
-    current.values[current.len] = Some(provenance.node);
-    current.len += 1;
-    let mut total = 0_usize;
-
-    let result = (|| {
-        loop {
-            if current.len == 0 {
-                let Some(previous) = current.previous.take() else {
-                    break;
-                };
-                budget.release_temporary(PROVENANCE_WORK_CHUNK_SIZE);
-                reserved_chunks -= 1;
-                current = previous;
-                continue;
-            }
-            current.len -= 1;
-            let node = current.values[current.len]
-                .take()
-                .expect("work-stack entries are initialized before they are counted");
-            match &arena.nodes[node] {
-                RelationProvenanceNode::Direct(source) |
-                RelationProvenanceNode::Unavailable { source, .. } => {
-                    total = total.checked_add(1_usize.checked_add(source.indices.len())?)?;
+    let mut total = Some(0_usize);
+    let completed = try_visit_relation_provenance(
+        &data.relation_provenance,
+        || true,
+        |visit| {
+            let elements = match visit {
+                RelationProvenanceVisit::Direct(source) |
+                RelationProvenanceVisit::Unavailable { source, .. } => {
+                    1_usize.checked_add(source.indices.len())
                 }
-                RelationProvenanceNode::Switch { branches, .. } => {
-                    total = total.checked_add(1_usize.checked_add(branches.len())?)?;
-                    for branch in branches {
-                        for node in branch {
-                            if current.len == PROVENANCE_WORK_CHUNK_SIZE {
-                                budget.reserve_temporary(PROVENANCE_WORK_CHUNK_SIZE).ok()?;
-                                reserved_chunks = reserved_chunks.checked_add(1)?;
-                                current = Box::new(ProvenanceWorkChunk {
-                                    values: [None; PROVENANCE_WORK_CHUNK_SIZE],
-                                    len: 0,
-                                    previous: Some(current),
-                                });
-                            }
-                            current.values[current.len] = Some(*node);
-                            current.len += 1;
-                        }
-                    }
+                RelationProvenanceVisit::Switch { branch_count, .. } => {
+                    1_usize.checked_add(branch_count)
                 }
-            }
-        }
-        Some(total)
-    })();
-    budget.release_temporary(reserved_chunks * PROVENANCE_WORK_CHUNK_SIZE);
-    result
-}
-
-/// Counts only provenance that merge will transfer, before `merge_from` can
-/// allocate branch storage or move a provenance collection into `to`.
-fn merge_provenance_delta(
-    to: &AnalysisData,
-    from: &AnalysisData,
-    relation_limit: usize,
-    budget: &mut ResourceBudget,
-) -> Option<(usize, bool)> {
-    let additional = 0_usize;
-    let mut resulting_relations = to.relation_provenance.len();
-    for provenance in &from.relation_provenance {
-        if !to.relation_provenance.iter().any(|existing| existing == provenance) {
-            resulting_relations = resulting_relations.checked_add(1)?;
-            if resulting_relations > relation_limit {
-                return Some((additional, true));
-            }
-            // Dedup walks the arena iteratively under the temporary budget,
-            // but a successful merge transfers only an existing handle.
-            let _ = provenance_owned_elements_for_with_budget(provenance, budget)?;
-        }
-    }
-    Some((additional, false))
+            };
+            total =
+                total.and_then(|total| elements.and_then(|elements| total.checked_add(elements)));
+        },
+    );
+    completed.then_some(total).flatten()
 }
 
 fn invalid_analysis_data() -> AnalysisData {
@@ -2572,7 +2301,6 @@ mod tests {
                         egraph.add(MxxLang::Switch(vec![selector, selected].into_boxed_slice()));
                 }
                 assert_eq!(provenance_owned_elements(&egraph[selected].data), Some(1 + 2 * DEPTH));
-                assert_eq!(egraph.analysis.resource_budget.temporary_elements, 0);
             })
             .expect("constrained-stack egraph worker must start")
             .join()
@@ -2580,22 +2308,7 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_owned_element_budget_is_sticky() {
-        let mut analysis = MxxAnalysis::default();
-        analysis.resource_budget.total_owned_element_limit = 1;
-        let mut egraph = EGraph::new(analysis);
-        let first = egraph.add(MxxLang::IntConst(0.into()));
-        let second = egraph.add(MxxLang::IntConst(1.into()));
-        let _ = egraph.add(MxxLang::IntAdd([first, second]));
-
-        assert!(matches!(
-            egraph.analysis.resource_failure,
-            Some(ResourceObserved::Counter { limit: 1, observed: 2 })
-        ));
-    }
-
-    #[test]
-    fn make_budget_failure_does_not_construct_switch_provenance() {
+    fn large_switch_constructs_one_shallow_provenance_node() {
         let mut symbols = SymbolTables::default();
         let relation = symbols.atomic_sources.intern(AtomicSourceDescriptor {
             key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from("relation")),
@@ -2608,24 +2321,16 @@ mod tests {
         let selector = egraph.add(MxxLang::IntConst(0.into()));
         let first =
             egraph.add(MxxLang::Atom { source: AtomicSourceId(relation), indices: Box::new([]) });
-        let before = egraph.analysis.resource_budget.owned();
-        // The Switch needs only its arena node and immediate branch handles,
-        // plus the language node's children: 66 + 66 owned elements.
-        egraph.analysis.resource_budget.total_owned_element_limit = before + 131;
         let mut children = vec![selector];
         children.extend(std::iter::repeat(first).take(65));
 
         let switch = egraph.add(MxxLang::Switch(children.into_boxed_slice()));
 
-        assert!(matches!(
-            egraph.analysis.resource_failure,
-            Some(ResourceObserved::Counter { limit, observed }) if limit == (before + 131) as u64 && observed == (before + 132) as u64
-        ));
-        assert!(egraph[switch].data.relation_provenance.is_empty());
+        assert_eq!(egraph[switch].data.relation_provenance.len(), 1);
     }
 
     #[test]
-    fn deeply_nested_switch_preflight_charges_only_the_new_shallow_switch() {
+    fn deeply_nested_switch_adds_only_one_new_shallow_switch() {
         const DEPTH: usize = 96;
         let mut symbols = SymbolTables::default();
         let relation = symbols.atomic_sources.intern(AtomicSourceDescriptor {
@@ -2643,18 +2348,8 @@ mod tests {
             selected = egraph.add(MxxLang::Switch(vec![selector, selected].into_boxed_slice()));
         }
 
-        let before = egraph.analysis.resource_budget.owned();
-        egraph.analysis.resource_budget.total_owned_element_limit = before + 3;
         let overflow = egraph.add(MxxLang::Switch(vec![selector, selected].into_boxed_slice()));
-
-        assert_eq!(
-            egraph.analysis.resource_failure,
-            Some(ResourceObserved::Counter {
-                limit: (before + 3) as u64,
-                observed: (before + 4) as u64,
-            })
-        );
-        assert!(egraph[overflow].data.relation_provenance.is_empty());
+        assert_eq!(egraph[overflow].data.relation_provenance.len(), 1);
     }
 
     #[test]
@@ -2721,59 +2416,28 @@ mod tests {
         );
         let incomplete = AnalysisData::scalar(MxxSort::Int, None, ScalarProvenance::Ordinary);
 
-        let (_, overflow) = complete.merge_from(incomplete, 64, &mut ResourceBudget::production());
+        let _ = complete.merge_from(incomplete);
 
-        assert!(!overflow);
         assert!(matches!(complete.sort, Err(AnalysisError::EClassSortConflict { .. })));
     }
 
     #[test]
-    fn relation_limit_failure_is_sticky_on_the_analysis_owner() {
-        let mut to = AnalysisData::matrix(
-            ResolvedMatrixType {
-                modulus: ResolvedIntExpr::Const(17.into()),
-                ring_dimension: ResolvedIntExpr::Const(1.into()),
-                rows: ResolvedIntExpr::Const(1.into()),
-                columns: ResolvedIntExpr::Const(1.into()),
-            },
-            None,
-        );
-        let mut from = to.clone();
-        from.relation_provenance.push(test_direct_provenance());
-        let mut analysis = MxxAnalysis::with_relation_limit(SymbolTables::default(), 0);
-
-        let _ = <MxxAnalysis as Analysis<MxxLang>>::merge(&mut analysis, &mut to, from);
-
-        assert_eq!(
-            analysis.resource_failure,
-            Some(ResourceObserved::Counter { limit: 0, observed: 1 })
-        );
-    }
-
-    #[test]
-    fn merge_budget_failure_does_not_insert_new_provenance() {
+    fn merge_retains_all_distinct_provenance_without_recursive_cloning() {
         let mut to = AnalysisData::matrix(scalar_matrix_type(1), None);
         let mut from = AnalysisData::matrix(scalar_matrix_type(1), None);
-        from.relation_provenance.push(test_direct_provenance());
+        for _ in 0..65 {
+            from.relation_provenance.push(test_direct_provenance());
+        }
         let mut analysis = MxxAnalysis::default();
-        analysis.resource_budget.total_owned_element_limit = 0;
 
         let merged = <MxxAnalysis as Analysis<MxxLang>>::merge(&mut analysis, &mut to, from);
 
-        assert!(!merged.0 && !merged.1);
-        assert!(to.relation_provenance.is_empty());
-        assert_eq!(analysis.resource_budget.owned(), 0);
-        assert_eq!(
-            analysis.resource_failure,
-            Some(ResourceObserved::Counter {
-                limit: 0,
-                observed: PROVENANCE_WORK_CHUNK_SIZE as u64,
-            })
-        );
+        assert!(merged.0 && merged.1);
+        assert_eq!(to.relation_provenance.len(), 65);
     }
 
     #[test]
-    fn deep_merge_preflight_releases_scratch_but_keeps_cumulative_reservations() {
+    fn deep_merge_transfers_the_shallow_provenance_handle() {
         const DEPTH: usize = 256;
         let mut symbols = SymbolTables::default();
         let relation = symbols.atomic_sources.intern(AtomicSourceDescriptor {
@@ -2792,23 +2456,8 @@ mod tests {
         }
         let mut to = AnalysisData::matrix(scalar_matrix_type(1), None);
         let from = egraph[selected].data.clone();
-        let before = egraph.analysis.resource_budget.owned();
         let merged = <MxxAnalysis as Analysis<MxxLang>>::merge(&mut egraph.analysis, &mut to, from);
         assert!(merged.0 && merged.1);
-        assert_eq!(egraph.analysis.resource_budget.temporary_elements, 0);
-        assert!(egraph.analysis.resource_budget.owned() > before);
-
-        let mut failed_to = AnalysisData::matrix(scalar_matrix_type(1), None);
-        let failed_from = egraph[selected].data.clone();
-        let before = egraph.analysis.resource_budget.owned();
-        egraph.analysis.resource_budget.total_owned_element_limit = before + 1;
-        let merged = <MxxAnalysis as Analysis<MxxLang>>::merge(
-            &mut egraph.analysis,
-            &mut failed_to,
-            failed_from,
-        );
-        assert!(!merged.0 && !merged.1);
-        assert!(failed_to.relation_provenance.is_empty());
-        assert_eq!(egraph.analysis.resource_budget.temporary_elements, 0);
+        assert_eq!(to.relation_provenance.len(), 1);
     }
 }

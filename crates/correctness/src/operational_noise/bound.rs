@@ -112,9 +112,6 @@ pub enum BoundEvaluationError {
     InvalidMatrixScale { term: Id },
     InvalidCrtRecompose { term: Id },
     InvalidPack { term: Id },
-    IntegerLimitExceeded { operation: &'static str, value: BigUint },
-    IntegerBitLimitExceeded { operation: &'static str, bits: BigUint },
-    RecurrenceStepLimitExceeded { limit: BigUint, count: BigUint },
     UnconsumedLargeTerm { term: Id },
 }
 
@@ -146,45 +143,12 @@ pub trait BoundInput {
         spec: CrtSpecId,
         term: Id,
     ) -> Result<Box<[BigInt]>, BoundEvaluationError>;
-    fn validate_integer(
-        &self,
-        value: &BigUint,
-        operation: &'static str,
-    ) -> Result<(), BoundEvaluationError>;
-    fn validate_integer_bits(
-        &self,
-        _: &BigUint,
-        _: &'static str,
-    ) -> Result<(), BoundEvaluationError> {
-        Ok(())
-    }
-    fn reserve_owned_elements(&self, _: usize) -> Result<(), BoundEvaluationError> {
-        Ok(())
-    }
-    fn check_deadline(&self) -> Result<(), BoundEvaluationError> {
-        Ok(())
-    }
     fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError>;
 }
 
-/// Job-wide controls used by production bound inputs.  The evaluator calls
-/// these at every work-stack and transfer boundary; implementations must share
-/// their deadline and cumulative allocation accounting with lowering, rewrite,
-/// and extraction.  Test inputs may deliberately omit this bridge.
+/// Semantic validation used by production bound inputs.
 pub trait BoundEvaluationControl {
-    fn check_deadline(&self) -> Result<(), BoundEvaluationError>;
-    fn reserve_owned_elements(&self, requested: usize) -> Result<(), BoundEvaluationError>;
-    fn validate_integer_bits(
-        &self,
-        value: &BigUint,
-        operation: &'static str,
-    ) -> Result<(), BoundEvaluationError>;
     fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError>;
-    /// The job-wide recurrence ceiling.  Test inputs may omit it; production
-    /// adapters must return the `CheckerLimits` value for the active job.
-    fn recurrence_step_limit(&self) -> Option<BigUint> {
-        None
-    }
 }
 
 /// Evaluates one extracted matrix root without recursion.
@@ -208,10 +172,8 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             Finish(Id, MxxLang),
         }
 
-        self.input.reserve_owned_elements(1)?;
         let mut work = vec![Work::Enter(root)];
         while let Some(item) = work.pop() {
-            self.input.check_deadline()?;
             match item {
                 Work::Enter(term) if self.memo.contains_key(&term) => {}
                 Work::Enter(term) => {
@@ -221,7 +183,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                         .ok_or(BoundEvaluationError::MissingExtractedTerm { term })?
                         .clone();
                     let children = matrix_children(&node, term)?;
-                    self.input.reserve_owned_elements(1usize.saturating_add(children.len()))?;
                     work.push(Work::Finish(term, node));
                     for child in children.into_iter().rev() {
                         if !self.memo.contains_key(&child) {
@@ -234,7 +195,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                         continue;
                     }
                     let bound = self.finish(term, &node)?;
-                    self.input.reserve_owned_elements(1)?;
                     self.memo.insert(term, bound);
                 }
             }
@@ -398,11 +358,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                     return Err(BoundEvaluationError::InvalidMatrixConstant { term });
                 }
                 let absolute = base.abs().to_biguint().unwrap_or_default();
-                if absolute > BigUint::one() {
-                    let prospective_bits = BigUint::from(absolute.bits()) * &exponent;
-                    self.input
-                        .validate_integer_bits(&prospective_bits, "power-of-base constant")?;
-                }
                 let exponent = exponent
                     .try_into()
                     .map_err(|_| BoundEvaluationError::InvalidMatrixConstant { term })?;
@@ -429,9 +384,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                 }))
             }
         };
-        if let Some(value) = coefficient_class.maximum_absolute_coefficient() {
-            self.input.validate_integer(&value, "matrix constant")?;
-        }
         Ok(MatrixBound { matrix_type, coefficient_class, metadata })
     }
 
@@ -450,9 +402,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             }
             Ok(accumulator.add(&bound.coefficient_class))
         })?;
-        if let Some(value) = class.maximum_absolute_coefficient() {
-            self.input.validate_integer(&value, "matrix addition")?;
-        }
         Ok(MatrixBound {
             matrix_type,
             coefficient_class: class,
@@ -476,9 +425,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
         let mut bound = self.child(first)?.clone();
         for child in rest {
             bound = product_bound(&bound, self.child(*child)?)?;
-            if let Some(value) = bound.coefficient_class.maximum_absolute_coefficient() {
-                self.input.validate_integer(&value, "matrix product")?;
-            }
         }
         let output = self.input.matrix_type(term)?;
         if bound.matrix_type != output {
@@ -502,7 +448,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             BoundClass::ExactZero => BoundClass::ExactZero,
             BoundClass::Bounded { maximum_absolute_coefficient } => {
                 let maximum_absolute_coefficient = maximum_absolute_coefficient * scalar;
-                self.input.validate_integer(&maximum_absolute_coefficient, "matrix scale")?;
                 if maximum_absolute_coefficient.is_zero() {
                     BoundClass::ExactZero
                 } else {
@@ -563,9 +508,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             };
         let class =
             multiply_classes(&left.coefficient_class, &right.coefficient_class, &ring_factor);
-        if let Some(value) = class.maximum_absolute_coefficient() {
-            self.input.validate_integer(&value, "matrix tensor")?;
-        }
         Ok(MatrixBound {
             matrix_type,
             coefficient_class: class,
@@ -587,7 +529,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             return Err(BoundEvaluationError::EmptyMatrixOperation { term });
         }
         let matrix_type = self.input.matrix_type(term)?;
-        self.input.reserve_owned_elements(inputs.len())?;
         let bounds = inputs.iter().map(|id| self.child(*id)).collect::<Result<Vec<_>, _>>()?;
         let first = bounds[0];
         let mut rows = 0_usize;
@@ -644,9 +585,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             });
         }
         let class = BoundClass::maximum(bounds.iter().map(|bound| bound.coefficient_class.clone()));
-        if let Some(value) = class.maximum_absolute_coefficient() {
-            self.input.validate_integer(&value, "matrix concatenation")?;
-        }
         Ok(MatrixBound {
             matrix_type,
             coefficient_class: class,
@@ -667,7 +605,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             return Err(BoundEvaluationError::EmptyMatrixOperation { term });
         }
         let matrix_type = self.input.matrix_type(term)?;
-        self.input.reserve_owned_elements(cases.len())?;
         let bounds = cases.iter().map(|id| self.child(*id)).collect::<Result<Vec<_>, _>>()?;
         if bounds.iter().any(|bound| bound.matrix_type != matrix_type) {
             return Err(BoundEvaluationError::IncompatibleMatrixProduct {
@@ -681,9 +618,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             .map(|bound| bound.metadata.known_zero_rows.clone())
             .collect::<Option<Vec<_>>>()
             .and_then(|values| values.into_iter().min());
-        if let Some(value) = class.maximum_absolute_coefficient() {
-            self.input.validate_integer(&value, "matrix switch")?;
-        }
         Ok(MatrixBound {
             matrix_type,
             coefficient_class: class,
@@ -729,9 +663,6 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
                 },
                 BoundClass::Large => BoundClass::Large,
             });
-        }
-        if let Some(value) = class.maximum_absolute_coefficient() {
-            self.input.validate_integer(&value, "CRT recomposition")?;
         }
         Ok(MatrixBound {
             matrix_type,
@@ -872,7 +803,6 @@ mod tests {
         constants: BTreeMap<u32, (ConcreteMatrixType, ResolvedMatrixConstant)>,
         crt_coefficients: BTreeMap<u32, Box<[BigInt]>>,
         scalars: BTreeMap<Id, BigUint>,
-        maximum_integer_bits: Option<BigUint>,
     }
 
     impl BoundInput for Input {
@@ -921,26 +851,6 @@ mod tests {
                 .get(&spec.0)
                 .cloned()
                 .ok_or(BoundEvaluationError::InvalidCrtRecompose { term })
-        }
-        fn validate_integer(
-            &self,
-            _: &BigUint,
-            _: &'static str,
-        ) -> Result<(), BoundEvaluationError> {
-            Ok(())
-        }
-        fn validate_integer_bits(
-            &self,
-            bits: &BigUint,
-            operation: &'static str,
-        ) -> Result<(), BoundEvaluationError> {
-            if self.maximum_integer_bits.as_ref().is_some_and(|maximum| bits > maximum) {
-                return Err(BoundEvaluationError::IntegerBitLimitExceeded {
-                    operation,
-                    bits: bits.clone(),
-                });
-            }
-            Ok(())
         }
         fn validate_pack(&self, _: Id, _: usize) -> Result<(), BoundEvaluationError> {
             Ok(())
@@ -1089,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn power_of_base_is_preflighted_before_pow() {
+    fn power_of_base_uses_an_exact_representable_exponent() {
         let root = Id::from(0);
         let mut input = Input::default();
         input.nodes.insert(root, MxxLang::MatrixConstant(MatrixConstantSpecId(0)));
@@ -1098,20 +1008,12 @@ mod tests {
             0,
             (
                 matrix(1, 1),
-                ResolvedMatrixConstant::PowerOfBase {
-                    base: 2.into(),
-                    exponent: 1_000_000_u32.into(),
-                },
+                ResolvedMatrixConstant::PowerOfBase { base: 2.into(), exponent: 16_u8.into() },
             ),
         );
-        input.maximum_integer_bits = Some(32_u32.into());
-
         assert_eq!(
-            BoundEvaluator::new(&input).evaluate(root),
-            Err(BoundEvaluationError::IntegerBitLimitExceeded {
-                operation: "power-of-base constant",
-                bits: 2_000_000_u32.into(),
-            }),
+            BoundEvaluator::new(&input).evaluate(root).unwrap().coefficient_class,
+            BoundClass::Bounded { maximum_absolute_coefficient: 65_536_u32.into() },
         );
     }
 

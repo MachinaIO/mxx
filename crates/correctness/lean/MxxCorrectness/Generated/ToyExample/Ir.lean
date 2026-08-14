@@ -8,7 +8,7 @@ def ToyExample_generatorVersion : String := "mxx-correctness-emitter-v11"
 
 def ToyExample_protocolSourcePaths : List String := ["crates/correctness/Cargo.toml", "crates/correctness/examples/emit_correctness.rs", "crates/correctness/src", "crates/dsl/Cargo.toml", "crates/dsl/src", "crates/ir-core/Cargo.toml", "crates/ir-core/src"]
 
-def ToyExample_protocolSourceHash : String := "af6c9fff3beec0b5a14eb876542a084f2e5841891597fe88155bb2fe4602e91d"
+def ToyExample_protocolSourceHash : String := "b2c13f11e0f6700efd629eb71e0e2ad36993828eeddd326059c4ca3477ff0acb"
 
 def ToyExample_workflowHash : String := "f0727b300c312d49e01c5cba55cf8d11de69de7efa5d17b68a4133c5a6a15c6b"
 

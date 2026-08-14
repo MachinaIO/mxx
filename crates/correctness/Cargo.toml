@@ -17,6 +17,7 @@ sha2.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 sha2.workspace = true

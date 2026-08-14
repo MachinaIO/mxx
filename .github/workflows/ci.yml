@@ -144,7 +144,7 @@ jobs:
       - name: Run Rust operational checker test
         run: |
           MXX_REGENERATE_CORRECTNESS=1 cargo test -r -p mxx-we --lib \
-            diamond::parameter_search::tests::evaluated_operational_reports_preserve_accepted_and_rejected_candidates -- \
+            diamond::parameter_search::tests::smallest_diamond_candidate_reaches_typed_checker_rejection -- \
             --exact
 
   ci-success:

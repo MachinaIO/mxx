@@ -20,7 +20,7 @@ use mxx_correctness::{
     OperationalDecoderTarget, OutputRef, StageId,
     operational_noise::{
         OperationalCheckRequest, OperationalGadgetLayout, OperationalSimulationReport,
-        check_operational_noise_candidate,
+        ProgressEventKind, check_operational_noise_candidate_with_progress,
     },
     operational_protocol_from_graphs,
 };
@@ -77,7 +77,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 const HASH_KEY_INPUT: &str = "tall_nested_rns_hash_key";
 const SECRET_ARTIFACT: &str = "tall_nested_rns_secret";
@@ -389,6 +389,26 @@ fn run_tall_operational_check(
     if nested.p_moduli.is_empty() {
         return Err("nested-RNS plaintext contract requires a nonempty p-basis".to_owned());
     }
+    let graph_counts = |graph: &mxx_ir_core::Graph| {
+        (
+            graph.scopes().len(),
+            graph.scopes().values().map(|scope| scope.nodes().len()).sum::<usize>(),
+            graph.outputs().len(),
+        )
+    };
+    let (producer_scopes, producer_nodes, producer_outputs) = graph_counts(&producer.graph);
+    let (encoding_scopes, encoding_nodes, encoding_outputs) = graph_counts(&encoding.graph);
+    info!(
+        ring_dimension = parameters.ring_dimension(),
+        crt_depth = parameters.to_crt().2,
+        producer_scopes,
+        producer_nodes,
+        producer_outputs,
+        encoding_scopes,
+        encoding_nodes,
+        encoding_outputs,
+        "constructed Tall operational checker graphs"
+    );
     let mut exact_input_metadata = BTreeMap::new();
     for node in encoding.graph.root_scope().nodes() {
         let NodeKind::Input { name, .. } = node.kind() else { continue };
@@ -489,8 +509,48 @@ fn run_tall_operational_check(
         target_id: TALL_OPERATIONAL_TARGET_ID.to_owned(),
     };
     let evaluation_started = Instant::now();
-    let report = check_operational_noise_candidate(&protocol, &request)
-        .map_err(|error| error.to_string())?;
+    info!(target = request.target_id, "begin Tall operational noise checker");
+    let report = check_operational_noise_candidate_with_progress(&protocol, &request, |event| {
+        let emit = event.event != ProgressEventKind::Progress || event.processed % 4_096 == 0;
+        if event.event == ProgressEventKind::Progress && emit {
+            debug!(
+                phase = ?event.phase,
+                event = ?event.event,
+                elapsed_ms = event.elapsed_ms,
+                processed = event.processed,
+                total_or_discovered = ?event.total_or_discovered,
+                owned_elements = event.owned_elements,
+                egraph_nodes = ?event.egraph_nodes,
+                rewrite_iterations = event.rewrite_iterations,
+                program = ?event.program,
+                scope = ?event.scope,
+                node = ?event.node,
+                "Tall operational checker progress"
+            );
+        } else if event.event != ProgressEventKind::Progress {
+            info!(
+                phase = ?event.phase,
+                event = ?event.event,
+                elapsed_ms = event.elapsed_ms,
+                processed = event.processed,
+                owned_elements = event.owned_elements,
+                egraph_nodes = ?event.egraph_nodes,
+                rewrite_iterations = event.rewrite_iterations,
+                program = ?event.program,
+                scope = ?event.scope,
+                node = ?event.node,
+                "Tall operational checker phase summary"
+            );
+        }
+    })
+    .map_err(|simulation_error| {
+        error!(
+            elapsed = ?evaluation_started.elapsed(),
+            error = %simulation_error,
+            "Tall operational noise checker failed"
+        );
+        simulation_error.to_string()
+    })?;
     info!(
         elapsed = ?evaluation_started.elapsed(),
         accepted = report.accepted,
@@ -1275,9 +1335,12 @@ fn benchmark_estimation(
         per_instance_occupancy: 1,
     };
     let mut preprocessing_backend = make_backend();
+    let preprocessing_started = Instant::now();
+    info!(subgraph = "preprocessing", "benchmark subgraph estimation begin");
     let preprocessing_report =
         estimate(&preprocessing_graph, &mut preprocessing_backend, &preprocessing_estimator_config)
             .map_err(|error| error.to_string())?;
+    info!(subgraph = "preprocessing", elapsed = ?preprocessing_started.elapsed(), "benchmark subgraph estimation complete");
     info!(
         lookup_preimage_count = selected.lookup_preimage_count,
         slot_preimage_count = selected.slot_preimage_count,
@@ -1286,12 +1349,18 @@ fn benchmark_estimation(
     );
     log_cost_report("TallBggPreprocessing", &preprocessing_report);
     let mut public_backend = make_backend();
+    let public_started = Instant::now();
+    info!(subgraph = "public-key", "benchmark subgraph estimation begin");
     let public_report = estimate(&public_graph, &mut public_backend, &estimator_config)
         .map_err(|error| error.to_string())?;
+    info!(subgraph = "public-key", elapsed = ?public_started.elapsed(), "benchmark subgraph estimation complete");
     log_cost_report("TallBggPublicKey", &public_report);
     let mut encoding_backend = make_backend();
+    let encoding_started = Instant::now();
+    info!(subgraph = "encoding", "benchmark subgraph estimation begin");
     let encoding_report = estimate(&encoding_graph, &mut encoding_backend, &estimator_config)
         .map_err(|error| error.to_string())?;
+    info!(subgraph = "encoding", elapsed = ?encoding_started.elapsed(), "benchmark subgraph estimation complete");
     log_cost_report("TallBggEncoding", &encoding_report);
     Ok((preprocessing_report, public_report, encoding_report))
 }

@@ -327,18 +327,6 @@
       "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
     },
     {
-      "error_tag": "Lower.ResourceDeadlineExceeded",
-      "tall_reachability": "reachable",
-      "classification": "resource_limit",
-      "rationale": "Tall shares the one checker deadline across generic graph-lowering work."
-    },
-    {
-      "error_tag": "Lower.ResourceAllocationExceeded",
-      "tall_reachability": "reachable",
-      "classification": "resource_limit",
-      "rationale": "Tall shares the one checker allocation budget across generic graph-lowering work."
-    },
-    {
       "error_tag": "Lower.InvalidLog2CeilArgument",
       "tall_reachability": "reachable",
       "classification": "graph_lowering",
@@ -739,54 +727,6 @@
       "tall_reachability": "reachable",
       "classification": "noise_bound_evaluation",
       "rationale": "A symbolic Tall family may use one representative only after a closed uniform maximum proof; the checker rejects an unproved representative without expanding logical lanes."
-    },
-    {
-      "error_tag": "Resource.RewriteIterations",
-      "tall_reachability": "reachable_if_limit_exceeded",
-      "classification": "resource_limit",
-      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
-    },
-    {
-      "error_tag": "Resource.EGraphNodes",
-      "tall_reachability": "reachable_if_limit_exceeded",
-      "classification": "resource_limit",
-      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
-    },
-    {
-      "error_tag": "Resource.TotalOwnedElements",
-      "tall_reachability": "reachable_if_limit_exceeded",
-      "classification": "resource_limit",
-      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
-    },
-    {
-      "error_tag": "Resource.TotalTime",
-      "tall_reachability": "reachable_if_limit_exceeded",
-      "classification": "resource_limit",
-      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
-    },
-    {
-      "error_tag": "Resource.RelationSourcesPerEClass",
-      "tall_reachability": "reachable_if_limit_exceeded",
-      "classification": "resource_limit",
-      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
-    },
-    {
-      "error_tag": "Resource.SwitchCases",
-      "tall_reachability": "reachable_if_limit_exceeded",
-      "classification": "resource_limit",
-      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
-    },
-    {
-      "error_tag": "Resource.RecurrenceSteps",
-      "tall_reachability": "reachable_if_limit_exceeded",
-      "classification": "resource_limit",
-      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
-    },
-    {
-      "error_tag": "Resource.IntegerBits",
-      "tall_reachability": "reachable_if_limit_exceeded",
-      "classification": "resource_limit",
-      "rationale": "The generic checker resource budget also applies to Tall; this tag reports exhaustion of the named budget rather than an unsupported Tall operation."
     }
   ]
 }

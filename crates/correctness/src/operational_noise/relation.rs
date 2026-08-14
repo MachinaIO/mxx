@@ -435,16 +435,22 @@ pub fn classify_proposal_node(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     node: &MxxLang,
     context: &RewriteContext,
-) -> Result<(bool, bool), RelationFailure> {
-    let large_atom = matches!(node, MxxLang::Atom { source, .. }
-    if !matches!(
-        egraph.analysis.symbols.atomic_sources.get(source.0).map(|descriptor| &descriptor.key),
-        Some(
-            super::identity::AtomicSourceKey::Sampler(_) |
-            super::identity::AtomicSourceKey::SequentialRecurrence { .. }
-        )
-    ));
-    let MxxLang::MatrixMultiply(factors) = node else { return Ok((false, large_atom)) };
+) -> Result<(bool, Option<AtomicSourceId>), RelationFailure> {
+    let large_atom_witness = match node {
+        MxxLang::Atom { source, .. } => {
+            egraph.analysis.symbols.atomic_sources.get(source.0).and_then(|descriptor| {
+                (!matches!(
+                    descriptor.key,
+                    AtomicSourceKey::Sampler(_) | AtomicSourceKey::SequentialRecurrence { .. }
+                ))
+                .then_some(*source)
+            })
+        }
+        _ => None,
+    };
+    let MxxLang::MatrixMultiply(factors) = node else {
+        return Ok((false, large_atom_witness));
+    };
     for relation_position in 1..factors.len() {
         let relation = egraph.find(factors[relation_position]);
         if egraph[relation].data.relation_provenance.is_empty() {
@@ -473,12 +479,12 @@ pub fn classify_proposal_node(
                     (distributed_public.is_some() ||
                         egraph.find(registration.expected_public) == public)
                 {
-                    return Ok((true, large_atom));
+                    return Ok((true, large_atom_witness));
                 }
             }
         }
     }
-    Ok((false, large_atom))
+    Ok((false, large_atom_witness))
 }
 
 /// Validates the exact Graph-derived records before accepting an e-class

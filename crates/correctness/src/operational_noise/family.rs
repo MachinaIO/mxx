@@ -286,6 +286,10 @@ pub fn instantiate_shared_element<E>(
                         .expect("every sampler Atom has an interned descriptor")
                         .clone();
                     match &sampler {
+                        SamplerIdentity::Gaussian { indices, .. } |
+                        SamplerIdentity::UniformInterval { indices, .. } => {
+                            pending.extend(indices.iter().copied());
+                        }
                         SamplerIdentity::Preimage {
                             indices,
                             public,
@@ -378,6 +382,10 @@ pub fn instantiate_shared_element<E>(
                     let sampler = &samplers[sampler];
                     let mut references = Vec::new();
                     match sampler {
+                        SamplerIdentity::Gaussian { indices, .. } |
+                        SamplerIdentity::UniformInterval { indices, .. } => {
+                            references.extend(indices.iter().copied());
+                        }
                         SamplerIdentity::Preimage { indices, public, trapdoor, target, .. } => {
                             references.extend(indices.iter().copied());
                             references.extend([*public, *target]);
@@ -433,6 +441,21 @@ pub fn instantiate_shared_element<E>(
             let AtomicSourceKey::Sampler(sampler_id) = descriptor.key
         {
             let sampler = match samplers[&sampler_id].clone() {
+                SamplerIdentity::Gaussian { source, indices, max_coefficient_bound } => {
+                    SamplerIdentity::Gaussian {
+                        source,
+                        indices: indices.iter().map(|term| remap(*term)).collect(),
+                        max_coefficient_bound,
+                    }
+                }
+                SamplerIdentity::UniformInterval { source, indices, minimum, maximum } => {
+                    SamplerIdentity::UniformInterval {
+                        source,
+                        indices: indices.iter().map(|term| remap(*term)).collect(),
+                        minimum,
+                        maximum,
+                    }
+                }
                 SamplerIdentity::Preimage { source, indices, public, trapdoor, target, cutoff } => {
                     let trapdoor = trapdoors[&trapdoor].clone();
                     let trapdoor = TrapdoorDescriptorId(egraph.analysis.symbols.trapdoors.intern(
@@ -495,6 +518,8 @@ pub fn instantiate_shared_element<E>(
                 },
             };
             let indices = match &sampler {
+                SamplerIdentity::Gaussian { indices, .. } |
+                SamplerIdentity::UniformInterval { indices, .. } |
                 SamplerIdentity::Preimage { indices, .. } |
                 SamplerIdentity::DecomposedHash { indices, .. } |
                 SamplerIdentity::GadgetDecomposition { indices, .. } => indices.clone(),

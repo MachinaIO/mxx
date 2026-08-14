@@ -111,6 +111,28 @@ impl BoundInput for ProductionBoundInput<'_, '_, '_> {
                     .get(id.0)
                     .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
                 match sampler {
+                    SamplerIdentity::Gaussian { max_coefficient_bound, .. } => {
+                        let maximum_absolute_coefficient = resolved_integer(max_coefficient_bound)
+                            .and_then(|bound| bound.to_biguint())
+                            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
+                        BoundClass::Bounded { maximum_absolute_coefficient }
+                    }
+                    SamplerIdentity::UniformInterval { minimum, maximum, .. } => {
+                        let minimum = resolved_integer(minimum)
+                            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
+                        let maximum = resolved_integer(maximum)
+                            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
+                        if minimum > maximum {
+                            return Err(BoundEvaluationError::InvalidMatrixConstant { term });
+                        }
+                        BoundClass::Bounded {
+                            maximum_absolute_coefficient: minimum
+                                .abs()
+                                .max(maximum.abs())
+                                .to_biguint()
+                                .expect("absolute interval endpoint"),
+                        }
+                    }
                     SamplerIdentity::Preimage { cutoff, .. } => {
                         let cutoff = resolved_integer(cutoff)
                             .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
@@ -901,6 +923,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         indices: indices.clone(),
                     })
                 }
+                SamplerIdentity::Gaussian { .. } | SamplerIdentity::UniformInterval { .. } => None,
             })
             .collect()
     }
@@ -2308,7 +2331,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 return Err(LowerError::FamilyProducerNotResolved { family: wire.source.wire });
             }
         };
-        let (key, integer_domain, canonical_residue_convention) =
+        let (key, integer_domain, canonical_residue_convention) = if let Some(sampler) =
+            self.non_relation_sampler_for_wire(wire, environment)?
+        {
+            (super::identity::AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)), None, None)
+        } else {
             self.protocol_input_source(wire, environment, &sort)?.unwrap_or_else(|| {
                 (
                     super::identity::AtomicSourceKey::GraphWire(
@@ -2324,7 +2351,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     None,
                     None,
                 )
-            });
+            })
+        };
         let descriptor = super::identity::AtomicSourceDescriptor {
             key,
             sort,
@@ -2342,6 +2370,59 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 .collect(),
         });
         Ok(atom)
+    }
+
+    fn non_relation_sampler_for_wire(
+        &mut self,
+        wire: &LoweringWire,
+        environment: &LowerEnv,
+    ) -> Result<Option<u32>, LowerError> {
+        let kind = self
+            .graph_for_program(&wire.source.scope.program)?
+            .scope(&wire.source.scope.definition)
+            .ok_or(LowerError::MissingWire { wire: wire.source.wire })?
+            .node(wire.source.wire.node)
+            .ok_or(LowerError::MissingNode { node: wire.source.wire.node })?
+            .kind()
+            .clone();
+        let source = super::identity::GraphWireSourceKey {
+            wire: wire.source.clone(),
+            coordinate_binders: environment
+                .active_coordinates
+                .iter()
+                .map(|coordinate| coordinate.binder.clone())
+                .collect(),
+        };
+        let indices =
+            environment.active_coordinates.iter().map(|coordinate| coordinate.index.term).collect();
+        let sampler = match kind {
+            NodeKind::GaussianSample { max_coefficient_bound, .. } => {
+                let max_coefficient_bound =
+                    self.resolve_int(&max_coefficient_bound, environment)?;
+                if let Some(cutoff) = resolved_integer(&max_coefficient_bound) &&
+                    cutoff.is_negative()
+                {
+                    return Err(LowerError::NegativeSamplerCutoff { cutoff });
+                }
+                SamplerIdentity::Gaussian { source, indices, max_coefficient_bound }
+            }
+            NodeKind::UniformIntervalSample { range, .. } => {
+                let minimum = self.resolve_int(&range.minimum, environment)?;
+                let maximum = self.resolve_int(&range.maximum, environment)?;
+                if let (Some(minimum_value), Some(maximum_value)) =
+                    (resolved_integer(&minimum), resolved_integer(&maximum)) &&
+                    minimum_value > maximum_value
+                {
+                    return Err(LowerError::InvalidUniformInterval {
+                        minimum: minimum_value,
+                        maximum: maximum_value,
+                    });
+                }
+                SamplerIdentity::UniformInterval { source, indices, minimum, maximum }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(self.egraph.analysis.symbols.samplers.intern(sampler)))
     }
 
     /// Normalizes a non-artifact root-stage input to its closed protocol input identity.  The
@@ -4386,6 +4467,165 @@ mod tests {
             }],
         });
         protocol
+    }
+
+    fn sampled_matrix_graph(kind: NodeKind) -> (mxx_ir_core::graph::Graph, WireRef) {
+        use mxx_ir_core::graph::{GraphOutput, NodeHandle};
+
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let output = NodeHandle::new(kind, Vec::new(), vec![WireType::Matrix(matrix)])
+            .output(0)
+            .expect("sampler output");
+        let graph = mxx_ir_core::graph::Graph::freeze(
+            "bounded-sampler-fixture",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output.clone(), confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze sampler graph")
+        .0;
+        let output = graph.outputs()["output"].value;
+        (graph, output)
+    }
+
+    fn with_lowered_sampled_matrix(
+        kind: NodeKind,
+        inspect: impl FnOnce(&GraphLowerer<'_, '_>, Id),
+    ) {
+        let (graph, output) = sampled_matrix_graph(kind);
+        let protocol = hash_protocol(graph);
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "sampler".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let LoweredValue::Term(term) = lowerer
+            .lower_stage_wire(&StageId("encrypt".to_owned()), output)
+            .expect("lower sampler")
+        else {
+            panic!("sampler is a matrix term")
+        };
+        inspect(&lowerer, term);
+    }
+
+    fn lower_sampled_matrix_result(kind: NodeKind) -> Result<(), LowerError> {
+        let (graph, output) = sampled_matrix_graph(kind);
+        let protocol = hash_protocol(graph);
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "sampler".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        lowerer.lower_stage_wire(&StageId("encrypt".to_owned()), output).map(|_| ())
+    }
+
+    #[test]
+    fn gaussian_and_uniform_interval_are_bounded_nonrelation_samplers() {
+        with_lowered_sampled_matrix(
+            NodeKind::GaussianSample {
+                matrix_type: MatrixType {
+                    modulus: IntExpr::constant(17),
+                    ring_dimension: IntExpr::constant(1),
+                    rows: IntExpr::constant(1),
+                    columns: IntExpr::constant(1),
+                },
+                sigma: mxx_ir_core::RealExpr::from_integer(1),
+                max_coefficient_bound: IntExpr::constant(5),
+            },
+            |gaussian, gaussian_term| {
+                assert!(matches!(
+                    gaussian.egraph.analysis.symbols.samplers.values.as_slice(),
+                    [SamplerIdentity::Gaussian { max_coefficient_bound: ResolvedIntExpr::Const(value), .. }]
+                        if value == &BigInt::from(5)
+                ));
+                assert!(gaussian.relation_registrations().is_empty());
+                assert_eq!(
+                    BoundEvaluator::new(&gaussian.production_bound_view())
+                        .evaluate(gaussian_term)
+                        .unwrap()
+                        .coefficient_class,
+                    BoundClass::Bounded { maximum_absolute_coefficient: 5_u8.into() },
+                );
+            },
+        );
+
+        with_lowered_sampled_matrix(
+            NodeKind::UniformIntervalSample {
+                matrix_type: MatrixType {
+                    modulus: IntExpr::constant(17),
+                    ring_dimension: IntExpr::constant(1),
+                    rows: IntExpr::constant(1),
+                    columns: IntExpr::constant(1),
+                },
+                range: mxx_ir_core::node::SampleRange {
+                    minimum: IntExpr::constant(-3),
+                    maximum: IntExpr::constant(2),
+                },
+            },
+            |interval, interval_term| {
+                assert!(matches!(
+                    interval.egraph.analysis.symbols.samplers.values.as_slice(),
+                    [SamplerIdentity::UniformInterval {
+                        minimum: ResolvedIntExpr::Const(minimum),
+                        maximum: ResolvedIntExpr::Const(maximum),
+                        ..
+                    }] if minimum == &BigInt::from(-3) && maximum == &BigInt::from(2)
+                ));
+                assert!(interval.relation_registrations().is_empty());
+                assert_eq!(
+                    BoundEvaluator::new(&interval.production_bound_view())
+                        .evaluate(interval_term)
+                        .unwrap()
+                        .coefficient_class,
+                    BoundClass::Bounded { maximum_absolute_coefficient: 3_u8.into() },
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn bounded_nonrelation_sampler_contracts_fail_closed() {
+        let gaussian = lower_sampled_matrix_result(NodeKind::GaussianSample {
+            matrix_type: MatrixType {
+                modulus: IntExpr::constant(17),
+                ring_dimension: IntExpr::constant(1),
+                rows: IntExpr::constant(1),
+                columns: IntExpr::constant(1),
+            },
+            sigma: mxx_ir_core::RealExpr::from_integer(1),
+            max_coefficient_bound: IntExpr::constant(-1),
+        });
+        assert!(
+            matches!(gaussian, Err(LowerError::NegativeSamplerCutoff { cutoff }) if cutoff == BigInt::from(-1))
+        );
+
+        let interval = lower_sampled_matrix_result(NodeKind::UniformIntervalSample {
+            matrix_type: MatrixType {
+                modulus: IntExpr::constant(17),
+                ring_dimension: IntExpr::constant(1),
+                rows: IntExpr::constant(1),
+                columns: IntExpr::constant(1),
+            },
+            range: mxx_ir_core::node::SampleRange {
+                minimum: IntExpr::constant(3),
+                maximum: IntExpr::constant(2),
+            },
+        });
+        assert!(
+            matches!(interval, Err(LowerError::InvalidUniformInterval { minimum, maximum }) if minimum == BigInt::from(3) && maximum == BigInt::from(2))
+        );
     }
 
     #[test]

@@ -367,6 +367,19 @@ compact_id!(
 /// later relation pass; lowering never guesses a relation from a matrix shape.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum SamplerIdentity {
+    /// A non-relation sampler with an explicit, nonnegative coefficient cap.
+    Gaussian {
+        source: GraphWireSourceKey,
+        indices: Box<[egg::Id]>,
+        max_coefficient_bound: ResolvedIntExpr,
+    },
+    /// A non-relation sampler with an explicit closed integer interval.
+    UniformInterval {
+        source: GraphWireSourceKey,
+        indices: Box<[egg::Id]>,
+        minimum: ResolvedIntExpr,
+        maximum: ResolvedIntExpr,
+    },
     Preimage {
         source: GraphWireSourceKey,
         indices: Box<[egg::Id]>,
@@ -594,6 +607,37 @@ mod tests {
             coordinate_binders: Box::new([binder]),
         };
         assert_eq!(source.coordinate_binders.len(), 1);
+    }
+
+    #[test]
+    fn nonrelation_sampler_identity_includes_its_resolved_contract() {
+        let source = GraphWireSourceKey {
+            wire: WireSourceKey {
+                scope: scope(ProgramKey::WorkflowStage(StageId("encrypt".to_owned()))),
+                wire: WireRef { node: NodeId(11), port: Port(0) },
+            },
+            coordinate_binders: Box::new([]),
+        };
+        let first = SamplerIdentity::Gaussian {
+            source: source.clone(),
+            indices: Box::new([]),
+            max_coefficient_bound: ResolvedIntExpr::Const(3.into()),
+        };
+        let different_bound = SamplerIdentity::Gaussian {
+            source: source.clone(),
+            indices: Box::new([]),
+            max_coefficient_bound: ResolvedIntExpr::Const(4.into()),
+        };
+        let interval = SamplerIdentity::UniformInterval {
+            source,
+            indices: Box::new([]),
+            minimum: ResolvedIntExpr::Const((-3).into()),
+            maximum: ResolvedIntExpr::Const(2.into()),
+        };
+        let mut interner = Interner::default();
+        let first_id = interner.intern(first);
+        assert_ne!(first_id, interner.intern(different_bound));
+        assert_ne!(first_id, interner.intern(interval));
     }
 
     #[test]

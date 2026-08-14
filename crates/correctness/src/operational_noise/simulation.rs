@@ -482,12 +482,16 @@ pub fn check_operational_noise_candidate_with_progress(
                     root,
                     &mut ExtractionControl { invalid_dag: &mut invalid_dag },
                     &mut |_, node, egraph| {
-                        let (relation_redex, large_atom) =
+                        let (relation_redex, large_atom_witness) =
                             super::relation::classify_proposal_node(egraph, node, &context)
                                 .map_err(|failure| {
                                     relation_error(&stage, wire, &egraph.analysis.symbols, failure)
                                 })?;
-                        Ok(ProposalNodeClassification { relation_redex, large_atom })
+                        Ok(ProposalNodeClassification {
+                            relation_redex,
+                            large_atom: large_atom_witness.is_some(),
+                            large_atom_witness,
+                        })
                     },
                 )?;
                 if proposal.cost.remaining_relation_redexes != 0 ||
@@ -500,6 +504,15 @@ pub fn check_operational_noise_candidate_with_progress(
                             remaining_relation_redexes: proposal.cost.remaining_relation_redexes,
                             hidden_relation_redexes: proposal.cost.hidden_relation_redexes,
                             large_atom_count: proposal.cost.large_atom_count,
+                            large_atom_witness: proposal.large_atom_witness.and_then(|source| {
+                                lowerer
+                                    .egraph
+                                    .analysis
+                                    .symbols
+                                    .atomic_sources
+                                    .get(source.0)
+                                    .map(|descriptor| descriptor.key.clone())
+                            }),
                         },
                     });
                 }

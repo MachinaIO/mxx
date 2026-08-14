@@ -1254,6 +1254,8 @@ fn graph_wire_coordinates_are_authoritative(
                 return false;
             };
             let (_source, recorded) = match sampler {
+                super::identity::SamplerIdentity::Gaussian { source, indices, .. } |
+                super::identity::SamplerIdentity::UniformInterval { source, indices, .. } |
                 super::identity::SamplerIdentity::Preimage { source, indices, .. } |
                 super::identity::SamplerIdentity::DecomposedHash { source, indices, .. } |
                 super::identity::SamplerIdentity::GadgetDecomposition {

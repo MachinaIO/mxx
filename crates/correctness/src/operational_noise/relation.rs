@@ -342,6 +342,14 @@ fn checked_replacement(
             // not itself the sampler public key.
             let distributed_public =
                 distribution_public_operand(egraph, actual_public, registration.expected_public);
+            if distributed_public.is_none() &&
+                egraph.find(registration.expected_public) != actual_public
+            {
+                // This registration is not applicable to this product.  It is
+                // not a malformed relation: another registration or another
+                // product e-node may be the matching use.
+                continue;
+            }
             let preflight_public = distributed_public.unwrap_or(actual_public);
             if let Err(failure) =
                 preflight_registration(egraph, relation, &source, &registration, preflight_public)
@@ -351,12 +359,6 @@ fn checked_replacement(
             }
             if !same_canonical_indices(egraph, &source.indices, &registration.indices) {
                 failures.insert(RelationFailure::MismatchedIndex { source: source.source });
-                continue;
-            }
-            if distributed_public.is_none() &&
-                egraph.find(registration.expected_public) != actual_public
-            {
-                failures.insert(RelationFailure::MismatchedPublic { source: source.source });
                 continue;
             }
             let target = egraph.find(registration.target);
@@ -865,6 +867,50 @@ fn switch_node(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operational_noise::identity::{
+        AtomicSourceDescriptor, AtomicSourceKey, CanonicalResidueConvention, ResolvedIntExpr,
+        ResolvedMatrixType,
+    };
+
+    fn scalar_matrix_type() -> ResolvedMatrixType {
+        ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(1.into()),
+            columns: ResolvedIntExpr::Const(1.into()),
+        }
+    }
+
+    fn matrix_atom(
+        egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+        name: &str,
+        relation_role: Option<AtomicRelationRole>,
+    ) -> (Id, AtomicSourceId) {
+        let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+            key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(name)),
+            sort: MxxSort::Matrix(scalar_matrix_type()),
+            integer_domain: None,
+            canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
+            relation_role,
+        });
+        let source = AtomicSourceId(source);
+        let term = egraph.add(MxxLang::Atom { source, indices: Box::new([]) });
+        (term, source)
+    }
+
+    fn registration(
+        source: AtomicSourceId,
+        expected_public: Id,
+        target: Id,
+    ) -> RelationRegistration {
+        RelationRegistration {
+            source,
+            expected_public,
+            target,
+            trapdoor: None,
+            indices: Box::new([]),
+        }
+    }
 
     #[test]
     fn pointwise_selector_product_distributes_a_single_switch_linearly() {
@@ -929,6 +975,75 @@ mod tests {
             pointwise_same_selector(&mut egraph, left, right, true),
             Err(RelationFailure::DifferentSelectorBlocked),
         );
+    }
+
+    #[test]
+    fn unmatched_public_registration_is_not_a_global_relation_failure() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (expected_public, _) = matrix_atom(&mut egraph, "expected", None);
+        let (actual_public, _) = matrix_atom(&mut egraph, "actual", None);
+        let (target, _) = matrix_atom(&mut egraph, "target", None);
+        let (relation, source) =
+            matrix_atom(&mut egraph, "relation", Some(AtomicRelationRole::Preimage));
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, expected_public, target));
+
+        assert!(
+            checked_replacement(&mut egraph, &context, &[actual_public, relation], 1).is_none()
+        );
+        assert_eq!(context.failure(), None);
+    }
+
+    #[test]
+    fn additive_distribution_keeps_nonmatching_residual_without_failure() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (prefix, _) = matrix_atom(&mut egraph, "prefix", None);
+        let (expected_public, _) = matrix_atom(&mut egraph, "expected", None);
+        let (residual, _) = matrix_atom(&mut egraph, "residual", None);
+        let (target, _) = matrix_atom(&mut egraph, "target", None);
+        let (relation, source) =
+            matrix_atom(&mut egraph, "relation", Some(AtomicRelationRole::Preimage));
+        let matching_summand =
+            egraph.add(MxxLang::MatrixMultiply(vec![prefix, expected_public].into_boxed_slice()));
+        let actual_public =
+            egraph.add(MxxLang::MatrixAdd(vec![matching_summand, residual].into_boxed_slice()));
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, expected_public, target));
+
+        let replacement = checked_replacement(&mut egraph, &context, &[actual_public, relation], 1)
+            .expect("matching additive summand is rewritten")
+            .0;
+        assert_eq!(context.failure(), None);
+        let MxxLang::MatrixAdd(terms) = egraph[egraph.find(replacement)]
+            .nodes
+            .iter()
+            .find(|node| matches!(node, MxxLang::MatrixAdd(_)))
+            .expect("distribution produces an additive replacement")
+        else {
+            unreachable!()
+        };
+        assert!(terms.iter().any(|term| {
+            egraph[egraph.find(*term)].nodes.iter().any(|node| {
+                matches!(node, MxxLang::MatrixMultiply(factors)
+                    if factors.len() == 2 &&
+                        egraph.find(factors[0]) == egraph.find(residual) &&
+                        egraph.find(factors[1]) == egraph.find(relation))
+            })
+        }));
+    }
+
+    #[test]
+    fn applicable_relation_with_malformed_target_remains_fail_closed() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (public, _) = matrix_atom(&mut egraph, "public", None);
+        let target = egraph.add(MxxLang::IntConst(0.into()));
+        let (relation, source) =
+            matrix_atom(&mut egraph, "relation", Some(AtomicRelationRole::Preimage));
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, public, target));
+
+        assert!(checked_replacement(&mut egraph, &context, &[public, relation], 1).is_none());
+        assert_eq!(context.failure(), Some(RelationFailure::MismatchedType { source }));
     }
 
     #[test]

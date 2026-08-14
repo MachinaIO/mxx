@@ -1,6 +1,6 @@
 # Lean correctness pipeline
 
-The `lean/` package contains the Graph IR semantics, hard-bounded sampler contract, and
+The `lean/` package contains the Graph IR semantics, bounded-sampler contract, and
 protocol-independent proof lemmas under `lean/Mxx`. Each crate owns its generated protocol
 statements and human-written proofs. `mxx-correctness` uses
 `crates/correctness/lean/MxxCorrectness`; application-specific checker sources live with their
@@ -44,10 +44,11 @@ The protocol-independent certificate syntax lives under `lean/Mxx/Certificate`. 
 concrete wires, body templates, instantiated loop paths, joint family elements, and recurrence
 results. Matrix and bound recurrence paths are different types. Signal terms are affine pairs of a
 proved-bounded coefficient and an ordered public basis; all remaining uncertainty is represented
-by a worst-case noise bound. Both symbolic bound derivation and concrete bound evaluation are
-implemented by the Lean verifier. Rust emits the frozen executable IR, protocol input contracts,
-and resolved semantic labels; it does not derive affine facts, symbolic bounds, or rule
-applications.
+by a worst-case noise bound. The retained Lean development proves symbolic facts about executable
+semantics. Production operational parameter selection is separate: the generic Rust checker
+lowers the frozen workflow, applies registered sampler relations, computes worst-case bounds, and
+checks the declared decoder target. Rust protocol emission still supplies frozen IR, input
+contracts, and resolved semantic labels to the theorem-development path.
 
 Protocol artifact identity is stage-relative. An `ArtifactBinding` commits to the producer stage
 and output, and validation requires that output name to equal the artifact name read by the
@@ -76,8 +77,8 @@ The committed toy example workflow is a two-stage executable example: encryption
 the `q/2` representative, adds a hard-bounded Gaussian sample, and exports a ciphertext artifact.
 The decryption entrypoint applies the threshold decoder and labels its Boolean output as the
 registered endpoint. The direct equality comparator compares that endpoint with the sampler-free
-ideal Boolean. Phase A derives the decoding-radius obligation from the actual Gaussian and decoder
-nodes; Phase B evaluates it using exact Lean arithmetic.
+ideal Boolean. The Rust operational checker derives and evaluates the decoding-radius obligation
+from the frozen Gaussian and decoder nodes.
 
 Correctness uses truncated CPU and GPU samplers and deterministic worst-case bounds. GPU Gaussian
 sampling rejects individual coefficients in CUDA; batched GPU preimage sampling rejects whole
@@ -99,9 +100,9 @@ cargo build -p mxx-correctness
 cargo check -p mxx-gadgets
 ```
 
-`mxx-we` builds its crate-owned Lean hard-bound checker from `build.rs` and exposes the resulting
-private executable to parameter search. Diamond protocol emission produces one parameterized
-protocol family rather than a selected shape or cryptographic configuration. Rust supplies a
-concrete parameter environment to the generated checker and consumes its decision; it does not
-reimplement the checker formulas. The final workflow soundness theorem is still under migration,
-so the current build must not be presented as an end-to-end Diamond correctness result.
+`mxx-we` uses the generic Rust operational checker directly during parameter search. Diamond
+protocol emission produces one parameterized protocol family rather than a selected shape or
+cryptographic configuration. The crate-owned Lean build remains the theorem-development and
+derivation-validation path; it is not the production operational parameter checker. The final
+workflow soundness theorem is still under migration, so the current build must not be presented as
+an end-to-end Diamond correctness result.

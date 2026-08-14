@@ -2928,12 +2928,22 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 },
             )?)?;
         }
-        Ok(LoweredValue::Term(family::instantiate_shared_element(
+        let scope = domain.binder.loop_scope.clone();
+        let node = domain.binder.loop_node;
+        let control = &mut self.control;
+        family::instantiate_shared_element(
             &mut self.egraph,
             representative,
             super::identity::BinderId(binder_id),
             index.term,
-        )))
+            &mut || {
+                if let Some(control) = control.as_deref_mut() {
+                    control.work(&scope, node)?;
+                }
+                Ok(())
+            },
+        )
+        .map(LoweredValue::Term)
     }
 
     fn family_element(

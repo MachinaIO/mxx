@@ -8,14 +8,17 @@ reviewable without presenting the unfinished end-to-end theorem as part of the n
 - The generated parameterized `ClosedProtocolDecl`.
 - The typed certificate identities, expressions, affine facts, recurrence paths, and closed rule
   universe under `lean/Mxx/Certificate`.
-- Proof-producing symbolic normalization and the exact Lean hard-bound expression evaluator.
+- Proof-producing symbolic normalization for the retained theorem-development path.
 - DSL semantic anchors resolved directly at freeze time, with no graph-search fallback.
 - The checked-in M0 node, transform, loop-bound, and origin audit.
-- The executable Diamond Phase-B parameter checker over the generated closed bundle.
-- The standalone `mxx_diamond_checker` executable used by Rust parameter search.
+- The generic Rust operational-noise checker over the frozen workflow, exact input contracts,
+  registered sampler relations, compact family representations, and decoder acceptance targets.
+- Diamond parameter search calls that Rust checker directly and retains its structured report for
+  each accepted or rejected candidate.
 
-Building `MxxWe` establishes only that this stable subset type-checks. Checker acceptance proves
-the checked parameter inequalities; it is not an end-to-end correctness theorem.
+Building `MxxWe` establishes only that this stable subset type-checks. Rust checker acceptance
+establishes the implemented operational bound and decoder inequality for the supplied frozen
+workflow and concrete parameter environment; it is not an end-to-end correctness theorem.
 
 ## Work in progress
 
@@ -35,7 +38,7 @@ Run the stable checkpoint build with:
 
 ```text
 cd lean
-lake build MxxWe mxx_diamond_checker
+lake build MxxWe mxx_diamond_derivation_checker
 ```
 
 The repository-wide generated-source and Rust build gate is:

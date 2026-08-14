@@ -52,6 +52,18 @@ fn lut_mod_p_map_size(p_i: u64, max_p_modulus: u64, modulus_count: usize) -> u12
     (p_i as u128 * max_p_modulus as u128).max(p_i as u128 * (2 * modulus_count) as u128)
 }
 
+/// Every mod-p lookup receives wires governed by the context-wide trace invariant, not merely
+/// one canonical p_i residue. Therefore every physical table uses the same authoritative input
+/// coefficient domain. The expression remains parameter-generic and is exactly the capacity
+/// tracked by `lut_mod_p_max_map_size`.
+fn lut_mod_p_table_len(max_p_modulus: u64, modulus_count: usize) -> u128 {
+    lut_mod_p_map_size(max_p_modulus, max_p_modulus, modulus_count)
+}
+
+fn lookup_input_coefficient_fits(bound: &BigUint, table_len: &BigUint) -> bool {
+    bound < table_len
+}
+
 /// Precompute the gadget vector residues used by decomposition and reconstruction helpers.
 ///
 /// The returned rows are consumed by the encoding helpers in `encoding.rs` and by the full-reduce
@@ -133,9 +145,9 @@ impl NestedRnsPolyContext {
         trace: &BigUint,
     ) -> Vec<SubCircuitInputMaxPlaintextNormRange> {
         for &p_i in &self.p_moduli {
-            let table_len = BigUint::from(lut_mod_p_map_size(p_i, self.p_max, self.p_moduli.len()));
+            let table_len = self.lut_mod_p_max_map_size.clone();
             assert!(
-                trace < &table_len,
+                lookup_input_coefficient_fits(trace, &table_len),
                 "nested-RNS lookup input bound {trace} does not fit the p={p_i} table of length {table_len}"
             );
         }
@@ -187,9 +199,9 @@ impl NestedRnsPolyContext {
     ) -> Vec<SubCircuitInputMaxPlaintextNormRange> {
         assert_eq!(norms.len(), self.p_moduli.len());
         for (&p_i, norm) in self.p_moduli.iter().zip(&norms) {
-            let table_len = BigUint::from(lut_mod_p_map_size(p_i, self.p_max, self.p_moduli.len()));
+            let table_len = self.lut_mod_p_max_map_size.clone();
             assert!(
-                norm < &table_len,
+                lookup_input_coefficient_fits(norm, &table_len),
                 "nested-RNS lookup input bound {norm} does not fit the p={p_i} table of length {table_len}"
             );
         }
@@ -269,7 +281,7 @@ impl NestedRnsPolyContext {
             max_p_modulus
         );
         let lut_mod_p_max_map_size =
-            BigUint::from(lut_mod_p_map_size(max_p_modulus, max_p_modulus, p_moduli_depth));
+            BigUint::from(lut_mod_p_table_len(max_p_modulus, p_moduli_depth));
         let active_q_moduli = q_moduli;
         let p_full = p_moduli.iter().fold(BigUint::from(1u64), |acc, &pi| acc * BigUint::from(pi));
         let full_reduce_max_plaintexts = active_q_moduli
@@ -324,7 +336,7 @@ impl NestedRnsPolyContext {
         let mut lut_x_to_real = Vec::with_capacity(p_moduli_depth);
 
         for (p_i_idx, &p_i) in p_moduli.iter().enumerate() {
-            let lut_mod_p_map_size = lut_mod_p_map_size(p_i, max_p_modulus, p_moduli.len());
+            let lut_mod_p_map_size = lut_mod_p_table_len(max_p_modulus, p_moduli.len());
             debug_assert!(
                 lut_mod_p_map_size < q_moduli_min as u128,
                 "LUT size exceeds q modulus size; increase q_moduli_bits or decrease p_moduli_bits"
@@ -645,5 +657,23 @@ impl<P: Poly + 'static> ModularArithmeticContext<P> for NestedRnsPolyContext {
 
     fn plaintext_capacity_bound(&self) -> BigUint {
         self.p_full.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mod_p_table_domain_accepts_its_largest_input_coefficient() {
+        let table_len = BigUint::from(lut_mod_p_table_len(29, 3));
+        let largest_valid = &table_len - BigUint::from(1u8);
+        assert!(lookup_input_coefficient_fits(&largest_valid, &table_len));
+    }
+
+    #[test]
+    fn mod_p_table_domain_rejects_the_first_larger_input_coefficient() {
+        let table_len = BigUint::from(lut_mod_p_table_len(29, 3));
+        assert!(!lookup_input_coefficient_fits(&table_len, &table_len));
     }
 }

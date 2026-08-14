@@ -141,11 +141,11 @@ jobs:
           lake build Mxx MxxCorrectness MxxGadgets MxxWe \
             mxx_diamond_derivation_checker
 
-      - name: Run Rust to Lean checker integration test
+      - name: Run Rust operational checker test
         run: |
           MXX_REGENERATE_CORRECTNESS=1 cargo test -r -p mxx-we --lib \
-            diamond::parameter_search::tests::exact_cutoffs_and_lean_checker_match_rust -- \
-            --ignored --exact
+            diamond::parameter_search::tests::evaluated_operational_reports_preserve_accepted_and_rejected_candidates -- \
+            --exact
 
   ci-success:
     name: ci success

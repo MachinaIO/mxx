@@ -80,7 +80,9 @@ pub(crate) enum ResolvedDecoderKind {
     BooleanInterval,
 }
 
-/// One structured, allocation-free progress record supplied to the caller's logging backend.
+/// One structured, allocation-free progress record supplied at instrumented checker boundaries.
+/// Progress is best-effort: opaque library operations such as an individual egg scan may run
+/// between events, so this is not a wall-clock heartbeat guarantee.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgressEvent {
     pub phase: CheckerPhase,
@@ -519,8 +521,9 @@ pub fn check_operational_noise_candidate(
     check_operational_noise_candidate_with_progress(protocol, request, |_| {})
 }
 
-/// Checks one closed protocol candidate and exposes bounded-cadence progress
-/// without coupling the checker to a logging implementation.
+/// Checks one closed protocol candidate and exposes best-effort progress at instrumented work
+/// boundaries without coupling the checker to a logging implementation. The callback is not a
+/// wall-clock heartbeat while control is inside an opaque third-party operation.
 pub fn check_operational_noise_candidate_with_progress(
     protocol: &ProtocolDecl,
     request: &super::OperationalCheckRequest,

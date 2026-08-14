@@ -94,7 +94,6 @@ impl SharedRewriteBudget {
     pub fn new(deadline: Instant, owned_element_limit: usize) -> Self {
         Self { deadline, owned_limit: owned_element_limit, owned: Arc::new(AtomicUsize::new(0)) }
     }
-
     /// Uses the simulation driver's cumulative counter.  This is the
     /// production constructor: relation callbacks never own a second budget.
     pub(crate) fn from_shared(

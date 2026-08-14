@@ -97,6 +97,7 @@ struct TestConfig {
     max_crt_depth: usize,
     min_log_ring_dimension: usize,
     max_log_ring_dimension: usize,
+    selected_parameters: Option<(usize, usize)>,
     security_bits: u64,
     crt_modulus_bits: usize,
     gadget_base_bits: usize,
@@ -123,21 +124,38 @@ impl TestConfig {
         // width minimizes the gadget representation without an independent tuning knob; the
         // nested-RNS p basis is selected from the concrete q basis below.
         let crt_modulus_bits = env_usize("MXX_TALL_NESTED_RNS_CRT_MODULUS_BITS", 10)?;
+        let selected_crt_depth = env_optional_usize("MXX_TALL_NESTED_RNS_SELECTED_CRT_DEPTH")?;
+        let selected_log_ring_dimension =
+            env_optional_usize("MXX_TALL_NESTED_RNS_SELECTED_LOG_RING_DIMENSION")?;
+        let selected_parameters = match (selected_crt_depth, selected_log_ring_dimension) {
+            (None, None) => None,
+            (Some(crt_depth), Some(log_ring_dimension)) => Some((crt_depth, log_ring_dimension)),
+            _ => {
+                return Err(
+                    "MXX_TALL_NESTED_RNS_SELECTED_CRT_DEPTH and MXX_TALL_NESTED_RNS_SELECTED_LOG_RING_DIMENSION must be supplied together"
+                        .to_owned(),
+                );
+            }
+        };
         let config = Self {
             mul_count: env_usize("MXX_TALL_NESTED_RNS_MUL_COUNT", 1)?,
             min_crt_depth: env_usize("MXX_TALL_NESTED_RNS_MIN_CRT_DEPTH", 1)?,
             max_crt_depth: env_usize("MXX_TALL_NESTED_RNS_MAX_CRT_DEPTH", 16)?,
-            min_log_ring_dimension: 3,
-            max_log_ring_dimension: 3,
+            min_log_ring_dimension: env_usize("MXX_TALL_NESTED_RNS_MIN_LOG_RING_DIMENSION", 3)?,
+            max_log_ring_dimension: env_usize("MXX_TALL_NESTED_RNS_MAX_LOG_RING_DIMENSION", 3)?,
+            selected_parameters,
             // n = 8 is intentionally an execution smoke parameter and has no positive lattice
             // security estimate. A caller may request a positive target, which will reject it.
             security_bits: env_u64("MXX_TALL_NESTED_RNS_SECURITY_BITS", 0)?,
             crt_modulus_bits,
-            gadget_base_bits: crt_modulus_bits.div_ceil(2),
+            gadget_base_bits: env_usize(
+                "MXX_TALL_NESTED_RNS_GADGET_BASE_BITS",
+                crt_modulus_bits.div_ceil(2),
+            )?,
             // The multiplication's full-reduce intermediate exceeds the one-product p basis;
             // retain the two-product budget required by the nested-RNS bound check.
             max_unreduced_muls: env_usize("MXX_TALL_NESTED_RNS_MAX_UNREDUCED_MULS", 2)?,
-            scale: 1 << 10,
+            scale: env_u64("MXX_TALL_NESTED_RNS_SCALE", 1 << 10)?,
             error_sigma: env_f64("MXX_TALL_NESTED_RNS_ERROR_SIGMA", 1.0)?,
             trapdoor_sigma: env_f64("MXX_TALL_NESTED_RNS_TRAPDOOR_SIGMA", 4.578)?,
             benchmark_warmups: env_usize("MXX_TALL_NESTED_RNS_BENCH_WARMUPS", 1)?,
@@ -181,8 +199,9 @@ impl TestConfig {
         };
         if config.min_crt_depth == 0 ||
             config.min_crt_depth > config.max_crt_depth ||
-            config.min_log_ring_dimension != 3 ||
-            config.max_log_ring_dimension != 3 ||
+            config.min_log_ring_dimension > config.max_log_ring_dimension ||
+            u32::try_from(config.max_log_ring_dimension).is_err() ||
+            1u32.checked_shl(config.max_log_ring_dimension as u32).is_none() ||
             config.crt_modulus_bits == 0 ||
             config.gadget_base_bits == 0 ||
             config.max_unreduced_muls == 0 ||
@@ -200,7 +219,43 @@ impl TestConfig {
         {
             return Err("invalid Tall nested-RNS GPU test configuration".to_owned());
         }
+        if let Some((crt_depth, log_ring_dimension)) = config.selected_parameters &&
+            (crt_depth == 0 ||
+                u32::try_from(log_ring_dimension).is_err() ||
+                1u32.checked_shl(log_ring_dimension as u32).is_none())
+        {
+            return Err("invalid selected Tall nested-RNS parameters".to_owned());
+        }
         Ok(config)
+    }
+
+    fn candidate_dimensions(&self) -> Vec<(usize, usize)> {
+        candidate_dimensions(
+            self.min_crt_depth,
+            self.max_crt_depth,
+            self.min_log_ring_dimension,
+            self.max_log_ring_dimension,
+            self.selected_parameters,
+        )
+    }
+}
+
+fn candidate_dimensions(
+    min_crt_depth: usize,
+    max_crt_depth: usize,
+    min_log_ring_dimension: usize,
+    max_log_ring_dimension: usize,
+    selected: Option<(usize, usize)>,
+) -> Vec<(usize, usize)> {
+    if let Some(selected) = selected {
+        vec![selected]
+    } else {
+        (min_crt_depth..=max_crt_depth)
+            .flat_map(|crt_depth| {
+                (min_log_ring_dimension..=max_log_ring_dimension)
+                    .map(move |log_ring_dimension| (crt_depth, log_ring_dimension))
+            })
+            .collect()
     }
 }
 
@@ -257,6 +312,15 @@ fn env_usize(name: &str, default: usize) -> Result<usize, String> {
 fn env_u64(name: &str, default: u64) -> Result<u64, String> {
     env::var(name).map_or(Ok(default), |value| {
         value.parse().map_err(|_| format!("{name} must be a nonnegative integer"))
+    })
+}
+
+fn env_optional_usize(name: &str) -> Result<Option<usize>, String> {
+    env::var(name).map_or(Ok(None), |value| {
+        if value.is_empty() {
+            return Err(format!("{name} must not be empty"));
+        }
+        value.parse().map(Some).map_err(|_| format!("{name} must be a nonnegative integer"))
     })
 }
 
@@ -1068,12 +1132,7 @@ fn lattice_security_bits(parameters: &DCRTPolyParams, sigma: f64) -> Result<u64,
 
 fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
     info!("stage 1/4: parameter simulation");
-    let candidate_dimensions = (config.min_crt_depth..=config.max_crt_depth)
-        .flat_map(|crt_depth| {
-            (config.min_log_ring_dimension..=config.max_log_ring_dimension)
-                .map(move |log_ring_dimension| (crt_depth, log_ring_dimension))
-        })
-        .collect::<Vec<_>>();
+    let candidate_dimensions = config.candidate_dimensions();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(config.parameter_simulation_parallelism)
         .thread_name(|index| format!("tall-parameter-simulation-{index}"))
@@ -1081,6 +1140,15 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
         .map_err(|error| format!("could not create parameter simulation pool: {error}"))?;
     info!(
         candidate_count = candidate_dimensions.len(),
+        selected_mode = config.selected_parameters.is_some(),
+        selected_crt_depth = config.selected_parameters.map(|selected| selected.0),
+        selected_log_ring_dimension = config.selected_parameters.map(|selected| selected.1),
+        min_crt_depth = config.min_crt_depth,
+        max_crt_depth = config.max_crt_depth,
+        min_log_ring_dimension = config.min_log_ring_dimension,
+        max_log_ring_dimension = config.max_log_ring_dimension,
+        gadget_base_bits = config.gadget_base_bits,
+        scale = config.scale,
         parallelism = config.parameter_simulation_parallelism,
         "configured bounded parallel parameter simulation"
     );
@@ -1712,6 +1780,16 @@ fn runtime_verification(
         ));
     }
     Ok(())
+}
+
+#[test]
+fn selected_parameters_produce_exactly_one_candidate() {
+    assert_eq!(candidate_dimensions(1, 16, 3, 8, Some((7, 5))), vec![(7, 5)]);
+}
+
+#[test]
+fn range_parameters_preserve_the_cartesian_candidate_search() {
+    assert_eq!(candidate_dimensions(2, 3, 4, 5, None), vec![(2, 4), (2, 5), (3, 4), (3, 5)]);
 }
 
 #[test]

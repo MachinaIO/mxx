@@ -11,7 +11,7 @@ use super::{
     language::MxxLang,
     lower::LoweredInt,
 };
-use egg::{AstSize, EGraph, Extractor, Id, Language, RecExpr};
+use egg::{CostFunction, EGraph, Extractor, Id, Language, RecExpr};
 use mxx_ir_core::types::ConcreteMatrixType;
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
@@ -240,24 +240,63 @@ pub fn shared_element(
 
 /// Instantiates one shared representative by replacing only its owning binder.
 /// Other binder nodes are retained, so nested independent domains stay symbolic.
-pub fn instantiate_shared_element<A>(
+pub fn instantiate_shared_element<A, E>(
     egraph: &mut EGraph<MxxLang, A>,
     representative: Id,
     binder: BinderId,
     replacement: Id,
-) -> Id
+    progress: &mut dyn FnMut() -> Result<(), E>,
+) -> Result<Id, E>
 where
     A: egg::Analysis<MxxLang>,
 {
-    let extractor = Extractor::new(egraph, AstSize);
-    let (_, template) = extractor.find_best(representative);
-    let (_, replacement) = extractor.find_best(replacement);
+    struct ProgressAstSize<'a, E> {
+        progress: &'a mut dyn FnMut() -> Result<(), E>,
+        failure: std::rc::Rc<std::cell::RefCell<Option<E>>>,
+    }
+    impl<E> CostFunction<MxxLang> for ProgressAstSize<'_, E> {
+        type Cost = usize;
+        fn cost<C>(&mut self, enode: &MxxLang, mut costs: C) -> usize
+        where
+            C: FnMut(Id) -> usize,
+        {
+            if self.failure.borrow().is_none() &&
+                let Err(error) = (self.progress)()
+            {
+                *self.failure.borrow_mut() = Some(error);
+            }
+            enode.fold(1, |sum, child| sum.saturating_add(costs(child)))
+        }
+    }
+    fn extract<A, E>(
+        egraph: &EGraph<MxxLang, A>,
+        root: Id,
+        progress: &mut dyn FnMut() -> Result<(), E>,
+    ) -> Result<RecExpr<MxxLang>, E>
+    where
+        A: egg::Analysis<MxxLang>,
+    {
+        let failure = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let extractor = Extractor::new(
+            egraph,
+            ProgressAstSize { progress, failure: std::rc::Rc::clone(&failure) },
+        );
+        let (_, expression) = extractor.find_best(root);
+        if let Some(error) = failure.borrow_mut().take() {
+            return Err(error);
+        }
+        Ok(expression)
+    }
+    let template = extract(egraph, representative, progress)?;
+    let replacement = extract(egraph, replacement, progress)?;
     let mut instantiated = RecExpr::default();
     let mut template_ids = Vec::with_capacity(template.len());
     for node in template.as_ref() {
+        progress()?;
         let root = if matches!(node, MxxLang::IntBinder(candidate) if *candidate == binder) {
             let mut replacement_ids = Vec::with_capacity(replacement.len());
             for replacement_node in replacement.as_ref() {
+                progress()?;
                 let rebuilt = replacement_node
                     .clone()
                     .map_children(|child| replacement_ids[usize::from(child)]);
@@ -270,7 +309,7 @@ where
         };
         template_ids.push(root);
     }
-    egraph.add_expr(&instantiated)
+    Ok(egraph.add_expr(&instantiated))
 }
 
 /// Selects a compact family.  Exact storage evaluates only stored references;
@@ -975,13 +1014,36 @@ mod tests {
         let representative = egraph.add(MxxLang::IntAdd([owner_term, outer_term]));
         let replacement = egraph.add(MxxLang::IntConst(5.into()));
 
-        let instantiated =
-            instantiate_shared_element(&mut egraph, representative, owner_id, replacement);
-        let (_, expression) = Extractor::new(&egraph, AstSize).find_best(instantiated);
+        let mut progress_calls = 0;
+        let instantiated = instantiate_shared_element(
+            &mut egraph,
+            representative,
+            owner_id,
+            replacement,
+            &mut || {
+                progress_calls += 1;
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+        let (_, expression) = Extractor::new(&egraph, egg::AstSize).find_best(instantiated);
 
         assert!(expression.iter().any(|node| node == &MxxLang::IntConst(5.into())));
         assert!(expression.iter().any(|node| node == &MxxLang::IntBinder(outer_id)));
         assert!(!expression.iter().any(|node| node == &MxxLang::IntBinder(owner_id)));
+        assert!(progress_calls >= 6, "both extractor scans and rebuild report work");
+
+        let mut rejected = || Err::<(), _>("progress stopped");
+        assert_eq!(
+            instantiate_shared_element(
+                &mut egraph,
+                representative,
+                owner_id,
+                replacement,
+                &mut rejected,
+            ),
+            Err("progress stopped")
+        );
     }
 
     #[test]

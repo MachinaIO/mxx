@@ -70,7 +70,8 @@ slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
 Diamond protocol. A Diamond protocol fixes a layered Boolean shape but accepts gate opcodes and
 previous-layer indices as public runtime families. Encryption and decryption consume the same
 circuit assignment; witness bits are decryption-only inputs. Parameter search uses deterministic
-worst-case bounds and accepts a candidate only after the Lean hard-bound checker returns true.
+worst-case bounds and accepts a candidate only after the generic Rust operational checker accepts
+the frozen workflow and concrete parameter environment.
 
 `mxx-func-enc` and `mxx-io` currently expose compiling interface shells. Their protocol modules
 remain disabled.

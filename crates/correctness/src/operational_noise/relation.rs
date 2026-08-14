@@ -20,7 +20,7 @@ use egg::{Applier, EGraph, Id, SearchMatches, Searcher, Subst, Symbol, Var};
 use num_bigint::BigInt;
 use num_traits::Zero;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -213,12 +213,15 @@ impl Searcher<MxxLang, MxxAnalysis> for RelationSearcher {
             return None;
         }
         let class = &egraph[egraph.find(eclass)];
-        let matched = class.nodes.iter().any(|node| {
-            let MxxLang::MatrixMultiply(factors) = node else { return false };
-            factors
-                .iter()
-                .any(|factor| !egraph[egraph.find(*factor)].data.relation_provenance.is_empty())
+        let relation_match = class.nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixMultiply(factors)
+            if factors.iter().any(|factor| {
+                !egraph[egraph.find(*factor)].data.relation_provenance.is_empty()
+            }))
         });
+        let has_physical_add = class.nodes.iter().any(|node| matches!(node, MxxLang::MatrixAdd(_)));
+        let matched = relation_match ||
+            (has_physical_add && exact_additive_cancellation_possible(egraph, eclass));
         matched.then(|| SearchMatches { eclass, substs: vec![Subst::default()], ast: None })
     }
 
@@ -256,6 +259,12 @@ impl Applier<MxxLang, MxxAnalysis> for RelationApplier {
         }
         let root = egraph.find(eclass);
         let nodes = egraph[root].nodes.clone();
+        if let Some(replacement) = exact_additive_remainder(egraph, root) {
+            if egraph.union(root, replacement) {
+                self.context.note_rewrite(false);
+                return vec![replacement];
+            }
+        }
         for node in nodes {
             let MxxLang::MatrixMultiply(factors) = node else { continue };
             for relation_position in 1..factors.len() {
@@ -302,6 +311,174 @@ impl Applier<MxxLang, MxxAnalysis> for RelationApplier {
             }
         }
         Vec::new()
+    }
+}
+
+/// Returns the sole physical `MatrixAdd` representation for an e-class.
+/// Distinct alternatives are intentionally not normalized: selecting one
+/// would make a relation rewrite depend on an arbitrary e-node choice.
+fn unique_add_terms(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
+    let mut unique = None;
+    for node in &egraph[egraph.find(id)].nodes {
+        let MxxLang::MatrixAdd(terms) = node else { continue };
+        let candidate =
+            terms.iter().map(|term| egraph.find(*term)).collect::<Vec<_>>().into_boxed_slice();
+        match &unique {
+            Some(previous) if previous != &candidate => return None,
+            Some(_) => {}
+            None => unique = Some(candidate),
+        }
+    }
+    unique
+}
+
+/// Flattens only a unique physical additive representation.  The explicit
+/// work stack keeps deep checked relations stack-safe; `visiting` prevents a
+/// malformed cyclic e-class from being expanded through itself.  A cycle or a
+/// repeated nested Add aborts the whole normalization rather than changing
+/// coefficients.  This keeps work linear in the visited physical e-nodes.
+fn flattened_additive_terms(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+) -> Option<(Vec<Id>, bool)> {
+    let root = egraph.find(root);
+    let terms = unique_add_terms(egraph, root)?;
+    let mut output = Vec::with_capacity(terms.len());
+    let mut work = terms.iter().rev().map(|term| (egraph.find(*term), false)).collect::<Vec<_>>();
+    let mut visiting = HashSet::new();
+    let mut expanded_adds = HashSet::new();
+    visiting.insert(root);
+    let mut flattened = false;
+
+    while let Some((term, exiting)) = work.pop() {
+        if exiting {
+            visiting.remove(&term);
+            continue;
+        }
+        let Some(children) = unique_add_terms(egraph, term) else {
+            output.push(term);
+            continue;
+        };
+        if !visiting.insert(term) {
+            return None;
+        }
+        if !expanded_adds.insert(term) {
+            return None;
+        }
+        flattened = true;
+        work.push((term, true));
+        for child in children.iter().rev() {
+            work.push((egraph.find(*child), false));
+        }
+    }
+    Some((output, flattened))
+}
+
+/// Returns a negated base only when the e-class has exactly one physical
+/// negate representation.  This avoids silently choosing a sign from an
+/// ambiguous e-class.
+fn unique_negated_base(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> Option<Id> {
+    let mut unique = None;
+    for node in &egraph[egraph.find(term)].nodes {
+        let MxxLang::MatrixNegate([input]) = node else { continue };
+        let candidate = egraph.find(*input);
+        match unique {
+            Some(previous) if previous != candidate => return None,
+            Some(_) => {}
+            None => unique = Some(candidate),
+        }
+    }
+    unique
+}
+
+/// Finds exact opposite pairs in physical term order.  Every input term is
+/// queued or paired once, so this is O(k) without signed counters or overflow
+/// conversions.  The returned mask preserves the original retained order.
+fn cancelled_additive_terms(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    terms: &[Id],
+) -> (Vec<bool>, bool) {
+    let mut cancelled = vec![false; terms.len()];
+    let mut positive = HashMap::<Id, Vec<usize>>::new();
+    let mut negative = HashMap::<Id, Vec<usize>>::new();
+    let mut any = false;
+
+    for (index, term) in terms.iter().enumerate() {
+        let term = egraph.find(*term);
+        let (base, is_negative) = match unique_negated_base(egraph, term) {
+            Some(base) => (base, true),
+            None => (term, false),
+        };
+        let opposite = if is_negative { &mut positive } else { &mut negative };
+        if let Some(match_index) = opposite.get_mut(&base).and_then(Vec::pop) {
+            cancelled[index] = true;
+            cancelled[match_index] = true;
+            any = true;
+        } else {
+            let same = if is_negative { &mut negative } else { &mut positive };
+            same.entry(base).or_default().push(index);
+        }
+    }
+    (cancelled, any)
+}
+
+fn additive_remainder_terms(egraph: &EGraph<MxxLang, MxxAnalysis>, root: Id) -> Option<Vec<Id>> {
+    let root = egraph.find(root);
+    let (terms, flattened) = flattened_additive_terms(egraph, root)?;
+    let (cancelled, any_cancelled) = cancelled_additive_terms(egraph, &terms);
+    if !flattened && !any_cancelled {
+        return None;
+    }
+    let remaining = terms
+        .into_iter()
+        .zip(cancelled)
+        .filter_map(|(term, cancelled)| (!cancelled).then_some(term))
+        .collect::<Vec<_>>();
+    // A cyclic e-class can expose its root as an atomic child after a prior
+    // union.  Rebuilding an addition that contains that root would neither
+    // reduce the expression nor be a useful physical normalization.
+    (!remaining.iter().any(|term| egraph.find(*term) == root)).then_some(remaining)
+}
+
+fn exact_additive_cancellation_possible(egraph: &EGraph<MxxLang, MxxAnalysis>, root: Id) -> bool {
+    let root = egraph.find(root);
+    let Some(remaining) = additive_remainder_terms(egraph, root) else { return false };
+    match remaining.as_slice() {
+        [term] => egraph.find(*term) != root,
+        _ => !egraph[root].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixAdd(terms)
+            if terms.len() == remaining.len() &&
+                terms.iter().zip(&remaining).all(|(left, right)| {
+                    egraph.find(*left) == egraph.find(*right)
+                }))
+        }),
+    }
+}
+
+fn exact_additive_remainder(egraph: &mut EGraph<MxxLang, MxxAnalysis>, root: Id) -> Option<Id> {
+    let root = egraph.find(root);
+    let remaining = additive_remainder_terms(egraph, root)?;
+    match remaining.len() {
+        0 => match egraph[root].data.sort.clone() {
+            Ok(MxxSort::Matrix(matrix_type)) => {
+                let spec = egraph.analysis.symbols.matrix_constants.intern(
+                    super::identity::MatrixConstantSpec {
+                        matrix_type,
+                        value: MatrixConstantValue::Zero,
+                    },
+                );
+                Some(
+                    egraph
+                        .add(MxxLang::MatrixConstant(super::identity::MatrixConstantSpecId(spec))),
+                )
+            }
+            _ => None,
+        },
+        // Keep the retained child behind one physical Add node.  Unioning an
+        // Add e-class directly with one of its own children makes that old
+        // e-node self-referential after egg canonicalization, which can keep
+        // saturation active even though the cancellation is complete.
+        _ => Some(egraph.add(MxxLang::MatrixAdd(remaining.into_boxed_slice()))),
     }
 }
 
@@ -587,39 +764,14 @@ fn unique_concat_columns(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Optio
     (matches.len() == 1).then(|| matches.into_iter().next().expect("checked singleton"))
 }
 
-fn unique_add_terms(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
-    let matches = egraph[egraph.find(id)]
-        .nodes
-        .iter()
-        .filter_map(|node| match node {
-            MxxLang::MatrixAdd(terms) => Some(
-                terms.iter().map(|term| egraph.find(*term)).collect::<Vec<_>>().into_boxed_slice(),
-            ),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    (matches.len() == 1).then(|| matches.into_iter().next().expect("checked singleton"))
-}
-
 /// A concat chunk is either one direct signal term or one unambiguous
 /// physical addition.  An e-class with competing add representations is not
 /// a basis for choosing which residual to preserve.
 fn chunk_terms(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
-    let adds = egraph[egraph.find(id)]
-        .nodes
-        .iter()
-        .filter_map(|node| match node {
-            MxxLang::MatrixAdd(terms) => Some(
-                terms.iter().map(|term| egraph.find(*term)).collect::<Vec<_>>().into_boxed_slice(),
-            ),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    match adds.len() {
-        0 => Some(vec![egraph.find(id)].into_boxed_slice()),
-        1 => adds.into_iter().next(),
-        _ => None,
-    }
+    unique_add_terms(egraph, id).or_else(|| {
+        (!egraph[egraph.find(id)].nodes.iter().any(|node| matches!(node, MxxLang::MatrixAdd(_))))
+            .then(|| vec![egraph.find(id)].into_boxed_slice())
+    })
 }
 
 fn unique_product_factors(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
@@ -1224,9 +1376,16 @@ fn switch_node(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operational_noise::identity::{
-        AtomicSourceDescriptor, AtomicSourceKey, CanonicalResidueConvention, ResolvedIndexRange,
-        ResolvedIntExpr, ResolvedMatrixType, SamplerDescriptorId, SliceSpec, SliceSpecId,
+    use crate::operational_noise::{
+        bound::{
+            BoundClass, BoundEvaluationError, BoundEvaluator, BoundInput, MatrixBound,
+            MatrixMetadata, ResolvedMatrixConstant,
+        },
+        identity::{
+            AtomicSourceDescriptor, AtomicSourceKey, CanonicalResidueConvention, HashQuerySpec,
+            HashQuerySpecId, HashTagPart, ResolvedIndexRange, ResolvedIntExpr, ResolvedMatrixType,
+            SamplerDescriptorId, SliceSpec, SliceSpecId,
+        },
     };
 
     fn scalar_matrix_type() -> ResolvedMatrixType {
@@ -1262,6 +1421,73 @@ mod tests {
         let source = AtomicSourceId(source);
         let term = egraph.add(MxxLang::Atom { source, indices: Box::new([]) });
         (term, source)
+    }
+
+    struct UnaryAddBoundInput {
+        nodes: BTreeMap<Id, MxxLang>,
+        source: AtomicSourceId,
+        bound: MatrixBound,
+    }
+
+    impl BoundInput for UnaryAddBoundInput {
+        fn node(&self, term: Id) -> Option<&MxxLang> {
+            self.nodes.get(&term)
+        }
+
+        fn matrix_type(
+            &self,
+            _: Id,
+        ) -> Result<mxx_ir_core::types::ConcreteMatrixType, BoundEvaluationError> {
+            Ok(self.bound.matrix_type.clone())
+        }
+
+        fn atom_bound(
+            &self,
+            source: AtomicSourceId,
+            term: Id,
+        ) -> Result<MatrixBound, BoundEvaluationError> {
+            (source == self.source)
+                .then(|| self.bound.clone())
+                .ok_or(BoundEvaluationError::MissingInputBoundContract { term })
+        }
+
+        fn matrix_constant(
+            &self,
+            _: super::super::identity::MatrixConstantSpecId,
+            term: Id,
+        ) -> Result<
+            (mxx_ir_core::types::ConcreteMatrixType, ResolvedMatrixConstant),
+            BoundEvaluationError,
+        > {
+            Err(BoundEvaluationError::InvalidMatrixConstant { term })
+        }
+
+        fn scalar_maximum_absolute(
+            &self,
+            term: Id,
+        ) -> Result<num_bigint::BigUint, BoundEvaluationError> {
+            Err(BoundEvaluationError::InvalidMatrixScale { term })
+        }
+
+        fn lift_constant_polynomial_class(
+            &self,
+            term: Id,
+            _: Id,
+        ) -> Result<BoundClass, BoundEvaluationError> {
+            Err(BoundEvaluationError::InvalidMatrixScale { term })
+        }
+
+        fn crt_coefficients(
+            &self,
+            _: super::super::identity::CrtSpecId,
+            term: Id,
+        ) -> Result<Box<[BigInt]>, BoundEvaluationError> {
+            Err(BoundEvaluationError::InvalidCrtRecompose { term })
+        }
+
+        fn validate_pack(&self, term: Id, _: usize) -> Result<(), BoundEvaluationError> {
+            Err(BoundEvaluationError::InvalidPack { term })
+        }
     }
 
     #[test]
@@ -1758,6 +1984,255 @@ mod tests {
 
         assert!(checked_replacement(&mut egraph, &context, &[public, relation], 1).is_none());
         assert_eq!(context.failure(), Some(RelationFailure::MismatchedType { source }));
+    }
+
+    #[test]
+    fn registered_relation_cancels_the_newly_equal_additive_signal_in_one_saturation() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (public, _) = matrix_atom(&mut egraph, "public", None);
+        let (target, _) = matrix_atom(&mut egraph, "target", None);
+        let (residual, _) = matrix_atom(&mut egraph, "residual", None);
+        let (relation, source) =
+            matrix_atom(&mut egraph, "relation", Some(AtomicRelationRole::Preimage));
+        let product = egraph.add(MxxLang::MatrixMultiply(vec![public, relation].into()));
+        let negated_target = egraph.add(MxxLang::MatrixNegate([target]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![product, negated_target, residual].into()));
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, public, target));
+        let rewrite = egg::Rewrite::new(
+            "registered-relation-exact-additive-cancellation",
+            RelationSearcher::new(context.clone()),
+            RelationApplier::new(context.clone()),
+        )
+        .expect("closed relation rewrite");
+
+        let egraph = egg::Runner::default().with_egraph(egraph).run(&[rewrite]).egraph;
+        assert!(egraph[egraph.find(root)].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixAdd(terms)
+                if terms.len() == 1 && egraph.find(terms[0]) == egraph.find(residual))
+        }));
+        assert_eq!(context.failure(), None);
+    }
+
+    #[test]
+    fn exact_additive_cancellation_flattens_once_and_preserves_multiplicity_order() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (term, _) = matrix_atom(&mut egraph, "term", None);
+        let (residual, residual_source) = matrix_atom(&mut egraph, "residual", None);
+        let negated = egraph.add(MxxLang::MatrixNegate([term]));
+        let nested = egraph.add(MxxLang::MatrixAdd(vec![negated, term].into()));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![term, nested, negated, residual].into()));
+        egraph.rebuild();
+
+        let replacement = exact_additive_remainder(&mut egraph, root)
+            .expect("two exact pairs reduce to the physical residual");
+        assert!(egraph[egraph.find(replacement)].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixAdd(terms)
+                if terms.len() == 1 && egraph.find(terms[0]) == egraph.find(residual))
+        }));
+        let wrapper = egraph[egraph.find(replacement)]
+            .nodes
+            .iter()
+            .find(|node| matches!(node, MxxLang::MatrixAdd(terms) if terms.len() == 1))
+            .expect("singleton wrapper")
+            .clone();
+        let residual_node = egraph[egraph.find(residual)]
+            .nodes
+            .iter()
+            .find(|node| matches!(node, MxxLang::Atom { .. }))
+            .expect("residual atom")
+            .clone();
+        let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
+            modulus: 17.into(),
+            ring_dimension: 1,
+            rows: 1,
+            columns: 1,
+        };
+        let residual_bound = MatrixBound {
+            matrix_type,
+            coefficient_class: BoundClass::bounded(7_u8.into()),
+            metadata: MatrixMetadata::unknown(),
+        };
+        let input = UnaryAddBoundInput {
+            nodes: BTreeMap::from([(replacement, wrapper), (residual, residual_node)]),
+            source: residual_source,
+            bound: residual_bound.clone(),
+        };
+        assert_eq!(BoundEvaluator::new(&input).evaluate(replacement), Ok(residual_bound));
+    }
+
+    #[test]
+    fn exact_additive_cancellation_rejects_shared_nested_add_dags() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (term, _) = matrix_atom(&mut egraph, "term", None);
+        let negated = egraph.add(MxxLang::MatrixNegate([term]));
+        let shared = egraph.add(MxxLang::MatrixAdd(vec![term, negated].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![shared, shared].into_boxed_slice()));
+        egraph.rebuild();
+
+        assert!(exact_additive_remainder(&mut egraph, root).is_none());
+        assert!(!exact_additive_cancellation_possible(&egraph, root));
+    }
+
+    #[test]
+    fn exact_additive_cancellation_rejects_cyclic_add_eclasses() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (term, _) = matrix_atom(&mut egraph, "term", None);
+        let root = egraph.add(MxxLang::MatrixAdd(vec![term].into_boxed_slice()));
+        egraph.union(root, term);
+        let canonical_root = egraph.find(root);
+        assert_eq!(canonical_root, egraph.find(term));
+        assert!(matches!(
+            unique_add_terms(&egraph, root).as_deref(),
+            Some([child]) if egraph.find(*child) == canonical_root
+        ));
+
+        assert!(exact_additive_remainder(&mut egraph, root).is_none());
+        assert!(!exact_additive_cancellation_possible(&egraph, root));
+    }
+
+    #[test]
+    fn exact_additive_cancellation_requires_the_same_selector() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let first_selector = egraph.add(MxxLang::IntConst(0.into()));
+        let second_selector = egraph.add(MxxLang::IntConst(1.into()));
+        let (first_case, _) = matrix_atom(&mut egraph, "first-case", None);
+        let (second_case, _) = matrix_atom(&mut egraph, "second-case", None);
+        let first = egraph
+            .add(MxxLang::Switch(vec![first_selector, first_case, second_case].into_boxed_slice()));
+        let second = egraph.add(MxxLang::Switch(
+            vec![second_selector, first_case, second_case].into_boxed_slice(),
+        ));
+        let negated_second = egraph.add(MxxLang::MatrixNegate([second]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![first, negated_second].into_boxed_slice()));
+        egraph.rebuild();
+
+        assert!(exact_additive_remainder(&mut egraph, root).is_none());
+    }
+
+    #[test]
+    fn exact_additive_cancellation_emits_a_typed_zero() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (term, _) = matrix_atom(&mut egraph, "term", None);
+        let negated = egraph.add(MxxLang::MatrixNegate([term]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![term, negated].into_boxed_slice()));
+        egraph.rebuild();
+
+        let zero =
+            exact_additive_remainder(&mut egraph, root).expect("complete exact cancellation");
+        assert!(egraph[egraph.find(zero)].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixConstant(spec)
+            if matches!(
+                egraph.analysis.symbols.matrix_constants.get(spec.0),
+                Some(super::super::identity::MatrixConstantSpec {
+                    matrix_type,
+                    value: MatrixConstantValue::Zero,
+                }) if matrix_type == &scalar_matrix_type()
+            ))
+        }));
+    }
+
+    #[test]
+    fn exact_additive_cancellation_rejects_competing_physical_adds() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "first", None);
+        let (second, _) = matrix_atom(&mut egraph, "second", None);
+        let (third, _) = matrix_atom(&mut egraph, "third", None);
+        let (fourth, _) = matrix_atom(&mut egraph, "fourth", None);
+        let first_add = egraph.add(MxxLang::MatrixAdd(vec![first, second].into_boxed_slice()));
+        let second_add = egraph.add(MxxLang::MatrixAdd(vec![third, fourth].into_boxed_slice()));
+        egraph.union(first_add, second_add);
+        egraph.rebuild();
+
+        assert!(exact_additive_remainder(&mut egraph, first_add).is_none());
+        assert!(!exact_additive_cancellation_possible(&egraph, first_add));
+    }
+
+    #[test]
+    fn exact_additive_cancellation_keeps_noncanonical_lookalikes_atomic() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (source_left, _) = matrix_atom(&mut egraph, "source-left", None);
+        let (source_right, _) = matrix_atom(&mut egraph, "source-right", None);
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (first_case, _) = matrix_atom(&mut egraph, "first-case", None);
+        let (second_case, _) = matrix_atom(&mut egraph, "second-case", None);
+        let forward_switch =
+            egraph.add(MxxLang::Switch(vec![selector, first_case, second_case].into_boxed_slice()));
+        let reversed_switch =
+            egraph.add(MxxLang::Switch(vec![selector, second_case, first_case].into_boxed_slice()));
+        let left_slice_spec = SliceSpecId(egraph.analysis.symbols.slices.intern(SliceSpec {
+            rows: None,
+            columns: Some(ResolvedIndexRange {
+                start: ResolvedIntExpr::Const(0.into()),
+                end: ResolvedIntExpr::Const(1.into()),
+            }),
+        }));
+        let right_slice_spec = SliceSpecId(egraph.analysis.symbols.slices.intern(SliceSpec {
+            rows: None,
+            columns: Some(ResolvedIndexRange {
+                start: ResolvedIntExpr::Const(1.into()),
+                end: ResolvedIntExpr::Const(2.into()),
+            }),
+        }));
+        let left_slice =
+            egraph.add(MxxLang::MatrixSlice { spec: left_slice_spec, input: [source_left] });
+        let right_slice =
+            egraph.add(MxxLang::MatrixSlice { spec: right_slice_spec, input: [source_left] });
+        let first_query =
+            HashQuerySpecId(egraph.analysis.symbols.hash_queries.intern(HashQuerySpec {
+                matrix_type: scalar_matrix_type(),
+                tag_program:
+                    vec![HashTagPart::Literal(vec![1].into_boxed_slice())].into_boxed_slice(),
+            }));
+        let second_query =
+            HashQuerySpecId(egraph.analysis.symbols.hash_queries.intern(HashQuerySpec {
+                matrix_type: scalar_matrix_type(),
+                tag_program:
+                    vec![HashTagPart::Literal(vec![2].into_boxed_slice())].into_boxed_slice(),
+            }));
+        let first_hash = egraph.add(MxxLang::HashPlain {
+            query: first_query,
+            arguments: vec![source_left].into_boxed_slice(),
+        });
+        let second_hash = egraph.add(MxxLang::HashPlain {
+            query: second_query,
+            arguments: vec![source_right].into_boxed_slice(),
+        });
+        let pairs = [
+            (source_left, source_right),
+            (forward_switch, reversed_switch),
+            (left_slice, right_slice),
+            (first_hash, second_hash),
+        ];
+        let roots = pairs
+            .into_iter()
+            .map(|(left, right)| {
+                let negate = egraph.add(MxxLang::MatrixNegate([right]));
+                egraph.add(MxxLang::MatrixAdd(vec![left, negate].into_boxed_slice()))
+            })
+            .collect::<Vec<_>>();
+        egraph.rebuild();
+
+        for root in roots {
+            assert!(
+                exact_additive_remainder(&mut egraph, root).is_none(),
+                "only canonical e-class equality can cancel"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_additive_cancellation_does_not_choose_an_ambiguous_negate() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (base, _) = matrix_atom(&mut egraph, "base", None);
+        let (other, _) = matrix_atom(&mut egraph, "other", None);
+        let first_negate = egraph.add(MxxLang::MatrixNegate([base]));
+        let second_negate = egraph.add(MxxLang::MatrixNegate([other]));
+        egraph.union(first_negate, second_negate);
+        let root = egraph.add(MxxLang::MatrixAdd(vec![base, first_negate].into_boxed_slice()));
+        egraph.rebuild();
+
+        assert!(exact_additive_remainder(&mut egraph, root).is_none());
     }
 
     #[test]

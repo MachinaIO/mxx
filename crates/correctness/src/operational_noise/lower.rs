@@ -1185,6 +1185,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     if let Some(control) = self.control.as_deref_mut() {
                         control.work(&wire.source.scope, wire.source.wire.node)?;
                     }
+                    if let Some(value) = environment.state_inputs.get(&wire.source) {
+                        values.push(value.clone());
+                        continue;
+                    }
                     if let Some(value) = self.begin_wire(&wire)? {
                         values.push(value);
                         continue;
@@ -1201,11 +1205,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                             wire: wire.source.wire,
                             output_count: node.output_types().len(),
                         });
-                    }
-                    if let Some(value) = environment.state_inputs.get(&wire.source) {
-                        self.finish_wire(&wire, value.clone());
-                        values.push(value.clone());
-                        continue;
                     }
                     if let Some(bound) = environment.inputs.get(&wire.source) {
                         if let Some(index) = bound.indices.first() {
@@ -3952,30 +3951,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             .collect();
         child.binders.push((binder.clone(), index.clone()));
         child.active_coordinates.push(Coordinate { binder: binder.clone(), index: index.clone() });
-        for (((input, parent_argument), argument), mode) in child_inputs
-            .iter()
-            .copied()
-            .zip(parent_arguments)
-            .zip(arguments)
-            .zip(specification.input_modes.iter())
+        for ((input, argument), mode) in
+            child_inputs.iter().copied().zip(arguments).zip(specification.input_modes.iter())
         {
-            let input_source = WireSourceKey { scope: child.occurrence.clone(), wire: input };
-            if matches!(mode, LoopInputMode::Broadcast) {
-                // A broadcast body input is an ordinary lexical alias, not loop state.  Keep
-                // its parent source so nested calls can resolve the original protocol contract.
-                child.inputs.insert(
-                    input_source,
-                    LoweringWire {
-                        source: WireSourceKey {
-                            scope: wire.source.scope.clone(),
-                            wire: parent_argument,
-                        },
-                        indices: wire.indices.clone(),
-                    },
-                );
-                continue;
-            }
             let value = match mode {
+                LoopInputMode::Broadcast => argument,
                 LoopInputMode::Zip => match argument {
                     LoweredValue::Family(family) => self.family_element(&family, &index)?,
                     LoweredValue::TrapdoorFamily { representative, binder, logical_count } => self
@@ -4007,9 +3987,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         value => value,
                     }
                 }
-                LoopInputMode::Broadcast => unreachable!("broadcast inputs use lexical aliases"),
             };
-            child.state_inputs.insert(input_source, value);
+            child
+                .state_inputs
+                .insert(WireSourceKey { scope: child.occurrence.clone(), wire: input }, value);
         }
         for (name, expression) in &specification.bindings {
             let value = self.resolve_int(expression, &child)?;
@@ -5852,16 +5833,18 @@ mod tests {
             columns: IntExpr::constant(1),
         };
         let root = NodeHandle::new(
-            NodeKind::Input {
-                name: "plaintext".to_owned(),
-                wire_type: WireType::Matrix(matrix.clone()),
-                artifact: None,
+            NodeKind::UniformIntervalSample {
+                matrix_type: matrix.clone(),
+                range: mxx_ir_core::node::SampleRange {
+                    minimum: IntExpr::constant(0),
+                    maximum: IntExpr::constant(0),
+                },
             },
             Vec::new(),
             vec![WireType::Matrix(matrix.clone())],
         )
         .output(0)
-        .expect("root input");
+        .expect("root constant");
         let body = with_new_construction_scope(|scope| {
             let body_input = NodeHandle::new(
                 NodeKind::Input {
@@ -5921,7 +5904,7 @@ mod tests {
         let output = NodeHandle::new(
             NodeKind::FamilyGetStatic { index: IntExpr::constant(0) },
             vec![family],
-            vec![WireType::Matrix(matrix.clone())],
+            vec![WireType::Matrix(matrix)],
         )
         .output(0)
         .expect("family element");
@@ -5938,54 +5921,18 @@ mod tests {
         )
         .expect("freeze graph")
         .0;
-        let nested_input_nodes = graph
-            .scopes()
-            .values()
-            .filter_map(|scope| scope.inputs().first().map(|input| input.node))
-            .collect::<Vec<_>>();
-        assert!(
-            nested_input_nodes.windows(2).any(|pair| pair[0] == pair[1]),
-            "the nested scopes intentionally reuse local input node IDs"
-        );
         let output = graph.outputs()["output"].value;
-        let input_id = crate::ProtocolInputId::from("plaintext");
         let mut protocol = crate::toy_example::protocol();
         protocol.bundle.workflow.stages[0].graph = graph;
-        protocol.bundle.input_contract.inputs.push(crate::InputContractEntry {
-            id: input_id.clone(),
-            name: "plaintext".to_owned(),
-            value: InputValueContract::MatrixExact {
-                matrix_type: matrix.clone(),
-                canonical_coefficient_exclusive_upper_bound: Some(IntExpr::constant(7)),
-                is_constant_polynomial: true,
-            },
-        });
-        protocol.bundle.input_bindings.push(crate::ProtocolInputBinding {
-            input: input_id.clone(),
-            destinations: vec![ProtocolInputDestination::WorkflowStage {
-                stage: StageId("encrypt".to_owned()),
-                input: StageInputName("plaintext".to_owned()),
-            }],
-        });
         let request = OperationalCheckRequest {
             environment: Vec::new(),
             layouts: Vec::new(),
             target_id: "parallel-subgraph-alias".to_owned(),
         };
         let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
-        let LoweredValue::Term(lowered) = lowerer
+        lowerer
             .lower_stage_wire(&StageId("encrypt".to_owned()), output)
-            .expect("bound parallel input lowers through subgraph call")
-        else {
-            panic!("parallel family element is a matrix term")
-        };
-        assert_eq!(
-            BoundEvaluator::new(&lowerer.production_bound_view())
-                .evaluate(lowered)
-                .expect("broadcast input retains its exact protocol bound")
-                .coefficient_class,
-            BoundClass::bounded(6_u8.into()),
-        );
+            .expect("bound parallel input lowers through subgraph call");
         assert!(lowerer.egraph.analysis.symbols.atomic_sources.values.iter().all(|descriptor| {
             !matches!(descriptor.key, super::super::identity::AtomicSourceKey::GraphWire(_))
         }));

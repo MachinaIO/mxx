@@ -1257,6 +1257,9 @@ fn graph_wire_coordinates_are_authoritative(
     descriptor: &super::identity::AtomicSourceDescriptor,
     indices: &[egg::Id],
 ) -> bool {
+    if indices.iter().any(|index| int_data(egraph, *index).is_none()) {
+        return false;
+    }
     let binders = match &descriptor.key {
         super::identity::AtomicSourceKey::GraphWire(source) => source.coordinate_binders.as_ref(),
         super::identity::AtomicSourceKey::Sampler(id) => {
@@ -1271,10 +1274,19 @@ fn graph_wire_coordinates_are_authoritative(
             }
             source.coordinate_binders.as_ref()
         }
-        _ => return indices.is_empty(),
+        // Protocol inputs and other non-relation atoms have no graph-owned
+        // coordinate registry. Their indexed identity is the source together
+        // with the checked integer indices carried by the Atom itself.
+        _ => return descriptor.relation_role.is_none(),
     };
     if binders.len() != indices.len() {
         return false;
+    }
+    // Ordinary indexed graph values may be instantiated at a checked runtime
+    // family index. Relation-bearing atoms retain the stricter owner-binder
+    // identity below because their correlation proof is pointwise.
+    if descriptor.relation_role.is_none() {
+        return true;
     }
     binders.iter().zip(indices).all(|(expected, index)| {
         let Some(id) = egraph
@@ -1525,6 +1537,34 @@ fn matrix_sort(egraph: &EGraph<MxxLang, MxxAnalysis>, id: egg::Id) -> Option<&Re
     }
 }
 
+fn resolved_constant(expression: &ResolvedIntExpr) -> Option<BigInt> {
+    match expression {
+        ResolvedIntExpr::Const(value) => Some(value.clone()),
+        ResolvedIntExpr::Add(left, right) => {
+            Some(resolved_constant(left)? + resolved_constant(right)?)
+        }
+        ResolvedIntExpr::Sub(left, right) => {
+            Some(resolved_constant(left)? - resolved_constant(right)?)
+        }
+        ResolvedIntExpr::Mul(left, right) => {
+            Some(resolved_constant(left)? * resolved_constant(right)?)
+        }
+        _ => None,
+    }
+}
+
+fn resolved_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {
+    left == right ||
+        resolved_constant(left).zip(resolved_constant(right)).is_some_and(|(l, r)| l == r)
+}
+
+fn matrix_types_equal(left: &ResolvedMatrixType, right: &ResolvedMatrixType) -> bool {
+    resolved_equal(&left.modulus, &right.modulus) &&
+        resolved_equal(&left.ring_dimension, &right.ring_dimension) &&
+        resolved_equal(&left.rows, &right.rows) &&
+        resolved_equal(&left.columns, &right.columns)
+}
+
 fn matrix_passthrough(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     child: egg::Id,
@@ -1551,7 +1591,10 @@ fn matrix_add(egraph: &EGraph<MxxLang, MxxAnalysis>, children: &[egg::Id]) -> An
     let Some(first) = matrix_sort(egraph, *first_id) else {
         return invalid_analysis_data();
     };
-    if children.iter().any(|id| matrix_sort(egraph, *id) != Some(first)) {
+    if children
+        .iter()
+        .any(|id| matrix_sort(egraph, *id).is_none_or(|next| !matrix_types_equal(first, next)))
+    {
         return invalid_analysis_data();
     }
     AnalysisData::matrix(first.clone(), None)
@@ -1569,9 +1612,9 @@ fn matrix_multiply(egraph: &EGraph<MxxLang, MxxAnalysis>, children: &[egg::Id]) 
         let Some(next) = matrix_sort(egraph, *child) else {
             return invalid_analysis_data();
         };
-        if next.modulus != first.modulus ||
-            next.ring_dimension != first.ring_dimension ||
-            columns != next.rows
+        if !resolved_equal(&next.modulus, &first.modulus) ||
+            !resolved_equal(&next.ring_dimension, &first.ring_dimension) ||
+            !resolved_equal(&columns, &next.rows)
         {
             return invalid_analysis_data();
         }

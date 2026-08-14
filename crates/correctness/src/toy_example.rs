@@ -220,7 +220,7 @@ mod tests {
         *plaintext_modulus = IntExpr::constant(3);
         assert_eq!(
             protocol.bundle.validate(),
-            Err(crate::BundleValidationError::OperationalDecoderTargetKindMismatch)
+            Err(crate::BundleValidationError::InvalidOperationalDecoderTarget)
         );
     }
 }

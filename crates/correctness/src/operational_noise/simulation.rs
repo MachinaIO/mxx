@@ -584,7 +584,7 @@ fn validate_shared_representative(
         control.reserve_owned_elements(1)?;
         control.work(1, None, Some(egraph.total_size() as u64))?;
         for node in &egraph[term].nodes {
-            if let MxxLang::MatrixScale([_, scalar]) = node {
+            if let MxxLang::MatrixScale([scalar, _]) = node {
                 let scalar = egraph.find(*scalar);
                 let scalar_domain =
                     egraph[scalar].data.integer_domain.as_ref().ok_or_else(|| {

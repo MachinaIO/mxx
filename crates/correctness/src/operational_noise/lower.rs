@@ -713,10 +713,52 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         consumer: SelectorOnlyConsumer,
         selector_allowed: bool,
     ) -> Result<(), LowerError> {
-        let Some((_, provenance)) = self.integer_analysis(term) else {
+        self.validate_scalar_consumer(
+            term,
+            MxxSort::Int,
+            mxx_ir_core::WireType::Int,
+            consumer,
+            selector_allowed,
+        )
+    }
+
+    fn validate_boolean_consumer(
+        &self,
+        term: Id,
+        consumer: SelectorOnlyConsumer,
+        selector_allowed: bool,
+    ) -> Result<(), LowerError> {
+        self.validate_scalar_consumer(
+            term,
+            MxxSort::Bool,
+            mxx_ir_core::WireType::Bool,
+            consumer,
+            selector_allowed,
+        )
+    }
+
+    fn validate_scalar_consumer(
+        &self,
+        term: Id,
+        expected_sort: MxxSort,
+        expected_wire_type: mxx_ir_core::WireType,
+        consumer: SelectorOnlyConsumer,
+        selector_allowed: bool,
+    ) -> Result<(), LowerError> {
+        let data = &self.egraph[self.egraph.find(term)].data;
+        if data.sort != Ok(expected_sort) {
+            let actual = match data.sort.as_ref().ok() {
+                Some(MxxSort::Int) => mxx_ir_core::WireType::Int,
+                Some(MxxSort::Bool) => mxx_ir_core::WireType::Bool,
+                Some(MxxSort::Real) => mxx_ir_core::WireType::Real,
+                _ => expected_wire_type.clone(),
+            };
+            return Err(LowerError::InvalidOperandSort { expected: expected_wire_type, actual });
+        }
+        let Some(provenance) = data.scalar_provenance else {
             return Err(LowerError::InvalidOperandSort {
-                expected: mxx_ir_core::WireType::Int,
-                actual: mxx_ir_core::WireType::Int,
+                expected: expected_wire_type.clone(),
+                actual: expected_wire_type,
             });
         };
         if provenance == ScalarProvenance::SelectorOnly && !selector_allowed {
@@ -956,7 +998,9 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         values.push(value.clone());
                         continue;
                     }
-                    if let Some(bound) = environment.inputs.get(&wire.source.wire) {
+                    if wire.source.scope == environment.occurrence &&
+                        let Some(bound) = environment.inputs.get(&wire.source.wire)
+                    {
                         if let Some(index) = bound.indices.first() {
                             work.push(LoweringFrame::FinishIndexedAlias {
                                 wire,
@@ -1273,12 +1317,22 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                 ),
                                 _ => None,
                             };
-                            let atom = self.atom_for_wire(
-                                &wire,
-                                &environment,
-                                node.output_types()[wire.source.wire.port.0 as usize].clone(),
-                                role,
-                            )?;
+                            let output_type =
+                                node.output_types()[wire.source.wire.port.0 as usize].clone();
+                            if let WireType::IndexedFamily { element, count } = output_type {
+                                let value = if wire.indices.is_empty() {
+                                    self.lower_source_family(&wire, &environment, *element, count)?
+                                } else {
+                                    let atom =
+                                        self.atom_for_wire(&wire, &environment, *element, role)?;
+                                    LoweredValue::Term(self.egraph.add(atom))
+                                };
+                                self.finish_wire(&wire, value.clone());
+                                values.push(value);
+                                continue;
+                            }
+                            let atom =
+                                self.atom_for_wire(&wire, &environment, output_type, role)?;
                             let value = LoweredValue::Term(self.egraph.add(atom));
                             self.finish_wire(&wire, value.clone());
                             values.push(value);
@@ -1555,12 +1609,15 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 LoweringFrame::FinishIndexedAlias { wire, index } => {
                     let value =
                         values.pop().ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
-                    let LoweredValue::Family(family) = value else {
-                        return Err(LowerError::FamilyProducerNotResolved {
-                            family: wire.source.wire,
-                        });
+                    let value = match value {
+                        LoweredValue::Term(term) => LoweredValue::Term(term),
+                        LoweredValue::Family(family) => self.family_element(&family, &index)?,
+                        LoweredValue::Trapdoor(_) => {
+                            return Err(LowerError::FamilyProducerNotResolved {
+                                family: wire.source.wire,
+                            });
+                        }
                     };
-                    let value = self.family_element(&family, &index)?;
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
                 }
@@ -2090,6 +2147,62 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             })
     }
 
+    fn lower_source_family(
+        &mut self,
+        wire: &LoweringWire,
+        environment: &LowerEnv,
+        element: WireType,
+        count: IntExpr,
+    ) -> Result<LoweredValue, LowerError> {
+        let count_value = self.lower_int_expr(&count, environment)?;
+        let count_range = self
+            .integer_analysis(count_value.term)
+            .and_then(|(domain, _)| domain.interval().ok())
+            .ok_or_else(|| LowerError::InvalidFamilyCount { count: count.clone() })?;
+        if count_range.minimum != count_range.maximum || count_range.minimum <= BigInt::zero() {
+            return Err(LowerError::InvalidFamilyCount { count });
+        }
+        let logical_count = count_range
+            .minimum
+            .to_biguint()
+            .ok_or_else(|| LowerError::InvalidFamilyCount { count: count.clone() })?;
+        let binder = BinderKey {
+            loop_scope: environment.occurrence.clone(),
+            loop_node: wire.source.wire.node,
+            slot: wire.source.wire.port.0,
+        };
+        let binder_id =
+            self.egraph.analysis.symbols.binders.intern(super::identity::BinderDescriptor {
+                key: binder.clone(),
+                minimum: BigInt::zero(),
+                maximum: count_range.minimum - BigInt::from(1_u8),
+            });
+        let index = LoweredInt {
+            term: self.egraph.add(MxxLang::IntBinder(super::identity::BinderId(binder_id))),
+            stable_identity: Some(ResolvedIntExpr::Binder(binder.clone())),
+        };
+        let mut indexed_wire = wire.clone();
+        indexed_wire.indices = wire.indices.iter().cloned().chain([index.clone()]).collect();
+        let mut indexed_environment = environment.clone();
+        indexed_environment.active_coordinates.push(Coordinate { binder: binder.clone(), index });
+        let element_type = self.resolve_family_element_sort(&element, &indexed_environment)?;
+        let atom = self.atom_for_wire(&indexed_wire, &indexed_environment, element, None)?;
+        let representative = self.egraph.add(atom);
+        Ok(LoweredValue::Family(FamilyLoweringValue {
+            element_type,
+            storage: FamilyCoverageStorage::SharedTemplate {
+                domain: family::LoopDomainKey { binder: binder.clone(), logical_count },
+                representative,
+                binder_domains: vec![family::CoverageBinderDomain {
+                    binder,
+                    minimum: BigInt::zero(),
+                    maximum: count_range.maximum - BigInt::from(1_u8),
+                }]
+                .into_boxed_slice(),
+            },
+        }))
+    }
+
     fn atom_for_wire(
         &mut self,
         wire: &LoweringWire,
@@ -2390,14 +2503,20 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             children.try_into().map_err(|values: Vec<LoweredInt>| {
                 LowerError::InvalidOperandArity { expected: 2, actual: values.len() }
             })?;
+        let stable_identity = left
+            .stable_identity
+            .zip(right.stable_identity)
+            .map(|(left, right)| identity(Box::new(left), Box::new(right)));
         let term = self.egraph.add(node([left.term, right.term]));
-        Ok(LoweredInt {
-            term,
-            stable_identity: left
-                .stable_identity
-                .zip(right.stable_identity)
-                .map(|(left, right)| identity(Box::new(left), Box::new(right))),
-        })
+        let stable_identity = self
+            .integer_analysis(term)
+            .and_then(|(domain, _)| domain.interval().ok())
+            .and_then(|interval| {
+                (interval.minimum == interval.maximum)
+                    .then_some(ResolvedIntExpr::Const(interval.minimum))
+            })
+            .or(stable_identity);
+        Ok(LoweredInt { term, stable_identity })
     }
 
     /// Constructs one closed ordinary expression after its graph arguments have already been
@@ -2497,7 +2616,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             }
             NodeKind::BoolToInt => {
                 let values = terms(1)?;
-                self.validate_integer_consumer(values[0], SelectorOnlyConsumer::BoolToInt, false)?;
+                self.validate_boolean_consumer(values[0], SelectorOnlyConsumer::BoolToInt, false)?;
                 self.egraph.add(MxxLang::BoolToInt([values[0]]))
             }
             NodeKind::IntToReal => {
@@ -2546,7 +2665,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     SelectorOnlyConsumer::MatrixScale,
                     false,
                 )?;
-                self.egraph.add(MxxLang::MatrixScale([matrix, scalar.term]))
+                self.egraph.add(MxxLang::MatrixScale([scalar.term, matrix]))
             }
             NodeKind::Transpose => self.egraph.add(MxxLang::MatrixTranspose([terms(1)?[0]])),
             NodeKind::Slice { rows, columns } => {
@@ -2678,30 +2797,30 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         actual: output_type,
                     });
                 };
-                let WireType::Matrix(matrix) = *element else {
-                    return Err(LowerError::FamilyElementTypeMismatch {
-                        expected: WireType::Matrix(MatrixType {
-                            modulus: IntExpr::constant(1),
-                            ring_dimension: IntExpr::constant(1),
-                            rows: IntExpr::constant(1),
-                            columns: IntExpr::constant(1),
-                        }),
-                        actual: *element,
-                    });
-                };
+                let element_wire_type = *element;
+                let element_type =
+                    self.resolve_family_element_sort(&element_wire_type, environment)?;
                 let elements = arguments
                     .iter()
                     .map(|argument| match argument {
-                        LoweredValue::Term(term) => Ok(*term),
+                        LoweredValue::Term(term)
+                            if self.egraph[self.egraph.find(*term)].data.sort ==
+                                Ok(element_type.clone()) =>
+                        {
+                            Ok(*term)
+                        }
+                        LoweredValue::Term(term) => Err(LowerError::FamilyElementTypeMismatch {
+                            expected: element_wire_type.clone(),
+                            actual: self.scalar_wire_type(*term).unwrap_or(WireType::Int),
+                        }),
                         LoweredValue::Family(_) | LoweredValue::Trapdoor(_) => {
                             Err(LowerError::FamilyElementTypeMismatch {
-                                expected: WireType::Matrix(matrix.clone()),
+                                expected: element_wire_type.clone(),
                                 actual: WireType::Int,
                             })
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let element_type = self.concrete_matrix_type(&matrix, environment)?;
                 let value = FamilyLoweringValue {
                     element_type,
                     storage: FamilyCoverageStorage::ExactStored { elements: elements.into() },
@@ -2984,35 +3103,37 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             .collect();
         child.binders.push((binder.clone(), index.clone()));
         child.active_coordinates.push(Coordinate { binder: binder.clone(), index: index.clone() });
-        for ((input, argument), mode) in
-            child_inputs.iter().copied().zip(parent_arguments).zip(specification.input_modes.iter())
+        for ((input, argument), mode) in child_inputs
+            .iter()
+            .copied()
+            .zip(arguments)
+            .zip(specification.input_modes.iter())
         {
-            let indices: Box<[LoweredInt]> = match mode {
-                LoopInputMode::Broadcast => wire.indices.clone(),
-                LoopInputMode::Zip => wire.indices.iter().cloned().chain([index.clone()]).collect(),
+            let value = match mode {
+                LoopInputMode::Broadcast => argument,
+                LoopInputMode::Zip => match argument {
+                    LoweredValue::Family(family) => self.family_element(&family, &index)?,
+                    value => value,
+                },
                 LoopInputMode::ZipOffset { offset } => {
                     let offset = self.add_int(
                         BigInt::from(*offset),
                         ResolvedIntExpr::Const(BigInt::from(*offset)),
                     );
-                    wire.indices
-                        .iter()
-                        .cloned()
-                        .chain([self.combine_int(
-                            vec![index.clone(), offset],
-                            MxxLang::IntAdd,
-                            ResolvedIntExpr::Add,
-                        )?])
-                        .collect()
+                    let offset_index = self.combine_int(
+                        vec![index.clone(), offset],
+                        MxxLang::IntAdd,
+                        ResolvedIntExpr::Add,
+                    )?;
+                    match argument {
+                        LoweredValue::Family(family) => {
+                            self.family_element(&family, &offset_index)?
+                        }
+                        value => value,
+                    }
                 }
             };
-            child.inputs.insert(
-                input,
-                LoweringWire {
-                    source: WireSourceKey { scope: wire.source.scope.clone(), wire: argument },
-                    indices,
-                },
-            );
+            child.state_inputs.insert(input, value);
         }
         for (name, expression) in &specification.bindings {
             let value = self.resolve_int(expression, &child)?;
@@ -3062,12 +3183,15 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 actual: output_type,
             });
         };
-        let WireType::Matrix(matrix) = *element else {
+        let element_wire_type = *element;
+        let element_type = self.resolve_family_element_sort(&element_wire_type, environment)?;
+        if self.egraph[self.egraph.find(representative)].data.sort != Ok(element_type.clone()) {
+            eprintln!("parallel family expected {element_type:?}, actual {:?}, nodes {:?}", self.egraph[self.egraph.find(representative)].data.sort, self.egraph[self.egraph.find(representative)].nodes);
             return Err(LowerError::FamilyElementTypeMismatch {
-                expected: WireType::Int,
-                actual: *element,
+                expected: element_wire_type,
+                actual: self.scalar_wire_type(representative).unwrap_or(WireType::Int),
             });
-        };
+        }
         let mut binder_domains = environment
             .active_coordinates
             .iter()
@@ -3091,7 +3215,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             maximum,
         });
         let value = FamilyLoweringValue {
-            element_type: self.concrete_matrix_type(&matrix, environment)?,
+            element_type,
             storage: FamilyCoverageStorage::SharedTemplate {
                 domain: family::LoopDomainKey { binder: binder.clone(), logical_count },
                 representative,
@@ -3344,27 +3468,31 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         })))
     }
 
-    fn concrete_matrix_type(
+    fn resolve_family_element_sort(
         &mut self,
-        matrix: &MatrixType,
+        element: &WireType,
         environment: &LowerEnv,
-    ) -> Result<mxx_ir_core::types::ConcreteMatrixType, LowerError> {
-        let modulus = self.resolve_exact_int_value(&matrix.modulus, environment)?;
-        let ring_dimension = self
-            .resolve_exact_int_value(&matrix.ring_dimension, environment)?
-            .to_usize()
-            .ok_or_else(|| LowerError::NonExactIdentityIndex {
-                expression: matrix.ring_dimension.clone(),
-            })?;
-        let rows = self
-            .resolve_exact_int_value(&matrix.rows, environment)?
-            .to_usize()
-            .ok_or_else(|| LowerError::NonExactIdentityIndex { expression: matrix.rows.clone() })?;
-        let columns =
-            self.resolve_exact_int_value(&matrix.columns, environment)?.to_usize().ok_or_else(
-                || LowerError::NonExactIdentityIndex { expression: matrix.columns.clone() },
-            )?;
-        Ok(mxx_ir_core::types::ConcreteMatrixType { modulus, ring_dimension, rows, columns })
+    ) -> Result<MxxSort, LowerError> {
+        match element {
+            WireType::Int => Ok(MxxSort::Int),
+            WireType::Bool => Ok(MxxSort::Bool),
+            WireType::Matrix(matrix) => {
+                self.resolve_matrix_type(matrix, environment).map(MxxSort::Matrix)
+            }
+            actual => Err(LowerError::FamilyElementTypeMismatch {
+                expected: WireType::Int,
+                actual: actual.clone(),
+            }),
+        }
+    }
+
+    fn scalar_wire_type(&self, term: Id) -> Option<WireType> {
+        match self.egraph[self.egraph.find(term)].data.sort.as_ref().ok()? {
+            MxxSort::Int => Some(WireType::Int),
+            MxxSort::Bool => Some(WireType::Bool),
+            MxxSort::Real => Some(WireType::Real),
+            _ => None,
+        }
     }
 
     /// Resolves a compile-time integer only when both its owner-resolved syntax and canonical
@@ -3471,6 +3599,27 @@ mod tests {
             state_inputs: BTreeMap::new(),
             active_coordinates: Vec::new(),
         }
+    }
+
+    #[test]
+    fn scalar_consumer_validation_uses_the_consumed_boolean_sort() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "scalar-consumer".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let boolean = lowerer.egraph.add(MxxLang::BoolConst(true));
+        lowerer
+            .validate_boolean_consumer(boolean, SelectorOnlyConsumer::BoolToInt, false)
+            .expect("an ordinary boolean is a valid BoolToInt operand");
+
+        let integer = lowerer.egraph.add(MxxLang::IntConst(BigInt::from(1)));
+        assert_eq!(
+            lowerer.validate_boolean_consumer(integer, SelectorOnlyConsumer::BoolToInt, false,),
+            Err(LowerError::InvalidOperandSort { expected: WireType::Bool, actual: WireType::Int })
+        );
     }
 
     #[test]

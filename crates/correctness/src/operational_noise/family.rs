@@ -6,13 +6,12 @@
 //! the supplied finite count; it has no policy ceiling.
 
 use super::{
-    analysis::IntegerDomain,
+    analysis::{IntegerDomain, MxxSort},
     identity::{BinderId, BinderKey, ResolvedIntExpr},
     language::MxxLang,
     lower::LoweredInt,
 };
 use egg::{CostFunction, EGraph, Extractor, Id, Language, RecExpr};
-use mxx_ir_core::types::ConcreteMatrixType;
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use std::collections::BTreeMap;
@@ -33,7 +32,7 @@ pub struct CoverageBinderDomain {
     pub maximum: BigInt,
 }
 
-/// The only two compact representations of a matrix family.
+/// The only two compact representations of a supported operational family.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FamilyCoverageStorage {
     /// Physical element references present in the Graph IR or manifest.
@@ -46,10 +45,10 @@ pub enum FamilyCoverageStorage {
     },
 }
 
-/// A family residual together with its single concrete matrix schema.
+/// A family residual together with its single closed element sort.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FamilyLoweringValue {
-    pub element_type: ConcreteMatrixType,
+    pub element_type: MxxSort,
     pub storage: FamilyCoverageStorage,
 }
 
@@ -62,7 +61,7 @@ pub enum FamilyCoverageError {
     SharedCountMismatch { count: BigUint, domain_size: BigUint },
     StaticIndexOutOfRange { index: BigInt, count: BigUint },
     DynamicIndexOutOfRange { minimum: BigInt, maximum: BigInt, count: BigUint },
-    MatrixTypeMismatch { expected: ConcreteMatrixType, actual: ConcreteMatrixType },
+    ElementTypeMismatch { expected: MxxSort, actual: MxxSort },
     StorageMismatch,
     SelectorCaseCountMismatch { expected: usize, actual: usize },
     NonAffineSharedMaximum,
@@ -329,7 +328,7 @@ where
     for case in &cases[1..] {
         case.validate()?;
         if case.element_type != first.element_type {
-            return Err(FamilyCoverageError::MatrixTypeMismatch {
+            return Err(FamilyCoverageError::ElementTypeMismatch {
                 expected: first.element_type.clone(),
                 actual: case.element_type.clone(),
             });

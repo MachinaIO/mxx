@@ -387,8 +387,8 @@ mod tests {
         bound::{BoundEvaluationError, ResolvedMatrixConstant},
         identity::{
             AtomicRelationRole, AtomicSourceDescriptor, AtomicSourceKey,
-            CanonicalResidueConvention, CrtSpecId, MatrixConstantSpecId, ResolvedIntExpr,
-            ResolvedMatrixType,
+            CanonicalResidueConvention, CrtSpecId, MatrixConstantSpecId, ResolvedIndexRange,
+            ResolvedIntExpr, ResolvedMatrixType, SliceSpec, SliceSpecId,
         },
         relation::{
             RelationApplier, RelationRegistration, RelationSearcher, RewriteContext,
@@ -553,6 +553,106 @@ mod tests {
             &mut |_, _, _| Ok(ProposalNodeClassification::default()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn extraction_selects_a_finite_two_level_affine_relation_residual() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (b0, b0_source) = matrix_atom(&mut egraph, "b0");
+        let (b1, b1_source) = matrix_atom(&mut egraph, "b1");
+        let (prefix, prefix_source) = matrix_atom(&mut egraph, "prefix");
+        let (error, error_source) = matrix_atom(&mut egraph, "error");
+        let relation_atom = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, name: &str| {
+            let source = AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(
+                AtomicSourceDescriptor {
+                    key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(name)),
+                    sort: MxxSort::Matrix(scalar_matrix_type()),
+                    integer_domain: None,
+                    canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
+                    relation_role: Some(AtomicRelationRole::Preimage),
+                },
+            ));
+            let term = egraph.add(MxxLang::Atom { source, indices: Box::new([]) });
+            (term, source)
+        };
+        let (inner, inner_source) = relation_atom(&mut egraph, "inner");
+        let (outer, outer_source) = relation_atom(&mut egraph, "outer");
+        let (outer_target, outer_target_source) = matrix_atom(&mut egraph, "outer-target");
+        let spec = SliceSpecId(egraph.analysis.symbols.slices.intern(SliceSpec {
+            rows: None,
+            columns: Some(ResolvedIndexRange {
+                start: ResolvedIntExpr::Const(0.into()),
+                end: ResolvedIntExpr::Const(1.into()),
+            }),
+        }));
+        let slice = egraph.add(MxxLang::MatrixSlice { spec, input: [b1] });
+        let signal = egraph.add(MxxLang::MatrixMultiply(vec![prefix, slice].into()));
+        let inner_target = egraph.add(MxxLang::MatrixAdd(vec![signal, error].into()));
+        let inner_product = egraph.add(MxxLang::MatrixMultiply(vec![b0, inner].into()));
+        let concat = egraph.add(MxxLang::MatrixConcat {
+            axis: super::super::identity::Axis::Columns,
+            inputs: vec![inner_product].into(),
+        });
+        let root = egraph.add(MxxLang::MatrixMultiply(vec![concat, outer].into()));
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(RelationRegistration {
+            source: inner_source,
+            expected_public: b0,
+            target: inner_target,
+            trapdoor: None,
+            indices: Box::new([]),
+        });
+        context.register(RelationRegistration {
+            source: outer_source,
+            expected_public: b1,
+            target: outer_target,
+            trapdoor: None,
+            indices: Box::new([]),
+        });
+        let rewrite = egg::Rewrite::new(
+            "test-extraction-nested-affine-relation",
+            RelationSearcher::new(context.clone()),
+            RelationApplier::new(context.clone()),
+        )
+        .expect("closed relation rewrite");
+        let egraph = egg::Runner::default().with_egraph(egraph).run(&[rewrite]).egraph;
+        let input = SemanticInput {
+            atom_classes: BTreeMap::from([
+                (b0_source, BoundClass::Large),
+                (b1_source, BoundClass::Large),
+                (prefix_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (error_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (inner_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (outer_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (
+                    outer_target_source,
+                    BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let mut invalid = |_| panic!("fixture has a finite selected DAG");
+        let mut bound_error = |error| panic!("fixture has valid bounds: {error:?}");
+        let result = extract_best_proposal(
+            &egraph,
+            root,
+            &input,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut |_, node, egraph| {
+                super::super::relation::classify_proposal_node(egraph, node, &context)
+                    .map(|relation_redex| ProposalNodeClassification { relation_redex })
+                    .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
+            },
+        )
+        .expect("finite normalized residual extracts");
+        assert!(!result.cost.large_residual);
+        assert_eq!(result.cost.remaining_relation_redexes, 0);
+        assert_eq!(result.cost.hidden_relation_redexes, 0);
+        assert_eq!(result.first_large_source, None);
+        assert!(matches!(
+            result.semantic_bound.map(|bound| bound.coefficient_class),
+            Some(BoundClass::Bounded { .. }) | Some(BoundClass::ExactZero)
+        ));
     }
 
     fn extract(

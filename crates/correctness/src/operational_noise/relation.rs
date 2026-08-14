@@ -11,8 +11,8 @@ use super::{
         matrix_types_equal, resolved_constant, resolved_equal, try_visit_relation_provenance,
     },
     identity::{
-        AtomicRelationRole, AtomicSourceId, AtomicSourceKey, MatrixConstantValue, SamplerIdentity,
-        TrapdoorDescriptorId,
+        AtomicRelationRole, AtomicSourceId, AtomicSourceKey, Axis, MatrixConstantValue,
+        SamplerIdentity, TrapdoorDescriptorId,
     },
     language::MxxLang,
 };
@@ -266,11 +266,11 @@ impl Applier<MxxLang, MxxAnalysis> for RelationApplier {
                 let public = factors[relation_position - 1];
                 match pointwise_same_selector(egraph, public, relation, true) {
                     Ok(Some(product)) => {
-                        let replacement = ordered_product_without_pair(
+                        let replacement = ordered_product_sequence(
                             egraph,
-                            &factors,
-                            relation_position,
-                            product,
+                            &factors[..relation_position - 1],
+                            &[product],
+                            &factors[relation_position + 1..],
                         );
                         if egraph.union(root, replacement) {
                             self.context.note_rewrite(true);
@@ -342,7 +342,10 @@ fn checked_replacement(
             // not itself the sampler public key.
             let distributed_public =
                 distribution_public_operand(egraph, actual_public, registration.expected_public);
+            let affine_plan =
+                affine_concat_plan(egraph, actual_public, registration.expected_public);
             if distributed_public.is_none() &&
+                affine_plan.is_none() &&
                 egraph.find(registration.expected_public) != actual_public
             {
                 // This registration is not applicable to this product.  It is
@@ -350,7 +353,11 @@ fn checked_replacement(
                 // product e-node may be the matching use.
                 continue;
             }
-            let preflight_public = distributed_public.unwrap_or(actual_public);
+            let preflight_public = if distributed_public.is_some() || affine_plan.is_some() {
+                registration.expected_public
+            } else {
+                actual_public
+            };
             if let Err(failure) =
                 preflight_registration(egraph, relation, &source, &registration, preflight_public)
             {
@@ -362,6 +369,18 @@ fn checked_replacement(
                 continue;
             }
             let target = egraph.find(registration.target);
+            if let Some(plan) = affine_plan {
+                let normalized_public =
+                    build_affine_concat(egraph, registration.expected_public, &plan);
+                replacements.insert(ordered_product_sequence(
+                    egraph,
+                    &factors[..relation_position - 1],
+                    &[normalized_public, relation],
+                    &factors[relation_position + 1..],
+                ));
+                sources.insert(source.source);
+                continue;
+            }
             let distributed = relation_guided_distribution(
                 egraph,
                 factors,
@@ -382,9 +401,13 @@ fn checked_replacement(
                     failures.insert(RelationFailure::TransformedOperand);
                     continue;
                 }
-                (false, None) => {
-                    ordered_product_without_pair(egraph, factors, relation_position, target)
-                }
+                (false, None) => target_spliced_product(
+                    egraph,
+                    &factors[..relation_position - 1],
+                    &[],
+                    target,
+                    &factors[relation_position + 1..],
+                ),
             };
             replacements.insert(replacement);
             sources.insert(source.source);
@@ -429,6 +452,283 @@ fn distribution_public_operand(
     })
 }
 
+/// A local, read-only proof that a column concat is an affine view of one
+/// exact public operand.  It is intentionally available only while consuming
+/// a registered relation: this is not a general e-graph distribution rule.
+#[derive(Clone, Debug)]
+struct AffineConcatPlan {
+    prefix: Box<[Id]>,
+    residuals: Option<Box<[Box<[Id]>]>>,
+    outside: Box<[Id]>,
+}
+
+fn affine_concat_plan(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    actual_public: Id,
+    expected_public: Id,
+) -> Option<AffineConcatPlan> {
+    let expected_public = egraph.find(expected_public);
+    let (concat_id, concat, outside) = affine_concat_operand(egraph, actual_public)?;
+    let (Ok(MxxSort::Matrix(actual_type)), Ok(MxxSort::Matrix(concat_type))) =
+        (&egraph[egraph.find(actual_public)].data.sort, &egraph[egraph.find(concat_id)].data.sort)
+    else {
+        return None;
+    };
+    if !matrix_types_equal(actual_type, concat_type) {
+        return None;
+    }
+    if concat.is_empty() {
+        return None;
+    }
+    affine_concat_plan_for_inputs(egraph, expected_public, concat, outside)
+}
+
+fn affine_concat_operand(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    actual_public: Id,
+) -> Option<(Id, Box<[Id]>, Box<[Id]>)> {
+    if let Some(concat) = unique_concat_columns(egraph, actual_public) {
+        return Some((egraph.find(actual_public), concat, Box::new([])));
+    }
+    let terms = unique_add_terms(egraph, actual_public)?;
+    let mut matching = terms.iter().enumerate().filter_map(|(index, term)| {
+        unique_concat_columns(egraph, *term).map(|inputs| (index, inputs))
+    });
+    let (index, concat) = matching.next()?;
+    matching.next().is_none().then(|| {
+        let outside = terms
+            .iter()
+            .enumerate()
+            .filter_map(|(other, term)| (other != index).then_some(*term))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        (egraph.find(terms[index]), concat, outside)
+    })
+}
+
+fn affine_concat_plan_for_inputs(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    expected_public: Id,
+    concat: Box<[Id]>,
+    outside: Box<[Id]>,
+) -> Option<AffineConcatPlan> {
+    let full_columns = match &egraph[expected_public].data.sort {
+        Ok(MxxSort::Matrix(matrix)) => resolved_constant(&matrix.columns)?,
+        _ => return None,
+    };
+    if full_columns <= BigInt::zero() || concat.is_empty() {
+        return None;
+    }
+    let mut next_column = BigInt::zero();
+    let mut shared_prefix: Option<Box<[Id]>> = None;
+    let mut residuals = Vec::with_capacity(concat.len());
+    let mut has_residual = None;
+    for chunk in concat.iter() {
+        let terms = chunk_terms(egraph, *chunk)?;
+        let mut match_term = None;
+        for (index, term) in terms.iter().enumerate() {
+            let Some((prefix, start, end)) = slice_product(egraph, *term, expected_public) else {
+                continue;
+            };
+            if start != next_column || end <= start || end > full_columns || match_term.is_some() {
+                return None;
+            }
+            match &shared_prefix {
+                Some(previous) if !same_canonical_indices(egraph, previous, &prefix) => {
+                    return None;
+                }
+                None => shared_prefix = Some(prefix),
+                _ => {}
+            }
+            match_term = Some((index, end));
+        }
+        let Some((matched_index, end)) = match_term else { return None };
+        let remaining = terms
+            .iter()
+            .enumerate()
+            .filter_map(|(index, term)| (index != matched_index).then_some(*term))
+            .collect::<Vec<_>>();
+        // A concat can be entirely signal-only, in which case no zero matrix
+        // needs to be invented.  Mixing signal-only and affine chunks would
+        // require a typed zero residual for the missing columns, so reject it
+        // rather than adding a checker-only zero primitive.
+        match (has_residual, remaining.is_empty()) {
+            (Some(false), false) | (Some(true), true) => return None,
+            (None, empty) => has_residual = Some(!empty),
+            _ => {}
+        }
+        if !remaining.is_empty() {
+            residuals.push(remaining.into_boxed_slice());
+        }
+        next_column = end;
+    }
+    (next_column == full_columns).then(|| AffineConcatPlan {
+        prefix: shared_prefix.unwrap_or_default(),
+        residuals: has_residual.filter(|has| *has).map(|_| residuals.into_boxed_slice()),
+        outside,
+    })
+}
+
+fn unique_concat_columns(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
+    let matches = egraph[egraph.find(id)]
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            MxxLang::MatrixConcat { axis: Axis::Columns, inputs } => Some(
+                inputs
+                    .iter()
+                    .map(|input| egraph.find(*input))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    (matches.len() == 1).then(|| matches.into_iter().next().expect("checked singleton"))
+}
+
+fn unique_add_terms(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
+    let matches = egraph[egraph.find(id)]
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            MxxLang::MatrixAdd(terms) => Some(
+                terms.iter().map(|term| egraph.find(*term)).collect::<Vec<_>>().into_boxed_slice(),
+            ),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    (matches.len() == 1).then(|| matches.into_iter().next().expect("checked singleton"))
+}
+
+/// A concat chunk is either one direct signal term or one unambiguous
+/// physical addition.  An e-class with competing add representations is not
+/// a basis for choosing which residual to preserve.
+fn chunk_terms(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
+    let adds = egraph[egraph.find(id)]
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            MxxLang::MatrixAdd(terms) => Some(
+                terms.iter().map(|term| egraph.find(*term)).collect::<Vec<_>>().into_boxed_slice(),
+            ),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    match adds.len() {
+        0 => Some(vec![egraph.find(id)].into_boxed_slice()),
+        1 => adds.into_iter().next(),
+        _ => None,
+    }
+}
+
+fn unique_product_factors(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
+    let matches = egraph[egraph.find(id)]
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            MxxLang::MatrixMultiply(factors) => Some(
+                factors
+                    .iter()
+                    .map(|factor| egraph.find(*factor))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    (matches.len() == 1).then(|| matches.into_iter().next().expect("checked singleton"))
+}
+
+fn slice_product(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    term: Id,
+    expected_public: Id,
+) -> Option<(Box<[Id]>, BigInt, BigInt)> {
+    let mut candidates: BTreeSet<(Box<[Id]>, BigInt, BigInt)> = BTreeSet::new();
+    for node in &egraph[egraph.find(term)].nodes {
+        let MxxLang::MatrixSlice { spec, input } = node else { continue };
+        if egraph.find(input[0]) != egraph.find(expected_public) {
+            continue;
+        }
+        let Some(spec) = egraph.analysis.symbols.slices.get(spec.0) else { continue };
+        let Some(columns) = spec.columns.as_ref() else { continue };
+        if spec.rows.is_none() {
+            if let (Some(start), Some(end)) =
+                (resolved_constant(&columns.start), resolved_constant(&columns.end))
+            {
+                candidates.insert((Vec::new().into_boxed_slice(), start, end));
+            }
+        }
+    }
+    for node in &egraph[egraph.find(term)].nodes {
+        let MxxLang::MatrixMultiply(factors) = node else { continue };
+        let Some(last) = factors.last() else { continue };
+        for node in &egraph[egraph.find(*last)].nodes {
+            let MxxLang::MatrixSlice { spec, input } = node else { continue };
+            if egraph.find(input[0]) != egraph.find(expected_public) {
+                continue;
+            }
+            let Some(spec) = egraph.analysis.symbols.slices.get(spec.0) else { continue };
+            let Some(columns) = spec.columns.as_ref() else { continue };
+            if spec.rows.is_some() {
+                continue;
+            }
+            let (Some(start), Some(end)) =
+                (resolved_constant(&columns.start), resolved_constant(&columns.end))
+            else {
+                continue;
+            };
+            let prefix = factors[..factors.len() - 1]
+                .iter()
+                .map(|factor| egraph.find(*factor))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            candidates.insert((prefix, start, end));
+        }
+    }
+    if candidates.len() != 1 {
+        return None;
+    }
+    candidates.into_iter().next()
+}
+
+fn build_affine_concat(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    expected_public: Id,
+    plan: &AffineConcatPlan,
+) -> Id {
+    let leading = ordered_product_sequence(egraph, &plan.prefix, &[expected_public], &[]);
+    let residual_chunks = plan
+        .residuals
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(|terms| {
+            if terms.len() == 1 { terms[0] } else { egraph.add(MxxLang::MatrixAdd(terms.clone())) }
+        })
+        .collect::<Vec<_>>();
+    let residual = match residual_chunks.len() {
+        0 => None,
+        1 => Some(residual_chunks[0]),
+        _ => Some(egraph.add(MxxLang::MatrixConcat {
+            axis: Axis::Columns,
+            inputs: residual_chunks.into_boxed_slice(),
+        })),
+    };
+    let mut terms = Vec::with_capacity(plan.outside.len() + 1 + usize::from(residual.is_some()));
+    terms.push(leading);
+    if let Some(residual) = residual {
+        terms.push(residual);
+    }
+    terms.extend_from_slice(&plan.outside);
+    if terms.len() == 1 {
+        terms[0]
+    } else {
+        egraph.add(MxxLang::MatrixAdd(terms.into_boxed_slice()))
+    }
+}
+
 /// Closed relation-redex classification used by extraction.  Matrix bounds
 /// are resolved independently through the authoritative bound input and the
 /// shared node transfer; source syntax is never treated as a bound contract.
@@ -462,17 +762,23 @@ pub fn classify_proposal_node(
             for registration in context.registrations(source.source) {
                 let distributed_public =
                     distribution_public_operand(egraph, public, registration.expected_public);
+                let affine_plan = affine_concat_plan(egraph, public, registration.expected_public);
                 let preflight_public = distributed_public.unwrap_or(public);
                 if preflight_registration(
                     egraph,
                     relation,
                     &source,
                     &registration,
-                    preflight_public,
+                    if distributed_public.is_some() || affine_plan.is_some() {
+                        registration.expected_public
+                    } else {
+                        preflight_public
+                    },
                 )
                 .is_ok() &&
                     same_canonical_indices(egraph, &source.indices, &registration.indices) &&
                     (distributed_public.is_some() ||
+                        affine_plan.is_some() ||
                         egraph.find(registration.expected_public) == public)
                 {
                     return Ok(true);
@@ -695,13 +1001,11 @@ fn relation_guided_distribution(
         });
         if has_expected_public {
             let product_factors = product.expect("checked above");
-            let mut replacement = Vec::with_capacity(product_factors.len() - 1);
-            replacement.extend_from_slice(&product_factors[..product_factors.len() - 1]);
-            replacement.push(target);
-            terms.push(ordered_product_sequence(
+            terms.push(target_spliced_product(
                 egraph,
                 &factors[..relation_position - 1],
-                &replacement,
+                &product_factors[..product_factors.len() - 1],
+                target,
                 &factors[relation_position + 1..],
             ));
             consumed = true;
@@ -734,21 +1038,37 @@ fn ordered_product_sequence(
     }
 }
 
-fn ordered_product_without_pair(
+fn target_spliced_product(
     egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    factors: &[Id],
-    relation_position: usize,
+    prefix: &[Id],
+    target_prefix: &[Id],
     target: Id,
+    suffix: &[Id],
 ) -> Id {
-    let mut result = Vec::with_capacity(factors.len() - 1);
-    result.extend_from_slice(&factors[..relation_position - 1]);
-    result.push(target);
-    result.extend_from_slice(&factors[relation_position + 1..]);
-    if result.len() == 1 {
-        result[0]
-    } else {
-        egraph.add(MxxLang::MatrixMultiply(result.into_boxed_slice()))
+    if let Some(terms) = unique_add_terms(egraph, target) {
+        if terms.is_empty() {
+            return target;
+        }
+        let mut products = Vec::with_capacity(terms.len());
+        for term in terms.iter() {
+            let expanded = unique_product_factors(egraph, *term);
+            let mut middle = Vec::with_capacity(
+                target_prefix.len() + expanded.as_ref().map_or(1, |factors| factors.len()),
+            );
+            middle.extend_from_slice(target_prefix);
+            if let Some(factors) = expanded {
+                middle.extend_from_slice(&factors);
+            } else {
+                middle.push(*term);
+            }
+            products.push(ordered_product_sequence(egraph, prefix, &middle, suffix));
+        }
+        return egraph.add(MxxLang::MatrixAdd(products.into_boxed_slice()));
     }
+    let mut middle = Vec::with_capacity(target_prefix.len() + 1);
+    middle.extend_from_slice(target_prefix);
+    middle.push(target);
+    ordered_product_sequence(egraph, prefix, &middle, suffix)
 }
 
 fn same_canonical_indices(
@@ -895,8 +1215,8 @@ fn switch_node(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]
 mod tests {
     use super::*;
     use crate::operational_noise::identity::{
-        AtomicSourceDescriptor, AtomicSourceKey, CanonicalResidueConvention, ResolvedIntExpr,
-        ResolvedMatrixType, SamplerDescriptorId,
+        AtomicSourceDescriptor, AtomicSourceKey, CanonicalResidueConvention, ResolvedIndexRange,
+        ResolvedIntExpr, ResolvedMatrixType, SamplerDescriptorId, SliceSpec, SliceSpecId,
     };
 
     fn scalar_matrix_type() -> ResolvedMatrixType {
@@ -932,6 +1252,183 @@ mod tests {
         let source = AtomicSourceId(source);
         let term = egraph.add(MxxLang::Atom { source, indices: Box::new([]) });
         (term, source)
+    }
+
+    #[test]
+    fn affine_concat_plan_preserves_wrapper_and_all_residual_terms() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let matrix = |rows: i32, columns: i32| ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(rows.into()),
+            columns: ResolvedIntExpr::Const(columns.into()),
+        };
+        let (expected, _) = matrix_atom_with_type(&mut egraph, "expected", matrix(2, 4), None);
+        let (prefix, _) = matrix_atom_with_type(&mut egraph, "prefix", matrix(1, 2), None);
+        let (error0, _) = matrix_atom_with_type(&mut egraph, "error0", matrix(1, 2), None);
+        let (error1, _) = matrix_atom_with_type(&mut egraph, "error1", matrix(1, 2), None);
+        let (extra0, _) = matrix_atom_with_type(&mut egraph, "extra0", matrix(1, 2), None);
+        let (extra1, _) = matrix_atom_with_type(&mut egraph, "extra1", matrix(1, 2), None);
+        let (outside, _) = matrix_atom_with_type(&mut egraph, "outside", matrix(1, 4), None);
+        let slice = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, start: i32, end: i32| {
+            let spec = SliceSpecId(egraph.analysis.symbols.slices.intern(SliceSpec {
+                rows: None,
+                columns: Some(ResolvedIndexRange {
+                    start: ResolvedIntExpr::Const(start.into()),
+                    end: ResolvedIntExpr::Const(end.into()),
+                }),
+            }));
+            egraph.add(MxxLang::MatrixSlice { spec, input: [expected] })
+        };
+        let slice0 = slice(&mut egraph, 0, 2);
+        let signal0 = egraph.add(MxxLang::MatrixMultiply(vec![prefix, slice0].into()));
+        let chunk0 = egraph.add(MxxLang::MatrixAdd(vec![signal0, error0, extra0].into()));
+        let slice1 = slice(&mut egraph, 2, 4);
+        let signal1 = egraph.add(MxxLang::MatrixMultiply(vec![prefix, slice1].into()));
+        let chunk1 = egraph.add(MxxLang::MatrixAdd(vec![signal1, error1, extra1].into()));
+        let concat = egraph.add(MxxLang::MatrixConcat {
+            axis: Axis::Columns,
+            inputs: vec![chunk0, chunk1].into(),
+        });
+        let (other_public, _) =
+            matrix_atom_with_type(&mut egraph, "other-public", matrix(2, 4), None);
+        let (other_prefix, _) =
+            matrix_atom_with_type(&mut egraph, "other-prefix", matrix(1, 2), None);
+        let mismatched_signal =
+            egraph.add(MxxLang::MatrixMultiply(vec![other_prefix, slice1].into()));
+        let mismatched_chunk =
+            egraph.add(MxxLang::MatrixAdd(vec![mismatched_signal, error1].into()));
+        let prefix_mismatch = egraph.add(MxxLang::MatrixConcat {
+            axis: Axis::Columns,
+            inputs: vec![chunk0, mismatched_chunk].into(),
+        });
+        let wrapper = egraph.add(MxxLang::MatrixAdd(vec![concat, outside].into()));
+        egraph.rebuild();
+
+        let plan = affine_concat_plan(&egraph, wrapper, expected).expect("exact column partition");
+        assert!(affine_concat_plan(&egraph, concat, other_public).is_none());
+        assert!(affine_concat_plan(&egraph, prefix_mismatch, expected).is_none());
+        assert_eq!(plan.prefix.len(), 1);
+        assert_eq!(egraph.find(plan.prefix[0]), egraph.find(prefix));
+        let residuals = plan.residuals.as_ref().expect("every chunk has residual terms");
+        assert_eq!(residuals.len(), 2);
+        assert!(residuals.iter().all(|terms| terms.len() == 2));
+        assert_eq!(plan.outside.len(), 1);
+        assert_eq!(egraph.find(plan.outside[0]), egraph.find(outside));
+
+        let normalized = build_affine_concat(&mut egraph, expected, &plan);
+        assert!(egraph[egraph.find(normalized)].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixAdd(terms)
+                if terms.iter().any(|term| egraph.find(*term) == egraph.find(outside)))
+        }));
+
+        let (relation, source) = matrix_atom_with_type(
+            &mut egraph,
+            "relation",
+            matrix(4, 1),
+            Some(AtomicRelationRole::Preimage),
+        );
+        let (target, _) = matrix_atom_with_type(&mut egraph, "target", matrix(2, 1), None);
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, expected, target));
+        let root = egraph.add(MxxLang::MatrixMultiply(vec![wrapper, relation].into()));
+        let rewrite = egg::Rewrite::new(
+            "test-affine-concat-relation",
+            RelationSearcher::new(context.clone()),
+            RelationApplier::new(context.clone()),
+        )
+        .expect("closed relation rewrite");
+        let egraph = egg::Runner::default().with_egraph(egraph).run(&[rewrite]).egraph;
+        assert!(
+            egraph[egraph.find(root)]
+                .nodes
+                .iter()
+                .any(|node| { matches!(node, MxxLang::MatrixAdd(terms) if terms.len() >= 2) })
+        );
+        assert!(context.counters().rewrites >= 2);
+        assert_eq!(context.failure(), None);
+    }
+
+    #[test]
+    fn affine_concat_plan_rejects_a_column_gap() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let matrix = |rows: i32, columns: i32| ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(rows.into()),
+            columns: ResolvedIntExpr::Const(columns.into()),
+        };
+        let (expected, _) = matrix_atom_with_type(&mut egraph, "expected", matrix(1, 4), None);
+        let slice = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, start: i32, end: i32| {
+            let spec = SliceSpecId(egraph.analysis.symbols.slices.intern(SliceSpec {
+                rows: None,
+                columns: Some(ResolvedIndexRange {
+                    start: ResolvedIntExpr::Const(start.into()),
+                    end: ResolvedIntExpr::Const(end.into()),
+                }),
+            }));
+            egraph.add(MxxLang::MatrixSlice { spec, input: [expected] })
+        };
+        let (error0, _) = matrix_atom_with_type(&mut egraph, "error0", matrix(1, 2), None);
+        let (error1, _) = matrix_atom_with_type(&mut egraph, "error1", matrix(1, 1), None);
+        let slice0 = slice(&mut egraph, 0, 2);
+        let chunk0 = egraph.add(MxxLang::MatrixAdd(vec![slice0, error0].into()));
+        let slice1 = slice(&mut egraph, 3, 4);
+        let chunk1 = egraph.add(MxxLang::MatrixAdd(vec![slice1, error1].into()));
+        let actual = egraph.add(MxxLang::MatrixConcat {
+            axis: Axis::Columns,
+            inputs: vec![chunk0, chunk1].into(),
+        });
+        let wrong_axis = egraph
+            .add(MxxLang::MatrixConcat { axis: Axis::Rows, inputs: vec![chunk0, chunk1].into() });
+        egraph.rebuild();
+        assert!(affine_concat_plan(&egraph, actual, expected).is_none());
+        assert!(affine_concat_plan(&egraph, wrong_axis, expected).is_none());
+    }
+
+    #[test]
+    fn affine_concat_plan_accepts_direct_pure_signal_chunk() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (expected, _) = matrix_atom(&mut egraph, "expected", None);
+        let spec = SliceSpecId(egraph.analysis.symbols.slices.intern(SliceSpec {
+            rows: None,
+            columns: Some(ResolvedIndexRange {
+                start: ResolvedIntExpr::Const(0.into()),
+                end: ResolvedIntExpr::Const(1.into()),
+            }),
+        }));
+        let chunk = egraph.add(MxxLang::MatrixSlice { spec, input: [expected] });
+        let actual =
+            egraph.add(MxxLang::MatrixConcat { axis: Axis::Columns, inputs: vec![chunk].into() });
+        egraph.rebuild();
+        let plan = affine_concat_plan(&egraph, actual, expected).expect("complete pure partition");
+        assert!(plan.prefix.is_empty());
+        assert!(plan.residuals.is_none());
+        assert!(plan.outside.is_empty());
+    }
+
+    #[test]
+    fn target_add_splice_preserves_ordered_product_factors() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (prefix, _) = matrix_atom(&mut egraph, "prefix", None);
+        let (left, _) = matrix_atom(&mut egraph, "left", None);
+        let (right, _) = matrix_atom(&mut egraph, "right", None);
+        let (error, _) = matrix_atom(&mut egraph, "error", None);
+        let (suffix, _) = matrix_atom(&mut egraph, "suffix", None);
+        let signal = egraph.add(MxxLang::MatrixMultiply(vec![left, right].into()));
+        let target = egraph.add(MxxLang::MatrixAdd(vec![signal, error].into()));
+        let replacement = target_spliced_product(&mut egraph, &[prefix], &[], target, &[suffix]);
+        assert!(egraph[egraph.find(replacement)].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixAdd(terms) if terms.iter().any(|term| {
+                egraph[egraph.find(*term)].nodes.iter().any(|node| matches!(node,
+                    MxxLang::MatrixMultiply(factors)
+                        if factors.len() == 4 &&
+                            egraph.find(factors[0]) == egraph.find(prefix) &&
+                            egraph.find(factors[1]) == egraph.find(left) &&
+                            egraph.find(factors[2]) == egraph.find(right) &&
+                            egraph.find(factors[3]) == egraph.find(suffix)))
+            }))
+        }));
     }
 
     #[test]

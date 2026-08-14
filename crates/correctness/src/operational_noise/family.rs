@@ -9,13 +9,13 @@ use super::{
     analysis::{IntegerDomain, MxxAnalysis, MxxSort},
     identity::{
         AtomicSourceDescriptor, AtomicSourceId, AtomicSourceKey, BinderId, BinderKey,
-        ResolvedIntExpr, SamplerDescriptorId, SamplerIdentity, TrapdoorDescriptorId,
-        TrapdoorIdentity,
+        ResolvedIntExpr, SamplerDescriptorId, SamplerIdentity, SequentialRecurrenceDescriptor,
+        SequentialRecurrenceId, TrapdoorDescriptorId, TrapdoorIdentity,
     },
     language::MxxLang,
     lower::LoweredInt,
 };
-use egg::{CostFunction, EGraph, Extractor, Id, Language, RecExpr};
+use egg::{EGraph, Id, Language};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use std::collections::BTreeMap;
@@ -243,165 +243,145 @@ pub fn shared_element(
 
 /// Instantiates one shared representative by replacing only its owning binder.
 /// Other binder nodes are retained, so nested independent domains stay symbolic.
-/// Extracts one immutable, semantically valid template snapshot.  A lowering
-/// job retains it by canonical root; later unions may make it nonminimal but
-/// cannot invalidate an already valid expression.
-/// Records every descriptor term reachable from `roots` before materializing
-/// anything.  `Extractor::new` computes costs for the whole e-graph, so a
-/// descriptor closure must share one extractor rather than construct one per
-/// descriptor root.
-fn snapshot_shared_template_closure<E>(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    templates: &mut std::collections::HashMap<Id, RecExpr<MxxLang>>,
-    roots: impl IntoIterator<Item = Id>,
-    progress: &mut dyn FnMut() -> Result<(), E>,
-) -> Result<(), E> {
-    let mut pending = roots
-        .into_iter()
-        .map(|root| egraph.find(root))
-        .filter(|root| !templates.contains_key(root))
-        .collect::<Vec<_>>();
-    if pending.is_empty() {
-        return Ok(());
-    }
-    struct ProgressAstSize<'a, E> {
-        progress: &'a mut dyn FnMut() -> Result<(), E>,
-        failure: std::rc::Rc<std::cell::RefCell<Option<E>>>,
-    }
-    impl<E> CostFunction<MxxLang> for ProgressAstSize<'_, E> {
-        type Cost = usize;
-        fn cost<C>(&mut self, enode: &MxxLang, mut costs: C) -> usize
-        where
-            C: FnMut(Id) -> usize,
-        {
-            if self.failure.borrow().is_none() &&
-                let Err(error) = (self.progress)()
-            {
-                *self.failure.borrow_mut() = Some(error);
-            }
-            enode.fold(1, |sum, child| sum.saturating_add(costs(child)))
-        }
-    }
-    let failure = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let extractor =
-        Extractor::new(egraph, ProgressAstSize { progress, failure: std::rc::Rc::clone(&failure) });
-
-    let mut scheduled = std::collections::HashSet::new();
-    while let Some(root) = pending.pop() {
-        let root = egraph.find(root);
-        if !scheduled.insert(root) || templates.contains_key(&root) {
-            continue;
-        }
-        let (_, expression) = extractor.find_best(root);
-        if let Some(error) = failure.borrow_mut().take() {
-            return Err(error);
-        }
-        for node in expression.as_ref() {
-            let MxxLang::Atom { source, .. } = node else { continue };
-            let Some(AtomicSourceDescriptor { key: AtomicSourceKey::Sampler(id), .. }) =
-                egraph.analysis.symbols.atomic_sources.get(source.0)
-            else {
-                continue;
-            };
-            let sampler = egraph
-                .analysis
-                .symbols
-                .samplers
-                .get(id.0)
-                .expect("every sampler Atom has an interned descriptor");
-            match sampler {
-                SamplerIdentity::Preimage { indices, public, trapdoor, target, .. } => {
-                    pending.extend(indices.iter().copied());
-                    pending.extend([*public, *target]);
-                    let trapdoor = egraph
-                        .analysis
-                        .symbols
-                        .trapdoors
-                        .get(trapdoor.0)
-                        .expect("every preimage sampler trapdoor is interned");
-                    pending.extend(trapdoor.indices.iter().copied());
-                    pending.push(trapdoor.public);
-                }
-                SamplerIdentity::DecomposedHash { indices, public, target, arguments, .. } => {
-                    pending.extend(indices.iter().copied());
-                    pending.extend([*public, *target]);
-                    pending.extend(arguments.iter().copied());
-                }
-                SamplerIdentity::GadgetDecomposition { indices, public, target, .. } => {
-                    pending.extend(indices.iter().copied());
-                    pending.extend([*public, *target]);
-                }
-            }
-        }
-        templates.insert(root, expression);
-    }
-    Ok(())
-}
-
 pub fn instantiate_shared_element<E>(
     egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    templates: &mut std::collections::HashMap<Id, RecExpr<MxxLang>>,
     representative: Id,
     binder: BinderId,
     replacement: Id,
     progress: &mut dyn FnMut() -> Result<(), E>,
 ) -> Result<Id, E> {
-    // The snapshots are immutable valid expressions.  Complete the entire
-    // descriptor reference closure before `egraph.add` can change canonical
-    // classes or symbol-table descriptors.
-    snapshot_shared_template_closure(egraph, templates, [representative], progress)?;
-
-    enum Work {
-        Enter(Id),
-        Exit(Id, RecExpr<MxxLang>),
-    }
-    let mut completed = std::collections::HashMap::<Id, Id>::new();
-    let mut scheduled = std::collections::HashSet::new();
-    // Descriptor fields retain original e-class handles.  Remember their
-    // canonical snapshot handle before materialization so re-interning below
-    // never needs an immutable e-graph borrow while mutating symbol tables.
-    let mut canonical = std::collections::HashMap::<Id, Id>::new();
-    let replacement = egraph.find(replacement);
-    completed.insert(replacement, replacement);
-    canonical.insert(replacement, replacement);
-    let mut work = vec![Work::Enter(representative)];
-    while let Some(item) = work.pop() {
-        match item {
-            Work::Enter(root) => {
-                let original = root;
-                let root = egraph.find(root);
-                canonical.insert(original, root);
-                if !scheduled.insert(root) {
-                    continue;
-                }
-                let template = templates
-                    .get(&root)
-                    .expect("descriptor closure snapshots every scheduled root")
-                    .clone();
-                let mut references = Vec::new();
-                for node in template.as_ref() {
-                    let MxxLang::Atom { source, .. } = node else { continue };
-                    let Some(AtomicSourceDescriptor { key: AtomicSourceKey::Sampler(id), .. }) =
-                        egraph.analysis.symbols.atomic_sources.get(source.0)
-                    else {
-                        continue
-                    };
+    // Snapshot exactly one raw representative per reachable e-class before
+    // adding anything. Sampler and trapdoor records hold extra e-class edges,
+    // so their complete descriptor closure belongs to the same snapshot.
+    let mut nodes = std::collections::HashMap::<Id, MxxLang>::new();
+    let mut source_descriptors =
+        std::collections::HashMap::<AtomicSourceId, AtomicSourceDescriptor>::new();
+    let mut samplers = std::collections::HashMap::<SamplerDescriptorId, SamplerIdentity>::new();
+    let mut trapdoors = std::collections::HashMap::<TrapdoorDescriptorId, TrapdoorIdentity>::new();
+    let mut recurrences =
+        std::collections::HashMap::<SequentialRecurrenceId, SequentialRecurrenceDescriptor>::new();
+    let mut pending = vec![representative];
+    while let Some(id) = pending.pop() {
+        if nodes.contains_key(&id) {
+            continue;
+        }
+        progress()?;
+        let node = egraph.id_to_node(id).clone();
+        pending.extend(node.children().iter().copied());
+        if let MxxLang::Atom { source, .. } = &node {
+            let descriptor = egraph
+                .analysis
+                .symbols
+                .atomic_sources
+                .get(source.0)
+                .expect("every Atom source is interned")
+                .clone();
+            match &descriptor.key {
+                AtomicSourceKey::Sampler(sampler_id) => {
                     let sampler = egraph
                         .analysis
                         .symbols
                         .samplers
-                        .get(id.0)
-                        .expect("every sampler Atom has an interned descriptor");
-                    match sampler {
-                        SamplerIdentity::Preimage { indices, public, trapdoor, target, .. } => {
-                            references.extend(indices.iter().copied());
-                            references.extend([*public, *target]);
+                        .get(sampler_id.0)
+                        .expect("every sampler Atom has an interned descriptor")
+                        .clone();
+                    match &sampler {
+                        SamplerIdentity::Preimage {
+                            indices,
+                            public,
+                            trapdoor: trapdoor_id,
+                            target,
+                            ..
+                        } => {
+                            pending.extend(indices.iter().copied());
+                            pending.extend([*public, *target]);
                             let trapdoor = egraph
                                 .analysis
                                 .symbols
                                 .trapdoors
-                                .get(trapdoor.0)
-                                .expect("every preimage sampler trapdoor is interned");
+                                .get(trapdoor_id.0)
+                                .expect("every preimage sampler trapdoor is interned")
+                                .clone();
+                            pending.extend(trapdoor.indices.iter().copied());
+                            pending.push(trapdoor.public);
+                            trapdoors.insert(*trapdoor_id, trapdoor);
+                        }
+                        SamplerIdentity::DecomposedHash {
+                            indices,
+                            public,
+                            target,
+                            arguments,
+                            ..
+                        } => {
+                            pending.extend(indices.iter().copied());
+                            pending.extend([*public, *target]);
+                            pending.extend(arguments.iter().copied());
+                        }
+                        SamplerIdentity::GadgetDecomposition {
+                            indices, public, target, ..
+                        } => {
+                            pending.extend(indices.iter().copied());
+                            pending.extend([*public, *target]);
+                        }
+                    }
+                    samplers.insert(*sampler_id, sampler);
+                }
+                AtomicSourceKey::SequentialRecurrence { recurrence: recurrence_id, .. } => {
+                    let recurrence = egraph
+                        .analysis
+                        .symbols
+                        .sequential_recurrences
+                        .get(recurrence_id.0)
+                        .expect("every sequential recurrence Atom has an interned descriptor")
+                        .clone();
+                    pending.extend(recurrence.initial.iter().copied());
+                    pending.extend(recurrence.transition.iter().copied());
+                    recurrences.insert(*recurrence_id, recurrence);
+                }
+                _ => {}
+            }
+            source_descriptors.insert(*source, descriptor);
+        }
+        nodes.insert(id, node);
+    }
+
+    enum Visit {
+        Enter(Id),
+        Exit(Id),
+    }
+    // Replacement is already an e-class in this e-graph.  Treat it as an
+    // opaque leaf: copying it would both duplicate work and accidentally
+    // substitute owner binders that are intentionally inside its value.
+    let mut completed = std::collections::HashMap::<Id, Id>::from([(replacement, replacement)]);
+    let mut work = vec![Visit::Enter(representative)];
+    while let Some(visit) = work.pop() {
+        let id = match visit {
+            Visit::Enter(id) => {
+                if completed.contains_key(&id) {
+                    continue;
+                }
+                if matches!(nodes[&id], MxxLang::IntBinder(candidate) if candidate == binder) {
+                    completed.insert(id, replacement);
+                    continue;
+                }
+                work.push(Visit::Exit(id));
+                let node = &nodes[&id];
+                for child in node.children().iter().rev() {
+                    work.push(Visit::Enter(*child));
+                }
+                if let MxxLang::Atom { source, .. } = node &&
+                    let Some(AtomicSourceDescriptor {
+                        key: AtomicSourceKey::Sampler(sampler),
+                        ..
+                    }) = source_descriptors.get(source)
+                {
+                    let sampler = &samplers[sampler];
+                    let mut references = Vec::new();
+                    match sampler {
+                        SamplerIdentity::Preimage { indices, public, trapdoor, target, .. } => {
+                            references.extend(indices.iter().copied());
+                            references.extend([*public, *target]);
+                            let trapdoor = &trapdoors[trapdoor];
                             references.extend(trapdoor.indices.iter().copied());
                             references.push(trapdoor.public);
                         }
@@ -423,154 +403,136 @@ pub fn instantiate_shared_element<E>(
                             references.extend([*public, *target]);
                         }
                     }
-                }
-                work.push(Work::Exit(root, template));
-                for reference in references.into_iter().rev() {
-                    let reference_root = egraph.find(reference);
-                    canonical.insert(reference, reference_root);
-                    if reference_root != root {
-                        work.push(Work::Enter(reference));
+                    for term in references.into_iter().rev() {
+                        work.push(Visit::Enter(term));
+                    }
+                } else if let MxxLang::Atom { source, .. } = node &&
+                    let Some(AtomicSourceDescriptor {
+                        key: AtomicSourceKey::SequentialRecurrence { recurrence, .. },
+                        ..
+                    }) = source_descriptors.get(source)
+                {
+                    let recurrence = &recurrences[recurrence];
+                    for term in recurrence.initial.iter().chain(recurrence.transition.iter()).rev()
+                    {
+                        work.push(Visit::Enter(*term));
                     }
                 }
+                continue;
             }
-            Work::Exit(root, template) => {
-                let mut ids = Vec::with_capacity(template.len());
-                for node in template.as_ref() {
-                    progress()?;
-                    let rebuilt = if matches!(node, MxxLang::IntBinder(candidate) if *candidate == binder)
-                    {
-                        completed[&egraph.find(replacement)]
-                    } else if let MxxLang::Atom { source, .. } = node {
-                        let descriptor = egraph
-                            .analysis
-                            .symbols
-                            .atomic_sources
-                            .get(source.0)
-                            .expect("every Atom source is interned")
-                            .clone();
-                        let AtomicSourceKey::Sampler(sampler_id) = descriptor.key else {
-                            ids.push(
-                                egraph.add(
-                                    node.clone().map_children(|child| ids[usize::from(child)]),
-                                ),
-                            );
-                            continue;
-                        };
-                        // Descriptor IDs are e-class IDs recorded by the
-                        // same extractor snapshots queued above.  `completed`
-                        // is keyed by those canonical snapshot IDs, so this
-                        // lookup does not borrow the e-graph while the
-                        // interners below are mutated.
-                        let remap = |term: Id| completed[&canonical[&term]];
-                        let sampler = egraph
-                            .analysis
-                            .symbols
-                            .samplers
-                            .get(sampler_id.0)
-                            .expect("every sampler Atom has an interned descriptor")
-                            .clone();
-                        let sampler = match sampler {
-                            SamplerIdentity::Preimage {
-                                source,
-                                indices,
-                                public,
-                                trapdoor,
-                                target,
-                                cutoff,
-                            } => {
-                                let trapdoor = egraph
-                                    .analysis
-                                    .symbols
-                                    .trapdoors
-                                    .get(trapdoor.0)
-                                    .expect("every preimage sampler trapdoor is interned")
-                                    .clone();
-                                let trapdoor = TrapdoorIdentity {
-                                    indices: trapdoor
-                                        .indices
-                                        .iter()
-                                        .map(|term| remap(*term))
-                                        .collect(),
-                                    public: remap(trapdoor.public),
-                                    ..trapdoor
-                                };
-                                let trapdoor = TrapdoorDescriptorId(
-                                    egraph.analysis.symbols.trapdoors.intern(trapdoor),
-                                );
-                                SamplerIdentity::Preimage {
-                                    source,
-                                    indices: indices.iter().map(|term| remap(*term)).collect(),
-                                    public: remap(public),
-                                    trapdoor,
-                                    target: remap(target),
-                                    cutoff,
-                                }
-                            }
-                            SamplerIdentity::DecomposedHash {
-                                source,
-                                indices,
-                                public,
-                                target,
-                                arguments,
-                                matrix_type,
-                                base,
-                                digit_count,
-                                small,
-                                range_proved,
-                            } => SamplerIdentity::DecomposedHash {
-                                source,
-                                indices: indices.iter().map(|term| remap(*term)).collect(),
-                                public: remap(public),
-                                target: remap(target),
-                                arguments: arguments.iter().map(|term| remap(*term)).collect(),
-                                matrix_type,
-                                base,
-                                digit_count,
-                                small,
-                                range_proved,
-                            },
-                            SamplerIdentity::GadgetDecomposition {
-                                source,
-                                indices,
-                                public,
-                                target,
-                                base,
-                                digit_count,
-                                small,
-                                range_proved,
-                            } => SamplerIdentity::GadgetDecomposition {
-                                source,
-                                indices: indices.iter().map(|term| remap(*term)).collect(),
-                                public: remap(public),
-                                target: remap(target),
-                                base,
-                                digit_count,
-                                small,
-                                range_proved,
-                            },
-                        };
-                        let indices = match &sampler {
-                            SamplerIdentity::Preimage { indices, .. } |
-                            SamplerIdentity::DecomposedHash { indices, .. } |
-                            SamplerIdentity::GadgetDecomposition { indices, .. } => indices.clone(),
-                        };
-                        let sampler = egraph.analysis.symbols.samplers.intern(sampler);
-                        let source =
-                            egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
-                                key: AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
-                                ..descriptor
-                            });
-                        egraph.add(MxxLang::Atom { source: AtomicSourceId(source), indices })
-                    } else {
-                        egraph.add(node.clone().map_children(|child| ids[usize::from(child)]))
-                    };
-                    ids.push(rebuilt);
-                }
-                completed.insert(root, *ids.last().expect("egg extraction is nonempty"));
-            }
+            Visit::Exit(id) => id,
+        };
+        if completed.contains_key(&id) {
+            continue;
         }
+        progress()?;
+        let node = &nodes[&id];
+        let remap = |term| completed[&term];
+        let rebuilt = if let MxxLang::Atom { source, .. } = node &&
+            let Some(descriptor) = source_descriptors.get(source) &&
+            let AtomicSourceKey::Sampler(sampler_id) = descriptor.key
+        {
+            let sampler = match samplers[&sampler_id].clone() {
+                SamplerIdentity::Preimage { source, indices, public, trapdoor, target, cutoff } => {
+                    let trapdoor = trapdoors[&trapdoor].clone();
+                    let trapdoor = TrapdoorDescriptorId(egraph.analysis.symbols.trapdoors.intern(
+                        TrapdoorIdentity {
+                            indices: trapdoor.indices.iter().map(|term| remap(*term)).collect(),
+                            public: remap(trapdoor.public),
+                            ..trapdoor
+                        },
+                    ));
+                    SamplerIdentity::Preimage {
+                        source,
+                        indices: indices.iter().map(|term| remap(*term)).collect(),
+                        public: remap(public),
+                        trapdoor,
+                        target: remap(target),
+                        cutoff,
+                    }
+                }
+                SamplerIdentity::DecomposedHash {
+                    source,
+                    indices,
+                    public,
+                    target,
+                    arguments,
+                    matrix_type,
+                    base,
+                    digit_count,
+                    small,
+                    range_proved,
+                } => SamplerIdentity::DecomposedHash {
+                    source,
+                    indices: indices.iter().map(|term| remap(*term)).collect(),
+                    public: remap(public),
+                    target: remap(target),
+                    arguments: arguments.iter().map(|term| remap(*term)).collect(),
+                    matrix_type,
+                    base,
+                    digit_count,
+                    small,
+                    range_proved,
+                },
+                SamplerIdentity::GadgetDecomposition {
+                    source,
+                    indices,
+                    public,
+                    target,
+                    base,
+                    digit_count,
+                    small,
+                    range_proved,
+                } => SamplerIdentity::GadgetDecomposition {
+                    source,
+                    indices: indices.iter().map(|term| remap(*term)).collect(),
+                    public: remap(public),
+                    target: remap(target),
+                    base,
+                    digit_count,
+                    small,
+                    range_proved,
+                },
+            };
+            let indices = match &sampler {
+                SamplerIdentity::Preimage { indices, .. } |
+                SamplerIdentity::DecomposedHash { indices, .. } |
+                SamplerIdentity::GadgetDecomposition { indices, .. } => indices.clone(),
+            };
+            let sampler = egraph.analysis.symbols.samplers.intern(sampler);
+            let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+                key: AtomicSourceKey::Sampler(SamplerDescriptorId(sampler)),
+                ..descriptor.clone()
+            });
+            egraph.add(MxxLang::Atom { source: AtomicSourceId(source), indices })
+        } else if let MxxLang::Atom { source, indices } = node &&
+            let Some(descriptor) = source_descriptors.get(source) &&
+            let AtomicSourceKey::SequentialRecurrence { recurrence, carried_index } =
+                descriptor.key
+        {
+            let recurrence = recurrences[&recurrence].clone();
+            let recurrence =
+                SequentialRecurrenceId(egraph.analysis.symbols.sequential_recurrences.intern(
+                    SequentialRecurrenceDescriptor {
+                        initial: recurrence.initial.iter().map(|term| remap(*term)).collect(),
+                        transition: recurrence.transition.iter().map(|term| remap(*term)).collect(),
+                        ..recurrence
+                    },
+                ));
+            let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+                key: AtomicSourceKey::SequentialRecurrence { recurrence, carried_index },
+                ..descriptor.clone()
+            });
+            egraph.add(MxxLang::Atom {
+                source: AtomicSourceId(source),
+                indices: indices.iter().map(|term| remap(*term)).collect(),
+            })
+        } else {
+            egraph.add(node.clone().map_children(remap))
+        };
+        completed.insert(id, rebuilt);
     }
-    Ok(completed[&egraph.find(representative)])
+    Ok(completed[&representative])
 }
 
 /// Selects a compact family.  Exact storage evaluates only stored references;
@@ -984,7 +946,8 @@ mod tests {
         analysis::MxxAnalysis,
         identity::{
             AtomicRelationRole, AtomicSourceDescriptor, BinderDescriptor, GraphWireSourceKey,
-            OccurrenceScope, ProgramKey, ResolvedMatrixType, TrapdoorSourceKey, WireSourceKey,
+            OccurrenceFrame, OccurrenceScope, ProgramKey, ResolvedMatrixType, TrapdoorSourceKey,
+            WireSourceKey,
         },
     };
 
@@ -1057,12 +1020,10 @@ mod tests {
         let outer_term = egraph.add(MxxLang::IntBinder(outer_id));
         let representative = egraph.add(MxxLang::IntAdd([owner_term, outer_term]));
         let replacement = egraph.add(MxxLang::IntConst(5.into()));
-        let mut templates = std::collections::HashMap::new();
 
         let mut progress_calls = 0;
         let instantiated = instantiate_shared_element(
             &mut egraph,
-            &mut templates,
             representative,
             owner_id,
             replacement,
@@ -1086,7 +1047,6 @@ mod tests {
         let mut unrelated_progress_calls = 0;
         instantiate_shared_element(
             &mut egraph,
-            &mut templates,
             representative,
             owner_id,
             new_replacement,
@@ -1097,15 +1057,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            unrelated_progress_calls < progress_calls,
-            "a new replacement reuses the representative snapshot without re-extracting the graph"
+            unrelated_progress_calls <= progress_calls,
+            "unrelated e-classes do not add instantiation work"
         );
 
         let mut rejected = || Err::<(), _>("progress stopped");
         assert_eq!(
             instantiate_shared_element(
                 &mut egraph,
-                &mut templates,
                 representative,
                 owner_id,
                 replacement,
@@ -1135,11 +1094,9 @@ mod tests {
         let two = egraph.add(MxxLang::IntConst(2.into()));
         let three = egraph.add(MxxLang::IntConst(3.into()));
         let replacement = egraph.add(MxxLang::IntAdd([two, three]));
-        let mut templates = std::collections::HashMap::new();
 
         let instantiated = instantiate_shared_element(
             &mut egraph,
-            &mut templates,
             representative,
             owner_id,
             replacement,
@@ -1228,10 +1185,8 @@ mod tests {
             source: AtomicSourceId(source),
             indices: vec![owner_term].into_boxed_slice(),
         });
-        let mut templates = std::collections::HashMap::new();
         let instantiated = instantiate_shared_element(
             &mut egraph,
-            &mut templates,
             representative,
             owner_id,
             replacement,
@@ -1269,6 +1224,105 @@ mod tests {
         assert_eq!(egraph.find(*target), egraph.find(public));
         let trapdoor = egraph.analysis.symbols.trapdoors.get(trapdoor.0).unwrap();
         assert_eq!(egraph.find(trapdoor.public), egraph.find(public));
+    }
+
+    #[test]
+    fn nested_parallel_sequential_descriptor_uses_the_selected_outer_index() {
+        let mut analysis = MxxAnalysis::default();
+        let root_scope = OccurrenceScope {
+            program: ProgramKey::Ideal,
+            definition: mxx_ir_core::FrozenGraphScopeId::Root,
+            path: Box::new([]),
+        };
+        let outer = BinderKey {
+            loop_scope: root_scope.clone(),
+            loop_node: mxx_ir_core::NodeId(10),
+            slot: 0,
+        };
+        let outer_id = BinderId(analysis.symbols.binders.intern(BinderDescriptor {
+            key: outer,
+            minimum: 0.into(),
+            maximum: 7.into(),
+        }));
+        let matrix_type = ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(1.into()),
+            columns: ResolvedIntExpr::Const(1.into()),
+        };
+        let mut egraph = EGraph::new(analysis);
+        let outer_term = egraph.add(MxxLang::IntBinder(outer_id));
+        let replacement = egraph.add(MxxLang::IntConst(4.into()));
+        let initial = egraph.add(MxxLang::LiftConstantPolynomial {
+            matrix_type: matrix_type.clone(),
+            input: [outer_term],
+        });
+        let transition = egraph.add(MxxLang::LiftConstantPolynomial {
+            matrix_type: matrix_type.clone(),
+            input: [outer_term],
+        });
+        let sequential_scope = OccurrenceScope {
+            program: ProgramKey::Ideal,
+            definition: mxx_ir_core::FrozenGraphScopeId::Root,
+            path: Box::new([OccurrenceFrame::ParallelLoop {
+                parent: mxx_ir_core::FrozenGraphScopeId::Root,
+                owner: mxx_ir_core::NodeId(10),
+            }]),
+        };
+        let recurrence = SequentialRecurrenceId(
+            egraph.analysis.symbols.sequential_recurrences.intern(SequentialRecurrenceDescriptor {
+                loop_scope: sequential_scope,
+                loop_node: mxx_ir_core::NodeId(11),
+                count: ResolvedIntExpr::Const(3.into()),
+                initial: vec![initial].into_boxed_slice(),
+                transition: vec![transition].into_boxed_slice(),
+                output_types: vec![matrix_type.clone()].into_boxed_slice(),
+            }),
+        );
+        let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+            key: AtomicSourceKey::SequentialRecurrence { recurrence, carried_index: 0 },
+            sort: MxxSort::Matrix(matrix_type),
+            integer_domain: None,
+            canonical_residue_convention: None,
+            relation_role: None,
+        });
+        let representative =
+            egraph.add(MxxLang::Atom { source: AtomicSourceId(source), indices: Box::new([]) });
+
+        let instantiated = instantiate_shared_element(
+            &mut egraph,
+            representative,
+            outer_id,
+            replacement,
+            &mut || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        let MxxLang::Atom { source, .. } = &egraph[instantiated].nodes[0] else {
+            panic!("instantiated sequential recurrence remains an Atom");
+        };
+        let AtomicSourceKey::SequentialRecurrence { recurrence, carried_index } = egraph
+            .analysis
+            .symbols
+            .atomic_sources
+            .get(source.0)
+            .expect("instantiated source is interned")
+            .key
+        else {
+            panic!("sequential recurrence source");
+        };
+        assert_eq!(carried_index, 0);
+        let descriptor = egraph
+            .analysis
+            .symbols
+            .sequential_recurrences
+            .get(recurrence.0)
+            .expect("instantiated recurrence is interned");
+        for term in descriptor.initial.iter().chain(descriptor.transition.iter()) {
+            let MxxLang::LiftConstantPolynomial { input, .. } = egraph.id_to_node(*term) else {
+                panic!("recurrence term remains a lifted constant polynomial");
+            };
+            assert_eq!(egraph.find(input[0]), egraph.find(replacement));
+        }
     }
 
     #[test]

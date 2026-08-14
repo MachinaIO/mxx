@@ -21,7 +21,7 @@ use super::{
     language::MxxLang,
 };
 use crate::{InputValueContract, ProtocolDecl, ProtocolInputDestination, StageId, StageInputName};
-use egg::{EGraph, Id, RecExpr};
+use egg::{EGraph, Id};
 use mxx_ir_core::{
     IntExpr, RealExpr, WireRef, WireType,
     graph::FrozenGraphScopeId,
@@ -683,10 +683,6 @@ pub struct GraphLowerer<'a, 'control> {
     pub egraph: EGraph<MxxLang, MxxAnalysis>,
     memo: HashMap<LoweringWireKey, LoweredValue>,
     active: HashSet<LoweringWireKey>,
-    /// Extracted shared representatives are immutable valid snapshots.  They
-    /// are keyed by canonical e-class at first use and remain valid after
-    /// later unions; a later canonical root simply causes a harmless miss.
-    shared_templates: HashMap<Id, RecExpr<MxxLang>>,
     control: Option<&'control mut dyn LoweringControl>,
 }
 
@@ -702,7 +698,6 @@ impl<'a> GraphLowerer<'a, '_> {
             egraph: EGraph::new(analysis),
             memo: HashMap::new(),
             active: HashSet::new(),
-            shared_templates: HashMap::new(),
             control: None,
         }
     }
@@ -724,7 +719,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             egraph: EGraph::new(analysis),
             memo: HashMap::new(),
             active: HashSet::new(),
-            shared_templates: HashMap::new(),
             control: Some(control),
         }
     }
@@ -739,7 +733,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             egraph: self.egraph,
             memo: self.memo,
             active: self.active,
-            shared_templates: self.shared_templates,
             control: None,
         }
     }
@@ -3321,7 +3314,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             let control = &mut self.control;
             let representative = family::instantiate_shared_element(
                 &mut self.egraph,
-                &mut self.shared_templates,
                 *representative,
                 super::identity::BinderId(binder_id),
                 common_binder_term,
@@ -3385,7 +3377,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let control = &mut self.control;
         family::instantiate_shared_element(
             &mut self.egraph,
-            &mut self.shared_templates,
             representative,
             super::identity::BinderId(binder_id),
             index.term,
@@ -3471,7 +3462,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         let mut instantiate = |term| {
             family::instantiate_shared_element(
                 &mut self.egraph,
-                &mut self.shared_templates,
                 term,
                 super::identity::BinderId(binder_id),
                 index.term,

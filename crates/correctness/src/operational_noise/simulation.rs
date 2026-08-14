@@ -8,17 +8,20 @@
 use super::{
     OperationalAcceptanceReport, OperationalSimulationDiagnostics, OperationalSimulationReport,
     analysis::MxxAnalysis,
-    bound::BoundEvaluator,
+    bound::{BoundEvaluationControl, BoundEvaluationError, BoundEvaluator},
     error::{
         CheckerPhase, OperationalSimulationError, ResourceLimitKind, ResourceObserved, TargetError,
     },
     extract::{ExtractionControl, ProposalNodeClassification, extract_best_proposal},
-    lower::{GraphLowerer, LoweredValue},
+    lower::{GraphLowerer, LoweredValue, LoweringControl},
     relation::{RelationApplier, RelationSearcher, RewriteContext, SharedRewriteBudget},
 };
 use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
 use egg::{EGraph, Rewrite, Runner};
-use mxx_ir_core::{FrozenGraphScopeId, IntExpr, ParamEnv, WireRef, WireType};
+use mxx_ir_core::{
+    FrozenGraphScopeId, IntExpr, ParamEnv, WireRef, WireType,
+    node::{IntCompareOp, NodeKind},
+};
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use std::{
@@ -104,6 +107,87 @@ struct ProgressState {
     next_work_threshold: u64,
 }
 
+/// Read-only bound callbacks still mutate the one job control through this
+/// interior-mutability bridge; no phase gets its own deadline or allocation
+/// counter.
+struct BoundControlAdapter<'a, 'limits> {
+    control: RefCell<&'a mut SimulationControl<'limits>>,
+}
+
+/// Shares the production job limits with graph lowering without giving it a
+/// phase-local clock or allocation counter.
+struct LoweringControlAdapter {
+    deadline: Instant,
+    owned_elements: Arc<AtomicUsize>,
+    total_owned_element_limit: usize,
+}
+
+impl LoweringControl for LoweringControlAdapter {
+    fn check_deadline(&self) -> Result<(), super::error::LowerError> {
+        if Instant::now() >= self.deadline {
+            return Err(super::error::LowerError::ResourceDeadlineExceeded);
+        }
+        Ok(())
+    }
+
+    fn reserve_owned_elements(&self, requested: usize) -> Result<(), super::error::LowerError> {
+        self.check_deadline()?;
+        let mut current = self.owned_elements.load(Ordering::Relaxed);
+        loop {
+            let observed = current.checked_add(requested).unwrap_or(usize::MAX);
+            if observed > self.total_owned_element_limit {
+                return Err(super::error::LowerError::ResourceAllocationExceeded { requested });
+            }
+            match self.owned_elements.compare_exchange_weak(
+                current,
+                observed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+impl BoundEvaluationControl for BoundControlAdapter<'_, '_> {
+    fn check_deadline(&self) -> Result<(), BoundEvaluationError> {
+        self.control.borrow_mut().check_deadline().map_err(|_| {
+            BoundEvaluationError::IntegerLimitExceeded {
+                operation: "bound deadline",
+                value: BigUint::zero(),
+            }
+        })
+    }
+
+    fn reserve_owned_elements(&self, requested: usize) -> Result<(), BoundEvaluationError> {
+        self.control.borrow_mut().reserve_owned_elements(requested).map_err(|_| {
+            BoundEvaluationError::IntegerLimitExceeded {
+                operation: "bound allocation",
+                value: BigUint::from(requested),
+            }
+        })
+    }
+
+    fn validate_integer_bits(
+        &self,
+        value: &BigUint,
+        operation: &'static str,
+    ) -> Result<(), BoundEvaluationError> {
+        self.control.borrow_mut().check_integer_bits(value, operation).map_err(|_| {
+            BoundEvaluationError::IntegerBitLimitExceeded {
+                operation,
+                bits: BigUint::from(value.bits()),
+            }
+        })
+    }
+
+    fn validate_pack(&self, term: egg::Id, _bit_count: usize) -> Result<(), BoundEvaluationError> {
+        self.check_deadline().map_err(|_| BoundEvaluationError::InvalidPack { term })
+    }
+}
+
 impl ProgressState {
     fn new(started: Instant) -> Self {
         Self { processed: 0, last_emitted: started, next_work_threshold: PROGRESS_WORK_CADENCE }
@@ -156,6 +240,14 @@ impl<'a> SimulationControl<'a> {
             self.limits.total_owned_element_limit,
             Arc::clone(&self.owned_elements),
         )
+    }
+
+    fn lowering_control(&self) -> Arc<dyn LoweringControl> {
+        Arc::new(LoweringControlAdapter {
+            deadline: self.deadline,
+            owned_elements: Arc::clone(&self.owned_elements),
+            total_owned_element_limit: self.limits.total_owned_element_limit,
+        })
     }
 
     pub(crate) fn check_deadline(&mut self) -> Result<(), OperationalSimulationError> {
@@ -355,6 +447,9 @@ pub fn check_operational_noise_candidate(
     protocol: &ProtocolDecl,
     request: &super::OperationalCheckRequest,
 ) -> Result<OperationalSimulationReport, OperationalSimulationError> {
+    request
+        .validate(protocol.params.iter().map(|parameter| parameter.name.clone()))
+        .map_err(OperationalSimulationError::Request)?;
     let (target, stage, wire) = resolve_target(protocol, request)?;
     let limits = CheckerLimits::production();
     let mut emit = |_| {};
@@ -364,7 +459,12 @@ pub fn check_operational_noise_candidate(
         &mut emit,
         |control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
-            let mut lowerer = GraphLowerer::new(protocol, request, MxxAnalysis::default());
+            let mut lowerer = GraphLowerer::new_with_control(
+                protocol,
+                request,
+                MxxAnalysis::default(),
+                control.lowering_control(),
+            );
             let value = lowerer.lower_stage_wire(&stage, wire).map_err(|source| {
                 OperationalSimulationError::Lower { site: site(&stage, wire, "lower"), source }
             })?;
@@ -374,11 +474,39 @@ pub fn check_operational_noise_candidate(
                 Some(lowerer.egraph.total_size() as u64),
             )?;
             control.diagnostics_mut().lowered_term_count = lowerer.lowered_wire_count() as u64;
-            let LoweredValue::Term(root) = value else {
-                return Err(OperationalSimulationError::Lower {
-                    site: site(&stage, wire, "lower residual"),
-                    source: super::error::LowerError::FamilyProducerNotResolved { family: wire },
-                });
+            let root = match value {
+                LoweredValue::Term(root) => root,
+                LoweredValue::Family(family) => {
+                    family.validate().map_err(|_| OperationalSimulationError::Lower {
+                        site: site(&stage, wire, "validate residual family"),
+                        source: super::error::LowerError::InvalidFamilyCount {
+                            count: IntExpr::constant(0),
+                        },
+                    })?;
+                    match family.storage {
+                        super::family::FamilyCoverageStorage::ExactStored { elements } => {
+                            let selector = lowerer
+                                .egraph
+                                .add(super::language::MxxLang::IntConst(BigInt::zero()));
+                            let mut children = Vec::with_capacity(elements.len() + 1);
+                            children.push(selector);
+                            children.extend(elements.iter().copied());
+                            lowerer.egraph.add(super::language::MxxLang::Switch(children.into()))
+                        }
+                        super::family::FamilyCoverageStorage::SharedTemplate {
+                            representative,
+                            ..
+                        } => representative,
+                    }
+                }
+                LoweredValue::Trapdoor(_) => {
+                    return Err(OperationalSimulationError::Lower {
+                        site: site(&stage, wire, "lower residual"),
+                        source: super::error::LowerError::FamilyProducerNotResolved {
+                            family: wire,
+                        },
+                    });
+                }
             };
             Ok((lowerer, root, stage.clone(), wire))
         },
@@ -402,6 +530,12 @@ pub fn check_operational_noise_candidate(
                 .with_node_limit(limits.node_limit)
                 .with_time_limit(limits.total_time_limit)
                 .run(&[rewrite]);
+            if runner.iterations.len() >= limits.iteration_limit {
+                // Egg reports a bounded fixed point only by reaching the
+                // configured iteration cap.  A proposal from that state is
+                // not saturated and must never be accepted.
+                control.check_rewrite_iterations(limits.iteration_limit + 1)?;
+            }
             lowerer.egraph = runner.egraph;
             control.check_rewrite_iterations(runner.iterations.len())?;
             control.check_egraph_nodes(lowerer.egraph.total_size())?;
@@ -420,9 +554,9 @@ pub fn check_operational_noise_candidate(
             if let Some(failure) = context.failure() {
                 return Err(relation_error(&stage, wire, failure));
             }
-            Ok((lowerer, root, stage, wire))
+            Ok((lowerer, root, stage, wire, context))
         },
-        |(mut lowerer, root, stage, wire), control| {
+        |(mut lowerer, root, stage, wire, context), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
             let control = RefCell::new(control);
             let mut check_node_count = |count| control.borrow_mut().check_egraph_nodes(count);
@@ -441,8 +575,38 @@ pub fn check_operational_noise_candidate(
                     check_deadline: &mut deadline,
                     invalid_dag: &mut invalid_dag,
                 },
-                &mut |_, _, _| Ok(ProposalNodeClassification::default()),
+                &mut |_, node, egraph| {
+                    let (relation_redex, large_atom) =
+                        super::relation::classify_proposal_node(egraph, node, &context)
+                            .map_err(|failure| relation_error(&stage, wire, failure))?;
+                    Ok(ProposalNodeClassification { relation_redex, large_atom })
+                },
             )?;
+            if proposal.cost.remaining_relation_redexes != 0 ||
+                proposal.cost.hidden_relation_redexes != 0 ||
+                proposal.cost.large_atom_count != 0
+            {
+                return Err(OperationalSimulationError::Bound {
+                    site: site(&stage, wire, "extract residual"),
+                    source: super::error::BoundError::UnconsumedLargeTerm {
+                        source: super::identity::AtomicSourceKey::GraphWire(
+                            super::identity::GraphWireSourceKey {
+                                wire: super::identity::WireSourceKey {
+                                    scope: super::identity::OccurrenceScope {
+                                        program: super::identity::ProgramKey::WorkflowStage(
+                                            stage.clone(),
+                                        ),
+                                        definition: FrozenGraphScopeId::Root,
+                                        path: Box::new([]),
+                                    },
+                                    wire,
+                                },
+                                coordinate_binders: Box::new([]),
+                            },
+                        ),
+                    },
+                });
+            }
             control.borrow_mut().work(
                 proposal.expression.as_ref().len() as u64,
                 None,
@@ -457,7 +621,8 @@ pub fn check_operational_noise_candidate(
         },
         |(lowerer, root, stage, wire), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
-            let view = lowerer.production_bound_view();
+            let bound_control = BoundControlAdapter { control: RefCell::new(control) };
+            let view = lowerer.production_bound_view_with_control(&bound_control);
             let result = BoundEvaluator::new(&view).evaluate(root).map_err(|_| {
                 OperationalSimulationError::Bound {
                     site: site(&stage, wire, "bound"),
@@ -466,6 +631,8 @@ pub fn check_operational_noise_candidate(
                     },
                 }
             })?;
+            drop(view);
+            drop(bound_control);
             let bound =
                 result.coefficient_class.maximum_absolute_coefficient().ok_or_else(|| {
                     OperationalSimulationError::Bound {
@@ -497,7 +664,18 @@ fn resolve_target(
         } else {
             TargetError::DuplicateTargetId {
                 target_id: request.target_id.clone(),
-                declarations: Box::new([]),
+                declarations: matches
+                    .iter()
+                    .map(|target| super::error::TargetDeclarationSite {
+                        target_id: target.target_id.clone(),
+                        residual: stage_output(target),
+                        decoder: super::error::DecoderWireRef {
+                            stage: target.decoder_stage.clone(),
+                            node: target.decoder_node,
+                            port: 0,
+                        },
+                    })
+                    .collect(),
             }
         }));
     };
@@ -537,17 +715,195 @@ fn resolve_target(
         })?;
     let matrix = match wire_type {
         WireType::Matrix(matrix) => matrix,
+        WireType::IndexedFamily { element, .. } => match element.as_ref() {
+            WireType::Matrix(matrix) => matrix,
+            actual => {
+                return Err(OperationalSimulationError::Target(TargetError::InvalidResidualSort {
+                    target_id: target.target_id.clone(),
+                    residual: stage_output(target),
+                    actual: actual.clone(),
+                }));
+            }
+        },
         actual => {
             return Err(OperationalSimulationError::Target(TargetError::InvalidResidualSort {
                 target_id: target.target_id.clone(),
-                residual: super::error::StageOutputRef {
-                    stage: target.residual_stage.clone(),
-                    output: target.residual_output.clone(),
-                },
+                residual: stage_output(target),
                 actual: actual.clone(),
             }))
         }
     };
+    let decoder_stage =
+        protocol.stages().iter().find(|stage| stage.id == target.decoder_stage).ok_or_else(
+            || {
+                OperationalSimulationError::Target(TargetError::MissingStage {
+                    target_id: target.target_id.clone(),
+                    role: super::error::TargetStageRole::Decoder,
+                    stage: target.decoder_stage.clone(),
+                })
+            },
+        )?;
+    let decoder = super::error::DecoderWireRef {
+        stage: target.decoder_stage.clone(),
+        node: target.decoder_node,
+        port: 0,
+    };
+    let node = decoder_stage.graph.root_scope().node(target.decoder_node).ok_or_else(|| {
+        OperationalSimulationError::Target(TargetError::MissingDecoderWire {
+            target_id: target.target_id.clone(),
+            decoder: decoder.clone(),
+        })
+    })?;
+    let endpoint = protocol.bundle.endpoints.entries.iter().find(|endpoint| {
+        endpoint.stage == target.decoder_stage &&
+            decoder_stage
+                .graph
+                .outputs()
+                .get(&endpoint.workflow_output.output)
+                .is_some_and(|output| output.value.node == target.decoder_node)
+    });
+    let endpoint_output = endpoint.and_then(|endpoint| {
+        decoder_stage
+            .graph
+            .outputs()
+            .get(&endpoint.workflow_output.output)
+            .map(|output| output.value)
+    });
+    let endpoint_ref = endpoint_output.map(|wire| super::error::DecoderWireRef {
+        stage: target.decoder_stage.clone(),
+        node: wire.node,
+        port: wire.port.0,
+    });
+    if endpoint_ref.as_ref() != Some(&decoder) {
+        return Err(OperationalSimulationError::Target(
+            TargetError::DecoderWorkflowOutputMismatch {
+                target_id: target.target_id.clone(),
+                expected: decoder.clone(),
+                actual: endpoint_ref,
+            },
+        ));
+    }
+    if let Some(scope) = endpoint
+        .and_then(|endpoint| decoder_stage.semantic_anchors.get(&endpoint.semantic_anchor))
+        .and_then(|wires| wires.iter().find(|wire| wire.wire.node == target.decoder_node))
+        .map(|wire| wire.scope.clone())
+        .filter(|scope| *scope != FrozenGraphScopeId::Root)
+    {
+        return Err(OperationalSimulationError::Target(TargetError::DecoderWireNotRoot {
+            target_id: target.target_id.clone(),
+            decoder: decoder.clone(),
+            actual_scope: scope,
+        }));
+    }
+    let semantic_ref = endpoint
+        .and_then(|endpoint| {
+            decoder_stage.semantic_anchors.get(&endpoint.semantic_anchor).and_then(|wires| {
+                (wires.len() == 1 && wires[0].scope == FrozenGraphScopeId::Root)
+                    .then_some(&wires[0])
+            })
+        })
+        .map(|wire| super::error::DecoderWireRef {
+            stage: target.decoder_stage.clone(),
+            node: wire.wire.node,
+            port: wire.wire.port.0,
+        });
+    if semantic_ref.as_ref() != Some(&decoder) {
+        return Err(OperationalSimulationError::Target(
+            TargetError::DecoderSemanticAnchorMismatch {
+                target_id: target.target_id.clone(),
+                expected: decoder.clone(),
+                actual: semantic_ref,
+            },
+        ));
+    }
+    let actual_kind = node.kind().clone();
+    let kind_matches = matches!(
+        (&target.kind, node.kind()),
+        (OperationalDecoderKind::ThresholdDecode { .. }, NodeKind::ThresholdDecode { .. }) |
+            (OperationalDecoderKind::BooleanInterval, NodeKind::IntCompare(IntCompareOp::Equal))
+    );
+    if !kind_matches {
+        return Err(OperationalSimulationError::Target(TargetError::DecoderKindMismatch {
+            target_id: target.target_id.clone(),
+            decoder: decoder.clone(),
+            expected: target.kind.clone(),
+            actual: actual_kind,
+        }));
+    }
+    let arguments = decoder_stage.graph.root_scope().arguments(node).unwrap_or_default();
+    let expected_arity = match &target.kind {
+        OperationalDecoderKind::ThresholdDecode { .. } => 1,
+        OperationalDecoderKind::BooleanInterval => 2,
+    };
+    if arguments.len() != expected_arity {
+        return Err(OperationalSimulationError::Target(TargetError::DecoderArityMismatch {
+            target_id: target.target_id.clone(),
+            decoder: decoder.clone(),
+            expected: expected_arity,
+            actual: arguments.len(),
+        }));
+    }
+    let output_types = node.output_types();
+    if output_types.len() != 1 {
+        return Err(OperationalSimulationError::Target(TargetError::DecoderOutputCountMismatch {
+            target_id: target.target_id.clone(),
+            decoder: decoder.clone(),
+            expected: 1,
+            actual: output_types.len(),
+        }));
+    }
+    if decoder.port as usize >= output_types.len() {
+        return Err(OperationalSimulationError::Target(TargetError::DecoderOutputPortOutOfRange {
+            target_id: target.target_id.clone(),
+            decoder: decoder.clone(),
+            output_count: output_types.len(),
+        }));
+    }
+    if output_types[decoder.port as usize] != WireType::Bool {
+        return Err(OperationalSimulationError::Target(TargetError::DecoderOutputTypeMismatch {
+            target_id: target.target_id.clone(),
+            decoder: decoder.clone(),
+            expected: WireType::Bool,
+            actual: output_types[decoder.port as usize].clone(),
+        }));
+    }
+    let expected_snapshot = target_decoder_snapshot(&target.kind, node.kind(), output_types);
+    let actual_snapshot = node_decoder_snapshot(node.kind(), Some(output_types));
+    if expected_snapshot != actual_snapshot {
+        return Err(OperationalSimulationError::Target(TargetError::DecoderAttributeMismatch {
+            target_id: target.target_id.clone(),
+            decoder: decoder.clone(),
+            expected: expected_snapshot,
+            actual: actual_snapshot,
+        }));
+    }
+    if target.decoder_stage != target.residual_stage ||
+        !arguments.iter().copied().any(|input| wire_consumes(&decoder_stage.graph, input, wire))
+    {
+        return Err(OperationalSimulationError::Target(
+            TargetError::DecoderInputDoesNotConsumeResidual {
+                target_id: target.target_id.clone(),
+                decoder: decoder.clone(),
+                residual: stage_output(target),
+                actual_input: arguments.first().copied(),
+            },
+        ));
+    }
+    if let Some(WireType::Matrix(decoder_input)) = decoder_stage
+        .graph
+        .root_scope()
+        .node(arguments[0].node)
+        .and_then(|input| input.output_types().get(arguments[0].port.0 as usize))
+    {
+        if decoder_input.modulus != matrix.modulus {
+            return Err(OperationalSimulationError::Target(TargetError::DecoderModulusMismatch {
+                target_id: target.target_id.clone(),
+                decoder: decoder.clone(),
+                residual_modulus: matrix.modulus.clone(),
+                decoder_modulus: decoder_input.modulus.clone(),
+            }));
+        }
+    }
     let environment = ParamEnv {
         integers: request
             .environment
@@ -600,6 +956,93 @@ fn resolve_target(
     ))
 }
 
+fn stage_output(target: &crate::OperationalDecoderTarget) -> super::error::StageOutputRef {
+    super::error::StageOutputRef {
+        stage: target.residual_stage.clone(),
+        output: target.residual_output.clone(),
+    }
+}
+
+fn target_decoder_snapshot(
+    kind: &OperationalDecoderKind,
+    node_kind: &NodeKind,
+    output_types: &[WireType],
+) -> super::error::DecoderSnapshot {
+    match kind {
+        OperationalDecoderKind::ThresholdDecode { plaintext_modulus } => {
+            super::error::DecoderSnapshot {
+                kind: kind.clone(),
+                operand_count: 1,
+                output_types: output_types.into(),
+                plaintext_modulus: plaintext_modulus.clone(),
+                length: match node_kind {
+                    NodeKind::ThresholdDecode { length, .. } => Some(length.clone()),
+                    _ => None,
+                },
+                output_bool: Some(true),
+            }
+        }
+        OperationalDecoderKind::BooleanInterval => super::error::DecoderSnapshot {
+            kind: kind.clone(),
+            operand_count: 2,
+            output_types: output_types.into(),
+            plaintext_modulus: IntExpr::constant(0),
+            length: None,
+            output_bool: None,
+        },
+    }
+}
+
+fn node_decoder_snapshot(
+    kind: &NodeKind,
+    output_types: Option<&[WireType]>,
+) -> super::error::DecoderSnapshot {
+    match kind {
+        NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
+            super::error::DecoderSnapshot {
+                kind: OperationalDecoderKind::ThresholdDecode {
+                    plaintext_modulus: plaintext_modulus.clone(),
+                },
+                operand_count: 1,
+                output_types: output_types.unwrap_or(&[]).into(),
+                plaintext_modulus: plaintext_modulus.clone(),
+                length: Some(length.clone()),
+                output_bool: Some(*output_bool),
+            }
+        }
+        NodeKind::IntCompare(IntCompareOp::Equal) => super::error::DecoderSnapshot {
+            kind: OperationalDecoderKind::BooleanInterval,
+            operand_count: 2,
+            output_types: output_types.unwrap_or(&[]).into(),
+            plaintext_modulus: IntExpr::constant(0),
+            length: None,
+            output_bool: None,
+        },
+        _ => unreachable!("decoder kind was checked before snapshot construction"),
+    }
+}
+
+fn wire_consumes(graph: &mxx_ir_core::Graph, current: WireRef, target: WireRef) -> bool {
+    let mut pending = vec![current];
+    let mut visited = Vec::new();
+    while let Some(wire) = pending.pop() {
+        if wire == target {
+            return true;
+        }
+        if visited.contains(&wire) {
+            continue;
+        }
+        visited.push(wire);
+        let Some(node) = graph.root_scope().node(wire.node) else {
+            continue;
+        };
+        if let Some(arguments) = graph.root_scope().arguments(node) {
+            pending.extend(arguments.iter().copied());
+        }
+    }
+    false
+}
+
 fn site(stage: &StageId, wire: WireRef, operation: &str) -> super::error::ErrorSite {
     super::error::ErrorSite {
         program: super::identity::ProgramKey::WorkflowStage(stage.clone()),
@@ -614,21 +1057,84 @@ fn site(stage: &StageId, wire: WireRef, operation: &str) -> super::error::ErrorS
 fn relation_error(
     stage: &StageId,
     wire: WireRef,
-    _: super::relation::RelationFailure,
+    failure: super::relation::RelationFailure,
 ) -> OperationalSimulationError {
-    OperationalSimulationError::Relation {
-        site: site(stage, wire, "relation rewrite"),
-        source: super::error::RelationError::TransformedRelationOperand {
-            operand: super::identity::WireSourceKey {
-                scope: super::identity::OccurrenceScope {
-                    program: super::identity::ProgramKey::WorkflowStage(stage.clone()),
-                    definition: FrozenGraphScopeId::Root,
-                    path: Box::new([]),
+    let key = super::identity::AtomicSourceKey::GraphWire(super::identity::GraphWireSourceKey {
+        wire: super::identity::WireSourceKey {
+            scope: super::identity::OccurrenceScope {
+                program: super::identity::ProgramKey::WorkflowStage(stage.clone()),
+                definition: FrozenGraphScopeId::Root,
+                path: Box::new([]),
+            },
+            wire,
+        },
+        coordinate_binders: Box::new([]),
+    });
+    let source = match failure {
+        super::relation::RelationFailure::MissingRegistration { .. } |
+        super::relation::RelationFailure::InvalidRelationProducer { .. } => {
+            super::error::RelationError::InvalidRelationProducer {
+                producer: match key.clone() {
+                    super::identity::AtomicSourceKey::GraphWire(producer) => producer.wire,
+                    _ => unreachable!(),
                 },
-                wire,
+            }
+        }
+        super::relation::RelationFailure::MismatchedIndex { .. } => {
+            super::error::RelationError::MismatchedRelationIndex {
+                expected: key.clone(),
+                actual: key.clone(),
+            }
+        }
+        super::relation::RelationFailure::MismatchedType { .. } => {
+            super::error::RelationError::TransformedRelationOperand {
+                operand: match key.clone() {
+                    super::identity::AtomicSourceKey::GraphWire(value) => value.wire,
+                    _ => unreachable!(),
+                },
+            }
+        }
+        super::relation::RelationFailure::MismatchedLayout { .. } => {
+            super::error::RelationError::MismatchedRelationLayout {
+                expected: IntExpr::constant(0),
+                actual: IntExpr::constant(0),
+            }
+        }
+        super::relation::RelationFailure::MismatchedPublic { .. } => {
+            super::error::RelationError::MismatchedPreimagePublicIdentity {
+                expected: key.clone(),
+                actual: key.clone(),
+            }
+        }
+        super::relation::RelationFailure::MismatchedTrapdoor { .. } => {
+            super::error::RelationError::MismatchedTrapdoorIdentity {
+                expected: key.clone(),
+                actual: key.clone(),
+            }
+        }
+        super::relation::RelationFailure::MismatchedTarget { .. } => {
+            super::error::RelationError::MismatchedRelationTargetIdentity {
+                expected: key.clone(),
+                actual: key.clone(),
+            }
+        }
+        super::relation::RelationFailure::DifferentSelectorBlocked => {
+            super::error::RelationError::DifferentSelectorRelationBlocked {
+                left: key.clone(),
+                right: key.clone(),
+            }
+        }
+        super::relation::RelationFailure::UnavailableRelation { .. } => {
+            super::error::RelationError::SmallDecompositionRangeNotProved { source: key.clone() }
+        }
+        _ => super::error::RelationError::TransformedRelationOperand {
+            operand: match key {
+                super::identity::AtomicSourceKey::GraphWire(value) => value.wire,
+                _ => unreachable!(),
             },
         },
-    }
+    };
+    OperationalSimulationError::Relation { site: site(stage, wire, "relation rewrite"), source }
 }
 
 /// Drives the real lower/rewrite/extract/bound stages under one job-wide resource policy.
@@ -836,6 +1342,28 @@ mod tests {
         assert!(matches!(
             report.acceptance,
             OperationalAcceptanceReport::Threshold { margin, .. } if margin.is_zero()
+        ));
+    }
+
+    #[test]
+    fn closed_target_rejects_a_same_modulus_decoder_that_does_not_consume_the_residual() {
+        let protocol = crate::toy_example::protocol();
+        let request = super::super::OperationalCheckRequest {
+            environment: vec![(
+                "cutoff".to_owned(),
+                super::super::OperationalParameterValue::Integer(1.into()),
+            )],
+            layouts: Vec::new(),
+            target_id: "toy-threshold".to_owned(),
+        };
+        let error = resolve_target(&protocol, &request)
+            .expect_err("the decoder input must be derived from the declared residual");
+        assert!(matches!(
+            error,
+            OperationalSimulationError::Target(TargetError::DecoderInputDoesNotConsumeResidual {
+                target_id,
+                ..
+            }) if target_id == "toy-threshold"
         ));
     }
 

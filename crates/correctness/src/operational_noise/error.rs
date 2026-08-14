@@ -134,6 +134,18 @@ macro_rules! operational_error_registry {
 }
 
 operational_error_registry! {
+    Request => RequestError {
+        EmptyParameterName,
+        DuplicateParameter { name: String },
+        MissingParameter { name: String },
+        UnexpectedParameter { name: String },
+        RationalParameter { name: String },
+        EmptyLayoutId,
+        DuplicateLayout { params_id: String },
+        DuplicateLayoutRing { ring_dimension: usize, modulus: BigUint },
+        InvalidLayout { params_id: String },
+    }
+
     Target => TargetError {
         MissingTargetId { target_id: String },
         DuplicateTargetId { target_id: String, declarations: Box<[TargetDeclarationSite]> },
@@ -247,6 +259,8 @@ operational_error_registry! {
         DivisionByZeroDomain { divisor: IntExpr },
         NonExactEuclideanDomain { divisor: IntExpr },
         InvalidRoundDivDenominator { divisor: IntExpr },
+        ResourceDeadlineExceeded,
+        ResourceAllocationExceeded { requested: usize },
         InvalidLog2CeilArgument { argument: IntExpr },
         IntervalOperationNotSupported { expression: IntExpr },
         NonUniformParallelMatrixType { expected: WireType, actual: WireType },
@@ -352,6 +366,7 @@ pub enum CheckerPhase {
 /// Public, fail-closed result for one operational-noise simulation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationalSimulationError {
+    Request(RequestError),
     Target(TargetError),
     Lower {
         site: ErrorSite,

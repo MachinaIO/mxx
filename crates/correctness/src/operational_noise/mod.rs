@@ -16,9 +16,11 @@ pub mod lower;
 pub mod relation;
 pub mod simulation;
 
+use std::collections::BTreeSet;
+
 use num_bigint::{BigInt, BigUint};
 
-pub use error::OperationalSimulationError;
+pub use error::{OperationalSimulationError, RequestError};
 pub use simulation::check_operational_noise_candidate;
 
 /// A concrete value supplied for one named protocol parameter.
@@ -48,6 +50,75 @@ pub struct OperationalCheckRequest {
     pub environment: Vec<(String, OperationalParameterValue)>,
     pub layouts: Vec<OperationalGadgetLayout>,
     pub target_id: String,
+}
+
+impl OperationalCheckRequest {
+    /// Validates request-owned values before a graph stage can observe them.
+    /// The checker has no rational transfer domain, so rationals are rejected
+    /// rather than omitted while constructing integer environments.
+    pub(crate) fn validate(
+        &self,
+        parameter_names: impl IntoIterator<Item = String>,
+    ) -> Result<(), RequestError> {
+        let expected = parameter_names.into_iter().collect::<BTreeSet<_>>();
+        let mut supplied = BTreeSet::new();
+        for (name, value) in &self.environment {
+            if name.is_empty() {
+                return Err(RequestError::EmptyParameterName);
+            }
+            if !supplied.insert(name.clone()) {
+                return Err(RequestError::DuplicateParameter { name: name.clone() });
+            }
+            if matches!(value, OperationalParameterValue::Rational { .. }) {
+                return Err(RequestError::RationalParameter { name: name.clone() });
+            }
+            if !expected.contains(name) {
+                return Err(RequestError::UnexpectedParameter { name: name.clone() });
+            }
+        }
+        if let Some(name) = expected.into_iter().find(|name| !supplied.contains(name)) {
+            return Err(RequestError::MissingParameter { name });
+        }
+
+        let mut layouts = BTreeSet::new();
+        let mut layout_rings = BTreeSet::new();
+        for layout in &self.layouts {
+            if layout.params_id.is_empty() {
+                return Err(RequestError::EmptyLayoutId);
+            }
+            if !layouts.insert(layout.params_id.clone()) {
+                return Err(RequestError::DuplicateLayout { params_id: layout.params_id.clone() });
+            }
+            let expected_base = BigInt::from(1_u8) << layout.base_bits;
+            let modulus = layout
+                .crt_moduli
+                .iter()
+                .fold(BigUint::from(1_u8), |product, modulus| product * modulus);
+            let expected_small_digits =
+                (layout.base_bits != 0).then(|| layout.crt_bits.div_ceil(layout.base_bits));
+            let valid = layout.ring_dimension != 0 &&
+                !layout.crt_moduli.is_empty() &&
+                layout.crt_moduli.iter().all(|modulus| *modulus != 0) &&
+                layout.crt_moduli.iter().copied().collect::<BTreeSet<_>>().len() ==
+                    layout.crt_moduli.len() &&
+                layout.crt_moduli.iter().copied().min() == Some(layout.smallest_crt_modulus) &&
+                layout.base_bits != 0 &&
+                layout.crt_bits != 0 &&
+                layout.base == expected_base &&
+                expected_small_digits == Some(layout.small_digit_count) &&
+                layout.regular_digit_count == layout.small_digit_count * layout.crt_moduli.len();
+            if !valid {
+                return Err(RequestError::InvalidLayout { params_id: layout.params_id.clone() });
+            }
+            if !layout_rings.insert((layout.ring_dimension, modulus.clone())) {
+                return Err(RequestError::DuplicateLayoutRing {
+                    ring_dimension: layout.ring_dimension,
+                    modulus,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Exact result of the decoder-specific acceptance rule.
@@ -94,4 +165,46 @@ pub struct OperationalSimulationReport {
     pub accepted: bool,
     pub acceptance: OperationalAcceptanceReport,
     pub diagnostics: OperationalSimulationDiagnostics,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_validation_rejects_rational_and_duplicate_layout_inputs() {
+        let rational = OperationalCheckRequest {
+            environment: vec![(
+                "cutoff".to_owned(),
+                OperationalParameterValue::Rational { numerator: 1.into(), denominator: 2.into() },
+            )],
+            layouts: Vec::new(),
+            target_id: "target".to_owned(),
+        };
+        assert_eq!(
+            rational.validate(["cutoff".to_owned()]),
+            Err(RequestError::RationalParameter { name: "cutoff".to_owned() })
+        );
+
+        let layout = OperationalGadgetLayout {
+            params_id: "layout".to_owned(),
+            ring_dimension: 8,
+            crt_moduli: vec![17],
+            crt_bits: 5,
+            base_bits: 2,
+            base: 4.into(),
+            regular_digit_count: 3,
+            small_digit_count: 3,
+            smallest_crt_modulus: 17,
+        };
+        let duplicate = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: vec![layout.clone(), layout],
+            target_id: "target".to_owned(),
+        };
+        assert_eq!(
+            duplicate.validate(std::iter::empty()),
+            Err(RequestError::DuplicateLayout { params_id: "layout".to_owned() })
+        );
+    }
 }

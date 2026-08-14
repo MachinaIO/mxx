@@ -3,6 +3,60 @@
   "scope": "Generic Tall reachability classification for every operational-checker error tag. Rows describe checker phases and do not assert fixture-specific node identities.",
   "entries": [
     {
+      "error_tag": "Request.EmptyParameterName",
+      "tall_reachability": "reachable",
+      "classification": "request_validation",
+      "rationale": "Tall supplies request-scoped parameters through the generic closed request validator."
+    },
+    {
+      "error_tag": "Request.DuplicateParameter",
+      "tall_reachability": "reachable",
+      "classification": "request_validation",
+      "rationale": "Tall supplies request-scoped parameters through the generic closed request validator."
+    },
+    {
+      "error_tag": "Request.MissingParameter",
+      "tall_reachability": "reachable",
+      "classification": "request_validation",
+      "rationale": "Tall supplies request-scoped parameters through the generic closed request validator."
+    },
+    {
+      "error_tag": "Request.UnexpectedParameter",
+      "tall_reachability": "reachable",
+      "classification": "request_validation",
+      "rationale": "Tall supplies request-scoped parameters through the generic closed request validator."
+    },
+    {
+      "error_tag": "Request.RationalParameter",
+      "tall_reachability": "reachable",
+      "classification": "request_validation",
+      "rationale": "Tall supplies request-scoped parameters through the generic closed request validator."
+    },
+    {
+      "error_tag": "Request.EmptyLayoutId",
+      "tall_reachability": "reachable",
+      "classification": "request_validation",
+      "rationale": "Tall supplies request-scoped gadget layouts through the generic closed request validator."
+    },
+    {
+      "error_tag": "Request.DuplicateLayout",
+      "tall_reachability": "reachable",
+      "classification": "request_validation",
+      "rationale": "Tall supplies request-scoped gadget layouts through the generic closed request validator."
+    },
+    {
+      "error_tag": "Request.DuplicateLayoutRing",
+      "tall_reachability": "reachable",
+      "classification": "request_validation",
+      "rationale": "Tall supplies request-scoped gadget layouts through the generic closed request validator."
+    },
+    {
+      "error_tag": "Request.InvalidLayout",
+      "tall_reachability": "reachable",
+      "classification": "request_validation",
+      "rationale": "Tall supplies request-scoped gadget layouts through the generic closed request validator."
+    },
+    {
       "error_tag": "Target.MissingTargetId",
       "tall_reachability": "reachable",
       "classification": "target_validation",
@@ -271,6 +325,18 @@
       "tall_reachability": "reachable",
       "classification": "graph_lowering",
       "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.ResourceDeadlineExceeded",
+      "tall_reachability": "reachable",
+      "classification": "resource_limit",
+      "rationale": "Tall shares the one checker deadline across generic graph-lowering work."
+    },
+    {
+      "error_tag": "Lower.ResourceAllocationExceeded",
+      "tall_reachability": "reachable",
+      "classification": "resource_limit",
+      "rationale": "Tall shares the one checker allocation budget across generic graph-lowering work."
     },
     {
       "error_tag": "Lower.InvalidLog2CeilArgument",

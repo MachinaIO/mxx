@@ -16,11 +16,13 @@ use mxx_bgg::{
 };
 use mxx_correctness::{
     ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
-    EndpointSemanticBinding, EndpointSpecId, ExactMatrixInputMetadata, OperationalCheckRequest,
-    OperationalCheckerReport, OperationalDecoderKind, OperationalDecoderTarget,
-    OperationalGadgetLayout, OutputRef, StageId, emit_protocol_for,
-    operational_protocol_from_graphs, prepare_emitted_operational_checker,
-    run_prepared_operational_checks,
+    EndpointSemanticBinding, EndpointSpecId, ExactMatrixInputMetadata, OperationalDecoderKind,
+    OperationalDecoderTarget, OutputRef, StageId,
+    operational_noise::{
+        OperationalCheckRequest, OperationalGadgetLayout, OperationalSimulationReport,
+        check_operational_noise_candidate,
+    },
+    operational_protocol_from_graphs,
 };
 use mxx_dsl::{
     Bool, BuiltGraph, DslContext, Family, IdealSpec, Ring, SemanticAnchor, parallel_zip,
@@ -220,8 +222,8 @@ struct PreparedCandidate {
     rotation_offsets: Vec<u32>,
     public_key_graph: BuiltGraph,
     encoding_graph: BuiltGraph,
-    lean_operational_bound: BigUint,
-    lean_report: OperationalCheckerReport,
+    operational_noise_bound: BigUint,
+    operational_report: OperationalSimulationReport,
     achieved_security_bits: u64,
 }
 
@@ -306,7 +308,7 @@ fn run_tall_operational_check(
     encoding: &BuiltGraph,
     parameters: &DCRTPolyParams,
     nested: &NestedRnsPolyContext,
-) -> Result<OperationalCheckerReport, String> {
+) -> Result<OperationalSimulationReport, String> {
     if nested.p_moduli.is_empty() {
         return Err("nested-RNS plaintext contract requires a nonempty p-basis".to_owned());
     }
@@ -392,14 +394,6 @@ fn run_tall_operational_check(
         },
     )
     .map_err(|error| error.to_string())?;
-    let emitted = emit_protocol_for("TallNestedRnsCandidate", &protocol, "MxxCorrectness", &[])
-        .map_err(|error| error.to_string())?;
-    info!(
-        operational_source_bytes = emitted.ir.len(),
-        proof_source_bytes = emitted.proof_ir.len(),
-        derivation_source_bytes = emitted.derivation_ir.len(),
-        "emitted Tall correctness sources"
-    );
     let base_bits = parameters.base_bits() as usize;
     let small_digit_count = crt_bits.div_ceil(base_bits);
     let request = OperationalCheckRequest {
@@ -417,52 +411,16 @@ fn run_tall_operational_check(
         }],
         target_id: TALL_OPERATIONAL_TARGET_ID.to_owned(),
     };
-    let lean_workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lean");
-    let preparation_started = Instant::now();
-    let prepared = prepare_emitted_operational_checker(&lean_workspace, &emitted)
-        .map_err(|error| error.to_string())?;
-    info!(
-        elapsed = ?preparation_started.elapsed(),
-        olean = %prepared.olean_path().display(),
-        "prepared and cached Tall operational IR and derivation"
-    );
-    let warm_preparation_started = Instant::now();
-    let warm_prepared = prepare_emitted_operational_checker(&lean_workspace, &emitted)
-        .map_err(|error| error.to_string())?;
-    if warm_prepared.olean_path() != prepared.olean_path() {
-        return Err("warm Tall preparation selected a different cache artifact".to_owned());
-    }
-    info!(
-        elapsed = ?warm_preparation_started.elapsed(),
-        olean = %warm_prepared.olean_path().display(),
-        "reused cached Tall operational IR and derivation"
-    );
-
     let evaluation_started = Instant::now();
-    let mut reports = run_prepared_operational_checks(&lean_workspace, &prepared, &[request])
+    let report = check_operational_noise_candidate(&protocol, &request)
         .map_err(|error| error.to_string())?;
     info!(
         elapsed = ?evaluation_started.elapsed(),
-        request_count = reports.len(),
-        "evaluated Tall parameter requests with one prepared derivation"
+        accepted = report.accepted,
+        noise_bound = %report.noise_bound,
+        "evaluated Tall parameter request with Rust operational checker"
     );
-    for (request_index, report) in reports.iter().enumerate() {
-        info!(
-            request_index,
-            decode_time_ns = report.decode_time_ns,
-            evaluation_time_ns = report.evaluation_time_ns,
-            accepted = report.accepted,
-            noise_bound = %report.noise_bound,
-            "measured Lean Tall operational request"
-        );
-    }
-    if reports.len() != 1 {
-        return Err(format!("expected one Tall operational report, got {}", reports.len()));
-    }
-    if reports[0].request_digest.is_empty() {
-        return Err("Tall operational report omitted its request digest".to_owned());
-    }
-    Ok(reports.remove(0))
+    Ok(report)
 }
 
 fn prepare_candidate(
@@ -752,12 +710,9 @@ fn prepare_candidate(
     operational_encoding_graph
         .validate_with_manifests(&bindings, &manifests)
         .map_err(|error| error.to_string())?;
-    let lean_report =
+    let operational_report =
         run_tall_operational_check(&producer, &operational_encoding_graph, &parameters, &nested)?;
-    let lean_operational_bound = lean_report
-        .noise_bound
-        .parse::<BigUint>()
-        .map_err(|_| "Lean operational checker returned a non-natural noise bound".to_owned())?;
+    let operational_noise_bound = operational_report.noise_bound.clone();
     Ok(PreparedCandidate {
         parameters,
         circuit,
@@ -776,8 +731,8 @@ fn prepare_candidate(
         rotation_offsets,
         public_key_graph,
         encoding_graph,
-        lean_operational_bound,
-        lean_report,
+        operational_noise_bound,
+        operational_report,
         achieved_security_bits,
     })
 }
@@ -1163,12 +1118,12 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
             let Some(candidate) = result? else {
                 continue;
             };
-            let accepted = candidate.lean_report.accepted;
+            let accepted = candidate.operational_report.accepted;
             info!(
                 crt_depth = *crt_depth,
                 ring_dimension = 1usize << *log_ring_dimension,
-                lean_operational_bound = %candidate.lean_operational_bound,
-                rejection = ?candidate.lean_report.rejection,
+                operational_noise_bound = %candidate.operational_noise_bound,
+                diagnostics = ?candidate.operational_report.diagnostics,
                 accepted,
                 "evaluated Tall BGG+ operational candidate"
             );
@@ -1726,16 +1681,16 @@ fn runtime_verification(
     info!(
         maximum_noise = %maximum_noise,
         ?maximum_location,
-        lean_operational_bound = %selected.lean_operational_bound,
-        within_operational_envelope = maximum_noise <= selected.lean_operational_bound,
+        operational_noise_bound = %selected.operational_noise_bound,
+        within_operational_envelope = maximum_noise <= selected.operational_noise_bound,
         threshold_lhs = %threshold_lhs,
         ciphertext_modulus = %modulus,
         "measured Tall BGG+ residual"
     );
-    if maximum_noise > selected.lean_operational_bound {
+    if maximum_noise > selected.operational_noise_bound {
         return Err(format!(
-            "measured residual {maximum_noise} at {maximum_location:?} exceeds Lean bound {}",
-            selected.lean_operational_bound
+            "measured residual {maximum_noise} at {maximum_location:?} exceeds operational bound {}",
+            selected.operational_noise_bound
         ));
     }
     if threshold_lhs >= modulus {
@@ -1747,20 +1702,20 @@ fn runtime_verification(
 }
 
 #[test]
-#[ignore = "runs the Lean-only Tall BGG+ parameter simulation"]
+#[ignore = "runs the Rust Tall BGG+ operational parameter simulation"]
 fn test_tall_bgg_nested_rns_parameter_simulation() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
     let config = TestConfig::from_env().expect("valid Tall nested-RNS configuration");
     info!(?config, "effective Tall nested-RNS parameter-simulation configuration");
-    let selected = select_parameters(&config).expect("Lean parameter simulation");
+    let selected = select_parameters(&config).expect("Rust operational parameter simulation");
     info!(
         crt_depth = selected.parameters.to_crt().2,
         ring_dimension = selected.parameters.ring_dimension(),
-        lean_operational_bound = %selected.lean_operational_bound,
-        lean_accepted = selected.lean_report.accepted,
-        "completed Lean-only Tall parameter simulation"
+        operational_noise_bound = %selected.operational_noise_bound,
+        operational_accepted = selected.operational_report.accepted,
+        "completed Rust-only Tall parameter simulation"
     );
 }
 
@@ -1779,8 +1734,8 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
         physical_slots = selected.parameters.ring_dimension() as usize *
             selected.nested.q_moduli_depth,
         achieved_security_bits = selected.achieved_security_bits,
-        lean_operational_bound = %selected.lean_operational_bound,
-        lean_accepted = selected.lean_report.accepted,
+        operational_noise_bound = %selected.operational_noise_bound,
+        operational_accepted = selected.operational_report.accepted,
         "selected Tall nested-RNS parameters"
     );
     let device_ids = detected_gpu_device_ids();

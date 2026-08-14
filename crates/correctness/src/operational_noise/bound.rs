@@ -166,6 +166,21 @@ pub trait BoundInput {
     fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError>;
 }
 
+/// Job-wide controls used by production bound inputs.  The evaluator calls
+/// these at every work-stack and transfer boundary; implementations must share
+/// their deadline and cumulative allocation accounting with lowering, rewrite,
+/// and extraction.  Test inputs may deliberately omit this bridge.
+pub trait BoundEvaluationControl {
+    fn check_deadline(&self) -> Result<(), BoundEvaluationError>;
+    fn reserve_owned_elements(&self, requested: usize) -> Result<(), BoundEvaluationError>;
+    fn validate_integer_bits(
+        &self,
+        value: &BigUint,
+        operation: &'static str,
+    ) -> Result<(), BoundEvaluationError>;
+    fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError>;
+}
+
 /// Evaluates one extracted matrix root without recursion.
 pub struct BoundEvaluator<'a, I> {
     input: &'a I,

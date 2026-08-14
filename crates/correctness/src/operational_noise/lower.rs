@@ -8,8 +8,8 @@ use super::{
     OperationalCheckRequest,
     analysis::{IntegerDomain, MxxAnalysis, MxxSort, ScalarProvenance},
     bound::{
-        BoundClass, BoundEvaluationError, BoundInput, MatrixBound, MatrixMetadata,
-        ResolvedMatrixConstant,
+        BoundClass, BoundEvaluationControl, BoundEvaluationError, BoundEvaluator, BoundInput,
+        MatrixBound, MatrixMetadata, ResolvedMatrixConstant,
     },
     error::{LowerError, SelectorOnlyConsumer},
     family::{self, FamilyCoverageStorage, FamilyLoweringValue},
@@ -33,7 +33,10 @@ use mxx_ir_core::{
 };
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 /// Structural-family dispatch is deliberately outside ordinary expression lowering.
 ///
@@ -49,10 +52,19 @@ pub trait FamilyResolver {
     ) -> Result<LoweringWire, LowerError>;
 }
 
+/// The lowering side of the single checker-job resource owner.  Production
+/// callers pass one live implementation through [`GraphLowerer::new_with_control`];
+/// direct lowering tests may use [`GraphLowerer::new`] without a budget.
+pub trait LoweringControl: Send + Sync {
+    fn check_deadline(&self) -> Result<(), LowerError>;
+    fn reserve_owned_elements(&self, requested: usize) -> Result<(), LowerError>;
+}
+
 /// Read-only production bridge from a lowered e-graph to the bound evaluator.
 /// It deliberately has no memo: `BoundEvaluator` owns computed bounds.
 pub struct ProductionBoundInput<'a, 'protocol> {
     lowerer: &'a GraphLowerer<'protocol>,
+    control: Option<&'a dyn BoundEvaluationControl>,
 }
 
 impl BoundInput for ProductionBoundInput<'_, '_> {
@@ -76,6 +88,9 @@ impl BoundInput for ProductionBoundInput<'_, '_> {
         source: super::identity::AtomicSourceId,
         term: Id,
     ) -> Result<MatrixBound, BoundEvaluationError> {
+        if self.lowerer.sequential_recurrence(source).is_some() {
+            return self.evaluate_sequential_recurrence(source, term);
+        }
         let descriptor = self
             .lowerer
             .egraph
@@ -103,9 +118,8 @@ impl BoundInput for ProductionBoundInput<'_, '_> {
                     .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
                 BoundClass::Bounded { maximum_absolute_coefficient: cutoff }
             }
-            // Sequential transitions have a compact descriptor but are not a
-            // sampler cutoff.  The bound phase must reject them rather than
-            // manufacture a loop unrolling or a numeric margin.
+            // A carried-state placeholder is meaningful only inside the
+            // descriptor-owned simultaneous transition overlay below.
             super::identity::AtomicSourceKey::SequentialRecurrence { .. } |
             super::identity::AtomicSourceKey::SequentialState(_) |
             super::identity::AtomicSourceKey::ProtocolInput(_) |
@@ -228,13 +242,215 @@ impl BoundInput for ProductionBoundInput<'_, '_> {
 
     fn validate_integer(
         &self,
-        _: &num_bigint::BigUint,
-        _: &'static str,
+        value: &num_bigint::BigUint,
+        operation: &'static str,
     ) -> Result<(), BoundEvaluationError> {
+        if let Some(control) = &self.control {
+            control.validate_integer_bits(value, operation)?;
+        }
         Ok(())
     }
-    fn validate_pack(&self, _: Id, _: usize) -> Result<(), BoundEvaluationError> {
+    fn validate_integer_bits(
+        &self,
+        value: &num_bigint::BigUint,
+        operation: &'static str,
+    ) -> Result<(), BoundEvaluationError> {
+        if let Some(control) = self.control {
+            control.validate_integer_bits(value, operation)?;
+        }
         Ok(())
+    }
+    fn reserve_owned_elements(&self, requested: usize) -> Result<(), BoundEvaluationError> {
+        if let Some(control) = self.control {
+            control.reserve_owned_elements(requested)?;
+        }
+        Ok(())
+    }
+    fn check_deadline(&self) -> Result<(), BoundEvaluationError> {
+        if let Some(control) = self.control {
+            control.check_deadline()?;
+        }
+        Ok(())
+    }
+    fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError> {
+        if let Some(control) = self.control {
+            control.validate_pack(term, bit_count)?;
+        }
+        Ok(())
+    }
+}
+
+impl ProductionBoundInput<'_, '_> {
+    /// Evaluates a graph-owned sequential descriptor without rebuilding its
+    /// body or materializing any logical iteration/lane graph.  Each numeric
+    /// iteration evaluates the one fixed transition with a read-only overlay
+    /// of every *previous* carried bound, and commits the complete next vector
+    /// only after all outputs succeed.
+    fn evaluate_sequential_recurrence(
+        &self,
+        source: super::identity::AtomicSourceId,
+        term: Id,
+    ) -> Result<MatrixBound, BoundEvaluationError> {
+        let (descriptor, carried_index) = self
+            .lowerer
+            .sequential_recurrence(source)
+            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
+        let count = resolved_nonnegative(&descriptor.count)
+            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })?;
+        if descriptor.initial.len() != descriptor.transition.len() ||
+            descriptor.transition.len() != descriptor.output_types.len() ||
+            carried_index >= descriptor.transition.len()
+        {
+            return Err(BoundEvaluationError::InvalidMatrixConstant { term });
+        }
+        self.reserve_owned_elements(descriptor.transition.len())?;
+        let mut state = descriptor
+            .initial
+            .iter()
+            .map(|initial| BoundEvaluator::new(self).evaluate(*initial))
+            .collect::<Result<Vec<_>, _>>()?;
+        if count.is_zero() {
+            return state
+                .get(carried_index)
+                .cloned()
+                .ok_or(BoundEvaluationError::InvalidMatrixConstant { term });
+        }
+        let state_sources = self.sequential_state_sources(descriptor, term)?;
+        let mut iteration = num_bigint::BigUint::zero();
+        while iteration < count {
+            self.check_deadline()?;
+            self.reserve_owned_elements(descriptor.transition.len())?;
+            let overlay =
+                SequentialBoundInput { base: self, states: &state_sources, values: &state };
+            let next = descriptor
+                .transition
+                .iter()
+                .map(|transition| BoundEvaluator::new(&overlay).evaluate(*transition))
+                .collect::<Result<Vec<_>, _>>()?;
+            // The `next` vector is constructed from the unmodified `state`;
+            // replacing it here is the sole simultaneous-commit boundary.
+            state = next;
+            iteration += num_bigint::BigUint::from(1_u8);
+        }
+        state
+            .get(carried_index)
+            .cloned()
+            .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })
+    }
+
+    fn sequential_state_sources(
+        &self,
+        descriptor: &SequentialRecurrenceDescriptor,
+        term: Id,
+    ) -> Result<Vec<super::identity::AtomicSourceId>, BoundEvaluationError> {
+        (0..descriptor.transition.len())
+            .map(|carried_index| {
+                self.lowerer
+                    .egraph
+                    .analysis
+                    .symbols
+                    .atomic_sources
+                    .values
+                    .iter()
+                    .enumerate()
+                    .find_map(|(source, descriptor_candidate)| {
+                        matches!(
+                            &descriptor_candidate.key,
+                            super::identity::AtomicSourceKey::SequentialState(state)
+                            if state.loop_scope == descriptor.loop_scope &&
+                                state.loop_node == descriptor.loop_node &&
+                                state.carried_index == carried_index
+                        )
+                        .then_some(super::identity::AtomicSourceId(source as u32))
+                    })
+                    .ok_or(BoundEvaluationError::InvalidMatrixConstant { term })
+            })
+            .collect()
+    }
+}
+
+/// A recurrence transition delegates every ordinary fact to the production
+/// input, overriding only the descriptor's carried-state atoms.  It owns no
+/// cache; each [`BoundEvaluator`] remains the sole owner of its bound memo.
+struct SequentialBoundInput<'a, 'protocol> {
+    base: &'a ProductionBoundInput<'a, 'protocol>,
+    states: &'a [super::identity::AtomicSourceId],
+    values: &'a [MatrixBound],
+}
+
+impl BoundInput for SequentialBoundInput<'_, '_> {
+    fn node(&self, term: Id) -> Option<&MxxLang> {
+        self.base.node(term)
+    }
+    fn matrix_type(
+        &self,
+        term: Id,
+    ) -> Result<mxx_ir_core::types::ConcreteMatrixType, BoundEvaluationError> {
+        self.base.matrix_type(term)
+    }
+    fn atom_bound(
+        &self,
+        source: super::identity::AtomicSourceId,
+        term: Id,
+    ) -> Result<MatrixBound, BoundEvaluationError> {
+        self.states
+            .iter()
+            .position(|candidate| *candidate == source)
+            .map(|index| self.values[index].clone())
+            .map_or_else(|| self.base.atom_bound(source, term), Ok)
+    }
+    fn matrix_constant(
+        &self,
+        spec: super::identity::MatrixConstantSpecId,
+        term: Id,
+    ) -> Result<
+        (mxx_ir_core::types::ConcreteMatrixType, ResolvedMatrixConstant),
+        BoundEvaluationError,
+    > {
+        self.base.matrix_constant(spec, term)
+    }
+    fn scalar_maximum_absolute(
+        &self,
+        term: Id,
+    ) -> Result<num_bigint::BigUint, BoundEvaluationError> {
+        self.base.scalar_maximum_absolute(term)
+    }
+    fn lift_constant_polynomial_class(
+        &self,
+        term: Id,
+        input: Id,
+    ) -> Result<BoundClass, BoundEvaluationError> {
+        self.base.lift_constant_polynomial_class(term, input)
+    }
+    fn crt_coefficients(
+        &self,
+        spec: super::identity::CrtSpecId,
+        term: Id,
+    ) -> Result<Box<[BigInt]>, BoundEvaluationError> {
+        self.base.crt_coefficients(spec, term)
+    }
+    fn validate_integer(
+        &self,
+        value: &num_bigint::BigUint,
+        operation: &'static str,
+    ) -> Result<(), BoundEvaluationError> {
+        self.base.validate_integer(value, operation)
+    }
+    fn validate_integer_bits(
+        &self,
+        value: &num_bigint::BigUint,
+        operation: &'static str,
+    ) -> Result<(), BoundEvaluationError> {
+        self.base.validate_integer_bits(value, operation)
+    }
+    fn reserve_owned_elements(&self, requested: usize) -> Result<(), BoundEvaluationError> {
+        self.base.reserve_owned_elements(requested)
+    }
+    fn check_deadline(&self) -> Result<(), BoundEvaluationError> {
+        self.base.check_deadline()
+    }
+    fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError> {
+        self.base.validate_pack(term, bit_count)
     }
 }
 
@@ -388,6 +604,65 @@ pub struct LowerEnv {
     pub active_coordinates: Vec<Coordinate>,
 }
 
+/// One continuation on the job-wide graph-lowering stack.  Structural nodes
+/// schedule their child bodies here instead of re-entering lowering with a
+/// nested work stack.
+enum LoweringFrame {
+    Enter {
+        wire: LoweringWire,
+        environment: LowerEnv,
+    },
+    Finish {
+        wire: LoweringWire,
+        environment: LowerEnv,
+        kind: NodeKind,
+        dependency_count: usize,
+    },
+    FinishStructural {
+        wire: LoweringWire,
+        environment: LowerEnv,
+        kind: NodeKind,
+        output_type: WireType,
+        dependency_count: usize,
+    },
+    FinishAlias {
+        wire: LoweringWire,
+    },
+    FinishValue {
+        wire: LoweringWire,
+        value: LoweredValue,
+    },
+    FinishIndexedAlias {
+        wire: LoweringWire,
+        index: LoweredInt,
+    },
+    FinishPreimage {
+        wire: LoweringWire,
+        environment: LowerEnv,
+        cutoff: IntExpr,
+        output_type: WireType,
+    },
+    FinishParallelLoop {
+        wire: LoweringWire,
+        environment: LowerEnv,
+        specification: ParallelLoop,
+        output_type: WireType,
+        binder: BinderKey,
+        logical_count: num_bigint::BigUint,
+        maximum: BigInt,
+    },
+    FinishSequentialLoop {
+        wire: LoweringWire,
+        environment: LowerEnv,
+        count: ResolvedIntExpr,
+        initial: Vec<Id>,
+        output_types: Vec<super::identity::ResolvedMatrixType>,
+        output_type: WireType,
+        carried_index: usize,
+        dependency_count: usize,
+    },
+}
+
 /// The sole mutable owner for one lowering/rewrite job.
 pub struct GraphLowerer<'a> {
     pub protocol: &'a ProtocolDecl,
@@ -395,6 +670,7 @@ pub struct GraphLowerer<'a> {
     pub egraph: EGraph<MxxLang, MxxAnalysis>,
     memo: HashMap<LoweringWireKey, LoweredValue>,
     active: HashSet<LoweringWireKey>,
+    control: Option<Arc<dyn LoweringControl>>,
 }
 
 impl<'a> GraphLowerer<'a> {
@@ -409,6 +685,28 @@ impl<'a> GraphLowerer<'a> {
             egraph: EGraph::new(analysis),
             memo: HashMap::new(),
             active: HashSet::new(),
+            control: None,
+        }
+    }
+}
+
+impl<'a> GraphLowerer<'a> {
+    /// Constructs a production lowerer with the job-wide control bridge.
+    /// This bridge is retained by nested parallel and sequential body walks,
+    /// rather than being recreated per lexical scope.
+    pub fn new_with_control(
+        protocol: &'a ProtocolDecl,
+        request: &'a OperationalCheckRequest,
+        analysis: MxxAnalysis,
+        control: Arc<dyn LoweringControl>,
+    ) -> Self {
+        Self {
+            protocol,
+            request,
+            egraph: EGraph::new(analysis),
+            memo: HashMap::new(),
+            active: HashSet::new(),
+            control: Some(control),
         }
     }
 
@@ -464,6 +762,10 @@ impl<'a> GraphLowerer<'a> {
     /// Begins one memoized wire lowering.  A repeated active key is a graph dependency cycle;
     /// completed keys return their one stored result without repeating graph work.
     pub fn begin_wire(&mut self, wire: &LoweringWire) -> Result<Option<LoweredValue>, LowerError> {
+        if let Some(control) = &self.control {
+            control.check_deadline()?;
+            control.reserve_owned_elements(1)?;
+        }
         let key = LoweringWireKey::from(wire);
         if let Some(value) = self.memo.get(&key) {
             return Ok(Some(value.clone()));
@@ -530,7 +832,40 @@ impl<'a> GraphLowerer<'a> {
     /// Returns the one production view used by the bound evaluator.  It reads
     /// canonical e-graph analysis and exact lowering descriptors only.
     pub fn production_bound_view(&self) -> ProductionBoundInput<'_, 'a> {
-        ProductionBoundInput { lowerer: self }
+        ProductionBoundInput { lowerer: self, control: None }
+    }
+
+    /// Constructs the production evaluator view with the caller's single
+    /// job-wide resource owner.  Checker execution must use this entry point;
+    /// the control-free view remains only for direct, deterministic unit tests.
+    pub fn production_bound_view_with_control<'b>(
+        &'b self,
+        control: &'b dyn BoundEvaluationControl,
+    ) -> ProductionBoundInput<'b, 'a> {
+        ProductionBoundInput { lowerer: self, control: Some(control) }
+    }
+
+    /// Returns the complete, graph-owned recurrence for one compact sequential
+    /// output.  Consumers receive the descriptor and selected carried slot
+    /// together, rather than re-identifying a loop from a node number or
+    /// replaying the loop body.  In particular, this API never expands the
+    /// count into iterations or lanes.
+    pub fn sequential_recurrence(
+        &self,
+        source: super::identity::AtomicSourceId,
+    ) -> Option<(&SequentialRecurrenceDescriptor, usize)> {
+        let descriptor = self.egraph.analysis.symbols.atomic_sources.get(source.0)?;
+        let super::identity::AtomicSourceKey::SequentialRecurrence { recurrence, carried_index } =
+            descriptor.key
+        else {
+            return None;
+        };
+        self.egraph
+            .analysis
+            .symbols
+            .sequential_recurrences
+            .get(recurrence.0)
+            .map(|descriptor| (descriptor, carried_index))
     }
 
     /// Starts the one job-wide, non-recursive lowering traversal at a workflow-stage wire.
@@ -580,46 +915,14 @@ impl<'a> GraphLowerer<'a> {
         root: LoweringWire,
         root_environment: LowerEnv,
     ) -> Result<LoweredValue, LowerError> {
-        enum Frame {
-            Enter {
-                wire: LoweringWire,
-                environment: LowerEnv,
-            },
-            Finish {
-                wire: LoweringWire,
-                environment: LowerEnv,
-                kind: NodeKind,
-                dependency_count: usize,
-            },
-            FinishStructural {
-                wire: LoweringWire,
-                environment: LowerEnv,
-                kind: NodeKind,
-                output_type: WireType,
-                dependency_count: usize,
-            },
-            FinishAlias {
-                wire: LoweringWire,
-            },
-            /// Resolves one zipped loop input after its family producer has been lowered.  The
-            /// family remains in the sole graph-wire memo; this frame only projects the active
-            /// symbolic lane and never materializes the loop count.
-            FinishIndexedAlias {
-                wire: LoweringWire,
-                index: LoweredInt,
-            },
-            FinishPreimage {
-                wire: LoweringWire,
-                environment: LowerEnv,
-                cutoff: IntExpr,
-                output_type: WireType,
-            },
-        }
-        let mut work = vec![Frame::Enter { wire: root, environment: root_environment }];
+        let mut work = vec![LoweringFrame::Enter { wire: root, environment: root_environment }];
         let mut values = Vec::<LoweredValue>::new();
         while let Some(frame) = work.pop() {
+            if let Some(control) = &self.control {
+                control.check_deadline()?;
+            }
             match frame {
-                Frame::Enter { wire, environment } => {
+                LoweringFrame::Enter { wire, environment } => {
                     if let Some(value) = self.begin_wire(&wire)? {
                         values.push(value);
                         continue;
@@ -644,11 +947,14 @@ impl<'a> GraphLowerer<'a> {
                     }
                     if let Some(bound) = environment.inputs.get(&wire.source.wire) {
                         if let Some(index) = bound.indices.first() {
-                            work.push(Frame::FinishIndexedAlias { wire, index: index.clone() });
+                            work.push(LoweringFrame::FinishIndexedAlias {
+                                wire,
+                                index: index.clone(),
+                            });
                         } else {
-                            work.push(Frame::FinishAlias { wire });
+                            work.push(LoweringFrame::FinishAlias { wire });
                         }
-                        work.push(Frame::Enter { wire: bound.clone(), environment });
+                        work.push(LoweringFrame::Enter { wire: bound.clone(), environment });
                         continue;
                     }
                     if let mxx_ir_core::node::NodeKind::Input { name, artifact: Some(_), .. } =
@@ -708,8 +1014,8 @@ impl<'a> GraphLowerer<'a> {
                                     input: StageInputName(name.clone()),
                                 },
                             )?;
-                        work.push(Frame::FinishAlias { wire });
-                        work.push(Frame::Enter {
+                        work.push(LoweringFrame::FinishAlias { wire });
+                        work.push(LoweringFrame::Enter {
                             wire: LoweringWire {
                                 source: WireSourceKey {
                                     scope: OccurrenceScope {
@@ -754,7 +1060,7 @@ impl<'a> GraphLowerer<'a> {
                                         actual: arguments.len(),
                                     });
                                 }
-                                work.push(Frame::FinishPreimage {
+                                work.push(LoweringFrame::FinishPreimage {
                                     wire: wire.clone(),
                                     environment: environment.clone(),
                                     cutoff: max_coefficient_bound.clone(),
@@ -763,7 +1069,7 @@ impl<'a> GraphLowerer<'a> {
                                         .clone(),
                                 });
                                 for argument in arguments.into_iter().rev() {
-                                    work.push(Frame::Enter {
+                                    work.push(LoweringFrame::Enter {
                                         wire: LoweringWire {
                                             source: WireSourceKey {
                                                 scope: environment.occurrence.clone(),
@@ -872,14 +1178,14 @@ impl<'a> GraphLowerer<'a> {
                             let arguments = scope
                                 .arguments(node)
                                 .ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
-                            work.push(Frame::Finish {
+                            work.push(LoweringFrame::Finish {
                                 wire: wire.clone(),
                                 environment: environment.clone(),
                                 kind: node.kind().clone(),
                                 dependency_count: arguments.len(),
                             });
                             for argument in arguments.into_iter().rev() {
-                                work.push(Frame::Enter {
+                                work.push(LoweringFrame::Enter {
                                     wire: LoweringWire {
                                         source: WireSourceKey {
                                             scope: environment.occurrence.clone(),
@@ -959,8 +1265,8 @@ impl<'a> GraphLowerer<'a> {
                                     wire: wire.source.wire,
                                     output_count: child_outputs.len(),
                                 })?;
-                                work.push(Frame::FinishAlias { wire });
-                                work.push(Frame::Enter {
+                                work.push(LoweringFrame::FinishAlias { wire });
+                                work.push(LoweringFrame::Enter {
                                     wire: LoweringWire {
                                         source: WireSourceKey {
                                             scope: child.occurrence.clone(),
@@ -975,7 +1281,7 @@ impl<'a> GraphLowerer<'a> {
                                 let arguments = scope
                                     .arguments(node)
                                     .ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
-                                work.push(Frame::FinishStructural {
+                                work.push(LoweringFrame::FinishStructural {
                                     wire: wire.clone(),
                                     environment: environment.clone(),
                                     kind: node.kind().clone(),
@@ -985,7 +1291,7 @@ impl<'a> GraphLowerer<'a> {
                                     dependency_count: arguments.len(),
                                 });
                                 for argument in arguments.into_iter().rev() {
-                                    work.push(Frame::Enter {
+                                    work.push(LoweringFrame::Enter {
                                         wire: LoweringWire {
                                             source: WireSourceKey {
                                                 scope: environment.occurrence.clone(),
@@ -1002,7 +1308,7 @@ impl<'a> GraphLowerer<'a> {
                         }
                     }
                 }
-                Frame::Finish { wire, environment, kind, dependency_count } => {
+                LoweringFrame::Finish { wire, environment, kind, dependency_count } => {
                     if values.len() < dependency_count {
                         return Err(LowerError::InvalidOperandArity {
                             expected: dependency_count,
@@ -1014,7 +1320,7 @@ impl<'a> GraphLowerer<'a> {
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
                 }
-                Frame::FinishStructural {
+                LoweringFrame::FinishStructural {
                     wire,
                     environment,
                     kind,
@@ -1028,23 +1334,116 @@ impl<'a> GraphLowerer<'a> {
                         });
                     }
                     let arguments = values.split_off(values.len() - dependency_count);
-                    let value = self.lower_structural_node(
-                        &wire,
-                        &kind,
-                        &arguments,
+                    match &kind {
+                        NodeKind::ParallelLoop(specification) => {
+                            self.queue_parallel_loop(
+                                wire,
+                                specification.clone(),
+                                arguments,
+                                environment,
+                                output_type,
+                                &mut work,
+                            )?;
+                            continue;
+                        }
+                        NodeKind::SequentialLoop(specification) => {
+                            self.queue_sequential_loop(
+                                wire,
+                                specification.clone(),
+                                arguments,
+                                environment,
+                                output_type,
+                                &mut work,
+                            )?;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let value =
+                        self.lower_structural_node(&kind, &arguments, &environment, output_type)?;
+                    self.finish_wire(&wire, value.clone());
+                    values.push(value);
+                }
+                LoweringFrame::FinishParallelLoop {
+                    wire,
+                    environment,
+                    specification,
+                    output_type,
+                    binder,
+                    logical_count,
+                    maximum,
+                } => {
+                    let LoweredValue::Term(representative) =
+                        values.pop().ok_or(LowerError::MissingWire { wire: wire.source.wire })?
+                    else {
+                        return Err(LowerError::NonUniformParallelMatrixType {
+                            expected: output_type,
+                            actual: WireType::Int,
+                        });
+                    };
+                    let value = self.finish_parallel_loop(
+                        &specification,
                         &environment,
                         output_type,
+                        binder,
+                        logical_count,
+                        maximum,
+                        representative,
                     )?;
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
                 }
-                Frame::FinishAlias { wire } => {
+                LoweringFrame::FinishSequentialLoop {
+                    wire,
+                    environment,
+                    count,
+                    initial,
+                    output_types,
+                    output_type,
+                    carried_index,
+                    dependency_count,
+                } => {
+                    if values.len() < dependency_count {
+                        return Err(LowerError::InvalidOperandArity {
+                            expected: dependency_count,
+                            actual: values.len(),
+                        });
+                    }
+                    let transitions = values
+                        .split_off(values.len() - dependency_count)
+                        .into_iter()
+                        .map(|value| match value {
+                            LoweredValue::Term(term) => Ok(term),
+                            _ => Err(LowerError::InvalidOperandArity {
+                                expected: dependency_count,
+                                actual: dependency_count,
+                            }),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let value = self.finish_sequential_loop(
+                        &wire,
+                        &environment,
+                        count,
+                        initial,
+                        transitions,
+                        output_types,
+                        output_type,
+                        carried_index,
+                    )?;
+                    self.finish_wire(&wire, value.clone());
+                    values.push(value);
+                }
+                LoweringFrame::FinishAlias { wire } => {
                     let value =
                         values.pop().ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
                 }
-                Frame::FinishIndexedAlias { wire, index } => {
+                LoweringFrame::FinishValue { wire, value } => {
+                    self.finish_wire(&wire, value.clone());
+                    values.push(value);
+                }
+                LoweringFrame::FinishIndexedAlias { wire, index } => {
                     let value =
                         values.pop().ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
                     let LoweredValue::Family(family) = value else {
@@ -1056,7 +1455,7 @@ impl<'a> GraphLowerer<'a> {
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
                 }
-                Frame::FinishPreimage { wire, environment, cutoff, output_type } => {
+                LoweringFrame::FinishPreimage { wire, environment, cutoff, output_type } => {
                     let arguments = values.split_off(values.len().checked_sub(3).ok_or(
                         LowerError::InvalidOperandArity { expected: 3, actual: values.len() },
                     )?);
@@ -1293,6 +1692,10 @@ impl<'a> GraphLowerer<'a> {
         let mut work = vec![Frame::Enter(expression)];
         let mut values = Vec::<LoweredInt>::new();
         while let Some(frame) = work.pop() {
+            if let Some(control) = &self.control {
+                control.check_deadline()?;
+                control.reserve_owned_elements(1)?;
+            }
             match frame {
                 Frame::Enter(
                     value @ (IntExpr::Const(_) | IntExpr::Var(_) | IntExpr::LoopIndex(_)),
@@ -1727,7 +2130,6 @@ impl<'a> GraphLowerer<'a> {
 
     fn lower_structural_node(
         &mut self,
-        wire: &LoweringWire,
         kind: &NodeKind,
         arguments: &[LoweredValue],
         environment: &LowerEnv,
@@ -1861,11 +2263,8 @@ impl<'a> GraphLowerer<'a> {
                         .add(MxxLang::Switch(std::iter::once(*selector).chain(terms).collect())),
                 ))
             }
-            NodeKind::ParallelLoop(specification) => {
-                self.lower_parallel_loop(wire, specification, arguments, environment, output_type)
-            }
-            NodeKind::SequentialLoop(specification) => {
-                self.lower_sequential_loop(wire, specification, arguments, environment, output_type)
+            NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) => {
+                unreachable!("loop lowering is scheduled on the outer continuation stack")
             }
             NodeKind::PackPolynomialCoefficients { .. } => {
                 Err(LowerError::PackRequiresExplicitBooleanFamily { actual: output_type })
@@ -1918,28 +2317,29 @@ impl<'a> GraphLowerer<'a> {
     /// Enters a parallel body once with an owner-resolved binder.  Its output is retained as a
     /// shared template, so a 30,720-lane family costs one body traversal rather than one
     /// traversal per logical lane.
-    fn lower_parallel_loop(
+    fn queue_parallel_loop(
         &mut self,
-        wire: &LoweringWire,
-        specification: &ParallelLoop,
-        arguments: &[LoweredValue],
-        environment: &LowerEnv,
+        wire: LoweringWire,
+        specification: ParallelLoop,
+        arguments: Vec<LoweredValue>,
+        environment: LowerEnv,
         output_type: WireType,
-    ) -> Result<LoweredValue, LowerError> {
-        let count = self.lower_int_expr(&specification.count, environment)?;
+        work: &mut Vec<LoweringFrame>,
+    ) -> Result<(), LowerError> {
+        let count = self.lower_int_expr(&specification.count, &environment)?;
         let Some((domain, _)) = self.integer_analysis(count.term) else {
             return Err(LowerError::InvalidFamilyCount { count: specification.count.clone() });
         };
         let range = domain
             .interval()
             .map_err(|_| LowerError::InvalidFamilyCount { count: specification.count.clone() })?;
-        let logical_count = range
-            .maximum
-            .to_biguint()
-            .ok_or_else(|| LowerError::InvalidFamilyCount { count: specification.count.clone() })?;
-        if !range.minimum.is_zero() || logical_count == BigInt::zero().to_biguint().unwrap() {
+        if range.minimum != range.maximum || range.minimum <= BigInt::zero() {
             return Err(LowerError::InvalidFamilyCount { count: specification.count.clone() });
         }
+        let logical_count = range
+            .minimum
+            .to_biguint()
+            .ok_or_else(|| LowerError::InvalidFamilyCount { count: specification.count.clone() })?;
         if arguments.len() != specification.input_modes.len() {
             return Err(LowerError::InvalidOperandArity {
                 expected: specification.input_modes.len(),
@@ -1987,7 +2387,7 @@ impl<'a> GraphLowerer<'a> {
             self.egraph.analysis.symbols.binders.intern(super::identity::BinderDescriptor {
                 key: binder.clone(),
                 minimum: BigInt::zero(),
-                maximum: range.maximum.clone() - BigInt::from(1_u8),
+                maximum: range.minimum.clone() - BigInt::from(1_u8),
             });
         let index = LoweredInt {
             term: self.egraph.add(MxxLang::IntBinder(super::identity::BinderId(binder_id))),
@@ -2043,19 +2443,35 @@ impl<'a> GraphLowerer<'a> {
                 output_count: child_outputs.len(),
             },
         )?;
-        let body = self.lower_wire_iterative(
-            LoweringWire {
+        work.push(LoweringFrame::FinishParallelLoop {
+            wire,
+            environment,
+            specification,
+            output_type,
+            binder,
+            logical_count,
+            maximum: range.minimum - BigInt::from(1_u8),
+        });
+        work.push(LoweringFrame::Enter {
+            wire: LoweringWire {
                 source: WireSourceKey { scope: child.occurrence.clone(), wire: body_output },
                 indices: Box::new([]),
             },
-            child,
-        )?;
-        let LoweredValue::Term(representative) = body else {
-            return Err(LowerError::NonUniformParallelMatrixType {
-                expected: output_type,
-                actual: WireType::Int,
-            });
-        };
+            environment: child,
+        });
+        Ok(())
+    }
+
+    fn finish_parallel_loop(
+        &mut self,
+        specification: &ParallelLoop,
+        environment: &LowerEnv,
+        output_type: WireType,
+        binder: BinderKey,
+        logical_count: num_bigint::BigUint,
+        maximum: BigInt,
+        representative: Id,
+    ) -> Result<LoweredValue, LowerError> {
         let WireType::IndexedFamily { element, .. } = output_type else {
             return Err(LowerError::IncompatibleFamilyCoverage {
                 expected: WireType::IndexedFamily {
@@ -2079,7 +2495,7 @@ impl<'a> GraphLowerer<'a> {
                 binder_domains: Box::new([family::CoverageBinderDomain {
                     binder,
                     minimum: BigInt::zero(),
-                    maximum: range.maximum - BigInt::from(1_u8),
+                    maximum,
                 }]),
             },
         };
@@ -2089,21 +2505,22 @@ impl<'a> GraphLowerer<'a> {
         Ok(LoweredValue::Family(value))
     }
 
-    fn lower_sequential_loop(
+    fn queue_sequential_loop(
         &mut self,
-        wire: &LoweringWire,
-        specification: &SequentialLoop,
-        arguments: &[LoweredValue],
-        environment: &LowerEnv,
+        wire: LoweringWire,
+        specification: SequentialLoop,
+        arguments: Vec<LoweredValue>,
+        environment: LowerEnv,
         output_type: WireType,
-    ) -> Result<LoweredValue, LowerError> {
+        work: &mut Vec<LoweringFrame>,
+    ) -> Result<(), LowerError> {
         if specification.carried_count == 0 || arguments.len() < specification.carried_count {
             return Err(LowerError::InvalidOperandArity {
                 expected: specification.carried_count,
                 actual: arguments.len(),
             });
         }
-        let count = self.lower_int_expr(&specification.count, environment)?;
+        let count = self.lower_int_expr(&specification.count, &environment)?;
         let Some((domain, _)) = self.integer_analysis(count.term) else {
             return Err(LowerError::InvalidFamilyCount { count: specification.count.clone() });
         };
@@ -2121,10 +2538,13 @@ impl<'a> GraphLowerer<'a> {
             });
         }
         if count_range.minimum.is_zero() {
-            return arguments.get(carried_index).cloned().ok_or(LowerError::InvalidOperandArity {
-                expected: specification.carried_count,
-                actual: arguments.len(),
-            });
+            let value =
+                arguments.get(carried_index).cloned().ok_or(LowerError::InvalidOperandArity {
+                    expected: specification.carried_count,
+                    actual: arguments.len(),
+                })?;
+            work.push(LoweringFrame::FinishValue { wire, value });
+            return Ok(());
         }
         let count_identity = count.stable_identity.ok_or_else(|| {
             LowerError::NonExactIdentityIndex { expression: specification.count.clone() }
@@ -2251,28 +2671,45 @@ impl<'a> GraphLowerer<'a> {
             let value = self.resolve_int(expression, &child)?;
             child.parameters.insert(name.clone(), value);
         }
-        let mut transition = Vec::with_capacity(specification.carried_count);
-        for output in child_outputs {
-            let LoweredValue::Term(term) = self.lower_wire_iterative(
-                LoweringWire {
+        let dependency_count = child_outputs.len();
+        work.push(LoweringFrame::FinishSequentialLoop {
+            wire,
+            environment,
+            count: count_identity,
+            initial,
+            output_types,
+            output_type,
+            carried_index,
+            dependency_count,
+        });
+        for output in child_outputs.into_iter().rev() {
+            work.push(LoweringFrame::Enter {
+                wire: LoweringWire {
                     source: WireSourceKey { scope: child.occurrence.clone(), wire: output },
                     indices: Box::new([]),
                 },
-                child.clone(),
-            )?
-            else {
-                return Err(LowerError::InvalidOperandArity {
-                    expected: specification.carried_count,
-                    actual: arguments.len(),
-                });
-            };
-            transition.push(term);
+                environment: child.clone(),
+            });
         }
+        Ok(())
+    }
+
+    fn finish_sequential_loop(
+        &mut self,
+        wire: &LoweringWire,
+        environment: &LowerEnv,
+        count: ResolvedIntExpr,
+        initial: Vec<Id>,
+        transition: Vec<Id>,
+        output_types: Vec<super::identity::ResolvedMatrixType>,
+        output_type: WireType,
+        carried_index: usize,
+    ) -> Result<LoweredValue, LowerError> {
         let recurrence = self.egraph.analysis.symbols.sequential_recurrences.intern(
             SequentialRecurrenceDescriptor {
                 loop_scope: environment.occurrence.clone(),
                 loop_node: wire.source.wire.node,
-                count: count_identity,
+                count,
                 initial: initial.into_boxed_slice(),
                 transition: transition.into_boxed_slice(),
                 output_types: output_types.into_boxed_slice(),
@@ -2385,6 +2822,110 @@ impl<'a> GraphLowerer<'a> {
 mod tests {
     use super::*;
     use num_bigint::BigInt;
+    use std::collections::BTreeMap;
+
+    fn deep_parallel_graph(depth: usize, logical_count: i64) -> mxx_ir_core::graph::Graph {
+        use mxx_ir_core::{
+            graph::{
+                GraphOutput, NodeHandle, SubgraphHandle, ValueHandle, with_new_construction_scope,
+            },
+            node::LoopInputMode,
+        };
+
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        fn nested(
+            depth: usize,
+            input: ValueHandle,
+            matrix: &MatrixType,
+            logical_count: i64,
+        ) -> ValueHandle {
+            if depth == 0 {
+                return NodeHandle::new(
+                    NodeKind::MatrixScale { scalar: IntExpr::constant(1) },
+                    vec![input],
+                    vec![WireType::Matrix(matrix.clone())],
+                )
+                .output(0)
+                .expect("matrix scale output");
+            }
+            let body = with_new_construction_scope(|scope| {
+                let body_input = NodeHandle::new(
+                    NodeKind::Input {
+                        name: format!("input-{depth}"),
+                        wire_type: WireType::Matrix(matrix.clone()),
+                        artifact: None,
+                    },
+                    Vec::new(),
+                    vec![WireType::Matrix(matrix.clone())],
+                )
+                .output(0)
+                .expect("body input output");
+                let output = nested(depth - 1, body_input.clone(), matrix, logical_count);
+                SubgraphHandle::new(
+                    format!("deep-parallel-{depth}"),
+                    scope,
+                    vec![body_input],
+                    vec![output],
+                )
+                .expect("parallel body")
+            });
+            let family = WireType::IndexedFamily {
+                element: Box::new(WireType::Matrix(matrix.clone())),
+                count: IntExpr::constant(logical_count),
+            };
+            let loop_output = NodeHandle::parallel_loop(
+                body,
+                vec![input],
+                vec![family.clone()],
+                ParallelLoop {
+                    count: IntExpr::constant(logical_count),
+                    minimum_count: 0,
+                    index_slot: 0,
+                    bindings: Vec::new(),
+                    input_modes: vec![LoopInputMode::Broadcast],
+                },
+            )
+            .output(0)
+            .expect("parallel loop output");
+            NodeHandle::new(
+                NodeKind::FamilyGetStatic { index: IntExpr::constant(0) },
+                vec![loop_output],
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .expect("family element output")
+        }
+
+        let input = NodeHandle::new(
+            NodeKind::ConstantMatrix {
+                matrix_type: matrix.clone(),
+                value: mxx_ir_core::node::ConstantMatrix::Zero,
+            },
+            Vec::new(),
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .expect("root input output");
+        let output = nested(depth, input, &matrix, logical_count);
+        mxx_ir_core::graph::Graph::freeze(
+            "deep-parallel-lowering",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze deep graph")
+        .0
+    }
 
     #[test]
     fn runtime_and_stable_indices_have_distinct_memo_keys() {
@@ -2409,5 +2950,40 @@ mod tests {
         };
 
         assert_ne!(LoweringWireKey::from(&stable), LoweringWireKey::from(&runtime));
+    }
+
+    #[test]
+    fn deeply_nested_parallel_loops_use_one_compact_work_stack() {
+        const DEPTH: usize = 96;
+        const LOGICAL_COUNT: i64 = 1_000_000;
+        let graph = deep_parallel_graph(DEPTH, LOGICAL_COUNT);
+        let output = graph.outputs()["output"].value;
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = graph;
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "deep-stack".to_owned(),
+        };
+        let result = std::thread::Builder::new()
+            .name("deep-lowering-stack".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let stage = StageId("encrypt".to_owned());
+                let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+                lowerer.lower_stage_wire(&stage, output).expect("deep lowering succeeds");
+                (
+                    lowerer.egraph.number_of_classes(),
+                    lowerer.egraph.analysis.symbols.binders.values.len(),
+                )
+            })
+            .expect("constrained stack thread")
+            .join()
+            .expect("deep lowering thread");
+        assert_eq!(result.1, DEPTH);
+        assert!(
+            result.0 < DEPTH * 8,
+            "lowering must scale with structural nodes, not {LOGICAL_COUNT} logical lanes"
+        );
     }
 }

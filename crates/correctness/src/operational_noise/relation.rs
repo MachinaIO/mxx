@@ -355,8 +355,15 @@ fn checked_replacement(
             continue;
         }
         for registration in registrations {
+            // Section 27 permits distribution only through a physical summand
+            // ending in this registration's exact public operand.  Validate that
+            // summand before accepting the relation; the enclosing addition is
+            // not itself the sampler public key.
+            let preflight_public =
+                distribution_public_operand(egraph, actual_public, registration.expected_public)
+                    .unwrap_or(actual_public);
             if let Err(failure) =
-                preflight_registration(egraph, relation, &source, &registration, actual_public)
+                preflight_registration(egraph, relation, &source, &registration, preflight_public)
             {
                 context.fail(failure);
                 continue;
@@ -370,16 +377,30 @@ fn checked_replacement(
                 continue;
             }
             let target = egraph.find(registration.target);
-            let replacement = relation_guided_distribution(
+            let distributed = relation_guided_distribution(
                 egraph,
                 factors,
                 relation_position,
                 registration.expected_public,
                 target,
-            )
-            .unwrap_or_else(|| {
-                ordered_product_without_pair(egraph, factors, relation_position, target)
-            });
+            );
+            // If the left factor is additive, consuming the relation without
+            // an exact matching summand would be an unsound general-product
+            // rewrite.  Fail closed instead of silently taking that fallback.
+            let additive_public = egraph[egraph.find(actual_public)]
+                .nodes
+                .iter()
+                .any(|node| matches!(node, MxxLang::MatrixAdd(_)));
+            let replacement = match (additive_public, distributed) {
+                (_, Some(replacement)) => replacement,
+                (true, None) => {
+                    context.fail(RelationFailure::TransformedOperand);
+                    continue;
+                }
+                (false, None) => {
+                    ordered_product_without_pair(egraph, factors, relation_position, target)
+                }
+            };
             replacements.insert(replacement);
             sources.insert(source.source);
         }
@@ -393,6 +414,72 @@ fn checked_replacement(
     let selector_distribution =
         switch_node(egraph, actual_public).is_some() || switch_node(egraph, relation).is_some();
     Some((replacement, selector_distribution))
+}
+
+fn distribution_public_operand(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    actual_public: Id,
+    expected_public: Id,
+) -> Option<Id> {
+    let add = egraph[egraph.find(actual_public)].nodes.iter().find_map(|node| match node {
+        MxxLang::MatrixAdd(children) => Some(children),
+        _ => None,
+    })?;
+    add.iter().find_map(|term| {
+        egraph[egraph.find(*term)].nodes.iter().find_map(|node| match node {
+            MxxLang::MatrixMultiply(factors)
+                if factors
+                    .last()
+                    .is_some_and(|last| egraph.find(*last) == egraph.find(expected_public)) =>
+            {
+                Some(expected_public)
+            }
+            _ => None,
+        })
+    })
+}
+
+/// Closed production classification used by extraction.  It deliberately
+/// consults only e-node syntax and analysis-owned source/role tables.
+pub fn classify_proposal_node(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    node: &MxxLang,
+    context: &RewriteContext,
+) -> Result<(bool, bool), RelationFailure> {
+    let large_atom = matches!(node, MxxLang::Atom { source, .. }
+    if egraph.analysis.symbols.atomic_sources.get(source.0).is_some_and(|descriptor| !matches!(
+        descriptor.key, super::identity::AtomicSourceKey::Sampler(_)
+    )));
+    let MxxLang::MatrixMultiply(factors) = node else { return Ok((false, large_atom)) };
+    for relation_position in 1..factors.len() {
+        let relation = egraph.find(factors[relation_position]);
+        if egraph[relation].data.relation_provenance.is_empty() {
+            continue;
+        }
+        let mut sources = Vec::new();
+        flatten_provenance(&egraph[relation].data.relation_provenance, &mut sources)?;
+        for source in sources {
+            for registration in context.registrations(source.source) {
+                let public = egraph.find(factors[relation_position - 1]);
+                let preflight_public =
+                    distribution_public_operand(egraph, public, registration.expected_public)
+                        .unwrap_or(public);
+                if preflight_registration(
+                    egraph,
+                    relation,
+                    &source,
+                    &registration,
+                    preflight_public,
+                )
+                .is_ok() &&
+                    same_canonical_indices(egraph, &source.indices, &registration.indices)
+                {
+                    return Ok((true, large_atom));
+                }
+            }
+        }
+    }
+    Ok((false, large_atom))
 }
 
 /// Validates the exact Graph-derived records before accepting an e-class

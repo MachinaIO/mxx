@@ -386,8 +386,13 @@ mod tests {
         analysis::{MxxAnalysis, MxxSort},
         bound::{BoundEvaluationError, ResolvedMatrixConstant},
         identity::{
-            AtomicSourceDescriptor, AtomicSourceKey, CanonicalResidueConvention, CrtSpecId,
-            MatrixConstantSpecId, ResolvedIntExpr, ResolvedMatrixType,
+            AtomicRelationRole, AtomicSourceDescriptor, AtomicSourceKey,
+            CanonicalResidueConvention, CrtSpecId, MatrixConstantSpecId, ResolvedIntExpr,
+            ResolvedMatrixType,
+        },
+        relation::{
+            RelationApplier, RelationRegistration, RelationSearcher, RewriteContext,
+            SharedRewriteBudget,
         },
     };
     use mxx_ir_core::types::ConcreteMatrixType;
@@ -444,6 +449,7 @@ mod tests {
         nodes: BTreeMap<Id, MxxLang>,
         atom_classes: BTreeMap<AtomicSourceId, BoundClass>,
         missing: Option<AtomicSourceId>,
+        reachable_cases: BTreeMap<Id, Box<[bool]>>,
     }
 
     fn scalar_matrix_type() -> ResolvedMatrixType {
@@ -518,6 +524,17 @@ mod tests {
         }
         fn validate_pack(&self, term: Id, _: usize) -> Result<(), BoundEvaluationError> {
             Err(BoundEvaluationError::InvalidPack { term })
+        }
+        fn switch_reachable_cases(
+            &self,
+            term: Id,
+            _: Id,
+            _: usize,
+        ) -> Result<Box<[bool]>, BoundEvaluationError> {
+            self.reachable_cases
+                .get(&term)
+                .cloned()
+                .ok_or(BoundEvaluationError::InvalidSwitchReachability { term })
         }
     }
 
@@ -666,6 +683,108 @@ mod tests {
             Some(BoundClass::Bounded { maximum_absolute_coefficient })
                 if maximum_absolute_coefficient == BigUint::from(3_u8)
         ));
+    }
+
+    #[test]
+    fn extraction_prefers_pointwise_preimage_normalization_over_the_original_large_public() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (scale, scale_source) = matrix_atom(&mut egraph, "scale");
+        let (public, public_source) = matrix_atom(&mut egraph, "public");
+        let (residual, residual_source) = matrix_atom(&mut egraph, "residual");
+        let (left_target, left_target_source) = matrix_atom(&mut egraph, "left-target");
+        let (right_target, right_target_source) = matrix_atom(&mut egraph, "right-target");
+        let relation_atom = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, name| {
+            let source = AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(
+                AtomicSourceDescriptor {
+                    key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(name)),
+                    sort: MxxSort::Matrix(scalar_matrix_type()),
+                    integer_domain: None,
+                    canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
+                    relation_role: Some(AtomicRelationRole::Preimage),
+                },
+            ));
+            let term =
+                egraph.add(MxxLang::Atom { source, indices: vec![selector].into_boxed_slice() });
+            (term, source)
+        };
+        let (left_relation, left_source) = relation_atom(&mut egraph, "left-relation");
+        let (right_relation, right_source) = relation_atom(&mut egraph, "right-relation");
+        let relation = egraph
+            .add(MxxLang::Switch(vec![selector, left_relation, right_relation].into_boxed_slice()));
+        let matching = egraph.add(MxxLang::MatrixMultiply(vec![scale, public].into_boxed_slice()));
+        let additive = egraph.add(MxxLang::MatrixAdd(vec![matching, residual].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixMultiply(vec![additive, relation].into_boxed_slice()));
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        for (source, target) in [(left_source, left_target), (right_source, right_target)] {
+            context.register(RelationRegistration {
+                source,
+                expected_public: public,
+                target,
+                trapdoor: None,
+                indices: vec![selector].into_boxed_slice(),
+            });
+        }
+        let rewrite = egg::Rewrite::new(
+            "test-pointwise-preimage",
+            RelationSearcher::new(context.clone()),
+            RelationApplier::new(context.clone()),
+        )
+        .expect("closed test rewrite");
+        let runner = egg::Runner::default().with_egraph(egraph).run(&[rewrite]);
+        let egraph = runner.egraph;
+        assert_eq!(context.failure(), None);
+        assert_eq!(context.counters().selector_distributions, 1);
+        assert!(context.counters().rewrites >= 3);
+
+        let reachable_cases = egraph
+            .classes()
+            .filter_map(|class| {
+                class.nodes.iter().find_map(|node| match node {
+                    MxxLang::Switch(cases) => Some((class.id, vec![true; cases.len() - 1].into())),
+                    _ => None,
+                })
+            })
+            .collect();
+        let input = SemanticInput {
+            atom_classes: BTreeMap::from([
+                (scale_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (public_source, BoundClass::Large),
+                (
+                    residual_source,
+                    BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() },
+                ),
+                (left_target_source, BoundClass::Large),
+                (right_target_source, BoundClass::Large),
+                (left_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+                (right_source, BoundClass::Bounded { maximum_absolute_coefficient: 1_u8.into() }),
+            ]),
+            reachable_cases,
+            ..Default::default()
+        };
+        let mut invalid = |_| panic!("fixture has a finite selected DAG");
+        let mut bound_error = |error| panic!("fixture has valid matrix bounds: {error:?}");
+        let result = extract_best_proposal(
+            &egraph,
+            egraph.find(root),
+            &input,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut |_, node, egraph| {
+                super::super::relation::classify_proposal_node(egraph, node, &context)
+                    .map(|relation_redex| ProposalNodeClassification { relation_redex })
+                    .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
+            },
+        )
+        .expect("pointwise relation candidate extracts");
+
+        assert!(result.cost.large_residual);
+        assert!(matches!(
+            result.first_large_source,
+            Some(source) if source == left_target_source || source == right_target_source
+        ));
+        assert!(!result.expression.as_ref().iter().any(|node| {
+            matches!(node, MxxLang::Atom { source, .. } if *source == public_source)
+        }));
     }
 
     #[test]

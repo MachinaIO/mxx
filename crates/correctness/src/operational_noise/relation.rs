@@ -445,6 +445,14 @@ pub fn classify_proposal_node(
         if egraph[relation].data.relation_provenance.is_empty() {
             continue;
         }
+        let public = egraph.find(factors[relation_position - 1]);
+        // Distribution itself is a closed structural rewrite.  It must be
+        // charged before checking a relation source inside a selected Switch:
+        // that source is not yet a bare atom, but the applier will expose it
+        // pointwise without enumerating selector combinations.
+        if pointwise_selector_is_distributable(egraph, public, relation)? {
+            return Ok(true);
+        }
         let mut sources = Vec::new();
         if !flatten_provenance(&egraph[relation].data.relation_provenance, context, &mut sources) {
             return Err(context.failure().expect("failed provenance reservation records a failure"));
@@ -452,7 +460,6 @@ pub fn classify_proposal_node(
         for candidate in sources {
             let RelationCandidate::Direct(source) = candidate else { continue };
             for registration in context.registrations(source.source) {
-                let public = egraph.find(factors[relation_position - 1]);
                 let distributed_public =
                     distribution_public_operand(egraph, public, registration.expected_public);
                 let preflight_public = distributed_public.unwrap_or(public);
@@ -794,16 +801,13 @@ pub fn pointwise_same_selector(
 ) -> Result<Option<Id>, RelationFailure> {
     let left = egraph.find(left);
     let right = egraph.find(right);
+    if !pointwise_selector_is_distributable(egraph, left, right)? {
+        return Ok(None);
+    }
     let left_switch = switch_node(egraph, left);
     let right_switch = switch_node(egraph, right);
     match (left_switch, right_switch) {
         (Some(left_cases), Some(right_cases)) => {
-            if egraph.find(left_cases[0]) != egraph.find(right_cases[0]) {
-                return Err(RelationFailure::DifferentSelectorBlocked);
-            }
-            if left_cases.len() != right_cases.len() || left_cases.len() < 2 {
-                return Ok(None);
-            }
             let mut cases = Vec::with_capacity(left_cases.len());
             cases.push(left_cases[0]);
             for (left, right) in left_cases[1..].iter().zip(&right_cases[1..]) {
@@ -821,8 +825,40 @@ pub fn pointwise_same_selector(
         (None, Some(cases)) => {
             Ok(pointwise_switch_with_fixed_operand(egraph, cases, left, false, multiply))
         }
-        (None, None) => Ok(None),
+        (None, None) => unreachable!("a distributable selector has a switch"),
     }
+}
+
+/// Checks the selector shape shared by pointwise construction and extraction.
+/// It reads only canonical selector identities and case counts; it neither
+/// clones cases nor visits alternatives.
+fn pointwise_selector_is_distributable(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    left: Id,
+    right: Id,
+) -> Result<bool, RelationFailure> {
+    let left = switch_shape(egraph, left);
+    let right = switch_shape(egraph, right);
+    match (left, right) {
+        (Some((left_selector, left_count)), Some((right_selector, right_count))) => {
+            if left_selector != right_selector {
+                Err(RelationFailure::DifferentSelectorBlocked)
+            } else {
+                Ok(left_count == right_count && left_count >= 2)
+            }
+        }
+        (Some((_, count)), None) | (None, Some((_, count))) => Ok(count >= 2),
+        (None, None) => Ok(false),
+    }
+}
+
+fn switch_shape(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<(Id, usize)> {
+    egraph[egraph.find(id)].nodes.iter().find_map(|node| match node {
+        MxxLang::Switch(cases) => {
+            cases.first().map(|selector| (egraph.find(*selector), cases.len()))
+        }
+        _ => None,
+    })
 }
 
 fn pointwise_switch_with_fixed_operand(

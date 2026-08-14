@@ -789,8 +789,10 @@ fn flatten_provenance(
     completed
 }
 
-/// Builds the only selector correlation allowed by the relation engine.
-/// Different selectors return `None` without constructing a branch product.
+/// Builds a pointwise selector product.  A selector may be present on one
+/// operand only; the fixed operand is then used in every branch.  Two
+/// selectors must still be identical, so this never creates a Cartesian
+/// product of branch families.
 pub fn pointwise_same_selector(
     egraph: &mut EGraph<MxxLang, MxxAnalysis>,
     left: Id,
@@ -801,25 +803,56 @@ pub fn pointwise_same_selector(
     let right = egraph.find(right);
     let left_switch = switch_node(egraph, left);
     let right_switch = switch_node(egraph, right);
-    let (Some(left_cases), Some(right_cases)) = (left_switch, right_switch) else {
-        return Ok(None);
-    };
-    if egraph.find(left_cases[0]) != egraph.find(right_cases[0]) {
-        return Err(RelationFailure::DifferentSelectorBlocked);
+    match (left_switch, right_switch) {
+        (Some(left_cases), Some(right_cases)) => {
+            if egraph.find(left_cases[0]) != egraph.find(right_cases[0]) {
+                return Err(RelationFailure::DifferentSelectorBlocked);
+            }
+            if left_cases.len() != right_cases.len() || left_cases.len() < 2 {
+                return Ok(None);
+            }
+            let mut cases = Vec::with_capacity(left_cases.len());
+            cases.push(left_cases[0]);
+            for (left, right) in left_cases[1..].iter().zip(&right_cases[1..]) {
+                cases.push(egraph.add(if multiply {
+                    MxxLang::MatrixMultiply(vec![*left, *right].into_boxed_slice())
+                } else {
+                    MxxLang::MatrixAdd(vec![*left, *right].into_boxed_slice())
+                }));
+            }
+            Ok(Some(egraph.add(MxxLang::Switch(cases.into_boxed_slice()))))
+        }
+        (Some(cases), None) => {
+            Ok(pointwise_switch_with_fixed_operand(egraph, cases, right, true, multiply))
+        }
+        (None, Some(cases)) => {
+            Ok(pointwise_switch_with_fixed_operand(egraph, cases, left, false, multiply))
+        }
+        (None, None) => Ok(None),
     }
-    if left_cases.len() != right_cases.len() || left_cases.len() < 2 {
-        return Ok(None);
+}
+
+fn pointwise_switch_with_fixed_operand(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    cases: Box<[Id]>,
+    fixed: Id,
+    switch_is_left: bool,
+    multiply: bool,
+) -> Option<Id> {
+    if cases.len() < 2 {
+        return None;
     }
-    let mut cases = Vec::with_capacity(left_cases.len());
-    cases.push(left_cases[0]);
-    for (left, right) in left_cases[1..].iter().zip(&right_cases[1..]) {
-        cases.push(egraph.add(if multiply {
-            MxxLang::MatrixMultiply(vec![*left, *right].into_boxed_slice())
+    let mut output_cases = Vec::with_capacity(cases.len());
+    output_cases.push(cases[0]);
+    for case in &cases[1..] {
+        let (left, right) = if switch_is_left { (*case, fixed) } else { (fixed, *case) };
+        output_cases.push(egraph.add(if multiply {
+            MxxLang::MatrixMultiply(vec![left, right].into_boxed_slice())
         } else {
-            MxxLang::MatrixAdd(vec![*left, *right].into_boxed_slice())
+            MxxLang::MatrixAdd(vec![left, right].into_boxed_slice())
         }));
     }
-    Ok(Some(egraph.add(MxxLang::Switch(cases.into_boxed_slice()))))
+    Some(egraph.add(MxxLang::Switch(output_cases.into_boxed_slice())))
 }
 
 fn switch_node(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
@@ -832,6 +865,71 @@ fn switch_node(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointwise_selector_product_distributes_a_single_switch_linearly() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let left_cases =
+            [egraph.add(MxxLang::IntConst(2.into())), egraph.add(MxxLang::IntConst(3.into()))];
+        let left = egraph
+            .add(MxxLang::Switch(vec![selector, left_cases[0], left_cases[1]].into_boxed_slice()));
+        let right = egraph.add(MxxLang::IntConst(5.into()));
+
+        let product = pointwise_same_selector(&mut egraph, left, right, true)
+            .expect("one-sided selection is valid")
+            .expect("the selection is distributed");
+        let cases = switch_node(&egraph, product).expect("selector is retained");
+        assert_eq!(egraph.find(cases[0]), egraph.find(selector));
+        assert_eq!(cases.len(), 3);
+        for (case, left_case) in cases[1..].iter().zip(left_cases) {
+            assert!(egraph[egraph.find(*case)].nodes.iter().any(|node| {
+                matches!(node, MxxLang::MatrixMultiply(factors)
+                    if factors.len() == 2 &&
+                        egraph.find(factors[0]) == egraph.find(left_case) &&
+                        egraph.find(factors[1]) == egraph.find(right))
+            }));
+        }
+
+        let right_cases =
+            [egraph.add(MxxLang::IntConst(7.into())), egraph.add(MxxLang::IntConst(11.into()))];
+        let selected_right = egraph.add(MxxLang::Switch(
+            vec![selector, right_cases[0], right_cases[1]].into_boxed_slice(),
+        ));
+        let product = pointwise_same_selector(&mut egraph, right, selected_right, true)
+            .expect("one-sided selection is valid")
+            .expect("the selection is distributed");
+        let cases = switch_node(&egraph, product).expect("selector is retained");
+        for (case, right_case) in cases[1..].iter().zip(right_cases) {
+            assert!(egraph[egraph.find(*case)].nodes.iter().any(|node| {
+                matches!(node, MxxLang::MatrixMultiply(factors)
+                    if factors.len() == 2 &&
+                        egraph.find(factors[0]) == egraph.find(right) &&
+                        egraph.find(factors[1]) == egraph.find(right_case))
+            }));
+        }
+    }
+
+    #[test]
+    fn pointwise_selector_product_rejects_different_two_sided_selectors() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let left_selector = egraph.add(MxxLang::IntConst(0.into()));
+        let right_selector = egraph.add(MxxLang::IntConst(1.into()));
+        let left_cases =
+            [egraph.add(MxxLang::IntConst(2.into())), egraph.add(MxxLang::IntConst(3.into()))];
+        let right_cases =
+            [egraph.add(MxxLang::IntConst(5.into())), egraph.add(MxxLang::IntConst(7.into()))];
+        let left = egraph.add(MxxLang::Switch(
+            vec![left_selector, left_cases[0], left_cases[1]].into_boxed_slice(),
+        ));
+        let right = egraph.add(MxxLang::Switch(
+            vec![right_selector, right_cases[0], right_cases[1]].into_boxed_slice(),
+        ));
+        assert_eq!(
+            pointwise_same_selector(&mut egraph, left, right, true),
+            Err(RelationFailure::DifferentSelectorBlocked),
+        );
+    }
 
     #[test]
     fn shared_budget_observes_owned_work() {

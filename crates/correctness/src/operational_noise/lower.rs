@@ -2352,7 +2352,8 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                                     .iter()
                                     .map(|coordinate| coordinate.binder.clone())
                                     .collect(),
-                            },
+                            }
+                            .into(),
                             indices: indices.clone(),
                             public,
                             target,
@@ -3285,10 +3286,29 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         .map(|range| self.resolve_range(range, environment))
                         .transpose()?,
                 };
+                let input = self.egraph.find(terms(1)?[0]);
+                let is_full_axis = |range: Option<&super::identity::ResolvedIndexRange>,
+                                    extent: &ResolvedIntExpr| {
+                    let Some(range) = range else { return true };
+                    let (Some(start), Some(end), Some(extent)) = (
+                        resolved_constant(&range.start),
+                        resolved_constant(&range.end),
+                        resolved_constant(extent),
+                    ) else {
+                        return false;
+                    };
+                    start.is_zero() && end == extent && extent.is_positive()
+                };
+                if let Ok(MxxSort::Matrix(matrix)) = &self.egraph[input].data.sort &&
+                    is_full_axis(spec.rows.as_ref(), &matrix.rows) &&
+                    is_full_axis(spec.columns.as_ref(), &matrix.columns)
+                {
+                    return Ok(LoweredValue::Term(input));
+                }
                 let id = self.egraph.analysis.symbols.slices.intern(spec);
                 self.egraph.add(MxxLang::MatrixSlice {
                     spec: super::identity::SliceSpecId(id),
-                    input: [terms(1)?[0]],
+                    input: [input],
                 })
             }
             NodeKind::Tensor => {
@@ -4731,6 +4751,134 @@ mod tests {
     }
 
     #[test]
+    fn full_closed_slices_lower_to_their_input_without_slice_nodes() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "full-slice-identity".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let matrix_type = super::super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(3.into()),
+            columns: ResolvedIntExpr::Const(2.into()),
+        };
+        let spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type,
+                value: super::super::identity::MatrixConstantValue::Zero,
+            },
+        );
+        let matrix = lowerer
+            .egraph
+            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)));
+        let range = |start, end| mxx_ir_core::node::IndexRange {
+            start: IntExpr::constant(start),
+            end: IntExpr::constant(end),
+        };
+        let slice_nodes = |lowerer: &GraphLowerer<'_, '_>| {
+            lowerer
+                .egraph
+                .classes()
+                .flat_map(|class| class.nodes.iter())
+                .filter(|node| matches!(node, MxxLang::MatrixSlice { .. }))
+                .count()
+        };
+        let before = slice_nodes(&lowerer);
+        for kind in [
+            NodeKind::Slice { rows: Some(range(0, 3)), columns: None },
+            NodeKind::Slice { rows: None, columns: Some(range(0, 2)) },
+            NodeKind::Slice { rows: Some(range(0, 3)), columns: Some(range(0, 2)) },
+            NodeKind::Slice { rows: None, columns: None },
+        ] {
+            let LoweredValue::Term(slice) = lowerer
+                .lower_node(&kind, &[LoweredValue::Term(matrix)], &root_test_environment())
+                .expect("full slice lowers")
+            else {
+                panic!("full slice is a matrix term")
+            };
+            assert_eq!(lowerer.egraph.find(slice), lowerer.egraph.find(matrix));
+        }
+        assert_eq!(slice_nodes(&lowerer), before, "full views add no MatrixSlice node");
+    }
+
+    #[test]
+    fn proper_or_symbolic_extent_slices_retain_matrix_slice_nodes() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "proper-slice-retained".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let matrix = |lowerer: &mut GraphLowerer<'_, '_>, rows| {
+            let spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
+                super::super::identity::MatrixConstantSpec {
+                    matrix_type: super::super::identity::ResolvedMatrixType {
+                        modulus: ResolvedIntExpr::Const(17.into()),
+                        ring_dimension: ResolvedIntExpr::Const(1.into()),
+                        rows,
+                        columns: ResolvedIntExpr::Const(2.into()),
+                    },
+                    value: super::super::identity::MatrixConstantValue::Zero,
+                },
+            );
+            lowerer
+                .egraph
+                .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)))
+        };
+        let range = |start, end| mxx_ir_core::node::IndexRange {
+            start: IntExpr::constant(start),
+            end: IntExpr::constant(end),
+        };
+        for rows in [Some(range(0, 2)), Some(range(1, 3))] {
+            let input = matrix(&mut lowerer, ResolvedIntExpr::Const(3.into()));
+            let LoweredValue::Term(slice) = lowerer
+                .lower_node(
+                    &NodeKind::Slice { rows, columns: None },
+                    &[LoweredValue::Term(input)],
+                    &root_test_environment(),
+                )
+                .expect("proper slice lowers")
+            else {
+                panic!("proper slice is a matrix term")
+            };
+            assert_ne!(lowerer.egraph.find(slice), lowerer.egraph.find(input));
+            assert!(
+                lowerer.egraph[lowerer.egraph.find(slice)]
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node, MxxLang::MatrixSlice { .. }))
+            );
+        }
+        let symbolic_rows = ResolvedIntExpr::Binder(BinderKey {
+            loop_scope: root_test_environment().occurrence,
+            loop_node: mxx_ir_core::NodeId(7),
+            slot: 0,
+        });
+        let input = matrix(&mut lowerer, symbolic_rows);
+        let LoweredValue::Term(slice) = lowerer
+            .lower_node(
+                &NodeKind::Slice { rows: Some(range(0, 3)), columns: None },
+                &[LoweredValue::Term(input)],
+                &root_test_environment(),
+            )
+            .expect("symbolic-extent slice lowers conservatively")
+        else {
+            panic!("symbolic-extent slice is a matrix term")
+        };
+        assert_ne!(lowerer.egraph.find(slice), lowerer.egraph.find(input));
+        assert!(
+            lowerer.egraph[lowerer.egraph.find(slice)]
+                .nodes
+                .iter()
+                .any(|node| matches!(node, MxxLang::MatrixSlice { .. }))
+        );
+    }
+
+    #[test]
     fn plain_extract_uses_authoritative_source_full_modulus_fallback() {
         let protocol = crate::toy_example::protocol();
         let request = OperationalCheckRequest {
@@ -5741,7 +5889,7 @@ mod tests {
         };
         let sampler =
             lowerer.egraph.analysis.symbols.samplers.intern(SamplerIdentity::GadgetDecomposition {
-                source: source.clone(),
+                source: source.clone().into(),
                 indices: indices.clone(),
                 public,
                 target,
@@ -5771,6 +5919,59 @@ mod tests {
             indices: indices.clone(),
         });
 
+        let same_sampler =
+            lowerer.egraph.analysis.symbols.samplers.intern(SamplerIdentity::GadgetDecomposition {
+                source: super::super::identity::GraphWireSourceKey {
+                    wire: WireSourceKey {
+                        scope: source.wire.scope.clone(),
+                        wire: WireRef {
+                            node: mxx_ir_core::NodeId(777),
+                            port: mxx_ir_core::Port(0),
+                        },
+                    },
+                    coordinate_binders: source.coordinate_binders.clone(),
+                }
+                .into(),
+                indices: indices.clone(),
+                public,
+                target,
+                base: base.clone(),
+                digit_count: digit_count.clone(),
+                small: false,
+                range_proved: false,
+            });
+        assert_eq!(same_sampler, sampler, "equal deterministic decompositions share a sampler");
+        let same_atom_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::Sampler(SamplerDescriptorId(
+                    same_sampler,
+                )),
+                sort: sort.clone(),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: Some(
+                    super::super::identity::AtomicRelationRole::GadgetDecomposition,
+                ),
+            },
+        );
+        assert_eq!(same_atom_source, atom_source, "the shared sampler has one atom source");
+        let same_decomposition = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(same_atom_source),
+            indices: indices.clone(),
+        });
+        assert_eq!(
+            lowerer.egraph.find(same_decomposition),
+            lowerer.egraph.find(decomposition),
+            "the same atom source and ordered coordinates hash-cons into one e-class"
+        );
+        let registrations = lowerer.relation_registrations();
+        assert!(registrations.iter().any(|registration| {
+            registration.source == super::super::identity::AtomicSourceId(atom_source) &&
+                registration.expected_public == public &&
+                registration.target == target &&
+                registration.indices.as_ref() == indices.as_ref()
+        }));
+
         assert_eq!(
             BoundEvaluator::new(&lowerer.production_bound_view())
                 .evaluate(decomposition)
@@ -5781,7 +5982,7 @@ mod tests {
 
         let sampler =
             lowerer.egraph.analysis.symbols.samplers.intern(SamplerIdentity::GadgetDecomposition {
-                source,
+                source: source.into(),
                 indices: indices.clone(),
                 public,
                 target,

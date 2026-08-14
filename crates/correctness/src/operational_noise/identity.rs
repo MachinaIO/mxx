@@ -75,6 +75,30 @@ pub struct GraphWireSourceKey {
     pub coordinate_binders: Box<[BinderKey]>,
 }
 
+/// The first graph occurrence that lowered a deterministic gadget
+/// decomposition. This is audit-only metadata: it does not alter the matrix
+/// value, so equality and hashing deliberately ignore the payload.
+#[derive(Clone, Debug)]
+pub struct GadgetDecompositionAuditOccurrence(pub GraphWireSourceKey);
+
+impl From<GraphWireSourceKey> for GadgetDecompositionAuditOccurrence {
+    fn from(source: GraphWireSourceKey) -> Self {
+        Self(source)
+    }
+}
+
+impl PartialEq for GadgetDecompositionAuditOccurrence {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for GadgetDecompositionAuditOccurrence {}
+
+impl Hash for GadgetDecompositionAuditOccurrence {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+
 /// The source of an ordinary symbolic value.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum AtomicSourceKey {
@@ -369,6 +393,10 @@ compact_id!(
 
 /// A source-level sampler record retains the exact operand e-classes for a
 /// later relation pass; lowering never guesses a relation from a matrix shape.
+///
+/// A `GadgetDecomposition` is deterministic, so its graph-wire occurrence is
+/// audit metadata rather than part of the produced value's identity.  The
+/// interner retains the first occurrence only for diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum SamplerIdentity {
     /// A non-relation sampler with an explicit, nonnegative coefficient cap.
@@ -408,7 +436,7 @@ pub enum SamplerIdentity {
         range_proved: bool,
     },
     GadgetDecomposition {
-        source: GraphWireSourceKey,
+        source: GadgetDecompositionAuditOccurrence,
         indices: Box<[egg::Id]>,
         public: egg::Id,
         target: egg::Id,
@@ -642,6 +670,73 @@ mod tests {
         let first_id = interner.intern(first);
         assert_ne!(first_id, interner.intern(different_bound));
         assert_ne!(first_id, interner.intern(interval));
+    }
+
+    #[test]
+    fn deterministic_gadget_decomposition_interns_by_semantics_not_occurrence() {
+        let occurrence = |node| GraphWireSourceKey {
+            wire: WireSourceKey {
+                scope: scope(ProgramKey::WorkflowStage(StageId("encrypt".to_owned()))),
+                wire: WireRef { node: NodeId(node), port: Port(0) },
+            },
+            coordinate_binders: Box::new([]),
+        };
+        let decomposition = |source: GraphWireSourceKey,
+                             public: usize,
+                             target: usize,
+                             base: i64,
+                             digit_count: i64,
+                             small: bool,
+                             indices: Box<[egg::Id]>,
+                             range_proved: bool| {
+            SamplerIdentity::GadgetDecomposition {
+                source: source.into(),
+                indices,
+                public: egg::Id::from(public),
+                target: egg::Id::from(target),
+                base: ResolvedIntExpr::Const(base.into()),
+                digit_count: ResolvedIntExpr::Const(digit_count.into()),
+                small,
+                range_proved,
+            }
+        };
+        let first = decomposition(occurrence(11), 7, 9, 32, 2, false, vec![3.into()].into(), false);
+        let same_value_other_occurrence =
+            decomposition(occurrence(12), 7, 9, 32, 2, false, vec![3.into()].into(), false);
+        let different_target =
+            decomposition(occurrence(12), 7, 10, 32, 2, false, vec![3.into()].into(), false);
+        let different_base =
+            decomposition(occurrence(12), 7, 9, 64, 2, false, vec![3.into()].into(), false);
+        let different_digit_count =
+            decomposition(occurrence(12), 7, 9, 32, 3, false, vec![3.into()].into(), false);
+        let different_small =
+            decomposition(occurrence(12), 7, 9, 32, 2, true, vec![3.into()].into(), false);
+        let different_indices =
+            decomposition(occurrence(12), 7, 9, 32, 2, false, vec![4.into()].into(), false);
+        let different_range_proved =
+            decomposition(occurrence(12), 7, 9, 32, 2, false, vec![3.into()].into(), true);
+
+        let mut samplers = Interner::default();
+        let first_id = samplers.intern(first);
+        assert_eq!(first_id, samplers.intern(same_value_other_occurrence));
+        assert_ne!(first_id, samplers.intern(different_target));
+        assert_ne!(first_id, samplers.intern(different_base));
+        assert_ne!(first_id, samplers.intern(different_digit_count));
+        assert_ne!(first_id, samplers.intern(different_small));
+        assert_ne!(first_id, samplers.intern(different_indices));
+        assert_ne!(first_id, samplers.intern(different_range_proved));
+        assert_eq!(samplers.len(), 7);
+
+        let SamplerIdentity::GadgetDecomposition { source, .. } =
+            &samplers.values[first_id as usize]
+        else {
+            panic!("first sampler is a gadget decomposition")
+        };
+        assert_eq!(
+            source.0.wire.wire.node,
+            NodeId(11),
+            "the retained occurrence is diagnostic only"
+        );
     }
 
     #[test]

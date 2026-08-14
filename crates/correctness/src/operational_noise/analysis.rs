@@ -1272,10 +1272,20 @@ fn graph_wire_coordinates_are_authoritative(
                 super::identity::SamplerIdentity::Gaussian { source, indices, .. } |
                 super::identity::SamplerIdentity::UniformInterval { source, indices, .. } |
                 super::identity::SamplerIdentity::Preimage { source, indices, .. } |
-                super::identity::SamplerIdentity::DecomposedHash { source, indices, .. } |
+                super::identity::SamplerIdentity::DecomposedHash { source, indices, .. } => {
+                    (source, indices)
+                }
                 super::identity::SamplerIdentity::GadgetDecomposition {
-                    source, indices, ..
-                } => (source, indices),
+                    indices: recorded_indices,
+                    ..
+                } => {
+                    // The occurrence is audit-only; relation identity is the
+                    // sampler descriptor plus its checked atom children.
+                    return recorded_indices.len() == indices.len() &&
+                        recorded_indices.iter().zip(indices).all(|(recorded, actual)| {
+                            egraph.find(*recorded) == egraph.find(*actual)
+                        });
+                }
             };
             if recorded.len() != indices.len() ||
                 recorded

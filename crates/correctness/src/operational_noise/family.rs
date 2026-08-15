@@ -552,6 +552,30 @@ pub fn instantiate_shared_element<E>(
                 source: AtomicSourceId(source),
                 indices: indices.iter().map(|term| remap(*term)).collect(),
             })
+        } else if let MxxLang::Switch(children) = node {
+            let remapped = children.iter().map(|term| remap(*term)).collect::<Vec<_>>();
+            let (selector, cases) =
+                remapped.split_first().expect("stored Switch nodes have a selector");
+            // A substituted exact selector has the ordinary runtime Switch
+            // meaning: select its zero-based case instead of retaining every
+            // unreachable branch in the instantiated representative.
+            match egraph[egraph.find(*selector)]
+                .data
+                .integer_domain
+                .as_ref()
+                .and_then(|domain| match domain {
+                    IntegerDomain::Exact(value) => Some(value),
+                    IntegerDomain::Affine { .. } | IntegerDomain::IntervalOnly(_) => None,
+                })
+                .and_then(|value| value.to_usize())
+                .and_then(|index| cases.get(index))
+            {
+                Some(selected) => *selected,
+                // An out-of-range exact selector cannot be selected safely.
+                // Keep the invalid Switch structural so the owning generic
+                // validation path rejects it rather than guessing a branch.
+                None => egraph.add(MxxLang::Switch(remapped.into_boxed_slice())),
+            }
         } else {
             egraph.add(node.clone().map_children(remap))
         };
@@ -978,6 +1002,103 @@ mod tests {
 
     fn evaluate(recurrence: &VectorRecurrence) -> Result<Box<[BigUint]>, RecurrenceFailure> {
         recurrence.evaluate()
+    }
+
+    fn test_binder(analysis: &mut MxxAnalysis, node: u32) -> BinderId {
+        let scope = OccurrenceScope {
+            program: ProgramKey::Ideal,
+            definition: mxx_ir_core::FrozenGraphScopeId::Root,
+            path: Box::new([]),
+        };
+        BinderId(analysis.symbols.binders.intern(BinderDescriptor {
+            key: BinderKey {
+                loop_scope: scope,
+                loop_node: mxx_ir_core::NodeId(node.into()),
+                slot: 0,
+            },
+            minimum: 0.into(),
+            maximum: 7.into(),
+        }))
+    }
+
+    #[test]
+    fn shared_template_instantiation_selects_exact_switch_cases() {
+        for (selector_value, expected) in [(0, 10), (1, 20), (2, 30)] {
+            let mut analysis = MxxAnalysis::default();
+            let binder = test_binder(&mut analysis, 1);
+            let mut egraph = EGraph::new(analysis);
+            let selector = egraph.add(MxxLang::IntBinder(binder));
+            let cases = [10, 20, 30].map(|value| egraph.add(MxxLang::IntConst(value.into())));
+            let representative =
+                egraph.add(MxxLang::Switch([selector, cases[0], cases[1], cases[2]].into()));
+            let replacement = egraph.add(MxxLang::IntConst(selector_value.into()));
+            let instantiated = instantiate_shared_element(
+                &mut egraph,
+                representative,
+                binder,
+                replacement,
+                &mut || Ok::<(), ()>(()),
+            )
+            .unwrap();
+            let expected = egraph.add(MxxLang::IntConst(expected.into()));
+            assert_eq!(egraph.find(instantiated), egraph.find(expected));
+        }
+    }
+
+    #[test]
+    fn shared_template_instantiation_keeps_nonexact_or_invalid_switches_structural() {
+        let mut analysis = MxxAnalysis::default();
+        let owner = test_binder(&mut analysis, 1);
+        let foreign = test_binder(&mut analysis, 2);
+        let mut egraph = EGraph::new(analysis);
+        let owner_selector = egraph.add(MxxLang::IntBinder(owner));
+        let foreign_selector = egraph.add(MxxLang::IntBinder(foreign));
+        let first = egraph.add(MxxLang::IntConst(10.into()));
+        let second = egraph.add(MxxLang::IntConst(20.into()));
+        let nonexact = egraph.add(MxxLang::Switch([foreign_selector, first, second].into()));
+        let replacement = egraph.add(MxxLang::IntConst(1.into()));
+        let instantiated =
+            instantiate_shared_element(&mut egraph, nonexact, owner, replacement, &mut || {
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert!(matches!(egraph.id_to_node(instantiated), MxxLang::Switch(_)));
+
+        let invalid = egraph.add(MxxLang::Switch([owner_selector, first, second].into()));
+        let out_of_range = egraph.add(MxxLang::IntConst(2.into()));
+        let instantiated =
+            instantiate_shared_element(&mut egraph, invalid, owner, out_of_range, &mut || {
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert!(matches!(egraph.id_to_node(instantiated), MxxLang::Switch(_)));
+    }
+
+    #[test]
+    fn shared_template_instantiation_selects_nested_switches_without_replacing_foreign_binders() {
+        let mut analysis = MxxAnalysis::default();
+        let owner = test_binder(&mut analysis, 1);
+        let foreign = test_binder(&mut analysis, 2);
+        let mut egraph = EGraph::new(analysis);
+        let owner_selector = egraph.add(MxxLang::IntBinder(owner));
+        let foreign_selector = egraph.add(MxxLang::IntBinder(foreign));
+        let first = egraph.add(MxxLang::IntConst(10.into()));
+        let second = egraph.add(MxxLang::IntConst(20.into()));
+        let inner = egraph.add(MxxLang::Switch([foreign_selector, first, second].into()));
+        let representative = egraph.add(MxxLang::Switch([owner_selector, first, inner].into()));
+        let replacement = egraph.add(MxxLang::IntConst(1.into()));
+        let instantiated = instantiate_shared_element(
+            &mut egraph,
+            representative,
+            owner,
+            replacement,
+            &mut || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        let expression = egraph.id_to_expr(instantiated);
+        assert!(matches!(expression[expression.root()], MxxLang::Switch(_)));
+        assert!(expression.iter().any(|node| node == &MxxLang::IntBinder(foreign)));
+        assert!(!expression.iter().any(|node| node == &MxxLang::IntBinder(owner)));
     }
 
     #[test]

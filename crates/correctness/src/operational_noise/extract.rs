@@ -284,7 +284,13 @@ pub fn extract_best_proposal<I: BoundInput>(
             .as_ref()
             .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large))
     {
-        let diagnostic = selected_large_diagnostic(egraph, root, &candidates, bound_input);
+        let diagnostic = selected_large_diagnostic(
+            egraph,
+            root,
+            root_candidate.first_large_source,
+            &candidates,
+            bound_input,
+        );
         tracing::debug!(
             selected_cost = ?root_candidate.cost,
             selected_large_source_id = ?root_candidate.first_large_source.map(|source| source.0),
@@ -1186,6 +1192,10 @@ fn negative_fixed_term_paths<I: BoundInput>(
             steps: selected_large_path_from(
                 egraph,
                 Id::from(term.eclass),
+                candidates
+                    .get(usize::from(egraph.find(Id::from(term.eclass))))
+                    .and_then(Option::as_ref)
+                    .and_then(|candidate| candidate.first_large_source),
                 candidates,
                 bound_input,
                 false,
@@ -1690,10 +1700,11 @@ fn selected_add_product_boundary(
 fn selected_large_diagnostic<I: BoundInput>(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     root: Id,
+    target_source: Option<AtomicSourceId>,
     candidates: &[Option<Candidate>],
     bound_input: &I,
 ) -> Vec<SelectedLargePathStep> {
-    selected_large_path_from(egraph, root, candidates, bound_input, true)
+    selected_large_path_from(egraph, root, target_source, candidates, bound_input, true)
 }
 
 fn selected_atomic_source_kind(
@@ -1712,10 +1723,14 @@ fn selected_atomic_source_kind(
 
 /// Follows only the selected Large child at every edge.  The root trace and
 /// each retained negative fixed-term trace share this walker so diagnostics
-/// cannot silently use different expression-selection rules.
+/// cannot silently use different expression-selection rules.  When extraction
+/// recorded a source, every selected edge must retain that same source; a
+/// missing matching child terminates the diagnostic rather than changing
+/// provenance.
 fn selected_large_path_from<I: BoundInput>(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     start: Id,
+    target_source: Option<AtomicSourceId>,
     candidates: &[Option<Candidate>],
     bound_input: &I,
     include_negative_fixed_paths: bool,
@@ -1820,7 +1835,7 @@ fn selected_large_path_from<I: BoundInput>(
             }
             _ => (None, None),
         };
-        let selected_large_child = selected_large_child(egraph, candidates, node);
+        let selected_large_child = selected_large_child(egraph, candidates, node, target_source);
         let following_switch_cases = selected_large_child.and_then(|child| {
             match candidates
                 .get(usize::from(egraph.find(child)))
@@ -1882,11 +1897,23 @@ fn selected_large_child(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     candidates: &[Option<Candidate>],
     node: &MxxLang,
+    target_source: Option<AtomicSourceId>,
 ) -> Option<Id> {
-    node.children()
-        .iter()
-        .copied()
-        .find(|child| candidate_has_large_bound(egraph, candidates, *child))
+    node.children().iter().copied().find(|child| {
+        let canonical = egraph.find(*child);
+        let Some(candidate) = candidates.get(usize::from(canonical)).and_then(Option::as_ref)
+        else {
+            return false;
+        };
+        candidate
+            .semantic_bound
+            .as_ref()
+            .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large)) &&
+            match target_source {
+                Some(source) => candidate.first_large_source == Some(source),
+                None => true,
+            }
+    })
 }
 
 /// Computes the ordinary extraction cost of an already-existing normalized
@@ -2417,7 +2444,7 @@ mod tests {
         let root = egraph.add(MxxLang::MatrixAdd(vec![switch].into_boxed_slice()));
         egraph.rebuild();
         let candidates = diagnostic_candidates(&egraph, &[root, switch, first, second]);
-        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
 
         assert!(steps.iter().any(|step| step.following_switch_cases == Some(2)));
         assert!(steps.iter().any(|step| step.selected_switch_case == Some(0)));
@@ -2430,9 +2457,42 @@ mod tests {
         }
         egraph.rebuild();
         let candidates = diagnostic_candidates(&egraph, &large);
-        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
 
         assert_eq!(steps.len(), MAX_SELECTED_LARGE_DIAGNOSTIC_STEPS);
+    }
+
+    #[test]
+    fn selected_large_diagnostic_follows_the_recorded_large_source() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (first, first_source) = matrix_atom(&mut egraph, "first-large");
+        let (second, second_source) = matrix_atom(&mut egraph, "second-large");
+        let switch = egraph.add(MxxLang::Switch(vec![selector, first, second].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![switch].into_boxed_slice()));
+        egraph.rebuild();
+
+        let mut candidates = diagnostic_candidates(&egraph, &[root, switch, first, second]);
+        for (class, source) in [
+            (root, second_source),
+            (switch, second_source),
+            (first, first_source),
+            (second, second_source),
+        ] {
+            candidates[usize::from(egraph.find(class))]
+                .as_mut()
+                .expect("diagnostic candidate")
+                .first_large_source = Some(source);
+        }
+        let before = egraph.total_size();
+
+        let steps =
+            selected_large_diagnostic(&egraph, root, Some(second_source), &candidates, &NoBounds);
+
+        assert_eq!(egraph.total_size(), before, "diagnostic selection is read-only");
+        assert!(steps.len() <= MAX_SELECTED_LARGE_DIAGNOSTIC_STEPS);
+        assert!(steps.iter().any(|step| step.selected_switch_case == Some(1)));
+        assert!(steps.iter().all(|step| step.selected_switch_case != Some(0)));
     }
 
     #[test]
@@ -2928,7 +2988,7 @@ mod tests {
             &egraph,
             &egraph.classes().map(|class| class.id).collect::<Vec<_>>(),
         );
-        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
 
         let multiply = steps.first().expect("root multiply step");
         assert!(multiply.product_spine.is_some(), "selected positive product has a spine");
@@ -3007,7 +3067,7 @@ mod tests {
         let before = egraph.total_size();
 
         let candidates = diagnostic_candidates(&egraph, &[root, switch, first_case, second_case]);
-        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
 
         let probe = steps
             .first()
@@ -3082,7 +3142,7 @@ mod tests {
             &[root, switch, first_case, second_case, fixed, negative_fixed],
         );
 
-        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
         let root_step = steps.first().expect("root Add diagnostic");
         let report = root_step
             .pointwise_switch_sampler_cases
@@ -3245,7 +3305,7 @@ mod tests {
             "{direct_fixed_search:?}"
         );
 
-        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
         let report = steps
             .first()
             .and_then(|step| step.pointwise_switch_sampler_cases.as_ref())
@@ -3353,7 +3413,7 @@ mod tests {
             &[root, selected_switch, first_case, second_case, fixed, negative_fixed],
         );
 
-        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
         let root_step = steps.first().expect("root Add diagnostic");
         let (rejection_selector, rejection_cases) =
             match root_step.pointwise_first_direct_reject.as_ref().expect("pointwise rejection") {
@@ -3449,7 +3509,7 @@ mod tests {
         egraph.rebuild();
         let before = egraph.total_size();
         let candidates = diagnostic_candidates(&egraph, &[root, switch, fixed, negative_fixed]);
-        let report = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds)
+        let report = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds)
             .into_iter()
             .next()
             .and_then(|step| step.pointwise_switch_sampler_cases)
@@ -3538,7 +3598,7 @@ mod tests {
             ],
         );
 
-        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
         let root_step = steps.first().expect("root diagnostic step");
         assert_eq!(root_step.add_selected_large_child_count, Some(3));
         assert_eq!(root_step.add_direct_child_views.as_ref().expect("direct Add views").len(), 3);
@@ -3599,7 +3659,7 @@ mod tests {
         let mut large = terms.clone();
         large.push(root);
         let candidates = diagnostic_candidates(&egraph, &large);
-        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
         let root_step = steps.first().expect("root Add step");
         assert_eq!(root_step.add_selected_large_child_count, Some(17));
         assert_eq!(
@@ -3631,7 +3691,7 @@ mod tests {
             output: None,
         });
         let cycle_steps =
-            selected_large_path_from(&egraph, canonical, &cycle_candidates, &NoBounds, false);
+            selected_large_path_from(&egraph, canonical, None, &cycle_candidates, &NoBounds, false);
         assert_eq!(cycle_steps.len(), 1, "local visited guard stops a selected self-cycle");
     }
 

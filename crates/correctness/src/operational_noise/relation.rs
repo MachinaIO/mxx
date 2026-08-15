@@ -2730,7 +2730,15 @@ fn peel_fixed_targets(
     let trace_fixed_targets = tracing::enabled!(tracing::Level::DEBUG);
     let mut omitted_fixed_targets = 0usize;
     for (target_index, target) in fixed.iter().enumerate() {
-        if target.0.len() == 1 && is_exact_zero_matrix(egraph, target.0[0], progress)? {
+        let mut exact_zero = false;
+        for factor in &target.0 {
+            if is_exact_zero_matrix(egraph, *factor, progress)? {
+                exact_zero = true;
+                break;
+            }
+        }
+        if exact_zero {
+            any_peeled = true;
             if trace_fixed_targets && target_index < PEEL_DIAGNOSTIC_LIMIT {
                 let (fixed_spine, fixed_spine_omitted) =
                     capped_peel_diagnostic_ids(egraph, &target.0);
@@ -7869,6 +7877,111 @@ mod tests {
             Some((true, Vec::new()))
         );
         assert!(terms.is_empty());
+    }
+
+    #[test]
+    fn fixed_guided_peeling_drops_zero_product_fixed_targets_before_planning() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (p, _) = matrix_atom(&mut egraph, "peel-zero-product-prefix", None);
+        let (a, _) = matrix_atom(&mut egraph, "peel-zero-product-actual", None);
+        let (d, _) = matrix_atom(&mut egraph, "peel-zero-product-suffix", None);
+        let zero_spec = egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type: scalar_matrix_type(),
+                value: MatrixConstantValue::Zero,
+            },
+        );
+        let zero = egraph
+            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(zero_spec)));
+        let (zero_alias, _) = matrix_atom(&mut egraph, "peel-zero-product-opaque-alias", None);
+        assert!(
+            !egraph[zero_alias].nodes.iter().any(|node| matches!(node, MxxLang::MatrixConstant(_))),
+            "the alias starts as a nonconstant physical node"
+        );
+        egraph.union(zero_alias, zero);
+        egraph.rebuild();
+        let mut zero_progress = || Ok(());
+        assert!(
+            is_exact_zero_matrix(&egraph, zero_alias, &mut zero_progress).unwrap(),
+            "the original opaque alias resolves through its canonical e-class to the zero witness"
+        );
+        let actual = vec![PeelTerm::Concrete { base: a, negative: false }];
+        for (spine, negative) in
+            [(vec![zero, p, d], false), (vec![p, zero_alias, d], true), (vec![p, d, zero], false)]
+        {
+            let mut terms = actual.clone();
+            let mut progress = || Ok(());
+            assert_eq!(
+                peel_fixed_targets(
+                    &egraph,
+                    &mut terms,
+                    &[(spine.into_boxed_slice(), negative)],
+                    &mut progress,
+                ),
+                Some((true, Vec::new())),
+                "a zero factor in any ordered position is a zero fixed product"
+            );
+            assert_eq!(terms, actual, "zero normalization does not touch the actual residual");
+        }
+
+        let nested_actual = vec![PeelTerm::ProductFactor {
+            prefix: vec![egraph.find(p)].into_boxed_slice(),
+            terms: vec![(egraph.find(a), false)],
+            suffix: vec![egraph.find(d)].into_boxed_slice(),
+            negative: false,
+        }];
+        let zero_target =
+            vec![egraph.find(p), egraph.find(zero), egraph.find(d)].into_boxed_slice();
+        let mut nested_terms = nested_actual.clone();
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut nested_terms,
+                &[(zero_target.clone(), true)],
+                &mut progress,
+            ),
+            Some((true, Vec::new()))
+        );
+        assert_eq!(nested_terms, nested_actual, "zero products skip ProductFactor reopening too");
+
+        let nonzero_target = vec![egraph.find(p), egraph.find(d)].into_boxed_slice();
+        let mut nonzero_terms = actual.clone();
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut nonzero_terms,
+                &[(nonzero_target.clone(), true)],
+                &mut progress,
+            ),
+            Some((false, vec![(nonzero_target, true)])),
+            "an ordinary fixed product remains unmatched without an exact witness"
+        );
+        assert_eq!(nonzero_terms, actual);
+
+        let before = egraph.total_size();
+        let mut full_calls = 0;
+        let mut funded = actual.clone();
+        assert!(
+            peel_fixed_targets(&egraph, &mut funded, &[(zero_target.clone(), false)], &mut || {
+                full_calls += 1;
+                Ok(())
+            },)
+            .is_some()
+        );
+        let mut interrupted = actual.clone();
+        let mut calls = 0;
+        assert!(
+            peel_fixed_targets(&egraph, &mut interrupted, &[(zero_target, false)], &mut || {
+                calls += 1;
+                (calls < full_calls).then_some(()).ok_or(())
+            },)
+            .is_none(),
+            "an interrupted zero-factor scan cannot commit the private plan"
+        );
+        assert_eq!(interrupted, actual);
+        assert_eq!(egraph.total_size(), before);
     }
 
     #[test]

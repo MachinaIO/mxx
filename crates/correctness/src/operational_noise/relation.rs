@@ -1802,6 +1802,111 @@ fn is_exact_zero_matrix(
     Some(false)
 }
 
+/// Returns whether `factor` is a scalar ring constant whose polynomial has no
+/// nonconstant coefficients.  These are the only factors that may move across
+/// another matrix factor while matching a fixed product spine: a 1-by-1
+/// constant polynomial is central in the coefficient ring, whereas neither a
+/// general 1-by-1 polynomial nor a larger matrix is.
+fn is_central_constant_scalar(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    factor: Id,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<bool> {
+    let factor = egraph.find(factor);
+    let Ok(MxxSort::Matrix(matrix_type)) = &egraph[factor].data.sort else {
+        return Some(false);
+    };
+    if resolved_constant(&matrix_type.rows) != Some(BigInt::from(1_u8)) ||
+        resolved_constant(&matrix_type.columns) != Some(BigInt::from(1_u8))
+    {
+        return Some(false);
+    }
+    for node in &egraph[factor].nodes {
+        progress().ok()?;
+        let MxxLang::MatrixConstant(spec) = node else { continue };
+        let Some(super::identity::MatrixConstantSpec {
+            value: MatrixConstantValue::Polynomial { coefficients },
+            ..
+        }) = egraph.analysis.symbols.matrix_constants.get(spec.0)
+        else {
+            continue;
+        };
+        let mut constant = true;
+        for coefficient in coefficients.iter().skip(1) {
+            progress().ok()?;
+            if resolved_constant(coefficient).is_none_or(|coefficient| !coefficient.is_zero()) {
+                constant = false;
+                break;
+            }
+        }
+        if constant {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Matches two already-fixed product spines after removing precisely the
+/// central scalar factors accepted by [`is_central_constant_scalar`].  The
+/// non-scalar sequence stays ordered, and scalar identities retain exact
+/// multiplicity, so this is not a general matrix-commutation rule.
+fn scalar_reordered_spines_match(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    actual: &[Id],
+    target: &[Id],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<bool> {
+    let mut actual_scalars = HashMap::<Id, usize>::new();
+    let mut target_scalars = HashMap::<Id, usize>::new();
+    let mut actual_nonscalars = Vec::new();
+    let mut target_nonscalars = Vec::new();
+    for factor in actual {
+        let factor = egraph.find(*factor);
+        progress().ok()?;
+        if is_central_constant_scalar(egraph, factor, progress)? {
+            *actual_scalars.entry(factor).or_default() += 1;
+        } else {
+            actual_nonscalars.try_reserve(1).ok()?;
+            actual_nonscalars.push(factor);
+        }
+    }
+    for factor in target {
+        let factor = egraph.find(*factor);
+        progress().ok()?;
+        if is_central_constant_scalar(egraph, factor, progress)? {
+            *target_scalars.entry(factor).or_default() += 1;
+        } else {
+            target_nonscalars.try_reserve(1).ok()?;
+            target_nonscalars.push(factor);
+        }
+    }
+    if actual_scalars.is_empty() ||
+        actual_scalars != target_scalars ||
+        actual_nonscalars.len() != target_nonscalars.len()
+    {
+        return Some(false);
+    }
+    for (actual, target) in actual_nonscalars.iter().zip(&target_nonscalars) {
+        progress().ok()?;
+        if actual != target {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn scalar_reordered_direct_span_matches(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    term: Id,
+    target: &[Id],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<bool> {
+    let Some(Some(actual)) = flatten_uncontested_product_factors(egraph, term, progress) else {
+        return Some(false);
+    };
+    scalar_reordered_spines_match(egraph, &actual, target, progress)
+}
+
 /// Returns every target position reachable from one e-class.  Each state is
 /// `(canonical eclass, target position, sign)`: singleton identity is always
 /// admitted, then only direct Multiply/Negate e-nodes are explored. Add and
@@ -1928,7 +2033,8 @@ fn has_opposite_direct_span(
             return Some(true);
         }
     }
-    Some(false)
+    scalar_reordered_direct_span_matches(egraph, term, target, progress)
+        .map(|matched| matched && actual_negative != target_negative)
 }
 
 /// Matches a product with one selected additive leaf using a small dynamic
@@ -1972,7 +2078,7 @@ fn product_factor_span_matches(
         }
         states = next;
         if states.is_empty() {
-            return Some(false);
+            break;
         }
     }
     for (position, negative) in states {
@@ -1981,7 +2087,22 @@ fn product_factor_span_matches(
             return Some(true);
         }
     }
-    Some(false)
+    let mut actual = Vec::new();
+    for factor in prefix {
+        progress().ok()?;
+        actual.try_reserve(1).ok()?;
+        actual.push(*factor);
+    }
+    progress().ok()?;
+    actual.try_reserve(1).ok()?;
+    actual.push(term);
+    for factor in suffix {
+        progress().ok()?;
+        actual.try_reserve(1).ok()?;
+        actual.push(*factor);
+    }
+    scalar_reordered_spines_match(egraph, &actual, target, progress)
+        .map(|matched| matched && (actual_negative != term_negative) != target_negative)
 }
 
 fn copy_ids(ids: &[Id], progress: &mut dyn FnMut() -> Result<(), ()>) -> Option<Box<[Id]>> {
@@ -4971,6 +5092,37 @@ mod tests {
         let source = AtomicSourceId(source);
         let term = egraph.add(MxxLang::Atom { source, indices: Box::new([]) });
         (term, source)
+    }
+
+    fn scalar_polynomial_constant(
+        egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+        coefficients: &[i64],
+    ) -> Id {
+        let spec = egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type: scalar_matrix_type(),
+                value: MatrixConstantValue::Polynomial {
+                    coefficients: coefficients
+                        .iter()
+                        .map(|coefficient| ResolvedIntExpr::Const((*coefficient).into()))
+                        .collect(),
+                },
+            },
+        );
+        egraph.add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)))
+    }
+
+    fn regular_scalar_gadget(egraph: &mut EGraph<MxxLang, MxxAnalysis>) -> Id {
+        let spec = egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type: scalar_matrix_type(),
+                value: MatrixConstantValue::Gadget {
+                    base: ResolvedIntExpr::Const(2.into()),
+                    small: false,
+                },
+            },
+        );
+        egraph.add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)))
     }
 
     fn binder_matrix_atom(egraph: &mut EGraph<MxxLang, MxxAnalysis>, binder: Id, name: &str) -> Id {
@@ -7965,6 +8117,182 @@ mod tests {
             Some((false, vec![(reordered, true)]))
         );
         assert_eq!(terms, original, "noncommutative reordering remains ineligible");
+    }
+
+    #[test]
+    fn fixed_guided_peeling_cancels_lookup_y_signal_through_a_constant_scalar() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (case_switch, _) = matrix_atom(&mut egraph, "lookup-case-switch", None);
+        let output_scalar = scalar_polynomial_constant(&mut egraph, &[9]);
+        let gadget = regular_scalar_gadget(&mut egraph);
+        let (low_preimage, _) = matrix_atom(&mut egraph, "lookup-low-preimage", None);
+        // The lookup preprocessing target contributes yG, while the encoded
+        // signal reaches the relation pass as Gy.  A regular gadget is Large,
+        // so this must be exact signal cancellation rather than a bound.
+        let actual = egraph.add(MxxLang::MatrixMultiply(
+            vec![case_switch, gadget, output_scalar, low_preimage].into_boxed_slice(),
+        ));
+        egraph.rebuild();
+        let target = vec![
+            egraph.find(case_switch),
+            egraph.find(output_scalar),
+            egraph.find(gadget),
+            egraph.find(low_preimage),
+        ]
+        .into_boxed_slice();
+        let mut terms = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(&egraph, &mut terms, &[(target, true)], &mut progress),
+            Some((true, Vec::new()))
+        );
+        assert!(terms.is_empty(), "the lookup y-signal must not survive as bounded noise");
+    }
+
+    #[test]
+    fn fixed_guided_peeling_rejects_nonconstant_scalar_polynomial_reordering() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (case_switch, _) = matrix_atom(&mut egraph, "lookup-nonconstant-case-switch", None);
+        let nonconstant_scalar = scalar_polynomial_constant(&mut egraph, &[9, 1]);
+        let gadget = regular_scalar_gadget(&mut egraph);
+        let (low_preimage, _) = matrix_atom(&mut egraph, "lookup-nonconstant-low-preimage", None);
+        let actual = egraph.add(MxxLang::MatrixMultiply(
+            vec![case_switch, gadget, nonconstant_scalar, low_preimage].into_boxed_slice(),
+        ));
+        egraph.rebuild();
+        let target = vec![
+            egraph.find(case_switch),
+            egraph.find(nonconstant_scalar),
+            egraph.find(gadget),
+            egraph.find(low_preimage),
+        ]
+        .into_boxed_slice();
+        let original = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut terms = original.clone();
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(&egraph, &mut terms, &[(target.clone(), true)], &mut progress),
+            Some((false, vec![(target, true)]))
+        );
+        assert_eq!(terms, original, "a nonconstant polynomial is not a central scalar");
+    }
+
+    #[test]
+    fn fixed_guided_product_factor_scalar_fallback_preserves_the_selected_sign() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (case_switch, _) = matrix_atom(&mut egraph, "lookup-signed-case-switch", None);
+        let output_scalar = scalar_polynomial_constant(&mut egraph, &[9]);
+        let gadget = regular_scalar_gadget(&mut egraph);
+        let (low_preimage, _) = matrix_atom(&mut egraph, "lookup-signed-low-preimage", None);
+        egraph.rebuild();
+        let target = vec![
+            egraph.find(case_switch),
+            egraph.find(output_scalar),
+            egraph.find(gadget),
+            egraph.find(low_preimage),
+        ]
+        .into_boxed_slice();
+        let original = vec![PeelTerm::ProductFactor {
+            prefix: vec![egraph.find(case_switch)].into_boxed_slice(),
+            terms: vec![(egraph.find(gadget), true)],
+            suffix: vec![egraph.find(output_scalar), egraph.find(low_preimage)].into_boxed_slice(),
+            negative: false,
+        }];
+
+        let mut same_sign = original.clone();
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(&egraph, &mut same_sign, &[(target.clone(), true)], &mut progress),
+            Some((false, vec![(target.clone(), true)]))
+        );
+        assert_eq!(same_sign, original);
+
+        let mut opposite_sign = original;
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(&egraph, &mut opposite_sign, &[(target, false)], &mut progress),
+            Some((true, Vec::new()))
+        );
+        assert!(opposite_sign.is_empty());
+    }
+
+    #[test]
+    fn fixed_guided_scalar_fallback_requires_exact_duplicate_multiplicity() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (case_switch, _) = matrix_atom(&mut egraph, "lookup-duplicate-case-switch", None);
+        let output_scalar = scalar_polynomial_constant(&mut egraph, &[9]);
+        let gadget = regular_scalar_gadget(&mut egraph);
+        let (low_preimage, _) = matrix_atom(&mut egraph, "lookup-duplicate-low-preimage", None);
+        let actual = egraph.add(MxxLang::MatrixMultiply(
+            vec![case_switch, gadget, output_scalar, output_scalar, low_preimage]
+                .into_boxed_slice(),
+        ));
+        egraph.rebuild();
+        let matching_target = vec![
+            egraph.find(case_switch),
+            egraph.find(output_scalar),
+            egraph.find(output_scalar),
+            egraph.find(gadget),
+            egraph.find(low_preimage),
+        ]
+        .into_boxed_slice();
+        let mut terms = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(&egraph, &mut terms, &[(matching_target, true)], &mut progress),
+            Some((true, Vec::new()))
+        );
+
+        let mismatched_target = vec![
+            egraph.find(case_switch),
+            egraph.find(output_scalar),
+            egraph.find(gadget),
+            egraph.find(low_preimage),
+        ]
+        .into_boxed_slice();
+        let original = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut terms = original.clone();
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut terms,
+                &[(mismatched_target.clone(), true)],
+                &mut progress,
+            ),
+            Some((false, vec![(mismatched_target, true)]))
+        );
+        assert_eq!(terms, original);
+    }
+
+    #[test]
+    fn fixed_guided_scalar_fallback_keeps_nonscalar_order_exact() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (case_switch, _) = matrix_atom(&mut egraph, "lookup-order-case-switch", None);
+        let output_scalar = scalar_polynomial_constant(&mut egraph, &[9]);
+        let gadget = regular_scalar_gadget(&mut egraph);
+        let (first, _) = matrix_atom(&mut egraph, "lookup-order-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "lookup-order-second", None);
+        let actual = egraph.add(MxxLang::MatrixMultiply(
+            vec![case_switch, gadget, output_scalar, first, second].into_boxed_slice(),
+        ));
+        egraph.rebuild();
+        let target = vec![
+            egraph.find(case_switch),
+            egraph.find(output_scalar),
+            egraph.find(gadget),
+            egraph.find(second),
+            egraph.find(first),
+        ]
+        .into_boxed_slice();
+        let original = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut terms = original.clone();
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(&egraph, &mut terms, &[(target.clone(), true)], &mut progress),
+            Some((false, vec![(target, true)]))
+        );
+        assert_eq!(terms, original);
     }
 
     #[test]

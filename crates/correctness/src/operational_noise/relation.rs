@@ -2070,53 +2070,154 @@ fn signed_additive_term(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> Opti
     }
 }
 
-/// Iteratively expands only unambiguous physical Add and Negate nodes into
-/// ordered canonical signed leaves. Reused nested Adds and sign cycles are
-/// rejected rather than choosing one DAG occurrence implicitly.
+/// Expands every finite physical Add/Negate representation into signed
+/// leaves, then accepts a representative only when every additive
+/// representation has the same canonical signed polynomial. Non-additive
+/// e-nodes are not alternative decompositions. The representative preserves
+/// its physical leaf ids for later binder instantiation; consensus is checked
+/// with ordered product keys, so it is insensitive to product association but
+/// not product order. Cycles, empty Adds, and competing representations with
+/// different polynomials remain fail-closed.
 fn signed_additive_leaves(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     terms: &[Id],
 ) -> Option<Vec<(Id, bool)>> {
-    let mut output = Vec::new();
-    let mut work =
-        terms.iter().rev().map(|term| (egraph.find(*term), false, false)).collect::<Vec<_>>();
-    let mut expanded_adds = HashSet::new();
-    let mut active = HashSet::new();
-    while let Some((term, negative, exiting)) = work.pop() {
-        let state = (term, negative);
-        if exiting {
-            active.remove(&state);
-            continue;
+    signed_additive_leaves_with_visit(egraph, terms, |_| {})
+}
+
+/// The callback is test instrumentation only at its call sites.  The generic
+/// no-op production instantiation has no storage or dynamic-dispatch cost.
+fn signed_additive_leaves_with_visit<F>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    terms: &[Id],
+    mut visit: F,
+) -> Option<Vec<(Id, bool)>>
+where
+    F: FnMut(Id),
+{
+    type Canonical = Vec<(Box<[Id]>, bool, usize)>;
+
+    #[derive(Clone)]
+    struct Consensus {
+        representative: Vec<(Id, bool)>,
+        canonical: Canonical,
+    }
+
+    fn normalized_counts(counts: BTreeMap<Box<[Id]>, (usize, usize)>) -> Canonical {
+        counts
+            .into_iter()
+            .filter_map(|(key, (positive, negative))| match positive.cmp(&negative) {
+                std::cmp::Ordering::Greater => Some((key, false, positive - negative)),
+                std::cmp::Ordering::Less => Some((key, true, negative - positive)),
+                std::cmp::Ordering::Equal => None,
+            })
+            .collect()
+    }
+
+    fn canonical_from_terms(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        terms: &[(Id, bool)],
+    ) -> Option<Canonical> {
+        let mut counts = BTreeMap::<Box<[Id]>, (usize, usize)>::new();
+        for (term, negative) in terms {
+            let counts = counts.entry(ordered_product_leaves(egraph, *term)?).or_default();
+            let count = if *negative { &mut counts.1 } else { &mut counts.0 };
+            *count = count.checked_add(1)?;
         }
-        if !active.insert(state) {
+        Some(normalized_counts(counts))
+    }
+
+    fn add_canonical(
+        counts: &mut BTreeMap<Box<[Id]>, (usize, usize)>,
+        canonical: &Canonical,
+    ) -> Option<()> {
+        for (key, negative, count) in canonical {
+            let counts = counts.entry(key.clone()).or_default();
+            let total = if *negative { &mut counts.1 } else { &mut counts.0 };
+            *total = total.checked_add(*count)?;
+        }
+        Some(())
+    }
+
+    fn consensus<F>(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        term: Id,
+        memo: &mut HashMap<Id, Consensus>,
+        active: &mut HashSet<Id>,
+        visit: &mut F,
+    ) -> Option<Consensus>
+    where
+        F: FnMut(Id),
+    {
+        let term = egraph.find(term);
+        if let Some(existing) = memo.get(&term) {
+            return Some(existing.clone());
+        }
+        if !active.insert(term) {
             return None;
         }
-        match physical_negated_base(egraph, term) {
-            PhysicalStructure::Ambiguous => return None,
-            PhysicalStructure::Unique(base) => {
-                if base == term {
-                    return None;
-                }
-                work.push((term, negative, true));
-                work.push((base, !negative, false));
-            }
-            PhysicalStructure::Absent => match physical_add_terms(egraph, term) {
-                PhysicalStructure::Ambiguous => return None,
-                PhysicalStructure::Unique(children) => {
-                    if !expanded_adds.insert(term) {
+        visit(term);
+        let result = (|| {
+            let mut agreed: Option<Consensus> = None;
+            let mut has_additive_structure = false;
+            for node in &egraph[term].nodes {
+                let candidate = match node {
+                    MxxLang::MatrixNegate([base]) => {
+                        has_additive_structure = true;
+                        let mut candidate = consensus(egraph, *base, memo, active, visit)?;
+                        for (_, negative) in &mut candidate.representative {
+                            *negative = !*negative;
+                        }
+                        for (_, negative, _) in &mut candidate.canonical {
+                            *negative = !*negative;
+                        }
+                        candidate
+                    }
+                    MxxLang::MatrixAdd(children) => {
+                        has_additive_structure = true;
+                        if children.is_empty() {
+                            return None;
+                        }
+                        let mut representative = Vec::new();
+                        let mut counts = BTreeMap::new();
+                        for child in children.iter() {
+                            let child = consensus(egraph, *child, memo, active, visit)?;
+                            representative.extend(child.representative);
+                            add_canonical(&mut counts, &child.canonical)?;
+                        }
+                        Consensus { representative, canonical: normalized_counts(counts) }
+                    }
+                    _ => continue,
+                };
+                if let Some(previous) = &agreed {
+                    if previous.canonical != candidate.canonical {
                         return None;
                     }
-                    work.push((term, negative, true));
-                    for child in children.iter().rev() {
-                        work.push((egraph.find(*child), negative, false));
-                    }
+                } else {
+                    agreed = Some(candidate);
                 }
-                PhysicalStructure::Absent => {
-                    active.remove(&state);
-                    output.push((term, negative));
-                }
-            },
-        }
+            }
+            if has_additive_structure {
+                agreed
+            } else {
+                let representative = vec![(term, false)];
+                Some(Consensus {
+                    canonical: canonical_from_terms(egraph, &representative)?,
+                    representative,
+                })
+            }
+        })();
+        active.remove(&term);
+        let result = result?;
+        memo.insert(term, result.clone());
+        Some(result)
+    }
+
+    let mut memo = HashMap::new();
+    let mut active = HashSet::new();
+    let mut output = Vec::new();
+    for term in terms {
+        output.extend(consensus(egraph, *term, &mut memo, &mut active, &mut visit)?.representative);
     }
     Some(output)
 }
@@ -4268,8 +4369,7 @@ mod tests {
         let binder = test_binder(&mut egraph, 0, 1);
         let selector = egraph.add(MxxLang::IntBinder(binder));
         let (signal, _) = matrix_atom(&mut egraph, "flatten-signal", None);
-        let repeated = egraph.add(MxxLang::MatrixAdd(vec![signal].into_boxed_slice()));
-        let fixed = egraph.add(MxxLang::MatrixAdd(vec![repeated, repeated].into_boxed_slice()));
+        let fixed = egraph.add(MxxLang::MatrixAdd(Vec::new().into_boxed_slice()));
         let (first, _) = matrix_atom(&mut egraph, "flatten-first", None);
         let (second, _) = matrix_atom(&mut egraph, "flatten-second", None);
         let root = build(&mut egraph, selector, fixed, vec![first, second]);
@@ -5332,30 +5432,118 @@ mod tests {
         );
 
         let shared = egraph.add(MxxLang::MatrixAdd(vec![left, right].into_boxed_slice()));
-        assert!(signed_additive_leaves(&egraph, &[shared, shared]).is_none());
+        assert_eq!(
+            signed_additive_leaves(&egraph, &[shared, shared]),
+            Some(vec![
+                (egraph.find(left), false),
+                (egraph.find(right), false),
+                (egraph.find(left), false),
+                (egraph.find(right), false),
+            ])
+        );
     }
 
     #[test]
-    fn signed_additive_leaves_reject_safe_competing_physical_add_and_negate_nodes() {
+    fn signed_additive_leaves_accept_equivalent_competing_add_associations() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
-        let (left, _) = matrix_atom(&mut egraph, "ambiguous-left", None);
-        let (right, _) = matrix_atom(&mut egraph, "ambiguous-right", None);
+        let (first, _) = matrix_atom(&mut egraph, "association-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "association-second", None);
+        let (third, _) = matrix_atom(&mut egraph, "association-third", None);
+        let left = egraph.add(MxxLang::MatrixAdd(vec![first, second].into_boxed_slice()));
+        let left_associated = egraph.add(MxxLang::MatrixAdd(vec![left, third].into_boxed_slice()));
+        let right = egraph.add(MxxLang::MatrixAdd(vec![second, third].into_boxed_slice()));
+        let right_associated =
+            egraph.add(MxxLang::MatrixAdd(vec![first, right].into_boxed_slice()));
+        egraph.union(left_associated, right_associated);
+        egraph.rebuild();
+        assert!(matches!(
+            physical_add_terms(&egraph, left_associated),
+            PhysicalStructure::Ambiguous
+        ));
+        let leaves = signed_additive_leaves(&egraph, &[left_associated])
+            .expect("equivalent Add associations have one signed polynomial");
+        assert_eq!(
+            cancelled_signed_additive_leaves(
+                &egraph,
+                &leaves
+                    .iter()
+                    .copied()
+                    .chain(leaves.iter().map(|(term, negative)| (*term, !negative)))
+                    .collect::<Vec<_>>(),
+            ),
+            (vec![true; leaves.len() * 2], true),
+        );
+    }
+
+    #[test]
+    fn signed_additive_leaves_accept_equivalent_competing_negate_and_add_layouts() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (left, _) = matrix_atom(&mut egraph, "negate-add-left", None);
+        let (right, _) = matrix_atom(&mut egraph, "negate-add-right", None);
+        let sum = egraph.add(MxxLang::MatrixAdd(vec![left, right].into_boxed_slice()));
+        let negated_sum = egraph.add(MxxLang::MatrixNegate([sum]));
+        let negated_left = egraph.add(MxxLang::MatrixNegate([left]));
+        let negated_right = egraph.add(MxxLang::MatrixNegate([right]));
+        let expanded =
+            egraph.add(MxxLang::MatrixAdd(vec![negated_left, negated_right].into_boxed_slice()));
+        egraph.union(negated_sum, expanded);
+        egraph.rebuild();
+        assert!(signed_additive_leaves(&egraph, &[negated_sum]).is_some());
+    }
+
+    #[test]
+    fn signed_additive_consensus_cancels_internal_opposites_before_comparison() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (cancelled, _) = matrix_atom(&mut egraph, "consensus-cancelled", None);
+        let (retained, _) = matrix_atom(&mut egraph, "consensus-retained", None);
+        let negated = egraph.add(MxxLang::MatrixNegate([cancelled]));
+        let expanded =
+            egraph.add(MxxLang::MatrixAdd(vec![cancelled, negated, retained].into_boxed_slice()));
+        let direct = egraph.add(MxxLang::MatrixAdd(vec![retained].into_boxed_slice()));
+        egraph.union(expanded, direct);
+        egraph.rebuild();
+
+        assert!(signed_additive_leaves(&egraph, &[expanded]).is_some());
+    }
+
+    #[test]
+    fn signed_additive_consensus_visits_shared_equivalent_children_once() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let mut children = Vec::new();
+        for index in 0..12 {
+            let (left, _) = matrix_atom(&mut egraph, &format!("consensus-left-{index}"), None);
+            let (right, _) = matrix_atom(&mut egraph, &format!("consensus-right-{index}"), None);
+            let forward = egraph.add(MxxLang::MatrixAdd(vec![left, right].into_boxed_slice()));
+            let reverse = egraph.add(MxxLang::MatrixAdd(vec![right, left].into_boxed_slice()));
+            egraph.union(forward, reverse);
+            children.push(forward);
+        }
+        let root = egraph.add(MxxLang::MatrixAdd(children.into_boxed_slice()));
+        egraph.rebuild();
+
+        let mut visits = Vec::new();
+        assert!(
+            signed_additive_leaves_with_visit(&egraph, &[root], |id| visits.push(id)).is_some()
+        );
+        let unique = visits.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(visits.len(), unique.len(), "each e-class is processed once per call");
+        assert_eq!(visits.len(), 1 + 12 + 24, "root, children, and their atomic leaves");
+    }
+
+    #[test]
+    fn signed_additive_leaves_reject_genuinely_different_competing_adds_and_cycles() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (left, _) = matrix_atom(&mut egraph, "different-add-left", None);
+        let (right, _) = matrix_atom(&mut egraph, "different-add-right", None);
         let first_add = egraph.add(MxxLang::MatrixAdd(vec![left].into_boxed_slice()));
         let second_add = egraph.add(MxxLang::MatrixAdd(vec![right].into_boxed_slice()));
         egraph.union(first_add, second_add);
         egraph.rebuild();
-        assert!(matches!(physical_add_terms(&egraph, first_add), PhysicalStructure::Ambiguous));
         assert!(signed_additive_leaves(&egraph, &[first_add]).is_none());
 
-        let first_negate = egraph.add(MxxLang::MatrixNegate([left]));
-        let second_negate = egraph.add(MxxLang::MatrixNegate([right]));
-        egraph.union(first_negate, second_negate);
-        egraph.rebuild();
-        assert!(matches!(
-            physical_negated_base(&egraph, first_negate),
-            PhysicalStructure::Ambiguous
-        ));
-        assert!(signed_additive_leaves(&egraph, &[first_negate]).is_none());
+        let cyclic = egraph.add(MxxLang::MatrixAdd(vec![left].into_boxed_slice()));
+        egraph.union(cyclic, left);
+        assert!(signed_additive_leaves(&egraph, &[cyclic]).is_none());
     }
 
     #[test]

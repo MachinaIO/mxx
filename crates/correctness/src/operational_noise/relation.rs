@@ -4744,6 +4744,7 @@ mod tests {
         let ambiguous = egraph.add(MxxLang::MatrixMultiply(vec![first, second].into_boxed_slice()));
         let alternate = egraph.add(MxxLang::MatrixMultiply(vec![second, first].into_boxed_slice()));
         egraph.union(ambiguous, alternate);
+        egraph.rebuild();
         let (cycle_leaf, _) = matrix_atom(&mut egraph, "flatten-status-cycle", None);
         let cyclic = egraph.add(MxxLang::MatrixMultiply(vec![cycle_leaf].into_boxed_slice()));
         egraph.union(cyclic, cycle_leaf);
@@ -4760,7 +4761,6 @@ mod tests {
         let deep = (0..33).fold(deep_leaf, |child, _| {
             egraph.add(MxxLang::MatrixMultiply(vec![child].into_boxed_slice()))
         });
-        egraph.rebuild();
 
         let views = retained_product_leaves(
             &egraph,

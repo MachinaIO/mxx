@@ -14,7 +14,7 @@ use super::{
         SelectedChildBounds,
     },
     error::OperationalSimulationError,
-    identity::{AtomicRelationRole, AtomicSourceId},
+    identity::{AtomicRelationRole, AtomicSourceId, AtomicSourceKey},
     language::MxxLang,
     relation::{
         AddNormalizationProbe, PointwiseAddSwitchProbe, PointwiseAddSwitchReject,
@@ -282,17 +282,19 @@ pub fn extract_best_proposal<I: BoundInput>(
         root_candidate
             .semantic_bound
             .as_ref()
-            .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large)) &&
-        root_candidate.first_large_source.is_none()
+            .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large))
     {
-        let diagnostic =
-            selected_source_less_large_diagnostic(egraph, root, &candidates, bound_input);
+        let diagnostic = selected_large_diagnostic(egraph, root, &candidates, bound_input);
         tracing::debug!(
             selected_cost = ?root_candidate.cost,
+            selected_large_source_id = ?root_candidate.first_large_source.map(|source| source.0),
+            selected_large_source_kind = ?root_candidate
+                .first_large_source
+                .and_then(|source| selected_atomic_source_kind(egraph, source)),
             selected_large_path = ?diagnostic,
             egraph_classes = egraph.number_of_classes(),
             egraph_nodes = egraph.nodes().len(),
-            "selected source-less Large residual"
+            "selected Large residual"
         );
     }
     Ok(ExtractedProposal {
@@ -304,7 +306,7 @@ pub fn extract_best_proposal<I: BoundInput>(
 }
 
 /// A bounded, read-only trace of one selected Large path.  It exists only in
-/// the failure logging branch above; extraction never stores it in analysis or
+/// the debug logging branch above; extraction never stores it in analysis or
 /// proposal state.
 struct SelectedLargePathStep {
     operator: &'static str,
@@ -1685,13 +1687,27 @@ fn selected_add_product_boundary(
     })
 }
 
-fn selected_source_less_large_diagnostic<I: BoundInput>(
+fn selected_large_diagnostic<I: BoundInput>(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     root: Id,
     candidates: &[Option<Candidate>],
     bound_input: &I,
 ) -> Vec<SelectedLargePathStep> {
     selected_large_path_from(egraph, root, candidates, bound_input, true)
+}
+
+fn selected_atomic_source_kind(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    source: AtomicSourceId,
+) -> Option<&'static str> {
+    egraph.analysis.symbols.atomic_sources.get(source.0).map(|descriptor| match &descriptor.key {
+        AtomicSourceKey::ProtocolInput(_) => "protocol-input",
+        AtomicSourceKey::GraphWire(_) => "graph-wire",
+        AtomicSourceKey::ExplicitLarge(_) => "explicit-large",
+        AtomicSourceKey::SequentialState(_) => "sequential-state",
+        AtomicSourceKey::SequentialRecurrence { .. } => "sequential-recurrence",
+        AtomicSourceKey::Sampler(_) => "sampler",
+    })
 }
 
 /// Follows only the selected Large child at every edge.  The root trace and
@@ -2034,7 +2050,58 @@ mod tests {
     use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef, types::ConcreteMatrixType};
     use num_bigint::{BigInt, BigUint};
     use num_traits::ToPrimitive;
-    use std::{cell::Cell, collections::BTreeMap};
+    use std::{
+        cell::Cell,
+        collections::BTreeMap,
+        fmt,
+        sync::{Arc, Mutex},
+    };
+    use tracing::{
+        Event, Subscriber,
+        field::{Field, Visit},
+        level_filters::LevelFilter,
+    };
+    use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
+
+    #[derive(Default)]
+    struct DiagnosticEventFields {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for DiagnosticEventFields {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.fields.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    #[derive(Clone)]
+    struct SelectedLargeDiagnosticCapture {
+        level: LevelFilter,
+        events: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    impl SelectedLargeDiagnosticCapture {
+        fn new(level: LevelFilter) -> Self {
+            Self { level, events: Arc::default() }
+        }
+    }
+
+    impl<S> Layer<S> for SelectedLargeDiagnosticCapture
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn max_level_hint(&self) -> Option<LevelFilter> {
+            Some(self.level)
+        }
+
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            let mut event_fields = DiagnosticEventFields::default();
+            event.record(&mut event_fields);
+            if event_fields.fields.contains_key("selected_large_path") {
+                self.events.lock().expect("diagnostic capture lock").push(event_fields.fields);
+            }
+        }
+    }
 
     struct NoBounds;
 
@@ -2350,7 +2417,7 @@ mod tests {
         let root = egraph.add(MxxLang::MatrixAdd(vec![switch].into_boxed_slice()));
         egraph.rebuild();
         let candidates = diagnostic_candidates(&egraph, &[root, switch, first, second]);
-        let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
 
         assert!(steps.iter().any(|step| step.following_switch_cases == Some(2)));
         assert!(steps.iter().any(|step| step.selected_switch_case == Some(0)));
@@ -2363,7 +2430,7 @@ mod tests {
         }
         egraph.rebuild();
         let candidates = diagnostic_candidates(&egraph, &large);
-        let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
 
         assert_eq!(steps.len(), MAX_SELECTED_LARGE_DIAGNOSTIC_STEPS);
     }
@@ -2861,7 +2928,7 @@ mod tests {
             &egraph,
             &egraph.classes().map(|class| class.id).collect::<Vec<_>>(),
         );
-        let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
 
         let multiply = steps.first().expect("root multiply step");
         assert!(multiply.product_spine.is_some(), "selected positive product has a spine");
@@ -2940,7 +3007,7 @@ mod tests {
         let before = egraph.total_size();
 
         let candidates = diagnostic_candidates(&egraph, &[root, switch, first_case, second_case]);
-        let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
 
         let probe = steps
             .first()
@@ -3015,7 +3082,7 @@ mod tests {
             &[root, switch, first_case, second_case, fixed, negative_fixed],
         );
 
-        let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
         let root_step = steps.first().expect("root Add diagnostic");
         let report = root_step
             .pointwise_switch_sampler_cases
@@ -3178,7 +3245,7 @@ mod tests {
             "{direct_fixed_search:?}"
         );
 
-        let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
         let report = steps
             .first()
             .and_then(|step| step.pointwise_switch_sampler_cases.as_ref())
@@ -3286,7 +3353,7 @@ mod tests {
             &[root, selected_switch, first_case, second_case, fixed, negative_fixed],
         );
 
-        let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
         let root_step = steps.first().expect("root Add diagnostic");
         let (rejection_selector, rejection_cases) =
             match root_step.pointwise_first_direct_reject.as_ref().expect("pointwise rejection") {
@@ -3382,7 +3449,7 @@ mod tests {
         egraph.rebuild();
         let before = egraph.total_size();
         let candidates = diagnostic_candidates(&egraph, &[root, switch, fixed, negative_fixed]);
-        let report = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds)
+        let report = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds)
             .into_iter()
             .next()
             .and_then(|step| step.pointwise_switch_sampler_cases)
@@ -3471,7 +3538,7 @@ mod tests {
             ],
         );
 
-        let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
         let root_step = steps.first().expect("root diagnostic step");
         assert_eq!(root_step.add_selected_large_child_count, Some(3));
         assert_eq!(root_step.add_direct_child_views.as_ref().expect("direct Add views").len(), 3);
@@ -3532,7 +3599,7 @@ mod tests {
         let mut large = terms.clone();
         large.push(root);
         let candidates = diagnostic_candidates(&egraph, &large);
-        let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
+        let steps = selected_large_diagnostic(&egraph, root, &candidates, &NoBounds);
         let root_step = steps.first().expect("root Add step");
         assert_eq!(root_step.add_selected_large_child_count, Some(17));
         assert_eq!(
@@ -3849,10 +3916,42 @@ mod tests {
             ..Default::default()
         };
 
-        let result = extract_with_input(&egraph, root, &input);
+        let debug_capture = SelectedLargeDiagnosticCapture::new(LevelFilter::DEBUG);
+        let debug_subscriber = tracing_subscriber::registry().with(debug_capture.clone());
+        let result = tracing::subscriber::with_default(debug_subscriber, || {
+            extract_with_input(&egraph, root, &input)
+        });
 
         assert!(result.cost.large_residual);
         assert_eq!(result.first_large_source, Some(large_source));
+        let events = debug_capture.events.lock().expect("diagnostic capture lock");
+        assert_eq!(events.len(), 1);
+        let expected_source = format!("Some({})", large_source.0);
+        assert_eq!(
+            events[0].get("selected_large_source_id").map(String::as_str),
+            Some(expected_source.as_str()),
+        );
+        assert_eq!(
+            events[0].get("selected_large_source_kind").map(String::as_str),
+            Some("Some(\"protocol-input\")"),
+        );
+        assert!(
+            events[0]
+                .get("selected_large_path")
+                .is_some_and(|path| path.contains("SelectedLargePathStep"))
+        );
+        drop(events);
+
+        let info_capture = SelectedLargeDiagnosticCapture::new(LevelFilter::INFO);
+        let info_subscriber = tracing_subscriber::registry().with(info_capture.clone());
+        tracing::subscriber::with_default(info_subscriber, || {
+            let result = extract_with_input(&egraph, root, &input);
+            assert_eq!(result.first_large_source, Some(large_source));
+        });
+        assert!(
+            info_capture.events.lock().expect("diagnostic capture lock").is_empty(),
+            "the diagnostic path is not built or emitted below DEBUG"
+        );
     }
 
     #[test]

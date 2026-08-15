@@ -77,7 +77,6 @@ struct RelationState {
     registrations: BTreeMap<AtomicSourceId, Vec<RelationRegistration>>,
     failure: Option<RelationFailure>,
     counters: RelationCounters,
-    binder_build_rejection_logged: bool,
 }
 
 /// Job-owned controls shared with all checker phases.  Relation rewriting only
@@ -130,7 +129,6 @@ impl RewriteContext {
                 registrations: BTreeMap::new(),
                 failure: None,
                 counters: RelationCounters::default(),
-                binder_build_rejection_logged: false,
             })),
             budget,
         }
@@ -188,18 +186,6 @@ impl RewriteContext {
             .get(&source)
             .cloned()
             .unwrap_or_default()
-    }
-
-    /// Returns true once per checker context so a repeated unsuccessful
-    /// e-graph applier attempt cannot flood production DEBUG output.
-    fn take_binder_build_rejection_log(&self) -> bool {
-        let mut state = self.state.lock().expect("relation context lock");
-        if state.binder_build_rejection_logged {
-            false
-        } else {
-            state.binder_build_rejection_logged = true;
-            true
-        }
     }
 }
 
@@ -1365,8 +1351,8 @@ fn build_pointwise_add_switch_cancellation_with_context(
     context: &RewriteContext,
 ) -> Option<Id> {
     let selector = plan.selector;
-    let mut log_first_reject =
-        || tracing::enabled!(tracing::Level::DEBUG) && context.take_binder_build_rejection_log();
+    let mut diagnostic_available = tracing::enabled!(tracing::Level::DEBUG);
+    let mut log_first_reject = || std::mem::take(&mut diagnostic_available);
     let mut emit_reject = |reject: &BinderBuildReject| {
         emit_binder_build_reject(root, selector, reject);
     };
@@ -5002,7 +4988,7 @@ mod tests {
     }
 
     #[test]
-    fn production_binder_build_failure_logs_once_across_repeated_applier_attempts() {
+    fn production_binder_build_failure_logs_once_per_applier_attempt() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let binder = test_binder(&mut egraph, 0, 1);
         let selector = egraph.add(MxxLang::IntBinder(binder));
@@ -5039,7 +5025,7 @@ mod tests {
             }
         });
 
-        assert_eq!(capture.0.lock().expect("event capture lock").len(), 1);
+        assert_eq!(capture.0.lock().expect("event capture lock").len(), 2);
     }
 
     #[test]

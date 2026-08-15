@@ -3588,8 +3588,13 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     .zip(argument_sources)
                     .map(|(argument, producer)| match argument {
                         LoweredValue::Term(term)
-                            if self.egraph[self.egraph.find(*term)].data.sort ==
-                                Ok(element_type.clone()) =>
+                            if self.egraph[self.egraph.find(*term)]
+                                .data
+                                .sort
+                                .as_ref()
+                                .is_ok_and(|actual| {
+                                    super::analysis::sorts_equal(&element_type, actual)
+                                }) =>
                         {
                             Ok(*term)
                         }
@@ -5977,6 +5982,85 @@ mod tests {
                 .coefficient_class,
             BoundClass::bounded(5_u8.into())
         );
+    }
+
+    #[test]
+    fn family_pack_accepts_a_slice_with_a_semantically_equal_matrix_type() {
+        use mxx_ir_core::{
+            graph::{GraphOutput, NodeHandle},
+            node::IndexRange,
+        };
+
+        let source_type = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(2),
+            columns: IntExpr::constant(1),
+        };
+        let element_type = MatrixType { rows: IntExpr::constant(1), ..source_type.clone() };
+        let source = NodeHandle::new(
+            NodeKind::ConstantMatrix {
+                matrix_type: source_type.clone(),
+                value: mxx_ir_core::node::ConstantMatrix::Zero,
+            },
+            Vec::new(),
+            vec![WireType::Matrix(source_type)],
+        )
+        .output(0)
+        .expect("source matrix");
+        let slice = NodeHandle::new(
+            NodeKind::Slice {
+                rows: Some(IndexRange { start: IntExpr::constant(0), end: IntExpr::constant(1) }),
+                columns: None,
+            },
+            vec![source],
+            vec![WireType::Matrix(element_type.clone())],
+        )
+        .output(0)
+        .expect("one-row slice");
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(element_type.clone())),
+            count: IntExpr::constant(2),
+        };
+        let family = NodeHandle::new(
+            NodeKind::FamilyPack { count: IntExpr::constant(2) },
+            vec![slice.clone(), slice],
+            vec![family_type],
+        )
+        .output(0)
+        .expect("family");
+        let output = NodeHandle::new(
+            NodeKind::FamilyGetStatic { index: IntExpr::constant(0) },
+            vec![family],
+            vec![WireType::Matrix(element_type)],
+        )
+        .output(0)
+        .expect("family element");
+        let graph = mxx_ir_core::graph::Graph::freeze(
+            "family-pack-semantic-slice-type",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("freeze graph")
+        .0;
+        let mut protocol = crate::toy_example::protocol();
+        protocol.bundle.workflow.stages[0].graph = graph;
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "family-pack-semantic-slice-type".to_owned(),
+        };
+        let output = protocol.bundle.workflow.stages[0].graph.outputs()["output"].value;
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        lowerer
+            .lower_stage_wire(&StageId("encrypt".to_owned()), output)
+            .expect("family accepts the equivalent one-row slice type");
     }
 
     #[test]

@@ -735,7 +735,7 @@ fn merge_sort(
 /// byte lengths is semantic, not syntactic: relation preflight and the typed
 /// operator transfers already use the same rule.  Runtime-dependent
 /// expressions still require structural equality through `resolved_equal`.
-fn sorts_equal(left: &MxxSort, right: &MxxSort) -> bool {
+pub(crate) fn sorts_equal(left: &MxxSort, right: &MxxSort) -> bool {
     match (left, right) {
         (MxxSort::Matrix(left), MxxSort::Matrix(right)) => matrix_types_equal(left, right),
         (MxxSort::Bytes(left), MxxSort::Bytes(right)) => resolved_equal(left, right),

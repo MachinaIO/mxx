@@ -721,15 +721,7 @@ fn prepare_candidate(
         error_max_coefficient_bound: error_max_coefficient_bound.clone().into(),
     };
     let rotations = rotation_compiler
-        .preprocess(
-            hash_key.clone(),
-            // Until the rotation lowering is rewritten, this legacy adapter
-            // receives no online secret.  It must not establish the Tall
-            // secret source for input encodings or residuals.
-            ring.zero((1, 1)),
-            slots.secrets.clone(),
-            &rotation_offsets,
-        )
+        .preprocess(hash_key.clone(), &rotation_offsets)
         .map_err(|error| error.to_string())?;
 
     let mut producer_context = DslContext::new("gpu-tall-nested-rns-preprocessing")
@@ -1069,16 +1061,18 @@ fn build_encoding_graph(
         slot_count: u32::try_from(physical_slots)
             .map_err(|_| "physical slot count exceeds u32".to_owned())?,
     };
-    let rotations = rotation_offsets
-        .iter()
-        .filter_map(|offset| {
-            rotation_compiler
-                .import_artifacts(&rotation_artifacts, *offset)
-                .transpose()
-                .map(|result| result.map(|rotation| (rotation.key, rotation)))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()
-        .map_err(|error| error.to_string())?;
+    let mut rotations = BTreeMap::new();
+    for offset in rotation_offsets {
+        if let Some(public) = rotation_compiler
+            .import_artifacts(&rotation_artifacts, *offset)
+            .map_err(|error| error.to_string())?
+        {
+            let rotation = rotation_compiler
+                .encode(&public, secret_rows.clone())
+                .map_err(|error| error.to_string())?;
+            rotations.insert(rotation.key, rotation);
+        }
+    }
     let public_key_compiler = BggPublicKeyCompiler {
         ring: ring.clone(),
         base: layout.gadget_base.clone(),

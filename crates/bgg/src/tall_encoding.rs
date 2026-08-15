@@ -2,9 +2,9 @@
 //!
 //! A wire with diagonal message `X` represents
 //! `C_X = S A_X - X S G + E_X`, with one BGG+ row per slot and one public
-//! matrix shared by every row.  Rotation artifacts encode cyclic permutation
-//! matrices only inside preprocessing; they never enter the ordinary circuit
-//! wire type.  For a provisioned permutation `P`, rotation evaluates
+//! matrix shared by every row. Rotation preprocessing exports only public
+//! matrices; the online graph derives the matching permutation encodings from
+//! its one shared secret-row family. For a provisioned permutation `P`, rotation evaluates
 //! `C_P G^-1(A_X) + P C_X` followed by multiplication with the inverse
 //! permutation encoding.
 
@@ -1016,20 +1016,7 @@ mod tests {
             error_max_coefficient_bound: 0.into(),
         };
         let ring = compiler.ring();
-        let transforms = Family::pack(
-            (0..slots)
-                .map(|slot| ring.input(format!("transform-{slot}"), (secret_size, secret_size)))
-                .collect(),
-        )
-        .unwrap();
-        let preprocessing = compiler
-            .preprocess(
-                ring.bytes_input("hash-key", 32),
-                ring.input("secret", (1, secret_size)),
-                transforms,
-                &[1, 3],
-            )
-            .unwrap();
+        let preprocessing = compiler.preprocess(ring.bytes_input("hash-key", 32), &[1, 3]).unwrap();
         let producer = compiler
             .export_preprocessing(DslContext::new("rotation-producer"), preprocessing)
             .unwrap()
@@ -1038,19 +1025,9 @@ mod tests {
             .validate(&ParamEnv::default())
             .unwrap();
 
-        let secret = row(&parameters, secret_size, 2);
-        let transform_values = (0..slots)
-            .map(|slot| public_matrix(&parameters, secret_size, secret_size, 5 + slot * 2))
-            .collect::<Vec<_>>();
         let hash_key = [0x42; 32];
-        let mut producer_inputs = BTreeMap::from([
-            ("hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec())),
-            ("secret".to_owned(), RuntimeValue::matrix(secret.clone())),
-        ]);
-        for (slot, transform) in transform_values.iter().enumerate() {
-            producer_inputs
-                .insert(format!("transform-{slot}"), RuntimeValue::matrix(transform.clone()));
-        }
+        let producer_inputs =
+            BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]);
         let mut store = MemoryArtifactStore::default();
         let mut backend = cpu_backend([parameters.clone()]);
         let produced =
@@ -1058,15 +1035,20 @@ mod tests {
                 .unwrap();
         let production_id = produced.production_id.expect("artifact production");
         let manifest = store.manifest(&production_id).unwrap().clone();
-        assert_eq!(manifest.artifacts.len(), 8);
+        assert_eq!(manifest.artifacts.len(), 4);
 
         let artifacts = TallRotationEncodingArtifacts {
             production_id: production_id.clone(),
             slot_count: slots as u32,
         };
         let mut context = DslContext::new("rotation-consumer");
+        let secret_rows = Family::pack(
+            (0..slots).map(|slot| ring.input(format!("secret-{slot}"), (1, secret_size))).collect(),
+        )
+        .unwrap();
         for offset in [1, 3] {
-            let rotation = compiler.import_artifacts(&artifacts, offset).unwrap().unwrap();
+            let public = compiler.import_artifacts(&artifacts, offset).unwrap().unwrap();
+            let rotation = compiler.encode(&public, secret_rows.clone()).unwrap();
             context = context
                 .output(format!("a-forward-{offset}"), rotation.a_forward)
                 .unwrap()
@@ -1094,16 +1076,25 @@ mod tests {
                 &BTreeMap::from([(production_id, manifest)]),
             )
             .unwrap();
-        let consumed =
-            execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let secret_rows_values =
+            (0..slots).map(|slot| row(&parameters, secret_size, 2 + slot * 2)).collect::<Vec<_>>();
+        let consumed = execute(
+            &consumer,
+            &mut backend,
+            secret_rows_values
+                .iter()
+                .enumerate()
+                .map(|(slot, value)| {
+                    (format!("secret-{slot}"), RuntimeValue::matrix(value.clone()))
+                })
+                .collect(),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .unwrap();
 
         let hash = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new();
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size);
-        let transformed = transform_values
-            .iter()
-            .map(|transform| secret.clone() * transform.clone())
-            .collect::<Vec<_>>();
         for offset in [1usize, 3] {
             let key = TallRotationEncodingKey { num_slots: slots as u32, offset: offset as u32 };
             let forward_tag = format!("bgg_tall_rotation_n{slots}_r{offset}_forward");
@@ -1135,13 +1126,13 @@ mod tests {
                 let backward_source = (slot + offset) % slots;
                 assert_eq!(
                     matrix_output(&consumed, &format!("c-forward-{offset}-{slot}")),
-                    &(transformed[slot].clone() * expected_forward.clone() -
-                        transformed[forward_source].clone() * gadget.clone())
+                    &(secret_rows_values[slot].clone() * expected_forward.clone() -
+                        secret_rows_values[forward_source].clone() * gadget.clone())
                 );
                 assert_eq!(
                     matrix_output(&consumed, &format!("c-backward-{offset}-{slot}")),
-                    &(transformed[slot].clone() * expected_backward.clone() -
-                        transformed[backward_source].clone() * gadget.clone())
+                    &(secret_rows_values[slot].clone() * expected_backward.clone() -
+                        secret_rows_values[backward_source].clone() * gadget.clone())
                 );
             }
         }

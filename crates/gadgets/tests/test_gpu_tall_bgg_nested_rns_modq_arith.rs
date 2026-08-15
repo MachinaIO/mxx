@@ -83,9 +83,7 @@ use std::{
 use tracing::{debug, error, info};
 
 const HASH_KEY_INPUT: &str = "tall_nested_rns_hash_key";
-const SECRET_ARTIFACT: &str = "tall_nested_rns_secret";
-const C_B0_ARTIFACT: &str = "tall_nested_rns_c_b0";
-const LOOKUP_C_B_ARTIFACT: &str = "tall_nested_rns_lookup_c_b";
+const LOOKUP_PUBLIC_B_ARTIFACT: &str = "tall_nested_rns_lookup_public_b";
 const INPUT_PUBLIC_KEY_PREFIX: &str = "tall_nested_rns_input_public_key";
 const TALL_OPERATIONAL_TARGET_ID: &str = "tall-threshold-decode";
 const TALL_OPERATIONAL_RESIDUAL: &str = "operational_residual";
@@ -312,7 +310,7 @@ struct EndToEndOutputs {
     encoding_public_key: GpuDCRTPolyMatrix,
     encoding_rows: Vec<GpuDCRTPolyMatrix>,
     output_plaintexts: Vec<GpuDCRTPolyMatrix>,
-    transformed_secrets: Vec<GpuDCRTPolyMatrix>,
+    residuals: Vec<GpuDCRTPolyMatrix>,
     expected_evaluation_slots: Vec<BigUint>,
 }
 
@@ -618,7 +616,6 @@ fn prepare_candidate(
     };
     let ring = layout.ring();
     let hash_key = ring.bytes_input(HASH_KEY_INPUT, 32);
-    let secret = ring.uniform_interval((1, 1), -1, 1);
     let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
         hash_key.clone(),
         b"tall-nested-rns-input-public-keys".as_slice(),
@@ -709,37 +706,6 @@ fn prepare_candidate(
     let gate_wires = artifact_compiler
         .build_gate_preimages(&base, &slots, &slot_requests)
         .map_err(|error| error.to_string())?;
-    let transformed_secrets = slots
-        .secrets
-        .clone()
-        .parallel_map({
-            let secret = secret.clone();
-            move |_, transform| secret.clone() * transform
-        })
-        .map_err(|error| error.to_string())?;
-    let error_sigma =
-        RealExpr::from_f64_exact(config.error_sigma).map_err(|error| error.to_string())?;
-    let b0_columns = 1usize
-        .checked_mul(parameters.modulus_digits() + 2)
-        .ok_or_else(|| "B0 column count overflow".to_owned())?;
-    let c_b0 = secret.clone() * base.b0.public_matrix() +
-        ring.gaussian((1, b0_columns), error_sigma.clone(), error_max_coefficient_bound.clone());
-    let lookup_c_b = transformed_secrets
-        .clone()
-        .parallel_map({
-            let ring = ring.clone();
-            let b0 = base.b0.public_matrix();
-            let error_max_coefficient_bound = error_max_coefficient_bound.clone();
-            move |_, slot_secret| {
-                slot_secret * b0.clone() +
-                    ring.gaussian(
-                        (1, b0_columns),
-                        error_sigma.clone(),
-                        error_max_coefficient_bound.clone(),
-                    )
-            }
-        })
-        .map_err(|error| error.to_string())?;
     let rotation_keys =
         required_tall_rotation_encodings(&circuit).map_err(|error| error.to_string())?;
     let rotation_offsets = rotation_keys.iter().map(|key| key.offset).collect::<Vec<_>>();
@@ -755,15 +721,19 @@ fn prepare_candidate(
         error_max_coefficient_bound: error_max_coefficient_bound.clone().into(),
     };
     let rotations = rotation_compiler
-        .preprocess(hash_key.clone(), secret.clone(), slots.secrets.clone(), &rotation_offsets)
+        .preprocess(
+            hash_key.clone(),
+            // Until the rotation lowering is rewritten, this legacy adapter
+            // receives no online secret.  It must not establish the Tall
+            // secret source for input encodings or residuals.
+            ring.zero((1, 1)),
+            slots.secrets.clone(),
+            &rotation_offsets,
+        )
         .map_err(|error| error.to_string())?;
 
     let mut producer_context = DslContext::new("gpu-tall-nested-rns-preprocessing")
-        .private_output(SECRET_ARTIFACT, secret)
-        .map_err(|error| error.to_string())?
-        .public_output(C_B0_ARTIFACT, c_b0)
-        .map_err(|error| error.to_string())?
-        .public_family_output(LOOKUP_C_B_ARTIFACT, lookup_c_b)
+        .public_output(LOOKUP_PUBLIC_B_ARTIFACT, base.b0.public_matrix())
         .map_err(|error| error.to_string())?;
     for (index, public_key) in public_keys.iter().enumerate() {
         producer_context = producer_context
@@ -824,7 +794,7 @@ fn prepare_candidate(
         &rotation_offsets,
         physical_slots,
         config.error_sigma,
-        false,
+        true,
     )?;
     let manifests = BTreeMap::from([(production.clone(), runtime_manifest.clone())]);
     public_key_graph
@@ -848,7 +818,7 @@ fn prepare_candidate(
             true,
         )?;
         for output in
-            ["encoding_rows", "encoding_public_key", "output_plaintexts", "transformed_secrets"]
+            ["encoding_rows", "encoding_public_key", "output_plaintexts", TALL_OPERATIONAL_RESIDUAL]
         {
             if encoding_graph.graph.outputs().get(output) !=
                 operational_encoding_graph.graph.outputs().get(output)
@@ -989,12 +959,6 @@ fn build_encoding_graph(
 ) -> Result<BuiltGraph, String> {
     let ring = layout.ring();
     let hash_key = ring.bytes_input(HASH_KEY_INPUT, 32);
-    let secret = ring.artifact_input(
-        production.clone(),
-        SECRET_ARTIFACT,
-        (1, layout.secret_dimension),
-        ArtifactConfidentiality::Private,
-    );
     let public_keys =
         imported_public_keys(&ring, &production, circuit.num_input(), layout.public_key_columns());
     let plaintexts = (0..circuit.num_input())
@@ -1010,6 +974,20 @@ fn build_encoding_graph(
     let imported_slots = artifact_compiler
         .import_slots(&BggSlotTransferSlotArtifacts { production_id: production.clone() })
         .map_err(|error| error.to_string())?;
+    // The online protocol owns exactly one fresh Tall secret matrix.  The
+    // family below contains row views of that one `physical_slots × n` sample,
+    // not independently sampled per-slot secrets.
+    let tall_secret = ring.uniform_interval((physical_slots, layout.secret_dimension), -1, 1);
+    let secret_rows = Family::pack(
+        (0..physical_slots)
+            .map(|slot| {
+                tall_secret
+                    .clone()
+                    .slice(Some(IndexRange { start: slot.into(), end: (slot + 1).into() }), None)
+            })
+            .collect(),
+    )
+    .map_err(|error| error.to_string())?;
     let sample = BggTallEncodingSampler {
         layout: layout.clone(),
         gaussian_sigma: Some(
@@ -1023,22 +1001,8 @@ fn build_encoding_graph(
             .into(),
         ),
     }
-    .sample(
-        secret.clone(),
-        &public_keys,
-        &plaintexts,
-        physical_slots.into(),
-        Some(imported_slots.secrets.clone()),
-    )
+    .sample(secret_rows.clone(), &public_keys, &plaintexts, physical_slots.into())
     .map_err(|error| error.to_string())?;
-    let transformed_secrets = imported_slots
-        .secrets
-        .clone()
-        .parallel_map({
-            let secret = secret.clone();
-            move |_, transform| secret.clone() * transform
-        })
-        .map_err(|error| error.to_string())?;
     let invocations = bind_lwe_lookup_invocations(
         parameters,
         circuit,
@@ -1046,13 +1010,33 @@ fn build_encoding_graph(
         lookup_compilers.iter().cloned(),
     )
     .map_err(|error| error.to_string())?;
-    let lookup_c_b = ring.family_artifact_input(
+    let lookup_public_b = ring.artifact_input(
         production.clone(),
-        LOOKUP_C_B_ARTIFACT,
-        physical_slots,
-        (1, layout.secret_dimension * (layout.digit_count + 2)),
+        LOOKUP_PUBLIC_B_ARTIFACT,
+        (layout.secret_dimension, layout.secret_dimension * (layout.digit_count + 2)),
         ArtifactConfidentiality::Public,
     );
+    let lookup_error_sigma =
+        RealExpr::from_f64_exact(error_sigma).map_err(|error| error.to_string())?;
+    let lookup_error_bound: IntExpr = BigInt::from(hard_cutoff_from_sigma_bound(
+        &BigDecimal::from_f64(error_sigma)
+            .ok_or_else(|| "error sigma must be finite".to_owned())?,
+    ))
+    .into();
+    let lookup_ring = ring.clone();
+    let lookup_columns = layout.secret_dimension * (layout.digit_count + 2);
+    let lookup_public_b_for_c_b = lookup_public_b.clone();
+    let lookup_c_b = secret_rows
+        .clone()
+        .parallel_map(move |_, secret_row| {
+            secret_row * lookup_public_b_for_c_b.clone() +
+                lookup_ring.gaussian(
+                    (1, lookup_columns),
+                    lookup_error_sigma.clone(),
+                    lookup_error_bound.clone(),
+                )
+        })
+        .map_err(|error| error.to_string())?;
     let mut lookup = LweLookupTallEncodingLowering::new(invocations, lookup_c_b)
         .map_err(|error| error.to_string())?;
     let public_slots = BggSlotTransferPublicSlotWires {
@@ -1105,12 +1089,9 @@ fn build_encoding_graph(
         artifact: artifact_compiler.clone(),
         hash_key,
         output_public_key_production: Some(production.clone()),
-        c_b0: ring.artifact_input(
-            production,
-            C_B0_ARTIFACT,
-            (1, layout.secret_dimension * (layout.digit_count + 2)),
-            ArtifactConfidentiality::Public,
-        ),
+        // Slot transfer is a legacy adapter pending its separate removal.
+        // It receives only the public base, never a secret-dependent sample.
+        c_b0: lookup_public_b,
         slots: public_slots,
         gates: gate_wires,
         rotations,
@@ -1138,18 +1119,16 @@ fn build_encoding_graph(
         .output("encoding_public_key", output_public_key.clone())
         .map_err(|error| error.to_string())?
         .family_output("output_plaintexts", output_plaintexts.clone())
-        .map_err(|error| error.to_string())?
-        .family_output("transformed_secrets", transformed_secrets.clone())
         .map_err(|error| error.to_string())?;
     if include_operational_residual {
         let gadget =
             ring.gadget(layout.secret_dimension, layout.gadget_base.clone(), layout.digit_count);
         let public_key = output_public_key.clone();
         let residuals = parallel_zip(
-            (encoding_rows, output_plaintexts, transformed_secrets),
-            move |_, (encoding, plaintext, transformed_secret)| {
-                let signal = transformed_secret.clone() * public_key.clone() -
-                    plaintext * (transformed_secret * gadget.clone());
+            (encoding_rows, output_plaintexts, secret_rows),
+            move |_, (encoding, plaintext, secret_row)| {
+                let signal = secret_row.clone() * public_key.clone() -
+                    plaintext * (secret_row * gadget.clone());
                 encoding - signal
             },
         )
@@ -1735,7 +1714,7 @@ fn end_to_end_processing(
         &selected.rotation_offsets,
         selected.parameters.ring_dimension() as usize * selected.nested.q_moduli_depth,
         config.error_sigma,
-        false,
+        true,
     )?;
     info!(elapsed = ?started.elapsed(), "timed Tall encoding graph construction");
     let encoding_pass_started = Instant::now();
@@ -1759,13 +1738,17 @@ fn end_to_end_processing(
         matrix_family_output(&mut encoding_result, "encoding_rows", &backend, &mut store)?;
     let output_plaintexts =
         matrix_family_output(&mut encoding_result, "output_plaintexts", &backend, &mut store)?;
-    let transformed_secrets =
-        matrix_family_output(&mut encoding_result, "transformed_secrets", &backend, &mut store)?;
+    let residuals = matrix_family_output(
+        &mut encoding_result,
+        TALL_OPERATIONAL_RESIDUAL,
+        &backend,
+        &mut store,
+    )?;
     encoding_result.cleanup_staged(&mut store).map_err(|error| error.to_string())?;
     encoding_public_key.wait_until_ready();
     encoding_rows.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
     output_plaintexts.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
-    transformed_secrets.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
+    residuals.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
     info!(elapsed = ?started.elapsed(), "timed TallBggEncoding end-to-end evaluation");
     let started = Instant::now();
     let _transferred_public_key = public_key.to_cpu_matrix();
@@ -1774,8 +1757,8 @@ fn end_to_end_processing(
         encoding_rows.par_iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>();
     let _transferred_plaintexts =
         output_plaintexts.par_iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>();
-    let _transferred_secrets =
-        transformed_secrets.par_iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>();
+    let _transferred_residuals =
+        residuals.par_iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>();
     info!(elapsed = ?started.elapsed(), "timed output transfer");
     info!(elapsed = ?encoding_pass_started.elapsed(), "timed encoding-pass total");
     Ok(EndToEndOutputs {
@@ -1783,7 +1766,7 @@ fn end_to_end_processing(
         encoding_public_key,
         encoding_rows,
         output_plaintexts,
-        transformed_secrets,
+        residuals,
         expected_evaluation_slots,
     })
 }
@@ -1803,13 +1786,12 @@ fn measure_runtime_residual(
         selected.parameters.ring_dimension() as usize * selected.nested.q_moduli_depth;
     if outputs.encoding_rows.len() != physical_slots ||
         outputs.output_plaintexts.len() != physical_slots ||
-        outputs.transformed_secrets.len() != physical_slots
+        outputs.residuals.len() != physical_slots
     {
         return Err(
             "Tall output family cardinality differs from the physical SIMD lane count".to_owned()
         );
     }
-    let gadget = GpuDCRTPolyMatrix::gadget_matrix(gpu_parameters, selected.layout.secret_dimension);
     let modulus = selected.parameters.modulus().as_ref().clone();
     let half_modulus = &modulus / BigUint::from(2u8);
     let mut maximum_noise = BigUint::zero();
@@ -1828,9 +1810,7 @@ fn measure_runtime_residual(
         if outputs.output_plaintexts[slot] != expected_matrix {
             return Err(format!("runtime plaintext mismatch at physical slot {slot}"));
         }
-        let signal = &outputs.transformed_secrets[slot] * &outputs.encoding_public_key -
-            &expected_matrix * (&outputs.transformed_secrets[slot] * &gadget);
-        let residual = &outputs.encoding_rows[slot] - &signal;
+        let residual = &outputs.residuals[slot];
         residual.wait_until_ready();
         let cpu = residual.to_cpu_matrix();
         for column in 0..cpu.col_size() {

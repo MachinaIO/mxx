@@ -12,7 +12,7 @@ use crate::{
     BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout,
     tall_rotation_encoding::{TallRotationDirection, TallRotationEncodingWires},
 };
-use mxx_dsl::{DslError, Family, Mat, Parallel, parallel_zip};
+use mxx_dsl::{DslError, Family, Mat, parallel_zip};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     node::{ConcatAxis, IndexRange},
@@ -53,13 +53,11 @@ pub struct BggTallEncodingCompiler {
     pub public_key: BggPublicKeyCompiler,
 }
 
-/// Sampling result containing all requested tall encodings and slot transforms.
+/// Sampling result containing all requested tall encodings.
 #[derive(Clone)]
 pub struct BggTallEncodingSample {
     /// Sampled encodings, in the same order as the supplied public keys.
     pub encodings: Vec<BggTallEncodingWire>,
-    /// Matrices `R_i` defining slot secrets `s_i = s R_i`.
-    pub slot_secret_matrices: Family<Mat>,
 }
 
 /// Sampler for tall BGG+ encodings.
@@ -356,14 +354,18 @@ impl BggTallEncodingWire {
 }
 
 impl BggTallEncodingSampler {
-    /// Samples slot transforms and packed tall BGG+ rows.
+    /// Packs tall BGG+ rows under caller-supplied per-slot secrets.
+    ///
+    /// The caller owns sampling the fresh `S_i` family.  In particular, this
+    /// sampler never derives a slot secret from a long-lived secret or a slot
+    /// transform, which keeps the online encoding protocol free of hidden
+    /// preprocessing state.
     pub fn sample(
         &self,
-        secret: Mat,
+        secret_rows: Family<Mat>,
         public_keys: &[BggPublicKeyWire],
         plaintexts: &[Family<Mat>],
         slot_count: IntExpr,
-        supplied_slot_secrets: Option<Family<Mat>>,
     ) -> Result<BggTallEncodingSample, TallCompileError> {
         if public_keys.len() != plaintexts.len() + 1 {
             return Err(TallCompileError::InvalidLayout);
@@ -374,7 +376,8 @@ impl BggTallEncodingSampler {
         let ring = self.layout.ring();
         let secret_size = self.layout.secret_dimension;
         let columns = self.layout.public_key_columns();
-        if !same_matrix_type(secret.matrix_type(), &ring.matrix_type((1, secret_size))) ||
+        if secret_rows.count() != &slot_count ||
+            !same_matrix_type(secret_rows.element_type(), &ring.matrix_type((1, secret_size))) ||
             public_keys.par_iter().any(|key| {
                 !same_matrix_type(
                     key.matrix.matrix_type(),
@@ -388,33 +391,7 @@ impl BggTallEncodingSampler {
         {
             return Err(TallCompileError::InvalidLayout);
         }
-        let (slot_secret_matrices, transformed_secrets) =
-            if let Some(slot_secrets) = supplied_slot_secrets {
-                if slot_secrets.count() != &slot_count ||
-                    !same_matrix_type(
-                        slot_secrets.element_type(),
-                        &ring.matrix_type((secret_size, secret_size)),
-                    )
-                {
-                    return Err(TallCompileError::InvalidLayout);
-                }
-                let transformed = slot_secrets.clone().parallel_map({
-                    let secret = secret.clone();
-                    move |_, transform| secret.clone() * transform
-                })?;
-                (slot_secrets, transformed)
-            } else {
-                let (transformed, sampled) = Parallel::range(slot_count.clone()).map_values({
-                    let ring = ring.clone();
-                    let secret = secret.clone();
-                    move |_| {
-                        let transform = ring.uniform_interval((secret_size, secret_size), -1, 1);
-                        (secret.clone() * transform.clone(), transform)
-                    }
-                })?;
-                (sampled, transformed)
-            };
-        let ones = transformed_secrets.clone().parallel_map({
+        let ones = secret_rows.clone().parallel_map({
             let ring = ring.clone();
             move |_, _| ring.identity(1)
         })?;
@@ -438,11 +415,10 @@ impl BggTallEncodingSampler {
         let gadget =
             ring.gadget(secret_size, self.layout.gadget_base.clone(), self.layout.digit_count);
         let sigma = self.gaussian_sigma.clone();
-        let row_families = parallel_zip(
-            (transformed_secrets, encoded_plaintexts),
-            move |_, (slot_secret, encoded)| {
-                let packed = slot_secret.clone() * packed_public.clone() -
-                    encoded.tensor(slot_secret * gadget.clone()) +
+        let row_families =
+            parallel_zip((secret_rows, encoded_plaintexts), move |_, (secret_row, encoded)| {
+                let packed = secret_row.clone() * packed_public.clone() -
+                    encoded.tensor(secret_row * gadget.clone()) +
                     match (&sigma, &self.gaussian_max_coefficient_bound) {
                         (Some(sigma), Some(bound)) => {
                             ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
@@ -461,8 +437,7 @@ impl BggTallEncodingSampler {
                         )
                     })
                     .collect::<Vec<_>>()
-            },
-        )?;
+            })?;
         let encodings = row_families
             .into_iter()
             .enumerate()
@@ -481,7 +456,7 @@ impl BggTallEncodingSampler {
                 canonical_input_exclusive_upper: None,
             })
             .collect();
-        Ok(BggTallEncodingSample { encodings, slot_secret_matrices })
+        Ok(BggTallEncodingSample { encodings })
     }
 }
 
@@ -927,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn tall_sampler_uses_supplied_slot_transforms_in_the_bgg_formula() {
+    fn tall_sampler_uses_supplied_fresh_slot_secrets_in_the_bgg_formula() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let secret_size = 2;
         let slots = 3;
@@ -954,9 +929,9 @@ mod tests {
             (0..slots).map(|slot| ring.input(format!("plaintext-{slot}"), (1, 1))).collect(),
         )
         .unwrap();
-        let transforms = Family::pack(
+        let slot_secrets = Family::pack(
             (0..slots)
-                .map(|slot| ring.input(format!("transform-{slot}"), (secret_size, secret_size)))
+                .map(|slot| ring.input(format!("slot-secret-{slot}"), (1, secret_size)))
                 .collect(),
         )
         .unwrap();
@@ -965,36 +940,22 @@ mod tests {
             gaussian_sigma: None,
             gaussian_max_coefficient_bound: None,
         }
-        .sample(
-            ring.input("secret", (1, secret_size)),
-            &public_keys,
-            &[plaintexts],
-            slots.into(),
-            Some(transforms),
-        )
+        .sample(slot_secrets, &public_keys, &[plaintexts], slots.into())
         .unwrap();
         let mut context = DslContext::new("tall-sampler-runtime");
         for slot in 0..slots {
             context = context
                 .output(format!("row-{slot}"), sample.encodings[1].rows.get_static(slot))
-                .unwrap()
-                .private_output(
-                    format!("transform-out-{slot}"),
-                    sample.slot_secret_matrices.get_static(slot),
-                )
                 .unwrap();
         }
 
-        let secret = row(&parameters, secret_size, 1);
         let public_one = public_matrix(&parameters, secret_size, columns, 4);
         let public_message = public_matrix(&parameters, secret_size, columns, 7);
         let plaintext_values =
             (0..slots).map(|slot| row(&parameters, 1, 10 + slot)).collect::<Vec<_>>();
-        let transform_values = (0..slots)
-            .map(|slot| public_matrix(&parameters, secret_size, secret_size, 14 + slot * 2))
-            .collect::<Vec<_>>();
+        let slot_secret_values =
+            (0..slots).map(|slot| row(&parameters, secret_size, 14 + slot * 2)).collect::<Vec<_>>();
         let mut inputs = BTreeMap::from([
-            ("secret".to_owned(), RuntimeValue::matrix(secret.clone())),
             ("public-one".to_owned(), RuntimeValue::matrix(public_one)),
             ("public-message".to_owned(), RuntimeValue::matrix(public_message.clone())),
         ]);
@@ -1004,18 +965,14 @@ mod tests {
                 RuntimeValue::matrix(plaintext_values[slot].clone()),
             );
             inputs.insert(
-                format!("transform-{slot}"),
-                RuntimeValue::matrix(transform_values[slot].clone()),
+                format!("slot-secret-{slot}"),
+                RuntimeValue::matrix(slot_secret_values[slot].clone()),
             );
         }
         let result = execute_graph(context.build().unwrap(), parameters.clone(), inputs);
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size);
         for slot in 0..slots {
-            assert_eq!(
-                matrix_output(&result, &format!("transform-out-{slot}")),
-                &transform_values[slot]
-            );
-            let slot_secret = secret.clone() * transform_values[slot].clone();
+            let slot_secret = slot_secret_values[slot].clone();
             let expected = slot_secret.clone() * public_message.clone() -
                 plaintext_values[slot].clone().tensor(&(slot_secret * gadget.clone()));
             assert_eq!(matrix_output(&result, &format!("row-{slot}")), &expected);

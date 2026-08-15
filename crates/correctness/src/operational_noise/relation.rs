@@ -295,11 +295,17 @@ impl Applier<MxxLang, MxxAnalysis> for RelationApplier {
                 right_nested_relation_factor_candidates(egraph, &factors, &self.context);
             for candidate in std::iter::once(factors).chain(nested_candidates.into_iter().flatten())
             {
-                if let Some((replacement, selector_distribution)) =
-                    checked_product_replacement(egraph, &self.context, &candidate)
+                if let Some(plan) =
+                    checked_product_replacement_plan(egraph, &self.context, &candidate)
                 {
-                    if egraph.union(root, replacement) {
-                        self.context.note_rewrite(selector_distribution);
+                    if replacement_plan_satisfied(egraph, root, &plan.replacement) {
+                        continue;
+                    }
+                    if let Some(replacement) =
+                        materialize_replacement_plan(egraph, &self.context, &plan.replacement) &&
+                        egraph.union(root, replacement)
+                    {
+                        self.context.note_rewrite(plan.selector_distribution);
                         return vec![replacement];
                     }
                 }
@@ -376,28 +382,73 @@ fn right_nested_relation_factor_candidates(
     })
 }
 
-fn checked_product_replacement(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ReplacementPlan {
+    Existing(Id),
+    Product(Box<[ReplacementPlan]>),
+    Add(Box<[ReplacementPlan]>),
+    Switch(Box<[ReplacementPlan]>),
+    Concat {
+        axis: Axis,
+        inputs: Box<[ReplacementPlan]>,
+    },
+    /// Every member is an exact physical witness of one relation result.  The
+    /// applier unions them just as the old distribution materializer did.
+    Equivalent(Box<[ReplacementPlan]>),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CheckedProductReplacementPlan {
+    replacement: ReplacementPlan,
+    selector_distribution: bool,
+}
+
+fn existing_product_plan(factors: &[Id]) -> ReplacementPlan {
+    let factors = factors.iter().copied().map(ReplacementPlan::Existing).collect::<Vec<_>>();
+    if factors.len() == 1 {
+        factors.into_iter().next().expect("one product factor")
+    } else {
+        ReplacementPlan::Product(factors.into_boxed_slice())
+    }
+}
+
+fn splice_product_plan(
+    prefix: &[Id],
+    middle: &[ReplacementPlan],
+    suffix: &[Id],
+) -> ReplacementPlan {
+    let mut factors = Vec::with_capacity(prefix.len() + middle.len() + suffix.len());
+    factors.extend(prefix.iter().copied().map(ReplacementPlan::Existing));
+    factors.extend_from_slice(middle);
+    factors.extend(suffix.iter().copied().map(ReplacementPlan::Existing));
+    if factors.len() == 1 {
+        factors.into_iter().next().expect("one product factor")
+    } else {
+        ReplacementPlan::Product(factors.into_boxed_slice())
+    }
+}
+
+fn checked_product_replacement_plan(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
     context: &RewriteContext,
     factors: &[Id],
-) -> Option<(Id, bool)> {
+) -> Option<CheckedProductReplacementPlan> {
     for relation_position in 1..factors.len() {
         let relation = factors[relation_position];
         if egraph[egraph.find(relation)].data.relation_provenance.is_empty() {
             continue;
         }
         let public = factors[relation_position - 1];
-        match pointwise_same_selector(egraph, public, relation, true) {
+        match pointwise_same_selector_plan(egraph, public, relation, true) {
             Ok(Some(product)) => {
-                return Some((
-                    ordered_product_sequence(
-                        egraph,
+                return Some(CheckedProductReplacementPlan {
+                    replacement: splice_product_plan(
                         &factors[..relation_position - 1],
                         &[product],
                         &factors[relation_position + 1..],
                     ),
-                    true,
-                ));
+                    selector_distribution: true,
+                });
             }
             Ok(None)
                 if switch_node(egraph, public).is_some() ||
@@ -413,7 +464,8 @@ fn checked_product_replacement(
             }
             Ok(None) => {}
         }
-        if let Some(replacement) = checked_replacement(egraph, context, factors, relation_position)
+        if let Some(replacement) =
+            checked_replacement_plan(egraph, context, factors, relation_position)
         {
             return Some(replacement);
         }
@@ -833,13 +885,29 @@ fn signed_additive_child_matches(
     (base, negative): (Id, bool),
 ) -> bool {
     let child = egraph.find(child);
-    if !negative {
-        return child == base;
+    let direct = if !negative {
+        child == base
+    } else {
+        matches!(
+            physical_negated_base(egraph, child),
+            PhysicalStructure::Unique(negated) if negated == base && negated != child
+        )
+    };
+    if direct {
+        return true;
     }
-    matches!(
-        physical_negated_base(egraph, child),
-        PhysicalStructure::Unique(negated) if negated == base && negated != child
-    )
+    match physical_add_terms(egraph, child) {
+        // Singleton wrappers are intentionally materialized when a selected
+        // Switch result would otherwise be an input of the Add being unioned.
+        // They preserve the exact signed leaf while preventing an e-class
+        // self-cycle; treat that wrapper as the same retained term here.
+        PhysicalStructure::Unique(terms) if terms.len() == 1 && egraph.find(terms[0]) != child => {
+            signed_additive_child_matches(egraph, terms[0], (base, negative))
+        }
+        PhysicalStructure::Absent | PhysicalStructure::Ambiguous | PhysicalStructure::Unique(_) => {
+            false
+        }
+    }
 }
 
 fn strict_additive_remainder(
@@ -1474,6 +1542,123 @@ pub(crate) fn selected_product_switch_eligibility<'a>(
         return None;
     }
     Some(SelectedProductSwitchEligibility { selector, case_count })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedProductAddEligibility {
+    add_factor_index: usize,
+    addend_count: usize,
+}
+
+/// One-layer ordered distribution eligibility. It is intentionally narrower
+/// than general polynomial expansion: exactly one direct selected Add factor
+/// is allowed, and every resulting product must have no direct selected Add.
+pub(crate) fn selected_product_add_eligibility<'a>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    product_origin: Id,
+    factors: &[Id],
+    lookup: impl Copy + Fn(Id) -> Option<SelectedNodeRef<'a>>,
+) -> Option<SelectedProductAddEligibility> {
+    if selected_product_switch_eligibility(egraph, product_origin, factors, lookup).is_some() {
+        return None;
+    }
+    let product_origin = egraph.find(product_origin);
+    let mut selected_add = None;
+    for (factor_index, factor) in factors.iter().enumerate() {
+        let selected = lookup(*factor)?;
+        if egraph.find(selected.origin) == product_origin {
+            return None;
+        }
+        let MxxLang::MatrixAdd(addends) = selected.node else { continue };
+        if addends.is_empty() || selected_add.is_some() {
+            return None;
+        }
+        for addend in addends {
+            let addend = lookup(*addend)?;
+            if egraph.find(addend.origin) == product_origin ||
+                matches!(addend.node, MxxLang::MatrixAdd(_))
+            {
+                return None;
+            }
+        }
+        selected_add = Some(SelectedProductAddEligibility {
+            add_factor_index: factor_index,
+            addend_count: addends.len(),
+        });
+    }
+    selected_add
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct SelectedProductAddRedex {
+    pub(crate) origin: Id,
+    add_factor_index: usize,
+    factors: Box<[Id]>,
+    addends: Box<[Id]>,
+}
+
+pub(crate) fn selected_product_add_redex(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    expression: &RecExpr<MxxLang>,
+    origins: &[Id],
+    product_index: usize,
+) -> Option<SelectedProductAddRedex> {
+    let MxxLang::MatrixMultiply(selected_factors) = expression.as_ref().get(product_index)? else {
+        return None;
+    };
+    if origins.len() != expression.as_ref().len() {
+        return None;
+    }
+    let origin = egraph.find(*origins.get(product_index)?);
+    let lookup = |handle: Id| {
+        let index = usize::from(handle);
+        (index < product_index).then_some(())?;
+        Some(SelectedNodeRef {
+            node: expression.as_ref().get(index)?,
+            origin: *origins.get(index)?,
+        })
+    };
+    let eligibility = selected_product_add_eligibility(egraph, origin, selected_factors, lookup)?;
+    let add_handle = *selected_factors.get(eligibility.add_factor_index)?;
+    let MxxLang::MatrixAdd(selected_addends) = lookup(add_handle)?.node else {
+        return None;
+    };
+    let factors = selected_factors
+        .iter()
+        .map(|factor| lookup(*factor).map(|selected| egraph.find(selected.origin)))
+        .collect::<Option<Vec<_>>>()?;
+    let addends = selected_addends
+        .iter()
+        .map(|addend| lookup(*addend).map(|selected| egraph.find(selected.origin)))
+        .collect::<Option<Vec<_>>>()?;
+    (addends.len() == eligibility.addend_count).then_some(SelectedProductAddRedex {
+        origin,
+        add_factor_index: eligibility.add_factor_index,
+        factors: factors.into_boxed_slice(),
+        addends: addends.into_boxed_slice(),
+    })
+}
+
+pub(crate) fn materialize_selected_product_add_redex(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    redex: SelectedProductAddRedex,
+    context: &RewriteContext,
+) -> Option<(Id, Id)> {
+    let work = redex.addends.len().checked_mul(redex.factors.len())?.checked_add(1)?;
+    if !context.reserve(work) {
+        return None;
+    }
+    context.note_candidate();
+    let mut terms = Vec::with_capacity(redex.addends.len());
+    for addend in redex.addends {
+        let mut factors = redex.factors.to_vec();
+        *factors.get_mut(redex.add_factor_index)? = addend;
+        if factors.iter().any(|factor| *factor == redex.origin) {
+            return None;
+        }
+        terms.push(egraph.add(MxxLang::MatrixMultiply(factors.into_boxed_slice())));
+    }
+    Some((redex.origin, egraph.add(MxxLang::MatrixAdd(terms.into_boxed_slice()))))
 }
 
 /// One exact product distribution planned only from the selected RecExpr DAG.
@@ -2159,7 +2344,7 @@ fn build_pointwise_add_switch_cancellation_inner(
                 term.base
             });
         }
-        cases.push(build_additive_terms(egraph, root, materialized));
+        cases.push(build_detached_pointwise_terms(egraph, root, materialized));
     }
     Some(egraph.add(MxxLang::Switch(cases.into_boxed_slice())))
 }
@@ -4448,6 +4633,23 @@ fn build_additive_terms(egraph: &mut EGraph<MxxLang, MxxAnalysis>, root: Id, ter
     }
 }
 
+/// The direct pointwise Switch builder unions its output with an enclosing
+/// Add. A singleton case can therefore be one of that Add's original
+/// children. Keep a one-child Add wrapper for exactly this path, so rebuild
+/// never canonicalizes an old parent e-node into a self-cycle. Binder-aware
+/// builders have their own instantiation safety checks and retain their
+/// original singleton representation.
+fn build_detached_pointwise_terms(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+    terms: Vec<Id>,
+) -> Id {
+    match terms.len() {
+        1 => egraph.add(MxxLang::MatrixAdd(terms.into_boxed_slice())),
+        _ => build_additive_terms(egraph, root, terms),
+    }
+}
+
 fn unique_switch_cases(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> Option<Box<[Id]>> {
     match physical_switch_cases(egraph, term) {
         PhysicalStructure::Unique(cases) => Some(cases),
@@ -5144,12 +5346,12 @@ fn equivalent_signed_switch_exists(
     })
 }
 
-fn checked_replacement(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+fn checked_replacement_plan(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
     context: &RewriteContext,
     factors: &[Id],
     relation_position: usize,
-) -> Option<(Id, bool)> {
+) -> Option<CheckedProductReplacementPlan> {
     let relation = egraph.find(factors[relation_position]);
     let actual_public = egraph.find(factors[relation_position - 1]);
     let provenance = &egraph[relation].data.relation_provenance;
@@ -5222,11 +5424,10 @@ fn checked_replacement(
             let target = egraph.find(registration.target);
             if let Some(plan) = affine_plan {
                 let normalized_public =
-                    build_affine_concat(egraph, registration.expected_public, &plan);
-                replacements.insert(ordered_product_sequence(
-                    egraph,
+                    affine_concat_replacement_plan(registration.expected_public, &plan);
+                replacements.insert(splice_product_plan(
                     &factors[..relation_position - 1],
-                    &[normalized_public, relation],
+                    &[normalized_public, ReplacementPlan::Existing(relation)],
                     &factors[relation_position + 1..],
                 ));
                 sources.insert(source.source);
@@ -5263,7 +5464,7 @@ fn checked_replacement(
                     failures.insert(RelationFailure::TransformedOperand);
                     continue;
                 }
-                (false, true) => target_spliced_product(
+                (false, true) => target_spliced_replacement_plan(
                     egraph,
                     &factors[..relation_position - 1],
                     &[],
@@ -5286,17 +5487,141 @@ fn checked_replacement(
     let replacement = if let Some(replacement) = replacements.into_iter().next() {
         replacement
     } else if let Some(plan) = distribution_plans.into_iter().next() {
-        materialize_distribution_plan(egraph, context, &plan)?
+        distribution_replacement_plan(&plan)
     } else {
         if let Some(failure) = failures.into_iter().next() {
             context.fail(failure);
         }
         return None;
     };
-    let replacement = egraph.find(replacement);
     let selector_distribution =
         switch_node(egraph, actual_public).is_some() || switch_node(egraph, relation).is_some();
-    Some((replacement, selector_distribution))
+    Some(CheckedProductReplacementPlan { replacement, selector_distribution })
+}
+
+#[cfg(test)]
+fn checked_replacement(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    context: &RewriteContext,
+    factors: &[Id],
+    relation_position: usize,
+) -> Option<(Id, bool)> {
+    let plan = checked_replacement_plan(egraph, context, factors, relation_position)?;
+    let replacement = materialize_replacement_plan(egraph, context, &plan.replacement)?;
+    Some((replacement, plan.selector_distribution))
+}
+
+/// Returns whether `root` already has the exact e-node tree described by the
+/// checked relation result.  This is deliberately a structural lookup, not a
+/// second e-graph or a memo table: the plan is small, ephemeral, and carries
+/// only the concrete result the applier would otherwise insert.
+fn replacement_plan_satisfied(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+    plan: &ReplacementPlan,
+) -> bool {
+    fn node_matches(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        root: Id,
+        plan: &ReplacementPlan,
+    ) -> bool {
+        let root = egraph.find(root);
+        match plan {
+            ReplacementPlan::Existing(existing) => root == egraph.find(*existing),
+            ReplacementPlan::Product(factors) => egraph[root].nodes.iter().any(|node| {
+                matches!(node, MxxLang::MatrixMultiply(existing)
+                    if existing.len() == factors.len() &&
+                        existing.iter().zip(factors).all(|(child, factor)|
+                            node_matches(egraph, *child, factor)))
+            }),
+            ReplacementPlan::Add(terms) => egraph[root].nodes.iter().any(|node| {
+                matches!(node, MxxLang::MatrixAdd(existing)
+                    if existing.len() == terms.len() &&
+                        existing.iter().zip(terms).all(|(child, term)|
+                            node_matches(egraph, *child, term)))
+            }),
+            ReplacementPlan::Switch(cases) => egraph[root].nodes.iter().any(|node| {
+                matches!(node, MxxLang::Switch(existing)
+                    if existing.len() == cases.len() &&
+                        existing.iter().zip(cases).all(|(child, case)|
+                            node_matches(egraph, *child, case)))
+            }),
+            ReplacementPlan::Concat { axis, inputs } => egraph[root].nodes.iter().any(|node| {
+                matches!(node, MxxLang::MatrixConcat { axis: existing_axis, inputs: existing }
+                    if existing_axis == axis && existing.len() == inputs.len() &&
+                        existing.iter().zip(inputs).all(|(child, input)|
+                            node_matches(egraph, *child, input)))
+            }),
+            ReplacementPlan::Equivalent(plans) => {
+                plans.iter().all(|plan| node_matches(egraph, root, plan))
+            }
+        }
+    }
+
+    node_matches(egraph, root, plan)
+}
+
+/// Materializes precisely the tree inspected by `replacement_plan_satisfied`.
+/// `Equivalent` retains the prior distribution behaviour by unifying every
+/// independently witnessed result, while all other variants add one ordinary
+/// e-node using canonical child identities.
+fn materialize_replacement_plan(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    context: &RewriteContext,
+    plan: &ReplacementPlan,
+) -> Option<Id> {
+    match plan {
+        ReplacementPlan::Existing(id) => Some(egraph.find(*id)),
+        ReplacementPlan::Product(factors) => {
+            let mut materialized = Vec::with_capacity(factors.len());
+            for factor in factors {
+                context.reserve(1).then_some(())?;
+                materialized.push(materialize_replacement_plan(egraph, context, factor)?);
+            }
+            context.reserve(1).then_some(())?;
+            Some(egraph.add(MxxLang::MatrixMultiply(materialized.into_boxed_slice())))
+        }
+        ReplacementPlan::Add(terms) => {
+            let mut materialized = Vec::with_capacity(terms.len());
+            for term in terms {
+                context.reserve(1).then_some(())?;
+                materialized.push(materialize_replacement_plan(egraph, context, term)?);
+            }
+            context.reserve(1).then_some(())?;
+            Some(egraph.add(MxxLang::MatrixAdd(materialized.into_boxed_slice())))
+        }
+        ReplacementPlan::Switch(cases) => {
+            let mut materialized = Vec::with_capacity(cases.len());
+            for case in cases {
+                context.reserve(1).then_some(())?;
+                materialized.push(materialize_replacement_plan(egraph, context, case)?);
+            }
+            context.reserve(1).then_some(())?;
+            Some(egraph.add(MxxLang::Switch(materialized.into_boxed_slice())))
+        }
+        ReplacementPlan::Concat { axis, inputs } => {
+            let mut materialized = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                context.reserve(1).then_some(())?;
+                materialized.push(materialize_replacement_plan(egraph, context, input)?);
+            }
+            context.reserve(1).then_some(())?;
+            Some(egraph.add(MxxLang::MatrixConcat {
+                axis: *axis,
+                inputs: materialized.into_boxed_slice(),
+            }))
+        }
+        ReplacementPlan::Equivalent(plans) => {
+            let mut plans = plans.iter();
+            let representative = materialize_replacement_plan(egraph, context, plans.next()?)?;
+            for alternative in plans {
+                let alternative = materialize_replacement_plan(egraph, context, alternative)?;
+                context.reserve(1).then_some(())?;
+                egraph.union(representative, alternative);
+            }
+            Some(representative)
+        }
+    }
 }
 
 fn distribution_public_operand(
@@ -5615,18 +5940,64 @@ fn build_affine_concat(
     }
 }
 
+fn affine_concat_replacement_plan(expected_public: Id, plan: &AffineConcatPlan) -> ReplacementPlan {
+    let leading =
+        splice_product_plan(&plan.prefix, &[ReplacementPlan::Existing(expected_public)], &[]);
+    let residual_chunks = plan
+        .residuals
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(|terms| {
+            if terms.len() == 1 {
+                ReplacementPlan::Existing(terms[0])
+            } else {
+                ReplacementPlan::Add(
+                    terms
+                        .iter()
+                        .copied()
+                        .map(ReplacementPlan::Existing)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    let residual = match residual_chunks.len() {
+        0 => None,
+        1 => residual_chunks.into_iter().next(),
+        _ => Some(ReplacementPlan::Concat {
+            axis: Axis::Columns,
+            inputs: residual_chunks.into_boxed_slice(),
+        }),
+    };
+    let mut terms = Vec::with_capacity(plan.outside.len() + 1 + usize::from(residual.is_some()));
+    terms.push(leading);
+    if let Some(residual) = residual {
+        terms.push(residual);
+    }
+    terms.extend(plan.outside.iter().copied().map(ReplacementPlan::Existing));
+    if terms.len() == 1 {
+        terms.into_iter().next().expect("affine leading term")
+    } else {
+        ReplacementPlan::Add(terms.into_boxed_slice())
+    }
+}
+
 /// Closed relation-redex classification used by extraction.  Matrix bounds
 /// are resolved independently through the authoritative bound input and the
 /// shared node transfer; source syntax is never treated as a bound contract.
 pub fn classify_proposal_node(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
+    origin: Id,
     node: &MxxLang,
     context: &RewriteContext,
 ) -> Result<bool, RelationFailure> {
     let MxxLang::MatrixMultiply(factors) = node else {
         return Ok(false);
     };
-    if classify_product_factors(egraph, factors, context)? {
+    let origin = egraph.find(origin);
+    if classify_product_factors(egraph, origin, factors, context)? {
         return Ok(true);
     }
     let Some(nested_candidates) = right_nested_relation_factor_candidates(egraph, factors, context)
@@ -5637,7 +6008,7 @@ pub fn classify_proposal_node(
         };
     };
     for factors in nested_candidates {
-        if classify_product_factors(egraph, &factors, context)? {
+        if classify_product_factors(egraph, origin, &factors, context)? {
             return Ok(true);
         }
     }
@@ -5646,66 +6017,17 @@ pub fn classify_proposal_node(
 
 fn classify_product_factors(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
+    origin: Id,
     factors: &[Id],
     context: &RewriteContext,
 ) -> Result<bool, RelationFailure> {
-    for relation_position in 1..factors.len() {
-        let relation = egraph.find(factors[relation_position]);
-        if egraph[relation].data.relation_provenance.is_empty() {
-            continue;
-        }
-        let public = egraph.find(factors[relation_position - 1]);
-        // Distribution itself is a closed structural rewrite.  It must be
-        // charged before checking a relation source inside a selected Switch:
-        // that source is not yet a bare atom, but the applier will expose it
-        // pointwise without enumerating selector combinations.
-        match pointwise_selector_is_distributable(egraph, public, relation) {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
-            Err(RelationFailure::DifferentSelectorBlocked) => continue,
-            Err(failure) => return Err(failure),
-        }
-        let mut sources = Vec::new();
-        if !flatten_provenance(&egraph[relation].data.relation_provenance, context, &mut sources) {
-            return Err(context.failure().expect("failed provenance reservation records a failure"));
-        }
-        for candidate in sources {
-            let RelationCandidate::Direct(source) = candidate else { continue };
-            for registration in context.registrations(source.source) {
-                let distributed_public = distribution_public_operand(
-                    egraph,
-                    public,
-                    registration.expected_public,
-                    context,
-                );
-                if context.failure().is_some() {
-                    return Err(context.failure().expect("distribution reservation failure"));
-                }
-                let affine_plan = affine_concat_plan(egraph, public, registration.expected_public);
-                let preflight_public = distributed_public.unwrap_or(public);
-                if preflight_registration(
-                    egraph,
-                    relation,
-                    &source,
-                    &registration,
-                    if distributed_public.is_some() || affine_plan.is_some() {
-                        registration.expected_public
-                    } else {
-                        preflight_public
-                    },
-                )
-                .is_ok() &&
-                    same_canonical_indices(egraph, &source.indices, &registration.indices) &&
-                    (distributed_public.is_some() ||
-                        affine_plan.is_some() ||
-                        egraph.find(registration.expected_public) == public)
-                {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-    Ok(false)
+    let Some(plan) = checked_product_replacement_plan(egraph, context, factors) else {
+        return match context.failure() {
+            Some(failure) => Err(failure),
+            None => Ok(false),
+        };
+    };
+    Ok(!replacement_plan_satisfied(egraph, origin, &plan.replacement))
 }
 
 /// Validates the exact Graph-derived records before accepting an e-class
@@ -5926,6 +6248,45 @@ enum DistributionOperation {
     Existing(Id),
 }
 
+fn distribution_replacement_plan(plan: &DistributionPlan) -> ReplacementPlan {
+    let witnesses = plan
+        .witnesses
+        .iter()
+        .map(|witness| {
+            ReplacementPlan::Add(
+                witness
+                    .terms
+                    .iter()
+                    .map(|term| {
+                        let plans = std::iter::once(&term.primary)
+                            .chain(term.alternatives.iter())
+                            .map(distribution_operation_replacement_plan)
+                            .collect::<Vec<_>>();
+                        if plans.len() == 1 {
+                            plans.into_iter().next().expect("one primary distribution operation")
+                        } else {
+                            ReplacementPlan::Equivalent(plans.into_boxed_slice())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if witnesses.len() == 1 {
+        witnesses.into_iter().next().expect("one distribution witness")
+    } else {
+        ReplacementPlan::Equivalent(witnesses.into_boxed_slice())
+    }
+}
+
+fn distribution_operation_replacement_plan(operation: &DistributionOperation) -> ReplacementPlan {
+    match operation {
+        DistributionOperation::Existing(id) => ReplacementPlan::Existing(*id),
+        DistributionOperation::Product(factors) => existing_product_plan(factors),
+    }
+}
+
 fn relation_guided_distribution(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     factors: &[Id],
@@ -6078,62 +6439,6 @@ fn distribution_target_operations(
     )
 }
 
-fn materialize_distribution_plan(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    context: &RewriteContext,
-    plan: &DistributionPlan,
-) -> Option<Id> {
-    let mut witnesses = plan.witnesses.iter();
-    let representative = materialize_distribution_add_plan(egraph, context, witnesses.next()?)?;
-    for alternate in witnesses {
-        let alternate = materialize_distribution_add_plan(egraph, context, alternate)?;
-        context.reserve(1).then_some(())?;
-        egraph.union(representative, alternate);
-    }
-    Some(representative)
-}
-
-fn materialize_distribution_add_plan(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    context: &RewriteContext,
-    plan: &DistributionAddPlan,
-) -> Option<Id> {
-    context.reserve(1).then_some(())?;
-    let mut terms = Vec::with_capacity(plan.terms.len());
-    for term in &plan.terms {
-        let representative = materialize_distribution_operation(egraph, context, &term.primary)?;
-        for alternate in &term.alternatives {
-            let alternate = materialize_distribution_operation(egraph, context, alternate)?;
-            context.reserve(1).then_some(())?;
-            egraph.union(representative, alternate);
-        }
-        context.reserve(1).then_some(())?;
-        terms.push(representative);
-    }
-    context.reserve(1).then_some(())?;
-    Some(egraph.add(MxxLang::MatrixAdd(terms.into_boxed_slice())))
-}
-
-fn materialize_distribution_operation(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    context: &RewriteContext,
-    operation: &DistributionOperation,
-) -> Option<Id> {
-    match operation {
-        DistributionOperation::Existing(id) => Some(egraph.find(*id)),
-        DistributionOperation::Product(factors) => {
-            context.reserve(1).then_some(())?;
-            let mut copied = Vec::with_capacity(factors.len());
-            for factor in factors {
-                context.reserve(1).then_some(())?;
-                copied.push(egraph.find(*factor));
-            }
-            context.reserve(1).then_some(())?;
-            Some(egraph.add(MxxLang::MatrixMultiply(copied.into_boxed_slice())))
-        }
-    }
-}
-
 fn ordered_product_sequence(
     egraph: &mut EGraph<MxxLang, MxxAnalysis>,
     prefix: &[Id],
@@ -6182,6 +6487,45 @@ fn target_spliced_product(
     middle.extend_from_slice(target_prefix);
     middle.push(target);
     ordered_product_sequence(egraph, prefix, &middle, suffix)
+}
+
+fn target_spliced_replacement_plan(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    prefix: &[Id],
+    target_prefix: &[Id],
+    target: Id,
+    suffix: &[Id],
+) -> ReplacementPlan {
+    if let Some(terms) = unique_add_terms(egraph, target) {
+        if terms.is_empty() {
+            return ReplacementPlan::Existing(target);
+        }
+        return ReplacementPlan::Add(
+            terms
+                .iter()
+                .map(|term| {
+                    let mut middle = Vec::with_capacity(
+                        target_prefix.len() +
+                            unique_product_factors(egraph, *term)
+                                .as_ref()
+                                .map_or(1, |factors| factors.len()),
+                    );
+                    middle.extend(target_prefix.iter().copied().map(ReplacementPlan::Existing));
+                    if let Some(factors) = unique_product_factors(egraph, *term) {
+                        middle.extend(factors.iter().copied().map(ReplacementPlan::Existing));
+                    } else {
+                        middle.push(ReplacementPlan::Existing(*term));
+                    }
+                    splice_product_plan(prefix, &middle, suffix)
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+    }
+    let mut middle =
+        target_prefix.iter().copied().map(ReplacementPlan::Existing).collect::<Vec<_>>();
+    middle.push(ReplacementPlan::Existing(target));
+    splice_product_plan(prefix, &middle, suffix)
 }
 
 fn same_canonical_indices(
@@ -6257,6 +6601,58 @@ pub fn pointwise_same_selector(
         }
         (None, Some(cases)) => {
             Ok(pointwise_switch_with_fixed_operand(egraph, cases, left, false, multiply))
+        }
+        (None, None) => unreachable!("a distributable selector has a switch"),
+    }
+}
+
+/// Read-only counterpart of `pointwise_same_selector`.  It captures the exact
+/// Switch/Product tree before an e-node is inserted, so extraction can charge
+/// only an equality that has not already been recorded in the e-graph.
+fn pointwise_same_selector_plan(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    left: Id,
+    right: Id,
+    multiply: bool,
+) -> Result<Option<ReplacementPlan>, RelationFailure> {
+    let left = egraph.find(left);
+    let right = egraph.find(right);
+    if !pointwise_selector_is_distributable(egraph, left, right)? {
+        return Ok(None);
+    }
+    let left_switch = switch_node(egraph, left);
+    let right_switch = switch_node(egraph, right);
+    let combine = |left: Id, right: Id| {
+        if multiply {
+            ReplacementPlan::Product(
+                vec![ReplacementPlan::Existing(left), ReplacementPlan::Existing(right)].into(),
+            )
+        } else {
+            ReplacementPlan::Add(
+                vec![ReplacementPlan::Existing(left), ReplacementPlan::Existing(right)].into(),
+            )
+        }
+    };
+    match (left_switch, right_switch) {
+        (Some(left_cases), Some(right_cases)) => {
+            let mut cases = Vec::with_capacity(left_cases.len());
+            cases.push(ReplacementPlan::Existing(left_cases[0]));
+            for (left, right) in left_cases[1..].iter().zip(&right_cases[1..]) {
+                cases.push(combine(*left, *right));
+            }
+            Ok(Some(ReplacementPlan::Switch(cases.into_boxed_slice())))
+        }
+        (Some(cases), None) => {
+            let mut output_cases = Vec::with_capacity(cases.len());
+            output_cases.push(ReplacementPlan::Existing(cases[0]));
+            output_cases.extend(cases[1..].iter().map(|case| combine(*case, right)));
+            Ok(Some(ReplacementPlan::Switch(output_cases.into_boxed_slice())))
+        }
+        (None, Some(cases)) => {
+            let mut output_cases = Vec::with_capacity(cases.len());
+            output_cases.push(ReplacementPlan::Existing(cases[0]));
+            output_cases.extend(cases[1..].iter().map(|case| combine(left, *case)));
+            Ok(Some(ReplacementPlan::Switch(output_cases.into_boxed_slice())))
         }
         (None, None) => unreachable!("a distributable selector has a switch"),
     }
@@ -6899,10 +7295,10 @@ mod tests {
 
         for term in [bytes, integer, sampler] {
             let node = egraph[egraph.find(term)].nodes.first().expect("atom node");
-            assert!(!classify_proposal_node(&egraph, node, &context).unwrap());
+            assert!(!classify_proposal_node(&egraph, term, node, &context).unwrap());
         }
         let node = egraph[egraph.find(matrix)].nodes.first().expect("matrix atom node");
-        assert!(!classify_proposal_node(&egraph, node, &context).unwrap());
+        assert!(!classify_proposal_node(&egraph, matrix, node, &context).unwrap());
     }
 
     fn registration(
@@ -7067,6 +7463,71 @@ mod tests {
     }
 
     #[test]
+    fn selected_product_add_distributes_one_middle_factor_in_order() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let left = egraph.add(MxxLang::IntConst(2.into()));
+        let addends = [
+            egraph.add(MxxLang::IntConst(3.into())),
+            egraph.add(MxxLang::IntConst(5.into())),
+            egraph.add(MxxLang::IntConst(7.into())),
+        ];
+        let right = egraph.add(MxxLang::IntConst(11.into()));
+        let add = egraph.add(MxxLang::MatrixAdd(addends.to_vec().into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixMultiply(vec![left, add, right].into_boxed_slice()));
+        egraph.rebuild();
+        let mut expression = RecExpr::default();
+        let left_expr = expression.add(MxxLang::IntConst(2.into()));
+        let mut origins = vec![left];
+        let addend_exprs = addends.map(|addend| {
+            let expr = expression.add(MxxLang::IntConst(3.into()));
+            origins.push(addend);
+            expr
+        });
+        let add_expr = expression.add(MxxLang::MatrixAdd(addend_exprs.into()));
+        origins.push(add);
+        let right_expr = expression.add(MxxLang::IntConst(11.into()));
+        origins.push(right);
+        let root_expr = expression
+            .add(MxxLang::MatrixMultiply(vec![left_expr, add_expr, right_expr].into_boxed_slice()));
+        origins.push(root);
+        let redex =
+            selected_product_add_redex(&egraph, &expression, &origins, usize::from(root_expr))
+                .expect("one direct selected Add factor");
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        let (_, replacement) = materialize_selected_product_add_redex(&mut egraph, redex, &context)
+            .expect("one-layer distribution");
+        let terms = egraph[egraph.find(replacement)]
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                MxxLang::MatrixAdd(terms) => Some(terms),
+                _ => None,
+            })
+            .expect("expanded Add");
+        assert_eq!(terms.len(), 3);
+        for (term, addend) in terms.iter().zip(addends) {
+            assert!(egraph[egraph.find(*term)].nodes.iter().any(|node| {
+                matches!(node, MxxLang::MatrixMultiply(factors)
+                    if factors.len() == 3 &&
+                        egraph.find(factors[0]) == egraph.find(left) &&
+                        egraph.find(factors[1]) == egraph.find(addend) &&
+                        egraph.find(factors[2]) == egraph.find(right))
+            }));
+        }
+
+        let second_add = expression.add(MxxLang::MatrixAdd(addend_exprs.into()));
+        origins.push(add);
+        let two_adds =
+            expression.add(MxxLang::MatrixMultiply(vec![add_expr, second_add].into_boxed_slice()));
+        origins.push(root);
+        assert!(
+            selected_product_add_redex(&egraph, &expression, &origins, usize::from(two_adds),)
+                .is_none(),
+            "two direct selected Add factors are deliberately deferred"
+        );
+    }
+
+    #[test]
     fn classifier_skips_different_selector_relation_position_without_failure() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let left_selector = egraph.add(MxxLang::IntConst(0.into()));
@@ -7088,7 +7549,8 @@ mod tests {
             .find(|node| matches!(node, MxxLang::MatrixMultiply(_)))
             .expect("product node");
         assert!(
-            !classify_proposal_node(&egraph, node, &context).expect("selector mismatch is local")
+            !classify_proposal_node(&egraph, product, node, &context)
+                .expect("selector mismatch is local")
         );
         assert_eq!(context.failure(), None);
     }
@@ -7113,7 +7575,8 @@ mod tests {
             .find(|node| matches!(node, MxxLang::MatrixMultiply(_)))
             .expect("product node");
         assert!(
-            classify_proposal_node(&egraph, node, &context).expect("same selector distributes")
+            classify_proposal_node(&egraph, product, node, &context)
+                .expect("same selector distributes")
         );
         assert_eq!(context.failure(), None);
     }
@@ -7138,7 +7601,7 @@ mod tests {
             .iter()
             .find(|node| matches!(node, MxxLang::MatrixMultiply(_)))
             .expect("outer product witness");
-        assert!(classify_proposal_node(&egraph, node, &context).expect("closed relation"));
+        assert!(classify_proposal_node(&egraph, root, node, &context).expect("closed relation"));
         let searcher = RelationSearcher::new(context.clone());
         assert!(Searcher::search_eclass_with_limit(&searcher, &egraph, root, 1).is_some());
 
@@ -7155,6 +7618,20 @@ mod tests {
             .is_empty()
         );
         assert_eq!(egraph.find(root), egraph.find(expected));
+        let raw_node = egraph[egraph.find(root)]
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(node, MxxLang::MatrixMultiply(factors) if factors.len() == 2 &&
+                    egraph.find(factors[0]) == egraph.find(public) &&
+                    egraph.find(factors[1]) == egraph.find(inner))
+            })
+            .expect("the rewritten e-class retains its raw relation representation");
+        assert!(
+            !classify_proposal_node(&egraph, root, raw_node, &context)
+                .expect("canonical-equivalent replacement is satisfied"),
+            "an already-unioned relation must not remain an extraction obligation"
+        );
         assert_eq!(context.failure(), None);
     }
 
@@ -7180,7 +7657,9 @@ mod tests {
             .iter()
             .find(|node| matches!(node, MxxLang::MatrixMultiply(_)))
             .expect("outer product witness");
-        assert!(!classify_proposal_node(&egraph, node, &context).expect("not an ordered match"));
+        assert!(
+            !classify_proposal_node(&egraph, root, node, &context).expect("not an ordered match")
+        );
 
         let applier = RelationApplier::new(context.clone());
         assert!(
@@ -11895,8 +12374,16 @@ mod tests {
         let replacement =
             build_pointwise_add_switch_cancellation(&mut egraph, root, plan).expect("replacement");
         let cases = switch_node(&egraph, replacement).expect("distributed switch");
-        assert_eq!(egraph.find(cases[1]), egraph.find(signal));
-        assert_eq!(egraph.find(cases[2]), egraph.find(other));
+        assert!(matches!(
+            physical_add_terms(&egraph, cases[1]),
+            PhysicalStructure::Unique(terms)
+                if terms.len() == 1 && egraph.find(terms[0]) == egraph.find(signal)
+        ));
+        assert!(matches!(
+            physical_add_terms(&egraph, cases[2]),
+            PhysicalStructure::Unique(terms)
+                if terms.len() == 1 && egraph.find(terms[0]) == egraph.find(other)
+        ));
         egraph.union(root, replacement);
         egraph.rebuild();
         let after_first_application = egraph.total_size();

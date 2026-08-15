@@ -36,7 +36,7 @@ use mxx_ir_core::{
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Signed, ToPrimitive, Zero};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Constructs the sole lowered representation of a binary matrix product.
 /// It expands only uniquely represented structural sums; ambiguity, cycles,
@@ -182,6 +182,15 @@ pub trait LoweringControl {
 pub struct ProductionBoundInput<'a, 'protocol, 'control> {
     lowerer: &'a GraphLowerer<'protocol, 'control>,
     control: Option<&'a dyn BoundEvaluationControl>,
+}
+
+/// Read-only protocol identity for a graph-generated source.  This is
+/// diagnostic data only: output and artifact names never affect bounds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphWireBindingDiagnostic {
+    pub(crate) stage: Option<crate::StageId>,
+    pub(crate) output_names: Box<[String]>,
+    pub(crate) artifact_consumers: Box<[(crate::StageId, crate::StageInputName)]>,
 }
 
 impl BoundInput for ProductionBoundInput<'_, '_, '_> {
@@ -1207,6 +1216,57 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
     /// canonical e-graph analysis and exact lowering descriptors only.
     pub fn production_bound_view(&self) -> ProductionBoundInput<'_, 'a, 'control> {
         ProductionBoundInput { lowerer: self, control: None }
+    }
+
+    /// Resolves a graph wire back to its declared workflow output and exact
+    /// artifact consumers.  The lookup uses frozen program/scope/wire
+    /// identity; node numbers, output order, and protocol-specific names are
+    /// never interpreted.
+    pub(crate) fn graph_wire_binding_diagnostic(
+        &self,
+        source: &super::identity::GraphWireSourceKey,
+    ) -> GraphWireBindingDiagnostic {
+        let super::identity::ProgramKey::WorkflowStage(stage_id) = &source.wire.scope.program
+        else {
+            return GraphWireBindingDiagnostic {
+                stage: None,
+                output_names: Box::new([]),
+                artifact_consumers: Box::new([]),
+            };
+        };
+        let stage = self.protocol.stages().iter().find(|stage| &stage.id == stage_id);
+        let mut output_names = Vec::new();
+        if source.wire.scope.path.is_empty() &&
+            source.wire.scope.definition == FrozenGraphScopeId::Root
+        {
+            if let Some(stage) = stage {
+                output_names.extend(stage.graph.outputs().iter().filter_map(|(name, output)| {
+                    (output.value == source.wire.wire).then_some(name.clone())
+                }));
+            }
+        }
+        output_names.sort();
+        output_names.dedup();
+        let output_name_set = output_names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let mut artifact_consumers = self
+            .protocol
+            .stages()
+            .iter()
+            .flat_map(|consumer| {
+                consumer.bindings.iter().filter_map(|binding| {
+                    (&binding.producer_stage == stage_id &&
+                        output_name_set.contains(binding.producer_output.0.as_str()))
+                    .then_some((consumer.id.clone(), binding.consumer_input.clone()))
+                })
+            })
+            .collect::<Vec<_>>();
+        artifact_consumers.sort();
+        artifact_consumers.dedup();
+        GraphWireBindingDiagnostic {
+            stage: stage.map(|stage| stage.id.clone()),
+            output_names: output_names.into_boxed_slice(),
+            artifact_consumers: artifact_consumers.into_boxed_slice(),
+        }
     }
 
     /// Constructs the production evaluator view with semantic pack validation.

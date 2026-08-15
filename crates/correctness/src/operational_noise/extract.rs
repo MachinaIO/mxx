@@ -19,7 +19,8 @@ use super::{
     relation::{
         AddNormalizationProbe, PointwiseAddSwitchProbe, PointwiseAddSwitchReject,
         PointwiseDirectProbe, SelectedNodeRef, pointwise_add_switch_probe,
-        probe_exact_additive_normalization, selected_product_switch_eligibility,
+        probe_exact_additive_normalization, selected_product_add_eligibility,
+        selected_product_switch_eligibility,
     },
 };
 use egg::{EGraph, Id, Language, RecExpr};
@@ -2485,16 +2486,19 @@ fn proposal_cost<I: BoundInput>(
         return Ok(None);
     };
     let classification = classify(class, node, egraph)?;
-    let selected_product_normalization = match node {
+    let selected_product_normalizations = match node {
         MxxLang::MatrixMultiply(factors) => {
-            selected_product_switch_eligibility(egraph, class, factors, |handle| {
+            let lookup = |handle| {
                 let origin = egraph.find(handle);
                 let candidate = candidates.get(usize::from(origin))?.as_ref()?;
                 Some(SelectedNodeRef { node: &candidate.node, origin })
-            })
-            .is_some()
+            };
+            u64::from(selected_product_switch_eligibility(egraph, class, factors, lookup).is_some())
+                .saturating_add(u64::from(
+                    selected_product_add_eligibility(egraph, class, factors, lookup).is_some(),
+                ))
         }
-        _ => false,
+        _ => 0,
     };
     let semantic_bound = matches!(&egraph[class].data.sort, Ok(MxxSort::Matrix(_)))
         .then(|| {
@@ -2512,7 +2516,7 @@ fn proposal_cost<I: BoundInput>(
         ProposalCost {
             remaining_relation_redexes: child_remaining
                 .saturating_add(u64::from(classification.relation_redex))
-                .saturating_add(u64::from(selected_product_normalization)),
+                .saturating_add(selected_product_normalizations),
             // At an addition all relation redexes below it are hidden exactly once;
             // an enclosing addition replaces this value with the same descendant count.
             hidden_relation_redexes: if matches!(node, MxxLang::MatrixAdd(_)) {
@@ -4506,8 +4510,8 @@ mod tests {
             root,
             &input,
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
-            &mut |_, node, egraph| {
-                super::super::relation::classify_proposal_node(egraph, node, &context)
+            &mut |origin, node, egraph| {
+                super::super::relation::classify_proposal_node(egraph, origin, node, &context)
                     .map(|relation_redex| ProposalNodeClassification { relation_redex })
                     .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
             },
@@ -4530,8 +4534,8 @@ mod tests {
             root,
             &input,
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
-            &mut |_, node, egraph| {
-                super::super::relation::classify_proposal_node(egraph, node, &context)
+            &mut |origin, node, egraph| {
+                super::super::relation::classify_proposal_node(egraph, origin, node, &context)
                     .map(|relation_redex| ProposalNodeClassification { relation_redex })
                     .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
             },
@@ -4822,8 +4826,8 @@ mod tests {
             egraph.find(root),
             &input,
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
-            &mut |_, node, egraph| {
-                super::super::relation::classify_proposal_node(egraph, node, &context)
+            &mut |origin, node, egraph| {
+                super::super::relation::classify_proposal_node(egraph, origin, node, &context)
                     .map(|relation_redex| ProposalNodeClassification { relation_redex })
                     .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
             },
@@ -4886,7 +4890,7 @@ mod tests {
             .find(|node| matches!(node, MxxLang::MatrixMultiply(_)))
             .expect("matrix product representative");
         assert!(
-            !super::super::relation::classify_proposal_node(&egraph, node, &context)
+            !super::super::relation::classify_proposal_node(&egraph, root, node, &context)
                 .expect("different selectors are locally inapplicable")
         );
         assert_eq!(context.failure(), None);
@@ -4916,8 +4920,8 @@ mod tests {
             root,
             &input,
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
-            &mut |_, node, egraph| {
-                super::super::relation::classify_proposal_node(egraph, node, &context)
+            &mut |origin, node, egraph| {
+                super::super::relation::classify_proposal_node(egraph, origin, node, &context)
                     .map(|relation_redex| ProposalNodeClassification { relation_redex })
                     .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
             },

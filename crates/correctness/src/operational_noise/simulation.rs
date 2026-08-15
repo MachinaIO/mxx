@@ -18,10 +18,11 @@ use super::{
     lower::{GraphLowerer, LoweredValue, LoweringControl},
     relation::{
         RelationApplier, RelationSearcher, RewriteContext, SelectedMultiSwitchRedex,
-        SelectedProductSwitchRedex, SharedRewriteBudget, materialize_selected_multi_switch_redex,
+        SelectedProductAddRedex, SelectedProductSwitchRedex, SharedRewriteBudget,
+        materialize_selected_multi_switch_redex, materialize_selected_product_add_redex,
         materialize_selected_product_switch_redex, note_selected_multi_switch_union,
         prepare_selected_multi_switch_redex, selected_multi_switch_redex,
-        selected_product_switch_redex,
+        selected_product_add_redex, selected_product_switch_redex,
     },
 };
 use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
@@ -48,6 +49,7 @@ const PROGRESS_TIME_CADENCE: Duration = Duration::from_secs(1);
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum SelectedNormalizationRedex {
     Add(SelectedMultiSwitchRedex),
+    ProductAdd(SelectedProductAddRedex),
     Product(SelectedProductSwitchRedex),
 }
 
@@ -55,6 +57,7 @@ impl SelectedNormalizationRedex {
     fn origin(&self) -> egg::Id {
         match self {
             Self::Add(redex) => redex.origin,
+            Self::ProductAdd(redex) => redex.origin,
             Self::Product(redex) => redex.origin,
         }
     }
@@ -541,17 +544,13 @@ pub fn check_operational_noise_candidate_with_progress(
                                 invalid_dag: &mut invalid_dag,
                                 bound_error: &mut bound_error,
                             },
-                            &mut |_, node, egraph| {
-                                let relation_redex =
-                                    super::relation::classify_proposal_node(egraph, node, &context)
-                                        .map_err(|failure| {
-                                            relation_error(
-                                                &stage,
-                                                wire,
-                                                &egraph.analysis.symbols,
-                                                failure,
-                                            )
-                                        })?;
+                            &mut |origin, node, egraph| {
+                                let relation_redex = super::relation::classify_proposal_node(
+                                    egraph, origin, node, &context,
+                                )
+                                .map_err(|failure| {
+                                    relation_error(&stage, wire, &egraph.analysis.symbols, failure)
+                                })?;
                                 Ok(ProposalNodeClassification { relation_redex })
                             },
                         )?;
@@ -596,9 +595,23 @@ pub fn check_operational_noise_candidate_with_progress(
                                         expression_index,
                                     )
                                     .map(SelectedNormalizationRedex::Product)
+                                    .or_else(|| {
+                                        selected_product_add_redex(
+                                            &lowerer.egraph,
+                                            &extracted.proposal.expression,
+                                            &extracted.origins,
+                                            expression_index,
+                                        )
+                                        .map(SelectedNormalizationRedex::ProductAdd)
+                                    })
                                 });
-                            let is_product_redex =
-                                matches!(redex, Some(SelectedNormalizationRedex::Product(_)));
+                            let is_product_redex = matches!(
+                                redex,
+                                Some(
+                                    SelectedNormalizationRedex::Product(_) |
+                                        SelectedNormalizationRedex::ProductAdd(_)
+                                )
+                            );
                             let product_in_switch_case = is_product_redex &&
                                 matches!(node, MxxLang::MatrixMultiply(factors) if factors.iter().any(|factor| {
                                     matches!(
@@ -614,7 +627,11 @@ pub fn check_operational_noise_candidate_with_progress(
                             if let Some(redex) = redex &&
                                 seen_origins.insert(redex.origin())
                             {
-                                if matches!(redex, SelectedNormalizationRedex::Product(_)) {
+                                if matches!(
+                                    redex,
+                                    SelectedNormalizationRedex::Product(_) |
+                                        SelectedNormalizationRedex::ProductAdd(_)
+                                ) {
                                     product_with_product_descendant_count +=
                                         usize::from(has_product_descendant);
                                     product_with_product_in_switch_case_count +=
@@ -638,7 +655,8 @@ pub fn check_operational_noise_candidate_with_progress(
                             SelectedNormalizationRedex::Product(redex) => {
                                 Some(redex.diagnostic_shape())
                             }
-                            SelectedNormalizationRedex::Add(_) => None,
+                            SelectedNormalizationRedex::Add(_) |
+                            SelectedNormalizationRedex::ProductAdd(_) => None,
                         });
                     let previous_before = prior_measure.unwrap_or(measure);
                     let previous_batch_size = prior_measure.unwrap_or(0);
@@ -773,6 +791,13 @@ pub fn check_operational_noise_candidate_with_progress(
                                     &context,
                                 )
                             }
+                            SelectedNormalizationRedex::ProductAdd(redex) => {
+                                materialize_selected_product_add_redex(
+                                    &mut lowerer.egraph,
+                                    redex,
+                                    &context,
+                                )
+                            }
                         };
                         let Some(equality) = equality else {
                             if let Some(failure) = context.failure() {
@@ -848,9 +873,9 @@ pub fn check_operational_noise_candidate_with_progress(
                         invalid_dag: &mut invalid_dag,
                         bound_error: &mut bound_error,
                     },
-                    &mut |_, node, egraph| {
+                    &mut |origin, node, egraph| {
                         let relation_redex =
-                            super::relation::classify_proposal_node(egraph, node, &context)
+                            super::relation::classify_proposal_node(egraph, origin, node, &context)
                                 .map_err(|failure| {
                                     relation_error(&stage, wire, &egraph.analysis.symbols, failure)
                                 })?;
@@ -886,6 +911,21 @@ pub fn check_operational_noise_candidate_with_progress(
                             .get(source.0)
                             .map(|descriptor| descriptor.key.clone())
                     });
+                    if let Some(super::identity::AtomicSourceKey::ExplicitLarge(graph_source)) =
+                        source.as_ref()
+                    {
+                        let binding = lowerer.graph_wire_binding_diagnostic(graph_source);
+                        tracing::info!(
+                            event = "operational_explicit_large_binding",
+                            selected_root = usize::from(root),
+                            selected_expression_nodes = proposal.expression.as_ref().len(),
+                            source = ?graph_source,
+                            producer_stage = ?binding.stage,
+                            producer_outputs = ?binding.output_names,
+                            artifact_consumers = ?binding.artifact_consumers,
+                            "selected residual retains an explicitly Large workflow artifact"
+                        );
+                    }
                     return Err(OperationalSimulationError::Bound {
                         site: site(&stage, wire, "extract residual"),
                         source: source.map_or_else(

@@ -549,7 +549,6 @@ mod public_key {
         }
     }
 }
-pub(crate) use public_key::gate_token;
 pub use public_key::*;
 
 fn slot_gate_public_key_name(reduction: bool, identity: &str) -> String {
@@ -1868,41 +1867,41 @@ mod artifact {
         }
     }
 }
-pub(crate) use artifact::gate_preimage_name;
 pub use artifact::*;
 
 mod tall {
-    use super::{
-        BggSlotTransferArtifactCompiler, BggSlotTransferGateWires,
-        BggSlotTransferPublicKeyLowering, BggSlotTransferPublicSlotWires, gate_preimage_name,
-        gate_token,
-    };
     use crate::{
         BggPublicKeyWire, CircuitCompileError,
-        tall_encoding::{BggTallEncodingCompiler, BggTallEncodingWire, BggTallPlaintext},
+        tall_encoding::{BggTallEncodingCompiler, BggTallEncodingSampler, BggTallEncodingWire},
         tall_rotation_encoding::{
             TallRotationDirection, TallRotationEncodingKey, TallRotationEncodingWires,
-            tall_rotation_public_key_tag,
+            TallRotationPublicWires,
         },
     };
-    use mxx_dsl::{Bytes, Family, HashTag, Mat, Parallel};
+    use mxx_dsl::{Family, Mat};
     use mxx_gadgets::{
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_ir_core::{
-        IntExpr,
-        artifact::{ArtifactConfidentiality, ProductionId},
-        node::ConcatAxis,
-    };
-    use rayon::prelude::*;
+    use mxx_ir_core::IntExpr;
     use std::collections::BTreeMap;
 
-    /// Public-key slot lowering that uses the same direct rotation formula as tall encodings.
+    /// Public-key slot lowering for the secret-transfer-free Tall subset.
+    ///
+    /// The only ordinary transfer it accepts is an identity-source diagonal
+    /// mask.  Its public key is the fixed mask public matrix multiplied by the
+    /// input public key; the matching mask encoding is built online below from
+    /// the one supplied Tall secret family.
     #[derive(Clone)]
     pub struct BggTallSlotPublicKeyLowering {
-        /// Existing public-key slot lowering used for transfer and reduction.
-        pub inner: BggSlotTransferPublicKeyLowering,
+        /// BGG+ public-key arithmetic.
+        pub compiler: crate::BggPublicKeyCompiler,
+        /// Public key used for every per-row diagonal mask.
+        pub diagonal_mask_public_key: BggPublicKeyWire,
+        /// Exact physical Tall slot count.
+        pub configured_slot_count: usize,
+        /// Exact preprocessed public matrices for cyclic rotations.
+        pub rotations: BTreeMap<TallRotationEncodingKey, TallRotationPublicWires>,
     }
 
     impl CircuitLoweringTypes for BggTallSlotPublicKeyLowering {
@@ -1917,12 +1916,13 @@ mod tall {
             source_slots: &[(u32, Option<u32>)],
             gate: GateInstance<'_>,
         ) -> Result<Self::Wire, Self::Error> {
-            <BggSlotTransferPublicKeyLowering as SlotOperationLowering<P>>::slot_transfer(
-                &mut self.inner,
-                input,
-                source_slots,
-                gate,
-            )
+            validate_identity_sources(source_slots, self.configured_slot_count, gate)?;
+            if input.matrix.matrix_type() != self.diagonal_mask_public_key.matrix.matrix_type() {
+                return Err(CircuitCompileError::InvalidSlotTransfer {
+                    gate: gate.local_gate().index(),
+                });
+            }
+            Ok(self.compiler.mul(&self.diagonal_mask_public_key, input))
         }
 
         fn slot_reduce(
@@ -1931,12 +1931,11 @@ mod tall {
             slot_count: usize,
             gate: GateInstance<'_>,
         ) -> Result<Self::Wire, Self::Error> {
-            <BggSlotTransferPublicKeyLowering as SlotOperationLowering<P>>::slot_reduce(
-                &mut self.inner,
-                inputs,
-                slot_count,
-                gate,
-            )
+            let _ = (inputs, slot_count);
+            Err(CircuitCompileError::Unsupported {
+                gate: gate.local_gate().index(),
+                feature: "nonidentity Tall slot reduction",
+            })
         }
 
         fn slot_rotation(
@@ -1955,312 +1954,81 @@ mod tall {
             };
             if usize::try_from(num_slots)
                 .ok()
-                .is_none_or(|slots| slots != self.inner.configured_slot_count) ||
-                input.matrix.matrix_type() != &self.inner.public_key_type
+                .is_none_or(|slots| slots != self.configured_slot_count) ||
+                input.matrix.matrix_type() != self.diagonal_mask_public_key.matrix.matrix_type()
             {
                 return Err(CircuitCompileError::InvalidSlotTransfer {
                     gate: gate.local_gate().index(),
                 });
             }
-            let ring = self.inner.compiler.ring.clone();
-            let shape = (
-                self.inner.public_key_type.rows.clone(),
-                self.inner.public_key_type.columns.clone(),
-            );
-            let a_forward = ring.hash_matrix(
-                self.inner.hash_key.clone(),
-                tall_rotation_public_key_tag(key, false),
-                shape.clone(),
-            );
-            let a_backward = ring.hash_matrix(
-                self.inner.hash_key.clone(),
-                tall_rotation_public_key_tag(key, true),
-                shape,
-            );
-            let base = self.inner.compiler.base.clone();
-            let digits = self.inner.compiler.digit_count.clone();
-            let step1 =
-                a_forward * input.matrix.clone().decompose(base.clone(), digits.clone()).as_mat();
+            let rotation = self.rotations.get(&key).ok_or(
+                CircuitCompileError::MissingTallRotationEncoding {
+                    num_slots: key.num_slots,
+                    offset: key.offset,
+                },
+            )?;
+            let base = self.compiler.base.clone();
+            let digits = self.compiler.digit_count.clone();
+            let step1 = rotation.a_forward.clone() *
+                input.matrix.clone().decompose(base.clone(), digits.clone()).as_mat();
             Ok(BggPublicKeyWire {
-                matrix: step1 * a_backward.decompose(base, digits).as_mat(),
+                matrix: step1 * rotation.a_backward.clone().decompose(base, digits).as_mat(),
                 reveal_plaintext: input.reveal_plaintext,
             })
         }
     }
 
-    /// Encoding-side slot lowering with specialized direct rotations.
+    /// Encoding-side lowering for the secret-transfer-free Tall subset.
+    ///
+    /// Ordinary transfers are limited to identity-source per-row masks.  The
+    /// fixed public mask key is encoded afresh under `secret_rows`; no
+    /// trapdoor, transfer matrix, per-slot artifact, or gate preimage exists
+    /// on this path.  General transfer/broadcast/reduction remains explicitly
+    /// unsupported until it has a separately reviewed secret-free construction.
     #[derive(Clone)]
     pub struct BggTallSlotLowering {
         /// Tall arithmetic compiler.
         pub compiler: BggTallEncodingCompiler,
-        /// Existing cryptographic slot-transfer artifact layout.
-        pub artifact: BggSlotTransferArtifactCompiler,
-        /// Hash key used for ordinary transfer output public keys.
-        pub hash_key: Bytes,
-        /// Producer containing the exact ordinary gate output public keys.
-        pub output_public_key_production: Option<ProductionId>,
-        /// Base trapdoor encoding used by the ordinary transfer path.
-        pub c_b0: Mat,
-        /// Public per-slot transfer artifacts.
-        pub slots: BggSlotTransferPublicSlotWires,
-        /// Per-gate transfer artifacts.
-        pub gates: BggSlotTransferGateWires,
+        /// Public key used for every per-row diagonal mask.
+        pub diagonal_mask_public_key: BggPublicKeyWire,
+        /// The one fresh Tall secret-row family owned by the online graph.
+        pub secret_rows: Family<Mat>,
+        /// Error configuration for direct diagonal-mask encodings.
+        pub sampler: BggTallEncodingSampler,
         /// Direct tall-rotation encodings keyed by `(num_slots, normalized_offset)`.
         pub rotations: BTreeMap<TallRotationEncodingKey, TallRotationEncodingWires>,
     }
 
     impl BggTallSlotLowering {
-        fn output_public_key(&self, gate: GateInstance<'_>, reduction: bool) -> BggPublicKeyWire {
-            let operation = if reduction { "slot_reduce" } else { "slot_transfer" };
-            let identity = gate_token(gate);
-            let matrix = self.output_public_key_production.as_ref().map_or_else(
-                || {
-                    self.artifact.ring().hash_matrix(
-                        self.hash_key.clone(),
-                        HashTag::from(format!("{operation}_gate_a_out_{identity}").into_bytes()),
-                        (self.artifact.secret_size, self.artifact.gadget_columns()),
-                    )
-                },
-                |production| {
-                    self.artifact.ring().artifact_input(
-                        production.clone(),
-                        super::slot_gate_public_key_name(reduction, &identity),
-                        (self.artifact.secret_size, self.artifact.gadget_columns()),
-                        ArtifactConfidentiality::Public,
-                    )
-                },
-            );
-            BggPublicKeyWire { matrix, reveal_plaintext: true }
-        }
-
-        fn product_chunks(
-            &self,
-            left: Mat,
-            families: &[Family<Mat>],
-            index: usize,
-        ) -> Result<Mat, CircuitCompileError> {
-            let chunks = families
-                .iter()
-                .map(|family| left.clone() * family.get_static(index))
-                .collect::<Vec<_>>();
-            chunks
-                .first()
-                .cloned()
-                .map(|first| {
-                    if chunks.len() == 1 { first } else { Mat::concat(ConcatAxis::Columns, chunks) }
-                })
-                .ok_or_else(|| {
-                    CircuitCompileError::Structure("empty slot-transfer chunk list".to_owned())
-                })
-        }
-
-        fn gate_families(
-            &self,
-            reduction: bool,
-            identity: &str,
-        ) -> Result<Vec<Family<Mat>>, CircuitCompileError> {
-            self.artifact
-                .chunks(self.artifact.gadget_columns())
-                .into_par_iter()
-                .enumerate()
-                .map(|(chunk, _)| {
-                    let name = gate_preimage_name(reduction, identity, chunk);
-                    self.gates
-                        .preimage_chunks
-                        .get(&name)
-                        .cloned()
-                        .ok_or(CircuitCompileError::MissingSlotTransferArtifact { name })
-                })
-                .collect()
-        }
-
-        fn validate_input(
-            &self,
-            input: &BggTallEncodingWire,
-        ) -> Result<Family<Mat>, CircuitCompileError> {
-            let BggTallPlaintext::Diagonal(plaintexts) = &input.plaintext else {
-                return Err(CircuitCompileError::Structure(
-                    "slot-transfer input requires revealed tall plaintexts".to_owned(),
-                ));
-            };
-            if input.rows.element_type() !=
-                &self.artifact.matrix_type(1, self.artifact.gadget_columns()) ||
-                input.pubkey.matrix.matrix_type() != &self.artifact.public_key_type() ||
-                plaintexts.count() != input.rows.count() ||
-                plaintexts.element_type() != &self.artifact.matrix_type(1, 1)
-            {
-                return Err(CircuitCompileError::Structure(
-                    "slot-transfer input has incompatible tall BGG layout".to_owned(),
-                ));
-            }
-            Ok(plaintexts.clone())
-        }
-
         fn transfer(
             &self,
             input: &BggTallEncodingWire,
             source_slots: &[(u32, Option<u32>)],
             gate: GateInstance<'_>,
         ) -> Result<BggTallEncodingWire, CircuitCompileError> {
-            let plaintexts = self.validate_input(input)?;
-            if source_slots.len() > self.artifact.slot_count ||
+            validate_identity_sources(source_slots, self.configured_slot_count(), gate)?;
+            let ring = self.sampler.layout.ring();
+            let masks = Family::pack(
                 source_slots
-                    .par_iter()
-                    .any(|(source, _)| *source as usize >= self.artifact.slot_count)
-            {
-                return Err(CircuitCompileError::InvalidSlotTransfer {
-                    gate: gate.local_gate().index(),
-                });
-            }
-            if source_slots.is_empty() {
-                let ring = self.artifact.ring();
-                let columns = self.artifact.gadget_columns();
-                return Ok(BggTallEncodingWire {
-                    rows: Parallel::range(0).map({
-                        let ring = ring.clone();
-                        move |_| ring.zero((1, columns))
-                    })?,
-                    pubkey: self.output_public_key(gate, false),
-                    plaintext: BggTallPlaintext::Diagonal(
-                        Parallel::range(0).map(move |_| ring.zero((1, 1)))?,
-                    ),
-                    canonical_input_exclusive_upper: None,
-                });
-            }
-            let identity = gate_token(gate);
-            let gate_families = self.gate_families(false, &identity)?;
-            let outputs = source_slots
-                .iter()
-                .enumerate()
-                .map(|(destination, (source, scalar))| {
-                    let source = usize::try_from(*source).expect("u32 fits usize");
-                    let input_row = input.rows.get_static(source);
-                    let plaintext_matrix = plaintexts.get_static(source);
-                    let plaintext = plaintext_matrix
-                        .clone()
-                        .extract_coefficient_with_canonical_input_exclusive_upper(
-                            0,
-                            input.canonical_input_exclusive_upper.clone(),
-                        )
-                        .lift_to_constant_polynomial(plaintext_matrix.matrix_type().clone());
-                    let decomposed = self
-                        .slots
-                        .public_keys
-                        .get_static(destination)
-                        .decompose(self.artifact.gadget_base.clone(), self.artifact.digit_count)
-                        .as_mat();
-                    let c_b1 = self.product_chunks(
-                        self.c_b0.clone(),
-                        &self.slots.b0_preimage_chunks,
-                        source,
-                    )?;
-                    let c_transfer =
-                        self.product_chunks(c_b1, &self.slots.b1_preimage_chunks, destination)?;
-                    let scalar =
-                        self.artifact.ring().polynomial([IntExpr::constant(scalar.unwrap_or(1))]);
-                    let pre_output =
-                        (input_row * decomposed + c_transfer * plaintext.clone()) * scalar.clone();
-                    let c_gate =
-                        self.product_chunks(self.c_b0.clone(), &gate_families, destination)?;
-                    Ok((c_gate + pre_output, plaintext * scalar))
-                })
-                .collect::<Result<Vec<_>, CircuitCompileError>>()?;
-            let (rows, plaintexts): (Vec<_>, Vec<_>) = outputs.into_iter().unzip();
-            Ok(BggTallEncodingWire {
-                rows: Family::pack(rows)?,
-                pubkey: self.output_public_key(gate, false),
-                plaintext: BggTallPlaintext::Diagonal(Family::pack(plaintexts)?),
-                canonical_input_exclusive_upper: None,
-            })
+                    .iter()
+                    .map(|(_, scalar)| ring.polynomial([IntExpr::constant(scalar.unwrap_or(1))]))
+                    .collect(),
+            )?;
+            let mask = self.sampler.sample_diagonal(
+                self.secret_rows.clone(),
+                self.diagonal_mask_public_key.clone(),
+                masks,
+            )?;
+            Ok(self.compiler.simd_mul(&mask, input)?)
         }
 
-        fn reduce(
-            &self,
-            inputs: &[BggTallEncodingWire],
-            source_slot_count: usize,
-            gate: GateInstance<'_>,
-        ) -> Result<BggTallEncodingWire, CircuitCompileError> {
-            if inputs.is_empty() ||
-                inputs.len() > source_slot_count ||
-                source_slot_count == 0 ||
-                source_slot_count > self.artifact.slot_count
-            {
-                return Err(CircuitCompileError::InvalidSlotTransfer {
-                    gate: gate.local_gate().index(),
-                });
+        fn configured_slot_count(&self) -> usize {
+            match self.secret_rows.count() {
+                IntExpr::Const(count) => {
+                    usize::try_from(count).expect("Tall slot count must fit usize")
+                }
+                _ => unreachable!("Tall slot lowering requires a concrete secret-row family"),
             }
-            let plaintexts = inputs
-                .par_iter()
-                .map(|input| self.validate_input(input))
-                .collect::<Result<Vec<_>, _>>()?;
-            let identity = gate_token(gate);
-            let gate_families = self.gate_families(true, &identity)?;
-            let ring = self.artifact.ring();
-            let outputs = inputs
-                .iter()
-                .zip(plaintexts)
-                .enumerate()
-                .map(|(destination, (input, input_plaintexts))| {
-                    let decomposed = self
-                        .slots
-                        .public_keys
-                        .get_static(destination)
-                        .decompose(self.artifact.gadget_base.clone(), self.artifact.digit_count)
-                        .as_mat();
-                    let source_terms = (0..source_slot_count)
-                        .map(|source| {
-                            let plaintext_matrix = input_plaintexts.get_static(source);
-                            let plaintext = plaintext_matrix
-                                .clone()
-                                .extract_coefficient_with_canonical_input_exclusive_upper(
-                                    0,
-                                    input.canonical_input_exclusive_upper.clone(),
-                                )
-                                .lift_to_constant_polynomial(
-                                    plaintext_matrix.matrix_type().clone(),
-                                );
-                            let c_b1 = self.product_chunks(
-                                self.c_b0.clone(),
-                                &self.slots.b0_preimage_chunks,
-                                source,
-                            )?;
-                            let c_transfer = self.product_chunks(
-                                c_b1,
-                                &self.slots.b1_preimage_chunks,
-                                destination,
-                            )?;
-                            let rotation = ring.constant(
-                                (1, 1),
-                                mxx_ir_core::node::ConstantMatrix::Rotation {
-                                    exponent: IntExpr::constant(source),
-                                },
-                            );
-                            Ok((
-                                (input.rows.get_static(source) * decomposed.clone() +
-                                    c_transfer * plaintext.clone()) *
-                                    rotation.clone(),
-                                plaintext * rotation,
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, CircuitCompileError>>()?;
-                    let (pre_output, plaintext) = source_terms
-                        .into_iter()
-                        .reduce(|(left_row, left_plain), (right_row, right_plain)| {
-                            (left_row + right_row, left_plain + right_plain)
-                        })
-                        .expect("validated nonzero source slots");
-                    let c_gate =
-                        self.product_chunks(self.c_b0.clone(), &gate_families, destination)?;
-                    Ok((c_gate + pre_output, plaintext))
-                })
-                .collect::<Result<Vec<_>, CircuitCompileError>>()?;
-            let (rows, plaintexts): (Vec<_>, Vec<_>) = outputs.into_iter().unzip();
-            Ok(BggTallEncodingWire {
-                rows: Family::pack(rows)?,
-                pubkey: self.output_public_key(gate, true),
-                plaintext: BggTallPlaintext::Diagonal(Family::pack(plaintexts)?),
-                canonical_input_exclusive_upper: None,
-            })
         }
     }
 
@@ -2285,7 +2053,11 @@ mod tall {
             slot_count: usize,
             gate: GateInstance<'_>,
         ) -> Result<Self::Wire, Self::Error> {
-            self.reduce(inputs, slot_count, gate)
+            let _ = (inputs, slot_count);
+            Err(CircuitCompileError::Unsupported {
+                gate: gate.local_gate().index(),
+                feature: "nonidentity Tall slot reduction",
+            })
         }
 
         fn slot_rotation(
@@ -2321,6 +2093,29 @@ mod tall {
                 .rotate(input, rotation, TallRotationDirection::Forward)
                 .map_err(Into::into)
         }
+    }
+
+    fn validate_identity_sources(
+        source_slots: &[(u32, Option<u32>)],
+        slot_count: usize,
+        gate: GateInstance<'_>,
+    ) -> Result<(), CircuitCompileError> {
+        if source_slots.len() != slot_count {
+            return Err(CircuitCompileError::InvalidSlotTransfer {
+                gate: gate.local_gate().index(),
+            });
+        }
+        if source_slots
+            .iter()
+            .enumerate()
+            .any(|(destination, (source, _))| *source != destination as u32)
+        {
+            return Err(CircuitCompileError::Unsupported {
+                gate: gate.local_gate().index(),
+                feature: "nonidentity Tall slot transfer",
+            });
+        }
+        Ok(())
     }
 }
 pub use tall::*;

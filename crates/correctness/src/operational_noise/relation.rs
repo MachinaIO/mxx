@@ -3088,7 +3088,43 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
         cases.push(build_additive_terms(egraph, root, terms));
     }
     progress().ok()?;
-    Some(egraph.add(MxxLang::Switch(cases.into_boxed_slice())))
+    let candidate = MxxLang::Switch(cases.into_boxed_slice());
+    let candidate_id = egraph.lookup(candidate.clone());
+    let root = egraph.find(root);
+    let candidate_is_direct_child = if let Some(candidate_id) = candidate_id {
+        let candidate_id = egraph.find(candidate_id);
+        let mut direct = false;
+        for node in &egraph[root].nodes {
+            progress().ok()?;
+            let MxxLang::MatrixAdd(children) = node else { continue };
+            for child in children {
+                progress().ok()?;
+                if egraph.find(*child) == candidate_id {
+                    direct = true;
+                    break;
+                }
+            }
+            if direct {
+                break;
+            }
+        }
+        direct
+    } else {
+        false
+    };
+    if candidate_is_direct_child {
+        let MxxLang::Switch(mut guarded_cases) = candidate else { return None };
+        let first_case = *guarded_cases.get(1)?;
+        progress().ok()?;
+        guarded_cases[1] = egraph.add(MxxLang::MatrixAdd(vec![first_case].into_boxed_slice()));
+        let guarded = MxxLang::Switch(guarded_cases);
+        progress().ok()?;
+        if egraph.lookup(guarded.clone()).is_some_and(|existing| egraph.find(existing) == root) {
+            return None;
+        }
+        return Some(egraph.add(guarded));
+    }
+    Some(egraph.add(candidate))
 }
 
 #[cfg(test)]
@@ -6885,8 +6921,15 @@ mod tests {
         let replacement = build_pointwise_add_switch_cancellation(&mut egraph, root, plan)
             .expect("coalesced cancellation");
         let cases = switch_node(&egraph, replacement).expect("replacement switch");
-        assert!(cases[1..].iter().all(|case| egraph[egraph.find(*case)].nodes.iter().any(|node| matches!(node, MxxLang::MatrixConstant(spec)
-            if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. }))))));
+        assert!(cases[1..].iter().all(|case| {
+            egraph[egraph.find(*case)].nodes.iter().any(|node| {
+                matches!(node, MxxLang::MatrixConstant(spec)
+                    if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. }))) ||
+                    matches!(node, MxxLang::MatrixAdd(children)
+                        if children.len() == 1 && egraph[egraph.find(children[0])].nodes.iter().any(|child| matches!(child, MxxLang::MatrixConstant(spec)
+                            if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. })))))
+            })
+        }));
     }
 
     #[test]
@@ -7008,6 +7051,197 @@ mod tests {
         assert!(
             owned.load(std::sync::atomic::Ordering::Relaxed) >= 3,
             "the applier reservation and both candidate reservations are owned work"
+        );
+    }
+
+    #[test]
+    fn pointwise_zero_fixed_product_guard_avoids_a_parent_child_cycle() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let binder = test_binder(&mut egraph, 0, 1);
+        let selector = egraph.add(MxxLang::IntBinder(binder));
+        let shared = binder_matrix_atom(&mut egraph, selector, "zero-cycle-shared");
+        let (first, _) = matrix_atom(&mut egraph, "zero-cycle-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "zero-cycle-second", None);
+        let zero_spec = egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type: scalar_matrix_type(),
+                value: MatrixConstantValue::Zero,
+            },
+        );
+        let zero = egraph
+            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(zero_spec)));
+        let switch = egraph.add(MxxLang::Switch(vec![selector, first, second].into_boxed_slice()));
+        let zero_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![shared, zero].into_boxed_slice()));
+        let fixed = egraph.add(MxxLang::MatrixNegate([zero_product]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![switch, fixed].into_boxed_slice()));
+        egraph.rebuild();
+
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        let applier = RelationApplier::new(context);
+        assert!(
+            !Applier::apply_one(
+                &applier,
+                &mut egraph,
+                root,
+                &Subst::default(),
+                None,
+                Symbol::from("pointwise-zero-cycle"),
+            )
+            .is_empty()
+        );
+        egraph.rebuild();
+        let root = egraph.find(root);
+        assert_ne!(
+            egraph.find(switch),
+            root,
+            "the original direct Switch child must not be unioned with its Add parent"
+        );
+        assert!(egraph[root].nodes.iter().any(|node| {
+            let MxxLang::Switch(cases) = node else { return false };
+            cases.get(1).is_some_and(|case| {
+                egraph[egraph.find(*case)]
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node, MxxLang::MatrixAdd(children) if children.len() == 1 && egraph.find(children[0]) == egraph.find(first)))
+            })
+        }));
+
+        let after_first = egraph.total_size();
+        assert!(
+            Applier::apply_one(
+                &applier,
+                &mut egraph,
+                root,
+                &Subst::default(),
+                None,
+                Symbol::from("pointwise-zero-cycle-repeat"),
+            )
+            .is_empty()
+        );
+        egraph.rebuild();
+        assert_eq!(egraph.total_size(), after_first, "a repeated apply cannot grow guarded nodes");
+    }
+
+    #[test]
+    fn pointwise_binder_cancels_real_fixed_terms_alongside_zero_products() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let binder = test_binder(&mut egraph, 0, 1);
+        let selector = egraph.add(MxxLang::IntBinder(binder));
+        let shared = binder_matrix_atom(&mut egraph, selector, "mixed-zero-real-shared");
+        let zero_spec = egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type: scalar_matrix_type(),
+                value: MatrixConstantValue::Zero,
+            },
+        );
+        let zero = egraph
+            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(zero_spec)));
+        let zero_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![shared, zero].into_boxed_slice()));
+        let mut cases = vec![selector];
+        let mut residuals = Vec::new();
+        for case_index in 0..2 {
+            let index = egraph.add(MxxLang::IntConst(BigInt::from(case_index)));
+            let mapped =
+                family::instantiate_shared_element(&mut egraph, shared, binder, index, &mut || {
+                    Ok::<(), ()>(())
+                })
+                .expect("test instantiation");
+            let (residual, _) =
+                matrix_atom(&mut egraph, &format!("mixed-zero-real-residual-{case_index}"), None);
+            residuals.push(residual);
+            cases.push(egraph.add(MxxLang::MatrixAdd(vec![mapped, residual].into_boxed_slice())));
+        }
+        let switch = egraph.add(MxxLang::Switch(cases.into_boxed_slice()));
+        let negative_shared = egraph.add(MxxLang::MatrixNegate([shared]));
+        let negative_zero_product = egraph.add(MxxLang::MatrixNegate([zero_product]));
+        let root = egraph.add(MxxLang::MatrixAdd(
+            vec![switch, negative_shared, negative_zero_product].into_boxed_slice(),
+        ));
+        egraph.rebuild();
+
+        let applier = RelationApplier::new(RewriteContext::new(SharedRewriteBudget::new()));
+        assert!(
+            !Applier::apply_one(
+                &applier,
+                &mut egraph,
+                root,
+                &Subst::default(),
+                None,
+                Symbol::from("pointwise-mixed-zero-real"),
+            )
+            .is_empty()
+        );
+        egraph.rebuild();
+        let root = egraph.find(root);
+        assert!(
+            egraph[root].nodes.iter().any(|node| {
+                let MxxLang::Switch(cases) = node else { return false };
+                cases.len() == 3 &&
+                    egraph.find(cases[1]) == egraph.find(residuals[0]) &&
+                    egraph.find(cases[2]) == egraph.find(residuals[1])
+            }),
+            "the zero product is ignored while the real binder-owned term is cancelled"
+        );
+    }
+
+    #[test]
+    fn pointwise_zero_fixed_product_guard_grows_linearly_with_stored_cases() {
+        fn guarded_growth(case_count: usize) -> usize {
+            let mut egraph = EGraph::new(MxxAnalysis::default());
+            let binder = test_binder(&mut egraph, 0, (case_count - 1) as i64);
+            let selector = egraph.add(MxxLang::IntBinder(binder));
+            let shared = binder_matrix_atom(&mut egraph, selector, "zero-cycle-linear-shared");
+            let zero_spec = egraph.analysis.symbols.matrix_constants.intern(
+                super::super::identity::MatrixConstantSpec {
+                    matrix_type: scalar_matrix_type(),
+                    value: MatrixConstantValue::Zero,
+                },
+            );
+            let zero = egraph.add(MxxLang::MatrixConstant(
+                super::super::identity::MatrixConstantSpecId(zero_spec),
+            ));
+            let mut cases = vec![selector];
+            for case_index in 0..case_count {
+                cases.push(
+                    matrix_atom(
+                        &mut egraph,
+                        &format!("zero-cycle-linear-case-{case_count}-{case_index}"),
+                        None,
+                    )
+                    .0,
+                );
+            }
+            let switch = egraph.add(MxxLang::Switch(cases.into_boxed_slice()));
+            let zero_product =
+                egraph.add(MxxLang::MatrixMultiply(vec![shared, zero].into_boxed_slice()));
+            let fixed = egraph.add(MxxLang::MatrixNegate([zero_product]));
+            let root = egraph.add(MxxLang::MatrixAdd(vec![switch, fixed].into_boxed_slice()));
+            egraph.rebuild();
+            let before = egraph.total_size();
+
+            let applier = RelationApplier::new(RewriteContext::new(SharedRewriteBudget::new()));
+            assert!(
+                !Applier::apply_one(
+                    &applier,
+                    &mut egraph,
+                    root,
+                    &Subst::default(),
+                    None,
+                    Symbol::from("pointwise-zero-cycle-linear"),
+                )
+                .is_empty()
+            );
+            egraph.rebuild();
+            egraph.total_size() - before
+        }
+
+        let eight = guarded_growth(8);
+        let sixteen = guarded_growth(16);
+        assert!(
+            sixteen <= eight.saturating_mul(3),
+            "doubling stored cases must stay linear: 8={eight}, 16={sixteen}"
         );
     }
 

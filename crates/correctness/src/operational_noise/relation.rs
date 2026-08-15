@@ -378,6 +378,30 @@ fn physical_add_terms(
     }
 }
 
+fn physical_product_factors(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    id: Id,
+) -> PhysicalStructure<Box<[Id]>> {
+    let mut unique = None;
+    for node in &egraph[egraph.find(id)].nodes {
+        let MxxLang::MatrixMultiply(factors) = node else { continue };
+        let candidate = factors
+            .iter()
+            .map(|factor| egraph.find(*factor))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        match &unique {
+            Some(previous) if previous != &candidate => return PhysicalStructure::Ambiguous,
+            Some(_) => {}
+            None => unique = Some(candidate),
+        }
+    }
+    match unique {
+        Some(factors) => PhysicalStructure::Unique(factors),
+        None => PhysicalStructure::Absent,
+    }
+}
+
 fn unique_add_terms(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
     match physical_add_terms(egraph, id) {
         PhysicalStructure::Unique(terms) => Some(terms),
@@ -1546,7 +1570,7 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
             mapped_fixed.push((mapped, occurrence.negative));
         }
         after_cross.extend(mapped_fixed.iter().copied());
-        let (cancelled, any_cancelled) = cancelled_signed_additive_leaves(&after_cross);
+        let (cancelled, any_cancelled) = cancelled_signed_additive_leaves(egraph, &after_cross);
         if !any_cancelled {
             report_binder_build_reject(
                 egraph,
@@ -1816,20 +1840,57 @@ fn signed_additive_leaves(
     Some(output)
 }
 
-fn cancelled_signed_additive_leaves(terms: &[(Id, bool)]) -> (Vec<bool>, bool) {
+/// Returns the sole ordered MatrixMultiply leaf sequence for `term`, flattening
+/// association without changing factor order.  A class with no physical
+/// product is its own singleton leaf; competing product layouts and product
+/// cycles are not given a cancellation key.
+fn ordered_product_leaves(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> Option<Box<[Id]>> {
+    fn collect(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        term: Id,
+        active: &mut HashSet<Id>,
+        leaves: &mut Vec<Id>,
+    ) -> Option<()> {
+        let term = egraph.find(term);
+        match physical_product_factors(egraph, term) {
+            PhysicalStructure::Absent => leaves.push(term),
+            PhysicalStructure::Ambiguous => return None,
+            PhysicalStructure::Unique(factors) => {
+                if !active.insert(term) {
+                    return None;
+                }
+                for factor in factors.iter() {
+                    collect(egraph, *factor, active, leaves)?;
+                }
+                active.remove(&term);
+            }
+        }
+        Some(())
+    }
+
+    let mut leaves = Vec::new();
+    collect(egraph, term, &mut HashSet::new(), &mut leaves)?;
+    Some(leaves.into_boxed_slice())
+}
+
+fn cancelled_signed_additive_leaves(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    terms: &[(Id, bool)],
+) -> (Vec<bool>, bool) {
     let mut cancelled = vec![false; terms.len()];
-    let mut positive = HashMap::<Id, Vec<usize>>::new();
-    let mut negative = HashMap::<Id, Vec<usize>>::new();
+    let mut positive = HashMap::<Box<[Id]>, Vec<usize>>::new();
+    let mut negative = HashMap::<Box<[Id]>, Vec<usize>>::new();
     let mut any = false;
     for (index, (base, is_negative)) in terms.iter().enumerate() {
+        let Some(key) = ordered_product_leaves(egraph, *base) else { continue };
         let opposite = if *is_negative { &mut positive } else { &mut negative };
-        if let Some(other) = opposite.get_mut(base).and_then(Vec::pop) {
+        if let Some(other) = opposite.get_mut(&key).and_then(Vec::pop) {
             cancelled[index] = true;
             cancelled[other] = true;
             any = true;
         } else {
             let same = if *is_negative { &mut negative } else { &mut positive };
-            same.entry(*base).or_default().push(index);
+            same.entry(key).or_default().push(index);
         }
     }
     (cancelled, any)
@@ -2152,21 +2213,10 @@ fn chunk_terms(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]
 }
 
 fn unique_product_factors(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
-    let matches = egraph[egraph.find(id)]
-        .nodes
-        .iter()
-        .filter_map(|node| match node {
-            MxxLang::MatrixMultiply(factors) => Some(
-                factors
-                    .iter()
-                    .map(|factor| egraph.find(*factor))
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            ),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    (matches.len() == 1).then(|| matches.into_iter().next().expect("checked singleton"))
+    match physical_product_factors(egraph, id) {
+        PhysicalStructure::Unique(factors) => Some(factors),
+        PhysicalStructure::Absent | PhysicalStructure::Ambiguous => None,
+    }
 }
 
 fn slice_product(
@@ -4884,6 +4934,81 @@ mod tests {
             PhysicalStructure::Ambiguous
         ));
         assert!(signed_additive_leaves(&egraph, &[first_negate]).is_none());
+    }
+
+    #[test]
+    fn cancelled_signed_additive_leaves_associate_products_without_reordering() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "product-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "product-second", None);
+        let (third, _) = matrix_atom(&mut egraph, "product-third", None);
+        let left = egraph.add(MxxLang::MatrixMultiply(vec![first, second].into_boxed_slice()));
+        let left_associated =
+            egraph.add(MxxLang::MatrixMultiply(vec![left, third].into_boxed_slice()));
+        let right = egraph.add(MxxLang::MatrixMultiply(vec![second, third].into_boxed_slice()));
+        let right_associated =
+            egraph.add(MxxLang::MatrixMultiply(vec![first, right].into_boxed_slice()));
+        let reordered =
+            egraph.add(MxxLang::MatrixMultiply(vec![second, first, third].into_boxed_slice()));
+        egraph.rebuild();
+        let before = egraph.total_size();
+
+        assert_eq!(
+            ordered_product_leaves(&egraph, left_associated),
+            ordered_product_leaves(&egraph, right_associated),
+        );
+        assert_ne!(
+            ordered_product_leaves(&egraph, left_associated),
+            ordered_product_leaves(&egraph, reordered),
+        );
+        assert_eq!(
+            cancelled_signed_additive_leaves(
+                &egraph,
+                &[(left_associated, false), (right_associated, true)],
+            ),
+            (vec![true, true], true),
+        );
+        assert_eq!(
+            cancelled_signed_additive_leaves(
+                &egraph,
+                &[(left_associated, false), (reordered, true)],
+            ),
+            (vec![false, false], false),
+        );
+        assert_eq!(
+            cancelled_signed_additive_leaves(
+                &egraph,
+                &[(left_associated, false), (left_associated, false), (right_associated, true),],
+            ),
+            (vec![false, true, true], true),
+        );
+        assert_eq!(egraph.total_size(), before, "cancellation key is read-only");
+    }
+
+    #[test]
+    fn cancelled_signed_additive_leaves_reject_ambiguous_or_cyclic_products() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "ambiguous-product-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "ambiguous-product-second", None);
+        let (third, _) = matrix_atom(&mut egraph, "ambiguous-product-third", None);
+        let first_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![first, second].into_boxed_slice()));
+        let second_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![first, third].into_boxed_slice()));
+        egraph.union(first_product, second_product);
+        egraph.rebuild();
+        let cyclic = egraph.add(MxxLang::MatrixMultiply(vec![third].into_boxed_slice()));
+        egraph.union(cyclic, third);
+
+        assert_eq!(ordered_product_leaves(&egraph, first_product), None);
+        assert_eq!(ordered_product_leaves(&egraph, cyclic), None);
+        assert_eq!(
+            cancelled_signed_additive_leaves(
+                &egraph,
+                &[(first_product, false), (first_product, true), (cyclic, false), (cyclic, true),],
+            ),
+            (vec![false, false, false, false], false),
+        );
     }
 
     #[test]

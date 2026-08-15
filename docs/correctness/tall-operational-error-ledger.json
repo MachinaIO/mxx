@@ -351,12 +351,6 @@
       "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
     },
     {
-      "error_tag": "Lower.NonUniformParallelMatrixType",
-      "tall_reachability": "reachable",
-      "classification": "graph_lowering",
-      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
-    },
-    {
       "error_tag": "Lower.InvalidFamilyCount",
       "tall_reachability": "reachable",
       "classification": "graph_lowering",
@@ -382,6 +376,12 @@
     },
     {
       "error_tag": "Lower.FamilyElementTypeMismatch",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
+    },
+    {
+      "error_tag": "Lower.FamilyElementLoweringMismatch",
       "tall_reachability": "reachable",
       "classification": "graph_lowering",
       "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."

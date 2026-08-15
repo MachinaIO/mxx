@@ -83,6 +83,18 @@ pub enum SelectorOnlyConsumer {
     NoiseBoundArithmetic,
 }
 
+/// The lowering-level category of a value that cannot serve as one family element.
+///
+/// This is deliberately separate from [`WireType`]: a family and a trapdoor have no scalar
+/// wire type, so reporting either as `Int` would hide the failed structural producer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoweredValueCategory {
+    Term,
+    Family,
+    Trapdoor,
+    TrapdoorFamily,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelationRewriteBlockReason {
     DifferentSelector,
@@ -269,12 +281,17 @@ operational_error_registry! {
         InvalidLog2CeilArgument { argument: IntExpr },
         IntervalOperationNotSupported { expression: IntExpr },
         MissingIntegerAnalysis { term: egg::Id },
-        NonUniformParallelMatrixType { expected: WireType, actual: WireType },
         InvalidFamilyCount { count: IntExpr },
         FamilyProducerNotResolved { family: WireRef },
         IncompatibleFamilyCoverage { expected: WireType, actual: WireType },
         FamilyAccessOutOfRange { index: IntExpr, count: IntExpr },
         FamilyElementTypeMismatch { expected: WireType, actual: WireType },
+        FamilyElementLoweringMismatch {
+            expected: WireType,
+            actual_category: LoweredValueCategory,
+            actual_sort: Option<MxxSort>,
+            producer: WireSourceKey,
+        },
         NegativeSamplerCutoff { cutoff: BigInt },
         InvalidUniformInterval { minimum: BigInt, maximum: BigInt },
         PackRequiresExplicitBooleanFamily { actual: WireType },

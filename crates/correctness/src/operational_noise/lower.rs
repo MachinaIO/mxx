@@ -957,6 +957,7 @@ enum LoweringFrame {
     },
     FinishParallelLoop {
         wire: LoweringWire,
+        body_source: WireSourceKey,
         environment: LowerEnv,
         specification: ParallelLoop,
         output_type: WireType,
@@ -1858,13 +1859,19 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         }
                         _ => {}
                     }
-                    let value =
-                        self.lower_structural_node(&kind, &arguments, &environment, output_type)?;
+                    let value = self.lower_structural_node(
+                        &wire,
+                        &kind,
+                        &arguments,
+                        &environment,
+                        output_type,
+                    )?;
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
                 }
                 LoweringFrame::FinishParallelLoop {
                     wire,
+                    body_source,
                     environment,
                     specification,
                     output_type,
@@ -1874,6 +1881,10 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 } => {
                     let representative_value =
                         values.pop().ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
+                    let expected_element_type = match &output_type {
+                        WireType::IndexedFamily { element, .. } => element.as_ref().clone(),
+                        output_type => output_type.clone(),
+                    };
                     let representative_value =
                         if let WireType::IndexedFamily { element, .. } = &output_type {
                             self.normalize_singleton_for_input(representative_value, element)?
@@ -1883,9 +1894,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                     if let LoweredValue::Trapdoor(representative) = representative_value {
                         if !matches!(&output_type, WireType::IndexedFamily { element, .. } if matches!(element.as_ref(), WireType::Trapdoor { .. }))
                         {
-                            return Err(LowerError::NonUniformParallelMatrixType {
-                                expected: output_type,
-                                actual: WireType::Int,
+                            return Err(LowerError::FamilyElementLoweringMismatch {
+                                expected: expected_element_type,
+                                actual_category: super::error::LoweredValueCategory::Trapdoor,
+                                actual_sort: None,
+                                producer: body_source,
                             });
                         }
                         let value =
@@ -1895,9 +1908,12 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         continue;
                     }
                     let LoweredValue::Term(representative) = representative_value else {
-                        return Err(LowerError::NonUniformParallelMatrixType {
-                            expected: output_type,
-                            actual: WireType::Int,
+                        return Err(LowerError::FamilyElementLoweringMismatch {
+                            expected: expected_element_type,
+                            actual_category: Self::lowered_value_category(&representative_value)
+                                .expect("non-term loop body"),
+                            actual_sort: None,
+                            producer: body_source,
                         });
                     };
                     let value = self.finish_parallel_loop(
@@ -1908,6 +1924,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         logical_count,
                         maximum,
                         representative,
+                        body_source,
                     )?;
                     self.finish_wire(&wire, value.clone());
                     values.push(value);
@@ -3539,6 +3556,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
 
     fn lower_structural_node(
         &mut self,
+        wire: &LoweringWire,
         kind: &NodeKind,
         arguments: &[LoweredValue],
         environment: &LowerEnv,
@@ -3558,25 +3576,45 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 let element_wire_type = *element;
                 let element_type =
                     self.resolve_family_element_sort(&element_wire_type, environment)?;
+                let argument_sources = self.structural_argument_sources(wire)?;
+                if argument_sources.len() != arguments.len() {
+                    return Err(LowerError::InvalidOperandArity {
+                        expected: argument_sources.len(),
+                        actual: arguments.len(),
+                    });
+                }
                 let elements = arguments
                     .iter()
-                    .map(|argument| match argument {
+                    .zip(argument_sources)
+                    .map(|(argument, producer)| match argument {
                         LoweredValue::Term(term)
                             if self.egraph[self.egraph.find(*term)].data.sort ==
                                 Ok(element_type.clone()) =>
                         {
                             Ok(*term)
                         }
-                        LoweredValue::Term(term) => Err(LowerError::FamilyElementTypeMismatch {
-                            expected: element_wire_type.clone(),
-                            actual: self.scalar_wire_type(*term).unwrap_or(WireType::Int),
-                        }),
+                        LoweredValue::Term(term) => {
+                            Err(LowerError::FamilyElementLoweringMismatch {
+                                expected: element_wire_type.clone(),
+                                actual_category: super::error::LoweredValueCategory::Term,
+                                actual_sort: self.egraph[self.egraph.find(*term)]
+                                    .data
+                                    .sort
+                                    .as_ref()
+                                    .ok()
+                                    .cloned(),
+                                producer,
+                            })
+                        }
                         LoweredValue::Family(_) |
                         LoweredValue::Trapdoor(_) |
                         LoweredValue::TrapdoorFamily { .. } => {
-                            Err(LowerError::FamilyElementTypeMismatch {
+                            Err(LowerError::FamilyElementLoweringMismatch {
                                 expected: element_wire_type.clone(),
-                                actual: WireType::Int,
+                                actual_category: Self::lowered_value_category(argument)
+                                    .expect("non-term family member"),
+                                actual_sort: None,
+                                producer,
                             })
                         }
                     })
@@ -3778,6 +3816,41 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             }
             NodeKind::SubgraphCall(_) | NodeKind::ThresholdDecode { .. } => unreachable!(),
             _ => unreachable!("only structural nodes reach structural lowering"),
+        }
+    }
+
+    fn structural_argument_sources(
+        &self,
+        wire: &LoweringWire,
+    ) -> Result<Vec<WireSourceKey>, LowerError> {
+        let scope = self
+            .graph_for_program(&wire.source.scope.program)?
+            .scope(&wire.source.scope.definition)
+            .ok_or(LowerError::MissingWire { wire: wire.source.wire })?;
+        let node = scope
+            .node(wire.source.wire.node)
+            .ok_or(LowerError::MissingNode { node: wire.source.wire.node })?;
+        scope.arguments(node).ok_or(LowerError::MissingWire { wire: wire.source.wire }).map(
+            |arguments| {
+                arguments
+                    .into_iter()
+                    .map(|argument| WireSourceKey {
+                        scope: wire.source.scope.clone(),
+                        wire: argument,
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    fn lowered_value_category(value: &LoweredValue) -> Option<super::error::LoweredValueCategory> {
+        match value {
+            LoweredValue::Term(_) => Some(super::error::LoweredValueCategory::Term),
+            LoweredValue::Family(_) => Some(super::error::LoweredValueCategory::Family),
+            LoweredValue::Trapdoor(_) => Some(super::error::LoweredValueCategory::Trapdoor),
+            LoweredValue::TrapdoorFamily { .. } => {
+                Some(super::error::LoweredValueCategory::TrapdoorFamily)
+            }
         }
     }
 
@@ -4198,6 +4271,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         )?;
         work.push(LoweringFrame::FinishParallelLoop {
             wire,
+            body_source: WireSourceKey { scope: child.occurrence.clone(), wire: body_output },
             environment,
             specification,
             output_type,
@@ -4224,6 +4298,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
         logical_count: num_bigint::BigUint,
         maximum: BigInt,
         representative: Id,
+        body_source: WireSourceKey,
     ) -> Result<LoweredValue, LowerError> {
         let WireType::IndexedFamily { element, .. } = output_type else {
             return Err(LowerError::IncompatibleFamilyCoverage {
@@ -4245,9 +4320,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
             (_, Err(_)) => false,
         };
         if !sort_matches {
-            return Err(LowerError::FamilyElementTypeMismatch {
+            return Err(LowerError::FamilyElementLoweringMismatch {
                 expected: element_wire_type,
-                actual: self.scalar_wire_type(representative).unwrap_or(WireType::Int),
+                actual_category: super::error::LoweredValueCategory::Term,
+                actual_sort: actual_sort.as_ref().ok().cloned(),
+                producer: body_source,
             });
         }
         let mut binder_domains = environment
@@ -4565,15 +4642,6 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                 expected: WireType::Int,
                 actual: actual.clone(),
             }),
-        }
-    }
-
-    fn scalar_wire_type(&self, term: Id) -> Option<WireType> {
-        match self.egraph[self.egraph.find(term)].data.sort.as_ref().ok()? {
-            MxxSort::Int => Some(WireType::Int),
-            MxxSort::Bool => Some(WireType::Bool),
-            MxxSort::Real => Some(WireType::Real),
-            _ => None,
         }
     }
 

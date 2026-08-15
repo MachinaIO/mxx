@@ -222,7 +222,8 @@ impl Searcher<MxxLang, MxxAnalysis> for RelationSearcher {
             matches!(node, MxxLang::MatrixMultiply(factors)
             if factors.iter().any(|factor| {
                 !egraph[egraph.find(*factor)].data.relation_provenance.is_empty()
-            }))
+            }) || right_nested_relation_factor_candidates(egraph, factors, &self.context)
+                .is_some_and(|candidates| !candidates.is_empty()))
         });
         let has_physical_add = class.nodes.iter().any(|node| matches!(node, MxxLang::MatrixAdd(_)));
         let matched = relation_match ||
@@ -290,52 +291,137 @@ impl Applier<MxxLang, MxxAnalysis> for RelationApplier {
         }
         for node in nodes {
             let MxxLang::MatrixMultiply(factors) = node else { continue };
-            for relation_position in 1..factors.len() {
-                let relation = factors[relation_position];
-                if egraph[egraph.find(relation)].data.relation_provenance.is_empty() {
-                    continue;
-                }
-                let public = factors[relation_position - 1];
-                match pointwise_same_selector(egraph, public, relation, true) {
-                    Ok(Some(product)) => {
-                        let replacement = ordered_product_sequence(
-                            egraph,
-                            &factors[..relation_position - 1],
-                            &[product],
-                            &factors[relation_position + 1..],
-                        );
-                        if egraph.union(root, replacement) {
-                            self.context.note_rewrite(true);
-                            return vec![replacement];
-                        }
-                        continue;
-                    }
-                    Ok(None)
-                        if switch_node(egraph, public).is_some() ||
-                            switch_node(egraph, relation).is_some() =>
-                    {
-                        self.context.fail(RelationFailure::TransformedOperand);
-                        return Vec::new();
-                    }
-                    Err(RelationFailure::DifferentSelectorBlocked) => continue,
-                    Err(failure) => {
-                        self.context.fail(failure);
-                        return Vec::new();
-                    }
-                    Ok(None) => {}
-                }
+            let nested_candidates =
+                right_nested_relation_factor_candidates(egraph, &factors, &self.context);
+            for candidate in std::iter::once(factors).chain(nested_candidates.into_iter().flatten())
+            {
                 if let Some((replacement, selector_distribution)) =
-                    checked_replacement(egraph, &self.context, &factors, relation_position)
+                    checked_product_replacement(egraph, &self.context, &candidate)
                 {
                     if egraph.union(root, replacement) {
                         self.context.note_rewrite(selector_distribution);
                         return vec![replacement];
                     }
                 }
+                if self.context.failure().is_some() {
+                    return Vec::new();
+                }
             }
         }
         Vec::new()
     }
+}
+
+/// Enumerates only immediate, ordered right-nested relation boundaries.  A
+/// candidate is `prefix * K * (R * tail) * suffix`, exposed as the ephemeral
+/// factor sequence `prefix, K, R, tail, suffix`.  Physical inner witnesses
+/// remain independent; this never combines e-class alternatives or inserts an
+/// associativity e-node.
+fn right_nested_relation_factor_candidates_with_reserve(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    factors: &[Id],
+    reserve: &mut dyn FnMut() -> bool,
+) -> Option<Vec<Box<[Id]>>> {
+    let mut candidates = Vec::new();
+    for outer_position in 1..factors.len() {
+        if !reserve() {
+            return None;
+        }
+        let inner = egraph.find(factors[outer_position]);
+        for node in &egraph[inner].nodes {
+            if !reserve() {
+                return None;
+            }
+            let MxxLang::MatrixMultiply(inner_factors) = node else { continue };
+            let Some(relation) = inner_factors.first().copied() else { continue };
+            if egraph[egraph.find(relation)].data.relation_provenance.is_empty() {
+                continue;
+            }
+            if !reserve() {
+                return None;
+            }
+            let mut candidate = Vec::new();
+            candidate
+                .try_reserve_exact(
+                    factors.len().checked_add(inner_factors.len())?.saturating_sub(1),
+                )
+                .ok()?;
+            for factor in factors[..outer_position]
+                .iter()
+                .chain(inner_factors)
+                .chain(&factors[outer_position + 1..])
+            {
+                if !reserve() {
+                    return None;
+                }
+                candidate.push(egraph.find(*factor));
+            }
+            if !reserve() {
+                return None;
+            }
+            candidates.try_reserve(1).ok()?;
+            candidates.push(candidate.into_boxed_slice());
+        }
+    }
+    Some(candidates)
+}
+
+fn right_nested_relation_factor_candidates(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    factors: &[Id],
+    context: &RewriteContext,
+) -> Option<Vec<Box<[Id]>>> {
+    right_nested_relation_factor_candidates_with_reserve(egraph, factors, &mut || {
+        context.reserve(1)
+    })
+}
+
+fn checked_product_replacement(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    context: &RewriteContext,
+    factors: &[Id],
+) -> Option<(Id, bool)> {
+    for relation_position in 1..factors.len() {
+        let relation = factors[relation_position];
+        if egraph[egraph.find(relation)].data.relation_provenance.is_empty() {
+            continue;
+        }
+        let public = factors[relation_position - 1];
+        match pointwise_same_selector(egraph, public, relation, true) {
+            Ok(Some(product)) => {
+                return Some((
+                    ordered_product_sequence(
+                        egraph,
+                        &factors[..relation_position - 1],
+                        &[product],
+                        &factors[relation_position + 1..],
+                    ),
+                    true,
+                ));
+            }
+            Ok(None)
+                if switch_node(egraph, public).is_some() ||
+                    switch_node(egraph, relation).is_some() =>
+            {
+                context.fail(RelationFailure::TransformedOperand);
+                return None;
+            }
+            Err(RelationFailure::DifferentSelectorBlocked) => continue,
+            Err(failure) => {
+                context.fail(failure);
+                return None;
+            }
+            Ok(None) => {}
+        }
+        if let Some(replacement) = checked_replacement(egraph, context, factors, relation_position)
+        {
+            return Some(replacement);
+        }
+        if context.failure().is_some() {
+            return None;
+        }
+    }
+    None
 }
 
 /// A physical representation query never conflates an absent operation with
@@ -1695,6 +1781,14 @@ struct FixedSpineFactorDiagnostic {
     semantic_nodes_omitted: usize,
 }
 
+impl FixedSpineFactorDiagnostic {
+    fn log_fields(
+        &self,
+    ) -> (usize, Option<&super::identity::ResolvedMatrixType>, &[String], usize) {
+        (self.eclass, self.matrix_shape.as_ref(), &self.semantic_nodes, self.semantic_nodes_omitted)
+    }
+}
+
 fn fixed_spine_factor_diagnostic(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     id: Id,
@@ -1821,12 +1915,14 @@ fn log_pre_cancel_mapped_fixed_spines(
         fixed_spines.iter().take(PEEL_DIAGNOSTIC_LIMIT).enumerate()
     {
         let (factors, factors_omitted) = capped_peel_diagnostic_ids(egraph, spine);
+        let factor_fields =
+            factors.iter().map(FixedSpineFactorDiagnostic::log_fields).collect::<Vec<_>>();
         tracing::debug!(
             event = "binder_pre_cancel_mapped_fixed_spine",
             case_index,
             spine_index,
             negative,
-            factors = ?factors,
+            factors = ?factor_fields,
             factors_omitted,
         );
     }
@@ -1851,13 +1947,18 @@ fn log_peel_term(
     match term {
         PeelTerm::Concrete { base, negative } => {
             let base = fixed_spine_factor_diagnostic(egraph, *base);
+            let (base_eclass, base_matrix_shape, base_semantic_nodes, base_semantic_nodes_omitted) =
+                base.log_fields();
             tracing::debug!(
                 event = "fixed_target_peel_term",
                 target_index = ?target_index,
                 contribution,
                 position,
                 kind = "concrete",
-                base = ?base,
+                base_eclass,
+                base_matrix_shape = ?base_matrix_shape,
+                base_semantic_nodes = ?base_semantic_nodes,
+                base_semantic_nodes_omitted,
                 negative,
             )
         }
@@ -1876,6 +1977,14 @@ fn log_peel_term(
             let selected_additive_leaves_omitted =
                 terms.len().saturating_sub(PEEL_DIAGNOSTIC_SPINE_LIMIT);
             let (suffix, suffix_omitted) = capped_peel_diagnostic_ids(egraph, suffix);
+            let prefix_fields =
+                prefix.iter().map(FixedSpineFactorDiagnostic::log_fields).collect::<Vec<_>>();
+            let selected_additive_leaf_fields = selected_additive_leaves
+                .iter()
+                .map(FixedSpineFactorDiagnostic::log_fields)
+                .collect::<Vec<_>>();
+            let suffix_fields =
+                suffix.iter().map(FixedSpineFactorDiagnostic::log_fields).collect::<Vec<_>>();
             tracing::debug!(
                 event = "fixed_target_peel_term",
                 target_index = ?target_index,
@@ -1883,12 +1992,12 @@ fn log_peel_term(
                 position,
                 kind = "product_factor",
                 negative,
-                prefix = ?prefix,
+                prefix = ?prefix_fields,
                 prefix_omitted,
-                selected_additive_leaves = ?selected_additive_leaves,
+                selected_additive_leaves = ?selected_additive_leaf_fields,
                 selected_additive_leaf_negative = ?selected_additive_leaf_negative,
                 selected_additive_leaves_omitted,
-                suffix = ?suffix,
+                suffix = ?suffix_fields,
                 suffix_omitted,
             );
         }
@@ -4106,13 +4215,179 @@ where
 }
 
 /// A read-only signed noncommutative polynomial view used only for mapped
-/// fixed targets while building one binder case.  It first reuses the existing
-/// Add/Negate consensus, then distributes only an unambiguous physical
-/// MatrixMultiply spine.  The actual case uses fixed-guided peeling instead,
-/// so this is the remaining fixed-target-only Cartesian expansion. A product
-/// e-class with competing forms is an atomic leaf: relation saturation may
-/// legitimately have unioned it with a structurally different target.
-/// Switch is deliberately atomic and is never enumerated.
+/// fixed targets while building one binder case.  Every direct product root is
+/// flattened and must agree exactly. Nested factors inspect every direct
+/// product witness and retain the lexicographically smallest finite acyclic
+/// output. Product-only cycles reject, while any non-product representative
+/// (including `Switch`) stays opaque and is never enumerated.
+fn mapped_fixed_product_consensus_with_progress(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Option<Box<[Id]>>> {
+    fn product_witnesses(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        term: Id,
+        progress: &mut dyn FnMut() -> Result<(), ()>,
+    ) -> Option<(Vec<Box<[Id]>>, bool)> {
+        let term = egraph.find(term);
+        let mut witnesses = Vec::new();
+        let mut has_non_product = false;
+        for node in &egraph[term].nodes {
+            progress().ok()?;
+            let MxxLang::MatrixMultiply(factors) = node else {
+                has_non_product = true;
+                continue;
+            };
+            progress().ok()?;
+            let mut canonical = Vec::new();
+            canonical.try_reserve_exact(factors.len()).ok()?;
+            for factor in factors {
+                progress().ok()?;
+                canonical.push(egraph.find(*factor));
+            }
+            progress().ok()?;
+            witnesses.try_reserve(1).ok()?;
+            witnesses.push(canonical.into_boxed_slice());
+        }
+        Some((witnesses, has_non_product))
+    }
+
+    fn compare_sequences(
+        left: &[Id],
+        right: &[Id],
+        progress: &mut dyn FnMut() -> Result<(), ()>,
+    ) -> Option<std::cmp::Ordering> {
+        for (left, right) in left.iter().zip(right) {
+            progress().ok()?;
+            match left.cmp(right) {
+                std::cmp::Ordering::Equal => {}
+                order => return Some(order),
+            }
+        }
+        progress().ok()?;
+        Some(left.len().cmp(&right.len()))
+    }
+
+    fn flatten_factor(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        term: Id,
+        active: &mut HashSet<Id>,
+        progress: &mut dyn FnMut() -> Result<(), ()>,
+        output: &mut Vec<Id>,
+    ) -> Option<bool> {
+        let term = egraph.find(term);
+        if active.contains(&term) {
+            return Some(false);
+        }
+        let (witnesses, has_non_product) = product_witnesses(egraph, term, progress)?;
+        if witnesses.is_empty() {
+            progress().ok()?;
+            output.try_reserve(1).ok()?;
+            output.push(term);
+            return Some(true);
+        }
+        debug_assert!(active.insert(term));
+        let checkpoint = output.len();
+        let mut best: Option<Vec<Id>> = None;
+        for factors in witnesses {
+            output.truncate(checkpoint);
+            if factors.is_empty() {
+                continue;
+            }
+            let mut finite = true;
+            for factor in factors {
+                progress().ok()?;
+                if !flatten_factor(egraph, factor, active, progress, output)? {
+                    finite = false;
+                    break;
+                }
+            }
+            if finite {
+                let candidate_len = output.len().checked_sub(checkpoint)?;
+                progress().ok()?;
+                let mut candidate = Vec::new();
+                candidate.try_reserve_exact(candidate_len).ok()?;
+                for factor in &output[checkpoint..] {
+                    progress().ok()?;
+                    candidate.push(*factor);
+                }
+                let replace = match &best {
+                    None => true,
+                    Some(previous) => {
+                        compare_sequences(&candidate, previous, progress)? ==
+                            std::cmp::Ordering::Less
+                    }
+                };
+                if replace {
+                    best = Some(candidate);
+                }
+            }
+        }
+        output.truncate(checkpoint);
+        active.remove(&term);
+        if let Some(best) = best {
+            output.try_reserve_exact(best.len()).ok()?;
+            for factor in best {
+                progress().ok()?;
+                output.push(factor);
+            }
+            return Some(true);
+        }
+        if has_non_product {
+            progress().ok()?;
+            output.try_reserve(1).ok()?;
+            output.push(term);
+            Some(true)
+        } else {
+            Some(false)
+        }
+    }
+
+    fn flatten_witness(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        factors: &[Id],
+        active: &mut HashSet<Id>,
+        progress: &mut dyn FnMut() -> Result<(), ()>,
+    ) -> Option<Vec<Id>> {
+        let mut output = Vec::new();
+        for factor in factors {
+            progress().ok()?;
+            if !flatten_factor(egraph, *factor, active, progress, &mut output)? {
+                return None;
+            }
+        }
+        Some(output)
+    }
+
+    let root = egraph.find(root);
+    let (witnesses, _) = product_witnesses(egraph, root, progress)?;
+    if witnesses.is_empty() {
+        return Some(None);
+    }
+    if witnesses.iter().any(|factors| factors.is_empty()) {
+        return None;
+    }
+    let mut agreed: Option<Vec<Id>> = None;
+    for factors in witnesses {
+        let flattened = flatten_witness(egraph, &factors, &mut HashSet::new(), progress)?;
+        if let Some(previous) = &agreed {
+            if previous.len() != flattened.len() {
+                return None;
+            }
+            for (left, right) in previous.iter().zip(&flattened) {
+                progress().ok()?;
+                if left != right {
+                    return None;
+                }
+            }
+        } else {
+            agreed = Some(flattened);
+        }
+    }
+    Some(Some(agreed?.into_boxed_slice()))
+}
+
 fn signed_ordered_monomial_spines(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     terms: &[(Id, bool)],
@@ -4126,7 +4401,7 @@ fn signed_ordered_monomial_spines(
         progress: &mut dyn FnMut() -> Result<(), ()>,
     ) -> Option<Vec<(Box<[Id]>, bool)>> {
         let term = egraph.find(term);
-        let factors = uncontested_product_factors_with_progress(egraph, term, progress);
+        let factors = mapped_fixed_product_consensus_with_progress(egraph, term, progress)?;
         let Some(factors) = factors else {
             progress().ok()?;
             let mut output = Vec::new();
@@ -4737,6 +5012,29 @@ pub fn classify_proposal_node(
     let MxxLang::MatrixMultiply(factors) = node else {
         return Ok(false);
     };
+    if classify_product_factors(egraph, factors, context)? {
+        return Ok(true);
+    }
+    let Some(nested_candidates) = right_nested_relation_factor_candidates(egraph, factors, context)
+    else {
+        return match context.failure() {
+            Some(failure) => Err(failure),
+            None => Ok(false),
+        };
+    };
+    for factors in nested_candidates {
+        if classify_product_factors(egraph, &factors, context)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn classify_product_factors(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    factors: &[Id],
+    context: &RewriteContext,
+) -> Result<bool, RelationFailure> {
     for relation_position in 1..factors.len() {
         let relation = egraph.find(factors[relation_position]);
         if egraph[relation].data.relation_provenance.is_empty() {
@@ -6036,6 +6334,187 @@ mod tests {
             classify_proposal_node(&egraph, node, &context).expect("same selector distributes")
         );
         assert_eq!(context.failure(), None);
+    }
+
+    #[test]
+    fn right_nested_relation_boundary_rewrites_and_classifies() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (public, _) = matrix_atom(&mut egraph, "right-nested-public", None);
+        let (relation, source) =
+            matrix_atom(&mut egraph, "right-nested-relation", Some(AtomicRelationRole::Preimage));
+        let (target, _) = matrix_atom(&mut egraph, "right-nested-target", None);
+        let (tail, _) = matrix_atom(&mut egraph, "right-nested-tail", None);
+        let inner = egraph.add(MxxLang::MatrixMultiply(vec![relation, tail].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixMultiply(vec![public, inner].into_boxed_slice()));
+        let expected = egraph.add(MxxLang::MatrixMultiply(vec![target, tail].into_boxed_slice()));
+        egraph.rebuild();
+
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, public, target));
+        let node = egraph[egraph.find(root)]
+            .nodes
+            .iter()
+            .find(|node| matches!(node, MxxLang::MatrixMultiply(_)))
+            .expect("outer product witness");
+        assert!(classify_proposal_node(&egraph, node, &context).expect("closed relation"));
+        let searcher = RelationSearcher::new(context.clone());
+        assert!(Searcher::search_eclass_with_limit(&searcher, &egraph, root, 1).is_some());
+
+        let applier = RelationApplier::new(context.clone());
+        assert!(
+            !Applier::apply_one(
+                &applier,
+                &mut egraph,
+                root,
+                &Subst::default(),
+                None,
+                Symbol::from("right-nested-relation"),
+            )
+            .is_empty()
+        );
+        assert_eq!(egraph.find(root), egraph.find(expected));
+        assert_eq!(context.failure(), None);
+    }
+
+    #[test]
+    fn right_nested_relation_boundary_preserves_noncommutative_order() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (public, _) = matrix_atom(&mut egraph, "right-nested-order-public", None);
+        let (relation, source) = matrix_atom(
+            &mut egraph,
+            "right-nested-order-relation",
+            Some(AtomicRelationRole::Preimage),
+        );
+        let (target, _) = matrix_atom(&mut egraph, "right-nested-order-target", None);
+        let (tail, _) = matrix_atom(&mut egraph, "right-nested-order-tail", None);
+        let inner = egraph.add(MxxLang::MatrixMultiply(vec![tail, relation].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixMultiply(vec![public, inner].into_boxed_slice()));
+        egraph.rebuild();
+
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(registration(source, public, target));
+        let node = egraph[egraph.find(root)]
+            .nodes
+            .iter()
+            .find(|node| matches!(node, MxxLang::MatrixMultiply(_)))
+            .expect("outer product witness");
+        assert!(!classify_proposal_node(&egraph, node, &context).expect("not an ordered match"));
+
+        let applier = RelationApplier::new(context.clone());
+        assert!(
+            Applier::apply_one(
+                &applier,
+                &mut egraph,
+                root,
+                &Subst::default(),
+                None,
+                Symbol::from("right-nested-order"),
+            )
+            .is_empty()
+        );
+        assert_ne!(egraph.find(root), egraph.find(target));
+        assert_eq!(context.failure(), None);
+    }
+
+    #[test]
+    fn right_nested_relation_witnesses_are_independent_and_budgeted() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (public, _) = matrix_atom(&mut egraph, "right-nested-witness-public", None);
+        let (relation, _) = matrix_atom(
+            &mut egraph,
+            "right-nested-witness-relation",
+            Some(AtomicRelationRole::Preimage),
+        );
+        let (first_tail, _) = matrix_atom(&mut egraph, "right-nested-witness-first", None);
+        let (second_tail, _) = matrix_atom(&mut egraph, "right-nested-witness-second", None);
+        let first =
+            egraph.add(MxxLang::MatrixMultiply(vec![relation, first_tail].into_boxed_slice()));
+        let second =
+            egraph.add(MxxLang::MatrixMultiply(vec![relation, second_tail].into_boxed_slice()));
+        egraph.union(first, second);
+        let root = egraph.add(MxxLang::MatrixMultiply(vec![public, first].into_boxed_slice()));
+        egraph.rebuild();
+        let factors = egraph[egraph.find(root)]
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                MxxLang::MatrixMultiply(factors) => Some(factors.clone()),
+                _ => None,
+            })
+            .expect("outer product witness");
+
+        let mut full_charges = 0;
+        let candidates =
+            right_nested_relation_factor_candidates_with_reserve(&egraph, &factors, &mut || {
+                full_charges += 1;
+                true
+            })
+            .expect("funded witness scan");
+        assert_eq!(candidates.len(), 2, "physical witnesses remain independent");
+        assert!(candidates.iter().all(|candidate| candidate.len() == 3));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.as_ref() ==
+                [egraph.find(public), egraph.find(relation), egraph.find(first_tail)]
+        }));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.as_ref() ==
+                [egraph.find(public), egraph.find(relation), egraph.find(second_tail)]
+        }));
+
+        let before = egraph.total_size();
+        let mut charges = 0;
+        assert!(
+            right_nested_relation_factor_candidates_with_reserve(&egraph, &factors, &mut || {
+                charges += 1;
+                charges < full_charges
+            },)
+            .is_none()
+        );
+        assert_eq!(egraph.total_size(), before, "budget exhaustion is pre-mutation");
+
+        let charges_for = |tail_count| {
+            let mut egraph = EGraph::new(MxxAnalysis::default());
+            let (public, _) = matrix_atom(&mut egraph, "right-nested-linear-public", None);
+            let (relation, _) = matrix_atom(
+                &mut egraph,
+                "right-nested-linear-relation",
+                Some(AtomicRelationRole::Preimage),
+            );
+            let tails = (0..tail_count)
+                .map(|index| {
+                    matrix_atom(&mut egraph, &format!("right-nested-linear-{index}"), None).0
+                })
+                .collect::<Vec<_>>();
+            let inner = egraph.add(MxxLang::MatrixMultiply(
+                std::iter::once(relation).chain(tails).collect::<Vec<_>>().into_boxed_slice(),
+            ));
+            let root = egraph.add(MxxLang::MatrixMultiply(vec![public, inner].into_boxed_slice()));
+            egraph.rebuild();
+            let factors = egraph[egraph.find(root)]
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    MxxLang::MatrixMultiply(factors) => Some(factors.clone()),
+                    _ => None,
+                })
+                .expect("outer product witness");
+            let mut charges = 0;
+            assert!(
+                right_nested_relation_factor_candidates_with_reserve(
+                    &egraph,
+                    &factors,
+                    &mut || {
+                        charges += 1;
+                        true
+                    },
+                )
+                .is_some()
+            );
+            charges
+        };
+        let eight = charges_for(8);
+        let sixteen = charges_for(16);
+        assert!(sixteen > eight && sixteen <= eight * 3, "linear scan: {eight} -> {sixteen}");
     }
 
     #[test]
@@ -8409,7 +8888,179 @@ mod tests {
     }
 
     #[test]
-    fn signed_ordered_monomials_accept_equivalent_add_forms_and_keep_relation_unions_atomic() {
+    fn mapped_fixed_product_consensus_flattens_associations_and_ignores_switch_witnesses() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (y, _) = matrix_atom(&mut egraph, "mapped-consensus-y", None);
+        let (s, _) = matrix_atom(&mut egraph, "mapped-consensus-s", None);
+        let (r, _) = matrix_atom(&mut egraph, "mapped-consensus-r", None);
+        let (g, _) = matrix_atom(&mut egraph, "mapped-consensus-g", None);
+        let left_prefix = egraph.add(MxxLang::MatrixMultiply(vec![y, s].into_boxed_slice()));
+        let left = egraph.add(MxxLang::MatrixMultiply(vec![left_prefix, r, g].into_boxed_slice()));
+        let right_suffix = egraph.add(MxxLang::MatrixMultiply(vec![s, r, g].into_boxed_slice()));
+        let right = egraph.add(MxxLang::MatrixMultiply(vec![y, right_suffix].into_boxed_slice()));
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let switch = egraph.add(MxxLang::Switch(vec![selector, y, s].into_boxed_slice()));
+        egraph.union(left, right);
+        egraph.union(left, switch);
+        egraph.rebuild();
+
+        let mut progress = || Ok(());
+        assert_eq!(
+            mapped_fixed_product_consensus_with_progress(&egraph, left, &mut progress),
+            Some(Some(
+                vec![egraph.find(y), egraph.find(s), egraph.find(r), egraph.find(g)]
+                    .into_boxed_slice()
+            ))
+        );
+    }
+
+    #[test]
+    fn mapped_fixed_product_consensus_rejects_reordering_empty_roots_and_budget_cutoff() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (y, _) = matrix_atom(&mut egraph, "mapped-reject-y", None);
+        let (s, _) = matrix_atom(&mut egraph, "mapped-reject-s", None);
+        let (r, _) = matrix_atom(&mut egraph, "mapped-reject-r", None);
+        let forward = egraph.add(MxxLang::MatrixMultiply(vec![y, s, r].into_boxed_slice()));
+        let reordered = egraph.add(MxxLang::MatrixMultiply(vec![r, s, y].into_boxed_slice()));
+        egraph.union(forward, reordered);
+        egraph.rebuild();
+        let mut progress = || Ok(());
+        assert!(
+            mapped_fixed_product_consensus_with_progress(&egraph, forward, &mut progress).is_none()
+        );
+
+        let empty = egraph.add(MxxLang::MatrixMultiply(Box::default()));
+        let mut progress = || Ok(());
+        assert!(
+            mapped_fixed_product_consensus_with_progress(&egraph, empty, &mut progress).is_none(),
+            "an empty direct root witness is fail-closed"
+        );
+        let nested_empty = egraph.add(MxxLang::MatrixMultiply(Box::default()));
+        let nested_empty_root =
+            egraph.add(MxxLang::MatrixMultiply(vec![nested_empty, y].into_boxed_slice()));
+        let mut progress = || Ok(());
+        assert!(
+            mapped_fixed_product_consensus_with_progress(&egraph, nested_empty_root, &mut progress)
+                .is_none(),
+            "an empty nested witness cannot erase a product factor"
+        );
+
+        let funded = egraph.add(MxxLang::MatrixMultiply(vec![y, s].into_boxed_slice()));
+        let mut full_calls = 0;
+        assert!(
+            mapped_fixed_product_consensus_with_progress(&egraph, funded, &mut || {
+                full_calls += 1;
+                Ok(())
+            })
+            .is_some()
+        );
+        let mut calls = 0;
+        assert!(
+            mapped_fixed_product_consensus_with_progress(&egraph, funded, &mut || {
+                calls += 1;
+                (calls < full_calls).then_some(()).ok_or(())
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn mapped_fixed_product_consensus_keeps_switch_cases_opaque_and_scales_linearly() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (y, _) = matrix_atom(&mut egraph, "mapped-opaque-y", None);
+        let (s, _) = matrix_atom(&mut egraph, "mapped-opaque-s", None);
+        let product = egraph.add(MxxLang::MatrixMultiply(vec![y, s].into_boxed_slice()));
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let mut cases = vec![selector];
+        cases.extend(std::iter::repeat_n(y, 128));
+        let switch = egraph.add(MxxLang::Switch(cases.into_boxed_slice()));
+        egraph.union(product, switch);
+        egraph.rebuild();
+        let mut switch_charges = 0;
+        assert!(
+            mapped_fixed_product_consensus_with_progress(&egraph, product, &mut || {
+                switch_charges += 1;
+                Ok(())
+            })
+            .is_some()
+        );
+        assert!(switch_charges < 32, "Switch cases are opaque to product consensus");
+
+        let charges_for = |width| {
+            let mut egraph = EGraph::new(MxxAnalysis::default());
+            let factors = (0..width)
+                .map(|index| {
+                    matrix_atom(&mut egraph, &format!("mapped-linear-{width}-{index}"), None).0
+                })
+                .collect::<Vec<_>>();
+            let product = egraph.add(MxxLang::MatrixMultiply(factors.into_boxed_slice()));
+            egraph.rebuild();
+            let mut charges = 0;
+            assert!(
+                mapped_fixed_product_consensus_with_progress(&egraph, product, &mut || {
+                    charges += 1;
+                    Ok(())
+                })
+                .is_some()
+            );
+            charges
+        };
+        let eight = charges_for(8);
+        let sixteen = charges_for(16);
+        assert!(
+            sixteen > eight && sixteen <= eight * 3,
+            "near-linear charges: {eight} -> {sixteen}"
+        );
+
+        let association_charges_for = |depth| {
+            let mut egraph = EGraph::new(MxxAnalysis::default());
+            let factors = (0..depth)
+                .map(|index| {
+                    matrix_atom(&mut egraph, &format!("mapped-association-{depth}-{index}"), None).0
+                })
+                .collect::<Vec<_>>();
+            let mut product = factors[0];
+            for factor in &factors[1..] {
+                product =
+                    egraph.add(MxxLang::MatrixMultiply(vec![product, *factor].into_boxed_slice()));
+            }
+            let mut alternate = *factors.last().expect("nonempty association");
+            for factor in factors[..factors.len() - 1].iter().rev() {
+                alternate = egraph
+                    .add(MxxLang::MatrixMultiply(vec![*factor, alternate].into_boxed_slice()));
+            }
+            egraph.union(product, alternate);
+            egraph.rebuild();
+            let physical_witnesses = egraph[egraph.find(product)]
+                .nodes
+                .iter()
+                .filter(|node| matches!(node, MxxLang::MatrixMultiply(_)))
+                .count();
+            assert!(
+                physical_witnesses >= 2,
+                "both immediate association witnesses remain in the rebuilt root class"
+            );
+            let mut charges = 0;
+            let leaves =
+                mapped_fixed_product_consensus_with_progress(&egraph, product, &mut || {
+                    charges += 1;
+                    Ok(())
+                })
+                .expect("funded association")
+                .expect("association is a product");
+            assert_eq!(leaves.len(), depth);
+            charges
+        };
+        let associated_eight = association_charges_for(8);
+        let associated_sixteen = association_charges_for(16);
+        assert!(
+            associated_sixteen <= associated_eight * 4,
+            "output-sensitive witness traversal scales within the retained association outputs: {associated_eight} -> {associated_sixteen}"
+        );
+    }
+
+    #[test]
+    fn signed_ordered_monomials_reject_different_product_witnesses() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let (first, _) = matrix_atom(&mut egraph, "monomial-consensus-first", None);
         let (second, _) = matrix_atom(&mut egraph, "monomial-consensus-second", None);
@@ -8425,7 +9076,8 @@ mod tests {
         let mut progress = || Ok(());
         assert!(
             signed_ordered_monomial_spines(&egraph, &[(left_product, false)], &mut progress)
-                .is_some()
+                .is_none(),
+            "mapped fixed products require one ordered canonical witness"
         );
 
         let (relation_target, _) = matrix_atom(&mut egraph, "monomial-relation-target", None);
@@ -8434,8 +9086,8 @@ mod tests {
         let mut progress = || Ok(());
         assert!(
             signed_ordered_monomial_spines(&egraph, &[(left_product, false)], &mut progress)
-                .is_some(),
-            "a relation-unioned product remains one atomic leaf"
+                .is_none(),
+            "a non-Multiply relation alternative cannot hide conflicting product witnesses"
         );
 
         let (cycle_leaf, _) = matrix_atom(&mut egraph, "monomial-cycle", None);
@@ -8464,8 +9116,8 @@ mod tests {
         .expect("shared additive factor has one consensus result");
         assert_eq!(spines.len(), 4, "only mathematically required product monomials are retained");
         assert_eq!(
-            charges, 81,
-            "63 baseline charges plus 18 direct eclass/factor scans; changing either traversal changes this calibrated total"
+            charges, 89,
+            "the selected direct product witness and its required Cartesian monomials are charged"
         );
     }
 
@@ -8690,9 +9342,9 @@ mod tests {
             .expect("the retained pre-cancel spine is logged");
         assert!(spine.get("negative").is_some_and(|negative| negative.contains("true")));
         let factors = spine.get("factors").expect("factor descriptors");
-        let left = format!("eclass: {}", usize::from(egraph.find(left)));
-        let middle = format!("eclass: {}", usize::from(egraph.find(middle)));
-        let right = format!("eclass: {}", usize::from(egraph.find(right)));
+        let left = format!("({},", usize::from(egraph.find(left)));
+        let middle = format!("({},", usize::from(egraph.find(middle)));
+        let right = format!("({},", usize::from(egraph.find(right)));
         assert!(factors.find(&left) < factors.find(&middle));
         assert!(factors.find(&middle) < factors.find(&right));
     }

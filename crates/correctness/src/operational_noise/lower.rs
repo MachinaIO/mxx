@@ -38,6 +38,120 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// Constructs the sole lowered representation of a binary matrix product.
+/// It expands only uniquely represented structural sums; ambiguity, cycles,
+/// and empty sums are typed lowering failures.
+fn lowered_matrix_product(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    left: Id,
+    right: Id,
+) -> Result<Id, LowerError> {
+    let left_terms = lowered_signed_summands(egraph, left, false, &mut HashSet::new())
+        .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
+    let right_terms = lowered_signed_summands(egraph, right, false, &mut HashSet::new())
+        .map_err(|_| LowerError::UnsupportedMatrixProductExpansion)?;
+    let mut products = Vec::with_capacity(left_terms.len().saturating_mul(right_terms.len()));
+    for (left_negative, left) in &left_terms {
+        for (right_negative, right) in &right_terms {
+            let Ok(mut factors) = lowered_product_factors(egraph, *left, &mut HashSet::new())
+            else {
+                return Err(LowerError::UnsupportedMatrixProductExpansion);
+            };
+            let Ok(right_factors) = lowered_product_factors(egraph, *right, &mut HashSet::new())
+            else {
+                return Err(LowerError::UnsupportedMatrixProductExpansion);
+            };
+            factors.extend(right_factors);
+            if factors.is_empty() {
+                return Err(LowerError::UnsupportedMatrixProductExpansion);
+            }
+            let product = egraph.add(MxxLang::MatrixMultiply(factors.into()));
+            products.push(if *left_negative ^ *right_negative {
+                egraph.add(MxxLang::MatrixNegate([product]))
+            } else {
+                product
+            });
+        }
+    }
+    match products.as_slice() {
+        [] => Err(LowerError::UnsupportedMatrixProductExpansion),
+        [product] => Ok(*product),
+        _ => Ok(egraph.add(MxxLang::MatrixAdd(products.into()))),
+    }
+}
+
+fn lowered_signed_summands(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    term: Id,
+    negative: bool,
+    active: &mut HashSet<Id>,
+) -> Result<Vec<(bool, Id)>, ()> {
+    let term = egraph.find(term);
+    if !active.insert(term) {
+        return Err(());
+    }
+    let result = match lowered_unique_structure(egraph, term, |node| match node {
+        MxxLang::MatrixNegate([input]) => Some(*input),
+        _ => None,
+    })? {
+        Some(input) => lowered_signed_summands(egraph, input, !negative, active),
+        None => match lowered_unique_structure(egraph, term, |node| match node {
+            MxxLang::MatrixAdd(terms) => Some(terms.clone()),
+            _ => None,
+        })? {
+            Some(terms) if terms.is_empty() => Err(()),
+            Some(terms) => terms.into_iter().try_fold(Vec::new(), |mut out, child| {
+                out.extend(lowered_signed_summands(egraph, child, negative, active)?);
+                Ok(out)
+            }),
+            None => Ok(vec![(negative, term)]),
+        },
+    };
+    active.remove(&term);
+    result
+}
+
+fn lowered_product_factors(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    term: Id,
+    active: &mut HashSet<Id>,
+) -> Result<Vec<Id>, ()> {
+    let term = egraph.find(term);
+    if !active.insert(term) {
+        return Err(());
+    }
+    let result = match lowered_unique_structure(egraph, term, |node| match node {
+        MxxLang::MatrixMultiply(factors) => Some(factors.clone()),
+        _ => None,
+    })? {
+        Some(factors) if factors.is_empty() => Err(()),
+        Some(factors) => factors.into_iter().try_fold(Vec::new(), |mut out, factor| {
+            out.extend(lowered_product_factors(egraph, factor, active)?);
+            Ok(out)
+        }),
+        None => Ok(vec![term]),
+    };
+    active.remove(&term);
+    result
+}
+
+fn lowered_unique_structure<T: Eq>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    term: Id,
+    mut select: impl FnMut(&MxxLang) -> Option<T>,
+) -> Result<Option<T>, ()> {
+    let mut found = None;
+    for node in &egraph[egraph.find(term)].nodes {
+        let Some(candidate) = select(node) else { continue };
+        match &found {
+            Some(previous) if previous != &candidate => return Err(()),
+            Some(_) => {}
+            None => found = Some(candidate),
+        }
+    }
+    Ok(found)
+}
+
 /// Structural-family dispatch is deliberately outside ordinary expression lowering.
 ///
 /// The resolver receives the exact occurrence and lexical environment, so it can enter a
@@ -3251,7 +3365,7 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         }
                     }
                     MatrixBinaryOp::Multiply => {
-                        self.egraph.add(MxxLang::MatrixMultiply(values.into_boxed_slice()))
+                        lowered_matrix_product(&mut self.egraph, values[0], values[1])?
                     }
                 }
             }
@@ -4563,6 +4677,124 @@ mod tests {
             state_inputs: BTreeMap::new(),
             active_coordinates: Vec::new(),
         }
+    }
+
+    fn test_matrix_atom(egraph: &mut EGraph<MxxLang, MxxAnalysis>, name: &str) -> Id {
+        let matrix_type = super::super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(1.into()),
+            columns: ResolvedIntExpr::Const(1.into()),
+        };
+        let source = egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ProtocolInput(
+                    crate::ProtocolInputId::from(name),
+                ),
+                sort: MxxSort::Matrix(matrix_type),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            },
+        );
+        egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(source),
+            indices: Box::new([]),
+        })
+    }
+
+    #[test]
+    fn lowered_matrix_product_expands_ordered_nested_sums_and_preserves_signs() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let a = test_matrix_atom(&mut egraph, "a");
+        let b = test_matrix_atom(&mut egraph, "b");
+        let c = test_matrix_atom(&mut egraph, "c");
+        let d = test_matrix_atom(&mut egraph, "d");
+        let nested = egraph.add(MxxLang::MatrixAdd(vec![a, b].into()));
+        let left = egraph.add(MxxLang::MatrixAdd(vec![nested, c].into()));
+        let right = egraph.add(MxxLang::MatrixAdd(vec![d, a].into()));
+        let root = lowered_matrix_product(&mut egraph, left, right).unwrap();
+        let MxxLang::MatrixAdd(terms) = &egraph[egraph.find(root)].nodes[0] else {
+            panic!("both sides expand")
+        };
+        assert_eq!(terms.len(), 6);
+        let first = &egraph[egraph.find(terms[0])].nodes[0];
+        assert!(matches!(first, MxxLang::MatrixMultiply(factors)
+            if egraph.find(factors[0]) == egraph.find(a) && egraph.find(factors[1]) == egraph.find(d)));
+
+        let negative_a = egraph.add(MxxLang::MatrixNegate([a]));
+        let negative_d = egraph.add(MxxLang::MatrixNegate([d]));
+        let signed = egraph.add(MxxLang::MatrixAdd(vec![d, negative_d].into()));
+        let signed_root = lowered_matrix_product(&mut egraph, negative_a, signed).unwrap();
+        assert!(matches!(egraph[egraph.find(signed_root)].nodes[0], MxxLang::MatrixAdd(_)));
+    }
+
+    #[test]
+    fn lowered_matrix_product_rejects_empty_ambiguous_and_cyclic_structures() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "product-expansion-rejection".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let a = test_matrix_atom(&mut lowerer.egraph, "a");
+        let b = test_matrix_atom(&mut lowerer.egraph, "b");
+        let zero_type = match &lowerer.egraph[lowerer.egraph.find(a)].data.sort {
+            Ok(MxxSort::Matrix(matrix_type)) => matrix_type.clone(),
+            _ => unreachable!("test atom is matrix"),
+        };
+        let zero_spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type: zero_type,
+                value: super::super::identity::MatrixConstantValue::Zero,
+            },
+        );
+        let zero = lowerer
+            .egraph
+            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(zero_spec)));
+        let zero_product = lowerer
+            .lower_node(
+                &NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
+                &[LoweredValue::Term(zero), LoweredValue::Term(a)],
+                &root_test_environment(),
+            )
+            .unwrap();
+        assert!(matches!(zero_product, LoweredValue::Term(_)));
+        let empty = lowerer.egraph.add(MxxLang::MatrixAdd(Box::new([])));
+        assert!(matches!(
+            lowerer.lower_node(
+                &NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
+                &[LoweredValue::Term(empty), LoweredValue::Term(b)],
+                &root_test_environment(),
+            ),
+            Err(LowerError::UnsupportedMatrixProductExpansion)
+        ));
+
+        let first = lowerer.egraph.add(MxxLang::MatrixAdd(vec![a, b].into()));
+        let second = lowerer.egraph.add(MxxLang::MatrixAdd(vec![b, a].into()));
+        lowerer.egraph.union(first, second);
+        lowerer.egraph.rebuild();
+        assert!(matches!(
+            lowerer.lower_node(
+                &NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
+                &[LoweredValue::Term(first), LoweredValue::Term(b)],
+                &root_test_environment(),
+            ),
+            Err(LowerError::UnsupportedMatrixProductExpansion)
+        ));
+
+        let cyclic = lowerer.egraph.add(MxxLang::MatrixAdd(vec![a].into()));
+        lowerer.egraph.union(cyclic, a);
+        lowerer.egraph.rebuild();
+        assert!(matches!(
+            lowerer.lower_node(
+                &NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
+                &[LoweredValue::Term(cyclic), LoweredValue::Term(b)],
+                &root_test_environment(),
+            ),
+            Err(LowerError::UnsupportedMatrixProductExpansion)
+        ));
     }
 
     #[test]

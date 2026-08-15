@@ -231,6 +231,12 @@
       "rationale": "Tall lowers frozen stage graphs, scope occurrences, families, lookups, and sampler inputs through the generic lowering path; this error reports a failed lowering precondition."
     },
     {
+      "error_tag": "Lower.UnsupportedMatrixProductExpansion",
+      "tall_reachability": "reachable",
+      "classification": "graph_lowering",
+      "rationale": "Tall matrix products must have one acyclic, nonempty structural expansion; ambiguous or cyclic physical representations are rejected during lowering."
+    },
+    {
       "error_tag": "Lower.MissingChildBinding",
       "tall_reachability": "reachable",
       "classification": "graph_lowering",

@@ -241,6 +241,7 @@ operational_error_registry! {
         InvalidOutputPort { wire: WireRef, output_count: usize },
         InvalidOperandArity { expected: usize, actual: usize },
         InvalidOperandSort { expected: WireType, actual: WireType },
+        UnsupportedMatrixProductExpansion,
         MissingChildBinding { definition: FrozenGraphScopeId, input: WireRef },
         MissingProtocolInputBinding { input: ProtocolInputId },
         ArtifactProducerMissing { consumer: StageId, input: StageInputName },

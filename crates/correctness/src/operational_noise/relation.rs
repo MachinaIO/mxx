@@ -77,6 +77,7 @@ struct RelationState {
     registrations: BTreeMap<AtomicSourceId, Vec<RelationRegistration>>,
     failure: Option<RelationFailure>,
     counters: RelationCounters,
+    binder_build_rejection_logged: bool,
 }
 
 /// Job-owned controls shared with all checker phases.  Relation rewriting only
@@ -129,6 +130,7 @@ impl RewriteContext {
                 registrations: BTreeMap::new(),
                 failure: None,
                 counters: RelationCounters::default(),
+                binder_build_rejection_logged: false,
             })),
             budget,
         }
@@ -186,6 +188,18 @@ impl RewriteContext {
             .get(&source)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Returns true once per checker context so a repeated unsuccessful
+    /// e-graph applier attempt cannot flood production DEBUG output.
+    fn take_binder_build_rejection_log(&self) -> bool {
+        let mut state = self.state.lock().expect("relation context lock");
+        if state.binder_build_rejection_logged {
+            false
+        } else {
+            state.binder_build_rejection_logged = true;
+            true
+        }
     }
 }
 
@@ -1308,7 +1322,16 @@ fn build_pointwise_add_switch_cancellation(
     root: Id,
     plan: PointwiseAddSwitchPlan,
 ) -> Option<Id> {
-    build_pointwise_add_switch_cancellation_inner(egraph, root, plan, &mut || Ok(()))
+    let mut do_not_collect = || false;
+    let mut ignore = ignore_binder_build_reject;
+    build_pointwise_add_switch_cancellation_inner(
+        egraph,
+        root,
+        plan,
+        &mut || Ok(()),
+        &mut do_not_collect,
+        &mut ignore,
+    )
 }
 
 fn build_pointwise_add_switch_cancellation_with_context(
@@ -1317,9 +1340,20 @@ fn build_pointwise_add_switch_cancellation_with_context(
     plan: PointwiseAddSwitchPlan,
     context: &RewriteContext,
 ) -> Option<Id> {
-    build_pointwise_add_switch_cancellation_inner(egraph, root, plan, &mut || {
-        context.reserve(1).then_some(()).ok_or(())
-    })
+    let selector = plan.selector;
+    let mut log_first_reject =
+        || tracing::enabled!(tracing::Level::DEBUG) && context.take_binder_build_rejection_log();
+    let mut emit_reject = |reject: &BinderBuildReject| {
+        emit_binder_build_reject(root, selector, reject);
+    };
+    build_pointwise_add_switch_cancellation_inner(
+        egraph,
+        root,
+        plan,
+        &mut || context.reserve(1).then_some(()).ok_or(()),
+        &mut log_first_reject,
+        &mut emit_reject,
+    )
 }
 
 fn build_pointwise_add_switch_cancellation_inner(
@@ -1327,16 +1361,21 @@ fn build_pointwise_add_switch_cancellation_inner(
     root: Id,
     plan: PointwiseAddSwitchPlan,
     progress: &mut dyn FnMut() -> Result<(), ()>,
+    should_collect: &mut dyn FnMut() -> bool,
+    sink: &mut dyn FnMut(&BinderBuildReject),
 ) -> Option<Id> {
     if let Some(binder_plans) = plan.binder_aware {
         for binder_plan in binder_plans.into_vec() {
-            if let Some(replacement) = build_binder_aware_pointwise_add_switch_cancellation(
+            let replacement = build_binder_aware_pointwise_add_switch_cancellation_with_sink(
                 egraph,
                 root,
                 plan.selector,
                 binder_plan,
                 progress,
-            ) {
+                should_collect,
+                sink,
+            );
+            if let Some(replacement) = replacement {
                 return Some(replacement);
             }
         }
@@ -1353,6 +1392,7 @@ fn build_pointwise_add_switch_cancellation_inner(
 /// Instantiates each distinct fixed base once per physical stored case, then
 /// normalizes every case with the reconstructed fixed sequence. The caller
 /// unions only after every case has completed.
+#[cfg(test)]
 fn build_binder_aware_pointwise_add_switch_cancellation(
     egraph: &mut EGraph<MxxLang, MxxAnalysis>,
     root: Id,
@@ -1360,14 +1400,18 @@ fn build_binder_aware_pointwise_add_switch_cancellation(
     plan: BinderAwarePointwiseAddSwitchPlan,
     progress: &mut dyn FnMut() -> Result<(), ()>,
 ) -> Option<Id> {
-    let mut ignore_diagnostic = ignore_binder_build_reject;
+    let mut log_enabled = || tracing::enabled!(tracing::Level::DEBUG);
+    let mut log_reject = |reject: &BinderBuildReject| {
+        emit_binder_build_reject(root, selector, reject);
+    };
     build_binder_aware_pointwise_add_switch_cancellation_with_sink(
         egraph,
         root,
         selector,
         plan,
         progress,
-        &mut ignore_diagnostic,
+        &mut log_enabled,
+        &mut log_reject,
     )
 }
 
@@ -1399,6 +1443,7 @@ struct BinderBuildReject {
     fixed_product_spines: Box<[RetainedProductSpine]>,
 }
 
+#[cfg(test)]
 fn ignore_binder_build_reject(_: &BinderBuildReject) {}
 
 fn summarize_binder_build_leaves(leaves: &[(Id, bool)]) -> (Box<[BinderBuildSignedLeaf]>, usize) {
@@ -1416,14 +1461,16 @@ fn summarize_binder_build_leaves(leaves: &[(Id, bool)]) -> (Box<[BinderBuildSign
 
 fn report_binder_build_reject(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
-    root: usize,
-    selector: usize,
     case_index: usize,
     stage: BinderBuildRejectStage,
     actual: &[(Id, bool)],
     fixed: &[(Id, bool)],
+    should_collect: &mut dyn FnMut() -> bool,
     sink: &mut dyn FnMut(&BinderBuildReject),
 ) {
+    if !should_collect() {
+        return;
+    }
     let (actual, actual_omitted) = summarize_binder_build_leaves(actual);
     let (fixed, fixed_omitted) = summarize_binder_build_leaves(fixed);
     let actual_ids = actual.iter().map(|leaf| Id::from(leaf.eclass)).collect::<Vec<_>>();
@@ -1439,11 +1486,14 @@ fn report_binder_build_reject(
         fixed_omitted,
     };
     sink(&reject);
+}
+
+fn emit_binder_build_reject(root: Id, selector: Id, reject: &BinderBuildReject) {
     if tracing::enabled!(tracing::Level::DEBUG) {
         tracing::debug!(
             event = "pointwise_binder_build_failure",
-            root,
-            selector,
+            root = usize::from(root),
+            selector = usize::from(selector),
             case_index = reject.case_index,
             stage = ?reject.stage,
             actual = ?reject.actual,
@@ -1464,10 +1514,9 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
     selector: Id,
     plan: BinderAwarePointwiseAddSwitchPlan,
     progress: &mut dyn FnMut() -> Result<(), ()>,
+    should_collect: &mut dyn FnMut() -> bool,
     sink: &mut dyn FnMut(&BinderBuildReject),
 ) -> Option<Id> {
-    let diagnostic_root = usize::from(egraph.find(root));
-    let diagnostic_selector = usize::from(egraph.find(selector));
     let mut normalized_cases = Vec::with_capacity(plan.case_terms.len());
     for (case_index, terms) in plan.case_terms.iter().enumerate() {
         let index = egraph.add(MxxLang::IntConst(BigInt::from(case_index)));
@@ -1481,12 +1530,11 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
         let Some(mut after_cross) = signed_additive_leaves(egraph, terms) else {
             report_binder_build_reject(
                 egraph,
-                diagnostic_root,
-                diagnostic_selector,
                 case_index,
                 BinderBuildRejectStage::CaseSignedReject,
                 &[],
                 &[],
+                should_collect,
                 sink,
             );
             return None;
@@ -1502,12 +1550,11 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
         if !any_cancelled {
             report_binder_build_reject(
                 egraph,
-                diagnostic_root,
-                diagnostic_selector,
                 case_index,
                 BinderBuildRejectStage::NoExactCancellation,
                 &actual,
                 &mapped_fixed,
+                should_collect,
                 sink,
             );
             return None;
@@ -1525,12 +1572,11 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
         if remaining.iter().any(|term| egraph.find(*term) == egraph.find(root)) {
             report_binder_build_reject(
                 egraph,
-                diagnostic_root,
-                diagnostic_selector,
                 case_index,
                 BinderBuildRejectStage::RootCycle,
                 &actual,
                 &mapped_fixed,
+                should_collect,
                 sink,
             );
             return None;
@@ -1540,12 +1586,11 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
     if equivalent_switch_exists(egraph, root, selector, &normalized_cases) {
         report_binder_build_reject(
             egraph,
-            diagnostic_root,
-            diagnostic_selector,
             0,
             BinderBuildRejectStage::Equivalent,
             &[],
             &[],
+            should_collect,
             sink,
         );
         return None;
@@ -1567,25 +1612,52 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_diagnostic(
     sink: &mut dyn FnMut(&BinderBuildReject),
 ) -> Option<Id> {
     let mut progress = || Ok(());
+    let mut always_collect = || true;
     build_binder_aware_pointwise_add_switch_cancellation_with_sink(
         egraph,
         root,
         selector,
         plan,
         &mut progress,
+        &mut always_collect,
         sink,
     )
 }
 
-/// Diagnostic-only direct product view.  It never associates products: a
-/// product child which itself has a physical product is reported as `Nested`.
-/// Each retained leaf contributes at most eight ordered factor coordinates.
+/// Diagnostic-only physical product view. It never associates products, and
+/// reports up to eight ordered factors even when one is itself a product.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RetainedProductSpine {
-    Absent { leaf: usize },
-    Ambiguous { leaf: usize },
-    Nested { leaf: usize },
-    Direct { leaf: usize, factors: Box<[usize]>, omitted: usize },
+    Absent {
+        leaf: usize,
+    },
+    Ambiguous {
+        leaf: usize,
+    },
+    Direct {
+        leaf: usize,
+        factors: Box<[usize]>,
+        factor_adds: Box<[RetainedFactorAdd]>,
+        omitted: usize,
+    },
+}
+
+/// Bounded, failure-only physical Add evidence for one retained product
+/// factor. It distinguishes no physical Add from exactly one and competing
+/// physical Adds without retaining e-graph state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedFactorAdd {
+    Absent,
+    Unique,
+    Ambiguous,
+}
+
+fn retained_factor_add(egraph: &EGraph<MxxLang, MxxAnalysis>, factor: Id) -> RetainedFactorAdd {
+    match physical_add_terms(egraph, factor) {
+        PhysicalStructure::Absent => RetainedFactorAdd::Absent,
+        PhysicalStructure::Unique(_) => RetainedFactorAdd::Unique,
+        PhysicalStructure::Ambiguous => RetainedFactorAdd::Ambiguous,
+    }
 }
 
 fn retained_product_spines(
@@ -1611,24 +1683,22 @@ fn retained_product_spines(
                 0 => RetainedProductSpine::Absent { leaf: usize::from(leaf) },
                 1 => {
                     let factors = products.into_iter().next().expect("one product");
-                    if factors.iter().any(|factor| {
-                        egraph[egraph.find(*factor)]
-                            .nodes
+                    let omitted = factors.len().saturating_sub(FACTOR_LIMIT);
+                    RetainedProductSpine::Direct {
+                        leaf: usize::from(leaf),
+                        factors: factors
                             .iter()
-                            .any(|node| matches!(node, MxxLang::MatrixMultiply(_)))
-                    }) {
-                        RetainedProductSpine::Nested { leaf: usize::from(leaf) }
-                    } else {
-                        let omitted = factors.len().saturating_sub(FACTOR_LIMIT);
-                        RetainedProductSpine::Direct {
-                            leaf: usize::from(leaf),
-                            factors: factors
-                                .into_iter()
-                                .take(FACTOR_LIMIT)
-                                .map(usize::from)
-                                .collect(),
-                            omitted,
-                        }
+                            .copied()
+                            .take(FACTOR_LIMIT)
+                            .map(usize::from)
+                            .collect(),
+                        factor_adds: factors
+                            .iter()
+                            .copied()
+                            .take(FACTOR_LIMIT)
+                            .map(|factor| retained_factor_add(egraph, factor))
+                            .collect(),
+                        omitted,
                     }
                 }
                 _ => RetainedProductSpine::Ambiguous { leaf: usize::from(leaf) },
@@ -4155,6 +4225,8 @@ mod tests {
                 leaf: usize::from(egraph.find(direct)),
                 factors: vec![usize::from(egraph.find(left)), usize::from(egraph.find(middle))]
                     .into_boxed_slice(),
+                factor_adds: vec![RetainedFactorAdd::Absent, RetainedFactorAdd::Absent]
+                    .into_boxed_slice(),
                 omitted: 0,
             }]
         );
@@ -4164,12 +4236,21 @@ mod tests {
                 leaf: usize::from(egraph.find(reordered)),
                 factors: vec![usize::from(egraph.find(middle)), usize::from(egraph.find(left))]
                     .into_boxed_slice(),
+                factor_adds: vec![RetainedFactorAdd::Absent, RetainedFactorAdd::Absent]
+                    .into_boxed_slice(),
                 omitted: 0,
             }]
         );
         assert_eq!(
             retained_product_spines(&egraph, &[nested]),
-            vec![RetainedProductSpine::Nested { leaf: usize::from(egraph.find(nested)) }]
+            vec![RetainedProductSpine::Direct {
+                leaf: usize::from(egraph.find(nested)),
+                factors: vec![usize::from(egraph.find(direct)), usize::from(egraph.find(right))]
+                    .into_boxed_slice(),
+                factor_adds: vec![RetainedFactorAdd::Absent, RetainedFactorAdd::Absent]
+                    .into_boxed_slice(),
+                omitted: 0,
+            }]
         );
 
         let alternate = egraph.add(MxxLang::MatrixMultiply(vec![right, left].into_boxed_slice()));
@@ -4178,6 +4259,45 @@ mod tests {
         assert_eq!(
             retained_product_spines(&egraph, &[direct]),
             vec![RetainedProductSpine::Ambiguous { leaf: usize::from(egraph.find(direct)) }]
+        );
+    }
+
+    #[test]
+    fn binder_build_product_diagnostics_classify_bounded_factor_adds() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (left, _) = matrix_atom(&mut egraph, "diagnostic-factor-add-left", None);
+        let (first, _) = matrix_atom(&mut egraph, "diagnostic-factor-add-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "diagnostic-factor-add-second", None);
+        let (third, _) = matrix_atom(&mut egraph, "diagnostic-factor-add-third", None);
+        let unique_add = egraph.add(MxxLang::MatrixAdd(vec![first, second].into_boxed_slice()));
+        let ambiguous_add = egraph.add(MxxLang::MatrixAdd(vec![second, third].into_boxed_slice()));
+        let competing_add = egraph.add(MxxLang::MatrixAdd(vec![third, first].into_boxed_slice()));
+        egraph.union(ambiguous_add, competing_add);
+        let nested_factor =
+            egraph.add(MxxLang::MatrixMultiply(vec![left, first].into_boxed_slice()));
+        let product = egraph.add(MxxLang::MatrixMultiply(
+            vec![nested_factor, unique_add, ambiguous_add].into_boxed_slice(),
+        ));
+        egraph.rebuild();
+
+        assert_eq!(
+            retained_product_spines(&egraph, &[product]),
+            vec![RetainedProductSpine::Direct {
+                leaf: usize::from(egraph.find(product)),
+                factors: vec![
+                    usize::from(egraph.find(nested_factor)),
+                    usize::from(egraph.find(unique_add)),
+                    usize::from(egraph.find(ambiguous_add)),
+                ]
+                .into_boxed_slice(),
+                factor_adds: vec![
+                    RetainedFactorAdd::Absent,
+                    RetainedFactorAdd::Unique,
+                    RetainedFactorAdd::Ambiguous,
+                ]
+                .into_boxed_slice(),
+                omitted: 0,
+            }]
         );
     }
 
@@ -4202,6 +4322,7 @@ mod tests {
                     .iter()
                     .map(|factor| usize::from(egraph.find(*factor)))
                     .collect(),
+                factor_adds: vec![RetainedFactorAdd::Absent; 8].into_boxed_slice(),
                 omitted: 1,
             }]
         );
@@ -4306,6 +4427,47 @@ mod tests {
         assert!(
             events[0].get("fixed_product_spines").is_some_and(|value| value.contains("Absent"))
         );
+    }
+
+    #[test]
+    fn production_binder_build_failure_logs_once_across_repeated_applier_attempts() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let binder = test_binder(&mut egraph, 0, 1);
+        let selector = egraph.add(MxxLang::IntBinder(binder));
+        let shared = binder_matrix_atom(&mut egraph, selector, "diagnostic-production-shared");
+        let zero = egraph.add(MxxLang::IntConst(0.into()));
+        let at_zero =
+            family::instantiate_shared_element(&mut egraph, shared, binder, zero, &mut || {
+                Ok::<(), ()>(())
+            })
+            .expect("test instantiation");
+        let (unmatched, _) = matrix_atom(&mut egraph, "diagnostic-production-unmatched", None);
+        let switch =
+            egraph.add(MxxLang::Switch(vec![selector, at_zero, unmatched].into_boxed_slice()));
+        let fixed = egraph.add(MxxLang::MatrixNegate([shared]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![switch, fixed].into_boxed_slice()));
+        egraph.rebuild();
+        let capture = BinderFailureEventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..2 {
+                let plan = pointwise_add_switch_cancellation_plan(&egraph, root)
+                    .expect("binder-aware cancellation plan");
+                assert!(
+                    build_pointwise_add_switch_cancellation_with_context(
+                        &mut egraph,
+                        root,
+                        plan,
+                        &context,
+                    )
+                    .is_none()
+                );
+            }
+        });
+
+        assert_eq!(capture.0.lock().expect("event capture lock").len(), 1);
     }
 
     #[test]

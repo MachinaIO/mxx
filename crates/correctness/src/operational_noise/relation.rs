@@ -17,7 +17,7 @@ use super::{
     },
     language::MxxLang,
 };
-use egg::{Applier, EGraph, Id, SearchMatches, Searcher, Subst, Symbol, Var};
+use egg::{Applier, EGraph, Id, Language, SearchMatches, Searcher, Subst, Symbol, Var};
 use num_bigint::BigInt;
 use num_traits::Zero;
 use std::{
@@ -1465,6 +1465,8 @@ struct BinderBuildReject {
     fixed_omitted: usize,
     actual_product_spines: Box<[RetainedProductSpine]>,
     fixed_product_spines: Box<[RetainedProductSpine]>,
+    actual_product_leaves: Box<[ProductLeafDiagnostic]>,
+    fixed_product_leaves: Box<[ProductLeafDiagnostic]>,
 }
 
 #[cfg(test)]
@@ -1504,6 +1506,8 @@ fn report_binder_build_reject(
         stage,
         actual_product_spines: retained_product_spines(egraph, &actual_ids).into_boxed_slice(),
         fixed_product_spines: retained_product_spines(egraph, &fixed_ids).into_boxed_slice(),
+        actual_product_leaves: retained_product_leaves(egraph, &actual_ids).into_boxed_slice(),
+        fixed_product_leaves: retained_product_leaves(egraph, &fixed_ids).into_boxed_slice(),
         actual,
         actual_omitted,
         fixed,
@@ -1526,6 +1530,8 @@ fn emit_binder_build_reject(root: Id, selector: Id, reject: &BinderBuildReject) 
             fixed_omitted = reject.fixed_omitted,
             actual_product_spines = ?reject.actual_product_spines,
             fixed_product_spines = ?reject.fixed_product_spines,
+            actual_product_leaves = ?reject.actual_product_leaves,
+            fixed_product_leaves = ?reject.fixed_product_leaves,
         );
     }
 }
@@ -1674,6 +1680,281 @@ enum RetainedFactorAdd {
     Absent,
     Unique,
     Ambiguous,
+}
+
+/// Failure-only ordered-product evidence for one retained signed root.  This
+/// is deliberately derived after the one-shot diagnostic gate: no traversal
+/// or descriptor allocation occurs on the normal rewrite path.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ProductLeafDiagnostic {
+    root: usize,
+    leaves: Box<[LeafView]>,
+    leaf_omitted: ProductLeafOmission,
+    status: ProductLeafStatus,
+}
+
+/// Exact only when the bounded traversal has ruled out any unvisited product
+/// branch. Otherwise the retained prefix is truthful and this reports the
+/// minimum number of flattened leaves known to be absent from it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum ProductLeafOmission {
+    Exact(usize),
+    AtLeast(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum ProductLeafStatus {
+    Complete,
+    Ambiguous { at: usize },
+    Cycle { at: usize },
+    Truncated { pending: usize },
+}
+
+/// A bounded view of one physical non-product leaf e-class.  Child ids are
+/// canonicalized at collection time, so the view is stable across a rebuilt
+/// e-graph without retaining nodes or paths.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct LeafView {
+    eclass: usize,
+    nodes: Box<[LeafNodeDescriptor]>,
+    nodes_omitted: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum LeafNodeDescriptor {
+    Atom {
+        source_id: u32,
+        source_kind: &'static str,
+        indices: Box<[usize]>,
+        indices_omitted: usize,
+    },
+    MatrixConstant {
+        spec: u32,
+        value_kind: &'static str,
+    },
+    HashPlain {
+        query: u32,
+        arguments: Box<[usize]>,
+        arguments_omitted: usize,
+    },
+    Switch {
+        selector: Option<usize>,
+        cases: Box<[usize]>,
+        cases_omitted: usize,
+    },
+    Other {
+        operator_name: &'static str,
+        children: Box<[usize]>,
+        children_omitted: usize,
+    },
+}
+
+fn atomic_source_kind(source: &AtomicSourceKey) -> &'static str {
+    match source {
+        AtomicSourceKey::ProtocolInput(_) => "protocol-input",
+        AtomicSourceKey::GraphWire(_) => "graph-wire",
+        AtomicSourceKey::ExplicitLarge(_) => "explicit-large",
+        AtomicSourceKey::SequentialState(_) => "sequential-state",
+        AtomicSourceKey::SequentialRecurrence { .. } => "sequential-recurrence",
+        AtomicSourceKey::Sampler(_) => "sampler",
+    }
+}
+
+fn matrix_constant_value_kind(value: &MatrixConstantValue) -> &'static str {
+    match value {
+        MatrixConstantValue::Zero => "zero",
+        MatrixConstantValue::Identity => "identity",
+        MatrixConstantValue::UnitRow { .. } => "unit-row",
+        MatrixConstantValue::UnitColumn { .. } => "unit-column",
+        MatrixConstantValue::Gadget { .. } => "gadget",
+        MatrixConstantValue::PowerOfBase { .. } => "power-of-base",
+        MatrixConstantValue::Rotation { .. } => "rotation",
+        MatrixConstantValue::Polynomial { .. } => "polynomial",
+    }
+}
+
+fn capped_canonical_children(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    children: &[Id],
+) -> (Box<[usize]>, usize) {
+    const CHILD_LIMIT: usize = 8;
+    (
+        children.iter().take(CHILD_LIMIT).map(|child| usize::from(egraph.find(*child))).collect(),
+        children.len().saturating_sub(CHILD_LIMIT),
+    )
+}
+
+fn leaf_node_descriptor(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    node: &MxxLang,
+) -> LeafNodeDescriptor {
+    match node {
+        MxxLang::Atom { source, indices } => {
+            let (indices, indices_omitted) = capped_canonical_children(egraph, indices);
+            let source_kind = egraph
+                .analysis
+                .symbols
+                .atomic_sources
+                .get(source.0)
+                .map(|descriptor| atomic_source_kind(&descriptor.key))
+                .unwrap_or("missing-source");
+            LeafNodeDescriptor::Atom { source_id: source.0, source_kind, indices, indices_omitted }
+        }
+        MxxLang::MatrixConstant(spec) => LeafNodeDescriptor::MatrixConstant {
+            spec: spec.0,
+            value_kind: egraph
+                .analysis
+                .symbols
+                .matrix_constants
+                .get(spec.0)
+                .map(|constant| matrix_constant_value_kind(&constant.value))
+                .unwrap_or("missing-spec"),
+        },
+        MxxLang::HashPlain { query, arguments } => {
+            let (arguments, arguments_omitted) = capped_canonical_children(egraph, arguments);
+            LeafNodeDescriptor::HashPlain { query: query.0, arguments, arguments_omitted }
+        }
+        MxxLang::Switch(cases) => {
+            let selector = cases.first().map(|selector| usize::from(egraph.find(*selector)));
+            let (cases, cases_omitted) =
+                capped_canonical_children(egraph, cases.get(1..).unwrap_or_default());
+            LeafNodeDescriptor::Switch { selector, cases, cases_omitted }
+        }
+        other => {
+            let (children, children_omitted) = capped_canonical_children(egraph, other.children());
+            LeafNodeDescriptor::Other {
+                operator_name: other.operator_name(),
+                children,
+                children_omitted,
+            }
+        }
+    }
+}
+
+fn leaf_view(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> LeafView {
+    const NODE_LIMIT: usize = 4;
+    let id = egraph.find(id);
+    let mut nodes = egraph[id].nodes.iter().collect::<Vec<_>>();
+    nodes.sort_unstable();
+    let nodes_omitted = nodes.len().saturating_sub(NODE_LIMIT);
+    LeafView {
+        eclass: usize::from(id),
+        nodes: nodes
+            .into_iter()
+            .take(NODE_LIMIT)
+            .map(|node| leaf_node_descriptor(egraph, node))
+            .collect(),
+        nodes_omitted,
+    }
+}
+
+fn retained_product_leaves(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    roots: &[Id],
+) -> Vec<ProductLeafDiagnostic> {
+    const LEAF_LIMIT: usize = 16;
+    const PRODUCT_VISIT_LIMIT: usize = 32;
+
+    enum ProductWork {
+        Visit(Id),
+        Exit(Id),
+        Schedule { factors: Box<[Id]>, next: usize },
+    }
+
+    fn pending_product_work(work: &[ProductWork]) -> usize {
+        work.iter()
+            .map(|item| match item {
+                ProductWork::Visit(_) => 1,
+                ProductWork::Exit(_) => 0,
+                ProductWork::Schedule { factors, next } => factors.len().saturating_sub(*next),
+            })
+            .sum()
+    }
+
+    roots
+        .iter()
+        .map(|root| {
+            let root = egraph.find(*root);
+            let mut leaves = Vec::new();
+            let mut work = vec![ProductWork::Visit(root)];
+            let mut active = HashSet::new();
+            let mut visits = 0;
+            let (status, leaf_omitted) = loop {
+                let Some(item) = work.pop() else {
+                    break (ProductLeafStatus::Complete, ProductLeafOmission::Exact(0));
+                };
+                match item {
+                    ProductWork::Exit(term) => {
+                        active.remove(&term);
+                    }
+                    ProductWork::Schedule { factors, next } => {
+                        if let Some(factor) = factors.get(next).copied() {
+                            work.push(ProductWork::Schedule { factors, next: next + 1 });
+                            work.push(ProductWork::Visit(egraph.find(factor)));
+                        }
+                    }
+                    ProductWork::Visit(term) => {
+                        let term = egraph.find(term);
+                        if visits == PRODUCT_VISIT_LIMIT {
+                            break (
+                                ProductLeafStatus::Truncated {
+                                    pending: pending_product_work(&work) + 1,
+                                },
+                                ProductLeafOmission::AtLeast(0),
+                            );
+                        }
+                        visits += 1;
+                        match physical_product_factors(egraph, term) {
+                            PhysicalStructure::Absent => {
+                                if leaves.len() == LEAF_LIMIT {
+                                    let pending = pending_product_work(&work) + 1;
+                                    break (
+                                        ProductLeafStatus::Truncated { pending },
+                                        if pending == 1 {
+                                            ProductLeafOmission::Exact(1)
+                                        } else {
+                                            ProductLeafOmission::AtLeast(1)
+                                        },
+                                    );
+                                }
+                                leaves.push(leaf_view(egraph, term));
+                            }
+                            PhysicalStructure::Ambiguous => {
+                                break (
+                                    ProductLeafStatus::Ambiguous { at: usize::from(term) },
+                                    if pending_product_work(&work) == 0 {
+                                        ProductLeafOmission::Exact(0)
+                                    } else {
+                                        ProductLeafOmission::AtLeast(0)
+                                    },
+                                );
+                            }
+                            PhysicalStructure::Unique(factors) => {
+                                if !active.insert(term) {
+                                    break (
+                                        ProductLeafStatus::Cycle { at: usize::from(term) },
+                                        if pending_product_work(&work) == 0 {
+                                            ProductLeafOmission::Exact(0)
+                                        } else {
+                                            ProductLeafOmission::AtLeast(0)
+                                        },
+                                    );
+                                }
+                                work.push(ProductWork::Exit(term));
+                                work.push(ProductWork::Schedule { factors, next: 0 });
+                            }
+                        }
+                    }
+                }
+            };
+            ProductLeafDiagnostic {
+                root: usize::from(root),
+                leaf_omitted,
+                leaves: leaves.into_boxed_slice(),
+                status,
+            }
+        })
+        .collect()
 }
 
 fn retained_factor_add(egraph: &EGraph<MxxLang, MxxAnalysis>, factor: Id) -> RetainedFactorAdd {
@@ -4376,6 +4657,147 @@ mod tests {
                 omitted: 1,
             }]
         );
+    }
+
+    #[test]
+    fn binder_build_flattened_product_views_preserve_association_and_order() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "flatten-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "flatten-second", None);
+        let (third, _) = matrix_atom(&mut egraph, "flatten-third", None);
+        let first_second =
+            egraph.add(MxxLang::MatrixMultiply(vec![first, second].into_boxed_slice()));
+        let left_associated =
+            egraph.add(MxxLang::MatrixMultiply(vec![first_second, third].into_boxed_slice()));
+        let second_third =
+            egraph.add(MxxLang::MatrixMultiply(vec![second, third].into_boxed_slice()));
+        let right_associated =
+            egraph.add(MxxLang::MatrixMultiply(vec![first, second_third].into_boxed_slice()));
+        let reordered =
+            egraph.add(MxxLang::MatrixMultiply(vec![second, first, third].into_boxed_slice()));
+        let shorter = egraph.add(MxxLang::MatrixMultiply(vec![first, second].into_boxed_slice()));
+        egraph.rebuild();
+
+        let views = retained_product_leaves(
+            &egraph,
+            &[left_associated, right_associated, reordered, shorter],
+        );
+        assert_eq!(views[0].status, ProductLeafStatus::Complete);
+        assert_eq!(views[0].leaves, views[1].leaves, "association is flattened");
+        assert_ne!(views[0].leaves, views[2].leaves, "factor order is retained");
+        assert_ne!(views[0].leaves, views[3].leaves, "arity is retained");
+    }
+
+    #[test]
+    fn binder_build_flattened_product_views_describe_generic_leaf_nodes() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let index = egraph.add(MxxLang::IntConst(7.into()));
+        let atom = indexed_matrix_atom(&mut egraph, &[index], "view-atom");
+        let constant_spec = egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type: scalar_matrix_type(),
+                value: MatrixConstantValue::Identity,
+            },
+        );
+        let constant = egraph.add(MxxLang::MatrixConstant(
+            super::super::identity::MatrixConstantSpecId(constant_spec),
+        ));
+        let query = HashQuerySpecId(egraph.analysis.symbols.hash_queries.intern(HashQuerySpec {
+            matrix_type: scalar_matrix_type(),
+            tag_program: Box::new([]),
+        }));
+        let hash = egraph
+            .add(MxxLang::HashPlain { query, arguments: vec![atom, constant].into_boxed_slice() });
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let switch = egraph.add(MxxLang::Switch(vec![selector, atom, constant].into_boxed_slice()));
+        let other = egraph.add(MxxLang::MatrixAdd(vec![atom, constant].into_boxed_slice()));
+        egraph.rebuild();
+
+        let views = retained_product_leaves(&egraph, &[atom, constant, hash, switch, other]);
+        assert!(matches!(
+            views[0].leaves[0].nodes[0],
+            LeafNodeDescriptor::Atom { source_kind: "protocol-input", indices_omitted: 0, .. }
+        ));
+        assert!(matches!(
+            views[1].leaves[0].nodes[0],
+            LeafNodeDescriptor::MatrixConstant { value_kind: "identity", .. }
+        ));
+        assert!(matches!(
+            views[2].leaves[0].nodes[0],
+            LeafNodeDescriptor::HashPlain { query: 0, arguments_omitted: 0, .. }
+        ));
+        assert!(matches!(
+            views[3].leaves[0].nodes[0],
+            LeafNodeDescriptor::Switch { selector: Some(_), cases_omitted: 0, .. }
+        ));
+        assert!(matches!(
+            views[4].leaves[0].nodes[0],
+            LeafNodeDescriptor::Other { operator_name: "matrix-add", children_omitted: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn binder_build_flattened_product_views_report_ambiguous_cycle_and_truncation() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "flatten-status-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "flatten-status-second", None);
+        let ambiguous = egraph.add(MxxLang::MatrixMultiply(vec![first, second].into_boxed_slice()));
+        let alternate = egraph.add(MxxLang::MatrixMultiply(vec![second, first].into_boxed_slice()));
+        egraph.union(ambiguous, alternate);
+        let (cycle_leaf, _) = matrix_atom(&mut egraph, "flatten-status-cycle", None);
+        let cyclic = egraph.add(MxxLang::MatrixMultiply(vec![cycle_leaf].into_boxed_slice()));
+        egraph.union(cyclic, cycle_leaf);
+        let (trailing, _) = matrix_atom(&mut egraph, "flatten-status-trailing", None);
+        let ambiguous_then_trailing =
+            egraph.add(MxxLang::MatrixMultiply(vec![ambiguous, trailing].into_boxed_slice()));
+        let cycle_then_trailing =
+            egraph.add(MxxLang::MatrixMultiply(vec![cyclic, trailing].into_boxed_slice()));
+        let wide_factors = (0..65)
+            .map(|index| matrix_atom(&mut egraph, &format!("flatten-wide-{index}"), None).0)
+            .collect::<Vec<_>>();
+        let wide = egraph.add(MxxLang::MatrixMultiply(wide_factors.into_boxed_slice()));
+        let (deep_leaf, _) = matrix_atom(&mut egraph, "flatten-deep", None);
+        let deep = (0..33).fold(deep_leaf, |child, _| {
+            egraph.add(MxxLang::MatrixMultiply(vec![child].into_boxed_slice()))
+        });
+        egraph.rebuild();
+
+        let views = retained_product_leaves(
+            &egraph,
+            &[ambiguous, cyclic, wide, deep, ambiguous_then_trailing, cycle_then_trailing],
+        );
+        assert!(matches!(views[0].status, ProductLeafStatus::Ambiguous { .. }));
+        assert!(matches!(views[1].status, ProductLeafStatus::Cycle { .. }));
+        assert_eq!(views[2].leaves.len(), 16);
+        assert_eq!(views[2].leaf_omitted, ProductLeafOmission::AtLeast(1));
+        assert_eq!(views[2].status, ProductLeafStatus::Truncated { pending: 49 });
+        assert!(views[3].leaves.is_empty());
+        assert!(matches!(views[3].status, ProductLeafStatus::Truncated { .. }));
+        assert!(matches!(views[4].status, ProductLeafStatus::Ambiguous { .. }));
+        assert_eq!(views[4].leaf_omitted, ProductLeafOmission::AtLeast(0));
+        assert!(matches!(views[5].status, ProductLeafStatus::Cycle { .. }));
+        assert_eq!(views[5].leaf_omitted, ProductLeafOmission::AtLeast(0));
+    }
+
+    #[test]
+    fn binder_build_disabled_diagnostic_gate_does_not_traverse_rejected_roots() {
+        let egraph = EGraph::new(MxxAnalysis::default());
+        let mut checks = 0;
+        let mut sink_called = false;
+        report_binder_build_reject(
+            &egraph,
+            0,
+            BinderBuildRejectStage::NoExactCancellation,
+            &[(Id::from(usize::MAX), false)],
+            &[],
+            &mut || {
+                checks += 1;
+                false
+            },
+            &mut |_| sink_called = true,
+        );
+        assert_eq!(checks, 1);
+        assert!(!sink_called);
     }
 
     #[test]

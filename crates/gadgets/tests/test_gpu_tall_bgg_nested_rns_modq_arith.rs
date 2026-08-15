@@ -2014,7 +2014,9 @@ fn noiseless_runtime_config() -> TestConfig {
         benchmark_iterations: 1,
         run_mode: TallRunMode::Full,
         parameter_simulation_parallelism: 1,
-        preimage_progress_interval: 1,
+        // Keep the 31,232-preimage smoke run observable without logging once
+        // per preimage (about 122 quantitative progress reports).
+        preimage_progress_interval: 256,
         max_parallel_instances: 1,
         preprocessing_parallel_instances: 1,
         release_fence_interval: 1,

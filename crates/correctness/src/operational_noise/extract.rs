@@ -17,8 +17,8 @@ use super::{
     identity::{AtomicRelationRole, AtomicSourceId},
     language::MxxLang,
     relation::{
-        AddNormalizationProbe, PointwiseAddSwitchReject, pointwise_add_switch_cancellation_reason,
-        probe_exact_additive_normalization,
+        AddNormalizationProbe, PointwiseAddSwitchProbe, PointwiseAddSwitchReject,
+        PointwiseDirectProbe, pointwise_add_switch_probe, probe_exact_additive_normalization,
     },
 };
 use egg::{EGraph, Id, Language, RecExpr};
@@ -311,7 +311,13 @@ struct SelectedLargePathStep {
     selected_cost: ProposalCost,
     add_normalization: Option<AddNormalizationProbe>,
     normalized_cost: Option<ProposalCost>,
-    pointwise_add_switch_reject: Option<PointwiseAddSwitchReject>,
+    /// The bounded outcome for every inspected eligible structure.  This is
+    /// the authoritative pointwise diagnostic; it never substitutes one
+    /// direct candidate's rejection for the whole e-class result.
+    pointwise_add_switch_probe: Option<PointwiseAddSwitchProbe>,
+    /// Detail-only first direct rejection used by the older product/sampler
+    /// views below.  Its field name makes the limited scope explicit.
+    pointwise_first_direct_reject: Option<PointwiseAddSwitchReject>,
     pointwise_negative_fixed_views: Option<Box<[SelectedClassView]>>,
     pointwise_negative_fixed_paths: Option<Box<[SelectedNegativeFixedPath]>>,
     /// Read-only stored-case evidence for a sampler-index mismatch across one
@@ -344,7 +350,8 @@ impl fmt::Debug for SelectedLargePathStep {
             .field("selected_cost", &self.selected_cost)
             .field("add_normalization", &self.add_normalization)
             .field("normalized_cost", &self.normalized_cost)
-            .field("pointwise_add_switch_reject", &self.pointwise_add_switch_reject)
+            .field("pointwise_add_switch_probe", &self.pointwise_add_switch_probe)
+            .field("pointwise_first_direct_reject", &self.pointwise_first_direct_reject)
             .field("pointwise_negative_fixed_views", &self.pointwise_negative_fixed_views)
             .field("pointwise_negative_fixed_paths", &self.pointwise_negative_fixed_paths)
             .field("pointwise_switch_sampler_cases", &self.pointwise_switch_sampler_cases)
@@ -1720,15 +1727,20 @@ fn selected_large_path_from<I: BoundInput>(
             }
             _ => None,
         };
-        let pointwise_add_switch_reject = matches!(node, MxxLang::MatrixAdd(_))
-            .then(|| pointwise_add_switch_cancellation_reason(egraph, current).err())
-            .flatten();
+        let pointwise_add_switch_probe = matches!(node, MxxLang::MatrixAdd(_))
+            .then(|| pointwise_add_switch_probe(egraph, current));
+        let pointwise_first_direct_reject = pointwise_add_switch_probe.as_ref().and_then(|probe| {
+            probe.outcomes.iter().find_map(|outcome| match &outcome.direct {
+                PointwiseDirectProbe::Rejected(reject) => Some(reject.clone()),
+                PointwiseDirectProbe::Ready => None,
+            })
+        });
         let pointwise_negative_fixed_views =
-            negative_fixed_term_views(pointwise_add_switch_reject.as_ref(), egraph, candidates);
+            negative_fixed_term_views(pointwise_first_direct_reject.as_ref(), egraph, candidates);
         let pointwise_negative_fixed_paths = include_negative_fixed_paths
             .then(|| {
                 negative_fixed_term_paths(
-                    pointwise_add_switch_reject.as_ref(),
+                    pointwise_first_direct_reject.as_ref(),
                     egraph,
                     candidates,
                     bound_input,
@@ -1736,12 +1748,12 @@ fn selected_large_path_from<I: BoundInput>(
             })
             .flatten();
         let pointwise_switch_sampler_cases = pointwise_switch_sampler_cases(
-            pointwise_add_switch_reject.as_ref(),
+            pointwise_first_direct_reject.as_ref(),
             egraph,
             candidates,
         );
         let pointwise_fixed_product_spines =
-            fixed_product_spines(pointwise_add_switch_reject.as_ref(), egraph, candidates);
+            fixed_product_spines(pointwise_first_direct_reject.as_ref(), egraph, candidates);
         let (
             add_selected_large_child_count,
             add_direct_child_views,
@@ -1814,7 +1826,8 @@ fn selected_large_path_from<I: BoundInput>(
             selected_cost: candidate.cost.clone(),
             add_normalization,
             normalized_cost,
-            pointwise_add_switch_reject,
+            pointwise_add_switch_probe,
+            pointwise_first_direct_reject,
             pointwise_negative_fixed_views,
             pointwise_negative_fixed_paths,
             pointwise_switch_sampler_cases,
@@ -2929,9 +2942,14 @@ mod tests {
         let candidates = diagnostic_candidates(&egraph, &[root, switch, first_case, second_case]);
         let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
 
+        let probe = steps
+            .first()
+            .and_then(|step| step.pointwise_add_switch_probe.as_ref())
+            .expect("selected Add uses the shared pointwise probe");
+        assert_eq!(probe.outcomes.len(), 1);
         assert!(matches!(
-            steps.first().and_then(|step| step.pointwise_add_switch_reject.as_ref()),
-            Some(PointwiseAddSwitchReject::UnmatchedFixedTerms {
+            &probe.outcomes[0].direct,
+            PointwiseDirectProbe::Rejected(PointwiseAddSwitchReject::UnmatchedFixedTerms {
                 case_index: 0,
                 matched: 0,
                 required: 1,
@@ -3271,7 +3289,7 @@ mod tests {
         let steps = selected_source_less_large_diagnostic(&egraph, root, &candidates, &NoBounds);
         let root_step = steps.first().expect("root Add diagnostic");
         let (rejection_selector, rejection_cases) =
-            match root_step.pointwise_add_switch_reject.as_ref().expect("pointwise rejection") {
+            match root_step.pointwise_first_direct_reject.as_ref().expect("pointwise rejection") {
                 PointwiseAddSwitchReject::UnmatchedFixedTerms {
                     physical_root_adds,
                     eligible_single_switch_adds,

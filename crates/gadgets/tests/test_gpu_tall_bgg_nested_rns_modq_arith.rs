@@ -6,11 +6,12 @@ use mxx_bench_estimator::{
     harness::MeasurementHarnessConfig,
 };
 use mxx_bgg::{
-    BggPublicKeyCompiler, BggPublicKeySampler, BggPublicKeyWire, BggSamplerLayout,
+    BggEncodingWire, BggPublicKeyCompiler, BggPublicKeySampler, BggPublicKeyWire, BggSamplerLayout,
     BggSlotTransferArtifactCompiler, BggSlotTransferGateArtifacts,
     BggSlotTransferPublicKeyLowering, BggSlotTransferPublicSlotWires, BggSlotTransferSlotArtifacts,
     BggTallEncodingCompiler, BggTallEncodingSampler, BggTallPlaintext, BggTallSlotLowering,
-    BggTallSlotPublicKeyLowering, LweLookupPreprocessingLowering, LweLookupPublicKeyLowering,
+    BggTallSlotPublicKeyLowering, LweLookupArtifactNames, LweLookupArtifacts, LweLookupCompiler,
+    LweLookupIdentity, LweLookupPreprocessingLowering, LweLookupPublicKeyLowering, LweLookupTable,
     LweLookupTallEncodingLowering, PolyCircuitCompiler, TallRotationEncodingArtifacts,
     TallRotationEncodingCompiler, bind_lwe_lookup_invocations, required_tall_rotation_encodings,
 };
@@ -19,8 +20,9 @@ use mxx_correctness::{
     EndpointSemanticBinding, EndpointSpecId, ExactMatrixInputMetadata, OperationalDecoderKind,
     OperationalDecoderTarget, OutputRef, StageId,
     operational_noise::{
-        OperationalCheckRequest, OperationalGadgetLayout, OperationalSimulationReport,
-        ProgressEventKind, check_operational_noise_candidate_with_progress,
+        OperationalCheckRequest, OperationalGadgetLayout, OperationalSimulationError,
+        OperationalSimulationReport, ProgressEventKind, bound::BoundEvaluationError,
+        check_operational_noise_candidate_with_progress, error::BoundError,
     },
     operational_protocol_from_graphs,
 };
@@ -42,6 +44,7 @@ use mxx_ir_core::{
     },
     encoding::spec_hash,
     node::{IndexRange, NodeKind},
+    types::MatrixType,
 };
 use mxx_primitives::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
@@ -1853,6 +1856,209 @@ fn runtime_verification(
 #[test]
 fn selected_parameters_produce_exactly_one_candidate() {
     assert_eq!(candidate_dimensions(1, 16, 3, 8, Some((7, 5))), vec![(7, 5)]);
+}
+
+fn single_lwe_public_lut_signal_check(
+    residual_from_signal: impl FnOnce(mxx_dsl::Mat) -> mxx_dsl::Mat,
+) -> Result<OperationalSimulationReport, OperationalSimulationError> {
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+    let digit_count = parameters.modulus_digits();
+    let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+    let ring = Ring::new(modulus.clone(), parameters.ring_dimension() as usize);
+    let matrix_type = |rows, columns| MatrixType {
+        modulus: IntExpr::constant(modulus.clone()),
+        ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+        rows: IntExpr::constant(rows),
+        columns: IntExpr::constant(columns),
+    };
+    let mut circuit = PolyCircuit::<DCRTPoly>::new();
+    let input_gate = circuit.input(1).as_single_wire();
+    let lookup_id = circuit.register_public_lookup(
+        mxx_gadgets::circuit::PublicLutProgram::new(2, mxx_gadgets::circuit::LutExpr::input())
+            .expect("identity public LUT"),
+    );
+    let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
+    circuit.output([output_gate]);
+    let lookup = LweLookupCompiler {
+        identity: LweLookupIdentity {
+            call_path: Vec::new(),
+            gate: output_gate.as_single_wire().index(),
+            occurrence: 0,
+            lookup: lookup_id,
+            slot: None,
+        },
+        table: LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
+            .expect("lookup table"),
+        public_key_type: matrix_type(1, digit_count),
+        low_matrix_type: matrix_type(digit_count, digit_count),
+        high_matrix_type: matrix_type(digit_count + 2, digit_count),
+        gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
+        digit_count: IntExpr::constant(digit_count),
+    };
+    let production = ProductionId {
+        spec_hash: mxx_ir_core::artifact::SpecHash([6; 32]),
+        execution_nonce: [9; 32],
+    };
+    let artifacts = LweLookupArtifacts::for_compiler(production, &lookup);
+    let trapdoor = ring.sample_trapdoor(
+        1,
+        5,
+        lookup.gadget_base.clone(),
+        lookup.digit_count.clone(),
+        1_000_000,
+    );
+    let preprocessing = lookup
+        .preprocess(
+            ring.bytes_input("single-lwe-public-lut-hash-key", 32),
+            &BggPublicKeyWire { matrix: ring.zero((1, digit_count)), reveal_plaintext: true },
+            &trapdoor,
+        )
+        .expect("LWE public-LUT preprocessing");
+    let producer = lookup
+        .export_preprocessing(
+            DslContext::new("single-lwe-public-lut-producer"),
+            preprocessing,
+            &LweLookupArtifactNames::for_compiler(&lookup),
+        )
+        .expect("public-LUT artifacts")
+        .build()
+        .expect("public-LUT producer graph");
+    let output = lookup
+        .encoding(
+            &BggEncodingWire {
+                vector: ring.zero((1, digit_count)),
+                pubkey: BggPublicKeyWire {
+                    matrix: ring.zero((1, digit_count)),
+                    reveal_plaintext: true,
+                },
+                plaintext: Some(ring.polynomial([IntExpr::constant(0)])),
+            },
+            &ring.zero((1, digit_count + 2)),
+            &lookup.import_artifacts(&artifacts).expect("imported public-LUT artifacts"),
+        )
+        .expect("one public-LUT evaluation");
+    let output_plaintext = output.plaintext.expect("public-LUT output plaintext");
+    let secret = ring.uniform_interval((1, 1), -1, 1);
+    let gadget = ring.gadget(1, lookup.gadget_base.clone(), lookup.digit_count.clone());
+    let first_column = Some(IndexRange { start: IntExpr::constant(0), end: IntExpr::constant(1) });
+    let signal = secret.clone() * output.pubkey.matrix.slice(None, first_column.clone()) -
+        output_plaintext * secret * gadget.slice(None, first_column);
+    let residual = residual_from_signal(signal);
+    let decoded = residual
+        .clone()
+        .threshold_decode_bools(2, 1)
+        .into_iter()
+        .next()
+        .expect("one threshold output")
+        .semantic_anchor("single-lwe-public-lut.decoder")
+        .expect("decoder anchor");
+    let encoding = DslContext::new("single-lwe-public-lut-encoding")
+        .private_output("residual", residual)
+        .expect("residual output")
+        .bool_output("decoded", decoded)
+        .expect("decoder output")
+        .build()
+        .expect("public-LUT encoding graph");
+    let decoder_node = encoding.graph.outputs()["decoded"].value.node;
+    let endpoint = EndpointSpecId::ToyThresholdDecode;
+    let ideal = IdealSpec::new(
+        DslContext::new("single-lwe-public-lut-ideal")
+            .bool_output("decoded", Bool::constant(false))
+            .expect("ideal output")
+            .build()
+            .expect("ideal graph"),
+    )
+    .expect("sampler-free ideal");
+    let decoder_stage = StageId("encoding".to_owned());
+    let protocol = operational_protocol_from_graphs(
+        vec![("producer".to_owned(), &producer), ("encoding".to_owned(), &encoding)],
+        "encoding",
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        |bundle| {
+            bundle.ideal = ideal;
+            bundle.comparator = ComparatorSpec::Equality {
+                endpoints: vec![ComparatorEndpointBinding {
+                    endpoint,
+                    actual_input: "decoded".to_owned(),
+                    ideal_input: "decoded".to_owned(),
+                    result_output: "failure".to_owned(),
+                    failure_value: true,
+                }],
+            };
+            bundle.endpoints = EndpointAnchors {
+                entries: vec![EndpointAnchor {
+                    spec: endpoint,
+                    stage: decoder_stage.clone(),
+                    semantic_anchor: "single-lwe-public-lut.decoder".to_owned(),
+                    semantics: EndpointSemanticBinding::ThresholdDecode,
+                    workflow_output: OutputRef {
+                        stage: decoder_stage.clone(),
+                        output: "decoded".to_owned(),
+                    },
+                    ideal_output: "decoded".to_owned(),
+                }],
+            };
+            bundle.operational_decoder_targets = vec![OperationalDecoderTarget {
+                target_id: "single-lwe-public-lut".to_owned(),
+                residual_stage: decoder_stage.clone(),
+                residual_output: "residual".to_owned(),
+                decoder_stage,
+                decoder_node,
+                kind: OperationalDecoderKind::ThresholdDecode {
+                    plaintext_modulus: IntExpr::constant(2),
+                },
+            }];
+            bundle.endpoint_specs = vec![endpoint];
+        },
+    )
+    .expect("operational public-LUT protocol");
+    let (crt_moduli, crt_bits, _) = parameters.to_crt();
+    let base_bits = parameters.base_bits() as usize;
+    let request = OperationalCheckRequest {
+        environment: Vec::new(),
+        layouts: vec![OperationalGadgetLayout {
+            params_id: "single-lwe-public-lut".to_owned(),
+            ring_dimension: parameters.ring_dimension() as usize,
+            crt_moduli: crt_moduli.clone(),
+            crt_bits,
+            base_bits,
+            base: BigInt::from(1u8) << base_bits,
+            regular_digit_count: crt_bits.div_ceil(base_bits) * crt_moduli.len(),
+            small_digit_count: crt_bits.div_ceil(base_bits),
+            smallest_crt_modulus: *crt_moduli.iter().min().expect("CRT modulus"),
+        }],
+        target_id: "single-lwe-public-lut".to_owned(),
+    };
+    check_operational_noise_candidate_with_progress(&protocol, &request, |_| {})
+}
+
+#[test]
+fn single_lwe_public_lut_raw_signal_is_an_unconsumed_large_term() {
+    let error = single_lwe_public_lut_signal_check(|signal| signal)
+        .expect_err("an uncancelled public-LUT signal must remain Large");
+    let OperationalSimulationError::Bound {
+        source:
+            BoundError::EvaluationFailed { source: BoundEvaluationError::UnconsumedLargeTerm { .. } },
+        ..
+    } = error
+    else {
+        panic!("raw public-LUT signal must reject as an unconsumed Large term: {error:?}")
+    };
+}
+
+#[test]
+fn single_lwe_public_lut_signal_subtraction_cancels_in_the_operational_checker() {
+    let report = single_lwe_public_lut_signal_check(|signal| signal.clone() - signal)
+        .expect("the exact same public-LUT signal must cancel under subtraction");
+    assert_eq!(report.noise_bound, BigUint::zero());
+}
+
+#[test]
+fn single_lwe_public_lut_signal_add_negate_cancels_in_the_operational_checker() {
+    let report = single_lwe_public_lut_signal_check(|signal| signal.clone() + -signal)
+        .expect("the exact same public-LUT signal must cancel under Add + Negate");
+    assert_eq!(report.noise_bound, BigUint::zero());
 }
 
 #[test]

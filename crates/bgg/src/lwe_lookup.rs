@@ -1488,7 +1488,11 @@ mod tests {
     };
     use mxx_dsl::DslContext;
     use mxx_gadgets::circuit::{LutExpr, PolyCircuit, PublicLutProgram};
-    use mxx_ir_core::{ParamEnv, artifact::SpecHash, node::NodeKind};
+    use mxx_ir_core::{
+        ParamEnv,
+        artifact::{ArtifactConfidentiality, SpecHash},
+        node::{ConstantMatrix, MatrixBinaryOp, NodeKind},
+    };
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -2073,6 +2077,152 @@ mod tests {
             nodes.iter().filter(|node| matches!(node.kind(), NodeKind::Select { .. })).count(),
             1
         );
+    }
+
+    #[test]
+    fn single_public_lookup_keeps_the_output_signal_in_secret_public_key_gadget_order() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let digit_count = parameters.modulus_digits();
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let input_gate = circuit.input(1).as_single_wire();
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
+        circuit.output([output_gate]);
+        let lookup = compiler(
+            &parameters,
+            LweLookupIdentity {
+                call_path: Vec::new(),
+                gate: output_gate.as_single_wire().index(),
+                occurrence: 0,
+                lookup: lookup_id,
+                slot: None,
+            },
+            LweLookupTable::from_public_lut(circuit.lookup_table(lookup_id).as_ref())
+                .expect("table"),
+        );
+        let production_id = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [8; 32] };
+        let output_public_key_artifact =
+            LweLookupArtifactNames::for_compiler(&lookup).output_public_key;
+        let invocation = LweLookupInvocation::bind(
+            lookup.clone(),
+            LweLookupArtifacts::for_compiler(production_id.clone(), &lookup),
+            &parameters,
+            &circuit,
+        )
+        .expect("invocation");
+        let ring = lookup.ring();
+        let circuit_compiler = crate::PolyCircuitCompiler {
+            public_key: BggPublicKeyCompiler {
+                ring: ring.clone(),
+                base: lookup.gadget_base.clone(),
+                digit_count: lookup.digit_count.clone(),
+            },
+        };
+        let encoding = |prefix: &str| BggEncodingWire {
+            vector: ring.input(format!("{prefix}-vector"), (1, digit_count)),
+            pubkey: BggPublicKeyWire {
+                matrix: ring.input(format!("{prefix}-public"), (1, digit_count)),
+                reveal_plaintext: true,
+            },
+            plaintext: Some(ring.input(format!("{prefix}-plaintext"), (1, 1))),
+        };
+        let input_encoding = encoding("input");
+        let input_plaintext = input_encoding.plaintext.clone().expect("input plaintext");
+        let mut lowering =
+            LweLookupEncodingLowering::new([invocation], ring.input("c-b", (1, digit_count + 2)))
+                .expect("lowering");
+        let mut slots = crate::NoSlotOperations::default();
+        let output = circuit_compiler
+            .compile_encodings_with_lowerings(
+                &circuit,
+                encoding("one"),
+                [input_encoding],
+                &mut lowering,
+                &mut slots,
+            )
+            .expect("lookup lowering")
+            .into_iter()
+            .next()
+            .expect("one LUT output");
+        let output_plaintext = output.plaintext.clone().expect("lookup output plaintext");
+        let secret = ring.input("lookup-secret", (1, 1));
+        let gadget = ring.gadget(1, lookup.gadget_base.clone(), lookup.digit_count.clone());
+        let signal = secret.clone() * output.pubkey.matrix.clone() -
+            output_plaintext.clone() * secret.clone() * gadget.clone();
+
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) = signal.value_handle().node().kind()
+        else {
+            panic!("lookup signal must be a subtraction")
+        };
+        let [left, right] = signal.value_handle().node().arguments() else {
+            panic!("lookup signal subtraction must have two operands")
+        };
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = left.node().kind() else {
+            panic!("lookup signal left side must be secret times output public key")
+        };
+        assert_eq!(
+            left.node().arguments(),
+            [secret.value_handle().clone(), output.pubkey.matrix.value_handle().clone()]
+        );
+        let NodeKind::Input { artifact: Some(artifact), .. } =
+            output.pubkey.matrix.value_handle().node().kind()
+        else {
+            panic!("lookup output public key must be imported from its exact artifact")
+        };
+        assert_eq!(artifact.production_id, production_id);
+        assert_eq!(artifact.artifact_name, output_public_key_artifact);
+        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
+
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = right.node().kind() else {
+            panic!("lookup signal right side must end with a gadget multiplication")
+        };
+        let [plaintext_times_secret, right_gadget] = right.node().arguments() else {
+            panic!("lookup signal gadget product must have two operands")
+        };
+        assert_eq!(right_gadget, gadget.value_handle());
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = plaintext_times_secret.node().kind()
+        else {
+            panic!("lookup signal must multiply its plaintext by the secret before the gadget")
+        };
+        assert_eq!(
+            plaintext_times_secret.node().arguments(),
+            [output_plaintext.value_handle().clone(), secret.value_handle().clone()]
+        );
+        let NodeKind::Select { count } = output_plaintext.value_handle().node().kind() else {
+            panic!("one public LUT output must select a table constant")
+        };
+        assert_eq!(count, &IntExpr::constant(2));
+        let [selector, zero, one] = output_plaintext.value_handle().node().arguments() else {
+            panic!("identity LUT select must have one selector and exactly two branches")
+        };
+        let NodeKind::ExtractCoefficient { position, canonical_input_exclusive_upper } =
+            selector.node().kind()
+        else {
+            panic!("lookup selector must be the input plaintext's constant coefficient")
+        };
+        assert_eq!(position, &IntExpr::constant(0));
+        assert_eq!(canonical_input_exclusive_upper, &None);
+        assert_eq!(selector.node().arguments(), [input_plaintext.value_handle().clone()]);
+        assert!(matches!(
+            zero.node().kind(),
+            NodeKind::ConstantMatrix {
+                value: ConstantMatrix::Polynomial { coefficients },
+                ..
+            } if coefficients.as_slice() == [IntExpr::constant(0)]
+        ));
+        assert!(matches!(
+            one.node().kind(),
+            NodeKind::ConstantMatrix {
+                value: ConstantMatrix::Polynomial { coefficients },
+                ..
+            } if coefficients.as_slice() == [IntExpr::constant(1)]
+        ));
+
+        DslContext::new("single-lwe-public-lookup-signal")
+            .output("signal", signal)
+            .expect("signal output")
+            .build()
+            .expect("signal graph");
     }
 
     #[test]

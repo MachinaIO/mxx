@@ -1124,6 +1124,65 @@ impl<P: Poly> NestedRnsPoly<P> {
         sum_mod_q.as_single_wire()
     }
 
+    /// Reconstructs each active q-level only into its coefficient's q1 anchor.
+    ///
+    /// The returned wire is intentionally not a full-lane reconstruction: for
+    /// coefficient `c`, only slot `c * q_moduli_depth` is authoritative.  This
+    /// path is for Tall's anchor consumer, which reads exactly those slots.  It
+    /// uses cyclic slot rotations rather than ordinary reconstruction transfers,
+    /// while leaving [`Self::reconstruct`] unchanged for callers that require
+    /// every lane to be valid.
+    pub fn reconstruct_q1_anchors(&self, circuit: &mut PolyCircuit<P>) -> Q1AnchorReconstruction {
+        let operand = self.prepare_for_reconstruct(circuit);
+        let levels = operand.resolve_enable_levels();
+        let active_moduli = operand.active_q_moduli();
+        let active_modulus =
+            active_moduli.iter().fold(BigUint::from(1u64), |acc, &q_i| acc * BigUint::from(q_i));
+        let (ys, w) = operand.decomposition_terms(circuit);
+        let mut x_prime = circuit.const_zero_gate();
+        for (p_idx, y_i) in ys.into_iter().enumerate() {
+            let scaled = circuit.large_scalar_mul(y_i, &[operand.ctx.p_over_pis[p_idx].clone()]);
+            x_prime = circuit.add_gate(x_prime, scaled);
+        }
+        let pv = circuit.large_scalar_mul(w, &[operand.ctx.p_full.clone()]);
+        x_prime = circuit.sub_gate(x_prime, pv);
+
+        let lanes = operand.ctx.q_moduli_depth;
+        let physical_slots = operand
+            .num_coefficient_slots
+            .checked_mul(lanes)
+            .expect("nested-RNS physical slot count overflow");
+        let mut anchors = circuit.const_zero_gate();
+        for a in 0..levels {
+            let q_i_big = BigUint::from(active_moduli[a]);
+            let q_over_qi = &active_modulus / &q_i_big;
+            let q_over_qi_mod = &q_over_qi % &q_i_big;
+            let inv = mod_inverse(
+                q_over_qi_mod.to_u64().expect("CRT residue must fit in u64"),
+                active_moduli[a],
+            )
+            .expect("CRT modulus must be invertible within the active range");
+            let reconst_coeff = (&q_over_qi * BigUint::from(inv)) % &active_modulus;
+            let g = operand.level_offset + a;
+            let aligned = if g == 0 {
+                x_prime
+            } else {
+                circuit.slot_rotation_gate(
+                    x_prime,
+                    (physical_slots - g) % physical_slots,
+                    physical_slots,
+                )
+            };
+            let scaled = circuit.large_scalar_mul(aligned, &[reconst_coeff]);
+            anchors = circuit.add_gate(anchors, scaled);
+        }
+        Q1AnchorReconstruction {
+            anchor_wire: anchors.as_single_wire(),
+            coefficient_slots: operand.num_coefficient_slots,
+            q_moduli_depth: lanes,
+        }
+    }
+
     pub fn benchmark_multiplication_tree(
         ctx: Arc<NestedRnsPolyContext>,
         circuit: &mut PolyCircuit<P>,
@@ -2181,7 +2240,7 @@ impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for NestedRnsPoly<P> {
 mod tests {
     use super::*;
     use crate::{
-        circuit::PolyGateKind,
+        circuit::{GateParamSource, PolyGateKind, PolyGateType, SlotTransferSpec},
         circuit_gadgets::arith::DecomposeArithmeticGadget,
         test_utils::{
             PolyVec, diagonal_matrix, execute_circuit_with_shape, execute_polyvec_circuit,
@@ -2855,6 +2914,73 @@ mod tests {
         );
         assert_eq!(automatic_output, manual_output);
         assert_eq!(automatic.count_gates_by_type_vec(), manual.count_gates_by_type_vec());
+    }
+
+    #[test]
+    fn q1_anchor_reconstruction_matches_full_reconstruction_on_active_window() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (parameters, context) = create_context(&mut circuit, None);
+        let input = NestedRnsPoly::input(context.clone(), 2, Some(2), Some(1), &mut circuit);
+        let full = input.reconstruct(&mut circuit);
+        let anchors = input.reconstruct_q1_anchors(&mut circuit);
+        circuit.output([full, anchors.anchor_wire()]);
+
+        let values = [BigUint::from(17u8), BigUint::from(83u8)];
+        let inputs = encode_nested_rns_poly_with_offset::<DCRTPoly>(
+            context.p_moduli_bits,
+            context.max_unreduced_muls,
+            &parameters,
+            &values,
+            1,
+            Some(2),
+        )
+        .into_iter()
+        .map(|lanes| {
+            diagonal_matrix(
+                &parameters,
+                lanes
+                    .into_iter()
+                    .map(|value| DCRTPoly::from_biguint_to_constant(&parameters, value)),
+            )
+        })
+        .collect::<Vec<_>>();
+        let physical_slots = 2 * context.q_moduli_depth;
+        let outputs = execute_circuit_with_shape(
+            "nested-rns-q1-anchor-reconstruction-runtime",
+            &parameters,
+            &circuit,
+            &inputs,
+            (physical_slots, physical_slots),
+        );
+        for coefficient in 0..values.len() {
+            let anchor = anchors.anchor_slot(coefficient);
+            assert_eq!(
+                outputs[1].entry(anchor, anchor).coeffs_biguints(),
+                outputs[0].entry(anchor, anchor).coeffs_biguints(),
+                "q1 anchor for coefficient {coefficient} must equal full reconstruction"
+            );
+        }
+    }
+
+    #[test]
+    fn q1_anchor_reconstruction_uses_only_cyclic_slot_rotations() {
+        let mut circuit = PolyCircuit::<DCRTPoly>::new();
+        let (_, context) = create_context(&mut circuit, None);
+        let input = NestedRnsPoly::input(context, 3, Some(2), Some(1), &mut circuit);
+        let anchors = input.reconstruct_q1_anchors(&mut circuit);
+        circuit.output([anchors.anchor_wire()]);
+
+        let transfers = circuit
+            .gates_in_id_order()
+            .filter_map(|(_, gate)| match &gate.gate_type {
+                PolyGateType::SlotTransfer { src_slots } => Some(src_slots),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(transfers.len(), 2, "one cyclic rotation per nonzero active level");
+        assert!(transfers.iter().all(|src_slots| {
+            matches!(src_slots, GateParamSource::Const(SlotTransferSpec::Rotation { .. }))
+        }));
     }
 
     #[test]

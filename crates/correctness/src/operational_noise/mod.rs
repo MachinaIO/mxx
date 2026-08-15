@@ -2,8 +2,7 @@
 //!
 //! This module lowers a frozen Graph IR program into a compact egg expression,
 //! applies only checked relations, and evaluates the extracted expression in
-//! Rust.  It is intentionally separate from the legacy Lean runner while the
-//! migration is in progress.
+//! Rust.
 
 pub mod analysis;
 pub mod bound;

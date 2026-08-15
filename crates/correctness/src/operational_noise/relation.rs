@@ -1668,6 +1668,628 @@ fn emit_binder_build_reject(root: Id, selector: Id, reject: &BinderBuildReject) 
     }
 }
 
+/// A temporary actual-case term used while peeling fixed monomials.  It is a
+/// plan only: no e-node is created until every fixed target has been removed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PeelTerm {
+    Concrete { base: Id, negative: bool },
+    ProductFactor { prefix: Box<[Id]>, terms: Vec<(Id, bool)>, suffix: Box<[Id]>, negative: bool },
+}
+
+fn uncontested_product_factors_with_progress(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    term: Id,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Box<[Id]>> {
+    let term = egraph.find(term);
+    let mut unique: Option<Box<[Id]>> = None;
+    for node in &egraph[term].nodes {
+        progress().ok()?;
+        let MxxLang::MatrixMultiply(factors) = node else {
+            return None;
+        };
+        let mut candidate = Vec::new();
+        for factor in factors {
+            progress().ok()?;
+            candidate.try_reserve(1).ok()?;
+            candidate.push(egraph.find(*factor));
+        }
+        let candidate = candidate.into_boxed_slice();
+        if let Some(previous) = &unique {
+            if previous.len() != candidate.len() {
+                return None;
+            }
+            for (left, right) in previous.iter().zip(&candidate) {
+                progress().ok()?;
+                if left != right {
+                    return None;
+                }
+            }
+        } else {
+            unique = Some(candidate);
+        }
+    }
+    unique
+}
+
+fn is_exact_zero_matrix(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    term: Id,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<bool> {
+    for node in &egraph[egraph.find(term)].nodes {
+        progress().ok()?;
+        if matches!(
+            node,
+            MxxLang::MatrixConstant(spec)
+                if matches!(
+                    egraph.analysis.symbols.matrix_constants.get(spec.0),
+                    Some(super::identity::MatrixConstantSpec {
+                        value: MatrixConstantValue::Zero,
+                        ..
+                    })
+                )
+        ) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Returns every target position reachable from one e-class.  Each state is
+/// `(canonical eclass, target position, sign)`: singleton identity is always
+/// admitted, then only direct Multiply/Negate e-nodes are explored. Add and
+/// Switch stay atomic.  This proves a direct ordered witness across arbitrary
+/// product association without materializing a Cartesian spine list.
+fn direct_signed_target_positions(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    term: Id,
+    position: usize,
+    negative: bool,
+    target: &[Id],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<BTreeSet<(usize, bool)>> {
+    type State = (Id, usize, bool);
+    fn visit(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        state: State,
+        target: &[Id],
+        memo: &mut HashMap<State, BTreeSet<(usize, bool)>>,
+        active: &mut HashSet<State>,
+        progress: &mut dyn FnMut() -> Result<(), ()>,
+    ) -> Option<BTreeSet<(usize, bool)>> {
+        progress().ok()?;
+        if let Some(previous) = memo.get(&state) {
+            let mut copied = BTreeSet::new();
+            for position in previous {
+                progress().ok()?;
+                copied.insert(*position);
+            }
+            return Some(copied);
+        }
+        if !active.insert(state) {
+            // A recursive structural representation is simply not a witness
+            // for this branch.  The canonical singleton check above remains
+            // valid in its caller and must not be discarded with the branch.
+            return Some(BTreeSet::new());
+        }
+        let (term, position, negative) = state;
+        let mut output = BTreeSet::new();
+        if position < target.len() {
+            progress().ok()?;
+            if term == egraph.find(target[position]) {
+                progress().ok()?;
+                output.insert((position + 1, negative));
+            }
+        }
+        for node in &egraph[term].nodes {
+            progress().ok()?;
+            match node {
+                MxxLang::MatrixNegate([input]) => {
+                    for result in visit(
+                        egraph,
+                        (egraph.find(*input), position, !negative),
+                        target,
+                        memo,
+                        active,
+                        progress,
+                    )? {
+                        progress().ok()?;
+                        output.insert(result);
+                    }
+                }
+                MxxLang::MatrixMultiply(factors) => {
+                    progress().ok()?;
+                    let mut states = BTreeSet::from([(position, negative)]);
+                    for factor in factors {
+                        let mut next = BTreeSet::new();
+                        for (child_position, child_negative) in states {
+                            for result in visit(
+                                egraph,
+                                (egraph.find(*factor), child_position, child_negative),
+                                target,
+                                memo,
+                                active,
+                                progress,
+                            )? {
+                                progress().ok()?;
+                                next.insert(result);
+                            }
+                        }
+                        states = next;
+                        if states.is_empty() {
+                            break;
+                        }
+                    }
+                    for result in states {
+                        progress().ok()?;
+                        output.insert(result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        active.remove(&state);
+        let mut stored = BTreeSet::new();
+        for result in &output {
+            progress().ok()?;
+            stored.insert(*result);
+        }
+        progress().ok()?;
+        memo.insert(state, stored);
+        Some(output)
+    }
+
+    progress().ok()?;
+    let mut memo = HashMap::new();
+    progress().ok()?;
+    let mut active = HashSet::new();
+    visit(egraph, (egraph.find(term), position, negative), target, &mut memo, &mut active, progress)
+}
+
+fn has_opposite_direct_span(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    term: Id,
+    target: &[Id],
+    actual_negative: bool,
+    target_negative: bool,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<bool> {
+    let positions = direct_signed_target_positions(egraph, term, 0, false, target, progress)?;
+    for (position, negative) in positions {
+        progress().ok()?;
+        if position == target.len() && (actual_negative != negative) != target_negative {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Matches a product with one selected additive leaf using a small dynamic
+/// program over the fixed target positions.  This normalizes direct Negate
+/// signs in every factor without enumerating products of alternatives.
+fn product_factor_span_matches(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    prefix: &[Id],
+    term: Id,
+    term_negative: bool,
+    suffix: &[Id],
+    target: &[Id],
+    actual_negative: bool,
+    target_negative: bool,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<bool> {
+    let factors = prefix
+        .iter()
+        .copied()
+        .map(|factor| (factor, false))
+        .chain(std::iter::once((term, term_negative)))
+        .chain(suffix.iter().copied().map(|factor| (factor, false)));
+    progress().ok()?;
+    let mut states = BTreeSet::new();
+    progress().ok()?;
+    states.insert((0usize, false));
+    for (factor, factor_negative) in factors {
+        let mut next = BTreeSet::new();
+        for (position, negative) in states {
+            for (end, span_negative) in direct_signed_target_positions(
+                egraph,
+                factor,
+                position,
+                factor_negative,
+                target,
+                progress,
+            )? {
+                progress().ok()?;
+                next.insert((end, negative != span_negative));
+            }
+        }
+        states = next;
+        if states.is_empty() {
+            return Some(false);
+        }
+    }
+    for (position, negative) in states {
+        progress().ok()?;
+        if position == target.len() && (actual_negative != negative) != target_negative {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn copy_ids(ids: &[Id], progress: &mut dyn FnMut() -> Result<(), ()>) -> Option<Box<[Id]>> {
+    let mut output = Vec::new();
+    for id in ids {
+        progress().ok()?;
+        output.try_reserve(1).ok()?;
+        output.push(*id);
+    }
+    Some(output.into_boxed_slice())
+}
+
+fn copy_signed_terms(
+    terms: &[(Id, bool)],
+    skip: Option<usize>,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<(Id, bool)>> {
+    let mut output = Vec::new();
+    for (index, term) in terms.iter().enumerate() {
+        if Some(index) != skip {
+            progress().ok()?;
+            output.try_reserve(1).ok()?;
+            output.push(*term);
+        }
+    }
+    Some(output)
+}
+
+fn peel_fixed_target_from_term(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    term: &PeelTerm,
+    target: &(Box<[Id]>, bool),
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Option<Vec<PeelTerm>>> {
+    let (target_spine, target_negative) = target;
+    match term {
+        PeelTerm::Concrete { base, negative } => {
+            if has_opposite_direct_span(
+                egraph,
+                *base,
+                target_spine,
+                *negative,
+                *target_negative,
+                progress,
+            )? {
+                return Some(Some(Vec::new()));
+            }
+            let leaves = signed_additive_leaves_with_progress(egraph, &[*base], progress)?;
+            if leaves.len() > 1 {
+                for (index, (leaf, leaf_negative)) in leaves.iter().enumerate() {
+                    progress().ok()?;
+                    if has_opposite_direct_span(
+                        egraph,
+                        *leaf,
+                        target_spine,
+                        *negative != *leaf_negative,
+                        *target_negative,
+                        progress,
+                    )? {
+                        let mut remaining = Vec::new();
+                        for (sibling_index, (sibling, sibling_negative)) in
+                            leaves.iter().enumerate()
+                        {
+                            if sibling_index != index {
+                                progress().ok()?;
+                                remaining.try_reserve(1).ok()?;
+                                remaining.push(PeelTerm::Concrete {
+                                    base: *sibling,
+                                    negative: *negative != *sibling_negative,
+                                });
+                            }
+                        }
+                        return Some(Some(remaining));
+                    }
+                }
+            }
+            let Some(factors) = uncontested_product_factors_with_progress(egraph, *base, progress)
+            else {
+                return Some(None);
+            };
+            for factor_index in 0..factors.len() {
+                let leaves = signed_additive_leaves_with_progress(
+                    egraph,
+                    &[factors[factor_index]],
+                    progress,
+                )?;
+                for (leaf_index, (leaf, leaf_negative)) in leaves.iter().enumerate() {
+                    progress().ok()?;
+                    if product_factor_span_matches(
+                        egraph,
+                        &factors[..factor_index],
+                        *leaf,
+                        *leaf_negative,
+                        &factors[factor_index + 1..],
+                        target_spine,
+                        *negative,
+                        *target_negative,
+                        progress,
+                    )? {
+                        let remaining = copy_signed_terms(&leaves, Some(leaf_index), progress)?;
+                        if remaining.is_empty() {
+                            return Some(Some(Vec::new()));
+                        }
+                        progress().ok()?;
+                        return Some(Some(vec![PeelTerm::ProductFactor {
+                            prefix: copy_ids(&factors[..factor_index], progress)?,
+                            terms: remaining,
+                            suffix: copy_ids(&factors[factor_index + 1..], progress)?,
+                            negative: *negative,
+                        }]));
+                    }
+                }
+            }
+            Some(None)
+        }
+        PeelTerm::ProductFactor { prefix, terms, suffix, negative } => {
+            for (index, (leaf, leaf_negative)) in terms.iter().enumerate() {
+                progress().ok()?;
+                if product_factor_span_matches(
+                    egraph,
+                    prefix,
+                    *leaf,
+                    *leaf_negative,
+                    suffix,
+                    target_spine,
+                    *negative,
+                    *target_negative,
+                    progress,
+                )? {
+                    let remaining = copy_signed_terms(terms, Some(index), progress)?;
+                    if remaining.is_empty() {
+                        return Some(Some(Vec::new()));
+                    }
+                    progress().ok()?;
+                    return Some(Some(vec![PeelTerm::ProductFactor {
+                        prefix: copy_ids(prefix, progress)?,
+                        terms: remaining,
+                        suffix: copy_ids(suffix, progress)?,
+                        negative: *negative,
+                    }]));
+                }
+            }
+            Some(None)
+        }
+    }
+}
+
+fn copy_peel_term(
+    term: &PeelTerm,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<PeelTerm> {
+    match term {
+        PeelTerm::Concrete { base, negative } => {
+            progress().ok()?;
+            Some(PeelTerm::Concrete { base: *base, negative: *negative })
+        }
+        PeelTerm::ProductFactor { prefix, terms, suffix, negative } => {
+            let prefix = copy_ids(prefix, progress)?;
+            let terms = copy_signed_terms(terms, None, progress)?;
+            let suffix = copy_ids(suffix, progress)?;
+            progress().ok()?;
+            Some(PeelTerm::ProductFactor { prefix, terms, suffix, negative: *negative })
+        }
+    }
+}
+
+fn copy_peel_terms(
+    terms: &[PeelTerm],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<PeelTerm>> {
+    let mut copied = Vec::new();
+    for term in terms {
+        let term = copy_peel_term(term, progress)?;
+        progress().ok()?;
+        copied.try_reserve(1).ok()?;
+        copied.push(term);
+    }
+    Some(copied)
+}
+
+fn replace_peel_term(
+    terms: &[PeelTerm],
+    index: usize,
+    replacement: Vec<PeelTerm>,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<PeelTerm>> {
+    let mut replaced = Vec::new();
+    for term in &terms[..index] {
+        let term = copy_peel_term(term, progress)?;
+        progress().ok()?;
+        replaced.try_reserve(1).ok()?;
+        replaced.push(term);
+    }
+    for term in replacement {
+        progress().ok()?;
+        replaced.try_reserve(1).ok()?;
+        replaced.push(term);
+    }
+    for term in &terms[index + 1..] {
+        let term = copy_peel_term(term, progress)?;
+        progress().ok()?;
+        replaced.try_reserve(1).ok()?;
+        replaced.push(term);
+    }
+    Some(replaced)
+}
+
+fn peel_fixed_targets(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    actual: &mut Vec<PeelTerm>,
+    fixed: &[(Box<[Id]>, bool)],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<(bool, Vec<(Box<[Id]>, bool)>)> {
+    // This function is a transaction: it plans every target against a deep
+    // private copy and commits only after the whole fixed list has succeeded.
+    let mut planned = copy_peel_terms(actual, progress)?;
+    let mut unmatched = Vec::new();
+    let mut any_peeled = false;
+    for target in fixed {
+        if target.0.len() == 1 && is_exact_zero_matrix(egraph, target.0[0], progress)? {
+            continue;
+        }
+        let mut peeled = false;
+        for index in 0..planned.len() {
+            progress().ok()?;
+            let Some(replacement) =
+                peel_fixed_target_from_term(egraph, &planned[index], target, progress)?
+            else {
+                continue;
+            };
+            planned = replace_peel_term(&planned, index, replacement, progress)?;
+            peeled = true;
+            any_peeled = true;
+            break;
+        }
+        if !peeled {
+            let spine = copy_ids(&target.0, progress)?;
+            progress().ok()?;
+            unmatched.try_reserve(1).ok()?;
+            unmatched.push((spine, target.1));
+        }
+    }
+    for _ in actual.iter() {
+        progress().ok()?;
+    }
+    *actual = planned;
+    Some((any_peeled, unmatched))
+}
+
+fn materialize_fixed_spines(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    fixed: Vec<(Box<[Id]>, bool)>,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<Id>> {
+    let mut output = Vec::new();
+    for (factors, negative) in fixed {
+        let base = match factors.as_ref() {
+            [] => return None,
+            [factor] => *factor,
+            _ => {
+                progress().ok()?;
+                egraph.add(MxxLang::MatrixMultiply(factors))
+            }
+        };
+        let materialized = if negative {
+            progress().ok()?;
+            egraph.add(MxxLang::MatrixNegate([base]))
+        } else {
+            base
+        };
+        progress().ok()?;
+        output.try_reserve(1).ok()?;
+        output.push(materialized);
+    }
+    Some(output)
+}
+
+/// Fixed targets may themselves become equal after binder instantiation.  Drop
+/// only exact opposite spines before touching the grouped actual case.
+fn cancel_fixed_spines(
+    fixed: Vec<(Box<[Id]>, bool)>,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<(Vec<(Box<[Id]>, bool)>, bool)> {
+    let mut cancelled = Vec::new();
+    let mut positive = HashMap::<Box<[Id]>, Vec<usize>>::new();
+    let mut negative = HashMap::<Box<[Id]>, Vec<usize>>::new();
+    let mut any = false;
+    for (index, (spine, negative_sign)) in fixed.iter().enumerate() {
+        progress().ok()?;
+        cancelled.try_reserve(1).ok()?;
+        cancelled.push(false);
+        let opposite = if *negative_sign { &mut positive } else { &mut negative };
+        if let Some(other) = opposite.get_mut(spine).and_then(Vec::pop) {
+            cancelled[index] = true;
+            cancelled[other] = true;
+            any = true;
+        } else {
+            let same = if *negative_sign { &mut negative } else { &mut positive };
+            let spine = copy_ids(spine, progress)?;
+            progress().ok()?;
+            let entries = same.entry(spine).or_default();
+            progress().ok()?;
+            entries.try_reserve(1).ok()?;
+            entries.push(index);
+        }
+    }
+    let mut remaining = Vec::new();
+    for (term, cancelled) in fixed.into_iter().zip(cancelled) {
+        if !cancelled {
+            progress().ok()?;
+            remaining.try_reserve(1).ok()?;
+            remaining.push(term);
+        }
+    }
+    Some((remaining, any))
+}
+
+fn materialize_peel_terms(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+    terms: Vec<PeelTerm>,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<Id>> {
+    let mut output = Vec::new();
+    for term in terms {
+        let (base, negative) = match term {
+            PeelTerm::Concrete { base, negative } => (base, negative),
+            PeelTerm::ProductFactor { prefix, terms, suffix, negative } => {
+                let mut factor_terms = Vec::new();
+                for (base, negative) in terms {
+                    progress().ok()?;
+                    factor_terms.try_reserve(1).ok()?;
+                    factor_terms.push(PeelTerm::Concrete { base, negative });
+                }
+                let factor = materialize_peel_terms(egraph, root, factor_terms, progress)?;
+                let factor = build_additive_terms(egraph, root, factor);
+                let mut factors = Vec::new();
+                for prefix_factor in prefix {
+                    progress().ok()?;
+                    factors.try_reserve(1).ok()?;
+                    factors.push(prefix_factor);
+                }
+                progress().ok()?;
+                factors.try_reserve(1).ok()?;
+                factors.push(factor);
+                for suffix_factor in suffix {
+                    progress().ok()?;
+                    factors.try_reserve(1).ok()?;
+                    factors.push(suffix_factor);
+                }
+                let base = match factors.as_slice() {
+                    [] => return None,
+                    [factor] => *factor,
+                    _ => {
+                        progress().ok()?;
+                        egraph.add(MxxLang::MatrixMultiply(factors.into_boxed_slice()))
+                    }
+                };
+                (base, negative)
+            }
+        };
+        let materialized = if negative {
+            progress().ok()?;
+            egraph.add(MxxLang::MatrixNegate([base]))
+        } else {
+            base
+        };
+        progress().ok()?;
+        output.try_reserve(1).ok()?;
+        output.push(materialized);
+    }
+    Some(output)
+}
+
 /// Internal build path shared by production logging and the cfg(test) sink.
 /// The sink is synchronous and ephemeral; it cannot affect construction.
 fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
@@ -1679,21 +2301,31 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
     should_collect: &mut dyn FnMut() -> bool,
     sink: &mut dyn FnMut(&BinderBuildReject),
 ) -> Option<Id> {
-    let mut normalized_cases = Vec::with_capacity(plan.case_terms.len());
+    let mut normalized_cases = Vec::new();
     for (case_index, terms) in plan.case_terms.iter().enumerate() {
+        progress().ok()?;
         let index = egraph.add(MxxLang::IntConst(BigInt::from(case_index)));
-        let mut mapped_bases = Vec::with_capacity(plan.fixed_bases.len());
+        let mut mapped_bases = Vec::new();
         for fixed in &plan.fixed_bases {
             let instantiated =
                 family::instantiate_shared_element(egraph, *fixed, plan.binder, index, progress)
                     .ok()?;
+            progress().ok()?;
+            mapped_bases.try_reserve(1).ok()?;
             mapped_bases.push(egraph.find(instantiated));
         }
-        let Some(actual_spines) = signed_ordered_monomial_spines(
-            egraph,
-            &terms.iter().copied().map(|term| (term, false)).collect::<Vec<_>>(),
-            progress,
-        ) else {
+        let mut actual = Vec::new();
+        let mut actual_valid = true;
+        for term in terms {
+            let Some((base, negative)) = signed_additive_term(egraph, *term) else {
+                actual_valid = false;
+                break;
+            };
+            progress().ok()?;
+            actual.try_reserve(1).ok()?;
+            actual.push(PeelTerm::Concrete { base, negative });
+        }
+        if !actual_valid {
             report_binder_build_reject(
                 egraph,
                 case_index,
@@ -1705,9 +2337,11 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
             );
             return None;
         };
-        let mut mapped_fixed = Vec::with_capacity(plan.fixed_occurrences.len());
+        let mut mapped_fixed = Vec::new();
         for occurrence in &plan.fixed_occurrences {
             let mapped = mapped_bases[occurrence.base_index];
+            progress().ok()?;
+            mapped_fixed.try_reserve(1).ok()?;
             mapped_fixed.push((mapped, occurrence.negative));
         }
         let Some(mapped_fixed_spines) =
@@ -1724,55 +2358,39 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
             );
             return None;
         };
-        let actual_count = actual_spines.len();
-        let mut after_cross = actual_spines;
-        after_cross.extend(mapped_fixed_spines);
-        let (cancelled, any_cancelled) = cancelled_signed_monomial_spines(&after_cross);
-        if !any_cancelled {
-            // Failure diagnostics retain the old concrete leaf rendering, but
-            // successful cancellation never materializes terms it removes.
-            let actual = materialize_signed_ordered_monomials(
-                egraph,
-                after_cross[..actual_count].to_vec(),
-                progress,
-            )?;
-            let mapped_fixed = materialize_signed_ordered_monomials(
-                egraph,
-                after_cross[actual_count..].to_vec(),
-                progress,
-            )?;
+        let (mapped_fixed_spines, fixed_cancelled) =
+            cancel_fixed_spines(mapped_fixed_spines, progress)?;
+        let (any_peeled, unmatched_fixed) =
+            peel_fixed_targets(egraph, &mut actual, &mapped_fixed_spines, progress)?;
+        if !any_peeled && !fixed_cancelled {
+            let mut diagnostic_actual = Vec::new();
+            for term in terms {
+                progress().ok()?;
+                if let Some(term) = signed_additive_term(egraph, *term) {
+                    progress().ok()?;
+                    diagnostic_actual.try_reserve(1).ok()?;
+                    diagnostic_actual.push(term);
+                }
+            }
             report_binder_build_reject(
                 egraph,
                 case_index,
                 BinderBuildRejectStage::NoExactCancellation,
-                &actual,
+                &diagnostic_actual,
                 &mapped_fixed,
                 should_collect,
                 sink,
             );
             return None;
         }
-        // Both plans were read-only.  Materialize only the uncancelled
-        // ordered monomials after exact spine cancellation has succeeded.
-        let remaining = materialize_signed_ordered_monomials(
-            egraph,
-            after_cross
-                .into_iter()
-                .zip(cancelled)
-                .filter_map(|(term, cancelled)| (!cancelled).then_some(term))
-                .collect(),
-            progress,
-        )?
-        .into_iter()
-        .map(|(base, negative)| {
-            if negative {
-                progress().ok()?;
-                Some(egraph.add(MxxLang::MatrixNegate([base])))
-            } else {
-                Some(base)
-            }
-        })
-        .collect::<Option<Vec<_>>>()?;
+        // Peeling is entirely read-only.  Only the surviving residual path is
+        // materialized after every fixed target has matched.
+        let mut remaining = materialize_peel_terms(egraph, root, actual, progress)?;
+        for term in materialize_fixed_spines(egraph, unmatched_fixed, progress)? {
+            progress().ok()?;
+            remaining.try_reserve(1).ok()?;
+            remaining.push(term);
+        }
         if remaining.iter().any(|term| egraph.find(*term) == egraph.find(root)) {
             report_binder_build_reject(
                 egraph,
@@ -1785,6 +2403,8 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
             );
             return None;
         }
+        progress().ok()?;
+        normalized_cases.try_reserve(1).ok()?;
         normalized_cases.push(remaining);
     }
     if equivalent_switch_exists(egraph, root, selector, &normalized_cases) {
@@ -1799,11 +2419,16 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
         );
         return None;
     }
-    let mut cases = Vec::with_capacity(normalized_cases.len() + 1);
+    let mut cases = Vec::new();
+    progress().ok()?;
+    cases.try_reserve(1).ok()?;
     cases.push(selector);
-    cases.extend(
-        normalized_cases.into_iter().map(|terms| build_additive_terms(egraph, root, terms)),
-    );
+    for terms in normalized_cases {
+        progress().ok()?;
+        cases.try_reserve(1).ok()?;
+        cases.push(build_additive_terms(egraph, root, terms));
+    }
+    progress().ok()?;
     Some(egraph.add(MxxLang::Switch(cases.into_boxed_slice())))
 }
 
@@ -2462,6 +3087,7 @@ where
         for _ in &result.representative {
             progress().ok()?;
         }
+        progress().ok()?;
         memo.insert(term, result.clone());
         Some(result)
     }
@@ -2480,9 +3106,11 @@ where
     Some(output)
 }
 
-/// A read-only signed noncommutative polynomial view used only while building
-/// one binder case.  It first reuses the existing Add/Negate consensus, then
-/// distributes only an unambiguous physical MatrixMultiply spine.  A product
+/// A read-only signed noncommutative polynomial view used only for mapped
+/// fixed targets while building one binder case.  It first reuses the existing
+/// Add/Negate consensus, then distributes only an unambiguous physical
+/// MatrixMultiply spine.  The actual case uses fixed-guided peeling instead,
+/// so this is the remaining fixed-target-only Cartesian expansion. A product
 /// e-class with competing forms is an atomic leaf: relation saturation may
 /// legitimately have unioned it with a structurally different target.
 /// Switch is deliberately atomic and is never enumerated.
@@ -2491,24 +3119,6 @@ fn signed_ordered_monomial_spines(
     terms: &[(Id, bool)],
     progress: &mut dyn FnMut() -> Result<(), ()>,
 ) -> Option<Vec<(Box<[Id]>, bool)>> {
-    fn uncontested_product_factors(
-        egraph: &EGraph<MxxLang, MxxAnalysis>,
-        term: Id,
-    ) -> Option<Box<[Id]>> {
-        let term = egraph.find(term);
-        let PhysicalStructure::Unique(factors) = physical_product_factors(egraph, term) else {
-            return None;
-        };
-        egraph[term]
-            .nodes
-            .iter()
-            .all(|node| {
-                matches!(node, MxxLang::MatrixMultiply(candidate)
-                if candidate.iter().map(|factor| egraph.find(*factor)).eq(factors.iter().copied()))
-            })
-            .then_some(factors)
-    }
-
     fn expand_leaf(
         egraph: &EGraph<MxxLang, MxxAnalysis>,
         term: Id,
@@ -2517,31 +3127,37 @@ fn signed_ordered_monomial_spines(
         progress: &mut dyn FnMut() -> Result<(), ()>,
     ) -> Option<Vec<(Box<[Id]>, bool)>> {
         let term = egraph.find(term);
-        let factors = uncontested_product_factors(egraph, term);
-        if factors.is_none() &&
-            matches!(physical_product_factors(egraph, term), PhysicalStructure::Unique(ref factors) if factors.iter().any(|factor| egraph.find(*factor) == term))
-        {
-            return None;
-        }
+        let factors = uncontested_product_factors_with_progress(egraph, term, progress);
         let Some(factors) = factors else {
             progress().ok()?;
             let mut output = Vec::new();
             output.try_reserve_exact(1).ok()?;
-            output.push((vec![term].into_boxed_slice(), negative));
+            let mut singleton = Vec::new();
+            progress().ok()?;
+            singleton.try_reserve_exact(1).ok()?;
+            singleton.push(term);
+            output.push((singleton.into_boxed_slice(), negative));
             return Some(output);
         };
         if factors.is_empty() || !active.insert(term) {
             return None;
         }
         let result = (|| -> Option<Vec<(Box<[Id]>, bool)>> {
-            let mut product = vec![(Box::<[Id]>::default(), false)];
+            progress().ok()?;
+            let mut product = Vec::new();
+            progress().ok()?;
+            product.try_reserve_exact(1).ok()?;
+            product.push((Box::<[Id]>::default(), false));
             for factor in factors {
                 let additive = signed_additive_leaves_with_progress(egraph, &[factor], progress)?;
                 let mut expanded_factor = Vec::new();
                 for (leaf, leaf_negative) in additive {
                     let expanded = expand_leaf(egraph, leaf, leaf_negative, active, progress)?;
-                    expanded_factor.try_reserve(expanded.len()).ok()?;
-                    expanded_factor.extend(expanded);
+                    for monomial in expanded {
+                        progress().ok()?;
+                        expanded_factor.try_reserve(1).ok()?;
+                        expanded_factor.push(monomial);
+                    }
                 }
                 let combinations = product.len().checked_mul(expanded_factor.len())?;
                 let mut next = Vec::new();
@@ -2552,10 +3168,17 @@ fn signed_ordered_monomial_spines(
                         progress().ok()?;
                         next.try_reserve(1).ok()?;
                         let length = prefix.len().checked_add(suffix.len())?;
+                        progress().ok()?;
                         let mut combined = Vec::new();
                         combined.try_reserve_exact(length).ok()?;
-                        combined.extend(prefix.iter().copied());
-                        combined.extend(suffix.iter().copied());
+                        for factor in prefix {
+                            progress().ok()?;
+                            combined.push(*factor);
+                        }
+                        for factor in suffix {
+                            progress().ok()?;
+                            combined.push(*factor);
+                        }
                         next.push((
                             combined.into_boxed_slice(),
                             *prefix_negative != *suffix_negative,
@@ -2570,6 +3193,7 @@ fn signed_ordered_monomial_spines(
         active.remove(&term);
         let mut result = result?;
         for (_, sign) in &mut result {
+            progress().ok()?;
             *sign = *sign != negative;
         }
         Some(result)
@@ -2582,57 +3206,14 @@ fn signed_ordered_monomial_spines(
         for (leaf, leaf_negative) in additive {
             let expanded =
                 expand_leaf(egraph, leaf, leaf_negative != *outer_negative, &mut active, progress)?;
-            output.try_reserve(expanded.len()).ok()?;
-            output.extend(expanded);
+            for monomial in expanded {
+                progress().ok()?;
+                output.try_reserve(1).ok()?;
+                output.push(monomial);
+            }
         }
     }
     Some(output)
-}
-
-/// Materializes only the signed monomials that survived a successful
-/// read-only binder-case plan.  Product spines are already flattened, so this
-/// preserves noncommutative factor order without adding associativity rewrites.
-fn materialize_signed_ordered_monomials(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    monomials: Vec<(Box<[Id]>, bool)>,
-    progress: &mut dyn FnMut() -> Result<(), ()>,
-) -> Option<Vec<(Id, bool)>> {
-    monomials
-        .into_iter()
-        .map(|(factors, negative)| {
-            let base = match factors.as_ref() {
-                [] => return None,
-                [factor] => *factor,
-                _ => {
-                    progress().ok()?;
-                    egraph.add(MxxLang::MatrixMultiply(factors))
-                }
-            };
-            Some((base, negative))
-        })
-        .collect()
-}
-
-/// Cancels exact opposites using the already checked ordered factor spines.
-/// Unlike `cancelled_signed_additive_leaves`, this deliberately does not
-/// reopen an atomic relation-unioned product e-class.
-fn cancelled_signed_monomial_spines(terms: &[(Box<[Id]>, bool)]) -> (Vec<bool>, bool) {
-    let mut cancelled = vec![false; terms.len()];
-    let mut positive = HashMap::<Box<[Id]>, Vec<usize>>::new();
-    let mut negative = HashMap::<Box<[Id]>, Vec<usize>>::new();
-    let mut any = false;
-    for (index, (factors, is_negative)) in terms.iter().enumerate() {
-        let opposite = if *is_negative { &mut positive } else { &mut negative };
-        if let Some(other) = opposite.get_mut(factors).and_then(Vec::pop) {
-            cancelled[index] = true;
-            cancelled[other] = true;
-            any = true;
-        } else {
-            let same = if *is_negative { &mut negative } else { &mut positive };
-            same.entry(factors.clone()).or_default().push(index);
-        }
-    }
-    (cancelled, any)
 }
 
 /// Returns the sole ordered MatrixMultiply leaf sequence for `term`, flattening
@@ -6059,8 +6640,8 @@ mod tests {
         .expect("shared additive factor has one consensus result");
         assert_eq!(spines.len(), 4, "only mathematically required product monomials are retained");
         assert_eq!(
-            charges, 33,
-            "additive representative copies, memo clones, output copies, and all Cartesian products are charged"
+            charges, 81,
+            "63 baseline charges plus 18 direct eclass/factor scans; changing either traversal changes this calibrated total"
         );
     }
 
@@ -6176,6 +6757,505 @@ mod tests {
                     if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. })))
             }));
         }
+    }
+
+    #[test]
+    fn fixed_guided_peeling_removes_one_additive_product_summand_in_order() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (a, _) = matrix_atom(&mut egraph, "peel-a", None);
+        let (b, _) = matrix_atom(&mut egraph, "peel-b", None);
+        let (d, _) = matrix_atom(&mut egraph, "peel-d", None);
+        let sum = egraph.add(MxxLang::MatrixAdd(vec![a, b].into_boxed_slice()));
+        let actual = egraph.add(MxxLang::MatrixMultiply(vec![sum, d].into_boxed_slice()));
+        egraph.rebuild();
+        let mut terms = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut terms,
+                &[(vec![egraph.find(a), egraph.find(d)].into_boxed_slice(), true)],
+                &mut progress,
+            ),
+            Some((true, Vec::new()))
+        );
+        assert!(matches!(
+            terms.as_slice(),
+            [PeelTerm::ProductFactor { prefix, terms, suffix, negative: false }]
+                if prefix.is_empty() && suffix.as_ref() == [egraph.find(d)] && terms == &vec![(egraph.find(b), false)]
+        ));
+    }
+
+    #[test]
+    fn fixed_guided_peeling_preserves_product_prefix_suffix_and_rejects_reordering() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (p, _) = matrix_atom(&mut egraph, "peel-prefix", None);
+        let (a, _) = matrix_atom(&mut egraph, "peel-middle-a", None);
+        let (b, _) = matrix_atom(&mut egraph, "peel-middle-b", None);
+        let (s, _) = matrix_atom(&mut egraph, "peel-suffix", None);
+        let sum = egraph.add(MxxLang::MatrixAdd(vec![a, b].into_boxed_slice()));
+        let actual = egraph.add(MxxLang::MatrixMultiply(vec![p, sum, s].into_boxed_slice()));
+        egraph.rebuild();
+        let target = vec![egraph.find(p), egraph.find(a), egraph.find(s)].into_boxed_slice();
+        let mut terms = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(&egraph, &mut terms, &[(target, true)], &mut progress),
+            Some((true, Vec::new()))
+        );
+        let mut reordered = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut reordered,
+                &[(vec![egraph.find(a), egraph.find(p), egraph.find(s)].into_boxed_slice(), true)],
+                &mut progress,
+            ),
+            Some((
+                false,
+                vec![(
+                    vec![egraph.find(a), egraph.find(p), egraph.find(s)].into_boxed_slice(),
+                    true
+                )]
+            ))
+        );
+
+        let negated_a = egraph.add(MxxLang::MatrixNegate([a]));
+        let double_negated_a = egraph.add(MxxLang::MatrixNegate([negated_a]));
+        let negative_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![p, negated_a, s].into_boxed_slice()));
+        let double_negative_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![p, double_negated_a, s].into_boxed_slice()));
+        egraph.rebuild();
+        let mut negative_terms =
+            vec![PeelTerm::Concrete { base: negative_product, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut negative_terms,
+                &[(vec![egraph.find(p), egraph.find(a), egraph.find(s)].into_boxed_slice(), false)],
+                &mut progress,
+            ),
+            Some((true, Vec::new()))
+        );
+        assert!(negative_terms.is_empty());
+        let mut double_negative_terms =
+            vec![PeelTerm::Concrete { base: double_negative_product, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut double_negative_terms,
+                &[(vec![egraph.find(p), egraph.find(a), egraph.find(s)].into_boxed_slice(), true)],
+                &mut progress,
+            ),
+            Some((true, Vec::new()))
+        );
+        assert!(double_negative_terms.is_empty());
+
+        let ab = egraph.add(MxxLang::MatrixMultiply(vec![a, b].into_boxed_slice()));
+        let abc = egraph.add(MxxLang::MatrixMultiply(vec![ab, p].into_boxed_slice()));
+        let abcd = egraph.add(MxxLang::MatrixMultiply(vec![abc, s].into_boxed_slice()));
+        egraph.rebuild();
+        let mut associated = vec![PeelTerm::Concrete { base: abcd, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut associated,
+                &[(
+                    vec![egraph.find(a), egraph.find(b), egraph.find(p), egraph.find(s)]
+                        .into_boxed_slice(),
+                    true
+                )],
+                &mut progress,
+            ),
+            Some((true, Vec::new()))
+        );
+        let mut reordered_associated = vec![PeelTerm::Concrete { base: abcd, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut reordered_associated,
+                &[(
+                    vec![egraph.find(b), egraph.find(a), egraph.find(p), egraph.find(s)]
+                        .into_boxed_slice(),
+                    true
+                )],
+                &mut progress,
+            ),
+            Some((
+                false,
+                vec![(
+                    vec![egraph.find(b), egraph.find(a), egraph.find(p), egraph.find(s)]
+                        .into_boxed_slice(),
+                    true
+                )]
+            ))
+        );
+    }
+
+    #[test]
+    fn fixed_guided_peeling_supports_signs_multiplicity_and_zero_fixed_terms() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (a, _) = matrix_atom(&mut egraph, "peel-sign-a", None);
+        let (b, _) = matrix_atom(&mut egraph, "peel-sign-b", None);
+        let grouped = egraph.add(MxxLang::MatrixAdd(vec![a, b].into_boxed_slice()));
+        let negated = egraph.add(MxxLang::MatrixNegate([grouped]));
+        let zero_spec = egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type: scalar_matrix_type(),
+                value: MatrixConstantValue::Zero,
+            },
+        );
+        let zero = egraph
+            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(zero_spec)));
+        egraph.rebuild();
+        let mut terms = vec![PeelTerm::Concrete { base: negated, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut terms,
+                &[
+                    (vec![egraph.find(zero)].into_boxed_slice(), false),
+                    (vec![egraph.find(a)].into_boxed_slice(), false),
+                    (vec![egraph.find(b)].into_boxed_slice(), false),
+                ],
+                &mut progress,
+            ),
+            Some((true, Vec::new()))
+        );
+        assert!(terms.is_empty());
+    }
+
+    #[test]
+    fn fixed_guided_peeling_keeps_switch_and_relation_unioned_products_atomic() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (a, _) = matrix_atom(&mut egraph, "peel-switch-a", None);
+        let (b, _) = matrix_atom(&mut egraph, "peel-switch-b", None);
+        let (d, _) = matrix_atom(&mut egraph, "peel-switch-d", None);
+        let switch = egraph.add(MxxLang::Switch(vec![selector, a, b].into_boxed_slice()));
+        let switched = egraph.add(MxxLang::MatrixMultiply(vec![switch, d].into_boxed_slice()));
+        let mut switch_terms = vec![PeelTerm::Concrete { base: switched, negative: false }];
+        let before = egraph.total_size();
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut switch_terms,
+                &[(vec![egraph.find(a), egraph.find(d)].into_boxed_slice(), true)],
+                &mut progress,
+            ),
+            Some((false, vec![(vec![egraph.find(a), egraph.find(d)].into_boxed_slice(), true)]))
+        );
+        assert_eq!(egraph.total_size(), before, "failed peeling adds no e-nodes");
+
+        let (s, _) = matrix_atom(&mut egraph, "peel-relation-s", None);
+        let (h, _) = matrix_atom(&mut egraph, "peel-relation-h", None);
+        let (noise, _) = matrix_atom(&mut egraph, "peel-relation-noise", None);
+        let product = egraph.add(MxxLang::MatrixMultiply(vec![s, h].into_boxed_slice()));
+        let (relation_target, _) = matrix_atom(&mut egraph, "peel-relation-target", None);
+        egraph.union(product, relation_target);
+        let grouped = egraph.add(MxxLang::MatrixAdd(vec![product, noise].into_boxed_slice()));
+        let actual = egraph.add(MxxLang::MatrixMultiply(vec![grouped, d].into_boxed_slice()));
+        egraph.rebuild();
+        let mut terms = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut terms,
+                &[(vec![egraph.find(s), egraph.find(h), egraph.find(d)].into_boxed_slice(), true)],
+                &mut progress,
+            ),
+            Some((true, Vec::new())),
+            "the direct Multiply witness inside a relation-unioned e-class matches the target span"
+        );
+        assert!(matches!(
+            terms.as_slice(),
+            [PeelTerm::ProductFactor { terms, .. }] if terms == &vec![(egraph.find(noise), false)]
+        ));
+        let mut singleton_terms = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut singleton_terms,
+                &[(vec![egraph.find(product), egraph.find(d)].into_boxed_slice(), true)],
+                &mut progress,
+            ),
+            Some((true, Vec::new())),
+            "the relation-unioned product remains a canonical singleton identity"
+        );
+
+        let cyclic = egraph.add(MxxLang::MatrixMultiply(vec![relation_target].into_boxed_slice()));
+        egraph.union(cyclic, relation_target);
+        let mut progress = || Ok(());
+        assert!(
+            direct_signed_target_positions(
+                &egraph,
+                cyclic,
+                0,
+                false,
+                &[egraph.find(cyclic)],
+                &mut progress,
+            )
+            .is_some_and(|positions| positions.contains(&(1, false))),
+            "a cyclic structural branch cannot discard the canonical singleton identity"
+        );
+        let mut visits = 0;
+        assert_eq!(
+            direct_signed_target_positions(
+                &egraph,
+                cyclic,
+                0,
+                false,
+                &[egraph.find(s)],
+                &mut || {
+                    visits += 1;
+                    Ok(())
+                },
+            ),
+            Some(BTreeSet::new()),
+            "a structural cycle alone is rejected as a witness without recursive traversal"
+        );
+        assert!(visits < 64, "cycle handling is local and bounded");
+    }
+
+    #[test]
+    fn fixed_guided_peeling_is_linear_in_a_grouped_additive_case() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let mut children = Vec::new();
+        for index in 0..128 {
+            children.push(matrix_atom(&mut egraph, &format!("peel-many-{index}"), None).0);
+        }
+        let grouped = egraph.add(MxxLang::MatrixAdd(children.clone().into_boxed_slice()));
+        egraph.rebuild();
+        let mut terms = vec![PeelTerm::Concrete { base: grouped, negative: false }];
+        let mut charges = 0;
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut terms,
+                &[(vec![egraph.find(children[64])].into_boxed_slice(), true)],
+                &mut || {
+                    charges += 1;
+                    Ok(())
+                },
+            ),
+            Some((true, Vec::new()))
+        );
+        assert_eq!(terms.len(), 127);
+        assert!(charges < 5_000, "one target scans/copies the grouped case linearly");
+    }
+
+    #[test]
+    fn fixed_guided_peeling_stops_before_unfunded_second_peel_or_fixed_cancellation() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (p, _) = matrix_atom(&mut egraph, "peel-budget-prefix", None);
+        let (a, _) = matrix_atom(&mut egraph, "peel-budget-a", None);
+        let (b, _) = matrix_atom(&mut egraph, "peel-budget-b", None);
+        let (c, _) = matrix_atom(&mut egraph, "peel-budget-c", None);
+        let (s, _) = matrix_atom(&mut egraph, "peel-budget-suffix", None);
+        let sum = egraph.add(MxxLang::MatrixAdd(vec![a, b, c].into_boxed_slice()));
+        let actual = egraph.add(MxxLang::MatrixMultiply(vec![p, sum, s].into_boxed_slice()));
+        egraph.rebuild();
+        let mut terms = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let mut progress = || Ok(());
+        assert_eq!(
+            peel_fixed_targets(
+                &egraph,
+                &mut terms,
+                &[(vec![egraph.find(p), egraph.find(a), egraph.find(s)].into_boxed_slice(), true)],
+                &mut progress,
+            ),
+            Some((true, Vec::new()))
+        );
+        let before = egraph.total_size();
+        let original_terms = terms.clone();
+        let second_target = vec![egraph.find(p), egraph.find(b), egraph.find(s)].into_boxed_slice();
+        let copy_probe = vec![egraph.find(p); 8];
+        let mut full_copy_calls = 0;
+        assert!(
+            copy_ids(&copy_probe, &mut || {
+                full_copy_calls += 1;
+                Ok(())
+            })
+            .is_some()
+        );
+        assert_eq!(full_copy_calls, 8, "one progress callback guards each copied id");
+        let mut copy_calls = 0;
+        assert!(
+            copy_ids(&copy_probe, &mut || {
+                copy_calls += 1;
+                (copy_calls < 5).then_some(()).ok_or(())
+            })
+            .is_none(),
+            "the fifth callback interrupts the middle of an eight-id copy"
+        );
+        assert_eq!(copy_calls, 5);
+
+        let mut full_peel_calls = 0;
+        let mut funded_candidate = original_terms.clone();
+        assert!(
+            peel_fixed_targets(
+                &egraph,
+                &mut funded_candidate,
+                &[(second_target.clone(), true)],
+                &mut || {
+                    full_peel_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_some()
+        );
+        let mut candidate = original_terms.clone();
+        let mut peel_calls = 0;
+        assert!(
+            peel_fixed_targets(
+                &egraph,
+                &mut candidate,
+                &[(second_target.clone(), true)],
+                &mut || {
+                    peel_calls += 1;
+                    (peel_calls < full_peel_calls - 1).then_some(()).ok_or(())
+                },
+            )
+            .is_none(),
+            "the calibrated late callback interrupts the ProductFactor peel"
+        );
+        assert_eq!(candidate, original_terms, "interrupted peeling keeps the plan unchanged");
+        assert_eq!(egraph.total_size(), before, "interrupted planning creates no e-nodes");
+
+        let nested = egraph.add(MxxLang::MatrixMultiply(vec![p, a].into_boxed_slice()));
+        let nested = egraph.add(MxxLang::MatrixMultiply(vec![nested, b].into_boxed_slice()));
+        egraph.rebuild();
+        let after_nested = egraph.total_size();
+        let target = vec![egraph.find(p), egraph.find(a), egraph.find(b)];
+        let mut full_scan_calls = 0;
+        assert!(
+            direct_signed_target_positions(&egraph, nested, 0, false, &target, &mut || {
+                full_scan_calls += 1;
+                Ok(())
+            })
+            .is_some()
+        );
+        assert!(full_scan_calls > 8, "nested product reaches the structural DP phase");
+        let mut scan_calls = 0;
+        assert!(
+            direct_signed_target_positions(&egraph, nested, 0, false, &target, &mut || {
+                scan_calls += 1;
+                (scan_calls < full_scan_calls / 2).then_some(()).ok_or(())
+            })
+            .is_none(),
+            "the calibrated halfway callback interrupts the direct Mul DP scan"
+        );
+        assert!(scan_calls > 2, "the DP setup callbacks were funded before interruption");
+
+        let fixed =
+            (0..16).map(|_| (vec![egraph.find(a)].into_boxed_slice(), false)).collect::<Vec<_>>();
+        let mut full_fixed_calls = 0;
+        assert!(
+            cancel_fixed_spines(fixed.clone(), &mut || {
+                full_fixed_calls += 1;
+                Ok(())
+            })
+            .is_some()
+        );
+        let mut fixed_calls = 0;
+        assert!(
+            cancel_fixed_spines(fixed, &mut || {
+                fixed_calls += 1;
+                (fixed_calls < full_fixed_calls - 1).then_some(()).ok_or(())
+            })
+            .is_none(),
+            "the calibrated final callback interrupts fixed-map output materialization"
+        );
+        assert_eq!(egraph.total_size(), after_nested, "all interrupted paths are read-only");
+    }
+
+    #[test]
+    fn fixed_guided_peeling_commits_only_after_every_fixed_target_is_funded() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "peel-transaction-first", None);
+        let factors = (0..12)
+            .map(|index| matrix_atom(&mut egraph, &format!("peel-transaction-{index}"), None).0)
+            .collect::<Vec<_>>();
+        let product = egraph.add(MxxLang::MatrixMultiply(factors.clone().into_boxed_slice()));
+        let actual = egraph.add(MxxLang::MatrixAdd(vec![first, product].into_boxed_slice()));
+        egraph.rebuild();
+        let original = vec![PeelTerm::Concrete { base: actual, negative: false }];
+        let first_target = (vec![egraph.find(first)].into_boxed_slice(), true);
+        let second_target = (
+            factors
+                .iter()
+                .map(|factor| egraph.find(*factor))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            true,
+        );
+
+        let mut first_only_calls = 0;
+        let mut first_only = original.clone();
+        assert!(
+            peel_fixed_targets(
+                &egraph,
+                &mut first_only,
+                std::slice::from_ref(&first_target),
+                &mut || {
+                    first_only_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_some()
+        );
+
+        let mut full_calls = 0;
+        let mut funded = original.clone();
+        assert!(
+            peel_fixed_targets(
+                &egraph,
+                &mut funded,
+                &[first_target.clone(), second_target.clone()],
+                &mut || {
+                    full_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_some()
+        );
+        let interruption = full_calls / 2;
+        assert!(
+            interruption > first_only_calls,
+            "the calibrated halfway point is after target one and inside the large second-target DP"
+        );
+
+        let before = egraph.total_size();
+        let mut interrupted = original.clone();
+        let mut calls = 0;
+        assert!(
+            peel_fixed_targets(
+                &egraph,
+                &mut interrupted,
+                &[first_target, second_target],
+                &mut || {
+                    calls += 1;
+                    (calls < interruption).then_some(()).ok_or(())
+                },
+            )
+            .is_none(),
+            "the second target is interrupted after the first target has been fully planned"
+        );
+        assert_eq!(
+            interrupted, original,
+            "a failed later target cannot partially commit target one"
+        );
+        assert_eq!(egraph.total_size(), before, "transactional planning does not add e-nodes");
     }
 
     #[test]

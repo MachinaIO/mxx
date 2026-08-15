@@ -18,7 +18,8 @@ use super::{
     language::MxxLang,
     relation::{
         AddNormalizationProbe, PointwiseAddSwitchProbe, PointwiseAddSwitchReject,
-        PointwiseDirectProbe, pointwise_add_switch_probe, probe_exact_additive_normalization,
+        PointwiseDirectProbe, SelectedNodeRef, pointwise_add_switch_probe,
+        probe_exact_additive_normalization, selected_product_switch_eligibility,
     },
 };
 use egg::{EGraph, Id, Language, RecExpr};
@@ -33,6 +34,9 @@ use std::{
 /// monotone even when a compact e-graph represents an exponentially large AST.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ProposalCost {
+    /// Checked relation rewrites and selected structural normalizations that
+    /// remain in this exact representative. Both are exact obligations that
+    /// must be discharged before final bound acceptance.
     pub remaining_relation_redexes: u64,
     pub hidden_relation_redexes: u64,
     /// Whether this whole selected matrix expression is semantically Large.
@@ -209,6 +213,54 @@ pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
         }
         if !changed {
             break;
+        }
+    }
+
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        'diagnostic: for &class_id in &classes {
+            let class = egraph.find(class_id);
+            let Some(selected) = candidates.get(usize::from(class)).and_then(Option::as_ref) else {
+                continue;
+            };
+            let MxxLang::MatrixMultiply(factors) = &selected.node else { continue };
+            if selected_product_switch_eligibility(egraph, class, factors, |handle| {
+                let origin = egraph.find(handle);
+                let candidate = candidates.get(usize::from(origin))?.as_ref()?;
+                Some(SelectedNodeRef { node: &candidate.node, origin })
+            })
+            .is_none()
+            {
+                continue;
+            }
+            for node in &egraph[class].nodes {
+                let MxxLang::Switch(cases) = node else { continue };
+                let Some(switch_cost) =
+                    diagnostic_node_cost(egraph, class, node, &candidates, bound_input)
+                else {
+                    continue;
+                };
+                let case_costs = cases[1..]
+                    .iter()
+                    .take(8)
+                    .filter_map(|case| {
+                        let origin = egraph.find(*case);
+                        candidates.get(usize::from(origin))?.as_ref().map(|candidate| {
+                            (origin, candidate.cost.clone(), candidate.node.operator_name())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                tracing::debug!(
+                    event = "selected_product_switch_cost_comparison",
+                    selected_product_cost = ?selected.cost,
+                    selected_product_factor_count = factors.len(),
+                    switch_cost = ?switch_cost,
+                    switch_case_count = cases.len().saturating_sub(1),
+                    switch_case_costs = ?case_costs,
+                    switch_case_costs_omitted = cases.len().saturating_sub(1).saturating_sub(8),
+                    "compact selected product retained over materialized Switch alternative"
+                );
+                break 'diagnostic;
+            }
         }
     }
 
@@ -2327,14 +2379,8 @@ fn diagnostic_node_cost<I: BoundInput>(
     candidates: &[Option<Candidate>],
     bound_input: &I,
 ) -> Option<ProposalCost> {
-    let mut remaining_relation_redexes = 0_u64;
-    let mut node_count = 1_u64;
-    for child in node.children() {
-        let candidate = candidates.get(usize::from(egraph.find(*child)))?.as_ref()?;
-        remaining_relation_redexes =
-            remaining_relation_redexes.saturating_add(candidate.cost.remaining_relation_redexes);
-        node_count = node_count.saturating_add(candidate.cost.node_count);
-    }
+    let (remaining_relation_redexes, child_hidden, node_count) =
+        selected_child_obligations(egraph, node, candidates)?;
     let semantic_bound = matches!(&egraph[class].data.sort, Ok(MxxSort::Matrix(_)))
         .then(|| {
             let children = CandidateChildBounds { egraph, candidates };
@@ -2348,11 +2394,58 @@ fn diagnostic_node_cost<I: BoundInput>(
         hidden_relation_redexes: if matches!(node, MxxLang::MatrixAdd(_)) {
             remaining_relation_redexes
         } else {
-            0
+            child_hidden
         },
         large_residual: matches!(semantic_bound.coefficient_class, BoundClass::Large),
         node_count,
     })
+}
+
+/// Aggregates already-selected child rewrite obligations without allocation.
+/// Switch cases are mutually exclusive at runtime: the selector is always
+/// evaluated, while every encoded case remains conservatively covered by the
+/// maximum case obligation. Physical DAG size is still the sum of all stored
+/// children and remains an independent final tie-breaker.
+fn selected_child_obligations(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    node: &MxxLang,
+    candidates: &[Option<Candidate>],
+) -> Option<(u64, u64, u64)> {
+    let cost = |child: Id| {
+        candidates.get(usize::from(egraph.find(child)))?.as_ref().map(|candidate| &candidate.cost)
+    };
+    let mut node_count = 1_u64;
+    for child in node.children() {
+        node_count = node_count.saturating_add(cost(*child)?.node_count);
+    }
+    if let MxxLang::Switch(children) = node {
+        let (&selector, cases) = children.split_first()?;
+        if cases.is_empty() {
+            return None;
+        }
+        let selector = cost(selector)?;
+        let mut case_remaining = 0_u64;
+        let mut case_hidden = 0_u64;
+        for case in cases {
+            let case = cost(*case)?;
+            case_remaining = case_remaining.max(case.remaining_relation_redexes);
+            case_hidden = case_hidden.max(case.hidden_relation_redexes);
+        }
+        Some((
+            selector.remaining_relation_redexes.saturating_add(case_remaining),
+            selector.hidden_relation_redexes.saturating_add(case_hidden),
+            node_count,
+        ))
+    } else {
+        let mut remaining = 0_u64;
+        let mut hidden = 0_u64;
+        for child in node.children() {
+            let child = cost(*child)?;
+            remaining = remaining.saturating_add(child.remaining_relation_redexes);
+            hidden = hidden.saturating_add(child.hidden_relation_redexes);
+        }
+        Some((remaining, hidden, node_count))
+    }
 }
 
 struct CandidateChildBounds<'a> {
@@ -2386,19 +2479,23 @@ fn proposal_cost<I: BoundInput>(
     Option<(ProposalCost, Option<MatrixBound>, Option<AtomicSourceId>)>,
     OperationalSimulationError,
 > {
-    let mut child_remaining = 0_u64;
-    let mut child_hidden = 0_u64;
-    let mut node_count = 1_u64;
-    for &child in node.children() {
-        let child = egraph.find(child);
-        let Some(child) = candidates.get(usize::from(child)).and_then(Option::as_ref) else {
-            return Ok(None);
-        };
-        child_remaining = child_remaining.saturating_add(child.cost.remaining_relation_redexes);
-        child_hidden = child_hidden.saturating_add(child.cost.hidden_relation_redexes);
-        node_count = node_count.saturating_add(child.cost.node_count);
-    }
+    let Some((child_remaining, child_hidden, node_count)) =
+        selected_child_obligations(egraph, node, candidates)
+    else {
+        return Ok(None);
+    };
     let classification = classify(class, node, egraph)?;
+    let selected_product_normalization = match node {
+        MxxLang::MatrixMultiply(factors) => {
+            selected_product_switch_eligibility(egraph, class, factors, |handle| {
+                let origin = egraph.find(handle);
+                let candidate = candidates.get(usize::from(origin))?.as_ref()?;
+                Some(SelectedNodeRef { node: &candidate.node, origin })
+            })
+            .is_some()
+        }
+        _ => false,
+    };
     let semantic_bound = matches!(&egraph[class].data.sort, Ok(MxxSort::Matrix(_)))
         .then(|| {
             let children = CandidateChildBounds { egraph, candidates };
@@ -2414,7 +2511,8 @@ fn proposal_cost<I: BoundInput>(
     Ok(Some((
         ProposalCost {
             remaining_relation_redexes: child_remaining
-                .saturating_add(u64::from(classification.relation_redex)),
+                .saturating_add(u64::from(classification.relation_redex))
+                .saturating_add(u64::from(selected_product_normalization)),
             // At an addition all relation redexes below it are hidden exactly once;
             // an enclosing addition replaces this value with the same descendant count.
             hidden_relation_redexes: if matches!(node, MxxLang::MatrixAdd(_)) {
@@ -2471,7 +2569,8 @@ mod tests {
         },
         relation::{
             PointwiseAddSwitchReject, RelationApplier, RelationRegistration, RelationSearcher,
-            RewriteContext, SharedRewriteBudget,
+            RewriteContext, SharedRewriteBudget, materialize_selected_product_switch_redex,
+            selected_product_switch_redex,
         },
     };
     use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef, types::ConcreteMatrixType};
@@ -4960,6 +5059,68 @@ mod tests {
     }
 
     #[test]
+    fn switch_obligations_add_selector_take_case_max_and_sum_node_count() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let low = egraph.add(MxxLang::IntConst(1.into()));
+        let high = egraph.add(MxxLang::IntConst(2.into()));
+        let switch = MxxLang::Switch(
+            std::iter::once(selector)
+                .chain([low, low, low, high, low, low, low, low])
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        egraph.add(switch.clone());
+        egraph.rebuild();
+        let mut candidates = vec![None; egraph.nodes().len()];
+        let candidate = |node: MxxLang, cost: ProposalCost| Candidate {
+            cost,
+            semantic_bound: None,
+            first_large_source: None,
+            node,
+            state: ExtractionState::Pending,
+            output: None,
+        };
+        candidates[usize::from(egraph.find(selector))] = Some(candidate(
+            MxxLang::IntConst(0.into()),
+            ProposalCost {
+                remaining_relation_redexes: 1,
+                hidden_relation_redexes: 2,
+                node_count: 3,
+                ..Default::default()
+            },
+        ));
+        candidates[usize::from(egraph.find(low))] = Some(candidate(
+            MxxLang::IntConst(1.into()),
+            ProposalCost {
+                remaining_relation_redexes: 2,
+                hidden_relation_redexes: 4,
+                node_count: 5,
+                ..Default::default()
+            },
+        ));
+        candidates[usize::from(egraph.find(high))] = Some(candidate(
+            MxxLang::IntConst(2.into()),
+            ProposalCost {
+                remaining_relation_redexes: 7,
+                hidden_relation_redexes: 1,
+                node_count: 11,
+                ..Default::default()
+            },
+        ));
+
+        assert_eq!(
+            selected_child_obligations(&egraph, &switch, &candidates),
+            Some((8, 6, 50)),
+            "selector obligations add, case obligations take max, and all stored nodes count"
+        );
+        let all_zero = MxxLang::Switch(vec![selector, selector, selector].into_boxed_slice());
+        candidates[usize::from(egraph.find(selector))].as_mut().unwrap().cost =
+            ProposalCost { node_count: 3, ..Default::default() };
+        assert_eq!(selected_child_obligations(&egraph, &all_zero, &candidates), Some((0, 0, 10)));
+    }
+
+    #[test]
     fn shared_child_is_materialized_once_as_a_dag() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let child = egraph.add(MxxLang::IntConst(7.into()));
@@ -4997,6 +5158,62 @@ mod tests {
             egraph.find(root)
         );
         assert!(extracted.origins.iter().all(|origin| *origin == egraph.find(*origin)));
+    }
+
+    #[test]
+    fn extraction_prefers_a_materialized_product_switch_over_the_compact_raw_product() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let left = egraph.add(MxxLang::IntConst(2.into()));
+        let right = egraph.add(MxxLang::IntConst(3.into()));
+        let fixed = egraph.add(MxxLang::IntConst(5.into()));
+        let selected = egraph.add(MxxLang::Switch(vec![selector, left, right].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixMultiply(vec![selected, fixed].into_boxed_slice()));
+        egraph.rebuild();
+        let extract = |egraph: &EGraph<MxxLang, MxxAnalysis>| {
+            let mut invalid = |_| panic!("fixture has a finite selected DAG");
+            let mut bound_error = |error| panic!("non-matrix fixture has no bound: {error:?}");
+            extract_best_proposal_with_origins(
+                egraph,
+                root,
+                &NoBounds,
+                &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+                &mut |_, _, _| Ok(ProposalNodeClassification::default()),
+            )
+            .expect("selected proposal")
+        };
+        let raw = extract(&egraph);
+        assert_eq!(raw.proposal.cost.remaining_relation_redexes, 1);
+        let product_index = usize::from(raw.proposal.expression.root());
+        let redex = selected_product_switch_redex(
+            &egraph,
+            &raw.proposal.expression,
+            &raw.origins,
+            product_index,
+        )
+        .expect("raw product normalization");
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        let (origin, replacement) =
+            materialize_selected_product_switch_redex(&mut egraph, redex, &context)
+                .expect("materialized outer Switch");
+        assert!(egraph.union(origin, replacement));
+        egraph.rebuild();
+
+        let normalized = extract(&egraph);
+        assert_eq!(normalized.proposal.cost.remaining_relation_redexes, 0);
+        assert!(matches!(
+            normalized.proposal.expression[normalized.proposal.expression.root()],
+            MxxLang::Switch(_)
+        ));
+        assert!(
+            selected_product_switch_redex(
+                &egraph,
+                &normalized.proposal.expression,
+                &normalized.origins,
+                usize::from(normalized.proposal.expression.root()),
+            )
+            .is_none()
+        );
     }
 
     #[test]

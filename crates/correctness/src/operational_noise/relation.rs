@@ -17,7 +17,7 @@ use super::{
     },
     language::MxxLang,
 };
-use egg::{Applier, EGraph, Id, Language, SearchMatches, Searcher, Subst, Symbol, Var};
+use egg::{Applier, EGraph, Id, Language, RecExpr, SearchMatches, Searcher, Subst, Symbol, Var};
 use num_bigint::BigInt;
 use num_traits::Zero;
 use std::{
@@ -1411,6 +1411,180 @@ pub(crate) fn materialize_selected_multi_switch_redex(
 
 pub(crate) fn note_selected_multi_switch_union(context: &RewriteContext) {
     context.note_rewrite(true);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum SelectedProductFactor {
+    Fixed(Id),
+    Cases(Box<[Id]>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SelectedNodeRef<'a> {
+    pub(crate) node: &'a MxxLang,
+    pub(crate) origin: Id,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedProductSwitchEligibility {
+    selector: Id,
+    case_count: usize,
+}
+
+/// Allocation-free authority for deciding whether one selected product has an
+/// exact Switch-scope normalization. `lookup` exposes only selected nodes and
+/// their canonical origins, never arbitrary physical alternatives.
+pub(crate) fn selected_product_switch_eligibility<'a>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    product_origin: Id,
+    factors: &[Id],
+    lookup: impl Fn(Id) -> Option<SelectedNodeRef<'a>>,
+) -> Option<SelectedProductSwitchEligibility> {
+    if factors.is_empty() {
+        return None;
+    }
+    let product_origin = egraph.find(product_origin);
+    let mut selector = None;
+    let mut case_count = None;
+    let mut switch_count = 0_usize;
+    for factor in factors {
+        let selected = lookup(*factor)?;
+        if egraph.find(selected.origin) == product_origin {
+            return None;
+        }
+        let MxxLang::Switch(selected_cases) = selected.node else { continue };
+        let (&selected_selector, selected_cases) = selected_cases.split_first()?;
+        if selected_cases.is_empty() {
+            return None;
+        }
+        let selected_selector = egraph.find(lookup(selected_selector)?.origin);
+        let selected_count = selected_cases.len();
+        if selector.is_some_and(|selector| selector != selected_selector) ||
+            case_count.is_some_and(|count| count != selected_count)
+        {
+            return None;
+        }
+        selector = Some(selected_selector);
+        case_count = Some(selected_count);
+        switch_count += 1;
+    }
+    let selector = selector?;
+    let case_count = case_count?;
+    if switch_count == 0 || !selector_domain_matches_cases(egraph, selector, case_count) {
+        return None;
+    }
+    Some(SelectedProductSwitchEligibility { selector, case_count })
+}
+
+/// One exact product distribution planned only from the selected RecExpr DAG.
+/// No e-class alternative is consulted while deciding which factors Switch.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct SelectedProductSwitchRedex {
+    pub(crate) origin: Id,
+    selector: Id,
+    case_count: usize,
+    factors: Box<[SelectedProductFactor]>,
+}
+
+impl SelectedProductSwitchRedex {
+    pub(crate) fn diagnostic_shape(&self) -> (usize, usize) {
+        (self.case_count, self.factors.len())
+    }
+}
+
+pub(crate) fn selected_product_switch_redex(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    expression: &RecExpr<MxxLang>,
+    origins: &[Id],
+    product_index: usize,
+) -> Option<SelectedProductSwitchRedex> {
+    let node = expression.as_ref().get(product_index)?;
+    let MxxLang::MatrixMultiply(selected_factors) = node else { return None };
+    if selected_factors.is_empty() || origins.len() != expression.as_ref().len() {
+        return None;
+    }
+    let origin = egraph.find(*origins.get(product_index)?);
+    let eligibility =
+        selected_product_switch_eligibility(egraph, origin, selected_factors, |handle| {
+            let index = usize::from(handle);
+            Some(SelectedNodeRef {
+                node: expression.as_ref().get(index)?,
+                origin: *origins.get(index)?,
+            })
+        })?;
+    let mut factors = Vec::with_capacity(selected_factors.len());
+    for factor in selected_factors {
+        let factor_index = usize::from(*factor);
+        debug_assert!(factor_index < product_index, "RecExpr children precede their product");
+        if factor_index >= product_index {
+            return None;
+        }
+        let factor_origin = egraph.find(*origins.get(factor_index)?);
+        if factor_origin == origin {
+            return None;
+        }
+        match expression.as_ref().get(factor_index)? {
+            MxxLang::Switch(selected_cases) => {
+                let (&selected_selector, selected_cases) = selected_cases.split_first()?;
+                debug_assert!(
+                    usize::from(selected_selector) < product_index &&
+                        selected_cases.iter().all(|case| usize::from(*case) < product_index),
+                    "selected Switch children precede their product"
+                );
+                if selected_cases.is_empty() || usize::from(selected_selector) >= product_index {
+                    return None;
+                }
+                if selected_cases.iter().any(|case| usize::from(*case) >= product_index) {
+                    return None;
+                }
+                let cases = selected_cases
+                    .iter()
+                    .map(|case| origins.get(usize::from(*case)).map(|origin| egraph.find(*origin)))
+                    .collect::<Option<Vec<_>>>()?;
+                if cases.iter().any(|case| *case == origin) {
+                    return None;
+                }
+                factors.push(SelectedProductFactor::Cases(cases.into_boxed_slice()));
+            }
+            _ => factors.push(SelectedProductFactor::Fixed(factor_origin)),
+        }
+    }
+    Some(SelectedProductSwitchRedex {
+        origin,
+        selector: eligibility.selector,
+        case_count: eligibility.case_count,
+        factors: factors.into_boxed_slice(),
+    })
+}
+
+pub(crate) fn materialize_selected_product_switch_redex(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    redex: SelectedProductSwitchRedex,
+    context: &RewriteContext,
+) -> Option<(Id, Id)> {
+    let work = redex.case_count.checked_mul(redex.factors.len())?.checked_add(1)?;
+    if !context.reserve(work) {
+        return None;
+    }
+    context.note_candidate();
+    let mut cases = Vec::with_capacity(redex.case_count + 1);
+    cases.push(redex.selector);
+    for case_index in 0..redex.case_count {
+        let factors = redex
+            .factors
+            .iter()
+            .map(|factor| match factor {
+                SelectedProductFactor::Fixed(factor) => Some(*factor),
+                SelectedProductFactor::Cases(cases) => cases.get(case_index).copied(),
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if factors.iter().any(|factor| *factor == redex.origin) {
+            return None;
+        }
+        cases.push(egraph.add(MxxLang::MatrixMultiply(factors.into_boxed_slice())));
+    }
+    let replacement = egraph.add(MxxLang::Switch(cases.into_boxed_slice()));
+    Some((redex.origin, replacement))
 }
 
 /// Distributes one Add over two or more stored Switch families that share one
@@ -6790,6 +6964,109 @@ mod tests {
     }
 
     #[test]
+    fn selected_product_switch_preserves_order_and_diagonalizes_three_factors() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let fixed = egraph.add(MxxLang::IntConst(19.into()));
+        let cases = [
+            [egraph.add(MxxLang::IntConst(2.into())), egraph.add(MxxLang::IntConst(3.into()))],
+            [egraph.add(MxxLang::IntConst(5.into())), egraph.add(MxxLang::IntConst(7.into()))],
+            [egraph.add(MxxLang::IntConst(11.into())), egraph.add(MxxLang::IntConst(13.into()))],
+        ];
+        let mut expression = RecExpr::default();
+        let mut origins = Vec::new();
+        let selector_expr = expression.add(MxxLang::IntConst(0.into()));
+        origins.push(selector);
+        let mut selected_switches = Vec::new();
+        for switch_cases in cases {
+            let mut selected_cases = Vec::new();
+            for case in switch_cases {
+                selected_cases.push(expression.add(MxxLang::IntConst(1.into())));
+                origins.push(case);
+            }
+            selected_switches.push(
+                expression.add(MxxLang::Switch(
+                    std::iter::once(selector_expr)
+                        .chain(selected_cases)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                )),
+            );
+            origins.push(egraph.add(MxxLang::Switch(
+                vec![selector, switch_cases[0], switch_cases[1]].into_boxed_slice(),
+            )));
+        }
+        let fixed_expr = expression.add(MxxLang::IntConst(19.into()));
+        origins.push(fixed);
+        let product_expr = expression.add(MxxLang::MatrixMultiply(
+            vec![selected_switches[0], fixed_expr, selected_switches[1], selected_switches[2]]
+                .into_boxed_slice(),
+        ));
+        let product_origin = egraph.add(MxxLang::MatrixMultiply(
+            vec![origins[3], fixed, origins[6], origins[9]].into_boxed_slice(),
+        ));
+        origins.push(product_origin);
+        egraph.rebuild();
+
+        let redex = selected_product_switch_redex(
+            &egraph,
+            &expression,
+            &origins,
+            usize::from(product_expr),
+        )
+        .expect("selected product redex");
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        let (_, replacement) =
+            materialize_selected_product_switch_redex(&mut egraph, redex, &context)
+                .expect("materialized product switch");
+        let switch = switch_node(&egraph, replacement).expect("outer switch");
+        for (case_index, product) in switch[1..].iter().enumerate() {
+            let factors = egraph[egraph.find(*product)]
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    MxxLang::MatrixMultiply(factors) => Some(factors),
+                    _ => None,
+                })
+                .expect("one n-ary case product");
+            assert_eq!(factors.len(), 4);
+            assert_eq!(egraph.find(factors[0]), egraph.find(cases[0][case_index]));
+            assert_eq!(egraph.find(factors[1]), egraph.find(fixed));
+            assert_eq!(egraph.find(factors[2]), egraph.find(cases[1][case_index]));
+            assert_eq!(egraph.find(factors[3]), egraph.find(cases[2][case_index]));
+        }
+    }
+
+    #[test]
+    fn selected_product_switch_ignores_unselected_physical_switch_alternatives() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let left = egraph.add(MxxLang::IntConst(2.into()));
+        let right = egraph.add(MxxLang::IntConst(3.into()));
+        let alternative_left = egraph.add(MxxLang::IntConst(5.into()));
+        let alternative_right = egraph.add(MxxLang::IntConst(7.into()));
+        let physical_switch = egraph.add(MxxLang::Switch(
+            vec![selector, alternative_left, alternative_right].into_boxed_slice(),
+        ));
+        egraph.union(left, physical_switch);
+        egraph.rebuild();
+        let mut expression = RecExpr::default();
+        let selected_left = expression.add(MxxLang::IntConst(2.into()));
+        let selected_right = expression.add(MxxLang::IntConst(3.into()));
+        let product = expression
+            .add(MxxLang::MatrixMultiply(vec![selected_left, selected_right].into_boxed_slice()));
+        let product_origin =
+            egraph.add(MxxLang::MatrixMultiply(vec![left, right].into_boxed_slice()));
+        let origins = [left, right, product_origin];
+
+        assert!(
+            selected_product_switch_redex(&egraph, &expression, &origins, usize::from(product))
+                .is_none(),
+            "an unselected physical Switch alternative must not create a plan"
+        );
+    }
+
+    #[test]
     fn classifier_skips_different_selector_relation_position_without_failure() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let left_selector = egraph.add(MxxLang::IntConst(0.into()));
@@ -12110,6 +12387,38 @@ mod tests {
         );
         assert!(selected_multi_switch_redex(&egraph, child, &child_node).is_none());
         assert!(selected_multi_switch_redex(&egraph, parent, &parent_node).is_none());
+    }
+
+    #[test]
+    fn selected_multi_switch_materialization_exposes_an_ordinary_additive_redex() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (signal, _) = matrix_atom(&mut egraph, "joint-loop-signal", None);
+        let negated = egraph.add(MxxLang::MatrixNegate([signal]));
+        let first = egraph.add(MxxLang::Switch(vec![selector, signal, signal].into_boxed_slice()));
+        let second =
+            egraph.add(MxxLang::Switch(vec![selector, negated, negated].into_boxed_slice()));
+        let selected = MxxLang::MatrixAdd(vec![first, second].into_boxed_slice());
+        let root = egraph.add(selected.clone());
+        egraph.rebuild();
+        let redex = selected_multi_switch_redex(&egraph, root, &selected).expect("selected redex");
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        assert_eq!(apply_selected_multi_switch_batch_for_test(&mut egraph, [redex], &context), 1);
+        let rewrites_before_ordinary = context.counters().rewrites;
+        let rewrite = egg::Rewrite::new(
+            "selected-then-ordinary-additive-cancellation",
+            RelationSearcher::new(context.clone()),
+            RelationApplier::new(context.clone()),
+        )
+        .expect("closed relation rewrite");
+
+        let runner = egg::Runner::default().with_egraph(egraph).run(&[rewrite]);
+        assert!(matches!(runner.stop_reason, Some(egg::StopReason::Saturated)));
+        assert!(
+            context.counters().rewrites > rewrites_before_ordinary,
+            "the next ordinary saturation consumes the redex created by selected materialization"
+        );
+        assert_eq!(context.failure(), None);
     }
 
     #[test]

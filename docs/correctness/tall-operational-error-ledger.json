@@ -702,7 +702,7 @@
       "error_tag": "Bound.UnresolvedExtraction",
       "tall_reachability": "reachable",
       "classification": "relation_extraction",
-      "rationale": "The generic extractor rejects a residual relation redex or Large atom before numeric noise evaluation; its counters identify the unconsumed category without protocol-specific state."
+      "rationale": "The generic extractor rejects any remaining checked rewrite or selected-normalization obligation before numeric noise evaluation; its counters identify unconsumed exact work without protocol-specific state."
     },
     {
       "error_tag": "Bound.EvaluationFailed",

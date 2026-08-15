@@ -1428,6 +1428,7 @@ fn build_binder_aware_pointwise_add_switch_cancellation(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BinderBuildRejectStage {
     CaseSignedReject,
+    FixedSignedReject,
     NoExactCancellation,
     RootCycle,
     Equivalent,
@@ -1543,7 +1544,11 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
                     .ok()?;
             mapped_bases.push(egraph.find(instantiated));
         }
-        let Some(mut after_cross) = signed_additive_leaves(egraph, terms) else {
+        let Some(actual_spines) = signed_ordered_monomial_spines(
+            egraph,
+            &terms.iter().copied().map(|term| (term, false)).collect::<Vec<_>>(),
+            progress,
+        ) else {
             report_binder_build_reject(
                 egraph,
                 case_index,
@@ -1555,15 +1560,42 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
             );
             return None;
         };
-        let actual = after_cross.clone();
         let mut mapped_fixed = Vec::with_capacity(plan.fixed_occurrences.len());
         for occurrence in &plan.fixed_occurrences {
             let mapped = mapped_bases[occurrence.base_index];
             mapped_fixed.push((mapped, occurrence.negative));
         }
-        after_cross.extend(mapped_fixed.iter().copied());
-        let (cancelled, any_cancelled) = cancelled_signed_additive_leaves(egraph, &after_cross);
+        let Some(mapped_fixed_spines) =
+            signed_ordered_monomial_spines(egraph, &mapped_fixed, progress)
+        else {
+            report_binder_build_reject(
+                egraph,
+                case_index,
+                BinderBuildRejectStage::FixedSignedReject,
+                &[],
+                &[],
+                should_collect,
+                sink,
+            );
+            return None;
+        };
+        let actual_count = actual_spines.len();
+        let mut after_cross = actual_spines;
+        after_cross.extend(mapped_fixed_spines);
+        let (cancelled, any_cancelled) = cancelled_signed_monomial_spines(&after_cross);
         if !any_cancelled {
+            // Failure diagnostics retain the old concrete leaf rendering, but
+            // successful cancellation never materializes terms it removes.
+            let actual = materialize_signed_ordered_monomials(
+                egraph,
+                after_cross[..actual_count].to_vec(),
+                progress,
+            )?;
+            let mapped_fixed = materialize_signed_ordered_monomials(
+                egraph,
+                after_cross[actual_count..].to_vec(),
+                progress,
+            )?;
             report_binder_build_reject(
                 egraph,
                 case_index,
@@ -1575,23 +1607,34 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
             );
             return None;
         }
-        let remaining = after_cross
-            .into_iter()
-            .zip(cancelled)
-            .filter_map(|(term, cancelled)| (!cancelled).then_some(term))
-            .map(
-                |(base, negative)| {
-                    if negative { egraph.add(MxxLang::MatrixNegate([base])) } else { base }
-                },
-            )
-            .collect::<Vec<_>>();
+        // Both plans were read-only.  Materialize only the uncancelled
+        // ordered monomials after exact spine cancellation has succeeded.
+        let remaining = materialize_signed_ordered_monomials(
+            egraph,
+            after_cross
+                .into_iter()
+                .zip(cancelled)
+                .filter_map(|(term, cancelled)| (!cancelled).then_some(term))
+                .collect(),
+            progress,
+        )?
+        .into_iter()
+        .map(|(base, negative)| {
+            if negative {
+                progress().ok()?;
+                Some(egraph.add(MxxLang::MatrixNegate([base])))
+            } else {
+                Some(base)
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
         if remaining.iter().any(|term| egraph.find(*term) == egraph.find(root)) {
             report_binder_build_reject(
                 egraph,
                 case_index,
                 BinderBuildRejectStage::RootCycle,
-                &actual,
-                &mapped_fixed,
+                &[],
+                &[],
                 should_collect,
                 sink,
             );
@@ -2068,15 +2111,40 @@ fn signed_additive_leaves(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     terms: &[Id],
 ) -> Option<Vec<(Id, bool)>> {
-    signed_additive_leaves_with_visit(egraph, terms, |_| {})
+    let mut no_progress = || Ok(());
+    signed_additive_leaves_with_visit_and_progress(egraph, terms, |_| {}, &mut no_progress)
 }
 
-/// The callback is test instrumentation only at its call sites.  The generic
-/// no-op production instantiation has no storage or dynamic-dispatch cost.
+/// The callback is test instrumentation only at its call sites.
+#[cfg(test)]
 fn signed_additive_leaves_with_visit<F>(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     terms: &[Id],
+    visit: F,
+) -> Option<Vec<(Id, bool)>>
+where
+    F: FnMut(Id),
+{
+    let mut no_progress = || Ok(());
+    signed_additive_leaves_with_visit_and_progress(egraph, terms, visit, &mut no_progress)
+}
+
+/// The binder polynomial path uses the same additive consensus while charging
+/// the existing shared rewrite budget for every representative occurrence it
+/// copies or allocates.  Other callers keep their read-only behavior.
+fn signed_additive_leaves_with_progress(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    terms: &[Id],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<(Id, bool)>> {
+    signed_additive_leaves_with_visit_and_progress(egraph, terms, |_| {}, progress)
+}
+
+fn signed_additive_leaves_with_visit_and_progress<F>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    terms: &[Id],
     mut visit: F,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
 ) -> Option<Vec<(Id, bool)>>
 where
     F: FnMut(Id),
@@ -2100,13 +2168,52 @@ where
             .collect()
     }
 
+    /// Add/Negate consensus needs a stable key for an outer product even
+    /// when one factor is relation-unioned with another product shape.  Such
+    /// a factor is an atomic key here; a physical product cycle still rejects.
+    fn additive_product_leaves(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        term: Id,
+    ) -> Option<Box<[Id]>> {
+        fn collect(
+            egraph: &EGraph<MxxLang, MxxAnalysis>,
+            term: Id,
+            active: &mut HashSet<Id>,
+            leaves: &mut Vec<Id>,
+        ) -> Option<()> {
+            let term = egraph.find(term);
+            match physical_product_factors(egraph, term) {
+                PhysicalStructure::Absent | PhysicalStructure::Ambiguous => leaves.push(term),
+                PhysicalStructure::Unique(factors) => {
+                    if !active.insert(term) {
+                        return None;
+                    }
+                    for factor in factors.iter() {
+                        collect(egraph, *factor, active, leaves)?;
+                    }
+                    active.remove(&term);
+                }
+            }
+            Some(())
+        }
+
+        let mut leaves = Vec::new();
+        collect(egraph, term, &mut HashSet::new(), &mut leaves)?;
+        Some(leaves.into_boxed_slice())
+    }
+
     fn canonical_from_terms(
         egraph: &EGraph<MxxLang, MxxAnalysis>,
         terms: &[(Id, bool)],
     ) -> Option<Canonical> {
         let mut counts = BTreeMap::<Box<[Id]>, (usize, usize)>::new();
         for (term, negative) in terms {
-            let counts = counts.entry(ordered_product_leaves(egraph, *term)?).or_default();
+            // A relation may legitimately union a product with a structurally
+            // different target.  Add/Negate consensus must still be able to
+            // treat that exact e-class as one atomic additive leaf; only
+            // callers that need a product cancellation key reject it later.
+            let key = additive_product_leaves(egraph, *term)?;
+            let counts = counts.entry(key).or_default();
             let count = if *negative { &mut counts.1 } else { &mut counts.0 };
             *count = count.checked_add(1)?;
         }
@@ -2131,12 +2238,16 @@ where
         memo: &mut HashMap<Id, Consensus>,
         active: &mut HashSet<Id>,
         visit: &mut F,
+        progress: &mut dyn FnMut() -> Result<(), ()>,
     ) -> Option<Consensus>
     where
         F: FnMut(Id),
     {
         let term = egraph.find(term);
         if let Some(existing) = memo.get(&term) {
+            for _ in &existing.representative {
+                progress().ok()?;
+            }
             return Some(existing.clone());
         }
         if !active.insert(term) {
@@ -2150,7 +2261,8 @@ where
                 let candidate = match node {
                     MxxLang::MatrixNegate([base]) => {
                         has_additive_structure = true;
-                        let mut candidate = consensus(egraph, *base, memo, active, visit)?;
+                        let mut candidate =
+                            consensus(egraph, *base, memo, active, visit, progress)?;
                         for (_, negative) in &mut candidate.representative {
                             *negative = !*negative;
                         }
@@ -2167,8 +2279,12 @@ where
                         let mut representative = Vec::new();
                         let mut counts = BTreeMap::new();
                         for child in children.iter() {
-                            let child = consensus(egraph, *child, memo, active, visit)?;
-                            representative.extend(child.representative);
+                            let child = consensus(egraph, *child, memo, active, visit, progress)?;
+                            for occurrence in child.representative {
+                                progress().ok()?;
+                                representative.try_reserve(1).ok()?;
+                                representative.push(occurrence);
+                            }
                             add_canonical(&mut counts, &child.canonical)?;
                         }
                         Consensus { representative, canonical: normalized_counts(counts) }
@@ -2186,7 +2302,10 @@ where
             if has_additive_structure {
                 agreed
             } else {
-                let representative = vec![(term, false)];
+                progress().ok()?;
+                let mut representative = Vec::new();
+                representative.try_reserve_exact(1).ok()?;
+                representative.push((term, false));
                 Some(Consensus {
                     canonical: canonical_from_terms(egraph, &representative)?,
                     representative,
@@ -2195,6 +2314,9 @@ where
         })();
         active.remove(&term);
         let result = result?;
+        for _ in &result.representative {
+            progress().ok()?;
+        }
         memo.insert(term, result.clone());
         Some(result)
     }
@@ -2203,15 +2325,176 @@ where
     let mut active = HashSet::new();
     let mut output = Vec::new();
     for term in terms {
-        output.extend(consensus(egraph, *term, &mut memo, &mut active, &mut visit)?.representative);
+        let consensus = consensus(egraph, *term, &mut memo, &mut active, &mut visit, progress)?;
+        for occurrence in consensus.representative {
+            progress().ok()?;
+            output.try_reserve(1).ok()?;
+            output.push(occurrence);
+        }
     }
     Some(output)
+}
+
+/// A read-only signed noncommutative polynomial view used only while building
+/// one binder case.  It first reuses the existing Add/Negate consensus, then
+/// distributes only an unambiguous physical MatrixMultiply spine.  A product
+/// e-class with competing forms is an atomic leaf: relation saturation may
+/// legitimately have unioned it with a structurally different target.
+/// Switch is deliberately atomic and is never enumerated.
+fn signed_ordered_monomial_spines(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    terms: &[(Id, bool)],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<(Box<[Id]>, bool)>> {
+    fn uncontested_product_factors(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        term: Id,
+    ) -> Option<Box<[Id]>> {
+        let term = egraph.find(term);
+        let PhysicalStructure::Unique(factors) = physical_product_factors(egraph, term) else {
+            return None;
+        };
+        egraph[term]
+            .nodes
+            .iter()
+            .all(|node| {
+                matches!(node, MxxLang::MatrixMultiply(candidate)
+                if candidate.iter().map(|factor| egraph.find(*factor)).eq(factors.iter().copied()))
+            })
+            .then_some(factors)
+    }
+
+    fn expand_leaf(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        term: Id,
+        negative: bool,
+        active: &mut HashSet<Id>,
+        progress: &mut dyn FnMut() -> Result<(), ()>,
+    ) -> Option<Vec<(Box<[Id]>, bool)>> {
+        let term = egraph.find(term);
+        let factors = uncontested_product_factors(egraph, term);
+        if factors.is_none() &&
+            matches!(physical_product_factors(egraph, term), PhysicalStructure::Unique(ref factors) if factors.iter().any(|factor| egraph.find(*factor) == term))
+        {
+            return None;
+        }
+        let Some(factors) = factors else {
+            progress().ok()?;
+            let mut output = Vec::new();
+            output.try_reserve_exact(1).ok()?;
+            output.push((vec![term].into_boxed_slice(), negative));
+            return Some(output);
+        };
+        if factors.is_empty() || !active.insert(term) {
+            return None;
+        }
+        let result = (|| -> Option<Vec<(Box<[Id]>, bool)>> {
+            let mut product = vec![(Box::<[Id]>::default(), false)];
+            for factor in factors {
+                let additive = signed_additive_leaves_with_progress(egraph, &[factor], progress)?;
+                let mut expanded_factor = Vec::new();
+                for (leaf, leaf_negative) in additive {
+                    let expanded = expand_leaf(egraph, leaf, leaf_negative, active, progress)?;
+                    expanded_factor.try_reserve(expanded.len()).ok()?;
+                    expanded_factor.extend(expanded);
+                }
+                let combinations = product.len().checked_mul(expanded_factor.len())?;
+                let mut next = Vec::new();
+                for (prefix, prefix_negative) in &product {
+                    for (suffix, suffix_negative) in &expanded_factor {
+                        // Every generated Cartesian monomial consumes the
+                        // shared rewrite budget before allocating or pushing.
+                        progress().ok()?;
+                        next.try_reserve(1).ok()?;
+                        let length = prefix.len().checked_add(suffix.len())?;
+                        let mut combined = Vec::new();
+                        combined.try_reserve_exact(length).ok()?;
+                        combined.extend(prefix.iter().copied());
+                        combined.extend(suffix.iter().copied());
+                        next.push((
+                            combined.into_boxed_slice(),
+                            *prefix_negative != *suffix_negative,
+                        ));
+                    }
+                }
+                debug_assert_eq!(next.len(), combinations);
+                product = next;
+            }
+            Some(product)
+        })();
+        active.remove(&term);
+        let mut result = result?;
+        for (_, sign) in &mut result {
+            *sign = *sign != negative;
+        }
+        Some(result)
+    }
+
+    let mut active = HashSet::new();
+    let mut output = Vec::new();
+    for (term, outer_negative) in terms {
+        let additive = signed_additive_leaves_with_progress(egraph, &[*term], progress)?;
+        for (leaf, leaf_negative) in additive {
+            let expanded =
+                expand_leaf(egraph, leaf, leaf_negative != *outer_negative, &mut active, progress)?;
+            output.try_reserve(expanded.len()).ok()?;
+            output.extend(expanded);
+        }
+    }
+    Some(output)
+}
+
+/// Materializes only the signed monomials that survived a successful
+/// read-only binder-case plan.  Product spines are already flattened, so this
+/// preserves noncommutative factor order without adding associativity rewrites.
+fn materialize_signed_ordered_monomials(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    monomials: Vec<(Box<[Id]>, bool)>,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<(Id, bool)>> {
+    monomials
+        .into_iter()
+        .map(|(factors, negative)| {
+            let base = match factors.as_ref() {
+                [] => return None,
+                [factor] => *factor,
+                _ => {
+                    progress().ok()?;
+                    egraph.add(MxxLang::MatrixMultiply(factors))
+                }
+            };
+            Some((base, negative))
+        })
+        .collect()
+}
+
+/// Cancels exact opposites using the already checked ordered factor spines.
+/// Unlike `cancelled_signed_additive_leaves`, this deliberately does not
+/// reopen an atomic relation-unioned product e-class.
+fn cancelled_signed_monomial_spines(terms: &[(Box<[Id]>, bool)]) -> (Vec<bool>, bool) {
+    let mut cancelled = vec![false; terms.len()];
+    let mut positive = HashMap::<Box<[Id]>, Vec<usize>>::new();
+    let mut negative = HashMap::<Box<[Id]>, Vec<usize>>::new();
+    let mut any = false;
+    for (index, (factors, is_negative)) in terms.iter().enumerate() {
+        let opposite = if *is_negative { &mut positive } else { &mut negative };
+        if let Some(other) = opposite.get_mut(factors).and_then(Vec::pop) {
+            cancelled[index] = true;
+            cancelled[other] = true;
+            any = true;
+        } else {
+            let same = if *is_negative { &mut negative } else { &mut positive };
+            same.entry(factors.clone()).or_default().push(index);
+        }
+    }
+    (cancelled, any)
 }
 
 /// Returns the sole ordered MatrixMultiply leaf sequence for `term`, flattening
 /// association without changing factor order.  A class with no physical
 /// product is its own singleton leaf; competing product layouts and product
 /// cycles are not given a cancellation key.
+#[cfg(test)]
 fn ordered_product_leaves(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> Option<Box<[Id]>> {
     fn collect(
         egraph: &EGraph<MxxLang, MxxAnalysis>,
@@ -2241,6 +2524,7 @@ fn ordered_product_leaves(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> Op
     Some(leaves.into_boxed_slice())
 }
 
+#[cfg(test)]
 fn cancelled_signed_additive_leaves(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     terms: &[(Id, bool)],
@@ -5530,6 +5814,223 @@ mod tests {
         let cyclic = egraph.add(MxxLang::MatrixAdd(vec![left].into_boxed_slice()));
         egraph.union(cyclic, left);
         assert!(signed_additive_leaves(&egraph, &[cyclic]).is_none());
+    }
+
+    #[test]
+    fn signed_ordered_monomials_distribute_products_and_preserve_order_and_sign() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "monomial-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "monomial-second", None);
+        let (factor, _) = matrix_atom(&mut egraph, "monomial-factor", None);
+        let sum = egraph.add(MxxLang::MatrixAdd(vec![first, second].into_boxed_slice()));
+        let product = egraph.add(MxxLang::MatrixMultiply(vec![sum, factor].into_boxed_slice()));
+        let negated = egraph.add(MxxLang::MatrixNegate([product]));
+        let reordered = egraph.add(MxxLang::MatrixMultiply(vec![factor, sum].into_boxed_slice()));
+        egraph.rebuild();
+
+        let mut progress = || Ok(());
+        assert_eq!(
+            signed_ordered_monomial_spines(&egraph, &[(negated, false)], &mut progress),
+            Some(vec![
+                (vec![egraph.find(first), egraph.find(factor)].into_boxed_slice(), true),
+                (vec![egraph.find(second), egraph.find(factor)].into_boxed_slice(), true),
+            ])
+        );
+        let mut progress = || Ok(());
+        assert_ne!(
+            signed_ordered_monomial_spines(&egraph, &[(product, false)], &mut progress),
+            signed_ordered_monomial_spines(&egraph, &[(reordered, false)], &mut progress),
+            "matrix factor order is noncommutative"
+        );
+
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let switch = egraph.add(MxxLang::Switch(vec![selector, first, second].into_boxed_slice()));
+        let switch_factor =
+            egraph.add(MxxLang::MatrixMultiply(vec![sum, switch].into_boxed_slice()));
+        let mut progress = || Ok(());
+        assert_eq!(
+            signed_ordered_monomial_spines(&egraph, &[(switch_factor, false)], &mut progress),
+            Some(vec![
+                (vec![egraph.find(first), egraph.find(switch)].into_boxed_slice(), false),
+                (vec![egraph.find(second), egraph.find(switch)].into_boxed_slice(), false),
+            ]),
+            "Switch remains one opaque factor rather than enumerating its cases"
+        );
+    }
+
+    #[test]
+    fn signed_ordered_monomials_accept_equivalent_add_forms_and_keep_relation_unions_atomic() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "monomial-consensus-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "monomial-consensus-second", None);
+        let (factor, _) = matrix_atom(&mut egraph, "monomial-consensus-factor", None);
+        let left = egraph.add(MxxLang::MatrixAdd(vec![first, second].into_boxed_slice()));
+        let right = egraph.add(MxxLang::MatrixAdd(vec![second, first].into_boxed_slice()));
+        let left_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![left, factor].into_boxed_slice()));
+        let right_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![right, factor].into_boxed_slice()));
+        egraph.union(left_product, right_product);
+        egraph.rebuild();
+        let mut progress = || Ok(());
+        assert!(
+            signed_ordered_monomial_spines(&egraph, &[(left_product, false)], &mut progress)
+                .is_some()
+        );
+
+        let (relation_target, _) = matrix_atom(&mut egraph, "monomial-relation-target", None);
+        egraph.union(left_product, relation_target);
+        egraph.rebuild();
+        let mut progress = || Ok(());
+        assert!(
+            signed_ordered_monomial_spines(&egraph, &[(left_product, false)], &mut progress)
+                .is_some(),
+            "a relation-unioned product remains one atomic leaf"
+        );
+
+        let (cycle_leaf, _) = matrix_atom(&mut egraph, "monomial-cycle", None);
+        let cyclic = egraph.add(MxxLang::MatrixMultiply(vec![cycle_leaf].into_boxed_slice()));
+        egraph.union(cyclic, cycle_leaf);
+        let mut progress = || Ok(());
+        assert!(
+            signed_ordered_monomial_spines(&egraph, &[(cyclic, false)], &mut progress).is_none()
+        );
+    }
+
+    #[test]
+    fn signed_ordered_monomials_charge_every_generated_cartesian_monomial() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "monomial-shared-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "monomial-shared-second", None);
+        let shared = egraph.add(MxxLang::MatrixAdd(vec![first, second].into_boxed_slice()));
+        let product = egraph.add(MxxLang::MatrixMultiply(vec![shared, shared].into_boxed_slice()));
+        egraph.rebuild();
+
+        let mut charges = 0;
+        let spines = signed_ordered_monomial_spines(&egraph, &[(product, false)], &mut || {
+            charges += 1;
+            Ok(())
+        })
+        .expect("shared additive factor has one consensus result");
+        assert_eq!(spines.len(), 4, "only mathematically required product monomials are retained");
+        assert_eq!(
+            charges, 33,
+            "additive representative copies, memo clones, output copies, and all Cartesian products are charged"
+        );
+    }
+
+    #[test]
+    fn signed_ordered_monomials_stop_before_an_unfunded_cartesian_product() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "monomial-budget-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "monomial-budget-second", None);
+        let shared = egraph.add(MxxLang::MatrixAdd(vec![first, second].into_boxed_slice()));
+        let product = egraph.add(MxxLang::MatrixMultiply(vec![shared, shared].into_boxed_slice()));
+        egraph.rebuild();
+
+        let mut remaining = 5;
+        assert!(
+            signed_ordered_monomial_spines(&egraph, &[(product, false)], &mut || {
+                if remaining == 0 {
+                    Err(())
+                } else {
+                    remaining -= 1;
+                    Ok(())
+                }
+            })
+            .is_none(),
+            "the sixth generated monomial is rejected before it is allocated"
+        );
+    }
+
+    #[test]
+    fn signed_ordered_monomials_stop_before_expanding_a_compact_shared_add_dag() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (first, _) = matrix_atom(&mut egraph, "monomial-dag-first", None);
+        let (second, _) = matrix_atom(&mut egraph, "monomial-dag-second", None);
+        let mut shared = egraph.add(MxxLang::MatrixAdd(vec![first, second].into_boxed_slice()));
+        for _ in 0..12 {
+            shared = egraph.add(MxxLang::MatrixAdd(vec![shared, shared].into_boxed_slice()));
+        }
+        let (factor, _) = matrix_atom(&mut egraph, "monomial-dag-factor", None);
+        let product = egraph.add(MxxLang::MatrixMultiply(vec![shared, factor].into_boxed_slice()));
+        egraph.rebuild();
+
+        let mut remaining = 64;
+        assert!(
+            signed_ordered_monomial_spines(&egraph, &[(product, false)], &mut || {
+                if remaining == 0 {
+                    Err(())
+                } else {
+                    remaining -= 1;
+                    Ok(())
+                }
+            })
+            .is_none(),
+            "representative copies stop at the shared budget before the compact DAG expands"
+        );
+    }
+
+    #[test]
+    fn binder_distribution_cancels_distributed_product_without_switch_cartesian_expansion() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let binder = test_binder(&mut egraph, 0, 1);
+        let selector = egraph.add(MxxLang::IntBinder(binder));
+        let first = binder_matrix_atom(&mut egraph, selector, "distributed-first");
+        let second = binder_matrix_atom(&mut egraph, selector, "distributed-second");
+        let (factor, _) = matrix_atom(&mut egraph, "distributed-factor", None);
+        let shared_sum = egraph.add(MxxLang::MatrixAdd(vec![first, second].into_boxed_slice()));
+        let shared =
+            egraph.add(MxxLang::MatrixMultiply(vec![shared_sum, factor].into_boxed_slice()));
+        let zero = egraph.add(MxxLang::IntConst(0.into()));
+        let one = egraph.add(MxxLang::IntConst(1.into()));
+        let instantiate =
+            |egraph: &mut EGraph<MxxLang, MxxAnalysis>, term, index| {
+                family::instantiate_shared_element(egraph, term, binder, index, &mut || {
+                    Ok::<(), ()>(())
+                })
+                .expect("test instantiation")
+            };
+        let first_zero = instantiate(&mut egraph, first, zero);
+        let second_zero = instantiate(&mut egraph, second, zero);
+        let first_one = instantiate(&mut egraph, first, one);
+        let second_one = instantiate(&mut egraph, second, one);
+        let case = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, left, right| {
+            let left = egraph.add(MxxLang::MatrixMultiply(vec![left, factor].into_boxed_slice()));
+            let right = egraph.add(MxxLang::MatrixMultiply(vec![right, factor].into_boxed_slice()));
+            egraph.add(MxxLang::MatrixAdd(vec![left, right].into_boxed_slice()))
+        };
+        let zero_case = case(&mut egraph, first_zero, second_zero);
+        let one_case = case(&mut egraph, first_one, second_one);
+        let switch =
+            egraph.add(MxxLang::Switch(vec![selector, zero_case, one_case].into_boxed_slice()));
+        let fixed = egraph.add(MxxLang::MatrixNegate([shared]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![switch, fixed].into_boxed_slice()));
+        egraph.rebuild();
+
+        let (selector, plan) = only_binder_plan(&egraph, root);
+        let mut charges = 0;
+        let replacement = build_binder_aware_pointwise_add_switch_cancellation(
+            &mut egraph,
+            root,
+            selector,
+            plan,
+            &mut || {
+                charges += 1;
+                Ok(())
+            },
+        )
+        .expect("distributed signal terms cancel per binder case");
+        let cases =
+            switch_node(&egraph, replacement).expect("replacement remains a two-case switch");
+        assert_eq!(cases.len(), 3, "Switch remains opaque and has no selector Cartesian expansion");
+        assert!(charges > 0, "read-only planning and construction share the rewrite budget");
+        for case in &cases[1..] {
+            assert!(egraph[egraph.find(*case)].nodes.iter().any(|node| {
+                matches!(node, MxxLang::MatrixConstant(spec)
+                    if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. })))
+            }));
+        }
     }
 
     #[test]

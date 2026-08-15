@@ -4770,6 +4770,17 @@ struct AffineConcatPlan {
     outside: Box<[Id]>,
 }
 
+/// One locally witnessed decomposition of a concat chunk.  The signal and
+/// residual terms remain canonical e-class ids so duplicate physical add
+/// nodes do not create spurious ambiguity.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AffineChunkDecomposition {
+    signal: Id,
+    prefix: Box<[Id]>,
+    end: BigInt,
+    residual: Box<[Id]>,
+}
+
 fn affine_concat_plan(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     actual_public: Id,
@@ -4832,30 +4843,22 @@ fn affine_concat_plan_for_inputs(
     let mut residuals = Vec::with_capacity(concat.len());
     let mut has_residual = None;
     for chunk in concat.iter() {
-        let terms = chunk_terms(egraph, *chunk)?;
-        let mut match_term = None;
-        for (index, term) in terms.iter().enumerate() {
-            let Some((prefix, start, end)) = slice_product(egraph, *term, expected_public) else {
-                continue;
-            };
-            if start != next_column || end <= start || end > full_columns || match_term.is_some() {
-                return None;
-            }
-            match &shared_prefix {
-                Some(previous) if !same_canonical_indices(egraph, previous, &prefix) => {
-                    return None;
-                }
-                None => shared_prefix = Some(prefix),
-                _ => {}
-            }
-            match_term = Some((index, end));
+        let decompositions = affine_chunk_decompositions(
+            egraph,
+            *chunk,
+            expected_public,
+            &next_column,
+            &full_columns,
+            shared_prefix.as_deref(),
+        );
+        if decompositions.len() != 1 {
+            return None;
         }
-        let Some((matched_index, end)) = match_term else { return None };
-        let remaining = terms
-            .iter()
-            .enumerate()
-            .filter_map(|(index, term)| (index != matched_index).then_some(*term))
-            .collect::<Vec<_>>();
+        let decomposition = decompositions.into_iter().next().expect("checked singleton");
+        if shared_prefix.is_none() {
+            shared_prefix = Some(decomposition.prefix.clone());
+        }
+        let remaining = decomposition.residual;
         // A concat can be entirely signal-only, in which case no zero matrix
         // needs to be invented.  Mixing signal-only and affine chunks would
         // require a typed zero residual for the missing columns, so reject it
@@ -4866,9 +4869,9 @@ fn affine_concat_plan_for_inputs(
             _ => {}
         }
         if !remaining.is_empty() {
-            residuals.push(remaining.into_boxed_slice());
+            residuals.push(remaining);
         }
-        next_column = end;
+        next_column = decomposition.end;
     }
     (next_column == full_columns).then(|| AffineConcatPlan {
         prefix: shared_prefix.unwrap_or_default(),
@@ -4895,14 +4898,53 @@ fn unique_concat_columns(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Optio
     (matches.len() == 1).then(|| matches.into_iter().next().expect("checked singleton"))
 }
 
-/// A concat chunk is either one direct signal term or one unambiguous
-/// physical addition.  An e-class with competing add representations is not
-/// a basis for choosing which residual to preserve.
-fn chunk_terms(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
-    unique_add_terms(egraph, id).or_else(|| {
-        (!egraph[egraph.find(id)].nodes.iter().any(|node| matches!(node, MxxLang::MatrixAdd(_))))
-            .then(|| vec![egraph.find(id)].into_boxed_slice())
-    })
+/// Enumerates only the physical add witnesses of one concat chunk.  Each
+/// witness is examined independently; this deliberately never combines
+/// alternatives across chunks.
+fn affine_chunk_decompositions(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    chunk: Id,
+    expected_public: Id,
+    next_column: &BigInt,
+    full_columns: &BigInt,
+    shared_prefix: Option<&[Id]>,
+) -> BTreeSet<AffineChunkDecomposition> {
+    let chunk = egraph.find(chunk);
+    let mut witnesses = BTreeSet::new();
+    for node in &egraph[chunk].nodes {
+        let MxxLang::MatrixAdd(terms) = node else { continue };
+        witnesses.insert(
+            terms.iter().map(|term| egraph.find(*term)).collect::<Vec<_>>().into_boxed_slice(),
+        );
+    }
+    if witnesses.is_empty() {
+        witnesses.insert(vec![chunk].into_boxed_slice());
+    }
+
+    let mut decompositions = BTreeSet::new();
+    for terms in witnesses {
+        for (signal_index, signal) in terms.iter().copied().enumerate() {
+            let Some((prefix, start, end)) = slice_product(egraph, signal, expected_public) else {
+                continue;
+            };
+            if start != *next_column ||
+                end <= start ||
+                end > *full_columns ||
+                shared_prefix
+                    .is_some_and(|previous| !same_canonical_indices(egraph, previous, &prefix))
+            {
+                continue;
+            }
+            let residual = terms
+                .iter()
+                .enumerate()
+                .filter_map(|(index, term)| (index != signal_index).then_some(*term))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            decompositions.insert(AffineChunkDecomposition { signal, prefix, end, residual });
+        }
+    }
+    decompositions
 }
 
 fn unique_product_factors(egraph: &EGraph<MxxLang, MxxAnalysis>, id: Id) -> Option<Box<[Id]>> {
@@ -6056,6 +6098,8 @@ mod tests {
             axis: Axis::Columns,
             inputs: vec![chunk0, mismatched_chunk].into(),
         });
+        let invalid_witness = egraph.add(MxxLang::MatrixAdd(vec![other_prefix, error0].into()));
+        egraph.union(chunk0, invalid_witness);
         let wrapper = egraph.add(MxxLang::MatrixAdd(vec![concat, outside].into()));
         egraph.rebuild();
 
@@ -6101,6 +6145,38 @@ mod tests {
         );
         assert!(context.counters().rewrites >= 2);
         assert_eq!(context.failure(), None);
+    }
+
+    #[test]
+    fn affine_concat_plan_rejects_distinct_valid_chunk_witnesses() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let matrix = |rows: i32, columns: i32| ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(rows.into()),
+            columns: ResolvedIntExpr::Const(columns.into()),
+        };
+        let (expected, _) = matrix_atom_with_type(&mut egraph, "expected", matrix(1, 1), None);
+        let (prefix, _) = matrix_atom_with_type(&mut egraph, "prefix", matrix(1, 1), None);
+        let (error0, _) = matrix_atom_with_type(&mut egraph, "error0", matrix(1, 1), None);
+        let (error1, _) = matrix_atom_with_type(&mut egraph, "error1", matrix(1, 1), None);
+        let spec = SliceSpecId(egraph.analysis.symbols.slices.intern(SliceSpec {
+            rows: None,
+            columns: Some(ResolvedIndexRange {
+                start: ResolvedIntExpr::Const(0.into()),
+                end: ResolvedIntExpr::Const(1.into()),
+            }),
+        }));
+        let slice = egraph.add(MxxLang::MatrixSlice { spec, input: [expected] });
+        let prefixed_signal = egraph.add(MxxLang::MatrixMultiply(vec![prefix, slice].into()));
+        let first_witness = egraph.add(MxxLang::MatrixAdd(vec![prefixed_signal, error0].into()));
+        let second_witness = egraph.add(MxxLang::MatrixAdd(vec![slice, error1].into()));
+        egraph.union(first_witness, second_witness);
+        let actual = egraph
+            .add(MxxLang::MatrixConcat { axis: Axis::Columns, inputs: vec![first_witness].into() });
+        egraph.rebuild();
+
+        assert!(affine_concat_plan(&egraph, actual, expected).is_none());
     }
 
     #[test]

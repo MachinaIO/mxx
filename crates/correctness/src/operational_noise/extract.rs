@@ -336,7 +336,7 @@ struct SelectedLargePathStep {
     /// relation rewrite or an e-graph summary.
     pointwise_fixed_product_spines: Option<Box<[SelectedFixedProductSpine]>>,
     add_selected_large_child_count: Option<usize>,
-    add_direct_child_views: Option<Box<[SelectedClassView]>>,
+    add_direct_child_inputs: Option<Box<[SelectedDiagnosticInput]>>,
     add_direct_child_omitted_child_count: usize,
     multiply_factors: Option<Box<[SelectedClassView]>>,
     multiply_omitted_factor_count: usize,
@@ -344,6 +344,7 @@ struct SelectedLargePathStep {
     /// appears on both the root (positive) path and retained negative paths.
     product_spine: Option<SelectedProductSpine>,
     add_product_boundary: Option<SelectedAddProductBoundary>,
+    matrix_concat: Option<SelectedMatrixConcat>,
     slice: Option<SelectedSlice>,
     hash_plain: Option<SelectedHashPlain>,
     following_switch_cases: Option<usize>,
@@ -365,7 +366,7 @@ impl fmt::Debug for SelectedLargePathStep {
             .field("pointwise_switch_sampler_cases", &self.pointwise_switch_sampler_cases)
             .field("pointwise_fixed_product_spines", &self.pointwise_fixed_product_spines)
             .field("add_selected_large_child_count", &self.add_selected_large_child_count)
-            .field("add_direct_child_views", &self.add_direct_child_views)
+            .field("add_direct_child_inputs", &self.add_direct_child_inputs)
             .field(
                 "add_direct_child_omitted_child_count",
                 &self.add_direct_child_omitted_child_count,
@@ -374,6 +375,7 @@ impl fmt::Debug for SelectedLargePathStep {
             .field("multiply_omitted_factor_count", &self.multiply_omitted_factor_count)
             .field("product_spine", &self.product_spine)
             .field("add_product_boundary", &self.add_product_boundary)
+            .field("matrix_concat", &self.matrix_concat)
             .field("slice", &self.slice)
             .field("hash_plain", &self.hash_plain)
             .field("following_switch_cases", &self.following_switch_cases)
@@ -513,6 +515,34 @@ struct SelectedProductSpine {
     omitted_subtrees: usize,
 }
 
+/// A bounded, selected-node-only view of a MatrixConcat.  It retains the
+/// physical selected product spine for product inputs, and expands a direct
+/// selected Add input by exactly one bounded child layer.  This is diagnostic
+/// evidence only and never changes e-graph state or extraction selection.
+struct SelectedMatrixConcat {
+    axis: super::identity::Axis,
+    inputs: Box<[SelectedDiagnosticInput]>,
+    omitted_input_count: usize,
+}
+
+struct SelectedDiagnosticInput {
+    canonical_eclass: usize,
+    selected: SelectedDiagnosticInputView,
+}
+
+enum SelectedDiagnosticInputView {
+    Product(SelectedProductSpine),
+    /// Only a concat input may expand an Add.  Its retained children never
+    /// expand nested Adds, so this diagnostic remains bounded by one layer.
+    Add(SelectedDiagnosticAddChildren),
+    Class(SelectedClassView),
+}
+
+struct SelectedDiagnosticAddChildren {
+    inputs: Box<[SelectedDiagnosticInput]>,
+    omitted_input_count: usize,
+}
+
 /// The first direct Add factor in one selected product, together with the
 /// selected product spines on its two sides.  It deliberately skips the Add's
 /// own siblings: this is only the multiplication context needed to compare
@@ -544,6 +574,47 @@ impl fmt::Debug for SelectedProductSpine {
             .field("cycle", &self.cycle)
             .field("truncated", &self.truncated)
             .field("omitted_subtrees", &self.omitted_subtrees)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SelectedMatrixConcat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedMatrixConcat")
+            .field("axis", &self.axis)
+            .field("inputs", &self.inputs)
+            .field("omitted_input_count", &self.omitted_input_count)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SelectedDiagnosticInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedDiagnosticInput")
+            .field("canonical_eclass", &self.canonical_eclass)
+            .field("selected", &self.selected)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SelectedDiagnosticInputView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Product(spine) => formatter.debug_tuple("Product").field(spine).finish(),
+            Self::Add(children) => formatter.debug_tuple("Add").field(children).finish(),
+            Self::Class(view) => formatter.debug_tuple("Class").field(view).finish(),
+        }
+    }
+}
+
+impl fmt::Debug for SelectedDiagnosticAddChildren {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedDiagnosticAddChildren")
+            .field("inputs", &self.inputs)
+            .field("omitted_input_count", &self.omitted_input_count)
             .finish()
     }
 }
@@ -1697,6 +1768,59 @@ fn selected_add_product_boundary(
     })
 }
 
+fn selected_diagnostic_inputs(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    candidates: &[Option<Candidate>],
+    inputs: &[Id],
+    expand_direct_add: bool,
+) -> Box<[SelectedDiagnosticInput]> {
+    inputs
+        .iter()
+        .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
+        .filter_map(|input| {
+            selected_diagnostic_input(egraph, candidates, *input, expand_direct_add)
+        })
+        .collect()
+}
+
+fn selected_diagnostic_input(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    candidates: &[Option<Candidate>],
+    input: Id,
+    expand_direct_add: bool,
+) -> Option<SelectedDiagnosticInput> {
+    let canonical = egraph.find(input);
+    let candidate = candidates.get(usize::from(canonical))?.as_ref()?;
+    let selected = match &candidate.node {
+        MxxLang::MatrixMultiply(_) => SelectedDiagnosticInputView::Product(selected_product_spine(
+            egraph, candidates, canonical,
+        )),
+        MxxLang::MatrixAdd(children) if expand_direct_add => {
+            SelectedDiagnosticInputView::Add(SelectedDiagnosticAddChildren {
+                inputs: selected_diagnostic_inputs(egraph, candidates, children, false),
+                omitted_input_count: children
+                    .len()
+                    .saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
+            })
+        }
+        _ => {
+            SelectedDiagnosticInputView::Class(selected_class_view(egraph, candidates, canonical)?)
+        }
+    };
+    Some(SelectedDiagnosticInput { canonical_eclass: usize::from(canonical), selected })
+}
+
+fn selected_matrix_concat(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    candidates: &[Option<Candidate>],
+    axis: super::identity::Axis,
+    inputs: &[Id],
+) -> SelectedMatrixConcat {
+    let omitted_input_count = inputs.len().saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN);
+    let inputs = selected_diagnostic_inputs(egraph, candidates, inputs, true);
+    SelectedMatrixConcat { axis, inputs, omitted_input_count }
+}
+
 fn selected_large_diagnostic<I: BoundInput>(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     root: Id,
@@ -1787,7 +1911,7 @@ fn selected_large_path_from<I: BoundInput>(
             fixed_product_spines(pointwise_first_direct_reject.as_ref(), egraph, candidates);
         let (
             add_selected_large_child_count,
-            add_direct_child_views,
+            add_direct_child_inputs,
             add_direct_child_omitted_child_count,
         ) = match node {
             MxxLang::MatrixAdd(children) => {
@@ -1795,14 +1919,10 @@ fn selected_large_path_from<I: BoundInput>(
                     .iter()
                     .filter(|child| candidate_has_large_bound(egraph, candidates, **child))
                     .count();
-                let views = children
-                    .iter()
-                    .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
-                    .filter_map(|child| selected_class_view(egraph, candidates, *child))
-                    .collect::<Vec<_>>();
+                let inputs = selected_diagnostic_inputs(egraph, candidates, children, false);
                 (
                     Some(selected_large_child_count),
-                    Some(views.into_boxed_slice()),
+                    Some(inputs),
                     children.len().saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
                 )
             }
@@ -1826,6 +1946,12 @@ fn selected_large_path_from<I: BoundInput>(
         let add_product_boundary = selected_add_product_boundary(egraph, candidates, node);
         let product_spine = matches!(node, MxxLang::MatrixMultiply(_))
             .then(|| selected_product_spine(egraph, candidates, current));
+        let matrix_concat = match node {
+            MxxLang::MatrixConcat { axis, inputs } => {
+                Some(selected_matrix_concat(egraph, candidates, *axis, inputs))
+            }
+            _ => None,
+        };
         let (slice, hash_plain) = match node {
             MxxLang::MatrixSlice { spec, input } => {
                 (Some(selected_slice(egraph, spec.0, input[0])), None)
@@ -1864,12 +1990,13 @@ fn selected_large_path_from<I: BoundInput>(
             pointwise_switch_sampler_cases,
             pointwise_fixed_product_spines,
             add_selected_large_child_count,
-            add_direct_child_views,
+            add_direct_child_inputs,
             add_direct_child_omitted_child_count,
             multiply_factors,
             multiply_omitted_factor_count,
             product_spine,
             add_product_boundary,
+            matrix_concat,
             slice,
             hash_plain,
             following_switch_cases,
@@ -3019,6 +3146,171 @@ mod tests {
     }
 
     #[test]
+    fn selected_large_diagnostic_records_capped_affine_concat_inputs_without_mutation() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (scale, scale_source) = typed_matrix_atom(&mut egraph, "concat-scale", 1, 1, None);
+        let (public, _) = typed_matrix_atom(&mut egraph, "concat-public", 1, 2, None);
+        let (residual, residual_source) =
+            typed_matrix_atom(&mut egraph, "concat-residual", 1, 1, None);
+        let (third_residual, _) =
+            typed_matrix_atom(&mut egraph, "concat-third-residual", 1, 1, None);
+        let (fourth_residual, _) =
+            typed_matrix_atom(&mut egraph, "concat-fourth-residual", 1, 1, None);
+        let slice = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, start: i64, end: i64| {
+            let spec = SliceSpecId(egraph.analysis.symbols.slices.intern(SliceSpec {
+                rows: None,
+                columns: Some(ResolvedIndexRange {
+                    start: ResolvedIntExpr::Const(start.into()),
+                    end: ResolvedIntExpr::Const(end.into()),
+                }),
+            }));
+            (spec, egraph.add(MxxLang::MatrixSlice { spec, input: [public] }))
+        };
+        let (first_spec, first_slice) = slice(&mut egraph, 0, 1);
+        let (second_spec, second_slice) = slice(&mut egraph, 1, 2);
+        let first_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![scale, first_slice].into_boxed_slice()));
+        let second_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![scale, second_slice].into_boxed_slice()));
+        let residual_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![scale, residual].into_boxed_slice()));
+        let third_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![scale, third_residual].into_boxed_slice()));
+        let fourth_product =
+            egraph.add(MxxLang::MatrixMultiply(vec![scale, fourth_residual].into_boxed_slice()));
+        let first_chunk = egraph.add(MxxLang::MatrixAdd(
+            vec![first_product, residual_product, residual_product].into_boxed_slice(),
+        ));
+        let second_chunk = egraph.add(MxxLang::MatrixAdd(
+            vec![second_product, residual_product, residual_product].into_boxed_slice(),
+        ));
+        let third_chunk = egraph.add(MxxLang::MatrixAdd(
+            vec![third_product, third_product, third_product].into_boxed_slice(),
+        ));
+        let fourth_chunk = egraph.add(MxxLang::MatrixAdd(
+            vec![fourth_product, fourth_product, fourth_product].into_boxed_slice(),
+        ));
+        let mut inputs = vec![first_chunk, second_chunk, third_chunk, fourth_chunk];
+        while inputs.len() <= MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN {
+            inputs.push(fourth_chunk);
+        }
+        let concat = egraph.add(MxxLang::MatrixConcat {
+            axis: super::super::identity::Axis::Columns,
+            inputs: inputs.into_boxed_slice(),
+        });
+        let root = egraph.add(MxxLang::MatrixAdd(vec![concat].into_boxed_slice()));
+        egraph.rebuild();
+        let before = egraph.total_size();
+        let candidates = diagnostic_candidates(
+            &egraph,
+            &egraph.classes().map(|class| class.id).collect::<Vec<_>>(),
+        );
+
+        let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
+        let concat = steps
+            .iter()
+            .find_map(|step| step.matrix_concat.as_ref())
+            .expect("selected concat step");
+        let selected_chunk_add = steps
+            .iter()
+            .find(|step| {
+                step.add_direct_child_inputs.as_ref().is_some_and(|inputs| inputs.len() == 3)
+            })
+            .expect("selected chunk Add step");
+        assert!(
+            selected_chunk_add
+                .add_direct_child_inputs
+                .as_ref()
+                .expect("selected chunk Add inputs")
+                .iter()
+                .all(|input| matches!(input.selected, SelectedDiagnosticInputView::Product(_)))
+        );
+        assert_eq!(concat.axis, super::super::identity::Axis::Columns);
+        assert_eq!(
+            [first_chunk, second_chunk, third_chunk, fourth_chunk]
+                .map(|chunk| egraph.find(chunk))
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4,
+            "fixture keeps four physical Add eclasses"
+        );
+        assert_eq!(concat.inputs.len(), MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN);
+        assert_eq!(concat.omitted_input_count, 1);
+        assert_eq!(
+            concat.inputs.iter().map(|input| input.canonical_eclass).collect::<Vec<_>>(),
+            [first_chunk, second_chunk, third_chunk, fourth_chunk]
+                .into_iter()
+                .chain(std::iter::repeat(fourth_chunk))
+                .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
+                .map(|input| usize::from(egraph.find(input)))
+                .collect::<Vec<_>>(),
+            "concat inputs retain physical order before the diagnostic cap"
+        );
+
+        for (input, expected_first_product) in [
+            (&concat.inputs[0], first_product),
+            (&concat.inputs[1], second_product),
+            (&concat.inputs[2], third_product),
+            (&concat.inputs[3], fourth_product),
+        ] {
+            let SelectedDiagnosticInputView::Add(children) = &input.selected else {
+                panic!("concat input retains its direct selected Add children");
+            };
+            assert_eq!(children.inputs.len(), 3);
+            assert_eq!(children.omitted_input_count, 0);
+            assert_eq!(
+                children.inputs[0].canonical_eclass,
+                usize::from(egraph.find(expected_first_product))
+            );
+            for child in children.inputs.iter() {
+                let SelectedDiagnosticInputView::Product(spine) = &child.selected else {
+                    panic!("direct Add child retains its selected product spine");
+                };
+                assert_eq!(spine.leaves.len(), 2);
+                assert_eq!(spine.leaves[0].canonical_eclass, usize::from(egraph.find(scale)));
+                assert_eq!(
+                    spine.leaves[0].atom_source.as_ref().map(|source| source.source_id),
+                    Some(scale_source.0)
+                );
+            }
+        }
+        for (input, slice_spec, sliced) in [
+            (&concat.inputs[0], first_spec, first_slice),
+            (&concat.inputs[1], second_spec, second_slice),
+        ] {
+            let SelectedDiagnosticInputView::Add(children) = &input.selected else {
+                unreachable!("above asserts that this concat input is an Add");
+            };
+            let SelectedDiagnosticInputView::Product(spine) = &children.inputs[0].selected else {
+                unreachable!("above asserts that direct Add children are products");
+            };
+            assert_eq!(spine.leaves[1].canonical_eclass, usize::from(egraph.find(sliced)));
+            assert_eq!(
+                spine.leaves[1].slice.as_ref().map(|slice| slice.spec_id),
+                Some(slice_spec.0)
+            );
+            assert_eq!(
+                spine.leaves[1].slice.as_ref().map(|slice| slice.canonical_input),
+                Some(usize::from(egraph.find(public)))
+            );
+        }
+        let SelectedDiagnosticInputView::Add(children) = &concat.inputs[0].selected else {
+            unreachable!("above asserts that the first concat input is an Add");
+        };
+        let SelectedDiagnosticInputView::Product(residual_spine) = &children.inputs[1].selected
+        else {
+            unreachable!("above asserts that direct Add children are products");
+        };
+        assert_eq!(residual_spine.leaves[1].canonical_eclass, usize::from(egraph.find(residual)));
+        assert_eq!(
+            residual_spine.leaves[1].atom_source.as_ref().map(|source| source.source_id),
+            Some(residual_source.0)
+        );
+        assert_eq!(egraph.total_size(), before, "concat diagnosis must not mutate the e-graph");
+    }
+
+    #[test]
     fn selected_slice_diagnostic_keeps_unresolved_input_dimensions() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let matrix_type = ResolvedMatrixType {
@@ -3601,7 +3893,7 @@ mod tests {
         let steps = selected_large_diagnostic(&egraph, root, None, &candidates, &NoBounds);
         let root_step = steps.first().expect("root diagnostic step");
         assert_eq!(root_step.add_selected_large_child_count, Some(3));
-        assert_eq!(root_step.add_direct_child_views.as_ref().expect("direct Add views").len(), 3);
+        assert_eq!(root_step.add_direct_child_inputs.as_ref().expect("direct Add inputs").len(), 3);
         let paths = root_step
             .pointwise_negative_fixed_paths
             .as_ref()
@@ -3663,7 +3955,7 @@ mod tests {
         let root_step = steps.first().expect("root Add step");
         assert_eq!(root_step.add_selected_large_child_count, Some(17));
         assert_eq!(
-            root_step.add_direct_child_views.as_ref().expect("capped direct views").len(),
+            root_step.add_direct_child_inputs.as_ref().expect("capped direct inputs").len(),
             MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN
         );
         assert_eq!(root_step.add_direct_child_omitted_child_count, 1);

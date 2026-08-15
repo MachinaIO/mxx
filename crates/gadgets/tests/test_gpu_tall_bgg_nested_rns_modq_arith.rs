@@ -209,7 +209,7 @@ impl TestConfig {
             config.gadget_base_bits == 0 ||
             config.max_unreduced_muls == 0 ||
             config.scale == 0 ||
-            config.error_sigma <= 0.0 ||
+            config.error_sigma < 0.0 ||
             !config.error_sigma.is_finite() ||
             config.trapdoor_sigma <= 0.0 ||
             !config.trapdoor_sigma.is_finite() ||
@@ -285,9 +285,19 @@ struct PreparedCandidate {
     rotation_offsets: Vec<u32>,
     public_key_graph: BuiltGraph,
     encoding_graph: BuiltGraph,
-    operational_noise_bound: BigUint,
-    operational_report: OperationalSimulationReport,
+    operational_report: Option<OperationalSimulationReport>,
     achieved_security_bits: u64,
+}
+
+/// Whether graph preparation also runs the CPU-only operational-noise checker.
+///
+/// The noiseless runtime test deliberately skips it: it verifies the executable
+/// Tall construction against an independent plaintext product, rather than
+/// making that runtime check depend on the checker currently under development.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CandidatePreparation {
+    OperationalChecked,
+    RuntimeOnly,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -566,6 +576,7 @@ fn prepare_candidate(
     parameters: DCRTPolyParams,
     config: &TestConfig,
     achieved_security_bits: u64,
+    preparation: CandidatePreparation,
 ) -> Result<PreparedCandidate, String> {
     let ring_dimension = parameters.ring_dimension() as usize;
     let (q_moduli, _, _) = parameters.to_crt();
@@ -815,30 +826,6 @@ fn prepare_candidate(
         config.error_sigma,
         false,
     )?;
-    let operational_encoding_graph = build_encoding_graph(
-        &parameters,
-        &circuit,
-        &layout,
-        &artifact_compiler,
-        production.clone(),
-        &lookup_compilers,
-        &slot_requests,
-        &rotation_offsets,
-        physical_slots,
-        config.error_sigma,
-        true,
-    )?;
-    for output in
-        ["encoding_rows", "encoding_public_key", "output_plaintexts", "transformed_secrets"]
-    {
-        if encoding_graph.graph.outputs().get(output) !=
-            operational_encoding_graph.graph.outputs().get(output)
-        {
-            return Err(format!(
-                "operational residual suffix changed executable output identity {output}"
-            ));
-        }
-    }
     let manifests = BTreeMap::from([(production.clone(), runtime_manifest.clone())]);
     public_key_graph
         .validate_with_manifests(&bindings, &manifests)
@@ -846,12 +833,43 @@ fn prepare_candidate(
     encoding_graph
         .validate_with_manifests(&bindings, &manifests)
         .map_err(|error| error.to_string())?;
-    operational_encoding_graph
-        .validate_with_manifests(&bindings, &manifests)
-        .map_err(|error| error.to_string())?;
-    let operational_report =
-        run_tall_operational_check(&producer, &operational_encoding_graph, &parameters, &nested)?;
-    let operational_noise_bound = operational_report.noise_bound.clone();
+    let operational_report = if preparation == CandidatePreparation::OperationalChecked {
+        let operational_encoding_graph = build_encoding_graph(
+            &parameters,
+            &circuit,
+            &layout,
+            &artifact_compiler,
+            production.clone(),
+            &lookup_compilers,
+            &slot_requests,
+            &rotation_offsets,
+            physical_slots,
+            config.error_sigma,
+            true,
+        )?;
+        for output in
+            ["encoding_rows", "encoding_public_key", "output_plaintexts", "transformed_secrets"]
+        {
+            if encoding_graph.graph.outputs().get(output) !=
+                operational_encoding_graph.graph.outputs().get(output)
+            {
+                return Err(format!(
+                    "operational residual suffix changed executable output identity {output}"
+                ));
+            }
+        }
+        operational_encoding_graph
+            .validate_with_manifests(&bindings, &manifests)
+            .map_err(|error| error.to_string())?;
+        Some(run_tall_operational_check(
+            &producer,
+            &operational_encoding_graph,
+            &parameters,
+            &nested,
+        )?)
+    } else {
+        None
+    };
     Ok(PreparedCandidate {
         parameters,
         circuit,
@@ -870,7 +888,6 @@ fn prepare_candidate(
         rotation_offsets,
         public_key_graph,
         encoding_graph,
-        operational_noise_bound,
         operational_report,
         achieved_security_bits,
     })
@@ -1252,7 +1269,12 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
                     if achieved_security_bits < config.security_bits {
                         return Ok(None);
                     }
-                    let candidate = prepare_candidate(parameters, config, achieved_security_bits)?;
+                    let candidate = prepare_candidate(
+                        parameters,
+                        config,
+                        achieved_security_bits,
+                        CandidatePreparation::OperationalChecked,
+                    )?;
                     Ok(Some(candidate))
                 })
                 .collect::<Vec<_>>()
@@ -1261,12 +1283,16 @@ fn select_parameters(config: &TestConfig) -> Result<PreparedCandidate, String> {
             let Some(candidate) = result? else {
                 continue;
             };
-            let accepted = candidate.operational_report.accepted;
+            let operational_report = candidate
+                .operational_report
+                .as_ref()
+                .ok_or_else(|| "operational candidate omitted its checker report".to_owned())?;
+            let accepted = operational_report.accepted;
             info!(
                 crt_depth = *crt_depth,
                 ring_dimension = 1usize << *log_ring_dimension,
-                operational_noise_bound = %candidate.operational_noise_bound,
-                diagnostics = ?candidate.operational_report.diagnostics,
+                operational_noise_bound = %operational_report.noise_bound,
+                diagnostics = ?operational_report.diagnostics,
                 accepted,
                 "evaluated Tall BGG+ operational candidate"
             );
@@ -1762,11 +1788,13 @@ fn end_to_end_processing(
     })
 }
 
-fn runtime_verification(
+/// Verifies the executable encoding against the independently evaluated
+/// plaintext circuit and returns its largest centered encoding residual.
+fn measure_runtime_residual(
     selected: &PreparedCandidate,
     gpu_parameters: &GpuDCRTPolyParams,
     outputs: EndToEndOutputs,
-) -> Result<(), String> {
+) -> Result<(BigUint, (usize, usize, usize)), String> {
     info!("stage 4/4: runtime verification");
     if outputs.public_key != outputs.encoding_public_key {
         return Err("Tall encoding output public key differs from public-key evaluation".to_owned());
@@ -1822,6 +1850,20 @@ fn runtime_verification(
             }
         }
     }
+    Ok((maximum_noise, maximum_location))
+}
+
+fn runtime_verification(
+    selected: &PreparedCandidate,
+    gpu_parameters: &GpuDCRTPolyParams,
+    outputs: EndToEndOutputs,
+) -> Result<(), String> {
+    let (maximum_noise, maximum_location) =
+        measure_runtime_residual(selected, gpu_parameters, outputs)?;
+    let operational_report = selected
+        .operational_report
+        .as_ref()
+        .ok_or_else(|| "runtime verification requires an operational checker report".to_owned())?;
     let q_max = selected
         .parameters
         .to_crt()
@@ -1829,20 +1871,21 @@ fn runtime_verification(
         .into_iter()
         .max()
         .ok_or_else(|| "runtime verification requires a nonempty CRT basis".to_owned())?;
+    let modulus = selected.parameters.modulus().as_ref().clone();
     let threshold_lhs = BigUint::from(2u8) * BigUint::from(q_max) * &maximum_noise;
     info!(
         maximum_noise = %maximum_noise,
         ?maximum_location,
-        operational_noise_bound = %selected.operational_noise_bound,
-        within_operational_envelope = maximum_noise <= selected.operational_noise_bound,
+        operational_noise_bound = %operational_report.noise_bound,
+        within_operational_envelope = maximum_noise <= operational_report.noise_bound,
         threshold_lhs = %threshold_lhs,
         ciphertext_modulus = %modulus,
         "measured Tall BGG+ residual"
     );
-    if maximum_noise > selected.operational_noise_bound {
+    if maximum_noise > operational_report.noise_bound {
         return Err(format!(
             "measured residual {maximum_noise} at {maximum_location:?} exceeds operational bound {}",
-            selected.operational_noise_bound
+            operational_report.noise_bound
         ));
     }
     if threshold_lhs >= modulus {
@@ -2066,6 +2109,75 @@ fn range_parameters_preserve_the_cartesian_candidate_search() {
     assert_eq!(candidate_dimensions(2, 3, 4, 5, None), vec![(2, 4), (2, 5), (3, 4), (3, 5)]);
 }
 
+/// Uses the same small arithmetic parameters as the nested-RNS Ring-GSW unit
+/// tests.  Setting this one value to zero reaches every additive Gaussian
+/// error source in the Tall preprocessing and evaluation graphs: slot and gate
+/// preimage targets, `c_b0`, lookup `c_b`, rotations, and sampled Tall rows.
+fn noiseless_runtime_config() -> TestConfig {
+    TestConfig {
+        mul_count: 1,
+        min_crt_depth: 1,
+        max_crt_depth: 1,
+        min_log_ring_dimension: 1,
+        max_log_ring_dimension: 1,
+        selected_parameters: Some((1, 1)),
+        security_bits: 0,
+        crt_modulus_bits: 10,
+        gadget_base_bits: 5,
+        max_unreduced_muls: 2,
+        scale: 16,
+        error_sigma: 0.0,
+        // Trapdoors and preimages remain sampled.  They are not additive
+        // encryption errors: each preimage satisfies its target relation
+        // exactly, which this test checks through the final residual.
+        trapdoor_sigma: 4.578,
+        benchmark_warmups: 1,
+        benchmark_iterations: 1,
+        stop_after_benchmark_estimation: false,
+        parameter_simulation_parallelism: 1,
+        preimage_progress_interval: 1,
+        max_parallel_instances: 1,
+        preprocessing_parallel_instances: 1,
+        release_fence_interval: 1,
+        checkpoint_root: PathBuf::from("test_data/tall_nested_rns_noiseless_gpu"),
+        reuse_checkpoint: None,
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU; checks a small noiseless Tall BGG+ execution against an independent plaintext product"]
+fn test_gpu_tall_bgg_nested_rns_noiseless_encoding_matches_ideal_product() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let config = noiseless_runtime_config();
+    let parameters = DCRTPolyParams::new(2, 1, 10, 5);
+    let selected = prepare_candidate(parameters, &config, 0, CandidatePreparation::RuntimeOnly)
+        .expect("small noiseless Tall graphs");
+    assert!(
+        selected.operational_report.is_none(),
+        "the executable noiseless check must not depend on checker acceptance"
+    );
+    let device_ids = detected_gpu_device_ids();
+    assert!(!device_ids.is_empty(), "at least one CUDA GPU");
+    let (moduli, _, _) = selected.parameters.to_crt();
+    let gpu_parameters = GpuDCRTPolyParams::new(
+        selected.parameters.ring_dimension(),
+        moduli,
+        selected.parameters.base_bits(),
+    );
+    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)
+        .expect("small noiseless Tall execution");
+    let (maximum_residual, location) =
+        measure_runtime_residual(&selected, &gpu_parameters, outputs)
+            .expect("Tall output plaintext must equal the independent product");
+    assert_eq!(
+        maximum_residual,
+        BigUint::zero(),
+        "noiseless Tall encoding residual must be exactly zero (first nonzero location: {location:?})"
+    );
+}
+
 #[test]
 #[ignore = "runs the Rust Tall BGG+ operational parameter simulation"]
 fn test_tall_bgg_nested_rns_parameter_simulation() {
@@ -2075,11 +2187,15 @@ fn test_tall_bgg_nested_rns_parameter_simulation() {
     let config = TestConfig::from_env().expect("valid Tall nested-RNS configuration");
     info!(?config, "effective Tall nested-RNS parameter-simulation configuration");
     let selected = select_parameters(&config).expect("Rust operational parameter simulation");
+    let operational_report = selected
+        .operational_report
+        .as_ref()
+        .expect("parameter simulation runs the operational checker");
     info!(
         crt_depth = selected.parameters.to_crt().2,
         ring_dimension = selected.parameters.ring_dimension(),
-        operational_noise_bound = %selected.operational_noise_bound,
-        operational_accepted = selected.operational_report.accepted,
+        operational_noise_bound = %operational_report.noise_bound,
+        operational_accepted = operational_report.accepted,
         "completed Rust-only Tall parameter simulation"
     );
 }
@@ -2093,14 +2209,18 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
     let config = TestConfig::from_env().expect("valid GPU Tall nested-RNS configuration");
     info!(?config, "effective GPU Tall nested-RNS integration configuration");
     let selected = select_parameters(&config).expect("parameter simulation");
+    let operational_report = selected
+        .operational_report
+        .as_ref()
+        .expect("parameter selection runs the operational checker");
     info!(
         crt_depth = selected.parameters.to_crt().2,
         ring_dimension = selected.parameters.ring_dimension(),
         physical_slots = selected.parameters.ring_dimension() as usize *
             selected.nested.q_moduli_depth,
         achieved_security_bits = selected.achieved_security_bits,
-        operational_noise_bound = %selected.operational_noise_bound,
-        operational_accepted = selected.operational_report.accepted,
+        operational_noise_bound = %operational_report.noise_bound,
+        operational_accepted = operational_report.accepted,
         "selected Tall nested-RNS parameters"
     );
     let device_ids = detected_gpu_device_ids();

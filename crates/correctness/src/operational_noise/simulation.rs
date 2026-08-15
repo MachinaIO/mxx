@@ -10,10 +10,17 @@ use super::{
     analysis::{MxxAnalysis, ResourceBudget},
     bound::BoundEvaluationError,
     error::{OperationalSimulationError, TargetError},
-    extract::{ExtractionControl, ProposalNodeClassification, extract_best_proposal},
+    extract::{
+        ExtractionControl, ProposalNodeClassification, extract_best_proposal,
+        extract_best_proposal_with_origins,
+    },
     language::MxxLang,
     lower::{GraphLowerer, LoweredValue, LoweringControl},
-    relation::{RelationApplier, RelationSearcher, RewriteContext, SharedRewriteBudget},
+    relation::{
+        RelationApplier, RelationSearcher, RewriteContext, SharedRewriteBudget,
+        materialize_selected_multi_switch_redex, note_selected_multi_switch_union,
+        prepare_selected_multi_switch_redex, selected_multi_switch_redex,
+    },
 };
 use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
 use egg::{EGraph, Language, Rewrite, Runner, StopReason};
@@ -25,6 +32,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 use std::{
     cell::RefCell,
+    collections::BTreeSet,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -452,7 +460,7 @@ pub fn check_operational_noise_candidate_with_progress(
             }
             Ok((lowerer, roots, stage, wire, context))
         },
-        |(lowerer, roots, stage, wire, context), control| {
+        |(mut lowerer, roots, stage, wire, context), control| {
             control.set_progress_site(stage.0.clone(), "root".to_owned(), wire.node.0 as u64);
             let control = RefCell::new(control);
             let mut invalid_dag = |_| OperationalSimulationError::Lower {
@@ -463,6 +471,182 @@ pub fn check_operational_noise_candidate_with_progress(
                 site: site(&stage, wire, "extract semantic bound"),
                 source: super::error::BoundError::EvaluationFailed { source },
             };
+            let mut selected_roots =
+                roots.iter().map(|root| lowerer.egraph.find(*root)).collect::<BTreeSet<_>>();
+            // This is deliberately outside egg saturation: only Add nodes in
+            // the deterministic selected DAG may materialize a same-selector
+            // Switch distribution. A successful step replaces one selected
+            // Add with one Switch; nested selected Add redexes were already
+            // counted, so the fresh selected-redex count must strictly fall.
+            let mut prior_epoch = None::<(usize, Box<[egg::Id]>)>;
+            let mut normalization_epoch = 0_u64;
+            loop {
+                let extraction_started = Instant::now();
+                let view = lowerer.production_bound_view();
+                let mut selected = Vec::with_capacity(selected_roots.len());
+                for root in &selected_roots {
+                    let proposal = extract_best_proposal_with_origins(
+                        &lowerer.egraph,
+                        *root,
+                        &view,
+                        &mut ExtractionControl {
+                            invalid_dag: &mut invalid_dag,
+                            bound_error: &mut bound_error,
+                        },
+                        &mut |_, node, egraph| {
+                            let relation_redex =
+                                super::relation::classify_proposal_node(egraph, node, &context)
+                                    .map_err(|failure| {
+                                        relation_error(
+                                            &stage,
+                                            wire,
+                                            &egraph.analysis.symbols,
+                                            failure,
+                                        )
+                                    })?;
+                            Ok(ProposalNodeClassification { relation_redex })
+                        },
+                    )?;
+                    selected.push((*root, proposal));
+                }
+                drop(view);
+
+                let mut seen_origins = BTreeSet::new();
+                let mut redexes = Vec::new();
+                for (root, extracted) in &selected {
+                    debug_assert_eq!(
+                        extracted.proposal.expression.as_ref().len(),
+                        extracted.origins.len(),
+                        "selected expression and origin records stay aligned"
+                    );
+                    for (node, origin) in
+                        extracted.proposal.expression.as_ref().iter().zip(extracted.origins.iter())
+                    {
+                        let Some(redex) =
+                            selected_multi_switch_redex(&lowerer.egraph, *origin, node)
+                        else {
+                            continue;
+                        };
+                        if seen_origins.insert(redex.origin) {
+                            redexes.push((*root, redex));
+                        }
+                    }
+                }
+                redexes.sort_unstable();
+                let measure = redexes.len();
+                let previous_before = prior_epoch.as_ref().map_or(measure, |previous| previous.0);
+                let previous_batch_size =
+                    prior_epoch.as_ref().map_or(0, |previous| previous.1.len());
+                info!(
+                    epoch = normalization_epoch,
+                    before_redex_count = previous_before,
+                    after_redex_count = measure,
+                    batch_size = previous_batch_size,
+                    egraph_nodes = lowerer.egraph.total_size(),
+                    extraction_milliseconds = extraction_started.elapsed().as_millis() as u64,
+                    "selected relation normalization epoch"
+                );
+                if let Some(previous) = prior_epoch.take() {
+                    let current_origins = redexes
+                        .iter()
+                        .map(|(_, redex)| lowerer.egraph.find(redex.origin))
+                        .collect::<BTreeSet<_>>();
+                    if measure >= previous.0 ||
+                        previous.1.iter().any(|origin| {
+                            current_origins.contains(&lowerer.egraph.find(*origin))
+                        })
+                    {
+                        return Err(OperationalSimulationError::Relation {
+                            site: site(&stage, wire, "selected relation normalization"),
+                            source:
+                                super::error::RelationError::SelectedNormalizationDidNotContract {
+                                    before: previous.0,
+                                    after: measure,
+                                },
+                        });
+                    }
+                }
+                if redexes.is_empty() {
+                    break;
+                }
+                let before = measure;
+                let epoch_origins =
+                    redexes.iter().map(|(_, redex)| redex.origin).collect::<Box<[_]>>();
+                let mut pending_unions = Vec::with_capacity(redexes.len());
+                for (_, redex) in redexes {
+                    let Some(prepared) =
+                        prepare_selected_multi_switch_redex(&lowerer.egraph, redex)
+                    else {
+                        return Err(OperationalSimulationError::Relation {
+                            site: site(&stage, wire, "selected relation normalization"),
+                            source:
+                                super::error::RelationError::SelectedNormalizationDidNotContract {
+                                    before,
+                                    after: before,
+                                },
+                        });
+                    };
+                    let Some(equality) = materialize_selected_multi_switch_redex(
+                        &mut lowerer.egraph,
+                        prepared,
+                        &context,
+                    ) else {
+                        if let Some(failure) = context.failure() {
+                            return Err(relation_error(
+                                &stage,
+                                wire,
+                                &lowerer.egraph.analysis.symbols,
+                                failure,
+                            ));
+                        }
+                        return Err(OperationalSimulationError::Relation {
+                            site: site(&stage, wire, "selected relation normalization"),
+                            source:
+                                super::error::RelationError::SelectedNormalizationDidNotContract {
+                                    before,
+                                    after: before,
+                                },
+                        });
+                    };
+                    pending_unions.push(equality);
+                }
+                if let Some(failure) = context.failure() {
+                    return Err(relation_error(
+                        &stage,
+                        wire,
+                        &lowerer.egraph.analysis.symbols,
+                        failure,
+                    ));
+                }
+                let mut union_count = 0_u64;
+                for (origin, replacement) in pending_unions {
+                    if lowerer.egraph.union(origin, replacement) {
+                        union_count += 1;
+                        note_selected_multi_switch_union(&context);
+                    }
+                }
+                if union_count == 0 {
+                    return Err(OperationalSimulationError::Relation {
+                        site: site(&stage, wire, "selected relation normalization"),
+                        source: super::error::RelationError::SelectedNormalizationDidNotContract {
+                            before,
+                            after: before,
+                        },
+                    });
+                }
+                lowerer.egraph.rebuild();
+                control.borrow_mut().work(
+                    union_count,
+                    None,
+                    Some(lowerer.egraph.total_size() as u64),
+                )?;
+                selected_roots = roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
+                prior_epoch = Some((before, epoch_origins));
+                normalization_epoch += 1;
+            }
+            let counters = context.counters();
+            control.borrow_mut().diagnostics_mut().relation_candidate_count = counters.candidates;
+            control.borrow_mut().diagnostics_mut().relation_rewrite_count = counters.rewrites;
             let view = lowerer.production_bound_view();
             control.borrow_mut().reserve_owned_elements(roots.len())?;
             let mut proposals = Vec::with_capacity(roots.len());

@@ -335,6 +335,7 @@ operational_error_registry! {
         RelationTargetMismatch { source: AtomicSourceKey },
         BlockedRelationRewrite { reason: RelationRewriteBlockReason },
         RewriteDidNotSaturate { reason: String },
+        SelectedNormalizationDidNotContract { before: usize, after: usize },
         InvalidRelationProducer { producer: WireSourceKey },
         MismatchedRelationIndex { expected: AtomicSourceKey, actual: AtomicSourceKey },
         MismatchedRelationType { expected: WireType, actual: WireType },

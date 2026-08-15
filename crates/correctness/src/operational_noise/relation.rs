@@ -454,6 +454,30 @@ fn physical_add_terms(
     }
 }
 
+/// Returns Switch cases only when every physical Switch representation agrees
+/// after e-class canonicalization.  A selector diagonalization is an exact
+/// equality, so it must not choose one competing stored-case vector.
+fn physical_switch_cases(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    id: Id,
+) -> PhysicalStructure<Box<[Id]>> {
+    let mut unique = None;
+    for node in &egraph[egraph.find(id)].nodes {
+        let MxxLang::Switch(cases) = node else { continue };
+        let candidate =
+            cases.iter().map(|case| egraph.find(*case)).collect::<Vec<_>>().into_boxed_slice();
+        match &unique {
+            Some(previous) if previous != &candidate => return PhysicalStructure::Ambiguous,
+            Some(_) => {}
+            None => unique = Some(candidate),
+        }
+    }
+    match unique {
+        Some(cases) => PhysicalStructure::Unique(cases),
+        None => PhysicalStructure::Absent,
+    }
+}
+
 fn physical_product_factors(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     id: Id,
@@ -661,6 +685,109 @@ fn physical_negated_base(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> Phy
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointwiseCaseFlattenReject {
+    AmbiguousAdd,
+    NestedSwitchOrCycle,
+}
+
+/// Failure-only metadata captured with the signed case plan.  It prevents a
+/// later diagnostic from reinterpreting an e-class after saturation changed
+/// its physical representation.
+struct FlattenedPointwiseCase {
+    terms: Vec<SignedPointwiseTerm>,
+    physical_adds: usize,
+    grouped_add_children: usize,
+}
+
+/// Flattens one stored outer case while diagonally selecting nested Switches
+/// that are governed by exactly the same selector.  The traversal is local to
+/// one stored case and read-only: it neither enumerates selector products nor
+/// constructs an e-node.  A nested Switch is usable only when its sole
+/// physical case vector agrees with the outer selector and case count.
+fn flatten_pointwise_case(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+    outer_selector: Id,
+    outer_case_count: usize,
+    case_index: usize,
+    input: Id,
+) -> Result<FlattenedPointwiseCase, PointwiseCaseFlattenReject> {
+    let root = egraph.find(root);
+    let outer_selector = egraph.find(outer_selector);
+    if case_index >= outer_case_count ||
+        !selector_domain_matches_cases(egraph, outer_selector, outer_case_count)
+    {
+        return Err(PointwiseCaseFlattenReject::NestedSwitchOrCycle);
+    }
+
+    if egraph.find(input) == root {
+        return Err(PointwiseCaseFlattenReject::NestedSwitchOrCycle);
+    }
+    let case = egraph.find(input);
+    let physical_adds =
+        egraph[case].nodes.iter().filter(|node| matches!(node, MxxLang::MatrixAdd(_))).count();
+    let grouped_add_children = egraph[case]
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            MxxLang::MatrixAdd(children) => Some(children.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter(|child| unique_add_terms(egraph, **child).is_some())
+        .count();
+    let mut specialize = |term| match physical_switch_cases(egraph, term) {
+        PhysicalStructure::Absent => Ok(None),
+        PhysicalStructure::Ambiguous => Err(()),
+        PhysicalStructure::Unique(cases) => {
+            let Some((&selector, cases)) = cases.split_first() else { return Err(()) };
+            if selector != outer_selector || cases.len() != outer_case_count {
+                return Err(());
+            }
+            let selected = cases.get(case_index).copied().ok_or(())?;
+            Ok(Some((selected != root).then_some((selected, false)).ok_or(())?))
+        }
+    };
+    signed_additive_leaves_with_specialization_and_progress(
+        egraph,
+        &[input],
+        |_| {},
+        &mut specialize,
+        &mut || Ok(()),
+    )
+    .map(|terms| FlattenedPointwiseCase {
+        terms: terms
+            .into_iter()
+            .map(|(base, negative)| SignedPointwiseTerm { base, negative })
+            .collect(),
+        physical_adds,
+        grouped_add_children,
+    })
+    .ok_or(PointwiseCaseFlattenReject::AmbiguousAdd)
+}
+
+/// A binder selector carries the authoritative stored-case domain.  Plain
+/// selectors have no owner descriptor, so their physical case vector itself
+/// remains the complete contract used by the direct planner.
+fn selector_domain_matches_cases(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    selector: Id,
+    case_count: usize,
+) -> bool {
+    let selector = egraph.find(selector);
+    match egraph[selector].nodes.as_slice() {
+        [MxxLang::IntBinder(binder)] => {
+            egraph.analysis.symbols.binders.get(binder.0).is_some_and(|descriptor| {
+                descriptor.minimum == BigInt::zero() &&
+                    descriptor.maximum == BigInt::from(case_count.saturating_sub(1))
+            })
+        }
+        nodes if nodes.iter().any(|node| matches!(node, MxxLang::IntBinder(_))) => false,
+        _ => true,
+    }
+}
+
 /// Finds exact opposite pairs in physical term order.  Every input term is
 /// queued or paired once, so this is O(k) without signed counters or overflow
 /// conversions.  The returned mask preserves the original retained order.
@@ -752,9 +879,8 @@ fn strict_additive_remainder(
 
 /// Opens one unambiguous Add/Negate tree into signed leaves.  This is local
 /// to exact root normalization: unlike the binder consensus path it never
-/// tries to reconcile competing representations.  A repeated structured
-/// e-class is rejected rather than copied, keeping this pass linear in the
-/// physical tree it accepts.
+/// tries to reconcile competing representations. Shared structured e-classes
+/// are expanded once per occurrence, while active-path cycles remain rejected.
 fn flattened_signed_additive_terms_from(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     root: Id,
@@ -764,7 +890,6 @@ fn flattened_signed_additive_terms_from(
     let mut work =
         terms.iter().rev().map(|term| (egraph.find(*term), false, false)).collect::<Vec<_>>();
     let mut visiting = HashSet::new();
-    let mut expanded = HashSet::new();
     visiting.insert(egraph.find(root));
     let mut flattened = false;
 
@@ -778,7 +903,7 @@ fn flattened_signed_additive_terms_from(
         match (add, negate) {
             (PhysicalStructure::Absent, PhysicalStructure::Absent) => output.push((term, negative)),
             (PhysicalStructure::Unique(children), PhysicalStructure::Absent) => {
-                if !visiting.insert(term) || !expanded.insert(term) {
+                if !visiting.insert(term) {
                     return None;
                 }
                 flattened = true;
@@ -788,7 +913,7 @@ fn flattened_signed_additive_terms_from(
                 }
             }
             (PhysicalStructure::Absent, PhysicalStructure::Unique(base)) if base != term => {
-                if !visiting.insert(term) || !expanded.insert(term) {
+                if !visiting.insert(term) {
                     return None;
                 }
                 flattened = true;
@@ -916,8 +1041,17 @@ fn exact_additive_remainder(egraph: &mut EGraph<MxxLang, MxxAnalysis>, root: Id)
 /// so a failing case cannot leave partial e-nodes in the graph.
 struct PointwiseAddSwitchPlan {
     selector: Id,
-    cases: Vec<Vec<Id>>,
+    cases: Vec<Vec<SignedPointwiseTerm>>,
     binder_aware: Option<Box<[BinderAwarePointwiseAddSwitchPlan]>>,
+}
+
+/// A signed leaf selected while planning a pointwise Add/Switch rewrite.  It
+/// is intentionally only a plan: a negation required by selector
+/// diagonalization is materialized after all stored cases have passed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SignedPointwiseTerm {
+    base: Id,
+    negative: bool,
 }
 
 /// A read-only description of the symbolic fixed portion of a pointwise
@@ -927,7 +1061,7 @@ struct BinderAwarePointwiseAddSwitchPlan {
     binder: BinderId,
     /// Direct terms of every physical stored case, structurally checked by the
     /// read-only planner before the applier creates its first e-node.
-    case_terms: Box<[Box<[Id]>]>,
+    case_terms: Box<[Box<[SignedPointwiseTerm]>]>,
     fixed_bases: Box<[Id]>,
     fixed_occurrences: Box<[FixedOccurrence]>,
 }
@@ -1106,6 +1240,62 @@ fn pointwise_add_switch_cancellation_plan(
     pointwise_add_switch_cancellation_plans(egraph, root).into_iter().next()
 }
 
+#[cfg(test)]
+fn selected_multi_switch_plan(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+) -> Option<PointwiseAddSwitchPlan> {
+    same_selector_multi_switch_distribution_plan(egraph, root).map(|plan| plan.plan)
+}
+
+#[cfg(test)]
+fn apply_selected_multi_switch_redex_for_test(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    redex: SelectedMultiSwitchRedex,
+    context: &RewriteContext,
+) -> bool {
+    let Some(prepared) = prepare_selected_multi_switch_redex(egraph, redex) else {
+        return false;
+    };
+    let Some((origin, replacement)) =
+        materialize_selected_multi_switch_redex(egraph, prepared, context)
+    else {
+        return false;
+    };
+    let changed = egraph.union(origin, replacement);
+    if changed {
+        note_selected_multi_switch_union(context);
+    }
+    egraph.rebuild();
+    changed
+}
+
+#[cfg(test)]
+fn apply_selected_multi_switch_batch_for_test(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    redexes: impl IntoIterator<Item = SelectedMultiSwitchRedex>,
+    context: &RewriteContext,
+) -> usize {
+    let mut equalities = Vec::new();
+    for redex in redexes {
+        let prepared = prepare_selected_multi_switch_redex(egraph, redex).expect("prepared redex");
+        equalities.push(
+            materialize_selected_multi_switch_redex(egraph, prepared, context)
+                .expect("materialized equality"),
+        );
+    }
+    assert_eq!(context.failure(), None, "the complete batch is valid before union");
+    let mut changed = 0;
+    for (origin, replacement) in equalities {
+        if egraph.union(origin, replacement) {
+            changed += 1;
+            note_selected_multi_switch_union(context);
+        }
+    }
+    egraph.rebuild();
+    changed
+}
+
 /// Enumerates every structurally distinct physical Add candidate in a stable
 /// order.  A plan is entirely read-only; application may still fail while
 /// instantiating a binder-owned element, in which case the next candidate is
@@ -1143,6 +1333,170 @@ fn pointwise_add_switch_cancellation_plans(
             })
     }));
     plans
+}
+
+/// One same-selector Add distribution selected by extraction.  It is
+/// intentionally epoch-local: it is neither e-graph analysis nor rewrite
+/// search state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct SelectedMultiSwitchRedex {
+    pub(crate) origin: Id,
+    pub(crate) input_switch_count: usize,
+}
+
+/// A read-only plan prepared against one epoch snapshot.  Callers must drop
+/// it immediately after materialization; only the resulting equality belongs
+/// to the pending union batch.
+pub(crate) struct PreparedSelectedMultiSwitchRedex {
+    origin: Id,
+    input_switch_count: usize,
+    plan: PointwiseAddSwitchPlan,
+}
+
+struct SameSelectorMultiSwitchPlan {
+    plan: PointwiseAddSwitchPlan,
+    input_switch_count: usize,
+}
+
+/// Returns a local distribution only when `selected_node` is the Add node
+/// actually chosen by extraction for this e-class.
+pub(crate) fn selected_multi_switch_redex(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    origin: Id,
+    selected_node: &MxxLang,
+) -> Option<SelectedMultiSwitchRedex> {
+    matches!(selected_node, MxxLang::MatrixAdd(_)).then_some(())?;
+    let origin = egraph.find(origin);
+    let plan = same_selector_multi_switch_distribution_plan(egraph, origin)?;
+    Some(SelectedMultiSwitchRedex { origin, input_switch_count: plan.input_switch_count })
+}
+
+/// Revalidates and prepares one extraction-selected distribution without
+/// changing e-graph equivalence.
+pub(crate) fn prepare_selected_multi_switch_redex(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    redex: SelectedMultiSwitchRedex,
+) -> Option<PreparedSelectedMultiSwitchRedex> {
+    let origin = egraph.find(redex.origin);
+    let plan = same_selector_multi_switch_distribution_plan(egraph, origin)?;
+    (plan.input_switch_count == redex.input_switch_count).then_some(
+        PreparedSelectedMultiSwitchRedex {
+            origin,
+            input_switch_count: plan.input_switch_count,
+            plan: plan.plan,
+        },
+    )
+}
+
+/// Materializes one prepared equality without unioning or rebuilding.  This
+/// lets the caller validate the complete deterministic batch before changing
+/// any equivalence class.
+pub(crate) fn materialize_selected_multi_switch_redex(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    prepared: PreparedSelectedMultiSwitchRedex,
+    context: &RewriteContext,
+) -> Option<(Id, Id)> {
+    if prepared.input_switch_count < 2 || !context.reserve(1) {
+        return None;
+    }
+    context.note_candidate();
+    let replacement = build_pointwise_add_switch_cancellation_with_context(
+        egraph,
+        prepared.origin,
+        prepared.plan,
+        context,
+    )?;
+    Some((prepared.origin, replacement))
+}
+
+pub(crate) fn note_selected_multi_switch_union(context: &RewriteContext) {
+    context.note_rewrite(true);
+}
+
+/// Distributes one Add over two or more stored Switch families that share one
+/// canonical selector.  Add/Negate consensus is established before selecting
+/// any Switch case, so competing physical Add witnesses cannot choose a
+/// selector-correlated representation opportunistically.
+fn same_selector_multi_switch_distribution_plan(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+) -> Option<SameSelectorMultiSwitchPlan> {
+    let root = egraph.find(root);
+    let leaves = signed_additive_leaves(egraph, &[root])?;
+    let mut fixed = Vec::new();
+    let mut switches = Vec::<(Box<[Id]>, bool)>::new();
+    let mut selector = None;
+    let mut case_count = None;
+    for (base, negative) in leaves {
+        match physical_switch_cases(egraph, base) {
+            PhysicalStructure::Absent => {
+                fixed.push(SignedPointwiseTerm { base: egraph.find(base), negative })
+            }
+            PhysicalStructure::Ambiguous => return None,
+            PhysicalStructure::Unique(cases) => {
+                let Some((&candidate_selector, cases)) = cases.split_first() else { return None };
+                let candidate_selector = egraph.find(candidate_selector);
+                let candidate_count = cases.len();
+                if candidate_count == 0 ||
+                    selector.is_some_and(|selector| selector != candidate_selector) ||
+                    case_count.is_some_and(|count| count != candidate_count)
+                {
+                    return None;
+                }
+                selector = Some(candidate_selector);
+                case_count = Some(candidate_count);
+                switches.push((
+                    std::iter::once(candidate_selector)
+                        .chain(cases.iter().map(|case| egraph.find(*case)))
+                        .collect::<Box<[Id]>>(),
+                    negative,
+                ));
+            }
+        }
+    }
+    if switches.len() < 2 {
+        return None;
+    }
+    let selector = selector?;
+    let case_count = case_count?;
+    if !selector_domain_matches_cases(egraph, selector, case_count) {
+        return None;
+    }
+    let mut normalized_cases = Vec::<Vec<SignedPointwiseTerm>>::with_capacity(case_count);
+    for case_index in 0..case_count {
+        let mut terms = fixed.clone();
+        for (cases, negative) in &switches {
+            let base = egraph.find(*cases.get(case_index + 1)?);
+            if base == root {
+                return None;
+            }
+            terms.push(SignedPointwiseTerm { base, negative: *negative });
+        }
+        let signed_terms = terms.iter().map(|term| (term.base, term.negative)).collect::<Vec<_>>();
+        let (cancelled, _) = cancelled_signed_additive_terms(&signed_terms);
+        normalized_cases.push(
+            terms
+                .into_iter()
+                .zip(cancelled)
+                .filter_map(|(term, cancelled)| (!cancelled).then_some(term))
+                .collect(),
+        );
+        // `signed_additive_leaves` has already proved every physical Add
+        // witness denotes this same signed polynomial.  Canonicalize only the
+        // freshly distributed case order, so equivalent witnesses produce one
+        // e-node and the rule cannot keep redistributing its own result.
+        normalized_cases
+            .last_mut()
+            .expect("one case was just pushed")
+            .sort_unstable_by_key(|term| (usize::from(egraph.find(term.base)), term.negative));
+    }
+    if equivalent_signed_switch_exists(egraph, root, selector, &normalized_cases) {
+        return None;
+    }
+    Some(SameSelectorMultiSwitchPlan {
+        plan: PointwiseAddSwitchPlan { selector, cases: normalized_cases, binder_aware: None },
+        input_switch_count: switches.len(),
+    })
 }
 
 #[cfg(test)]
@@ -1201,23 +1555,26 @@ fn pointwise_add_switch_cancellation_for_structure(
     let fixed_count = fixed.len();
     let mut normalized_cases = Vec::with_capacity(structure.switch.len() - 1);
     for (case_epoch, case) in structure.switch[1..].iter().enumerate() {
-        let terms = direct_add_terms_or_atomic(egraph, *case)
-            .ok_or(PointwiseAddSwitchReject::CaseCycleOrNestedSwitch { case_index: case_epoch })?;
-        let case = egraph.find(*case);
-        if case == root || terms.iter().any(|term| has_physical_switch(egraph, *term)) {
-            return Err(PointwiseAddSwitchReject::CaseCycleOrNestedSwitch {
-                case_index: case_epoch,
-            });
-        }
+        let flattened = flatten_pointwise_case(
+            egraph,
+            root,
+            structure.switch[0],
+            structure.switch.len() - 1,
+            case_epoch,
+            *case,
+        )
+        .map_err(|_| PointwiseAddSwitchReject::CaseCycleOrNestedSwitch {
+            case_index: case_epoch,
+        })?;
+        let case_physical_adds = flattened.physical_adds;
+        let case_grouped_add_children = flattened.grouped_add_children;
+        let terms = flattened.terms;
         let mut consumed = vec![false; terms.len()];
         let mut matched = 0;
         for (index, term) in terms.iter().enumerate() {
-            let Some((base, negative)) = signed_additive_term(egraph, *term) else {
-                return Err(PointwiseAddSwitchReject::CaseCycleOrNestedSwitch {
-                    case_index: case_epoch,
-                });
-            };
-            if let Some((required, seen_epoch, used)) = fixed_signed.get_mut(&(base, !negative)) {
+            if let Some((required, seen_epoch, used)) =
+                fixed_signed.get_mut(&(term.base, !term.negative))
+            {
                 if *seen_epoch != case_epoch + 1 {
                     *seen_epoch = case_epoch + 1;
                     *used = 0;
@@ -1230,7 +1587,13 @@ fn pointwise_add_switch_cancellation_for_structure(
             }
         }
         if matched != fixed_count {
-            let diagnostic = unmatched_fixed_terms_diagnostic(egraph, &fixed, case);
+            let diagnostic = unmatched_fixed_terms_diagnostic(
+                egraph,
+                &fixed,
+                &terms,
+                case_physical_adds,
+                case_grouped_add_children,
+            );
             return Err(PointwiseAddSwitchReject::UnmatchedFixedTerms {
                 physical_root_adds,
                 eligible_single_switch_adds,
@@ -1255,14 +1618,15 @@ fn pointwise_add_switch_cancellation_for_structure(
             .zip(consumed)
             .filter_map(|(term, consumed)| (!consumed).then_some(term))
             .collect::<Vec<_>>();
-        let (cancelled, _) = cancelled_additive_terms(egraph, &after_cross)
-            .ok_or(PointwiseAddSwitchReject::CaseCycleOrNestedSwitch { case_index: case_epoch })?;
+        let signed_after_cross =
+            after_cross.iter().map(|term| (term.base, term.negative)).collect::<Vec<_>>();
+        let (cancelled, _) = cancelled_signed_additive_terms(&signed_after_cross);
         let remaining = after_cross
             .into_iter()
             .zip(cancelled)
             .filter_map(|(term, cancelled)| (!cancelled).then_some(term))
             .collect::<Vec<_>>();
-        if remaining.iter().any(|term| egraph.find(*term) == root) {
+        if remaining.iter().any(|term| egraph.find(term.base) == root) {
             return Err(PointwiseAddSwitchReject::CaseCycleOrNestedSwitch {
                 case_index: case_epoch,
             });
@@ -1270,7 +1634,7 @@ fn pointwise_add_switch_cancellation_for_structure(
         normalized_cases.push(remaining);
     }
     let selector = egraph.find(structure.switch[0]);
-    if equivalent_switch_exists(egraph, root, selector, &normalized_cases) {
+    if equivalent_signed_switch_exists(egraph, root, selector, &normalized_cases) {
         return Err(PointwiseAddSwitchReject::EquivalentResult);
     }
     Ok(PointwiseAddSwitchPlan { selector, cases: normalized_cases, binder_aware: None })
@@ -1330,26 +1694,21 @@ fn binder_aware_pointwise_add_switch_cancellation_for_structure(
     }
     let mut case_terms = Vec::with_capacity(case_count);
     for (case_index, case) in structure.switch[1..].iter().enumerate() {
-        let case = egraph.find(*case);
-        if case == root {
-            return Err(BinderPreflightReject::CaseSelfCycle { case_index });
-        }
-        let terms = match physical_add_terms(egraph, case) {
-            PhysicalStructure::Absent => vec![case],
-            PhysicalStructure::Ambiguous => {
-                return Err(BinderPreflightReject::CaseAmbiguous { case_index });
-            }
-            PhysicalStructure::Unique(terms) => {
-                let terms = terms.into_iter().collect::<Vec<_>>();
-                if terms.iter().any(|child| *child == case) {
+        let terms =
+            match flatten_pointwise_case(egraph, root, selector, case_count, case_index, *case) {
+                Ok(flattened) => flattened.terms,
+                Err(PointwiseCaseFlattenReject::AmbiguousAdd) => {
+                    return Err(BinderPreflightReject::CaseAmbiguous { case_index });
+                }
+                Err(PointwiseCaseFlattenReject::NestedSwitchOrCycle)
+                    if egraph.find(*case) == root =>
+                {
                     return Err(BinderPreflightReject::CaseSelfCycle { case_index });
                 }
-                terms
-            }
-        };
-        if terms.iter().any(|term| has_physical_switch(egraph, *term)) {
-            return Err(BinderPreflightReject::CaseNestedSwitch { case_index });
-        }
+                Err(PointwiseCaseFlattenReject::NestedSwitchOrCycle) => {
+                    return Err(BinderPreflightReject::CaseNestedSwitch { case_index });
+                }
+            };
         case_terms.push(terms.into_boxed_slice());
     }
     Ok(BinderAwarePointwiseAddSwitchPlan {
@@ -1430,40 +1789,29 @@ struct UnmatchedFixedTermsDiagnostic {
 }
 
 /// Builds a bounded failure-only report.  The success path never calls this
-/// helper: it retains at most sixteen identities while it rescans the already
-/// selected failing case and its direct fixed-term sequence.
+/// helper: it retains at most sixteen identities from the already validated
+/// signed case plan and its direct fixed-term sequence.
 fn unmatched_fixed_terms_diagnostic(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     fixed: &[Id],
-    case: Id,
+    case_terms: &[SignedPointwiseTerm],
+    case_physical_adds: usize,
+    case_grouped_add_children: usize,
 ) -> UnmatchedFixedTermsDiagnostic {
-    let case = egraph.find(case);
-    let case_direct_terms = direct_add_terms_or_atomic(egraph, case)
-        .expect("validated pointwise case remains structurally stable during read-only diagnosis");
     let (fixed_terms, fixed_terms_omitted_occurrences) = signed_multiplicity_summary(egraph, fixed);
+    let signed_case_terms =
+        case_terms.iter().map(|term| (term.base, term.negative)).collect::<Vec<_>>();
     let (case_terms, case_terms_omitted_occurrences) =
-        signed_multiplicity_summary(egraph, &case_direct_terms);
+        signed_leaf_multiplicity_summary(&signed_case_terms);
     UnmatchedFixedTermsDiagnostic {
-        direct_terms: case_direct_terms.len(),
-        negated_terms: case_direct_terms
-            .iter()
-            .filter(|term| {
-                signed_additive_term(egraph, **term).is_some_and(|(_, negative)| negative)
-            })
-            .count(),
+        direct_terms: signed_case_terms.len(),
+        negated_terms: signed_case_terms.iter().filter(|(_, negative)| *negative).count(),
         fixed_unique_add_children: fixed
             .iter()
             .filter(|term| unique_add_terms(egraph, **term).is_some())
             .count(),
-        case_physical_adds: egraph[case]
-            .nodes
-            .iter()
-            .filter(|node| matches!(node, MxxLang::MatrixAdd(_)))
-            .count(),
-        case_grouped_add_children: case_direct_terms
-            .iter()
-            .filter(|term| unique_add_terms(egraph, **term).is_some())
-            .count(),
+        case_physical_adds,
+        case_grouped_add_children,
         fixed_terms,
         fixed_terms_omitted_occurrences,
         case_terms,
@@ -1629,7 +1977,15 @@ fn build_pointwise_add_switch_cancellation_inner(
     let mut cases = Vec::with_capacity(plan.cases.len() + 1);
     cases.push(plan.selector);
     for terms in plan.cases {
-        cases.push(build_additive_terms(egraph, root, terms));
+        let mut materialized = Vec::with_capacity(terms.len());
+        for term in terms {
+            materialized.push(if term.negative {
+                egraph.add(MxxLang::MatrixNegate([term.base]))
+            } else {
+                term.base
+            });
+        }
+        cases.push(build_additive_terms(egraph, root, materialized));
     }
     Some(egraph.add(MxxLang::Switch(cases.into_boxed_slice())))
 }
@@ -1662,7 +2018,6 @@ fn build_binder_aware_pointwise_add_switch_cancellation(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BinderBuildRejectStage {
-    CaseSignedReject,
     FixedSignedReject,
     NoExactCancellation,
     RootCycle,
@@ -3385,28 +3740,11 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
             mapped_bases.push(egraph.find(instantiated));
         }
         let mut actual = Vec::new();
-        let mut actual_valid = true;
         for term in terms {
-            let Some((base, negative)) = signed_additive_term(egraph, *term) else {
-                actual_valid = false;
-                break;
-            };
             progress().ok()?;
             actual.try_reserve(1).ok()?;
-            actual.push(PeelTerm::Concrete { base, negative });
+            actual.push(PeelTerm::Concrete { base: term.base, negative: term.negative });
         }
-        if !actual_valid {
-            report_binder_build_reject(
-                egraph,
-                case_index,
-                BinderBuildRejectStage::CaseSignedReject,
-                &[],
-                &[],
-                should_collect,
-                sink,
-            );
-            return None;
-        };
         let mut mapped_fixed = Vec::new();
         for occurrence in &plan.fixed_occurrences {
             let mapped = mapped_bases[occurrence.base_index];
@@ -3438,11 +3776,9 @@ fn build_binder_aware_pointwise_add_switch_cancellation_with_sink(
             let mut diagnostic_actual = Vec::new();
             for term in terms {
                 progress().ok()?;
-                if let Some(term) = signed_additive_term(egraph, *term) {
-                    progress().ok()?;
-                    diagnostic_actual.try_reserve(1).ok()?;
-                    diagnostic_actual.push(term);
-                }
+                progress().ok()?;
+                diagnostic_actual.try_reserve(1).ok()?;
+                diagnostic_actual.push((term.base, term.negative));
             }
             report_binder_build_reject(
                 egraph,
@@ -3938,31 +4274,11 @@ fn build_additive_terms(egraph: &mut EGraph<MxxLang, MxxAnalysis>, root: Id, ter
     }
 }
 
-fn direct_add_terms_or_atomic(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> Option<Vec<Id>> {
-    let term = egraph.find(term);
-    match physical_add_terms(egraph, term) {
-        PhysicalStructure::Absent => Some(vec![term]),
-        PhysicalStructure::Ambiguous => None,
-        PhysicalStructure::Unique(terms) => {
-            let terms = terms.into_iter().collect::<Vec<_>>();
-            (!terms.iter().any(|child| *child == term)).then_some(terms)
-        }
-    }
-}
-
 fn unique_switch_cases(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> Option<Box<[Id]>> {
-    let mut unique = None;
-    for node in &egraph[egraph.find(term)].nodes {
-        let MxxLang::Switch(cases) = node else { continue };
-        let cases =
-            cases.iter().map(|term| egraph.find(*term)).collect::<Vec<_>>().into_boxed_slice();
-        match &unique {
-            Some(previous) if previous != &cases => return None,
-            Some(_) => {}
-            None => unique = Some(cases),
-        }
+    match physical_switch_cases(egraph, term) {
+        PhysicalStructure::Unique(cases) => Some(cases),
+        PhysicalStructure::Absent | PhysicalStructure::Ambiguous => None,
     }
-    unique
 }
 
 fn has_physical_switch(egraph: &EGraph<MxxLang, MxxAnalysis>, term: Id) -> bool {
@@ -4021,11 +4337,31 @@ fn signed_additive_leaves_with_progress(
 fn signed_additive_leaves_with_visit_and_progress<F>(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     terms: &[Id],
-    mut visit: F,
+    visit: F,
     progress: &mut dyn FnMut() -> Result<(), ()>,
 ) -> Option<Vec<(Id, bool)>>
 where
     F: FnMut(Id),
+{
+    signed_additive_leaves_with_specialization_and_progress(
+        egraph,
+        terms,
+        visit,
+        |_| Ok(None),
+        progress,
+    )
+}
+
+fn signed_additive_leaves_with_specialization_and_progress<F, S>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    terms: &[Id],
+    mut visit: F,
+    mut specialize: S,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<(Id, bool)>>
+where
+    F: FnMut(Id),
+    S: FnMut(Id) -> Result<Option<(Id, bool)>, ()>,
 {
     type Canonical = Vec<(Box<[Id]>, bool, usize)>;
 
@@ -4110,16 +4446,18 @@ where
         Some(())
     }
 
-    fn consensus<F>(
+    fn consensus<F, S>(
         egraph: &EGraph<MxxLang, MxxAnalysis>,
         term: Id,
         memo: &mut HashMap<Id, Consensus>,
         active: &mut HashSet<Id>,
         visit: &mut F,
+        specialize: &mut S,
         progress: &mut dyn FnMut() -> Result<(), ()>,
     ) -> Option<Consensus>
     where
         F: FnMut(Id),
+        S: FnMut(Id) -> Result<Option<(Id, bool)>, ()>,
     {
         let term = egraph.find(term);
         if let Some(existing) = memo.get(&term) {
@@ -4135,12 +4473,26 @@ where
         let result = (|| {
             let mut agreed: Option<Consensus> = None;
             let mut has_additive_structure = false;
+            if let Some((base, negative)) = specialize(term).ok()? {
+                has_additive_structure = true;
+                let mut candidate =
+                    consensus(egraph, base, memo, active, visit, specialize, progress)?;
+                if negative {
+                    for (_, negative) in &mut candidate.representative {
+                        *negative = !*negative;
+                    }
+                    for (_, negative, _) in &mut candidate.canonical {
+                        *negative = !*negative;
+                    }
+                }
+                agreed = Some(candidate);
+            }
             for node in &egraph[term].nodes {
                 let candidate = match node {
                     MxxLang::MatrixNegate([base]) => {
                         has_additive_structure = true;
                         let mut candidate =
-                            consensus(egraph, *base, memo, active, visit, progress)?;
+                            consensus(egraph, *base, memo, active, visit, specialize, progress)?;
                         for (_, negative) in &mut candidate.representative {
                             *negative = !*negative;
                         }
@@ -4157,7 +4509,9 @@ where
                         let mut representative = Vec::new();
                         let mut counts = BTreeMap::new();
                         for child in children.iter() {
-                            let child = consensus(egraph, *child, memo, active, visit, progress)?;
+                            let child = consensus(
+                                egraph, *child, memo, active, visit, specialize, progress,
+                            )?;
                             for occurrence in child.representative {
                                 progress().ok()?;
                                 representative.try_reserve(1).ok()?;
@@ -4204,7 +4558,15 @@ where
     let mut active = HashSet::new();
     let mut output = Vec::new();
     for term in terms {
-        let consensus = consensus(egraph, *term, &mut memo, &mut active, &mut visit, progress)?;
+        let consensus = consensus(
+            egraph,
+            *term,
+            &mut memo,
+            &mut active,
+            &mut visit,
+            &mut specialize,
+            progress,
+        )?;
         for occurrence in consensus.representative {
             progress().ok()?;
             output.try_reserve(1).ok()?;
@@ -4566,6 +4928,42 @@ fn equivalent_switch_exists(
                 }
                 egraph[egraph.find(*case)].nodes.iter().any(|node| matches!(node, MxxLang::MatrixAdd(existing_terms)
                     if existing_terms.len() == terms.len() && existing_terms.iter().zip(terms).all(|(left, right)| egraph.find(*left) == egraph.find(*right))))
+            })
+        }
+        _ => false,
+    })
+}
+
+fn equivalent_signed_switch_exists(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+    selector: Id,
+    cases: &[Vec<SignedPointwiseTerm>],
+) -> bool {
+    egraph[egraph.find(root)].nodes.iter().any(|node| match node {
+        MxxLang::Switch(existing)
+            if existing.len() == cases.len() + 1 && egraph.find(existing[0]) == selector =>
+        {
+            existing[1..].iter().zip(cases).all(|(case, terms)| match terms.len() {
+                0 => egraph[egraph.find(*case)].nodes.iter().any(|node| {
+                    matches!(node, MxxLang::MatrixConstant(spec)
+                        if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. })))
+                }),
+                1 => signed_additive_child_matches(
+                    egraph,
+                    *case,
+                    (terms[0].base, terms[0].negative),
+                ),
+                _ => egraph[egraph.find(*case)].nodes.iter().any(|node| {
+                    matches!(node, MxxLang::MatrixAdd(existing_terms)
+                        if existing_terms.len() == terms.len()
+                            && existing_terms.iter().zip(terms).all(|(child, term)|
+                                signed_additive_child_matches(
+                                    egraph,
+                                    *child,
+                                    (term.base, term.negative),
+                                )))
+                }),
             })
         }
         _ => false,
@@ -5763,8 +6161,9 @@ mod tests {
         identity::{
             AtomicSourceDescriptor, AtomicSourceKey, BinderDescriptor, BinderKey,
             CanonicalResidueConvention, GraphWireSourceKey, HashQuerySpec, HashQuerySpecId,
-            HashTagPart, OccurrenceScope, ProgramKey, ResolvedIndexRange, ResolvedIntExpr,
-            ResolvedMatrixType, SamplerDescriptorId, SliceSpec, SliceSpecId, WireSourceKey,
+            HashTagPart, IntegerSourceDomain, OccurrenceScope, ProgramKey, ResolvedIndexRange,
+            ResolvedIntExpr, ResolvedMatrixType, SamplerDescriptorId, SliceSpec, SliceSpecId,
+            WireSourceKey,
         },
     };
     use std::{
@@ -5871,6 +6270,17 @@ mod tests {
         let source = AtomicSourceId(source);
         let term = egraph.add(MxxLang::Atom { source, indices: Box::new([]) });
         (term, source)
+    }
+
+    fn integer_atom(egraph: &mut EGraph<MxxLang, MxxAnalysis>, name: &str) -> Id {
+        let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+            key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(name)),
+            sort: MxxSort::Int,
+            integer_domain: Some(IntegerSourceDomain { minimum: 0.into(), maximum: 1.into() }),
+            canonical_residue_convention: None,
+            relation_role: None,
+        });
+        egraph.add(MxxLang::Atom { source: AtomicSourceId(source), indices: Box::new([]) })
     }
 
     fn scalar_polynomial_constant(
@@ -5985,8 +6395,8 @@ mod tests {
 
     struct UnaryAddBoundInput {
         nodes: BTreeMap<Id, MxxLang>,
-        source: AtomicSourceId,
-        bound: MatrixBound,
+        bounds: BTreeMap<AtomicSourceId, MatrixBound>,
+        reachable_switch_cases: BTreeMap<Id, Box<[bool]>>,
     }
 
     impl BoundInput for UnaryAddBoundInput {
@@ -5998,7 +6408,13 @@ mod tests {
             &self,
             _: Id,
         ) -> Result<mxx_ir_core::types::ConcreteMatrixType, BoundEvaluationError> {
-            Ok(self.bound.matrix_type.clone())
+            Ok(self
+                .bounds
+                .values()
+                .next()
+                .expect("test bound input has one matrix bound")
+                .matrix_type
+                .clone())
         }
 
         fn atom_bound(
@@ -6006,8 +6422,9 @@ mod tests {
             source: AtomicSourceId,
             term: Id,
         ) -> Result<MatrixBound, BoundEvaluationError> {
-            (source == self.source)
-                .then(|| self.bound.clone())
+            self.bounds
+                .get(&source)
+                .cloned()
                 .ok_or(BoundEvaluationError::MissingInputBoundContract { term })
         }
 
@@ -6047,6 +6464,18 @@ mod tests {
 
         fn validate_pack(&self, term: Id, _: usize) -> Result<(), BoundEvaluationError> {
             Err(BoundEvaluationError::InvalidPack { term })
+        }
+
+        fn switch_reachable_cases(
+            &self,
+            term: Id,
+            _: Id,
+            _: usize,
+        ) -> Result<Box<[bool]>, BoundEvaluationError> {
+            self.reachable_switch_cases
+                .get(&term)
+                .cloned()
+                .ok_or(BoundEvaluationError::InvalidSwitchReachability { term })
         }
     }
 
@@ -7260,14 +7689,14 @@ mod tests {
         };
         let input = UnaryAddBoundInput {
             nodes: BTreeMap::from([(replacement, wrapper), (residual, residual_node)]),
-            source: residual_source,
-            bound: residual_bound.clone(),
+            bounds: BTreeMap::from([(residual_source, residual_bound.clone())]),
+            reachable_switch_cases: BTreeMap::new(),
         };
         assert_eq!(BoundEvaluator::new(&input).evaluate(replacement), Ok(residual_bound));
     }
 
     #[test]
-    fn exact_additive_cancellation_rejects_shared_nested_add_dags() {
+    fn exact_additive_cancellation_expands_shared_nested_add_occurrences() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let (term, _) = matrix_atom(&mut egraph, "term", None);
         let negated = egraph.add(MxxLang::MatrixNegate([term]));
@@ -7275,8 +7704,22 @@ mod tests {
         let root = egraph.add(MxxLang::MatrixAdd(vec![shared, shared].into_boxed_slice()));
         egraph.rebuild();
 
-        assert!(exact_additive_remainder(&mut egraph, root).is_none());
-        assert!(!exact_additive_cancellation_possible(&egraph, root));
+        let zero = exact_additive_remainder(&mut egraph, root)
+            .expect("each shared occurrence contributes a cancellable signed pair");
+        assert!(egraph[egraph.find(zero)].nodes.iter().any(|node| {
+            matches!(
+                node,
+                MxxLang::MatrixConstant(spec)
+                    if matches!(
+                        egraph.analysis.symbols.matrix_constants.get(spec.0),
+                        Some(super::super::identity::MatrixConstantSpec {
+                            value: MatrixConstantValue::Zero,
+                            ..
+                        })
+                    )
+            )
+        }));
+        assert!(exact_additive_cancellation_possible(&egraph, root));
     }
 
     #[test]
@@ -7539,7 +7982,7 @@ mod tests {
         egraph.rebuild();
         assert!(matches!(
             pointwise_add_switch_probe(&egraph, root).outcomes[0].binder,
-            Err(BinderPreflightReject::CaseNestedSwitch { case_index: 0 })
+            Ok(BinderPreflightReady { case_count: 2, .. })
         ));
 
         let ambiguous_left = egraph.add(MxxLang::MatrixAdd(vec![first].into_boxed_slice()));
@@ -11155,7 +11598,7 @@ mod tests {
     }
 
     #[test]
-    fn pointwise_add_switch_rejects_two_switches_and_failed_case_without_mutation() {
+    fn pointwise_add_switch_distributes_two_same_selector_switches_without_mutation_during_plan() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let selector = egraph.add(MxxLang::IntConst(0.into()));
         let (signal, _) = matrix_atom(&mut egraph, "signal", None);
@@ -11164,10 +11607,102 @@ mod tests {
         let first = egraph.add(MxxLang::Switch(vec![selector, signal, signal].into_boxed_slice()));
         let second = egraph.add(MxxLang::Switch(vec![selector, signal, other].into_boxed_slice()));
         let root = egraph.add(MxxLang::MatrixAdd(vec![first, second, negated].into_boxed_slice()));
+        let reordered =
+            egraph.add(MxxLang::MatrixAdd(vec![negated, second, first].into_boxed_slice()));
+        egraph.union(root, reordered);
         egraph.rebuild();
         let before = egraph.total_size();
-        assert!(pointwise_add_switch_cancellation_plan(&egraph, root).is_none());
-        assert_eq!(egraph.total_size(), before);
+        assert!(pointwise_add_switch_cancellation_plans(&egraph, root).is_empty());
+        let plan = selected_multi_switch_plan(&egraph, root).expect("distribution plan");
+        assert_eq!(egraph.total_size(), before, "planning is read-only");
+        let replacement =
+            build_pointwise_add_switch_cancellation(&mut egraph, root, plan).expect("replacement");
+        let cases = switch_node(&egraph, replacement).expect("distributed switch");
+        assert_eq!(egraph.find(cases[1]), egraph.find(signal));
+        assert_eq!(egraph.find(cases[2]), egraph.find(other));
+        egraph.union(root, replacement);
+        egraph.rebuild();
+        let after_first_application = egraph.total_size();
+        assert!(
+            selected_multi_switch_plan(&egraph, root).is_none(),
+            "a canonical multi-Switch output must not be redistributed"
+        );
+        assert_eq!(
+            egraph.total_size(),
+            after_first_application,
+            "planning an already-normalized root must not add nodes"
+        );
+
+        let negated_second = egraph.add(MxxLang::MatrixNegate([second]));
+        let signed_root =
+            egraph.add(MxxLang::MatrixAdd(vec![first, negated_second].into_boxed_slice()));
+        egraph.rebuild();
+        let plan = selected_multi_switch_plan(&egraph, signed_root).expect("signed plan");
+        let replacement = build_pointwise_add_switch_cancellation(&mut egraph, signed_root, plan)
+            .expect("signed replacement");
+        let cases = switch_node(&egraph, replacement).expect("distributed switch");
+        assert!(egraph[egraph.find(cases[1])].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixConstant(spec)
+                if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. })))
+        }));
+        assert!(matches!(
+            physical_add_terms(&egraph, cases[2]),
+            PhysicalStructure::Unique(terms)
+                if terms.len() == 2
+                    && egraph.find(terms[0]) == egraph.find(signal)
+                    && matches!(physical_negated_base(&egraph, terms[1]), PhysicalStructure::Unique(base) if base == egraph.find(other))
+        ));
+    }
+
+    #[test]
+    fn pointwise_multi_switch_canonicalizes_survivor_order_before_equivalent_check() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (first_case, _) = matrix_atom(&mut egraph, "canonical-order-first", None);
+        let (second_case, _) = matrix_atom(&mut egraph, "canonical-order-second", None);
+        let first =
+            egraph.add(MxxLang::Switch(vec![selector, first_case, first_case].into_boxed_slice()));
+        let second = egraph
+            .add(MxxLang::Switch(vec![selector, second_case, second_case].into_boxed_slice()));
+        let canonical_case =
+            egraph.add(MxxLang::MatrixAdd(vec![first_case, second_case].into_boxed_slice()));
+        let canonical = egraph.add(MxxLang::Switch(
+            vec![selector, canonical_case, canonical_case].into_boxed_slice(),
+        ));
+        // Both distributed cases retain two terms.  The physical Add is
+        // deliberately reversed from the already materialized output.
+        let root = egraph.add(MxxLang::MatrixAdd(vec![second, first].into_boxed_slice()));
+        egraph.union(root, canonical);
+        egraph.rebuild();
+
+        let before = egraph.total_size();
+        assert!(
+            selected_multi_switch_plan(&egraph, root).is_none(),
+            "canonical per-case order must recognize the existing output"
+        );
+        assert_eq!(egraph.total_size(), before, "planning must be read-only");
+    }
+
+    #[test]
+    fn pointwise_add_switch_rejects_multi_switches_without_one_consensus_selector() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let other_selector = egraph.add(MxxLang::IntConst(1.into()));
+        let (left, _) = matrix_atom(&mut egraph, "multi-left", None);
+        let (right, _) = matrix_atom(&mut egraph, "multi-right", None);
+        let first = egraph.add(MxxLang::Switch(vec![selector, left, right].into_boxed_slice()));
+        let second =
+            egraph.add(MxxLang::Switch(vec![other_selector, left, right].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![first, second].into_boxed_slice()));
+        egraph.rebuild();
+        assert!(selected_multi_switch_plan(&egraph, root).is_none());
+
+        let alternate = egraph.add(MxxLang::Switch(vec![selector, right, left].into_boxed_slice()));
+        egraph.union(first, alternate);
+        egraph.rebuild();
+        let root = egraph.add(MxxLang::MatrixAdd(vec![first, first].into_boxed_slice()));
+        egraph.rebuild();
+        assert!(selected_multi_switch_plan(&egraph, root).is_none());
     }
 
     #[test]
@@ -11406,10 +11941,13 @@ mod tests {
         let selector = egraph.add(MxxLang::IntConst(0.into()));
         let (signal, _) = matrix_atom(&mut egraph, "signal", None);
         let negated = egraph.add(MxxLang::MatrixNegate([signal]));
-        let mut cases = vec![selector];
-        cases.extend(std::iter::repeat_n(signal, 32));
-        let switch = egraph.add(MxxLang::Switch(cases.into_boxed_slice()));
-        let root = egraph.add(MxxLang::MatrixAdd(vec![switch, negated].into_boxed_slice()));
+        let mut inner_cases = vec![selector];
+        inner_cases.extend(std::iter::repeat_n(signal, 512));
+        let inner = egraph.add(MxxLang::Switch(inner_cases.into_boxed_slice()));
+        let mut outer_cases = vec![selector];
+        outer_cases.extend(std::iter::repeat_n(inner, 512));
+        let outer = egraph.add(MxxLang::Switch(outer_cases.into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![outer, negated].into_boxed_slice()));
         egraph.rebuild();
         let before = egraph.total_size();
         let plan =
@@ -11417,12 +11955,370 @@ mod tests {
         let replacement = build_pointwise_add_switch_cancellation(&mut egraph, root, plan)
             .expect("direct plan builds");
         assert!(
-            matches!(egraph[egraph.find(replacement)].nodes.as_slice(), [MxxLang::Switch(cases)] if cases.len() == 33)
+            matches!(egraph[egraph.find(replacement)].nodes.as_slice(), [MxxLang::Switch(cases)] if cases.len() == 513)
         );
         assert!(
-            egraph.total_size() <= before + 33,
+            egraph.total_size() <= before + 513,
             "one switch plus at most one node per stored case"
         );
+    }
+
+    #[test]
+    fn pointwise_multi_switch_distribution_visits_512_cases_linearly() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (signal, _) = matrix_atom(&mut egraph, "multi-linear-signal", None);
+        let mut first_cases = vec![selector];
+        first_cases.extend(std::iter::repeat_n(signal, 512));
+        let first = egraph.add(MxxLang::Switch(first_cases.into_boxed_slice()));
+        let mut second_cases = vec![selector];
+        second_cases.extend(std::iter::repeat_n(signal, 512));
+        let second = egraph.add(MxxLang::Switch(second_cases.into_boxed_slice()));
+        let negated_second = egraph.add(MxxLang::MatrixNegate([second]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![first, negated_second].into_boxed_slice()));
+        egraph.rebuild();
+        let before = egraph.total_size();
+        let plan = selected_multi_switch_plan(&egraph, root).expect("512-case plan");
+        assert_eq!(egraph.total_size(), before, "planning is read-only");
+        let replacement =
+            build_pointwise_add_switch_cancellation(&mut egraph, root, plan).expect("replacement");
+        assert!(
+            matches!(egraph[egraph.find(replacement)].nodes.as_slice(), [MxxLang::Switch(cases)] if cases.len() == 513)
+        );
+        assert!(egraph.total_size() <= before + 513, "one output switch plus one case result");
+    }
+
+    #[test]
+    fn selected_multi_switch_application_contracts_a_nested_selected_redex() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (left, _) = matrix_atom(&mut egraph, "selected-nested-left", None);
+        let (right, _) = matrix_atom(&mut egraph, "selected-nested-right", None);
+        let inner_left =
+            egraph.add(MxxLang::Switch(vec![selector, left, right].into_boxed_slice()));
+        let inner_right =
+            egraph.add(MxxLang::Switch(vec![selector, right, left].into_boxed_slice()));
+        let outer_left =
+            egraph.add(MxxLang::Switch(vec![selector, inner_left, inner_left].into_boxed_slice()));
+        let outer_right = egraph
+            .add(MxxLang::Switch(vec![selector, inner_right, inner_right].into_boxed_slice()));
+        let selected = MxxLang::MatrixAdd(vec![outer_left, outer_right].into_boxed_slice());
+        let root = egraph.add(selected.clone());
+        egraph.rebuild();
+
+        let before = selected_multi_switch_redex(&egraph, root, &selected)
+            .expect("the selected outer Add has one materializable redex");
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        assert!(apply_selected_multi_switch_redex_for_test(&mut egraph, before, &context));
+        assert!(
+            selected_multi_switch_redex(&egraph, root, &selected).is_none(),
+            "the applied selected Add no longer has a materializable multi-Switch plan"
+        );
+        assert_eq!(context.failure(), None);
+    }
+
+    #[test]
+    fn selected_multi_switch_restarts_from_the_next_canonical_root() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let make_root = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, label: &str| {
+            let (left, _) = matrix_atom(egraph, &format!("{label}-left"), None);
+            let (right, _) = matrix_atom(egraph, &format!("{label}-right"), None);
+            let first = egraph.add(MxxLang::Switch(vec![selector, left, left].into_boxed_slice()));
+            let second =
+                egraph.add(MxxLang::Switch(vec![selector, right, right].into_boxed_slice()));
+            let node = MxxLang::MatrixAdd(vec![first, second].into_boxed_slice());
+            (egraph.add(node.clone()), node)
+        };
+        let (first_root, first_node) = make_root(&mut egraph, "first-root");
+        let (second_root, second_node) = make_root(&mut egraph, "second-root");
+        egraph.rebuild();
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+
+        let first = selected_multi_switch_redex(&egraph, first_root, &first_node)
+            .expect("first root is selected");
+        assert!(apply_selected_multi_switch_redex_for_test(&mut egraph, first, &context));
+        let second = selected_multi_switch_redex(&egraph, egraph.find(second_root), &second_node)
+            .expect("second root remains discoverable after rebuild");
+        assert!(apply_selected_multi_switch_redex_for_test(&mut egraph, second, &context));
+        assert!(selected_multi_switch_redex(&egraph, first_root, &first_node).is_none());
+        assert!(selected_multi_switch_redex(&egraph, second_root, &second_node).is_none());
+    }
+
+    #[test]
+    fn selected_multi_switch_batches_sibling_redexes_before_one_rebuild() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let make_root = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, label: &str| {
+            let (left, _) = matrix_atom(egraph, &format!("{label}-left"), None);
+            let (right, _) = matrix_atom(egraph, &format!("{label}-right"), None);
+            let first = egraph.add(MxxLang::Switch(vec![selector, left, right].into_boxed_slice()));
+            let second =
+                egraph.add(MxxLang::Switch(vec![selector, right, left].into_boxed_slice()));
+            let node = MxxLang::MatrixAdd(vec![first, second].into_boxed_slice());
+            (egraph.add(node.clone()), node)
+        };
+        let (first_root, first_node) = make_root(&mut egraph, "batch-first");
+        let (second_root, second_node) = make_root(&mut egraph, "batch-second");
+        egraph.rebuild();
+        let redexes = [
+            selected_multi_switch_redex(&egraph, first_root, &first_node).expect("first redex"),
+            selected_multi_switch_redex(&egraph, second_root, &second_node).expect("second redex"),
+        ];
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+
+        assert_eq!(apply_selected_multi_switch_batch_for_test(&mut egraph, redexes, &context), 2);
+        assert!(selected_multi_switch_redex(&egraph, first_root, &first_node).is_none());
+        assert!(selected_multi_switch_redex(&egraph, second_root, &second_node).is_none());
+        assert_eq!(context.counters().candidates, 2);
+        assert_eq!(context.counters().rewrites, 2);
+        assert_eq!(context.counters().selector_distributions, 2);
+    }
+
+    #[test]
+    fn selected_multi_switch_batch_materializes_parent_and_child_from_one_snapshot() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (left, _) = matrix_atom(&mut egraph, "batch-nested-left", None);
+        let (right, _) = matrix_atom(&mut egraph, "batch-nested-right", None);
+        let child_first =
+            egraph.add(MxxLang::Switch(vec![selector, left, right].into_boxed_slice()));
+        let child_second =
+            egraph.add(MxxLang::Switch(vec![selector, right, left].into_boxed_slice()));
+        let child_node = MxxLang::MatrixAdd(vec![child_first, child_second].into_boxed_slice());
+        let child = egraph.add(child_node.clone());
+        let parent_first =
+            egraph.add(MxxLang::Switch(vec![selector, child, left].into_boxed_slice()));
+        let parent_second =
+            egraph.add(MxxLang::Switch(vec![selector, left, child].into_boxed_slice()));
+        let parent_node = MxxLang::MatrixAdd(vec![parent_first, parent_second].into_boxed_slice());
+        let parent = egraph.add(parent_node.clone());
+        egraph.rebuild();
+        let child_redex =
+            selected_multi_switch_redex(&egraph, child, &child_node).expect("child redex");
+        let parent_redex =
+            selected_multi_switch_redex(&egraph, parent, &parent_node).expect("parent redex");
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+
+        assert_eq!(
+            apply_selected_multi_switch_batch_for_test(
+                &mut egraph,
+                [parent_redex, child_redex],
+                &context,
+            ),
+            2
+        );
+        assert!(selected_multi_switch_redex(&egraph, child, &child_node).is_none());
+        assert!(selected_multi_switch_redex(&egraph, parent, &parent_node).is_none());
+    }
+
+    #[test]
+    fn final_bound_evaluates_the_selected_materialized_switch() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (left, left_source) = matrix_atom(&mut egraph, "bound-left", None);
+        let (right, right_source) = matrix_atom(&mut egraph, "bound-right", None);
+        let first = egraph.add(MxxLang::Switch(vec![selector, left, left].into_boxed_slice()));
+        let second = egraph.add(MxxLang::Switch(vec![selector, right, right].into_boxed_slice()));
+        let selected = MxxLang::MatrixAdd(vec![first, second].into_boxed_slice());
+        let root = egraph.add(selected.clone());
+        egraph.rebuild();
+        let redex = selected_multi_switch_redex(&egraph, root, &selected).expect("selected plan");
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        assert!(apply_selected_multi_switch_redex_for_test(&mut egraph, redex, &context));
+        let root = egraph.find(root);
+        let switch = egraph[root]
+            .nodes
+            .iter()
+            .find(|node| matches!(node, MxxLang::Switch(_)))
+            .expect("selected normalization materialized one Switch")
+            .clone();
+        let MxxLang::Switch(cases) = &switch else { unreachable!() };
+        let cases = cases.clone();
+        let mut nodes = BTreeMap::from([
+            (root, switch),
+            (left, egraph[egraph.find(left)].nodes[0].clone()),
+            (right, egraph[egraph.find(right)].nodes[0].clone()),
+        ]);
+        for case in &cases[1..] {
+            nodes.insert(*case, egraph[egraph.find(*case)].nodes[0].clone());
+        }
+        let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
+            modulus: 17.into(),
+            ring_dimension: 1,
+            rows: 1,
+            columns: 1,
+        };
+        let bounded = |maximum: u8| MatrixBound {
+            matrix_type: matrix_type.clone(),
+            coefficient_class: BoundClass::bounded(maximum.into()),
+            metadata: MatrixMetadata::unknown(),
+        };
+        let input = UnaryAddBoundInput {
+            nodes,
+            bounds: BTreeMap::from([(left_source, bounded(2_u8)), (right_source, bounded(3_u8))]),
+            reachable_switch_cases: BTreeMap::from([(root, vec![true, true].into_boxed_slice())]),
+        };
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(root),
+            Ok(bounded(5_u8)),
+            "final bound follows the materialized Switch rather than the discarded outer Add"
+        );
+    }
+
+    #[test]
+    fn pointwise_add_switch_diagonalizes_same_selector_cases_and_negation() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = integer_atom(&mut egraph, "diagonal-selector");
+        let selector_alias = integer_atom(&mut egraph, "diagonal-selector-alias");
+        egraph.union(selector, selector_alias);
+        egraph.rebuild();
+        let (signal, _) = matrix_atom(&mut egraph, "diagonal-signal", None);
+        let inner =
+            egraph.add(MxxLang::Switch(vec![selector_alias, signal, signal].into_boxed_slice()));
+        let outer = egraph.add(MxxLang::Switch(vec![selector, inner, inner].into_boxed_slice()));
+        let negative_signal = egraph.add(MxxLang::MatrixNegate([signal]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![outer, negative_signal].into_boxed_slice()));
+        egraph.rebuild();
+
+        let plan = pointwise_add_switch_cancellation_plan(&egraph, root).expect("same selector");
+        let replacement =
+            build_pointwise_add_switch_cancellation(&mut egraph, root, plan).expect("replacement");
+        let cases = switch_node(&egraph, replacement).expect("result switch");
+        assert!(egraph[egraph.find(cases[1])].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixConstant(spec)
+                if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. })))
+        }));
+        assert!(egraph[egraph.find(cases[2])].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixConstant(spec)
+                if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. })))
+        }));
+
+        let negative_inner = egraph.add(MxxLang::MatrixNegate([inner]));
+        let negative_outer = egraph.add(MxxLang::Switch(
+            vec![selector, negative_inner, negative_inner].into_boxed_slice(),
+        ));
+        let negated_root =
+            egraph.add(MxxLang::MatrixAdd(vec![negative_outer, signal].into_boxed_slice()));
+        egraph.rebuild();
+        let plan = pointwise_add_switch_cancellation_plan(&egraph, negated_root)
+            .expect("negated selector");
+        let replacement = build_pointwise_add_switch_cancellation(&mut egraph, negated_root, plan)
+            .expect("replacement");
+        let cases = switch_node(&egraph, replacement).expect("result switch");
+        assert!(egraph[egraph.find(cases[1])].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixConstant(spec)
+                if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. })))
+        }));
+        assert!(egraph[egraph.find(cases[2])].nodes.iter().any(|node| {
+            matches!(node, MxxLang::MatrixConstant(spec)
+                if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. })))
+        }));
+    }
+
+    #[test]
+    fn binder_pointwise_plan_diagonalizes_same_selector_nested_cases() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let binder = test_binder(&mut egraph, 0, 1);
+        let selector = egraph.add(MxxLang::IntBinder(binder));
+        let shared = binder_matrix_atom(&mut egraph, selector, "nested-binder-shared");
+        let zero = egraph.add(MxxLang::IntConst(0.into()));
+        let one = egraph.add(MxxLang::IntConst(1.into()));
+        let at_zero =
+            family::instantiate_shared_element(&mut egraph, shared, binder, zero, &mut || {
+                Ok::<(), ()>(())
+            })
+            .expect("zero case");
+        let at_one =
+            family::instantiate_shared_element(&mut egraph, shared, binder, one, &mut || {
+                Ok::<(), ()>(())
+            })
+            .expect("one case");
+        let inner = egraph.add(MxxLang::Switch(vec![selector, at_zero, at_one].into_boxed_slice()));
+        let outer = egraph.add(MxxLang::Switch(vec![selector, inner, inner].into_boxed_slice()));
+        let fixed = egraph.add(MxxLang::MatrixNegate([shared]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![outer, fixed].into_boxed_slice()));
+        egraph.rebuild();
+
+        let plan = pointwise_add_switch_cancellation_plan(&egraph, root).expect("binder plan");
+        assert!(plan.binder_aware.is_some());
+        let replacement =
+            build_pointwise_add_switch_cancellation(&mut egraph, root, plan).expect("replacement");
+        let cases = switch_node(&egraph, replacement).expect("result switch");
+        for case in &cases[1..] {
+            assert!(egraph[egraph.find(*case)].nodes.iter().any(|node| {
+                matches!(node, MxxLang::MatrixConstant(spec)
+                    if matches!(egraph.analysis.symbols.matrix_constants.get(spec.0), Some(super::super::identity::MatrixConstantSpec { value: MatrixConstantValue::Zero, .. })))
+            }));
+        }
+    }
+
+    #[test]
+    fn pointwise_add_switch_rejects_non_consensus_nested_selector_cases() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let other_selector = egraph.add(MxxLang::IntConst(1.into()));
+        let (signal, _) = matrix_atom(&mut egraph, "nested-signal", None);
+        let (other, _) = matrix_atom(&mut egraph, "nested-other", None);
+        let negative_signal = egraph.add(MxxLang::MatrixNegate([signal]));
+
+        let distinct =
+            egraph.add(MxxLang::Switch(vec![other_selector, signal, other].into_boxed_slice()));
+        let outer =
+            egraph.add(MxxLang::Switch(vec![selector, distinct, distinct].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![outer, negative_signal].into_boxed_slice()));
+        egraph.rebuild();
+        assert!(pointwise_add_switch_cancellation_plan(&egraph, root).is_none());
+
+        let short = egraph.add(MxxLang::Switch(vec![selector, signal].into_boxed_slice()));
+        let outer = egraph.add(MxxLang::Switch(vec![selector, short, short].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![outer, negative_signal].into_boxed_slice()));
+        egraph.rebuild();
+        assert!(pointwise_add_switch_cancellation_plan(&egraph, root).is_none());
+
+        let first = egraph.add(MxxLang::Switch(vec![selector, signal, other].into_boxed_slice()));
+        let second = egraph.add(MxxLang::Switch(vec![selector, other, signal].into_boxed_slice()));
+        egraph.union(first, second);
+        egraph.rebuild();
+        let outer = egraph.add(MxxLang::Switch(vec![selector, first, first].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![outer, negative_signal].into_boxed_slice()));
+        egraph.rebuild();
+        assert!(pointwise_add_switch_cancellation_plan(&egraph, root).is_none());
+
+        let cyclic_structure = PointwiseAddSwitchStructure {
+            terms: vec![outer, negative_signal],
+            switch_index: 0,
+            switch: vec![selector, root, other].into_boxed_slice(),
+        };
+        assert!(matches!(
+            pointwise_add_switch_cancellation_for_structure(&egraph, root, &cyclic_structure, 1, 1),
+            Err(PointwiseAddSwitchReject::CaseCycleOrNestedSwitch { case_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn pointwise_add_switch_reports_unmatched_diagonalized_case_without_rereading_it() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (signal, _) = matrix_atom(&mut egraph, "diagnostic-signal", None);
+        let (other, _) = matrix_atom(&mut egraph, "diagnostic-other", None);
+        let inner = egraph.add(MxxLang::Switch(vec![selector, signal, other].into_boxed_slice()));
+        let outer = egraph.add(MxxLang::Switch(vec![selector, inner, inner].into_boxed_slice()));
+        let fixed = egraph.add(MxxLang::MatrixNegate([signal]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![outer, fixed].into_boxed_slice()));
+        egraph.rebuild();
+
+        assert!(matches!(
+            pointwise_add_switch_cancellation_reason(&egraph, root),
+            Err(PointwiseAddSwitchReject::UnmatchedFixedTerms {
+                case_index: 1,
+                direct_terms: 1,
+                negated_terms: 0,
+                case_physical_adds: 0,
+                case_grouped_add_children: 0,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -11442,9 +12338,13 @@ mod tests {
             vec![switch, negated_signal, negated_signal].into_boxed_slice(),
         ));
         egraph.rebuild();
+        let plan = pointwise_add_switch_cancellation_plan(&egraph, root).expect("duplicates match");
         assert_eq!(
-            pointwise_add_switch_cancellation_plan(&egraph, root).expect("duplicates match").cases,
-            vec![vec![egraph.find(residual)], vec![egraph.find(residual)]]
+            plan.cases,
+            vec![
+                vec![SignedPointwiseTerm { base: egraph.find(residual), negative: false }],
+                vec![SignedPointwiseTerm { base: egraph.find(residual), negative: false }],
+            ]
         );
 
         let inner = egraph.add(MxxLang::Switch(vec![selector, signal, signal].into_boxed_slice()));
@@ -11454,10 +12354,7 @@ mod tests {
             egraph.add(MxxLang::Switch(vec![selector, signal, negated_signal].into_boxed_slice()));
         egraph.union(switch, alternate);
         egraph.rebuild();
-        assert_eq!(
-            pointwise_add_switch_cancellation_reason(&egraph, nested),
-            Err(PointwiseAddSwitchReject::CaseCycleOrNestedSwitch { case_index: 0 })
-        );
+        assert!(pointwise_add_switch_cancellation_plan(&egraph, nested).is_some());
         assert_eq!(
             pointwise_add_switch_cancellation_reason(&egraph, root),
             Err(PointwiseAddSwitchReject::Structural {
@@ -11491,7 +12388,11 @@ mod tests {
         egraph.union(case, signal);
         let before = egraph.total_size();
         assert_eq!(egraph.find(case), egraph.find(signal));
-        assert!(direct_add_terms_or_atomic(&egraph, case).is_none());
+        assert!(matches!(
+            physical_add_terms(&egraph, case),
+            PhysicalStructure::Unique(terms)
+                if terms.iter().any(|child| *child == egraph.find(case))
+        ));
         assert_eq!(egraph.total_size(), before);
     }
 

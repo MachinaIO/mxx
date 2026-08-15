@@ -22,7 +22,10 @@ use super::{
     },
 };
 use egg::{EGraph, Id, Language, RecExpr};
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fmt,
+};
 
 /// The exact lexicographic preference used to select a final expression.
 ///
@@ -58,6 +61,15 @@ pub struct ExtractedProposal {
     /// stored in the e-graph, analysis data, or a source registry.
     pub first_large_source: Option<AtomicSourceId>,
     pub expression: RecExpr<MxxLang>,
+}
+
+/// Extraction-only provenance for the selected DAG.  Each entry has the same
+/// index as `proposal.expression` and names the canonical e-class from which
+/// that expression-local node was selected.  It is discarded before the
+/// public simulation result and is never stored in the e-graph or analysis.
+pub(crate) struct ExtractedProposalWithOrigins {
+    pub(crate) proposal: ExtractedProposal,
+    pub(crate) origins: Box<[Id]>,
 }
 
 /// Maps extraction failures that require the simulation driver's source site.
@@ -119,6 +131,24 @@ pub fn extract_best_proposal<I: BoundInput>(
         &EGraph<MxxLang, MxxAnalysis>,
     ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
 ) -> Result<ExtractedProposal, OperationalSimulationError> {
+    extract_best_proposal_with_origins(egraph, root, bound_input, control, classify)
+        .map(|extracted| extracted.proposal)
+}
+
+/// Internal form of [`extract_best_proposal`] which retains the selected
+/// e-class origin beside every emitted expression-local node for one local
+/// normalization epoch.
+pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+    bound_input: &I,
+    control: &mut ExtractionControl<'_>,
+    classify: &mut dyn FnMut(
+        Id,
+        &MxxLang,
+        &EGraph<MxxLang, MxxAnalysis>,
+    ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
+) -> Result<ExtractedProposalWithOrigins, OperationalSimulationError> {
     let class_count = egraph.number_of_classes();
     let mut classes = Vec::with_capacity(class_count);
     for class in egraph.classes() {
@@ -190,6 +220,7 @@ pub fn extract_best_proposal<I: BoundInput>(
 
     let mut work = vec![BuildFrame::Enter(root)];
     let mut nodes = Vec::<MxxLang>::new();
+    let mut origins = Vec::<Id>::new();
     while let Some(frame) = work.pop() {
         let class = match frame {
             BuildFrame::Enter(class) | BuildFrame::Finish(class) => egraph.find(class),
@@ -255,6 +286,7 @@ pub fn extract_best_proposal<I: BoundInput>(
                 );
                 let output = Id::from(nodes.len());
                 nodes.push(output_node);
+                origins.push(class);
                 let Some(candidate) = candidates[index].as_mut() else {
                     return Err((control.invalid_dag)(class));
                 };
@@ -303,11 +335,14 @@ pub fn extract_best_proposal<I: BoundInput>(
             "selected Large residual"
         );
     }
-    Ok(ExtractedProposal {
-        cost: root_candidate.cost.clone(),
-        semantic_bound: root_candidate.semantic_bound.clone(),
-        first_large_source: root_candidate.first_large_source,
-        expression,
+    Ok(ExtractedProposalWithOrigins {
+        proposal: ExtractedProposal {
+            cost: root_candidate.cost.clone(),
+            semantic_bound: root_candidate.semantic_bound.clone(),
+            first_large_source: root_candidate.first_large_source,
+            expression,
+        },
+        origins: origins.into_boxed_slice(),
     })
 }
 
@@ -722,6 +757,85 @@ struct SelectedClassView {
     slice: Option<SelectedSlice>,
     hash_plain: Option<SelectedHashPlain>,
     gadget_decomposition: Option<SelectedGadgetDecomposition>,
+    negate_bases: Option<SelectedNegateBases>,
+}
+
+struct SelectedNegateBases {
+    bases: Box<[SelectedNegateBase]>,
+    omitted_base_count: usize,
+}
+
+struct SelectedNegateBase {
+    canonical_eclass: usize,
+    nodes: Box<[SelectedShallowNode]>,
+    omitted_node_count: usize,
+    add_children: Box<[SelectedNegateBaseChild]>,
+    omitted_add_child_count: usize,
+}
+
+struct SelectedNegateBaseChild {
+    canonical_eclass: usize,
+    selected_operator: &'static str,
+    selected_direct_children: Box<[usize]>,
+    omitted_child_count: usize,
+    product_spine: Option<Box<SelectedProductSpine>>,
+    nested_negate_base: Option<Box<SelectedNestedNegateBase>>,
+}
+
+struct SelectedNestedNegateBase {
+    canonical_eclass: usize,
+    physical_nodes: Box<[SelectedShallowNode]>,
+    omitted_node_count: usize,
+    selected: SelectedDiagnosticInputView,
+}
+
+impl fmt::Debug for SelectedNegateBases {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SelectedNegateBases")
+            .field("bases", &self.bases)
+            .field("omitted_base_count", &self.omitted_base_count)
+            .finish()
+    }
+}
+impl fmt::Debug for SelectedNegateBase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SelectedNegateBase")
+            .field("canonical_eclass", &self.canonical_eclass)
+            .field("nodes", &self.nodes)
+            .field("omitted_node_count", &self.omitted_node_count)
+            .field("add_children", &self.add_children)
+            .field("omitted_add_child_count", &self.omitted_add_child_count)
+            .finish()
+    }
+}
+impl fmt::Debug for SelectedNegateBaseChild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SelectedNegateBaseChild")
+            .field("canonical_eclass", &self.canonical_eclass)
+            .field("selected_operator", &self.selected_operator)
+            .field("selected_direct_children", &self.selected_direct_children)
+            .field("omitted_child_count", &self.omitted_child_count)
+            .field("product_spine", &self.product_spine)
+            .field("nested_negate_base", &self.nested_negate_base)
+            .finish()
+    }
+}
+impl fmt::Debug for SelectedNestedNegateBase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SelectedNestedNegateBase")
+            .field("canonical_eclass", &self.canonical_eclass)
+            .field("physical_nodes", &self.physical_nodes)
+            .field("omitted_node_count", &self.omitted_node_count)
+            .field("selected", &self.selected)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SelectedShallowNode {
+    operator_name: &'static str,
+    canonical_children: Box<[usize]>,
+    omitted_child_count: usize,
 }
 
 /// The already-interned authority behind a selected Atom leaf.  This records
@@ -857,6 +971,8 @@ struct SelectedHashPlain {
     query_id: u32,
     canonical_arguments: Box<[usize]>,
     omitted_argument_count: usize,
+    physical_nodes: Box<[SelectedShallowNode]>,
+    omitted_node_count: usize,
 }
 
 impl fmt::Debug for SelectedClassView {
@@ -870,6 +986,7 @@ impl fmt::Debug for SelectedClassView {
             .field("slice", &self.slice)
             .field("hash_plain", &self.hash_plain)
             .field("gadget_decomposition", &self.gadget_decomposition)
+            .field("negate_bases", &self.negate_bases)
             .finish()
     }
 }
@@ -908,6 +1025,8 @@ impl fmt::Debug for SelectedHashPlain {
             .field("query_id", &self.query_id)
             .field("canonical_arguments", &self.canonical_arguments)
             .field("omitted_argument_count", &self.omitted_argument_count)
+            .field("physical_nodes", &self.physical_nodes)
+            .field("omitted_node_count", &self.omitted_node_count)
             .finish()
     }
 }
@@ -1000,6 +1119,7 @@ fn selected_hash_plain(
     query: u32,
     arguments: &[Id],
     egraph: &EGraph<MxxLang, MxxAnalysis>,
+    canonical: Id,
 ) -> SelectedHashPlain {
     let canonical_arguments = arguments
         .iter()
@@ -1010,6 +1130,29 @@ fn selected_hash_plain(
         query_id: query,
         canonical_arguments,
         omitted_argument_count: arguments
+            .len()
+            .saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
+        physical_nodes: egraph[egraph.find(canonical)]
+            .nodes
+            .iter()
+            .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
+            .map(|node| {
+                let children = node.children();
+                SelectedShallowNode {
+                    operator_name: node.operator_name(),
+                    canonical_children: children
+                        .iter()
+                        .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
+                        .map(|child| usize::from(egraph.find(*child)))
+                        .collect(),
+                    omitted_child_count: children
+                        .len()
+                        .saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
+                }
+            })
+            .collect(),
+        omitted_node_count: egraph[egraph.find(canonical)]
+            .nodes
             .len()
             .saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
     }
@@ -1027,7 +1170,7 @@ fn selected_class_view(
             (Some(selected_slice(egraph, spec.0, input[0])), None)
         }
         MxxLang::HashPlain { query, arguments } => {
-            (None, Some(selected_hash_plain(query.0, arguments, egraph)))
+            (None, Some(selected_hash_plain(query.0, arguments, egraph, canonical)))
         }
         _ => (None, None),
     };
@@ -1035,6 +1178,135 @@ fn selected_class_view(
     let gadget_decomposition = atom_source.as_ref().and_then(|atom| match &atom.sampler {
         Some(SelectedSamplerIdentity::GadgetDecomposition(gadget)) => Some(gadget.clone()),
         _ => None,
+    });
+    let negate_bases = matches!(node, MxxLang::MatrixNegate(_)).then(|| {
+        let bases = egraph[canonical]
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                MxxLang::MatrixNegate([input]) => Some(usize::from(egraph.find(*input))),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let omitted_base_count = bases.len().saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN);
+        SelectedNegateBases {
+            bases: bases
+                .into_iter()
+                .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
+                .map(|base| {
+                    let base_id = Id::from(base);
+                    let nodes = egraph[base_id]
+                        .nodes
+                        .iter()
+                        .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
+                        .map(|node| {
+                            let children = node.children();
+                            SelectedShallowNode {
+                                operator_name: node.operator_name(),
+                                canonical_children: children
+                                    .iter()
+                                    .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
+                                    .map(|child| usize::from(egraph.find(*child)))
+                                    .collect(),
+                                omitted_child_count: children
+                                    .len()
+                                    .saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let direct_children = egraph[base_id]
+                        .nodes
+                        .iter()
+                        .filter_map(|node| match node {
+                            MxxLang::MatrixAdd(children) => Some(children.iter().copied()),
+                            _ => None,
+                        })
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    let add_children = direct_children
+                        .iter()
+                        .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
+                        .filter_map(|child| {
+                            let canonical = egraph.find(*child);
+                            let selected = &candidates.get(usize::from(canonical))?.as_ref()?.node;
+                            let children = selected.children();
+                            let nested_negate_base = match selected {
+                                MxxLang::MatrixNegate([base]) => {
+                                    let base = egraph.find(*base);
+                                    let input =
+                                        selected_diagnostic_input(egraph, candidates, base, true)?;
+                                    Some(Box::new(SelectedNestedNegateBase {
+                                        canonical_eclass: usize::from(base),
+                                        physical_nodes: egraph[base]
+                                            .nodes
+                                            .iter()
+                                            .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
+                                            .map(|node| {
+                                                let children = node.children();
+                                                SelectedShallowNode {
+                                                    operator_name: node.operator_name(),
+                                                    canonical_children: children
+                                                        .iter()
+                                                        .take(
+                                                            MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN,
+                                                        )
+                                                        .map(|id| usize::from(egraph.find(*id)))
+                                                        .collect(),
+                                                    omitted_child_count: children
+                                                        .len()
+                                                        .saturating_sub(
+                                                            MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN,
+                                                        ),
+                                                }
+                                            })
+                                            .collect(),
+                                        omitted_node_count: egraph[base]
+                                            .nodes
+                                            .len()
+                                            .saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
+                                        selected: input.selected,
+                                    }))
+                                }
+                                _ => None,
+                            };
+                            Some(SelectedNegateBaseChild {
+                                canonical_eclass: usize::from(canonical),
+                                selected_operator: selected.operator_name(),
+                                selected_direct_children: children
+                                    .iter()
+                                    .take(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN)
+                                    .map(|child| usize::from(egraph.find(*child)))
+                                    .collect(),
+                                omitted_child_count: children
+                                    .len()
+                                    .saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
+                                product_spine: matches!(selected, MxxLang::MatrixMultiply(_)).then(
+                                    || {
+                                        Box::new(selected_product_spine(
+                                            egraph, candidates, canonical,
+                                        ))
+                                    },
+                                ),
+                                nested_negate_base,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    SelectedNegateBase {
+                        canonical_eclass: base,
+                        omitted_node_count: egraph[base_id]
+                            .nodes
+                            .len()
+                            .saturating_sub(MAX_SELECTED_LARGE_DIAGNOSTIC_CHILDREN),
+                        nodes: nodes.into_boxed_slice(),
+                        omitted_add_child_count: direct_children
+                            .len()
+                            .saturating_sub(add_children.len()),
+                        add_children: add_children.into_boxed_slice(),
+                    }
+                })
+                .collect(),
+            omitted_base_count,
+        }
     });
     Some(SelectedClassView {
         canonical_eclass: usize::from(canonical),
@@ -1044,6 +1316,7 @@ fn selected_class_view(
         slice,
         hash_plain,
         gadget_decomposition,
+        negate_bases,
     })
 }
 
@@ -1957,7 +2230,7 @@ fn selected_large_path_from<I: BoundInput>(
                 (Some(selected_slice(egraph, spec.0, input[0])), None)
             }
             MxxLang::HashPlain { query, arguments } => {
-                (None, Some(selected_hash_plain(query.0, arguments, egraph)))
+                (None, Some(selected_hash_plain(query.0, arguments, egraph, current)))
             }
             _ => (None, None),
         };
@@ -4699,6 +4972,31 @@ mod tests {
         let result = extract(&egraph, root, &mut classify).unwrap();
         assert_eq!(result.expression.as_ref().len(), 2);
         assert!(result.expression.is_dag());
+    }
+
+    #[test]
+    fn internal_extraction_origins_align_with_the_shared_selected_dag() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let child = egraph.add(MxxLang::IntConst(7.into()));
+        let root = egraph.add(MxxLang::IntAdd([child, child]));
+        egraph.rebuild();
+        let mut invalid = |_| panic!("fixture has a finite DAG");
+        let mut bound_error = |error| panic!("non-matrix fixture has no bounds: {error:?}");
+        let extracted = extract_best_proposal_with_origins(
+            &egraph,
+            root,
+            &NoBounds,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut |_, _, _| Ok(ProposalNodeClassification::default()),
+        )
+        .expect("shared DAG extracts");
+
+        assert_eq!(extracted.origins.len(), extracted.proposal.expression.as_ref().len());
+        assert_eq!(
+            extracted.origins[usize::from(extracted.proposal.expression.root())],
+            egraph.find(root)
+        );
+        assert!(extracted.origins.iter().all(|origin| *origin == egraph.find(*origin)));
     }
 
     #[test]

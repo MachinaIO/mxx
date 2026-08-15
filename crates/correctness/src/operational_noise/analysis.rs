@@ -1218,9 +1218,9 @@ fn make_analysis_data(egraph: &EGraph<MxxLang, MxxAnalysis>, enode: &MxxLang) ->
             };
             if inputs.iter().any(|id| {
                 matrix_sort(egraph, *id).is_none_or(|matrix| {
-                    matrix.ring_dimension != first.ring_dimension ||
-                        matrix.rows != first.rows ||
-                        matrix.columns != first.columns
+                    !resolved_equal(&matrix.ring_dimension, &first.ring_dimension) ||
+                        !resolved_equal(&matrix.rows, &first.rows) ||
+                        !resolved_equal(&matrix.columns, &first.columns)
                 })
             }) {
                 return invalid_analysis_data();
@@ -1624,13 +1624,122 @@ pub(crate) fn resolved_constant(expression: &ResolvedIntExpr) -> Option<BigInt> 
     (values.len() == 1).then(|| values.pop()).flatten()
 }
 
+/// One symbolic variable in the small affine subset accepted for semantic
+/// integer-attribute equality. Parameters and loop binders intentionally use
+/// different key variants: a parameter name can never alias a runtime binder.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum AffineSymbol {
+    Parameter(String),
+    Binder(BinderKey),
+}
+
+/// A sparse affine integer expression. This is local to one equality check;
+/// it is neither stored in the e-graph nor used to construct new expressions.
+#[derive(Debug, Default)]
+struct AffineForm {
+    constant: BigInt,
+    coefficients: BTreeMap<AffineSymbol, BigInt>,
+}
+
+impl AffineForm {
+    fn add_symbol(&mut self, symbol: AffineSymbol, coefficient: BigInt) {
+        use std::collections::btree_map::Entry;
+
+        if coefficient.is_zero() {
+            return;
+        }
+        match self.coefficients.entry(symbol) {
+            Entry::Vacant(entry) => {
+                entry.insert(coefficient);
+            }
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() += coefficient;
+                if entry.get().is_zero() {
+                    entry.remove();
+                }
+            }
+        }
+    }
+}
+
+/// Exact syntax equality without recursively traversing the expression tree.
+/// This preserves equality for identical unsupported operations before the
+/// narrower closed-constant and affine comparisons are attempted.
+fn resolved_structurally_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {
+    let mut work = vec![(left, right)];
+    while let Some((left, right)) = work.pop() {
+        match (left, right) {
+            (ResolvedIntExpr::Const(left), ResolvedIntExpr::Const(right)) if left == right => {}
+            (ResolvedIntExpr::Parameter(left), ResolvedIntExpr::Parameter(right))
+                if left == right => {}
+            (ResolvedIntExpr::Binder(left), ResolvedIntExpr::Binder(right)) if left == right => {}
+            (ResolvedIntExpr::Add(left_a, left_b), ResolvedIntExpr::Add(right_a, right_b)) |
+            (ResolvedIntExpr::Sub(left_a, left_b), ResolvedIntExpr::Sub(right_a, right_b)) |
+            (ResolvedIntExpr::Mul(left_a, left_b), ResolvedIntExpr::Mul(right_a, right_b)) |
+            (ResolvedIntExpr::Div(left_a, left_b), ResolvedIntExpr::Div(right_a, right_b)) |
+            (
+                ResolvedIntExpr::RoundDiv(left_a, left_b),
+                ResolvedIntExpr::RoundDiv(right_a, right_b),
+            ) => {
+                work.push((left_b, right_b));
+                work.push((left_a, right_a));
+            }
+            (ResolvedIntExpr::Log2Ceil(left), ResolvedIntExpr::Log2Ceil(right)) => {
+                work.push((left, right));
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Checks whether the normalized affine difference is zero. Every visited
+/// leaf updates one shared sparse accumulator, so traversal is
+/// `O(nodes * log(symbols))` rather than repeatedly merging subtree maps.
+fn resolved_affine_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {
+    let mut form = AffineForm::default();
+    let mut work = vec![(right, -BigInt::one()), (left, BigInt::one())];
+    while let Some((expression, scale)) = work.pop() {
+        if scale.is_zero() {
+            continue;
+        }
+        match expression {
+            ResolvedIntExpr::Const(value) => form.constant += scale * value,
+            ResolvedIntExpr::Parameter(parameter) => {
+                form.add_symbol(AffineSymbol::Parameter(parameter.clone()), scale);
+            }
+            ResolvedIntExpr::Binder(binder) => {
+                form.add_symbol(AffineSymbol::Binder(binder.clone()), scale);
+            }
+            ResolvedIntExpr::Add(left, right) => {
+                work.push((right, scale.clone()));
+                work.push((left, scale));
+            }
+            ResolvedIntExpr::Sub(left, right) => {
+                work.push((right, -scale.clone()));
+                work.push((left, scale));
+            }
+            ResolvedIntExpr::Mul(left, right) => match (&**left, &**right) {
+                (_, ResolvedIntExpr::Const(constant)) => work.push((left, scale * constant)),
+                (ResolvedIntExpr::Const(constant), _) => work.push((right, scale * constant)),
+                _ => return false,
+            },
+            ResolvedIntExpr::Div(_, _) |
+            ResolvedIntExpr::RoundDiv(_, _) |
+            ResolvedIntExpr::Log2Ceil(_) => return false,
+        }
+    }
+    form.constant.is_zero() && form.coefficients.is_empty()
+}
+
 /// Compares owner-resolved integer attributes without requiring their closed
-/// arithmetic syntax to be identical.  An unresolved parameter or binder is
-/// equal only to the same expression, so callers remain fail-closed for
-/// runtime-dependent dimensions.
+/// arithmetic syntax to be identical. It additionally recognizes the affine
+/// subset (addition, subtraction, and literal scaling) while remaining
+/// fail-closed for nonlinear or rounded runtime arithmetic.
 pub(crate) fn resolved_equal(left: &ResolvedIntExpr, right: &ResolvedIntExpr) -> bool {
-    left == right ||
-        resolved_constant(left).zip(resolved_constant(right)).is_some_and(|(l, r)| l == r)
+    resolved_structurally_equal(left, right) ||
+        resolved_constant(left).zip(resolved_constant(right)).is_some_and(|(l, r)| l == r) ||
+        resolved_affine_equal(left, right)
 }
 
 pub(crate) fn matrix_types_equal(left: &ResolvedMatrixType, right: &ResolvedMatrixType) -> bool {
@@ -1718,7 +1827,9 @@ fn matrix_tensor(egraph: &EGraph<MxxLang, MxxAnalysis>, children: &[egg::Id; 2])
     else {
         return invalid_analysis_data();
     };
-    if left.modulus != right.modulus || left.ring_dimension != right.ring_dimension {
+    if !resolved_equal(&left.modulus, &right.modulus) ||
+        !resolved_equal(&left.ring_dimension, &right.ring_dimension)
+    {
         return invalid_analysis_data();
     }
     AnalysisData::matrix(
@@ -1979,6 +2090,18 @@ mod tests {
             ring_dimension: ResolvedIntExpr::Const(1.into()),
             rows: ResolvedIntExpr::Const(1.into()),
             columns: ResolvedIntExpr::Const(columns.into()),
+        }
+    }
+
+    fn test_binder(node: u32) -> BinderKey {
+        BinderKey {
+            loop_scope: OccurrenceScope {
+                program: ProgramKey::Ideal,
+                definition: mxx_ir_core::FrozenGraphScopeId::Root,
+                path: Box::new([]),
+            },
+            loop_node: mxx_ir_core::NodeId(node.into()),
+            slot: 0,
         }
     }
 
@@ -2620,6 +2743,181 @@ mod tests {
         let mut unequal = data_for_sort(MxxSort::Bytes(ResolvedIntExpr::Const(2.into())));
         unequal.merge_from(data_for_sort(MxxSort::Bytes(ResolvedIntExpr::Const(3.into()))));
         assert!(matches!(unequal.sort, Err(AnalysisError::EClassSortConflict { .. })));
+    }
+
+    #[test]
+    fn resolved_equal_cancels_literal_scaled_affine_terms() {
+        let index = ResolvedIntExpr::Parameter("i".to_owned());
+        let sixty = || ResolvedIntExpr::Const(60.into());
+        let expression = ResolvedIntExpr::Sub(
+            Box::new(ResolvedIntExpr::Add(
+                Box::new(ResolvedIntExpr::Mul(Box::new(sixty()), Box::new(index.clone()))),
+                Box::new(sixty()),
+            )),
+            Box::new(ResolvedIntExpr::Mul(Box::new(sixty()), Box::new(index))),
+        );
+
+        assert!(resolved_equal(&expression, &sixty()));
+    }
+
+    #[test]
+    fn resolved_equal_is_associative_and_commutative_for_affine_sums() {
+        let first = ResolvedIntExpr::Parameter("first".to_owned());
+        let second = ResolvedIntExpr::Parameter("second".to_owned());
+        let third = ResolvedIntExpr::Parameter("third".to_owned());
+        let left = ResolvedIntExpr::Add(
+            Box::new(ResolvedIntExpr::Add(Box::new(first.clone()), Box::new(second.clone()))),
+            Box::new(third.clone()),
+        );
+        let right = ResolvedIntExpr::Add(
+            Box::new(third),
+            Box::new(ResolvedIntExpr::Add(Box::new(second), Box::new(first))),
+        );
+
+        assert!(resolved_equal(&left, &right));
+    }
+
+    #[test]
+    fn resolved_equal_keeps_parameters_and_binder_owners_distinct() {
+        assert!(!resolved_equal(
+            &ResolvedIntExpr::Parameter("left".to_owned()),
+            &ResolvedIntExpr::Parameter("right".to_owned()),
+        ));
+        assert!(!resolved_equal(
+            &ResolvedIntExpr::Binder(test_binder(1)),
+            &ResolvedIntExpr::Binder(test_binder(2)),
+        ));
+        assert!(!resolved_equal(
+            &ResolvedIntExpr::Parameter("index".to_owned()),
+            &ResolvedIntExpr::Binder(test_binder(1)),
+        ));
+    }
+
+    #[test]
+    fn resolved_equal_rejects_nonlinear_and_symbolic_division_rearrangements() {
+        let first = ResolvedIntExpr::Parameter("first".to_owned());
+        let second = ResolvedIntExpr::Parameter("second".to_owned());
+        assert!(!resolved_equal(
+            &ResolvedIntExpr::Mul(Box::new(first.clone()), Box::new(second.clone())),
+            &ResolvedIntExpr::Mul(Box::new(second), Box::new(first.clone())),
+        ));
+        assert!(!resolved_equal(
+            &ResolvedIntExpr::Div(
+                Box::new(ResolvedIntExpr::Add(
+                    Box::new(first.clone()),
+                    Box::new(ResolvedIntExpr::Const(2.into())),
+                )),
+                Box::new(ResolvedIntExpr::Const(2.into())),
+            ),
+            &ResolvedIntExpr::Add(
+                Box::new(ResolvedIntExpr::Div(
+                    Box::new(first),
+                    Box::new(ResolvedIntExpr::Const(2.into())),
+                )),
+                Box::new(ResolvedIntExpr::Const(1.into())),
+            ),
+        ));
+    }
+
+    #[test]
+    fn resolved_equal_handles_deep_affine_sums_iteratively() {
+        const DEPTH: usize = 8_192;
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let mut expression = ResolvedIntExpr::Parameter("index".to_owned());
+                for _ in 0..DEPTH {
+                    expression = ResolvedIntExpr::Add(
+                        Box::new(expression),
+                        Box::new(ResolvedIntExpr::Const(1.into())),
+                    );
+                }
+                let expected = ResolvedIntExpr::Add(
+                    Box::new(ResolvedIntExpr::Parameter("index".to_owned())),
+                    Box::new(ResolvedIntExpr::Const(DEPTH.into())),
+                );
+                assert!(resolved_equal(&expression, &expected));
+                // `ResolvedIntExpr` is recursive, while this test deliberately
+                // uses a constrained stack to prove the equality traversal is not.
+                std::mem::forget(expression);
+                std::mem::forget(expected);
+            })
+            .expect("constrained-stack affine worker must start")
+            .join()
+            .expect("constrained-stack affine worker must complete");
+    }
+
+    #[test]
+    fn resolved_equal_handles_deep_structural_equality_iteratively() {
+        const DEPTH: usize = 8_192;
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let build = || {
+                    let mut expression = ResolvedIntExpr::Parameter("index".to_owned());
+                    for _ in 0..DEPTH {
+                        expression = ResolvedIntExpr::Log2Ceil(Box::new(expression));
+                    }
+                    expression
+                };
+                let left = build();
+                let right = build();
+                assert!(resolved_equal(&left, &right));
+                // Recursive destruction is outside the behavior under test.
+                std::mem::forget(left);
+                std::mem::forget(right);
+            })
+            .expect("constrained-stack structural worker must start")
+            .join()
+            .expect("constrained-stack structural worker must complete");
+    }
+
+    #[test]
+    fn resolved_equal_handles_right_skewed_distinct_affine_symbols() {
+        const SYMBOLS: usize = 2_048;
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let parameter = |index| ResolvedIntExpr::Parameter(format!("symbol-{index}"));
+                let mut left = parameter(0);
+                for index in 1..SYMBOLS {
+                    left = ResolvedIntExpr::Add(Box::new(left), Box::new(parameter(index)));
+                }
+                let mut right = parameter(SYMBOLS - 1);
+                for index in (0..SYMBOLS - 1).rev() {
+                    right = ResolvedIntExpr::Add(Box::new(parameter(index)), Box::new(right));
+                }
+
+                assert!(resolved_equal(&left, &right));
+                std::mem::forget(left);
+                std::mem::forget(right);
+            })
+            .expect("constrained-stack distinct-symbol worker must start")
+            .join()
+            .expect("constrained-stack distinct-symbol worker must complete");
+    }
+
+    #[test]
+    fn merge_accepts_semantically_equal_affine_matrix_types() {
+        let mut literal = scalar_matrix_type(60);
+        let index = ResolvedIntExpr::Parameter("i".to_owned());
+        literal.columns = ResolvedIntExpr::Sub(
+            Box::new(ResolvedIntExpr::Add(
+                Box::new(ResolvedIntExpr::Mul(
+                    Box::new(ResolvedIntExpr::Const(60.into())),
+                    Box::new(index.clone()),
+                )),
+                Box::new(ResolvedIntExpr::Const(60.into())),
+            )),
+            Box::new(ResolvedIntExpr::Mul(
+                Box::new(ResolvedIntExpr::Const(60.into())),
+                Box::new(index),
+            )),
+        );
+        let mut merged = AnalysisData::matrix(literal, None);
+        merged.merge_from(AnalysisData::matrix(scalar_matrix_type(60), None));
+
+        assert!(matches!(merged.sort, Ok(MxxSort::Matrix(_))));
     }
 
     #[test]

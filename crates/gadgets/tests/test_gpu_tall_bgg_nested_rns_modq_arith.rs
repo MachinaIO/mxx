@@ -7,13 +7,12 @@ use mxx_bench_estimator::{
 };
 use mxx_bgg::{
     BggEncodingWire, BggPublicKeyCompiler, BggPublicKeySampler, BggPublicKeyWire, BggSamplerLayout,
-    BggSlotTransferArtifactCompiler, BggSlotTransferGateArtifacts,
-    BggSlotTransferPublicKeyLowering, BggSlotTransferPublicSlotWires, BggSlotTransferSlotArtifacts,
     BggTallEncodingCompiler, BggTallEncodingSampler, BggTallPlaintext, BggTallSlotLowering,
     BggTallSlotPublicKeyLowering, LweLookupArtifactNames, LweLookupArtifacts, LweLookupCompiler,
-    LweLookupIdentity, LweLookupPreprocessingLowering, LweLookupPublicKeyLowering, LweLookupTable,
-    LweLookupTallEncodingLowering, PolyCircuitCompiler, TallRotationEncodingArtifacts,
-    TallRotationEncodingCompiler, bind_lwe_lookup_invocations, required_tall_rotation_encodings,
+    LweLookupIdentity, LweLookupPreprocessingLowering, LweLookupTable,
+    LweLookupTallEncodingLowering, PolyCircuitCompiler, TallRotationEncodingArtifactNames,
+    TallRotationEncodingArtifacts, TallRotationEncodingCompiler, TallRotationEncodingKey,
+    bind_lwe_lookup_invocations, required_tall_rotation_encodings,
 };
 use mxx_correctness::{
     ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
@@ -67,7 +66,7 @@ use mxx_runtime::{
     transcript::SamplingMode,
 };
 use num_bigint::{BigInt, BigUint};
-use num_traits::{FromPrimitive, ToPrimitive, Zero};
+use num_traits::{FromPrimitive, Zero};
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -85,6 +84,8 @@ use tracing::{debug, error, info};
 const HASH_KEY_INPUT: &str = "tall_nested_rns_hash_key";
 const LOOKUP_PUBLIC_B_ARTIFACT: &str = "tall_nested_rns_lookup_public_b";
 const INPUT_PUBLIC_KEY_PREFIX: &str = "tall_nested_rns_input_public_key";
+const DIAGONAL_MASK_PUBLIC_KEY_ARTIFACT: &str = "tall_nested_rns_diagonal_mask_public_key";
+const OUTPUT_PUBLIC_KEY_ARTIFACT: &str = "tall_nested_rns_output_public_key";
 const TALL_OPERATIONAL_TARGET_ID: &str = "tall-threshold-decode";
 const TALL_OPERATIONAL_RESIDUAL: &str = "operational_residual";
 const TALL_OPERATIONAL_DECODED: &str = "operational_decoded";
@@ -108,7 +109,7 @@ struct TestConfig {
     trapdoor_sigma: f64,
     benchmark_warmups: usize,
     benchmark_iterations: usize,
-    stop_after_benchmark_estimation: bool,
+    run_mode: TallRunMode,
     parameter_simulation_parallelism: usize,
     preimage_progress_interval: usize,
     max_parallel_instances: usize,
@@ -161,10 +162,7 @@ impl TestConfig {
             trapdoor_sigma: env_f64("MXX_TALL_NESTED_RNS_TRAPDOOR_SIGMA", 4.578)?,
             benchmark_warmups: env_usize("MXX_TALL_NESTED_RNS_BENCH_WARMUPS", 1)?,
             benchmark_iterations: env_usize("MXX_TALL_NESTED_RNS_BENCH_ITERATIONS", 2)?,
-            stop_after_benchmark_estimation: env_bool(
-                "MXX_TALL_NESTED_RNS_STOP_AFTER_BENCHMARK_ESTIMATION",
-                false,
-            )?,
+            run_mode: TallRunMode::from_env()?,
             // Operational checking of the generated workflow is CPU-only and independent across
             // parameter candidates. Keep the default batch small because each checker can use
             // tens of GiB for large LUT graphs.
@@ -270,18 +268,14 @@ struct PreparedCandidate {
     circuit: PolyCircuit<DCRTPoly>,
     nested: Arc<NestedRnsPolyContext>,
     layout: BggSamplerLayout,
-    artifact_compiler: BggSlotTransferArtifactCompiler,
-    producer: BuiltGraph,
+    preprocessing: BuiltGraph,
     preprocessing_graph_construction: Duration,
     lookup_preimage_count: usize,
-    slot_preimage_count: usize,
     preprocessing_preimage_count: usize,
     production: ProductionId,
     runtime_manifest: RuntimeManifest,
     lookup_compilers: Vec<mxx_bgg::LweLookupCompiler>,
-    slot_requests: Vec<mxx_bgg::BggSlotTransferGateRequest>,
     rotation_offsets: Vec<u32>,
-    public_key_graph: BuiltGraph,
     encoding_graph: BuiltGraph,
     operational_report: Option<OperationalSimulationReport>,
     achieved_security_bits: u64,
@@ -306,8 +300,6 @@ struct PreprocessingCheckpoint {
 }
 
 struct EndToEndOutputs {
-    public_key: GpuDCRTPolyMatrix,
-    encoding_public_key: GpuDCRTPolyMatrix,
     encoding_rows: Vec<GpuDCRTPolyMatrix>,
     output_plaintexts: Vec<GpuDCRTPolyMatrix>,
     residuals: Vec<GpuDCRTPolyMatrix>,
@@ -335,12 +327,30 @@ fn env_optional_usize(name: &str) -> Result<Option<usize>, String> {
     })
 }
 
-fn env_bool(name: &str, default: bool) -> Result<bool, String> {
-    env::var(name).map_or(Ok(default), |value| match value.as_str() {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => Err(format!("{name} must be 0 or 1")),
-    })
+/// Chooses how far the existing Tall integration target runs. The modes are
+/// stages of one test, so every mode uses the same protocol definition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TallRunMode {
+    Graph,
+    ZeroNoise,
+    Simulation,
+    Benchmark,
+    Full,
+}
+
+impl TallRunMode {
+    fn from_env() -> Result<Self, String> {
+        match env::var("MXX_TALL_NESTED_RNS_MODE").as_deref().unwrap_or("full") {
+            "graph" => Ok(Self::Graph),
+            "zero-noise" => Ok(Self::ZeroNoise),
+            "simulation" => Ok(Self::Simulation),
+            "benchmark" => Ok(Self::Benchmark),
+            "full" => Ok(Self::Full),
+            value => Err(format!(
+                "MXX_TALL_NESTED_RNS_MODE must be graph, zero-noise, simulation, benchmark, or full (got {value})"
+            )),
+        }
+    }
 }
 
 fn env_f64(name: &str, default: f64) -> Result<f64, String> {
@@ -378,8 +388,8 @@ fn build_modq_multiplication_circuit(
     let mut inputs = inputs.into_iter();
     let first = inputs.next().expect("mul_count + 1 is positive");
     let product = inputs.fold(first, |left, right| left.mul(&right, &mut circuit));
-    let output = product.reconstruct(&mut circuit);
-    circuit.output([output]);
+    let output = product.reconstruct_q1_anchors(&mut circuit);
+    circuit.output([output.anchor_wire()]);
     CircuitBundle { circuit, nested }
 }
 
@@ -392,7 +402,7 @@ fn gate_kind_counts(circuit: &PolyCircuit<DCRTPoly>) -> HashMap<PolyGateKind, us
 }
 
 fn run_tall_operational_check(
-    producer: &BuiltGraph,
+    preprocessing: &BuiltGraph,
     encoding: &BuiltGraph,
     parameters: &DCRTPolyParams,
     nested: &NestedRnsPolyContext,
@@ -407,14 +417,15 @@ fn run_tall_operational_check(
             graph.outputs().len(),
         )
     };
-    let (producer_scopes, producer_nodes, producer_outputs) = graph_counts(&producer.graph);
+    let (preprocessing_scopes, preprocessing_nodes, preprocessing_outputs) =
+        graph_counts(&preprocessing.graph);
     let (encoding_scopes, encoding_nodes, encoding_outputs) = graph_counts(&encoding.graph);
     info!(
         ring_dimension = parameters.ring_dimension(),
         crt_depth = parameters.to_crt().2,
-        producer_scopes,
-        producer_nodes,
-        producer_outputs,
+        preprocessing_scopes,
+        preprocessing_nodes,
+        preprocessing_outputs,
         encoding_scopes,
         encoding_nodes,
         encoding_outputs,
@@ -460,7 +471,7 @@ fn run_tall_operational_check(
     )
     .map_err(|error| error.to_string())?;
     let protocol = operational_protocol_from_graphs(
-        vec![("producer".to_owned(), producer), ("encoding".to_owned(), encoding)],
+        vec![("preprocessing".to_owned(), preprocessing), ("encoding".to_owned(), encoding)],
         "encoding",
         &exact_input_metadata,
         &BTreeMap::new(),
@@ -621,50 +632,56 @@ fn prepare_candidate(
         b"tall-nested-rns-input-public-keys".as_slice(),
         &vec![true; circuit.num_input()],
     );
+    let diagonal_mask_public_key = BggPublicKeySampler { layout: layout.clone() }
+        .sample(hash_key.clone(), b"tall-nested-rns-diagonal-mask".as_slice(), &[true])
+        .into_iter()
+        .next()
+        .expect("one diagonal-mask public key");
     let public_key_compiler = BggPublicKeyCompiler {
         ring: ring.clone(),
         base: gadget_base.clone().into(),
         digit_count: parameters.modulus_digits().into(),
     };
     let circuit_compiler = PolyCircuitCompiler { public_key: public_key_compiler.clone() };
-    let artifact_compiler = BggSlotTransferArtifactCompiler {
-        modulus: modulus.clone().into(),
-        ring_dimension: ring_dimension.into(),
-        secret_size: 1,
-        slot_count: physical_slots,
-        digit_count: parameters.modulus_digits(),
-        chunk_columns: parameters.modulus_digits().max(1),
-        gadget_base: gadget_base.clone().into(),
-        trapdoor_sigma: RealExpr::from_f64_exact(config.trapdoor_sigma)
-            .map_err(|error| error.to_string())?,
-        error_sigma: RealExpr::from_f64_exact(config.error_sigma)
-            .map_err(|error| error.to_string())?,
-        preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone().into(),
-        error_max_coefficient_bound: error_max_coefficient_bound.clone().into(),
-    };
-    let base = artifact_compiler.build_base().map_err(|error| error.to_string())?;
-    let slots = artifact_compiler
-        .build_slots(hash_key.clone(), &base)
-        .map_err(|error| error.to_string())?;
+    let lookup_trapdoor = ring.sample_trapdoor(
+        1,
+        RealExpr::from_f64_exact(config.trapdoor_sigma).map_err(|error| error.to_string())?,
+        gadget_base.clone(),
+        parameters.modulus_digits(),
+        preimage_max_coefficient_bound.clone(),
+    );
     let mut lookup_preprocessing = LweLookupPreprocessingLowering::new(
         parameters.clone(),
         hash_key.clone(),
-        base.b0.clone(),
+        lookup_trapdoor.clone(),
         gadget_base.clone().into(),
         parameters.modulus_digits().into(),
         Vec::new(),
     );
-    let mut slot_preprocessing = BggTallSlotPublicKeyLowering {
-        inner: BggSlotTransferPublicKeyLowering {
-            compiler: public_key_compiler.clone(),
-            hash_key: hash_key.clone(),
-            public_key_type: ring.matrix_type((1, parameters.modulus_digits())),
-            configured_slot_count: physical_slots,
-            output_public_key_production: None,
-            requests: Vec::new(),
-        },
+    let rotation_keys =
+        required_tall_rotation_encodings(&circuit).map_err(|error| error.to_string())?;
+    let rotation_offsets = rotation_keys.iter().map(|key| key.offset).collect::<Vec<_>>();
+    let rotation_compiler = TallRotationEncodingCompiler {
+        modulus: modulus.clone().into(),
+        ring_dimension: ring_dimension.into(),
+        secret_size: 1,
+        slot_count: physical_slots,
+        gadget_base: gadget_base.clone().into(),
+        digit_count: parameters.modulus_digits(),
+        error_sigma: RealExpr::from_f64_exact(config.error_sigma)
+            .map_err(|error| error.to_string())?,
+        error_max_coefficient_bound: error_max_coefficient_bound.clone().into(),
     };
-    circuit_compiler
+    let rotations = rotation_compiler
+        .preprocess(hash_key.clone(), &rotation_offsets)
+        .map_err(|error| error.to_string())?;
+    let mut slot_preprocessing = BggTallSlotPublicKeyLowering {
+        compiler: public_key_compiler.clone(),
+        diagonal_mask_public_key: diagonal_mask_public_key.clone(),
+        configured_slot_count: physical_slots,
+        rotations: rotations.rotations.clone(),
+    };
+    let output_public_key = circuit_compiler
         .compile_public_keys_with_lowerings(
             &circuit,
             public_keys[0].clone(),
@@ -672,7 +689,10 @@ fn prepare_candidate(
             &mut lookup_preprocessing,
             &mut slot_preprocessing,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Tall preprocessing public-key circuit has no output".to_owned())?;
     let lookup_entries = lookup_preprocessing.into_entries();
     let mut lookup_preimage_start = 0usize;
     for (lookup_index, entry) in lookup_entries.iter().enumerate() {
@@ -691,72 +711,51 @@ fn prepare_candidate(
         lookup_entries.iter().map(|entry| entry.compiler.preprocessing_row_count()).sum::<usize>();
     let lookup_compilers =
         lookup_entries.iter().map(|entry| entry.compiler.clone()).collect::<Vec<_>>();
-    let slot_requests = slot_preprocessing.inner.requests;
-    let slot_preimage_count = artifact_compiler
-        .preprocessing_preimage_count(&slot_requests)
-        .map_err(|error| error.to_string())?;
-    let preprocessing_preimage_count = lookup_preimage_count + slot_preimage_count;
+    let preprocessing_preimage_count = lookup_preimage_count;
     info!(
         lookup_tables = lookup_entries.len(),
         lookup_preimage_count,
-        slot_preimage_count,
         total_preimage_count = preprocessing_preimage_count,
-        "preprocessing preimage plan"
+        "lookup preprocessing preimage plan"
     );
-    let gate_wires = artifact_compiler
-        .build_gate_preimages(&base, &slots, &slot_requests)
-        .map_err(|error| error.to_string())?;
-    let rotation_keys =
-        required_tall_rotation_encodings(&circuit).map_err(|error| error.to_string())?;
-    let rotation_offsets = rotation_keys.iter().map(|key| key.offset).collect::<Vec<_>>();
-    let rotation_compiler = TallRotationEncodingCompiler {
-        modulus: modulus.clone().into(),
-        ring_dimension: ring_dimension.into(),
-        secret_size: 1,
-        slot_count: physical_slots,
-        gadget_base: gadget_base.clone().into(),
-        digit_count: parameters.modulus_digits(),
-        error_sigma: RealExpr::from_f64_exact(config.error_sigma)
-            .map_err(|error| error.to_string())?,
-        error_max_coefficient_bound: error_max_coefficient_bound.clone().into(),
-    };
-    let rotations = rotation_compiler
-        .preprocess(hash_key.clone(), &rotation_offsets)
-        .map_err(|error| error.to_string())?;
-
-    let mut producer_context = DslContext::new("gpu-tall-nested-rns-preprocessing")
-        .public_output(LOOKUP_PUBLIC_B_ARTIFACT, base.b0.public_matrix())
+    let mut preprocessing_context = DslContext::new("gpu-tall-nested-rns-preprocessing")
+        .public_output(LOOKUP_PUBLIC_B_ARTIFACT, lookup_trapdoor.public_matrix())
         .map_err(|error| error.to_string())?;
     for (index, public_key) in public_keys.iter().enumerate() {
-        producer_context = producer_context
+        preprocessing_context = preprocessing_context
             .public_output(format!("{INPUT_PUBLIC_KEY_PREFIX}_{index}"), public_key.matrix.clone())
             .map_err(|error| error.to_string())?;
     }
-    producer_context = artifact_compiler
-        .export_slots(producer_context, slots)
+    preprocessing_context = preprocessing_context
+        .public_output(DIAGONAL_MASK_PUBLIC_KEY_ARTIFACT, diagonal_mask_public_key.matrix.clone())
         .map_err(|error| error.to_string())?;
-    producer_context = artifact_compiler
-        .export_gate_public_keys(producer_context, &slot_requests)
-        .map_err(|error| error.to_string())?;
-    producer_context = artifact_compiler
-        .export_gate_preimages(producer_context, gate_wires)
+    preprocessing_context = preprocessing_context
+        .public_output(OUTPUT_PUBLIC_KEY_ARTIFACT, output_public_key.matrix)
         .map_err(|error| error.to_string())?;
     for entry in &lookup_entries {
-        producer_context = entry.export(producer_context).map_err(|error| error.to_string())?;
+        preprocessing_context =
+            entry.export(preprocessing_context).map_err(|error| error.to_string())?;
     }
-    producer_context = rotation_compiler
-        .export_preprocessing(producer_context, rotations)
+    preprocessing_context = rotation_compiler
+        .export_preprocessing(preprocessing_context, rotations)
         .map_err(|error| error.to_string())?;
-    let producer = producer_context.build().map_err(|error| error.to_string())?;
+    let preprocessing = preprocessing_context.build().map_err(|error| error.to_string())?;
     let preprocessing_graph_construction = preprocessing_graph_started.elapsed();
     let bindings = ParamEnv::default();
-    let validated_producer = producer.validate(&bindings).map_err(|error| error.to_string())?;
+    let validated_preprocessing =
+        preprocessing.validate(&bindings).map_err(|error| error.to_string())?;
     let production = production_id(
-        spec_hash(&producer.graph, &bindings).map_err(|error| error.to_string())?,
+        spec_hash(&preprocessing.graph, &bindings).map_err(|error| error.to_string())?,
         [0x71; 32],
     );
-    let runtime_manifest = export_validated_manifest(production.clone(), &validated_producer)
+    let runtime_manifest = export_validated_manifest(production.clone(), &validated_preprocessing)
         .map_err(|error| error.to_string())?;
+    validate_tall_preprocessing_manifest(
+        &runtime_manifest,
+        circuit.num_input(),
+        &lookup_compilers,
+        rotation_keys,
+    )?;
     info!(
         ring_dimension,
         crt_depth = parameters.to_crt().2,
@@ -767,31 +766,18 @@ fn prepare_candidate(
         "constructed Tall nested-RNS candidate graphs"
     );
     debug!(q_moduli = ?parameters.to_crt().0, "candidate CRT moduli");
-    let public_key_graph = build_public_key_graph(
-        &parameters,
-        &circuit,
-        &layout,
-        &artifact_compiler,
-        production.clone(),
-        &lookup_compilers,
-    )?;
     let encoding_graph = build_encoding_graph(
         &parameters,
         &circuit,
         &layout,
-        &artifact_compiler,
         production.clone(),
         &lookup_compilers,
-        &slot_requests,
         &rotation_offsets,
         physical_slots,
         config.error_sigma,
         true,
     )?;
     let manifests = BTreeMap::from([(production.clone(), runtime_manifest.clone())]);
-    public_key_graph
-        .validate_with_manifests(&bindings, &manifests)
-        .map_err(|error| error.to_string())?;
     encoding_graph
         .validate_with_manifests(&bindings, &manifests)
         .map_err(|error| error.to_string())?;
@@ -800,18 +786,14 @@ fn prepare_candidate(
             &parameters,
             &circuit,
             &layout,
-            &artifact_compiler,
             production.clone(),
             &lookup_compilers,
-            &slot_requests,
             &rotation_offsets,
             physical_slots,
             config.error_sigma,
             true,
         )?;
-        for output in
-            ["encoding_rows", "encoding_public_key", "output_plaintexts", TALL_OPERATIONAL_RESIDUAL]
-        {
+        for output in ["encoding_rows", "output_plaintexts", TALL_OPERATIONAL_RESIDUAL] {
             if encoding_graph.graph.outputs().get(output) !=
                 operational_encoding_graph.graph.outputs().get(output)
             {
@@ -824,7 +806,7 @@ fn prepare_candidate(
             .validate_with_manifests(&bindings, &manifests)
             .map_err(|error| error.to_string())?;
         Some(run_tall_operational_check(
-            &producer,
+            &preprocessing,
             &operational_encoding_graph,
             &parameters,
             &nested,
@@ -837,18 +819,14 @@ fn prepare_candidate(
         circuit,
         nested,
         layout,
-        artifact_compiler,
-        producer,
+        preprocessing,
         preprocessing_graph_construction,
         lookup_preimage_count,
-        slot_preimage_count,
         preprocessing_preimage_count,
         production,
         runtime_manifest,
         lookup_compilers,
-        slot_requests,
         rotation_offsets,
-        public_key_graph,
         encoding_graph,
         operational_report,
         achieved_security_bits,
@@ -874,65 +852,55 @@ fn imported_public_keys(
         .collect()
 }
 
-fn build_public_key_graph(
-    parameters: &DCRTPolyParams,
-    circuit: &PolyCircuit<DCRTPoly>,
-    layout: &BggSamplerLayout,
-    _artifact_compiler: &BggSlotTransferArtifactCompiler,
-    production: ProductionId,
+fn validate_tall_preprocessing_manifest(
+    manifest: &RuntimeManifest,
+    input_count: usize,
     lookup_compilers: &[mxx_bgg::LweLookupCompiler],
-) -> Result<BuiltGraph, String> {
-    let ring = layout.ring();
-    let hash_key = ring.bytes_input(HASH_KEY_INPUT, 32);
-    let public_key_compiler = BggPublicKeyCompiler {
-        ring: ring.clone(),
-        base: layout.gadget_base.clone(),
-        digit_count: layout.digit_count.into(),
-    };
-    let public_keys =
-        imported_public_keys(&ring, &production, circuit.num_input(), layout.public_key_columns());
-    let invocations = bind_lwe_lookup_invocations(
-        parameters,
-        circuit,
-        production.clone(),
-        lookup_compilers.iter().cloned(),
-    )
-    .map_err(|error| error.to_string())?;
-    let mut lookup =
-        LweLookupPublicKeyLowering::new(invocations).map_err(|error| error.to_string())?;
-    let mut slots = BggTallSlotPublicKeyLowering {
-        inner: BggSlotTransferPublicKeyLowering {
-            compiler: public_key_compiler.clone(),
-            hash_key,
-            public_key_type: ring.matrix_type((1, layout.public_key_columns())),
-            configured_slot_count: layout
-                .ring_dimension
-                .evaluate(&ParamEnv::default())
-                .map_err(|error| error.to_string())?
-                .to_usize()
-                .ok_or_else(|| "ring dimension does not fit usize".to_owned())? *
-                parameters.to_crt().2,
-            output_public_key_production: Some(production),
-            requests: Vec::new(),
-        },
-    };
-    let output = PolyCircuitCompiler { public_key: public_key_compiler }
-        .compile_public_keys_with_lowerings(
-            circuit,
-            public_keys[0].clone(),
-            public_keys.into_iter().skip(1),
-            &mut lookup,
-            &mut slots,
-        )
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "public-key circuit has no output".to_owned())?;
-    DslContext::new("gpu-tall-nested-rns-public-key")
-        .output("public_key", output.matrix)
-        .map_err(|error| error.to_string())?
-        .build()
-        .map_err(|error| error.to_string())
+    rotations: impl IntoIterator<Item = TallRotationEncodingKey>,
+) -> Result<(), String> {
+    let forbidden = [
+        "slot_transfer",
+        "slot_reduce",
+        "slot_secret",
+        "transformed_secret",
+        "lookup_c_b",
+        "c_forward",
+        "c_backward",
+    ];
+    if let Some(name) = manifest
+        .artifacts
+        .keys()
+        .find(|name| forbidden.iter().any(|fragment| name.contains(fragment)))
+    {
+        return Err(format!("Tall preprocessing exported forbidden legacy artifact {name}"));
+    }
+    let mut required = vec![
+        LOOKUP_PUBLIC_B_ARTIFACT.to_owned(),
+        DIAGONAL_MASK_PUBLIC_KEY_ARTIFACT.to_owned(),
+        OUTPUT_PUBLIC_KEY_ARTIFACT.to_owned(),
+    ];
+    required.extend((0..input_count).map(|index| format!("{INPUT_PUBLIC_KEY_PREFIX}_{index}")));
+    for compiler in lookup_compilers {
+        let names = LweLookupArtifactNames::for_compiler(compiler);
+        let low_chunk = names.low_chunk(0);
+        let high_chunk = names.high_chunk(0);
+        required.extend([names.output_public_key, low_chunk, high_chunk]);
+    }
+    for key in rotations {
+        let names = TallRotationEncodingArtifactNames::for_key(key);
+        required.extend([names.a_forward, names.a_backward]);
+    }
+    if let Some(name) = required.into_iter().find(|name| !manifest.artifacts.contains_key(name)) {
+        return Err(format!("Tall preprocessing manifest omits required public artifact {name}"));
+    }
+    if let Some((name, _)) = manifest
+        .artifacts
+        .iter()
+        .find(|(_, descriptor)| descriptor.confidentiality != ArtifactConfidentiality::Public)
+    {
+        return Err(format!("Tall preprocessing exports non-public artifact {name}"));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -940,17 +908,14 @@ fn build_encoding_graph(
     parameters: &DCRTPolyParams,
     circuit: &PolyCircuit<DCRTPoly>,
     layout: &BggSamplerLayout,
-    artifact_compiler: &BggSlotTransferArtifactCompiler,
     production: ProductionId,
     lookup_compilers: &[mxx_bgg::LweLookupCompiler],
-    slot_requests: &[mxx_bgg::BggSlotTransferGateRequest],
     rotation_offsets: &[u32],
     physical_slots: usize,
     error_sigma: f64,
     include_operational_residual: bool,
 ) -> Result<BuiltGraph, String> {
     let ring = layout.ring();
-    let hash_key = ring.bytes_input(HASH_KEY_INPUT, 32);
     let public_keys =
         imported_public_keys(&ring, &production, circuit.num_input(), layout.public_key_columns());
     let plaintexts = (0..circuit.num_input())
@@ -963,9 +928,6 @@ fn build_encoding_graph(
             .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let imported_slots = artifact_compiler
-        .import_slots(&BggSlotTransferSlotArtifacts { production_id: production.clone() })
-        .map_err(|error| error.to_string())?;
     // The online protocol owns exactly one fresh Tall secret matrix.  The
     // family below contains row views of that one `physical_slots × n` sample,
     // not independently sampled per-slot secrets.
@@ -1031,17 +993,6 @@ fn build_encoding_graph(
         .map_err(|error| error.to_string())?;
     let mut lookup = LweLookupTallEncodingLowering::new(invocations, lookup_c_b)
         .map_err(|error| error.to_string())?;
-    let public_slots = BggSlotTransferPublicSlotWires {
-        public_keys: imported_slots.public_keys,
-        b0_preimage_chunks: imported_slots.b0_preimage_chunks,
-        b1_preimage_chunks: imported_slots.b1_preimage_chunks,
-    };
-    let gate_wires = artifact_compiler
-        .import_gate_preimages(
-            &BggSlotTransferGateArtifacts { production_id: production.clone() },
-            slot_requests,
-        )
-        .map_err(|error| error.to_string())?;
     let rotation_compiler = TallRotationEncodingCompiler {
         modulus: layout.modulus.clone(),
         ring_dimension: layout.ring_dimension.clone(),
@@ -1078,16 +1029,32 @@ fn build_encoding_graph(
         base: layout.gadget_base.clone(),
         digit_count: layout.digit_count.into(),
     };
+    let diagonal_mask_public_key = BggPublicKeyWire {
+        matrix: ring.artifact_input(
+            production.clone(),
+            DIAGONAL_MASK_PUBLIC_KEY_ARTIFACT,
+            (layout.secret_dimension, layout.public_key_columns()),
+            ArtifactConfidentiality::Public,
+        ),
+        reveal_plaintext: true,
+    };
     let mut slots = BggTallSlotLowering {
         compiler: BggTallEncodingCompiler { public_key: public_key_compiler.clone() },
-        artifact: artifact_compiler.clone(),
-        hash_key,
-        output_public_key_production: Some(production.clone()),
-        // Slot transfer is a legacy adapter pending its separate removal.
-        // It receives only the public base, never a secret-dependent sample.
-        c_b0: lookup_public_b,
-        slots: public_slots,
-        gates: gate_wires,
+        diagonal_mask_public_key,
+        secret_rows: secret_rows.clone(),
+        sampler: BggTallEncodingSampler {
+            layout: layout.clone(),
+            gaussian_sigma: Some(
+                RealExpr::from_f64_exact(error_sigma).map_err(|error| error.to_string())?,
+            ),
+            gaussian_max_coefficient_bound: Some(
+                BigInt::from(hard_cutoff_from_sigma_bound(
+                    &BigDecimal::from_f64(error_sigma)
+                        .ok_or_else(|| "error sigma must be finite".to_owned())?,
+                ))
+                .into(),
+            ),
+        },
         rotations,
     };
     let output = PolyCircuitCompiler { public_key: public_key_compiler }
@@ -1105,12 +1072,25 @@ fn build_encoding_graph(
     let BggTallPlaintext::Diagonal(output_plaintexts) = output.plaintext else {
         return Err("nested-RNS output plaintext is hidden".to_owned());
     };
-    let encoding_rows = output.rows;
-    let output_public_key = output.pubkey.matrix;
+    let anchor_indices = (0..physical_slots).step_by(parameters.to_crt().2).collect::<Vec<_>>();
+    let encoding_rows =
+        Family::pack(anchor_indices.iter().map(|slot| output.rows.get_static(*slot)).collect())
+            .map_err(|error| error.to_string())?;
+    let output_plaintexts = Family::pack(
+        anchor_indices.iter().map(|slot| output_plaintexts.get_static(*slot)).collect(),
+    )
+    .map_err(|error| error.to_string())?;
+    let residual_secret_rows =
+        Family::pack(anchor_indices.iter().map(|slot| secret_rows.get_static(*slot)).collect())
+            .map_err(|error| error.to_string())?;
+    let output_public_key = ring.artifact_input(
+        production.clone(),
+        OUTPUT_PUBLIC_KEY_ARTIFACT,
+        (layout.secret_dimension, layout.public_key_columns()),
+        ArtifactConfidentiality::Public,
+    );
     let mut context = DslContext::new("gpu-tall-nested-rns-encoding")
         .family_output("encoding_rows", encoding_rows.clone())
-        .map_err(|error| error.to_string())?
-        .output("encoding_public_key", output_public_key.clone())
         .map_err(|error| error.to_string())?
         .family_output("output_plaintexts", output_plaintexts.clone())
         .map_err(|error| error.to_string())?;
@@ -1119,7 +1099,7 @@ fn build_encoding_graph(
             ring.gadget(layout.secret_dimension, layout.gadget_base.clone(), layout.digit_count);
         let public_key = output_public_key.clone();
         let residuals = parallel_zip(
-            (encoding_rows, output_plaintexts, secret_rows),
+            (encoding_rows.clone(), output_plaintexts.clone(), residual_secret_rows),
             move |_, (encoding, plaintext, secret_row)| {
                 let signal = secret_row.clone() * public_key.clone() -
                     plaintext * (secret_row * gadget.clone());
@@ -1127,9 +1107,7 @@ fn build_encoding_graph(
             },
         )
         .map_err(|error| error.to_string())?;
-        // The operational target remains the complete residual family.  The
-        // executable decoder is a fixed lane witness taken from that exact
-        // family, rather than an independently computed same-modulus matrix.
+        // The operational target contains only the authoritative q1 anchors.
         let decoder_input = residuals
             .get_static(0)
             .slice(
@@ -1299,17 +1277,13 @@ fn benchmark_estimation(
     config: &TestConfig,
     gpu_parameters: &GpuDCRTPolyParams,
     device_ids: &[i32],
-) -> Result<(CostReport, CostReport, CostReport), String> {
+) -> Result<(CostReport, CostReport), String> {
     info!("stage 2/4: benchmark estimation");
     let bindings = ParamEnv::default();
     let manifests =
         BTreeMap::from([(selected.production.clone(), selected.runtime_manifest.clone())]);
     let preprocessing_graph =
-        selected.producer.validate(&bindings).map_err(|error| error.to_string())?;
-    let public_graph = selected
-        .public_key_graph
-        .validate_with_manifests(&bindings, &manifests)
-        .map_err(|error| error.to_string())?;
+        selected.preprocessing.validate(&bindings).map_err(|error| error.to_string())?;
     let encoding_graph = selected
         .encoding_graph
         .validate_with_manifests(&bindings, &manifests)
@@ -1344,18 +1318,10 @@ fn benchmark_estimation(
     info!(subgraph = "preprocessing", elapsed = ?preprocessing_started.elapsed(), "benchmark subgraph estimation complete");
     info!(
         lookup_preimage_count = selected.lookup_preimage_count,
-        slot_preimage_count = selected.slot_preimage_count,
         total_preimage_count = selected.preprocessing_preimage_count,
-        "estimated lookup and slot-operation preimage sampling"
+        "estimated lookup preimage sampling"
     );
     log_cost_report("TallBggPreprocessing", &preprocessing_report);
-    let mut public_backend = make_backend();
-    let public_started = Instant::now();
-    info!(subgraph = "public-key", "benchmark subgraph estimation begin");
-    let public_report = estimate(&public_graph, &mut public_backend, &estimator_config)
-        .map_err(|error| error.to_string())?;
-    info!(subgraph = "public-key", elapsed = ?public_started.elapsed(), "benchmark subgraph estimation complete");
-    log_cost_report("TallBggPublicKey", &public_report);
     let mut encoding_backend = make_backend();
     let encoding_started = Instant::now();
     info!(subgraph = "encoding", "benchmark subgraph estimation begin");
@@ -1363,7 +1329,7 @@ fn benchmark_estimation(
         .map_err(|error| error.to_string())?;
     info!(subgraph = "encoding", elapsed = ?encoding_started.elapsed(), "benchmark subgraph estimation complete");
     log_cost_report("TallBggEncoding", &encoding_report);
-    Ok((preprocessing_report, public_report, encoding_report))
+    Ok((preprocessing_report, encoding_report))
 }
 
 fn execution_config(
@@ -1385,17 +1351,6 @@ fn execution_config(
                 .expect("validated nonzero fence interval"),
         ),
     })
-}
-
-fn matrix_output(
-    result: &ExecutionResult<GpuDcrtBackend>,
-    name: &str,
-) -> Result<GpuDCRTPolyMatrix, String> {
-    match result.outputs.get(name) {
-        Some(RuntimeValue::Matrix(value)) => Ok(value.as_ref().clone()),
-        Some(_) => Err(format!("output {name} is not a matrix")),
-        None => Err(format!("missing output {name}")),
-    }
 }
 
 fn matrix_family_output(
@@ -1527,7 +1482,6 @@ fn encoding_inputs(
     selected: &PreparedCandidate,
     gpu_parameters: &GpuDCRTPolyParams,
     operands: &[Vec<BigUint>],
-    hash_key: [u8; 32],
 ) -> Result<BTreeMap<String, RuntimeValue<GpuDcrtBackend>>, String> {
     let encoded = operands
         .iter()
@@ -1549,8 +1503,7 @@ fn encoding_inputs(
             selected.circuit.num_input()
         ));
     }
-    let mut inputs =
-        BTreeMap::from([(HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]);
+    let mut inputs = BTreeMap::new();
     let matrices = encoded
         .into_par_iter()
         .enumerate()
@@ -1595,9 +1548,9 @@ fn end_to_end_processing(
         elapsed = ?selected.preprocessing_graph_construction,
         "timed preprocessing graph construction during selected-candidate preparation"
     );
-    let (mut store, manifest, hash_key) = if let Some(checkpoint_path) = &config.reuse_checkpoint {
+    let (mut store, manifest) = if let Some(checkpoint_path) = &config.reuse_checkpoint {
         let started = Instant::now();
-        let (store, manifest, hash_key) = reload_preprocessing(checkpoint_path)?;
+        let (store, manifest, _) = reload_preprocessing(checkpoint_path)?;
         if manifest.production_id != selected.production {
             return Err(
                 "reused checkpoint production id differs from selected parameters".to_owned()
@@ -1608,103 +1561,72 @@ fn end_to_end_processing(
             path = %checkpoint_path.display(),
             "reused preprocessing checkpoint; skipped preprocessing execution"
         );
-        (store, manifest, hash_key)
+        (store, manifest)
     } else {
         let mut hash_key = [0u8; 32];
         rand::rng().fill(&mut hash_key);
         let started = Instant::now();
-        let producer = selected.producer.validate(&bindings).map_err(|error| error.to_string())?;
+        let preprocessing =
+            selected.preprocessing.validate(&bindings).map_err(|error| error.to_string())?;
         info!(elapsed = ?started.elapsed(), "timed preprocessing graph validation");
 
-        let mut producer_store = MemoryArtifactStore::default();
+        let mut preprocessing_store = MemoryArtifactStore::default();
         // Preprocessing artifacts are serialized by the store below. Use a dedicated context so
-        // the consumer passes start without the producer's allocator pool and transient preimage
+        // the consumer starts without the preprocessing allocator pool and transient preimage
         // buffers still resident on the GPU.
         let production = {
-            let mut producer_backend =
+            let mut preprocessing_backend =
                 gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
             let started = Instant::now();
-            let producer_result = execute_in_session_with_config(
-                &producer,
-                &mut producer_backend,
+            let preprocessing_result = execute_in_session_with_config(
+                &preprocessing,
+                &mut preprocessing_backend,
                 BTreeMap::from([(
                     HASH_KEY_INPUT.to_owned(),
                     RuntimeValue::Bytes(hash_key.to_vec()),
                 )]),
-                &mut producer_store,
+                &mut preprocessing_store,
                 [0x71; 32],
                 producer_execution_config,
             )
             .map_err(|error| error.to_string())?;
             info!(elapsed = ?started.elapsed(), "timed preprocessing execution");
-            producer_result
+            preprocessing_result
                 .production_id
                 .ok_or_else(|| "preprocessing execution returned no production id".to_owned())?
         };
         if production != selected.production {
             return Err("preprocessing production id differs from the selected manifest".to_owned());
         }
-        let manifest = producer_store
+        let manifest = preprocessing_store
             .manifest(&production)
             .cloned()
             .ok_or_else(|| "preprocessing manifest was not committed".to_owned())?;
 
         let started = Instant::now();
-        let checkpoint_path = save_preprocessing(config, &producer_store, &manifest, hash_key)?;
+        let checkpoint_path =
+            save_preprocessing(config, &preprocessing_store, &manifest, hash_key)?;
         info!(elapsed = ?started.elapsed(), path = %checkpoint_path.display(), "timed checkpoint serialization");
         let started = Instant::now();
-        let (store, manifest, hash_key) = reload_preprocessing(&checkpoint_path)?;
+        let (store, manifest, _) = reload_preprocessing(&checkpoint_path)?;
         info!(elapsed = ?started.elapsed(), path = %checkpoint_path.display(), "timed checkpoint reload");
-        (store, manifest, hash_key)
+        (store, manifest)
     };
     let manifests = BTreeMap::from([(selected.production.clone(), manifest)]);
     let mut backend = gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
 
     let started = Instant::now();
-    let public_graph_source = build_public_key_graph(
-        &selected.parameters,
-        &selected.circuit,
-        &selected.layout,
-        &selected.artifact_compiler,
-        selected.production.clone(),
-        &selected.lookup_compilers,
-    )?;
-    info!(elapsed = ?started.elapsed(), "timed Tall public-key graph construction");
-    let public_pass_started = Instant::now();
-    let started = Instant::now();
-    let public_graph = public_graph_source
-        .validate_with_manifests(&bindings, &manifests)
-        .map_err(|error| error.to_string())?;
-    info!(elapsed = ?started.elapsed(), "timed Tall public-key graph validation");
-    let started = Instant::now();
-    let public_result = execute_with_config(
-        &public_graph,
-        &mut backend,
-        BTreeMap::from([(HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]),
-        &mut store,
-        SamplingMode::Fresh,
-        runtime_execution_config,
-    )
-    .map_err(|error| error.to_string())?;
-    let public_key = matrix_output(&public_result, "public_key")?;
-    public_key.wait_until_ready();
-    info!(elapsed = ?started.elapsed(), "timed TallBggPublicKey end-to-end evaluation");
-    info!(elapsed = ?public_pass_started.elapsed(), "timed public-key-pass total");
-
-    let started = Instant::now();
     let operands = random_operands(selected, config);
     let expected_evaluation_slots = expected_product_on_gpu(selected, gpu_parameters, &operands)?;
-    let inputs = encoding_inputs(selected, gpu_parameters, &operands, hash_key)?;
+    let inputs = encoding_inputs(selected, gpu_parameters, &operands)?;
     info!(elapsed = ?started.elapsed(), "timed random plaintext generation, GPU oracle, and Tall input encoding");
     let started = Instant::now();
     let encoding_graph_source = build_encoding_graph(
         &selected.parameters,
         &selected.circuit,
         &selected.layout,
-        &selected.artifact_compiler,
         selected.production.clone(),
         &selected.lookup_compilers,
-        &selected.slot_requests,
         &selected.rotation_offsets,
         selected.parameters.ring_dimension() as usize * selected.nested.q_moduli_depth,
         config.error_sigma,
@@ -1727,7 +1649,6 @@ fn end_to_end_processing(
         runtime_execution_config,
     )
     .map_err(|error| error.to_string())?;
-    let encoding_public_key = matrix_output(&encoding_result, "encoding_public_key")?;
     let encoding_rows =
         matrix_family_output(&mut encoding_result, "encoding_rows", &backend, &mut store)?;
     let output_plaintexts =
@@ -1739,14 +1660,11 @@ fn end_to_end_processing(
         &mut store,
     )?;
     encoding_result.cleanup_staged(&mut store).map_err(|error| error.to_string())?;
-    encoding_public_key.wait_until_ready();
     encoding_rows.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
     output_plaintexts.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
     residuals.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
     info!(elapsed = ?started.elapsed(), "timed TallBggEncoding end-to-end evaluation");
     let started = Instant::now();
-    let _transferred_public_key = public_key.to_cpu_matrix();
-    let _transferred_encoding_public_key = encoding_public_key.to_cpu_matrix();
     let _transferred_encoding_rows =
         encoding_rows.par_iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>();
     let _transferred_plaintexts =
@@ -1755,14 +1673,7 @@ fn end_to_end_processing(
         residuals.par_iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>();
     info!(elapsed = ?started.elapsed(), "timed output transfer");
     info!(elapsed = ?encoding_pass_started.elapsed(), "timed encoding-pass total");
-    Ok(EndToEndOutputs {
-        public_key,
-        encoding_public_key,
-        encoding_rows,
-        output_plaintexts,
-        residuals,
-        expected_evaluation_slots,
-    })
+    Ok(EndToEndOutputs { encoding_rows, output_plaintexts, residuals, expected_evaluation_slots })
 }
 
 /// Verifies the executable encoding against the independently evaluated
@@ -1773,38 +1684,31 @@ fn measure_runtime_residual(
     outputs: EndToEndOutputs,
 ) -> Result<(BigUint, (usize, usize, usize)), String> {
     info!("stage 4/4: runtime verification");
-    if outputs.public_key != outputs.encoding_public_key {
-        return Err("Tall encoding output public key differs from public-key evaluation".to_owned());
-    }
-    let physical_slots =
-        selected.parameters.ring_dimension() as usize * selected.nested.q_moduli_depth;
-    if outputs.encoding_rows.len() != physical_slots ||
-        outputs.output_plaintexts.len() != physical_slots ||
-        outputs.residuals.len() != physical_slots
+    let anchor_count = selected.parameters.ring_dimension() as usize;
+    if outputs.encoding_rows.len() != anchor_count ||
+        outputs.output_plaintexts.len() != anchor_count ||
+        outputs.residuals.len() != anchor_count
     {
-        return Err(
-            "Tall output family cardinality differs from the physical SIMD lane count".to_owned()
-        );
+        return Err("Tall output family cardinality differs from the q1 anchor count".to_owned());
     }
     let modulus = selected.parameters.modulus().as_ref().clone();
     let half_modulus = &modulus / BigUint::from(2u8);
     let mut maximum_noise = BigUint::zero();
     let mut maximum_location = (0usize, 0usize, 0usize);
-    for slot in 0..physical_slots {
-        let evaluation_slot = slot / selected.nested.q_moduli_depth;
+    for anchor in 0..anchor_count {
         let expected = outputs
             .expected_evaluation_slots
-            .get(evaluation_slot)
+            .get(anchor)
             .cloned()
             .ok_or_else(|| "GPU oracle omitted an expected evaluation slot".to_owned())?;
         let expected_poly = DCRTPoly::from_biguint_to_constant(&selected.parameters, expected);
         let expected_cpu =
             DCRTPolyMatrix::from_poly_vec_row(&selected.parameters, vec![expected_poly]);
         let expected_matrix = GpuDCRTPolyMatrix::from_cpu_matrix(gpu_parameters, &expected_cpu);
-        if outputs.output_plaintexts[slot] != expected_matrix {
-            return Err(format!("runtime plaintext mismatch at physical slot {slot}"));
+        if outputs.output_plaintexts[anchor] != expected_matrix {
+            return Err(format!("runtime plaintext mismatch at q1 anchor {anchor}"));
         }
-        let residual = &outputs.residuals[slot];
+        let residual = &outputs.residuals[anchor];
         residual.wait_until_ready();
         let cpu = residual.to_cpu_matrix();
         for column in 0..cpu.col_size() {
@@ -1814,7 +1718,7 @@ fn measure_runtime_residual(
                 let centered = if value > half_modulus { &modulus - value } else { value };
                 if centered > maximum_noise {
                     maximum_noise = centered;
-                    maximum_location = (slot, column, coefficient_index);
+                    maximum_location = (anchor, column, coefficient_index);
                     debug!(
                         maximum_noise = %maximum_noise,
                         ?maximum_location,
@@ -2085,8 +1989,9 @@ fn range_parameters_preserve_the_cartesian_candidate_search() {
 
 /// Uses the same small arithmetic parameters as the nested-RNS Ring-GSW unit
 /// tests.  Setting this one value to zero reaches every additive Gaussian
-/// error source in the Tall preprocessing and evaluation graphs: slot and gate
-/// preimage targets, `c_b0`, lookup `c_b`, rotations, and sampled Tall rows.
+/// error source in the current Tall construction: input and diagonal-mask
+/// public keys, online LUT `C_B`, online rotation `C`, and sampled Tall rows.
+/// The compact q1-anchor residual then checks the resulting zero-noise output.
 fn noiseless_runtime_config() -> TestConfig {
     TestConfig {
         mul_count: 1,
@@ -2107,7 +2012,7 @@ fn noiseless_runtime_config() -> TestConfig {
         trapdoor_sigma: 4.578,
         benchmark_warmups: 1,
         benchmark_iterations: 1,
-        stop_after_benchmark_estimation: false,
+        run_mode: TallRunMode::Full,
         parameter_simulation_parallelism: 1,
         preimage_progress_interval: 1,
         max_parallel_instances: 1,
@@ -2180,23 +2085,66 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
-    let config = TestConfig::from_env().expect("valid GPU Tall nested-RNS configuration");
-    info!(?config, "effective GPU Tall nested-RNS integration configuration");
-    let selected = select_parameters(&config).expect("parameter simulation");
-    let operational_report = selected
-        .operational_report
-        .as_ref()
-        .expect("parameter selection runs the operational checker");
+    let requested_config = TestConfig::from_env().expect("valid GPU Tall nested-RNS configuration");
+    let requested_mode = requested_config.run_mode;
+    let (config, selected) = match requested_mode {
+        TallRunMode::ZeroNoise => {
+            let config = noiseless_runtime_config();
+            let parameters = DCRTPolyParams::new(2, 1, 10, 5);
+            let selected =
+                prepare_candidate(parameters, &config, 0, CandidatePreparation::RuntimeOnly)
+                    .expect("small noiseless Tall graphs");
+            (config, selected)
+        }
+        TallRunMode::Graph => {
+            let (crt_depth, log_ring_dimension) = requested_config
+                .candidate_dimensions()
+                .into_iter()
+                .next()
+                .expect("validated candidate dimensions are nonempty");
+            let ring_dimension = 1u32
+                .checked_shl(u32::try_from(log_ring_dimension).expect("validated ring dimension"))
+                .expect("validated ring dimension");
+            let parameters = DCRTPolyParams::new(
+                ring_dimension,
+                crt_depth,
+                requested_config.crt_modulus_bits,
+                u32::try_from(requested_config.gadget_base_bits).expect("validated gadget base"),
+            );
+            let selected = prepare_candidate(
+                parameters,
+                &requested_config,
+                0,
+                CandidatePreparation::RuntimeOnly,
+            )
+            .expect("Tall graph construction");
+            (requested_config, selected)
+        }
+        TallRunMode::Simulation | TallRunMode::Benchmark | TallRunMode::Full => {
+            let selected = select_parameters(&requested_config).expect("parameter simulation");
+            (requested_config, selected)
+        }
+    };
+    info!(?config, ?requested_mode, "effective GPU Tall nested-RNS integration configuration");
+    if requested_mode == TallRunMode::Graph {
+        info!("completed Tall graph-only mode");
+        return;
+    }
+    let operational_report = selected.operational_report.as_ref();
     info!(
         crt_depth = selected.parameters.to_crt().2,
         ring_dimension = selected.parameters.ring_dimension(),
         physical_slots = selected.parameters.ring_dimension() as usize *
             selected.nested.q_moduli_depth,
         achieved_security_bits = selected.achieved_security_bits,
-        operational_noise_bound = %operational_report.noise_bound,
-        operational_accepted = operational_report.accepted,
+        operational_noise_bound = ?operational_report.map(|report| &report.noise_bound),
+        operational_accepted = ?operational_report.map(|report| report.accepted),
         "selected Tall nested-RNS parameters"
     );
+    if requested_mode == TallRunMode::Simulation {
+        info!("completed Tall simulation-only mode");
+        return;
+    }
     let device_ids = detected_gpu_device_ids();
     assert!(!device_ids.is_empty(), "at least one CUDA GPU");
     info!(?device_ids, gpu_count = device_ids.len(), "using all detected CUDA GPUs");
@@ -2208,8 +2156,8 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
     );
     let _reports = benchmark_estimation(&selected, &config, &gpu_parameters, &device_ids)
         .expect("benchmark estimation");
-    if config.stop_after_benchmark_estimation {
-        info!("stopped successfully after benchmark estimation before preprocessing execution");
+    if requested_mode == TallRunMode::Benchmark {
+        info!("completed Tall benchmark-only mode before preprocessing execution");
         return;
     }
     let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)

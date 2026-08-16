@@ -11,16 +11,19 @@ use super::{
     bound::BoundEvaluationError,
     error::{OperationalSimulationError, TargetError},
     extract::{
-        ExtractionControl, ProposalNodeClassification,
+        ExtractedProposal, ExtractedProposalWithOrigins, ExtractionControl, ProposalCost,
+        ProposalNodeClassification, evaluate_exact_selected_expression,
         extract_best_proposal_with_origins_and_structural_preference,
+        extract_best_proposals_with_origins,
     },
     language::MxxLang,
     lower::{GraphLowerer, LoweredValue, LoweringControl},
     relation::{
-        RelationApplier, RelationFailure, RelationSearcher, ReplacementPlan, RewriteContext,
-        SharedRewriteBudget, classify_proposal_node, materialize_selected_polynomial_redex,
-        replacement_plan_bounded_shape, replacement_plan_satisfied,
-        selected_polynomial_monomials_with_context, selected_polynomial_redexes_mut,
+        RelationApplier, RelationFailure, RelationRegistration, RelationSearcher, ReplacementPlan,
+        RewriteContext, SharedRewriteBudget, classify_proposal_node,
+        materialize_selected_polynomial_redex, replacement_plan_bounded_shape,
+        replacement_plan_satisfied, selected_polynomial_monomials_with_context,
+        selected_polynomial_normal_form_plan, selected_polynomial_redexes_mut,
     },
 };
 use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
@@ -44,6 +47,275 @@ use tracing::{debug, error, info};
 
 const PROGRESS_TIME_CADENCE: Duration = Duration::from_secs(1);
 const SHALLOW_ENODE_CHILD_LOG_LIMIT: usize = 16;
+const EXPLICIT_LARGE_PRODUCT_FACTOR_LOG_LIMIT: usize = 32;
+
+fn replacement_plan_existing_leaves(
+    plan: &ReplacementPlan,
+    leaves: &mut BTreeSet<egg::Id>,
+) -> bool {
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        match plan {
+            ReplacementPlan::Existing(term) => {
+                leaves.insert(*term);
+            }
+            ReplacementPlan::Product(children) | ReplacementPlan::Add(children) => {
+                pending.extend(children.iter())
+            }
+            ReplacementPlan::Negate(child) => pending.push(child),
+            ReplacementPlan::Switch(_) |
+            ReplacementPlan::Concat { .. } |
+            ReplacementPlan::Equivalent(_) => return false,
+        }
+    }
+    true
+}
+
+fn append_exact_expression(
+    output: &mut egg::RecExpr<MxxLang>,
+    origins: &mut Vec<egg::Id>,
+    extracted: &ExtractedProposalWithOrigins,
+) -> egg::Id {
+    let mut remap = Vec::with_capacity(extracted.proposal.expression.as_ref().len());
+    for (index, node) in extracted.proposal.expression.as_ref().iter().enumerate() {
+        let node = node.clone().map_children(|child| remap[usize::from(child)]);
+        remap.push(output.add(node));
+        origins.push(extracted.origins[index]);
+    }
+    *remap.last().expect("an extracted expression is nonempty")
+}
+
+/// Expands the shallow signed-polynomial recipe produced by
+/// `signed_spines_replacement_plan` into one exact expression. Its only
+/// recursive edges are Add/Negate/Product wrappers around Existing leaves;
+/// Switches and other opaque operations remain inside an extracted leaf.
+fn append_exact_final_plan(
+    plan: &ReplacementPlan,
+    composite_origin: egg::Id,
+    output: &mut egg::RecExpr<MxxLang>,
+    origins: &mut Vec<egg::Id>,
+    first_large_source: &mut Option<super::identity::AtomicSourceId>,
+    canonicalize_leaf: &mut dyn FnMut(egg::Id) -> egg::Id,
+    unresolved: &mut dyn FnMut(u64, u64) -> OperationalSimulationError,
+    extract_leaf: &mut dyn FnMut(
+        egg::Id,
+    ) -> Result<
+        ExtractedProposalWithOrigins,
+        OperationalSimulationError,
+    >,
+) -> Result<egg::Id, Option<OperationalSimulationError>> {
+    let (node, children) = match plan {
+        ReplacementPlan::Existing(term) => {
+            let term = canonicalize_leaf(*term);
+            let extracted = extract_leaf(term).map_err(Some)?;
+            let relation = extracted.proposal.cost.unsatisfied_relation_redexes;
+            let structural = extracted
+                .proposal
+                .cost
+                .unsatisfied_structural_redexes
+                .saturating_add(extracted.proposal.cost.hidden_structural_redexes);
+            if relation != 0 || structural != 0 {
+                return Err(Some(unresolved(relation, structural)));
+            }
+            if first_large_source.is_none() && extracted.proposal.cost.large_residual {
+                *first_large_source = extracted.proposal.first_large_source;
+            }
+            return Ok(append_exact_expression(output, origins, &extracted));
+        }
+        ReplacementPlan::Product(children) => ("product", children.as_ref()),
+        ReplacementPlan::Add(children) => ("add", children.as_ref()),
+        ReplacementPlan::Negate(child) => {
+            let child = append_exact_final_plan(
+                child,
+                composite_origin,
+                output,
+                origins,
+                first_large_source,
+                canonicalize_leaf,
+                unresolved,
+                extract_leaf,
+            )?;
+            let root = output.add(MxxLang::MatrixNegate([child]));
+            origins.push(composite_origin);
+            return Ok(root);
+        }
+        ReplacementPlan::Switch(_) |
+        ReplacementPlan::Concat { .. } |
+        ReplacementPlan::Equivalent(_) => {
+            return Err(None);
+        }
+    };
+    let children = children
+        .iter()
+        .map(|child| {
+            append_exact_final_plan(
+                child,
+                composite_origin,
+                output,
+                origins,
+                first_large_source,
+                canonicalize_leaf,
+                unresolved,
+                extract_leaf,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let root = match node {
+        "product" => output.add(MxxLang::MatrixMultiply(children.into_boxed_slice())),
+        "add" => output.add(MxxLang::MatrixAdd(children.into_boxed_slice())),
+        _ => unreachable!(),
+    };
+    origins.push(composite_origin);
+    Ok(root)
+}
+
+/// Finds the nearest selected ordered product containing the requested atomic
+/// source. Distances and the product spine are computed only from the already
+/// selected `RecExpr`; multiplication is flattened without reordering.
+fn nearest_selected_product_spine(
+    expression: &egg::RecExpr<MxxLang>,
+    target_source: super::identity::AtomicSourceId,
+) -> Option<(usize, Vec<egg::Id>, usize)> {
+    let mut source_distances = vec![None::<usize>; expression.as_ref().len()];
+    let mut nearest_product = None::<(usize, usize)>;
+    for (index, node) in expression.as_ref().iter().enumerate() {
+        let distance = match node {
+            MxxLang::Atom { source, .. } if *source == target_source => Some(0),
+            _ => node
+                .children()
+                .iter()
+                .filter_map(|child| source_distances[usize::from(*child)])
+                .min()
+                .map(|distance| distance.saturating_add(1)),
+        };
+        source_distances[index] = distance;
+        if matches!(node, MxxLang::MatrixMultiply(_)) &&
+            let Some(distance) = distance &&
+            nearest_product.is_none_or(|current| (distance, index) < current)
+        {
+            nearest_product = Some((distance, index));
+        }
+    }
+
+    let (_, product_index) = nearest_product?;
+    let MxxLang::MatrixMultiply(factors) = &expression.as_ref()[product_index] else {
+        unreachable!("nearest product index names a MatrixMultiply")
+    };
+    let mut pending = factors.iter().rev().copied().collect::<Vec<_>>();
+    let mut spine = Vec::new();
+    while let Some(factor) = pending.pop() {
+        match &expression[factor] {
+            MxxLang::MatrixMultiply(nested) => pending.extend(nested.iter().rev().copied()),
+            _ => spine.push(factor),
+        }
+    }
+    let source_position = spine.iter().position(|factor| {
+        matches!(&expression[*factor], MxxLang::Atom { source, .. } if *source == target_source)
+    })?;
+    Some((product_index, spine, source_position))
+}
+
+fn direct_selected_atomic_source(
+    expression: &egg::RecExpr<MxxLang>,
+    factor: Option<egg::Id>,
+) -> Option<super::identity::AtomicSourceId> {
+    match factor.map(|factor| &expression[factor]) {
+        Some(MxxLang::Atom { source, .. }) => Some(*source),
+        _ => None,
+    }
+}
+
+fn relation_canonical_ids(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    registrations: &[RelationRegistration],
+) -> Vec<usize> {
+    let relation_sources =
+        registrations.iter().map(|registration| registration.source).collect::<BTreeSet<_>>();
+    let mut canonical_ids = egraph
+        .classes()
+        .filter(|class| {
+            class.nodes.iter().any(|node| {
+                matches!(node, MxxLang::Atom { source, .. } if relation_sources.contains(source))
+            })
+        })
+        .map(|class| usize::from(egraph.find(class.id)))
+        .collect::<Vec<_>>();
+    canonical_ids.sort_unstable();
+    canonical_ids.dedup();
+    canonical_ids
+}
+
+/// Emits bounded, failure-only context for an explicitly Large selected atom.
+/// It reads the selected expression, its aligned origins, and the existing
+/// relation registry; no result is persisted in checker state.
+fn emit_explicit_large_product_context(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    expression: &egg::RecExpr<MxxLang>,
+    origins: &[egg::Id],
+    context: &RewriteContext,
+    source: super::identity::AtomicSourceId,
+) {
+    if !tracing::enabled!(tracing::Level::INFO) {
+        return;
+    }
+    let Some((product_index, spine, source_position)) =
+        nearest_selected_product_spine(expression, source)
+    else {
+        tracing::info!(
+            event = "operational_explicit_large_product_context",
+            canonical_source_id = source.0,
+            nearest_selected_product = false,
+            "explicitly Large selected source has no selected MatrixMultiply ancestor"
+        );
+        return;
+    };
+    let source_factor = spine[source_position];
+    let source_origin = egraph.find(origins[usize::from(source_factor)]);
+    let left = source_position.checked_sub(1).map(|position| spine[position]);
+    let right = spine.get(source_position + 1).copied();
+    let left_source = direct_selected_atomic_source(expression, left);
+    let right_source = direct_selected_atomic_source(expression, right);
+    let source_role = |source: super::identity::AtomicSourceId| {
+        egraph
+            .analysis
+            .symbols
+            .atomic_sources
+            .get(source.0)
+            .and_then(|descriptor| descriptor.relation_role)
+    };
+    let registrations = context.diagnostic_registrations_for_expected_public(egraph, source_origin);
+    let expected_relation_sources =
+        registrations.iter().map(|registration| registration.source).collect::<BTreeSet<_>>();
+    let expected_relation_canonical_ids = relation_canonical_ids(egraph, &registrations);
+    let exact_adjacent_right_is_expected_relation =
+        right_source.is_some_and(|right_source| expected_relation_sources.contains(&right_source));
+    let ordered_canonical_factors = spine
+        .iter()
+        .take(EXPLICIT_LARGE_PRODUCT_FACTOR_LOG_LIMIT)
+        .map(|factor| usize::from(egraph.find(origins[usize::from(*factor)])))
+        .collect::<Vec<_>>();
+    tracing::info!(
+        event = "operational_explicit_large_product_context",
+        canonical_source_id = source.0,
+        canonical_source_eclass = usize::from(source_origin),
+        nearest_selected_product = true,
+        nearest_product_expression_index = product_index,
+        factor_position = source_position,
+        ordered_canonical_factors = ?ordered_canonical_factors,
+        omitted_factor_count = spine.len().saturating_sub(EXPLICIT_LARGE_PRODUCT_FACTOR_LOG_LIMIT),
+        immediate_left_operator = ?left.map(|factor| expression[factor].operator_name()),
+        immediate_left_source_id = ?left_source.map(|source| source.0),
+        immediate_left_relation_role = ?left_source.and_then(source_role),
+        immediate_right_operator = ?right.map(|factor| expression[factor].operator_name()),
+        immediate_right_source_id = ?right_source.map(|source| source.0),
+        immediate_right_relation_role = ?right_source.and_then(source_role),
+        expected_relation_registration_count = registrations.len(),
+        expected_relation_canonical_ids = ?expected_relation_canonical_ids,
+        expected_relation_canonical_count = expected_relation_canonical_ids.len(),
+        exact_adjacent_right_is_expected_relation,
+        "selected explicitly Large source in its nearest ordered product context"
+    );
+}
 
 fn shallow_enode_log_shape(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
@@ -1045,9 +1317,10 @@ pub fn check_operational_noise_candidate_with_progress(
                             ),
                             Ok(SelectedPhasePostcondition::Complete)
                         );
-                        // `selected` covers every canonical root and no code
-                        // below this branch mutates the e-graph before final
-                        // acceptance, so reuse this exact extraction.
+                        // `selected` covers every canonical root and freezes
+                        // the normalization fixed point. Final acceptance
+                        // performs a separate preference-free extraction from
+                        // this immutable e-graph snapshot below.
                         break 'joint_fixed_point (egraph_mutation_epoch, selected);
                     }
                     egraph_mutation_epoch = egraph_mutation_epoch.saturating_add(1);
@@ -1343,26 +1616,176 @@ pub fn check_operational_noise_candidate_with_progress(
                     *roots.first().expect("a lowered residual has at least one selected root"),
                 );
                 return Err(OperationalSimulationError::Bound {
-                    site: site(&stage, wire, "reuse terminal extraction"),
+                    site: site(&stage, wire, "validate terminal snapshot"),
                     source: super::error::BoundError::EvaluationFailed {
                         source: BoundEvaluationError::MissingExtractedTerm { term: root },
                     },
                 });
             }
-            control.borrow_mut().reserve_owned_elements(roots.len())?;
+            // Retain the exact checked-relation-normalized polynomial recipe.
+            // Materializing it into this e-graph would not retain its syntax:
+            // hash-consing can return the original class and expose its raw
+            // relation-product alternatives again.
+            let mut normalized_plans = Vec::with_capacity(terminal_selected.len());
+            for (root, extracted) in &terminal_selected {
+                let mut progress = || context.reserve(1).then_some(()).ok_or(());
+                let plan = selected_polynomial_normal_form_plan(
+                    &mut lowerer.egraph,
+                    &extracted.proposal.expression,
+                    &extracted.origins,
+                    &context,
+                    &mut progress,
+                )
+                .ok_or_else(|| {
+                    if let Some(failure) = context.failure() {
+                        relation_error(&stage, wire, &lowerer.egraph.analysis.symbols, failure)
+                    } else {
+                        OperationalSimulationError::Bound {
+                            site: site(&stage, wire, "materialize final polynomial"),
+                            source: super::error::BoundError::EvaluationFailed {
+                                source: BoundEvaluationError::MissingExtractedTerm { term: *root },
+                            },
+                        }
+                    }
+                })?;
+                normalized_plans.push((*root, plan));
+            }
+            lowerer.egraph.rebuild();
+
+            let view = lowerer.production_bound_view();
+            let mut distinct_leaves = BTreeSet::new();
+            for (_, plan) in &normalized_plans {
+                if !replacement_plan_existing_leaves(plan, &mut distinct_leaves) {
+                    return Err(OperationalSimulationError::Bound {
+                        site: site(&stage, wire, "materialize final polynomial"),
+                        source: super::error::BoundError::EvaluationFailed {
+                            source: BoundEvaluationError::MissingExtractedTerm {
+                                term: *final_selected_roots
+                                    .first()
+                                    .expect("a lowered residual has a final root"),
+                            },
+                        },
+                    });
+                }
+            }
+            let distinct_leaves = distinct_leaves
+                .into_iter()
+                .map(|leaf| lowerer.egraph.find(leaf))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let extracted_leaves = extract_best_proposals_with_origins(
+                &lowerer.egraph,
+                &distinct_leaves,
+                &view,
+                &mut ExtractionControl {
+                    invalid_dag: &mut invalid_dag,
+                    bound_error: &mut bound_error,
+                },
+                &mut |origin, node, egraph| {
+                    let classification =
+                        super::relation::classify_proposal_node(egraph, origin, node, &context)
+                            .map_err(|failure| {
+                                relation_error(&stage, wire, &egraph.analysis.symbols, failure)
+                            })?;
+                    Ok(ProposalNodeClassification {
+                        relation_redex: classification.relation_redex,
+                        local_checked_relation_count: classification.local_checked_relation_count,
+                    })
+                },
+            )?;
+            let extracted_leaves =
+                distinct_leaves.iter().copied().zip(extracted_leaves).collect::<HashMap<_, _>>();
+            let mut final_selected = Vec::with_capacity(final_selected_roots.len());
+            for root in &final_selected_roots {
+                let normalized_index = normalized_plans
+                    .binary_search_by_key(root, |(root, _)| *root)
+                    .map_err(|_| OperationalSimulationError::Bound {
+                        site: site(&stage, wire, "reuse final polynomial"),
+                        source: super::error::BoundError::EvaluationFailed {
+                            source: BoundEvaluationError::MissingExtractedTerm { term: *root },
+                        },
+                    })?;
+                let plan = &normalized_plans[normalized_index].1;
+                let mut expression = egg::RecExpr::default();
+                let mut origins = Vec::new();
+                let mut first_large_source = None;
+                let mut canonicalize_leaf = |leaf| lowerer.egraph.find(leaf);
+                let mut unresolved =
+                    |unsatisfied_relation_redexes, unsatisfied_structural_redexes| {
+                        OperationalSimulationError::Bound {
+                            site: site(&stage, wire, "extract final polynomial leaf"),
+                            source: super::error::BoundError::UnresolvedExtraction {
+                                unsatisfied_relation_redexes,
+                                unsatisfied_structural_redexes,
+                            },
+                        }
+                    };
+                let mut extract_leaf = |leaf| {
+                    extracted_leaves.get(&leaf).cloned().ok_or_else(|| {
+                        OperationalSimulationError::Bound {
+                            site: site(&stage, wire, "reuse final polynomial leaf"),
+                            source: super::error::BoundError::EvaluationFailed {
+                                source: BoundEvaluationError::MissingExtractedTerm { term: leaf },
+                            },
+                        }
+                    })
+                };
+                append_exact_final_plan(
+                    plan,
+                    *root,
+                    &mut expression,
+                    &mut origins,
+                    &mut first_large_source,
+                    &mut canonicalize_leaf,
+                    &mut unresolved,
+                    &mut extract_leaf,
+                )
+                .map_err(|source| {
+                    source.unwrap_or_else(|| OperationalSimulationError::Bound {
+                        site: site(&stage, wire, "materialize final polynomial"),
+                        source: super::error::BoundError::EvaluationFailed {
+                            source: BoundEvaluationError::MissingExtractedTerm { term: *root },
+                        },
+                    })
+                })?;
+                let semantic_bound =
+                    evaluate_exact_selected_expression(&view, &expression, &origins)
+                        .map_err(&mut bound_error)?;
+                let proposal = ExtractedProposal {
+                    cost: ProposalCost {
+                        large_residual: matches!(
+                            semantic_bound.coefficient_class,
+                            super::bound::BoundClass::Large
+                        ),
+                        node_count: expression.as_ref().len() as u64,
+                        ..Default::default()
+                    },
+                    semantic_bound: Some(semantic_bound),
+                    first_large_source,
+                    expression,
+                };
+                final_selected.push((
+                    *root,
+                    ExtractedProposalWithOrigins { proposal, origins: origins.into_boxed_slice() },
+                ));
+            }
+            drop(view);
+            control.borrow_mut().reserve_owned_elements(final_selected_roots.len())?;
             let mut proposals = Vec::with_capacity(roots.len());
             let mut bounds = Vec::with_capacity(roots.len());
             for root in roots {
                 let root = lowerer.egraph.find(root);
-                let selected_index = terminal_selected
+                let selected_index = final_selected
                     .binary_search_by_key(&root, |(root, _)| *root)
                     .map_err(|_| OperationalSimulationError::Bound {
-                        site: site(&stage, wire, "reuse terminal extraction"),
+                        site: site(&stage, wire, "reuse final extraction"),
                         source: super::error::BoundError::EvaluationFailed {
                             source: BoundEvaluationError::MissingExtractedTerm { term: root },
                         },
                     })?;
-                let proposal = &terminal_selected[selected_index].1.proposal;
+                let extracted = &final_selected[selected_index].1;
+                let proposal = &extracted.proposal;
                 if proposal.cost.unsatisfied_relation_redexes != 0 ||
                     proposal.cost.unsatisfied_structural_redexes != 0
                 {
@@ -1399,6 +1822,15 @@ pub fn check_operational_noise_candidate_with_progress(
                     if let Some(super::identity::AtomicSourceKey::ExplicitLarge(graph_source)) =
                         source.as_ref()
                     {
+                        if let Some(source_id) = proposal.first_large_source {
+                            emit_explicit_large_product_context(
+                                &lowerer.egraph,
+                                &proposal.expression,
+                                &extracted.origins,
+                                &context,
+                                source_id,
+                            );
+                        }
                         let binding = lowerer.graph_wire_binding_diagnostic(graph_source);
                         tracing::info!(
                             event = "operational_explicit_large_binding",
@@ -2249,6 +2681,94 @@ fn shared_round_div(numerator: &BigInt, denominator: &BigInt) -> BigInt {
 mod tests {
     use super::*;
 
+    fn final_leaf_fixture(term: egg::Id, cost: ProposalCost) -> ExtractedProposalWithOrigins {
+        let mut expression = egg::RecExpr::default();
+        expression.add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(0)));
+        ExtractedProposalWithOrigins {
+            proposal: ExtractedProposal {
+                cost,
+                semantic_bound: Some(super::super::bound::MatrixBound {
+                    matrix_type: mxx_ir_core::types::ConcreteMatrixType {
+                        modulus: 17.into(),
+                        ring_dimension: 1,
+                        rows: 1,
+                        columns: 1,
+                    },
+                    coefficient_class: super::super::bound::BoundClass::bounded(1_u8.into()),
+                    metadata: super::super::bound::MatrixMetadata::unknown(),
+                }),
+                first_large_source: None,
+                expression,
+            },
+            origins: vec![term].into_boxed_slice(),
+        }
+    }
+
+    fn final_leaf_error(relation: u64, structural: u64) -> OperationalSimulationError {
+        OperationalSimulationError::Bound {
+            site: site(
+                &StageId("final-leaf-test".to_owned()),
+                WireRef { node: mxx_ir_core::NodeId(0), port: Port(0) },
+                "extract final polynomial leaf",
+            ),
+            source: super::super::error::BoundError::UnresolvedExtraction {
+                unsatisfied_relation_redexes: relation,
+                unsatisfied_structural_redexes: structural,
+            },
+        }
+    }
+
+    #[test]
+    fn exact_final_plan_prepass_deduplicates_repeated_leaves() {
+        let leaf = egg::Id::from(7);
+        let plan = ReplacementPlan::Add(
+            vec![ReplacementPlan::Existing(leaf), ReplacementPlan::Existing(leaf)]
+                .into_boxed_slice(),
+        );
+        let mut leaves = BTreeSet::new();
+        assert!(replacement_plan_existing_leaves(&plan, &mut leaves));
+        assert_eq!(leaves, BTreeSet::from([leaf]));
+    }
+
+    #[test]
+    fn exact_final_plan_rejects_bounded_leaf_with_unresolved_checked_relation() {
+        let leaf = egg::Id::from(9);
+        let mut output = egg::RecExpr::default();
+        let mut origins = Vec::new();
+        let mut first_large = None;
+        let error = append_exact_final_plan(
+            &ReplacementPlan::Existing(leaf),
+            leaf,
+            &mut output,
+            &mut origins,
+            &mut first_large,
+            &mut |term| term,
+            &mut final_leaf_error,
+            &mut |term| {
+                Ok(final_leaf_fixture(
+                    term,
+                    ProposalCost {
+                        unsatisfied_relation_redexes: 1,
+                        unsatisfied_structural_redexes: 2,
+                        hidden_structural_redexes: 3,
+                        ..Default::default()
+                    },
+                ))
+            },
+        )
+        .expect_err("an unresolved checked relation is never hidden by a finite bound");
+        assert!(matches!(
+            error,
+            Some(OperationalSimulationError::Bound {
+                source: super::super::error::BoundError::UnresolvedExtraction {
+                    unsatisfied_relation_redexes: 1,
+                    unsatisfied_structural_redexes: 5,
+                },
+                ..
+            })
+        ));
+    }
+
     fn test_matrix_atom(
         egraph: &mut EGraph<MxxLang, MxxAnalysis>,
         name: &str,
@@ -2303,6 +2823,78 @@ mod tests {
         let mut preferences = ExactStructuralPreferences::new();
         preferences.entry(egraph.find(product)).or_default().insert(product_node);
         (egraph, context, preferences, product, target)
+    }
+
+    #[test]
+    fn explicit_large_context_uses_nearest_ordered_spine_and_expected_public_registry() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (left, left_source) = test_matrix_atom(&mut egraph, "diagnostic-left", None);
+        let (explicit, explicit_source) =
+            test_matrix_atom(&mut egraph, "diagnostic-explicit", None);
+        let (relation, relation_source) = test_matrix_atom(
+            &mut egraph,
+            "diagnostic-relation",
+            Some(super::super::identity::AtomicRelationRole::Preimage),
+        );
+        let (tail, tail_source) = test_matrix_atom(&mut egraph, "diagnostic-tail", None);
+        let inner = egraph
+            .add(MxxLang::MatrixMultiply(vec![left, explicit, relation, tail].into_boxed_slice()));
+        let outer = egraph.add(MxxLang::MatrixMultiply(vec![left, inner].into_boxed_slice()));
+        egraph.rebuild();
+
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(super::super::relation::RelationRegistration {
+            source: relation_source,
+            expected_public: explicit,
+            target: tail,
+            trapdoor: None,
+            indices: Box::new([]),
+        });
+
+        let mut expression = egg::RecExpr::default();
+        let selected_left =
+            expression.add(MxxLang::Atom { source: left_source, indices: Box::new([]) });
+        let selected_explicit =
+            expression.add(MxxLang::Atom { source: explicit_source, indices: Box::new([]) });
+        let selected_relation =
+            expression.add(MxxLang::Atom { source: relation_source, indices: Box::new([]) });
+        let selected_tail =
+            expression.add(MxxLang::Atom { source: tail_source, indices: Box::new([]) });
+        let selected_inner = expression.add(MxxLang::MatrixMultiply(
+            vec![selected_left, selected_explicit, selected_relation, selected_tail]
+                .into_boxed_slice(),
+        ));
+        expression
+            .add(MxxLang::MatrixMultiply(vec![selected_left, selected_inner].into_boxed_slice()));
+        let origins = [left, explicit, relation, tail, inner, outer];
+
+        let (product_index, spine, source_position) =
+            nearest_selected_product_spine(&expression, explicit_source)
+                .expect("selected explicit source has a product ancestor");
+        assert_eq!(product_index, usize::from(selected_inner));
+        assert_eq!(source_position, 1);
+        assert_eq!(spine, vec![selected_left, selected_explicit, selected_relation, selected_tail]);
+        assert_eq!(
+            spine
+                .iter()
+                .map(|factor| usize::from(egraph.find(origins[usize::from(*factor)])))
+                .collect::<Vec<_>>(),
+            vec![left, explicit, relation, tail]
+                .into_iter()
+                .map(|factor| usize::from(egraph.find(factor)))
+                .collect::<Vec<_>>()
+        );
+
+        let registrations = context.diagnostic_registrations_for_expected_public(&egraph, explicit);
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(relation_canonical_ids(&egraph, &registrations), vec![usize::from(relation)]);
+        let right_source =
+            direct_selected_atomic_source(&expression, spine.get(source_position + 1).copied());
+        assert_eq!(right_source, Some(relation_source));
+        assert!(registrations.iter().any(|registration| {
+            right_source == Some(registration.source) &&
+                egraph.find(registration.expected_public) == egraph.find(explicit)
+        }));
     }
 
     #[test]

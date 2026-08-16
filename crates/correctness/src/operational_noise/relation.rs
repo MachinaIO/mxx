@@ -191,6 +191,26 @@ impl RewriteContext {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Failure-only diagnostic view of registrations whose public operand is
+    /// exactly this canonical e-class. It reuses the authoritative registry
+    /// and never affects matching, counters, or the shared rewrite budget.
+    pub(crate) fn diagnostic_registrations_for_expected_public(
+        &self,
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        expected_public: Id,
+    ) -> Vec<RelationRegistration> {
+        let expected_public = egraph.find(expected_public);
+        self.state
+            .lock()
+            .expect("relation context lock")
+            .registrations
+            .values()
+            .flatten()
+            .filter(|registration| egraph.find(registration.expected_public) == expected_public)
+            .cloned()
+            .collect()
+    }
 }
 
 /// A relation-bearing factor searcher.  It matches an ordered matrix product
@@ -1151,6 +1171,33 @@ pub(crate) fn selected_polynomial_monomials_with_context(
         memo.push(terms);
     }
     Some(memo)
+}
+
+/// Builds the exact ordered-polynomial normal form of one already selected
+/// expression. The caller retains this recipe through final evaluation rather
+/// than re-selecting an arbitrary representative of its e-class.
+pub(crate) fn selected_polynomial_normal_form_plan(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    expression: &RecExpr<MxxLang>,
+    origins: &[Id],
+    context: &RewriteContext,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<ReplacementPlan> {
+    let monomials = selected_polynomial_monomials_with_context(
+        egraph,
+        expression,
+        origins,
+        Some(context),
+        progress,
+    )?;
+    let root_index = usize::from(expression.root());
+    let terms = monomials.get(root_index)?;
+    if terms.is_empty() {
+        progress().ok()?;
+        let zero = build_additive_terms(egraph, *origins.get(root_index)?, Vec::new());
+        return Some(ReplacementPlan::Existing(zero));
+    }
+    signed_spines_replacement_plan(terms, None)
 }
 
 /// Canonicalizes only the already-reviewed central constant scalar factors in

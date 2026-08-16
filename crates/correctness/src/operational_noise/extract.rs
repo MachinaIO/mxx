@@ -14,7 +14,9 @@ use super::{
         SelectedChildBounds,
     },
     error::OperationalSimulationError,
-    identity::{AtomicRelationRole, AtomicSourceId, AtomicSourceKey},
+    identity::{
+        AtomicRelationRole, AtomicSourceId, AtomicSourceKey, CrtSpecId, MatrixConstantSpecId,
+    },
     language::MxxLang,
     relation::{
         PointwiseAddSwitchProbe, PointwiseAddSwitchReject, PointwiseDirectProbe,
@@ -22,6 +24,8 @@ use super::{
     },
 };
 use egg::{EGraph, Id, Language, RecExpr};
+use mxx_ir_core::types::ConcreteMatrixType;
+use num_bigint::{BigInt, BigUint};
 use std::{
     collections::{BTreeSet, HashSet},
     fmt,
@@ -93,9 +97,105 @@ pub struct ExtractedProposal {
 /// index as `proposal.expression` and names the canonical e-class from which
 /// that expression-local node was selected.  It is discarded before the
 /// public simulation result and is never stored in the e-graph or analysis.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExtractedProposalWithOrigins {
     pub(crate) proposal: ExtractedProposal,
     pub(crate) origins: Box<[Id]>,
+}
+
+/// Evaluates one exact expression recipe without consulting alternative
+/// representatives in any of its origin e-classes. The adapter is ephemeral:
+/// all semantic transfers and the sole bound memo remain owned by
+/// [`BoundEvaluator`].
+pub(crate) fn evaluate_exact_selected_expression<I: BoundInput>(
+    input: &I,
+    expression: &RecExpr<MxxLang>,
+    origins: &[Id],
+) -> Result<MatrixBound, BoundEvaluationError> {
+    struct ExactInput<'a, I> {
+        base: &'a I,
+        expression: &'a RecExpr<MxxLang>,
+        origins: &'a [Id],
+    }
+
+    impl<I: BoundInput> ExactInput<'_, I> {
+        fn origin(&self, term: Id) -> Result<Id, BoundEvaluationError> {
+            self.origins
+                .get(usize::from(term))
+                .copied()
+                .ok_or(BoundEvaluationError::MissingExtractedTerm { term })
+        }
+    }
+
+    impl<I: BoundInput> BoundInput for ExactInput<'_, I> {
+        fn node(&self, term: Id) -> Option<&MxxLang> {
+            self.expression.as_ref().get(usize::from(term))
+        }
+
+        fn matrix_type(&self, term: Id) -> Result<ConcreteMatrixType, BoundEvaluationError> {
+            self.base.matrix_type(self.origin(term)?)
+        }
+
+        fn atom_bound(
+            &self,
+            source: AtomicSourceId,
+            term: Id,
+        ) -> Result<MatrixBound, BoundEvaluationError> {
+            self.base.atom_bound(source, self.origin(term)?)
+        }
+
+        fn matrix_constant(
+            &self,
+            spec: MatrixConstantSpecId,
+            term: Id,
+        ) -> Result<(ConcreteMatrixType, super::bound::ResolvedMatrixConstant), BoundEvaluationError>
+        {
+            self.base.matrix_constant(spec, self.origin(term)?)
+        }
+
+        fn scalar_maximum_absolute(&self, term: Id) -> Result<BigUint, BoundEvaluationError> {
+            self.base.scalar_maximum_absolute(self.origin(term)?)
+        }
+
+        fn lift_constant_polynomial_class(
+            &self,
+            term: Id,
+            input: Id,
+        ) -> Result<BoundClass, BoundEvaluationError> {
+            self.base.lift_constant_polynomial_class(self.origin(term)?, self.origin(input)?)
+        }
+
+        fn crt_coefficients(
+            &self,
+            spec: CrtSpecId,
+            term: Id,
+        ) -> Result<Box<[BigInt]>, BoundEvaluationError> {
+            self.base.crt_coefficients(spec, self.origin(term)?)
+        }
+
+        fn validate_pack(&self, term: Id, bit_count: usize) -> Result<(), BoundEvaluationError> {
+            self.base.validate_pack(self.origin(term)?, bit_count)
+        }
+
+        fn pack_bit_maximum(&self, term: Id, bit: Id) -> Result<BigUint, BoundEvaluationError> {
+            self.base.pack_bit_maximum(self.origin(term)?, self.origin(bit)?)
+        }
+
+        fn switch_reachable_cases(
+            &self,
+            term: Id,
+            selector: Id,
+            case_count: usize,
+        ) -> Result<Box<[bool]>, BoundEvaluationError> {
+            self.base.switch_reachable_cases(self.origin(term)?, self.origin(selector)?, case_count)
+        }
+    }
+
+    if origins.len() != expression.as_ref().len() {
+        return Err(BoundEvaluationError::MissingExtractedTerm { term: expression.root() });
+    }
+    BoundEvaluator::new(&ExactInput { base: input, expression, origins })
+        .evaluate_allow_large(expression.root())
 }
 
 /// Maps extraction failures that require the simulation driver's source site.
@@ -241,9 +341,61 @@ pub(crate) fn extract_best_proposal_with_origins_and_structural_preference<I: Bo
         &EGraph<MxxLang, MxxAnalysis>,
     ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
     structural_preference: &mut dyn FnMut(Id, &MxxLang) -> u64,
-    mut diagnostic_preference_membership: Option<&mut dyn FnMut(Id, &MxxLang) -> bool>,
+    diagnostic_preference_membership: Option<&mut dyn FnMut(Id, &MxxLang) -> bool>,
     emit_detailed_large_diagnostic: bool,
 ) -> Result<ExtractedProposalWithOrigins, OperationalSimulationError> {
+    extract_best_proposals_with_origins_and_structural_preference(
+        egraph,
+        &[root],
+        bound_input,
+        control,
+        classify,
+        structural_preference,
+        diagnostic_preference_membership,
+        emit_detailed_large_diagnostic,
+    )?
+    .pop()
+    .ok_or_else(|| (control.invalid_dag)(egraph.find(root)))
+}
+
+pub(crate) fn extract_best_proposals_with_origins<I: BoundInput>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    roots: &[Id],
+    bound_input: &I,
+    control: &mut ExtractionControl<'_>,
+    classify: &mut dyn FnMut(
+        Id,
+        &MxxLang,
+        &EGraph<MxxLang, MxxAnalysis>,
+    ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
+) -> Result<Vec<ExtractedProposalWithOrigins>, OperationalSimulationError> {
+    extract_best_proposals_with_origins_and_structural_preference(
+        egraph,
+        roots,
+        bound_input,
+        control,
+        classify,
+        &mut |_, _| 0,
+        None,
+        false,
+    )
+}
+
+fn extract_best_proposals_with_origins_and_structural_preference<I: BoundInput>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    roots: &[Id],
+    bound_input: &I,
+    control: &mut ExtractionControl<'_>,
+    classify: &mut dyn FnMut(
+        Id,
+        &MxxLang,
+        &EGraph<MxxLang, MxxAnalysis>,
+    ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
+    structural_preference: &mut dyn FnMut(Id, &MxxLang) -> u64,
+    mut diagnostic_preference_membership: Option<&mut dyn FnMut(Id, &MxxLang) -> bool>,
+    emit_detailed_large_diagnostic: bool,
+) -> Result<Vec<ExtractedProposalWithOrigins>, OperationalSimulationError> {
+    let diagnostic_root = roots.first().copied().unwrap_or(Id::from(0));
     let class_count = egraph.number_of_classes();
     let mut classes = Vec::with_capacity(class_count);
     for class in egraph.classes() {
@@ -260,7 +412,7 @@ pub(crate) fn extract_best_proposal_with_origins_and_structural_preference<I: Bo
         let mut changed = false;
         let diagnostic_class = (emit_detailed_large_diagnostic &&
             diagnostic_preference_membership.is_some())
-        .then(|| first_selected_large_ambiguous_product_class(egraph, root, &candidates))
+        .then(|| first_selected_large_ambiguous_product_class(egraph, diagnostic_root, &candidates))
         .flatten();
         let mut diagnostic_rows = Vec::new();
         for &class_id in &classes {
@@ -469,164 +621,175 @@ pub(crate) fn extract_best_proposal_with_origins_and_structural_preference<I: Bo
         }
     }
 
-    let root = egraph.find(root);
-    let root_index = usize::from(root);
-    if candidates.get(root_index).and_then(Option::as_ref).is_none() {
-        return Err((control.invalid_dag)(root));
-    }
+    let mut extracted_roots = Vec::with_capacity(roots.len());
+    for requested_root in roots {
+        let root = egraph.find(*requested_root);
+        let root_index = usize::from(root);
+        if candidates.get(root_index).and_then(Option::as_ref).is_none() {
+            return Err((control.invalid_dag)(root));
+        }
 
-    let mut work = vec![BuildFrame::Enter(root)];
-    let mut nodes = Vec::<MxxLang>::new();
-    let mut origins = Vec::<Id>::new();
-    while let Some(frame) = work.pop() {
-        let class = match frame {
-            BuildFrame::Enter(class) | BuildFrame::Finish(class) => egraph.find(class),
-        };
-        let index = usize::from(class);
-        match frame {
-            BuildFrame::Enter(_) => {
-                let Some(candidate) = candidates.get_mut(index).and_then(Option::as_mut) else {
-                    return Err((control.invalid_dag)(class));
-                };
-                match candidate.state {
-                    ExtractionState::Complete => continue,
-                    ExtractionState::Visiting => return Err((control.invalid_dag)(class)),
-                    ExtractionState::Pending => candidate.state = ExtractionState::Visiting,
-                }
-                work.push(BuildFrame::Finish(class));
-                for &child in candidate.node.children().iter().rev() {
-                    work.push(BuildFrame::Enter(egraph.find(child)));
-                }
-            }
-            BuildFrame::Finish(_) => {
-                let Some(candidate) = candidates.get(index).and_then(Option::as_ref) else {
-                    return Err((control.invalid_dag)(class));
-                };
-                let mut missing_child = None;
-                let output_node = candidate.node.clone().map_children(|child| {
-                    let child = egraph.find(child);
-                    let child_candidate =
-                        candidates.get(usize::from(child)).and_then(Option::as_ref);
-                    match child_candidate.and_then(|candidate| candidate.output) {
-                        Some(output) => output,
-                        None => {
-                            missing_child = Some(child);
-                            Id::from(0)
-                        }
+        let mut work = vec![BuildFrame::Enter(root)];
+        let mut nodes = Vec::<MxxLang>::new();
+        let mut origins = Vec::<Id>::new();
+        while let Some(frame) = work.pop() {
+            let class = match frame {
+                BuildFrame::Enter(class) | BuildFrame::Finish(class) => egraph.find(class),
+            };
+            let index = usize::from(class);
+            match frame {
+                BuildFrame::Enter(_) => {
+                    let Some(candidate) = candidates.get_mut(index).and_then(Option::as_mut) else {
+                        return Err((control.invalid_dag)(class));
+                    };
+                    match candidate.state {
+                        ExtractionState::Complete => continue,
+                        ExtractionState::Visiting => return Err((control.invalid_dag)(class)),
+                        ExtractionState::Pending => candidate.state = ExtractionState::Visiting,
                     }
-                });
-                if let Some(child) = missing_child {
-                    return Err((control.invalid_dag)(child));
+                    work.push(BuildFrame::Finish(class));
+                    for &child in candidate.node.children().iter().rev() {
+                        work.push(BuildFrame::Enter(egraph.find(child)));
+                    }
                 }
-                // Relaxation selects by public lexicographic cost.  A child can
-                // change to an equally priced finite alternative without changing
-                // an ancestor's cost, so refresh the selected node only after its
-                // selected children are complete.  This is the same zero-first
-                // transfer used for final evaluation, not a second bound cache.
-                let semantic_bound = matches!(&egraph[class].data.sort, Ok(MxxSort::Matrix(_)))
-                    .then(|| {
-                        let children = CandidateChildBounds { egraph, candidates: &candidates };
-                        BoundEvaluator::evaluate_selected_node(
-                            bound_input,
-                            class,
-                            &candidate.node,
-                            &children,
-                        )
-                    })
-                    .transpose()
-                    .map_err(|source| (control.bound_error)(source))?;
-                let first_large_source = selected_first_large_source(
-                    egraph,
-                    &candidate.node,
-                    semantic_bound.as_ref(),
-                    &candidates,
-                );
-                let output = Id::from(nodes.len());
-                nodes.push(output_node);
-                origins.push(class);
-                let Some(candidate) = candidates[index].as_mut() else {
-                    return Err((control.invalid_dag)(class));
-                };
-                candidate.semantic_bound = semantic_bound;
-                candidate.cost.large_residual = candidate
-                    .semantic_bound
-                    .as_ref()
-                    .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large));
-                candidate.first_large_source = first_large_source;
-                candidate.output = Some(output);
-                candidate.state = ExtractionState::Complete;
+                BuildFrame::Finish(_) => {
+                    let Some(candidate) = candidates.get(index).and_then(Option::as_ref) else {
+                        return Err((control.invalid_dag)(class));
+                    };
+                    let mut missing_child = None;
+                    let output_node = candidate.node.clone().map_children(|child| {
+                        let child = egraph.find(child);
+                        let child_candidate =
+                            candidates.get(usize::from(child)).and_then(Option::as_ref);
+                        match child_candidate.and_then(|candidate| candidate.output) {
+                            Some(output) => output,
+                            None => {
+                                missing_child = Some(child);
+                                Id::from(0)
+                            }
+                        }
+                    });
+                    if let Some(child) = missing_child {
+                        return Err((control.invalid_dag)(child));
+                    }
+                    // Relaxation selects by public lexicographic cost.  A child can
+                    // change to an equally priced finite alternative without changing
+                    // an ancestor's cost, so refresh the selected node only after its
+                    // selected children are complete.  This is the same zero-first
+                    // transfer used for final evaluation, not a second bound cache.
+                    let semantic_bound = matches!(&egraph[class].data.sort, Ok(MxxSort::Matrix(_)))
+                        .then(|| {
+                            let children = CandidateChildBounds { egraph, candidates: &candidates };
+                            BoundEvaluator::evaluate_selected_node(
+                                bound_input,
+                                class,
+                                &candidate.node,
+                                &children,
+                            )
+                        })
+                        .transpose()
+                        .map_err(|source| (control.bound_error)(source))?;
+                    let first_large_source = selected_first_large_source(
+                        egraph,
+                        &candidate.node,
+                        semantic_bound.as_ref(),
+                        &candidates,
+                    );
+                    let output = Id::from(nodes.len());
+                    nodes.push(output_node);
+                    origins.push(class);
+                    let Some(candidate) = candidates[index].as_mut() else {
+                        return Err((control.invalid_dag)(class));
+                    };
+                    candidate.semantic_bound = semantic_bound;
+                    candidate.cost.large_residual = candidate
+                        .semantic_bound
+                        .as_ref()
+                        .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large));
+                    candidate.first_large_source = first_large_source;
+                    candidate.output = Some(output);
+                    candidate.state = ExtractionState::Complete;
+                }
             }
         }
-    }
 
-    let expression = RecExpr::from(nodes);
-    if !expression.is_dag() {
-        return Err((control.invalid_dag)(root));
-    }
-    let root_candidate = candidates
-        .get(root_index)
-        .and_then(Option::as_ref)
-        .ok_or_else(|| (control.invalid_dag)(root))?;
-    let selected_large = root_candidate
-        .semantic_bound
-        .as_ref()
-        .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large));
-    if selected_large {
-        tracing::info!(
-            event = "operational_selected_large_residual",
-            selected_root = usize::from(egraph.find(root)),
-            selected_expression_nodes = expression.as_ref().len(),
-            selected_large_source_id = ?root_candidate.first_large_source.map(|source| source.0),
-            "selected Large residual reaches final extraction"
-        );
-    }
-    let source_less_info_enabled = selected_large &&
-        root_candidate.first_large_source.is_none() &&
-        tracing::enabled!(tracing::Level::INFO);
-    let debug_enabled = selected_large && tracing::enabled!(tracing::Level::DEBUG);
-    let detailed_diagnostic = (emit_detailed_large_diagnostic &&
-        (source_less_info_enabled || debug_enabled))
-        .then(|| {
-            selected_large_diagnostic(
-                egraph,
-                root,
-                root_candidate.first_large_source,
-                &candidates,
-                bound_input,
-            )
-        });
-    if let Some(diagnostic) = detailed_diagnostic.as_ref() {
-        if source_less_info_enabled {
+        let expression = RecExpr::from(nodes);
+        if !expression.is_dag() {
+            return Err((control.invalid_dag)(root));
+        }
+        let root_candidate = candidates
+            .get(root_index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| (control.invalid_dag)(root))?;
+        let selected_large = root_candidate
+            .semantic_bound
+            .as_ref()
+            .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large));
+        if selected_large {
             tracing::info!(
-                event = "operational_selected_large_without_atomic_source",
+                event = "operational_selected_large_residual",
                 selected_root = usize::from(egraph.find(root)),
-                selected_large_path = ?diagnostic,
-                "selected Large residual has no atomic-source witness"
-            );
-        }
-        if debug_enabled {
-            tracing::debug!(
-                selected_cost = ?root_candidate.cost,
+                selected_expression_nodes = expression.as_ref().len(),
                 selected_large_source_id = ?root_candidate.first_large_source.map(|source| source.0),
-                selected_large_source_kind = ?root_candidate
-                    .first_large_source
-                    .and_then(|source| selected_atomic_source_kind(egraph, source)),
-                selected_large_path = ?diagnostic,
-                egraph_classes = egraph.number_of_classes(),
-                egraph_nodes = egraph.nodes().len(),
-                "selected Large residual"
+                "selected Large residual reaches final extraction"
             );
         }
-    }
-    Ok(ExtractedProposalWithOrigins {
-        proposal: ExtractedProposal {
+        let source_less_info_enabled = selected_large &&
+            root_candidate.first_large_source.is_none() &&
+            tracing::enabled!(tracing::Level::INFO);
+        let debug_enabled = selected_large && tracing::enabled!(tracing::Level::DEBUG);
+        let detailed_diagnostic = (emit_detailed_large_diagnostic &&
+            (source_less_info_enabled || debug_enabled))
+            .then(|| {
+                selected_large_diagnostic(
+                    egraph,
+                    root,
+                    root_candidate.first_large_source,
+                    &candidates,
+                    bound_input,
+                )
+            });
+        if let Some(diagnostic) = detailed_diagnostic.as_ref() {
+            if source_less_info_enabled {
+                tracing::info!(
+                    event = "operational_selected_large_without_atomic_source",
+                    selected_root = usize::from(egraph.find(root)),
+                    selected_large_path = ?diagnostic,
+                    "selected Large residual has no atomic-source witness"
+                );
+            }
+            if debug_enabled {
+                tracing::debug!(
+                    selected_cost = ?root_candidate.cost,
+                    selected_large_source_id = ?root_candidate.first_large_source.map(|source| source.0),
+                    selected_large_source_kind = ?root_candidate
+                        .first_large_source
+                        .and_then(|source| selected_atomic_source_kind(egraph, source)),
+                    selected_large_path = ?diagnostic,
+                    egraph_classes = egraph.number_of_classes(),
+                    egraph_nodes = egraph.nodes().len(),
+                    "selected Large residual"
+                );
+            }
+        }
+        let proposal = ExtractedProposal {
             cost: root_candidate.cost.clone(),
             semantic_bound: root_candidate.semantic_bound.clone(),
             first_large_source: root_candidate.first_large_source,
             expression,
-        },
-        origins: origins.into_boxed_slice(),
-    })
+        };
+        for origin in &origins {
+            if let Some(candidate) =
+                candidates.get_mut(usize::from(*origin)).and_then(Option::as_mut)
+            {
+                candidate.state = ExtractionState::Pending;
+                candidate.output = None;
+            }
+        }
+        extracted_roots
+            .push(ExtractedProposalWithOrigins { proposal, origins: origins.into_boxed_slice() });
+    }
+    Ok(extracted_roots)
 }
 
 /// A bounded, read-only trace of one selected Large path.  It exists only in
@@ -2746,7 +2909,8 @@ mod tests {
         },
         relation::{
             PointwiseAddSwitchReject, RelationApplier, RelationRegistration, RelationSearcher,
-            RewriteContext, SharedRewriteBudget,
+            ReplacementPlan, RewriteContext, SharedRewriteBudget,
+            selected_polynomial_normal_form_plan,
         },
     };
     use mxx_ir_core::{FrozenGraphScopeId, NodeId, Port, WireRef, types::ConcreteMatrixType};
@@ -5646,6 +5810,293 @@ mod tests {
         ));
         assert_eq!(extracted.proposal.cost.local_checked_structural_count, 0);
         assert_eq!(extracted.proposal.cost.local_checked_relation_count, 2);
+    }
+
+    #[test]
+    fn preference_free_final_extraction_selects_materialized_finite_equality() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (public, public_source) = matrix_atom(&mut egraph, "final-public");
+        let (relation, relation_source) = matrix_atom(&mut egraph, "final-relation");
+        let (finite, finite_source) = matrix_atom(&mut egraph, "final-finite");
+        let raw = egraph.add(MxxLang::MatrixMultiply(vec![public, relation].into_boxed_slice()));
+        egraph.union(raw, finite);
+        egraph.rebuild();
+
+        let root = egraph.find(raw);
+        let preferred_raw = MxxLang::MatrixMultiply(
+            vec![egraph.find(public), egraph.find(relation)].into_boxed_slice(),
+        );
+        let mut input = SemanticInput {
+            atom_classes: BTreeMap::from([
+                (public_source, BoundClass::Large),
+                (relation_source, BoundClass::bounded(1_u8.into())),
+                (finite_source, BoundClass::bounded(3_u8.into())),
+            ]),
+            ..Default::default()
+        };
+        populate_matrix_types(&mut input, &egraph);
+        let mut invalid = |_| panic!("fixture has a finite DAG");
+        let mut bound_error = |error| panic!("fixture has valid bounds: {error:?}");
+        let mut classify = |_: Id, _: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+            Ok(ProposalNodeClassification::default())
+        };
+        let first = extract_best_proposal_with_origins_and_structural_preference(
+            &egraph,
+            root,
+            &input,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut classify,
+            &mut |origin, node| u64::from(origin == root && node != &preferred_raw),
+            None,
+            false,
+        )
+        .expect("normalization extraction selects its exact raw recipe");
+        assert!(first.proposal.cost.large_residual);
+        assert!(matches!(
+            first.proposal.expression[first.proposal.expression.root()],
+            MxxLang::MatrixMultiply(_)
+        ));
+
+        let mut final_extract = |classify: &mut dyn FnMut(
+            Id,
+            &MxxLang,
+            &EGraph<MxxLang, MxxAnalysis>,
+        ) -> Result<
+            ProposalNodeClassification,
+            OperationalSimulationError,
+        >| {
+            extract_best_proposal_with_origins(
+                &egraph,
+                root,
+                &input,
+                &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+                classify,
+                false,
+            )
+        };
+        let final_selected = final_extract(&mut classify)
+            .expect("preference-free final extraction selects the finite equality");
+        assert!(!final_selected.proposal.cost.large_residual);
+        assert!(matches!(
+            final_selected.proposal.expression[final_selected.proposal.expression.root()],
+            MxxLang::Atom { source, .. } if source == finite_source
+        ));
+        let repeated = final_extract(&mut classify).expect("final extraction is deterministic");
+        assert_eq!(final_selected.proposal, repeated.proposal);
+        assert_eq!(final_selected.origins, repeated.origins);
+    }
+
+    #[test]
+    fn checked_large_product_cancels_in_the_exact_final_polynomial_recipe() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let graph_source = GraphWireSourceKey {
+            wire: WireSourceKey {
+                scope: OccurrenceScope {
+                    program: ProgramKey::Ideal,
+                    definition: FrozenGraphScopeId::Root,
+                    path: Box::new([]),
+                },
+                wire: WireRef { node: NodeId(91), port: Port(0) },
+            },
+            coordinate_binders: Box::new([]),
+        };
+        let public_source =
+            AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+                key: AtomicSourceKey::ExplicitLarge(graph_source),
+                sort: MxxSort::Matrix(scalar_matrix_type()),
+                integer_domain: None,
+                canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
+                relation_role: None,
+            }));
+        let public = egraph.add(MxxLang::Atom { source: public_source, indices: Box::new([]) });
+        let relation_source =
+            AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+                key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(
+                    "final-polynomial-preimage",
+                )),
+                sort: MxxSort::Matrix(scalar_matrix_type()),
+                integer_domain: None,
+                canonical_residue_convention: Some(CanonicalResidueConvention::Nonnegative),
+                relation_role: Some(AtomicRelationRole::Preimage),
+            }));
+        let relation = egraph.add(MxxLang::Atom { source: relation_source, indices: Box::new([]) });
+        let (target, target_source) = matrix_atom(&mut egraph, "final-polynomial-target");
+        let (error, error_source) = matrix_atom(&mut egraph, "final-polynomial-error");
+        let raw = egraph.add(MxxLang::MatrixMultiply(vec![public, relation].into_boxed_slice()));
+        egraph.union(raw, target);
+        egraph.rebuild();
+
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(RelationRegistration {
+            source: relation_source,
+            expected_public: public,
+            target,
+            trapdoor: None,
+            indices: Box::new([]),
+        });
+
+        // This is the occurrence-sensitive selected recipe at the fixed point:
+        // the checked target occurs opaquely while its matching raw product is
+        // explicit under a negation. The ordinary bound of that raw product is
+        // Large, but checked relation expansion makes the two spines identical.
+        let public_node = MxxLang::Atom { source: public_source, indices: Box::new([]) };
+        let relation_node = MxxLang::Atom { source: relation_source, indices: Box::new([]) };
+        let target_node = MxxLang::Atom { source: target_source, indices: Box::new([]) };
+        let error_node = MxxLang::Atom { source: error_source, indices: Box::new([]) };
+        let mut selected = RecExpr::default();
+        let selected_target = selected.add(target_node);
+        let selected_error = selected.add(error_node);
+        let selected_public = selected.add(public_node);
+        let selected_relation = selected.add(relation_node);
+        let selected_raw = selected.add(MxxLang::MatrixMultiply(
+            vec![selected_public, selected_relation].into_boxed_slice(),
+        ));
+        let selected_negative = selected.add(MxxLang::MatrixNegate([selected_raw]));
+        let selected_root = selected.add(MxxLang::MatrixAdd(
+            vec![selected_target, selected_error, selected_negative].into_boxed_slice(),
+        ));
+        let negative_origin = egraph.add(MxxLang::MatrixNegate([raw]));
+        let root_origin =
+            egraph.add(MxxLang::MatrixAdd(vec![target, error, negative_origin].into_boxed_slice()));
+        egraph.union(root_origin, error);
+        egraph.rebuild();
+        assert_eq!(
+            egraph.find(root_origin),
+            egraph.find(error),
+            "the full normalized equality is already satisfied in the original e-class"
+        );
+        let origins = [target, error, public, relation, raw, raw, root_origin];
+        assert_eq!(selected_root, selected.root());
+
+        let mut input = SemanticInput {
+            atom_classes: BTreeMap::from([
+                (public_source, BoundClass::Large),
+                (relation_source, BoundClass::bounded(1_u8.into())),
+                (target_source, BoundClass::Large),
+                (error_source, BoundClass::bounded(2_u8.into())),
+            ]),
+            ..Default::default()
+        };
+        populate_matrix_types(&mut input, &egraph);
+        assert!(matches!(
+            extract_with_input(&egraph, raw, &input)
+                .semantic_bound
+                .expect("raw product has a matrix bound")
+                .coefficient_class,
+            BoundClass::Large
+        ));
+
+        let mut progress = || Ok(());
+        let normalized = selected_polynomial_normal_form_plan(
+            &mut egraph,
+            &selected,
+            &origins,
+            &context,
+            &mut progress,
+        )
+        .expect("checked selected polynomial materializes");
+        let ReplacementPlan::Existing(normalized) = normalized else {
+            panic!("the globally cancelled polynomial retains only the bounded error")
+        };
+        egraph.rebuild();
+        populate_matrix_types(&mut input, &egraph);
+        let extracted = extract_with_input(&egraph, normalized, &input);
+        assert_eq!(
+            extracted.semantic_bound.unwrap().coefficient_class,
+            BoundClass::bounded(2_u8.into())
+        );
+    }
+
+    #[test]
+    fn preference_free_final_extraction_retains_unsatisfied_relation_obligation() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (public, public_source) = matrix_atom(&mut egraph, "unresolved-public");
+        let (relation, relation_source) = matrix_atom(&mut egraph, "unresolved-relation");
+        let root = egraph.add(MxxLang::MatrixMultiply(vec![public, relation].into_boxed_slice()));
+        egraph.rebuild();
+        let mut input = SemanticInput {
+            atom_classes: BTreeMap::from([
+                (public_source, BoundClass::bounded(1_u8.into())),
+                (relation_source, BoundClass::bounded(1_u8.into())),
+            ]),
+            ..Default::default()
+        };
+        populate_matrix_types(&mut input, &egraph);
+        let mut invalid = |_| panic!("fixture has a finite DAG");
+        let mut bound_error = |error| panic!("fixture has valid bounds: {error:?}");
+        let extracted = extract_best_proposal_with_origins(
+            &egraph,
+            root,
+            &input,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+                Ok(ProposalNodeClassification {
+                    relation_redex: matches!(node, MxxLang::MatrixMultiply(_)),
+                    local_checked_relation_count: 1,
+                })
+            },
+            false,
+        )
+        .expect("unresolved relation still extracts fail-closed evidence");
+
+        assert_eq!(extracted.proposal.cost.unsatisfied_relation_redexes, 1);
+        assert_eq!(extracted.proposal.cost.unsatisfied_structural_redexes, 0);
+    }
+
+    #[test]
+    fn multi_root_extraction_matches_single_roots_with_one_relaxation_scan() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (left, left_source) = matrix_atom(&mut egraph, "multi-root-left");
+        let (right, right_source) = matrix_atom(&mut egraph, "multi-root-right");
+        egraph.rebuild();
+        let mut input = SemanticInput {
+            atom_classes: BTreeMap::from([
+                (left_source, BoundClass::bounded(2_u8.into())),
+                (right_source, BoundClass::bounded(3_u8.into())),
+            ]),
+            ..Default::default()
+        };
+        populate_matrix_types(&mut input, &egraph);
+        let roots = [egraph.find(left), egraph.find(right)];
+
+        let multi_scans = Cell::new(0_u64);
+        let mut invalid = |_| panic!("fixture is acyclic");
+        let mut bound_error = |error| panic!("fixture has valid bounds: {error:?}");
+        let multi = extract_best_proposals_with_origins(
+            &egraph,
+            &roots,
+            &input,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut |_, _, _| {
+                multi_scans.set(multi_scans.get() + 1);
+                Ok(ProposalNodeClassification::default())
+            },
+        )
+        .expect("one shared relaxation extracts both roots");
+
+        let single_scans = Cell::new(0_u64);
+        let mut singles = Vec::new();
+        for root in roots {
+            singles.push(
+                extract_best_proposal_with_origins(
+                    &egraph,
+                    root,
+                    &input,
+                    &mut ExtractionControl {
+                        invalid_dag: &mut invalid,
+                        bound_error: &mut bound_error,
+                    },
+                    &mut |_, _, _| {
+                        single_scans.set(single_scans.get() + 1);
+                        Ok(ProposalNodeClassification::default())
+                    },
+                    false,
+                )
+                .expect("single-root wrapper extracts the same root"),
+            );
+        }
+        assert_eq!(multi, singles);
+        assert_eq!(single_scans.get(), multi_scans.get() * 2);
     }
 
     #[test]

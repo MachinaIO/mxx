@@ -37,18 +37,21 @@ pub struct ProposalCost {
     /// This is an exact obligation that must be discharged before structural
     /// normalization is considered.
     pub unsatisfied_relation_redexes: u64,
-    /// Checked relation boundaries in this exact raw e-node. This is
-    /// deliberately not aggregated from children: each selected child chooses
-    /// its materialized replacements locally.
-    pub local_checked_relation_count: u64,
     /// Checked selected structural normalizations in this exact raw e-node.
     /// This root-local preference includes a satisfied raw recipe, while the
     /// applied normalized representation has no recipe at all. It is never
-    /// propagated from children or across Switch cases.
+    /// propagated from children or across Switch cases. It is ordered before
+    /// the local relation-boundary count so extraction first minimizes the
+    /// selected structural scope of a representative.
     pub local_checked_structural_count: u64,
+    /// Checked relation boundaries in this exact raw e-node. This is
+    /// deliberately not aggregated from children: each selected child chooses
+    /// its materialized replacements locally. It is a tie-break only after
+    /// the exact root-local structural preference.
+    pub local_checked_relation_count: u64,
     /// Selected structural normalizations that remain in this exact
     /// representative. This is a separate exact obligation, ordered after
-    /// relation work and its root-local preference.
+    /// both root-local preferences.
     pub unsatisfied_structural_redexes: u64,
     /// Structural work made nonlocal by an Add. Relation work never enters
     /// this accounting: only selected structural normalization may be hidden.
@@ -67,7 +70,8 @@ pub struct ProposalNodeClassification {
     pub relation_redex: bool,
     /// Checked relation boundaries in this exact e-node, including boundaries
     /// whose replacement is already canonically equal to the enclosing class.
-    /// It is an extraction preference only, never a final obligation.
+    /// It is an extraction tie-break after root-local structural preference,
+    /// never a final obligation.
     pub local_checked_relation_count: u64,
 }
 
@@ -2682,8 +2686,8 @@ fn proposal_cost_with_classification<I: BoundInput>(
         ProposalCost {
             unsatisfied_relation_redexes: child_relation
                 .saturating_add(u64::from(classification.relation_redex)),
-            local_checked_relation_count: classification.local_checked_relation_count,
             local_checked_structural_count: 0,
+            local_checked_relation_count: classification.local_checked_relation_count,
             unsatisfied_structural_redexes: child_structural,
             // At an addition all selected structural work below it is hidden exactly once;
             // an enclosing addition replaces this value with the same descendant count.
@@ -4723,7 +4727,7 @@ mod tests {
     }
 
     #[test]
-    fn satisfied_raw_relation_precedes_two_structural_obligations() {
+    fn satisfied_raw_relation_precedes_propagated_structural_obligations() {
         let raw_satisfied_relation =
             ProposalCost { local_checked_relation_count: 1, ..Default::default() };
         let replacement_with_structural_work =
@@ -4731,7 +4735,43 @@ mod tests {
 
         assert!(
             replacement_with_structural_work < raw_satisfied_relation,
-            "the local relation preference is decided before structural work"
+            "the local relation tie-break is decided before propagated structural work"
+        );
+    }
+
+    #[test]
+    fn local_structural_preference_precedes_local_relation_count() {
+        let preferred_raw = ProposalCost { local_checked_relation_count: 2, ..Default::default() };
+        let alternative = ProposalCost { local_checked_structural_count: 1, ..Default::default() };
+
+        assert!(
+            preferred_raw < alternative,
+            "a smaller exact structural preference wins before relation-boundary count"
+        );
+    }
+
+    #[test]
+    fn unsatisfied_relation_remains_ahead_of_local_structural_preference() {
+        let preferred_raw = ProposalCost { local_checked_relation_count: 2, ..Default::default() };
+        let unresolved_alternative =
+            ProposalCost { unsatisfied_relation_redexes: 1, ..Default::default() };
+
+        assert!(
+            preferred_raw < unresolved_alternative,
+            "an unresolved relation remains worse than every root-local preference"
+        );
+    }
+
+    #[test]
+    fn local_relation_count_breaks_a_zero_structural_preference_tie() {
+        let fewer_boundaries =
+            ProposalCost { local_checked_relation_count: 1, ..Default::default() };
+        let more_boundaries =
+            ProposalCost { local_checked_relation_count: 2, ..Default::default() };
+
+        assert!(
+            fewer_boundaries < more_boundaries,
+            "relation-boundary count remains the tie-break when structural preference is equal"
         );
     }
 
@@ -5566,6 +5606,46 @@ mod tests {
         .expect("preference survives an ordinary rebuild and next extraction");
         assert_eq!(first.proposal.expression, second.proposal.expression);
         assert_eq!(first.proposal.semantic_bound, second.proposal.semantic_bound);
+    }
+
+    #[test]
+    fn extraction_prefers_zero_structural_cost_before_relation_boundary_count() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let left = egraph.add(MxxLang::IntConst(2.into()));
+        let right = egraph.add(MxxLang::IntConst(3.into()));
+        let preferred_raw = egraph.add(MxxLang::IntAdd([left, right]));
+        let structural_alternative = egraph.add(MxxLang::IntMul([left, right]));
+        egraph.union(preferred_raw, structural_alternative);
+        egraph.rebuild();
+
+        let root = egraph.find(preferred_raw);
+        let mut invalid = |_| panic!("fixture has a finite DAG");
+        let mut bound_error = |error| panic!("non-matrix fixture has no bounds: {error:?}");
+        let mut classify = |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+            Ok(ProposalNodeClassification {
+                local_checked_relation_count: u64::from(matches!(node, MxxLang::IntAdd(_))) * 2,
+                ..Default::default()
+            })
+        };
+        let mut preference = |_: Id, node: &MxxLang| u64::from(matches!(node, MxxLang::IntMul(_)));
+        let extracted = extract_best_proposal_with_origins_and_structural_preference(
+            &egraph,
+            root,
+            &NoBounds,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut classify,
+            &mut preference,
+            None,
+            false,
+        )
+        .expect("preferred raw representative extracts");
+
+        assert!(matches!(
+            extracted.proposal.expression[extracted.proposal.expression.root()],
+            MxxLang::IntAdd(_)
+        ));
+        assert_eq!(extracted.proposal.cost.local_checked_structural_count, 0);
+        assert_eq!(extracted.proposal.cost.local_checked_relation_count, 2);
     }
 
     #[test]

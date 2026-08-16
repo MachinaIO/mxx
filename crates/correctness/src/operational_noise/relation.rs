@@ -1222,6 +1222,11 @@ fn merge_selected_switch_view(
     }
 }
 
+pub(crate) struct SelectedPolynomialPlans {
+    pub(crate) redexes: Vec<(Id, ReplacementPlan)>,
+    pub(crate) preferred: Vec<ReplacementPlan>,
+}
+
 /// Collects selected polynomial rewrites in one child-before-parent pass.
 pub(crate) fn selected_polynomial_redexes_mut(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
@@ -1230,7 +1235,7 @@ pub(crate) fn selected_polynomial_redexes_mut(
     root_index: usize,
     monomials: &mut [Vec<(Box<[Id]>, bool)>],
     progress: &mut dyn FnMut() -> Result<(), ()>,
-) -> Option<Vec<(Id, ReplacementPlan)>> {
+) -> Option<SelectedPolynomialPlans> {
     if origins.len() != expression.as_ref().len() {
         return None;
     }
@@ -1245,6 +1250,7 @@ pub(crate) fn selected_polynomial_redexes_mut(
         origin: Id,
         plan: ReplacementPlan,
         consumed: Arc<[Id]>,
+        satisfied: bool,
     }
     let mut candidates = Vec::<Candidate>::new();
     let mut views = BTreeMap::new();
@@ -1275,7 +1281,13 @@ pub(crate) fn selected_polynomial_redexes_mut(
         if let Some((candidate_origin, plan)) =
             selected_switch_hoist_plan(egraph, origins, index, node, monomials, progress)
         {
-            candidates.push(Candidate { origin: candidate_origin, plan, consumed: Arc::from([]) });
+            let satisfied = replacement_plan_satisfied(egraph, candidate_origin, &plan);
+            candidates.push(Candidate {
+                origin: candidate_origin,
+                plan,
+                consumed: Arc::from([]),
+                satisfied,
+            });
         }
     }
     let mut changed = vec![false; expression.as_ref().len()];
@@ -1340,13 +1352,13 @@ pub(crate) fn selected_polynomial_redexes_mut(
             )? {
                 let origin = egraph.find(*origins.get(index)?);
                 let output_sort = egraph[origin].data.sort.as_ref().ok()?.clone();
-                if !replacement_plan_satisfied(egraph, origin, &add_plan.plan) {
-                    candidates.push(Candidate {
-                        origin,
-                        plan: add_plan.plan,
-                        consumed: add_plan.consumed_candidate_origins.clone(),
-                    });
-                }
+                let satisfied = replacement_plan_satisfied(egraph, origin, &add_plan.plan);
+                candidates.push(Candidate {
+                    origin,
+                    plan: add_plan.plan,
+                    consumed: add_plan.consumed_candidate_origins.clone(),
+                    satisfied,
+                });
                 monomials[index] = vec![(vec![origin].into_boxed_slice(), false)];
                 changed[index] = true;
                 merge_selected_switch_view(
@@ -1366,32 +1378,46 @@ pub(crate) fn selected_polynomial_redexes_mut(
     let mut suppressed = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut redexes = Vec::new();
+    let mut preferred = Vec::new();
     for candidate in candidates.into_iter().rev() {
         if suppressed.contains(&candidate.origin) || !seen.insert(candidate.origin) {
             continue;
         }
         suppressed.extend(candidate.consumed.iter().copied());
-        redexes.push((candidate.origin, candidate.plan));
+        if candidate.satisfied {
+            preferred.push(candidate.plan);
+        } else {
+            redexes.push((candidate.origin, candidate.plan));
+        }
     }
     redexes.reverse();
+    preferred.reverse();
 
     if !redexes.is_empty() {
-        return Some(redexes);
+        return Some(SelectedPolynomialPlans { redexes, preferred });
+    }
+
+    if !preferred.is_empty() {
+        return Some(SelectedPolynomialPlans { redexes, preferred });
     }
 
     if !matches!(
         expression.as_ref().get(root_index)?,
         MxxLang::MatrixAdd(_) | MxxLang::MatrixNegate(_) | MxxLang::MatrixMultiply(_)
     ) {
-        return Some(redexes);
+        return Some(SelectedPolynomialPlans { redexes, preferred });
     }
     let origin = egraph.find(*origins.get(root_index)?);
     progress().ok()?;
     let plan = signed_spines_replacement_plan(monomials.get(root_index)?, None)?;
-    if seen.insert(origin) && !replacement_plan_satisfied(egraph, origin, &plan) {
-        redexes.push((origin, plan));
+    if seen.insert(origin) {
+        if replacement_plan_satisfied(egraph, origin, &plan) {
+            preferred.push(plan);
+        } else {
+            redexes.push((origin, plan));
+        }
     }
-    Some(redexes)
+    Some(SelectedPolynomialPlans { redexes, preferred })
 }
 
 #[cfg(test)]
@@ -1412,6 +1438,7 @@ fn selected_polynomial_redexes(
         &mut monomials,
         progress,
     )
+    .map(|plans| plans.redexes)
 }
 
 /// Removes selector scope from a signed sum of one-Switch monomials only when
@@ -2445,11 +2472,11 @@ fn sorted_signed_spine_subtraction(
 
 pub(crate) fn materialize_selected_polynomial_redex(
     egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    (origin, plan): (Id, ReplacementPlan),
+    (origin, plan): (Id, &ReplacementPlan),
     context: &RewriteContext,
 ) -> Option<(Id, Id)> {
     context.note_candidate();
-    let replacement = materialize_replacement_plan(egraph, context, &plan)?;
+    let replacement = materialize_replacement_plan(egraph, context, plan)?;
     Some((origin, replacement))
 }
 
@@ -11382,7 +11409,7 @@ mod tests {
             &mut progress,
         )
         .expect("iterative scan");
-        assert!(redexes.is_empty());
+        assert!(redexes.redexes.is_empty());
         assert_eq!(monomials, before);
 
         let mut interrupted_monomials = before.clone();
@@ -11552,8 +11579,8 @@ mod tests {
             &mut progress,
         )
         .expect("one forward pass");
-        assert_eq!(redexes.len(), 1, "the outer proof consumes all inner candidates");
-        assert_eq!(redexes[0].0, egraph.find(outer));
+        assert_eq!(redexes.redexes.len(), 1, "the outer proof consumes all inner candidates");
+        assert_eq!(redexes.redexes[0].0, egraph.find(outer));
         assert_eq!(
             monomials[usize::from(outer_expression)],
             vec![(vec![egraph.find(outer)].into(), false)]
@@ -11576,7 +11603,28 @@ mod tests {
             vec![(vec![egraph.find(transposed_inner)].into(), false)],
             "a non-polynomial parent remains opaque and stops Derived-view transport"
         );
-        assert!(!blocked_redexes.is_empty(), "independent raw candidates remain available");
+        assert!(!blocked_redexes.redexes.is_empty(), "independent raw candidates remain available");
+
+        let satisfied_plan = redexes.redexes[0].1.clone();
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        let replacement = materialize_replacement_plan(&mut egraph, &context, &satisfied_plan)
+            .expect("validated outer plan materializes");
+        egraph.union(outer, replacement);
+        egraph.rebuild();
+        let mut satisfied_monomials =
+            selected_polynomial_monomials(&egraph, &expression, &origins, &mut progress)
+                .expect("satisfied polynomial table");
+        let satisfied = selected_polynomial_redexes_mut(
+            &egraph,
+            &expression,
+            &origins,
+            usize::from(outer_expression),
+            &mut satisfied_monomials,
+            &mut progress,
+        )
+        .expect("satisfied plan remains a structural preference recipe");
+        assert!(satisfied.redexes.is_empty());
+        assert_eq!(satisfied.preferred.len(), 1);
     }
 
     #[test]
@@ -12739,7 +12787,7 @@ mod tests {
         let pending = redexes
             .into_iter()
             .map(|redex| {
-                materialize_selected_polynomial_redex(&mut egraph, redex, &context)
+                materialize_selected_polynomial_redex(&mut egraph, (redex.0, &redex.1), &context)
                     .expect("snapshot-local plan materializes")
             })
             .collect::<Vec<_>>();

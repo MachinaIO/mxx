@@ -176,6 +176,33 @@ pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
     ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
     emit_detailed_large_diagnostic: bool,
 ) -> Result<ExtractedProposalWithOrigins, OperationalSimulationError> {
+    extract_best_proposal_with_origins_and_structural_preference(
+        egraph,
+        root,
+        bound_input,
+        control,
+        classify,
+        &mut |_, _| 0,
+        emit_detailed_large_diagnostic,
+    )
+}
+
+/// Internal extraction hook for an exact, runner-local structural preference.
+/// The callback may distinguish exact e-nodes inside one canonical e-class,
+/// but it cannot change semantic bounds or any propagated obligation.
+pub(crate) fn extract_best_proposal_with_origins_and_structural_preference<I: BoundInput>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+    bound_input: &I,
+    control: &mut ExtractionControl<'_>,
+    classify: &mut dyn FnMut(
+        Id,
+        &MxxLang,
+        &EGraph<MxxLang, MxxAnalysis>,
+    ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
+    structural_preference: &mut dyn FnMut(Id, &MxxLang) -> u64,
+    emit_detailed_large_diagnostic: bool,
+) -> Result<ExtractedProposalWithOrigins, OperationalSimulationError> {
     let class_count = egraph.number_of_classes();
     let mut classes = Vec::with_capacity(class_count);
     for class in egraph.classes() {
@@ -207,6 +234,8 @@ pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
                 else {
                     continue;
                 };
+                let mut cost = cost;
+                cost.local_checked_structural_count = structural_preference(canonical, node);
                 let replace = candidates[index].as_ref().is_none_or(|current| {
                     cost < current.cost || (cost == current.cost && node < &current.node)
                 });
@@ -5275,6 +5304,68 @@ mod tests {
             egraph.find(root)
         );
         assert!(extracted.origins.iter().all(|origin| *origin == egraph.find(*origin)));
+    }
+
+    #[test]
+    fn exact_structural_preference_selects_only_the_desired_enode_and_preserves_bounds() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (left, left_source) = matrix_atom(&mut egraph, "preferred_left");
+        let (right, right_source) = matrix_atom(&mut egraph, "preferred_right");
+        let raw = egraph.add(MxxLang::MatrixAdd(vec![left, right].into_boxed_slice()));
+        let normalized = egraph.add(MxxLang::MatrixAdd(vec![right, left].into_boxed_slice()));
+        egraph.union(raw, normalized);
+        egraph.rebuild();
+
+        let root = egraph.find(raw);
+        let desired =
+            MxxLang::MatrixAdd(vec![egraph.find(right), egraph.find(left)].into_boxed_slice());
+        let mut input = SemanticInput::default();
+        input.atom_classes.insert(left_source, BoundClass::bounded(2_u8.into()));
+        input.atom_classes.insert(right_source, BoundClass::bounded(3_u8.into()));
+        populate_matrix_types(&mut input, &egraph);
+        let mut invalid = |_| panic!("fixture has a finite DAG");
+        let mut bound_error = |error| panic!("fixture has valid bounds: {error:?}");
+        let mut classify = |_: Id, _: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+            Ok(ProposalNodeClassification::default())
+        };
+        let mut preference =
+            |class: Id, node: &MxxLang| u64::from(class == root && node != &desired);
+        let first = extract_best_proposal_with_origins_and_structural_preference(
+            &egraph,
+            root,
+            &input,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut classify,
+            &mut preference,
+            false,
+        )
+        .expect("preferred representative extracts");
+        let first_root = &first.proposal.expression[first.proposal.expression.root()];
+        let MxxLang::MatrixAdd(children) = first_root else { panic!("preferred root is an Add") };
+        assert_eq!(
+            children.iter().map(|child| first.origins[usize::from(*child)]).collect::<Vec<_>>(),
+            vec![egraph.find(right), egraph.find(left)]
+        );
+        assert_eq!(first.origins[usize::from(first.proposal.expression.root())], root);
+        assert_eq!(first.proposal.cost.local_checked_structural_count, 0);
+        assert_eq!(
+            first.proposal.semantic_bound.as_ref().map(|bound| &bound.coefficient_class),
+            Some(&BoundClass::bounded(5_u8.into()))
+        );
+
+        egraph.rebuild();
+        let second = extract_best_proposal_with_origins_and_structural_preference(
+            &egraph,
+            root,
+            &input,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            &mut classify,
+            &mut preference,
+            false,
+        )
+        .expect("preference survives an ordinary rebuild and next extraction");
+        assert_eq!(first.proposal.expression, second.proposal.expression);
+        assert_eq!(first.proposal.semantic_bound, second.proposal.semantic_bound);
     }
 
     #[test]

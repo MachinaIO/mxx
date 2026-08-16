@@ -1314,6 +1314,149 @@ fn selected_peel_terms_to_spines(
     Some(spines)
 }
 
+fn lookup_replacement_plan(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    plan: &ReplacementPlan,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Id> {
+    progress().ok()?;
+    let lookup_children = |plans: &[ReplacementPlan],
+                           progress: &mut dyn FnMut() -> Result<(), ()>|
+     -> Option<Box<[Id]>> {
+        plans
+            .iter()
+            .map(|plan| lookup_replacement_plan(egraph, plan, progress))
+            .collect::<Option<Vec<_>>>()
+            .map(Vec::into_boxed_slice)
+    };
+    let found = match plan {
+        ReplacementPlan::Existing(id) => return Some(egraph.find(*id)),
+        ReplacementPlan::Product(plans) => {
+            egraph.lookup(MxxLang::MatrixMultiply(lookup_children(plans, progress)?))
+        }
+        ReplacementPlan::Add(plans) => {
+            egraph.lookup(MxxLang::MatrixAdd(lookup_children(plans, progress)?))
+        }
+        ReplacementPlan::Negate(plan) => {
+            egraph.lookup(MxxLang::MatrixNegate([lookup_replacement_plan(egraph, plan, progress)?]))
+        }
+        ReplacementPlan::Switch(plans) => {
+            egraph.lookup(MxxLang::Switch(lookup_children(plans, progress)?))
+        }
+        ReplacementPlan::Concat { axis, inputs } => egraph.lookup(MxxLang::MatrixConcat {
+            axis: *axis,
+            inputs: lookup_children(inputs, progress)?,
+        }),
+        ReplacementPlan::Equivalent(plans) => {
+            let mut resolved =
+                plans.iter().map(|plan| lookup_replacement_plan(egraph, plan, progress));
+            let first = egraph.find(resolved.next()??);
+            return resolved
+                .all(|id| id.is_some_and(|id| egraph.find(id) == first))
+                .then_some(first);
+        }
+    }?;
+    Some(egraph.find(found))
+}
+
+fn replacement_plan_contains_switch(plan: &ReplacementPlan) -> bool {
+    match plan {
+        ReplacementPlan::Switch(_) => true,
+        ReplacementPlan::Product(plans) |
+        ReplacementPlan::Add(plans) |
+        ReplacementPlan::Equivalent(plans) => plans.iter().any(replacement_plan_contains_switch),
+        ReplacementPlan::Negate(plan) => replacement_plan_contains_switch(plan),
+        ReplacementPlan::Concat { inputs, .. } => {
+            inputs.iter().any(replacement_plan_contains_switch)
+        }
+        ReplacementPlan::Existing(_) => false,
+    }
+}
+
+fn replacement_plan_signed_spines(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    plan: &ReplacementPlan,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<(Box<[Id]>, bool)>> {
+    progress().ok()?;
+    match plan {
+        ReplacementPlan::Existing(id) => {
+            Some(vec![(vec![egraph.find(*id)].into_boxed_slice(), false)])
+        }
+        ReplacementPlan::Switch(_) |
+        ReplacementPlan::Concat { .. } |
+        ReplacementPlan::Equivalent(_) => Some(vec![(
+            vec![lookup_replacement_plan(egraph, plan, progress)?].into_boxed_slice(),
+            false,
+        )]),
+        ReplacementPlan::Negate(plan) => {
+            let mut terms = replacement_plan_signed_spines(egraph, plan, progress)?;
+            for (_, negative) in &mut terms {
+                *negative = !*negative;
+            }
+            Some(terms)
+        }
+        ReplacementPlan::Add(plans) => {
+            let mut terms = Vec::new();
+            for plan in plans {
+                progress().ok()?;
+                terms.extend(replacement_plan_signed_spines(egraph, plan, progress)?);
+            }
+            Some(terms)
+        }
+        ReplacementPlan::Product(plans) => {
+            let mut terms = vec![(Box::<[Id]>::default(), false)];
+            for plan in plans {
+                progress().ok()?;
+                let factor = replacement_plan_signed_spines(egraph, plan, progress)?;
+                terms = ordered_cartesian_multiply_signed_spines(terms, &factor, progress)?;
+            }
+            Some(terms)
+        }
+    }
+}
+
+fn selected_scope_minimized_root_terms(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    expression: &RecExpr<MxxLang>,
+    origins: &[Id],
+    selected_switches: &BTreeMap<Id, Option<usize>>,
+    root_terms: &[(Box<[Id]>, bool)],
+    monomials: &[Vec<(Box<[Id]>, bool)>],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<(Box<[Id]>, bool)>> {
+    let mut output = Vec::new();
+    for (spine, negative) in root_terms {
+        let mut expanded = vec![(Box::<[Id]>::default(), *negative)];
+        for factor in spine {
+            progress().ok()?;
+            let factor = egraph.find(*factor);
+            let replacement =
+                selected_switches.get(&factor).and_then(|index| *index).and_then(|index| {
+                    let node = expression.as_ref().get(index)?;
+                    let (origin, plan) = selected_switch_scope_plan(
+                        egraph, origins, index, node, monomials, progress,
+                    )?;
+                    (origin == factor &&
+                        replacement_plan_contains_switch(&plan) &&
+                        lookup_replacement_plan(egraph, &plan, progress) == Some(factor))
+                    .then_some(plan)
+                });
+            let factor_terms = if let Some(plan) = replacement {
+                replacement_plan_signed_spines(egraph, &plan, progress)?
+            } else {
+                vec![(vec![factor].into_boxed_slice(), false)]
+            };
+            expanded = ordered_cartesian_multiply_signed_spines(expanded, &factor_terms, progress)?;
+        }
+        output.try_reserve(expanded.len()).ok()?;
+        output.extend(expanded);
+    }
+    canonicalize_central_constant_scalar_spines(egraph, &mut output, progress)?;
+    cancel_signed_spines(&mut output);
+    Some(output)
+}
+
 fn selected_same_selector_add_hoist_plan(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     expression: &RecExpr<MxxLang>,
@@ -1331,7 +1474,17 @@ fn selected_same_selector_add_hoist_plan(
     if !matches!(egraph[root_origin].data.sort, Ok(MxxSort::Matrix(_))) {
         return Some(None);
     }
-    let root_terms = monomials.get(root_index)?;
+    let selected_root_terms = monomials.get(root_index)?;
+    let root_terms = selected_scope_minimized_root_terms(
+        egraph,
+        expression,
+        origins,
+        selected_switches,
+        selected_root_terms,
+        monomials,
+        progress,
+    )?;
+    let scope_changed = root_terms != *selected_root_terms;
     let mut groups = BTreeMap::<
         Id,
         (Option<usize>, bool, Vec<(usize, Box<[Id]>, bool, Box<[Id]>, Box<[Id]>)>),
@@ -1731,7 +1884,7 @@ fn selected_same_selector_add_hoist_plan(
                 let (reason, ordinal, negative, switch_occurrences) =
                     whole_rejection.unwrap_or(("whole-candidate-invalid", 0, false, Vec::new()));
                 let (spine, _) = root_terms.get(ordinal)?;
-                tracing::debug!(
+                tracing::info!(
                     event = "operational_selected_full_case_candidate_rejected",
                     add_origin = usize::from(root_origin),
                     selector = usize::from(selector_origin),
@@ -1876,7 +2029,7 @@ fn selected_same_selector_add_hoist_plan(
             &zero_witnesses,
             progress,
         )?;
-        tracing::debug!(
+        tracing::info!(
             event = "operational_selected_full_case_reduced",
             add_origin = usize::from(root_origin),
             selector = usize::from(selector_origin),
@@ -1908,7 +2061,12 @@ fn selected_same_selector_add_hoist_plan(
         }
     }
     if replacements.is_empty() {
-        return Some(None);
+        if !scope_changed {
+            return Some(None);
+        }
+        let (witness_spine, witness_negative) = selected_root_terms.first()?;
+        let witness = signed_spine_replacement_plan(witness_spine, *witness_negative)?;
+        return Some(Some(signed_spines_replacement_plan(&root_terms, Some(&witness))?));
     }
     let mut terms = Vec::new();
     for (ordinal, (spine, negative)) in root_terms.iter().enumerate() {
@@ -1919,7 +2077,11 @@ fn selected_same_selector_add_hoist_plan(
             None => terms.push(signed_spine_replacement_plan(spine, *negative)?),
         }
     }
-    Some(Some(ReplacementPlan::Add(terms.into_boxed_slice())))
+    Some(Some(match terms.len() {
+        0 => return Some(None),
+        1 => terms.into_iter().next()?,
+        _ => ReplacementPlan::Add(terms.into_boxed_slice()),
+    }))
 }
 
 fn signed_spine_replacement_plan(factors: &[Id], negative: bool) -> Option<ReplacementPlan> {
@@ -1985,7 +2147,7 @@ fn selected_case_residual_plan(
     })
 }
 
-fn selected_switch_hoist_plan(
+fn selected_switch_scope_plan(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     origins: &[Id],
     switch_index: usize,
@@ -2026,7 +2188,7 @@ fn selected_switch_hoist_plan(
 
     if case_terms.iter().all(Vec::is_empty) {
         let plan = signed_spines_replacement_plan(&common, None)?;
-        return (!replacement_plan_satisfied(egraph, origin, &plan)).then_some((origin, plan));
+        return Some((origin, plan));
     }
 
     let mut residual_spines = Vec::new();
@@ -2104,6 +2266,19 @@ fn selected_switch_hoist_plan(
         Some(common) => ReplacementPlan::Add(vec![switched, common].into_boxed_slice()),
         None => switched,
     };
+    Some((origin, plan))
+}
+
+fn selected_switch_hoist_plan(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    origins: &[Id],
+    switch_index: usize,
+    node: &MxxLang,
+    monomials: &[Vec<(Box<[Id]>, bool)>],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<(Id, ReplacementPlan)> {
+    let (origin, plan) =
+        selected_switch_scope_plan(egraph, origins, switch_index, node, monomials, progress)?;
     (!replacement_plan_satisfied(egraph, origin, &plan)).then_some((origin, plan))
 }
 
@@ -10684,6 +10859,22 @@ mod tests {
         .expect("typed all-empty residual");
         assert!(matches!(all_empty, ReplacementPlan::Add(ref zero)
             if zero.len() == 2 && zero[0] == zero0));
+
+        let no_common = vec![
+            vec![(vec![common].into_boxed_slice(), false)],
+            vec![(vec![differing].into_boxed_slice(), false)],
+        ];
+        let no_common = selected_case_residual_plan(
+            &no_common,
+            ReplacementPlan::Existing(Id::from(7)),
+            &[ReplacementPlan::Existing(Id::from(8)), ReplacementPlan::Existing(Id::from(9))],
+            &mut progress,
+        )
+        .expect("case-only residual");
+        assert!(
+            matches!(no_common, ReplacementPlan::Switch(_)),
+            "a case-only residual has an exact top-level Switch"
+        );
     }
 
     #[test]
@@ -10812,8 +11003,7 @@ mod tests {
             !contains_switch(&redexes[0].1),
             "the equality removes rather than merges Switches"
         );
-        assert!(matches!(redexes[0].1, ReplacementPlan::Add(ref terms)
-            if terms.len() == 1 && matches!(terms[0], ReplacementPlan::Add(ref zero) if zero.len() == 2)));
+        assert!(matches!(redexes[0].1, ReplacementPlan::Add(ref zero) if zero.len() == 2));
     }
 
     #[test]
@@ -10921,7 +11111,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_same_selector_case_sum_hoist_preserves_fixed_terms_and_fails_closed() {
+    fn selected_same_selector_case_sum_hoist_preserves_fixed_terms_and_isolates_invalid_cases() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let selector = egraph.add(MxxLang::IntConst(0.into()));
         let selector_alias = egraph.add(MxxLang::IntConst(1.into()));
@@ -11001,7 +11191,7 @@ mod tests {
         .expect("scan resources")
         .expect("case sums are selector independent");
         let ReplacementPlan::Add(terms) = plan else { panic!("one root Add") };
-        assert_eq!(terms.len(), 1, "the complete case residual occurs exactly once");
+        assert_eq!(terms.len(), 2, "the complete residual is not wrapped in a singleton Add");
         assert!(terms.iter().all(|term| !matches!(term, ReplacementPlan::Switch(_))));
 
         let case_origin = egraph.find(atoms[0]);
@@ -11011,35 +11201,39 @@ mod tests {
             .and_then(|indices| indices.first())
             .expect("stored case representative");
         repeated_case_indices.get_mut(&case_origin).expect("stored case").push(repeated);
+        let repeated_plan = selected_same_selector_add_hoist_plan(
+            &egraph,
+            &expression,
+            &origins,
+            &repeated_case_indices,
+            &selected_switches,
+            usize::from(root_expression),
+            &monomials,
+            &mut progress,
+        )
+        .expect("scan resources")
+        .expect("independent exact cancellation remains available");
         assert!(
-            selected_same_selector_add_hoist_plan(
-                &egraph,
-                &expression,
-                &origins,
-                &repeated_case_indices,
-                &selected_switches,
-                usize::from(root_expression),
-                &monomials,
-                &mut progress,
-            )
-            .is_some_and(|plan| plan.is_none()),
-            "repeated case origins remain fail-closed"
+            !replacement_plan_contains_switch(&repeated_plan),
+            "repeated case origins do not authorize a case rewrite"
         );
         let mut missing_case_indices = selected_indices.clone();
         missing_case_indices.remove(&case_origin);
+        let missing_plan = selected_same_selector_add_hoist_plan(
+            &egraph,
+            &expression,
+            &origins,
+            &missing_case_indices,
+            &selected_switches,
+            usize::from(root_expression),
+            &monomials,
+            &mut progress,
+        )
+        .expect("scan resources")
+        .expect("independent exact cancellation remains available");
         assert!(
-            selected_same_selector_add_hoist_plan(
-                &egraph,
-                &expression,
-                &origins,
-                &missing_case_indices,
-                &selected_switches,
-                usize::from(root_expression),
-                &monomials,
-                &mut progress,
-            )
-            .is_some_and(|plan| plan.is_none()),
-            "missing case origins remain fail-closed"
+            !replacement_plan_contains_switch(&missing_plan),
+            "missing case origins do not authorize a case rewrite"
         );
 
         let mut unequal = monomials.clone();
@@ -11053,8 +11247,16 @@ mod tests {
             usize::from(root_expression),
             &unequal,
             &mut progress,
+        )
+        .expect("scan resources")
+        .expect("case-dependent residual remains exact");
+        let ReplacementPlan::Add(unequal_terms) = unequal_plan else {
+            panic!("a common residual remains outside the case-dependent Switch")
+        };
+        assert!(
+            unequal_terms.iter().any(replacement_plan_contains_switch),
+            "multi-term reconstruction retains its case-dependent Switch"
         );
-        assert!(unequal_plan.is_some_and(|plan| plan.is_some()));
         let mut interrupted = || Err(());
         assert!(
             selected_same_selector_add_hoist_plan(
@@ -11185,9 +11387,7 @@ mod tests {
         )
         .expect("full-case scan")
         .expect("every preimage case has the same zero residual");
-        let ReplacementPlan::Add(terms) = plan else { panic!("typed zero uses an Add witness") };
-        assert_eq!(terms.len(), 1, "the root retains one complete residual");
-        let ReplacementPlan::Add(zero) = &terms[0] else { panic!("residual is typed zero") };
+        let ReplacementPlan::Add(zero) = plan else { panic!("typed zero uses an Add witness") };
         assert_eq!(zero.len(), 2);
         assert!(matches!(zero[1], ReplacementPlan::Negate(_)));
     }

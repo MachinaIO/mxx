@@ -353,6 +353,7 @@ pub(crate) fn extract_best_proposal_with_origins_and_structural_preference<I: Bo
         structural_preference,
         diagnostic_preference_membership,
         emit_detailed_large_diagnostic,
+        false,
     )?
     .pop()
     .ok_or_else(|| (control.invalid_dag)(egraph.find(root)))
@@ -368,6 +369,10 @@ pub(crate) fn extract_best_proposals_with_origins<I: BoundInput>(
         &MxxLang,
         &EGraph<MxxLang, MxxAnalysis>,
     ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
+    // Final exact leaves may not re-select a checked relation's raw lhs from
+    // the same e-class as its already materialized target. Ordinary
+    // scheduling passes `false` and retains its existing preference rules.
+    reject_checked_relation_nodes: bool,
 ) -> Result<Vec<ExtractedProposalWithOrigins>, OperationalSimulationError> {
     extract_best_proposals_with_origins_and_structural_preference(
         egraph,
@@ -378,6 +383,7 @@ pub(crate) fn extract_best_proposals_with_origins<I: BoundInput>(
         &mut |_, _| 0,
         None,
         false,
+        reject_checked_relation_nodes,
     )
 }
 
@@ -394,6 +400,7 @@ fn extract_best_proposals_with_origins_and_structural_preference<I: BoundInput>(
     structural_preference: &mut dyn FnMut(Id, &MxxLang) -> u64,
     mut diagnostic_preference_membership: Option<&mut dyn FnMut(Id, &MxxLang) -> bool>,
     emit_detailed_large_diagnostic: bool,
+    reject_checked_relation_nodes: bool,
 ) -> Result<Vec<ExtractedProposalWithOrigins>, OperationalSimulationError> {
     let diagnostic_root = roots.first().copied().unwrap_or(Id::from(0));
     let class_count = egraph.number_of_classes();
@@ -454,6 +461,10 @@ fn extract_best_proposals_with_origins_and_structural_preference<I: BoundInput>(
                     }
                     continue;
                 };
+                if reject_checked_relation_nodes && classification.local_checked_relation_count > 0
+                {
+                    continue;
+                }
                 let mut cost = cost;
                 cost.local_checked_structural_count = structural_preference(canonical, node);
                 if diagnostic_class == Some(canonical) {
@@ -4867,6 +4878,157 @@ mod tests {
         )
     }
 
+    fn extract_final_leaf(
+        egraph: &EGraph<MxxLang, MxxAnalysis>,
+        root: Id,
+        classify: &mut dyn FnMut(
+            Id,
+            &MxxLang,
+            &EGraph<MxxLang, MxxAnalysis>,
+        )
+            -> Result<ProposalNodeClassification, OperationalSimulationError>,
+    ) -> Result<ExtractedProposalWithOrigins, OperationalSimulationError> {
+        let mut invalid = |_| {
+            OperationalSimulationError::Request(
+                super::super::error::RequestError::EmptyParameterName,
+            )
+        };
+        let mut bound_error = |error| panic!("non-matrix test must not evaluate bounds: {error:?}");
+        extract_best_proposals_with_origins(
+            egraph,
+            &[root],
+            &NoBounds,
+            &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
+            classify,
+            true,
+        )?
+        .pop()
+        .ok_or_else(|| invalid(egraph.find(root)))
+    }
+
+    #[test]
+    fn final_leaf_filter_excludes_checked_lhs_globally_but_not_unchecked_products() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let public = egraph.add(MxxLang::IntConst(2.into()));
+        let relation = egraph.add(MxxLang::IntConst(3.into()));
+        let signal = egraph.add(MxxLang::IntConst(5.into()));
+        let error = egraph.add(MxxLang::IntConst(7.into()));
+        let raw = egraph.add(MxxLang::IntMul([public, relation]));
+        let target_product = egraph.add(MxxLang::IntMul([signal, public]));
+        let target = egraph.add(MxxLang::IntAdd([target_product, error]));
+        egraph.union(raw, target);
+        let outer = egraph.add(MxxLang::IntAdd([raw, signal]));
+        egraph.rebuild();
+
+        let classify = |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+            Ok(ProposalNodeClassification {
+                local_checked_relation_count: u64::from(matches!(node, MxxLang::IntMul(factors)
+                    if factors.len() == 2 && factors[0] == public && factors[1] == relation)),
+                ..Default::default()
+            })
+        };
+        let mut final_classify = classify;
+        let final_leaf = extract_final_leaf(&egraph, outer, &mut final_classify)
+            .expect("a relation-free target remains eligible in the nested child");
+        assert!(final_leaf.proposal.expression.as_ref().iter().all(|node| {
+            !matches!(node, MxxLang::IntMul(factors)
+                if egraph.find(final_leaf.origins[usize::from(factors[0])]) == egraph.find(public) &&
+                    egraph.find(final_leaf.origins[usize::from(factors[1])]) == egraph.find(relation))
+        }));
+
+        let mut ordinary_classify = classify;
+        let ordinary = extract_best_proposal_with_origins_and_structural_preference(
+            &egraph,
+            raw,
+            &NoBounds,
+            &mut ExtractionControl {
+                invalid_dag: &mut |_| panic!("fixture is acyclic"),
+                bound_error: &mut |error| panic!("unexpected bound error: {error:?}"),
+            },
+            &mut ordinary_classify,
+            &mut |_, node| {
+                u64::from(!matches!(node, MxxLang::IntMul(factors)
+                if factors.len() == 2 && factors[0] == public && factors[1] == relation))
+            },
+            None,
+            false,
+        )
+        .expect("ordinary scheduling may retain its preferred checked lhs");
+        assert!(matches!(
+            ordinary.proposal.expression[ordinary.proposal.expression.root()],
+            MxxLang::IntMul(_)
+        ));
+
+        let unchecked = egraph.add(MxxLang::IntMul([relation, public]));
+        let error_public = egraph.add(MxxLang::IntConst(11.into()));
+        let error_times_relation = egraph.add(MxxLang::IntMul([error_public, relation]));
+        egraph.rebuild();
+        let mut control_classify = classify;
+        let control = extract_final_leaf(&egraph, unchecked, &mut control_classify)
+            .expect("reverse or otherwise unregistered products remain eligible");
+        assert!(matches!(
+            control.proposal.expression[control.proposal.expression.root()],
+            MxxLang::IntMul(_)
+        ));
+        let mut error_classify = classify;
+        let error_control = extract_final_leaf(&egraph, error_times_relation, &mut error_classify)
+            .expect("an unregistered error-times-preimage product remains eligible");
+        assert!(matches!(
+            error_control.proposal.expression[error_control.proposal.expression.root()],
+            MxxLang::IntMul(_)
+        ));
+
+        let public_two = egraph.add(MxxLang::IntConst(13.into()));
+        let relation_two = egraph.add(MxxLang::IntConst(17.into()));
+        let raw_two = egraph.add(MxxLang::IntMul([public_two, relation_two]));
+        let target_two = egraph.add(MxxLang::IntAdd([public_two, signal]));
+        egraph.union(raw_two, target_two);
+        let two_boundaries = egraph.add(MxxLang::IntAdd([raw, raw_two]));
+        egraph.rebuild();
+        let mut classify_two = |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+            Ok(ProposalNodeClassification {
+                local_checked_relation_count: u64::from(matches!(node, MxxLang::IntMul(factors)
+                    if (factors[0] == public && factors[1] == relation) ||
+                        (factors[0] == public_two && factors[1] == relation_two))),
+                ..Default::default()
+            })
+        };
+        let two = extract_final_leaf(&egraph, two_boundaries, &mut classify_two)
+            .expect("every nested checked boundary has a relation-free alternative");
+        assert!(two.proposal.expression.as_ref().iter().all(|node| {
+            !matches!(node, MxxLang::IntMul(factors)
+            if {
+                let left = egraph.find(two.origins[usize::from(factors[0])]);
+                let right = egraph.find(two.origins[usize::from(factors[1])]);
+                (left == egraph.find(public) && right == egraph.find(relation)) ||
+                    (left == egraph.find(public_two) && right == egraph.find(relation_two))
+            })
+        }));
+    }
+
+    #[test]
+    fn final_leaf_filter_fails_closed_when_only_checked_lhs_exists() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let public = egraph.add(MxxLang::IntConst(2.into()));
+        let relation = egraph.add(MxxLang::IntConst(3.into()));
+        let raw = egraph.add(MxxLang::IntMul([public, relation]));
+        egraph.rebuild();
+        let mut classify = |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+            Ok(ProposalNodeClassification {
+                local_checked_relation_count: u64::from(matches!(node, MxxLang::IntMul(_))),
+                ..Default::default()
+            })
+        };
+        let error = extract_final_leaf(&egraph, raw, &mut classify)
+            .expect_err("a raw-only checked lhs has no valid final representative");
+        assert!(matches!(
+            error,
+            OperationalSimulationError::Request(
+                super::super::error::RequestError::EmptyParameterName
+            )
+        ));
+    }
+
     #[test]
     fn lexicographic_cost_prefers_relation_then_size_for_nonmatrices() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
@@ -6071,6 +6233,7 @@ mod tests {
                 multi_scans.set(multi_scans.get() + 1);
                 Ok(ProposalNodeClassification::default())
             },
+            false,
         )
         .expect("one shared relaxation extracts both roots");
 

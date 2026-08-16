@@ -1679,12 +1679,19 @@ pub fn check_operational_noise_candidate_with_progress(
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
+            let mut invalid_final_leaf = |_| OperationalSimulationError::Bound {
+                site: site(&stage, wire, "extract final polynomial leaf"),
+                source: super::error::BoundError::UnresolvedExtraction {
+                    unsatisfied_relation_redexes: 1,
+                    unsatisfied_structural_redexes: 0,
+                },
+            };
             let extracted_leaves = extract_best_proposals_with_origins(
                 &lowerer.egraph,
                 &distinct_leaves,
                 &view,
                 &mut ExtractionControl {
-                    invalid_dag: &mut invalid_dag,
+                    invalid_dag: &mut invalid_final_leaf,
                     bound_error: &mut bound_error,
                 },
                 &mut |origin, node, egraph| {
@@ -1698,6 +1705,7 @@ pub fn check_operational_noise_candidate_with_progress(
                         local_checked_relation_count: classification.local_checked_relation_count,
                     })
                 },
+                true,
             )?;
             let extracted_leaves =
                 distinct_leaves.iter().copied().zip(extracted_leaves).collect::<HashMap<_, _>>();

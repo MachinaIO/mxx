@@ -16,7 +16,7 @@ use super::{
     relation::{
         RelationApplier, RelationSearcher, ReplacementPlan, RewriteContext, SharedRewriteBudget,
         materialize_selected_polynomial_redex, selected_polynomial_monomials,
-        selected_polynomial_redexes,
+        selected_polynomial_redexes_mut,
     },
 };
 use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
@@ -649,15 +649,15 @@ pub fn check_operational_noise_candidate_with_progress(
                         selected_polynomial_evaluation_count += 1;
                         let mut selected_polynomial_progress =
                             || context.reserve(1).then_some(()).ok_or(());
-                        let selected_polynomial = selected_polynomial_monomials(
+                        let mut selected_polynomial = selected_polynomial_monomials(
                             &lowerer.egraph,
                             &extracted.proposal.expression,
                             &extracted.origins,
                             &mut selected_polynomial_progress,
                         );
                         let selected_polynomial_redexes =
-                            selected_polynomial.as_ref().and_then(|monomials| {
-                                selected_polynomial_redexes(
+                            selected_polynomial.as_mut().and_then(|monomials| {
+                                selected_polynomial_redexes_mut(
                                     &lowerer.egraph,
                                     &extracted.proposal.expression,
                                     &extracted.origins,

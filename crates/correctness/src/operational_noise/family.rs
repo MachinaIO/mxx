@@ -3,7 +3,8 @@
 //! This module deliberately owns neither graph-wire memoization nor integer
 //! analysis.  [`GraphLowerer`](super::lower::GraphLowerer) supplies one
 //! symbolic element at a time.  Numeric recurrence evaluation is exact over
-//! the supplied finite count; it has no policy ceiling.
+//! the supplied finite count; it has no policy ceiling. Runtime Switches may
+//! omit only a suffix proved unreachable by the selector's authoritative interval.
 
 use super::{
     analysis::{IntegerDomain, MxxAnalysis, MxxSort},
@@ -19,6 +20,30 @@ use egg::{EGraph, Id, Language};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use std::collections::BTreeMap;
+
+/// Adds one runtime Switch, retaining every case through the authoritative
+/// maximum selector value. Invalid or unavailable selector facts preserve the
+/// complete physical case list for the owning validation path.
+pub(crate) fn add_runtime_switch(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+    selector: Id,
+    cases: &[Id],
+) -> Id {
+    let selector = egraph.find(selector);
+    let retained = egraph[selector]
+        .data
+        .integer_domain
+        .as_ref()
+        .and_then(|domain| domain.interval().ok())
+        .filter(|interval| interval.minimum >= BigInt::zero())
+        .and_then(|interval| interval.maximum.to_usize())
+        .and_then(|maximum| (maximum < cases.len()).then_some(maximum + 1))
+        .unwrap_or(cases.len());
+    let mut children = Vec::with_capacity(retained + 1);
+    children.push(selector);
+    children.extend(cases[..retained].iter().map(|case| egraph.find(*case)));
+    egraph.add(MxxLang::Switch(children.into_boxed_slice()))
+}
 
 /// The owner of a parallel-loop logical count.  Output ports are deliberately
 /// absent: sibling outputs of one loop occurrence share this domain.
@@ -210,24 +235,18 @@ pub fn static_get(
 
 /// Builds one ordered physical `Switch`.  Its work is linear in physical
 /// cases and never in a symbolic template's logical count.
-pub fn dynamic_get<A>(
-    egraph: &mut EGraph<MxxLang, A>,
+pub fn dynamic_get(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
     family: &FamilyLoweringValue,
     selector: Id,
-) -> Result<Id, FamilyCoverageError>
-where
-    A: egg::Analysis<MxxLang>,
-{
+) -> Result<Id, FamilyCoverageError> {
     let FamilyCoverageStorage::ExactStored { elements } = &family.storage else {
         return Err(FamilyCoverageError::StorageMismatch);
     };
     if elements.is_empty() {
         return Err(FamilyCoverageError::EmptyExactStorage);
     }
-    let mut children = Vec::with_capacity(elements.len() + 1);
-    children.push(selector);
-    children.extend(elements.iter().copied());
-    Ok(egraph.add(MxxLang::Switch(children.into_boxed_slice())))
+    Ok(add_runtime_switch(egraph, selector, elements))
 }
 
 /// Resolves an element without enumerating a shared template.  The lowerer is
@@ -574,7 +593,7 @@ pub fn instantiate_shared_element<E>(
                 // An out-of-range exact selector cannot be selected safely.
                 // Keep the invalid Switch structural so the owning generic
                 // validation path rejects it rather than guessing a branch.
-                None => egraph.add(MxxLang::Switch(remapped.into_boxed_slice())),
+                None => add_runtime_switch(egraph, *selector, cases),
             }
         } else {
             egraph.add(node.clone().map_children(remap))
@@ -586,14 +605,11 @@ pub fn instantiate_shared_element<E>(
 
 /// Selects a compact family.  Exact storage evaluates only stored references;
 /// template storage combines representatives pointwise under one selector.
-pub fn select_family<A>(
-    egraph: &mut EGraph<MxxLang, A>,
+pub fn select_family(
+    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
     selector: Id,
     cases: &[FamilyLoweringValue],
-) -> Result<FamilyLoweringValue, FamilyCoverageError>
-where
-    A: egg::Analysis<MxxLang>,
-{
+) -> Result<FamilyLoweringValue, FamilyCoverageError> {
     let Some(first) = cases.first() else {
         return Err(FamilyCoverageError::SelectorCaseCountMismatch { expected: 1, actual: 0 });
     };
@@ -627,15 +643,14 @@ where
             }
             let mut selected = Vec::with_capacity(width);
             for lane in 0..width {
-                let mut children = Vec::with_capacity(cases.len() + 1);
-                children.push(selector);
+                let mut selected_cases = Vec::with_capacity(cases.len());
                 for case in cases {
                     let FamilyCoverageStorage::ExactStored { elements } = &case.storage else {
                         unreachable!("storage shape was checked before e-graph mutation");
                     };
-                    children.push(elements[lane]);
+                    selected_cases.push(elements[lane]);
                 }
-                selected.push(egraph.add(MxxLang::Switch(children.into_boxed_slice())));
+                selected.push(add_runtime_switch(egraph, selector, &selected_cases));
             }
             Ok(FamilyLoweringValue {
                 element_type: first.element_type.clone(),
@@ -645,8 +660,7 @@ where
             })
         }
         FamilyCoverageStorage::SharedTemplate { domain, binder_domains, .. } => {
-            let mut children = Vec::with_capacity(cases.len() + 1);
-            children.push(selector);
+            let mut selected_cases = Vec::with_capacity(cases.len());
             for case in cases {
                 let FamilyCoverageStorage::SharedTemplate {
                     domain: case_domain,
@@ -659,13 +673,13 @@ where
                 if case_domain != domain || case_binders != binder_domains {
                     return Err(FamilyCoverageError::StorageMismatch);
                 }
-                children.push(*representative);
+                selected_cases.push(*representative);
             }
             Ok(FamilyLoweringValue {
                 element_type: first.element_type.clone(),
                 storage: FamilyCoverageStorage::SharedTemplate {
                     domain: domain.clone(),
-                    representative: egraph.add(MxxLang::Switch(children.into_boxed_slice())),
+                    representative: add_runtime_switch(egraph, selector, &selected_cases),
                     binder_domains: binder_domains.clone(),
                 },
             })
@@ -1021,6 +1035,102 @@ mod tests {
         }))
     }
 
+    fn test_integer_selector(
+        egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+        name: &str,
+        minimum: BigInt,
+        maximum: BigInt,
+    ) -> Id {
+        let source = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+            key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from(name)),
+            sort: MxxSort::Int,
+            integer_domain: Some(super::super::identity::IntegerSourceDomain { minimum, maximum }),
+            canonical_residue_convention: None,
+            relation_role: None,
+        });
+        egraph.add(MxxLang::Atom { source: AtomicSourceId(source), indices: Box::new([]) })
+    }
+
+    #[test]
+    fn runtime_switch_trims_only_an_authoritative_unreachable_suffix() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = test_integer_selector(&mut egraph, "range-01", 0.into(), 1.into());
+        let cases = [10, 20, 30, 40].map(|value| egraph.add(MxxLang::IntConst(value.into())));
+        let three = add_runtime_switch(&mut egraph, selector, &cases[..3]);
+        let four = add_runtime_switch(&mut egraph, selector, &cases);
+        assert_eq!(egraph.find(three), egraph.find(four));
+        assert!(matches!(egraph.id_to_node(three), MxxLang::Switch(children)
+            if children.as_ref() == [selector, cases[0], cases[1]]));
+        assert_eq!(
+            egraph[egraph.find(three)].data.integer_domain.as_ref().unwrap().interval().unwrap(),
+            super::super::analysis::IntegerInterval::new(10.into(), 20.into()).unwrap(),
+            "analysis sees exactly the retained reachable cases"
+        );
+
+        let shifted = test_integer_selector(&mut egraph, "range-12", 1.into(), 2.into());
+        let shifted_switch = add_runtime_switch(&mut egraph, shifted, &cases);
+        assert!(matches!(egraph.id_to_node(shifted_switch), MxxLang::Switch(children)
+            if children.as_ref() == [shifted, cases[0], cases[1], cases[2]]));
+    }
+
+    #[test]
+    fn runtime_switch_preserves_cases_without_a_valid_strict_upper_bound() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let cases = [10, 20].map(|value| egraph.add(MxxLang::IntConst(value.into())));
+        let selectors = [
+            test_integer_selector(&mut egraph, "negative", (-1).into(), 1.into()),
+            test_integer_selector(&mut egraph, "at-count", 0.into(), 2.into()),
+            test_integer_selector(
+                &mut egraph,
+                "unconvertible",
+                0.into(),
+                BigInt::from(BigUint::one() << (usize::BITS + 1)),
+            ),
+        ];
+        for selector in selectors {
+            let switched = add_runtime_switch(&mut egraph, selector, &cases);
+            assert!(matches!(egraph.id_to_node(switched), MxxLang::Switch(children)
+                if children.len() == cases.len() + 1));
+        }
+
+        let missing = egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+            key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from("missing-domain")),
+            sort: MxxSort::Int,
+            integer_domain: None,
+            canonical_residue_convention: None,
+            relation_role: None,
+        });
+        let missing =
+            egraph.add(MxxLang::Atom { source: AtomicSourceId(missing), indices: Box::new([]) });
+        let switched = add_runtime_switch(&mut egraph, missing, &cases);
+        assert!(matches!(egraph.id_to_node(switched), MxxLang::Switch(children)
+            if children.len() == cases.len() + 1));
+    }
+
+    #[test]
+    fn runtime_switch_is_shared_by_dynamic_get_and_select_family_validation() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = test_integer_selector(&mut egraph, "shared-runtime", 0.into(), 1.into());
+        let elements = [10, 20, 30].map(|value| egraph.add(MxxLang::IntConst(value.into())));
+        let family = FamilyLoweringValue {
+            element_type: MxxSort::Int,
+            storage: FamilyCoverageStorage::ExactStored { elements: Box::new(elements) },
+        };
+        let dynamic = dynamic_get(&mut egraph, &family, selector).unwrap();
+        let direct = add_runtime_switch(&mut egraph, selector, &elements);
+        assert_eq!(egraph.find(dynamic), egraph.find(direct));
+
+        let invalid = FamilyLoweringValue {
+            element_type: MxxSort::Int,
+            storage: FamilyCoverageStorage::ExactStored { elements: Box::new([elements[0]]) },
+        };
+        assert_eq!(
+            select_family(&mut egraph, selector, &[family, invalid]),
+            Err(FamilyCoverageError::SelectorCaseCountMismatch { expected: 3, actual: 1 }),
+            "all original family storage is validated before any suffix can be trimmed"
+        );
+    }
+
     #[test]
     fn shared_template_instantiation_selects_exact_switch_cases() {
         for (selector_value, expected) in [(0, 10), (1, 20), (2, 30)] {
@@ -1063,6 +1173,23 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(egraph.id_to_node(instantiated), MxxLang::Switch(_)));
+
+        let bounded_selector =
+            test_integer_selector(&mut egraph, "instantiated-range", 0.into(), 1.into());
+        let bounded =
+            egraph.add(MxxLang::Switch([bounded_selector, first, second, replacement].into()));
+        let instantiated =
+            instantiate_shared_element(&mut egraph, bounded, owner, replacement, &mut || {
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        let MxxLang::Switch(children) = egraph.id_to_node(instantiated) else {
+            panic!("non-exact interval remains a Switch")
+        };
+        assert_eq!(children.len(), 3);
+        assert_eq!(egraph.find(children[0]), egraph.find(bounded_selector));
+        assert_eq!(egraph.find(children[1]), egraph.find(first));
+        assert_eq!(egraph.find(children[2]), egraph.find(second));
 
         let invalid = egraph.add(MxxLang::Switch([owner_selector, first, second].into()));
         let out_of_range = egraph.add(MxxLang::IntConst(2.into()));

@@ -3357,7 +3357,34 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         self.egraph.add(MxxLang::IntEuclideanDiv([values[0], values[1]]))
                     }
                     IntBinaryOp::Remainder => {
-                        self.egraph.add(MxxLang::IntEuclideanRemainder([values[0], values[1]]))
+                        let dividend = self.egraph.find(values[0]);
+                        let divisor = self.egraph.find(values[1]);
+                        let remainder_is_dividend = {
+                            let dividend_data = &self.egraph[dividend].data;
+                            let divisor_data = &self.egraph[divisor].data;
+                            match (
+                                dividend_data.integer_domain.as_ref(),
+                                divisor_data.integer_domain.as_ref(),
+                                divisor_data.scalar_provenance,
+                            ) {
+                                (
+                                    Some(dividend_domain),
+                                    Some(IntegerDomain::Exact(divisor)),
+                                    Some(ScalarProvenance::Ordinary),
+                                ) if divisor.is_positive() => {
+                                    dividend_domain.interval().is_ok_and(|interval| {
+                                        interval.minimum >= BigInt::zero() &&
+                                            interval.maximum < *divisor
+                                    })
+                                }
+                                _ => false,
+                            }
+                        };
+                        if remainder_is_dividend {
+                            dividend
+                        } else {
+                            self.egraph.add(MxxLang::IntEuclideanRemainder([dividend, divisor]))
+                        }
                     }
                 }
             }
@@ -3811,10 +3838,11 @@ impl<'a, 'control> GraphLowerer<'a, 'control> {
                         }),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(LoweredValue::Term(
-                    self.egraph
-                        .add(MxxLang::Switch(std::iter::once(*selector).chain(terms).collect())),
-                ))
+                Ok(LoweredValue::Term(family::add_runtime_switch(
+                    &mut self.egraph,
+                    *selector,
+                    &terms,
+                )))
             }
             NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) => {
                 unreachable!("loop lowering is scheduled on the outer continuation stack")
@@ -4836,6 +4864,32 @@ mod tests {
         })
     }
 
+    fn test_integer_atom(
+        egraph: &mut EGraph<MxxLang, MxxAnalysis>,
+        name: &str,
+        minimum: i64,
+        maximum: i64,
+    ) -> Id {
+        let source = egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ProtocolInput(
+                    crate::ProtocolInputId::from(name),
+                ),
+                sort: MxxSort::Int,
+                integer_domain: Some(super::super::identity::IntegerSourceDomain {
+                    minimum: minimum.into(),
+                    maximum: maximum.into(),
+                }),
+                canonical_residue_convention: None,
+                relation_role: None,
+            },
+        );
+        egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(source),
+            indices: Box::new([]),
+        })
+    }
+
     fn test_resolved_matrix() -> super::super::identity::ResolvedMatrixType {
         super::super::identity::ResolvedMatrixType {
             modulus: ResolvedIntExpr::Const(17.into()),
@@ -5189,6 +5243,160 @@ mod tests {
             Err(LowerError::InvalidExtractCoefficientCanonicalUpper { upper, modulus })
                 if upper == 18_u8.into() && modulus == 17_u8.into()
         ));
+    }
+
+    #[test]
+    fn lowering_remainder_reuses_only_a_proved_in_range_dividend() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "remainder-identity".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let environment = root_test_environment();
+        let lower_remainder = |lowerer: &mut GraphLowerer<'_, '_>, dividend, divisor| {
+            let LoweredValue::Term(term) = lowerer
+                .lower_node(
+                    &NodeKind::IntBinary(IntBinaryOp::Remainder),
+                    &[LoweredValue::Term(dividend), LoweredValue::Term(divisor)],
+                    &environment,
+                )
+                .expect("remainder lowers")
+            else {
+                panic!("remainder is an integer term")
+            };
+            term
+        };
+
+        let matrix_type = super::super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(1009.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(1.into()),
+            columns: ResolvedIntExpr::Const(1.into()),
+        };
+        let matrix_source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ProtocolInput(
+                    crate::ProtocolInputId::from("remainder-extract-input"),
+                ),
+                sort: MxxSort::Matrix(matrix_type),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            },
+        );
+        let matrix = lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(matrix_source),
+            indices: Box::new([]),
+        });
+        let LoweredValue::Term(extract) = lowerer
+            .lower_node(
+                &NodeKind::ExtractCoefficient {
+                    position: IntExpr::constant(0),
+                    canonical_input_exclusive_upper: Some(280_u16.into()),
+                },
+                &[LoweredValue::Term(matrix)],
+                &environment,
+            )
+            .expect("authoritative Tall-shaped extraction lowers")
+        else {
+            panic!("extraction is an integer term")
+        };
+        let divisor = lowerer.egraph.add(MxxLang::IntConst(512.into()));
+        let extract_data = lowerer.egraph[lowerer.egraph.find(extract)].data.clone();
+        let folded = lower_remainder(&mut lowerer, extract, divisor);
+        assert_eq!(lowerer.egraph.find(folded), lowerer.egraph.find(extract));
+        let folded_data = &lowerer.egraph[lowerer.egraph.find(folded)].data;
+        assert_eq!(folded_data.integer_domain, extract_data.integer_domain);
+        assert_eq!(folded_data.scalar_provenance, Some(ScalarProvenance::SelectorOnly));
+        assert_eq!(folded_data.direct_extract, extract_data.direct_extract);
+
+        let ordinary = test_integer_atom(&mut lowerer.egraph, "ordinary-in-range", 0, 279);
+        let ordinary_folded = lower_remainder(&mut lowerer, ordinary, divisor);
+        assert_eq!(
+            lowerer.egraph.find(ordinary_folded),
+            lowerer.egraph.find(ordinary),
+            "the identity depends on the authoritative interval, not selector provenance"
+        );
+
+        for (name, minimum, maximum, divisor_value) in [
+            ("boundary", 0, 512, 512),
+            ("negative-minimum", -1, 279, 512),
+            ("zero-divisor", 0, 0, 0),
+            ("negative-divisor", 0, 0, -1),
+        ] {
+            let dividend = test_integer_atom(&mut lowerer.egraph, name, minimum, maximum);
+            let divisor = lowerer.egraph.add(MxxLang::IntConst(divisor_value.into()));
+            let remainder = lower_remainder(&mut lowerer, dividend, divisor);
+            assert_ne!(lowerer.egraph.find(remainder), lowerer.egraph.find(dividend), "{name}");
+            assert!(
+                lowerer.egraph[lowerer.egraph.find(remainder)]
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node, MxxLang::IntEuclideanRemainder(_)))
+            );
+        }
+
+        let LoweredValue::Term(selector_divisor) = lowerer
+            .lower_node(
+                &NodeKind::ExtractCoefficient {
+                    position: IntExpr::constant(0),
+                    canonical_input_exclusive_upper: Some(513_u16.into()),
+                },
+                &[LoweredValue::Term(matrix)],
+                &environment,
+            )
+            .expect("selector-only divisor extraction lowers")
+        else {
+            panic!("extraction is an integer term")
+        };
+        let dividend = test_integer_atom(&mut lowerer.egraph, "selector-divisor-input", 0, 1);
+        let remainder = lower_remainder(&mut lowerer, dividend, selector_divisor);
+        assert_ne!(lowerer.egraph.find(remainder), lowerer.egraph.find(dividend));
+        assert!(
+            lowerer.egraph[lowerer.egraph.find(remainder)]
+                .nodes
+                .iter()
+                .any(|node| matches!(node, MxxLang::IntEuclideanRemainder(_)))
+        );
+    }
+
+    #[test]
+    fn runtime_switch_direct_select_matches_the_shared_family_constructor() {
+        let protocol = crate::toy_example::protocol();
+        let request = OperationalCheckRequest {
+            environment: Vec::new(),
+            layouts: Vec::new(),
+            target_id: "direct-select-switch".to_owned(),
+        };
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let selector = test_integer_atom(&mut lowerer.egraph, "direct-select-range", 0, 1);
+        let cases = [10, 20, 30].map(|value| lowerer.egraph.add(MxxLang::IntConst(value.into())));
+        let environment = root_test_environment();
+        let wire = LoweringWire {
+            source: WireSourceKey {
+                scope: environment.occurrence.clone(),
+                wire: WireRef { node: mxx_ir_core::NodeId(1), port: mxx_ir_core::Port(0) },
+            },
+            indices: Box::new([]),
+        };
+        let arguments =
+            std::iter::once(selector).chain(cases).map(LoweredValue::Term).collect::<Vec<_>>();
+        let LoweredValue::Term(direct) = lowerer
+            .lower_structural_node(
+                &wire,
+                &NodeKind::Select { count: IntExpr::constant(3) },
+                &arguments,
+                &environment,
+                WireType::Int,
+            )
+            .expect("direct Select lowers")
+        else {
+            panic!("direct Select is an integer term")
+        };
+        let shared = family::add_runtime_switch(&mut lowerer.egraph, selector, &cases);
+        assert_eq!(lowerer.egraph.find(direct), lowerer.egraph.find(shared));
     }
 
     #[test]

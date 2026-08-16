@@ -126,6 +126,41 @@ enum BuildFrame {
     Finish(Id),
 }
 
+fn first_selected_large_ambiguous_product_class(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    start: Id,
+    candidates: &[Option<Candidate>],
+) -> Option<Id> {
+    let mut visited = HashSet::new();
+    let mut current = egraph.find(start);
+    for _ in 0..MAX_SELECTED_LARGE_DIAGNOSTIC_STEPS {
+        if !visited.insert(current) {
+            return None;
+        }
+        let candidate = candidates.get(usize::from(current))?.as_ref()?;
+        if matches!(candidate.node, MxxLang::MatrixMultiply(_)) {
+            let mut physical = egraph[current].nodes.iter().filter_map(|node| match node {
+                MxxLang::MatrixMultiply(factors) => {
+                    Some(factors.iter().map(|factor| egraph.find(*factor)).collect::<Vec<_>>())
+                }
+                _ => None,
+            });
+            if let Some(first) = physical.next() &&
+                physical.any(|factors| factors != first)
+            {
+                return Some(current);
+            }
+        }
+        let Some(next) =
+            selected_large_child(egraph, candidates, &candidate.node, candidate.first_large_source)
+        else {
+            return None;
+        };
+        current = egraph.find(next);
+    }
+    None
+}
+
 /// Selects and materializes the best representative of `root`.
 ///
 /// The classification callback is the sole relation integration hook.  It is
@@ -183,6 +218,7 @@ pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
         control,
         classify,
         &mut |_, _| 0,
+        None,
         emit_detailed_large_diagnostic,
     )
 }
@@ -201,6 +237,7 @@ pub(crate) fn extract_best_proposal_with_origins_and_structural_preference<I: Bo
         &EGraph<MxxLang, MxxAnalysis>,
     ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
     structural_preference: &mut dyn FnMut(Id, &MxxLang) -> u64,
+    mut diagnostic_preference_membership: Option<&mut dyn FnMut(Id, &MxxLang) -> bool>,
     emit_detailed_large_diagnostic: bool,
 ) -> Result<ExtractedProposalWithOrigins, OperationalSimulationError> {
     let class_count = egraph.number_of_classes();
@@ -217,12 +254,17 @@ pub(crate) fn extract_best_proposal_with_origins_and_structural_preference<I: Bo
 
     for _ in 0..class_count {
         let mut changed = false;
+        let diagnostic_class = (emit_detailed_large_diagnostic &&
+            diagnostic_preference_membership.is_some())
+        .then(|| first_selected_large_ambiguous_product_class(egraph, root, &candidates))
+        .flatten();
+        let mut diagnostic_rows = Vec::new();
         for &class_id in &classes {
             let canonical = egraph.find(class_id);
             let index = usize::from(canonical);
             let class = &egraph[canonical];
             for node in class.iter() {
-                let Some((cost, semantic_bound, first_large_source)) = proposal_cost(
+                let proposal = proposal_cost_with_classification(
                     egraph,
                     canonical,
                     node,
@@ -230,12 +272,65 @@ pub(crate) fn extract_best_proposal_with_origins_and_structural_preference<I: Bo
                     bound_input,
                     control,
                     classify,
-                )?
+                )?;
+                let Some((cost, semantic_bound, first_large_source, classification)) = proposal
                 else {
+                    if diagnostic_class == Some(canonical) &&
+                        let MxxLang::MatrixMultiply(factors) = node
+                    {
+                        let preference_cost = structural_preference(canonical, node);
+                        let exact_preferred = diagnostic_preference_membership
+                            .as_deref_mut()
+                            .is_some_and(|membership| membership(canonical, node));
+                        diagnostic_rows.push((
+                            node.clone(),
+                            exact_preferred,
+                            preference_cost,
+                            None,
+                            Some(
+                                factors
+                                    .iter()
+                                    .map(|factor| usize::from(egraph.find(*factor)))
+                                    .collect::<Vec<_>>(),
+                            ),
+                            None::<Vec<usize>>,
+                        ));
+                    }
                     continue;
                 };
                 let mut cost = cost;
                 cost.local_checked_structural_count = structural_preference(canonical, node);
+                if diagnostic_class == Some(canonical) {
+                    if let MxxLang::MatrixMultiply(factors) = node {
+                        let exact_preferred = diagnostic_preference_membership
+                            .as_deref_mut()
+                            .is_some_and(|membership| membership(canonical, node));
+                        let ordered_factors = factors
+                            .iter()
+                            .map(|factor| usize::from(egraph.find(*factor)))
+                            .collect::<Vec<_>>();
+                        let flattened =
+                            selected_product_spine_from_roots(egraph, &candidates, factors);
+                        let flattened_factors = (!flattened.ambiguous_competing_product &&
+                            !flattened.cycle &&
+                            !flattened.truncated)
+                            .then(|| {
+                                flattened
+                                    .leaves
+                                    .iter()
+                                    .map(|leaf| leaf.canonical_eclass)
+                                    .collect::<Vec<_>>()
+                            });
+                        diagnostic_rows.push((
+                            node.clone(),
+                            exact_preferred,
+                            cost.local_checked_structural_count,
+                            Some((cost.clone(), classification)),
+                            Some(ordered_factors),
+                            flattened_factors,
+                        ));
+                    }
+                }
                 let replace = candidates[index].as_ref().is_none_or(|current| {
                     cost < current.cost || (cost == current.cost && node < &current.node)
                 });
@@ -264,6 +359,108 @@ pub(crate) fn extract_best_proposal_with_origins_and_structural_preference<I: Bo
             }
         }
         if !changed {
+            if let Some(class) = diagnostic_class {
+                let eligible_count = diagnostic_rows
+                    .iter()
+                    .filter(|(_, preferred, _, proposal, _, _)| {
+                        *preferred &&
+                            proposal.as_ref().is_some_and(|(_, classification)| {
+                                classification.local_checked_relation_count > 0 &&
+                                    !classification.relation_redex
+                            })
+                    })
+                    .count();
+                let selected_node = candidates
+                    .get(usize::from(class))
+                    .and_then(Option::as_ref)
+                    .map(|candidate| &candidate.node);
+                let selected_flattened_factors = selected_node.and_then(|node| {
+                    let MxxLang::MatrixMultiply(factors) = node else { return None };
+                    let flattened = selected_product_spine_from_roots(egraph, &candidates, factors);
+                    (!flattened.ambiguous_competing_product &&
+                        !flattened.cycle &&
+                        !flattened.truncated)
+                        .then(|| {
+                            flattened
+                                .leaves
+                                .iter()
+                                .map(|leaf| leaf.canonical_eclass)
+                                .collect::<Vec<_>>()
+                        })
+                });
+                let physical_node_count = diagnostic_rows.len();
+                for (
+                    physical_node_ordinal,
+                    (
+                        node,
+                        exact_preferred,
+                        preference_cost,
+                        proposal,
+                        ordered_factors,
+                        flattened_factors,
+                    ),
+                ) in diagnostic_rows.into_iter().enumerate()
+                {
+                    let selected_winner = selected_node == Some(&node);
+                    let flattened_spine_status =
+                        match (flattened_factors.as_ref(), selected_flattened_factors.as_ref()) {
+                            (Some(candidate), Some(selected)) if candidate == selected => {
+                                "same_ordered_spine"
+                            }
+                            (Some(_), Some(_)) => "different_ordered_spine",
+                            _ => "incomplete",
+                        };
+                    match proposal {
+                        Some((cost, classification)) => {
+                            let checked_and_satisfied = classification.local_checked_relation_count >
+                                0 &&
+                                !classification.relation_redex;
+                            tracing::info!(
+                                event = "operational_terminal_large_eclass_physical_node_cost",
+                                terminal_class = usize::from(class),
+                                physical_node_ordinal,
+                                physical_node_count,
+                                operator = node.operator_name(),
+                                exact_preferred,
+                                preference_cost,
+                                relation_redex = classification.relation_redex,
+                                local_checked_relation_count =
+                                    classification.local_checked_relation_count,
+                                ordered_canonical_factor_spine = ?ordered_factors,
+                                flattened_spine_status,
+                                selected_winner,
+                                checked_and_satisfied,
+                                unique_eligible_checked_satisfied_spine = exact_preferred &&
+                                    checked_and_satisfied && eligible_count == 1,
+                                proposal_cost_available = true,
+                                proposal_cost = ?Some(cost),
+                                failure_reason = ?Option::<&str>::None,
+                                "terminal selected-Large HashPlain eclass physical node cost"
+                            );
+                        }
+                        None => tracing::info!(
+                            event = "operational_terminal_large_eclass_physical_node_cost",
+                            terminal_class = usize::from(class),
+                            physical_node_ordinal,
+                            physical_node_count,
+                            operator = node.operator_name(),
+                            exact_preferred,
+                            preference_cost,
+                            relation_redex = ?Option::<bool>::None,
+                            local_checked_relation_count = ?Option::<u64>::None,
+                            ordered_canonical_factor_spine = ?ordered_factors,
+                            flattened_spine_status,
+                            selected_winner,
+                            checked_and_satisfied = false,
+                            unique_eligible_checked_satisfied_spine = false,
+                            proposal_cost_available = false,
+                            proposal_cost = ?Option::<ProposalCost>::None,
+                            failure_reason = "selected-child-cost-unavailable-or-cyclic",
+                            "terminal selected-Large HashPlain eclass physical node cost"
+                        ),
+                    }
+                }
+            }
             break;
         }
     }
@@ -2447,7 +2644,7 @@ impl SelectedChildBounds for CandidateChildBounds<'_> {
     }
 }
 
-fn proposal_cost<I: BoundInput>(
+fn proposal_cost_with_classification<I: BoundInput>(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     class: Id,
     node: &MxxLang,
@@ -2460,7 +2657,7 @@ fn proposal_cost<I: BoundInput>(
         &EGraph<MxxLang, MxxAnalysis>,
     ) -> Result<ProposalNodeClassification, OperationalSimulationError>,
 ) -> Result<
-    Option<(ProposalCost, Option<MatrixBound>, Option<AtomicSourceId>)>,
+    Option<(ProposalCost, Option<MatrixBound>, Option<AtomicSourceId>, ProposalNodeClassification)>,
     OperationalSimulationError,
 > {
     let Some((child_relation, child_structural, child_hidden_structural, node_count)) =
@@ -2500,6 +2697,7 @@ fn proposal_cost<I: BoundInput>(
         },
         semantic_bound,
         first_large_source,
+        classification,
     )))
 }
 
@@ -5337,6 +5535,7 @@ mod tests {
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
             &mut classify,
             &mut preference,
+            None,
             false,
         )
         .expect("preferred representative extracts");
@@ -5361,6 +5560,7 @@ mod tests {
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
             &mut classify,
             &mut preference,
+            None,
             false,
         )
         .expect("preference survives an ordinary rebuild and next extraction");

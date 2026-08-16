@@ -647,72 +647,106 @@ impl AnalysisData {
     /// relation IDs: egg canonicalization belongs to the post-rebuild relation
     /// phase, so merge order cannot affect the raw stored provenance.
     pub(crate) fn merge_from(&mut self, from: Self) -> bool {
-        // `egg::DidMerge` permits conservative change reporting.  Comparing
-        // the inputs avoids cloning their potentially deep provenance trees.
-        let inputs_differ = *self != from;
-        self.sort = merge_sort(self.sort.clone(), from.sort);
+        let mut changed = false;
+        let merged_sort = merge_sort(self.sort.clone(), from.sort);
+        changed |= replace_if_changed(&mut self.sort, merged_sort);
         let missing_integer_domain = matches!(&self.sort, Ok(MxxSort::Int)) &&
             (self.integer_domain.is_none() || from.integer_domain.is_none());
-        self.integer_domain = match (&self.integer_domain, &from.integer_domain) {
+        let integer_domain = match (&self.integer_domain, &from.integer_domain) {
             (Some(left), Some(right)) => left.hull(right).ok(),
             (None, None) => None,
             _ => None,
         };
+        changed |= replace_if_changed(&mut self.integer_domain, integer_domain);
         let permits_scalar_provenance =
             self.sort.as_ref().is_ok_and(MxxSort::permits_scalar_provenance);
         let missing_scalar_provenance = permits_scalar_provenance &&
             (self.scalar_provenance.is_none() || from.scalar_provenance.is_none());
-        self.scalar_provenance = match (self.scalar_provenance, from.scalar_provenance) {
+        let scalar_provenance = match (self.scalar_provenance, from.scalar_provenance) {
             (Some(left), Some(right)) => Some(left.merge(right)),
             _ => None,
         };
-        self.possible_false |= from.possible_false;
-        self.possible_true |= from.possible_true;
+        changed |= replace_if_changed(&mut self.scalar_provenance, scalar_provenance);
+        if from.possible_false && !self.possible_false {
+            self.possible_false = true;
+            changed = true;
+        }
+        if from.possible_true && !self.possible_true {
+            self.possible_true = true;
+            changed = true;
+        }
         let missing_real_constant = matches!(&self.sort, Ok(MxxSort::Real)) &&
             (self.real_constant_bits.is_none() || from.real_constant_bits.is_none());
-        self.real_constant_bits = match (self.real_constant_bits, from.real_constant_bits) {
+        let real_constant_bits = match (self.real_constant_bits, from.real_constant_bits) {
             (Some(left), Some(right)) if left == right => Some(left),
             (None, None) => None,
             _ => None,
         };
-        self.canonical_coefficient_exclusive_upper = match (
-            self.canonical_coefficient_exclusive_upper.take(),
+        changed |= replace_if_changed(&mut self.real_constant_bits, real_constant_bits);
+        match (
+            self.canonical_coefficient_exclusive_upper.as_mut(),
             from.canonical_coefficient_exclusive_upper,
         ) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (left @ Some(_), None) | (None, left @ Some(_)) => left,
-            (None, None) => None,
-        };
-        self.canonical_residue_convention =
+            (Some(left), Some(right)) if right < *left => {
+                *left = right;
+                changed = true;
+            }
+            (None, Some(right)) => {
+                self.canonical_coefficient_exclusive_upper = Some(right);
+                changed = true;
+            }
+            _ => {}
+        }
+        let canonical_residue_convention =
             match (self.canonical_residue_convention, from.canonical_residue_convention) {
                 (Some(left), Some(right)) if left == right => Some(left),
                 (left @ Some(_), None) | (None, left @ Some(_)) => left,
                 (Some(_), Some(_)) => {
-                    make_sort_conflict_sticky(&mut self.sort);
+                    changed |= make_sort_conflict_sticky(&mut self.sort);
                     None
                 }
                 (None, None) => None,
             };
-        self.direct_extract = match (self.direct_extract.take(), from.direct_extract) {
-            (Some(left), Some(right)) if left == right => Some(left),
-            _ => None,
-        };
+        changed |= replace_if_changed(
+            &mut self.canonical_residue_convention,
+            canonical_residue_convention,
+        );
+        let clear_direct_extract = !matches!(
+            (&self.direct_extract, &from.direct_extract),
+            (Some(left), Some(right)) if left == right
+        );
+        if clear_direct_extract && self.direct_extract.take().is_some() {
+            changed = true;
+        }
         for provenance in from.relation_provenance {
             if !self.relation_provenance.contains(&provenance) {
                 self.relation_provenance.push(provenance);
+                changed = true;
             }
         }
         if missing_integer_domain || missing_scalar_provenance || missing_real_constant {
-            make_sort_conflict_sticky(&mut self.sort);
+            changed |= make_sort_conflict_sticky(&mut self.sort);
         }
-        inputs_differ
+        changed
     }
 }
 
-fn make_sort_conflict_sticky(sort: &mut Result<MxxSort, AnalysisError>) {
+fn replace_if_changed<T: PartialEq>(target: &mut T, value: T) -> bool {
+    if *target == value {
+        false
+    } else {
+        *target = value;
+        true
+    }
+}
+
+fn make_sort_conflict_sticky(sort: &mut Result<MxxSort, AnalysisError>) -> bool {
     if let Ok(value) = sort {
         let value = value.clone();
         *sort = Err(AnalysisError::EClassSortConflict { expected: value.clone(), actual: value });
+        true
+    } else {
+        false
     }
 }
 
@@ -882,10 +916,11 @@ impl Analysis<MxxLang> for MxxAnalysis {
     }
 
     fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
+        let inputs_differ = *to != from;
         let changed = to.merge_from(from);
-        // The second flag may conservatively report that `from` changed.  It
-        // shares the clone-free input comparison from `merge_from`.
-        DidMerge(changed, changed)
+        // `from` may equal the final merge even when the inputs differ, but egg
+        // explicitly permits conservative reporting for the second flag.
+        DidMerge(changed, inputs_differ)
     }
 }
 
@@ -2957,6 +2992,75 @@ mod tests {
 
         assert!(merged.0 && merged.1);
         assert_eq!(to.relation_provenance.len(), 65);
+    }
+
+    #[test]
+    fn merge_change_reporting_is_exact_for_identical_and_provenance_subset_inputs() {
+        let provenance0 = test_direct_provenance();
+        let provenance1 = test_direct_provenance();
+        let mut superset = AnalysisData::matrix(scalar_matrix_type(1), None);
+        superset.relation_provenance.push(provenance0.clone());
+        superset.relation_provenance.push(provenance1.clone());
+
+        assert!(!superset.merge_from(superset.clone()), "identical data does not change");
+
+        let mut subset = AnalysisData::matrix(scalar_matrix_type(1), None);
+        subset.relation_provenance.push(provenance0);
+        assert!(
+            !superset.merge_from(subset.clone()),
+            "merging a retained provenance superset with its subset is unchanged"
+        );
+        assert!(
+            subset.merge_from({
+                let mut new = AnalysisData::matrix(scalar_matrix_type(1), None);
+                new.relation_provenance.push(provenance1);
+                new
+            }),
+            "receiving new provenance reports a change"
+        );
+
+        let mut analysis = MxxAnalysis::default();
+        let mut identical_to = superset.clone();
+        let identical = <MxxAnalysis as Analysis<MxxLang>>::merge(
+            &mut analysis,
+            &mut identical_to,
+            superset.clone(),
+        );
+        assert!(!identical.0 && !identical.1);
+        let mut retained_superset = superset;
+        let conservative = <MxxAnalysis as Analysis<MxxLang>>::merge(
+            &mut analysis,
+            &mut retained_superset,
+            AnalysisData::matrix(scalar_matrix_type(1), None),
+        );
+        assert!(
+            !conservative.0 && conservative.1,
+            "the retained superset is unchanged while egg may conservatively mark from changed"
+        );
+    }
+
+    #[test]
+    fn merge_change_reporting_tracks_interval_hulls_and_sticky_conflicts_once() {
+        let integer = |minimum: i64, maximum: i64| {
+            AnalysisData::scalar(
+                MxxSort::Int,
+                Some(IntegerDomain::IntervalOnly(
+                    IntegerInterval::new(minimum.into(), maximum.into()).expect("valid interval"),
+                )),
+                ScalarProvenance::Ordinary,
+            )
+        };
+        let mut wider = integer(-2, 2);
+        assert!(!wider.merge_from(integer(-1, 1)), "contained hull is unchanged");
+        let mut narrower = integer(-1, 1);
+        assert!(narrower.merge_from(integer(-2, 2)), "wider hull changes the interval");
+        assert_eq!(narrower.integer_domain, wider.integer_domain);
+
+        let conflicting = AnalysisData::matrix(scalar_matrix_type(2), None);
+        let mut sticky = AnalysisData::matrix(scalar_matrix_type(1), None);
+        assert!(sticky.merge_from(conflicting.clone()), "the first conflict changes the sort");
+        assert!(matches!(sticky.sort, Err(AnalysisError::EClassSortConflict { .. })));
+        assert!(!sticky.merge_from(conflicting), "the same sticky conflict changes only once");
     }
 
     #[test]

@@ -24,7 +24,7 @@ use super::{
     },
 };
 use crate::{OperationalDecoderKind, ProtocolDecl, StageId};
-use egg::{EGraph, Language, RecExpr, Rewrite, Runner, StopReason};
+use egg::{EGraph, Language, Rewrite, Runner, StopReason};
 use mxx_ir_core::{
     FrozenGraphScopeId, Graph, IntExpr, ParamEnv, Port, WireRef, WireType,
     node::{IntBinaryOp, IntCompareOp, NodeKind},
@@ -85,19 +85,6 @@ fn preference_only_reextract(redex_count: usize, preference_changed: bool) -> bo
 
 type ExactStructuralPreferences = HashMap<egg::Id, HashSet<MxxLang>>;
 
-/// Counters for the terminal, runner-local transport of exact `Existing`
-/// leaves.  They are diagnostics only: no graph state or alternative
-/// extraction authority is retained here.
-#[derive(Default)]
-struct ExistingLeafPreferenceTransport {
-    absent_single_node_class_count: usize,
-    absent_multi_node_class_count: usize,
-    carried_prior_single_node_preference_count: usize,
-    carried_prior_multi_node_preference_count: usize,
-    absent_without_prior_preference_count: usize,
-    absent_blocked_by_composite_count: usize,
-}
-
 fn canonicalize_structural_preferences(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     preferences: &mut ExactStructuralPreferences,
@@ -145,59 +132,45 @@ fn record_replacement_plan_preferences(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     plan: &ReplacementPlan,
     preferences: &mut ExactStructuralPreferences,
-    existing_leaves: &mut HashSet<egg::Id>,
 ) -> Option<egg::Id> {
     let node = match plan {
-        ReplacementPlan::Existing(id) => {
-            let class = egraph.find(*id);
-            existing_leaves.insert(class);
-            return Some(class);
-        }
+        ReplacementPlan::Existing(id) => return Some(egraph.find(*id)),
         ReplacementPlan::Product(plans) => {
             let children = plans
                 .iter()
-                .map(|plan| {
-                    record_replacement_plan_preferences(egraph, plan, preferences, existing_leaves)
-                })
+                .map(|plan| record_replacement_plan_preferences(egraph, plan, preferences))
                 .collect::<Option<Vec<_>>>()?;
             MxxLang::MatrixMultiply(children.into_boxed_slice())
         }
         ReplacementPlan::Add(plans) => {
             let children = plans
                 .iter()
-                .map(|plan| {
-                    record_replacement_plan_preferences(egraph, plan, preferences, existing_leaves)
-                })
+                .map(|plan| record_replacement_plan_preferences(egraph, plan, preferences))
                 .collect::<Option<Vec<_>>>()?;
             MxxLang::MatrixAdd(children.into_boxed_slice())
         }
         ReplacementPlan::Negate(plan) => {
-            let child =
-                record_replacement_plan_preferences(egraph, plan, preferences, existing_leaves)?;
+            let child = record_replacement_plan_preferences(egraph, plan, preferences)?;
             MxxLang::MatrixNegate([child])
         }
         ReplacementPlan::Switch(plans) => {
             let children = plans
                 .iter()
-                .map(|plan| {
-                    record_replacement_plan_preferences(egraph, plan, preferences, existing_leaves)
-                })
+                .map(|plan| record_replacement_plan_preferences(egraph, plan, preferences))
                 .collect::<Option<Vec<_>>>()?;
             MxxLang::Switch(children.into_boxed_slice())
         }
         ReplacementPlan::Concat { axis, inputs } => {
             let children = inputs
                 .iter()
-                .map(|plan| {
-                    record_replacement_plan_preferences(egraph, plan, preferences, existing_leaves)
-                })
+                .map(|plan| record_replacement_plan_preferences(egraph, plan, preferences))
                 .collect::<Option<Vec<_>>>()?;
             MxxLang::MatrixConcat { axis: *axis, inputs: children.into_boxed_slice() }
         }
         ReplacementPlan::Equivalent(plans) => {
-            let mut roots = plans.iter().map(|plan| {
-                record_replacement_plan_preferences(egraph, plan, preferences, existing_leaves)
-            });
+            let mut roots = plans
+                .iter()
+                .map(|plan| record_replacement_plan_preferences(egraph, plan, preferences));
             let root = roots.next()??;
             return roots.try_fold(root, |root, candidate| {
                 (egraph.find(candidate?) == egraph.find(root)).then_some(root)
@@ -208,116 +181,6 @@ fn record_replacement_plan_preferences(
     let class = egraph.find(class);
     preferences.entry(class).or_default().insert(node);
     Some(class)
-}
-
-fn stage_selected_existing_leaf_preferences(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    expression: &RecExpr<MxxLang>,
-    origins: &[egg::Id],
-    existing_leaves: &HashSet<egg::Id>,
-    staged: &mut HashMap<egg::Id, Option<MxxLang>>,
-) -> Option<()> {
-    if expression.as_ref().len() != origins.len() {
-        return None;
-    }
-    for (index, selected_node) in expression.as_ref().iter().enumerate() {
-        let class = egraph.find(*origins.get(index)?);
-        if !existing_leaves.contains(&class) {
-            continue;
-        }
-        if selected_node.children().iter().any(|child| usize::from(*child) >= origins.len()) {
-            return None;
-        }
-        let exact_node =
-            selected_node.clone().map_children(|child| egraph.find(origins[usize::from(child)]));
-        let lookup = egraph.lookup(exact_node.clone()).map(|id| egraph.find(id));
-        if lookup != Some(class) {
-            return None;
-        }
-        staged
-            .entry(class)
-            .and_modify(|stored| {
-                if stored.as_ref() != Some(&exact_node) {
-                    *stored = None;
-                }
-            })
-            .or_insert(Some(exact_node));
-    }
-    Some(())
-}
-
-fn commit_selected_existing_leaf_preferences(
-    preferred_batch: &mut ExactStructuralPreferences,
-    staged: HashMap<egg::Id, Option<MxxLang>>,
-) {
-    for (class, node) in staged {
-        let Some(node) = node else { continue };
-        match preferred_batch.get(&class) {
-            Some(_) => {}
-            None => {
-                preferred_batch.insert(class, HashSet::from([node]));
-            }
-        }
-    }
-}
-
-/// Retains an already-established exact physical representative when a
-/// context-aware selected polynomial introduced an `Existing` leaf that was
-/// not present in this extraction's RecExpr.  Selected syntax remains the
-/// authority when present; an exact composite in this batch has higher
-/// priority.  There is intentionally no fallback representative: a missing
-/// or conflicting prior preference remains unconstrained.
-fn carry_forward_absent_existing_leaf_preferences(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    existing_leaves: &HashSet<egg::Id>,
-    staged_selected: &HashMap<egg::Id, Option<MxxLang>>,
-    structural_preferences: &ExactStructuralPreferences,
-    preferred_batch: &mut ExactStructuralPreferences,
-) -> Option<ExistingLeafPreferenceTransport> {
-    let mut transport = ExistingLeafPreferenceTransport::default();
-    for requested in existing_leaves {
-        let class = egraph.find(*requested);
-        if staged_selected.contains_key(&class) {
-            continue;
-        }
-        if preferred_batch.contains_key(&class) {
-            transport.absent_blocked_by_composite_count =
-                transport.absent_blocked_by_composite_count.saturating_add(1);
-            continue;
-        }
-        if egraph[class].nodes.len() == 1 {
-            transport.absent_single_node_class_count =
-                transport.absent_single_node_class_count.saturating_add(1);
-        } else {
-            transport.absent_multi_node_class_count =
-                transport.absent_multi_node_class_count.saturating_add(1);
-        }
-        let Some(previous) = structural_preferences.get(&class) else {
-            transport.absent_without_prior_preference_count =
-                transport.absent_without_prior_preference_count.saturating_add(1);
-            continue;
-        };
-        let mut exact_nodes = HashSet::with_capacity(previous.len());
-        for node in previous {
-            let node = node.clone().map_children(|child| egraph.find(child));
-            if egraph.lookup(node.clone()).map(|id| egraph.find(id)) != Some(class) {
-                return None;
-            }
-            exact_nodes.insert(node);
-        }
-        if exact_nodes.is_empty() {
-            return None;
-        }
-        if exact_nodes.len() == 1 {
-            transport.carried_prior_single_node_preference_count =
-                transport.carried_prior_single_node_preference_count.saturating_add(1);
-        } else {
-            transport.carried_prior_multi_node_preference_count =
-                transport.carried_prior_multi_node_preference_count.saturating_add(1);
-        }
-        preferred_batch.insert(class, exact_nodes);
-    }
-    Some(transport)
 }
 
 fn run_ordinary_relation_saturation(
@@ -386,6 +249,17 @@ fn selected_relation_postcondition(
     } else {
         Err(unsatisfied_relation_redexes)
     }
+}
+
+fn selected_relation_rewrite_delta(
+    before: u64,
+    after: u64,
+    batch_size: usize,
+) -> Result<u64, super::error::RelationError> {
+    let delta = after.saturating_sub(before);
+    (delta != 0)
+        .then_some(delta)
+        .ok_or(super::error::RelationError::SelectedNormalizationBatchDidNotUnion { batch_size })
 }
 
 fn accumulated_rewrite_iterations(current: u64, additional: usize) -> u64 {
@@ -997,13 +871,11 @@ pub fn check_operational_noise_candidate_with_progress(
                     );
                     if selected_redexes.is_none() {
                         let mut preferred_batch = ExactStructuralPreferences::new();
-                        let mut existing_leaves = HashSet::new();
                         for plan in &snapshot_preferred {
                             let Some(recorded_root) = record_replacement_plan_preferences(
                                 &lowerer.egraph,
                                 plan,
                                 &mut preferred_batch,
-                                &mut existing_leaves,
                             ) else {
                                 return Err(OperationalSimulationError::Relation {
                                     site: site(&stage, wire, "selected structural preference"),
@@ -1015,97 +887,76 @@ pub fn check_operational_noise_candidate_with_progress(
                             };
                             let _ = recorded_root;
                         }
-                        let mut staged_existing = HashMap::new();
-                        for (_, extracted) in &selected {
-                            if stage_selected_existing_leaf_preferences(
-                                &lowerer.egraph,
-                                &extracted.proposal.expression,
-                                &extracted.origins,
-                                &existing_leaves,
-                                &mut staged_existing,
-                            )
-                            .is_none()
-                            {
-                                return Err(OperationalSimulationError::Relation {
-                                    site: site(&stage, wire, "selected structural preference"),
-                                    source: super::error::RelationError::
-                                        SelectedNormalizationBatchDidNotUnion {
-                                            batch_size: snapshot_preferred.len(),
-                                        },
-                                });
-                            }
-                        }
-                        let existing_leaf_count = existing_leaves.len();
-                        let staged_entry_count = staged_existing.len();
-                        let staged_some_count =
-                            staged_existing.values().filter(|node| node.is_some()).count();
-                        let staged_conflict_count =
-                            staged_existing.values().filter(|node| node.is_none()).count();
-                        let preferred_batch_class_count_before_leaf_commit = preferred_batch.len();
-                        let staged_some_blocked_by_composite_count = staged_existing
-                            .iter()
-                            .filter(|(class, node)| {
-                                node.is_some() && preferred_batch.contains_key(class)
-                            })
-                            .count();
-                        let staged_some_added_count = staged_some_count
-                            .saturating_sub(staged_some_blocked_by_composite_count);
-                        let requested_leaf_classes_absent_from_staged_count = existing_leaves
-                            .iter()
-                            .filter(|class| !staged_existing.contains_key(class))
-                            .count();
-                        let transported_absent = carry_forward_absent_existing_leaf_preferences(
-                            &lowerer.egraph,
-                            &existing_leaves,
-                            &staged_existing,
-                            &structural_preferences,
-                            &mut preferred_batch,
-                        )
-                        .ok_or_else(|| OperationalSimulationError::Relation {
-                            site: site(&stage, wire, "selected structural preference"),
-                            source: super::error::RelationError::SelectedNormalizationBatchDidNotUnion {
-                                batch_size: snapshot_preferred.len(),
-                            },
-                        })?;
-                        commit_selected_existing_leaf_preferences(
-                            &mut preferred_batch,
-                            staged_existing,
-                        );
-                        let final_preferred_batch_class_count = preferred_batch.len();
-                        let final_preferred_batch_node_count =
-                            preferred_batch.values().map(HashSet::len).sum::<usize>();
                         let structural_preference_changed = commit_structural_preference_batch(
                             &mut structural_preferences,
                             preferred_batch,
                         );
-                        info!(
-                            event = "operational_selected_existing_leaf_preference_epoch",
-                            epoch = normalization_epoch,
-                            existing_leaf_count,
-                            staged_entry_count,
-                            staged_some_count,
-                            staged_conflict_count,
-                            preferred_batch_class_count_before_leaf_commit,
-                            staged_some_blocked_by_composite_count,
-                            staged_some_added_count,
-                            requested_leaf_classes_absent_from_staged_count,
-                            absent_single_node_class_count =
-                                transported_absent.absent_single_node_class_count,
-                            absent_multi_node_class_count =
-                                transported_absent.absent_multi_node_class_count,
-                            carried_prior_single_node_preference_count =
-                                transported_absent.carried_prior_single_node_preference_count,
-                            carried_prior_multi_node_preference_count =
-                                transported_absent.carried_prior_multi_node_preference_count,
-                            absent_without_prior_preference_count =
-                                transported_absent.absent_without_prior_preference_count,
-                            absent_blocked_by_composite_count =
-                                transported_absent.absent_blocked_by_composite_count,
-                            final_preferred_batch_class_count,
-                            final_preferred_batch_node_count,
-                            structural_preference_changed,
-                            "selected Existing leaf preference aggregate"
+                        canonicalize_structural_preferences(
+                            &lowerer.egraph,
+                            &mut structural_preferences,
                         );
+                        let terminal_exposed_relation = preferred_batch_has_relation_redex(
+                            &lowerer.egraph,
+                            &structural_preferences,
+                            &context,
+                        )
+                        .map_err(|failure| {
+                            relation_error(&stage, wire, &lowerer.egraph.analysis.symbols, failure)
+                        })?;
+                        if terminal_exposed_relation {
+                            let rewrites_before = context.counters().rewrites;
+                            let iterations =
+                                run_ordinary_relation_saturation(&mut lowerer.egraph, &context)
+                                    .map_err(|source| OperationalSimulationError::Relation {
+                                        site: site(&stage, wire, "relation rewrite"),
+                                        source,
+                                    })?;
+                            if let Some(failure) = context.failure() {
+                                return Err(relation_error(
+                                    &stage,
+                                    wire,
+                                    &lowerer.egraph.analysis.symbols,
+                                    failure,
+                                ));
+                            }
+                            selected_relation_rewrite_delta(
+                                rewrites_before,
+                                context.counters().rewrites,
+                                snapshot_preferred.len(),
+                            )
+                            .map_err(|source| {
+                                OperationalSimulationError::Relation {
+                                    site: site(&stage, wire, "relation rewrite"),
+                                    source,
+                                }
+                            })?;
+                            egraph_mutation_epoch = egraph_mutation_epoch.saturating_add(1);
+                            canonicalize_structural_preferences(
+                                &lowerer.egraph,
+                                &mut structural_preferences,
+                            );
+                            {
+                                let mut control = control.borrow_mut();
+                                control.work(
+                                    iterations as u64,
+                                    None,
+                                    Some(lowerer.egraph.total_size() as u64),
+                                )?;
+                                let diagnostics = control.diagnostics_mut();
+                                diagnostics.rewrite_iteration_count =
+                                    accumulated_rewrite_iterations(
+                                        diagnostics.rewrite_iteration_count,
+                                        iterations,
+                                    );
+                                diagnostics.egraph_node_count = lowerer.egraph.total_size() as u64;
+                                diagnostics.egraph_class_count =
+                                    lowerer.egraph.number_of_classes() as u64;
+                            }
+                            selected_roots =
+                                roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
+                            normalization_epoch = 0;
+                            continue 'joint_fixed_point;
+                        }
                         if preference_only_reextract(
                             frontier_redex_count,
                             structural_preference_changed,
@@ -1377,12 +1228,10 @@ pub fn check_operational_noise_candidate_with_progress(
                         }
 
                         let mut plan_preferences = ExactStructuralPreferences::new();
-                        let mut existing_leaves = HashSet::new();
                         if record_replacement_plan_preferences(
                             &lowerer.egraph,
                             &plan,
                             &mut plan_preferences,
-                            &mut existing_leaves,
                         )
                         .is_none()
                         {
@@ -1392,19 +1241,10 @@ pub fn check_operational_noise_candidate_with_progress(
                                     SelectedNormalizationBatchDidNotUnion { batch_size },
                             });
                         }
-                        let exposed_relation = preferred_batch_has_relation_redex(
-                            &lowerer.egraph,
-                            &plan_preferences,
-                            &context,
-                        )
-                        .map_err(|failure| {
-                            relation_error(&stage, wire, &lowerer.egraph.analysis.symbols, failure)
-                        })?;
                         frontier_changed |= commit_structural_preference_batch(
                             &mut structural_preferences,
                             plan_preferences,
                         );
-                        frontier_exposed_relation |= exposed_relation;
                     }
                     if !frontier_changed {
                         return Err(OperationalSimulationError::Relation {
@@ -1420,13 +1260,45 @@ pub fn check_operational_noise_candidate_with_progress(
                         None,
                         Some(lowerer.egraph.total_size() as u64),
                     )?;
+                    canonicalize_structural_preferences(
+                        &lowerer.egraph,
+                        &mut structural_preferences,
+                    );
+                    frontier_exposed_relation |= preferred_batch_has_relation_redex(
+                        &lowerer.egraph,
+                        &structural_preferences,
+                        &context,
+                    )
+                    .map_err(|failure| {
+                        relation_error(&stage, wire, &lowerer.egraph.analysis.symbols, failure)
+                    })?;
                     if frontier_exposed_relation {
+                        let rewrites_before = context.counters().rewrites;
                         let iterations =
                             run_ordinary_relation_saturation(&mut lowerer.egraph, &context)
                                 .map_err(|source| OperationalSimulationError::Relation {
                                     site: site(&stage, wire, "relation rewrite"),
                                     source,
                                 })?;
+                        if let Some(failure) = context.failure() {
+                            return Err(relation_error(
+                                &stage,
+                                wire,
+                                &lowerer.egraph.analysis.symbols,
+                                failure,
+                            ));
+                        }
+                        selected_relation_rewrite_delta(
+                            rewrites_before,
+                            context.counters().rewrites,
+                            batch_size,
+                        )
+                        .map_err(|source| {
+                            OperationalSimulationError::Relation {
+                                site: site(&stage, wire, "relation rewrite"),
+                                source,
+                            }
+                        })?;
                         egraph_mutation_epoch = egraph_mutation_epoch.saturating_add(1);
                         canonicalize_structural_preferences(
                             &lowerer.egraph,
@@ -1448,14 +1320,10 @@ pub fn check_operational_noise_candidate_with_progress(
                             diagnostics.egraph_class_count =
                                 lowerer.egraph.number_of_classes() as u64;
                         }
-                        if let Some(failure) = context.failure() {
-                            return Err(relation_error(
-                                &stage,
-                                wire,
-                                &lowerer.egraph.analysis.symbols,
-                                failure,
-                            ));
-                        }
+                        selected_roots =
+                            roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
+                        normalization_epoch = 0;
+                        continue 'joint_fixed_point;
                     }
                     selected_roots = roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
                     normalization_epoch += 1;
@@ -2533,6 +2401,63 @@ mod tests {
     }
 
     #[test]
+    fn complete_preference_scan_catches_relation_exposed_after_a_later_union() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let (public, _) = test_matrix_atom(&mut egraph, "complete-scan-public", None);
+        let (ordinary, _) = test_matrix_atom(&mut egraph, "complete-scan-ordinary", None);
+        let (relation, source) = test_matrix_atom(
+            &mut egraph,
+            "complete-scan-relation",
+            Some(super::super::identity::AtomicRelationRole::Preimage),
+        );
+        let (target, _) = test_matrix_atom(&mut egraph, "complete-scan-target", None);
+        let preferred_node = MxxLang::MatrixMultiply(vec![public, ordinary].into_boxed_slice());
+        let preferred = egraph.add(preferred_node.clone());
+        let (later_left, _) = test_matrix_atom(&mut egraph, "complete-scan-later-left", None);
+        let (later_right, _) = test_matrix_atom(&mut egraph, "complete-scan-later-right", None);
+        let later_node = MxxLang::MatrixAdd(vec![later_left, later_right].into_boxed_slice());
+        let later = egraph.add(later_node.clone());
+        egraph.rebuild();
+
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        context.register(super::super::relation::RelationRegistration {
+            source,
+            expected_public: public,
+            target,
+            trapdoor: None,
+            indices: Box::new([]),
+        });
+        let mut preferences = ExactStructuralPreferences::from([(
+            egraph.find(preferred),
+            HashSet::from([preferred_node]),
+        )]);
+        let later_batch =
+            ExactStructuralPreferences::from([(egraph.find(later), HashSet::from([later_node]))]);
+
+        egraph.union(ordinary, relation);
+        egraph.rebuild();
+        canonicalize_structural_preferences(&egraph, &mut preferences);
+        assert!(
+            !preferred_batch_has_relation_redex(&egraph, &later_batch, &context)
+                .expect("the later batch itself has no relation")
+        );
+        assert!(
+            preferred_batch_has_relation_redex(&egraph, &preferences, &context)
+                .expect("the earlier preference becomes relation-applicable")
+        );
+
+        let rewrites_before = context.counters().rewrites;
+        run_ordinary_relation_saturation(&mut egraph, &context)
+            .expect("the complete preference scan routes to ordinary saturation");
+        let rewrites_after = context.counters().rewrites;
+        assert!(
+            selected_relation_rewrite_delta(rewrites_before, rewrites_after, 1).is_ok(),
+            "a terminal exposure restarts only after an actual rewrite"
+        );
+        assert_eq!(egraph.find(preferred), egraph.find(target));
+    }
+
+    #[test]
     fn replacement_preference_records_composites_but_not_existing_leaves() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let left = egraph.add(MxxLang::IntConst(1.into()));
@@ -2545,24 +2470,12 @@ mod tests {
         );
         let mut preferences = ExactStructuralPreferences::new();
         let mut first_batch = ExactStructuralPreferences::new();
-        let mut existing_leaves = HashSet::new();
-
-        let first = record_replacement_plan_preferences(
-            &egraph,
-            &plan,
-            &mut first_batch,
-            &mut existing_leaves,
-        );
+        let first = record_replacement_plan_preferences(&egraph, &plan, &mut first_batch);
         assert_eq!(first, Some(egraph.find(composite)));
         let first_changed = commit_structural_preference_batch(&mut preferences, first_batch);
         assert!(preference_only_reextract(0, first_changed));
         let mut duplicate_batch = ExactStructuralPreferences::new();
-        let duplicate = record_replacement_plan_preferences(
-            &egraph,
-            &plan,
-            &mut duplicate_batch,
-            &mut existing_leaves,
-        );
+        let duplicate = record_replacement_plan_preferences(&egraph, &plan, &mut duplicate_batch);
         assert_eq!(duplicate, Some(egraph.find(composite)));
         let duplicate_changed =
             commit_structural_preference_batch(&mut preferences, duplicate_batch);
@@ -2575,236 +2488,33 @@ mod tests {
     }
 
     #[test]
-    fn selected_existing_leaf_preference_replaces_prior_drift() {
+    fn existing_plan_leaves_prior_composite_preference_unchanged() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
-        let selected_leaf = egraph.add(MxxLang::IntConst(1.into()));
-        let competing_leaf = egraph.add(MxxLang::IntConst(2.into()));
-        egraph.union(selected_leaf, competing_leaf);
-        egraph.rebuild();
-        let leaf_class = egraph.find(selected_leaf);
-
-        let mut expression = RecExpr::default();
-        expression.add(MxxLang::IntConst(1.into()));
-        let mut staged = HashMap::new();
-        assert!(
-            stage_selected_existing_leaf_preferences(
-                &egraph,
-                &expression,
-                &[leaf_class],
-                &HashSet::from([leaf_class]),
-                &mut staged,
-            )
-            .is_some()
-        );
-        let mut batch = ExactStructuralPreferences::new();
-        let prior = ExactStructuralPreferences::from([(
-            leaf_class,
-            HashSet::from([MxxLang::IntConst(2.into())]),
-        )]);
-        let transport = carry_forward_absent_existing_leaf_preferences(
-            &egraph,
-            &HashSet::from([leaf_class]),
-            &staged,
-            &prior,
-            &mut batch,
-        )
-        .expect("selected syntax makes the prior preference inapplicable");
-        assert_eq!(transport.carried_prior_single_node_preference_count, 0);
-        commit_selected_existing_leaf_preferences(&mut batch, staged);
-        let mut preferences = ExactStructuralPreferences::new();
-        preferences.entry(leaf_class).or_default().insert(MxxLang::IntConst(2.into()));
-        assert!(commit_structural_preference_batch(&mut preferences, batch));
-        assert_eq!(preferences[&leaf_class], HashSet::from([MxxLang::IntConst(1.into())]));
-    }
-
-    #[test]
-    fn selected_existing_leaf_staging_is_transactional_and_rejects_conflicts() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let first = egraph.add(MxxLang::IntConst(1.into()));
-        let second = egraph.add(MxxLang::IntConst(2.into()));
-        egraph.union(first, second);
-        egraph.rebuild();
-        let class = egraph.find(first);
-
-        let mut conflicting = RecExpr::default();
-        conflicting.add(MxxLang::IntConst(1.into()));
-        conflicting.add(MxxLang::IntConst(2.into()));
-        let mut staged = HashMap::new();
-        assert!(
-            stage_selected_existing_leaf_preferences(
-                &egraph,
-                &conflicting,
-                &[class, class],
-                &HashSet::from([class]),
-                &mut staged,
-            )
-            .is_some()
-        );
-        let mut batch = ExactStructuralPreferences::new();
-        commit_selected_existing_leaf_preferences(&mut batch, staged);
-        assert!(!batch.contains_key(&class), "conflicting selected syntax is unconstrained");
-
-        let mut duplicate = RecExpr::default();
-        duplicate.add(MxxLang::IntConst(1.into()));
-        duplicate.add(MxxLang::IntConst(1.into()));
-        let mut staged = HashMap::new();
-        assert!(
-            stage_selected_existing_leaf_preferences(
-                &egraph,
-                &duplicate,
-                &[class, class],
-                &HashSet::from([class]),
-                &mut staged,
-            )
-            .is_some()
-        );
-        let mut duplicate_batch = ExactStructuralPreferences::new();
-        commit_selected_existing_leaf_preferences(&mut duplicate_batch, staged);
-        assert_eq!(duplicate_batch[&class], HashSet::from([MxxLang::IntConst(1.into())]));
-
-        let unrelated = egraph.add(MxxLang::IntConst(3.into()));
-        egraph.rebuild();
-        let mut mismatched = RecExpr::default();
-        mismatched.add(MxxLang::IntConst(3.into()));
-        let original = ExactStructuralPreferences::from([(
-            class,
-            HashSet::from([MxxLang::IntConst(1.into())]),
-        )]);
-        let mut staged = HashMap::new();
-        assert!(
-            stage_selected_existing_leaf_preferences(
-                &egraph,
-                &mismatched,
-                &[class],
-                &HashSet::from([class]),
-                &mut staged,
-            )
-            .is_none()
-        );
-        assert_eq!(
-            original[&class],
-            HashSet::from([MxxLang::IntConst(1.into())]),
-            "validation failure cannot mutate the eventual preference batch"
-        );
-        assert_ne!(egraph.find(unrelated), class);
-    }
-
-    #[test]
-    fn selected_existing_leaf_does_not_broaden_an_explicit_composite_constraint() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let child = egraph.add(MxxLang::IntConst(1.into()));
-        let composite_node = MxxLang::MatrixNegate([child]);
+        let (left, _) = test_matrix_atom(&mut egraph, "existing-preference-left", None);
+        let (right, _) = test_matrix_atom(&mut egraph, "existing-preference-right", None);
+        let composite_node = MxxLang::MatrixAdd(vec![left, right].into_boxed_slice());
         let composite = egraph.add(composite_node.clone());
-        let selected_node = MxxLang::MatrixAdd(vec![child].into_boxed_slice());
-        let selected = egraph.add(selected_node.clone());
-        egraph.union(composite, selected);
+        egraph.union(left, composite);
         egraph.rebuild();
-        let class = egraph.find(composite);
-
-        let mut expression = RecExpr::default();
-        let child_index = expression.add(MxxLang::IntConst(1.into()));
-        expression.add(MxxLang::MatrixAdd(vec![child_index].into_boxed_slice()));
-        let mut staged = HashMap::new();
-        assert!(
-            stage_selected_existing_leaf_preferences(
-                &egraph,
-                &expression,
-                &[child, class],
-                &HashSet::from([class]),
-                &mut staged,
-            )
-            .is_some()
-        );
-        let mut batch =
-            ExactStructuralPreferences::from([(class, HashSet::from([composite_node.clone()]))]);
-        let prior =
-            ExactStructuralPreferences::from([(class, HashSet::from([selected_node.clone()]))]);
-        let transport = carry_forward_absent_existing_leaf_preferences(
-            &egraph,
-            &HashSet::from([class]),
-            &HashMap::new(),
-            &prior,
-            &mut batch,
-        )
-        .expect("the already selected composite remains a physical member");
-        assert_eq!(transport.absent_blocked_by_composite_count, 1);
-        commit_selected_existing_leaf_preferences(&mut batch, staged);
-        assert_eq!(batch[&class], HashSet::from([composite_node]));
-
-        egraph.rebuild();
-        canonicalize_structural_preferences(&egraph, &mut batch);
-        assert_eq!(batch[&egraph.find(class)].len(), 1);
-    }
-
-    #[test]
-    fn absent_existing_leaf_retains_a_prior_ordered_product_preference() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let selector = egraph.add(MxxLang::IntConst(0.into()));
-        let (first_case, _) = test_matrix_atom(&mut egraph, "transport-first-case", None);
-        let (second_case, _) = test_matrix_atom(&mut egraph, "transport-second-case", None);
-        let switch_node =
-            MxxLang::Switch(vec![selector, first_case, second_case].into_boxed_slice());
-        let switch = egraph.add(switch_node.clone());
-        let (gadget, _) = test_matrix_atom(&mut egraph, "transport-gadget", None);
-        let forward_node = MxxLang::MatrixMultiply(vec![gadget, switch].into_boxed_slice());
-        let reverse_node = MxxLang::MatrixMultiply(vec![switch, gadget].into_boxed_slice());
-        let forward = egraph.add(forward_node.clone());
-        let reverse = egraph.add(reverse_node);
-        egraph.union(forward, switch);
-        egraph.union(forward, reverse);
-        egraph.rebuild();
-        let class = egraph.find(forward);
-
-        let unrelated = egraph.add(MxxLang::IntConst(9.into()));
-        egraph.rebuild();
-        let mut selected = RecExpr::default();
-        selected.add(MxxLang::IntConst(9.into()));
-        let mut staged_selected = HashMap::new();
-        stage_selected_existing_leaf_preferences(
-            &egraph,
-            &selected,
-            &[unrelated],
-            &HashSet::from([class]),
-            &mut staged_selected,
-        )
-        .expect("the omitted leaf does not produce selected syntax");
-        assert!(!staged_selected.contains_key(&class));
-
-        let mut without_prior_batch = ExactStructuralPreferences::new();
-        let without_prior = carry_forward_absent_existing_leaf_preferences(
-            &egraph,
-            &HashSet::from([class]),
-            &staged_selected,
-            &ExactStructuralPreferences::new(),
-            &mut without_prior_batch,
-        )
-        .expect("absence of a prior preference is deliberately not an error");
-        assert_eq!(without_prior.absent_without_prior_preference_count, 1);
-        assert!(!without_prior_batch.contains_key(&class));
-
-        let canonical_forward = forward_node.map_children(|child| egraph.find(child));
-        let mut prior =
-            ExactStructuralPreferences::from([(class, HashSet::from([canonical_forward.clone()]))]);
-        canonicalize_structural_preferences(&egraph, &mut prior);
+        let class = egraph.find(left);
+        let canonical_composite = composite_node.map_children(|child| egraph.find(child));
+        let mut preferences = ExactStructuralPreferences::from([(
+            class,
+            HashSet::from([canonical_composite.clone()]),
+        )]);
         let mut batch = ExactStructuralPreferences::new();
-        let transport = carry_forward_absent_existing_leaf_preferences(
-            &egraph,
-            &HashSet::from([class]),
-            &staged_selected,
-            &prior,
-            &mut batch,
-        )
-        .expect("the prior physical node remains a member of its canonical class");
 
-        assert_eq!(transport.absent_single_node_class_count, 0);
-        assert_eq!(transport.absent_multi_node_class_count, 1);
-        assert_eq!(transport.carried_prior_single_node_preference_count, 1);
-        assert_eq!(transport.carried_prior_multi_node_preference_count, 0);
-        assert_eq!(batch[&class], HashSet::from([canonical_forward]));
-        assert!(egraph[class].nodes.contains(&switch_node));
-        assert!(egraph[class].nodes.contains(&MxxLang::MatrixMultiply(
-            vec![egraph.find(switch), egraph.find(gadget)].into_boxed_slice(),
-        )));
+        assert_eq!(
+            record_replacement_plan_preferences(
+                &egraph,
+                &ReplacementPlan::Existing(class),
+                &mut batch,
+            ),
+            Some(class)
+        );
+        assert!(batch.is_empty(), "an Existing plan has no physical-node preference");
+        assert!(!commit_structural_preference_batch(&mut preferences, batch));
+        assert_eq!(preferences[&class], HashSet::from([canonical_composite]));
     }
 
     #[test]
@@ -2831,26 +2541,15 @@ mod tests {
         preferences.entry(child_class).or_default().insert(MxxLang::IntConst(1.into()));
 
         let mut first_batch = ExactStructuralPreferences::new();
-        let mut existing_leaves = HashSet::new();
-        record_replacement_plan_preferences(
-            &egraph,
-            &first_plan,
-            &mut first_batch,
-            &mut existing_leaves,
-        )
-        .expect("first batch compiles");
+        record_replacement_plan_preferences(&egraph, &first_plan, &mut first_batch)
+            .expect("first batch compiles");
         assert!(commit_structural_preference_batch(&mut preferences, first_batch));
         assert_eq!(preferences[&egraph.find(first)].len(), 1);
         assert!(preferences[&egraph.find(first)].contains(&first_node));
 
         let mut second_batch = ExactStructuralPreferences::new();
-        record_replacement_plan_preferences(
-            &egraph,
-            &second_plan,
-            &mut second_batch,
-            &mut existing_leaves,
-        )
-        .expect("second batch compiles");
+        record_replacement_plan_preferences(&egraph, &second_plan, &mut second_batch)
+            .expect("second batch compiles");
         assert!(commit_structural_preference_batch(&mut preferences, second_batch));
         assert_eq!(preferences[&egraph.find(first)].len(), 1);
         assert!(preferences[&egraph.find(first)].contains(&second_node));
@@ -2884,16 +2583,7 @@ mod tests {
         );
         let mut preferences = ExactStructuralPreferences::new();
 
-        let mut existing_leaves = HashSet::new();
-        assert!(
-            record_replacement_plan_preferences(
-                &egraph,
-                &plan,
-                &mut preferences,
-                &mut existing_leaves,
-            )
-            .is_some()
-        );
+        assert!(record_replacement_plan_preferences(&egraph, &plan, &mut preferences).is_some());
         egraph.rebuild();
         canonicalize_structural_preferences(&egraph, &mut preferences);
         let desired = &preferences[&egraph.find(first)];
@@ -2974,6 +2664,21 @@ mod tests {
         );
         assert_eq!(selected_relation_postcondition(0, 0), Ok(None));
         assert_eq!(selected_relation_postcondition(0, 1), Err(1));
+    }
+
+    #[test]
+    fn selected_relation_restart_requires_actual_rewrite_progress() {
+        assert!(matches!(
+            selected_relation_rewrite_delta(7, 7, 3),
+            Err(super::super::error::RelationError::SelectedNormalizationBatchDidNotUnion {
+                batch_size: 3,
+            })
+        ));
+        assert_eq!(
+            selected_relation_rewrite_delta(7, 9, 3),
+            Ok(2),
+            "a positive rewrite delta permits the fixed-point restart"
+        );
     }
 
     #[test]

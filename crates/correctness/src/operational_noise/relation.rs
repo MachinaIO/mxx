@@ -1260,6 +1260,125 @@ fn selected_context_has_independent_representative(
     Some(false)
 }
 
+const SELECTED_MISMATCH_SPINE_LIMIT: usize = 6;
+const SELECTED_MISMATCH_FACTOR_LIMIT: usize = 8;
+const SELECTED_MISMATCH_FACTOR_VIEW_LIMIT: usize = 12;
+
+fn selected_mismatch_spines(
+    terms: &[(Box<[Id]>, bool)],
+) -> (Vec<(bool, Box<[usize]>, usize, usize)>, usize) {
+    let mut retained = Vec::new();
+    let mut omitted = 0usize;
+    let mut index = 0usize;
+    while index < terms.len() {
+        let (factors, negative) = &terms[index];
+        let mut end = index + 1;
+        while end < terms.len() && terms[end] == terms[index] {
+            end += 1;
+        }
+        if retained.len() < SELECTED_MISMATCH_SPINE_LIMIT {
+            retained.push((
+                *negative,
+                factors
+                    .iter()
+                    .take(SELECTED_MISMATCH_FACTOR_LIMIT)
+                    .map(|factor| usize::from(*factor))
+                    .collect(),
+                factors.len().saturating_sub(SELECTED_MISMATCH_FACTOR_LIMIT),
+                end - index,
+            ));
+        } else {
+            omitted += end - index;
+        }
+        index = end;
+    }
+    (retained, omitted)
+}
+
+fn selected_mismatch_factor_views(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    baseline: &[(Box<[Id]>, bool)],
+    differing: &[(Box<[Id]>, bool)],
+) -> (Vec<LeafView>, usize) {
+    let baseline_counts = baseline.iter().fold(BTreeMap::new(), |mut counts, term| {
+        *counts.entry(term).or_insert(0usize) += 1;
+        counts
+    });
+    let differing_counts = differing.iter().fold(BTreeMap::new(), |mut counts, term| {
+        *counts.entry(term).or_insert(0usize) += 1;
+        counts
+    });
+    let mut factors = BTreeSet::new();
+    for term in baseline_counts.keys().chain(differing_counts.keys()) {
+        if baseline_counts.get(term) != differing_counts.get(term) {
+            factors.extend(term.0.iter().map(|factor| egraph.find(*factor)));
+        }
+    }
+    let omitted = factors.len().saturating_sub(SELECTED_MISMATCH_FACTOR_VIEW_LIMIT);
+    (
+        factors
+            .into_iter()
+            .take(SELECTED_MISMATCH_FACTOR_VIEW_LIMIT)
+            .map(|factor| leaf_view(egraph, factor))
+            .collect(),
+        omitted,
+    )
+}
+
+fn selected_spine_peel_term(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    spine: &[Id],
+    negative: bool,
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<PeelTerm> {
+    match spine {
+        [] => None,
+        [base] => Some(PeelTerm::Concrete { base: egraph.find(*base), negative }),
+        factors => {
+            let factors = copy_ids(factors, progress)?;
+            if let Some(product) = egraph.lookup(MxxLang::MatrixMultiply(factors.clone())) {
+                return Some(PeelTerm::Concrete { base: egraph.find(product), negative });
+            }
+            let (&base, suffix) = factors.split_first()?;
+            Some(PeelTerm::ProductFactor {
+                prefix: Box::default(),
+                terms: vec![(base, false)],
+                suffix: suffix.to_vec().into_boxed_slice(),
+                negative,
+            })
+        }
+    }
+}
+
+fn selected_peel_terms_to_spines(
+    terms: &[PeelTerm],
+    progress: &mut dyn FnMut() -> Result<(), ()>,
+) -> Option<Vec<(Box<[Id]>, bool)>> {
+    let mut spines = Vec::new();
+    for term in terms {
+        match term {
+            PeelTerm::Concrete { base, negative } => {
+                progress().ok()?;
+                spines.try_reserve(1).ok()?;
+                spines.push((vec![*base].into_boxed_slice(), *negative));
+            }
+            PeelTerm::ProductFactor { prefix, terms, suffix, negative } => {
+                for (base, base_negative) in terms {
+                    progress().ok()?;
+                    let mut spine = Vec::new();
+                    spine.try_reserve_exact(prefix.len() + 1 + suffix.len()).ok()?;
+                    spine.extend(prefix.iter().copied());
+                    spine.push(*base);
+                    spine.extend(suffix.iter().copied());
+                    spines.try_reserve(1).ok()?;
+                    spines.push((spine.into_boxed_slice(), *negative != *base_negative));
+                }
+            }
+        }
+    }
+    Some(spines)
+}
+
 fn selected_same_selector_add_hoist_plan(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     expression: &RecExpr<MxxLang>,
@@ -1274,10 +1393,9 @@ fn selected_same_selector_add_hoist_plan(
         return Some(None);
     }
     let root_origin = egraph.find(*origins.get(root_index)?);
-    let root_sort = match &egraph[root_origin].data.sort {
-        Ok(MxxSort::Matrix(matrix)) => matrix,
-        _ => return Some(None),
-    };
+    if !matches!(egraph[root_origin].data.sort, Ok(MxxSort::Matrix(_))) {
+        return Some(None);
+    }
     let root_terms = monomials.get(root_index)?;
     let mut groups = BTreeMap::<
         Id,
@@ -1302,8 +1420,8 @@ fn selected_same_selector_add_hoist_plan(
 
     for (ordinal, (spine, negative)) in root_terms.iter().enumerate() {
         progress().ok()?;
-        let mut selected_switch = None;
-        let mut ambiguous = false;
+        let mut occurrences = Vec::new();
+        let mut unresolved = false;
         for (position, factor) in spine.iter().enumerate() {
             progress().ok()?;
             let factor = egraph.find(*factor);
@@ -1349,142 +1467,169 @@ fn selected_same_selector_add_hoist_plan(
                             ));
                         }
                     }
-                    ambiguous = true;
+                    unresolved = true;
                     break;
                 };
-                if selected_switch.is_some() {
-                    ambiguous = true;
+                let Some(MxxLang::Switch(switch)) = expression.as_ref().get(selected_index) else {
+                    unresolved = true;
+                    break;
+                };
+                let Some(selector) = switch.first() else {
+                    unresolved = true;
+                    break;
+                };
+                occurrences.push((
+                    position,
+                    factor,
+                    selected_index,
+                    egraph.find(*origins.get(usize::from(*selector))?),
+                ));
+            }
+        }
+        if unresolved || occurrences.is_empty() {
+            continue;
+        }
+        let mut visited_selectors = BTreeSet::new();
+        for (switch_position, switch_origin, switch_index, selector_origin) in &occurrences {
+            progress().ok()?;
+            if !visited_selectors.insert(*selector_origin) ||
+                occurrences.iter().filter(|occurrence| occurrence.3 == *selector_origin).count() !=
+                    1
+            {
+                continue;
+            }
+            let MxxLang::Switch(switch) = expression.as_ref().get(*switch_index)? else { continue };
+            let (_, cases) = switch.split_first()?;
+            if cases.is_empty() {
+                continue;
+            }
+            let mut canonical_cases = Vec::new();
+            canonical_cases.try_reserve_exact(cases.len()).ok()?;
+            for case in cases {
+                progress().ok()?;
+                canonical_cases.push(egraph.find(*origins.get(usize::from(*case))?));
+            }
+            let canonical_cases = canonical_cases.into_boxed_slice();
+            let prefix = copy_ids(&spine[..*switch_position], progress)?;
+            let suffix = copy_ids(&spine[*switch_position + 1..], progress)?;
+            let mut context_valid = true;
+            let mut context_occurrences = Vec::new();
+            let mut context_rejection = None;
+            for factor in prefix.iter().chain(suffix.iter()) {
+                progress().ok()?;
+                let factor = egraph.find(*factor);
+                let Some(context_indices) = selected_indices.get(&factor) else {
+                    context_valid = false;
+                    context_rejection = Some("missing-context-origin");
+                    context_occurrences.push((usize::from(factor), 0));
+                    break;
+                };
+                context_occurrences.push((usize::from(factor), context_indices.len()));
+                if !selected_context_has_independent_representative(
+                    egraph,
+                    expression,
+                    origins,
+                    context_indices,
+                    *selector_origin,
+                    progress,
+                )? {
+                    context_valid = false;
+                    context_rejection = Some("all-context-representatives-selector-dependent");
                     break;
                 }
-                selected_switch = Some((position, factor, selected_index));
             }
-        }
-        if ambiguous {
-            continue;
-        }
-        let Some((switch_position, switch_origin, switch_index)) = selected_switch else {
-            continue;
-        };
-        let MxxLang::Switch(switch) = expression.as_ref().get(switch_index)? else {
-            continue;
-        };
-        let (&selector, cases) = switch.split_first()?;
-        if cases.is_empty() {
-            continue;
-        }
-        let selector_origin = egraph.find(*origins.get(usize::from(selector))?);
-        let mut canonical_cases = Vec::new();
-        canonical_cases.try_reserve_exact(cases.len()).ok()?;
-        for case in cases {
-            progress().ok()?;
-            canonical_cases.push(egraph.find(*origins.get(usize::from(*case))?));
-        }
-        let canonical_cases = canonical_cases.into_boxed_slice();
-        let prefix = copy_ids(&spine[..switch_position], progress)?;
-        let suffix = copy_ids(&spine[switch_position + 1..], progress)?;
-        let mut context_valid = true;
-        let mut context_occurrences = Vec::new();
-        let mut context_rejection = None;
-        for factor in prefix.iter().chain(suffix.iter()) {
-            progress().ok()?;
-            let factor = egraph.find(*factor);
-            let Some(context_indices) = selected_indices.get(&factor) else {
-                context_valid = false;
-                context_rejection = Some("missing-context-origin");
-                context_occurrences.push((usize::from(factor), 0));
-                break;
+            if !context_valid {
+                if diagnose {
+                    rejected_by_selector.entry(*selector_origin).or_default().push((
+                        ordinal,
+                        *negative,
+                        spine
+                            .iter()
+                            .take(8)
+                            .map(|factor| usize::from(egraph.find(*factor)))
+                            .collect(),
+                        spine.len().saturating_sub(8),
+                        1,
+                        usize::from(*switch_origin),
+                        canonical_cases.len(),
+                        context_occurrences,
+                        context_rejection.unwrap_or("context-rejected"),
+                        None,
+                    ));
+                }
+                continue;
+            }
+            let mut offending_case = None;
+            let switch_sort = match &egraph[*switch_origin].data.sort {
+                Ok(MxxSort::Matrix(matrix)) => Some(matrix),
+                _ => None,
             };
-            context_occurrences.push((usize::from(factor), context_indices.len()));
-            if !selected_context_has_independent_representative(
+            let rejection = if egraph[*selector_origin].data.sort != Ok(MxxSort::Int) {
+                Some("selector-sort-mismatch")
+            } else if !selector_domain_matches_cases(
                 egraph,
-                expression,
-                origins,
-                context_indices,
-                selector_origin,
-                progress,
-            )? {
-                context_valid = false;
-                context_rejection = Some("all-context-representatives-selector-dependent");
-                break;
-            }
-        }
-        if !context_valid {
-            if diagnose {
-                rejected_by_selector.entry(selector_origin).or_default().push((
+                *selector_origin,
+                canonical_cases.len(),
+            ) {
+                Some("selector-domain-case-count-mismatch")
+            } else if *switch_origin == root_origin {
+                Some("switch-root-cycle")
+            } else if switch_sort.is_none() {
+                Some("switch-output-sort-mismatch")
+            } else {
+                let switch_sort = switch_sort.expect("checked above");
+                canonical_cases.iter().enumerate().find_map(|(case_ordinal, case)| {
+                    let reason = if *case == root_origin || *case == *switch_origin {
+                        Some("case-cycle")
+                    } else {
+                        match &egraph[*case].data.sort {
+                            Ok(MxxSort::Matrix(case_sort))
+                                if matrix_types_equal(case_sort, switch_sort) =>
+                            {
+                                let count = selected_indices.get(case).map_or(0, Vec::len);
+                                (count != 1).then_some(if count == 0 {
+                                    "missing-case-selected-index"
+                                } else {
+                                    "duplicate-case-selected-indices"
+                                })
+                            }
+                            _ => Some("case-sort-mismatch"),
+                        }
+                    };
+                    reason.map(|reason| {
+                        offending_case = Some((
+                            case_ordinal,
+                            usize::from(*case),
+                            selected_indices.get(case).map_or(0, Vec::len),
+                        ));
+                        reason
+                    })
+                })
+            };
+            let valid = rejection.is_none();
+            if diagnose && let Some(rejection) = rejection {
+                rejected_by_selector.entry(*selector_origin).or_default().push((
                     ordinal,
                     *negative,
                     spine.iter().take(8).map(|factor| usize::from(egraph.find(*factor))).collect(),
                     spine.len().saturating_sub(8),
                     1,
-                    usize::from(switch_origin),
+                    usize::from(*switch_origin),
                     canonical_cases.len(),
                     context_occurrences,
-                    context_rejection.unwrap_or("context-rejected"),
-                    None,
+                    rejection,
+                    offending_case,
                 ));
             }
-            continue;
-        }
-        let mut offending_case = None;
-        let rejection = if egraph[selector_origin].data.sort != Ok(MxxSort::Int) {
-            Some("selector-sort-mismatch")
-        } else if !selector_domain_matches_cases(egraph, selector_origin, canonical_cases.len()) {
-            Some("selector-domain-case-count-mismatch")
-        } else if switch_origin == root_origin {
-            Some("switch-root-cycle")
-        } else if egraph[switch_origin].data.sort.as_ref().ok() !=
-            Some(&MxxSort::Matrix(root_sort.clone()))
-        {
-            Some("switch-output-sort-mismatch")
-        } else {
-            canonical_cases.iter().enumerate().find_map(|(case_ordinal, case)| {
-                let reason = if *case == root_origin || *case == switch_origin {
-                    Some("case-cycle")
-                } else if egraph[*case].data.sort.as_ref().ok() !=
-                    Some(&MxxSort::Matrix(root_sort.clone()))
-                {
-                    Some("case-sort-mismatch")
-                } else {
-                    let count = selected_indices.get(case).map_or(0, Vec::len);
-                    (count != 1).then_some(if count == 0 {
-                        "missing-case-selected-index"
-                    } else {
-                        "duplicate-case-selected-indices"
-                    })
-                };
-                reason.map(|reason| {
-                    offending_case = Some((
-                        case_ordinal,
-                        usize::from(*case),
-                        selected_indices.get(case).map_or(0, Vec::len),
-                    ));
-                    reason
-                })
-            })
-        };
-        let valid = rejection.is_none();
-        if diagnose && let Some(rejection) = rejection {
-            rejected_by_selector.entry(selector_origin).or_default().push((
-                ordinal,
-                *negative,
-                spine.iter().take(8).map(|factor| usize::from(egraph.find(*factor))).collect(),
-                spine.len().saturating_sub(8),
-                1,
-                usize::from(switch_origin),
-                canonical_cases.len(),
-                context_occurrences,
-                rejection,
-                offending_case,
+            let entry = groups.entry(*selector_origin).or_insert((
+                Some(canonical_cases.len()),
+                true,
+                Vec::new(),
             ));
+            entry.1 &= valid && entry.0 == Some(canonical_cases.len());
+            entry.2.try_reserve(1).ok()?;
+            entry.2.push((ordinal, canonical_cases, *negative, prefix, suffix));
         }
-        let entry = groups.entry(selector_origin).or_insert((
-            Some(canonical_cases.len()),
-            true,
-            Vec::new(),
-        ));
-        entry.1 &= valid && entry.0 == Some(canonical_cases.len());
-        entry.2.try_reserve(1).ok()?;
-        entry.2.push((ordinal, canonical_cases, *negative, prefix, suffix));
     }
 
     if diagnose {
@@ -1530,8 +1675,159 @@ fn selected_same_selector_add_hoist_plan(
             continue;
         }
         let case_count = case_count?;
+        let participant_ordinals =
+            participants.iter().map(|(ordinal, ..)| *ordinal).collect::<BTreeSet<_>>();
+        let mut exterior = Vec::new();
+        let mut candidate_valid = true;
+        let mut whole_rejection = None;
+        for (ordinal, (spine, negative)) in root_terms.iter().enumerate() {
+            progress().ok()?;
+            let mut switch_count = 0usize;
+            let mut same_selector = false;
+            let mut switch_occurrences = Vec::new();
+            for factor in spine {
+                progress().ok()?;
+                let factor = egraph.find(*factor);
+                let Some(selected_switch) = selected_switches.get(&factor) else { continue };
+                let Some(selected_switch) = *selected_switch else {
+                    candidate_valid = false;
+                    if switch_occurrences.len() < 4 {
+                        for index in selected_indices.get(&factor).into_iter().flatten() {
+                            let Some(MxxLang::Switch(children)) = expression.as_ref().get(*index)
+                            else {
+                                continue;
+                            };
+                            let Some(selector) = children.first() else { continue };
+                            switch_occurrences.push((
+                                usize::from(factor),
+                                usize::from(egraph.find(*origins.get(usize::from(*selector))?)),
+                                children.len().saturating_sub(1),
+                                selected_indices.get(&factor).map_or(0, Vec::len),
+                            ));
+                            if switch_occurrences.len() == 4 {
+                                break;
+                            }
+                        }
+                    }
+                    whole_rejection = Some((
+                        "unresolved-selected-switch",
+                        ordinal,
+                        *negative,
+                        std::mem::take(&mut switch_occurrences),
+                    ));
+                    break;
+                };
+                let MxxLang::Switch(children) = expression.as_ref().get(selected_switch)? else {
+                    candidate_valid = false;
+                    whole_rejection =
+                        Some(("unresolved-selected-switch", ordinal, *negative, Vec::new()));
+                    break;
+                };
+                let Some(selector) = children.first() else {
+                    candidate_valid = false;
+                    whole_rejection =
+                        Some(("unresolved-selected-switch", ordinal, *negative, Vec::new()));
+                    break;
+                };
+                let factor_selector = egraph.find(*origins.get(usize::from(*selector))?);
+                if factor_selector == selector_origin {
+                    switch_count += 1;
+                    same_selector = true;
+                    if switch_occurrences.len() < 4 {
+                        switch_occurrences.push((
+                            usize::from(factor),
+                            usize::from(factor_selector),
+                            children.len().saturating_sub(1),
+                            selected_indices.get(&factor).map_or(0, Vec::len),
+                        ));
+                    }
+                }
+            }
+            if !candidate_valid || switch_count > 1 {
+                if candidate_valid {
+                    whole_rejection =
+                        Some(("multiple-switches", ordinal, *negative, switch_occurrences));
+                }
+                candidate_valid = false;
+                break;
+            }
+            if switch_count == 1 {
+                if !same_selector || !participant_ordinals.contains(&ordinal) {
+                    candidate_valid = false;
+                    whole_rejection = Some((
+                        "unresolved-selected-switch",
+                        ordinal,
+                        *negative,
+                        switch_occurrences,
+                    ));
+                    break;
+                }
+                continue;
+            }
+            for factor in spine {
+                let factor = egraph.find(*factor);
+                let Some(indices) = selected_indices.get(&factor) else {
+                    candidate_valid = false;
+                    whole_rejection =
+                        Some(("missing-selected-representation", ordinal, *negative, Vec::new()));
+                    break;
+                };
+                if !selected_context_has_independent_representative(
+                    egraph,
+                    expression,
+                    origins,
+                    indices,
+                    selector_origin,
+                    progress,
+                )? {
+                    candidate_valid = false;
+                    whole_rejection = Some(("dependent-exterior", ordinal, *negative, Vec::new()));
+                    break;
+                }
+            }
+            if !candidate_valid {
+                break;
+            }
+            exterior.try_reserve(1).ok()?;
+            exterior.push((ordinal, spine.clone(), *negative));
+        }
+        if !candidate_valid {
+            if diagnose && participants.len() >= 2 {
+                let (reason, ordinal, negative, switch_occurrences) =
+                    whole_rejection.unwrap_or(("whole-candidate-invalid", 0, false, Vec::new()));
+                let (spine, _) = root_terms.get(ordinal)?;
+                tracing::debug!(
+                    event = "operational_selected_full_case_candidate_rejected",
+                    add_origin = usize::from(root_origin),
+                    selector = usize::from(selector_origin),
+                    reason,
+                    monomial_ordinal = ordinal,
+                    negative,
+                    spine = ?spine
+                        .iter()
+                        .take(8)
+                        .map(|factor| usize::from(egraph.find(*factor)))
+                        .collect::<Vec<_>>(),
+                    spine_omitted = spine.len().saturating_sub(8),
+                    switch_occurrences = ?switch_occurrences,
+                    participant_count = participants.len(),
+                    exterior_count = exterior.len(),
+                    total_monomial_count = root_terms.len(),
+                    "selected full-case candidate rejects one whole-root monomial"
+                );
+            }
+            continue;
+        }
+        // Cases are streamed.  The existing peel matcher is linear in stored
+        // cases and, per case, worst-case quadratic in actual versus fixed
+        // spines (times their ordered-factor traversal); no selector product
+        // or case polynomial is retained.
         let mut common_result: Option<Vec<(Box<[Id]>, bool)>> = None;
         let mut zero_witness = None;
+        let mut peeled_case_count = 0usize;
+        let mut total_actual_count = 0usize;
+        let mut total_fixed_count = 0usize;
+        let mut total_unmatched_fixed_count = 0usize;
         for case_ordinal in 0..case_count {
             let mut combined = Vec::new();
             for (_, cases, outer_negative, prefix, suffix) in &participants {
@@ -1556,30 +1852,99 @@ fn selected_same_selector_add_hoist_plan(
                         .push((contextual.into_boxed_slice(), *case_negative != *outer_negative));
                 }
             }
+            for (_, spine, negative) in &exterior {
+                progress().ok()?;
+                combined.try_reserve(1).ok()?;
+                combined.push((copy_ids(spine, progress)?, *negative));
+            }
+            canonicalize_central_constant_scalar_spines(egraph, &mut combined, progress)?;
+            cancel_signed_spines(&mut combined);
+            let mut actual = Vec::new();
+            let mut fixed_spines = Vec::new();
+            for (spine, negative) in combined {
+                progress().ok()?;
+                let term = selected_spine_peel_term(egraph, &spine, negative, progress)?;
+                let peelable = match &term {
+                    PeelTerm::Concrete { base, .. } => {
+                        factor_can_peel_fixed_target(egraph, *base, progress)?
+                    }
+                    PeelTerm::ProductFactor { terms, .. } => {
+                        let mut peelable = false;
+                        for (base, _) in terms {
+                            if factor_can_peel_fixed_target(egraph, *base, progress)? {
+                                peelable = true;
+                                break;
+                            }
+                        }
+                        peelable
+                    }
+                };
+                if peelable {
+                    actual.try_reserve(1).ok()?;
+                    actual.push(term);
+                } else {
+                    fixed_spines.try_reserve(1).ok()?;
+                    fixed_spines.push((spine, negative));
+                }
+            }
+            let actual_count = actual.len();
+            let fixed_count = fixed_spines.len();
+            let (peeled, unmatched_fixed) =
+                peel_fixed_targets(egraph, &mut actual, &fixed_spines, progress)?;
+            let unmatched_fixed_count = unmatched_fixed.len();
+            peeled_case_count += usize::from(peeled);
+            total_actual_count = total_actual_count.checked_add(actual_count)?;
+            total_fixed_count = total_fixed_count.checked_add(fixed_count)?;
+            total_unmatched_fixed_count =
+                total_unmatched_fixed_count.checked_add(unmatched_fixed_count)?;
+            let mut combined = selected_peel_terms_to_spines(&actual, progress)?;
+            for term in unmatched_fixed {
+                progress().ok()?;
+                combined.try_reserve(1).ok()?;
+                combined.push(term);
+            }
             canonicalize_central_constant_scalar_spines(egraph, &mut combined, progress)?;
             cancel_signed_spines(&mut combined);
             if let Some(previous) = &common_result {
                 if previous != &combined {
-                    let contexts = participants
-                        .iter()
-                        .map(|(_, _, negative, prefix, suffix)| {
-                            (*negative, prefix.len(), suffix.len())
-                        })
-                        .collect::<Vec<_>>();
-                    tracing::debug!(
-                        event = "operational_selected_cross_switch_case_mismatch",
-                        add_origin = usize::from(root_origin),
-                        selector = usize::from(selector_origin),
-                        participant_count = participants.len(),
-                        case_count,
-                        differing_case = case_ordinal,
-                        contexts = ?contexts,
-                        baseline_monomial_count = previous.len(),
-                        differing_monomial_count = combined.len(),
-                        baseline_omitted = previous.len().saturating_sub(4),
-                        differing_omitted = combined.len().saturating_sub(4),
-                        "selected same-selector case polynomials differ"
-                    );
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        let contexts = participants
+                            .iter()
+                            .map(|(_, _, negative, prefix, suffix)| {
+                                (*negative, prefix.len(), suffix.len())
+                            })
+                            .collect::<Vec<_>>();
+                        let (baseline_spines, baseline_omitted) =
+                            selected_mismatch_spines(previous);
+                        let (differing_spines, differing_omitted) =
+                            selected_mismatch_spines(&combined);
+                        let (differing_factor_views, differing_factor_views_omitted) =
+                            selected_mismatch_factor_views(egraph, previous, &combined);
+                        tracing::debug!(
+                            event = "operational_selected_full_case_residual_mismatch",
+                            add_origin = usize::from(root_origin),
+                            selector = usize::from(selector_origin),
+                            participant_count = participants.len(),
+                            exterior_count = exterior.len(),
+                            peeled,
+                            actual_count,
+                            fixed_count,
+                            unmatched_fixed_count,
+                            case_count,
+                            baseline_case = 0,
+                            differing_case = case_ordinal,
+                            contexts = ?contexts,
+                            baseline_monomial_count = previous.len(),
+                            differing_monomial_count = combined.len(),
+                            baseline_spines = ?baseline_spines,
+                            differing_spines = ?differing_spines,
+                            baseline_omitted,
+                            differing_omitted,
+                            differing_factor_views = ?differing_factor_views,
+                            differing_factor_views_omitted,
+                            "selected same-selector full-case residuals differ"
+                        );
+                    }
                     common_result = None;
                     break;
                 }
@@ -1591,13 +1956,18 @@ fn selected_same_selector_add_hoist_plan(
             continue;
         };
         tracing::debug!(
-            event = "operational_selected_cross_switch_case_equal",
+            event = "operational_selected_full_case_residual_equal",
             add_origin = usize::from(root_origin),
             selector = usize::from(selector_origin),
             participant_count = participants.len(),
+            exterior_count = exterior.len(),
             case_count,
+            peeled_case_count,
+            total_actual_count,
+            total_fixed_count,
+            total_unmatched_fixed_count,
             residual_monomial_count = common_result.len(),
-            "selected same-selector cases have one exterior polynomial"
+            "selected same-selector cases have one complete residual"
         );
         let plan = if common_result.is_empty() {
             let witness = ReplacementPlan::Existing(zero_witness?);
@@ -1608,12 +1978,14 @@ fn selected_same_selector_add_hoist_plan(
         } else {
             signed_spines_replacement_plan(&common_result, None)?
         };
-        let first = participants.iter().map(|(ordinal, ..)| *ordinal).min()?;
-        if participants.iter().any(|(ordinal, ..)| replacements.contains_key(ordinal)) {
+        let mut replaced_ordinals = participant_ordinals;
+        replaced_ordinals.extend(exterior.iter().map(|(ordinal, ..)| *ordinal));
+        let first = *replaced_ordinals.first()?;
+        if replaced_ordinals.iter().any(|ordinal| replacements.contains_key(ordinal)) {
             return Some(None);
         }
         replacements.insert(first, Some(plan));
-        for (ordinal, ..) in participants {
+        for ordinal in replaced_ordinals {
             if ordinal != first {
                 replacements.insert(ordinal, None);
             }
@@ -4316,6 +4688,7 @@ enum LeafNodeDescriptor {
     Atom {
         source_id: u32,
         source_kind: &'static str,
+        relation_role: Option<AtomicRelationRole>,
         indices: Box<[usize]>,
         indices_omitted: usize,
     },
@@ -4389,7 +4762,19 @@ fn leaf_node_descriptor(
                 .get(source.0)
                 .map(|descriptor| atomic_source_kind(&descriptor.key))
                 .unwrap_or("missing-source");
-            LeafNodeDescriptor::Atom { source_id: source.0, source_kind, indices, indices_omitted }
+            let relation_role = egraph
+                .analysis
+                .symbols
+                .atomic_sources
+                .get(source.0)
+                .and_then(|descriptor| descriptor.relation_role);
+            LeafNodeDescriptor::Atom {
+                source_id: source.0,
+                source_kind,
+                relation_role,
+                indices,
+                indices_omitted,
+            }
         }
         MxxLang::MatrixConstant(spec) => LeafNodeDescriptor::MatrixConstant {
             spec: spec.0,
@@ -6739,7 +7124,8 @@ mod tests {
                 event.contains("fixed_target_peel_match") ||
                     event.contains("fixed_target_peel_term") ||
                     event.contains("binder_pre_cancel_mapped_fixed_spine") ||
-                    event.contains("operational_selected_cross_switch_case_mismatch")
+                    event.contains("operational_selected_full_case_residual_mismatch") ||
+                    event.contains("operational_selected_full_case_candidate_rejected")
             }) {
                 self.0.lock().expect("event capture lock").push(fields.fields);
             }
@@ -6752,6 +7138,20 @@ mod tests {
             ring_dimension: ResolvedIntExpr::Const(1.into()),
             rows: ResolvedIntExpr::Const(1.into()),
             columns: ResolvedIntExpr::Const(1.into()),
+        }
+    }
+
+    fn concrete_matrix_type(
+        modulus: i64,
+        ring_dimension: i64,
+        rows: i64,
+        columns: i64,
+    ) -> ResolvedMatrixType {
+        ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(modulus.into()),
+            ring_dimension: ResolvedIntExpr::Const(ring_dimension.into()),
+            rows: ResolvedIntExpr::Const(rows.into()),
+            columns: ResolvedIntExpr::Const(columns.into()),
         }
     }
 
@@ -10223,6 +10623,75 @@ mod tests {
     }
 
     #[test]
+    fn selected_full_case_keeps_a_foreign_selector_opaque() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let foreign_selector = egraph.add(MxxLang::IntConst(1.into()));
+        let cases = (0..6)
+            .map(|index| matrix_atom(&mut egraph, &format!("rejected-case-{index}"), None).0)
+            .collect::<Vec<_>>();
+        let first =
+            egraph.add(MxxLang::Switch(vec![selector, cases[0], cases[1]].into_boxed_slice()));
+        let second =
+            egraph.add(MxxLang::Switch(vec![selector, cases[2], cases[3]].into_boxed_slice()));
+        let foreign = egraph
+            .add(MxxLang::Switch(vec![foreign_selector, cases[4], cases[5]].into_boxed_slice()));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![first, second, foreign].into_boxed_slice()));
+        egraph.rebuild();
+
+        let mut expression = RecExpr::default();
+        let selector_expression = expression.add(MxxLang::IntConst(0.into()));
+        let case0 = expression.add(MxxLang::IntConst(2.into()));
+        let case1 = expression.add(MxxLang::IntConst(3.into()));
+        let first_expression = expression
+            .add(MxxLang::Switch(vec![selector_expression, case0, case1].into_boxed_slice()));
+        let case2 = expression.add(MxxLang::IntConst(4.into()));
+        let case3 = expression.add(MxxLang::IntConst(5.into()));
+        let second_expression = expression
+            .add(MxxLang::Switch(vec![selector_expression, case2, case3].into_boxed_slice()));
+        let foreign_selector_expression = expression.add(MxxLang::IntConst(1.into()));
+        let case4 = expression.add(MxxLang::IntConst(6.into()));
+        let case5 = expression.add(MxxLang::IntConst(7.into()));
+        let foreign_expression = expression.add(MxxLang::Switch(
+            vec![foreign_selector_expression, case4, case5].into_boxed_slice(),
+        ));
+        let root_expression = expression.add(MxxLang::MatrixAdd(
+            vec![first_expression, second_expression, foreign_expression].into_boxed_slice(),
+        ));
+        let origins = [
+            selector,
+            cases[0],
+            cases[1],
+            first,
+            cases[2],
+            cases[3],
+            second,
+            foreign_selector,
+            cases[4],
+            cases[5],
+            foreign,
+            root,
+        ];
+        let mut progress = || Ok(());
+        let monomials =
+            selected_polynomial_monomials(&egraph, &expression, &origins, &mut progress)
+                .expect("selected polynomial");
+        let (selected_indices, selected_switches) =
+            selected_lookup_maps_for_test(&egraph, &expression, &origins);
+        let plan = selected_same_selector_add_hoist_plan(
+            &egraph,
+            &expression,
+            &origins,
+            &selected_indices,
+            &selected_switches,
+            usize::from(root_expression),
+            &monomials,
+            &mut progress,
+        );
+        assert!(plan.is_some_and(|plan| plan.is_none()));
+    }
+
+    #[test]
     fn selected_polynomial_eliminates_equal_same_selector_case_sums_without_a_switch_merge() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let selector = egraph.add(MxxLang::IntConst(0.into()));
@@ -10537,7 +11006,7 @@ mod tests {
         .expect("scan resources")
         .expect("case sums are selector independent");
         let ReplacementPlan::Add(terms) = plan else { panic!("one root Add") };
-        assert_eq!(terms.len(), 2, "the participating result and fixed term occur once each");
+        assert_eq!(terms.len(), 1, "the complete case residual occurs exactly once");
         assert!(terms.iter().all(|term| !matches!(term, ReplacementPlan::Switch(_))));
 
         let case_origin = egraph.find(atoms[0]);
@@ -10597,10 +11066,20 @@ mod tests {
         assert!(unequal_plan.is_some_and(|plan| plan.is_none()));
         let events = capture.0.lock().expect("event capture lock");
         assert_eq!(events.len(), 1, "only the first differing case is logged");
+        assert_eq!(events[0].get("baseline_case").map(String::as_str), Some("0"));
         assert_eq!(events[0].get("differing_case").map(String::as_str), Some("1"));
         assert!(events[0].contains_key("contexts"));
+        assert!(events[0].get("baseline_spines").is_some_and(|value| value.contains("false")));
+        assert!(events[0].get("differing_spines").is_some_and(|value| value.contains("false")));
+        assert!(
+            events[0]
+                .get("differing_factor_views")
+                .is_some_and(|value| value.contains("source_kind: \"protocol-input\"") &&
+                    value.contains("relation_role: None"))
+        );
         assert!(events[0].contains_key("baseline_omitted"));
         assert!(events[0].contains_key("differing_omitted"));
+        assert!(events[0].contains_key("differing_factor_views_omitted"));
         drop(events);
         let mut interrupted = || Err(());
         assert!(
@@ -10616,6 +11095,127 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn selected_same_selector_full_case_uses_preimage_union_before_comparing_cases() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let a_lt = matrix_atom(&mut egraph, "full-case-a-lt", None).0;
+        let mut rows = Vec::new();
+        for case in 0..2 {
+            let x_g_low = matrix_atom(&mut egraph, &format!("full-case-xg-low-{case}"), None).0;
+            let a_z_low = matrix_atom(&mut egraph, &format!("full-case-az-low-{case}"), None).0;
+            let y_g = matrix_atom(&mut egraph, &format!("full-case-yg-{case}"), None).0;
+            let b_high = matrix_atom(&mut egraph, &format!("full-case-b-high-{case}"), None).0;
+            let neg_a_z_low = egraph.add(MxxLang::MatrixNegate([a_z_low]));
+            let neg_y_g = egraph.add(MxxLang::MatrixNegate([y_g]));
+            let adjusted = egraph.add(MxxLang::MatrixAdd(
+                vec![a_lt, x_g_low, neg_a_z_low, neg_y_g].into_boxed_slice(),
+            ));
+            egraph.union(b_high, adjusted);
+            rows.push((x_g_low, a_z_low, y_g, b_high));
+        }
+        let x_switch =
+            egraph.add(MxxLang::Switch(vec![selector, rows[0].0, rows[1].0].into_boxed_slice()));
+        let az_switch =
+            egraph.add(MxxLang::Switch(vec![selector, rows[0].1, rows[1].1].into_boxed_slice()));
+        let y_switch =
+            egraph.add(MxxLang::Switch(vec![selector, rows[0].2, rows[1].2].into_boxed_slice()));
+        let high_switch =
+            egraph.add(MxxLang::Switch(vec![selector, rows[0].3, rows[1].3].into_boxed_slice()));
+        let neg_az_switch = egraph.add(MxxLang::MatrixNegate([az_switch]));
+        let neg_y_switch = egraph.add(MxxLang::MatrixNegate([y_switch]));
+        let neg_high_switch = egraph.add(MxxLang::MatrixNegate([high_switch]));
+        let root = egraph.add(MxxLang::MatrixAdd(
+            vec![a_lt, x_switch, neg_az_switch, neg_y_switch, neg_high_switch].into_boxed_slice(),
+        ));
+        egraph.rebuild();
+
+        let mut expression = RecExpr::default();
+        let selector_expression = expression.add(MxxLang::IntConst(0.into()));
+        let a_expression = expression.add(MxxLang::IntConst(1.into()));
+        let mut row_expressions = Vec::new();
+        for offset in 0..2 {
+            row_expressions.push((
+                expression.add(MxxLang::IntConst((2 + offset * 4).into())),
+                expression.add(MxxLang::IntConst((3 + offset * 4).into())),
+                expression.add(MxxLang::IntConst((4 + offset * 4).into())),
+                expression.add(MxxLang::IntConst((5 + offset * 4).into())),
+            ));
+        }
+        let x_expression = expression.add(MxxLang::Switch(
+            vec![selector_expression, row_expressions[0].0, row_expressions[1].0]
+                .into_boxed_slice(),
+        ));
+        let az_expression = expression.add(MxxLang::Switch(
+            vec![selector_expression, row_expressions[0].1, row_expressions[1].1]
+                .into_boxed_slice(),
+        ));
+        let y_expression = expression.add(MxxLang::Switch(
+            vec![selector_expression, row_expressions[0].2, row_expressions[1].2]
+                .into_boxed_slice(),
+        ));
+        let high_expression = expression.add(MxxLang::Switch(
+            vec![selector_expression, row_expressions[0].3, row_expressions[1].3]
+                .into_boxed_slice(),
+        ));
+        let neg_az_expression = expression.add(MxxLang::MatrixNegate([az_expression]));
+        let neg_y_expression = expression.add(MxxLang::MatrixNegate([y_expression]));
+        let neg_high_expression = expression.add(MxxLang::MatrixNegate([high_expression]));
+        let root_expression = expression.add(MxxLang::MatrixAdd(
+            vec![
+                a_expression,
+                x_expression,
+                neg_az_expression,
+                neg_y_expression,
+                neg_high_expression,
+            ]
+            .into_boxed_slice(),
+        ));
+        let origins = vec![
+            selector,
+            a_lt,
+            rows[0].0,
+            rows[0].1,
+            rows[0].2,
+            rows[0].3,
+            rows[1].0,
+            rows[1].1,
+            rows[1].2,
+            rows[1].3,
+            x_switch,
+            az_switch,
+            y_switch,
+            high_switch,
+            neg_az_switch,
+            neg_y_switch,
+            neg_high_switch,
+            root,
+        ];
+        let mut progress = || Ok(());
+        let monomials =
+            selected_polynomial_monomials(&egraph, &expression, &origins, &mut progress)
+                .expect("full-case selected polynomial");
+        let (selected_indices, selected_switches) =
+            selected_lookup_maps_for_test(&egraph, &expression, &origins);
+        let plan = selected_same_selector_add_hoist_plan(
+            &egraph,
+            &expression,
+            &origins,
+            &selected_indices,
+            &selected_switches,
+            usize::from(root_expression),
+            &monomials,
+            &mut progress,
+        )
+        .expect("full-case scan")
+        .expect("every preimage case has the same zero residual");
+        let ReplacementPlan::Add(terms) = plan else { panic!("typed zero uses an Add witness") };
+        assert_eq!(terms.len(), 1, "the root retains one complete residual");
+        let ReplacementPlan::Add(zero) = &terms[0] else { panic!("residual is typed zero") };
+        assert_eq!(zero.len(), 2);
+        assert!(matches!(zero[1], ReplacementPlan::Negate(_)));
     }
 
     #[test]
@@ -10899,6 +11499,330 @@ mod tests {
         .expect("opposite switches cancel");
         assert!(matches!(plan, ReplacementPlan::Add(_)));
         assert!(visits < 20_000, "stored-case work stays linear and bounded: {visits}");
+    }
+
+    #[test]
+    fn selected_same_selector_accepts_rectangular_switch_factor_context() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let prefix = matrix_atom_with_type(
+            &mut egraph,
+            "rectangular-prefix",
+            concrete_matrix_type(17, 8, 2, 3),
+            None,
+        )
+        .0;
+        let cases = (0..2)
+            .map(|index| {
+                matrix_atom_with_type(
+                    &mut egraph,
+                    &format!("rectangular-case-{index}"),
+                    concrete_matrix_type(17, 8, 3, 4),
+                    None,
+                )
+                .0
+            })
+            .collect::<Vec<_>>();
+        let suffix = matrix_atom_with_type(
+            &mut egraph,
+            "rectangular-suffix",
+            concrete_matrix_type(17, 8, 4, 5),
+            None,
+        )
+        .0;
+        let switch = egraph.add(MxxLang::Switch(
+            std::iter::once(selector)
+                .chain(cases.iter().copied())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ));
+        let product =
+            egraph.add(MxxLang::MatrixMultiply(vec![prefix, switch, suffix].into_boxed_slice()));
+        let negative = egraph.add(MxxLang::MatrixNegate([product]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![product, negative].into_boxed_slice()));
+        egraph.rebuild();
+        assert_ne!(egraph[switch].data.sort, egraph[root].data.sort);
+
+        let mut expression = RecExpr::default();
+        let selector_expression = expression.add(MxxLang::IntConst(0.into()));
+        let case_expressions = [
+            expression.add(MxxLang::IntConst(1.into())),
+            expression.add(MxxLang::IntConst(2.into())),
+        ];
+        let switch_expression = expression.add(MxxLang::Switch(
+            std::iter::once(selector_expression)
+                .chain(case_expressions)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ));
+        let prefix_expression = expression.add(MxxLang::IntConst(3.into()));
+        let suffix_expression = expression.add(MxxLang::IntConst(4.into()));
+        let product_expression = expression.add(MxxLang::MatrixMultiply(
+            vec![prefix_expression, switch_expression, suffix_expression].into_boxed_slice(),
+        ));
+        let negative_expression = expression.add(MxxLang::MatrixNegate([product_expression]));
+        let root_expression = expression.add(MxxLang::MatrixAdd(
+            vec![product_expression, negative_expression].into_boxed_slice(),
+        ));
+        let origins =
+            [selector, cases[0], cases[1], switch, prefix, suffix, product, negative, root];
+        let mut progress = || Ok(());
+        let mut monomials =
+            selected_polynomial_monomials(&egraph, &expression, &origins, &mut progress)
+                .expect("rectangular selected polynomial");
+        monomials[usize::from(root_expression)] = vec![
+            (vec![prefix, switch, suffix].into_boxed_slice(), false),
+            (vec![prefix, switch, suffix].into_boxed_slice(), true),
+        ];
+        let (selected_indices, selected_switches) =
+            selected_lookup_maps_for_test(&egraph, &expression, &origins);
+        assert!(
+            selected_same_selector_add_hoist_plan(
+                &egraph,
+                &expression,
+                &origins,
+                &selected_indices,
+                &selected_switches,
+                usize::from(root_expression),
+                &monomials,
+                &mut progress,
+            )
+            .is_some_and(|plan| plan.is_some()),
+            "same-sorted Switch cases remain valid inside a differently shaped product"
+        );
+    }
+
+    #[test]
+    fn selected_same_selector_rejects_cases_that_match_root_instead_of_switch() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let prefix = matrix_atom_with_type(
+            &mut egraph,
+            "wrong-case-prefix",
+            concrete_matrix_type(17, 8, 2, 3),
+            None,
+        )
+        .0;
+        let switch_cases = (0..2)
+            .map(|index| {
+                matrix_atom_with_type(
+                    &mut egraph,
+                    &format!("right-switch-case-{index}"),
+                    concrete_matrix_type(17, 8, 3, 5),
+                    None,
+                )
+                .0
+            })
+            .collect::<Vec<_>>();
+        let root_shaped_cases = (0..2)
+            .map(|index| {
+                matrix_atom_with_type(
+                    &mut egraph,
+                    &format!("wrong-root-shaped-case-{index}"),
+                    concrete_matrix_type(17, 8, 2, 5),
+                    None,
+                )
+                .0
+            })
+            .collect::<Vec<_>>();
+        let switch = egraph.add(MxxLang::Switch(
+            std::iter::once(selector).chain(switch_cases).collect::<Vec<_>>().into_boxed_slice(),
+        ));
+        let product = egraph.add(MxxLang::MatrixMultiply(vec![prefix, switch].into_boxed_slice()));
+        let negative = egraph.add(MxxLang::MatrixNegate([product]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![product, negative].into_boxed_slice()));
+        egraph.rebuild();
+        assert_eq!(egraph[root_shaped_cases[0]].data.sort, egraph[root].data.sort);
+
+        let mut expression = RecExpr::default();
+        let selector_expression = expression.add(MxxLang::IntConst(0.into()));
+        let first_case = expression.add(MxxLang::IntConst(1.into()));
+        let second_case = expression.add(MxxLang::IntConst(2.into()));
+        let switch_expression = expression.add(MxxLang::Switch(
+            vec![selector_expression, first_case, second_case].into_boxed_slice(),
+        ));
+        let prefix_expression = expression.add(MxxLang::IntConst(3.into()));
+        let product_expression = expression.add(MxxLang::MatrixMultiply(
+            vec![prefix_expression, switch_expression].into_boxed_slice(),
+        ));
+        let negative_expression = expression.add(MxxLang::MatrixNegate([product_expression]));
+        let root_expression = expression.add(MxxLang::MatrixAdd(
+            vec![product_expression, negative_expression].into_boxed_slice(),
+        ));
+        let origins = [
+            selector,
+            root_shaped_cases[0],
+            root_shaped_cases[1],
+            switch,
+            prefix,
+            product,
+            negative,
+            root,
+        ];
+        let mut progress = || Ok(());
+        let monomials =
+            selected_polynomial_monomials(&egraph, &expression, &origins, &mut progress)
+                .expect("selected polynomial with inconsistent case origins");
+        let (selected_indices, selected_switches) =
+            selected_lookup_maps_for_test(&egraph, &expression, &origins);
+        assert!(
+            selected_same_selector_add_hoist_plan(
+                &egraph,
+                &expression,
+                &origins,
+                &selected_indices,
+                &selected_switches,
+                usize::from(root_expression),
+                &monomials,
+                &mut progress,
+            )
+            .is_some_and(|plan| plan.is_none()),
+            "a root-shaped case cannot replace a differently shaped Switch factor"
+        );
+    }
+
+    #[test]
+    fn selected_same_selector_rejects_case_modulus_and_ring_mismatches() {
+        for (label, mismatched_type) in [
+            ("modulus", concrete_matrix_type(19, 8, 3, 4)),
+            ("ring", concrete_matrix_type(17, 16, 3, 4)),
+        ] {
+            let mut egraph = EGraph::new(MxxAnalysis::default());
+            let selector = egraph.add(MxxLang::IntConst(0.into()));
+            let switch_cases = (0..2)
+                .map(|index| {
+                    matrix_atom_with_type(
+                        &mut egraph,
+                        &format!("{label}-switch-case-{index}"),
+                        concrete_matrix_type(17, 8, 3, 4),
+                        None,
+                    )
+                    .0
+                })
+                .collect::<Vec<_>>();
+            let selected_cases = (0..2)
+                .map(|index| {
+                    matrix_atom_with_type(
+                        &mut egraph,
+                        &format!("{label}-selected-case-{index}"),
+                        mismatched_type.clone(),
+                        None,
+                    )
+                    .0
+                })
+                .collect::<Vec<_>>();
+            let switch = egraph.add(MxxLang::Switch(
+                std::iter::once(selector)
+                    .chain(switch_cases)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ));
+            let negative = egraph.add(MxxLang::MatrixNegate([switch]));
+            let root = egraph.add(MxxLang::MatrixAdd(vec![switch, negative].into_boxed_slice()));
+            egraph.rebuild();
+
+            let mut expression = RecExpr::default();
+            let selector_expression = expression.add(MxxLang::IntConst(0.into()));
+            let first_case = expression.add(MxxLang::IntConst(1.into()));
+            let second_case = expression.add(MxxLang::IntConst(2.into()));
+            let switch_expression = expression.add(MxxLang::Switch(
+                vec![selector_expression, first_case, second_case].into_boxed_slice(),
+            ));
+            let negative_expression = expression.add(MxxLang::MatrixNegate([switch_expression]));
+            let root_expression = expression.add(MxxLang::MatrixAdd(
+                vec![switch_expression, negative_expression].into_boxed_slice(),
+            ));
+            let origins = [selector, selected_cases[0], selected_cases[1], switch, negative, root];
+            let mut progress = || Ok(());
+            let monomials =
+                selected_polynomial_monomials(&egraph, &expression, &origins, &mut progress)
+                    .expect("selected polynomial with mismatched case contract");
+            let (selected_indices, selected_switches) =
+                selected_lookup_maps_for_test(&egraph, &expression, &origins);
+            assert!(
+                selected_same_selector_add_hoist_plan(
+                    &egraph,
+                    &expression,
+                    &origins,
+                    &selected_indices,
+                    &selected_switches,
+                    usize::from(root_expression),
+                    &monomials,
+                    &mut progress,
+                )
+                .is_some_and(|plan| plan.is_none()),
+                "{label} mismatch must reject"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_same_selector_accepts_resolved_equivalent_case_sorts() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let affine_rows = ResolvedIntExpr::Add(
+            Box::new(ResolvedIntExpr::Const(1.into())),
+            Box::new(ResolvedIntExpr::Const(2.into())),
+        );
+        let affine_case = matrix_atom_with_type(
+            &mut egraph,
+            "resolved-equivalent-affine-case",
+            ResolvedMatrixType {
+                modulus: ResolvedIntExpr::Const(17.into()),
+                ring_dimension: ResolvedIntExpr::Const(8.into()),
+                rows: affine_rows,
+                columns: ResolvedIntExpr::Const(4.into()),
+            },
+            None,
+        )
+        .0;
+        let literal_case = matrix_atom_with_type(
+            &mut egraph,
+            "resolved-equivalent-literal-case",
+            concrete_matrix_type(17, 8, 3, 4),
+            None,
+        )
+        .0;
+        let switch = egraph
+            .add(MxxLang::Switch(vec![selector, affine_case, literal_case].into_boxed_slice()));
+        let negative = egraph.add(MxxLang::MatrixNegate([switch]));
+        let root = egraph.add(MxxLang::MatrixAdd(vec![switch, negative].into_boxed_slice()));
+        egraph.rebuild();
+
+        let mut expression = RecExpr::default();
+        let selector_expression = expression.add(MxxLang::IntConst(0.into()));
+        let first_case = expression.add(MxxLang::IntConst(1.into()));
+        let second_case = expression.add(MxxLang::IntConst(2.into()));
+        let switch_expression = expression.add(MxxLang::Switch(
+            vec![selector_expression, first_case, second_case].into_boxed_slice(),
+        ));
+        let negative_expression = expression.add(MxxLang::MatrixNegate([switch_expression]));
+        let root_expression = expression.add(MxxLang::MatrixAdd(
+            vec![switch_expression, negative_expression].into_boxed_slice(),
+        ));
+        let origins = [selector, affine_case, literal_case, switch, negative, root];
+        let mut progress = || Ok(());
+        let mut monomials =
+            selected_polynomial_monomials(&egraph, &expression, &origins, &mut progress)
+                .expect("resolved-equivalent selected polynomial");
+        monomials[usize::from(root_expression)] =
+            vec![(vec![switch].into_boxed_slice(), false), (vec![switch].into_boxed_slice(), true)];
+        let (selected_indices, selected_switches) =
+            selected_lookup_maps_for_test(&egraph, &expression, &origins);
+        assert!(
+            selected_same_selector_add_hoist_plan(
+                &egraph,
+                &expression,
+                &origins,
+                &selected_indices,
+                &selected_switches,
+                usize::from(root_expression),
+                &monomials,
+                &mut progress,
+            )
+            .is_some_and(|plan| plan.is_some()),
+            "semantic matrix-type equality accepts resolved-equivalent dimensions"
+        );
     }
 
     #[test]

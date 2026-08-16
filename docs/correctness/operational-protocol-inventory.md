@@ -124,3 +124,13 @@ parallelize independent candidate reports, but it must not duplicate or replace 
 This operational checker is a parameter-search and runtime-validation component. It is the
 active implementation acceptance path, but passing it alone is not yet a proved end-to-end
 correctness theorem.
+
+## Extraction staging limitation
+
+Extraction orders unsatisfied checked relations before selected structural normalizations. A
+structural materialization that exposes a newly unsatisfied ordinary relation ends the selected
+structural epoch and reruns ordinary relation saturation before any structural contraction is
+compared. If that rerun cannot materialize the propagated relation replacement, extraction fails
+closed instead of treating the structural representative as a finite bound witness. This is a
+conservative limitation: the checker does not use structural normalization to justify an
+unmaterialized propagated relation.

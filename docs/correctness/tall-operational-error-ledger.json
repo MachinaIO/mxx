@@ -585,10 +585,10 @@
       "rationale": "Tall rejects a generic relation rewrite pass that stops without saturation."
     },
     {
-      "error_tag": "Relation.SelectedNormalizationDidNotContract",
+      "error_tag": "Relation.SelectedNormalizationBatchDidNotUnion",
       "tall_reachability": "reachable_for_relation_terms",
       "classification": "relation_validation",
-      "rationale": "Tall rejects an extraction-selected Switch normalization unless its selected redex count strictly contracts."
+      "rationale": "Tall rejects an extraction-selected normalization batch unless at least one planned equality creates a new union."
     },
     {
       "error_tag": "Relation.InvalidRelationProducer",

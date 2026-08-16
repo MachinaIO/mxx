@@ -19,8 +19,8 @@ use super::{
     relation::{
         AddNormalizationProbe, PointwiseAddSwitchProbe, PointwiseAddSwitchReject,
         PointwiseDirectProbe, SelectedNodeRef, pointwise_add_switch_probe,
-        probe_exact_additive_normalization, selected_product_add_eligibility,
-        selected_product_switch_eligibility,
+        probe_exact_additive_normalization, selected_multi_switch_structural_probe,
+        selected_product_structural_probe,
     },
 };
 use egg::{EGraph, Id, Language, RecExpr};
@@ -35,11 +35,26 @@ use std::{
 /// monotone even when a compact e-graph represents an exponentially large AST.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ProposalCost {
-    /// Checked relation rewrites and selected structural normalizations that
-    /// remain in this exact representative. Both are exact obligations that
-    /// must be discharged before final bound acceptance.
-    pub remaining_relation_redexes: u64,
-    pub hidden_relation_redexes: u64,
+    /// Checked relation rewrites that remain in this exact representative.
+    /// This is an exact obligation that must be discharged before structural
+    /// normalization is considered.
+    pub unsatisfied_relation_redexes: u64,
+    /// Checked relation boundaries in this exact raw e-node. This is
+    /// deliberately not aggregated from children: each selected child chooses
+    /// its materialized replacements locally.
+    pub local_checked_relation_count: u64,
+    /// Checked selected structural normalizations in this exact raw e-node.
+    /// This root-local preference includes a satisfied raw recipe, while the
+    /// applied normalized representation has no recipe at all. It is never
+    /// propagated from children or across Switch cases.
+    pub local_checked_structural_count: u64,
+    /// Selected structural normalizations that remain in this exact
+    /// representative. This is a separate exact obligation, ordered after
+    /// relation work and its root-local preference.
+    pub unsatisfied_structural_redexes: u64,
+    /// Structural work made nonlocal by an Add. Relation work never enters
+    /// this accounting: only selected structural normalization may be hidden.
+    pub hidden_structural_redexes: u64,
     /// Whether this whole selected matrix expression is semantically Large.
     /// This is deliberately root-local so proved-zero operations annihilate
     /// Large children before proposal ordering.
@@ -52,6 +67,10 @@ pub struct ProposalCost {
 pub struct ProposalNodeClassification {
     /// This exact e-node is a relation redex which a checked rewrite could consume.
     pub relation_redex: bool,
+    /// Checked relation boundaries in this exact e-node, including boundaries
+    /// whose replacement is already canonically equal to the enclosing class.
+    /// It is an extraction preference only, never a final obligation.
+    pub local_checked_relation_count: u64,
 }
 
 /// The extracted DAG and the cost that selected it.
@@ -115,7 +134,9 @@ enum BuildFrame {
 /// called with the containing canonical e-class and may inspect existing
 /// `AnalysisData::relation_provenance` through `egraph`; the relation stage
 /// must return `relation_redex = true` only after its complete typed identity
-/// checks.  Matrix semantics are not part of this callback: they are computed
+/// checks. It separately counts exact checked raw boundaries, even when their
+/// replacements are already canonically satisfied. Matrix semantics are not
+/// part of this callback: they are computed
 /// from `bound_input` and already-selected child candidates with the final
 /// evaluator's exact zero-first transfer.
 /// The callback must be idempotent: relaxation may classify the same e-node in
@@ -217,54 +238,6 @@ pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
         }
     }
 
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        'diagnostic: for &class_id in &classes {
-            let class = egraph.find(class_id);
-            let Some(selected) = candidates.get(usize::from(class)).and_then(Option::as_ref) else {
-                continue;
-            };
-            let MxxLang::MatrixMultiply(factors) = &selected.node else { continue };
-            if selected_product_switch_eligibility(egraph, class, factors, |handle| {
-                let origin = egraph.find(handle);
-                let candidate = candidates.get(usize::from(origin))?.as_ref()?;
-                Some(SelectedNodeRef { node: &candidate.node, origin })
-            })
-            .is_none()
-            {
-                continue;
-            }
-            for node in &egraph[class].nodes {
-                let MxxLang::Switch(cases) = node else { continue };
-                let Some(switch_cost) =
-                    diagnostic_node_cost(egraph, class, node, &candidates, bound_input)
-                else {
-                    continue;
-                };
-                let case_costs = cases[1..]
-                    .iter()
-                    .take(8)
-                    .filter_map(|case| {
-                        let origin = egraph.find(*case);
-                        candidates.get(usize::from(origin))?.as_ref().map(|candidate| {
-                            (origin, candidate.cost.clone(), candidate.node.operator_name())
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                tracing::debug!(
-                    event = "selected_product_switch_cost_comparison",
-                    selected_product_cost = ?selected.cost,
-                    selected_product_factor_count = factors.len(),
-                    switch_cost = ?switch_cost,
-                    switch_case_count = cases.len().saturating_sub(1),
-                    switch_case_costs = ?case_costs,
-                    switch_case_costs_omitted = cases.len().saturating_sub(1).saturating_sub(8),
-                    "compact selected product retained over materialized Switch alternative"
-                );
-                break 'diagnostic;
-            }
-        }
-    }
-
     let root = egraph.find(root);
     let root_index = usize::from(root);
     if candidates.get(root_index).and_then(Option::as_ref).is_none() {
@@ -363,12 +336,30 @@ pub(crate) fn extract_best_proposal_with_origins<I: BoundInput>(
         .get(root_index)
         .and_then(Option::as_ref)
         .ok_or_else(|| (control.invalid_dag)(root))?;
-    if tracing::enabled!(tracing::Level::DEBUG) &&
-        root_candidate
-            .semantic_bound
-            .as_ref()
-            .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large))
-    {
+    let selected_large = root_candidate
+        .semantic_bound
+        .as_ref()
+        .is_some_and(|bound| matches!(bound.coefficient_class, BoundClass::Large));
+    if selected_large {
+        tracing::info!(
+            event = "operational_selected_large_residual",
+            selected_root = usize::from(egraph.find(root)),
+            selected_expression_nodes = expression.as_ref().len(),
+            selected_large_source_id = ?root_candidate.first_large_source.map(|source| source.0),
+            "selected Large residual reaches final extraction"
+        );
+        if root_candidate.first_large_source.is_none() && tracing::enabled!(tracing::Level::INFO) {
+            let diagnostic =
+                selected_large_diagnostic(egraph, root, None, &candidates, bound_input);
+            tracing::info!(
+                event = "operational_selected_large_without_atomic_source",
+                selected_root = usize::from(egraph.find(root)),
+                selected_large_path = ?diagnostic,
+                "selected Large residual has no atomic-source witness"
+            );
+        }
+    }
+    if tracing::enabled!(tracing::Level::DEBUG) && selected_large {
         let diagnostic = selected_large_diagnostic(
             egraph,
             root,
@@ -2380,7 +2371,7 @@ fn diagnostic_node_cost<I: BoundInput>(
     candidates: &[Option<Candidate>],
     bound_input: &I,
 ) -> Option<ProposalCost> {
-    let (remaining_relation_redexes, child_hidden, node_count) =
+    let (unsatisfied_relation_redexes, unsatisfied_structural_redexes, child_hidden, node_count) =
         selected_child_obligations(egraph, node, candidates)?;
     let semantic_bound = matches!(&egraph[class].data.sort, Ok(MxxSort::Matrix(_)))
         .then(|| {
@@ -2391,9 +2382,12 @@ fn diagnostic_node_cost<I: BoundInput>(
         .ok()
         .flatten()?;
     Some(ProposalCost {
-        remaining_relation_redexes,
-        hidden_relation_redexes: if matches!(node, MxxLang::MatrixAdd(_)) {
-            remaining_relation_redexes
+        unsatisfied_relation_redexes,
+        local_checked_relation_count: 0,
+        local_checked_structural_count: 0,
+        unsatisfied_structural_redexes,
+        hidden_structural_redexes: if matches!(node, MxxLang::MatrixAdd(_)) {
+            unsatisfied_structural_redexes
         } else {
             child_hidden
         },
@@ -2411,7 +2405,7 @@ fn selected_child_obligations(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     node: &MxxLang,
     candidates: &[Option<Candidate>],
-) -> Option<(u64, u64, u64)> {
+) -> Option<(u64, u64, u64, u64)> {
     let cost = |child: Id| {
         candidates.get(usize::from(egraph.find(child)))?.as_ref().map(|candidate| &candidate.cost)
     };
@@ -2425,27 +2419,32 @@ fn selected_child_obligations(
             return None;
         }
         let selector = cost(selector)?;
-        let mut case_remaining = 0_u64;
-        let mut case_hidden = 0_u64;
+        let mut case_relation = 0_u64;
+        let mut case_structural = 0_u64;
+        let mut case_hidden_structural = 0_u64;
         for case in cases {
             let case = cost(*case)?;
-            case_remaining = case_remaining.max(case.remaining_relation_redexes);
-            case_hidden = case_hidden.max(case.hidden_relation_redexes);
+            case_relation = case_relation.max(case.unsatisfied_relation_redexes);
+            case_structural = case_structural.max(case.unsatisfied_structural_redexes);
+            case_hidden_structural = case_hidden_structural.max(case.hidden_structural_redexes);
         }
         Some((
-            selector.remaining_relation_redexes.saturating_add(case_remaining),
-            selector.hidden_relation_redexes.saturating_add(case_hidden),
+            selector.unsatisfied_relation_redexes.saturating_add(case_relation),
+            selector.unsatisfied_structural_redexes.saturating_add(case_structural),
+            selector.hidden_structural_redexes.saturating_add(case_hidden_structural),
             node_count,
         ))
     } else {
-        let mut remaining = 0_u64;
-        let mut hidden = 0_u64;
+        let mut relation = 0_u64;
+        let mut structural = 0_u64;
+        let mut hidden_structural = 0_u64;
         for child in node.children() {
             let child = cost(*child)?;
-            remaining = remaining.saturating_add(child.remaining_relation_redexes);
-            hidden = hidden.saturating_add(child.hidden_relation_redexes);
+            relation = relation.saturating_add(child.unsatisfied_relation_redexes);
+            structural = structural.saturating_add(child.unsatisfied_structural_redexes);
+            hidden_structural = hidden_structural.saturating_add(child.hidden_structural_redexes);
         }
-        Some((remaining, hidden, node_count))
+        Some((relation, structural, hidden_structural, node_count))
     }
 }
 
@@ -2480,25 +2479,23 @@ fn proposal_cost<I: BoundInput>(
     Option<(ProposalCost, Option<MatrixBound>, Option<AtomicSourceId>)>,
     OperationalSimulationError,
 > {
-    let Some((child_remaining, child_hidden, node_count)) =
+    let Some((child_relation, child_structural, child_hidden_structural, node_count)) =
         selected_child_obligations(egraph, node, candidates)
     else {
         return Ok(None);
     };
     let classification = classify(class, node, egraph)?;
-    let selected_product_normalizations = match node {
+    let selected_structural_normalization = match node {
         MxxLang::MatrixMultiply(factors) => {
             let lookup = |handle| {
                 let origin = egraph.find(handle);
                 let candidate = candidates.get(usize::from(origin))?.as_ref()?;
                 Some(SelectedNodeRef { node: &candidate.node, origin })
             };
-            u64::from(selected_product_switch_eligibility(egraph, class, factors, lookup).is_some())
-                .saturating_add(u64::from(
-                    selected_product_add_eligibility(egraph, class, factors, lookup).is_some(),
-                ))
+            selected_product_structural_probe(egraph, class, factors, lookup)
         }
-        _ => 0,
+        MxxLang::MatrixAdd(_) => selected_multi_switch_structural_probe(egraph, class, node),
+        _ => None,
     };
     let semantic_bound = matches!(&egraph[class].data.sort, Ok(MxxSort::Matrix(_)))
         .then(|| {
@@ -2514,15 +2511,19 @@ fn proposal_cost<I: BoundInput>(
         selected_first_large_source(egraph, node, semantic_bound.as_ref(), candidates);
     Ok(Some((
         ProposalCost {
-            remaining_relation_redexes: child_remaining
-                .saturating_add(u64::from(classification.relation_redex))
-                .saturating_add(selected_product_normalizations),
-            // At an addition all relation redexes below it are hidden exactly once;
+            unsatisfied_relation_redexes: child_relation
+                .saturating_add(u64::from(classification.relation_redex)),
+            local_checked_relation_count: classification.local_checked_relation_count,
+            local_checked_structural_count: u64::from(selected_structural_normalization.is_some()),
+            unsatisfied_structural_redexes: child_structural.saturating_add(u64::from(
+                selected_structural_normalization.is_some_and(|probe| !probe.satisfied),
+            )),
+            // At an addition all selected structural work below it is hidden exactly once;
             // an enclosing addition replaces this value with the same descendant count.
-            hidden_relation_redexes: if matches!(node, MxxLang::MatrixAdd(_)) {
-                child_remaining
+            hidden_structural_redexes: if matches!(node, MxxLang::MatrixAdd(_)) {
+                child_structural
             } else {
-                child_hidden
+                child_hidden_structural
             },
             large_residual,
             node_count,
@@ -4512,14 +4513,17 @@ mod tests {
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
             &mut |origin, node, egraph| {
                 super::super::relation::classify_proposal_node(egraph, origin, node, &context)
-                    .map(|relation_redex| ProposalNodeClassification { relation_redex })
+                    .map(|classification| ProposalNodeClassification {
+                        relation_redex: classification.relation_redex,
+                        local_checked_relation_count: classification.local_checked_relation_count,
+                    })
                     .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
             },
         )
         .expect("two-level normalized residual extracts");
 
-        assert_eq!(result.cost.remaining_relation_redexes, 0);
-        assert_eq!(result.cost.hidden_relation_redexes, 0);
+        assert_eq!(result.cost.unsatisfied_relation_redexes, 0);
+        assert_eq!(result.cost.unsatisfied_structural_redexes, 0);
         assert!(result.cost.large_residual);
         assert_eq!(result.first_large_source, Some(large_target_source));
 
@@ -4536,7 +4540,10 @@ mod tests {
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
             &mut |origin, node, egraph| {
                 super::super::relation::classify_proposal_node(egraph, origin, node, &context)
-                    .map(|relation_redex| ProposalNodeClassification { relation_redex })
+                    .map(|classification| ProposalNodeClassification {
+                        relation_redex: classification.relation_redex,
+                        local_checked_relation_count: classification.local_checked_relation_count,
+                    })
                     .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
             },
         )
@@ -4581,17 +4588,155 @@ mod tests {
         egraph.rebuild();
 
         let mut classify = |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
-            Ok(ProposalNodeClassification { relation_redex: matches!(node, MxxLang::IntAdd(_)) })
+            Ok(ProposalNodeClassification {
+                relation_redex: matches!(node, MxxLang::IntAdd(_)),
+                ..Default::default()
+            })
         };
         let result = extract(&egraph, compact_large, &mut classify).unwrap();
 
-        assert_eq!(result.cost.remaining_relation_redexes, 0);
+        assert_eq!(result.cost.unsatisfied_relation_redexes, 0);
         assert!(!result.cost.large_residual);
         assert!(matches!(result.expression[result.expression.root()], MxxLang::IntMul(_)));
     }
 
     #[test]
-    fn addition_counts_descendant_redexes_as_hidden_once() {
+    fn satisfied_raw_relation_precedes_two_structural_obligations() {
+        let raw_satisfied_relation =
+            ProposalCost { local_checked_relation_count: 1, ..Default::default() };
+        let replacement_with_structural_work =
+            ProposalCost { unsatisfied_structural_redexes: 2, ..Default::default() };
+
+        assert!(
+            replacement_with_structural_work < raw_satisfied_relation,
+            "the local relation preference is decided before structural work"
+        );
+    }
+
+    #[test]
+    fn checked_relation_count_selects_a_larger_satisfied_replacement() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let public = egraph.add(MxxLang::IntConst(2.into()));
+        let relation = egraph.add(MxxLang::IntConst(3.into()));
+        let signal = egraph.add(MxxLang::IntConst(5.into()));
+        let error = egraph.add(MxxLang::IntConst(7.into()));
+        let raw = egraph.add(MxxLang::IntMul([public, relation]));
+        let replacement_product = egraph.add(MxxLang::IntMul([signal, public]));
+        let replacement = egraph.add(MxxLang::IntAdd([replacement_product, error]));
+        egraph.union(raw, replacement);
+        egraph.rebuild();
+        let raw = egraph.find(raw);
+        let original_nodes = egraph.total_size();
+        let classify = |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+            Ok(ProposalNodeClassification {
+                local_checked_relation_count: u64::from(matches!(node, MxxLang::IntMul(factors)
+                    if factors.len() == 2 && factors[0] == public && factors[1] == relation)),
+                ..Default::default()
+            })
+        };
+
+        let mut first_classify = classify;
+        let first =
+            extract(&egraph, raw, &mut first_classify).expect("satisfied replacement extracts");
+        let mut second_classify = classify;
+        let second =
+            extract(&egraph, raw, &mut second_classify).expect("repeat extraction is stable");
+
+        assert_eq!(egraph.total_size(), original_nodes, "extraction does not mutate the e-graph");
+        assert_eq!(first, second, "local preference has deterministic extraction output");
+        assert_eq!(first.cost.local_checked_relation_count, 0);
+        assert!(matches!(first.expression[first.expression.root()], MxxLang::IntAdd(_)));
+    }
+
+    #[test]
+    fn missing_relation_replacement_remains_unresolved_until_materialized() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let public = egraph.add(MxxLang::IntConst(2.into()));
+        let relation = egraph.add(MxxLang::IntConst(3.into()));
+        let raw = egraph.add(MxxLang::IntMul([public, relation]));
+        egraph.rebuild();
+        let classify = |origin: Id, node: &MxxLang, egraph: &EGraph<MxxLang, MxxAnalysis>| {
+            let raw = matches!(node, MxxLang::IntMul(factors)
+                if factors.len() == 2 && factors[0] == public && factors[1] == relation);
+            let materialized = egraph[egraph.find(origin)]
+                .nodes
+                .iter()
+                .any(|node| matches!(node, MxxLang::IntAdd(_)));
+            Ok(ProposalNodeClassification {
+                relation_redex: raw && !materialized,
+                local_checked_relation_count: u64::from(raw),
+            })
+        };
+
+        let mut before_classify = classify;
+        let before = extract(&egraph, raw, &mut before_classify).expect("raw relation extracts");
+        assert_eq!(before.cost.unsatisfied_relation_redexes, 1);
+        assert_eq!(before.cost.local_checked_relation_count, 1);
+
+        let error = egraph.add(MxxLang::IntConst(7.into()));
+        let replacement = egraph.add(MxxLang::IntAdd([public, error]));
+        egraph.union(raw, replacement);
+        egraph.rebuild();
+        let mut after_classify = classify;
+        let after = extract(&egraph, raw, &mut after_classify)
+            .expect("materialized relation replacement extracts");
+        assert_eq!(after.cost.unsatisfied_relation_redexes, 0);
+        assert_eq!(after.cost.local_checked_relation_count, 0);
+        assert!(matches!(after.expression[after.expression.root()], MxxLang::IntAdd(_)));
+    }
+
+    #[test]
+    fn checked_relation_count_exposes_a_selected_add_to_its_outer_product() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let scale = egraph.add(MxxLang::IntConst(2.into()));
+        let public = egraph.add(MxxLang::IntConst(3.into()));
+        let relation = egraph.add(MxxLang::IntConst(5.into()));
+        let error = egraph.add(MxxLang::IntConst(7.into()));
+        let raw = egraph.add(MxxLang::IntMul([public, relation]));
+        let replacement = egraph.add(MxxLang::IntAdd([public, error]));
+        let outer = egraph.add(MxxLang::IntMul([scale, raw]));
+        egraph.union(raw, replacement);
+        egraph.rebuild();
+        let mut classify = |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+            Ok(ProposalNodeClassification {
+                local_checked_relation_count: u64::from(matches!(node, MxxLang::IntMul(factors)
+                    if factors.len() == 2 && factors[0] == public && factors[1] == relation)),
+                ..Default::default()
+            })
+        };
+
+        let result = extract(&egraph, outer, &mut classify).expect("outer product extracts");
+        let MxxLang::IntMul(factors) = &result.expression[result.expression.root()] else {
+            panic!("outer product remains visible");
+        };
+        assert!(matches!(result.expression[factors[1]], MxxLang::IntAdd(_)));
+        assert!(
+            result.cost.local_checked_relation_count == 0,
+            "the outer cost does not inherit its selected child's checked relation count"
+        );
+    }
+
+    #[test]
+    fn checked_relation_count_is_not_aggregated_from_children() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let left = egraph.add(MxxLang::IntConst(2.into()));
+        let right = egraph.add(MxxLang::IntConst(3.into()));
+        let raw = egraph.add(MxxLang::IntAdd([left, right]));
+        let outer = egraph.add(MxxLang::IntMul([left, raw]));
+        egraph.rebuild();
+        let mut classify = |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
+            Ok(ProposalNodeClassification {
+                local_checked_relation_count: u64::from(matches!(node, MxxLang::IntAdd(_))),
+                ..Default::default()
+            })
+        };
+
+        let result = extract(&egraph, outer, &mut classify).expect("outer expression extracts");
+        assert_eq!(result.cost.local_checked_relation_count, 0);
+    }
+
+    #[test]
+    fn addition_keeps_relation_obligations_separate_from_structural_hiding() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let left = egraph.add(MxxLang::IntConst(1.into()));
         let right = egraph.add(MxxLang::IntConst(2.into()));
@@ -4600,12 +4745,16 @@ mod tests {
         let outer = egraph.add(MxxLang::MatrixAdd(vec![inner].into_boxed_slice()));
         egraph.rebuild();
         let mut classify = |_: Id, node: &MxxLang, _: &EGraph<MxxLang, MxxAnalysis>| {
-            Ok(ProposalNodeClassification { relation_redex: matches!(node, MxxLang::IntMul(_)) })
+            Ok(ProposalNodeClassification {
+                relation_redex: matches!(node, MxxLang::IntMul(_)),
+                ..Default::default()
+            })
         };
 
         let result = extract(&egraph, outer, &mut classify).unwrap();
-        assert_eq!(result.cost.remaining_relation_redexes, 1);
-        assert_eq!(result.cost.hidden_relation_redexes, 1);
+        assert_eq!(result.cost.unsatisfied_relation_redexes, 1);
+        assert_eq!(result.cost.unsatisfied_structural_redexes, 0);
+        assert_eq!(result.cost.hidden_structural_redexes, 0);
     }
 
     #[test]
@@ -4627,6 +4776,48 @@ mod tests {
 
         assert!(!result.cost.large_residual);
         assert_eq!(result.first_large_source, None);
+    }
+
+    #[test]
+    fn source_less_large_emits_the_bounded_selected_path_at_info() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let key_source =
+            AtomicSourceId(egraph.analysis.symbols.atomic_sources.intern(AtomicSourceDescriptor {
+                key: AtomicSourceKey::ProtocolInput(crate::ProtocolInputId::from("hash-key")),
+                sort: MxxSort::Bytes(ResolvedIntExpr::Const(1.into())),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            }));
+        let key = egraph.add(MxxLang::Atom { source: key_source, indices: Box::new([]) });
+        let query = egraph
+            .analysis
+            .symbols
+            .hash_queries
+            .intern(HashQuerySpec { matrix_type: scalar_matrix_type(), tag_program: Box::new([]) });
+        let root = egraph.add(MxxLang::HashPlain {
+            query: super::super::identity::HashQuerySpecId(query),
+            arguments: vec![key].into_boxed_slice(),
+        });
+        egraph.rebuild();
+        let mut input = SemanticInput::default();
+        populate_matrix_types(&mut input, &egraph);
+
+        let capture = SelectedLargeDiagnosticCapture::new(LevelFilter::INFO);
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let result = tracing::subscriber::with_default(subscriber, || {
+            extract_with_input(&egraph, root, &input)
+        });
+
+        assert!(result.cost.large_residual);
+        assert_eq!(result.first_large_source, None);
+        let events = capture.events.lock().expect("diagnostic capture lock");
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .get("selected_large_path")
+                .is_some_and(|path| path.contains("SelectedLargePathStep"))
+        );
     }
 
     #[test]
@@ -4828,7 +5019,10 @@ mod tests {
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
             &mut |origin, node, egraph| {
                 super::super::relation::classify_proposal_node(egraph, origin, node, &context)
-                    .map(|relation_redex| ProposalNodeClassification { relation_redex })
+                    .map(|classification| ProposalNodeClassification {
+                        relation_redex: classification.relation_redex,
+                        local_checked_relation_count: classification.local_checked_relation_count,
+                    })
                     .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
             },
         )
@@ -4892,6 +5086,7 @@ mod tests {
         assert!(
             !super::super::relation::classify_proposal_node(&egraph, root, node, &context)
                 .expect("different selectors are locally inapplicable")
+                .relation_redex
         );
         assert_eq!(context.failure(), None);
 
@@ -4922,7 +5117,10 @@ mod tests {
             &mut ExtractionControl { invalid_dag: &mut invalid, bound_error: &mut bound_error },
             &mut |origin, node, egraph| {
                 super::super::relation::classify_proposal_node(egraph, origin, node, &context)
-                    .map(|relation_redex| ProposalNodeClassification { relation_redex })
+                    .map(|classification| ProposalNodeClassification {
+                        relation_redex: classification.relation_redex,
+                        local_checked_relation_count: classification.local_checked_relation_count,
+                    })
                     .map_err(|failure| panic!("fixture relation is valid: {failure:?}"))
             },
         )
@@ -5005,6 +5203,7 @@ mod tests {
                         MxxLang::Atom { source, .. }
                             if *source == root_source || *source == descendant_source
                     ),
+                    ..Default::default()
                 })
             },
         )
@@ -5088,8 +5287,9 @@ mod tests {
         candidates[usize::from(egraph.find(selector))] = Some(candidate(
             MxxLang::IntConst(0.into()),
             ProposalCost {
-                remaining_relation_redexes: 1,
-                hidden_relation_redexes: 2,
+                unsatisfied_relation_redexes: 1,
+                unsatisfied_structural_redexes: 2,
+                hidden_structural_redexes: 3,
                 node_count: 3,
                 ..Default::default()
             },
@@ -5097,8 +5297,9 @@ mod tests {
         candidates[usize::from(egraph.find(low))] = Some(candidate(
             MxxLang::IntConst(1.into()),
             ProposalCost {
-                remaining_relation_redexes: 2,
-                hidden_relation_redexes: 4,
+                unsatisfied_relation_redexes: 2,
+                unsatisfied_structural_redexes: 4,
+                hidden_structural_redexes: 5,
                 node_count: 5,
                 ..Default::default()
             },
@@ -5106,8 +5307,9 @@ mod tests {
         candidates[usize::from(egraph.find(high))] = Some(candidate(
             MxxLang::IntConst(2.into()),
             ProposalCost {
-                remaining_relation_redexes: 7,
-                hidden_relation_redexes: 1,
+                unsatisfied_relation_redexes: 7,
+                unsatisfied_structural_redexes: 1,
+                hidden_structural_redexes: 11,
                 node_count: 11,
                 ..Default::default()
             },
@@ -5115,13 +5317,28 @@ mod tests {
 
         assert_eq!(
             selected_child_obligations(&egraph, &switch, &candidates),
-            Some((8, 6, 50)),
-            "selector obligations add, case obligations take max, and all stored nodes count"
+            Some((8, 6, 14, 50)),
+            "each category adds the selector and takes the case maximum, while all stored nodes count"
         );
         let all_zero = MxxLang::Switch(vec![selector, selector, selector].into_boxed_slice());
         candidates[usize::from(egraph.find(selector))].as_mut().unwrap().cost =
             ProposalCost { node_count: 3, ..Default::default() };
-        assert_eq!(selected_child_obligations(&egraph, &all_zero, &candidates), Some((0, 0, 10)));
+        assert_eq!(
+            selected_child_obligations(&egraph, &all_zero, &candidates),
+            Some((0, 0, 0, 10))
+        );
+        candidates[usize::from(egraph.find(selector))].as_mut().unwrap().cost = ProposalCost {
+            unsatisfied_relation_redexes: u64::MAX,
+            unsatisfied_structural_redexes: u64::MAX,
+            hidden_structural_redexes: u64::MAX,
+            node_count: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            selected_child_obligations(&egraph, &all_zero, &candidates),
+            Some((u64::MAX, u64::MAX, u64::MAX, u64::MAX)),
+            "every accumulated category saturates independently"
+        );
     }
 
     #[test]
@@ -5187,7 +5404,7 @@ mod tests {
             .expect("selected proposal")
         };
         let raw = extract(&egraph);
-        assert_eq!(raw.proposal.cost.remaining_relation_redexes, 1);
+        assert_eq!(raw.proposal.cost.unsatisfied_structural_redexes, 1);
         let product_index = usize::from(raw.proposal.expression.root());
         let redex = selected_product_switch_redex(
             &egraph,
@@ -5204,7 +5421,7 @@ mod tests {
         egraph.rebuild();
 
         let normalized = extract(&egraph);
-        assert_eq!(normalized.proposal.cost.remaining_relation_redexes, 0);
+        assert_eq!(normalized.proposal.cost.unsatisfied_structural_redexes, 0);
         assert!(matches!(
             normalized.proposal.expression[normalized.proposal.expression.root()],
             MxxLang::Switch(_)
@@ -5217,6 +5434,43 @@ mod tests {
                 usize::from(normalized.proposal.expression.root()),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn local_structural_preference_precedes_propagated_work() {
+        // A ProductAdd whose exact expansion already exists has no remaining
+        // structural obligation, but retains one root-local checked recipe.
+        // Its expanded Add can expose two descendant ProductSwitch obligations.
+        // Keep this comparison capped and synthetic: it characterizes only the
+        // extraction stage order, without constructing a Tall-sized family.
+        let satisfied_raw_product_add =
+            ProposalCost { local_checked_structural_count: 1, node_count: 3, ..Default::default() };
+        let expanded_add_with_descendant_work =
+            ProposalCost { unsatisfied_structural_redexes: 2, node_count: 7, ..Default::default() };
+
+        assert_eq!(satisfied_raw_product_add.unsatisfied_structural_redexes, 0);
+        assert_eq!(satisfied_raw_product_add.local_checked_structural_count, 1);
+        assert_eq!(expanded_add_with_descendant_work.local_checked_structural_count, 0);
+        assert_eq!(expanded_add_with_descendant_work.unsatisfied_structural_redexes, 2);
+        assert!(
+            expanded_add_with_descendant_work < satisfied_raw_product_add,
+            "local structural preference precedes propagated structural obligations"
+        );
+    }
+
+    #[test]
+    fn local_structural_work_precedes_propagated_structural_work() {
+        let local = ProposalCost {
+            local_checked_structural_count: 1,
+            unsatisfied_structural_redexes: 1,
+            ..Default::default()
+        };
+        let propagated = ProposalCost { unsatisfied_structural_redexes: 2, ..Default::default() };
+
+        assert!(
+            propagated < local,
+            "local structural work is ordered before propagated structural obligations"
         );
     }
 

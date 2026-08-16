@@ -242,7 +242,12 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
         &self.memo
     }
 
-    pub fn evaluate(mut self, root: Id) -> Result<MatrixBound, BoundEvaluationError> {
+    /// Evaluates the complete selected worklist, retaining an explicitly
+    /// `Large` root for callers that can prove it is consumed later.
+    pub(crate) fn evaluate_allow_large(
+        mut self,
+        root: Id,
+    ) -> Result<MatrixBound, BoundEvaluationError> {
         enum Work {
             Enter(Id),
             Finish(Id, MxxLang),
@@ -279,6 +284,13 @@ impl<'a, I: BoundInput> BoundEvaluator<'a, I> {
             .memo
             .remove(&root)
             .ok_or(BoundEvaluationError::ExtractedExpressionCycle { term: root })?;
+        Ok(bound)
+    }
+
+    /// Evaluates one extracted matrix root and rejects an unconsumed final
+    /// `Large` result.
+    pub fn evaluate(self, root: Id) -> Result<MatrixBound, BoundEvaluationError> {
+        let bound = self.evaluate_allow_large(root)?;
         if matches!(bound.coefficient_class, BoundClass::Large) {
             return Err(BoundEvaluationError::UnconsumedLargeTerm { term: root });
         }
@@ -1324,6 +1336,29 @@ mod tests {
         assert_eq!(
             BoundEvaluator::new(&input).evaluate(scaled).unwrap().coefficient_class,
             BoundClass::ExactZero,
+        );
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate(large),
+            Err(BoundEvaluationError::UnconsumedLargeTerm { term: large }),
+        );
+    }
+
+    #[test]
+    fn permissive_evaluation_retains_large_until_its_caller_consumes_it() {
+        let large = Id::from(0);
+        let mut input = Input::default();
+        input.nodes.insert(
+            large,
+            MxxLang::HashPlain {
+                query: super::super::identity::HashQuerySpecId(0),
+                arguments: Box::new([]),
+            },
+        );
+        input.types.insert(large, matrix(1, 1));
+
+        assert_eq!(
+            BoundEvaluator::new(&input).evaluate_allow_large(large).unwrap().coefficient_class,
+            BoundClass::Large,
         );
         assert_eq!(
             BoundEvaluator::new(&input).evaluate(large),

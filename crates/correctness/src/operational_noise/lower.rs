@@ -608,7 +608,7 @@ impl ProductionBoundInput<'_, '_, '_> {
         let mut state = descriptor
             .initial
             .iter()
-            .map(|initial| BoundEvaluator::new(self).evaluate(*initial))
+            .map(|initial| BoundEvaluator::new(self).evaluate_allow_large(*initial))
             .collect::<Result<Vec<_>, _>>()?;
         if count.is_zero() {
             return state
@@ -624,7 +624,7 @@ impl ProductionBoundInput<'_, '_, '_> {
             let next = descriptor
                 .transition
                 .iter()
-                .map(|transition| BoundEvaluator::new(&overlay).evaluate(*transition))
+                .map(|transition| BoundEvaluator::new(&overlay).evaluate_allow_large(*transition))
                 .collect::<Result<Vec<_>, _>>()?;
             // The `next` vector is constructed from the unmodified `state`;
             // replacing it here is the sole simultaneous-commit boundary.
@@ -4834,6 +4834,211 @@ mod tests {
             source: super::super::identity::AtomicSourceId(source),
             indices: Box::new([]),
         })
+    }
+
+    fn test_resolved_matrix() -> super::super::identity::ResolvedMatrixType {
+        super::super::identity::ResolvedMatrixType {
+            modulus: ResolvedIntExpr::Const(17.into()),
+            ring_dimension: ResolvedIntExpr::Const(1.into()),
+            rows: ResolvedIntExpr::Const(1.into()),
+            columns: ResolvedIntExpr::Const(1.into()),
+        }
+    }
+
+    fn add_explicit_large(lowerer: &mut GraphLowerer<'_, '_>) -> Id {
+        let scope = root_test_environment().occurrence;
+        let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+            super::super::identity::AtomicSourceDescriptor {
+                key: super::super::identity::AtomicSourceKey::ExplicitLarge(
+                    super::super::identity::GraphWireSourceKey {
+                        wire: WireSourceKey {
+                            scope,
+                            wire: WireRef {
+                                node: mxx_ir_core::NodeId(98),
+                                port: mxx_ir_core::Port(0),
+                            },
+                        },
+                        coordinate_binders: Box::new([]),
+                    },
+                ),
+                sort: MxxSort::Matrix(test_resolved_matrix()),
+                integer_domain: None,
+                canonical_residue_convention: None,
+                relation_role: None,
+            },
+        );
+        lowerer.egraph.add(MxxLang::Atom {
+            source: super::super::identity::AtomicSourceId(source),
+            indices: Box::new([]),
+        })
+    }
+
+    fn add_bounded_polynomial(lowerer: &mut GraphLowerer<'_, '_>, coefficient: i64) -> Id {
+        let spec = lowerer.egraph.analysis.symbols.matrix_constants.intern(
+            super::super::identity::MatrixConstantSpec {
+                matrix_type: test_resolved_matrix(),
+                value: super::super::identity::MatrixConstantValue::Polynomial {
+                    coefficients: vec![ResolvedIntExpr::Const(coefficient.into())].into(),
+                },
+            },
+        );
+        lowerer
+            .egraph
+            .add(MxxLang::MatrixConstant(super::super::identity::MatrixConstantSpecId(spec)))
+    }
+
+    fn add_recurrence_states(lowerer: &mut GraphLowerer<'_, '_>, count: usize) -> Vec<Id> {
+        let scope = root_test_environment().occurrence;
+        (0..count)
+            .map(|carried_index| {
+                let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+                    super::super::identity::AtomicSourceDescriptor {
+                        key: super::super::identity::AtomicSourceKey::SequentialState(
+                            SequentialStateKey {
+                                loop_scope: scope.clone(),
+                                loop_node: mxx_ir_core::NodeId(99),
+                                carried_index,
+                            },
+                        ),
+                        sort: MxxSort::Matrix(test_resolved_matrix()),
+                        integer_domain: None,
+                        canonical_residue_convention: None,
+                        relation_role: None,
+                    },
+                );
+                lowerer.egraph.add(MxxLang::Atom {
+                    source: super::super::identity::AtomicSourceId(source),
+                    indices: Box::new([]),
+                })
+            })
+            .collect()
+    }
+
+    fn add_recurrence_roots(
+        lowerer: &mut GraphLowerer<'_, '_>,
+        count: u64,
+        initial: Vec<Id>,
+        transition: Vec<Id>,
+    ) -> Vec<Id> {
+        let scope = root_test_environment().occurrence;
+        let carried_count = transition.len();
+        let recurrence = lowerer.egraph.analysis.symbols.sequential_recurrences.intern(
+            SequentialRecurrenceDescriptor {
+                loop_scope: scope.clone(),
+                loop_node: mxx_ir_core::NodeId(99),
+                count: ResolvedIntExpr::Const(count.into()),
+                initial: initial.into(),
+                transition: transition.into(),
+                output_types: vec![test_resolved_matrix(); carried_count].into(),
+            },
+        );
+        (0..carried_count)
+            .map(|carried_index| {
+                let source = lowerer.egraph.analysis.symbols.atomic_sources.intern(
+                    super::super::identity::AtomicSourceDescriptor {
+                        key: super::super::identity::AtomicSourceKey::SequentialRecurrence {
+                            recurrence: super::super::identity::SequentialRecurrenceId(recurrence),
+                            carried_index,
+                        },
+                        sort: MxxSort::Matrix(test_resolved_matrix()),
+                        integer_domain: None,
+                        canonical_residue_convention: None,
+                        relation_role: None,
+                    },
+                );
+                lowerer.egraph.add(MxxLang::Atom {
+                    source: super::super::identity::AtomicSourceId(source),
+                    indices: Box::new([]),
+                })
+            })
+            .collect()
+    }
+
+    fn recurrence_lowerer() -> (ProtocolDecl, OperationalCheckRequest) {
+        (
+            crate::toy_example::protocol(),
+            OperationalCheckRequest {
+                environment: Vec::new(),
+                layouts: Vec::new(),
+                target_id: "recurrence-bound".to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn sequential_recurrence_consumes_large_through_zero_scale() {
+        let (protocol, request) = recurrence_lowerer();
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let initial = add_explicit_large(&mut lowerer);
+        let state = add_recurrence_states(&mut lowerer, 1).remove(0);
+        let zero = lowerer.egraph.add(MxxLang::IntConst(0.into()));
+        let transition = lowerer.egraph.add(MxxLang::MatrixScale([zero, state]));
+        let root = add_recurrence_roots(&mut lowerer, 1, vec![initial], vec![transition]).remove(0);
+
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate(root)
+                .unwrap()
+                .coefficient_class,
+            BoundClass::ExactZero,
+        );
+    }
+
+    #[test]
+    fn sequential_recurrence_keeps_zero_count_large_for_final_rejection() {
+        let (protocol, request) = recurrence_lowerer();
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let initial = add_explicit_large(&mut lowerer);
+        let state = add_recurrence_states(&mut lowerer, 1).remove(0);
+        let root = add_recurrence_roots(&mut lowerer, 0, vec![initial], vec![state]).remove(0);
+
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view())
+                .evaluate_allow_large(root)
+                .unwrap()
+                .coefficient_class,
+            BoundClass::Large,
+        );
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view()).evaluate(root),
+            Err(BoundEvaluationError::UnconsumedLargeTerm { term: root }),
+        );
+    }
+
+    #[test]
+    fn sequential_recurrence_preserves_bounded_and_simultaneous_multistate_values() {
+        let (protocol, request) = recurrence_lowerer();
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let one = add_bounded_polynomial(&mut lowerer, 1);
+        let three = add_bounded_polynomial(&mut lowerer, 3);
+        let states = add_recurrence_states(&mut lowerer, 2);
+        let roots =
+            add_recurrence_roots(&mut lowerer, 1, vec![one, three], vec![states[1], states[0]]);
+
+        for (root, expected) in roots.into_iter().zip([3_u8, 1_u8]) {
+            assert_eq!(
+                BoundEvaluator::new(&lowerer.production_bound_view())
+                    .evaluate(root)
+                    .unwrap()
+                    .coefficient_class,
+                BoundClass::bounded(expected.into()),
+            );
+        }
+    }
+
+    #[test]
+    fn sequential_recurrence_does_not_consume_large_through_negation() {
+        let (protocol, request) = recurrence_lowerer();
+        let mut lowerer = GraphLowerer::new(&protocol, &request, MxxAnalysis::default());
+        let initial = add_explicit_large(&mut lowerer);
+        let state = add_recurrence_states(&mut lowerer, 1).remove(0);
+        let transition = lowerer.egraph.add(MxxLang::MatrixNegate([state]));
+        let root = add_recurrence_roots(&mut lowerer, 1, vec![initial], vec![transition]).remove(0);
+
+        assert_eq!(
+            BoundEvaluator::new(&lowerer.production_bound_view()).evaluate(root),
+            Err(BoundEvaluationError::UnconsumedLargeTerm { term: root }),
+        );
     }
 
     #[test]

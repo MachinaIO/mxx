@@ -403,6 +403,19 @@ struct CheckedProductReplacementPlan {
     selector_distribution: bool,
 }
 
+/// Extraction-only classification of one exact product node. Both facts are
+/// derived from the same ephemeral checked replacement-plan scan.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProposalRelationClassification {
+    /// The checked replacement is not yet represented by the enclosing class.
+    pub relation_redex: bool,
+    /// The number of distinct canonical ordered factor-sequence boundaries
+    /// with one authoritative checked replacement. This is e-node-local and
+    /// never an extraction obligation, including after a replacement has been
+    /// unioned.
+    pub local_checked_relation_count: u64,
+}
+
 fn existing_product_plan(factors: &[Id]) -> ReplacementPlan {
     let factors = factors.iter().copied().map(ReplacementPlan::Existing).collect::<Vec<_>>();
     if factors.len() == 1 {
@@ -434,38 +447,8 @@ fn checked_product_replacement_plan(
     factors: &[Id],
 ) -> Option<CheckedProductReplacementPlan> {
     for relation_position in 1..factors.len() {
-        let relation = factors[relation_position];
-        if egraph[egraph.find(relation)].data.relation_provenance.is_empty() {
-            continue;
-        }
-        let public = factors[relation_position - 1];
-        match pointwise_same_selector_plan(egraph, public, relation, true) {
-            Ok(Some(product)) => {
-                return Some(CheckedProductReplacementPlan {
-                    replacement: splice_product_plan(
-                        &factors[..relation_position - 1],
-                        &[product],
-                        &factors[relation_position + 1..],
-                    ),
-                    selector_distribution: true,
-                });
-            }
-            Ok(None)
-                if switch_node(egraph, public).is_some() ||
-                    switch_node(egraph, relation).is_some() =>
-            {
-                context.fail(RelationFailure::TransformedOperand);
-                return None;
-            }
-            Err(RelationFailure::DifferentSelectorBlocked) => continue,
-            Err(failure) => {
-                context.fail(failure);
-                return None;
-            }
-            Ok(None) => {}
-        }
         if let Some(replacement) =
-            checked_replacement_plan(egraph, context, factors, relation_position)
+            checked_product_replacement_plan_at(egraph, context, factors, relation_position)
         {
             return Some(replacement);
         }
@@ -474,6 +457,47 @@ fn checked_product_replacement_plan(
         }
     }
     None
+}
+
+/// Checks exactly one ordered public/relation boundary in one factor sequence.
+/// Callers that need a first rewrite keep the historical left-to-right scan;
+/// extraction instead visits every such boundary to rank all checked plans.
+fn checked_product_replacement_plan_at(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    context: &RewriteContext,
+    factors: &[Id],
+    relation_position: usize,
+) -> Option<CheckedProductReplacementPlan> {
+    let relation = *factors.get(relation_position)?;
+    if relation_position == 0 || egraph[egraph.find(relation)].data.relation_provenance.is_empty() {
+        return None;
+    }
+    let public = factors[relation_position - 1];
+    match pointwise_same_selector_plan(egraph, public, relation, true) {
+        Ok(Some(product)) => {
+            return Some(CheckedProductReplacementPlan {
+                replacement: splice_product_plan(
+                    &factors[..relation_position - 1],
+                    &[product],
+                    &factors[relation_position + 1..],
+                ),
+                selector_distribution: true,
+            });
+        }
+        Ok(None)
+            if switch_node(egraph, public).is_some() || switch_node(egraph, relation).is_some() =>
+        {
+            context.fail(RelationFailure::TransformedOperand);
+            return None;
+        }
+        Err(RelationFailure::DifferentSelectorBlocked) => return None,
+        Err(failure) => {
+            context.fail(failure);
+            return None;
+        }
+        Ok(None) => {}
+    }
+    checked_replacement_plan(egraph, context, factors, relation_position)
 }
 
 /// A physical representation query never conflates an absent operation with
@@ -1439,6 +1463,28 @@ pub(crate) fn selected_multi_switch_redex(
     Some(SelectedMultiSwitchRedex { origin, input_switch_count: plan.input_switch_count })
 }
 
+/// Read-only selected-Add structural authority.  The signed additive
+/// consensus remains the sole multi-Switch equivalence authority; unlike the
+/// collector it retains an eligible recipe even when that exact Switch is
+/// already represented by the origin class.
+pub(crate) fn selected_multi_switch_structural_probe(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    origin: Id,
+    selected_node: &MxxLang,
+) -> Option<SelectedStructuralNormalizationProbe> {
+    matches!(selected_node, MxxLang::MatrixAdd(_)).then_some(())?;
+    let origin = egraph.find(origin);
+    let plan = same_selector_multi_switch_distribution_recipe(egraph, origin)?;
+    Some(SelectedStructuralNormalizationProbe {
+        satisfied: equivalent_signed_switch_exists(
+            egraph,
+            origin,
+            plan.plan.selector,
+            &plan.plan.cases,
+        ),
+    })
+}
+
 /// Revalidates and prepares one extraction-selected distribution without
 /// changing e-graph equivalence.
 pub(crate) fn prepare_selected_multi_switch_redex(
@@ -1550,6 +1596,14 @@ pub(crate) struct SelectedProductAddEligibility {
     addend_count: usize,
 }
 
+/// Read-only result for one selected structural normalization.  The recipe is
+/// re-derived by the collector immediately before materialization; extraction
+/// retains only this root-local classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedStructuralNormalizationProbe {
+    pub(crate) satisfied: bool,
+}
+
 /// One-layer ordered distribution eligibility. It is intentionally narrower
 /// than general polynomial expansion: exactly one direct selected Add factor
 /// is allowed, and every resulting product must have no direct selected Add.
@@ -1589,6 +1643,122 @@ pub(crate) fn selected_product_add_eligibility<'a>(
     selected_add
 }
 
+/// Checks the exact `Switch(selector, Product(case_0...), ...)` tree selected
+/// by the Switch-scope product rule.  Case and factor order are significant.
+fn selected_product_switch_satisfied<'a>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    product_origin: Id,
+    factors: &[Id],
+    eligibility: SelectedProductSwitchEligibility,
+    lookup: impl Copy + Fn(Id) -> Option<SelectedNodeRef<'a>>,
+) -> bool {
+    let product_origin = egraph.find(product_origin);
+    egraph[product_origin].nodes.iter().any(|node| {
+        let MxxLang::Switch(cases) = node else { return false };
+        cases.len() == eligibility.case_count + 1 &&
+            egraph.find(cases[0]) == eligibility.selector &&
+            cases[1..].iter().enumerate().all(|(case_index, product)| {
+                egraph[egraph.find(*product)].nodes.iter().any(|node| {
+                    let MxxLang::MatrixMultiply(actual) = node else { return false };
+                    actual.len() == factors.len() &&
+                        actual.iter().zip(factors).all(|(actual, factor)| {
+                            let Some(selected) = lookup(*factor) else { return false };
+                            let expected = match selected.node {
+                                MxxLang::Switch(selected_cases) => selected_cases
+                                    .get(case_index + 1)
+                                    .and_then(|case| lookup(*case))
+                                    .map(|selected| egraph.find(selected.origin)),
+                                _ => Some(egraph.find(selected.origin)),
+                            };
+                            expected.is_some_and(|expected| egraph.find(*actual) == expected)
+                        })
+                })
+            })
+    })
+}
+
+/// Checks the exact one-layer `Add(Product(prefix, addend, suffix), ...)`
+/// representation selected by the product-distribution rule.  This remains a
+/// structural e-class query: it neither adds nodes nor accepts a merely
+/// equivalent reassociation.
+fn selected_product_add_satisfied<'a>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    product_origin: Id,
+    factors: &[Id],
+    eligibility: SelectedProductAddEligibility,
+    lookup: impl Copy + Fn(Id) -> Option<SelectedNodeRef<'a>>,
+) -> bool {
+    let product_origin = egraph.find(product_origin);
+    let Some(add_handle) = factors.get(eligibility.add_factor_index).copied() else {
+        return false;
+    };
+    let Some(SelectedNodeRef { node: MxxLang::MatrixAdd(addends), .. }) = lookup(add_handle) else {
+        return false;
+    };
+    if addends.len() != eligibility.addend_count {
+        return false;
+    }
+    let expected_fixed = factors
+        .iter()
+        .map(|factor| lookup(*factor).map(|selected| egraph.find(selected.origin)))
+        .collect::<Option<Vec<_>>>();
+    let Some(expected_fixed) = expected_fixed else { return false };
+    egraph[product_origin].nodes.iter().any(|node| {
+        let MxxLang::MatrixAdd(terms) = node else { return false };
+        terms.len() == addends.len() &&
+            terms.iter().zip(addends).all(|(term, addend)| {
+                let Some(addend) = lookup(*addend).map(|selected| egraph.find(selected.origin))
+                else {
+                    return false;
+                };
+                egraph[egraph.find(*term)].nodes.iter().any(|node| {
+                    matches!(node, MxxLang::MatrixMultiply(product)
+                    if product.len() == expected_fixed.len() &&
+                        product.iter().enumerate().all(|(index, factor)|
+                            egraph.find(*factor) == if index == eligibility.add_factor_index {
+                                addend
+                            } else {
+                                expected_fixed[index]
+                            }))
+                })
+            })
+    })
+}
+
+/// Allocation-light selected-product structural authority.  It deliberately
+/// reports a satisfied recipe too, so extraction can prefer the existing
+/// normalized representation without turning it into an obligation.
+pub(crate) fn selected_product_structural_probe<'a>(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    product_origin: Id,
+    factors: &[Id],
+    lookup: impl Copy + Fn(Id) -> Option<SelectedNodeRef<'a>>,
+) -> Option<SelectedStructuralNormalizationProbe> {
+    if let Some(eligibility) =
+        selected_product_switch_eligibility(egraph, product_origin, factors, lookup)
+    {
+        return Some(SelectedStructuralNormalizationProbe {
+            satisfied: selected_product_switch_satisfied(
+                egraph,
+                product_origin,
+                factors,
+                eligibility,
+                lookup,
+            ),
+        });
+    }
+    let eligibility = selected_product_add_eligibility(egraph, product_origin, factors, lookup)?;
+    Some(SelectedStructuralNormalizationProbe {
+        satisfied: selected_product_add_satisfied(
+            egraph,
+            product_origin,
+            factors,
+            eligibility,
+            lookup,
+        ),
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct SelectedProductAddRedex {
     pub(crate) origin: Id,
@@ -1619,6 +1789,9 @@ pub(crate) fn selected_product_add_redex(
         })
     };
     let eligibility = selected_product_add_eligibility(egraph, origin, selected_factors, lookup)?;
+    if selected_product_add_satisfied(egraph, origin, selected_factors, eligibility, lookup) {
+        return None;
+    }
     let add_handle = *selected_factors.get(eligibility.add_factor_index)?;
     let MxxLang::MatrixAdd(selected_addends) = lookup(add_handle)?.node else {
         return None;
@@ -1697,6 +1870,16 @@ pub(crate) fn selected_product_switch_redex(
                 origin: *origins.get(index)?,
             })
         })?;
+    let lookup = |handle| {
+        let index = usize::from(handle);
+        Some(SelectedNodeRef {
+            node: expression.as_ref().get(index)?,
+            origin: *origins.get(index)?,
+        })
+    };
+    if selected_product_switch_satisfied(egraph, origin, selected_factors, eligibility, lookup) {
+        return None;
+    }
     let mut factors = Vec::with_capacity(selected_factors.len());
     for factor in selected_factors {
         let factor_index = usize::from(*factor);
@@ -1776,7 +1959,7 @@ pub(crate) fn materialize_selected_product_switch_redex(
 /// canonical selector.  Add/Negate consensus is established before selecting
 /// any Switch case, so competing physical Add witnesses cannot choose a
 /// selector-correlated representation opportunistically.
-fn same_selector_multi_switch_distribution_plan(
+fn same_selector_multi_switch_distribution_recipe(
     egraph: &EGraph<MxxLang, MxxAnalysis>,
     root: Id,
 ) -> Option<SameSelectorMultiSwitchPlan> {
@@ -1849,13 +2032,24 @@ fn same_selector_multi_switch_distribution_plan(
             .expect("one case was just pushed")
             .sort_unstable_by_key(|term| (usize::from(egraph.find(term.base)), term.negative));
     }
-    if equivalent_signed_switch_exists(egraph, root, selector, &normalized_cases) {
-        return None;
-    }
     Some(SameSelectorMultiSwitchPlan {
         plan: PointwiseAddSwitchPlan { selector, cases: normalized_cases, binder_aware: None },
         input_switch_count: switches.len(),
     })
+}
+
+fn same_selector_multi_switch_distribution_plan(
+    egraph: &EGraph<MxxLang, MxxAnalysis>,
+    root: Id,
+) -> Option<SameSelectorMultiSwitchPlan> {
+    let plan = same_selector_multi_switch_distribution_recipe(egraph, root)?;
+    (!equivalent_signed_switch_exists(
+        egraph,
+        egraph.find(root),
+        plan.plan.selector,
+        &plan.plan.cases,
+    ))
+    .then_some(plan)
 }
 
 #[cfg(test)]
@@ -5904,42 +6098,6 @@ fn slice_product(
     candidates.into_iter().next()
 }
 
-fn build_affine_concat(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    expected_public: Id,
-    plan: &AffineConcatPlan,
-) -> Id {
-    let leading = ordered_product_sequence(egraph, &plan.prefix, &[expected_public], &[]);
-    let residual_chunks = plan
-        .residuals
-        .as_ref()
-        .into_iter()
-        .flatten()
-        .map(|terms| {
-            if terms.len() == 1 { terms[0] } else { egraph.add(MxxLang::MatrixAdd(terms.clone())) }
-        })
-        .collect::<Vec<_>>();
-    let residual = match residual_chunks.len() {
-        0 => None,
-        1 => Some(residual_chunks[0]),
-        _ => Some(egraph.add(MxxLang::MatrixConcat {
-            axis: Axis::Columns,
-            inputs: residual_chunks.into_boxed_slice(),
-        })),
-    };
-    let mut terms = Vec::with_capacity(plan.outside.len() + 1 + usize::from(residual.is_some()));
-    terms.push(leading);
-    if let Some(residual) = residual {
-        terms.push(residual);
-    }
-    terms.extend_from_slice(&plan.outside);
-    if terms.len() == 1 {
-        terms[0]
-    } else {
-        egraph.add(MxxLang::MatrixAdd(terms.into_boxed_slice()))
-    }
-}
-
 fn affine_concat_replacement_plan(expected_public: Id, plan: &AffineConcatPlan) -> ReplacementPlan {
     let leading =
         splice_product_plan(&plan.prefix, &[ReplacementPlan::Existing(expected_public)], &[]);
@@ -5992,42 +6150,48 @@ pub fn classify_proposal_node(
     origin: Id,
     node: &MxxLang,
     context: &RewriteContext,
-) -> Result<bool, RelationFailure> {
+) -> Result<ProposalRelationClassification, RelationFailure> {
     let MxxLang::MatrixMultiply(factors) = node else {
-        return Ok(false);
+        return Ok(ProposalRelationClassification::default());
     };
     let origin = egraph.find(origin);
-    if classify_product_factors(egraph, origin, factors, context)? {
-        return Ok(true);
-    }
     let Some(nested_candidates) = right_nested_relation_factor_candidates(egraph, factors, context)
     else {
         return match context.failure() {
             Some(failure) => Err(failure),
-            None => Ok(false),
+            None => Ok(ProposalRelationClassification::default()),
         };
     };
-    for factors in nested_candidates {
-        if classify_product_factors(egraph, origin, &factors, context)? {
-            return Ok(true);
+    let mut classification = ProposalRelationClassification::default();
+    let mut unique_plans = BTreeSet::new();
+    let mut scan = |candidate: &[Id]| -> Result<(), RelationFailure> {
+        for relation_position in 1..candidate.len() {
+            let Some(plan) =
+                checked_product_replacement_plan_at(egraph, context, candidate, relation_position)
+            else {
+                if let Some(failure) = context.failure() {
+                    return Err(failure);
+                }
+                continue;
+            };
+            let unsatisfied = !replacement_plan_satisfied(egraph, origin, &plan.replacement);
+            // A checked plan itself is the canonical boundary identity: it
+            // contains the ordered public/relation splice context. Moving it
+            // into the set avoids cloning factor sequences while deduplicating
+            // direct and immediate right-nested physical exposures.
+            classification.relation_redex |= unsatisfied;
+            if unique_plans.insert(plan) {
+                classification.local_checked_relation_count =
+                    classification.local_checked_relation_count.saturating_add(1);
+            }
         }
-    }
-    Ok(false)
-}
-
-fn classify_product_factors(
-    egraph: &EGraph<MxxLang, MxxAnalysis>,
-    origin: Id,
-    factors: &[Id],
-    context: &RewriteContext,
-) -> Result<bool, RelationFailure> {
-    let Some(plan) = checked_product_replacement_plan(egraph, context, factors) else {
-        return match context.failure() {
-            Some(failure) => Err(failure),
-            None => Ok(false),
-        };
+        Ok(())
     };
-    Ok(!replacement_plan_satisfied(egraph, origin, &plan.replacement))
+    scan(factors)?;
+    for nested in nested_candidates {
+        scan(&nested)?;
+    }
+    Ok(classification)
 }
 
 /// Validates the exact Graph-derived records before accepting an e-class
@@ -6437,56 +6601,6 @@ fn distribution_target_operations(
         vec![distribution_product_operation(egraph, prefix, &middle, suffix, context)?]
             .into_boxed_slice(),
     )
-}
-
-fn ordered_product_sequence(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    prefix: &[Id],
-    middle: &[Id],
-    suffix: &[Id],
-) -> Id {
-    let mut factors = Vec::with_capacity(prefix.len() + middle.len() + suffix.len());
-    factors.extend_from_slice(prefix);
-    factors.extend_from_slice(middle);
-    factors.extend_from_slice(suffix);
-    if factors.len() == 1 {
-        factors[0]
-    } else {
-        egraph.add(MxxLang::MatrixMultiply(factors.into_boxed_slice()))
-    }
-}
-
-fn target_spliced_product(
-    egraph: &mut EGraph<MxxLang, MxxAnalysis>,
-    prefix: &[Id],
-    target_prefix: &[Id],
-    target: Id,
-    suffix: &[Id],
-) -> Id {
-    if let Some(terms) = unique_add_terms(egraph, target) {
-        if terms.is_empty() {
-            return target;
-        }
-        let mut products = Vec::with_capacity(terms.len());
-        for term in terms.iter() {
-            let expanded = unique_product_factors(egraph, *term);
-            let mut middle = Vec::with_capacity(
-                target_prefix.len() + expanded.as_ref().map_or(1, |factors| factors.len()),
-            );
-            middle.extend_from_slice(target_prefix);
-            if let Some(factors) = expanded {
-                middle.extend_from_slice(&factors);
-            } else {
-                middle.push(*term);
-            }
-            products.push(ordered_product_sequence(egraph, prefix, &middle, suffix));
-        }
-        return egraph.add(MxxLang::MatrixAdd(products.into_boxed_slice()));
-    }
-    let mut middle = Vec::with_capacity(target_prefix.len() + 1);
-    middle.extend_from_slice(target_prefix);
-    middle.push(target);
-    ordered_product_sequence(egraph, prefix, &middle, suffix)
 }
 
 fn target_spliced_replacement_plan(
@@ -7113,12 +7227,6 @@ mod tests {
         assert_eq!(plan.outside.len(), 1);
         assert_eq!(egraph.find(plan.outside[0]), egraph.find(outside));
 
-        let normalized = build_affine_concat(&mut egraph, expected, &plan);
-        assert!(egraph[egraph.find(normalized)].nodes.iter().any(|node| {
-            matches!(node, MxxLang::MatrixAdd(terms)
-                if terms.iter().any(|term| egraph.find(*term) == egraph.find(outside)))
-        }));
-
         let (relation, source) = matrix_atom_with_type(
             &mut egraph,
             "relation",
@@ -7237,30 +7345,6 @@ mod tests {
     }
 
     #[test]
-    fn target_add_splice_preserves_ordered_product_factors() {
-        let mut egraph = EGraph::new(MxxAnalysis::default());
-        let (prefix, _) = matrix_atom(&mut egraph, "prefix", None);
-        let (left, _) = matrix_atom(&mut egraph, "left", None);
-        let (right, _) = matrix_atom(&mut egraph, "right", None);
-        let (error, _) = matrix_atom(&mut egraph, "error", None);
-        let (suffix, _) = matrix_atom(&mut egraph, "suffix", None);
-        let signal = egraph.add(MxxLang::MatrixMultiply(vec![left, right].into()));
-        let target = egraph.add(MxxLang::MatrixAdd(vec![signal, error].into()));
-        let replacement = target_spliced_product(&mut egraph, &[prefix], &[], target, &[suffix]);
-        assert!(egraph[egraph.find(replacement)].nodes.iter().any(|node| {
-            matches!(node, MxxLang::MatrixAdd(terms) if terms.iter().any(|term| {
-                egraph[egraph.find(*term)].nodes.iter().any(|node| matches!(node,
-                    MxxLang::MatrixMultiply(factors)
-                        if factors.len() == 4 &&
-                            egraph.find(factors[0]) == egraph.find(prefix) &&
-                            egraph.find(factors[1]) == egraph.find(left) &&
-                            egraph.find(factors[2]) == egraph.find(right) &&
-                            egraph.find(factors[3]) == egraph.find(suffix)))
-            }))
-        }));
-    }
-
-    #[test]
     fn source_kinds_do_not_affect_relation_redex_classification() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let protocol_atom = |egraph: &mut EGraph<MxxLang, MxxAnalysis>, name: &str, sort| {
@@ -7295,10 +7379,10 @@ mod tests {
 
         for term in [bytes, integer, sampler] {
             let node = egraph[egraph.find(term)].nodes.first().expect("atom node");
-            assert!(!classify_proposal_node(&egraph, term, node, &context).unwrap());
+            assert!(!classify_proposal_node(&egraph, term, node, &context).unwrap().relation_redex);
         }
         let node = egraph[egraph.find(matrix)].nodes.first().expect("matrix atom node");
-        assert!(!classify_proposal_node(&egraph, matrix, node, &context).unwrap());
+        assert!(!classify_proposal_node(&egraph, matrix, node, &context).unwrap().relation_redex);
     }
 
     fn registration(
@@ -7551,6 +7635,7 @@ mod tests {
         assert!(
             !classify_proposal_node(&egraph, product, node, &context)
                 .expect("selector mismatch is local")
+                .relation_redex
         );
         assert_eq!(context.failure(), None);
     }
@@ -7574,10 +7659,10 @@ mod tests {
             .iter()
             .find(|node| matches!(node, MxxLang::MatrixMultiply(_)))
             .expect("product node");
-        assert!(
-            classify_proposal_node(&egraph, product, node, &context)
-                .expect("same selector distributes")
-        );
+        let classification = classify_proposal_node(&egraph, product, node, &context)
+            .expect("same selector distributes");
+        assert!(classification.relation_redex);
+        assert_eq!(classification.local_checked_relation_count, 1);
         assert_eq!(context.failure(), None);
     }
 
@@ -7601,7 +7686,11 @@ mod tests {
             .iter()
             .find(|node| matches!(node, MxxLang::MatrixMultiply(_)))
             .expect("outer product witness");
-        assert!(classify_proposal_node(&egraph, root, node, &context).expect("closed relation"));
+        assert!(
+            classify_proposal_node(&egraph, root, node, &context)
+                .expect("closed relation")
+                .relation_redex
+        );
         let searcher = RelationSearcher::new(context.clone());
         assert!(Searcher::search_eclass_with_limit(&searcher, &egraph, root, 1).is_some());
 
@@ -7627,10 +7716,15 @@ mod tests {
                     egraph.find(factors[1]) == egraph.find(inner))
             })
             .expect("the rewritten e-class retains its raw relation representation");
+        let classification = classify_proposal_node(&egraph, root, raw_node, &context)
+            .expect("canonical-equivalent replacement is satisfied");
         assert!(
-            !classify_proposal_node(&egraph, root, raw_node, &context)
-                .expect("canonical-equivalent replacement is satisfied"),
+            !classification.relation_redex,
             "an already-unioned relation must not remain an extraction obligation"
+        );
+        assert_eq!(
+            classification.local_checked_relation_count, 1,
+            "the raw relation node retains one checked relation boundary after replacement"
         );
         assert_eq!(context.failure(), None);
     }
@@ -7658,7 +7752,9 @@ mod tests {
             .find(|node| matches!(node, MxxLang::MatrixMultiply(_)))
             .expect("outer product witness");
         assert!(
-            !classify_proposal_node(&egraph, root, node, &context).expect("not an ordered match")
+            !classify_proposal_node(&egraph, root, node, &context)
+                .expect("not an ordered match")
+                .relation_redex
         );
 
         let applier = RelationApplier::new(context.clone());
@@ -12840,7 +12936,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_multi_switch_batch_materializes_parent_and_child_from_one_snapshot() {
+    fn selected_multi_switch_two_layer_expansion_converges_after_reextract() {
         let mut egraph = EGraph::new(MxxAnalysis::default());
         let selector = egraph.add(MxxLang::IntConst(0.into()));
         let (left, _) = matrix_atom(&mut egraph, "batch-nested-left", None);
@@ -12874,6 +12970,35 @@ mod tests {
         );
         assert!(selected_multi_switch_redex(&egraph, child, &child_node).is_none());
         assert!(selected_multi_switch_redex(&egraph, parent, &parent_node).is_none());
+    }
+
+    #[test]
+    fn stale_selected_batch_union_has_zero_progress() {
+        let mut egraph = EGraph::new(MxxAnalysis::default());
+        let selector = egraph.add(MxxLang::IntConst(0.into()));
+        let (left, _) = matrix_atom(&mut egraph, "stale-batch-left", None);
+        let (right, _) = matrix_atom(&mut egraph, "stale-batch-right", None);
+        let first = egraph.add(MxxLang::Switch(vec![selector, left, right].into_boxed_slice()));
+        let second = egraph.add(MxxLang::Switch(vec![selector, right, left].into_boxed_slice()));
+        let node = MxxLang::MatrixAdd(vec![first, second].into_boxed_slice());
+        let root = egraph.add(node.clone());
+        egraph.rebuild();
+        let redex = selected_multi_switch_redex(&egraph, root, &node).expect("snapshot redex");
+        let context = RewriteContext::new(SharedRewriteBudget::new());
+        let prepared = prepare_selected_multi_switch_redex(&egraph, redex).expect("prepared batch");
+        let equality = materialize_selected_multi_switch_redex(&mut egraph, prepared, &context)
+            .expect("materialized batch equality");
+
+        assert!(egraph.union(equality.0, equality.1), "the snapshot batch makes progress once");
+        egraph.rebuild();
+        assert!(
+            !egraph.union(equality.0, equality.1),
+            "reusing the same already-applied batch has zero union progress"
+        );
+        assert!(
+            selected_multi_switch_redex(&egraph, root, &node).is_none(),
+            "exact satisfaction excludes the applied recipe from the next extraction"
+        );
     }
 
     #[test]

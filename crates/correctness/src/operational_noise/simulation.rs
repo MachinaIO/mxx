@@ -10,10 +10,7 @@ use super::{
     analysis::{MxxAnalysis, ResourceBudget},
     bound::BoundEvaluationError,
     error::{OperationalSimulationError, TargetError},
-    extract::{
-        ExtractionControl, ProposalNodeClassification, extract_best_proposal,
-        extract_best_proposal_with_origins,
-    },
+    extract::{ExtractionControl, ProposalNodeClassification, extract_best_proposal_with_origins},
     language::MxxLang,
     lower::{GraphLowerer, LoweredValue, LoweringControl},
     relation::{
@@ -101,25 +98,38 @@ enum SelectedPhasePostcondition {
 }
 
 fn selected_phase_postcondition(
-    selected_unions: u64,
-    remaining: u64,
-    hidden: u64,
+    selected_structural_unions: u64,
+    unsatisfied_structural_redexes: u64,
+    hidden_structural_redexes: u64,
 ) -> Result<SelectedPhasePostcondition, (u64, u64)> {
-    if selected_unions != 0 {
+    if selected_structural_unions != 0 {
         Ok(SelectedPhasePostcondition::RestartOrdinary)
-    } else if remaining == 0 && hidden == 0 {
+    } else if unsatisfied_structural_redexes == 0 && hidden_structural_redexes == 0 {
         Ok(SelectedPhasePostcondition::Complete)
     } else {
-        Err((remaining, hidden))
+        Err((unsatisfied_structural_redexes, hidden_structural_redexes))
+    }
+}
+
+/// Relation work is always staged before structural contraction. A structural
+/// batch can expose an ordinary checked relation; in that case the selected
+/// epoch ends without comparing unrelated structural measures, then ordinary
+/// saturation rebuilds the available representation.
+fn selected_relation_postcondition(
+    selected_structural_unions: u64,
+    unsatisfied_relation_redexes: u64,
+) -> Result<Option<SelectedPhasePostcondition>, u64> {
+    if unsatisfied_relation_redexes == 0 {
+        Ok(None)
+    } else if selected_structural_unions != 0 {
+        Ok(Some(SelectedPhasePostcondition::RestartOrdinary))
+    } else {
+        Err(unsatisfied_relation_redexes)
     }
 }
 
 fn accumulated_rewrite_iterations(current: u64, additional: usize) -> u64 {
     current.saturating_add(additional as u64)
-}
-
-fn selected_measure_contracts(before: usize, after: usize) -> bool {
-    after < before
 }
 
 /// Logical checker phase reported by progress events and diagnostics.
@@ -521,15 +531,16 @@ pub fn check_operational_noise_candidate_with_progress(
                 roots.iter().map(|root| lowerer.egraph.find(*root)).collect::<BTreeSet<_>>();
             // This is deliberately outside egg saturation: only Add nodes in
             // the deterministic selected DAG may materialize a same-selector
-            // Switch distribution. A successful step replaces one selected
-            // Add with one Switch; nested selected Add redexes were already
-            // counted, so the fresh selected-redex count must strictly fall.
+            // Switch distribution. This finite protocol makes no universal
+            // termination claim from selected-redex counts: it freezes one
+            // selected snapshot, materializes its complete batch, requires at
+            // least one new union, rebuilds, and then extracts again.
             let mut normalization_epoch = 0_u64;
-            'joint_fixed_point: loop {
+            let mut egraph_mutation_epoch = 0_u64;
+            let (terminal_egraph_mutation_epoch, terminal_selected) = 'joint_fixed_point: loop {
                 // Ordinary saturation may expose a fresh selected multi-Switch
                 // shape.  Recurrence is meaningful only within one selected
                 // phase, so its epoch-local guard resets at this boundary.
-                let mut prior_measure = None::<usize>;
                 let mut selected_phase_unions = 0_u64;
                 loop {
                     let extraction_started = Instant::now();
@@ -545,18 +556,85 @@ pub fn check_operational_noise_candidate_with_progress(
                                 bound_error: &mut bound_error,
                             },
                             &mut |origin, node, egraph| {
-                                let relation_redex = super::relation::classify_proposal_node(
+                                let classification = super::relation::classify_proposal_node(
                                     egraph, origin, node, &context,
                                 )
                                 .map_err(|failure| {
                                     relation_error(&stage, wire, &egraph.analysis.symbols, failure)
                                 })?;
-                                Ok(ProposalNodeClassification { relation_redex })
+                                Ok(ProposalNodeClassification {
+                                    relation_redex: classification.relation_redex,
+                                    local_checked_relation_count: classification
+                                        .local_checked_relation_count,
+                                })
                             },
                         )?;
                         selected.push((*root, proposal));
                     }
                     drop(view);
+
+                    let unsatisfied_relation_redexes =
+                        selected.iter().fold(0_u64, |total, (_, extracted)| {
+                            total.saturating_add(
+                                extracted.proposal.cost.unsatisfied_relation_redexes,
+                            )
+                        });
+                    match selected_relation_postcondition(
+                        selected_phase_unions,
+                        unsatisfied_relation_redexes,
+                    ) {
+                        Ok(Some(SelectedPhasePostcondition::RestartOrdinary)) => {
+                            let iterations =
+                                run_ordinary_relation_saturation(&mut lowerer.egraph, &context)
+                                    .map_err(|source| OperationalSimulationError::Relation {
+                                        site: site(&stage, wire, "relation rewrite"),
+                                        source,
+                                    })?;
+                            egraph_mutation_epoch = egraph_mutation_epoch.saturating_add(1);
+                            {
+                                let mut control = control.borrow_mut();
+                                control.work(
+                                    iterations as u64,
+                                    None,
+                                    Some(lowerer.egraph.total_size() as u64),
+                                )?;
+                                let diagnostics = control.diagnostics_mut();
+                                diagnostics.rewrite_iteration_count =
+                                    accumulated_rewrite_iterations(
+                                        diagnostics.rewrite_iteration_count,
+                                        iterations,
+                                    );
+                                diagnostics.egraph_node_count = lowerer.egraph.total_size() as u64;
+                                diagnostics.egraph_class_count =
+                                    lowerer.egraph.number_of_classes() as u64;
+                            }
+                            if let Some(failure) = context.failure() {
+                                return Err(relation_error(
+                                    &stage,
+                                    wire,
+                                    &lowerer.egraph.analysis.symbols,
+                                    failure,
+                                ));
+                            }
+                            selected_roots =
+                                roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
+                            normalization_epoch = 0;
+                            continue 'joint_fixed_point;
+                        }
+                        Ok(None) => {}
+                        Ok(Some(SelectedPhasePostcondition::Complete)) => {
+                            unreachable!("relation staging never completes a structural phase")
+                        }
+                        Err(unsatisfied_relation_redexes) => {
+                            return Err(OperationalSimulationError::Bound {
+                                site: site(&stage, wire, "extract residual"),
+                                source: super::error::BoundError::UnresolvedExtraction {
+                                    unsatisfied_relation_redexes,
+                                    unsatisfied_structural_redexes: 0,
+                                },
+                            });
+                        }
+                    }
 
                     let mut seen_origins = BTreeSet::new();
                     let mut redexes = Vec::new();
@@ -649,7 +727,20 @@ pub fn check_operational_noise_candidate_with_progress(
                         .iter()
                         .filter(|(_, redex)| matches!(redex, SelectedNormalizationRedex::Add(_)))
                         .count();
-                    let product_redex_count = measure.saturating_sub(add_redex_count);
+                    let product_switch_redex_count = redexes
+                        .iter()
+                        .filter(|(_, redex)| {
+                            matches!(redex, SelectedNormalizationRedex::Product(_))
+                        })
+                        .count();
+                    let product_add_redex_count = redexes
+                        .iter()
+                        .filter(|(_, redex)| {
+                            matches!(redex, SelectedNormalizationRedex::ProductAdd(_))
+                        })
+                        .count();
+                    let product_redex_count =
+                        product_switch_redex_count.saturating_add(product_add_redex_count);
                     let representative_product_shape =
                         redexes.iter().find_map(|(_, redex)| match redex {
                             SelectedNormalizationRedex::Product(redex) => {
@@ -658,15 +749,14 @@ pub fn check_operational_noise_candidate_with_progress(
                             SelectedNormalizationRedex::Add(_) |
                             SelectedNormalizationRedex::ProductAdd(_) => None,
                         });
-                    let previous_before = prior_measure.unwrap_or(measure);
-                    let previous_batch_size = prior_measure.unwrap_or(0);
                     info!(
                         epoch = normalization_epoch,
-                        before_redex_count = previous_before,
-                        after_redex_count = measure,
-                        batch_size = previous_batch_size,
+                        selected_redex_count = measure,
+                        batch_size = measure,
                         add_redex_count,
                         product_redex_count,
+                        product_switch_redex_count,
+                        product_add_redex_count,
                         product_with_product_descendant_count,
                         product_with_product_in_switch_case_count,
                         representative_product_case_count =
@@ -677,36 +767,24 @@ pub fn check_operational_noise_candidate_with_progress(
                         extraction_milliseconds = extraction_started.elapsed().as_millis() as u64,
                         "selected relation normalization epoch"
                     );
-                    if let Some(previous) = prior_measure.take() {
-                        if !selected_measure_contracts(previous, measure) {
-                            return Err(OperationalSimulationError::Relation {
-                            site: site(&stage, wire, "selected relation normalization"),
-                            source:
-                                super::error::RelationError::SelectedNormalizationDidNotContract {
-                                    before: previous,
-                                    after: measure,
-                                },
-                        });
-                        }
-                    }
                     if redexes.is_empty() {
-                        let (remaining_relation_redexes, hidden_relation_redexes) = selected
+                        let (unsatisfied_structural_redexes, hidden_structural_redexes) = selected
                             .iter()
-                            .fold((0_u64, 0_u64), |(remaining, hidden), (_, extracted)| {
+                            .fold((0_u64, 0_u64), |(structural, hidden), (_, extracted)| {
                                 (
-                                    remaining.saturating_add(
-                                        extracted.proposal.cost.remaining_relation_redexes,
+                                    structural.saturating_add(
+                                        extracted.proposal.cost.unsatisfied_structural_redexes,
                                     ),
                                     hidden.saturating_add(
-                                        extracted.proposal.cost.hidden_relation_redexes,
+                                        extracted.proposal.cost.hidden_structural_redexes,
                                     ),
                                 )
                             });
                         if matches!(
                             selected_phase_postcondition(
                                 selected_phase_unions,
-                                remaining_relation_redexes,
-                                hidden_relation_redexes,
+                                unsatisfied_structural_redexes,
+                                hidden_structural_redexes,
                             ),
                             Ok(SelectedPhasePostcondition::RestartOrdinary)
                         ) {
@@ -716,6 +794,7 @@ pub fn check_operational_noise_candidate_with_progress(
                                         site: site(&stage, wire, "relation rewrite"),
                                         source,
                                     })?;
+                            egraph_mutation_epoch = egraph_mutation_epoch.saturating_add(1);
                             {
                                 let mut control = control.borrow_mut();
                                 control.work(
@@ -743,34 +822,39 @@ pub fn check_operational_noise_candidate_with_progress(
                             }
                             selected_roots =
                                 roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
+                            normalization_epoch = 0;
                             continue 'joint_fixed_point;
                         }
-                        if let Err((remaining_relation_redexes, hidden_relation_redexes)) =
+                        if let Err((unsatisfied_structural_redexes, hidden_structural_redexes)) =
                             selected_phase_postcondition(
                                 selected_phase_unions,
-                                remaining_relation_redexes,
-                                hidden_relation_redexes,
+                                unsatisfied_structural_redexes,
+                                hidden_structural_redexes,
                             )
                         {
                             return Err(OperationalSimulationError::Bound {
                                 site: site(&stage, wire, "extract residual"),
                                 source: super::error::BoundError::UnresolvedExtraction {
-                                    remaining_relation_redexes,
-                                    hidden_relation_redexes,
+                                    unsatisfied_relation_redexes: 0,
+                                    unsatisfied_structural_redexes: unsatisfied_structural_redexes
+                                        .max(hidden_structural_redexes),
                                 },
                             });
                         }
                         debug_assert_eq!(
                             selected_phase_postcondition(
                                 selected_phase_unions,
-                                remaining_relation_redexes,
-                                hidden_relation_redexes,
+                                unsatisfied_structural_redexes,
+                                hidden_structural_redexes,
                             ),
                             Ok(SelectedPhasePostcondition::Complete)
                         );
-                        break 'joint_fixed_point;
+                        // `selected` covers every canonical root and no code
+                        // below this branch mutates the e-graph before final
+                        // acceptance, so reuse this exact extraction.
+                        break 'joint_fixed_point (egraph_mutation_epoch, selected);
                     }
-                    let before = measure;
+                    egraph_mutation_epoch = egraph_mutation_epoch.saturating_add(1);
                     let mut pending_unions = Vec::with_capacity(redexes.len());
                     for (_, redex) in redexes {
                         let equality = match redex {
@@ -811,9 +895,8 @@ pub fn check_operational_noise_candidate_with_progress(
                             return Err(OperationalSimulationError::Relation {
                             site: site(&stage, wire, "selected relation normalization"),
                             source:
-                                super::error::RelationError::SelectedNormalizationDidNotContract {
-                                    before,
-                                    after: before,
+                                super::error::RelationError::SelectedNormalizationBatchDidNotUnion {
+                                    batch_size: measure,
                                 },
                         });
                         };
@@ -838,9 +921,8 @@ pub fn check_operational_noise_candidate_with_progress(
                         return Err(OperationalSimulationError::Relation {
                             site: site(&stage, wire, "selected relation normalization"),
                             source:
-                                super::error::RelationError::SelectedNormalizationDidNotContract {
-                                    before,
-                                    after: before,
+                                super::error::RelationError::SelectedNormalizationBatchDidNotUnion {
+                                    batch_size: measure,
                                 },
                         });
                     }
@@ -852,44 +934,55 @@ pub fn check_operational_noise_candidate_with_progress(
                         Some(lowerer.egraph.total_size() as u64),
                     )?;
                     selected_roots = roots.iter().map(|root| lowerer.egraph.find(*root)).collect();
-                    prior_measure = Some(before);
                     normalization_epoch += 1;
                 }
-            }
+            };
             let counters = context.counters();
             control.borrow_mut().diagnostics_mut().relation_candidate_count = counters.candidates;
             control.borrow_mut().diagnostics_mut().relation_rewrite_count = counters.rewrites;
-            let view = lowerer.production_bound_view();
+            let final_selected_roots =
+                roots.iter().map(|root| lowerer.egraph.find(*root)).collect::<BTreeSet<_>>();
+            let terminal_snapshot_is_current = terminal_egraph_mutation_epoch ==
+                egraph_mutation_epoch &&
+                selected_roots == final_selected_roots;
+            debug_assert!(terminal_snapshot_is_current);
+            if !terminal_snapshot_is_current {
+                let root = lowerer.egraph.find(
+                    *roots.first().expect("a lowered residual has at least one selected root"),
+                );
+                return Err(OperationalSimulationError::Bound {
+                    site: site(&stage, wire, "reuse terminal extraction"),
+                    source: super::error::BoundError::EvaluationFailed {
+                        source: BoundEvaluationError::MissingExtractedTerm { term: root },
+                    },
+                });
+            }
             control.borrow_mut().reserve_owned_elements(roots.len())?;
             let mut proposals = Vec::with_capacity(roots.len());
             let mut bounds = Vec::with_capacity(roots.len());
             for root in roots {
                 let root = lowerer.egraph.find(root);
-                let proposal = extract_best_proposal(
-                    &lowerer.egraph,
-                    root,
-                    &view,
-                    &mut ExtractionControl {
-                        invalid_dag: &mut invalid_dag,
-                        bound_error: &mut bound_error,
-                    },
-                    &mut |origin, node, egraph| {
-                        let relation_redex =
-                            super::relation::classify_proposal_node(egraph, origin, node, &context)
-                                .map_err(|failure| {
-                                    relation_error(&stage, wire, &egraph.analysis.symbols, failure)
-                                })?;
-                        Ok(ProposalNodeClassification { relation_redex })
-                    },
-                )?;
-                if proposal.cost.remaining_relation_redexes != 0 ||
-                    proposal.cost.hidden_relation_redexes != 0
+                let selected_index = terminal_selected
+                    .binary_search_by_key(&root, |(root, _)| *root)
+                    .map_err(|_| OperationalSimulationError::Bound {
+                        site: site(&stage, wire, "reuse terminal extraction"),
+                        source: super::error::BoundError::EvaluationFailed {
+                            source: BoundEvaluationError::MissingExtractedTerm { term: root },
+                        },
+                    })?;
+                let proposal = &terminal_selected[selected_index].1.proposal;
+                if proposal.cost.unsatisfied_relation_redexes != 0 ||
+                    proposal.cost.unsatisfied_structural_redexes != 0
                 {
                     return Err(OperationalSimulationError::Bound {
                         site: site(&stage, wire, "extract residual"),
                         source: super::error::BoundError::UnresolvedExtraction {
-                            remaining_relation_redexes: proposal.cost.remaining_relation_redexes,
-                            hidden_relation_redexes: proposal.cost.hidden_relation_redexes,
+                            unsatisfied_relation_redexes: proposal
+                                .cost
+                                .unsatisfied_relation_redexes,
+                            unsatisfied_structural_redexes: proposal
+                                .cost
+                                .unsatisfied_structural_redexes,
                         },
                     });
                 }
@@ -937,9 +1030,8 @@ pub fn check_operational_noise_candidate_with_progress(
                     });
                 }
                 bounds.push((root, semantic_bound));
-                proposals.push(proposal);
+                proposals.push(proposal.clone());
             }
-            drop(view);
             let term_count =
                 proposals.iter().map(|proposal| proposal.expression.as_ref().len()).sum::<usize>();
             control.borrow_mut().work(
@@ -1781,16 +1873,20 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_iteration_diagnostics_accumulate_saturatingly() {
-        assert_eq!(accumulated_rewrite_iterations(4, 3), 7);
-        assert_eq!(accumulated_rewrite_iterations(u64::MAX - 1, 3), u64::MAX);
+    fn relation_exposed_by_structural_work_restarts_before_structural_contraction() {
+        assert_eq!(
+            selected_relation_postcondition(1, 1),
+            Ok(Some(SelectedPhasePostcondition::RestartOrdinary)),
+            "a structural batch must return to ordinary saturation before comparing measures"
+        );
+        assert_eq!(selected_relation_postcondition(0, 0), Ok(None));
+        assert_eq!(selected_relation_postcondition(0, 1), Err(1));
     }
 
     #[test]
-    fn selected_measure_accepts_reduced_nested_work_at_the_same_parent_origin() {
-        assert!(selected_measure_contracts(598, 184));
-        assert!(!selected_measure_contracts(184, 184));
-        assert!(!selected_measure_contracts(184, 185));
+    fn rewrite_iteration_diagnostics_accumulate_saturatingly() {
+        assert_eq!(accumulated_rewrite_iterations(4, 3), 7);
+        assert_eq!(accumulated_rewrite_iterations(u64::MAX - 1, 3), u64::MAX);
     }
 
     fn boolean_target(q: u32) -> ResolvedAcceptanceTarget {
